@@ -52,10 +52,16 @@ def test_dashboard_output_pane_has_bounded_scroll_container():
     # min-height (a floor, not a cap), so the grid row was content-sized and
     # #output's scrollHeight never exceeded its clientHeight — overflow:auto
     # never engaged, scrollTop assignments were no-ops, and the whole *page*
-    # scrolled instead of the terminal pane. `height` + minmax(0,1fr) rows +
-    # min-height:0 down the chain give #output a real bounded box to scroll
-    # within, verified live in a real browser (see the report for this task).
-    assert "height:calc(100vh - 75px)" in DASHBOARD_HTML
+    # scrolled instead of the terminal pane. Now `body` is a flex app-shell
+    # (html/body height:100dvh + overflow:hidden) and `main` gets `flex:1;
+    # min-height:0` — a bounded box that can still shrink below its
+    # content's natural size — rather than a hardcoded "75px header" calc;
+    # grid-template-rows:minmax(0,1fr) + min-height:0 down the chain give
+    # #output a real bounded box to scroll within, verified live in a real
+    # browser (see the report for this task).
+    assert "height:100dvh" in DASHBOARD_HTML
+    assert "overflow:hidden" in DASHBOARD_HTML
+    assert "flex:1; min-height:0" in DASHBOARD_HTML
     assert "grid-template-rows:minmax(0,1fr)" in DASHBOARD_HTML
     assert "min-height:0" in DASHBOARD_HTML
 
@@ -112,6 +118,96 @@ def test_dashboard_sidebar_toggle_and_backdrop_wired_to_state():
 def test_dashboard_mobile_sidebar_respects_safe_areas():
     assert "env(safe-area-inset-top)" in DASHBOARD_HTML
     assert "viewport-fit=cover" in DASHBOARD_HTML
+
+
+def test_dashboard_mobile_compact_chrome_desktop_unaffected():
+    # Requirement: substantially smaller header/subtitle/status card on
+    # mobile so the terminal gets the space; desktop's base header/#summary
+    # rules (22px/28px padding, 20px title) must stay untouched — the
+    # smaller sizing only appears inside the narrow-viewport media query.
+    media_start = DASHBOARD_HTML.index("@media (max-width:760px)")
+    base_css = DASHBOARD_HTML[:media_start]
+    mobile_css = DASHBOARD_HTML[media_start:]
+
+    assert "padding:22px 28px" in base_css  # desktop header untouched
+    assert "font-size:20px" in base_css  # desktop h1 untouched
+    assert "header { padding:8px 12px" in mobile_css
+    assert "h1 { font-size:15px }" in mobile_css
+    assert "-webkit-line-clamp:2" in mobile_css  # compact status card, capped instead of growing
+
+
+def test_dashboard_mobile_composer_is_compact_and_shell_pinned():
+    # Requirement: more compact input composer on mobile, and it stays
+    # "pinned" simply by construction — it's the last row of the same
+    # bounded app-shell as everything else (see the no-outer-scroll test),
+    # so there is no page scroll left that could carry it away regardless
+    # of content length above it.
+    media_start = DASHBOARD_HTML.index("@media (max-width:760px)")
+    mobile_css = DASHBOARD_HTML[media_start:]
+    assert "#inputBar { padding:8px 10px" in mobile_css
+    assert "#inputBar input[type=text] { padding:7px 9px" in mobile_css
+
+
+def test_dashboard_fullscreen_control_present_and_wired():
+    # A dedicated fullscreen control exists, is disabled with no session
+    # selected (mirroring follow/jump), and drives a body class the mobile
+    # CSS keys off — plus opportunistic (never depended-on) real Fullscreen
+    # API progressive enhancement, with an Escape-key and
+    # fullscreenchange-event fallback so state never gets stuck out of sync.
+    assert 'id="fullscreenBtn"' in DASHBOARD_HTML
+    assert "fullscreenBtnEl.disabled = !selected;" in DASHBOARD_HTML
+    assert "document.body.classList.toggle('fullscreen-terminal', value);" in DASHBOARD_HTML
+    assert "fullscreenBtnEl.onclick = () => setFullscreen(!fullscreenTerminal);" in DASHBOARD_HTML
+    assert "if (document.documentElement.requestFullscreen)" in DASHBOARD_HTML
+    assert "document.addEventListener('fullscreenchange'" in DASHBOARD_HTML
+    assert "event.key === 'Escape' && fullscreenTerminal" in DASHBOARD_HTML
+
+
+def test_dashboard_fullscreen_hides_chrome_and_fills_terminal_on_mobile():
+    # In fullscreen, mobile hides every non-terminal element and gives the
+    # single remaining .detail row (.term) the full bounded height via
+    # minmax(0,1fr) — the same mechanism, not a special case, so the
+    # 300-line bound / ANSI rendering / auto-follow inside #output are
+    # completely untouched by any of this (pure presentation).
+    assert "body.fullscreen-terminal header," in DASHBOARD_HTML
+    assert "body.fullscreen-terminal #summary," in DASHBOARD_HTML
+    assert "body.fullscreen-terminal #inputBar," in DASHBOARD_HTML
+    assert "body.fullscreen-terminal .sessions-toggle," in DASHBOARD_HTML
+    assert "body.fullscreen-terminal .detail { grid-template-rows:minmax(0,1fr) }" in DASHBOARD_HTML
+
+
+def test_dashboard_exiting_fullscreen_restores_layout_on_session_loss():
+    # "Exiting must restore the normal mobile layout": if the viewed
+    # session disappears entirely while in fullscreen, there's nothing left
+    # to show fullscreen, so it exits automatically rather than leaving a
+    # blank fullscreen shell.
+    assert "if (fullscreenTerminal) setFullscreen(false); // nothing left to view fullscreen" in DASHBOARD_HTML
+
+
+def test_dashboard_remembers_last_session_name_only():
+    # Only the session identifier is ever written to localStorage — never
+    # tail output, status, or anything else that could carry secrets.
+    assert "localStorage.setItem(LAST_SESSION_KEY, name);" in DASHBOARD_HTML
+    assert "localStorage.getItem(LAST_SESSION_KEY);" in DASHBOARD_HTML
+    # Both reads and writes are guarded: localStorage can throw (private
+    # browsing / disabled storage), and losing this is never fatal.
+    assert "try { localStorage.setItem(LAST_SESSION_KEY, name); } catch (error)" in DASHBOARD_HTML
+    assert "try { return localStorage.getItem(LAST_SESSION_KEY); } catch (error)" in DASHBOARD_HTML
+
+
+def test_dashboard_auto_selects_remembered_or_first_session_once():
+    # On load: remembered session if it's still in the (already
+    # whitelist-filtered) allowed list, else the first available allowed
+    # session — and only ever on the first load, never fighting a manual
+    # selection/clear on the recurring 5s poll.
+    assert "let autoSelectAttempted = false;" in DASHBOARD_HTML
+    assert "if (!autoSelectAttempted) {" in DASHBOARD_HTML
+    assert "if (!selected && rows.length) {" in DASHBOARD_HTML
+    assert (
+        "const target = (remembered && rows.some(row => row.name === remembered)) ? remembered : rows[0].name;"
+        in DASHBOARD_HTML
+    )
+    assert "selectSession(target);" in DASHBOARD_HTML
 
 
 def test_dashboard_renders_ansi_via_dom_only():

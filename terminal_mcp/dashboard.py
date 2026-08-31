@@ -24,16 +24,27 @@ DASHBOARD_HTML = """<!doctype html>
   <title>Terminal MCP Sessions</title>
   <style>
     :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --term-bg:#0a0e1a; --mono: ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace; }
-    * { box-sizing:border-box } body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text) }
-    header { display:flex; justify-content:space-between; gap:16px; align-items:center; padding:22px 28px; border-bottom:1px solid var(--line) }
+    * { box-sizing:border-box }
+    /* True app-shell: the page itself never scrolls (100dvh — the *dynamic*
+       viewport height — tracks a mobile browser showing/hiding its own
+       chrome, unlike 100vh, which can be taller than what's actually
+       visible; `height:100vh` first is a fallback for browsers without dvh
+       support). `body` is a flex column so `header` keeps its natural
+       height and `main` gets exactly what's left — no more hardcoded
+       "75px header" magic number, so this stays correct however tall the
+       header actually is (including the shrunk mobile header below).
+       Only elements that opt into their own `overflow:auto` (the sessions
+       list, #output) ever scroll; everything else is bounded by this shell. */
+    html, body { height:100vh; height:100dvh; overflow:hidden }
+    body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text); display:flex; flex-direction:column }
+    header { flex:0 0 auto; display:flex; justify-content:space-between; gap:16px; align-items:center; padding:22px 28px; border-bottom:1px solid var(--line) }
     h1 { margin:0; font-size:20px } .muted { color:var(--muted) } .live { color:var(--green) }
-    /* `height` (not `min-height`) so the grid row is actually bounded, plus an
-       explicit row track — otherwise a grid row defaults to auto/content-sized,
-       overflow:hidden on a panel has nothing to clip against, and every
-       descendant just grows to fit its content instead of scrolling
-       internally (the whole page scrolls instead; #output's own overflow:auto
-       never engages because its scrollHeight never exceeds its clientHeight). */
-    main { display:grid; grid-template-columns:minmax(240px,340px) 1fr; grid-template-rows:minmax(0,1fr); gap:18px; padding:18px; height:calc(100vh - 75px) }
+    /* `flex:1; min-height:0` (not a fixed/min height) so `main` takes exactly
+       the shell's remaining space and can still shrink below its content's
+       natural size — the same "let a bounded box actually constrain its
+       children instead of growing to fit them" pattern used throughout this
+       chain (main -> .panel -> .detail -> .term -> #output). */
+    main { display:grid; grid-template-columns:minmax(240px,340px) 1fr; grid-template-rows:minmax(0,1fr); gap:18px; padding:18px; flex:1; min-height:0 }
     .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; min-height:0 }
     .panel-title { padding:13px 16px; border-bottom:1px solid var(--line); color:var(--muted) }
     /* Mobile-only "☰ Sessions" reopen control (styled like the other term-bar
@@ -72,11 +83,23 @@ DASHBOARD_HTML = """<!doctype html>
     #inputNote { padding:6px 16px 0; font-size:12px; color:var(--muted) }
     #inputNote.error { color:#ff6b6b }
     @media (max-width:760px) {
+      /* Substantially smaller top chrome so the terminal gets the space:
+         tighter header (title/subtitle/LIVE badge shrink together) and a
+         compact, line-clamped session-status card instead of the
+         desktop-sized versions. */
+      header { padding:8px 12px; gap:8px }
+      h1 { font-size:15px }
+      header .muted { font-size:10px; line-height:1.25 }
+      header .live { font-size:11px }
+      #summary {
+        padding:8px 12px; font-size:12px; line-height:1.3;
+        display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden;
+      }
       /* Narrow/mobile: stack the panels (sessions on top, kept compact and
          independently scrollable; detail fills the rest) instead of sitting
          side by side — same bounded-height pattern as desktop, reused so the
          terminal pane still scrolls internally rather than the whole page. */
-      main { grid-template-columns:1fr; grid-template-rows:auto minmax(0,1fr) }
+      main { grid-template-columns:1fr; grid-template-rows:auto minmax(0,1fr); position:relative }
       #sessions { max-height:32vh }
       .detail { min-height:0 }
       /* Smaller, tighter terminal text fits substantially more real output on
@@ -88,26 +111,67 @@ DASHBOARD_HTML = """<!doctype html>
       #output { font-size:11.5px; line-height:1.3; padding:10px 12px }
       .term-bar { padding:5px 10px }
       .term-btn { padding:4px 8px; font-size:11px }
+      /* More compact input composer; it is already effectively "pinned" —
+         it's the last row of the same bounded shell as everything else, and
+         the app-shell above means there is no page scroll left to carry it
+         away regardless. */
+      #inputBar { padding:8px 10px; gap:6px }
+      #inputBar input[type=text] { padding:7px 9px; font-size:13px }
+      #inputBar button { padding:7px 10px; font-size:13px }
+      #inputBar label { font-size:11px }
+      #inputNote { padding:4px 10px 0; font-size:11px }
       /* Once a session is open, the sidebar hides by default so the terminal
          pane gets essentially the full screen (main's "auto" sidebar row
          collapses to 0 with nothing placed in it); the ☰ Sessions button
          reopens it as a floating drawer over a backdrop, on top of the still
          full-size terminal, rather than resizing/displacing it. Before any
          session is picked, the sidebar stays inline exactly as it always
-         has, so first-time access to the list is never hidden. */
+         has, so first-time access to the list is never hidden. Positioned
+         `absolute` against `main` (not `fixed` with a guessed pixel offset
+         from the viewport top) so it always sits right below the header,
+         however tall the header actually is. */
       body.has-selection .sessions-toggle { display:inline-flex }
       body.has-selection #sessionsPanel { display:none }
       body.has-selection.sidebar-visible #sessionsPanel {
-        display:block; position:fixed; left:12px; right:12px;
-        top:calc(70px + env(safe-area-inset-top)); z-index:20;
+        display:block; position:absolute; left:0; right:0; top:0; z-index:20;
         max-height:70vh; overflow:auto; box-shadow:0 20px 50px rgba(0,0,0,.6);
       }
       body.has-selection.sidebar-visible #sidebarBackdrop {
         display:block; position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:15;
       }
-      /* Respect notch/home-indicator safe areas for the pane that now spans
+      /* Respect notch/home-indicator safe areas for the shell that now spans
          essentially the full viewport. */
       main { padding-left:max(18px, env(safe-area-inset-left)); padding-right:max(18px, env(safe-area-inset-right)); padding-bottom:max(18px, env(safe-area-inset-bottom)) }
+      header { padding-top:max(8px, env(safe-area-inset-top)) }
+
+      /* ---- fullscreen terminal mode ---------------------------------- */
+      /* Hides every non-terminal chrome element (header, status card,
+         sidebar/drawer controls, input composer) so essentially only the
+         terminal pane remains, its own small term-bar (title + follow/
+         jump/exit-fullscreen controls) acting as the "small floating
+         control" this needs. #output still scrolls internally the same
+         way; the 300-line bound, ANSI rendering, and auto-follow/pause/
+         jump are all untouched by anything in this block — it is pure
+         presentation. */
+      body.fullscreen-terminal header,
+      body.fullscreen-terminal #summary,
+      body.fullscreen-terminal #inputNote,
+      body.fullscreen-terminal #inputBar,
+      body.fullscreen-terminal .sessions-toggle,
+      body.fullscreen-terminal #sidebarBackdrop { display:none }
+      body.fullscreen-terminal main { padding:0; gap:0 }
+      body.fullscreen-terminal .detail { grid-template-rows:minmax(0,1fr) }
+      body.fullscreen-terminal .panel.detail { border-radius:0; border:none }
+      body.fullscreen-terminal .term-bar {
+        padding-top:max(7px, env(safe-area-inset-top));
+        padding-left:max(10px, env(safe-area-inset-left));
+        padding-right:max(10px, env(safe-area-inset-right));
+      }
+      body.fullscreen-terminal #output {
+        padding-bottom:max(10px, env(safe-area-inset-bottom));
+        padding-left:max(12px, env(safe-area-inset-left));
+        padding-right:max(12px, env(safe-area-inset-right));
+      }
     }
   </style>
 </head>
@@ -125,6 +189,7 @@ DASHBOARD_HTML = """<!doctype html>
           <span class="term-controls">
             <button id="followToggle" class="term-btn" type="button" disabled>Auto-follow: ON</button>
             <button id="jumpBtn" class="term-btn" type="button" disabled>Jump to latest</button>
+            <button id="fullscreenBtn" class="term-btn" type="button" disabled>⛶ Fullscreen</button>
           </span>
         </div>
         <pre id="output"></pre>
@@ -144,12 +209,14 @@ DASHBOARD_HTML = """<!doctype html>
     let autoFollow = true;
     let lastRenderedSession = null;
     let sidebarForcedOpen = false;
+    let fullscreenTerminal = false;
     const sessionsEl = document.querySelector('#sessions');
     const outputEl = document.querySelector('#output');
     const summaryEl = document.querySelector('#summary');
     const termTitleEl = document.querySelector('#termTitle');
     const followToggleEl = document.querySelector('#followToggle');
     const jumpBtnEl = document.querySelector('#jumpBtn');
+    const fullscreenBtnEl = document.querySelector('#fullscreenBtn');
     const sessionsToggleEl = document.querySelector('#sessionsToggle');
     const sidebarBackdropEl = document.querySelector('#sidebarBackdrop');
     const inputNoteEl = document.querySelector('#inputNote');
@@ -264,6 +331,7 @@ DASHBOARD_HTML = """<!doctype html>
     function refreshTermControls() {
       followToggleEl.disabled = !selected;
       jumpBtnEl.disabled = !selected;
+      fullscreenBtnEl.disabled = !selected;
       termTitleEl.textContent = selected || '';
     }
     followToggleEl.onclick = () => {
@@ -271,6 +339,43 @@ DASHBOARD_HTML = """<!doctype html>
       if (autoFollow) outputEl.scrollTop = outputEl.scrollHeight;
     };
     jumpBtnEl.onclick = () => { setAutoFollow(true); outputEl.scrollTop = outputEl.scrollHeight; };
+
+    // ---- fullscreen terminal (mobile: CSS-only chrome hide; everywhere:
+    // opportunistic real Fullscreen API) --------------------------------
+    // The body.fullscreen-terminal CSS class (scoped to the mobile media
+    // query) is what actually delivers "essentially only the terminal"
+    // everywhere, including iOS Safari, where Element.requestFullscreen()
+    // is not reliably available in a normal tab. The real Fullscreen API
+    // call below is progressive enhancement only — best-effort, never
+    // depended on — for browsers that do support it (desktop, Android
+    // Chrome), so those also get the OS/browser chrome hidden.
+    function setFullscreen(value) {
+      fullscreenTerminal = value;
+      document.body.classList.toggle('fullscreen-terminal', value);
+      fullscreenBtnEl.textContent = value ? '✕ Exit fullscreen' : '⛶ Fullscreen';
+      if (value) {
+        sidebarForcedOpen = false; updateSidebarVisibility(); // exiting must restore the normal layout, so never leave the drawer state stale
+        if (document.documentElement.requestFullscreen) {
+          document.documentElement.requestFullscreen().catch(() => {});
+        }
+      } else if (document.fullscreenElement) {
+        document.exitFullscreen().catch(() => {});
+      }
+      // Entering or exiting changes #output's clientHeight (chrome shows/
+      // hides around it) without moving scrollTop, so a pane that was
+      // pinned to the bottom before the toggle can end up short of it
+      // after — re-snap on both transitions whenever still auto-following.
+      if (autoFollow) { outputEl.scrollTop = outputEl.scrollHeight; }
+    }
+    fullscreenBtnEl.onclick = () => setFullscreen(!fullscreenTerminal);
+    document.addEventListener('fullscreenchange', () => {
+      // Stay in sync if real browser fullscreen was exited some other way
+      // (Esc, browser/OS UI) while the CSS-only mode was also active.
+      if (!document.fullscreenElement && fullscreenTerminal) setFullscreen(false);
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && fullscreenTerminal) setFullscreen(false);
+    });
     outputEl.addEventListener('scroll', () => {
       // A manual scroll away from the bottom pauses auto-follow so it is
       // never forcibly pulled back down; scrolling back near the bottom
@@ -310,25 +415,58 @@ DASHBOARD_HTML = """<!doctype html>
     }
     inputSendEl.onclick = sendInput;
     inputTextEl.addEventListener('keydown', event => { if (event.key === 'Enter') sendInput(); });
+    // ---- remember the last-viewed session (name only, nothing sensitive) --
+    const LAST_SESSION_KEY = 'terminal-mcp:last-session';
+    function rememberSession(name) {
+      try { localStorage.setItem(LAST_SESSION_KEY, name); } catch (error) { /* private mode / storage disabled: not essential, ignore */ }
+    }
+    function recalledSession() {
+      try { return localStorage.getItem(LAST_SESSION_KEY); } catch (error) { return null; }
+    }
+    let autoSelectAttempted = false;
+
+    // Shared by a manual click and the on-load auto-select below so both
+    // apply the exact same side effects (auto-follow reset, drawer close,
+    // input-control refresh, and persisting the choice for next visit).
+    function selectSession(name) {
+      selected = name; inputAllowed = false; sidebarForcedOpen = false; // opening a session always closes the mobile drawer again
+      setAutoFollow(true); refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
+      rememberSession(name);
+    }
+
     async function loadSessions() {
       const response = await fetch('/dashboard/api/sessions', {cache:'no-store'});
       const data = await response.json(); const rows = data.sessions || [];
       document.querySelector('#count').textContent = `(${rows.length})`;
+
+      // On first load only (never on the recurring 5s poll, which must not
+      // fight a user's manual choice to switch sessions or clear the
+      // selection): auto-open the remembered session if it still exists and
+      // is allowed, else the first available allowed session. `rows` here
+      // is already exactly "the allowed sessions" (terminal_list_sessions
+      // only ever returns whitelisted ones), so rows[0] already satisfies
+      // "first available allowed session" with no extra filtering needed.
+      if (!autoSelectAttempted) {
+        autoSelectAttempted = true;
+        if (!selected && rows.length) {
+          const remembered = recalledSession();
+          const target = (remembered && rows.some(row => row.name === remembered)) ? remembered : rows[0].name;
+          selectSession(target);
+        }
+      }
+
       sessionsEl.replaceChildren();
       for (const row of rows) {
         const button = document.createElement('button'); button.className = 'session' + (selected === row.name ? ' active' : '');
         const name = document.createElement('div'); name.className = 'name'; name.textContent = row.name;
         const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = `${row.windows} window · ${row.attached ? 'attached' : 'detached'}`;
         button.append(name, meta);
-        button.onclick = () => {
-          selected = row.name; inputAllowed = false; sidebarForcedOpen = false; // opening a session always closes the mobile drawer again
-          setAutoFollow(true); refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
-          loadSessions(); loadDetail();
-        };
+        button.onclick = () => { selectSession(row.name); loadSessions(); loadDetail(); };
         sessionsEl.append(button);
       }
       if (selected && !rows.some(row => row.name === selected)) {
         selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
+        if (fullscreenTerminal) setFullscreen(false); // nothing left to view fullscreen; restore the normal layout
         summaryEl.textContent = 'Session không còn tồn tại.'; outputEl.replaceChildren();
       }
     }
