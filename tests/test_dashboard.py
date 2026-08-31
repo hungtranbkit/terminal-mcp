@@ -37,6 +37,52 @@ def test_dashboard_auto_scrolls_output_to_newest_line():
     assert "outputEl.scrollTop = outputEl.scrollHeight" in DASHBOARD_HTML
 
 
+def test_dashboard_opening_a_session_always_starts_followed():
+    # Explicit regression for "initial open lands at the latest line": opening
+    # a session (or switching to a different one) always re-arms auto-follow
+    # regardless of whatever scroll state was left over from a previous
+    # session, so the very first render snaps to the newest line.
+    assert "const switchedSession = selected !== lastRenderedSession;" in DASHBOARD_HTML
+    assert "if (switchedSession) setAutoFollow(true);" in DASHBOARD_HTML
+    assert "if (autoFollow) { outputEl.scrollTop = outputEl.scrollHeight; }" in DASHBOARD_HTML
+
+
+def test_dashboard_output_pane_has_bounded_scroll_container():
+    # Regression guard for a real layout bug: `main` previously used
+    # min-height (a floor, not a cap), so the grid row was content-sized and
+    # #output's scrollHeight never exceeded its clientHeight — overflow:auto
+    # never engaged, scrollTop assignments were no-ops, and the whole *page*
+    # scrolled instead of the terminal pane. `height` + minmax(0,1fr) rows +
+    # min-height:0 down the chain give #output a real bounded box to scroll
+    # within, verified live in a real browser (see the report for this task).
+    assert "height:calc(100vh - 75px)" in DASHBOARD_HTML
+    assert "grid-template-rows:minmax(0,1fr)" in DASHBOARD_HTML
+    assert "min-height:0" in DASHBOARD_HTML
+
+
+def test_dashboard_mobile_terminal_bar_wraps_instead_of_clipping():
+    # Regression guard for a real narrow-viewport bug: the follow/jump
+    # buttons (flex:0 0 auto, non-shrinking) plus the title didn't fit a
+    # phone-width bar and were clipped invisible by the panel's
+    # overflow:hidden. flex-wrap lets the controls drop to their own line
+    # instead of being cut off.
+    assert "flex-wrap:wrap" in DASHBOARD_HTML
+
+
+def test_dashboard_mobile_uses_smaller_terminal_font_desktop_unchanged():
+    # Mobile-only: a compact ~11-12px font with tight line-height fits
+    # substantially more real terminal output on a phone screen. Desktop's
+    # base #output rule (14px body font, 1.45 line-height) must stay
+    # untouched — the smaller sizing only appears inside the narrow-viewport
+    # media query, never as a global change to the base rule.
+    media_start = DASHBOARD_HTML.index("@media (max-width:760px)")
+    base_css = DASHBOARD_HTML[:media_start]
+    mobile_css = DASHBOARD_HTML[media_start:]
+
+    assert "font-size" not in base_css.split("#output {", 1)[1].split("}", 1)[0]
+    assert "#output { font-size:11.5px; line-height:1.3;" in mobile_css
+
+
 def test_dashboard_renders_ansi_via_dom_only():
     # The terminal-style renderer must build styled runs with real DOM APIs
     # (never string concatenation into markup) and must handle SGR colour

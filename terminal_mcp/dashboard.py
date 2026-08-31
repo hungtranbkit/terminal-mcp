@@ -27,18 +27,24 @@ DASHBOARD_HTML = """<!doctype html>
     * { box-sizing:border-box } body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text) }
     header { display:flex; justify-content:space-between; gap:16px; align-items:center; padding:22px 28px; border-bottom:1px solid var(--line) }
     h1 { margin:0; font-size:20px } .muted { color:var(--muted) } .live { color:var(--green) }
-    main { display:grid; grid-template-columns:minmax(240px,340px) 1fr; gap:18px; padding:18px; min-height:calc(100vh - 75px) }
-    .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden }
+    /* `height` (not `min-height`) so the grid row is actually bounded, plus an
+       explicit row track — otherwise a grid row defaults to auto/content-sized,
+       overflow:hidden on a panel has nothing to clip against, and every
+       descendant just grows to fit its content instead of scrolling
+       internally (the whole page scrolls instead; #output's own overflow:auto
+       never engages because its scrollHeight never exceeds its clientHeight). */
+    main { display:grid; grid-template-columns:minmax(240px,340px) 1fr; grid-template-rows:minmax(0,1fr); gap:18px; padding:18px; height:calc(100vh - 75px) }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; min-height:0 }
     .panel-title { padding:13px 16px; border-bottom:1px solid var(--line); color:var(--muted) }
-    #sessions { padding:8px } button.session { width:100%; text-align:left; color:inherit; background:transparent; border:1px solid transparent; border-radius:8px; padding:11px; cursor:pointer }
+    #sessions { padding:8px; overflow:auto; max-height:100% } button.session { width:100%; text-align:left; color:inherit; background:transparent; border:1px solid transparent; border-radius:8px; padding:11px; cursor:pointer }
     button.session:hover, button.session.active { background:#19243b; border-color:#344360 }
     .name { font-weight:700 } .meta { font-size:12px; color:var(--muted); margin-top:4px }
-    .detail { display:grid; grid-template-rows:auto 1fr auto auto; min-width:0 } #summary { padding:14px 16px; border-bottom:1px solid var(--line) }
+    .detail { display:grid; grid-template-rows:auto minmax(0,1fr) auto auto; min-width:0; min-height:0 } #summary { padding:14px 16px; border-bottom:1px solid var(--line) }
     .state-WAITING_INPUT { color:var(--amber) } .state-RUNNING { color:var(--green) }
     /* Terminal-style pane: a small chrome bar (title + follow/jump controls)
        above a dark, monospace, ANSI-rendering scrollback view. */
     .term { display:flex; flex-direction:column; min-height:0 }
-    .term-bar { display:flex; align-items:center; gap:10px; padding:7px 12px; background:#0e1526; border-bottom:1px solid var(--line) }
+    .term-bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 10px; padding:7px 12px; background:#0e1526; border-bottom:1px solid var(--line) }
     .term-dots { display:flex; gap:6px; flex:0 0 auto }
     .term-dots i { width:10px; height:10px; border-radius:50%; display:inline-block }
     .term-dots i.r { background:#ff5f57 } .term-dots i.y { background:#febc2e } .term-dots i.g { background:#28c840 }
@@ -48,7 +54,7 @@ DASHBOARD_HTML = """<!doctype html>
     .term-btn:hover:not(:disabled) { background:#233252 }
     .term-btn:disabled { opacity:.5; cursor:not-allowed }
     .term-btn.paused { border-color:var(--amber); color:var(--amber) }
-    #output { flex:1; margin:0; padding:14px 18px; overflow:auto; white-space:pre-wrap; word-break:break-word; line-height:1.45; font-family:var(--mono); background:var(--term-bg); color:#dce5f5 }
+    #output { flex:1; min-height:0; margin:0; padding:14px 18px; overflow:auto; white-space:pre-wrap; word-break:break-word; line-height:1.45; font-family:var(--mono); background:var(--term-bg); color:#dce5f5 }
     #inputBar { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line) }
     #inputBar input[type=text] { flex:1; background:#0e1526; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:9px 11px; font:inherit }
     #inputBar button { background:#2b3f66; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:9px 14px; cursor:pointer; font:inherit }
@@ -56,7 +62,24 @@ DASHBOARD_HTML = """<!doctype html>
     #inputBar label { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:12px; white-space:nowrap }
     #inputNote { padding:6px 16px 0; font-size:12px; color:var(--muted) }
     #inputNote.error { color:#ff6b6b }
-    @media (max-width:760px) { main { grid-template-columns:1fr } .detail { min-height:55vh } }
+    @media (max-width:760px) {
+      /* Narrow/mobile: stack the panels (sessions on top, kept compact and
+         independently scrollable; detail fills the rest) instead of sitting
+         side by side — same bounded-height pattern as desktop, reused so the
+         terminal pane still scrolls internally rather than the whole page. */
+      main { grid-template-columns:1fr; grid-template-rows:auto minmax(0,1fr) }
+      #sessions { max-height:32vh }
+      .detail { min-height:0 }
+      /* Smaller, tighter terminal text fits substantially more real output on
+         a phone screen without hurting readability; desktop sizing (14px/1.45
+         via the base #output rule above) is untouched — this only applies
+         under the same narrow-viewport breakpoint as the rest of the mobile
+         layout. Monospace alignment, ANSI spans, and pre-wrap wrapping are
+         unaffected by font-size/line-height alone. */
+      #output { font-size:11.5px; line-height:1.3; padding:10px 12px }
+      .term-bar { padding:5px 10px }
+      .term-btn { padding:4px 8px; font-size:11px }
+    }
   </style>
 </head>
 <body>
