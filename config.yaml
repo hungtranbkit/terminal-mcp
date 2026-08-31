@@ -37,3 +37,12 @@ input_policy:
   sensitive_keys_require_confirmation: [C-c, C-d]
   max_text_length: 12000
   allowed_sensitive_commands: []
+
+# Supervisor Loop v1 — detection + durable event queue only (see README.md
+# "Supervisor Loop v1"). Conservative on enable: watched_session_patterns/
+# watched_bindings stay empty, so nothing is actually watched until an
+# explicit supervisor_watch call — enabling this alone changes no observed
+# behavior, it only starts the background poll thread (idle, watching
+# nothing) and makes the supervisor_* tools' background timer live.
+supervisor:
+  enabled: true
