@@ -241,9 +241,9 @@ DASHBOARD_HTML = """<!doctype html>
          terminal pane remains, its own small term-bar (title + follow/
          jump/exit-fullscreen controls) acting as the "small floating
          control" this needs. #output still scrolls internally the same
-         way; the 300-line bound, ANSI rendering, and auto-follow/pause/
-         jump are all untouched by anything in this block — it is pure
-         presentation. */
+         way; the config.default_tail_lines bound, ANSI rendering, and
+         auto-follow/pause/jump are all untouched by anything in this
+         block — it is pure presentation. */
       body.fullscreen-terminal header,
       body.fullscreen-terminal #summary,
       body.fullscreen-terminal #inputNote,

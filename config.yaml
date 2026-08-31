@@ -14,7 +14,7 @@ allowed_session_patterns:
   - "terminal"
 
 max_capture_lines: 2000
-default_tail_lines: 300
+default_tail_lines: 1000
 
 input_policy:
   allowed_session_patterns:

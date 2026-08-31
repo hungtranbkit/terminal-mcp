@@ -183,8 +183,8 @@ def test_dashboard_fullscreen_hides_chrome_and_fills_terminal_on_mobile():
     # In fullscreen, mobile hides every non-terminal element and gives the
     # single remaining .detail row (.term) the full bounded height via
     # minmax(0,1fr) — the same mechanism, not a special case, so the
-    # 300-line bound / ANSI rendering / auto-follow inside #output are
-    # completely untouched by any of this (pure presentation).
+    # config-driven line bound / ANSI rendering / auto-follow inside
+    # #output are completely untouched by any of this (pure presentation).
     assert "body.fullscreen-terminal header," in DASHBOARD_HTML
     assert "body.fullscreen-terminal #summary," in DASHBOARD_HTML
     assert "body.fullscreen-terminal #inputBar," in DASHBOARD_HTML
@@ -312,28 +312,30 @@ def test_session_detail_tail_length_is_driven_by_config_not_hardcoded(tmux_sessi
     assert len(large_output.splitlines()) == 60
 
 
-def test_session_detail_tail_respects_300_line_config_exactly(tmux_session_factory):
-    # The actual value now shipped in config.yaml: 400 real lines produced,
-    # default_tail_lines=300 configured -> exactly the most recent 300 come
-    # back, oldest-first/newest-last, with no reordering or off-by-some slop.
+def test_session_detail_tail_respects_1000_line_config_exactly(tmux_session_factory):
+    # The actual value now shipped in config.yaml: 1200 real lines produced,
+    # default_tail_lines=1000 configured -> exactly the most recent 1000
+    # come back, oldest-first/newest-last, with no reordering or off-by-
+    # some slop.
     session = tmux_session_factory(
-        "test-tail-300",
-        "bash -lc 'for i in $(seq -w 1 400); do echo line$i; done; sleep 30'",
+        "test-tail-1000",
+        "bash -lc 'for i in $(seq -w 1 1200); do echo line$i; done; sleep 30'",
     )
-    client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 500, 300))
+    client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 1500, 1000))
     response = client.get(f"/dashboard/api/session?name={session}")
     assert response.status_code == 200
     lines = response.json()["tail"]["output"].splitlines()
 
-    assert lines == [f"line{i:03d}" for i in range(101, 401)]
+    assert len(lines) == 1000
+    assert lines == [f"line{i:04d}" for i in range(201, 1201)]
 
 
-def test_repo_config_yaml_default_tail_lines_is_300():
+def test_repo_config_yaml_default_tail_lines_is_1000():
     # Guards the actual deployed source of truth the dashboard route reads
     # (terminal.terminal_tail(name) with no explicit `lines`): config.yaml's
     # default_tail_lines, not a hardcoded route-level number.
     config = load_config(REPO_CONFIG_PATH)
-    assert config.default_tail_lines == 300
+    assert config.default_tail_lines == 1000
 
 
 @pytest.fixture
