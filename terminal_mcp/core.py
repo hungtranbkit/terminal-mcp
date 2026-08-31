@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import threading
 import time
 from typing import Any
@@ -54,6 +55,61 @@ SENSITIVE_COMMANDS = {"ssh", "mysql", "psql", "sudo", "passwd"}
 SEND_VERIFY_LINES = 20
 SEND_VERIFY_TIMEOUT_SECONDS = 0.6
 SEND_VERIFY_POLL_INTERVAL_SECONDS = 0.05
+# Live-tested against the real Codex CLI (not just a synthetic fixture):
+# the base 0.6s window is fine for a simple shell but too short for an
+# LLM-backed agent CLI to visibly start responding -- a real send that
+# genuinely worked ("pong" came back correctly) was still reported
+# SUBMIT_UNCONFIRMED because no new output had appeared yet within 0.6s.
+# That is the safe failure direction (never a false CONFIRMED), but it is
+# needlessly pessimistic for RECOVERY_ELIGIBLE_COMMANDS, which are known
+# to need longer. Applies to *both* the initial check and the post-
+# recovery re-check for those commands only -- every other target keeps
+# the original, already-tested 0.6s window unchanged.
+RECOVERY_VERIFY_TIMEOUT_SECONDS = 3.0
+
+# Bounded Escape+Enter recovery for known composer-quirky interactive
+# agent CLIs (reported and reproduced on Codex, most reliably with a
+# long/multi-line prompt): the base verification above can itself be
+# fooled by a *live-redrawing* Ink-style UI -- a spinner tick, cursor
+# blink, or elapsed-timer update changes the captured snapshot even
+# though the composer never actually submitted, so "the pane changed"
+# alone is not reliable proof of submission for these targets specifically.
+# Scoped narrowly to this named set, not applied to every send target, so
+# the base snapshot-diff semantics everywhere else (including a target
+# that legitimately echoes the sent text back as its own confirmation
+# output) are completely unchanged.
+RECOVERY_ELIGIBLE_COMMANDS = {"codex"}
+# Text that means "this CLI is actively processing/working" -- if present,
+# Escape could genuinely interrupt real work, so recovery must never fire
+# regardless of anything else. Same conservative, bottom-of-pane-only
+# philosophy as status.py's WAIT_PATTERNS/ERROR_PATTERNS/DONE_PATTERNS.
+WORKING_EVIDENCE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (r"esc to interrupt", r"\bworking\b", r"\bthinking\b")
+)
+
+
+def _shows_working_evidence(lines: list[str]) -> bool:
+    tail = "\n".join(lines[-6:])
+    return any(pattern.search(tail) for pattern in WORKING_EVIDENCE_PATTERNS)
+
+
+def _shows_genuine_progress(before: list[str], after: list[str]) -> bool:
+    """Best-effort, only ever consulted for RECOVERY_ELIGIBLE_COMMANDS (see
+    the module comment above for why this isn't the base verification
+    signal used for every target): did the pane's captured *line count*
+    grow? A real submission produces genuinely new output (more non-blank
+    lines); a live-redrawing composer's own spinner/cursor/elapsed-timer
+    tick overwrites the SAME line in place (same line count, different
+    content on it) -- indistinguishable from a real change under a plain
+    "did anything differ" check, but not under this one. Deliberately not
+    a substring/marker match against the sent text (unlike this file's
+    earlier design note on that) -- a submission confirmation that quotes
+    the text back (e.g. "SUBMITTED: <text>") would make a text-match
+    signal false-negative on a *successful* recovery just as easily as it
+    would false-positive an ordinary target; line-count growth has neither
+    failure mode."""
+    return len(after) > len(before)
 
 
 class TerminalService:
@@ -281,11 +337,20 @@ class TerminalService:
             inconclusive result is reported as unconfirmed, never silently
             upgraded to success.
 
-        Never auto-retries Enter -- a second Enter risks a genuine double
-        submission (e.g. accepting a destructive confirmation prompt
-        twice), which is strictly worse than an honest UNCONFIRMED status
-        that a caller (a human, or Supervisor v2 -- see supervisor2.py's
-        execute_send) can act on deliberately.
+        Never blindly auto-retries Enter -- a second bare Enter risks a
+        genuine double submission (e.g. accepting a destructive
+        confirmation prompt twice), which is strictly worse than an honest
+        UNCONFIRMED status that a caller (a human, or Supervisor v2 -- see
+        supervisor2.py's execute_send) can act on deliberately. The one
+        exception: for RECOVERY_ELIGIBLE_COMMANDS (reported and reproduced
+        on Codex, most reliably with a long/multi-line prompt, where Enter
+        can land as "insert newline" instead of "submit" inside the
+        composer), exactly one bounded Escape-then-Enter recovery sequence
+        is attempted -- never more than once, and never at all if there is
+        WORKING_EVIDENCE the target is already actively processing (Escape
+        could genuinely interrupt real work). A successful recovery adds
+        `recovery_attempted: true` to the result and still reports
+        SUBMIT_CONFIRMED; a failed one stays SUBMIT_UNCONFIRMED.
 
         Verification method: capture the pane's tail exactly as it looks
         right after the text lands but *before* Enter is sent (the
@@ -321,26 +386,86 @@ class TerminalService:
             result["submit_status"] = "SUBMIT_UNCONFIRMED"
             result["submit_reason"] = "could not capture a pre-submit baseline to verify against"
             return result
-        deadline = time.monotonic() + SEND_VERIFY_TIMEOUT_SECONDS
+
+        # command/recovery-eligibility determined up front so a slower-to-
+        # respond RECOVERY_ELIGIBLE_COMMANDS target (a real LLM-backed CLI
+        # genuinely takes longer to visibly respond than the 0.6s default)
+        # gets the wider verification window from the very first check, not
+        # only after already being escalated to recovery.
+        try:
+            info = self.tmux.get_session(session)
+            command = (info.pane_current_command or "").casefold() if info is not None else ""
+        except TmuxError:
+            command = ""
+        recovery_eligible = command in RECOVERY_ELIGIBLE_COMMANDS
+        verify_timeout = RECOVERY_VERIFY_TIMEOUT_SECONDS if recovery_eligible else SEND_VERIFY_TIMEOUT_SECONDS
+
+        confirmed, after, reason = self._poll_for_submission(session, typed_snapshot, timeout=verify_timeout)
+
+        # Escape+Enter recovery: scoped narrowly to RECOVERY_ELIGIBLE_
+        # COMMANDS (see the module comment there for why), and only when
+        # there is no evidence the target is already actively working
+        # (Escape could genuinely interrupt real work). Triggers unless the
+        # pane shows *genuine* new output (line-count growth) -- the base
+        # "did anything change" signal alone is not enough for these
+        # targets, since a live-redrawing composer's own spinner/cursor
+        # tick can make `confirmed` true without an actual submission.
+        needs_recovery = (
+            recovery_eligible and after is not None
+            and not _shows_genuine_progress(typed_snapshot, after)
+        )
+        if needs_recovery and not _shows_working_evidence(after):
+            pre_recovery_snapshot = after  # diff the recovery's own effect against *this*, not the original
+            self.tmux.send_keys(session, ["Escape"])
+            time.sleep(SEND_TEXT_ENTER_SETTLE_SECONDS)
+            self.tmux.send_keys(session, ["Enter"])
+            result["recovery_attempted"] = True
+            confirmed2, after2, reason2 = self._poll_for_submission(session, pre_recovery_snapshot,
+                                                                    timeout=RECOVERY_VERIFY_TIMEOUT_SECONDS)
+            genuine2 = after2 is not None and _shows_genuine_progress(pre_recovery_snapshot, after2)
+            if confirmed2 and genuine2:
+                result["submit_status"] = "SUBMIT_CONFIRMED"
+                result["submit_reason"] = "confirmed after Escape+Enter recovery"
+            else:
+                result["submit_status"] = "SUBMIT_UNCONFIRMED"
+                result["submit_reason"] = "still unconfirmed after Escape+Enter recovery"
+            return result
+
+        if confirmed:
+            result["submit_status"] = "SUBMIT_CONFIRMED"
+            return result
+        result["submit_status"] = "SUBMIT_UNCONFIRMED"
+        result["submit_reason"] = reason
+        return result
+
+    def _poll_for_submission(self, session: str, typed_snapshot: list[str], *,
+                             timeout: float = SEND_VERIFY_TIMEOUT_SECONDS) -> tuple[bool, list[str] | None, str]:
+        """The base verification loop: poll until the pane's tail differs
+        from `typed_snapshot` (captured right after the text landed, before
+        Enter) or `timeout` elapses (SEND_VERIFY_TIMEOUT_SECONDS for every
+        caller except RECOVERY_ELIGIBLE_COMMANDS, which use the wider
+        RECOVERY_VERIFY_TIMEOUT_SECONDS instead -- see the caller). NOT a
+        substring/marker match against the sent text here -- a real
+        target's own confirmation output can legitimately echo the
+        submitted text back (e.g. "SUBMITTED: <text>"), which would falsely
+        look like "still pending" under a marker-suffix check; comparing
+        against the precise pre-Enter snapshot has no such false positive.
+        (RECOVERY_ELIGIBLE_COMMANDS layers an additional, narrowly-scoped
+        genuine-progress check on top of this in the caller -- seeing this
+        loop alone report "confirmed" is not sufficient proof for those.)
+        Returns (confirmed, last_capture, reason)."""
+        deadline = time.monotonic() + timeout
         after: list[str] | None = None
         while True:
             try:
                 after = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
             except TmuxError:
-                after = None
-                break
+                return False, None, "post-send capture failed"
             if after != typed_snapshot:
-                result["submit_status"] = "SUBMIT_CONFIRMED"
-                return result
+                return True, after, "confirmed"
             if time.monotonic() >= deadline:
-                break
+                return False, after, "the pane looked identical to its pre-Enter state throughout the verification window"
             time.sleep(SEND_VERIFY_POLL_INTERVAL_SECONDS)
-        result["submit_status"] = "SUBMIT_UNCONFIRMED"
-        result["submit_reason"] = (
-            "post-send capture failed" if after is None
-            else "the pane looked identical to its pre-Enter state throughout the verification window"
-        )
-        return result
 
     def terminal_send_text(self, session: str, text: str, press_enter: bool = False,
                            dry_run: bool = False, idempotency_key: str | None = None) -> dict[str, Any]:

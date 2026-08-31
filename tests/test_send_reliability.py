@@ -215,3 +215,138 @@ def test_stress_many_consecutive_sends_no_lost_no_duplicate_submissions(tmux_ses
     # This is the actual reliability claim: with the fix, every single one
     # of the n sends against a genuinely debouncing target confirmed.
     assert confirmed == n, f"only {confirmed}/{n} sends confirmed"
+
+
+# ---------------------------------------------------------------------------
+# Codex composer-stuck bug: reported live -- terminal_send_text(...,
+# press_enter=true) returned SUBMIT_CONFIRMED, a later Enter also returned
+# SENT, but Codex never actually started; sending Escape then Enter
+# immediately caused it to begin working. Root cause: a live-redrawing
+# Ink-style composer changes its own rendered content (a spinner/cursor
+# tick) even when an Enter is "swallowed" (interpreted as e.g. insert-
+# newline rather than submit, most commonly with a long/multi-line
+# prompt) -- so the base "did the pane change" verification signal alone
+# is not reliable proof of submission for these targets specifically.
+# ---------------------------------------------------------------------------
+
+CODEX_FIXTURE_PATH = FIXTURES_DIR / "codex_composer.py"
+
+
+def _codex_session(tmux_session_factory, name: str, mode: str) -> str:
+    command = f"bash -lc 'CODEX_FIXTURE_MODE={mode} exec -a codex python3 -u {CODEX_FIXTURE_PATH}'"
+    tmux_session_factory(name, command)
+    return name
+
+
+def test_codex_normal_submit_confirms_without_recovery(tmux_session_factory, tmp_path):
+    session = _codex_session(tmux_session_factory, "test-codex-normal", "submits_and_shows_working")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "hello", press_enter=True)
+    assert result["sent"] is True
+    assert result["submit_status"] == "SUBMIT_CONFIRMED"
+    assert "recovery_attempted" not in result
+    pane = service.terminal_tail(session, 10)["output"]
+    assert "SUBMITTED[1]: hello" in pane
+
+
+def test_codex_stuck_composer_recovers_via_escape_then_enter(tmux_session_factory, tmp_path):
+    session = _codex_session(tmux_session_factory, "test-codex-stuck", "stuck_then_escape")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "hello world", press_enter=True)
+    assert result["sent"] is True
+    assert result["recovery_attempted"] is True
+    assert result["submit_status"] == "SUBMIT_CONFIRMED"
+    assert "recovery" in result["submit_reason"]
+    pane = service.terminal_tail(session, 10)["output"]
+    assert "SUBMITTED[1]: hello world" in pane
+    # Exactly one recovery attempt -- one Escape sent, not looped.
+    assert pane.count("SUBMITTED[") == 1
+
+
+def test_codex_already_working_never_gets_escape_recovery(tmux_session_factory, tmp_path):
+    # The bare Enter DOES submit here (composer clears) and simultaneously
+    # shows working evidence -- confirms the base check alone is enough
+    # and, more importantly, that no Escape is ever sent when working
+    # evidence is present (verified indirectly: escape_count would bump
+    # redraw/undo the submission if it were sent while a real target were
+    # mid-processing; here we assert the result is a clean, single,
+    # un-recovered confirmation).
+    session = _codex_session(tmux_session_factory, "test-codex-working", "submits_and_shows_working")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "hello", press_enter=True)
+    assert result["submit_status"] == "SUBMIT_CONFIRMED"
+    assert "recovery_attempted" not in result
+    pane = service.terminal_tail(session, 10)["output"]
+    assert "esc to interrupt" in pane
+    assert pane.count("SUBMITTED[") == 1
+
+
+def test_codex_recovery_failure_reports_unconfirmed_not_false_success(tmux_session_factory, tmp_path):
+    session = _codex_session(tmux_session_factory, "test-codex-alwaysstuck", "always_stuck")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "hello", press_enter=True)
+    assert result["sent"] is True
+    assert result["recovery_attempted"] is True
+    assert result["submit_status"] == "SUBMIT_UNCONFIRMED"
+    assert "recovery" in result["submit_reason"]
+    pane = service.terminal_tail(session, 10)["output"]
+    assert "SUBMITTED[" not in pane  # never actually submitted -- honestly reported as such
+
+
+def test_codex_non_codex_command_never_triggers_recovery(tmux_session_factory, tmp_path):
+    # Same "stuck" fixture behavior, but NOT running as "codex" -- the
+    # recovery path must be scoped to RECOVERY_ELIGIBLE_COMMANDS only,
+    # never applied generically. The base verification's own "did
+    # anything change" signal is unmodified for every other target (that
+    # is deliberate -- see _poll_for_submission's docstring on why it
+    # isn't a text/line-count match): it still reports SUBMIT_CONFIRMED
+    # here off the composer's own in-place redraw, exactly as it always
+    # has for a non-recovery-eligible command. That known limitation for
+    # an *unlisted* live-redrawing TUI is the honest tradeoff of scoping
+    # the fix narrowly rather than guessing at every CLI's redraw
+    # behavior; the actual assertion that matters is that recovery itself
+    # never fires for a command outside the eligible set.
+    session = "test-notcodex-stuck"
+    tmux_session_factory(session, f"bash -lc 'CODEX_FIXTURE_MODE=stuck_then_escape python3 -u {CODEX_FIXTURE_PATH}'")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "hello", press_enter=True)
+    assert "recovery_attempted" not in result
+
+
+def test_codex_recovery_preserves_permission_and_whitelist_guards(tmux_session_factory, tmp_path):
+    # The recovery path only ever runs *after* every existing guard
+    # (terminal_input, whitelist, input_policy, sensitive-target) has
+    # already passed -- a disabled target must still be refused outright,
+    # never reaching tmux at all.
+    session = _codex_session(tmux_session_factory, "test-codex-permcheck", "stuck_then_escape")
+    time.sleep(0.3)
+    config = AppConfig(
+        PermissionsConfig(True, False), ("test-*",), 200, 100,  # terminal_input disabled
+        InputPolicyConfig(allowed_session_patterns=("test-*",), max_text_length=2000),
+    )
+    service = TerminalService(config, audit=AuditStore(tmp_path / "audit.db"))
+    result = service.terminal_send_text(session, "hello", press_enter=True)
+    assert result["error"] == "INPUT_DISABLED"
+    # Confirm nothing was ever sent to the pane at all -- read through a
+    # separate, read-only-capable service (this one's own terminal_read is
+    # fine to use for reading; only its terminal_input differs above).
+    reader = TerminalService(config, audit=AuditStore(tmp_path / "audit2.db"))
+    assert "hello" not in reader.terminal_tail(session, 10)["output"]
+
+
+def test_codex_recovery_duplicate_supervisor_send_stays_idempotent(tmux_session_factory, tmp_path):
+    session = _codex_session(tmux_session_factory, "test-codex-idem-recovery", "stuck_then_escape")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    first = service.terminal_send_text(session, "hello", press_enter=True, idempotency_key="codex-recover-key")
+    assert first["recovery_attempted"] is True
+    assert first["submit_status"] == "SUBMIT_CONFIRMED"
+    second = service.terminal_send_text(session, "hello", press_enter=True, idempotency_key="codex-recover-key")
+    assert second == first  # exact replay -- no second send, no second recovery attempt
+    pane = service.terminal_tail(session, 10)["output"]
+    assert pane.count("SUBMITTED[") == 1

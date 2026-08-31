@@ -840,3 +840,58 @@ def test_adversarial_instruction_to_mark_verified_done_has_no_effect(tmp_path, t
     assert action["state"] == "observing"
     assert action["completion_status"] == "completion_candidate"
     assert v2.get_policy(session=session)["auto_action_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Codex composer-stuck bug: supervisor2_execute_send must use the corrected
+# submission semantics -- never advance an action to 'observing'/'completed'
+# when the prompt merely redrew in the composer without actually submitting.
+# ---------------------------------------------------------------------------
+
+
+def test_execute_send_holds_when_codex_composer_recovery_fails(tmp_path, tmux_session_factory):
+    from pathlib import Path
+
+    fixture = Path(__file__).parent / "fixtures" / "codex_composer.py"
+    session = tmux_session_factory(
+        "test-v2-codex-stuck",
+        f"bash -lc 'CODEX_FIXTURE_MODE=always_stuck exec -a codex python3 -u {fixture}'",
+    )
+    time.sleep(0.3)
+    v2, svc = _v2(tmp_path)
+    svc.watch(session=session)
+    # always_stuck never prints anything WAITING_INPUT-shaped on its own
+    # (a real Codex composer prompt shape is out of scope to model here),
+    # so manufacture the watch/event state directly to exercise
+    # execute_send's actual send path (kind == "session") -- the same
+    # code this bug is about, regardless of how the watch got claimable.
+    watch = svc.store.get_watch(f"session:{session}")
+    svc.store.update_watch_progress(
+        watch["watch_key"], state="WAITING_INPUT", state_changed=True, output_hash="x",
+        output_changed=True, iteration_count=1, same_failure_count=0,
+        now_iso=watch["updated_at"], enabled=True, disabled_reason=None,
+    )
+    v2.store.set_policy(watch["watch_key"], policy_mode="suggest_only", approved_template=None,
+                        max_auto_actions=5, wall_clock_timeout_seconds=1800,
+                        same_prompt_repeat_limit=2, no_progress_limit=2)
+    event = svc.store.add_event(
+        watch_key=watch["watch_key"], kind="session", target=session, previous_state="UNKNOWN",
+        state="WAITING_INPUT", event_type="attention_required", reason="synthetic",
+        output_preview="composer ready", output_hash="x", iteration_count=1,
+    )
+    claim = v2.claim_event(event["id"], claimed_by="a")
+    v2.submit_decision(claim["id"], "y")
+    v2.review_action(claim["id"], "approve")
+    sent = v2.execute_send(claim["id"])
+    assert sent["sent"] is True
+    assert sent["recovery_attempted"] is True
+    assert sent["submit_status"] == "SUBMIT_UNCONFIRMED"
+
+    action = v2.store.get_action(claim["id"])
+    # Never advanced to 'observing'/'completed' from an unconfirmed send --
+    # the existing P0-6/P0-8 handling in execute_send (unchanged by this
+    # fix) holds it at 'blocked' for review, requiring an explicit policy
+    # reset before any further auto-send on this watch.
+    assert action["state"] == "blocked"
+    assert action["stop_reason"] == "submit_unconfirmed"
+    assert v2.get_policy(session=session)["blocked_reason"] == "submit_unconfirmed"
