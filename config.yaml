@@ -10,6 +10,27 @@ allowed_session_patterns:
   - "mesflow-*"
   - "projectflow-*"
   - "terminal-mcp-*"
+  - "terminal"
 
 max_capture_lines: 2000
 default_tail_lines: 200
+
+input_policy:
+  allowed_session_patterns:
+    - "claude-*"
+    - "codex-*"
+    - "mesflow-*"
+    - "projectflow-*"
+    - "terminal-mcp-*"
+  denied_session_patterns:
+    - "root*"
+    - "ssh-*"
+    - "database-*"
+    - "password-*"
+    - "secret-*"
+    - "prod-shell-*"
+  allow_send_text: true
+  allow_keys: [Enter, Escape, Up, Down, Left, Right, Tab]
+  sensitive_keys_require_confirmation: [C-c, C-d]
+  max_text_length: 12000
+  allowed_sensitive_commands: []

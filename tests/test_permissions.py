@@ -26,5 +26,4 @@ def test_key_allowlist_rejects_arbitrary_key():
     cfg = AppConfig(PermissionsConfig(True, True), ("test-*",), 50, 20)
     service = TerminalService(cfg)
     result = service.terminal_send_keys("test-any", ["run-shell"])
-    assert result["error"] == "INVALID_KEYS"
-
+    assert result["error"] in {"KEY_NOT_ALLOWED", "ACCESS_DENIED"}

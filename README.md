@@ -34,7 +34,14 @@ For the remote-capable, loopback-only Streamable HTTP mode:
 ```bash
 .venv/bin/terminal-mcp-http
 # MCP endpoint: http://127.0.0.1:8766/mcp
+# Read-only session dashboard: http://127.0.0.1:8766/dashboard
 ```
+
+The dashboard lists only whitelisted tmux sessions and shows their sanitized
+status and recent output. It has no input controls and refreshes every five
+seconds. Like the MCP endpoint, it remains bound to loopback and is intended for
+use directly on the Dell only; the Secure MCP Tunnel does not publish it as a
+general-purpose website.
 
 The HTTP bind address is deliberately fixed to `127.0.0.1`. Do not expose it
 directly or change it to `0.0.0.0`; use an authenticated HTTPS tunnel that maps
@@ -186,5 +193,46 @@ are true. Creating a binding never enables global terminal input.
 - Capture is line-based and capped; it does not stream incremental events.
 - Redaction covers common secret shapes, not full DLP.
 - HTTP mode is local-only until a separately authenticated HTTPS tunnel is configured.
+
+## Safe Input
+
+Terminal input is deny-by-default. Setting `permissions.terminal_input: true` only
+opens the global gate; a target must also match `input_policy.allowed_session_patterns`,
+must not match a denied pattern, and must pass the action and current-command guards.
+Logical bindings add another independent gate and default to `input_enabled: false`.
+
+```yaml
+permissions:
+  terminal_read: true
+  terminal_input: true
+
+input_policy:
+  allowed_session_patterns: ["claude-*", "codex-*"]
+  denied_session_patterns: ["ssh-*", "prod-shell-*"]
+  allow_send_text: true
+  max_text_length: 12000
+```
+
+Enable one binding explicitly with `terminal_bind(binding="mesflow-dev",
+session="claude-mesflow", input_enabled=true)`. Use `terminal_input_context` to
+inspect the command and last 20 sanitized lines first. Both `terminal_send_text`
+and `terminal_send_bound` accept `dry_run=true`; this validates every guard,
+records `DRY_RUN`, and sends nothing.
+
+Text is passed to `tmux send-keys -l` as one literal argument. It is never parsed
+as a shell command, interpolated into a command string, or executed with
+`shell=True`. `press_enter=true` sends Enter separately. Key input is restricted
+to the configured allowlist. `C-c` and `C-d` require
+`confirm_sensitive=true`; unknown keys return `KEY_NOT_ALLOWED`.
+
+Every successful, blocked, and dry-run input attempt is appended to
+`~/.local/state/terminal-mcp/audit.db` (mode `0600` where supported). The audit
+stores the full text's SHA-256, length, and a short redacted preview—never the
+full prompt. `terminal_list_input_audit` returns sanitized metadata and supports
+binding/session filters.
+
+Safe Input does not add an arbitrary command, file-read, scheduler, or supervisor
+facility. Input cannot bypass the session policy, and panes whose current command
+is `ssh`, `mysql`, `psql`, `sudo`, or `passwd` are denied unless locally allowed.
 - tmux sessions must run under the same Unix user as Terminal MCP.
 # terminal-mcp

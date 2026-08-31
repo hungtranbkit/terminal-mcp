@@ -35,13 +35,22 @@ def wait_for_port(host: str, port: int, timeout: float = 8) -> None:
 
 @pytest.fixture(scope="module")
 def http_server(tmp_path_factory):
+    with socket.socket() as probe:
+        probe.bind((HTTP_HOST, 0))
+        port = probe.getsockname()[1]
     env = os.environ.copy()
     env["TERMINAL_MCP_CONFIG"] = str(
         __import__("pathlib").Path(__file__).parents[1] / "config.yaml"
     )
     env["TERMINAL_MCP_BINDINGS_DB"] = str(tmp_path_factory.mktemp("http-bindings") / "bindings.db")
+    env["TERMINAL_MCP_AUDIT_DB"] = str(tmp_path_factory.mktemp("http-audit") / "audit.db")
+    launch = (
+        "from terminal_mcp.mcp_app import build_mcp; "
+        f"build_mcp().run(transport='streamable-http', host='{HTTP_HOST}', port={port}, "
+        f"streamable_http_path='{HTTP_PATH}', json_response=True)"
+    )
     process = subprocess.Popen(
-        [sys.executable, "-m", "terminal_mcp.server_http"],
+        [sys.executable, "-c", launch],
         cwd=__import__("pathlib").Path(__file__).parents[1],
         env=env,
         stdout=subprocess.DEVNULL,
@@ -49,8 +58,8 @@ def http_server(tmp_path_factory):
         text=True,
     )
     try:
-        wait_for_port(HTTP_HOST, HTTP_PORT)
-        yield process
+        wait_for_port(HTTP_HOST, port)
+        yield process, port
         assert process.poll() is None
     finally:
         process.terminate()
@@ -74,8 +83,9 @@ async def test_stdio_real_handshake_and_tools(tmp_path):
             initialized = await session.initialize()
             tools = await session.list_tools()
     assert initialized.server_info.name == "terminal-mcp"
+    assert initialized.server_info.version == "0.5.0"
     names = {tool.name for tool in tools.tools}
-    assert len(names) == 13
+    assert len(names) == 15
     assert {"terminal_tail", "terminal_send_keys", "terminal_bind", "terminal_tail_bound"} <= names
 
 
@@ -87,7 +97,8 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
         "printf \"Do you want to continue? [y/N] \"; read answer; sleep 10'",
     )
     tmux_session_factory("private-http", "bash -lc 'echo forbidden; sleep 10'")
-    url = f"http://{HTTP_HOST}:{HTTP_PORT}{HTTP_PATH}"
+    _, port = http_server
+    url = f"http://{HTTP_HOST}:{port}{HTTP_PATH}"
     async with streamable_http_client(url) as streams:
         async with ClientSession(*streams) as session:
             initialized = await session.initialize()
@@ -115,6 +126,7 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
             tools = await session.list_tools()
 
     assert initialized.server_info.name == "terminal-mcp"
+    assert initialized.server_info.version == "0.5.0"
     assert "test-http-secure" in {row["name"] for row in listed["sessions"]}
     assert "sk-live-secret" not in tail["output"]
     assert "<REDACTED>" in tail["output"]
@@ -122,7 +134,7 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
     assert denied["error"] == "ACCESS_DENIED"
     assert text_disabled["error"] == "INPUT_DISABLED"
     assert keys_disabled["error"] == "INPUT_DISABLED"
-    assert len(tools.tools) == 13
+    assert len(tools.tools) == 15
 
 
 def test_http_bind_is_fixed_loopback():

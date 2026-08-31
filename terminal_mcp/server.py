@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+
+from . import __version__
 from .mcp_app import build_mcp
 
 
@@ -8,6 +11,9 @@ mcp = build_mcp()
 
 
 def main() -> None:
+    if sys.argv[1:] == ["--version"]:
+        print(__version__)
+        return
     mcp.run(transport="stdio")
 
 

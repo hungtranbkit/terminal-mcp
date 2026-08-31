@@ -20,6 +20,8 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_tail_bound",
         "terminal_status_bound",
         "terminal_send_bound",
+        "terminal_list_input_audit",
+        "terminal_input_context",
     }
 
 

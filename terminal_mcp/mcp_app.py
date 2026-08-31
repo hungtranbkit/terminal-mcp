@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from mcp.server.mcpserver import MCPServer
 
+from . import __version__
 from .config import load_config
 from .core import TerminalService
 
@@ -13,7 +14,7 @@ def build_mcp(service: TerminalService | None = None) -> MCPServer:
         name="terminal-mcp",
         description="Whitelist-only tmux observation and controlled input",
         instructions="Only access explicitly allowed tmux sessions. Input is disabled by default.",
-        version="0.4.0",
+        version=__version__,
     )
 
     @server.tool()
@@ -37,14 +38,15 @@ def build_mcp(service: TerminalService | None = None) -> MCPServer:
         return terminal.terminal_status(session)
 
     @server.tool()
-    def terminal_send_text(session: str, text: str, press_enter: bool = False) -> dict:
+    def terminal_send_text(session: str, text: str, press_enter: bool = False,
+                           dry_run: bool = False) -> dict:
         """Send literal text only when terminal_input is enabled in local config."""
-        return terminal.terminal_send_text(session, text, press_enter)
+        return terminal.terminal_send_text(session, text, press_enter, dry_run)
 
     @server.tool()
-    def terminal_send_keys(session: str, keys: list[str]) -> dict:
+    def terminal_send_keys(session: str, keys: list[str], confirm_sensitive: bool = False) -> dict:
         """Send only allowlisted tmux keys when terminal_input is enabled in local config."""
-        return terminal.terminal_send_keys(session, keys)
+        return terminal.terminal_send_keys(session, keys, confirm_sensitive)
 
     @server.tool()
     def terminal_bind(binding: str, session: str, replace: bool = False,
@@ -78,8 +80,21 @@ def build_mcp(service: TerminalService | None = None) -> MCPServer:
         return terminal.terminal_status_bound(binding)
 
     @server.tool()
-    def terminal_send_bound(binding: str, text: str, press_enter: bool = False) -> dict:
+    def terminal_send_bound(binding: str, text: str, press_enter: bool = False,
+                            dry_run: bool = False) -> dict:
         """Send literal text only when global and binding input are enabled."""
-        return terminal.terminal_send_bound(binding, text, press_enter)
+        return terminal.terminal_send_bound(binding, text, press_enter, dry_run)
+
+    @server.tool()
+    def terminal_list_input_audit(limit: int = 50, binding: str | None = None,
+                                  session: str | None = None) -> dict:
+        """List sanitized input audit metadata; full prompts are never returned."""
+        return terminal.terminal_list_input_audit(limit, binding, session)
+
+    @server.tool()
+    def terminal_input_context(session: str | None = None,
+                               binding: str | None = None) -> dict:
+        """Inspect the last 20 lines and effective permission before sending input."""
+        return terminal.terminal_input_context(session, binding)
 
     return server

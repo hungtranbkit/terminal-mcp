@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import subprocess
 
-from terminal_mcp.config import AppConfig, PermissionsConfig
+from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig
 from terminal_mcp.core import TerminalService
 from terminal_mcp.bindings import BindingStore
 
@@ -26,7 +26,8 @@ def test_real_tmux_list_tail_status_and_denial(read_config, tmux_session_factory
 
 def test_capture_limit_and_real_input(tmux_session_factory):
     tmux_session_factory("test-input", "bash -lc 'read value; echo VALUE=$value; sleep 10'")
-    config = AppConfig(PermissionsConfig(True, True), ("test-*",), 5, 3)
+    config = AppConfig(PermissionsConfig(True, True), ("test-*",), 5, 3,
+                       InputPolicyConfig(allowed_session_patterns=("test-*",)))
     service = TerminalService(config)
 
     assert service.terminal_send_text("test-input", "hello-terminal-mcp", True)["sent"]

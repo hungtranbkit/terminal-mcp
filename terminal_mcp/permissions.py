@@ -35,6 +35,15 @@ def binding_session_allowed(session: str, config: AppConfig) -> bool:
     return session_allowed(session, config)
 
 
+def input_session_allowed(session: str, config: AppConfig) -> bool:
+    if not valid_session_name(session):
+        return False
+    policy = config.input_policy
+    if any(fnmatch.fnmatchcase(session, pattern) for pattern in policy.denied_session_patterns):
+        return False
+    return any(fnmatch.fnmatchcase(session, pattern) for pattern in policy.allowed_session_patterns)
+
+
 def require_read(config: AppConfig) -> str | None:
     return None if config.permissions.terminal_read else "READ_DISABLED"
 

@@ -80,7 +80,7 @@ def test_bound_permissions_and_redaction(tmp_path):
 
     enabled_global, _ = service(tmp_path, global_input=True)
     enabled_global.terminal_bind("read-only", "test-bind-b")
-    assert enabled_global.terminal_send_bound("read-only", "continue")["error"] == "INPUT_DISABLED"
+    assert enabled_global.terminal_send_bound("read-only", "continue")["error"] == "BINDING_INPUT_DISABLED"
 
     read_disabled, _ = service(tmp_path, global_read=False)
     assert read_disabled.terminal_tail_bound("phase4-a")["error"] == "READ_DISABLED"
