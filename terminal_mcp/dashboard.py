@@ -58,7 +58,13 @@ DASHBOARD_HTML = """<!doctype html>
     #sidebarBackdrop { display:none }
     #sessions { padding:8px; overflow:auto; max-height:100% } button.session { width:100%; text-align:left; color:inherit; background:transparent; border:1px solid transparent; border-radius:8px; padding:11px; cursor:pointer }
     button.session:hover, button.session.active { background:#19243b; border-color:#344360 }
+    button.session.needs-attention { border-color:var(--amber); background:rgba(255,200,87,.08) }
     .name { font-weight:700 } .meta { font-size:12px; color:var(--muted); margin-top:4px }
+    /* Compact attention badge: reused identically in the session list and the
+       viewer header (#summary) so a WAITING_INPUT session is obvious in both
+       places — driven entirely by classify_status()'s existing state string,
+       nothing new is inferred from pane content here. */
+    .attn-badge { display:inline-block; background:var(--amber); color:#231a00; font-size:11px; font-weight:700; padding:1px 6px; border-radius:4px; vertical-align:middle }
     .detail { display:grid; grid-template-rows:auto minmax(0,1fr) auto auto; min-width:0; min-height:0 } #summary { padding:14px 16px; border-bottom:1px solid var(--line) }
     .state-WAITING_INPUT { color:var(--amber) } .state-RUNNING { color:var(--green) }
     /* Terminal-style pane: a small chrome bar (title + follow/jump controls)
@@ -74,6 +80,18 @@ DASHBOARD_HTML = """<!doctype html>
     .term-btn:hover:not(:disabled) { background:#233252 }
     .term-btn:disabled { opacity:.5; cursor:not-allowed }
     .term-btn.paused { border-color:var(--amber); color:var(--amber) }
+    /* Client-side search over the currently rendered output only — no new
+       backend route, no history beyond what's already on screen. Hidden
+       (via the `hidden` attribute, not display:none in JS) until toggled,
+       so it costs no vertical space when not in use. */
+    .term-search { display:flex; align-items:center; gap:6px; padding:6px 12px; background:#0e1526; border-bottom:1px solid var(--line) }
+    .term-search[hidden] { display:none } /* [hidden] and .term-search share specificity; this must win explicitly */
+    .term-search input[type=text] { flex:1; min-width:0; background:var(--term-bg); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:5px 8px; font:12px var(--mono) }
+    .term-search-status { color:var(--muted); font-size:11px; white-space:nowrap; min-width:2.5em; text-align:center }
+    /* !important: the span it marks already carries an ANSI-assigned inline
+       color/background (see renderAnsi below), which would otherwise always
+       win over a class selector. */
+    .search-current { background:#ffd645 !important; color:#111 !important; border-radius:2px }
     #output { flex:1; min-height:0; margin:0; padding:14px 18px; overflow:auto; white-space:pre-wrap; word-break:break-word; line-height:1.45; font-family:var(--mono); background:var(--term-bg); color:#dce5f5 }
     #inputBar { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line) }
     #inputBar input[type=text] { flex:1; background:#0e1526; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:9px 11px; font:inherit }
@@ -111,6 +129,8 @@ DASHBOARD_HTML = """<!doctype html>
       #output { font-size:11.5px; line-height:1.3; padding:10px 12px }
       .term-bar { padding:5px 10px }
       .term-btn { padding:4px 8px; font-size:11px }
+      .term-search { padding:4px 8px }
+      .term-search input[type=text] { padding:4px 6px; font-size:11px }
       /* More compact input composer; it is already effectively "pinned" —
          it's the last row of the same bounded shell as everything else, and
          the app-shell above means there is no page scroll left to carry it
@@ -190,7 +210,18 @@ DASHBOARD_HTML = """<!doctype html>
             <button id="followToggle" class="term-btn" type="button" disabled>Auto-follow: ON</button>
             <button id="jumpBtn" class="term-btn" type="button" disabled>Jump to latest</button>
             <button id="fullscreenBtn" class="term-btn" type="button" disabled>⛶ Fullscreen</button>
+            <button id="fontDecBtn" class="term-btn" type="button" title="Decrease terminal font size">A−</button>
+            <button id="fontIncBtn" class="term-btn" type="button" title="Increase terminal font size">A+</button>
+            <button id="searchToggleBtn" class="term-btn" type="button" disabled title="Search output">🔍</button>
+            <button id="copyBtn" class="term-btn" type="button" disabled title="Copy output">⧉</button>
           </span>
+        </div>
+        <div class="term-search" id="termSearch" hidden>
+          <input type="text" id="searchInput" placeholder="Tìm trong output..." autocomplete="off">
+          <span class="term-search-status" id="searchStatus"></span>
+          <button id="searchPrevBtn" class="term-btn" type="button">‹</button>
+          <button id="searchNextBtn" class="term-btn" type="button">›</button>
+          <button id="searchCloseBtn" class="term-btn" type="button">✕</button>
         </div>
         <pre id="output"></pre>
       </div>
@@ -217,6 +248,16 @@ DASHBOARD_HTML = """<!doctype html>
     const followToggleEl = document.querySelector('#followToggle');
     const jumpBtnEl = document.querySelector('#jumpBtn');
     const fullscreenBtnEl = document.querySelector('#fullscreenBtn');
+    const fontDecBtnEl = document.querySelector('#fontDecBtn');
+    const fontIncBtnEl = document.querySelector('#fontIncBtn');
+    const searchToggleBtnEl = document.querySelector('#searchToggleBtn');
+    const copyBtnEl = document.querySelector('#copyBtn');
+    const termSearchEl = document.querySelector('#termSearch');
+    const searchInputEl = document.querySelector('#searchInput');
+    const searchStatusEl = document.querySelector('#searchStatus');
+    const searchPrevBtnEl = document.querySelector('#searchPrevBtn');
+    const searchNextBtnEl = document.querySelector('#searchNextBtn');
+    const searchCloseBtnEl = document.querySelector('#searchCloseBtn');
     const sessionsToggleEl = document.querySelector('#sessionsToggle');
     const sidebarBackdropEl = document.querySelector('#sidebarBackdrop');
     const inputNoteEl = document.querySelector('#inputNote');
@@ -319,6 +360,140 @@ DASHBOARD_HTML = """<!doctype html>
       }
     }
 
+    // ---- search (client-side, current rendered output only) ---------------
+    // Operates purely on outputEl's already-fetched, already-redacted DOM
+    // text — no backend route, no history beyond what's on screen, no
+    // filesystem/shell access. Only the *current* match is highlighted (a
+    // plain literal, case-insensitive substring scan — never a user-supplied
+    // regex) by marking its containing ANSI span; count/position are tracked
+    // for all matches without needing to mutate every one of them.
+    let searchMatches = []; // [{start, span}] — span is the ANSI run containing that match's start offset
+    let searchIndex = -1;
+    let searchQuery = '';
+    let searchMarkEl = null;
+    function clearSearchHighlight() {
+      if (searchMarkEl) { searchMarkEl.classList.remove('search-current'); searchMarkEl = null; }
+    }
+    function updateSearchStatus() {
+      searchStatusEl.textContent = searchMatches.length ? `${searchIndex + 1}/${searchMatches.length}`
+        : (searchQuery ? '0/0' : '');
+    }
+    function goToMatch(i) {
+      clearSearchHighlight();
+      if (!searchMatches.length) { searchIndex = -1; updateSearchStatus(); return; }
+      searchIndex = ((i % searchMatches.length) + searchMatches.length) % searchMatches.length;
+      const match = searchMatches[searchIndex];
+      if (match.span) {
+        match.span.classList.add('search-current');
+        searchMarkEl = match.span;
+        // Not near-bottom after this is exactly the existing "user scrolled
+        // away" case (see the #output scroll listener below) — auto-follow
+        // pauses itself the normal way, never yanking the match back down.
+        match.span.scrollIntoView({ block: 'center' });
+      }
+      updateSearchStatus();
+    }
+    function runSearch(query) {
+      clearSearchHighlight();
+      searchQuery = query; searchMatches = []; searchIndex = -1;
+      if (!query) { updateSearchStatus(); return; }
+      const text = outputEl.textContent;
+      const haystack = text.toLowerCase();
+      const needle = query.toLowerCase();
+      if (!needle) { updateSearchStatus(); return; }
+      const offsets = []; let pos = 0;
+      for (const span of outputEl.children) {
+        const len = span.textContent.length;
+        offsets.push({ span, start: pos, end: pos + len });
+        pos += len;
+      }
+      let from = 0;
+      while (true) {
+        const at = haystack.indexOf(needle, from);
+        if (at === -1) break;
+        const containing = offsets.find(o => at >= o.start && at < o.end);
+        searchMatches.push({ start: at, span: containing ? containing.span : (offsets[offsets.length - 1] || null) });
+        from = at + needle.length;
+      }
+      if (searchMatches.length) { goToMatch(0); } else { updateSearchStatus(); }
+    }
+    function closeSearch() {
+      termSearchEl.hidden = true;
+      searchInputEl.value = '';
+      clearSearchHighlight();
+      searchQuery = ''; searchMatches = []; searchIndex = -1;
+      searchStatusEl.textContent = '';
+    }
+    searchToggleBtnEl.onclick = () => {
+      termSearchEl.hidden = !termSearchEl.hidden;
+      if (!termSearchEl.hidden) { searchInputEl.focus(); } else { closeSearch(); }
+    };
+    searchCloseBtnEl.onclick = closeSearch;
+    searchInputEl.addEventListener('input', () => runSearch(searchInputEl.value));
+    searchNextBtnEl.onclick = () => goToMatch(searchIndex + 1);
+    searchPrevBtnEl.onclick = () => goToMatch(searchIndex - 1);
+    searchInputEl.addEventListener('keydown', event => {
+      if (event.key === 'Enter') { event.preventDefault(); goToMatch(searchIndex + (event.shiftKey ? -1 : 1)); }
+      else if (event.key === 'Escape') { event.stopPropagation(); closeSearch(); }
+    });
+
+    // ---- copy (plain text only, never HTML/ANSI markup) --------------------
+    async function copyText(text) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch (error) {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.focus(); ta.select();
+          const ok = document.execCommand('copy');
+          document.body.removeChild(ta);
+          return ok;
+        } catch (fallbackError) { return false; }
+      }
+    }
+    copyBtnEl.onclick = async () => {
+      // outputEl only ever contains plain-text span runs (see renderAnsi
+      // above) — no ANSI escape bytes and no markup ever end up in
+      // .textContent, whether copying a selection or the full pane.
+      const selectionText = window.getSelection().toString();
+      const selectionInOutput = selectionText && outputEl.contains(window.getSelection().anchorNode);
+      const text = selectionInOutput ? selectionText : outputEl.textContent;
+      const ok = await copyText(text);
+      // Brief inline feedback on the button itself, right where the action
+      // happened, rather than a status area elsewhere on the page.
+      const original = copyBtnEl.textContent;
+      copyBtnEl.textContent = ok ? '✓' : '✕';
+      setTimeout(() => { copyBtnEl.textContent = original; }, 1200);
+    };
+
+    // ---- terminal-only font size (A-/A+), persisted locally ----------------
+    // Only this one UI preference (a number) is stored — never output/session
+    // content. Unitless line-height in the #output CSS rules above (1.3
+    // mobile / 1.45 desktop) recomputes automatically from the element's own
+    // font-size, so only font-size itself needs to be set here.
+    const FONT_SIZE_KEY = 'terminal-mcp:font-size';
+    const FONT_SIZE_MIN = 9, FONT_SIZE_MAX = 16, FONT_SIZE_STEP = 1;
+    const FONT_SIZE_DEFAULT = window.matchMedia('(max-width:760px)').matches ? 11.5 : 14;
+    let outputFontSize = FONT_SIZE_DEFAULT;
+    (() => {
+      try {
+        const stored = parseFloat(localStorage.getItem(FONT_SIZE_KEY));
+        if (Number.isFinite(stored) && stored >= FONT_SIZE_MIN && stored <= FONT_SIZE_MAX) outputFontSize = stored;
+      } catch (error) { /* private mode / storage disabled: fall back to the default, not essential */ }
+    })();
+    function setFontSize(px) {
+      outputFontSize = Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, px));
+      outputEl.style.fontSize = outputFontSize + 'px';
+      fontDecBtnEl.disabled = outputFontSize <= FONT_SIZE_MIN;
+      fontIncBtnEl.disabled = outputFontSize >= FONT_SIZE_MAX;
+      try { localStorage.setItem(FONT_SIZE_KEY, String(outputFontSize)); } catch (error) { /* ignore */ }
+    }
+    fontDecBtnEl.onclick = () => setFontSize(outputFontSize - FONT_SIZE_STEP);
+    fontIncBtnEl.onclick = () => setFontSize(outputFontSize + FONT_SIZE_STEP);
+    setFontSize(outputFontSize); // apply the restored/default value immediately, before any session loads
+
     // ---- auto-follow / pause / jump-to-latest ------------------------------
     function nearBottom(el) {
       return el.scrollHeight - el.scrollTop - el.clientHeight < 40;
@@ -332,6 +507,8 @@ DASHBOARD_HTML = """<!doctype html>
       followToggleEl.disabled = !selected;
       jumpBtnEl.disabled = !selected;
       fullscreenBtnEl.disabled = !selected;
+      searchToggleBtnEl.disabled = !selected;
+      copyBtnEl.disabled = !selected;
       termTitleEl.textContent = selected || '';
     }
     followToggleEl.onclick = () => {
@@ -432,6 +609,7 @@ DASHBOARD_HTML = """<!doctype html>
       selected = name; inputAllowed = false; sidebarForcedOpen = false; // opening a session always closes the mobile drawer again
       setAutoFollow(true); refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
       rememberSession(name);
+      closeSearch(); // a search from a different session's content wouldn't make sense to keep open
     }
 
     async function loadSessions() {
@@ -457,8 +635,17 @@ DASHBOARD_HTML = """<!doctype html>
 
       sessionsEl.replaceChildren();
       for (const row of rows) {
-        const button = document.createElement('button'); button.className = 'session' + (selected === row.name ? ' active' : '');
+        // Rows already arrive sorted attention-first, then most-recent-
+        // activity, then name (see the /dashboard/api/sessions route) — no
+        // client-side reordering here, just rendering in the given order.
+        const needsAttention = row.state === 'WAITING_INPUT';
+        const button = document.createElement('button');
+        button.className = 'session' + (selected === row.name ? ' active' : '') + (needsAttention ? ' needs-attention' : '');
         const name = document.createElement('div'); name.className = 'name'; name.textContent = row.name;
+        if (needsAttention) {
+          const badge = document.createElement('span'); badge.className = 'attn-badge'; badge.textContent = '⚠ NEEDS INPUT';
+          name.append(' ', badge);
+        }
         const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = `${row.windows} window · ${row.attached ? 'attached' : 'detached'}`;
         button.append(name, meta);
         button.onclick = () => { selectSession(row.name); loadSessions(); loadDetail(); };
@@ -485,6 +672,10 @@ DASHBOARD_HTML = """<!doctype html>
       // reason) stays visible above the terminal pane exactly as before.
       const state = document.createElement('span'); state.className = `state-${clean(data.status.state)}`; state.textContent = clean(data.status.state);
       const reason = document.createElement('span'); reason.className = 'muted'; reason.textContent = ` — ${clean(data.status.reason)}`;
+      if (data.status.state === 'WAITING_INPUT') {
+        const badge = document.createElement('span'); badge.className = 'attn-badge'; badge.textContent = '⚠ NEEDS INPUT';
+        summaryEl.append(badge, document.createTextNode(' '));
+      }
       summaryEl.append(strong, state, reason);
       const switchedSession = selected !== lastRenderedSession;
       if (switchedSession) setAutoFollow(true); // opening a session always starts followed
@@ -513,7 +704,25 @@ def register_dashboard(server: MCPServer, terminal: TerminalService) -> None:
 
     @server.custom_route("/dashboard/api/sessions", methods=["GET"], include_in_schema=False)
     async def sessions(_: Request) -> JSONResponse:
-        return JSONResponse(terminal.terminal_list_sessions(), headers={"Cache-Control": "no-store"})
+        listed = terminal.terminal_list_sessions()
+        rows = listed.get("sessions")
+        if isinstance(rows, list):
+            # Reuses the exact same classify_status() heuristic terminal_status()
+            # already applies to a single session — no new/looser interpretation
+            # of pane content, so WAITING_INPUT here means exactly what it means
+            # everywhere else in this project, and UNKNOWN stays UNKNOWN when
+            # evidence is weak, same as always.
+            for row in rows:
+                status = terminal.terminal_status(row["name"])
+                row["state"] = status.get("state", "UNKNOWN")
+            # Stable multi-key sort applied least-significant-key first: name
+            # (deterministic fallback for ties) -> activity descending (most
+            # recent first) -> attention-needed first. No session is ever
+            # dropped, only reordered.
+            rows.sort(key=lambda r: r["name"])
+            rows.sort(key=lambda r: r.get("activity") or "", reverse=True)
+            rows.sort(key=lambda r: 0 if r.get("state") == "WAITING_INPUT" else 1)
+        return JSONResponse(listed, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/session", methods=["GET"], include_in_schema=False)
     async def session_detail(request: Request) -> JSONResponse:

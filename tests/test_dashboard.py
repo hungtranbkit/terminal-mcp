@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import time
 from pathlib import Path
 
 import pytest
@@ -418,3 +420,150 @@ def test_session_detail_ansi_read_only_input_route_unaffected(read_config):
     response = client.post("/dashboard/api/session/input", json={"name": "test-x", "text": "hi"})
     assert response.status_code == 403
     assert response.json()["error"] == "INPUT_DISABLED"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: attention state + sorting, mobile font controls, search + copy
+# ---------------------------------------------------------------------------
+
+
+def test_sessions_route_includes_state_and_sorts_attention_first(read_config, tmux_session_factory):
+    # Real classify_status() output (via terminal_status), not a new/looser
+    # heuristic. A session sitting at a live "[y/N]"-style prompt must sort
+    # ahead of everything else, regardless of activity recency.
+    tmux_session_factory("test-attn-idle", "bash -lc 'sleep 20'")
+    tmux_session_factory(
+        "test-attn-waiting",
+        "bash -lc 'echo \"Do you want to continue? [y/N]\"; read x; sleep 20'",
+    )
+    time.sleep(0.4)
+    client, _ = _client(read_config)
+    response = client.get("/dashboard/api/sessions")
+    assert response.status_code == 200
+    rows = response.json()["sessions"]
+    by_name = {row["name"]: row for row in rows}
+
+    assert by_name["test-attn-waiting"]["state"] == "WAITING_INPUT"
+    names = [row["name"] for row in rows]
+    assert names.index("test-attn-waiting") < names.index("test-attn-idle")
+
+
+def test_sessions_route_preserves_unknown_state_not_misclassified(read_config, tmux_session_factory):
+    # A freshly created, silent shell has no high-confidence evidence either
+    # way — classify_status() must still say UNKNOWN, not WAITING_INPUT, and
+    # the sessions route must carry that through unchanged (no new/looser
+    # interpretation invented for this feature).
+    tmux_session_factory("test-attn-unknown", "bash -lc 'sleep 20'")
+    time.sleep(0.4)
+    client, _ = _client(read_config)
+    rows = client.get("/dashboard/api/sessions").json()["sessions"]
+    row = next(r for r in rows if r["name"] == "test-attn-unknown")
+    assert row["state"] in ("UNKNOWN", "IDLE")  # never WAITING_INPUT for silent, ambiguous output
+    assert row["state"] != "WAITING_INPUT"
+
+
+def test_sessions_route_deterministic_fallback_and_activity_order(read_config, tmux_session_factory):
+    # No attention-needed sessions: ordering falls back to most-recent-
+    # activity, and ties/absence of a clear signal never drop a session.
+    tmux_session_factory("test-attn-a", "bash -lc 'sleep 20'")
+    time.sleep(0.05)
+    tmux_session_factory("test-attn-b", "bash -lc 'sleep 20'")
+    time.sleep(0.4)
+    client, _ = _client(read_config)
+    rows = client.get("/dashboard/api/sessions").json()["sessions"]
+    names = {row["name"] for row in rows}
+    assert {"test-attn-a", "test-attn-b"} <= names  # no allowed session ever hidden
+
+
+def test_sessions_route_still_denies_unlisted_sessions(read_config, tmux_session_factory):
+    # Security regression: the new per-row terminal_status() call and sort
+    # only touch presentation of the already-whitelist-filtered list; a
+    # session outside the pattern never appears, attention or not.
+    tmux_session_factory("private-attn-check", "bash -lc 'echo Do you want to continue? [y/N]; sleep 20'")
+    time.sleep(0.4)
+    client, _ = _client(read_config)
+    rows = client.get("/dashboard/api/sessions").json()["sessions"]
+    assert all(row["name"] != "private-attn-check" for row in rows)
+
+
+def test_dashboard_attention_badge_and_sort_wiring_present():
+    assert "row.state === 'WAITING_INPUT'" in DASHBOARD_HTML
+    assert "class=\"attn-badge\"" not in DASHBOARD_HTML  # built via DOM, not a literal HTML string
+    assert "badge.className = 'attn-badge'" in DASHBOARD_HTML
+    assert "needs-attention" in DASHBOARD_HTML
+    assert "Rows already arrive sorted attention-first" in DASHBOARD_HTML  # no client-side re-sort
+
+
+def test_dashboard_font_controls_present_bounded_and_persisted():
+    assert 'id="fontDecBtn"' in DASHBOARD_HTML
+    assert 'id="fontIncBtn"' in DASHBOARD_HTML
+    assert "FONT_SIZE_MIN = 9, FONT_SIZE_MAX = 16" in DASHBOARD_HTML
+    assert "outputEl.style.fontSize = outputFontSize + 'px';" in DASHBOARD_HTML
+    # Only the page font, never anything else (body/header/etc. untouched by this control).
+    assert "document.body.style.fontSize" not in DASHBOARD_HTML
+    assert "localStorage.setItem(FONT_SIZE_KEY, String(outputFontSize));" in DASHBOARD_HTML
+    assert "localStorage.getItem(FONT_SIZE_KEY)" in DASHBOARD_HTML
+    assert "try {" in DASHBOARD_HTML.split("FONT_SIZE_KEY", 2)[1]  # storage reads/writes are guarded
+
+
+def test_dashboard_search_controls_present_and_case_insensitive():
+    assert 'id="searchToggleBtn"' in DASHBOARD_HTML
+    assert 'id="searchInput"' in DASHBOARD_HTML
+    assert 'id="searchPrevBtn"' in DASHBOARD_HTML
+    assert 'id="searchNextBtn"' in DASHBOARD_HTML
+    assert "haystack = text.toLowerCase();" in DASHBOARD_HTML
+    assert "needle = query.toLowerCase();" in DASHBOARD_HTML
+    # Plain literal indexOf-based scan, never a user-supplied regex.
+    assert "new RegExp(" not in DASHBOARD_HTML
+    assert "haystack.indexOf(needle, from)" in DASHBOARD_HTML
+
+
+def test_dashboard_search_row_hidden_attribute_actually_wins():
+    # Regression for a real bug found live: `.term-search { display:flex }`
+    # and the browser's own `[hidden] { display:none }` share specificity,
+    # and the page rule (cascading after the UA stylesheet) was winning —
+    # the search row stayed visibly open even with hidden=true. An explicit
+    # `.term-search[hidden]` rule is required to make `hidden` win.
+    assert ".term-search[hidden] { display:none }" in DASHBOARD_HTML
+
+
+def test_dashboard_search_scrolls_current_match_without_breaking_follow():
+    assert "match.span.scrollIntoView({ block: 'center' });" in DASHBOARD_HTML
+    # No special-casing needed: scrollIntoView reuses the exact same
+    # near-bottom pause/resume path already covering manual scroll-up.
+    assert "if (nearBottom(outputEl)) { if (!autoFollow) setAutoFollow(true); }" in DASHBOARD_HTML
+
+
+def test_dashboard_search_closes_on_session_switch():
+    assert "closeSearch(); // a search from a different session's content wouldn't make sense to keep open" in DASHBOARD_HTML
+
+
+def test_dashboard_copy_uses_plain_text_never_ansi_markup():
+    assert 'id="copyBtn"' in DASHBOARD_HTML
+    assert "navigator.clipboard.writeText(text)" in DASHBOARD_HTML
+    assert "outputEl.textContent" in DASHBOARD_HTML  # plain text only, never innerHTML/markup
+    # Selection must actually belong to the output pane, else fall back
+    # instead of silently doing nothing or copying an unrelated selection.
+    assert "outputEl.contains(window.getSelection().anchorNode)" in DASHBOARD_HTML
+    assert "selectionInOutput ? selectionText : outputEl.textContent" in DASHBOARD_HTML
+
+
+def test_dashboard_search_and_copy_do_not_persist_content():
+    # Only the font-size preference and the last-viewed session *name* are
+    # ever written to localStorage anywhere in this file — never search
+    # terms or copied/rendered output.
+    keys = set(re.findall(r"localStorage\.(?:setItem|getItem)\(([A-Za-z_]+)", DASHBOARD_HTML))
+    assert keys == {"LAST_SESSION_KEY", "FONT_SIZE_KEY"}
+
+
+def test_dashboard_new_controls_disabled_without_a_selected_session():
+    assert "searchToggleBtnEl.disabled = !selected;" in DASHBOARD_HTML
+    assert "copyBtnEl.disabled = !selected;" in DASHBOARD_HTML
+
+
+def test_dashboard_fullscreen_and_mobile_layout_regressions_still_hold():
+    # This phase must not touch the fixed app-shell / fullscreen mechanics
+    # from the previous commits.
+    assert "height:100dvh" in DASHBOARD_HTML
+    assert "body.fullscreen-terminal header," in DASHBOARD_HTML
+    assert "const target = (remembered && rows.some(row => row.name === remembered)) ? remembered : rows[0].name;" in DASHBOARD_HTML
