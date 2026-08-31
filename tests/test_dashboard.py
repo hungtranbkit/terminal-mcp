@@ -757,3 +757,99 @@ def test_dashboard_orientation_resize_never_touches_persisted_ui_state():
     for body in (resize_body, orientation_body):
         assert "outputEl.scrollTop = outputEl.scrollHeight" in body
         assert "localStorage.setItem" not in body
+
+
+# ---------------------------------------------------------------------------
+# P0-1: dashboard.mutations_enabled -- an explicit boundary independent of
+# terminal_input/input_policy, in front of every dashboard POST route
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def read_only_dashboard_config() -> AppConfig:
+    from terminal_mcp.config import DashboardConfig
+
+    return AppConfig(
+        PermissionsConfig(True, True),  # terminal_input itself stays ON --
+        ("test-*", "agent-*"), 50, 20,  # this is a dashboard-specific gate,
+        InputPolicyConfig(allowed_session_patterns=("test-*",)),  # not a
+        dashboard=DashboardConfig(mutations_enabled=False),        # replacement for it.
+    )
+
+
+def test_dashboard_mutations_disabled_blocks_session_input_even_with_terminal_input_on(
+    read_only_dashboard_config,
+):
+    client, _ = _client(read_only_dashboard_config)
+    response = client.post("/dashboard/api/session/input", json={"name": "test-x", "text": "hi"})
+    assert response.status_code == 403
+    assert response.json()["error"] == "DASHBOARD_MUTATIONS_DISABLED"
+
+
+def test_dashboard_mutations_disabled_blocks_supervisor_ack(read_only_dashboard_config):
+    client, _ = _client(read_only_dashboard_config)
+    response = client.post("/dashboard/api/supervisor/ack", json={"id": 1})
+    assert response.status_code == 403
+    assert response.json()["error"] == "DASHBOARD_MUTATIONS_DISABLED"
+
+
+def test_dashboard_mutations_disabled_blocks_supervisor2_pause(read_only_dashboard_config):
+    client, _ = _client(read_only_dashboard_config)
+    response = client.post("/dashboard/api/supervisor2/pause", json={"target": "x", "kind": "session"})
+    assert response.status_code == 403
+    assert response.json()["error"] == "DASHBOARD_MUTATIONS_DISABLED"
+
+
+def test_dashboard_mutations_disabled_read_routes_still_fully_work(read_only_dashboard_config):
+    # The core P0-1 claim: read routes are available *independently* of
+    # the mutation gate -- disabling mutations must never take reads down.
+    client, _ = _client(read_only_dashboard_config)
+    assert client.get("/dashboard").status_code == 200
+    assert client.get("/dashboard/api/sessions").status_code == 200
+    # 404 (SESSION_NOT_FOUND, "test-x" doesn't exist) is the read route
+    # working normally -- the point being tested is that it is NOT 403
+    # DASHBOARD_MUTATIONS_DISABLED.
+    session_response = client.get("/dashboard/api/session", params={"name": "test-x"})
+    assert session_response.status_code == 404
+    assert session_response.json().get("error") != "DASHBOARD_MUTATIONS_DISABLED"
+    assert client.get("/dashboard/api/supervisor").status_code == 200
+    assert client.get("/dashboard/api/supervisor2").status_code == 200
+
+
+def test_dashboard_mutations_enabled_by_default_preserves_existing_ui(input_config):
+    # Default (no `dashboard:` section in config at all) must be
+    # mutations_enabled=True -- this flag is opt-in-to-restrict, not
+    # opt-in-to-allow, so existing deployments/UI are unaffected.
+    assert input_config.dashboard.mutations_enabled is True
+    client, _ = _client(input_config)
+    response = client.post("/dashboard/api/session/input", json={"name": "test-x", "text": "hi"})
+    # Still reaches the real guard chain (ACCESS_DENIED here, since
+    # "test-x" isn't a real tmux session) rather than being blocked by the
+    # mutation gate itself.
+    assert response.status_code in (403, 404)
+    assert response.json()["error"] != "DASHBOARD_MUTATIONS_DISABLED"
+
+
+def test_load_config_parses_dashboard_mutations_enabled(tmp_path):
+    from terminal_mcp.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "permissions:\n  terminal_read: true\n  terminal_input: true\n"
+        "allowed_session_patterns: ['test-*']\n"
+        "dashboard:\n  mutations_enabled: false\n"
+    )
+    config = load_config(config_path)
+    assert config.dashboard.mutations_enabled is False
+
+
+def test_load_config_defaults_dashboard_mutations_enabled_true_when_omitted(tmp_path):
+    from terminal_mcp.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "permissions:\n  terminal_read: true\n"
+        "allowed_session_patterns: ['test-*']\n"
+    )
+    config = load_config(config_path)
+    assert config.dashboard.mutations_enabled is True

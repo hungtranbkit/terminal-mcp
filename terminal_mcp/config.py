@@ -52,6 +52,21 @@ class SupervisorConfig:
 
 
 @dataclass(frozen=True)
+class DashboardConfig:
+    # A boundary specific to the web dashboard's own mutation routes
+    # (session input, supervisor event ack, supervisor2 pause) --
+    # independent of, and enforced in *addition to*, permissions.
+    # terminal_input/input_policy (which still gate the underlying
+    # TerminalService calls exactly as before regardless of this flag).
+    # Lets an operator publish a read-only dashboard (e.g. over a public
+    # tunnel) while a separate, locally-only MCP control plane keeps full
+    # input capability, or vice versa. Defaults True so existing
+    # deployments/UI keep working unchanged unless an operator opts into
+    # the stricter split.
+    mutations_enabled: bool = True
+
+
+@dataclass(frozen=True)
 class AppConfig:
     permissions: PermissionsConfig
     allowed_session_patterns: tuple[str, ...]
@@ -59,6 +74,7 @@ class AppConfig:
     default_tail_lines: int = 200
     input_policy: InputPolicyConfig = InputPolicyConfig()
     supervisor: SupervisorConfig = SupervisorConfig()
+    dashboard: DashboardConfig = DashboardConfig()
 
 
 DEFAULT_PATTERNS = ("claude-*", "codex-*", "agent-*", "test-*")
@@ -153,5 +169,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             watched_session_patterns=string_tuple_supervisor("watched_session_patterns"),
             watched_bindings=string_tuple_supervisor("watched_bindings"),
             v2_enabled=bool(supervisor_raw.get("v2_enabled", False)),
+        ),
+        dashboard=DashboardConfig(
+            mutations_enabled=bool(raw.get("dashboard", {}).get("mutations_enabled", True)),
         ),
     )

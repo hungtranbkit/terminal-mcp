@@ -1002,6 +1002,24 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
         supervisor_v2 = build_supervisor_v2(supervisor)
+
+    def _mutations_blocked() -> JSONResponse | None:
+        # Independent boundary in front of every dashboard POST route
+        # (session input, supervisor ack, supervisor2 pause) -- checked
+        # before any of them touch terminal/supervisor/supervisor_v2 at
+        # all. This is *in addition to*, never instead of, the guards
+        # those calls already enforce themselves (terminal_input,
+        # whitelist, input_policy, binding input_enabled, etc.) -- an
+        # operator who wants a strictly read-only dashboard (e.g. published
+        # over a public tunnel) now has one flag that turns off every
+        # mutation route regardless of what permissions/input_policy say,
+        # without having to disable terminal_input itself (which the MCP
+        # control plane may still need).
+        if terminal.config.dashboard.mutations_enabled:
+            return None
+        return JSONResponse({"error": "DASHBOARD_MUTATIONS_DISABLED"}, status_code=403,
+                            headers={"Cache-Control": "no-store"})
+
     @server.custom_route("/dashboard", methods=["GET"], include_in_schema=False)
     async def dashboard(_: Request) -> HTMLResponse:
         return HTMLResponse(
@@ -1060,6 +1078,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
     @server.custom_route("/dashboard/api/session/input", methods=["POST"], include_in_schema=False)
     async def session_input(request: Request) -> JSONResponse:
+        if (blocked := _mutations_blocked()) is not None:
+            return blocked
         try:
             body = await request.json()
         except ValueError:
@@ -1089,6 +1109,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # Simple safe local metadata action only: this only ever calls
         # SupervisorStore.ack_event, which just stamps acknowledged_at in
         # SQLite. No terminal_send/tmux call is reachable from this route.
+        if (blocked := _mutations_blocked()) is not None:
+            return blocked
         try:
             body = await request.json()
         except ValueError:
@@ -1124,6 +1146,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # STOP/PAUSE only: sets policy_mode back to observe_only. Local
         # metadata only, same as the v1 ack route — no terminal_send/tmux
         # call is reachable from this route either.
+        if (blocked := _mutations_blocked()) is not None:
+            return blocked
         try:
             body = await request.json()
         except ValueError:

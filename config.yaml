@@ -46,12 +46,11 @@ input_policy:
 # nothing) and makes the supervisor_* tools' background timer live.
 supervisor:
   enabled: true
-  # v2 (decision/send layer) — the global kill switch is now explicitly on,
-  # but this alone changes no observed behavior: every watch's own
-  # policy_mode still defaults to observe_only (see README "Supervisor Loop
-  # v2"), and no watch is auto-configured into suggest_only/
-  # approved_auto_continue anywhere in this file. execute_send only ever
-  # sends for a watch an operator has explicitly opted in via
-  # supervisor2_set_policy — this flag just removes the second, redundant
-  # instance-wide refusal on top of that per-watch opt-in.
-  v2_enabled: true
+  # v2 (decision/send layer) global kill switch: OFF again pending the P0
+  # hardening pass (identity pinning, per-pane lock, idempotency keys,
+  # revision CAS, confirmed delivery, structured completion verification --
+  # see the P0 hardening commits). v2 detection/observe_only/suggest_only
+  # review still work with this off; only supervisor2_execute_send is
+  # gated by it, so no watch can auto-send while this pass is in progress
+  # even if a per-watch policy were set to approved_auto_continue.
+  v2_enabled: false
