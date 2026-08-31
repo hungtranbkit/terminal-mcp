@@ -132,8 +132,11 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
     assert "<REDACTED>" in tail["output"]
     assert status["state"] == "WAITING_INPUT"
     assert denied["error"] == "ACCESS_DENIED"
-    assert text_disabled["error"] == "INPUT_DISABLED"
-    assert keys_disabled["error"] == "INPUT_DISABLED"
+    # config.yaml now enables permissions.terminal_input globally (for ChatGPT input),
+    # so "test-http-secure" is denied via input_policy pattern matching rather than the
+    # global INPUT_DISABLED gate; INPUT_DISABLED itself stays covered in test_permissions.py.
+    assert text_disabled["error"] == "ACCESS_DENIED"
+    assert keys_disabled["error"] == "ACCESS_DENIED"
     assert len(tools.tools) == 15
 
 

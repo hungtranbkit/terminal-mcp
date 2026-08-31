@@ -38,10 +38,15 @@ For the remote-capable, loopback-only Streamable HTTP mode:
 ```
 
 The dashboard lists only whitelisted tmux sessions and shows their sanitized
-status and recent output. It has no input controls and refreshes every five
-seconds. Like the MCP endpoint, it remains bound to loopback and is intended for
-use directly on the Dell only; the Secure MCP Tunnel does not publish it as a
-general-purpose website.
+status and recent output, refreshing every five seconds. It also has a text
+input box per session: sending from it calls the same guarded
+`terminal_send_text` path as the MCP tool, so it is still gated by
+`permissions.terminal_input`, `input_policy` (allowed/denied patterns, current
+pane command, max length), and is recorded in the same input audit log — the
+box is simply disabled client-side (and the server still enforces it) when a
+session doesn't pass those checks. Like the MCP endpoint, the dashboard remains
+bound to loopback and is intended for use directly on the Dell only; the
+Secure MCP Tunnel does not publish it as a general-purpose website.
 
 The HTTP bind address is deliberately fixed to `127.0.0.1`. Do not expose it
 directly or change it to `0.0.0.0`; use an authenticated HTTPS tunnel that maps
