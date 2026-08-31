@@ -83,6 +83,37 @@ def test_dashboard_mobile_uses_smaller_terminal_font_desktop_unchanged():
     assert "#output { font-size:11.5px; line-height:1.3;" in mobile_css
 
 
+def test_dashboard_mobile_sidebar_collapses_and_reopens_as_drawer():
+    # Mobile: once a session is open, the sidebar hides by default (freeing
+    # essentially the full viewport for the terminal pane) and reopens as a
+    # dismissible overlay drawer via the ☰ Sessions control, without
+    # resizing/displacing the terminal. Desktop/tablet keeps the sidebar
+    # permanently visible — none of this is gated only inside the media
+    # query text itself, so also check the toggle defaults to hidden and the
+    # drawer rules are scoped under body.has-selection (mobile-only state).
+    assert 'id="sessionsToggle"' in DASHBOARD_HTML
+    assert 'id="sessionsPanel"' in DASHBOARD_HTML
+    assert 'id="sidebarBackdrop"' in DASHBOARD_HTML
+    assert ".sessions-toggle { display:none }" in DASHBOARD_HTML  # hidden by default (desktop and pre-selection mobile)
+    assert "body.has-selection #sessionsPanel { display:none }" in DASHBOARD_HTML
+    assert "body.has-selection.sidebar-visible #sessionsPanel" in DASHBOARD_HTML
+    assert "body.has-selection.sidebar-visible #sidebarBackdrop" in DASHBOARD_HTML
+
+
+def test_dashboard_sidebar_toggle_and_backdrop_wired_to_state():
+    # The toggle opens/closes the drawer; picking a session always closes it
+    # again (hide-by-default-once-opened); the backdrop closes without
+    # changing the current selection.
+    assert "sessionsToggleEl.onclick = () => { sidebarForcedOpen = !sidebarForcedOpen; updateSidebarVisibility(); };" in DASHBOARD_HTML
+    assert "sidebarBackdropEl.onclick = () => { sidebarForcedOpen = false; updateSidebarVisibility(); };" in DASHBOARD_HTML
+    assert "sidebarForcedOpen = false; // opening a session always closes the mobile drawer again" in DASHBOARD_HTML
+
+
+def test_dashboard_mobile_sidebar_respects_safe_areas():
+    assert "env(safe-area-inset-top)" in DASHBOARD_HTML
+    assert "viewport-fit=cover" in DASHBOARD_HTML
+
+
 def test_dashboard_renders_ansi_via_dom_only():
     # The terminal-style renderer must build styled runs with real DOM APIs
     # (never string concatenation into markup) and must handle SGR colour

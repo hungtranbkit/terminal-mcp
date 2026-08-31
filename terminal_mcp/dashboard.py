@@ -20,7 +20,7 @@ DASHBOARD_HTML = """<!doctype html>
 <html lang="vi">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>Terminal MCP Sessions</title>
   <style>
     :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --term-bg:#0a0e1a; --mono: ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace; }
@@ -36,6 +36,15 @@ DASHBOARD_HTML = """<!doctype html>
     main { display:grid; grid-template-columns:minmax(240px,340px) 1fr; grid-template-rows:minmax(0,1fr); gap:18px; padding:18px; height:calc(100vh - 75px) }
     .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; min-height:0 }
     .panel-title { padding:13px 16px; border-bottom:1px solid var(--line); color:var(--muted) }
+    /* Mobile-only "☰ Sessions" reopen control (styled like the other term-bar
+       buttons via .term-btn) and its drawer backdrop; both stay display:none
+       outside the narrow-viewport media query below, so desktop/tablet keeps
+       the sidebar permanently visible exactly as before. Living inside
+       .term-bar (a flex row) rather than as a direct child of .detail means
+       it never participates in .detail's own grid row template, regardless
+       of which breakpoint/visibility state is active. */
+    .sessions-toggle { display:none }
+    #sidebarBackdrop { display:none }
     #sessions { padding:8px; overflow:auto; max-height:100% } button.session { width:100%; text-align:left; color:inherit; background:transparent; border:1px solid transparent; border-radius:8px; padding:11px; cursor:pointer }
     button.session:hover, button.session.active { background:#19243b; border-color:#344360 }
     .name { font-weight:700 } .meta { font-size:12px; color:var(--muted); margin-top:4px }
@@ -79,17 +88,38 @@ DASHBOARD_HTML = """<!doctype html>
       #output { font-size:11.5px; line-height:1.3; padding:10px 12px }
       .term-bar { padding:5px 10px }
       .term-btn { padding:4px 8px; font-size:11px }
+      /* Once a session is open, the sidebar hides by default so the terminal
+         pane gets essentially the full screen (main's "auto" sidebar row
+         collapses to 0 with nothing placed in it); the ☰ Sessions button
+         reopens it as a floating drawer over a backdrop, on top of the still
+         full-size terminal, rather than resizing/displacing it. Before any
+         session is picked, the sidebar stays inline exactly as it always
+         has, so first-time access to the list is never hidden. */
+      body.has-selection .sessions-toggle { display:inline-flex }
+      body.has-selection #sessionsPanel { display:none }
+      body.has-selection.sidebar-visible #sessionsPanel {
+        display:block; position:fixed; left:12px; right:12px;
+        top:calc(70px + env(safe-area-inset-top)); z-index:20;
+        max-height:70vh; overflow:auto; box-shadow:0 20px 50px rgba(0,0,0,.6);
+      }
+      body.has-selection.sidebar-visible #sidebarBackdrop {
+        display:block; position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:15;
+      }
+      /* Respect notch/home-indicator safe areas for the pane that now spans
+         essentially the full viewport. */
+      main { padding-left:max(18px, env(safe-area-inset-left)); padding-right:max(18px, env(safe-area-inset-right)); padding-bottom:max(18px, env(safe-area-inset-bottom)) }
     }
   </style>
 </head>
 <body>
   <header><div><h1>Terminal MCP</h1><div class="muted">Whitelisted tmux session monitor</div></div><div><span class="live">● LIVE</span></div></header>
   <main>
-    <section class="panel"><div class="panel-title">SESSIONS <span id="count"></span></div><div id="sessions"></div></section>
+    <section class="panel" id="sessionsPanel"><div class="panel-title">SESSIONS <span id="count"></span></div><div id="sessions"></div></section>
     <section class="panel detail">
       <div id="summary" class="muted">Chọn một session để xem output.</div>
       <div class="term">
         <div class="term-bar">
+          <button id="sessionsToggle" class="sessions-toggle term-btn" type="button">☰ Sessions</button>
           <span class="term-dots"><i class="r"></i><i class="y"></i><i class="g"></i></span>
           <span class="term-title" id="termTitle"></span>
           <span class="term-controls">
@@ -107,22 +137,40 @@ DASHBOARD_HTML = """<!doctype html>
       </div>
     </section>
   </main>
+  <div id="sidebarBackdrop"></div>
   <script>
     let selected = null;
     let inputAllowed = false;
     let autoFollow = true;
     let lastRenderedSession = null;
+    let sidebarForcedOpen = false;
     const sessionsEl = document.querySelector('#sessions');
     const outputEl = document.querySelector('#output');
     const summaryEl = document.querySelector('#summary');
     const termTitleEl = document.querySelector('#termTitle');
     const followToggleEl = document.querySelector('#followToggle');
     const jumpBtnEl = document.querySelector('#jumpBtn');
+    const sessionsToggleEl = document.querySelector('#sessionsToggle');
+    const sidebarBackdropEl = document.querySelector('#sidebarBackdrop');
     const inputNoteEl = document.querySelector('#inputNote');
     const inputTextEl = document.querySelector('#inputText');
     const inputEnterEl = document.querySelector('#inputEnter');
     const inputSendEl = document.querySelector('#inputSend');
     const clean = value => String(value ?? '');
+
+    // ---- mobile sidebar drawer ---------------------------------------------
+    // Desktop/tablet: pure CSS keeps #sessionsPanel always visible and
+    // .sessions-toggle always display:none, so none of this has any visible
+    // effect there. Mobile only: hides the session list once a session is
+    // open (main's own sidebar row collapses to 0 with nothing placed in
+    // it, so the terminal pane gets the freed height), reopenable as a
+    // floating drawer over a backdrop without displacing/resizing the pane.
+    function updateSidebarVisibility() {
+      document.body.classList.toggle('has-selection', Boolean(selected));
+      document.body.classList.toggle('sidebar-visible', sidebarForcedOpen);
+    }
+    sessionsToggleEl.onclick = () => { sidebarForcedOpen = !sidebarForcedOpen; updateSidebarVisibility(); };
+    sidebarBackdropEl.onclick = () => { sidebarForcedOpen = false; updateSidebarVisibility(); };
 
     // ---- minimal ANSI (SGR colour/style) renderer -------------------------
     // tmux `capture-pane -e` re-serializes its own already-resolved terminal
@@ -272,11 +320,15 @@ DASHBOARD_HTML = """<!doctype html>
         const name = document.createElement('div'); name.className = 'name'; name.textContent = row.name;
         const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = `${row.windows} window · ${row.attached ? 'attached' : 'detached'}`;
         button.append(name, meta);
-        button.onclick = () => { selected = row.name; inputAllowed = false; setAutoFollow(true); refreshInputControls(); refreshTermControls(); loadSessions(); loadDetail(); };
+        button.onclick = () => {
+          selected = row.name; inputAllowed = false; sidebarForcedOpen = false; // opening a session always closes the mobile drawer again
+          setAutoFollow(true); refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
+          loadSessions(); loadDetail();
+        };
         sessionsEl.append(button);
       }
       if (selected && !rows.some(row => row.name === selected)) {
-        selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls();
+        selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
         summaryEl.textContent = 'Session không còn tồn tại.'; outputEl.replaceChildren();
       }
     }
