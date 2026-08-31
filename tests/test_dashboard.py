@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from starlette.testclient import TestClient
 
-from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig
+from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig, load_config
 from terminal_mcp.core import TerminalService
 from terminal_mcp.dashboard import DASHBOARD_HTML, register_dashboard
 from terminal_mcp.mcp_app import build_mcp
+
+REPO_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 
 def test_dashboard_routes_are_registered(read_config):
@@ -44,15 +48,12 @@ def test_session_detail_tail_is_bounded_recent_and_chronological(read_config, tm
     client, _ = _client(read_config)
     response = client.get(f"/dashboard/api/session?name={session}")
     assert response.status_code == 200
-    output = response.json()["tail"]["output"]
+    lines = response.json()["tail"]["output"].splitlines()
 
-    # Bounded to recent output: the oldest printed line is long gone...
-    assert "line001" not in output
-    # ...and the newest printed line is present.
-    assert "line100" in output
-    # Rendered oldest-first/newest-last: an earlier line's text appears before a
-    # later one's, matching tmux capture-pane's natural chronological order.
-    assert output.index("line090") < output.index("line100")
+    # Exact bound: read_config's default_tail_lines is 20 (see conftest.py), and
+    # 100 real lines were produced, so exactly the most recent 20 come back —
+    # not "at least" or "roughly" 20, and no leftover blank padding rows.
+    assert lines == [f"line{i:03d}" for i in range(81, 101)]
 
 
 def test_session_detail_tail_length_is_driven_by_config_not_hardcoded(tmux_session_factory):
@@ -71,7 +72,33 @@ def test_session_detail_tail_length_is_driven_by_config_not_hardcoded(tmux_sessi
     small_output = small_client.get(f"/dashboard/api/session?name={session}").json()["tail"]["output"]
     large_output = large_client.get(f"/dashboard/api/session?name={session}").json()["tail"]["output"]
 
-    assert len(large_output.splitlines()) > len(small_output.splitlines())
+    # Each config's configured count comes back exactly, not just "more than".
+    assert len(small_output.splitlines()) == 3
+    assert len(large_output.splitlines()) == 60
+
+
+def test_session_detail_tail_respects_300_line_config_exactly(tmux_session_factory):
+    # The actual value now shipped in config.yaml: 400 real lines produced,
+    # default_tail_lines=300 configured -> exactly the most recent 300 come
+    # back, oldest-first/newest-last, with no reordering or off-by-some slop.
+    session = tmux_session_factory(
+        "test-tail-300",
+        "bash -lc 'for i in $(seq -w 1 400); do echo line$i; done; sleep 30'",
+    )
+    client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 500, 300))
+    response = client.get(f"/dashboard/api/session?name={session}")
+    assert response.status_code == 200
+    lines = response.json()["tail"]["output"].splitlines()
+
+    assert lines == [f"line{i:03d}" for i in range(101, 401)]
+
+
+def test_repo_config_yaml_default_tail_lines_is_300():
+    # Guards the actual deployed source of truth the dashboard route reads
+    # (terminal.terminal_tail(name) with no explicit `lines`): config.yaml's
+    # default_tail_lines, not a hardcoded route-level number.
+    config = load_config(REPO_CONFIG_PATH)
+    assert config.default_tail_lines == 300
 
 
 @pytest.fixture

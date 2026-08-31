@@ -59,9 +59,23 @@ class TmuxClient:
         return next((item for item in self.list_sessions() if item.name == name), None)
 
     def capture_lines(self, session: str, lines: int) -> list[str]:
+        """Return at most `lines` of the most recent real content from the pane.
+
+        tmux's `-S`/`-E` addressing is relative to the visible pane, not a
+        literal "last N lines" window: with no `-E`, `-S -{lines}` always
+        captures through the bottom of the *current visible pane* on top of
+        the requested history offset, so raw output can hold far more than
+        `lines` rows (and, when the pane is taller than the real output,
+        blank padding rows below the last real line). `rstrip` drops that
+        trailing blank padding; the final slice then deterministically bounds
+        the result to the requested count so callers get exactly the N most
+        recent real lines — or fewer, if the session hasn't produced that
+        much output yet — regardless of pane geometry.
+        """
         lines = max(1, lines)
         result = self._run(["capture-pane", "-p", "-J", "-S", f"-{lines}", "-t", session])
-        return result.stdout.rstrip("\n").splitlines()
+        captured = result.stdout.rstrip("\n").splitlines()
+        return captured[-lines:]
 
     def send_text(self, session: str, text: str, press_enter: bool) -> None:
         self._run(["send-keys", "-t", session, "-l", "--", text])

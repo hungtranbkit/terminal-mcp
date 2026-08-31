@@ -6,6 +6,7 @@ import subprocess
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig
 from terminal_mcp.core import TerminalService
 from terminal_mcp.bindings import BindingStore
+from terminal_mcp.tmux import TmuxClient
 
 
 def test_real_tmux_list_tail_status_and_denial(read_config, tmux_session_factory):
@@ -36,6 +37,40 @@ def test_capture_limit_and_real_input(tmux_session_factory):
     capped = service.terminal_tail("test-input", 200)
     assert capped["truncated"]
     assert len(capped["output"].splitlines()) <= 5
+
+
+def test_capture_lines_returns_exact_bounded_recent_count(tmux_session_factory):
+    # Regression for the pre-existing tmux capture quirk: `-S -N` with no `-E`
+    # always captures through the bottom of the *visible* pane on top of the
+    # requested history offset, so raw output could hold far more than N rows.
+    # capture_lines must deterministically bound to exactly N of the most
+    # recent real lines whenever more than N are available.
+    session = tmux_session_factory(
+        "test-exact-bound",
+        "bash -lc 'for i in $(seq -w 1 500); do echo line$i; done; sleep 15'",
+    )
+    time.sleep(0.3)
+    client = TmuxClient()
+    for n in (1, 7, 50, 300):
+        result = client.capture_lines(session, n)
+        assert len(result) == n
+        assert result[-1] == "line500"
+        assert result[0] == f"line{501 - n:03d}"
+    # Chronological within the window too: oldest of the window first, newest last.
+    window = client.capture_lines(session, 10)
+    assert window == [f"line{i:03d}" for i in range(491, 501)]
+
+
+def test_capture_lines_returns_all_available_when_fewer_than_requested(tmux_session_factory):
+    # The other edge of the same fix: a small headless pane pads its capture
+    # with blank rows below short real output. Those must not be counted as
+    # "content" or corrupt the bound — fewer real lines than requested means
+    # every real line comes back, nothing more.
+    session = tmux_session_factory("test-short-output", "bash -lc 'echo only-line; sleep 15'")
+    time.sleep(0.3)
+    client = TmuxClient()
+    result = client.capture_lines(session, 300)
+    assert result == ["only-line"]
 
 
 def test_real_tmux_binding_remap_missing_and_cleanup(read_config, tmux_session_factory, tmp_path):
