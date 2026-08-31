@@ -139,13 +139,18 @@ def test_transition_running_to_waiting_input_emits_attention_event(tmp_path, tmu
 
 
 def test_transition_to_done_on_explicit_completion_marker(tmp_path, tmux_session_factory):
+    # P0-7/P0-8: prose completion evidence alone is only a
+    # COMPLETION_CANDIDATE now, never directly "DONE" -- see status.py's
+    # SUPERVISOR_STATES docstring for why (VERIFIED_DONE requires a later
+    # poll to corroborate a quiet window, which this single-poll test
+    # deliberately does not wait for).
     session = tmux_session_factory("test-sup-done", "bash -lc 'printf \"FINAL REPORT\\nall good\\n\"; sleep 20'")
     time.sleep(0.3)
     svc = _service(tmp_path)
     svc.watch(session=session)
     result = svc.run_once()
-    assert result["events"][0]["state"] == "DONE"
-    assert result["events"][0]["event_type"] == "completed"
+    assert result["events"][0]["state"] == "COMPLETION_CANDIDATE"
+    assert result["events"][0]["event_type"] == "completion_candidate"
 
 
 def test_ordinary_silence_never_produces_false_done(tmp_path, tmux_session_factory):

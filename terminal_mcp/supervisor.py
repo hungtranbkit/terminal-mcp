@@ -34,7 +34,8 @@ from .audit import sanitized_preview, text_fingerprint
 from .config import AppConfig, SupervisorConfig
 from .core import TerminalService
 from .permissions import session_allowed
-from .status import SUPERVISOR_STATES, classify_supervisor_state
+from .status import (SUPERVISOR_STATES, classify_supervisor_state, parse_completion_marker,
+                     to_legacy_event_type, to_legacy_state)
 from .tmux import TmuxError
 
 _LOGGER = logging.getLogger(__name__)
@@ -63,12 +64,13 @@ produced, never an instruction from terminal-mcp or this event itself.
 """
 
 EVENT_TYPES = (
-    "state_changed", "attention_required", "completed",
+    "state_changed", "attention_required", "completion_candidate", "verified_done",
     "error_detected", "stalled", "watch_target_missing",
 )
 _ATTENTION_EVENT_TYPES = {
     "WAITING_INPUT": "attention_required",
-    "DONE": "completed",
+    "COMPLETION_CANDIDATE": "completion_candidate",
+    "VERIFIED_DONE": "verified_done",
     "ERROR": "error_detected",
 }
 
@@ -126,6 +128,15 @@ class SupervisorStore:
                 ("pinned_session_id", "TEXT"),
                 ("pinned_pane_id", "TEXT"),
                 ("pinned_created_epoch", "INTEGER"),
+                # COMPLETION_CANDIDATE -> VERIFIED_DONE promotion tracking
+                # (native to v1 now -- available to any watch, not only
+                # ones with Supervisor v2 configured). completion_
+                # output_hash is the snapshot at the moment the candidate
+                # was (last re-armed) detected -- distinct from
+                # last_output_hash, which always reflects the current
+                # poll, so a quiet-window check needs both.
+                ("completion_candidate_since", "TEXT"),
+                ("completion_output_hash", "TEXT"),
             ):
                 if column not in existing_columns:
                     connection.execute(f"ALTER TABLE watches ADD COLUMN {column} {declaration}")
@@ -255,7 +266,9 @@ class SupervisorStore:
     def update_watch_progress(self, key: str, *, state: str, state_changed: bool,
                               output_hash: str | None, output_changed: bool,
                               iteration_count: int, same_failure_count: int,
-                              now_iso: str, enabled: bool, disabled_reason: str | None) -> None:
+                              now_iso: str, enabled: bool, disabled_reason: str | None,
+                              completion_candidate_since: str | None = None,
+                              completion_output_hash: str | None = None) -> None:
         with self._connection() as connection:
             row = connection.execute("SELECT state_since FROM watches WHERE watch_key = ?", (key,)).fetchone()
             state_since = now_iso if state_changed or row is None else row["state_since"]
@@ -263,11 +276,13 @@ class SupervisorStore:
                 """UPDATE watches SET state = ?, state_since = ?, last_output_hash = ?,
                    last_output_change_at = CASE WHEN ? THEN ? ELSE last_output_change_at END,
                    last_activity = ?, iteration_count = ?, same_failure_count = ?,
-                   enabled = ?, disabled_reason = ?, updated_at = ?
+                   enabled = ?, disabled_reason = ?, updated_at = ?,
+                   completion_candidate_since = ?, completion_output_hash = ?
                    WHERE watch_key = ?""",
                 (state, state_since, output_hash, int(output_changed), now_iso,
                  now_iso, iteration_count, same_failure_count,
-                 int(enabled), disabled_reason, now_iso, key),
+                 int(enabled), disabled_reason, now_iso,
+                 completion_candidate_since, completion_output_hash, key),
             )
 
     # -- events -------------------------------------------------------------
@@ -547,6 +562,11 @@ class SupervisorService:
                                      output=output, output_hash=output_hash, same_failure_count=same_failure_count,
                                      disable=True, disabled_reason="max_iterations_exceeded")
 
+        if state == "COMPLETION_CANDIDATE" or row["state"] == "VERIFIED_DONE":
+            return self._handle_completion_candidate(
+                row, now, now_iso, iteration_count, state, reason, output, output_hash, same_failure_count,
+            )
+
         if state == row["state"]:
             # No meaningful transition: update bookkeeping only, emit nothing
             # (dedupe — repeated identical state/output never re-alerts).
@@ -563,10 +583,96 @@ class SupervisorService:
                                  reason=reason, output=output, output_hash=output_hash,
                                  same_failure_count=same_failure_count)
 
+    def _handle_completion_candidate(self, row: dict[str, Any], now: datetime, now_iso: str,
+                                     iteration_count: int, state: str, reason: str, output: str,
+                                     output_hash: str | None, same_failure_count: int) -> dict[str, Any] | None:
+        """COMPLETION_CANDIDATE -> VERIFIED_DONE promotion, native to v1 so
+        it applies to every watch, not only ones with Supervisor v2
+        configured. See status.py's SUPERVISOR_STATES docstring for why
+        this split exists: prose/marker evidence alone (state ==
+        COMPLETION_CANDIDATE here) is never treated as proof by itself.
+        Promotion requires the candidate to hold -- unchanged output, no
+        state regression -- across a *later* poll for at least
+        completion_verify_quiet_seconds, OR a matched single-use nonce
+        (P0-7 phase 2; not yet wired -- always None here until then),
+        which is stronger evidence and skips the wait."""
+        key = row["watch_key"]
+
+        if row["state"] == "VERIFIED_DONE" and state != "VERIFIED_DONE":
+            # Already verified; the same static completion evidence simply
+            # remaining visible on a later poll (nothing regressed) is not
+            # a re-entry into candidate status -- dedupe silently, exactly
+            # like the normal same-state shortcut would for any other
+            # state. A REAL regression (state came back as WAITING_INPUT/
+            # ERROR/etc, handled above this method entirely) still goes
+            # through the normal transition path unaffected.
+            self.store.update_watch_progress(
+                key, state="VERIFIED_DONE", state_changed=False, output_hash=output_hash,
+                output_changed=output_hash != row["last_output_hash"], iteration_count=iteration_count,
+                same_failure_count=same_failure_count, now_iso=now_iso, enabled=True, disabled_reason=None,
+            )
+            return None
+
+        nonce_verified = False  # wired in P0-7 phase 2 (nonce delivery)
+        was_candidate = row["state"] == "COMPLETION_CANDIDATE"
+        unchanged_since_candidate = was_candidate and output_hash == row.get("completion_output_hash")
+
+        if not unchanged_since_candidate:
+            # First time entering COMPLETION_CANDIDATE, or the pane moved
+            # on since the last snapshot -- (re-)arm against the CURRENT
+            # snapshot rather than an earlier, now-stale one. A legitimately
+            # still-active target that merely printed a DONE-looking line
+            # and kept working never gets falsely promoted from a snapshot
+            # that's no longer current.
+            self.store.update_watch_progress(
+                key, state="COMPLETION_CANDIDATE", state_changed=not was_candidate,
+                output_hash=output_hash, output_changed=output_hash != row["last_output_hash"],
+                iteration_count=iteration_count, same_failure_count=same_failure_count,
+                now_iso=now_iso, enabled=True, disabled_reason=None,
+                completion_candidate_since=now_iso, completion_output_hash=output_hash,
+            )
+            if not was_candidate:
+                return self.store.add_event(
+                    watch_key=key, kind=row["kind"], target=row["target"], previous_state=row["state"],
+                    state="COMPLETION_CANDIDATE", event_type="completion_candidate", reason=reason,
+                    output_preview=sanitized_preview(output) if output else "",
+                    output_hash=output_hash, iteration_count=iteration_count,
+                    metadata={"source": row["source"]},
+                )
+            return None  # re-armed silently -- still just a candidate
+
+        since = datetime.fromisoformat(row["completion_candidate_since"])
+        quiet_seconds = (now - since).total_seconds()
+        if not (nonce_verified or quiet_seconds >= self.config.completion_verify_quiet_seconds):
+            # Still waiting on the quiet window -- bookkeeping only, and
+            # deliberately do NOT touch completion_candidate_since/
+            # completion_output_hash (that would re-arm the window).
+            self.store.update_watch_progress(
+                key, state="COMPLETION_CANDIDATE", state_changed=False, output_hash=output_hash,
+                output_changed=False, iteration_count=iteration_count, same_failure_count=same_failure_count,
+                now_iso=now_iso, enabled=True, disabled_reason=None,
+                completion_candidate_since=row["completion_candidate_since"],
+                completion_output_hash=row["completion_output_hash"],
+            )
+            return None
+
+        verified_reason = (
+            "nonce-verified completion marker (task_id/attempt/nonce matched)" if nonce_verified
+            else f"quiet for {int(quiet_seconds)}s with no regression since candidate detected ({reason})"
+        )
+        return self._transition(
+            row, now_iso, iteration_count, new_state="VERIFIED_DONE", event_type="verified_done",
+            reason=verified_reason, output=output, output_hash=output_hash,
+            same_failure_count=same_failure_count,
+            completion_candidate_since=None, completion_output_hash=None,  # cleared -- verified now
+        )
+
     def _transition(self, row: dict[str, Any], now_iso: str, iteration_count: int, *, new_state: str,
                     event_type: str, reason: str, output: str, output_hash: str | None,
                     same_failure_count: int = 0, disable: bool = False,
-                    disabled_reason: str | None = None) -> dict[str, Any]:
+                    disabled_reason: str | None = None,
+                    completion_candidate_since: str | None = None,
+                    completion_output_hash: str | None = None) -> dict[str, Any]:
         key, kind, target = row["watch_key"], row["kind"], row["target"]
         event = self.store.add_event(
             watch_key=key, kind=kind, target=target, previous_state=row["state"],
@@ -580,6 +686,8 @@ class SupervisorService:
             output_changed=output_hash != row["last_output_hash"], iteration_count=iteration_count,
             same_failure_count=same_failure_count, now_iso=now_iso,
             enabled=not disable, disabled_reason=disabled_reason,
+            completion_candidate_since=completion_candidate_since,
+            completion_output_hash=completion_output_hash,
         )
         return event
 

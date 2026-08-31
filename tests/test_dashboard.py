@@ -876,3 +876,17 @@ def test_load_config_defaults_dashboard_mutations_enabled_true_when_omitted(tmp_
     )
     config = load_config(config_path)
     assert config.dashboard.mutations_enabled is True
+
+
+def test_dashboard_state_order_includes_completion_candidate_and_verified_done():
+    # P0-7/P0-8: state_counts from the backend now use COMPLETION_CANDIDATE/
+    # VERIFIED_DONE, not "DONE" -- a stale client-side order array keyed on
+    # the old name would silently drop both new states from the badge/panel
+    # (counts[state] always 0 for a name that no longer appears as a key).
+    assert "COMPLETION_CANDIDATE" in DASHBOARD_HTML
+    assert "VERIFIED_DONE" in DASHBOARD_HTML
+    order_start = DASHBOARD_HTML.index("SUPERVISOR_STATE_ORDER = [")
+    order_line = DASHBOARD_HTML[order_start:DASHBOARD_HTML.index("]", order_start)]
+    assert "'DONE'" not in order_line
+    assert "'COMPLETION_CANDIDATE'" in order_line
+    assert "'VERIFIED_DONE'" in order_line

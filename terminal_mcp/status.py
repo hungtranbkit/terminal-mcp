@@ -84,7 +84,37 @@ DONE_PATTERNS = tuple(
         r"✅.*\b(done|complete|passed)\b",
     )
 )
-SUPERVISOR_STATES = ("RUNNING", "IDLE", "WAITING_INPUT", "DONE", "ERROR", "UNKNOWN")
+SUPERVISOR_STATES = (
+    "RUNNING", "IDLE", "WAITING_INPUT",
+    "COMPLETION_CANDIDATE", "VERIFIED_DONE",
+    "ERROR", "UNKNOWN",
+)
+# "DONE" is no longer a value classify_supervisor_state (or anything built
+# on it) ever produces -- it is legacy-only, available strictly through
+# to_legacy_state()/to_legacy_event_type() below, never as the primary
+# state model. A raw consumer (a watch row, an event, supervisor_status's
+# counts) must handle COMPLETION_CANDIDATE (unverified: prose/marker
+# evidence seen, not yet corroborated) and VERIFIED_DONE (corroborated:
+# quiet window held, no regression, any configured nonce/verifier passed)
+# as genuinely different things -- prose alone was never proof, and
+# treating it as interchangeable with "DONE" is exactly the false-positive
+# risk this two-state split exists to eliminate.
+LEGACY_DONE_STATES = ("COMPLETION_CANDIDATE", "VERIFIED_DONE")
+
+
+def to_legacy_state(state: str) -> str:
+    """Explicit compatibility adapter, never the primary model: collapses
+    both new completion states back to the pre-existing "DONE" a caller
+    written against the old 6-state vocabulary expects. Call this
+    deliberately at an integration boundary -- never let it leak into new
+    code as a substitute for checking the real state."""
+    return "DONE" if state in LEGACY_DONE_STATES else state
+
+
+def to_legacy_event_type(event_type: str) -> str:
+    """Same adapter for event_type: both new completion event types map
+    back to the pre-existing "completed"."""
+    return "completed" if event_type in ("completion_candidate", "verified_done") else event_type
 
 
 def _match_recent(patterns: tuple[re.Pattern[str], ...], output: str, window: int = 20) -> tuple[bool, str]:
@@ -134,13 +164,17 @@ def parse_completion_marker(output: str) -> dict[str, str] | None:
 
 
 def classify_supervisor_state(state: str, reason: str, output: str) -> tuple[str, str]:
-    """Normalize a classify_status() result plus DONE/ERROR evidence to the
-    6-state supervisor vocabulary. WAITING_INPUT is already high-confidence
-    from classify_status and always wins outright — it is never overridden
-    by an ERROR/DONE marker elsewhere in the same recent window. DONE
-    requires explicit positive completion evidence (never inferred from
-    ordinary silence — that maps to IDLE at the loop level instead, see
-    supervisor.py's idle_threshold handling)."""
+    """Normalize a classify_status() result plus ERROR/completion evidence
+    to the 7-state supervisor vocabulary. WAITING_INPUT is already high-
+    confidence from classify_status and always wins outright — it is never
+    overridden by an ERROR/completion marker elsewhere in the same recent
+    window. Prose (DONE_PATTERNS) or a structured marker is only ever
+    COMPLETION_CANDIDATE here -- this function has no notion of time or
+    history, so it cannot itself verify anything; promotion to
+    VERIFIED_DONE happens in supervisor.py's polling loop, which tracks a
+    quiet window (and any configured nonce/verifier) across multiple calls
+    to this classifier. Never inferred from ordinary silence either way —
+    that maps to IDLE at the loop level instead (idle_threshold)."""
     if state == "WAITING_INPUT":
         return state, reason
     matched, why = _match_recent(ERROR_PATTERNS, output)
@@ -148,9 +182,9 @@ def classify_supervisor_state(state: str, reason: str, output: str) -> tuple[str
         return "ERROR", why
     matched, why = _match_recent(DONE_PATTERNS, output)
     if matched:
-        return "DONE", why
+        return "COMPLETION_CANDIDATE", why
     if parse_completion_marker(output) is not None:
-        return "DONE", "structured completion marker present (protocol=terminal-mcp-completion/v1)"
+        return "COMPLETION_CANDIDATE", "structured completion marker present (protocol=terminal-mcp-completion/v1)"
     if state in ("RUNNING", "IDLE", "UNKNOWN"):
         return state, reason
     return "UNKNOWN", reason

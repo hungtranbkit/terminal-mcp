@@ -49,6 +49,12 @@ class SupervisorConfig:
     # protects the whole instance even if some watch's policy was
     # (mis)configured to approved_auto_continue.
     v2_enabled: bool = False
+    # Minimum quiet time (pane output unchanged, no state regression) a
+    # COMPLETION_CANDIDATE must hold, on a *later* poll than the one that
+    # first detected it, before it is promoted to VERIFIED_DONE. A matched
+    # single-use nonce (see supervisor.py) skips this wait -- that is
+    # already stronger, harder-to-spoof evidence than elapsed silence.
+    completion_verify_quiet_seconds: int = 10
 
 
 @dataclass(frozen=True)
@@ -127,6 +133,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     max_iterations = int(supervisor_raw.get("max_iterations", 20))
     same_failure_limit = int(supervisor_raw.get("same_failure_limit", 2))
     event_retention = int(supervisor_raw.get("event_retention", 500))
+    completion_verify_quiet_seconds = int(supervisor_raw.get("completion_verify_quiet_seconds", 10))
     # >=5s floor: even with enabled:true and a mistyped tiny interval, this
     # never becomes an accidental hot loop hammering tmux/CPU.
     if poll_interval < 5:
@@ -139,6 +146,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         raise ValueError("supervisor.same_failure_limit must be at least 1")
     if not 1 <= event_retention <= 100_000:
         raise ValueError("supervisor.event_retention must be between 1 and 100000")
+    if completion_verify_quiet_seconds < 1:
+        raise ValueError("supervisor.completion_verify_quiet_seconds must be at least 1")
 
     return AppConfig(
         permissions=PermissionsConfig(
@@ -169,6 +178,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             watched_session_patterns=string_tuple_supervisor("watched_session_patterns"),
             watched_bindings=string_tuple_supervisor("watched_bindings"),
             v2_enabled=bool(supervisor_raw.get("v2_enabled", False)),
+            completion_verify_quiet_seconds=completion_verify_quiet_seconds,
         ),
         dashboard=DashboardConfig(
             mutations_enabled=bool(raw.get("dashboard", {}).get("mutations_enabled", True)),

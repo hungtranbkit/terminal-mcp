@@ -52,13 +52,10 @@ ACTION_STATES = (
 )
 TERMINAL_ACTION_STATES = ("completed", "blocked", "rejected", "failed")
 DEFAULT_LEASE_SECONDS = 300
-# P0-8: minimum quiet time (no pane change, no newer ERROR) a
-# COMPLETION_CANDIDATE must hold before it is promoted to VERIFIED_DONE
-# and the chain is reset. A floor on top of the natural multi-poll gap
-# (promotion can only happen on a later reconcile pass than the one that
-# first saw the candidate) -- not itself sufficient on its own for a very
-# slow poll_interval_seconds, but never less than this even for a fast one.
-COMPLETION_VERIFY_QUIET_SECONDS = 10
+# P0-8: the COMPLETION_CANDIDATE -> VERIFIED_DONE quiet-window promotion
+# itself lives in supervisor.py now (native to v1, shared by every watch)
+# -- its threshold is config.supervisor.completion_verify_quiet_seconds,
+# not a separate constant here.
 
 # Content-based safety screen, checked against both the triggering event's
 # output_preview and any proposed prompt: same conservative "known-shape
@@ -158,20 +155,16 @@ class SupervisorV2Store:
             existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(supervisor_actions)").fetchall()}
             if "expected_output_hash" not in existing_columns:
                 connection.execute("ALTER TABLE supervisor_actions ADD COLUMN expected_output_hash TEXT")
-            # P0-7/P0-8: completion-candidate -> verified-done tracking.
-            # DONE_PATTERNS/a structured marker alone only ever produces a
-            # *candidate* (completion_status='completion_candidate'); the
-            # chain is reset (see _reconcile_observing_actions) only once
-            # that candidate is independently corroborated by a quiet
-            # window with no newer error, not from the prose/marker text
-            # alone.
-            for column, declaration in (
-                ("completion_status", "TEXT"),
-                ("completion_candidate_since", "TEXT"),
-                ("completion_output_hash", "TEXT"),
-            ):
-                if column not in existing_columns:
-                    connection.execute(f"ALTER TABLE supervisor_actions ADD COLUMN {column} {declaration}")
+            # P0-7/P0-8 note: completion-candidate -> verified-done
+            # promotion is tracked natively on the *watch* (supervisor.py's
+            # watches table -- shared with v1, not v2-only) -- an earlier
+            # revision of this file tracked its own separate copy on the
+            # action row; _reconcile_observing_actions now purely observes
+            # watch["state"] instead. Any completion_status/
+            # completion_candidate_since/completion_output_hash columns
+            # from that earlier revision, if already migrated onto an
+            # existing db, are simply unused now -- harmless to leave in
+            # place, not worth a destructive column-drop migration.
         try:
             self.path.chmod(0o600)
         except OSError:
@@ -699,6 +692,14 @@ class SupervisorV2Service:
         return {**v1_result, "v2_reconciled": reconciled}
 
     def _reconcile_observing_actions(self) -> list[dict[str, Any]]:
+        """P0-7/P0-8: COMPLETION_CANDIDATE/VERIFIED_DONE promotion itself
+        is now native to v1 (supervisor.py's _handle_completion_candidate,
+        shared by every watch, not only ones with v2 configured) -- this
+        method purely *observes* the watch's own state rather than
+        tracking its own separate quiet window: an action never advances
+        past 'observing' (and the chain is never reset) while the watch is
+        still only COMPLETION_CANDIDATE, exactly the enforcement of "do
+        not reset the supervisor chain until VERIFIED_DONE"."""
         updates = []
         for action in self.store.list_actions(state="observing", limit=100):
             key = action["watch_key"]
@@ -709,15 +710,24 @@ class SupervisorV2Service:
             progressed = watch["last_output_hash"] != action["output_hash_at_send"]
             no_progress_count = self.store.record_progress_check(key, progressed=progressed)
             if progressed:
-                if watch["state"] == "DONE":
-                    result = self._advance_completion_candidate(action, watch)
-                    updates.append({"action_id": action["id"], "watch_key": key, **result})
+                if watch["state"] == "COMPLETION_CANDIDATE":
+                    # Unverified -- v1 is still holding it in its own
+                    # quiet-window check. Stay in 'observing', do not
+                    # complete, do not reset the chain.
+                    updates.append({"action_id": action["id"], "watch_key": key,
+                                    "result": "completion_candidate", "state": watch["state"]})
                     continue
                 events = self.v1.store.list_events(target=watch["target"], limit=1)
                 resulting_event_id = events[0]["id"] if events else None
                 self.store.cas_update(action["id"], expected_state="observing", state="completed",
                                       resulting_event_id=resulting_event_id)
-                updates.append({"action_id": action["id"], "watch_key": key, "result": "progressed", "state": watch["state"]})
+                if watch["state"] == "VERIFIED_DONE":
+                    self.store.reset_chain(key)  # loop stops cleanly, only now that it's verified
+                    updates.append({"action_id": action["id"], "watch_key": key,
+                                    "result": "verified_done", "state": watch["state"]})
+                else:
+                    updates.append({"action_id": action["id"], "watch_key": key,
+                                    "result": "progressed", "state": watch["state"]})
             else:
                 policy = self.store.get_policy(key)
                 if no_progress_count > policy["no_progress_limit"]:
@@ -726,45 +736,6 @@ class SupervisorV2Service:
                     self.store.block_policy(key, "no_progress_limit_exceeded")
                     updates.append({"action_id": action["id"], "watch_key": key, "result": "stalled_no_progress"})
         return updates
-
-    def _advance_completion_candidate(self, action: dict[str, Any], watch: dict[str, Any]) -> dict[str, Any]:
-        """P0-7/P0-8: the watch reports DONE (from prose/a structured
-        marker -- see status.py), but that alone is only a
-        COMPLETION_CANDIDATE, never treated as verified. This action stays
-        in 'observing' (the chain is NOT reset yet) until the candidate is
-        independently corroborated: the pane must stay quiet (output_hash
-        unchanged) for COMPLETION_VERIFY_QUIET_SECONDS with no newer ERROR
-        in between. New output appearing re-arms the quiet window (a
-        legitimately still-active target that merely printed a DONE-
-        looking line keeps working) rather than being treated as a
-        failure. Only once verified does this transition to 'completed'
-        and reset the chain -- the actual enforcement of "do not reset the
-        supervisor chain until VERIFIED_DONE"."""
-        now = datetime.now(timezone.utc)
-        current_hash = watch["last_output_hash"]
-        if action["completion_status"] != "completion_candidate" or action["completion_output_hash"] != current_hash:
-            # First time DONE was seen for this action, OR the pane moved
-            # on since the last candidate snapshot -- (re-)arm the quiet
-            # window against the CURRENT snapshot rather than an earlier
-            # session-stale one.
-            self.store.cas_update(action["id"], expected_state="observing",
-                                  completion_status="completion_candidate",
-                                  completion_candidate_since=now.isoformat(),
-                                  completion_output_hash=current_hash)
-            return {"result": "completion_candidate", "state": "DONE"}
-        since = datetime.fromisoformat(action["completion_candidate_since"])
-        quiet_seconds = (now - since).total_seconds()
-        if quiet_seconds < COMPLETION_VERIFY_QUIET_SECONDS:
-            return {"result": "completion_candidate_quiet_window", "state": "DONE",
-                   "quiet_seconds": quiet_seconds}
-        # Corroborated: quiet the whole window, still DONE (not reverted to
-        # ERROR/WAITING_INPUT by a later poll) -- promote to verified.
-        events = self.v1.store.list_events(target=watch["target"], limit=1)
-        resulting_event_id = events[0]["id"] if events else None
-        self.store.cas_update(action["id"], expected_state="observing", state="completed",
-                              completion_status="verified_done", resulting_event_id=resulting_event_id)
-        self.store.reset_chain(action["watch_key"])  # loop stops cleanly at VERIFIED_DONE
-        return {"result": "verified_done", "state": "DONE"}
 
     # -- helpers ------------------------------------------------------------
 

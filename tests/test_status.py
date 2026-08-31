@@ -65,14 +65,15 @@ def test_parse_completion_marker_picks_the_last_of_several():
 def test_quoted_or_pasted_marker_text_is_still_just_a_marker_match():
     # This module has no concept of "quoting" -- a marker match is a
     # marker match regardless of surrounding context. That is fine: the
-    # marker (like DONE_PATTERNS) only ever produces a v1 "DONE"
-    # classification, itself only ever a COMPLETION_CANDIDATE at the v2
-    # layer (see supervisor2.py _reconcile_observing_actions) -- never
-    # trusted as verified from this classification alone.
+    # marker (like DONE_PATTERNS) only ever produces a COMPLETION_CANDIDATE
+    # classification here -- never trusted as verified from this
+    # classification alone (promotion to VERIFIED_DONE requires a later
+    # poll to corroborate a quiet window; see supervisor.py's
+    # _handle_completion_candidate).
     quoted = f'the user pasted this earlier: "{MARKER_OK}" -- not a real completion'
     assert parse_completion_marker(quoted) is not None
     state, reason = classify_supervisor_state("RUNNING", "r", quoted)
-    assert state == "DONE"
+    assert state == "COMPLETION_CANDIDATE"
     assert "structured completion marker" in reason
 
 
@@ -81,8 +82,8 @@ def test_adversarial_marker_cannot_forge_a_different_status_value():
     assert parse_completion_marker(forged) is None  # only completion_candidate is a recognized status
 
 
-def test_classify_supervisor_state_marker_present_yields_done_not_verified():
+def test_classify_supervisor_state_marker_present_yields_candidate_not_verified():
     state, reason = classify_supervisor_state("RUNNING", "r", MARKER_OK)
-    assert state == "DONE"  # backward-compatible v1 label; NOT proof of verification
+    assert state == "COMPLETION_CANDIDATE"  # never direct proof of verification
     assert "structured completion marker" in reason
 

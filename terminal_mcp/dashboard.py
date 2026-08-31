@@ -382,7 +382,11 @@ DASHBOARD_HTML = """<!doctype html>
     // and the only write path is "ack one event", which is local metadata
     // only — see the ack handler below, it never touches a tmux session.
     let supervisorVisible = false;
-    const SUPERVISOR_STATE_ORDER = ['RUNNING', 'WAITING_INPUT', 'DONE', 'ERROR', 'IDLE', 'UNKNOWN'];
+    // P0-7/P0-8: "DONE" is legacy-only now (status.py's to_legacy_state) --
+    // the state_counts this renders come from the real, primary vocabulary
+    // (COMPLETION_CANDIDATE: prose/marker evidence seen, not yet
+    // corroborated; VERIFIED_DONE: independently corroborated).
+    const SUPERVISOR_STATE_ORDER = ['RUNNING', 'WAITING_INPUT', 'COMPLETION_CANDIDATE', 'VERIFIED_DONE', 'ERROR', 'IDLE', 'UNKNOWN'];
     function toggleSupervisorPanel(open) {
       supervisorVisible = open;
       document.body.classList.toggle('supervisor-visible', open);

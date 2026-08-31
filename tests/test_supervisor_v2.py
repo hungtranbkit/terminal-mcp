@@ -500,33 +500,35 @@ def test_full_e2e_approved_auto_continue_reaches_done(tmp_path, tmux_session_fac
 
     time.sleep(1.5)
     result = v2.run_once()
-    assert any(e["state"] == "DONE" for e in result["events"])
+    assert any(e["state"] == "COMPLETION_CANDIDATE" for e in result["events"])
     reconciled = result["v2_reconciled"]
-    # P0-7/P0-8: DONE alone is only a COMPLETION_CANDIDATE -- the action
-    # must NOT jump straight to 'completed'/reset the chain from a single
-    # DONE-looking poll.
+    # P0-7/P0-8: prose/marker evidence alone is only a COMPLETION_CANDIDATE
+    # -- the action must NOT jump straight to 'completed'/reset the chain
+    # from a single DONE-looking poll.
     assert any(r["action_id"] == claim["id"] and r["result"] == "completion_candidate" for r in reconciled)
     action = v2.store.get_action(claim["id"])
     assert action["state"] == "observing"
-    assert action["completion_status"] == "completion_candidate"
+    watch = svc.store.get_watch(f"session:{session}")
+    assert watch["state"] == "COMPLETION_CANDIDATE"
     policy_mid = v2.get_policy(session=session)
     assert policy_mid["auto_action_count"] == 1  # chain NOT reset yet
 
     # The candidate must hold quiet (no new pane output, no newer error)
     # for the verification window before promotion -- this is the actual
     # "do not reset the chain until VERIFIED_DONE" enforcement.
-    from terminal_mcp.supervisor2 import COMPLETION_VERIFY_QUIET_SECONDS
-    time.sleep(COMPLETION_VERIFY_QUIET_SECONDS + 1)
+    from terminal_mcp.config import SupervisorConfig
+    time.sleep(SupervisorConfig().completion_verify_quiet_seconds + 1)
     result2 = v2.run_once()
     reconciled2 = result2["v2_reconciled"]
     assert any(r["action_id"] == claim["id"] and r["result"] == "verified_done" for r in reconciled2)
 
     action = v2.store.get_action(claim["id"])
     assert action["state"] == "completed"
-    assert action["completion_status"] == "verified_done"
+    watch = svc.store.get_watch(f"session:{session}")
+    assert watch["state"] == "VERIFIED_DONE"
     assert action["resulting_event_id"] is not None
     resulting_event = [e for e in v2.v1.store.list_events(limit=10) if e["id"] == action["resulting_event_id"]][0]
-    assert resulting_event["state"] == "DONE"
+    assert resulting_event["state"] == "VERIFIED_DONE"
 
     # Chain closed cleanly ONLY now: a fresh policy read shows counters reset.
     policy = v2.get_policy(session=session)
@@ -595,18 +597,20 @@ async def test_supervisor2_tools_full_pipeline_via_mcp(tmp_path, tmux_session_fa
     assert sent["sent"] is True
     time.sleep(1.5)
     r = await call("supervisor_run_once")
-    assert any(e["state"] == "DONE" for e in r["events"])
+    assert any(e["state"] == "COMPLETION_CANDIDATE" for e in r["events"])
     actions = (await call("supervisor2_list_actions", target=session))["actions"]
-    # P0-7/P0-8: DONE alone is a COMPLETION_CANDIDATE, not yet verified.
+    # P0-7/P0-8: prose evidence alone is a COMPLETION_CANDIDATE, not yet verified.
     assert actions[0]["state"] == "observing"
-    assert actions[0]["completion_status"] == "completion_candidate"
+    watches = (await call("supervisor_list_watches"))["watches"]
+    assert next(w for w in watches if w["target"] == session)["state"] == "COMPLETION_CANDIDATE"
 
-    from terminal_mcp.supervisor2 import COMPLETION_VERIFY_QUIET_SECONDS
-    time.sleep(COMPLETION_VERIFY_QUIET_SECONDS + 1)
+    from terminal_mcp.config import SupervisorConfig
+    time.sleep(SupervisorConfig().completion_verify_quiet_seconds + 1)
     await call("supervisor_run_once")
     actions = (await call("supervisor2_list_actions", target=session))["actions"]
     assert actions[0]["state"] == "completed"
-    assert actions[0]["completion_status"] == "verified_done"
+    watches = (await call("supervisor_list_watches"))["watches"]
+    assert next(w for w in watches if w["target"] == session)["state"] == "VERIFIED_DONE"
 
 
 @pytest.fixture
@@ -744,20 +748,29 @@ def test_done_stays_candidate_until_quiet_window_then_promotes(tmp_path, tmux_se
 
     action = v2.store.get_action(claim["id"])
     assert action["state"] == "observing"
-    assert action["completion_status"] == "completion_candidate"
+    watch = svc.store.get_watch(f"session:{session}")
+    assert watch["state"] == "COMPLETION_CANDIDATE"
     policy = v2.get_policy(session=session)
     assert policy["auto_action_count"] == 1  # not reset yet
 
-    # Fast-forward past the quiet window instead of sleeping for real.
+    # Fast-forward past the quiet window instead of sleeping for real --
+    # the candidate tracking now lives on the watch (native to v1).
     backdated = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=999)).isoformat()
-    v2.store.cas_update(action["id"], expected_state="observing", completion_candidate_since=backdated)
+    svc.store.update_watch_progress(
+        watch["watch_key"], state="COMPLETION_CANDIDATE", state_changed=False,
+        output_hash=watch["last_output_hash"], output_changed=False,
+        iteration_count=watch["iteration_count"], same_failure_count=0,
+        now_iso=watch["updated_at"], enabled=True, disabled_reason=None,
+        completion_candidate_since=backdated, completion_output_hash=watch["completion_output_hash"],
+    )
     svc.run_once()
     reconciled = v2._reconcile_observing_actions()
     assert any(r["action_id"] == claim["id"] and r["result"] == "verified_done" for r in reconciled)
 
     action = v2.store.get_action(claim["id"])
     assert action["state"] == "completed"
-    assert action["completion_status"] == "verified_done"
+    watch = svc.store.get_watch(f"session:{session}")
+    assert watch["state"] == "VERIFIED_DONE"
     assert v2.get_policy(session=session)["auto_action_count"] == 0
 
 
@@ -782,17 +795,18 @@ def test_completion_candidate_rearms_when_new_output_appears(tmp_path, tmux_sess
     time.sleep(1.0)
     svc.run_once()
     v2._reconcile_observing_actions()
-    first_snapshot = v2.store.get_action(claim["id"])["completion_output_hash"]
+    first_snapshot = svc.store.get_watch(f"session:{session}")["completion_output_hash"]
 
     time.sleep(3.0)  # well past the fixture's own 2s delay for "actually one more step"
     svc.run_once()
     v2._reconcile_observing_actions()
     action = v2.store.get_action(claim["id"])
+    watch = svc.store.get_watch(f"session:{session}")
     # Still only a candidate (never verified from the stale pre-change
     # snapshot), and the tracked snapshot moved on to the new output.
     assert action["state"] == "observing"
-    assert action["completion_status"] == "completion_candidate"
-    assert action["completion_output_hash"] != first_snapshot
+    assert watch["state"] == "COMPLETION_CANDIDATE"
+    assert watch["completion_output_hash"] != first_snapshot
 
 
 def test_old_scrollback_done_phrase_is_not_picked_up_by_a_fresh_poll(tmp_path, tmux_session_factory):
@@ -838,7 +852,8 @@ def test_adversarial_instruction_to_mark_verified_done_has_no_effect(tmp_path, t
     # action is still only a candidate -- the adversarial text has zero
     # effect on the quiet-window requirement.
     assert action["state"] == "observing"
-    assert action["completion_status"] == "completion_candidate"
+    watch = svc.store.get_watch(f"session:{session}")
+    assert watch["state"] == "COMPLETION_CANDIDATE"
     assert v2.get_policy(session=session)["auto_action_count"] == 1
 
 
