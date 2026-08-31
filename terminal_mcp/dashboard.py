@@ -75,7 +75,12 @@ DASHBOARD_HTML = """<!doctype html>
     .term-dots i { width:10px; height:10px; border-radius:50%; display:inline-block }
     .term-dots i.r { background:#ff5f57 } .term-dots i.y { background:#febc2e } .term-dots i.g { background:#28c840 }
     .term-title { color:var(--muted); font-size:12px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
-    .term-controls { display:flex; gap:8px; flex:0 0 auto }
+    /* flex:1 1 auto + min-width:0 (not flex:0 0 auto): a flex item's
+       preferred size is its max-content (unwrapped) width by default, and
+       flex-shrink:0 refuses to go below that — so .term-controls never
+       actually shrank enough to let its own flex-wrap kick in, and its 7
+       buttons silently overflowed the 390px shell instead of wrapping. */
+    .term-controls { display:flex; flex-wrap:wrap; gap:8px; flex:1 1 auto; min-width:0 }
     .term-btn { background:#19243b; border:1px solid var(--line); color:var(--text); border-radius:6px; padding:5px 10px; font:12px var(--mono); cursor:pointer; white-space:nowrap }
     .term-btn:hover:not(:disabled) { background:#233252 }
     .term-btn:disabled { opacity:.5; cursor:not-allowed }

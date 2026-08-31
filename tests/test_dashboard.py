@@ -77,6 +77,20 @@ def test_dashboard_mobile_terminal_bar_wraps_instead_of_clipping():
     assert "flex-wrap:wrap" in DASHBOARD_HTML
 
 
+def test_dashboard_term_controls_group_itself_wraps_and_can_shrink():
+    # Regression for a real bug found live in the supervisor pass: once
+    # search/copy/font buttons brought .term-controls to 7 items, its own
+    # `flex:0 0 auto` (flex-shrink:0) meant it always demanded its full
+    # max-content (unwrapped) width and never actually shrank enough for
+    # its own flex-wrap to engage — buttons silently overflowed past the
+    # 390px shell instead of dropping to a new line. flex-shrink must be
+    # allowed (min-width:0 too, the same automatic-minimum-size trap fixed
+    # elsewhere in this file) for the wrap to actually take effect.
+    assert "flex:1 1 auto; min-width:0" in DASHBOARD_HTML
+    controls_rule = DASHBOARD_HTML.split(".term-controls {", 1)[1].split("}", 1)[0]
+    assert "flex-wrap:wrap" in controls_rule
+
+
 def test_dashboard_mobile_uses_smaller_terminal_font_desktop_unchanged():
     # Mobile-only: a compact ~11-12px font with tight line-height fits
     # substantially more real terminal output on a phone screen. Desktop's
