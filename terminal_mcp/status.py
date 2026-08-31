@@ -180,6 +180,64 @@ def verify_completion_marker(marker: dict[str, str] | None, *, task_id: str, att
     return marker.get("task_id") == task_id and marker.get("attempt") == str(attempt) and marker.get("nonce") == nonce
 
 
+# ---------------------------------------------------------------------------
+# P0-7/P0-8 phase 3: trusted verifier hooks. Never executes anything --
+# same principle as the completion marker above, generalized: an agent
+# that already ran its own tests / checked git status / worked through a
+# checklist can print a structured evidence marker reporting the result,
+# and a watch can be configured (supervisor_watch's required_verifiers) to
+# require one or more kinds of evidence, bound to the same nonce/attempt
+# as the completion token, before COMPLETION_CANDIDATE is allowed to
+# promote to VERIFIED_DONE at all -- see supervisor.py's
+# _handle_completion_candidate / _verifiers_satisfied. A watch with no
+# required_verifiers configured (the default) is completely unaffected --
+# this is strictly additive, opt-in evidence on top of the existing
+# completion-marker/quiet-window promotion, never a replacement for it.
+# ---------------------------------------------------------------------------
+
+KNOWN_VERIFIER_KINDS = ("tests", "git_status", "checklist")
+
+EVIDENCE_MARKER_RE = re.compile(
+    r"###TERMINAL_MCP_EVIDENCE\s+protocol=terminal-mcp-evidence/v1\s+([^#\n]*?)###"
+)
+EVIDENCE_MARKER_REQUIRED_FIELDS = ("kind", "task_id", "attempt", "nonce", "status")
+
+
+def parse_evidence_markers(output: str) -> dict[str, dict[str, str]]:
+    """Parse every well-formed evidence marker in `output`, keyed by
+    `kind` -- for a given kind, the LAST well-formed marker of that kind
+    wins (mirrors parse_completion_marker's "last one wins" rule, so an
+    agent can print an early failing attempt and a later passing one and
+    only the later one counts). A marker missing a required field, whose
+    `status` is not exactly 'pass' or 'fail', or whose `kind` is not one
+    of KNOWN_VERIFIER_KINDS, is skipped entirely -- never partially
+    trusted or guessed at, the same as an absent marker."""
+    result: dict[str, dict[str, str]] = {}
+    for match in EVIDENCE_MARKER_RE.findall(output):
+        fields = dict(_MARKER_FIELD_RE.findall(match))
+        if not all(name in fields for name in EVIDENCE_MARKER_REQUIRED_FIELDS):
+            continue
+        if fields.get("status") not in ("pass", "fail"):
+            continue
+        if fields.get("kind") not in KNOWN_VERIFIER_KINDS:
+            continue
+        result[fields["kind"]] = fields
+    return result
+
+
+def verify_evidence_marker(marker: dict[str, str] | None, *, task_id: str, attempt: int,
+                           nonce: str | None, nonce_consumed: bool) -> bool:
+    """Same binding check as verify_completion_marker, applied to one
+    evidence marker: True only if `marker` (one value from
+    parse_evidence_markers) matches the CURRENT, unconsumed attempt's
+    task_id/attempt/nonce. This says nothing about pass/fail -- a caller
+    checks marker['status'] separately once this confirms the marker is
+    genuinely for this attempt, not a stale or copied-in one."""
+    if marker is None or nonce is None or nonce_consumed:
+        return False
+    return marker.get("task_id") == task_id and marker.get("attempt") == str(attempt) and marker.get("nonce") == nonce
+
+
 def classify_supervisor_state(state: str, reason: str, output: str) -> tuple[str, str]:
     """Normalize a classify_status() result plus ERROR/completion evidence
     to the 7-state supervisor vocabulary. WAITING_INPUT is already high-

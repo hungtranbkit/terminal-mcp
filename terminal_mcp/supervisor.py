@@ -35,8 +35,9 @@ from .audit import sanitized_preview, text_fingerprint
 from .config import AppConfig, SupervisorConfig
 from .core import TerminalService
 from .permissions import session_allowed
-from .status import (SUPERVISOR_STATES, classify_supervisor_state, parse_completion_marker,
-                     to_legacy_event_type, to_legacy_state, verify_completion_marker)
+from .status import (KNOWN_VERIFIER_KINDS, SUPERVISOR_STATES, classify_supervisor_state,
+                     parse_completion_marker, parse_evidence_markers, to_legacy_event_type,
+                     to_legacy_state, verify_completion_marker, verify_evidence_marker)
 from .tmux import TmuxError
 
 _LOGGER = logging.getLogger(__name__)
@@ -87,6 +88,22 @@ def default_supervisor_db_path() -> Path:
 
 def watch_key(kind: str, target: str) -> str:
     return f"{kind}:{target}"
+
+
+def _parse_required_verifiers(row: dict[str, Any]) -> tuple[str, ...]:
+    """Defensive parse of the required_verifiers JSON column -- absent/
+    NULL/malformed all mean "no required verifiers" (the clear generic
+    default), never an error."""
+    raw = row.get("required_verifiers")
+    if not raw:
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(str(item) for item in parsed if item in KNOWN_VERIFIER_KINDS)
 
 
 class SupervisorStore:
@@ -154,6 +171,12 @@ class SupervisorStore:
                 ("completion_nonce", "TEXT"),
                 ("completion_attempt", "INTEGER NOT NULL DEFAULT 0"),
                 ("completion_nonce_consumed_at", "TEXT"),
+                # P0-7/P0-8 phase 3: trusted verifier hooks. JSON list of
+                # KNOWN_VERIFIER_KINDS strings; empty/NULL (the default) is
+                # the "clear generic default" -- no verifier configured,
+                # promotion behaves exactly as phases 1/2 already do. See
+                # _verifiers_satisfied.
+                ("required_verifiers", "TEXT"),
             ):
                 if column not in existing_columns:
                     connection.execute(f"ALTER TABLE watches ADD COLUMN {column} {declaration}")
@@ -219,7 +242,8 @@ class SupervisorStore:
 
     def upsert_watch(self, kind: str, target: str, *, source: str, enabled: bool = True,
                      pinned_session_id: str | None = None, pinned_pane_id: str | None = None,
-                     pinned_created_epoch: int | None = None) -> tuple[dict[str, Any], bool]:
+                     pinned_created_epoch: int | None = None,
+                     required_verifiers: tuple[str, ...] | None = None) -> tuple[dict[str, Any], bool]:
         """Create a watch, or re-enable/replace source on an existing one.
         Never resets state/iteration/failure bookkeeping on an existing row —
         only creation or an explicit re-enable touches those. A re-enable
@@ -229,10 +253,18 @@ class SupervisorStore:
         exactly like a binding rebind. It also mints a fresh completion
         nonce and bumps completion_attempt -- a new watch/re-watch is
         exactly what "a new attempt" means (P0-7 phase 2 nonce delivery;
-        see supervisor_get_completion_token)."""
+        see supervisor_get_completion_token).
+
+        required_verifiers (P0-7/8 phase 3): None means "leave whatever was
+        already configured alone" on a re-enable (sticky, unlike the pin/
+        nonce fields above, which always refresh) -- passing None on a
+        *fresh* watch simply stores the clear generic default of no
+        required verifiers. Pass an explicit tuple (including ()) to set
+        or clear it outright."""
         key = watch_key(kind, target)
         now = datetime.now(timezone.utc).isoformat()
         nonce = secrets.token_urlsafe(18)
+        verifiers_json = json.dumps(list(required_verifiers)) if required_verifiers is not None else "[]"
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute("SELECT * FROM watches WHERE watch_key = ?", (key,)).fetchone()
@@ -243,13 +275,14 @@ class SupervisorStore:
                      last_output_hash, last_output_change_at, last_activity,
                      iteration_count, same_failure_count, disabled_reason, created_at, updated_at,
                      pinned_session_id, pinned_pane_id, pinned_created_epoch,
-                     completion_nonce, completion_attempt, completion_nonce_consumed_at)
-                    VALUES (?, ?, ?, ?, 1, 'UNKNOWN', ?, NULL, NULL, NULL, 0, 0, NULL, ?, ?, ?, ?, ?, ?, 1, NULL)""",
+                     completion_nonce, completion_attempt, completion_nonce_consumed_at,
+                     required_verifiers)
+                    VALUES (?, ?, ?, ?, 1, 'UNKNOWN', ?, NULL, NULL, NULL, 0, 0, NULL, ?, ?, ?, ?, ?, ?, 1, NULL, ?)""",
                     (key, kind, target, source, now, now, now,
-                     pinned_session_id, pinned_pane_id, pinned_created_epoch, nonce),
+                     pinned_session_id, pinned_pane_id, pinned_created_epoch, nonce, verifiers_json),
                 )
                 created = True
-            else:
+            elif required_verifiers is None:
                 connection.execute(
                     """UPDATE watches SET enabled = 1, disabled_reason = NULL, updated_at = ?,
                        pinned_session_id = ?, pinned_pane_id = ?, pinned_created_epoch = ?,
@@ -257,6 +290,16 @@ class SupervisorStore:
                        completion_nonce_consumed_at = NULL
                        WHERE watch_key = ?""",
                     (now, pinned_session_id, pinned_pane_id, pinned_created_epoch, nonce, key),
+                )
+                created = False
+            else:
+                connection.execute(
+                    """UPDATE watches SET enabled = 1, disabled_reason = NULL, updated_at = ?,
+                       pinned_session_id = ?, pinned_pane_id = ?, pinned_created_epoch = ?,
+                       completion_nonce = ?, completion_attempt = completion_attempt + 1,
+                       completion_nonce_consumed_at = NULL, required_verifiers = ?
+                       WHERE watch_key = ?""",
+                    (now, pinned_session_id, pinned_pane_id, pinned_created_epoch, nonce, verifiers_json, key),
                 )
                 created = False
             row = connection.execute("SELECT * FROM watches WHERE watch_key = ?", (key,)).fetchone()
@@ -425,9 +468,18 @@ class SupervisorService:
 
     # -- watch management (supervisor_watch / _unwatch / _list_watches) ---
 
-    def watch(self, binding: str | None = None, session: str | None = None) -> dict[str, Any]:
+    def watch(self, binding: str | None = None, session: str | None = None,
+             required_verifiers: list[str] | None = None) -> dict[str, Any]:
         if (binding is None) == (session is None):
             return {"error": "EXACTLY_ONE_TARGET_REQUIRED"}
+        if required_verifiers is not None:
+            unknown = sorted(set(required_verifiers) - set(KNOWN_VERIFIER_KINDS))
+            if unknown:
+                # Fail closed on a typo/unknown kind rather than silently
+                # ignoring it -- an operator who thinks a verifier is
+                # required must never end up with one that quietly isn't.
+                return {"error": "UNKNOWN_VERIFIER_KIND", "unknown": unknown,
+                        "known": list(KNOWN_VERIFIER_KINDS)}
         pin: dict[str, Any] = {}
         if binding is not None:
             if self.terminal.bindings.get(binding) is None:
@@ -453,7 +505,9 @@ class SupervisorService:
             if info is not None:
                 pin = {"pinned_session_id": info.session_id, "pinned_pane_id": info.pane_id,
                       "pinned_created_epoch": info.created_epoch}
-        row, created = self.store.upsert_watch(kind, target, source="manual", **pin)
+        verifiers = tuple(required_verifiers) if required_verifiers is not None else None
+        row, created = self.store.upsert_watch(kind, target, source="manual",
+                                                required_verifiers=verifiers, **pin)
         return {**self._watch_view(row), "created": created}
 
     def unwatch(self, binding: str | None = None, session: str | None = None, delete: bool = False) -> dict[str, Any]:
@@ -670,7 +724,9 @@ class SupervisorService:
         it proves the agent actually saw and echoed back something only
         this supervisor instance handed out for this specific attempt, so
         it skips the wait and promotes on this very poll. The nonce is
-        consumed (single-use) at the moment it verifies."""
+        consumed (single-use) at the moment it verifies. (P0-7/8 phase 3)
+        If the watch has required_verifiers configured, promotion also
+        requires each one satisfied -- see _verifiers_satisfied."""
         key = row["watch_key"]
 
         if row["state"] == "VERIFIED_DONE" and state != "VERIFIED_DONE":
@@ -718,6 +774,15 @@ class SupervisorService:
                     output_hash=output_hash, iteration_count=iteration_count,
                     metadata={"source": row["source"]},
                 )
+            # (P0-7/8 phase 3 note: this re-arm-on-any-output-change rule
+            # also applies when the new output is a required-verifier's own
+            # evidence marker -- printing it re-arms a fresh quiet window
+            # over the combined snapshot, which then has to hold quiet a
+            # SECOND time before _verifiers_satisfied is even reached below.
+            # The nonce fast-path has no such double-wait, since a nonce-
+            # verified completion marker never goes through this branch at
+            # all -- one more reason to prefer it when a verifier is
+            # required.)
             return None  # re-armed silently -- still just a candidate
 
         quiet_seconds = 0.0
@@ -736,6 +801,36 @@ class SupervisorService:
                     completion_output_hash=row["completion_output_hash"],
                 )
                 return None
+
+        verifiers_ok, verifiers_reason = self._verifiers_satisfied(row, output)
+        if not verifiers_ok:
+            # P0-7/8 phase 3: an operator-required verifier that is missing
+            # or reports failure blocks promotion outright, regardless of
+            # which path (nonce fast-path or quiet-window) got here --
+            # completion evidence strong enough to promote on its own is
+            # not the same as evidence the operator additionally required.
+            # Deliberately do NOT consume the nonce here: it stays valid
+            # for this same attempt so the watch can promote as soon as the
+            # missing/failing evidence is supplied, without forcing a
+            # rewatch (a fresh attempt) just because a verifier lagged.
+            self.store.update_watch_progress(
+                key, state="COMPLETION_CANDIDATE", state_changed=not was_candidate,
+                output_hash=output_hash, output_changed=output_hash != row["last_output_hash"],
+                iteration_count=iteration_count, same_failure_count=same_failure_count,
+                now_iso=now_iso, enabled=True, disabled_reason=None,
+                completion_candidate_since=row["completion_candidate_since"] or now_iso,
+                completion_output_hash=output_hash,
+            )
+            if not was_candidate:
+                return self.store.add_event(
+                    watch_key=key, kind=row["kind"], target=row["target"], previous_state=row["state"],
+                    state="COMPLETION_CANDIDATE", event_type="completion_candidate",
+                    reason=f"{reason}; {verifiers_reason}",
+                    output_preview=sanitized_preview(output) if output else "",
+                    output_hash=output_hash, iteration_count=iteration_count,
+                    metadata={"source": row["source"]},
+                )
+            return None
 
         if nonce_verified:
             # Consume it -- if this loses a race (already consumed between
@@ -759,6 +854,38 @@ class SupervisorService:
             same_failure_count=same_failure_count,
             completion_candidate_since=None, completion_output_hash=None,  # cleared -- verified now
         )
+
+    def _verifiers_satisfied(self, row: dict[str, Any], output: str) -> tuple[bool, str]:
+        """P0-7/8 phase 3: trusted verifier hooks. Never executes anything
+        itself (no test runner, no `git diff`/`git status` invocation) --
+        purely reads structured evidence markers the agent already printed
+        into its own pane, the exact same untrusted-but-conservatively-
+        parsed pattern as the completion marker. Each required kind must
+        have a well-formed evidence marker bound to this watch's CURRENT,
+        unconsumed nonce/attempt (verify_evidence_marker) reporting
+        status=pass -- a marker for the wrong attempt, a missing marker, or
+        one reporting status=fail all count as unsatisfied, never guessed
+        at. A watch with no required_verifiers configured (the default)
+        always returns satisfied -- strictly additive, opt-in evidence on
+        top of the existing promotion path, never a replacement for it."""
+        required = _parse_required_verifiers(row)
+        if not required:
+            return True, "no required verifiers configured"
+        evidence = parse_evidence_markers(output)
+        unsatisfied = []
+        for kind in required:
+            marker = evidence.get(kind)
+            bound = verify_evidence_marker(
+                marker, task_id=row["watch_key"], attempt=row.get("completion_attempt") or 0,
+                nonce=row.get("completion_nonce"), nonce_consumed=bool(row.get("completion_nonce_consumed_at")),
+            )
+            if not bound:
+                unsatisfied.append(f"{kind}: no matching evidence for this attempt")
+            elif marker["status"] != "pass":
+                unsatisfied.append(f"{kind}: status={marker['status']}")
+        if unsatisfied:
+            return False, "required verifier(s) not satisfied: " + "; ".join(unsatisfied)
+        return True, "all required verifiers passed: " + ", ".join(required)
 
     def _transition(self, row: dict[str, Any], now_iso: str, iteration_count: int, *, new_state: str,
                     event_type: str, reason: str, output: str, output_hash: str | None,
@@ -796,6 +923,7 @@ class SupervisorService:
             "iteration_count": row["iteration_count"], "same_failure_count": row["same_failure_count"],
             "disabled_reason": row["disabled_reason"], "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "required_verifiers": list(_parse_required_verifiers(row)),
         }
 
 

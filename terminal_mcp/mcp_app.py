@@ -140,9 +140,18 @@ def build_mcp(service: TerminalService | None = None,
     # path is the same whitelist-guarded terminal_status(_bound) above. ----
 
     @server.tool()
-    def supervisor_watch(binding: str | None = None, session: str | None = None) -> dict:
-        """Create or re-enable a watch on an allowed binding or whitelisted session."""
-        return supervisor.watch(binding, session)
+    def supervisor_watch(binding: str | None = None, session: str | None = None,
+                         required_verifiers: list[str] | None = None) -> dict:
+        """Create or re-enable a watch on an allowed binding or whitelisted session.
+        required_verifiers (P0-7/8 phase 3, optional): kinds of trusted
+        evidence -- from {"tests", "git_status", "checklist"} -- that must
+        each have a matching ###TERMINAL_MCP_EVIDENCE marker (bound to this
+        watch's completion token, status=pass) present before
+        COMPLETION_CANDIDATE can promote to VERIFIED_DONE. Omitted on a
+        fresh watch: no required verifiers (unaffected, current behavior).
+        Omitted on a re-watch: whatever was already configured is left
+        alone. Pass an explicit list (including []) to set or clear it."""
+        return supervisor.watch(binding, session, required_verifiers)
 
     @server.tool()
     def supervisor_unwatch(binding: str | None = None, session: str | None = None,

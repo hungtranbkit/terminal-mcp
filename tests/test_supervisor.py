@@ -304,6 +304,164 @@ def test_get_completion_token_unknown_watch_is_reported_not_guessed(tmp_path):
     assert result["error"] == "WATCH_NOT_FOUND"
 
 
+# ---------------------------------------------------------------------------
+# P0-7/P0-8 phase 3: trusted verifier hooks. Never executes anything --
+# purely reads structured evidence markers the agent already printed into
+# its own pane, bound to the same nonce/attempt as the completion token.
+# ---------------------------------------------------------------------------
+
+
+def _evidence(kind: str, task_id: str, attempt, nonce: str, status: str) -> str:
+    return (
+        "###TERMINAL_MCP_EVIDENCE protocol=terminal-mcp-evidence/v1 "
+        f"kind={kind} task_id={task_id} attempt={attempt} nonce={nonce} "
+        f"status={status} summary=see-pane###"
+    )
+
+
+def test_watch_rejects_unknown_verifier_kind(tmp_path):
+    svc = _service(tmp_path)
+    result = svc.watch(session="test-sup-badverifier", required_verifiers=["not_a_real_kind"])
+    assert result["error"] == "UNKNOWN_VERIFIER_KIND"
+    assert result["unknown"] == ["not_a_real_kind"]
+    assert svc.list_watches()["watches"] == []  # rejected before any row was written
+
+
+def test_watch_with_no_required_verifiers_is_the_default_and_unaffected(tmp_path, tmux_session_factory):
+    session = tmux_session_factory(
+        "test-sup-verifier-default", "bash -lc 'printf \"FINAL REPORT\\nall good\\n\"; sleep 20'"
+    )
+    time.sleep(0.2)
+    svc = _service(tmp_path, completion_verify_quiet_seconds=1)
+    watch = svc.watch(session=session)
+    assert watch["required_verifiers"] == []
+    svc.run_once()
+    time.sleep(1.2)
+    svc.run_once()
+    # Unaffected: promotes via the ordinary quiet-window path exactly like
+    # before phase 3 existed, since no required_verifiers is configured.
+    assert svc.list_watches()["watches"][0]["state"] == "VERIFIED_DONE"
+
+
+def test_required_verifier_missing_blocks_promotion_even_after_quiet_window(tmp_path, tmux_session_factory):
+    session = tmux_session_factory(
+        "test-sup-verifier-missing", "bash -lc 'printf \"FINAL REPORT\\nall good\\n\"; sleep 20'"
+    )
+    time.sleep(0.2)
+    svc = _service(tmp_path, completion_verify_quiet_seconds=1)
+    watch = svc.watch(session=session, required_verifiers=["tests"])
+    assert watch["required_verifiers"] == ["tests"]
+
+    first = svc.run_once()
+    assert first["events"][0]["state"] == "COMPLETION_CANDIDATE"
+    time.sleep(1.2)
+    second = svc.run_once()
+    # Would ordinarily promote now (quiet window elapsed, no regression) --
+    # blocked because the required "tests" evidence was never printed.
+    assert second["events"] == []
+    assert svc.list_watches()["watches"][0]["state"] == "COMPLETION_CANDIDATE"
+
+
+def test_required_verifier_evidence_failing_blocks_promotion(tmp_path, tmux_session_factory):
+    # Prose/quiet-window path (not the nonce fast-path): printing the
+    # evidence marker is itself new pane output, so it (re-)arms a fresh
+    # quiet window over the combined completion+evidence snapshot -- the
+    # SAME snapshot must then hold quiet a second time before the required-
+    # verifier check is even reached, exactly like any other candidate
+    # snapshot. Two full run_once()/quiet-window cycles is the real
+    # sequence, not an artifact of this test.
+    session = tmux_session_factory(
+        "test-sup-verifier-fail",
+        "bash -lc 'printf \"FINAL REPORT\\nall good\\n\"; read marker; printf \"%s\\n\" \"$marker\"; sleep 20'",
+    )
+    time.sleep(0.2)
+    svc = _service(tmp_path, completion_verify_quiet_seconds=1)
+    svc.watch(session=session, required_verifiers=["tests"])
+    token = svc.get_completion_token(session=session)
+    svc.run_once()
+    time.sleep(1.2)
+
+    marker = _evidence("tests", token["task_id"], token["attempt"], token["nonce"], "fail")
+    _print_into_pane(session, marker)
+    time.sleep(0.3)
+    svc.run_once()  # re-arms on the new (evidence-included) snapshot
+    time.sleep(1.2)
+
+    result = svc.run_once()
+    assert result["events"] == []  # a failing verifier is not a re-alert-worthy transition
+    assert svc.list_watches()["watches"][0]["state"] == "COMPLETION_CANDIDATE"
+    # The completion nonce was never consumed by this -- still available.
+    assert svc.get_completion_token(session=session)["consumed"] is False
+    assert svc.get_completion_token(session=session)["nonce"] == token["nonce"]
+
+
+def test_required_verifier_evidence_passing_allows_promotion(tmp_path, tmux_session_factory):
+    session = tmux_session_factory(
+        "test-sup-verifier-pass",
+        "bash -lc 'printf \"FINAL REPORT\\nall good\\n\"; read marker; printf \"%s\\n\" \"$marker\"; sleep 20'",
+    )
+    time.sleep(0.2)
+    svc = _service(tmp_path, completion_verify_quiet_seconds=1)
+    svc.watch(session=session, required_verifiers=["tests"])
+    token = svc.get_completion_token(session=session)
+    svc.run_once()
+    time.sleep(1.2)
+
+    marker = _evidence("tests", token["task_id"], token["attempt"], token["nonce"], "pass")
+    _print_into_pane(session, marker)
+    time.sleep(0.3)
+    svc.run_once()  # re-arms on the new (evidence-included) snapshot
+    time.sleep(1.2)
+
+    result = svc.run_once()
+    assert result["events"][0]["event_type"] == "verified_done"
+    assert svc.list_watches()["watches"][0]["state"] == "VERIFIED_DONE"
+
+
+def test_required_verifier_gates_the_nonce_fast_path_too(tmp_path, tmux_session_factory):
+    # A nonce-verified completion marker alone is not enough when a
+    # verifier is required -- it must not consume the nonce or promote
+    # until the required evidence also shows up (bound to the same,
+    # still-unconsumed token).
+    session = tmux_session_factory("test-sup-verifier-noncegate", "bash -lc 'sleep 20'")
+    time.sleep(0.2)
+    svc = _service(tmp_path, completion_verify_quiet_seconds=3600)
+    svc.watch(session=session, required_verifiers=["tests"])
+    token = svc.get_completion_token(session=session)
+
+    completion_marker = _marker(token["task_id"], token["attempt"], token["nonce"])
+    _print_into_pane(session, completion_marker)
+    time.sleep(0.3)
+
+    result = svc.run_once()
+    assert result["events"][0]["event_type"] == "completion_candidate"
+    assert svc.list_watches()["watches"][0]["state"] == "COMPLETION_CANDIDATE"
+    assert svc.get_completion_token(session=session)["consumed"] is False  # not spent by the failed attempt
+
+    evidence_marker = _evidence("tests", token["task_id"], token["attempt"], token["nonce"], "pass")
+    _print_into_pane(session, evidence_marker)
+    time.sleep(0.3)
+
+    result2 = svc.run_once()
+    assert result2["events"][0]["event_type"] == "verified_done"
+    assert svc.list_watches()["watches"][0]["state"] == "VERIFIED_DONE"
+    assert svc.get_completion_token(session=session)["consumed"] is True
+
+
+def test_required_verifiers_are_sticky_on_rewatch_unless_explicitly_changed(tmp_path, tmux_session_factory):
+    session = tmux_session_factory("test-sup-verifier-sticky", "bash -lc 'sleep 20'")
+    time.sleep(0.2)
+    svc = _service(tmp_path)
+    svc.watch(session=session, required_verifiers=["tests", "git_status"])
+    svc.unwatch(session=session)
+
+    resumed = svc.watch(session=session)  # no required_verifiers passed -- sticky
+    assert sorted(resumed["required_verifiers"]) == ["git_status", "tests"]
+
+    cleared = svc.watch(session=session, required_verifiers=[])  # explicit clear
+    assert cleared["required_verifiers"] == []
+
+
 def test_ordinary_silence_never_produces_false_done(tmp_path, tmux_session_factory):
     # A quiet, unremarkable idle shell must never be classified DONE just
     # because nothing is happening — only explicit completion evidence does.
