@@ -13,6 +13,96 @@ def test_preserves_normal_output():
     assert redact_text("BUILD STEP 1") == "BUILD STEP 1"
 
 
+# ---------------------------------------------------------------------------
+# P0-10: expanded secret family coverage
+# ---------------------------------------------------------------------------
+
+
+def test_redacts_pem_private_key_block():
+    raw = (
+        "before\n-----BEGIN RSA PRIVATE KEY-----\n"
+        "MIIEpAIBAAKCAQEA1234567890abcdefgHIJKLMNOP\nQRSTUVWXYZ==\n"
+        "-----END RSA PRIVATE KEY-----\nafter"
+    )
+    result = redact_text(raw)
+    assert "MIIEpAIBAAKCAQEA1234567890abcdefgHIJKLMNOP" not in result
+    assert "-----BEGIN RSA PRIVATE KEY-----" in result
+    assert "-----END RSA PRIVATE KEY-----" in result
+    assert "<REDACTED>" in result
+    assert "before" in result and "after" in result
+
+
+def test_redacts_plain_and_openssh_private_key_blocks():
+    for key_type, header in (
+        ("", "-----BEGIN PRIVATE KEY-----"),
+        ("OPENSSH ", "-----BEGIN OPENSSH PRIVATE KEY-----"),
+        ("EC ", "-----BEGIN EC PRIVATE KEY-----"),
+    ):
+        raw = f"{header}\nsecretbodycontenthere\n-----END {key_type}PRIVATE KEY-----"
+        result = redact_text(raw)
+        assert "secretbodycontenthere" not in result
+
+
+def test_redacts_github_tokens():
+    for token in ("ghp_" + "a" * 36, "gho_" + "b" * 36, "github_pat_" + "c" * 22):
+        raw = f"export GITHUB_TOKEN={token}"
+        result = redact_text(raw)
+        assert token not in result
+        assert "<REDACTED>" in result
+
+
+def test_redacts_aws_keys():
+    raw = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\naws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\naws_session_token=FQoGZXIvYXdzEXAMPLE"
+    result = redact_text(raw)
+    assert "AKIAIOSFODNN7EXAMPLE" not in result
+    assert "wJalrXUtnFEMI" not in result
+    assert "FQoGZXIvYXdzEXAMPLE" not in result
+
+
+def test_redacts_npm_token():
+    token = "npm_" + "x" * 36
+    raw = f"//registry.npmjs.org/:_authToken={token}"
+    assert token not in redact_text(raw)
+
+
+def test_redacts_cookie_and_set_cookie_headers():
+    raw = "Cookie: session_id=abc123def456; other=1\nSet-Cookie: sid=xyz789; HttpOnly"
+    result = redact_text(raw)
+    assert "abc123def456" not in result
+    assert "xyz789" not in result
+    assert "Cookie:" in result and "Set-Cookie:" in result
+
+
+def test_redacts_generic_api_key_style_assignments():
+    for assignment in ("api_key=abc123", "API-KEY=abc123", "access_key=abc123",
+                       "client_secret=abc123", "secret_key=abc123"):
+        result = redact_text(assignment)
+        assert "abc123" not in result, assignment
+
+
+def test_redacts_x_api_key_header():
+    result = redact_text("X-Api-Key: super-secret-value-123")
+    assert "super-secret-value-123" not in result
+
+
+def test_redaction_does_not_over_redact_non_secret_near_misses():
+    # Plain English/log lines that merely *mention* these words, with no
+    # KEY=VALUE assignment or recognizable token shape, must survive
+    # untouched -- this is the "minimize destructive over-redaction" half
+    # of the requirement.
+    benign = [
+        "the secret to good code is testing",
+        "this API key rotation policy runs monthly",
+        "access is granted after login",
+        "the cookie jar was empty",
+        "npm install completed successfully",
+        "github actions workflow finished",
+        "client secret rotation reminder: next in 30 days",
+    ]
+    for line in benign:
+        assert redact_text(line) == line, line
+
+
 def test_strip_ansi_removes_sgr_sequences():
     colored = "\x1b[1;31mERROR\x1b[0m: build failed \x1b[32mOK\x1b[0m"
     assert strip_ansi(colored) == "ERROR: build failed OK"

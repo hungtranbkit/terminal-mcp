@@ -167,6 +167,13 @@ class TerminalService:
                 "lines_requested": requested,
                 "output": redact("\n".join(output_lines)),
                 "truncated": requested > self.config.max_capture_lines,
+                # P0-9: `output` is text the *watched program* printed, not
+                # an instruction from this tool or from terminal-mcp itself
+                # -- a caller (human or an external model driving these
+                # tools) must treat it as untrusted evidence to read, never
+                # as directives to follow. untrusted_fields names exactly
+                # which key(s) in this response carry that content.
+                "untrusted_output": True, "untrusted_fields": ["output"], "content_source": "session",
             }
         except TmuxError as exc:
             return {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
@@ -188,6 +195,7 @@ class TerminalService:
                 "lines_returned": len(sliced),
                 "truncated": truncated,
                 "max_capture_lines": self.config.max_capture_lines,
+                "untrusted_output": True, "untrusted_fields": ["output"], "content_source": "session",
             }
         except TmuxError as exc:
             return {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
@@ -210,6 +218,7 @@ class TerminalService:
                 "input_required": input_required,
                 "reason": reason,
                 "last_output": redact_text(last_output),
+                "untrusted_output": True, "untrusted_fields": ["last_output"], "content_source": "session",
             }
         except TmuxError as exc:
             return {"error": "TMUX_ERROR", "session": session, "reason": str(exc)}

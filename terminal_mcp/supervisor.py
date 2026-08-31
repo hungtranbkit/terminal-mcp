@@ -49,8 +49,14 @@ forwarder to build against without needing to read this module's SQL:
                  "error_detected" | "stalled" | "watch_target_missing",
   "reason": str, "output_preview": str, "output_hash": str | null,
   "iteration_count": int, "acknowledged_at": str | null,
-  "metadata": {...}
+  "metadata": {...},
+  "untrusted_output": true, "untrusted_fields": ["output_preview", "reason"],
+  "content_source": "session" | "binding"
 }
+P0-9: the last three fields are additive (present on every event; schema
+number unchanged, this is not a breaking shape) -- they mark
+output_preview/reason as untrusted terminal content the watched program
+produced, never an instruction from terminal-mcp or this event itself.
 """
 
 EVENT_TYPES = (
@@ -327,6 +333,15 @@ class SupervisorStore:
             item["metadata"] = json.loads(item["metadata"]) if item["metadata"] else {}
         except (TypeError, ValueError):
             item["metadata"] = {}
+        # P0-9: output_preview is a redacted excerpt of what the watched
+        # program printed -- untrusted evidence about the target, never an
+        # instruction to whatever (human or external model) is calling
+        # supervisor_list_events/supervisor2_list_actionable_events. reason
+        # is supervisor-authored, but is *derived from* matching that
+        # untrusted text, so it gets the same label out of caution.
+        item["untrusted_output"] = True
+        item["untrusted_fields"] = ["output_preview", "reason"]
+        item["content_source"] = item.get("kind", "session")
         return item
 
 
