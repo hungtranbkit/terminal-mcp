@@ -619,9 +619,9 @@ def test_dashboard_health_indicator_never_clears_last_rendered_output():
 def test_dashboard_health_indicator_no_new_backend_route():
     # Purely reactive to the two fetches loadSessions/loadDetail already
     # make — no new endpoint, no extra polling path added for the health
-    # indicator specifically (the two extra fetch()s below belong to the
-    # separate Supervisor Loop v1 feature's summary/ack calls).
-    assert DASHBOARD_HTML.count("fetch(") == 5  # sessions, session detail, session/input, supervisor, supervisor/ack
+    # indicator specifically (the other fetch()s below belong to the
+    # separate Supervisor Loop v1/v2 features' summary/ack/pause calls).
+    assert DASHBOARD_HTML.count("fetch(") == 7  # sessions, session detail, session/input, supervisor, supervisor/ack, supervisor2, supervisor2/pause
 
 
 def test_dashboard_fullscreen_preference_persisted_and_restored_once():
@@ -688,6 +688,8 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/session/input": {"POST"},
         "/dashboard/api/supervisor": {"GET", "HEAD"},
         "/dashboard/api/supervisor/ack": {"POST"},
+        "/dashboard/api/supervisor2": {"GET", "HEAD"},
+        "/dashboard/api/supervisor2/pause": {"POST"},
     }
 
 

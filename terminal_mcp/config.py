@@ -42,6 +42,13 @@ class SupervisorConfig:
     event_retention: int = 500
     watched_session_patterns: tuple[str, ...] = ()
     watched_bindings: tuple[str, ...] = ()
+    # v2 (decision/send layer) global kill switch — independent of, and in
+    # addition to, each watch's own per-watch policy_mode (which already
+    # defaults to observe_only). Both gates must be satisfied before
+    # supervisor2_execute_send will ever actually send anything: this one
+    # protects the whole instance even if some watch's policy was
+    # (mis)configured to approved_auto_continue.
+    v2_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,5 +152,6 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             event_retention=event_retention,
             watched_session_patterns=string_tuple_supervisor("watched_session_patterns"),
             watched_bindings=string_tuple_supervisor("watched_bindings"),
+            v2_enabled=bool(supervisor_raw.get("v2_enabled", False)),
         ),
     )

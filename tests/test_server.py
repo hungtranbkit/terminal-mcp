@@ -29,6 +29,14 @@ async def test_server_registers_v1_and_binding_tools():
         "supervisor_list_events",
         "supervisor_ack_event",
         "supervisor_run_once",
+        "supervisor2_set_policy",
+        "supervisor2_get_policy",
+        "supervisor2_list_actionable_events",
+        "supervisor2_claim_event",
+        "supervisor2_submit_decision",
+        "supervisor2_review_action",
+        "supervisor2_execute_send",
+        "supervisor2_list_actions",
     }
 
 

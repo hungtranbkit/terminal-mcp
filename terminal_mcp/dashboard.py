@@ -7,6 +7,7 @@ from starlette.responses import HTMLResponse, JSONResponse
 from .core import TerminalService
 from .permissions import input_session_allowed
 from .supervisor import SupervisorService, SupervisorStore
+from .supervisor2 import SupervisorV2Service, build_supervisor_v2
 
 
 INPUT_ERROR_STATUS = {
@@ -61,6 +62,17 @@ DASHBOARD_HTML = """<!doctype html>
     #supervisorPanel .sp-event .sp-target { font-weight:700 }
     #supervisorPanel .sp-event button { margin-top:4px; background:#19243b; border:1px solid var(--line); color:var(--text); border-radius:6px; padding:3px 8px; font:11px var(--mono); cursor:pointer }
     #supervisorPanel .sp-empty { padding:10px 14px; color:var(--muted); font-size:12px }
+    /* Supervisor v2 (policy-gated decision/send pipeline): compact, only
+       ever shows watches with a non-default policy — a plain v1-only watch
+       adds nothing here, so this never bloats the panel by default. */
+    .sp-v2 { padding:0 14px 12px }
+    .sp-v2:empty { display:none }
+    .sp-v2 .sp-v2-item { padding:8px 0; border-top:1px solid var(--line); font-size:12px }
+    .sp-v2 .sp-v2-item .sp-target { font-weight:700 }
+    .sp-v2 .sp-v2-policy { display:inline-block; font-size:10px; padding:1px 6px; border-radius:999px; border:1px solid var(--line); color:var(--muted); margin-left:6px }
+    .sp-v2 .sp-v2-policy.active { color:var(--amber); border-color:var(--amber) }
+    .sp-v2 .sp-v2-prompt { font-family:var(--mono); background:var(--term-bg); padding:4px 6px; border-radius:4px; margin:4px 0; word-break:break-word }
+    .sp-v2 .sp-v2-item button { margin-top:4px; background:#19243b; border:1px solid var(--line); color:var(--text); border-radius:6px; padding:3px 8px; font:11px var(--mono); cursor:pointer }
     /* Last-rendered output stays visible while disconnected (never cleared),
        just visibly dimmed so it reads as "maybe stale", not "still live". */
     #output.stale { opacity:.55 }
@@ -286,6 +298,7 @@ DASHBOARD_HTML = """<!doctype html>
     </div>
     <div class="sp-counts" id="supervisorCounts"></div>
     <div class="sp-events" id="supervisorEvents"></div>
+    <div class="sp-v2" id="supervisorV2"></div>
   </div>
   <script>
     let selected = null;
@@ -303,6 +316,7 @@ DASHBOARD_HTML = """<!doctype html>
     const supervisorBackdropEl = document.querySelector('#supervisorBackdrop');
     const supervisorCountsEl = document.querySelector('#supervisorCounts');
     const supervisorEventsEl = document.querySelector('#supervisorEvents');
+    const supervisorV2El = document.querySelector('#supervisorV2');
     const supervisorCloseBtnEl = document.querySelector('#supervisorCloseBtn');
     const termTitleEl = document.querySelector('#termTitle');
     const followToggleEl = document.querySelector('#followToggle');
@@ -420,6 +434,66 @@ DASHBOARD_HTML = """<!doctype html>
         ackBtn.onclick = () => ackSupervisorEvent(event.id);
         row.append(target, reason, ackBtn);
         supervisorEventsEl.append(row);
+      }
+    }
+
+    async function pauseSupervisorV2(target, kind) {
+      try {
+        await fetch('/dashboard/api/supervisor2/pause', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({target, kind}),
+        });
+      } catch (error) { /* best-effort; next refresh reconciles either way */ }
+      await loadSupervisorV2();
+    }
+
+    async function loadSupervisorV2() {
+      let data;
+      try {
+        const response = await fetch('/dashboard/api/supervisor2', {cache: 'no-store'});
+        data = await response.json();
+      } catch (error) {
+        return;
+      }
+      const watches = data.watches || [];
+      supervisorV2El.replaceChildren();
+      for (const w of watches) {
+        const item = document.createElement('div'); item.className = 'sp-v2-item';
+        const header = document.createElement('div'); header.className = 'sp-target';
+        header.textContent = `${clean(w.target)} `;
+        const policyBadge = document.createElement('span');
+        policyBadge.className = 'sp-v2-policy' + (w.policy.policy_mode !== 'observe_only' ? ' active' : '');
+        policyBadge.textContent = clean(w.policy.policy_mode);
+        header.append(policyBadge);
+        item.append(header);
+
+        const action = w.latest_action;
+        if (action) {
+          const stateLine = document.createElement('div'); stateLine.className = 'muted';
+          stateLine.textContent = `action #${action.id}: ${clean(action.state)}`
+            + (action.stop_reason ? ` — ${clean(action.stop_reason)}` : '');
+          item.append(stateLine);
+          if (action.proposed_prompt) {
+            const promptEl = document.createElement('div'); promptEl.className = 'sp-v2-prompt';
+            promptEl.textContent = clean(action.proposed_prompt);
+            item.append(promptEl);
+          }
+          if (action.send_result) {
+            const resultLine = document.createElement('div'); resultLine.className = 'muted';
+            resultLine.textContent = `last send: ${clean(action.send_result)}`;
+            item.append(resultLine);
+          }
+        }
+        const counters = document.createElement('div'); counters.className = 'muted';
+        counters.textContent = `auto actions: ${w.policy.auto_action_count}/${w.policy.max_auto_actions}`
+          + (w.policy.blocked_reason ? ` · blocked: ${clean(w.policy.blocked_reason)}` : '');
+        item.append(counters);
+
+        if (w.policy.policy_mode !== 'observe_only') {
+          const pauseBtn = document.createElement('button'); pauseBtn.type = 'button'; pauseBtn.textContent = 'Pause (observe only)';
+          pauseBtn.onclick = () => pauseSupervisorV2(w.target, w.kind);
+          item.append(pauseBtn);
+        }
+        supervisorV2El.append(item);
       }
     }
 
@@ -873,6 +947,7 @@ DASHBOARD_HTML = """<!doctype html>
       try {
         await loadSessions(); await loadDetail(); setConnectionState(true);
         await loadSupervisor(); // independent of session connectivity above; never affects the LIVE/RECONNECTING badge
+        await loadSupervisorV2();
         if (!fullscreenRestoreAttempted) {
           fullscreenRestoreAttempted = true;
           if (selected && recalledFullscreen()) setFullscreen(true, { persist: false });
@@ -886,9 +961,12 @@ DASHBOARD_HTML = """<!doctype html>
 
 
 def register_dashboard(server: MCPServer, terminal: TerminalService,
-                       supervisor: SupervisorService | None = None) -> None:
+                       supervisor: SupervisorService | None = None,
+                       supervisor_v2: SupervisorV2Service | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
+    if supervisor_v2 is None:
+        supervisor_v2 = build_supervisor_v2(supervisor)
     @server.custom_route("/dashboard", methods=["GET"], include_in_schema=False)
     async def dashboard(_: Request) -> HTMLResponse:
         return HTMLResponse(
@@ -984,5 +1062,42 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if not isinstance(event_id, int):
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         result = supervisor.ack_event(event_id)
+        status_code = 404 if "error" in result else 200
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/supervisor2", methods=["GET"], include_in_schema=False)
+    async def supervisor2_summary(_: Request) -> JSONResponse:
+        # Read-only: for every watch with a non-observe_only v2 policy, its
+        # policy/counters plus its most recent action (if any) — the same
+        # data the supervisor2_* MCP tools expose, nothing extra computed
+        # for this view.
+        rows = []
+        for watch in supervisor.list_watches()["watches"]:
+            policy = supervisor_v2.store.get_policy(watch["watch_key"])
+            if policy["policy_mode"] == "observe_only" and policy["created_at"] is None:
+                continue  # never configured for v2 at all — nothing to show
+            actions = supervisor_v2.store.list_actions(watch_key=watch["watch_key"], limit=1)
+            rows.append({
+                "watch_key": watch["watch_key"], "target": watch["target"], "kind": watch["kind"],
+                "watch_state": watch["state"], "policy": policy,
+                "latest_action": actions[0] if actions else None,
+            })
+        return JSONResponse({"watches": rows}, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/supervisor2/pause", methods=["POST"], include_in_schema=False)
+    async def supervisor2_pause(request: Request) -> JSONResponse:
+        # STOP/PAUSE only: sets policy_mode back to observe_only. Local
+        # metadata only, same as the v1 ack route — no terminal_send/tmux
+        # call is reachable from this route either.
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        target = body.get("target") if isinstance(body, dict) else None
+        kind = body.get("kind") if isinstance(body, dict) else None
+        if not isinstance(target, str) or kind not in ("session", "binding"):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        kwargs = {"session": target} if kind == "session" else {"binding": target}
+        result = supervisor_v2.set_policy(policy_mode="observe_only", **kwargs)
         status_code = 404 if "error" in result else 200
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})

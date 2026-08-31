@@ -6,19 +6,24 @@ from . import __version__
 from .config import load_config
 from .core import TerminalService
 from .supervisor import SupervisorService, SupervisorStore
+from .supervisor2 import SupervisorV2Service, build_supervisor_v2
 
 
 def build_mcp(service: TerminalService | None = None,
-              supervisor: SupervisorService | None = None) -> MCPServer:
+              supervisor: SupervisorService | None = None,
+              supervisor_v2: SupervisorV2Service | None = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
-    `supervisor` is always constructed and its tools always registered
-    (supervisor_watch/status/events are just data-plane operations, useful
-    even with the background auto-poll loop disabled) — only the *automatic*
-    background thread is gated on config.supervisor.enabled, and that gating
-    happens in server_http.py, not here."""
+    `supervisor`/`supervisor_v2` are always constructed and their tools
+    always registered (they're data-plane operations, useful even with the
+    background auto-poll loop disabled) — only the *automatic* background
+    thread is gated on config.supervisor.enabled, and that gating happens in
+    server_http.py, not here. v2's own default policy per watch is
+    observe_only (see supervisor2.py) regardless of anything registered
+    here — no tool call is required to keep v2 fully inert."""
     terminal = service or TerminalService(load_config())
     supervisor = supervisor or SupervisorService(terminal, SupervisorStore())
+    supervisor_v2 = supervisor_v2 or build_supervisor_v2(supervisor)
     server = MCPServer(
         name="terminal-mcp",
         description="Whitelist-only tmux observation and controlled input",
@@ -148,9 +153,85 @@ def build_mcp(service: TerminalService | None = None,
 
     @server.tool()
     def supervisor_run_once() -> dict:
-        """Run exactly one synchronous poll pass over all enabled watches now,
-        for deterministic manual testing independent of the background loop's
-        timer."""
-        return supervisor.run_once()
+        """Run exactly one synchronous poll pass over all enabled watches now
+        (plus a Supervisor v2 reconciliation pass — see supervisor_status_v2),
+        for deterministic manual testing independent of the background
+        loop's timer."""
+        return supervisor_v2.run_once()
+
+    # -- Supervisor Loop v2: a policy-gated decision-and-send pipeline on top
+    # of v1. Every send still goes through terminal_send_text/_send_bound —
+    # the same terminal_input/whitelist/binding/input_policy/confirmation/
+    # sensitive-target/redaction/audit gates as everywhere else. Default
+    # policy per watch is observe_only; nothing here sends without an
+    # explicit supervisor2_set_policy opt-in plus a claim/decide/(approve)
+    # sequence. See terminal_mcp/supervisor2.py module docstring for the
+    # v1/v2/v3 boundary (this module does not invoke any external model). --
+
+    @server.tool()
+    def supervisor2_set_policy(binding: str | None = None, session: str | None = None,
+                               policy_mode: str = "observe_only", approved_template: str | None = None,
+                               max_auto_actions: int = 5, wall_clock_timeout_seconds: int = 1800,
+                               same_prompt_repeat_limit: int = 2, no_progress_limit: int = 2) -> dict:
+        """Set a watch's v2 policy. policy_mode: observe_only (default, never
+        offers an action) | suggest_only (requires explicit approval before
+        any send) | approved_auto_continue (auto-sends only an exact match
+        of approved_template)."""
+        return supervisor_v2.set_policy(binding, session, policy_mode=policy_mode,
+                                        approved_template=approved_template, max_auto_actions=max_auto_actions,
+                                        wall_clock_timeout_seconds=wall_clock_timeout_seconds,
+                                        same_prompt_repeat_limit=same_prompt_repeat_limit,
+                                        no_progress_limit=no_progress_limit)
+
+    @server.tool()
+    def supervisor2_get_policy(binding: str | None = None, session: str | None = None) -> dict:
+        """Return a watch's current v2 policy and cumulative counters."""
+        return supervisor_v2.get_policy(binding, session)
+
+    @server.tool()
+    def supervisor2_list_actionable_events(limit: int = 50) -> dict:
+        """List unclaimed v1 events eligible for v2 action (policy is not
+        observe_only, not blocked, event still matches the watch's current
+        state, never claimed before)."""
+        return supervisor_v2.list_actionable_events(limit)
+
+    @server.tool()
+    def supervisor2_claim_event(event_id: int, claimed_by: str) -> dict:
+        """Claim one actionable event exactly once (a durable, lease-backed
+        claim — a second claim on the same event, or a second concurrent
+        action on the same watch, is refused)."""
+        return supervisor_v2.claim_event(event_id, claimed_by)
+
+    @server.tool()
+    def supervisor2_submit_decision(action_id: int, proposed_prompt: str, decision_reason: str = "") -> dict:
+        """Submit a proposed continuation prompt for a claimed action.
+        Screened against stop patterns (credential/destructive/confirmation
+        requests) and per-watch limits (same-prompt-repeat, max auto
+        actions, wall-clock timeout) before anything can be approved; in
+        approved_auto_continue mode, only an exact match of the watch's
+        approved_template auto-approves — anything else needs
+        supervisor2_review_action."""
+        return supervisor_v2.submit_decision(action_id, proposed_prompt, decision_reason)
+
+    @server.tool()
+    def supervisor2_review_action(action_id: int, decision: str, reason: str = "", approved_by: str = "") -> dict:
+        """Approve, reject, or hold a decided action. decision:
+        'approve' | 'reject' | 'hold'."""
+        return supervisor_v2.review_action(action_id, decision, reason, approved_by)
+
+    @server.tool()
+    def supervisor2_execute_send(action_id: int) -> dict:
+        """Send an approved action's prompt through the existing guarded
+        terminal_send_text/terminal_send_bound path. Idempotent: only the
+        first call on an approved action actually sends; every later call
+        (retry, duplicate, restart) is a no-op that reports the action is
+        already sent/not approved."""
+        return supervisor_v2.execute_send(action_id)
+
+    @server.tool()
+    def supervisor2_list_actions(target: str | None = None, state: str | None = None, limit: int = 50) -> dict:
+        """List v2 action history (claim/decision/approval/send/outcome),
+        optionally filtered by target session/binding name or action state."""
+        return supervisor_v2.list_actions(target, state, limit)
 
     return server

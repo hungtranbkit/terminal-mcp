@@ -49,3 +49,8 @@ supervisor:
   event_retention: 500        # oldest events beyond this count are pruned
   watched_session_patterns: []  # e.g. ["claude-*"] — matched against currently allowed sessions each poll
   watched_bindings: []          # e.g. ["mesflow-dev"] — must already exist via terminal_bind
+  # v2 (decision/send layer) global kill switch. supervisor2_execute_send
+  # refuses to send anything while this is false, regardless of any
+  # per-watch policy_mode (which itself defaults to observe_only per watch).
+  # Both gates must be explicitly opted into before v2 can ever send text.
+  v2_enabled: false

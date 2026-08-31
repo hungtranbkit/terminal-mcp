@@ -343,11 +343,94 @@ watches) with per-state counts and unacknowledged events in a small overlay
 panel; acknowledging an event from there only stamps `acknowledged_at` in
 SQLite — it is not a terminal-input path.
 
-**v2 (not built here):** an external wake-up — a webhook/relay that notices a
-newly queued `attention_required`/`error_detected` event via
-`supervisor_list_events(unacknowledged_only=true)` (or a future push
-mechanism) — invoking ChatGPT with a human-reviewed, approved prompt, and
-only then (through the existing, unchanged Safe Input path) sending it. v1
-intentionally stops at "detect and queue"; no insecure outbound callback is
-implemented here.
+## Supervisor Loop v2
+
+**What v2 solves:** when v1 emits an actionable, unacknowledged event
+(`WAITING_INPUT`/`ERROR`), v2 provides a safe, auditable, restart-safe
+claim → decide → approve → send pipeline that can continue a watched session
+without a human re-typing "check"/"continue" every time — while still going
+through the exact same guarded send path as manual input.
+
+**What v2 does not build:** no ChatGPT/webhook callback exists to invoke, and
+none is faked here. v2 is the local queue/claim/decide/send contract an
+external caller (ChatGPT, a script, a human) drives via the `supervisor2_*`
+MCP tools — it never invents a way to wake an external agent on its own. It
+also never adds a second send path: `execute_send` calls the exact same
+`terminal_send_text`/`terminal_send_bound` methods `terminal_send_text`/
+`terminal_input` already use, so `terminal_input`, whitelist, binding
+`input_enabled`, `input_policy`, confirmation, sensitive-target, redaction,
+audit, and length limits all still apply unchanged.
+
+**Policy modes** (per watch, via `supervisor2_set_policy`; default for every
+watch is `observe_only` — nothing is ever auto-sent unless a watch is
+explicitly opted in):
+
+- `observe_only` (default) — v2 never offers, claims, or sends anything for
+  this watch; `supervisor2_list_actionable_events` never returns its events.
+- `suggest_only` — a decision/prompt can be claimed and submitted, but always
+  needs an explicit `supervisor2_review_action(decision="approve")` before
+  `supervisor2_execute_send` will do anything.
+- `approved_auto_continue` — requires an `approved_template` string set on the
+  policy. A submitted prompt auto-approves **only** if it is byte-for-byte
+  equal (after redaction) to that template — no free-form filling, no partial
+  match. This is the whole mechanism that keeps auto-continue inside the
+  scope the watch owner pre-approved; anything else falls back to needing
+  `supervisor2_review_action`.
+
+**Hard stop conditions** — any of these halts the action (state `blocked` or
+`failed`) and surfaces the reason rather than guessing:
+`max_auto_actions`, `wall_clock_timeout_seconds` (since the watch's first v2
+action), `same_prompt_repeat_limit` (identical prompt sent too many times in a
+row), `no_progress_limit` (output hash unchanged across repeated post-send
+checks), a stale/expired claim lease, and content screening against
+`ATTENTION_STOP_PATTERNS` — password/API-key/credential/token requests,
+confirmation prompts ("are you sure", "irreversible", "cannot be undone"),
+and destructive-looking commands (`rm -rf`, `force-push`, `drop table`,
+`sudo`, ...) — checked at both claim time (against the triggering output) and
+decision time (against the proposed prompt and the freshly re-fetched current
+output). A match blocks the action **and** the watch's policy
+(`blocked_reason` set) so no repeated attempt can slip through.
+
+**Idempotency & concurrency.** A small SQLite compare-and-swap
+(`UPDATE supervisor_actions SET state=? WHERE id=? AND state=<expected>`) is
+the only concurrency primitive — no external queue/broker. `execute_send`
+CASes `approved → sent` *before* calling the guarded send, so a retry,
+duplicate call, or a restart mid-send always finds `state != approved` and
+is a safe no-op — it can never send twice. Only one open (non-terminal)
+action is allowed per watch at a time, so two workers can't double-claim or
+double-decide the same watch concurrently.
+
+**Recovery.** Nothing is replayed on restart: an action already in `sent` or
+beyond is never re-sent (the CAS guard above), and a `claimed`/`decided`
+action past its 5-minute lease is treated as expired and can be reclaimed
+rather than resumed blindly.
+
+**Reconciliation → DONE.** After every `supervisor_run_once`/poll cycle, v2
+checks every `observing` (post-send) action: if the watch's output hash
+changed, the action completes and links `resulting_event_id`; if the watch
+also reached `DONE`, the watch's v2 counters (`auto_action_count`, repeat/
+no-progress counters) reset — "the loop stops cleanly at DONE". If output
+never changes within `no_progress_limit` checks, the action is blocked
+instead.
+
+**MCP tools:** `supervisor2_set_policy`, `supervisor2_get_policy`,
+`supervisor2_list_actionable_events`, `supervisor2_claim_event`,
+`supervisor2_submit_decision`, `supervisor2_review_action`,
+`supervisor2_execute_send`, `supervisor2_list_actions`. Persisted in the same
+`supervisor.db` as v1, in two new tables: `supervisor_policies` (one row per
+watch opted into v2) and `supervisor_actions` (the full claim → decision →
+approval → send → outcome record per action, linking back to the triggering
+`supervisor_events.id`). Never stores secrets or raw unredacted output —
+prompts are redacted before storage and before send, and `send_result` only
+ever holds `terminal_send_text`/`terminal_send_bound`'s own return value
+(a character count, never the text itself).
+
+**Dashboard.** The existing 🛰 Supervisor overlay gained a compact per-watch
+v2 section (policy badge, auto-action count, latest action's state/blocked
+reason/send result, and a one-click "Pause (observe only)" button) — it does
+not touch or resize the main terminal viewer.
+
+Still fully manual/opt-in end to end: a fresh install defaults every watch to
+`observe_only`, and even `approved_auto_continue` only ever sends the one
+exact template a human configured for that watch.
 # terminal-mcp
