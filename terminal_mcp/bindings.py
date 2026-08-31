@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import sqlite3
@@ -45,8 +46,25 @@ class BindingStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextlib.contextmanager
+    def _connection(self):
+        """Open a connection, commit/rollback its transaction on exit (the
+        same semantics `with self._connect() as connection:` already had —
+        sqlite3.Connection's own context manager only manages the
+        transaction), and *also* always close the underlying OS handle,
+        which that alone never does. Relying on garbage collection to
+        eventually close it leaks one real file descriptor per call — fine
+        for occasional use, fatal ("Too many open files") for anything
+        called on a hot path (e.g. a poll loop)."""
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """
@@ -76,19 +94,19 @@ class BindingStore:
         )
 
     def get(self, name: str) -> Binding | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute("SELECT * FROM bindings WHERE name = ?", (name,)).fetchone()
         return self._from_row(row)
 
     def list(self) -> list[Binding]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute("SELECT * FROM bindings ORDER BY name").fetchall()
         return [binding for row in rows if (binding := self._from_row(row)) is not None]
 
     def put(self, name: str, session: str, *, read_enabled: bool = True,
             input_enabled: bool = False, replace: bool = False) -> tuple[Binding | None, bool]:
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute("SELECT * FROM bindings WHERE name = ?", (name,)).fetchone()
             if existing is not None and not replace:
@@ -107,6 +125,6 @@ class BindingStore:
         return self._from_row(row), True
 
     def delete(self, name: str) -> bool:
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute("DELETE FROM bindings WHERE name = ?", (name,))
         return cursor.rowcount == 1

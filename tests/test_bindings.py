@@ -101,3 +101,31 @@ def test_sqlite_persists_across_store_instances(tmp_path):
     config = terminal.config
     restarted = TerminalService(config, tmux, BindingStore(tmp_path / "bindings.db"))
     assert restarted.terminal_get_binding("phase4-a")["session"] == "test-bind-a"
+
+
+def test_binding_store_does_not_leak_file_descriptors(tmp_path):
+    # Regression: `with self._connect() as connection:` only manages the
+    # SQL transaction (commit/rollback) -- sqlite3.Connection's own context
+    # manager never closes the underlying OS handle. Relying on garbage
+    # collection to eventually reclaim it is exactly the kind of leak that
+    # took the real production terminal-mcp-http service down ("Too many
+    # open files") once something (the supervisor poll loop) called into a
+    # store like this one on a hot path. Assert real fd count stays flat
+    # across many calls, not just that the calls succeed.
+    import os
+
+    store = BindingStore(tmp_path / "bindings.db")
+
+    def open_fd_count() -> int:
+        return len(os.listdir(f"/proc/{os.getpid()}/fd"))
+
+    baseline = open_fd_count()
+    for i in range(200):
+        store.put(f"b{i}", f"session-{i}")
+        store.get(f"b{i}")
+        store.list()
+        store.delete(f"b{i}")
+    after = open_fd_count()
+    assert after - baseline < 20, (
+        f"fd count grew from {baseline} to {after} across 200 calls -- leak regression"
+    )

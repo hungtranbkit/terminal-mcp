@@ -552,3 +552,39 @@ async def test_supervisor2_tools_full_pipeline_via_mcp(tmp_path, tmux_session_fa
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+def test_run_once_does_not_leak_file_descriptors(tmp_path, tmux_session_factory):
+    # Regression for the real production incident: SupervisorLoop drives
+    # v2.run_once() (-> v1.run_once() + _reconcile_observing_actions()) on
+    # a fixed poll_interval_seconds forever. Each of those touches
+    # SupervisorStore/SupervisorV2Store (and, for a bound watch,
+    # BindingStore/AuditStore) many times per call. Every one of those
+    # stores previously leaked one real file descriptor per SQL call (see
+    # the fix in supervisor.py/supervisor2.py/audit.py/bindings.py's
+    # _connection() helper) -- under a real 20s poll loop this exhausted
+    # the process's file descriptor limit (1024) within about 25 minutes
+    # and made the whole HTTP service stop accepting connections while
+    # still showing as "active". Assert real fd count stays flat across
+    # many run_once() cycles, not just that they succeed.
+    import os
+
+    session = tmux_session_factory("test-v2-fdleak", _wait_prompt(""))
+    time.sleep(0.3)
+    v2, svc = _v2(tmp_path)
+    svc.watch(session=session)
+
+    def open_fd_count() -> int:
+        return len(os.listdir(f"/proc/{os.getpid()}/fd"))
+
+    baseline = open_fd_count()
+    for _ in range(150):
+        v2.run_once()
+    after = open_fd_count()
+    # A real leak grows roughly linearly with iteration count (150
+    # iterations previously leaked 300+ fds for this store pair alone).
+    # A small, bounded fluctuation is fine; anything near iteration count
+    # is the regression this guards against.
+    assert after - baseline < 20, (
+        f"fd count grew from {baseline} to {after} across 150 run_once() cycles -- leak regression"
+    )

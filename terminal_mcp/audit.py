@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -34,7 +35,7 @@ class AuditStore:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path is not None else default_audit_path()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS input_audit (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,11 +57,28 @@ class AuditStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextlib.contextmanager
+    def _connection(self):
+        """Open a connection, commit/rollback its transaction on exit (the
+        same semantics `with self._connect() as connection:` already had —
+        sqlite3.Connection's own context manager only manages the
+        transaction), and *also* always close the underlying OS handle,
+        which that alone never does. Relying on garbage collection to
+        eventually close it leaks one real file descriptor per call — fine
+        for occasional use, fatal ("Too many open files") for anything
+        called on a hot path (e.g. a poll loop)."""
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def record(self, *, action: str, session: str | None, result: str,
                binding: str | None = None, text: str | None = None,
                keys: list[str] | None = None, press_enter: bool = False,
                reason: str | None = None, source_transport: str = "mcp") -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 """INSERT INTO input_audit
                 (timestamp, action, binding, session, text_sha256, text_preview,
@@ -86,7 +104,7 @@ class AuditStore:
             params.append(session)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         query = "SELECT * FROM input_audit" + where + " ORDER BY id DESC LIMIT ?"
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(query, (*params, limit)).fetchall()
         results = []
         for row in rows:

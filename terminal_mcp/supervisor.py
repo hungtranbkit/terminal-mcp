@@ -18,6 +18,7 @@ docstring below for the JSON contract v2 can build a forwarder against.
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import json
 import os
@@ -82,7 +83,7 @@ class SupervisorStore:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path is not None else default_supervisor_db_path()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """
@@ -135,15 +136,33 @@ class SupervisorStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextlib.contextmanager
+    def _connection(self):
+        """Open a connection, commit/rollback its transaction on exit (the
+        same semantics `with self._connect() as connection:` already had —
+        sqlite3.Connection's own context manager only manages the
+        transaction), and *also* always close the underlying OS handle,
+        which that alone never does. Relying on garbage collection to
+        eventually close it leaks one real file descriptor per call — fine
+        for occasional use, fatal ("Too many open files") on a hot path
+        like this store's own poll loop, which calls in here dozens of
+        times a minute."""
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     # -- watches ----------------------------------------------------------
 
     def get_watch(self, key: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute("SELECT * FROM watches WHERE watch_key = ?", (key,)).fetchone()
         return dict(row) if row is not None else None
 
     def list_watches(self) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute("SELECT * FROM watches ORDER BY watch_key").fetchall()
         return [dict(row) for row in rows]
 
@@ -153,7 +172,7 @@ class SupervisorStore:
         only creation or an explicit re-enable touches those."""
         key = watch_key(kind, target)
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute("SELECT * FROM watches WHERE watch_key = ?", (key,)).fetchone()
             if existing is None:
@@ -177,7 +196,7 @@ class SupervisorStore:
 
     def set_enabled(self, key: str, enabled: bool, *, disabled_reason: str | None = None) -> bool:
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute(
                 "UPDATE watches SET enabled = ?, disabled_reason = ?, updated_at = ? WHERE watch_key = ?",
                 (int(enabled), disabled_reason, now, key),
@@ -185,7 +204,7 @@ class SupervisorStore:
         return cursor.rowcount == 1
 
     def delete_watch(self, key: str) -> bool:
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute("DELETE FROM watches WHERE watch_key = ?", (key,))
         return cursor.rowcount == 1
 
@@ -193,7 +212,7 @@ class SupervisorStore:
                               output_hash: str | None, output_changed: bool,
                               iteration_count: int, same_failure_count: int,
                               now_iso: str, enabled: bool, disabled_reason: str | None) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute("SELECT state_since FROM watches WHERE watch_key = ?", (key,)).fetchone()
             state_since = now_iso if state_changed or row is None else row["state_since"]
             connection.execute(
@@ -214,7 +233,7 @@ class SupervisorStore:
                   output_hash: str | None, iteration_count: int,
                   metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute(
                 """INSERT INTO supervisor_events
                 (timestamp, watch_key, kind, target, previous_state, state, event_type,
@@ -240,13 +259,13 @@ class SupervisorStore:
             clauses.append("acknowledged_at IS NULL")
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         query = "SELECT * FROM supervisor_events" + where + " ORDER BY id DESC LIMIT ?"
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(query, (*params, limit)).fetchall()
         return [self._event_from_row(row) for row in rows]
 
     def ack_event(self, event_id: int) -> dict[str, Any] | None:
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute(
                 "UPDATE supervisor_events SET acknowledged_at = ? WHERE id = ? AND acknowledged_at IS NULL",
                 (now, event_id),
@@ -257,7 +276,7 @@ class SupervisorStore:
         return self._event_from_row(row)
 
     def prune_events(self, retention: int) -> int:
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute(
                 "DELETE FROM supervisor_events WHERE id NOT IN "
                 "(SELECT id FROM supervisor_events ORDER BY id DESC LIMIT ?)",

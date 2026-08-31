@@ -32,6 +32,7 @@ module deliberately does not fabricate.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import sqlite3
@@ -93,7 +94,7 @@ class SupervisorV2Store:
 
     def __init__(self, path) -> None:
         self.path = path
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """
@@ -150,10 +151,27 @@ class SupervisorV2Store:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextlib.contextmanager
+    def _connection(self):
+        """Open a connection, commit/rollback its transaction on exit (the
+        same semantics `with self._connect() as connection:` already had —
+        sqlite3.Connection's own context manager only manages the
+        transaction), and *also* always close the underlying OS handle,
+        which that alone never does. Relying on garbage collection to
+        eventually close it leaks one real file descriptor per call — fine
+        for occasional use, fatal ("Too many open files") on a hot path
+        like the poll loop this store is driven from."""
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     # -- policy -------------------------------------------------------------
 
     def get_policy(self, key: str) -> dict[str, Any]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute("SELECT * FROM supervisor_policies WHERE watch_key = ?", (key,)).fetchone()
         if row is not None:
             return dict(row)
@@ -172,7 +190,7 @@ class SupervisorV2Store:
                    max_auto_actions: int, wall_clock_timeout_seconds: int,
                    same_prompt_repeat_limit: int, no_progress_limit: int) -> dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 """INSERT INTO supervisor_policies
                 (watch_key, policy_mode, approved_template, max_auto_actions,
@@ -207,7 +225,7 @@ class SupervisorV2Store:
         repeat = policy["last_prompt_repeat_count"] + 1 if policy["last_prompt_hash"] == prompt_hash else 1
         now = datetime.now(timezone.utc).isoformat()
         first_action_at = policy["first_action_at"] or now
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 """UPDATE supervisor_policies SET last_prompt_hash = ?, last_prompt_repeat_count = ?,
                    first_action_at = ?, updated_at = ? WHERE watch_key = ?""",
@@ -218,7 +236,7 @@ class SupervisorV2Store:
     def increment_auto_action_count(self, key: str) -> int:
         self._touch_policy_defaults(key)
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 "UPDATE supervisor_policies SET auto_action_count = auto_action_count + 1, updated_at = ? WHERE watch_key = ?",
                 (now, key),
@@ -228,7 +246,7 @@ class SupervisorV2Store:
     def record_progress_check(self, key: str, *, progressed: bool) -> int:
         self._touch_policy_defaults(key)
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
+        with self._connection() as connection:
             if progressed:
                 connection.execute(
                     "UPDATE supervisor_policies SET no_progress_count = 0, updated_at = ? WHERE watch_key = ?",
@@ -246,7 +264,7 @@ class SupervisorV2Store:
         for a *new* piece of work start fresh."""
         self._touch_policy_defaults(key)
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 """UPDATE supervisor_policies SET auto_action_count = 0, first_action_at = NULL,
                    last_prompt_hash = NULL, last_prompt_repeat_count = 0, no_progress_count = 0,
@@ -257,7 +275,7 @@ class SupervisorV2Store:
     def block_policy(self, key: str, reason: str) -> None:
         self._touch_policy_defaults(key)
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 "UPDATE supervisor_policies SET blocked_reason = ?, updated_at = ? WHERE watch_key = ?",
                 (reason, now, key),
@@ -266,7 +284,7 @@ class SupervisorV2Store:
     # -- actions --------------------------------------------------------
 
     def open_action_for_watch(self, key: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 f"SELECT * FROM supervisor_actions WHERE watch_key = ? AND state NOT IN "
                 f"({','.join('?' * len(TERMINAL_ACTION_STATES))}) ORDER BY id DESC LIMIT 1",
@@ -275,7 +293,7 @@ class SupervisorV2Store:
         return dict(row) if row is not None else None
 
     def action_for_event(self, event_id: int) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM supervisor_actions WHERE event_id = ? AND state NOT IN "
                 f"({','.join('?' * len(TERMINAL_ACTION_STATES))}) ORDER BY id DESC LIMIT 1",
@@ -288,7 +306,7 @@ class SupervisorV2Store:
         an event that already reached completed/blocked/rejected/failed was
         already processed and must never be offered as fresh/actionable
         again, even though it's no longer the "open" action for its watch."""
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute("SELECT 1 FROM supervisor_actions WHERE event_id = ? LIMIT 1", (event_id,)).fetchone()
         return row is not None
 
@@ -298,7 +316,7 @@ class SupervisorV2Store:
         now_iso = now.isoformat()
         lease = now.timestamp() + lease_seconds
         lease_iso = datetime.fromtimestamp(lease, tz=timezone.utc).isoformat()
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute(
                 """INSERT INTO supervisor_actions
                 (watch_key, event_id, state, claimed_by, claimed_at, lease_expires_at,
@@ -310,7 +328,7 @@ class SupervisorV2Store:
         return dict(row)
 
     def get_action(self, action_id: int) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute("SELECT * FROM supervisor_actions WHERE id = ?", (action_id,)).fetchone()
         return dict(row) if row is not None else None
 
@@ -324,7 +342,7 @@ class SupervisorV2Store:
             clauses.append("state = ?")
             params.append(state)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM supervisor_actions" + where + " ORDER BY id DESC LIMIT ?", (*params, limit)
             ).fetchall()
@@ -339,7 +357,7 @@ class SupervisorV2Store:
         fields = dict(fields)
         fields["updated_at"] = datetime.now(timezone.utc).isoformat()
         set_clause = ", ".join(f"{k} = ?" for k in fields)
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute(
                 f"UPDATE supervisor_actions SET {set_clause} WHERE id = ? AND state = ?",
                 (*fields.values(), action_id, expected_state),
