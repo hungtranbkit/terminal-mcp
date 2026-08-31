@@ -2,8 +2,11 @@
 serialization (P0-3), idempotency keys (P0-4)."""
 from __future__ import annotations
 
+import json
 import threading
 import time
+
+import pytest
 
 from terminal_mcp.audit import AuditStore
 from terminal_mcp.bindings import BindingStore
@@ -326,3 +329,74 @@ def test_prompt_injection_in_pane_output_remains_inert_data(tmux_session_factory
     assert policy["policy_mode"] == "observe_only"
     assert v2.list_actionable_events()["events"] == []
     assert v2.list_actions(target=session)["actions"] == []
+
+
+# ---------------------------------------------------------------------------
+# P0-4 regression: idempotency_key must be wired through the actual MCP
+# tool surface, not just TerminalService's own Python API. A live smoke
+# test against the real running production service is what actually
+# caught this gap (mcp_app.py's terminal_send_text/terminal_send_bound
+# tool wrappers did not expose the new parameter at all, even though
+# core.py's underlying methods did and every test calling core.py
+# directly passed) -- this test exercises the exact same MCP call path a
+# real client uses, so a future regression here fails loudly in CI
+# instead of needing another live-service smoke to notice.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_mcp_tool_idempotency_key_actually_prevents_duplicate_send(tmux_session_factory, tmp_path):
+    from terminal_mcp.mcp_app import build_mcp
+
+    session = tmux_session_factory("test-mcp-idem", "bash -lc 'read x; echo GOT:$x; sleep 10'")
+    time.sleep(0.2)
+    service = _service(tmp_path)
+    server = build_mcp(service)
+
+    async def call(name, **kwargs):
+        result = await server.call_tool(name, kwargs)
+        if result.structured_content is not None:
+            return result.structured_content
+        return json.loads(result.content[0].text)
+
+    first = await call("terminal_send_text", session=session, text="y", press_enter=True,
+                       idempotency_key="mcp-tool-key-1")
+    assert first["sent"] is True
+    second = await call("terminal_send_text", session=session, text="y", press_enter=True,
+                        idempotency_key="mcp-tool-key-1")
+    assert second == first, "MCP tool layer did not actually dedupe -- idempotency_key was dropped somewhere"
+
+    pane = service.terminal_tail(session, 10)["output"]
+    assert pane.count("GOT:y") == 1
+
+
+@pytest.mark.anyio
+async def test_mcp_tool_send_bound_idempotency_key_actually_prevents_duplicate_send(tmux_session_factory, tmp_path):
+    from terminal_mcp.mcp_app import build_mcp
+
+    session = tmux_session_factory("test-mcp-idem-bound", "bash -lc 'read x; echo GOT:$x; sleep 10'")
+    time.sleep(0.2)
+    service = _service(tmp_path)
+    service.terminal_bind("mcpbind", session, input_enabled=True)
+    server = build_mcp(service)
+
+    async def call(name, **kwargs):
+        result = await server.call_tool(name, kwargs)
+        if result.structured_content is not None:
+            return result.structured_content
+        return json.loads(result.content[0].text)
+
+    first = await call("terminal_send_bound", binding="mcpbind", text="y", press_enter=True,
+                       idempotency_key="mcp-bound-key-1")
+    assert first["sent"] is True
+    second = await call("terminal_send_bound", binding="mcpbind", text="y", press_enter=True,
+                        idempotency_key="mcp-bound-key-1")
+    assert second == first
+
+    pane = service.terminal_tail(session, 10)["output"]
+    assert pane.count("GOT:y") == 1
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"

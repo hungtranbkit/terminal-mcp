@@ -62,9 +62,15 @@ def build_mcp(service: TerminalService | None = None,
 
     @server.tool()
     def terminal_send_text(session: str, text: str, press_enter: bool = False,
-                           dry_run: bool = False) -> dict:
-        """Send literal text only when terminal_input is enabled in local config."""
-        return terminal.terminal_send_text(session, text, press_enter, dry_run)
+                           dry_run: bool = False, idempotency_key: str | None = None) -> dict:
+        """Send literal text only when terminal_input is enabled in local
+        config. Reports submit_status (TEXT_SENT/SUBMIT_CONFIRMED/
+        SUBMIT_UNCONFIRMED, press_enter=True only) -- sent=True alone is
+        NOT proof the target processed Enter; treat SUBMIT_UNCONFIRMED as
+        needing follow-up, never as success. Pass idempotency_key (e.g. a
+        UUID you generate) to make a retried/duplicate call with the same
+        key return the original result instead of sending again."""
+        return terminal.terminal_send_text(session, text, press_enter, dry_run, idempotency_key)
 
     @server.tool()
     def terminal_send_keys(session: str, keys: list[str], confirm_sensitive: bool = False) -> dict:
@@ -104,9 +110,18 @@ def build_mcp(service: TerminalService | None = None,
 
     @server.tool()
     def terminal_send_bound(binding: str, text: str, press_enter: bool = False,
-                            dry_run: bool = False) -> dict:
-        """Send literal text only when global and binding input are enabled."""
-        return terminal.terminal_send_bound(binding, text, press_enter, dry_run)
+                            dry_run: bool = False, idempotency_key: str | None = None) -> dict:
+        """Send literal text only when global and binding input are enabled.
+        Reports submit_status (TEXT_SENT/SUBMIT_CONFIRMED/SUBMIT_UNCONFIRMED,
+        press_enter=True only) -- sent=True alone is NOT proof the target
+        processed Enter; treat SUBMIT_UNCONFIRMED as needing follow-up,
+        never as success. Also re-verifies the binding's pinned session/pane
+        identity before sending (IDENTITY_MISMATCH if the session name was
+        recycled or its pane replaced -- rebind explicitly to accept the
+        new target). Pass idempotency_key (e.g. a UUID you generate) to
+        make a retried/duplicate call with the same key return the
+        original result instead of sending again."""
+        return terminal.terminal_send_bound(binding, text, press_enter, dry_run, idempotency_key)
 
     @server.tool()
     def terminal_list_input_audit(limit: int = 50, binding: str | None = None,
