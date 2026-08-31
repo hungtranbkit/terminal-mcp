@@ -163,6 +163,23 @@ def parse_completion_marker(output: str) -> dict[str, str] | None:
     return fields
 
 
+def verify_completion_marker(marker: dict[str, str] | None, *, task_id: str, attempt: int,
+                             nonce: str | None, nonce_consumed: bool) -> bool:
+    """P0-7 phase 2: True only if `marker` (from parse_completion_marker)
+    exactly matches the CURRENT, unconsumed attempt's task_id/attempt/
+    nonce -- an external caller fetches that nonce via
+    supervisor_get_completion_token and is responsible for having the
+    agent echo it back. Never guesses: a missing marker, a mismatched
+    task_id/attempt (a stale marker from an earlier watch/attempt), or an
+    already-consumed nonce (replay of an old marker, e.g. pasted or
+    scrolled back into view) all return False -- the caller falls back to
+    the ordinary quiet-window promotion instead, never treating a
+    non-match as an error."""
+    if marker is None or nonce is None or nonce_consumed:
+        return False
+    return marker.get("task_id") == task_id and marker.get("attempt") == str(attempt) and marker.get("nonce") == nonce
+
+
 def classify_supervisor_state(state: str, reason: str, output: str) -> tuple[str, str]:
     """Normalize a classify_status() result plus ERROR/completion evidence
     to the 7-state supervisor vocabulary. WAITING_INPUT is already high-

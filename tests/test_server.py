@@ -25,6 +25,7 @@ async def test_server_registers_v1_and_binding_tools():
         "supervisor_watch",
         "supervisor_unwatch",
         "supervisor_list_watches",
+        "supervisor_get_completion_token",
         "supervisor_status",
         "supervisor_list_events",
         "supervisor_ack_event",

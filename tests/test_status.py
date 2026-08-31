@@ -1,5 +1,11 @@
 from terminal_mcp.models import SessionInfo
-from terminal_mcp.status import classify_status, classify_supervisor_state, detect_waiting_input, parse_completion_marker
+from terminal_mcp.status import (
+    classify_status,
+    classify_supervisor_state,
+    detect_waiting_input,
+    parse_completion_marker,
+    verify_completion_marker,
+)
 
 
 def info(command="bash", activity=100, dead=False):
@@ -86,4 +92,62 @@ def test_classify_supervisor_state_marker_present_yields_candidate_not_verified(
     state, reason = classify_supervisor_state("RUNNING", "r", MARKER_OK)
     assert state == "COMPLETION_CANDIDATE"  # never direct proof of verification
     assert "structured completion marker" in reason
+
+
+# ---------------------------------------------------------------------------
+# P0-7 phase 2: nonce verification. MARKER_OK's fields: task_id=abc123,
+# attempt=1, nonce=n0nce.
+# ---------------------------------------------------------------------------
+
+MARKER_OK_FIELDS = parse_completion_marker(MARKER_OK)
+
+
+def test_verify_completion_marker_matches_current_unconsumed_attempt():
+    assert verify_completion_marker(
+        MARKER_OK_FIELDS, task_id="abc123", attempt=1, nonce="n0nce", nonce_consumed=False
+    ) is True
+
+
+def test_verify_completion_marker_none_marker_is_never_verified():
+    assert verify_completion_marker(None, task_id="abc123", attempt=1, nonce="n0nce", nonce_consumed=False) is False
+
+
+def test_verify_completion_marker_wrong_task_id_fails():
+    # A marker echoing a different (or stale) watch's task_id must never
+    # verify against this watch's token.
+    assert verify_completion_marker(
+        MARKER_OK_FIELDS, task_id="some-other-watch", attempt=1, nonce="n0nce", nonce_consumed=False
+    ) is False
+
+
+def test_verify_completion_marker_wrong_attempt_fails():
+    # Same task_id/nonce but a stale attempt number (e.g. a marker copied
+    # forward from a previous watch/rewatch cycle) must not verify.
+    assert verify_completion_marker(
+        MARKER_OK_FIELDS, task_id="abc123", attempt=2, nonce="n0nce", nonce_consumed=False
+    ) is False
+
+
+def test_verify_completion_marker_wrong_nonce_fails():
+    assert verify_completion_marker(
+        MARKER_OK_FIELDS, task_id="abc123", attempt=1, nonce="different-nonce", nonce_consumed=False
+    ) is False
+
+
+def test_verify_completion_marker_already_consumed_nonce_is_a_replay_and_fails():
+    # Correct task_id/attempt/nonce, but the token was already spent --
+    # this is exactly the replay case: an old, already-verified marker
+    # (pasted back in, scrolled into view again, or reused deliberately)
+    # must never verify a second time.
+    assert verify_completion_marker(
+        MARKER_OK_FIELDS, task_id="abc123", attempt=1, nonce="n0nce", nonce_consumed=True
+    ) is False
+
+
+def test_verify_completion_marker_none_nonce_on_watch_side_fails():
+    # A watch with no nonce minted yet (shouldn't happen post-upsert_watch,
+    # but defense in depth) never verifies, regardless of marker content.
+    assert verify_completion_marker(
+        MARKER_OK_FIELDS, task_id="abc123", attempt=1, nonce=None, nonce_consumed=False
+    ) is False
 

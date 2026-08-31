@@ -85,7 +85,7 @@ async def test_stdio_real_handshake_and_tools(tmp_path):
     assert initialized.server_info.name == "terminal-mcp"
     assert initialized.server_info.version == "0.7.0"
     names = {tool.name for tool in tools.tools}
-    assert len(names) == 30
+    assert len(names) == 31
     assert {"terminal_tail", "terminal_send_keys", "terminal_bind", "terminal_tail_bound"} <= names
 
 
@@ -137,7 +137,7 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
     # global INPUT_DISABLED gate; INPUT_DISABLED itself stays covered in test_permissions.py.
     assert text_disabled["error"] == "ACCESS_DENIED"
     assert keys_disabled["error"] == "ACCESS_DENIED"
-    assert len(tools.tools) == 30
+    assert len(tools.tools) == 31
 
 
 def test_http_bind_is_fixed_loopback():

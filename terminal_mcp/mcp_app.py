@@ -157,6 +157,20 @@ def build_mcp(service: TerminalService | None = None,
         return supervisor.list_watches()
 
     @server.tool()
+    def supervisor_get_completion_token(binding: str | None = None, session: str | None = None) -> dict:
+        """Return the current, unconsumed completion token (task_id/attempt/
+        nonce) for a watch's current attempt -- P0-7 phase 2. This tool
+        never sends anything itself: embed these three values in whatever
+        prompt you send the agent (through terminal_send_text/
+        terminal_send_bound, unchanged/still fully guarded), instructing it
+        to echo them back inside a ###TERMINAL_MCP_COMPLETION marker on
+        genuine completion. A marker whose task_id/attempt/nonce all match
+        promotes to VERIFIED_DONE immediately (skipping the ordinary quiet-
+        window wait) and is single-use -- calling supervisor_watch again
+        starts a fresh attempt with a new nonce."""
+        return supervisor.get_completion_token(binding, session)
+
+    @server.tool()
     def supervisor_status() -> dict:
         """Report whether the background poll loop is running and a summary of
         watch states, including any stalled/disabled watches."""

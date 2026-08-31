@@ -857,6 +857,123 @@ def test_adversarial_instruction_to_mark_verified_done_has_no_effect(tmp_path, t
     assert v2.get_policy(session=session)["auto_action_count"] == 1
 
 
+def _nonce_chain_session(tmux_session_factory, name: str) -> str:
+    # Two neutral lines between the answer and the marker are deliberate,
+    # not padding for its own sake: detect_waiting_input only ever looks
+    # at the bottom 4 non-empty lines, so without them the original "Do
+    # you want to continue?" prompt line is still inside that window when
+    # the marker lands, and base classify_status re-reports WAITING_INPUT
+    # -- which wins outright over any marker check (see
+    # classify_supervisor_state). Matches the real shape of the existing
+    # (already-passing) test_full_e2e_approved_auto_continue_reaches_done
+    # fixture above, which has the same five-real-lines structure.
+    return tmux_session_factory(
+        name,
+        "bash -lc 'echo \"Do you want to continue? [y/N]\"; read x; "
+        "printf \"step one\\nstep two\\n\"; read marker; printf \"%s\\n\" \"$marker\"; sleep 20'",
+    )
+
+
+def _send_marker(session: str, marker: str) -> None:
+    import subprocess
+
+    subprocess.run(["tmux", "send-keys", "-t", session, "-l", "--", marker], check=True)
+    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
+
+
+def test_nonce_verified_marker_reconciles_as_verified_done_and_resets_chain(tmp_path, tmux_session_factory):
+    # P0-7 phase 2, v2-layer coverage: a nonce-verified marker promotes
+    # COMPLETION_CANDIDATE -> VERIFIED_DONE on a single poll (v1's own
+    # quiet-window path needs two -- see test_done_stays_candidate_until_
+    # quiet_window_then_promotes above), so the watch is never externally
+    # observed sitting in COMPLETION_CANDIDATE at all here. The chain-reset
+    # property must still hold exactly the same way: this must reconcile
+    # via the 'verified_done' branch specifically (not the ordinary
+    # 'progressed' branch, which never resets the chain), and only THAT
+    # branch calls reset_chain.
+    session = _nonce_chain_session(tmux_session_factory, "test-v2-nonce-vdone")
+    time.sleep(0.3)
+    v2, svc = _v2(tmp_path, completion_verify_quiet_seconds=3600)
+
+    svc.watch(session=session)
+    token = svc.get_completion_token(session=session)
+    events = svc.run_once()["events"]
+    assert events[0]["event_type"] == "attention_required"
+
+    v2.set_policy(session=session, policy_mode="approved_auto_continue", approved_template="y")
+    actionable = v2.list_actionable_events()["events"]
+    claim = v2.claim_event(actionable[0]["id"], claimed_by="e2e-nonce")
+    v2.submit_decision(claim["id"], "y", "continue per approved template")
+    sent = v2.execute_send(claim["id"])
+    assert sent["sent"] is True
+
+    marker = (
+        "###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1 "
+        f"task_id={token['task_id']} attempt={token['attempt']} status=completion_candidate "
+        f"summary_sha256=deadbeef1234 nonce={token['nonce']}###"
+    )
+    _send_marker(session, marker)
+    time.sleep(0.5)
+
+    # This is the very first poll since the send.
+    result = v2.run_once()
+    reconciled = result["v2_reconciled"]
+    assert len(reconciled) == 1
+    assert reconciled[0]["action_id"] == claim["id"]
+    assert reconciled[0]["result"] == "verified_done"
+
+    action = v2.store.get_action(claim["id"])
+    assert action["state"] == "completed"
+    watch = svc.store.get_watch(f"session:{session}")
+    assert watch["state"] == "VERIFIED_DONE"
+    assert v2.get_policy(session=session)["auto_action_count"] == 0
+
+
+def test_marker_with_wrong_nonce_reconciles_as_completion_candidate_never_resets_chain(tmp_path, tmux_session_factory):
+    # Same shape as the test above, but the marker's nonce does not match
+    # the watch's current token. A well-formed marker (any task_id/nonce)
+    # still classifies as COMPLETION_CANDIDATE -- classify_supervisor_state
+    # has no notion of "correct" -- so this exercises the reconcile-side
+    # guard specifically: an action must stay in 'observing' (never
+    # 'completed', chain never reset) while the watch is only a candidate,
+    # regardless of how plausible the marker looked.
+    session = _nonce_chain_session(tmux_session_factory, "test-v2-nonce-wrong")
+    time.sleep(0.3)
+    v2, svc = _v2(tmp_path, completion_verify_quiet_seconds=3600)
+
+    svc.watch(session=session)
+    token = svc.get_completion_token(session=session)
+    events = svc.run_once()["events"]
+    assert events[0]["event_type"] == "attention_required"
+
+    v2.set_policy(session=session, policy_mode="approved_auto_continue", approved_template="y")
+    actionable = v2.list_actionable_events()["events"]
+    claim = v2.claim_event(actionable[0]["id"], claimed_by="e2e-nonce-wrong")
+    v2.submit_decision(claim["id"], "y", "continue per approved template")
+    sent = v2.execute_send(claim["id"])
+    assert sent["sent"] is True
+
+    marker = (
+        "###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1 "
+        f"task_id={token['task_id']} attempt={token['attempt']} status=completion_candidate "
+        "summary_sha256=deadbeef1234 nonce=not-the-real-nonce###"
+    )
+    _send_marker(session, marker)
+    time.sleep(0.5)
+
+    result = v2.run_once()
+    reconciled = result["v2_reconciled"]
+    assert len(reconciled) == 1
+    assert reconciled[0]["action_id"] == claim["id"]
+    assert reconciled[0]["result"] == "completion_candidate"
+
+    action = v2.store.get_action(claim["id"])
+    assert action["state"] == "observing"
+    watch = svc.store.get_watch(f"session:{session}")
+    assert watch["state"] == "COMPLETION_CANDIDATE"
+    assert v2.get_policy(session=session)["auto_action_count"] == 1  # not reset
+
+
 # ---------------------------------------------------------------------------
 # Codex composer-stuck bug: supervisor2_execute_send must use the corrected
 # submission semantics -- never advance an action to 'observing'/'completed'

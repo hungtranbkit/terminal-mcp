@@ -153,6 +153,157 @@ def test_transition_to_done_on_explicit_completion_marker(tmp_path, tmux_session
     assert result["events"][0]["event_type"] == "completion_candidate"
 
 
+def _marker(task_id: str, attempt, nonce: str, *, status: str = "completion_candidate") -> str:
+    return (
+        "###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1 "
+        f"task_id={task_id} attempt={attempt} status={status} "
+        f"summary_sha256=deadbeef1234 nonce={nonce}###"
+    )
+
+
+def _print_into_pane(session: str, text: str) -> None:
+    # Raw tmux send-keys, deliberately bypassing terminal_send_text's
+    # permission/audit layer -- these tests simulate the agent itself
+    # printing a marker into its own pane, not the supervisor sending
+    # anything, so the input-permission path (covered elsewhere) is
+    # irrelevant here. A plain `bash sleep` target is canonical-tty, so
+    # (unlike test_send_reliability.py's raw-tty targets) no settle gap
+    # is needed between the literal text and Enter.
+    import subprocess
+
+    subprocess.run(["tmux", "send-keys", "-t", session, "-l", "--", f"printf '%s\\n' '{text}'"], check=True)
+    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
+
+
+def test_nonce_verified_marker_promotes_to_verified_done_on_the_very_first_poll(tmp_path, tmux_session_factory):
+    # P0-7 phase 2: a marker whose task_id/attempt/nonce match the current,
+    # unconsumed token is materially stronger evidence than prose alone --
+    # it skips the ordinary quiet-window wait entirely and promotes on this
+    # very poll, even with a long quiet window configured.
+    session = tmux_session_factory("test-sup-nonce-ok", "bash -lc 'sleep 20'")
+    time.sleep(0.2)
+    svc = _service(tmp_path, completion_verify_quiet_seconds=3600)
+    svc.watch(session=session)
+    key = watch_key("session", session)
+    token = svc.get_completion_token(session=session)
+    assert token["consumed"] is False
+    assert token["task_id"] == key
+
+    marker = _marker(token["task_id"], token["attempt"], token["nonce"])
+    _print_into_pane(session, marker)
+    time.sleep(0.3)
+
+    result = svc.run_once()
+    watch = svc.list_watches()["watches"][0]
+    assert watch["state"] == "VERIFIED_DONE"
+    assert result["events"][0]["event_type"] == "verified_done"
+    assert "nonce-verified" in result["events"][0]["reason"]
+
+    # The token is single-use: fetching it again shows consumed.
+    assert svc.get_completion_token(session=session)["consumed"] is True
+
+
+def test_marker_with_wrong_task_id_does_not_bypass_the_quiet_window(tmp_path, tmux_session_factory):
+    session = tmux_session_factory("test-sup-nonce-wrongtask", "bash -lc 'sleep 20'")
+    time.sleep(0.2)
+    svc = _service(tmp_path, completion_verify_quiet_seconds=3600)
+    svc.watch(session=session)
+    token = svc.get_completion_token(session=session)
+
+    marker = _marker("some-other-watch-key", token["attempt"], token["nonce"])
+    _print_into_pane(session, marker)
+    time.sleep(0.3)
+
+    result = svc.run_once()
+    watch = svc.list_watches()["watches"][0]
+    # Falls back to an ordinary (unverified) candidate -- not promoted, and
+    # the token is left unconsumed since it never actually matched.
+    assert watch["state"] == "COMPLETION_CANDIDATE"
+    assert result["events"][0]["event_type"] == "completion_candidate"
+    assert svc.get_completion_token(session=session)["consumed"] is False
+
+
+def test_marker_with_wrong_attempt_does_not_bypass_the_quiet_window(tmp_path, tmux_session_factory):
+    session = tmux_session_factory("test-sup-nonce-wrongattempt", "bash -lc 'sleep 20'")
+    time.sleep(0.2)
+    svc = _service(tmp_path, completion_verify_quiet_seconds=3600)
+    svc.watch(session=session)
+    key = watch_key("session", session)
+    token = svc.get_completion_token(session=session)
+
+    # Same task_id/nonce, but a stale attempt number (e.g. echoed from
+    # before an unwatch/rewatch bumped the attempt counter).
+    marker = _marker(key, token["attempt"] + 1, token["nonce"])
+    _print_into_pane(session, marker)
+    time.sleep(0.3)
+
+    result = svc.run_once()
+    watch = svc.list_watches()["watches"][0]
+    assert watch["state"] == "COMPLETION_CANDIDATE"
+    assert result["events"][0]["event_type"] == "completion_candidate"
+    assert svc.get_completion_token(session=session)["consumed"] is False
+
+
+def test_replaying_a_consumed_nonce_after_rewatch_does_not_bypass_the_quiet_window(tmp_path, tmux_session_factory):
+    # Full replay scenario: attempt 1's token gets legitimately consumed,
+    # then the watch is disabled and re-enabled (a new attempt, per
+    # upsert_watch's docstring) minting a fresh token. An agent (buggy, or
+    # an adversarial pasted-back transcript) that echoes the OLD, already-
+    # consumed attempt-1 marker again must never verify against attempt 2.
+    session = tmux_session_factory("test-sup-nonce-replay", "bash -lc 'sleep 40'")
+    time.sleep(0.2)
+    svc = _service(tmp_path, completion_verify_quiet_seconds=3600)
+    svc.watch(session=session)
+    key = watch_key("session", session)
+    old_token = svc.get_completion_token(session=session)
+
+    svc.unwatch(session=session)
+    svc.watch(session=session)  # re-watch: new attempt, fresh nonce
+    new_token = svc.get_completion_token(session=session)
+    assert new_token["attempt"] == old_token["attempt"] + 1
+    assert new_token["nonce"] != old_token["nonce"]
+
+    replayed_marker = _marker(key, old_token["attempt"], old_token["nonce"])
+    _print_into_pane(session, replayed_marker)
+    time.sleep(0.3)
+
+    result = svc.run_once()
+    watch = svc.list_watches()["watches"][0]
+    assert watch["state"] == "COMPLETION_CANDIDATE"
+    assert result["events"][0]["event_type"] == "completion_candidate"
+    # The new attempt's token is untouched by the replay attempt.
+    assert svc.get_completion_token(session=session)["consumed"] is False
+
+
+def test_completion_token_and_attempt_persist_across_a_fresh_store_handle(tmp_path, tmux_session_factory):
+    # Restart persistence: a brand new SupervisorStore/Service pair opened
+    # against the same db path must see the same nonce/attempt/consumed
+    # state the first one wrote -- nonce delivery survives a service
+    # restart exactly like watches/events already do.
+    session = tmux_session_factory("test-sup-nonce-restart", "bash -lc 'sleep 20'")
+    time.sleep(0.2)
+    svc = _service(tmp_path)
+    svc.watch(session=session)
+    token_before = svc.get_completion_token(session=session)
+
+    reopened_store = SupervisorStore(svc.store.path)
+    reopened = SupervisorService(svc.terminal, reopened_store)
+    token_after = reopened.get_completion_token(session=session)
+    assert token_after == token_before
+
+
+def test_get_completion_token_requires_exactly_one_target(tmp_path):
+    svc = _service(tmp_path)
+    assert svc.get_completion_token()["error"] == "EXACTLY_ONE_TARGET_REQUIRED"
+    assert svc.get_completion_token(binding="a", session="b")["error"] == "EXACTLY_ONE_TARGET_REQUIRED"
+
+
+def test_get_completion_token_unknown_watch_is_reported_not_guessed(tmp_path):
+    svc = _service(tmp_path)
+    result = svc.get_completion_token(session="test-sup-never-watched")
+    assert result["error"] == "WATCH_NOT_FOUND"
+
+
 def test_ordinary_silence_never_produces_false_done(tmp_path, tmux_session_factory):
     # A quiet, unremarkable idle shell must never be classified DONE just
     # because nothing is happening — only explicit completion evidence does.

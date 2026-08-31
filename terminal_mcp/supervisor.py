@@ -23,6 +23,7 @@ import fnmatch
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -35,7 +36,7 @@ from .config import AppConfig, SupervisorConfig
 from .core import TerminalService
 from .permissions import session_allowed
 from .status import (SUPERVISOR_STATES, classify_supervisor_state, parse_completion_marker,
-                     to_legacy_event_type, to_legacy_state)
+                     to_legacy_event_type, to_legacy_state, verify_completion_marker)
 from .tmux import TmuxError
 
 _LOGGER = logging.getLogger(__name__)
@@ -137,6 +138,22 @@ class SupervisorStore:
                 # poll, so a quiet-window check needs both.
                 ("completion_candidate_since", "TEXT"),
                 ("completion_output_hash", "TEXT"),
+                # P0-7 phase 2: nonce delivery. A fresh, unguessable,
+                # single-use token minted on every (re-)watch (a new
+                # "attempt"); an external caller fetches it via
+                # supervisor_get_completion_token and is responsible for
+                # embedding it in whatever prompt it sends to the agent
+                # (through the existing guarded send path -- this module
+                # never sends anything itself). A structured marker whose
+                # task_id/attempt/nonce all match the CURRENT, unconsumed
+                # token is materially stronger evidence than prose alone
+                # and skips the quiet-window wait; consuming it (setting
+                # completion_nonce_consumed_at) makes it single-use, so a
+                # stale marker copied from an earlier attempt or replayed
+                # from old scrollback can never verify twice.
+                ("completion_nonce", "TEXT"),
+                ("completion_attempt", "INTEGER NOT NULL DEFAULT 0"),
+                ("completion_nonce_consumed_at", "TEXT"),
             ):
                 if column not in existing_columns:
                     connection.execute(f"ALTER TABLE watches ADD COLUMN {column} {declaration}")
@@ -209,9 +226,13 @@ class SupervisorStore:
         (supervisor_watch called again for an already-known target) DOES
         re-pin identity -- that is the explicit "I know about this, treat
         whatever answers to this name right now as correct" action,
-        exactly like a binding rebind."""
+        exactly like a binding rebind. It also mints a fresh completion
+        nonce and bumps completion_attempt -- a new watch/re-watch is
+        exactly what "a new attempt" means (P0-7 phase 2 nonce delivery;
+        see supervisor_get_completion_token)."""
         key = watch_key(kind, target)
         now = datetime.now(timezone.utc).isoformat()
+        nonce = secrets.token_urlsafe(18)
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute("SELECT * FROM watches WHERE watch_key = ?", (key,)).fetchone()
@@ -221,21 +242,39 @@ class SupervisorStore:
                     (watch_key, kind, target, source, enabled, state, state_since,
                      last_output_hash, last_output_change_at, last_activity,
                      iteration_count, same_failure_count, disabled_reason, created_at, updated_at,
-                     pinned_session_id, pinned_pane_id, pinned_created_epoch)
-                    VALUES (?, ?, ?, ?, 1, 'UNKNOWN', ?, NULL, NULL, NULL, 0, 0, NULL, ?, ?, ?, ?, ?)""",
+                     pinned_session_id, pinned_pane_id, pinned_created_epoch,
+                     completion_nonce, completion_attempt, completion_nonce_consumed_at)
+                    VALUES (?, ?, ?, ?, 1, 'UNKNOWN', ?, NULL, NULL, NULL, 0, 0, NULL, ?, ?, ?, ?, ?, ?, 1, NULL)""",
                     (key, kind, target, source, now, now, now,
-                     pinned_session_id, pinned_pane_id, pinned_created_epoch),
+                     pinned_session_id, pinned_pane_id, pinned_created_epoch, nonce),
                 )
                 created = True
             else:
                 connection.execute(
                     """UPDATE watches SET enabled = 1, disabled_reason = NULL, updated_at = ?,
-                       pinned_session_id = ?, pinned_pane_id = ?, pinned_created_epoch = ? WHERE watch_key = ?""",
-                    (now, pinned_session_id, pinned_pane_id, pinned_created_epoch, key),
+                       pinned_session_id = ?, pinned_pane_id = ?, pinned_created_epoch = ?,
+                       completion_nonce = ?, completion_attempt = completion_attempt + 1,
+                       completion_nonce_consumed_at = NULL
+                       WHERE watch_key = ?""",
+                    (now, pinned_session_id, pinned_pane_id, pinned_created_epoch, nonce, key),
                 )
                 created = False
             row = connection.execute("SELECT * FROM watches WHERE watch_key = ?", (key,)).fetchone()
         return dict(row), created
+
+    def mark_nonce_consumed(self, key: str, nonce: str, now_iso: str) -> bool:
+        """Single-use enforcement: only succeeds if `nonce` is still the
+        watch's CURRENT, unconsumed token -- a second attempt to consume
+        the same nonce (a replayed/pasted marker, or a genuine race) finds
+        completion_nonce_consumed_at already set and fails, exactly the
+        same compare-and-swap shape used throughout supervisor2.py."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE watches SET completion_nonce_consumed_at = ?
+                   WHERE watch_key = ? AND completion_nonce = ? AND completion_nonce_consumed_at IS NULL""",
+                (now_iso, key, nonce),
+            )
+        return cursor.rowcount == 1
 
     def adopt_pin(self, key: str, *, pinned_session_id: str, pinned_pane_id: str,
                   pinned_created_epoch: int) -> bool:
@@ -360,6 +399,13 @@ class SupervisorStore:
         item["untrusted_output"] = True
         item["untrusted_fields"] = ["output_preview", "reason"]
         item["content_source"] = item.get("kind", "session")
+        # P0-7/P0-8 explicit legacy adapter (status.py's to_legacy_state/
+        # to_legacy_event_type): additive, opt-in fields for a caller
+        # written against the pre-COMPLETION_CANDIDATE/VERIFIED_DONE
+        # vocabulary -- state/event_type themselves are never silently
+        # coerced back to it.
+        item["legacy_state"] = to_legacy_state(item["state"])
+        item["legacy_event_type"] = to_legacy_event_type(item["event_type"])
         return item
 
 
@@ -424,6 +470,31 @@ class SupervisorService:
 
     def list_watches(self) -> dict[str, Any]:
         return {"watches": [self._watch_view(row) for row in self.store.list_watches()]}
+
+    def get_completion_token(self, binding: str | None = None, session: str | None = None) -> dict[str, Any]:
+        """P0-7 phase 2 nonce delivery: the current, unconsumed completion
+        token for this watch's current attempt. This module never sends
+        anything itself -- an external caller (a human, or an external
+        model orchestrating via MCP) is responsible for embedding
+        task_id/attempt/nonce in whatever prompt it sends to the agent,
+        through the existing guarded terminal_send_text/terminal_send_bound
+        path, instructing it to echo the values back inside a
+        ###TERMINAL_MCP_COMPLETION marker on genuine completion (see
+        status.py's COMPLETION_MARKER_RE for the exact format). Each
+        (re-)watch mints a fresh nonce and bumps attempt -- calling
+        supervisor_watch again is how an operator starts a new attempt
+        with a fresh, unconsumed token."""
+        if (binding is None) == (session is None):
+            return {"error": "EXACTLY_ONE_TARGET_REQUIRED"}
+        key = watch_key("binding", binding) if binding is not None else watch_key("session", session)
+        row = self.store.get_watch(key)
+        if row is None:
+            return {"error": "WATCH_NOT_FOUND", "watch_key": key}
+        return {
+            "watch_key": key, "task_id": key, "attempt": row["completion_attempt"],
+            "nonce": row["completion_nonce"],
+            "consumed": row["completion_nonce_consumed_at"] is not None,
+        }
 
     def status(self) -> dict[str, Any]:
         watches = self.store.list_watches()
@@ -593,9 +664,13 @@ class SupervisorService:
         COMPLETION_CANDIDATE here) is never treated as proof by itself.
         Promotion requires the candidate to hold -- unchanged output, no
         state regression -- across a *later* poll for at least
-        completion_verify_quiet_seconds, OR a matched single-use nonce
-        (P0-7 phase 2; not yet wired -- always None here until then),
-        which is stronger evidence and skips the wait."""
+        completion_verify_quiet_seconds, OR (P0-7 phase 2) a structured
+        marker whose task_id/attempt/nonce match the watch's current,
+        unconsumed completion token -- materially stronger evidence, since
+        it proves the agent actually saw and echoed back something only
+        this supervisor instance handed out for this specific attempt, so
+        it skips the wait and promotes on this very poll. The nonce is
+        consumed (single-use) at the moment it verifies."""
         key = row["watch_key"]
 
         if row["state"] == "VERIFIED_DONE" and state != "VERIFIED_DONE":
@@ -613,11 +688,15 @@ class SupervisorService:
             )
             return None
 
-        nonce_verified = False  # wired in P0-7 phase 2 (nonce delivery)
+        marker = parse_completion_marker(output)
+        nonce_verified = verify_completion_marker(
+            marker, task_id=key, attempt=row.get("completion_attempt") or 0,
+            nonce=row.get("completion_nonce"), nonce_consumed=bool(row.get("completion_nonce_consumed_at")),
+        )
         was_candidate = row["state"] == "COMPLETION_CANDIDATE"
         unchanged_since_candidate = was_candidate and output_hash == row.get("completion_output_hash")
 
-        if not unchanged_since_candidate:
+        if not nonce_verified and not unchanged_since_candidate:
             # First time entering COMPLETION_CANDIDATE, or the pane moved
             # on since the last snapshot -- (re-)arm against the CURRENT
             # snapshot rather than an earlier, now-stale one. A legitimately
@@ -641,20 +720,34 @@ class SupervisorService:
                 )
             return None  # re-armed silently -- still just a candidate
 
-        since = datetime.fromisoformat(row["completion_candidate_since"])
-        quiet_seconds = (now - since).total_seconds()
-        if not (nonce_verified or quiet_seconds >= self.config.completion_verify_quiet_seconds):
-            # Still waiting on the quiet window -- bookkeeping only, and
-            # deliberately do NOT touch completion_candidate_since/
-            # completion_output_hash (that would re-arm the window).
-            self.store.update_watch_progress(
-                key, state="COMPLETION_CANDIDATE", state_changed=False, output_hash=output_hash,
-                output_changed=False, iteration_count=iteration_count, same_failure_count=same_failure_count,
-                now_iso=now_iso, enabled=True, disabled_reason=None,
-                completion_candidate_since=row["completion_candidate_since"],
-                completion_output_hash=row["completion_output_hash"],
-            )
-            return None
+        quiet_seconds = 0.0
+        if not nonce_verified:
+            since = datetime.fromisoformat(row["completion_candidate_since"])
+            quiet_seconds = (now - since).total_seconds()
+            if quiet_seconds < self.config.completion_verify_quiet_seconds:
+                # Still waiting on the quiet window -- bookkeeping only, and
+                # deliberately do NOT touch completion_candidate_since/
+                # completion_output_hash (that would re-arm the window).
+                self.store.update_watch_progress(
+                    key, state="COMPLETION_CANDIDATE", state_changed=False, output_hash=output_hash,
+                    output_changed=False, iteration_count=iteration_count, same_failure_count=same_failure_count,
+                    now_iso=now_iso, enabled=True, disabled_reason=None,
+                    completion_candidate_since=row["completion_candidate_since"],
+                    completion_output_hash=row["completion_output_hash"],
+                )
+                return None
+
+        if nonce_verified:
+            # Consume it -- if this loses a race (already consumed between
+            # the check above and here), fall back to the ordinary
+            # quiet-window path rather than promoting on a nonce that
+            # turned out not to be exclusively ours after all.
+            if not self.store.mark_nonce_consumed(key, row["completion_nonce"], now_iso):
+                nonce_verified = False
+                since = datetime.fromisoformat(row.get("completion_candidate_since") or now_iso)
+                quiet_seconds = (now - since).total_seconds()
+                if quiet_seconds < self.config.completion_verify_quiet_seconds:
+                    return None
 
         verified_reason = (
             "nonce-verified completion marker (task_id/attempt/nonce matched)" if nonce_verified
@@ -695,6 +788,10 @@ class SupervisorService:
         return {
             "watch_key": row["watch_key"], "kind": row["kind"], "target": row["target"],
             "source": row["source"], "enabled": bool(row["enabled"]), "state": row["state"],
+            # Explicit legacy adapter (status.py's to_legacy_state) -- see
+            # _event_from_row's identical field for why this exists rather
+            # than state itself ever meaning the old vocabulary.
+            "legacy_state": to_legacy_state(row["state"]),
             "state_since": row["state_since"], "last_activity": row["last_activity"],
             "iteration_count": row["iteration_count"], "same_failure_count": row["same_failure_count"],
             "disabled_reason": row["disabled_reason"], "created_at": row["created_at"],
