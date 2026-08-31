@@ -47,6 +47,21 @@ class AuditStore:
                     source_transport TEXT NOT NULL, server_version TEXT NOT NULL
                 )
             """)
+            # P0-4: durable idempotency keys for input submissions. A row is
+            # first inserted with result_json = NULL to *claim* the key
+            # (INSERT OR IGNORE -- only the first caller for a given key
+            # ever wins the claim, even across process restarts, since this
+            # is on disk), then updated with the real result once the send
+            # completes. Never stores raw prompt text -- result_json is
+            # exactly the same response dict callers already get back
+            # (sent/characters/press_enter/submit_status/error, no text).
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS idempotent_sends (
+                    idempotency_key TEXT PRIMARY KEY,
+                    result_json TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
         try:
             self.path.chmod(0o600)
         except OSError:
@@ -91,6 +106,40 @@ class AuditStore:
                  json.dumps(keys) if keys is not None else None, int(press_enter),
                  result, reason, source_transport, __version__),
             )
+
+    def claim_idempotency_key(self, key: str) -> bool:
+        """Returns True if this call is the one that gets to actually
+        perform the action (first claim of this key, ever -- durable
+        across process restart since it's on disk); False if another
+        caller (a prior completed call, or a concurrent in-flight one)
+        already claimed it first."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO idempotent_sends (idempotency_key, result_json, created_at) VALUES (?, NULL, ?)",
+                (key, now),
+            )
+        return cursor.rowcount == 1
+
+    def store_idempotent_result(self, key: str, result: dict[str, Any]) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE idempotent_sends SET result_json = ? WHERE idempotency_key = ?",
+                (json.dumps(result), key),
+            )
+
+    def get_idempotent_result(self, key: str) -> dict[str, Any] | None:
+        """None means either the key was never claimed, or it was claimed
+        but the claiming call hasn't stored a result yet (still in flight)
+        -- callers distinguish those two cases via claim_idempotency_key's
+        own return value, not this method alone."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT result_json FROM idempotent_sends WHERE idempotency_key = ?", (key,),
+            ).fetchone()
+        if row is None or row["result_json"] is None:
+            return None
+        return json.loads(row["result_json"])
 
     def list(self, limit: int = 50, binding: str | None = None,
              session: str | None = None) -> list[dict[str, Any]]:

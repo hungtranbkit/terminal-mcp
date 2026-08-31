@@ -34,6 +34,7 @@ from .config import AppConfig, SupervisorConfig
 from .core import TerminalService
 from .permissions import session_allowed
 from .status import SUPERVISOR_STATES, classify_supervisor_state
+from .tmux import TmuxError
 
 EVENT_SCHEMA_VERSION = 1
 """JSON shape of one persisted event, stable for a future v2 webhook
@@ -106,6 +107,19 @@ class SupervisorStore:
                 )
                 """
             )
+            # P0-2 identity pinning columns (session-kind watches only --
+            # binding-kind watches defer to the binding's own pin). Safe
+            # ALTER TABLE migration on an already-populated table; existing
+            # rows get NULL, adopted lazily on first use exactly like
+            # bindings.py's pinned_* columns.
+            existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(watches)").fetchall()}
+            for column, declaration in (
+                ("pinned_session_id", "TEXT"),
+                ("pinned_pane_id", "TEXT"),
+                ("pinned_created_epoch", "INTEGER"),
+            ):
+                if column not in existing_columns:
+                    connection.execute(f"ALTER TABLE watches ADD COLUMN {column} {declaration}")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS supervisor_events (
@@ -166,10 +180,16 @@ class SupervisorStore:
             rows = connection.execute("SELECT * FROM watches ORDER BY watch_key").fetchall()
         return [dict(row) for row in rows]
 
-    def upsert_watch(self, kind: str, target: str, *, source: str, enabled: bool = True) -> tuple[dict[str, Any], bool]:
+    def upsert_watch(self, kind: str, target: str, *, source: str, enabled: bool = True,
+                     pinned_session_id: str | None = None, pinned_pane_id: str | None = None,
+                     pinned_created_epoch: int | None = None) -> tuple[dict[str, Any], bool]:
         """Create a watch, or re-enable/replace source on an existing one.
         Never resets state/iteration/failure bookkeeping on an existing row —
-        only creation or an explicit re-enable touches those."""
+        only creation or an explicit re-enable touches those. A re-enable
+        (supervisor_watch called again for an already-known target) DOES
+        re-pin identity -- that is the explicit "I know about this, treat
+        whatever answers to this name right now as correct" action,
+        exactly like a binding rebind."""
         key = watch_key(kind, target)
         now = datetime.now(timezone.utc).isoformat()
         with self._connection() as connection:
@@ -180,19 +200,34 @@ class SupervisorStore:
                     """INSERT INTO watches
                     (watch_key, kind, target, source, enabled, state, state_since,
                      last_output_hash, last_output_change_at, last_activity,
-                     iteration_count, same_failure_count, disabled_reason, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, 1, 'UNKNOWN', ?, NULL, NULL, NULL, 0, 0, NULL, ?, ?)""",
-                    (key, kind, target, source, now, now, now),
+                     iteration_count, same_failure_count, disabled_reason, created_at, updated_at,
+                     pinned_session_id, pinned_pane_id, pinned_created_epoch)
+                    VALUES (?, ?, ?, ?, 1, 'UNKNOWN', ?, NULL, NULL, NULL, 0, 0, NULL, ?, ?, ?, ?, ?)""",
+                    (key, kind, target, source, now, now, now,
+                     pinned_session_id, pinned_pane_id, pinned_created_epoch),
                 )
                 created = True
             else:
                 connection.execute(
-                    "UPDATE watches SET enabled = 1, disabled_reason = NULL, updated_at = ? WHERE watch_key = ?",
-                    (now, key),
+                    """UPDATE watches SET enabled = 1, disabled_reason = NULL, updated_at = ?,
+                       pinned_session_id = ?, pinned_pane_id = ?, pinned_created_epoch = ? WHERE watch_key = ?""",
+                    (now, pinned_session_id, pinned_pane_id, pinned_created_epoch, key),
                 )
                 created = False
             row = connection.execute("SELECT * FROM watches WHERE watch_key = ?", (key,)).fetchone()
         return dict(row), created
+
+    def adopt_pin(self, key: str, *, pinned_session_id: str, pinned_pane_id: str,
+                  pinned_created_epoch: int) -> bool:
+        """Lazily pin a pre-existing watch's identity the first time it is
+        used after this feature was added (pinned_session_id was NULL)."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE watches SET pinned_session_id = ?, pinned_pane_id = ?, pinned_created_epoch = ?
+                   WHERE watch_key = ? AND pinned_session_id IS NULL""",
+                (pinned_session_id, pinned_pane_id, pinned_created_epoch, key),
+            )
+        return cursor.rowcount == 1
 
     def set_enabled(self, key: str, enabled: bool, *, disabled_reason: str | None = None) -> bool:
         now = datetime.now(timezone.utc).isoformat()
@@ -314,17 +349,32 @@ class SupervisorService:
     def watch(self, binding: str | None = None, session: str | None = None) -> dict[str, Any]:
         if (binding is None) == (session is None):
             return {"error": "EXACTLY_ONE_TARGET_REQUIRED"}
+        pin: dict[str, Any] = {}
         if binding is not None:
             if self.terminal.bindings.get(binding) is None:
                 return {"error": "BINDING_NOT_FOUND", "binding": binding}
             kind, target = "binding", binding
+            # No separate pin here -- a binding-kind watch defers entirely
+            # to the binding's own pinned identity (bindings.py), checked
+            # at send time via terminal_send_bound.
         else:
             # Same predicate _guard()/terminal_status() already enforce — a
             # watch can never be created for a session outside the whitelist.
             if not session_allowed(session, self.terminal.config):
                 return {"error": "ACCESS_DENIED", "session": session}
             kind, target = "session", session
-        row, created = self.store.upsert_watch(kind, target, source="manual")
+            # P0-2: pin identity at (re-)watch time -- best-effort; a
+            # session that doesn't exist yet (or a transient tmux error)
+            # just leaves it unpinned, lazily adopted on the watch's next
+            # successful poll instead of failing the watch call itself.
+            try:
+                info = self.terminal.tmux.get_session(session)
+            except TmuxError:
+                info = None
+            if info is not None:
+                pin = {"pinned_session_id": info.session_id, "pinned_pane_id": info.pane_id,
+                      "pinned_created_epoch": info.created_epoch}
+        row, created = self.store.upsert_watch(kind, target, source="manual", **pin)
         return {**self._watch_view(row), "created": created}
 
     def unwatch(self, binding: str | None = None, session: str | None = None, delete: bool = False) -> dict[str, Any]:

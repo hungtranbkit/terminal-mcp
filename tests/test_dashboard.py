@@ -384,7 +384,30 @@ def test_session_input_sends_text_to_allowed_session(input_config, tmux_session_
     )
     assert response.status_code == 200
     body = response.json()
-    assert body == {"session": session, "sent": True, "characters": len("echo hi"), "press_enter": False}
+    # press_enter=False -> submit_status is TEXT_SENT (nothing to confirm),
+    # not the fixed dict this asserted before submit_status existed.
+    assert body == {"session": session, "sent": True, "characters": len("echo hi"),
+                    "press_enter": False, "submit_status": "TEXT_SENT"}
+
+
+def test_session_input_idempotency_key_prevents_duplicate_send(input_config, tmux_session_factory):
+    import uuid
+
+    session = tmux_session_factory("test-dashboard-idem", "bash -lc 'read x; echo GOT:$x; sleep 10'")
+    client, _ = _client(input_config)
+    # _client() uses the real default AuditStore path (not isolated per
+    # test), so the key itself must be unique per run -- a fixed literal
+    # would collide with a prior run's own claim of the same key and
+    # silently replay THAT run's stored result instead of exercising
+    # anything about this run's session.
+    key = f"dash-key-{uuid.uuid4()}"
+    body = {"name": session, "text": "y", "press_enter": True, "idempotency_key": key}
+    first = client.post("/dashboard/api/session/input", json=body).json()
+    second = client.post("/dashboard/api/session/input", json=body).json()
+    assert first == second
+    time.sleep(0.3)
+    detail = client.get(f"/dashboard/api/session?name={session}").json()
+    assert detail["tail"]["output"].count("GOT:y") == 1
 
 
 def test_session_detail_reports_input_allowed(input_config, tmux_session_factory):

@@ -834,13 +834,25 @@ DASHBOARD_HTML = """<!doctype html>
       else if (!inputAllowed) { setInputNote('Input bị tắt cho session này (permission hoặc input_policy).', false); }
       else { setInputNote(''); }
     }
+    // P0-4: a fresh idempotency key per click/Enter -- if the fetch below
+    // fails ambiguously (e.g. a network drop after the send already
+    // reached the server) and the UI is retried, the retry replays the
+    // original stored result instead of risking a second real send.
+    function newIdempotencyKey() {
+      try { return crypto.randomUUID(); } catch (error) {
+        return 'dashboard-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+      }
+    }
     async function sendInput() {
       if (!selected || !inputTextEl.value) return;
       inputSendEl.disabled = true;
       try {
         const response = await fetch('/dashboard/api/session/input', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({name: selected, text: inputTextEl.value, press_enter: inputEnterEl.checked}),
+          body: JSON.stringify({
+            name: selected, text: inputTextEl.value, press_enter: inputEnterEl.checked,
+            idempotency_key: newIdempotencyKey(),
+          }),
         });
         const data = await response.json();
         if (data.error) { setInputNote(`${data.error}${data.reason ? ': ' + data.reason : ''}`, true); }
@@ -1087,9 +1099,12 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         name = body.get("name") if isinstance(body, dict) else None
         text = body.get("text") if isinstance(body, dict) else None
         press_enter = bool(body.get("press_enter", False)) if isinstance(body, dict) else False
+        idempotency_key = body.get("idempotency_key") if isinstance(body, dict) else None
         if not isinstance(name, str) or not name or not isinstance(text, str) or not text:
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
-        result = terminal.terminal_send_text(name, text, press_enter=press_enter)
+        if idempotency_key is not None and not isinstance(idempotency_key, str):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        result = terminal.terminal_send_text(name, text, press_enter=press_enter, idempotency_key=idempotency_key)
         status_code = 200
         if "error" in result:
             status_code = INPUT_ERROR_STATUS.get(result["error"], 400)

@@ -4,6 +4,7 @@ import time
 
 import pytest
 
+from terminal_mcp.audit import AuditStore
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig, SupervisorConfig
 from terminal_mcp.core import TerminalService
 from terminal_mcp.supervisor import SupervisorService, SupervisorStore
@@ -23,7 +24,12 @@ def _config(*, terminal_input=True, **overrides) -> AppConfig:
 
 
 def _v2(tmp_path, **overrides):
-    terminal = TerminalService(_config(**overrides))
+    # Isolated audit.db, not the default (real production) path -- besides
+    # polluting production audit history, sharing the default path let a
+    # STALE idempotency claim from an earlier test's action id survive
+    # into a fresh supervisor.db whose own action ids restart at 1,
+    # silently replaying a stored result instead of actually sending.
+    terminal = TerminalService(_config(**overrides), audit=AuditStore(tmp_path / "audit.db"))
     store = SupervisorStore(tmp_path / "supervisor.db")
     svc = SupervisorService(terminal, store)
     return build_supervisor_v2(svc), svc
@@ -185,7 +191,8 @@ def test_restart_recovery_does_not_replay_a_sent_action(tmp_path, tmux_session_f
     session = tmux_session_factory("test-v2-restart", _wait_prompt(""))
     time.sleep(0.3)
     db_path = tmp_path / "supervisor.db"
-    terminal = TerminalService(_config())
+    audit_path = tmp_path / "audit.db"  # shared across the "restart" below, isolated from production
+    terminal = TerminalService(_config(), audit=AuditStore(audit_path))
     svc1 = SupervisorService(terminal, SupervisorStore(db_path))
     v2_a = build_supervisor_v2(svc1)
     svc1.watch(session=session)
@@ -196,12 +203,19 @@ def test_restart_recovery_does_not_replay_a_sent_action(tmp_path, tmux_session_f
     v2_a.review_action(claim["id"], "approve")
     v2_a.execute_send(claim["id"])
 
-    # Fresh service/store pair against the same db path, simulating a restart.
-    svc2 = SupervisorService(TerminalService(_config()), SupervisorStore(db_path))
+    # Fresh service/store pair against the same db paths, simulating a restart.
+    svc2 = SupervisorService(TerminalService(_config(), audit=AuditStore(audit_path)), SupervisorStore(db_path))
     v2_b = build_supervisor_v2(svc2)
     replay = v2_b.execute_send(claim["id"])
     assert replay["error"] == "ALREADY_SENT_OR_NOT_APPROVED"
-    assert v2_b.store.get_action(claim["id"])["state"] in ("sent", "observing", "completed")
+    # "blocked" (stop_reason=submit_unconfirmed) is now also a legitimate
+    # outcome of the *original* send above: _wait_prompt's target consumes
+    # input silently (no visible pane change), which post-send
+    # verification correctly cannot distinguish from "still stuck" -- see
+    # P0-6's deliberately conservative UNCONFIRMED bias. The actual claim
+    # this test makes -- a second execute_send never replays/resends --
+    # already held regardless (the assert above).
+    assert v2_b.store.get_action(claim["id"])["state"] in ("sent", "observing", "completed", "blocked")
 
 
 # ---------------------------------------------------------------------------
@@ -288,10 +302,16 @@ def test_no_progress_limit_blocks_and_pauses_policy(tmp_path, tmux_session_facto
     # Either it progressed (the read consumed input, changing output) or it
     # correctly stalled — assert the mechanism produced a defensible outcome
     # either way, and never left the action stuck in 'observing' forever.
+    # "blocked" now covers two legitimate, equally conservative reasons:
+    # no_progress_limit_exceeded (reconciliation never saw the pane
+    # change) or submit_unconfirmed (post-send verification itself
+    # couldn't confirm Enter was processed -- _wait_prompt's target
+    # consumes input silently with no visible pane change either way, so
+    # this specific fixture can legitimately land on either).
     assert action["state"] in ("completed", "blocked")
     if action["state"] == "blocked":
-        assert action["stop_reason"].startswith("no_progress_limit_exceeded")
-        assert policy["blocked_reason"] == "no_progress_limit_exceeded"
+        assert action["stop_reason"].startswith(("no_progress_limit_exceeded", "submit_unconfirmed"))
+        assert policy["blocked_reason"] in ("no_progress_limit_exceeded", "submit_unconfirmed")
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +453,20 @@ def test_send_result_never_contains_raw_prompt_text(tmp_path, tmux_session_facto
     assert "y" not in action["send_result"] or '"characters"' in action["send_result"]
     import json
     parsed = json.loads(action["send_result"])
-    assert set(parsed.keys()) <= {"session", "binding", "sent", "characters", "press_enter"}
+    # submit_status is a fixed enum value, never raw text; submit_reason
+    # (only present when unconfirmed) is one of two fixed short phrases
+    # describing *why* verification was inconclusive -- never prompt
+    # content either way.
+    assert set(parsed.keys()) <= {
+        "session", "binding", "sent", "characters", "press_enter",
+        "submit_status", "submit_reason",
+    }
+    if "submit_reason" in parsed:
+        assert parsed["submit_reason"] in (
+            "could not capture a pre-submit baseline to verify against",
+            "post-send capture failed",
+            "the pane looked identical to its pre-Enter state throughout the verification window",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +544,7 @@ async def test_supervisor2_tools_full_pipeline_via_mcp(tmp_path, tmux_session_fa
         "if [ \"$x\" = y ]; then printf \"Continuing...\\nFINAL REPORT\\ndone\\n\"; else echo no; fi; sleep 20'",
     )
     time.sleep(0.3)
-    terminal = TerminalService(_config())
+    terminal = TerminalService(_config(), audit=AuditStore(tmp_path / "audit.db"))
     store = SupervisorStore(tmp_path / "supervisor.db")
     svc = SupervisorService(terminal, store)
     v2 = build_supervisor_v2(svc)
@@ -588,3 +621,68 @@ def test_run_once_does_not_leak_file_descriptors(tmp_path, tmux_session_factory)
     assert after - baseline < 20, (
         f"fd count grew from {baseline} to {after} across 150 run_once() cycles -- leak regression"
     )
+
+
+# ---------------------------------------------------------------------------
+# P0-5: revision CAS immediately before send
+# ---------------------------------------------------------------------------
+
+
+def test_execute_send_aborts_as_stale_decision_when_output_changed_since_decision(tmp_path, tmux_session_factory):
+    session = tmux_session_factory("test-v2-stale", _wait_prompt(""))
+    time.sleep(0.3)
+    v2, svc = _v2(tmp_path)
+    svc.watch(session=session)
+    events = svc.run_once()["events"]
+    v2.set_policy(session=session, policy_mode="suggest_only")
+    claim = v2.claim_event(events[0]["id"], claimed_by="a")
+    decided = v2.submit_decision(claim["id"], "y")
+    assert decided["expected_output_hash"] is not None
+    v2.review_action(claim["id"], "approve")
+
+    # Simulate "the watch's output changed since the decision was made" --
+    # e.g. a concurrent poll picked up a real transition -- by directly
+    # updating the watch's recorded output_hash to something else, exactly
+    # as a real poll cycle would if the pane's content had changed.
+    key = f"session:{session}"
+    watch = svc.store.get_watch(key)
+    svc.store.update_watch_progress(
+        key, state=watch["state"], state_changed=False, output_hash="deliberately-different-hash",
+        output_changed=True, iteration_count=watch["iteration_count"], same_failure_count=0,
+        now_iso=watch["updated_at"], enabled=True, disabled_reason=None,
+    )
+
+    result = v2.execute_send(claim["id"])
+    assert result["error"] == "STALE_DECISION"
+    action = v2.store.get_action(claim["id"])
+    assert action["state"] == "blocked"
+    assert action["stop_reason"] == "stale_decision"
+    policy = v2.get_policy(session=session)
+    assert policy["blocked_reason"] == "stale_decision"
+
+    # Never actually sent -- the pane must show nothing new.
+    pane = svc.terminal.terminal_tail(session, 10)["output"]
+    assert "Do you want to continue?" in pane
+    assert "y" not in pane.replace("Do you want to continue? [y/N]", "")
+
+    # Not a blind-retry failure mode: v1's own iteration/failure counters
+    # on the watch are untouched by this abort.
+    watch_after = svc.store.get_watch(key)
+    assert watch_after["same_failure_count"] == 0
+
+
+def test_execute_send_proceeds_when_output_unchanged_since_decision(tmp_path, tmux_session_factory):
+    # Sanity check for the same mechanism: the normal, common case (nothing
+    # changed between decision and send) must NOT be blocked.
+    session = tmux_session_factory("test-v2-notstale", _wait_prompt(""))
+    time.sleep(0.3)
+    v2, svc = _v2(tmp_path)
+    svc.watch(session=session)
+    events = svc.run_once()["events"]
+    v2.set_policy(session=session, policy_mode="suggest_only")
+    claim = v2.claim_event(events[0]["id"], claimed_by="a")
+    v2.submit_decision(claim["id"], "y")
+    v2.review_action(claim["id"], "approve")
+    result = v2.execute_send(claim["id"])
+    assert result.get("error") != "STALE_DECISION"
+    assert result["sent"] is True

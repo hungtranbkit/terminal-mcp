@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .audit import sanitized_preview, text_fingerprint
+from .models import SessionIdentity
 from .redaction import redact_text
 from .supervisor import SupervisorService, SupervisorStore, watch_key as make_watch_key
 
@@ -141,6 +142,15 @@ class SupervisorV2Store:
                 )
                 """
             )
+            # P0-5 revision CAS: the watch's output_hash captured at
+            # *decision* time (distinct from output_hash_at_send, captured
+            # at *send* time for reconciliation) -- execute_send re-checks
+            # the watch's current hash against this immediately before
+            # sending and aborts as STALE_DECISION if they differ, rather
+            # than sending against evidence that's no longer current.
+            existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(supervisor_actions)").fetchall()}
+            if "expected_output_hash" not in existing_columns:
+                connection.execute("ALTER TABLE supervisor_actions ADD COLUMN expected_output_hash TEXT")
         try:
             self.path.chmod(0o600)
         except OSError:
@@ -505,9 +515,14 @@ class SupervisorV2Service:
                                       stop_reason="wall_clock_timeout_exceeded")
                 return {"error": "WALL_CLOCK_TIMEOUT_EXCEEDED"}
 
+        # P0-5: the watch's output_hash *at decision time* -- execute_send
+        # re-checks the watch's hash immediately before actually sending
+        # and aborts (STALE_DECISION) rather than send if it has since
+        # changed materially, instead of acting on stale evidence.
         ok = self.store.cas_update(
             action_id, expected_state="claimed", state="decided",
             proposed_prompt=prompt, prompt_hash=prompt_hash, decision_reason=sanitized_preview(decision_reason or "", 200),
+            expected_output_hash=(watch or {}).get("last_output_hash"),
         )
         if not ok:
             return {"error": "INVALID_ACTION_STATE"}
@@ -565,23 +580,83 @@ class SupervisorV2Service:
         if watch is None:
             self.store.cas_update(action_id, expected_state="approved", state="failed", stop_reason="watch_not_found")
             return {"error": "WATCH_NOT_FOUND"}
+        # P0-5 revision CAS: re-read the watch's CURRENT output_hash right
+        # here, immediately before sending, and compare against the hash
+        # recorded at *decision* time (submit_decision). If the pane has
+        # moved on since the decision was made -- a human already
+        # answered, the state changed, anything -- the decision is stale
+        # and must not be acted on blindly. This is a HOLD requiring
+        # re-evaluation, never a blind retry: no failure/iteration counter
+        # is touched, only the policy is paused for review.
+        if action["expected_output_hash"] is not None and watch["last_output_hash"] != action["expected_output_hash"]:
+            self.store.cas_update(action_id, expected_state="approved", state="blocked",
+                                  stop_reason="stale_decision")
+            self.store.block_policy(action["watch_key"], "stale_decision")
+            return {"error": "STALE_DECISION", "reason": "the watch's output changed since this decision was made"}
+        # P0-2: for a session-kind watch, re-verify its pinned identity
+        # right here too (a binding-kind watch's identity is already
+        # re-checked inside terminal_send_bound itself, below).
+        if watch["kind"] == "session" and watch["pinned_session_id"]:
+            current = self.v1.terminal.resolve_identity(watch["target"])
+            pinned = SessionIdentity(name=watch["target"], session_id=watch["pinned_session_id"],
+                                     pane_id=watch["pinned_pane_id"] or "",
+                                     created_epoch=watch["pinned_created_epoch"] or 0)
+            if current is None or not pinned.matches(current):
+                self.store.cas_update(action_id, expected_state="approved", state="blocked",
+                                      stop_reason="identity_mismatch")
+                self.store.block_policy(action["watch_key"], "identity_mismatch")
+                return {"error": "IDENTITY_MISMATCH",
+                       "reason": "the session this watch was created for no longer matches "
+                                 "what currently answers to that name"}
         # Compare-and-swap the state to 'sent' BEFORE calling the guarded
         # send, so a retry/duplicate caller sees state != 'approved' and
         # stops here even if a first attempt's response was lost.
         claimed = self.store.cas_update(action_id, expected_state="approved", state="sent")
         if not claimed:
             return {"error": "ALREADY_SENT_OR_NOT_APPROVED"}
+        # P0-4: a durable idempotency key derived from the action's own id
+        # -- even if execute_send's own CAS above were somehow bypassed or
+        # raced, terminal_send_text/_bound's own idempotency layer refuses
+        # to send this exact action twice.
+        # action_id alone is not safe as a global idempotency key: it is an
+        # AUTOINCREMENT id *scoped to this supervisor db file*, so a fresh/
+        # reset supervisor.db (a new install, a restored backup, a test)
+        # restarts numbering at 1 while a separate, persistent audit.db
+        # could still hold an old claim under that same number. Folding in
+        # the action's own created_at timestamp makes the key unique
+        # across any such db-generation change, not just within one.
+        idempotency_key = f"supervisor2-action-{action_id}-{action['created_at']}"
         if watch["kind"] == "binding":
-            result = self.v1.terminal.terminal_send_bound(watch["target"], action["proposed_prompt"], press_enter=True)
+            result = self.v1.terminal.terminal_send_bound(watch["target"], action["proposed_prompt"],
+                                                           press_enter=True, idempotency_key=idempotency_key)
         else:
-            result = self.v1.terminal.terminal_send_text(watch["target"], action["proposed_prompt"], press_enter=True)
+            result = self.v1.terminal.terminal_send_text(watch["target"], action["proposed_prompt"],
+                                                          press_enter=True, idempotency_key=idempotency_key)
         # send_result never carries the raw text (terminal_send_text/_bound
         # never return it — only a character count) — safe to store verbatim.
         if "error" in result:
+            if result["error"] == "IDENTITY_MISMATCH":
+                # Same HOLD-not-failure treatment as the pre-check above --
+                # this is the binding-kind-watch path through
+                # terminal_send_bound's own identity check.
+                self.store.cas_update(action_id, expected_state="sent", state="blocked",
+                                      stop_reason="identity_mismatch", send_result=json.dumps(result))
+                self.store.block_policy(action["watch_key"], "identity_mismatch")
+                return {"sent": False, **result}
             self.store.cas_update(action_id, expected_state="sent", state="failed",
                                   stop_reason=result["error"], send_result=json.dumps(result))
             return {"sent": False, **result}
         watch = self.v1.store.get_watch(action["watch_key"])
+        if result.get("submit_status") == "SUBMIT_UNCONFIRMED":
+            # P0-6: the text really was sent (sent=True stays accurate),
+            # but Enter's submission could not be confirmed -- never count
+            # this as a successful auto-action or let reconciliation
+            # advance the chain as if it had progressed. Hold for review,
+            # exactly like a content-screening block.
+            self.store.cas_update(action_id, expected_state="sent", state="blocked",
+                                  stop_reason="submit_unconfirmed", send_result=json.dumps(result))
+            self.store.block_policy(action["watch_key"], "submit_unconfirmed")
+            return {"sent": True, **result}
         self.store.cas_update(action_id, expected_state="sent", state="observing",
                               send_result=json.dumps(result), output_hash_at_send=watch["last_output_hash"])
         self.store.increment_auto_action_count(action["watch_key"])

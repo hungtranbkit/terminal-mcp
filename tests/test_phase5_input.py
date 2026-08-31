@@ -20,7 +20,10 @@ class FakeTmux:
         return None if command is None else SessionInfo(name, False, 1, 1, 1, 1, command, False)
 
     def capture_lines(self, session, lines):
-        return ["ready", "prompt>"]
+        # Changes as soon as a second call (the separate Enter send-keys)
+        # is recorded, so send-then-verify confirms on its first poll
+        # instead of always timing out against a truly constant fake.
+        return ["ready", "prompt>", f"calls={len(self.sent)}"]
 
     def send_text(self, session, text, press_enter):
         self.sent.append((session, text, press_enter))
@@ -62,8 +65,13 @@ def test_binding_permission_and_literal_send(tmp_path):
     assert service.terminal_send_bound("agent", "x")["error"] == "BINDING_INPUT_DISABLED"
     service.terminal_bind("agent", "claude-test", replace=True, input_enabled=True)
     text = "```sh\necho '$HOME' && $(whoami)\n```"
-    assert service.terminal_send_bound("agent", text, True)["sent"]
-    assert tmux.sent[-1] == ("claude-test", text, True)
+    result = service.terminal_send_bound("agent", text, True)
+    assert result["sent"]
+    assert result["submit_status"] == "SUBMIT_CONFIRMED"
+    # text is sent literal-only (Enter is now a separate, later send_keys
+    # call -- see the lost-Enter settle-delay fix in core.py/tmux.py).
+    assert tmux.sent[-2] == ("claude-test", text, False)
+    assert tmux.sent[-1] == ("claude-test", ["Enter"])
     assert audit.list(binding="agent")[0]["text_sha256"] == hashlib.sha256(text.encode()).hexdigest()
 
 

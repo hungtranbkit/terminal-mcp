@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from datetime import datetime, timezone
 
 from .models import SessionInfo
@@ -8,6 +9,25 @@ from .models import SessionInfo
 
 class TmuxError(RuntimeError):
     pass
+
+
+SEND_TEXT_ENTER_SETTLE_SECONDS = 0.08
+"""Delay between the literal-text send-keys call and the Enter send-keys
+call in `send_text`. `tmux send-keys` writes bytes to the pane's pty and
+returns almost instantly -- it does not wait for the *receiving* program to
+finish processing them. Two send-keys calls fired back-to-back with zero
+gap can therefore land an Enter keystroke while an interactive TUI's own
+async input handling (redraw batching, bracketed-paste detection, a
+debounced line editor -- exactly what Codex/Claude-style CLIs use) is still
+mid-cycle from the preceding text; some of those debounce/redraw windows
+swallow an Enter that arrives too soon rather than queuing it, producing
+"the text is fully typed but nothing executes until a human presses Enter
+[again]". This fixed, small settle window gives the target process time to
+finish consuming the text before Enter is sent as a genuinely separate,
+later keystroke. See tests/fixtures/laggy_line_reader.py for a real,
+disposable-tmux-pane reproduction of this exact race, and
+TerminalService._send_text_and_verify (core.py) for the best-effort
+post-send confirmation layered on top of this."""
 
 
 class TmuxClient:
@@ -21,6 +41,8 @@ class TmuxClient:
             "#{pane_pid}",
             "#{pane_current_command}",
             "#{pane_dead}",
+            "#{session_id}",  # tmux's own "$N" id -- P0-2 identity pinning
+            "#{pane_id}",     # tmux's own "%N" id -- P0-2 identity pinning
         )
     )
 
@@ -92,6 +114,11 @@ class TmuxClient:
     def send_text(self, session: str, text: str, press_enter: bool) -> None:
         self._run(["send-keys", "-t", session, "-l", "--", text])
         if press_enter:
+            # See SEND_TEXT_ENTER_SETTLE_SECONDS above -- this is the fix
+            # for the intermittent "typed but not submitted" race, not an
+            # incidental pause: never remove it without also removing the
+            # reason it exists.
+            time.sleep(SEND_TEXT_ENTER_SETTLE_SECONDS)
             self._run(["send-keys", "-t", session, "Enter"])
 
     def send_keys(self, session: str, keys: list[str]) -> None:
@@ -100,10 +127,11 @@ class TmuxClient:
 
 
 def parse_session_line(line: str) -> SessionInfo:
-    parts = line.split("|", 7)
-    if len(parts) != 8:
+    parts = line.split("|", 9)
+    if len(parts) != 10:
         raise TmuxError("unexpected tmux session format")
-    name, attached, windows, created, activity, pane_pid, command, pane_dead = parts
+    (name, attached, windows, created, activity, pane_pid, command, pane_dead,
+     session_id, pane_id) = parts
     try:
         return SessionInfo(
             name=name,
@@ -114,6 +142,8 @@ def parse_session_line(line: str) -> SessionInfo:
             pane_pid=int(pane_pid),
             pane_current_command=command,
             pane_dead=bool(int(pane_dead)),
+            session_id=session_id,
+            pane_id=pane_id,
         )
     except ValueError as exc:
         raise TmuxError("invalid numeric field from tmux") from exc
