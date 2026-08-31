@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Print the last persisted ProjectFlow watcher status, human-readable by default."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+DEFAULT_STATUS_PATH = Path.home() / ".projectflow-watch" / "status.json"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="Print the raw JSON instead of a summary.")
+    parser.add_argument("--status-file", type=Path, default=DEFAULT_STATUS_PATH)
+    args = parser.parse_args()
+
+    if not args.status_file.exists():
+        print(f"No status file at {args.status_file} yet — has the timer run at least once?"
+              f" Try: systemctl --user start projectflow-watch.service", file=sys.stderr)
+        return 1
+
+    data = json.loads(args.status_file.read_text(encoding="utf-8"))
+
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+        return 0
+
+    print(f"session:       {data.get('session')}")
+    print(f"state:         {data.get('state')}")
+    print(f"reason:        {data.get('reason')}")
+    print(f"checked at:    {data.get('timestamp')}")
+    print(f"last activity: {data.get('last_activity')}")
+    print(f"exists:        {data.get('session_exists')}  "
+          f"attached: {data.get('attached')}  windows: {data.get('windows')}  "
+          f"command: {data.get('pane_current_command')}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

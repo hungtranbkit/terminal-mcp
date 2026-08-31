@@ -1,0 +1,8 @@
+[Unit]
+Description=ProjectFlow tmux watcher (monitor-only poll of projectflow-main)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/projectflow-watch --session projectflow-main --tail-lines 200
+# Read-only w.r.t. the target tmux session: this only runs `tmux has-session`,
+# `tmux display-message`, and `tmux capture-pane`. It never sends keys or text.

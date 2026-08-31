@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""ProjectFlow tmux watcher — monitor-only, no autonomous input.
+
+Polls one tmux session (default: projectflow-main), classifies its state from
+a sanitized recent tail, and persists the result atomically. Never sends
+keystrokes, never mutates the target session. Standalone stdlib script; not
+part of the terminal-mcp package so it keeps working regardless of that
+repo's location or venv.
+
+State file:   ~/.projectflow-watch/status.json   (overwritten every poll)
+History file: ~/.projectflow-watch/history.log   (appended only on state change)
+Lock file:    ~/.projectflow-watch/watch.lock     (prevents overlapping runs)
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_SESSION = "projectflow-main"
+DEFAULT_STATE_DIR = Path.home() / ".projectflow-watch"
+DEFAULT_TAIL_LINES = 200
+EXCERPT_MAX_LINES = 40
+EXCERPT_MAX_CHARS = 4000
+RECENT_ACTIVITY_SECONDS = 60
+
+VALID_STATES = (
+    "RUNNING",
+    "WAITING_INPUT",
+    "PLAN_APPROVAL",
+    "DONE",
+    "ERROR",
+    "SESSION_MISSING",
+    "UNKNOWN",
+)
+
+# --- redaction -------------------------------------------------------------
+
+REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+     "<REDACTED_PRIVATE_KEY>"),
+    (re.compile(r"(?i)\b(OPENAI_API_KEY|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|"
+                r"GH_TOKEN|GITHUB_TOKEN|NPM_TOKEN|[A-Z_]*STRIPE[A-Z_]*KEY)\s*=\s*(\S+)"),
+     r"\1=<REDACTED>"),
+    (re.compile(r"(?i)\b(Bearer)\s+([A-Za-z0-9._~+/-]+=*)"), r"\1 <REDACTED>"),
+    (re.compile(r"(?im)^(\s*Authorization\s*:\s*)(.+)$"), r"\1<REDACTED>"),
+    (re.compile(r"(?i)\b(password|passwd|token|secret|api[_-]?key|access[_-]?key)\s*[:=]\s*(\S+)"),
+     r"\1=<REDACTED>"),
+    (re.compile(r"\bsk-[A-Za-z0-9]{16,}\b"), "<REDACTED>"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<REDACTED_AWS_KEY>"),
+)
+
+
+def redact(text: str) -> str:
+    result = text
+    for pattern, replacement in REDACTIONS:
+        result = pattern.sub(replacement, result)
+    return result
+
+
+# --- classification ----------------------------------------------------
+
+PLAN_APPROVAL_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"would you like to proceed\??",
+    r"ready to code\??",
+    r"no,?\s+keep planning",
+    r"yes,?\s+and auto-accept edits",
+    r"exitplanmode",
+))
+
+WAITING_INPUT_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"do you want to continue",
+    r"what should claude do instead",
+    r"do you want to proceed",
+    r"\[y/n\]",
+    r"\(y/n\)",
+    r"press enter",
+    r"enter password",
+    r"password\s*:\s*$",
+    r"waiting for input",
+    r"\bapprove\b",
+    r"permission to",
+    r"continue\?\s*$",
+    r"^\s*❯\s*\d+[.)]",       # cursor pointing at a numbered menu choice
+))
+
+ERROR_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"traceback \(most recent call last\)",
+    r"\bexception\b.*:",
+    r"\bfatal:\s",
+    r"\bpanic:\s",
+    r"npm err!",
+    r"^\s*error\b[:\s]",
+    r"\d+\s+failed\b",
+    r"non-zero exit status",
+    r"exited with code [1-9]",
+    r"^\s*✗",
+))
+
+DONE_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"\bfinal report\b",
+    r"\btask complete\b",
+    r"\ball tests passed\b",
+    r"✅.*\b(done|complete|passed)\b",
+))
+
+ACTIVE_COMMANDS = {"claude", "codex", "python", "python3", "pytest", "node", "npm", "bash", "zsh"}
+
+
+def _nonempty_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.strip()]
+
+
+def _match_any(patterns: tuple[re.Pattern[str], ...], lines: list[str]) -> tuple[bool, str]:
+    # Scan from the bottom so the reported offset reflects the most recent match.
+    for offset, line in enumerate(reversed(lines)):
+        for pattern in patterns:
+            if pattern.search(line):
+                return True, f"matched {pattern.pattern!r} at offset {offset} from bottom"
+    return False, ""
+
+
+def classify(session_info: dict | None, tail_text: str, now: float) -> tuple[str, str]:
+    """Return (state, reason). `session_info` is None when the session is missing."""
+    if session_info is None:
+        return "SESSION_MISSING", "tmux has-session reported no such session"
+
+    lines = _nonempty_lines(tail_text)
+    bottom_window = lines[-8:]     # tight window for "a prompt is on screen right now"
+    recent_window = lines[-30:]    # wider window for error/completion banners
+
+    matched, why = _match_any(PLAN_APPROVAL_PATTERNS, bottom_window)
+    if matched:
+        return "PLAN_APPROVAL", why
+
+    matched, why = _match_any(WAITING_INPUT_PATTERNS, bottom_window)
+    if matched:
+        return "WAITING_INPUT", why
+
+    matched, why = _match_any(ERROR_PATTERNS, recent_window)
+    if matched:
+        return "ERROR", why
+
+    matched, why = _match_any(DONE_PATTERNS, recent_window)
+    if matched:
+        return "DONE", why
+
+    if session_info.get("pane_dead") == "1":
+        return "UNKNOWN", "pane process has exited (pane_dead=1)"
+
+    command = (session_info.get("pane_current_command") or "").casefold()
+    try:
+        activity_epoch = int(session_info.get("session_activity") or 0)
+    except ValueError:
+        activity_epoch = 0
+    age = max(0, int(now) - activity_epoch) if activity_epoch else None
+
+    if command in ACTIVE_COMMANDS and age is not None and age <= RECENT_ACTIVITY_SECONDS:
+        return "RUNNING", f"current command is {command!r}; tmux activity age is {age}s"
+
+    return "UNKNOWN", (
+        f"current command is {command or 'unknown'!r}; "
+        f"activity age is {'unknown' if age is None else f'{age}s'}; no prompt/error/done marker found"
+    )
+
+
+# --- tmux glue ---------------------------------------------------------
+
+def _run_tmux(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=10)
+
+
+def session_exists(session: str) -> bool:
+    return _run_tmux("has-session", "-t", session).returncode == 0
+
+
+def get_session_info(session: str) -> dict | None:
+    fmt = "\x1f".join((
+        "#{session_name}", "#{pane_current_command}", "#{pane_dead}",
+        "#{session_activity}", "#{session_attached}", "#{session_windows}",
+        "#{session_created}",
+    ))
+    result = _run_tmux("display-message", "-p", "-t", session, fmt)
+    if result.returncode != 0:
+        return None
+    fields = result.stdout.strip("\n").split("\x1f")
+    keys = ("session_name", "pane_current_command", "pane_dead", "session_activity",
+            "session_attached", "session_windows", "session_created")
+    if len(fields) != len(keys):
+        return None
+    return dict(zip(keys, fields))
+
+
+def capture_tail(session: str, lines: int) -> str:
+    result = _run_tmux("capture-pane", "-p", "-t", session, "-S", f"-{lines}")
+    if result.returncode != 0:
+        return ""
+    return result.stdout
+
+
+# --- persistence ---------------------------------------------------------
+
+def atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".status.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def append_history(path: Path, ts: str, old_state: str, new_state: str, reason: str) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(f"{ts}\t{old_state} -> {new_state}\t{reason}\n")
+    os.chmod(path, 0o600)
+
+
+def iso(epoch: float | int) -> str:
+    return datetime.fromtimestamp(float(epoch), tz=timezone.utc).isoformat()
+
+
+# --- main poll -------------------------------------------------------------
+
+def poll(session: str, state_dir: Path, tail_lines: int) -> dict:
+    now = datetime.now(tz=timezone.utc).timestamp()
+    info = get_session_info(session) if session_exists(session) else None
+    raw_tail = capture_tail(session, tail_lines) if info is not None else ""
+    sanitized_tail = redact(raw_tail)
+
+    state, reason = classify(info, sanitized_tail, now)
+
+    excerpt_lines = sanitized_tail.splitlines()[-EXCERPT_MAX_LINES:]
+    excerpt = "\n".join(excerpt_lines)[-EXCERPT_MAX_CHARS:]
+
+    last_activity = None
+    if info is not None and info.get("session_activity"):
+        try:
+            last_activity = iso(int(info["session_activity"]))
+        except (ValueError, OSError, OverflowError):
+            last_activity = None
+
+    status = {
+        "timestamp": iso(now),
+        "session": session,
+        "state": state,
+        "reason": reason,
+        "last_activity": last_activity,
+        "tail_excerpt": excerpt,
+        "session_exists": info is not None,
+        "pane_current_command": (info or {}).get("pane_current_command"),
+        "windows": int(info["session_windows"]) if info and info.get("session_windows") else None,
+        "attached": bool(info and info.get("session_attached") == "1"),
+    }
+
+    status_path = state_dir / "status.json"
+    history_path = state_dir / "history.log"
+
+    previous_state = None
+    if status_path.exists():
+        try:
+            previous_state = json.loads(status_path.read_text(encoding="utf-8")).get("state")
+        except (OSError, json.JSONDecodeError):
+            previous_state = None
+
+    atomic_write_json(status_path, status)
+
+    if previous_state != state:
+        append_history(history_path, status["timestamp"], previous_state or "NONE", state, reason)
+
+    return status
+
+
+# --- self-test (fixtures) ---------------------------------------------------
+
+def _fixture_cases(now: float) -> list[tuple[str, dict | None, str, str]]:
+    # "RECENT" fixtures need an activity timestamp close to `now`, not a fixed constant.
+    running_info = {"pane_current_command": "claude", "pane_dead": "0",
+                     "session_activity": str(int(now) - 5)}
+    idle_info = {"pane_current_command": "bash", "pane_dead": "0",
+                 "session_activity": str(int(now) - 3600)}
+    return [
+        ("session missing", None, "", "SESSION_MISSING"),
+        ("running claude, recent activity", running_info,
+         "Reading files...\nEditing core.py\n", "RUNNING"),
+        ("plan approval menu", idle_info,
+         "I've prepared a plan.\nWould you like to proceed?\n❯ 1. Yes\n  2. No, keep planning\n",
+         "PLAN_APPROVAL"),
+        ("ready to code prompt", idle_info,
+         "Here is my plan for the feature.\nReady to code?\n❯ 1. Yes\n  2. No\n", "PLAN_APPROVAL"),
+        ("generic y/n prompt", idle_info,
+         "Running migration...\nDo you want to continue? [y/N]\n", "WAITING_INPUT"),
+        ("what should claude do instead", idle_info,
+         "I was about to delete the file.\nWhat should Claude do instead?\n", "WAITING_INPUT"),
+        ("numbered menu cursor", idle_info,
+         "Select an option:\n❯ 1. Retry\n  2. Abort\n", "WAITING_INPUT"),
+        ("python traceback", idle_info,
+         "Running tests...\nTraceback (most recent call last):\n  File \"x.py\", line 1\nValueError: bad\n",
+         "ERROR"),
+        ("npm error", idle_info, "npm ERR! code 1\nnpm ERR! path /repo\n", "ERROR"),
+        ("final report marker", idle_info,
+         "All checks complete.\nFINAL REPORT\n- files created: 3\n", "DONE"),
+        ("plain idle shell", idle_info, "$ \n", "UNKNOWN"),
+    ]
+
+
+def self_test() -> bool:
+    now = datetime.now(tz=timezone.utc).timestamp()
+    all_ok = True
+    for name, info, tail, expected in _fixture_cases(now):
+        state, reason = classify(info, redact(tail), now)
+        ok = state == expected
+        all_ok &= ok
+        mark = "PASS" if ok else "FAIL"
+        print(f"[{mark}] {name}: expected={expected} got={state} ({reason})")
+    return all_ok
+
+
+# --- CLI ---------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--session", default=DEFAULT_SESSION)
+    parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
+    parser.add_argument("--tail-lines", type=int, default=DEFAULT_TAIL_LINES)
+    parser.add_argument("--self-test", action="store_true",
+                         help="Run built-in classification fixtures and exit.")
+    args = parser.parse_args(argv)
+
+    if args.self_test:
+        return 0 if self_test() else 1
+
+    args.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = args.state_dir / "watch.lock"
+    lock_file = open(lock_path, "a+")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("projectflow-watch: another run is in progress, skipping this poll", file=sys.stderr)
+        return 0
+
+    try:
+        status = poll(args.session, args.state_dir, args.tail_lines)
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_file.close()
+
+    print(f"{status['timestamp']} session={status['session']} state={status['state']} "
+          f"reason={status['reason']!r}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
