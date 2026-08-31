@@ -96,6 +96,43 @@ def _match_recent(patterns: tuple[re.Pattern[str], ...], output: str, window: in
     return False, ""
 
 
+# ---------------------------------------------------------------------------
+# P0-7: structured completion marker. DONE_PATTERNS above is deliberately
+# never treated as final proof of a verified completion (see supervisor2.py
+# _reconcile_observing_actions's completion-candidate gate) -- it is one
+# input to a COMPLETION_CANDIDATE determination, never a direct
+# VERIFIED_DONE. An agent that wants stronger, harder-to-spoof-by-accident
+# completion evidence can emit this structured marker instead of/alongside
+# prose; task_id/nonce let a caller correlate it to a specific attempt (a
+# supervisor-issued nonce, once a delivery mechanism to the agent exists,
+# would let genuine completion be distinguished from a coincidental or
+# copied-in string -- not built here, see the P0 final report's remaining-
+# heuristic-limitations section).
+# ---------------------------------------------------------------------------
+
+COMPLETION_MARKER_RE = re.compile(
+    r"###TERMINAL_MCP_COMPLETION\s+protocol=terminal-mcp-completion/v1\s+([^#\n]*?)###"
+)
+_MARKER_FIELD_RE = re.compile(r"(\w+)=(\S+)")
+COMPLETION_MARKER_REQUIRED_FIELDS = ("task_id", "status", "summary_sha256")
+
+
+def parse_completion_marker(output: str) -> dict[str, str] | None:
+    """Parse the LAST well-formed structured completion marker in `output`,
+    if any. Returns its fields as a dict, or None if no marker is present
+    or the marker found is missing a required field (never guessed/
+    partially trusted -- an ambiguous marker is the same as no marker)."""
+    matches = COMPLETION_MARKER_RE.findall(output)
+    if not matches:
+        return None
+    fields = dict(_MARKER_FIELD_RE.findall(matches[-1]))
+    if not all(name in fields for name in COMPLETION_MARKER_REQUIRED_FIELDS):
+        return None
+    if fields.get("status") != "completion_candidate":
+        return None
+    return fields
+
+
 def classify_supervisor_state(state: str, reason: str, output: str) -> tuple[str, str]:
     """Normalize a classify_status() result plus DONE/ERROR evidence to the
     6-state supervisor vocabulary. WAITING_INPUT is already high-confidence
@@ -112,6 +149,8 @@ def classify_supervisor_state(state: str, reason: str, output: str) -> tuple[str
     matched, why = _match_recent(DONE_PATTERNS, output)
     if matched:
         return "DONE", why
+    if parse_completion_marker(output) is not None:
+        return "DONE", "structured completion marker present (protocol=terminal-mcp-completion/v1)"
     if state in ("RUNNING", "IDLE", "UNKNOWN"):
         return state, reason
     return "UNKNOWN", reason

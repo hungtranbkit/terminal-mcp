@@ -219,6 +219,38 @@ def test_max_iterations_stops_watch_and_emits_stalled(tmp_path, tmux_session_fac
     assert any(e["event_type"] == "stalled" for e in result["events"])
 
 
+def test_max_iterations_does_not_stop_an_actively_progressing_watch(tmp_path, tmux_session_factory):
+    # Reliability cleanup: a watch whose output keeps changing (real
+    # ongoing work) must not be disabled merely because the raw poll count
+    # is high -- only once it *also* goes quiet.
+    session = tmux_session_factory(
+        "test-sup-maxiter-progress",
+        "bash -lc 'for i in $(seq 1 30); do echo step-$i; sleep 0.3; done; sleep 60'",
+    )
+    time.sleep(0.2)
+    svc = _service(tmp_path, max_iterations=2, idle_threshold_seconds=3600)
+    svc.watch(session=session)
+
+    # Poll well past max_iterations=2 while the fixture is still actively
+    # printing new lines -- must stay enabled the whole time.
+    for _ in range(4):
+        svc.run_once()
+        time.sleep(0.3)
+    watch = svc.list_watches()["watches"][0]
+    assert watch["enabled"] is True
+    assert watch["iteration_count"] > 2  # raw poll count really did exceed the ceiling
+    assert watch["disabled_reason"] is None
+
+    # Once it goes quiet (the loop finishes, falls into the trailing sleep
+    # 60), the next poll(s) with no new output do stop it.
+    for _ in range(3):
+        svc.run_once()
+        result = svc.run_once()
+    watch = svc.list_watches()["watches"][0]
+    assert watch["enabled"] is False
+    assert watch["disabled_reason"] == "max_iterations_exceeded"
+
+
 def test_missing_session_emits_watch_target_missing_and_disables(tmp_path, tmux_session_factory):
     session = tmux_session_factory("test-sup-vanish", "bash -lc 'sleep 3'")
     time.sleep(0.2)
@@ -401,6 +433,38 @@ async def test_supervisor_tools_registered_and_functional(tmp_path, tmux_session
     assert len(listed["events"]) == 1
     acked = await call("supervisor_ack_event", id=listed["events"][0]["id"])
     assert acked["acknowledged"] is True
+
+
+
+# ---------------------------------------------------------------------------
+# Reliability cleanup: the background loop never dies silently
+# ---------------------------------------------------------------------------
+
+
+def test_background_loop_survives_a_poll_exception_and_records_it(tmp_path):
+    from terminal_mcp.supervisor import SupervisorLoop, _LAST_POLL_ERROR
+
+    class ExplodingService:
+        config = SupervisorConfig(poll_interval_seconds=5)
+
+        def run_once(self):
+            raise RuntimeError("synthetic poll failure for this test")
+
+    _LAST_POLL_ERROR[0] = None
+    loop = SupervisorLoop(ExplodingService())
+    loop.start()
+    try:
+        deadline = time.monotonic() + 3
+        while _LAST_POLL_ERROR[0] is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _LAST_POLL_ERROR[0] is not None
+        assert "RuntimeError" in _LAST_POLL_ERROR[0]["error"]
+        assert "synthetic poll failure" in _LAST_POLL_ERROR[0]["error"]
+        # The thread is still alive -- one bad cycle never kills the loop.
+        assert loop.is_alive()
+    finally:
+        loop.stop()
+        _LAST_POLL_ERROR[0] = None
 
 
 @pytest.fixture

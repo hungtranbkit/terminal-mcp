@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import fnmatch
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -35,6 +36,8 @@ from .core import TerminalService
 from .permissions import session_allowed
 from .status import SUPERVISOR_STATES, classify_supervisor_state
 from .tmux import TmuxError
+
+_LOGGER = logging.getLogger(__name__)
 
 EVENT_SCHEMA_VERSION = 1
 """JSON shape of one persisted event, stable for a future v2 webhook
@@ -421,6 +424,7 @@ class SupervisorService:
             "loop_running": _ACTIVE_LOOP is not None and _ACTIVE_LOOP.is_alive(),
             "poll_interval_seconds": self.config.poll_interval_seconds,
             "last_poll_at": _LAST_POLL_AT[0],
+            "last_poll_error": _LAST_POLL_ERROR[0],
             "watch_count": len(watches),
             "enabled_watch_count": sum(1 for row in watches if row["enabled"]),
             "state_counts": counts,
@@ -467,6 +471,11 @@ class SupervisorService:
         try:
             sessions = self.terminal.tmux.list_sessions()
         except Exception:
+            # Best-effort skip for *this* sync pass only -- logged, not
+            # silently swallowed, so a persistently broken tmux/config is
+            # discoverable from the service log rather than only from the
+            # absence of expected watches.
+            _LOGGER.warning("supervisor: could not list sessions for config-pattern watch sync", exc_info=True)
             return
         for item in sessions:
             if not session_allowed(item.name, self.terminal.config):
@@ -526,9 +535,15 @@ class SupervisorService:
                                             f"(same_failure_limit={self.config.same_failure_limit}): {reason}",
                                      output=output, output_hash=output_hash, same_failure_count=same_failure_count,
                                      disable=True, disabled_reason="same_failure_limit_exceeded")
-        if iteration_count >= self.config.max_iterations:
+        # Reliability cleanup: max_iterations is a ceiling on being
+        # *stalled*, not on being watched at all -- a watch whose output is
+        # still actively changing (real ongoing work) must not be stopped
+        # merely because the raw poll count is high; only fire once the
+        # ceiling is reached AND this specific poll shows no progress.
+        if iteration_count >= self.config.max_iterations and not output_changed:
             return self._transition(row, now_iso, iteration_count, new_state=state, event_type="stalled",
-                                     reason=f"max_iterations ({self.config.max_iterations}) reached: {reason}",
+                                     reason=f"max_iterations ({self.config.max_iterations}) reached with no "
+                                            f"progress on this poll: {reason}",
                                      output=output, output_hash=output_hash, same_failure_count=same_failure_count,
                                      disable=True, disabled_reason="max_iterations_exceeded")
 
@@ -586,6 +601,12 @@ class SupervisorService:
 
 _ACTIVE_LOOP: "SupervisorLoop | None" = None
 _LAST_POLL_AT: list[str | None] = [None]
+# Reliability cleanup: the poll loop must never die silently from one bad
+# cycle, but a swallowed exception with zero trace was just as bad in the
+# other direction -- both the timestamp and a short, redacted-safe message
+# are tracked here so supervisor_status() can surface "the loop is alive
+# but its last cycle errored" instead of that being invisible.
+_LAST_POLL_ERROR: list[dict[str, str] | None] = [None]
 
 
 class SupervisorLoop:
@@ -625,6 +646,19 @@ class SupervisorLoop:
         while not self._stop_event.is_set():
             try:
                 self.service.run_once()
-            except Exception:
-                pass  # never let one bad poll cycle kill the background loop
+                _LAST_POLL_ERROR[0] = None  # a clean cycle clears any prior error
+            except Exception as exc:
+                # Never let one bad poll cycle kill the background loop --
+                # but never let it vanish without a trace either. Logged
+                # with a full traceback (service log/journalctl) and
+                # tracked for supervisor_status() to surface; exc's own
+                # message could in principle echo pane content through an
+                # unusual failure path, so it goes through the same
+                # sanitized_preview truncation/redaction as everything
+                # else this project persists.
+                _LOGGER.exception("supervisor: poll cycle failed, will retry next interval")
+                _LAST_POLL_ERROR[0] = {
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "error": sanitized_preview(f"{type(exc).__name__}: {exc}", 200),
+                }
             self._stop_event.wait(interval)
