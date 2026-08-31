@@ -46,8 +46,12 @@ input_policy:
 # nothing) and makes the supervisor_* tools' background timer live.
 supervisor:
   enabled: true
-  # v2 (decision/send layer) stays off by default even though v1 detection
-  # is on above -- turning this on is a deliberate, separate opt-in (see
-  # README "Supervisor Loop v2") on top of each watch's own policy_mode,
-  # which itself defaults to observe_only per watch.
-  # v2_enabled: true
+  # v2 (decision/send layer) — the global kill switch is now explicitly on,
+  # but this alone changes no observed behavior: every watch's own
+  # policy_mode still defaults to observe_only (see README "Supervisor Loop
+  # v2"), and no watch is auto-configured into suggest_only/
+  # approved_auto_continue anywhere in this file. execute_send only ever
+  # sends for a watch an operator has explicitly opted in via
+  # supervisor2_set_policy — this flag just removes the second, redundant
+  # instance-wide refusal on top of that per-watch opt-in.
+  v2_enabled: true
