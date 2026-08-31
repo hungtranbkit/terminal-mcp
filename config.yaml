@@ -1,6 +1,6 @@
 permissions:
   terminal_read: true
-  terminal_input: false
+  terminal_input: true
 
 allowed_session_patterns:
   - "claude-*"
@@ -10,6 +10,7 @@ allowed_session_patterns:
   - "mesflow-*"
   - "projectflow-*"
   - "terminal-mcp-*"
+  - "terminal-mcp"
   - "terminal"
 
 max_capture_lines: 2000
@@ -22,6 +23,8 @@ input_policy:
     - "mesflow-*"
     - "projectflow-*"
     - "terminal-mcp-*"
+    - "terminal-mcp"
+    - "terminal"
   denied_session_patterns:
     - "root*"
     - "ssh-*"
