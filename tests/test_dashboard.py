@@ -618,8 +618,10 @@ def test_dashboard_health_indicator_never_clears_last_rendered_output():
 
 def test_dashboard_health_indicator_no_new_backend_route():
     # Purely reactive to the two fetches loadSessions/loadDetail already
-    # make — no new endpoint, no extra polling path.
-    assert DASHBOARD_HTML.count("fetch(") == 3  # sessions, session detail, session/input (unchanged from before this batch)
+    # make — no new endpoint, no extra polling path added for the health
+    # indicator specifically (the two extra fetch()s below belong to the
+    # separate Supervisor Loop v1 feature's summary/ack calls).
+    assert DASHBOARD_HTML.count("fetch(") == 5  # sessions, session detail, session/input, supervisor, supervisor/ack
 
 
 def test_dashboard_fullscreen_preference_persisted_and_restored_once():
@@ -669,10 +671,12 @@ def test_dashboard_viewport_resizes_for_onscreen_keyboard():
     assert "viewport-fit=cover" in DASHBOARD_HTML  # unrelated safe-area support must survive alongside it
 
 
-def test_dashboard_supervisor_batch_no_security_route_changes(read_config):
-    # This whole batch is presentation-only: the same four routes, with the
-    # same methods, still registered — no new endpoint was added for the
-    # health indicator or any of this batch's other features.
+def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
+    # This whole batch (health indicator, remembered fullscreen, mobile input
+    # polish) is presentation-only: the same routes as before that batch,
+    # with the same methods, still registered — no new endpoint was added
+    # for it. (The two /dashboard/api/supervisor* routes below belong to the
+    # separate Supervisor Loop v1 feature, not this batch.)
     service = TerminalService(read_config)
     server = build_mcp(service)
     register_dashboard(server, service)
@@ -682,6 +686,8 @@ def test_dashboard_supervisor_batch_no_security_route_changes(read_config):
         "/dashboard/api/sessions": {"GET", "HEAD"},
         "/dashboard/api/session": {"GET", "HEAD"},
         "/dashboard/api/session/input": {"POST"},
+        "/dashboard/api/supervisor": {"GET", "HEAD"},
+        "/dashboard/api/supervisor/ack": {"POST"},
     }
 
 

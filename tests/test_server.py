@@ -22,6 +22,13 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_send_bound",
         "terminal_list_input_audit",
         "terminal_input_context",
+        "supervisor_watch",
+        "supervisor_unwatch",
+        "supervisor_list_watches",
+        "supervisor_status",
+        "supervisor_list_events",
+        "supervisor_ack_event",
+        "supervisor_run_once",
     }
 
 

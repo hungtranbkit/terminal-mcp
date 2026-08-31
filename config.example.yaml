@@ -34,3 +34,18 @@ input_policy:
   sensitive_keys_require_confirmation: [C-c, C-d]
   max_text_length: 12000
   allowed_sensitive_commands: []
+
+# Supervisor Loop v1: local detection + a durable event queue only. Disabled
+# by default — opt in explicitly. See README.md "Supervisor Loop v1" for the
+# full operator guide and the v1/v2 boundary. It never sends input and never
+# bypasses terminal_input/input_policy/binding/confirmation/audit; watches
+# only ever observe sessions/bindings that already pass the whitelist above.
+supervisor:
+  enabled: false
+  poll_interval_seconds: 20   # minimum enforced: 5 (avoids an accidental hot loop)
+  idle_threshold_seconds: 45
+  max_iterations: 20          # a watch auto-disables itself after this many polls
+  same_failure_limit: 2       # ...or after this many *identical* consecutive errors
+  event_retention: 500        # oldest events beyond this count are pruned
+  watched_session_patterns: []  # e.g. ["claude-*"] — matched against currently allowed sessions each poll
+  watched_bindings: []          # e.g. ["mesflow-dev"] — must already exist via terminal_bind

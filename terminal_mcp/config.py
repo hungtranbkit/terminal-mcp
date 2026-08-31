@@ -29,12 +29,29 @@ class InputPolicyConfig:
 
 
 @dataclass(frozen=True)
+class SupervisorConfig:
+    # Disabled by default everywhere (example, and production config.yaml
+    # unless an operator explicitly opts in) — v1 is detection/event-queue
+    # only, never autonomous, but it still runs an always-on background
+    # poll loop and that should never be silently on.
+    enabled: bool = False
+    poll_interval_seconds: int = 20
+    idle_threshold_seconds: int = 45
+    max_iterations: int = 20
+    same_failure_limit: int = 2
+    event_retention: int = 500
+    watched_session_patterns: tuple[str, ...] = ()
+    watched_bindings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class AppConfig:
     permissions: PermissionsConfig
     allowed_session_patterns: tuple[str, ...]
     max_capture_lines: int = 2000
     default_tail_lines: int = 200
     input_policy: InputPolicyConfig = InputPolicyConfig()
+    supervisor: SupervisorConfig = SupervisorConfig()
 
 
 DEFAULT_PATTERNS = ("claude-*", "codex-*", "agent-*", "test-*")
@@ -74,6 +91,32 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     if not 1 <= max_text_length <= 1_000_000:
         raise ValueError("input_policy.max_text_length must be between 1 and 1000000")
 
+    supervisor_raw = raw.get("supervisor", {})
+
+    def string_tuple_supervisor(name: str) -> tuple[str, ...]:
+        value = supervisor_raw.get(name, [])
+        if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+            raise ValueError(f"supervisor.{name} must be a list of strings")
+        return tuple(value)
+
+    poll_interval = int(supervisor_raw.get("poll_interval_seconds", 20))
+    idle_threshold = int(supervisor_raw.get("idle_threshold_seconds", 45))
+    max_iterations = int(supervisor_raw.get("max_iterations", 20))
+    same_failure_limit = int(supervisor_raw.get("same_failure_limit", 2))
+    event_retention = int(supervisor_raw.get("event_retention", 500))
+    # >=5s floor: even with enabled:true and a mistyped tiny interval, this
+    # never becomes an accidental hot loop hammering tmux/CPU.
+    if poll_interval < 5:
+        raise ValueError("supervisor.poll_interval_seconds must be at least 5")
+    if idle_threshold < 1:
+        raise ValueError("supervisor.idle_threshold_seconds must be at least 1")
+    if max_iterations < 1:
+        raise ValueError("supervisor.max_iterations must be at least 1")
+    if same_failure_limit < 1:
+        raise ValueError("supervisor.same_failure_limit must be at least 1")
+    if not 1 <= event_retention <= 100_000:
+        raise ValueError("supervisor.event_retention must be between 1 and 100000")
+
     return AppConfig(
         permissions=PermissionsConfig(
             terminal_read=bool(permissions.get("terminal_read", True)),
@@ -92,5 +135,15 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             ),
             max_text_length=max_text_length,
             allowed_sensitive_commands=string_tuple("allowed_sensitive_commands", (), allow_empty=True),
+        ),
+        supervisor=SupervisorConfig(
+            enabled=bool(supervisor_raw.get("enabled", False)),
+            poll_interval_seconds=poll_interval,
+            idle_threshold_seconds=idle_threshold,
+            max_iterations=max_iterations,
+            same_failure_limit=same_failure_limit,
+            event_retention=event_retention,
+            watched_session_patterns=string_tuple_supervisor("watched_session_patterns"),
+            watched_bindings=string_tuple_supervisor("watched_bindings"),
         ),
     )

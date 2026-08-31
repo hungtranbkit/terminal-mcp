@@ -5,11 +5,20 @@ from mcp.server.mcpserver import MCPServer
 from . import __version__
 from .config import load_config
 from .core import TerminalService
+from .supervisor import SupervisorService, SupervisorStore
 
 
-def build_mcp(service: TerminalService | None = None) -> MCPServer:
-    """Build one MCP surface over the shared, transport-independent service."""
+def build_mcp(service: TerminalService | None = None,
+              supervisor: SupervisorService | None = None) -> MCPServer:
+    """Build one MCP surface over the shared, transport-independent service.
+
+    `supervisor` is always constructed and its tools always registered
+    (supervisor_watch/status/events are just data-plane operations, useful
+    even with the background auto-poll loop disabled) — only the *automatic*
+    background thread is gated on config.supervisor.enabled, and that gating
+    happens in server_http.py, not here."""
     terminal = service or TerminalService(load_config())
+    supervisor = supervisor or SupervisorService(terminal, SupervisorStore())
     server = MCPServer(
         name="terminal-mcp",
         description="Whitelist-only tmux observation and controlled input",
@@ -96,5 +105,52 @@ def build_mcp(service: TerminalService | None = None) -> MCPServer:
                                binding: str | None = None) -> dict:
         """Inspect the last 20 lines and effective permission before sending input."""
         return terminal.terminal_input_context(session, binding)
+
+    # -- Supervisor Loop v1: detection + a durable event queue only. Never
+    # sends input, never executes a shell command; the underlying watch/poll
+    # path is the same whitelist-guarded terminal_status(_bound) above. ----
+
+    @server.tool()
+    def supervisor_watch(binding: str | None = None, session: str | None = None) -> dict:
+        """Create or re-enable a watch on an allowed binding or whitelisted session."""
+        return supervisor.watch(binding, session)
+
+    @server.tool()
+    def supervisor_unwatch(binding: str | None = None, session: str | None = None,
+                           delete: bool = False) -> dict:
+        """Disable (or, with delete=true, remove) a watch. Disabled watches stop
+        polling until explicitly re-watched."""
+        return supervisor.unwatch(binding, session, delete)
+
+    @server.tool()
+    def supervisor_list_watches() -> dict:
+        """List all watches and their current state/iteration/failure bookkeeping."""
+        return supervisor.list_watches()
+
+    @server.tool()
+    def supervisor_status() -> dict:
+        """Report whether the background poll loop is running and a summary of
+        watch states, including any stalled/disabled watches."""
+        return supervisor.status()
+
+    @server.tool()
+    def supervisor_list_events(target: str | None = None, state: str | None = None,
+                               unacknowledged_only: bool = False, limit: int = 50) -> dict:
+        """List persisted supervisor events (already redacted before storage),
+        optionally filtered by target, normalized state, or unacknowledged-only."""
+        return supervisor.list_events(target, state, unacknowledged_only, limit)
+
+    @server.tool()
+    def supervisor_ack_event(id: int) -> dict:
+        """Mark one event acknowledged. Local metadata only — never sends
+        anything to the watched session."""
+        return supervisor.ack_event(id)
+
+    @server.tool()
+    def supervisor_run_once() -> dict:
+        """Run exactly one synchronous poll pass over all enabled watches now,
+        for deterministic manual testing independent of the background loop's
+        timer."""
+        return supervisor.run_once()
 
     return server

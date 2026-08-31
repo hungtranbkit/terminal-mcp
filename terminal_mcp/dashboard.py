@@ -6,6 +6,7 @@ from starlette.responses import HTMLResponse, JSONResponse
 
 from .core import TerminalService
 from .permissions import input_session_allowed
+from .supervisor import SupervisorService, SupervisorStore
 
 
 INPUT_ERROR_STATUS = {
@@ -40,6 +41,26 @@ DASHBOARD_HTML = """<!doctype html>
     header { flex:0 0 auto; display:flex; justify-content:space-between; gap:16px; align-items:center; padding:22px 28px; border-bottom:1px solid var(--line) }
     h1 { margin:0; font-size:20px } .muted { color:var(--muted) } .live { color:var(--green) }
     .live.reconnecting { color:var(--amber) } .live.offline { color:#ff6b6b }
+    .header-right { display:flex; align-items:center; gap:10px }
+    /* Compact by default (hidden entirely — see JS — when there are zero
+       watches, so a supervisor.enabled:false deployment shows nothing extra
+       at all); only turns amber/noticeable when something actually needs
+       attention, otherwise a quiet muted count. */
+    .supervisor-badge { background:transparent; border:1px solid var(--line); color:var(--muted); border-radius:999px; padding:4px 10px; font:12px var(--mono); cursor:pointer; white-space:nowrap }
+    .supervisor-badge.attention { border-color:var(--amber); color:var(--amber) }
+    #supervisorPanel { display:none; position:fixed; right:16px; top:64px; z-index:25; width:min(360px, calc(100vw - 32px)); max-height:70vh; overflow:auto; background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 20px 50px rgba(0,0,0,.6) }
+    body.supervisor-visible #supervisorPanel { display:block }
+    body.supervisor-visible #supervisorBackdrop { display:block; position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:20 }
+    #supervisorPanel .sp-head { padding:12px 14px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center }
+    #supervisorPanel .sp-counts { display:flex; flex-wrap:wrap; gap:6px; padding:10px 14px }
+    #supervisorPanel .sp-count { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted) }
+    #supervisorPanel .sp-count.nonzero { color:var(--text); border-color:#344360 }
+    #supervisorPanel .sp-count.attn { color:var(--amber); border-color:var(--amber) }
+    #supervisorPanel .sp-events { padding:0 14px 12px }
+    #supervisorPanel .sp-event { padding:8px 0; border-top:1px solid var(--line); font-size:12px }
+    #supervisorPanel .sp-event .sp-target { font-weight:700 }
+    #supervisorPanel .sp-event button { margin-top:4px; background:#19243b; border:1px solid var(--line); color:var(--text); border-radius:6px; padding:3px 8px; font:11px var(--mono); cursor:pointer }
+    #supervisorPanel .sp-empty { padding:10px 14px; color:var(--muted); font-size:12px }
     /* Last-rendered output stays visible while disconnected (never cleared),
        just visibly dimmed so it reads as "maybe stale", not "still live". */
     #output.stale { opacity:.55 }
@@ -118,6 +139,9 @@ DASHBOARD_HTML = """<!doctype html>
       h1 { font-size:15px }
       header .muted { font-size:10px; line-height:1.25 }
       header .live { font-size:11px }
+      .header-right { gap:6px }
+      .supervisor-badge { padding:3px 8px; font-size:10px }
+      #supervisorPanel { top:52px; right:8px; width:min(320px, calc(100vw - 16px)) }
       #summary {
         padding:8px 12px; font-size:12px; line-height:1.3;
         display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden;
@@ -210,7 +234,13 @@ DASHBOARD_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <header><div><h1>Terminal MCP</h1><div class="muted">Whitelisted tmux session monitor</div></div><div><span class="live" id="liveBadge">● LIVE</span></div></header>
+  <header>
+    <div><h1>Terminal MCP</h1><div class="muted">Whitelisted tmux session monitor</div></div>
+    <div class="header-right">
+      <button id="supervisorBadge" class="supervisor-badge" type="button" hidden></button>
+      <span class="live" id="liveBadge">● LIVE</span>
+    </div>
+  </header>
   <main>
     <section class="panel" id="sessionsPanel"><div class="panel-title">SESSIONS <span id="count"></span></div><div id="sessions"></div></section>
     <section class="panel detail">
@@ -248,6 +278,15 @@ DASHBOARD_HTML = """<!doctype html>
     </section>
   </main>
   <div id="sidebarBackdrop"></div>
+  <div id="supervisorBackdrop"></div>
+  <div id="supervisorPanel">
+    <div class="sp-head">
+      <strong>Supervisor</strong>
+      <button id="supervisorCloseBtn" class="term-btn" type="button">✕</button>
+    </div>
+    <div class="sp-counts" id="supervisorCounts"></div>
+    <div class="sp-events" id="supervisorEvents"></div>
+  </div>
   <script>
     let selected = null;
     let inputAllowed = false;
@@ -259,6 +298,12 @@ DASHBOARD_HTML = """<!doctype html>
     const outputEl = document.querySelector('#output');
     const summaryEl = document.querySelector('#summary');
     const liveBadgeEl = document.querySelector('#liveBadge');
+    const supervisorBadgeEl = document.querySelector('#supervisorBadge');
+    const supervisorPanelEl = document.querySelector('#supervisorPanel');
+    const supervisorBackdropEl = document.querySelector('#supervisorBackdrop');
+    const supervisorCountsEl = document.querySelector('#supervisorCounts');
+    const supervisorEventsEl = document.querySelector('#supervisorEvents');
+    const supervisorCloseBtnEl = document.querySelector('#supervisorCloseBtn');
     const termTitleEl = document.querySelector('#termTitle');
     const followToggleEl = document.querySelector('#followToggle');
     const jumpBtnEl = document.querySelector('#jumpBtn');
@@ -294,6 +339,89 @@ DASHBOARD_HTML = """<!doctype html>
     }
     sessionsToggleEl.onclick = () => { sidebarForcedOpen = !sidebarForcedOpen; updateSidebarVisibility(); };
     sidebarBackdropEl.onclick = () => { sidebarForcedOpen = false; updateSidebarVisibility(); };
+
+    // ---- Supervisor Loop v1 summary (compact badge + overlay panel) -------
+    // Read-only from this page's point of view: the badge/panel only ever
+    // render what GET /dashboard/api/supervisor returns (the same
+    // whitelist-guarded watch/event data the supervisor_* MCP tools expose)
+    // and the only write path is "ack one event", which is local metadata
+    // only — see the ack handler below, it never touches a tmux session.
+    let supervisorVisible = false;
+    const SUPERVISOR_STATE_ORDER = ['RUNNING', 'WAITING_INPUT', 'DONE', 'ERROR', 'IDLE', 'UNKNOWN'];
+    function toggleSupervisorPanel(open) {
+      supervisorVisible = open;
+      document.body.classList.toggle('supervisor-visible', open);
+    }
+    supervisorBadgeEl.onclick = () => toggleSupervisorPanel(!supervisorVisible);
+    supervisorCloseBtnEl.onclick = () => toggleSupervisorPanel(false);
+    supervisorBackdropEl.onclick = () => toggleSupervisorPanel(false);
+
+    async function ackSupervisorEvent(id) {
+      try {
+        await fetch('/dashboard/api/supervisor/ack', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id}),
+        });
+      } catch (error) { /* best-effort; next refresh reconciles either way */ }
+      await loadSupervisor();
+    }
+
+    async function loadSupervisor() {
+      let data;
+      try {
+        const response = await fetch('/dashboard/api/supervisor', {cache: 'no-store'});
+        data = await response.json();
+      } catch (error) {
+        return; // connection health is already surfaced by the LIVE/RECONNECTING badge
+      }
+      const status = data.status || {}; const events = data.events || [];
+      const counts = status.state_counts || {};
+      const attentionCount = (counts.WAITING_INPUT || 0) + (counts.ERROR || 0) + (status.stalled_count || 0);
+
+      // Zero watches at all (e.g. supervisor.enabled:false and nobody has
+      // called supervisor_watch) -> no badge, nothing extra on screen.
+      if (!status.watch_count) {
+        supervisorBadgeEl.hidden = true;
+        if (supervisorVisible) toggleSupervisorPanel(false);
+        return;
+      }
+      supervisorBadgeEl.hidden = false;
+      supervisorBadgeEl.classList.toggle('attention', attentionCount > 0);
+      supervisorBadgeEl.textContent = attentionCount > 0
+        ? `🛰 ${attentionCount} needs attention` : `🛰 ${status.enabled_watch_count} watched`;
+
+      supervisorCountsEl.replaceChildren();
+      for (const state of SUPERVISOR_STATE_ORDER) {
+        const count = counts[state] || 0;
+        const chip = document.createElement('span');
+        chip.className = 'sp-count' + (count > 0 ? ' nonzero' : '') + ((state === 'WAITING_INPUT' || state === 'ERROR') && count > 0 ? ' attn' : '');
+        chip.textContent = `${state.replace('_', ' ')}: ${count}`;
+        supervisorCountsEl.append(chip);
+      }
+      if (status.stalled_count) {
+        const chip = document.createElement('span');
+        chip.className = 'sp-count attn';
+        chip.textContent = `STALLED: ${status.stalled_count}`;
+        supervisorCountsEl.append(chip);
+      }
+
+      supervisorEventsEl.replaceChildren();
+      if (!events.length) {
+        const empty = document.createElement('div');
+        empty.className = 'sp-empty'; empty.textContent = 'No unacknowledged events.';
+        supervisorEventsEl.append(empty);
+      }
+      for (const event of events) {
+        const row = document.createElement('div'); row.className = 'sp-event';
+        const target = document.createElement('div'); target.className = 'sp-target';
+        target.textContent = `${clean(event.target)} · ${clean(event.state)}`;
+        const reason = document.createElement('div'); reason.className = 'muted';
+        reason.textContent = clean(event.reason);
+        const ackBtn = document.createElement('button'); ackBtn.type = 'button'; ackBtn.textContent = 'Ack';
+        ackBtn.onclick = () => ackSupervisorEvent(event.id);
+        row.append(target, reason, ackBtn);
+        supervisorEventsEl.append(row);
+      }
+    }
 
     // ---- minimal ANSI (SGR colour/style) renderer -------------------------
     // tmux `capture-pane -e` re-serializes its own already-resolved terminal
@@ -744,6 +872,7 @@ DASHBOARD_HTML = """<!doctype html>
     async function refresh() {
       try {
         await loadSessions(); await loadDetail(); setConnectionState(true);
+        await loadSupervisor(); // independent of session connectivity above; never affects the LIVE/RECONNECTING badge
         if (!fullscreenRestoreAttempted) {
           fullscreenRestoreAttempted = true;
           if (selected && recalledFullscreen()) setFullscreen(true, { persist: false });
@@ -756,7 +885,10 @@ DASHBOARD_HTML = """<!doctype html>
 </html>"""
 
 
-def register_dashboard(server: MCPServer, terminal: TerminalService) -> None:
+def register_dashboard(server: MCPServer, terminal: TerminalService,
+                       supervisor: SupervisorService | None = None) -> None:
+    if supervisor is None:
+        supervisor = SupervisorService(terminal, SupervisorStore())
     @server.custom_route("/dashboard", methods=["GET"], include_in_schema=False)
     async def dashboard(_: Request) -> HTMLResponse:
         return HTMLResponse(
@@ -828,4 +960,29 @@ def register_dashboard(server: MCPServer, terminal: TerminalService) -> None:
         status_code = 200
         if "error" in result:
             status_code = INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/supervisor", methods=["GET"], include_in_schema=False)
+    async def supervisor_summary(_: Request) -> JSONResponse:
+        # Read-only: reuses the same SupervisorService the MCP tools use, so
+        # the dashboard can never see anything a supervisor_* tool call
+        # couldn't already show (same whitelist-guarded watch data).
+        status = supervisor.status()
+        events = supervisor.list_events(unacknowledged_only=True, limit=20)["events"]
+        return JSONResponse({"status": status, "events": events}, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/supervisor/ack", methods=["POST"], include_in_schema=False)
+    async def supervisor_ack(request: Request) -> JSONResponse:
+        # Simple safe local metadata action only: this only ever calls
+        # SupervisorStore.ack_event, which just stamps acknowledged_at in
+        # SQLite. No terminal_send/tmux call is reachable from this route.
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        event_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(event_id, int):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        result = supervisor.ack_event(event_id)
+        status_code = 404 if "error" in result else 200
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})

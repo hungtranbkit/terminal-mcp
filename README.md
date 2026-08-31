@@ -155,6 +155,11 @@ Restart the MCP child process after changing configuration. Enabling input lets 
 - `terminal_tail_bound`
 - `terminal_status_bound`
 - `terminal_send_bound`
+- `terminal_list_input_audit`
+- `terminal_input_context`
+- `supervisor_watch`, `supervisor_unwatch`, `supervisor_list_watches`,
+  `supervisor_status`, `supervisor_list_events`, `supervisor_ack_event`,
+  `supervisor_run_once` — see "Supervisor Loop v1" below
 
 ## Chat ↔ tmux logical binding
 
@@ -236,8 +241,113 @@ stores the full text's SHA-256, length, and a short redacted preview—never the
 full prompt. `terminal_list_input_audit` returns sanitized metadata and supports
 binding/session filters.
 
-Safe Input does not add an arbitrary command, file-read, scheduler, or supervisor
-facility. Input cannot bypass the session policy, and panes whose current command
-is `ssh`, `mysql`, `psql`, `sudo`, or `passwd` are denied unless locally allowed.
+Safe Input does not add an arbitrary command or file-read facility. Input cannot
+bypass the session policy, and panes whose current command is `ssh`, `mysql`,
+`psql`, `sudo`, or `passwd` are denied unless locally allowed. (Supervisor Loop
+v1, below, is a separate, detection-only facility — it never calls
+`terminal_send_text`/`terminal_send_keys` itself.)
 - tmux sessions must run under the same Unix user as Terminal MCP.
+
+## Supervisor Loop v1
+
+**What v1 solves:** local, automatic detection of a watched session/binding
+transitioning into a state that needs attention (waiting for input, an error,
+or a defensible completion signal), persisted as a durable, queryable event —
+so a human (or a future automation) doesn't have to keep polling by hand.
+
+**What v1 deliberately does not do:** it never sends text/keys to a watched
+session, never executes a shell command, and never bypasses
+`terminal_input`/`input_policy`/binding/confirmation/audit — those gates are
+completely unchanged. It also does not itself wake up or message ChatGPT; see
+"v2" below for what's still needed for that.
+
+Disabled by default. Enable in `config.yaml`:
+
+```yaml
+supervisor:
+  enabled: true
+  poll_interval_seconds: 20   # minimum enforced: 5
+  idle_threshold_seconds: 45
+  max_iterations: 20          # a watch auto-disables itself after this many polls
+  same_failure_limit: 2       # ...or after this many *identical* consecutive errors
+  event_retention: 500
+  watched_session_patterns: ["claude-*"]   # matched against currently allowed sessions each poll
+  watched_bindings: ["mesflow-dev"]        # must already exist via terminal_bind
+```
+
+Restart `terminal-mcp-http` after changing `supervisor.enabled` — the background
+poll thread is only started (as a daemon thread inside that process) when it is
+`true`, and only for the HTTP service (not the per-client STDIO server, which
+would start/stop a loop with every client connection). One loop per process;
+`supervisor_status` reports whether it is actually running.
+
+Watches can also be created dynamically at any time via `supervisor_watch`,
+independent of the config-seeded patterns/bindings above, and work even with
+`supervisor.enabled: false` (only the automatic timer is gated — the tools
+themselves, including `supervisor_run_once` for a single manual/deterministic
+pass, are always available). A watch can never be created for, or continue
+polling, a session outside the existing whitelist.
+
+**State machine.** Reuses `classify_status()` (the same heuristic
+`terminal_status` already applies) for `RUNNING`/`IDLE`/`WAITING_INPUT`/
+`UNKNOWN`, and layers two more states on top from explicit evidence only:
+`DONE` (an explicit completion marker — never inferred from ordinary silence,
+which maps to `IDLE` via `idle_threshold_seconds` instead) and `ERROR` (a
+traceback/fatal/exit-code-style marker). An event is persisted only on a
+*meaningful transition* — identical repeated state/output is deduplicated,
+never re-alerted.
+
+**Stop policy.** A watch auto-disables itself (an event with
+`event_type: "stalled"` is recorded) when either limit is hit, and stays
+disabled until explicitly resumed (call `supervisor_watch` again for the same
+target):
+- `same_failure_limit` — the same `ERROR` with unchanged output repeats this
+  many times in a row.
+- `max_iterations` — a hard poll-count ceiling per watch, regardless of state.
+
+A denied, since-excluded, or vanished session/binding emits
+`event_type: "watch_target_missing"` and also auto-disables the watch rather
+than retrying it.
+
+**Event types:** `state_changed`, `attention_required` (entering
+`WAITING_INPUT`), `completed` (entering `DONE`), `error_detected` (entering
+`ERROR`), `stalled`, `watch_target_missing`.
+
+**Event schema** (also in `terminal_mcp/supervisor.py`'s `EVENT_SCHEMA_VERSION`
+docstring — the stable JSON shape a future v2 webhook forwarder can build
+against):
+
+```json
+{
+  "schema_version": 1, "id": 1, "timestamp": "2026-...Z",
+  "watch_key": "session:claude-mesflow", "kind": "session", "target": "claude-mesflow",
+  "previous_state": "RUNNING", "state": "WAITING_INPUT",
+  "event_type": "attention_required",
+  "reason": "recent prompt matched ... at bottom offset 0",
+  "output_preview": "Do you want to continue? [y/N]",
+  "output_hash": "sha256...", "iteration_count": 3,
+  "acknowledged_at": null, "metadata": {"source": "manual"}
+}
+```
+
+`output_preview` is redacted (the same `redact_text`) and truncated *before*
+it is ever written to SQLite — never the full/raw pane output.
+
+Persisted in SQLite at `~/.local/state/terminal-mcp/supervisor.db` (or
+`TERMINAL_MCP_SUPERVISOR_DB`), same pattern as `bindings.db`/`audit.db`: a
+`watches` table (state/iteration/failure bookkeeping per target) and a
+`supervisor_events` table.
+
+The dashboard shows a compact "🛰" badge (hidden entirely when there are zero
+watches) with per-state counts and unacknowledged events in a small overlay
+panel; acknowledging an event from there only stamps `acknowledged_at` in
+SQLite — it is not a terminal-input path.
+
+**v2 (not built here):** an external wake-up — a webhook/relay that notices a
+newly queued `attention_required`/`error_detected` event via
+`supervisor_list_events(unacknowledged_only=true)` (or a future push
+mechanism) — invoking ChatGPT with a human-reviewed, approved prompt, and
+only then (through the existing, unchanged Safe Input path) sending it. v1
+intentionally stops at "detect and queue"; no insecure outbound callback is
+implemented here.
 # terminal-mcp
