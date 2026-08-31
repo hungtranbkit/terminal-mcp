@@ -701,3 +701,59 @@ def test_dashboard_supervisor_batch_input_route_still_gated(read_config):
     response = client.post("/dashboard/api/session/input", json={"name": "test-x", "text": "hi"})
     assert response.status_code == 403
     assert response.json()["error"] == "INPUT_DISABLED"
+
+
+# ---------------------------------------------------------------------------
+# Near-edge mobile layout + fullscreen/state persistence across orientation
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_mobile_media_query_matches_landscape_phones_too():
+    # A phone rotated to landscape can exceed 760px of *width* (e.g. 852px
+    # on an iPhone 15 Pro) while its height stays well under 760px. The
+    # mobile breakpoint must match on either axis, or the whole mobile
+    # block -- including every body.fullscreen-terminal rule -- silently
+    # stops applying mid-rotation even though the JS fullscreen state
+    # (and selected session, auto-follow, font size) never changed.
+    assert "@media (max-width:760px), (max-height:760px)" in DASHBOARD_HTML
+    # Only the one, combined mobile query should exist -- a second,
+    # narrower @media block would be exactly the kind of orientation trap
+    # this fixes if introduced by accident.
+    assert DASHBOARD_HTML.count("@media") == 1
+
+
+def test_dashboard_fullscreen_rules_live_inside_the_orientation_safe_query():
+    # body.fullscreen-terminal's chrome-hiding rules must be inside the
+    # combined (width OR height) query, not a width-only one, or fullscreen
+    # visually "exits" (header/sidebar reappear) on rotation to landscape.
+    media_start = DASHBOARD_HTML.index("@media (max-width:760px), (max-height:760px)")
+    mobile_css = DASHBOARD_HTML[media_start:]
+    assert "body.fullscreen-terminal header," in mobile_css
+    assert "body.fullscreen-terminal main { padding:0; gap:0 }" in mobile_css
+
+
+def test_dashboard_selected_session_runs_near_edge_to_edge_on_mobile():
+    media_start = DASHBOARD_HTML.index("@media (max-width:760px), (max-height:760px)")
+    mobile_css = DASHBOARD_HTML[media_start:]
+    assert "body.has-selection main { gap:6px;" in mobile_css
+    # Still safe-area aware -- never flush under a notch/home-indicator.
+    assert "env(safe-area-inset-left)" in mobile_css.split("body.has-selection main", 1)[1][:200]
+    # The actual output area's own font-size/padding is untouched by this
+    # change -- only the empty margin around the panel shrinks.
+    assert "#output { font-size:11.5px; line-height:1.3; padding:10px 12px }" in mobile_css
+
+
+def test_dashboard_orientation_resize_never_touches_persisted_ui_state():
+    # Rotating/resizing must re-snap scroll when auto-follow is on (the
+    # same pattern already used for the fullscreen-toggle transition) but
+    # must never write to any of the localStorage-backed UI state keys --
+    # fullscreen/session/font-size all stay exactly as they were.
+    assert "window.addEventListener('resize', () => {" in DASHBOARD_HTML
+    assert "window.addEventListener('orientationchange', () => {" in DASHBOARD_HTML
+    resize_start = DASHBOARD_HTML.index("window.addEventListener('resize'")
+    orientation_start = DASHBOARD_HTML.index("window.addEventListener('orientationchange'")
+    resize_body = DASHBOARD_HTML[resize_start:resize_start + 200]
+    orientation_body = DASHBOARD_HTML[orientation_start:orientation_start + 200]
+    for body in (resize_body, orientation_body):
+        assert "outputEl.scrollTop = outputEl.scrollHeight" in body
+        assert "localStorage.setItem" not in body

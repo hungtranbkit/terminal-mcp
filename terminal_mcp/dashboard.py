@@ -142,7 +142,17 @@ DASHBOARD_HTML = """<!doctype html>
     #inputBar label { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:12px; white-space:nowrap }
     #inputNote { padding:6px 16px 0; font-size:12px; color:var(--muted) }
     #inputNote.error { color:#ff6b6b }
-    @media (max-width:760px) {
+    /* Matched on EITHER dimension, not just width: a phone rotated to
+       landscape can easily exceed 760px of width (e.g. 852px on an iPhone
+       15 Pro) while its height drops well under 760px, and a naive
+       max-width-only query would stop applying mid-rotation — silently
+       restoring the desktop header/sidebar/padding and, worse, dropping
+       every body.fullscreen-terminal rule below (all scoped to this same
+       query) even though the JS fullscreen state never changed. Matching
+       on max-height too means a phone stays "mobile" in both orientations,
+       while a real desktop/tablet (comfortably over 760px on both axes)
+       is unaffected either way. */
+    @media (max-width:760px), (max-height:760px) {
       /* Substantially smaller top chrome so the terminal gets the space:
          tighter header (title/subtitle/LIVE badge shrink together) and a
          compact, line-clamped session-status card instead of the
@@ -213,6 +223,17 @@ DASHBOARD_HTML = """<!doctype html>
          essentially the full viewport. */
       main { padding-left:max(18px, env(safe-area-inset-left)); padding-right:max(18px, env(safe-area-inset-right)); padding-bottom:max(18px, env(safe-area-inset-bottom)) }
       header { padding-top:max(8px, env(safe-area-inset-top)) }
+      /* Once a session is open, the terminal panel IS the screen (the
+         sidebar is a floating drawer, not a sibling taking up column
+         space — see has-selection above) — so the generous desktop-style
+         18px outer gutter around it is wasted width on a phone. Shrink it
+         to a thin edge (still safe-area aware, never under it) without
+         touching #output's own padding/font-size, so the actual output
+         area is unchanged — only the empty margin around the panel
+         shrinks. Deliberately not applied before a session is selected,
+         so the sessions list keeps its normal comfortable padding. */
+      body.has-selection main { gap:6px; padding:max(6px, env(safe-area-inset-top)) max(6px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left)) }
+      body.has-selection .panel.detail { border-radius:8px }
 
       /* ---- fullscreen terminal mode ---------------------------------- */
       /* Hides every non-terminal chrome element (header, status card,
@@ -779,6 +800,20 @@ DASHBOARD_HTML = """<!doctype html>
     });
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape' && fullscreenTerminal) setFullscreen(false);
+    });
+    // Orientation change / resize (e.g. rotating a phone) never touches
+    // fullscreenTerminal, the selected session, auto-follow, or the
+    // remembered font size — none of that JS state is viewport-derived, so
+    // there is nothing to "restore" here. The one real side effect of a
+    // rotation is exactly like the fullscreen-toggle case just above:
+    // #output's clientHeight changes size without moving scrollTop, so
+    // re-snap to the bottom whenever still auto-following (a paused view
+    // deliberately keeps its scroll position through a rotation too).
+    window.addEventListener('resize', () => {
+      if (autoFollow) outputEl.scrollTop = outputEl.scrollHeight;
+    });
+    window.addEventListener('orientationchange', () => {
+      if (autoFollow) outputEl.scrollTop = outputEl.scrollHeight;
     });
     outputEl.addEventListener('scroll', () => {
       // A manual scroll away from the bottom pauses auto-follow so it is
