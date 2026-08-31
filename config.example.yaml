@@ -1,0 +1,15 @@
+permissions:
+  terminal_read: true
+  terminal_input: false
+
+allowed_session_patterns:
+  - "claude-*"
+  - "codex-*"
+  - "agent-*"
+  - "test-*"
+  - "mesflow-*"
+  - "projectflow-*"
+  - "terminal-mcp-*"
+
+max_capture_lines: 2000
+default_tail_lines: 200

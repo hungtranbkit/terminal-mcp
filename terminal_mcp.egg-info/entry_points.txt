@@ -1,0 +1,3 @@
+[console_scripts]
+terminal-mcp = terminal_mcp.server:main
+terminal-mcp-http = terminal_mcp.server_http:main

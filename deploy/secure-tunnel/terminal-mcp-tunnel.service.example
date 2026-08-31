@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenAI Secure MCP Tunnel for Terminal MCP
+After=network-online.target terminal-mcp-http.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/terminal-mcp/tunnel.env
+ExecStart=%h/.local/bin/tunnel-client run --profile terminal-mcp
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
