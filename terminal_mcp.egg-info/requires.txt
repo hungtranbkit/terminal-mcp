@@ -1,5 +1,0 @@
-mcp<3,>=2.1
-PyYAML<7,>=6
-
-[test]
-pytest<10,>=9

@@ -1,0 +1,38 @@
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Local configuration and credentials
+.env
+*.env
+!.env.example
+!*.env.example
+tunnel.env
+*tunnel*credential*
+*credentials*.json
+*.pem
+*.key
+
+# Runtime state, databases, and logs
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.log
+run/
+runtime/
+state/
+.terminal-mcp/
+
+# Editor and OS-local files
+.DS_Store
+.idea/
+.vscode/
+*.swp
