@@ -58,7 +58,7 @@ class TmuxClient:
     def get_session(self, name: str) -> SessionInfo | None:
         return next((item for item in self.list_sessions() if item.name == name), None)
 
-    def capture_lines(self, session: str, lines: int) -> list[str]:
+    def capture_lines(self, session: str, lines: int, *, ansi: bool = False) -> list[str]:
         """Return at most `lines` of the most recent real content from the pane.
 
         tmux's `-S`/`-E` addressing is relative to the visible pane, not a
@@ -71,9 +71,21 @@ class TmuxClient:
         the result to the requested count so callers get exactly the N most
         recent real lines — or fewer, if the session hasn't produced that
         much output yet — regardless of pane geometry.
+
+        `ansi=True` adds tmux's `-e`, which includes the SGR (colour/style)
+        escape sequences tmux's own terminal emulation has already resolved
+        for each cell — not raw, unprocessed program output, so this never
+        introduces cursor-movement or other control sequences, only `ESC [
+        ... m` runs. Defaults to False so every existing caller (terminal_tail,
+        terminal_capture, terminal_status) is completely unaffected; only the
+        dashboard's terminal-style renderer opts in.
         """
         lines = max(1, lines)
-        result = self._run(["capture-pane", "-p", "-J", "-S", f"-{lines}", "-t", session])
+        args = ["capture-pane", "-p", "-J"]
+        if ansi:
+            args.append("-e")
+        args += ["-S", f"-{lines}", "-t", session]
+        result = self._run(args)
         captured = result.stdout.rstrip("\n").splitlines()
         return captured[-lines:]
 

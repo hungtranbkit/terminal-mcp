@@ -73,6 +73,60 @@ def test_capture_lines_returns_all_available_when_fewer_than_requested(tmux_sess
     assert result == ["only-line"]
 
 
+def test_capture_lines_ansi_true_preserves_escapes_default_strips_them(tmux_session_factory):
+    # Real ANSI color output from an actual program, captured through tmux.
+    session = tmux_session_factory(
+        "test-ansi-capture",
+        "bash -lc 'printf \"\\x1b[31mERROR\\x1b[0m plain\\n\"; sleep 15'",
+    )
+    time.sleep(0.3)
+    client = TmuxClient()
+
+    plain = client.capture_lines(session, 10)  # default: ansi=False, unchanged behavior
+    colored = client.capture_lines(session, 10, ansi=True)
+
+    joined_plain = "\n".join(plain)
+    joined_colored = "\n".join(colored)
+    assert "\x1b[" not in joined_plain
+    assert "ERROR" in joined_plain
+    assert "\x1b[" in joined_colored
+    assert "ERROR" in joined_colored
+
+
+def test_terminal_tail_default_is_byte_identical_regardless_of_ansi_output(read_config, tmux_session_factory):
+    # The MCP-facing contract (ChatGPT/Claude call terminal_tail with no
+    # `ansi` kwarg) must stay exactly as before this feature: no escape
+    # sequences ever leak into it, even when the pane really has color.
+    session = tmux_session_factory(
+        "test-mcp-tail-plain",
+        "bash -lc 'printf \"\\x1b[32mBUILD OK\\x1b[0m\\n\"; sleep 15'",
+    )
+    time.sleep(0.3)
+    service = TerminalService(read_config)
+    result = service.terminal_tail(session, 10)
+    assert "\x1b[" not in result["output"]
+    assert "BUILD OK" in result["output"]
+
+
+def test_terminal_tail_ansi_redacts_secret_even_when_colored(tmux_session_factory):
+    # End-to-end: a real tmux session prints a secret wrapped in real ANSI
+    # color codes; the ansi=True path (used by the dashboard) must still
+    # redact it, same as the security regression already covered at the
+    # redaction-function level in test_redaction.py.
+    session = tmux_session_factory(
+        "test-ansi-redact",
+        "bash -lc 'printf \"OPENAI_API_KEY=sk-\\x1b[31mlivesecretvalue1234567890\\x1b[0m\\n\"; sleep 15'",
+    )
+    time.sleep(0.3)
+    config = AppConfig(PermissionsConfig(True, False), ("test-*",), 50, 20)
+    service = TerminalService(config)
+    result = service.terminal_tail(session, 10, ansi=True)
+    assert "livesecretvalue1234567890" not in result["output"]
+    assert "<REDACTED>" in result["output"]
+    # Whitelist is unaffected by the ansi flag: a disallowed session is still denied.
+    assert service.terminal_tail("private-ansi-session", 10, ansi=True)["error"] == "ACCESS_DENIED"
+
+
 def test_real_tmux_binding_remap_missing_and_cleanup(read_config, tmux_session_factory, tmp_path):
     tmux_session_factory("test-bind-claude", "bash -lc 'echo BOUND_A_READY; sleep 10'")
     tmux_session_factory("test-bind-codex", "bash -lc 'echo BOUND_B_READY; sleep 10'")

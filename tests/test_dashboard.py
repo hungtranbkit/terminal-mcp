@@ -37,6 +37,46 @@ def test_dashboard_auto_scrolls_output_to_newest_line():
     assert "outputEl.scrollTop = outputEl.scrollHeight" in DASHBOARD_HTML
 
 
+def test_dashboard_renders_ansi_via_dom_only():
+    # The terminal-style renderer must build styled runs with real DOM APIs
+    # (never string concatenation into markup) and must handle SGR colour
+    # codes specifically, since that's exactly what tmux `capture-pane -e`
+    # emits (see terminal_mcp/tmux.py).
+    assert "createElement('span')" in DASHBOARD_HTML
+    assert "span.textContent = run.t" in DASHBOARD_HTML
+    assert "CSI_RE" in DASHBOARD_HTML and "\\x1b\\[" in DASHBOARD_HTML
+    assert "innerHTML" not in DASHBOARD_HTML
+
+
+def test_dashboard_has_terminal_style_presentation():
+    # Dark, monospace, terminal-pane look (not the plain <pre> block it was).
+    assert "--term-bg" in DASHBOARD_HTML
+    assert "var(--mono)" in DASHBOARD_HTML
+    assert "white-space:pre-wrap" in DASHBOARD_HTML
+
+
+def test_dashboard_has_follow_pause_and_jump_controls():
+    # Explicit UX controls, plus the implicit near-bottom auto-pause/resume
+    # that keeps a manual scroll-up from being forcibly pulled back down.
+    assert 'id="followToggle"' in DASHBOARD_HTML
+    assert 'id="jumpBtn"' in DASHBOARD_HTML
+    assert "Auto-follow: ON" in DASHBOARD_HTML
+    assert "Auto-follow: PAUSED" in DASHBOARD_HTML
+    assert "function nearBottom(el)" in DASHBOARD_HTML
+    assert "outputEl.addEventListener('scroll'" in DASHBOARD_HTML
+    # Jump-to-latest always re-arms follow and snaps down, regardless of
+    # current scroll position.
+    assert "jumpBtnEl.onclick = () => { setAutoFollow(true); outputEl.scrollTop = outputEl.scrollHeight; };" in DASHBOARD_HTML
+
+
+def test_dashboard_keeps_session_status_display():
+    # RUNNING / WAITING_INPUT / etc. and its reason must still be shown above
+    # the terminal pane — this redesign only touches the output viewer.
+    assert "data.status.state" in DASHBOARD_HTML
+    assert "data.status.reason" in DASHBOARD_HTML
+    assert "state-WAITING_INPUT" in DASHBOARD_HTML
+
+
 def test_session_detail_tail_is_bounded_recent_and_chronological(read_config, tmux_session_factory):
     # Enough lines that the visible pane + config's default_tail_lines window
     # (see conftest.py) can't possibly cover the whole thing, so a truly
@@ -158,3 +198,50 @@ def test_session_detail_reports_input_allowed(input_config, tmux_session_factory
     response = client.get(f"/dashboard/api/session?name={session}")
     assert response.status_code == 200
     assert response.json()["input_allowed"] is True
+
+
+def test_session_detail_preserves_real_ansi_color(read_config, tmux_session_factory):
+    # The route now requests ansi=True: real color output from the pane must
+    # reach the JSON response as raw SGR escape sequences for the renderer
+    # to parse, not stripped plain text.
+    session = tmux_session_factory(
+        "test-tail-ansi-route",
+        "bash -lc 'printf \"\\x1b[32mBUILD OK\\x1b[0m\\n\"; sleep 30'",
+    )
+    client, _ = _client(read_config)
+    output = client.get(f"/dashboard/api/session?name={session}").json()["tail"]["output"]
+    assert "\x1b[" in output
+    assert "BUILD OK" in output
+
+
+def test_session_detail_redacts_secret_even_when_colored(read_config, tmux_session_factory):
+    # Note: the session name deliberately avoids "secret"/"password"/etc. —
+    # those trigger a separate, stricter sensitive-session-name whitelist rule
+    # (see terminal_mcp/permissions.py) unrelated to what this test covers.
+    session = tmux_session_factory(
+        "test-tail-ansi-key",
+        "bash -lc 'printf \"OPENAI_API_KEY=sk-\\x1b[31mlivesecretvalue1234567890\\x1b[0m\\n\"; sleep 30'",
+    )
+    client, _ = _client(read_config)
+    output = client.get(f"/dashboard/api/session?name={session}").json()["tail"]["output"]
+    assert "livesecretvalue1234567890" not in output
+    assert "<REDACTED>" in output
+
+
+def test_session_detail_ansi_still_enforces_whitelist():
+    # Security regression: the ansi=True path is a rendering detail, not a
+    # second, less-guarded read path — an unlisted session is still denied.
+    client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 50, 20))
+    response = client.get("/dashboard/api/session?name=private-ansi")
+    assert response.status_code == 403
+    assert response.json()["error"] == "ACCESS_DENIED"
+
+
+def test_session_detail_ansi_read_only_input_route_unaffected(read_config):
+    # The output viewer stays read-only by default: with terminal_input
+    # disabled (read_config), the separate input route still refuses to send,
+    # unchanged by anything in this redesign.
+    client, _ = _client(read_config)
+    response = client.post("/dashboard/api/session/input", json={"name": "test-x", "text": "hi"})
+    assert response.status_code == 403
+    assert response.json()["error"] == "INPUT_DISABLED"

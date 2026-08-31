@@ -16,7 +16,7 @@ class FakeTmux:
             return None
         return SessionInfo(name, False, 1, 1, 1, 123, "bash", False)
 
-    def capture_lines(self, session: str, lines: int) -> list[str]:
+    def capture_lines(self, session: str, lines: int, *, ansi: bool = False) -> list[str]:
         if session not in self.sessions:
             from terminal_mcp.tmux import TmuxError
             raise TmuxError("missing")

@@ -7,7 +7,7 @@ from .bindings import Binding, BindingStore, valid_binding_name
 from .config import AppConfig
 from .permissions import (binding_session_allowed, input_session_allowed, require_input,
                           require_read, session_allowed)
-from .redaction import redact_text
+from .redaction import redact_ansi_safe, redact_text
 from .status import classify_status
 from .tmux import TmuxClient, TmuxError, iso_timestamp
 
@@ -80,7 +80,12 @@ class TerminalService:
         except TmuxError as exc:
             return {"error": "TMUX_ERROR", "reason": str(exc), "sessions": []}
 
-    def terminal_tail(self, session: str, lines: int | None = None) -> dict[str, Any]:
+    def terminal_tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]:
+        """Return sanitized recent output. `ansi` is keyword-only, defaults to
+        False, and is never set by the MCP tool wrapper — only the dashboard's
+        terminal-style renderer opts in to get colour/style escape sequences
+        back (still redaction-safe; see redact_ansi_safe). Every other caller
+        keeps today's exact plain-text behavior unchanged."""
         if error := self._guard(session):
             return error
         requested = self.config.default_tail_lines if lines is None else lines
@@ -88,11 +93,12 @@ class TerminalService:
             return {"error": "INVALID_LINES", "session": session}
         effective = min(requested, self.config.max_capture_lines)
         try:
-            output_lines = self.tmux.capture_lines(session, effective)
+            output_lines = self.tmux.capture_lines(session, effective, ansi=ansi)
+            redact = redact_ansi_safe if ansi else redact_text
             return {
                 "session": session,
                 "lines_requested": requested,
-                "output": redact_text("\n".join(output_lines)),
+                "output": redact("\n".join(output_lines)),
                 "truncated": requested > self.config.max_capture_lines,
             }
         except TmuxError as exc:
