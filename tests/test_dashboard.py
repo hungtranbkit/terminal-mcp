@@ -196,8 +196,14 @@ def test_dashboard_exiting_fullscreen_restores_layout_on_session_loss():
     # "Exiting must restore the normal mobile layout": if the viewed
     # session disappears entirely while in fullscreen, there's nothing left
     # to show fullscreen, so it exits automatically rather than leaving a
-    # blank fullscreen shell.
-    assert "if (fullscreenTerminal) setFullscreen(false); // nothing left to view fullscreen" in DASHBOARD_HTML
+    # blank fullscreen shell. persist:false so this forced exit never wipes
+    # out the user's actual remembered fullscreen preference (see the
+    # remembered-fullscreen-preference tests below).
+    assert (
+        "if (fullscreenTerminal) setFullscreen(false, { persist: false }); "
+        "// forced exit — the remembered preference is unrelated and must survive"
+        in DASHBOARD_HTML
+    )
 
 
 def test_dashboard_remembers_last_session_name_only():
@@ -563,11 +569,12 @@ def test_dashboard_copy_uses_plain_text_never_ansi_markup():
 
 
 def test_dashboard_search_and_copy_do_not_persist_content():
-    # Only the font-size preference and the last-viewed session *name* are
-    # ever written to localStorage anywhere in this file — never search
-    # terms or copied/rendered output.
+    # Only three lightweight UI preferences are ever written to localStorage
+    # anywhere in this file: the last-viewed session *name*, the font-size
+    # number, and the fullscreen on/off flag — never search terms, copied
+    # text, or any rendered output/session content.
     keys = set(re.findall(r"localStorage\.(?:setItem|getItem)\(([A-Za-z_]+)", DASHBOARD_HTML))
-    assert keys == {"LAST_SESSION_KEY", "FONT_SIZE_KEY"}
+    assert keys == {"LAST_SESSION_KEY", "FONT_SIZE_KEY", "FULLSCREEN_KEY"}
 
 
 def test_dashboard_new_controls_disabled_without_a_selected_session():
@@ -581,3 +588,108 @@ def test_dashboard_fullscreen_and_mobile_layout_regressions_still_hold():
     assert "height:100dvh" in DASHBOARD_HTML
     assert "body.fullscreen-terminal header," in DASHBOARD_HTML
     assert "const target = (remembered && rows.some(row => row.name === remembered)) ? remembered : rows[0].name;" in DASHBOARD_HTML
+
+
+# ---------------------------------------------------------------------------
+# Supervisor batch: connection health, remembered fullscreen, mobile input polish
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_health_indicator_reflects_connection_and_marks_output_stale():
+    assert 'id="liveBadge"' in DASHBOARD_HTML
+    assert "function setConnectionState(ok)" in DASHBOARD_HTML
+    assert "'● RECONNECTING…'" in DASHBOARD_HTML
+    assert "'● OFFLINE'" in DASHBOARD_HTML
+    assert "outputEl.classList.add('stale')" in DASHBOARD_HTML
+    assert "outputEl.classList.remove('stale')" in DASHBOARD_HTML
+    assert "#output.stale { opacity:.55 }" in DASHBOARD_HTML
+
+
+def test_dashboard_health_indicator_never_clears_last_rendered_output():
+    # "Keep last rendered output visible but clearly marked stale" — the
+    # failure branch must never wipe outputEl's content, only dim it via the
+    # CSS class above; recovery is automatic (the existing 5s poll loop is
+    # already the retry mechanism, no separate timer needed).
+    refresh_fn = DASHBOARD_HTML.split("async function refresh() {", 1)[1].split("\n    refresh();", 1)[0]
+    assert "outputEl.replaceChildren()" not in refresh_fn
+    assert "outputEl.textContent = ''" not in refresh_fn
+    assert "catch (error) { setConnectionState(false); }" in DASHBOARD_HTML
+
+
+def test_dashboard_health_indicator_no_new_backend_route():
+    # Purely reactive to the two fetches loadSessions/loadDetail already
+    # make — no new endpoint, no extra polling path.
+    assert DASHBOARD_HTML.count("fetch(") == 3  # sessions, session detail, session/input (unchanged from before this batch)
+
+
+def test_dashboard_fullscreen_preference_persisted_and_restored_once():
+    assert "const FULLSCREEN_KEY = 'terminal-mcp:fullscreen';" in DASHBOARD_HTML
+    assert "function recalledFullscreen()" in DASHBOARD_HTML
+    assert "localStorage.setItem(FULLSCREEN_KEY, value ? '1' : '0');" in DASHBOARD_HTML
+    assert "localStorage.getItem(FULLSCREEN_KEY) === '1';" in DASHBOARD_HTML
+    assert "let fullscreenRestoreAttempted = false;" in DASHBOARD_HTML
+    assert "if (!fullscreenRestoreAttempted) {" in DASHBOARD_HTML
+    # Restoration only happens after a session is already selected/rendered
+    # (and therefore already scrolled to its latest line), never before —
+    # so it can never skip or race the initial auto-scroll-to-latest. It is
+    # the very next statement after the fullscreenRestoreAttempted guard.
+    assert (
+        "if (!fullscreenRestoreAttempted) {\n"
+        "          fullscreenRestoreAttempted = true;\n"
+        "          if (selected && recalledFullscreen()) setFullscreen(true, { persist: false });"
+        in DASHBOARD_HTML
+    )
+
+
+def test_dashboard_auto_follow_preference_deliberately_not_persisted():
+    # Unlike session/font/fullscreen, auto-follow is intentionally NOT
+    # persisted across reloads: restoring a remembered "paused" state would
+    # skip the initial scroll-to-latest on the very next open, which is an
+    # explicit, repeatedly-reiterated UX requirement this project keeps. The
+    # localStorage key inventory (see test_dashboard_search_and_copy_do_not_
+    # persist_content) has exactly three keys — no auto-follow key exists,
+    # and the function that flips the toggle never touches storage at all.
+    assert "AUTO_FOLLOW_KEY" not in DASHBOARD_HTML
+    set_auto_follow_fn = DASHBOARD_HTML.split("function setAutoFollow(value) {", 1)[1].split("}", 1)[0]
+    assert "localStorage" not in set_auto_follow_fn
+
+
+def test_dashboard_mobile_text_inputs_avoid_ios_safari_zoom():
+    # iOS Safari auto-zooms the whole page (breaking the fixed app-shell)
+    # when a focused text input computes to under 16px. Padding can still
+    # shrink for compactness; font-size must not, on either input.
+    media_start = DASHBOARD_HTML.index("@media (max-width:760px)")
+    mobile_css = DASHBOARD_HTML[media_start:]
+    assert ".term-search input[type=text] { padding:4px 6px; font-size:16px }" in mobile_css
+    assert "#inputBar input[type=text] { padding:7px 9px; font-size:16px }" in mobile_css
+
+
+def test_dashboard_viewport_resizes_for_onscreen_keyboard():
+    assert "interactive-widget=resizes-content" in DASHBOARD_HTML
+    assert "viewport-fit=cover" in DASHBOARD_HTML  # unrelated safe-area support must survive alongside it
+
+
+def test_dashboard_supervisor_batch_no_security_route_changes(read_config):
+    # This whole batch is presentation-only: the same four routes, with the
+    # same methods, still registered — no new endpoint was added for the
+    # health indicator or any of this batch's other features.
+    service = TerminalService(read_config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    routes = {route.path: set(route.methods) for route in server._custom_starlette_routes}
+    assert routes == {
+        "/dashboard": {"GET", "HEAD"},
+        "/dashboard/api/sessions": {"GET", "HEAD"},
+        "/dashboard/api/session": {"GET", "HEAD"},
+        "/dashboard/api/session/input": {"POST"},
+    }
+
+
+def test_dashboard_supervisor_batch_input_route_still_gated(read_config):
+    # And the input route itself still refuses exactly as before —
+    # terminal_input/whitelist/input_policy gating is untouched by any of
+    # this batch's presentation-only changes.
+    client, _ = _client(read_config)  # read_config has terminal_input disabled
+    response = client.post("/dashboard/api/session/input", json={"name": "test-x", "text": "hi"})
+    assert response.status_code == 403
+    assert response.json()["error"] == "INPUT_DISABLED"

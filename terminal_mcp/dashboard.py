@@ -20,7 +20,7 @@ DASHBOARD_HTML = """<!doctype html>
 <html lang="vi">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
   <title>Terminal MCP Sessions</title>
   <style>
     :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --term-bg:#0a0e1a; --mono: ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace; }
@@ -39,6 +39,10 @@ DASHBOARD_HTML = """<!doctype html>
     body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text); display:flex; flex-direction:column }
     header { flex:0 0 auto; display:flex; justify-content:space-between; gap:16px; align-items:center; padding:22px 28px; border-bottom:1px solid var(--line) }
     h1 { margin:0; font-size:20px } .muted { color:var(--muted) } .live { color:var(--green) }
+    .live.reconnecting { color:var(--amber) } .live.offline { color:#ff6b6b }
+    /* Last-rendered output stays visible while disconnected (never cleared),
+       just visibly dimmed so it reads as "maybe stale", not "still live". */
+    #output.stale { opacity:.55 }
     /* `flex:1; min-height:0` (not a fixed/min height) so `main` takes exactly
        the shell's remaining space and can still shrink below its content's
        natural size — the same "let a bounded box actually constrain its
@@ -135,13 +139,18 @@ DASHBOARD_HTML = """<!doctype html>
       .term-bar { padding:5px 10px }
       .term-btn { padding:4px 8px; font-size:11px }
       .term-search { padding:4px 8px }
-      .term-search input[type=text] { padding:4px 6px; font-size:11px }
+      /* 16px, not smaller: iOS Safari auto-zooms the whole page on focus
+         for any text input computing to under 16px, which is jarring and
+         breaks the fixed app-shell (the browser overrides the layout
+         viewport to zoom in). Padding still shrinks for compactness — only
+         font-size is held at the zoom threshold. */
+      .term-search input[type=text] { padding:4px 6px; font-size:16px }
       /* More compact input composer; it is already effectively "pinned" —
          it's the last row of the same bounded shell as everything else, and
          the app-shell above means there is no page scroll left to carry it
          away regardless. */
       #inputBar { padding:8px 10px; gap:6px }
-      #inputBar input[type=text] { padding:7px 9px; font-size:13px }
+      #inputBar input[type=text] { padding:7px 9px; font-size:16px }
       #inputBar button { padding:7px 10px; font-size:13px }
       #inputBar label { font-size:11px }
       #inputNote { padding:4px 10px 0; font-size:11px }
@@ -201,7 +210,7 @@ DASHBOARD_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <header><div><h1>Terminal MCP</h1><div class="muted">Whitelisted tmux session monitor</div></div><div><span class="live">● LIVE</span></div></header>
+  <header><div><h1>Terminal MCP</h1><div class="muted">Whitelisted tmux session monitor</div></div><div><span class="live" id="liveBadge">● LIVE</span></div></header>
   <main>
     <section class="panel" id="sessionsPanel"><div class="panel-title">SESSIONS <span id="count"></span></div><div id="sessions"></div></section>
     <section class="panel detail">
@@ -249,6 +258,7 @@ DASHBOARD_HTML = """<!doctype html>
     const sessionsEl = document.querySelector('#sessions');
     const outputEl = document.querySelector('#output');
     const summaryEl = document.querySelector('#summary');
+    const liveBadgeEl = document.querySelector('#liveBadge');
     const termTitleEl = document.querySelector('#termTitle');
     const followToggleEl = document.querySelector('#followToggle');
     const jumpBtnEl = document.querySelector('#jumpBtn');
@@ -531,10 +541,20 @@ DASHBOARD_HTML = """<!doctype html>
     // call below is progressive enhancement only — best-effort, never
     // depended on — for browsers that do support it (desktop, Android
     // Chrome), so those also get the OS/browser chrome hidden.
-    function setFullscreen(value) {
+    const FULLSCREEN_KEY = 'terminal-mcp:fullscreen';
+    function recalledFullscreen() {
+      try { return localStorage.getItem(FULLSCREEN_KEY) === '1'; } catch (error) { return false; }
+    }
+    function setFullscreen(value, { persist = true } = {}) {
       fullscreenTerminal = value;
       document.body.classList.toggle('fullscreen-terminal', value);
       fullscreenBtnEl.textContent = value ? '✕ Exit fullscreen' : '⛶ Fullscreen';
+      if (persist) {
+        // A deliberate toggle updates the remembered preference; a forced
+        // exit (e.g. the viewed session disappearing, below) must not — that
+        // would silently wipe out an unrelated, still-valid preference.
+        try { localStorage.setItem(FULLSCREEN_KEY, value ? '1' : '0'); } catch (error) { /* ignore */ }
+      }
       if (value) {
         sidebarForcedOpen = false; updateSidebarVisibility(); // exiting must restore the normal layout, so never leave the drawer state stale
         if (document.documentElement.requestFullscreen) {
@@ -658,7 +678,7 @@ DASHBOARD_HTML = """<!doctype html>
       }
       if (selected && !rows.some(row => row.name === selected)) {
         selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
-        if (fullscreenTerminal) setFullscreen(false); // nothing left to view fullscreen; restore the normal layout
+        if (fullscreenTerminal) setFullscreen(false, { persist: false }); // forced exit — the remembered preference is unrelated and must survive
         summaryEl.textContent = 'Session không còn tồn tại.'; outputEl.replaceChildren();
       }
     }
@@ -692,7 +712,44 @@ DASHBOARD_HTML = """<!doctype html>
       lastRenderedSession = selected;
       inputAllowed = Boolean(data.input_allowed); refreshInputControls(); refreshTermControls();
     }
-    async function refresh() { try { await loadSessions(); await loadDetail(); } catch (error) { summaryEl.textContent = 'Không thể tải dữ liệu: ' + error; } }
+    // ---- connection health -------------------------------------------------
+    // No new backend privilege: this only reacts to the same two fetches
+    // refresh() already made. Last-rendered output/status is left exactly as
+    // it was on failure (never cleared) — only dimmed via #output.stale and
+    // flagged via the header badge, so it reads as "maybe stale", not "still
+    // live". Auto-recovers the moment a poll succeeds again; the 5s
+    // setInterval below is already the retry loop, so RECONNECTING doubles
+    // as "retrying" with no separate timer needed.
+    let consecutiveFailures = 0;
+    function setConnectionState(ok) {
+      if (ok) {
+        consecutiveFailures = 0;
+        liveBadgeEl.textContent = '● LIVE';
+        liveBadgeEl.className = 'live';
+        outputEl.classList.remove('stale');
+      } else {
+        consecutiveFailures++;
+        const offline = consecutiveFailures >= 3; // a couple of blips read as reconnecting; sustained failure reads as offline
+        liveBadgeEl.textContent = offline ? '● OFFLINE' : '● RECONNECTING…';
+        liveBadgeEl.className = offline ? 'live offline' : 'live reconnecting';
+        if (selected) outputEl.classList.add('stale');
+      }
+    }
+    // Restored only once, right after the very first successful load — by
+    // then the restored/first session is already selected, rendered, and
+    // scrolled to its latest line (see loadDetail's switchedSession path),
+    // so this never competes with or skips that initial scroll-to-bottom;
+    // it just layers fullscreen presentation on top afterward.
+    let fullscreenRestoreAttempted = false;
+    async function refresh() {
+      try {
+        await loadSessions(); await loadDetail(); setConnectionState(true);
+        if (!fullscreenRestoreAttempted) {
+          fullscreenRestoreAttempted = true;
+          if (selected && recalledFullscreen()) setFullscreen(true, { persist: false });
+        }
+      } catch (error) { setConnectionState(false); }
+    }
     refresh(); setInterval(refresh, 5000);
   </script>
 </body>
