@@ -27,6 +27,53 @@ def test_dashboard_uses_safe_dom_rendering():
     assert "Whitelisted tmux session monitor" in DASHBOARD_HTML
 
 
+def test_dashboard_auto_scrolls_output_to_newest_line():
+    # UX guard: the pane must land on the newest (bottom) output without the
+    # viewer having to scroll manually, without reordering the rendered lines.
+    assert "outputEl.scrollTop = outputEl.scrollHeight" in DASHBOARD_HTML
+
+
+def test_session_detail_tail_is_bounded_recent_and_chronological(read_config, tmux_session_factory):
+    # Enough lines that the visible pane + config's default_tail_lines window
+    # (see conftest.py) can't possibly cover the whole thing, so a truly
+    # unbounded/full-history read would be distinguishable from a tail.
+    session = tmux_session_factory(
+        "test-tail-order",
+        "bash -lc 'for i in $(seq -w 1 100); do echo line$i; done; sleep 30'",
+    )
+    client, _ = _client(read_config)
+    response = client.get(f"/dashboard/api/session?name={session}")
+    assert response.status_code == 200
+    output = response.json()["tail"]["output"]
+
+    # Bounded to recent output: the oldest printed line is long gone...
+    assert "line001" not in output
+    # ...and the newest printed line is present.
+    assert "line100" in output
+    # Rendered oldest-first/newest-last: an earlier line's text appears before a
+    # later one's, matching tmux capture-pane's natural chronological order.
+    assert output.index("line090") < output.index("line100")
+
+
+def test_session_detail_tail_length_is_driven_by_config_not_hardcoded(tmux_session_factory):
+    # Same session, two services differing only in default_tail_lines, called via
+    # terminal_tail(name) with no explicit `lines` — proves the dashboard route
+    # (terminal_mcp/dashboard.py) no longer hardcodes 200 and instead flows
+    # through config.default_tail_lines, the project's existing single source of
+    # truth for "how many recent lines" (see config.yaml).
+    session = tmux_session_factory(
+        "test-tail-config",
+        "bash -lc 'for i in $(seq -w 1 100); do echo line$i; done; sleep 30'",
+    )
+    small_client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 90, 3))
+    large_client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 90, 60))
+
+    small_output = small_client.get(f"/dashboard/api/session?name={session}").json()["tail"]["output"]
+    large_output = large_client.get(f"/dashboard/api/session?name={session}").json()["tail"]["output"]
+
+    assert len(large_output.splitlines()) > len(small_output.splitlines())
+
+
 @pytest.fixture
 def input_config() -> AppConfig:
     return AppConfig(

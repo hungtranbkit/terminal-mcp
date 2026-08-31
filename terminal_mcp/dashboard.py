@@ -129,6 +129,10 @@ DASHBOARD_HTML = """<!doctype html>
       const state = document.createElement('span'); state.className = `state-${clean(data.status.state)}`; state.textContent = clean(data.status.state);
       const reason = document.createElement('span'); reason.className = 'muted'; reason.textContent = ` — ${clean(data.status.reason)}`;
       summaryEl.append(strong, state, reason); outputEl.textContent = clean(data.tail.output);
+      // Lines render oldest-first/newest-last (tmux's natural order); snap the
+      // scroll position to the bottom so the newest output is visible without
+      // manual scrolling through the whole window on every refresh.
+      outputEl.scrollTop = outputEl.scrollHeight;
       inputAllowed = Boolean(data.input_allowed); refreshInputControls();
     }
     async function refresh() { try { await loadSessions(); await loadDetail(); } catch (error) { summaryEl.textContent = 'Không thể tải dữ liệu: ' + error; } }
@@ -156,7 +160,12 @@ def register_dashboard(server: MCPServer, terminal: TerminalService) -> None:
         status = terminal.terminal_status(name)
         if "error" in status:
             return JSONResponse(status, status_code=403 if status["error"] == "ACCESS_DENIED" else 404)
-        tail = terminal.terminal_tail(name, 200)
+        # Uses config.default_tail_lines (already the project's one source of truth
+        # for "how many recent lines" — see config.yaml) rather than a hardcoded
+        # count. tmux capture-pane already returns that window oldest-line-first,
+        # newest-line-last, so the dashboard renders it in natural chronological
+        # order with no reordering needed.
+        tail = terminal.terminal_tail(name)
         if "error" in tail:
             return JSONResponse(tail, status_code=404)
         input_allowed = (
