@@ -31,4 +31,7 @@ version = {attr = "terminal_mcp.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra -m \"not live_cli\""
+markers = [
+  "live_cli: exercises a real, locally-installed Codex/Claude Code CLI binary in a disposable tmux session (real API calls, real cost/latency, not run by default -- see tests/test_adapters_real_cli.py). Run explicitly with `pytest -m live_cli`.",
+]

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-import re
 import threading
 import time
+import uuid
 from typing import Any
 
+from .adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
+                       DELIVERY_UNKNOWN, select_adapter, to_legacy_submit_status)
 from .audit import AuditStore
 from .bindings import Binding, BindingStore, valid_binding_name
 from .config import AppConfig
 from .grants import SessionGrantStore
+from .lease import DEFAULT_LEASE_TTL_SECONDS, PaneLeaseStore
 from .models import SessionIdentity
 from .permissions import (SENSITIVE_SESSION_WORDS, binding_session_allowed, input_session_allowed,
                           require_input, require_read, session_allowed, session_input_denied_by_pattern,
@@ -61,69 +64,48 @@ SEND_VERIFY_POLL_INTERVAL_SECONDS = 0.05
 # the base 0.6s window is fine for a simple shell but too short for an
 # LLM-backed agent CLI to visibly start responding -- a real send that
 # genuinely worked ("pong" came back correctly) was still reported
-# SUBMIT_UNCONFIRMED because no new output had appeared yet within 0.6s.
-# That is the safe failure direction (never a false CONFIRMED), but it is
-# needlessly pessimistic for RECOVERY_ELIGIBLE_COMMANDS, which are known
-# to need longer. Applies to *both* the initial check and the post-
-# recovery re-check for those commands only -- every other target keeps
-# the original, already-tested 0.6s window unchanged.
+# unconfirmed because no new output had appeared yet within 0.6s. That is
+# the safe failure direction (never a false CONFIRMED), but it is
+# needlessly pessimistic for adapters known to need longer (Codex, Claude).
+# Applies to *both* the initial check and the post-recovery re-check for
+# those adapters only -- every other target keeps the original,
+# already-tested 0.6s window unchanged.
 RECOVERY_VERIFY_TIMEOUT_SECONDS = 3.0
-
-# Bounded Escape+Enter recovery for known composer-quirky interactive
-# agent CLIs (reported and reproduced on Codex, most reliably with a
-# long/multi-line prompt): the base verification above can itself be
-# fooled by a *live-redrawing* Ink-style UI -- a spinner tick, cursor
-# blink, or elapsed-timer update changes the captured snapshot even
-# though the composer never actually submitted, so "the pane changed"
-# alone is not reliable proof of submission for these targets specifically.
-# Scoped narrowly to this named set, not applied to every send target, so
-# the base snapshot-diff semantics everywhere else (including a target
-# that legitimately echoes the sent text back as its own confirmation
-# output) are completely unchanged.
-RECOVERY_ELIGIBLE_COMMANDS = {"codex"}
-# Text that means "this CLI is actively processing/working" -- if present,
-# Escape could genuinely interrupt real work, so recovery must never fire
-# regardless of anything else. Same conservative, bottom-of-pane-only
-# philosophy as status.py's WAIT_PATTERNS/ERROR_PATTERNS/DONE_PATTERNS.
-WORKING_EVIDENCE_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in (r"esc to interrupt", r"\bworking\b", r"\bthinking\b")
-)
-
-
-def _shows_working_evidence(lines: list[str]) -> bool:
-    tail = "\n".join(lines[-6:])
-    return any(pattern.search(tail) for pattern in WORKING_EVIDENCE_PATTERNS)
-
-
-def _shows_genuine_progress(before: list[str], after: list[str]) -> bool:
-    """Best-effort, only ever consulted for RECOVERY_ELIGIBLE_COMMANDS (see
-    the module comment above for why this isn't the base verification
-    signal used for every target): did the pane's captured *line count*
-    grow? A real submission produces genuinely new output (more non-blank
-    lines); a live-redrawing composer's own spinner/cursor/elapsed-timer
-    tick overwrites the SAME line in place (same line count, different
-    content on it) -- indistinguishable from a real change under a plain
-    "did anything differ" check, but not under this one. Deliberately not
-    a substring/marker match against the sent text (unlike this file's
-    earlier design note on that) -- a submission confirmation that quotes
-    the text back (e.g. "SUBMITTED: <text>") would make a text-match
-    signal false-negative on a *successful* recovery just as easily as it
-    would false-positive an ordinary target; line-count growth has neither
-    failure mode."""
-    return len(after) > len(before)
+# P0 Part A: adapters (adapters.py) known to need the wider verification
+# window above -- an LLM-backed CLI genuinely takes longer to visibly
+# respond than a plain shell. Only affects *timeout*, not whether recovery
+# itself is attempted (that is decided per-attempt by the selected
+# adapter's own stuck_composer_evidence/safe_recovery_allowed, not by this
+# set) -- see _send_text_and_verify_locked.
+WIDE_VERIFY_ADAPTERS = {"codex", "claude"}
+# P0 Part B: how long a send waits for another process's already-held
+# pane lease before giving up and failing safely (PANE_BUSY) -- bounded so
+# a request never blocks indefinitely on someone else's send, generous
+# enough that a genuinely short-lived, benign race (two callers happening
+# to target the same pane moments apart) serializes cleanly instead of
+# needlessly failing one of them.
+PANE_LEASE_WAIT_SECONDS = 5.0
+PANE_LEASE_POLL_INTERVAL_SECONDS = 0.1
 
 
 class TerminalService:
     def __init__(self, config: AppConfig, tmux: TmuxClient | None = None,
                  bindings: BindingStore | None = None,
                  audit: AuditStore | None = None,
-                 grants: SessionGrantStore | None = None) -> None:
+                 grants: SessionGrantStore | None = None,
+                 leases: PaneLeaseStore | None = None) -> None:
         self.config = config
         self.tmux = tmux or TmuxClient()
         self.bindings = bindings or BindingStore()
         self.audit = audit or AuditStore()
         self.grants = grants or SessionGrantStore()
+        # P0 Part B: durable, cross-process pane lease -- defaults to the
+        # shared on-disk store (same file for every TerminalService in
+        # every process on this host, HTTP/STDIO/dashboard/Supervisor
+        # alike) unless a caller injects an isolated one (tests). See
+        # lease.py for why this exists on top of _pane_locks below, which
+        # only ever serializes *within this one process*.
+        self.leases = leases or PaneLeaseStore()
         self._pane_locks = PaneLockRegistry()
 
     def resolve_identity(self, session: str) -> SessionIdentity | None:
@@ -159,7 +141,8 @@ class TerminalService:
         # other reason string already passed through here.
         self.audit.record(action=action, binding=binding, session=session, text=text,
                           keys=keys, press_enter=press_enter, result=result,
-                          reason=error or response.get("reason") or response.get("submit_reason"))
+                          reason=error or response.get("reason") or response.get("submit_reason"),
+                          correlation_id=response.get("correlation_id"))
         return response
 
     def _input_guard(self, session: str) -> dict[str, Any] | None:
@@ -330,12 +313,34 @@ class TerminalService:
         except TmuxError as exc:
             return {"error": "TMUX_ERROR", "session": session, "reason": str(exc)}
 
+    def _acquire_pane_lease(self, lock_key: str, owner_id: str) -> bool:
+        """P0 Part B: bounded serialize-then-fail-safe. A concurrent
+        attempt to the same pane (any process, this one included) that
+        already holds the lease means this attempt waits briefly for it to
+        finish (the common case: a real send+verify cycle is a few seconds
+        at most) rather than failing immediately on a benign, short-lived
+        race -- but never waits unboundedly: past PANE_LEASE_WAIT_SECONDS
+        this gives up and the caller fails safely (PANE_BUSY) instead of
+        blocking a request indefinitely on another process's send."""
+        if self.leases.acquire(lock_key, owner_id, ttl_seconds=DEFAULT_LEASE_TTL_SECONDS):
+            return True
+        deadline = time.monotonic() + PANE_LEASE_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            time.sleep(PANE_LEASE_POLL_INTERVAL_SECONDS)
+            if self.leases.acquire(lock_key, owner_id, ttl_seconds=DEFAULT_LEASE_TTL_SECONDS):
+                return True
+        return False
+
     def _send_text_and_verify(self, session: str, text: str, press_enter: bool, *,
                               idempotency_key: str | None = None) -> dict[str, Any]:
-        """P0-3/P0-4 wrapper around _send_text_and_verify_locked: claims an
-        idempotency key (if given) before anything else, serializes on the
-        target pane's own lock so no two sends to the same pane can ever
-        interleave, and persists the final result under the claimed key.
+        """P0-3/P0-4/P0 Part B wrapper around _send_text_and_verify_locked:
+        claims an idempotency key (if given) before anything else,
+        acquires the durable cross-process pane lease (lease.py -- the
+        *only* thing that serializes correctly across HTTP/STDIO/
+        dashboard/Supervisor v2 each potentially being a different OS
+        process), serializes on the pane's own in-process lock too (a
+        same-process fast path that never needs to touch sqlite), and
+        persists the final result under the claimed idempotency key.
 
         idempotency_key semantics: the *first* caller to successfully claim
         a given key is the only one that ever actually sends -- a repeat
@@ -343,8 +348,17 @@ class TerminalService:
         made again after a process restart, since the claim is durable on
         disk) returns the original stored result instead of sending again.
         A concurrent caller that loses the claim race while the winner is
-        still mid-send gets an honest DUPLICATE_IN_PROGRESS rather than a
-        second send or a fabricated result.
+        still mid-send gets an honest DUPLICATE_IN_PROGRESS -- unless that
+        claim has since gone stale (the claimant crashed before storing a
+        result; see AuditStore.claim_idempotency_key), in which case this
+        call reclaims it and actually sends, rather than reporting
+        DUPLICATE_IN_PROGRESS forever for an attempt that will never finish.
+
+        Different concurrent attempts to the same pane (no shared
+        idempotency key -- two genuinely different sends racing for the
+        same target) serialize on the pane lease up to a bounded wait, then
+        fail safely (PANE_BUSY, delivery_state BLOCKED) rather than risk
+        interleaving keystrokes from two processes into the same pane.
         """
         if idempotency_key is not None:
             if not self.audit.claim_idempotency_key(idempotency_key):
@@ -354,13 +368,25 @@ class TerminalService:
                 return {"session": session, "error": "DUPLICATE_IN_PROGRESS", "idempotency_key": idempotency_key}
         identity = self.resolve_identity(session)
         lock_key = f"{identity.session_id}:{identity.pane_id}" if identity is not None else f"name:{session}"
-        with self._pane_locks.get(lock_key):
-            result = self._send_text_and_verify_locked(session, text, press_enter)
+        correlation_id = uuid.uuid4().hex
+        if not self._acquire_pane_lease(lock_key, correlation_id):
+            result = {"session": session, "error": "PANE_BUSY", "correlation_id": correlation_id,
+                      "delivery_state": DELIVERY_BLOCKED, "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED),
+                      "submit_reason": "another process is currently holding the send lease for this pane"}
+            if idempotency_key is not None:
+                self.audit.store_idempotent_result(idempotency_key, result)
+            return result
+        try:
+            with self._pane_locks.get(lock_key):
+                result = self._send_text_and_verify_locked(session, text, press_enter, correlation_id=correlation_id)
+        finally:
+            self.leases.release(lock_key, correlation_id)
         if idempotency_key is not None:
             self.audit.store_idempotent_result(idempotency_key, result)
         return result
 
-    def _send_text_and_verify_locked(self, session: str, text: str, press_enter: bool) -> dict[str, Any]:
+    def _send_text_and_verify_locked(self, session: str, text: str, press_enter: bool, *,
+                                     correlation_id: str) -> dict[str, Any]:
         """Send `text` (and, if requested, Enter) through the tmux layer,
         then make a bounded, best-effort attempt to confirm Enter actually
         *submitted* rather than merely having been typed. This is the fix
@@ -370,38 +396,54 @@ class TerminalService:
         written to the pty, not that the receiving program acted on them),
         so callers must not treat it as one.
 
-        Returns `sent` (the tmux-level send itself succeeded -- unchanged
-        meaning from before this fix) plus a new `submit_status`:
-          - "TEXT_SENT": press_enter was False. No submission was
-            attempted, so there is nothing to confirm -- unchanged
-            behavior, just a name for it.
-          - "SUBMIT_CONFIRMED": press_enter was True and the pane shows
-            evidence consistent with the Enter having been processed
-            (the previously-typed text is no longer sitting as unconsumed
-            trailing content, or the tail of the pane changed some other
-            way in the verification window).
-          - "SUBMIT_UNCONFIRMED": press_enter was True but verification
-            could not confirm submission within SEND_VERIFY_TIMEOUT_SECONDS
-            (the typed text still visibly sits unconsumed, or the pane's
-            tail never changed at all, or a post-send capture itself
-            failed). This is a deliberately conservative default: an
-            inconclusive result is reported as unconfirmed, never silently
-            upgraded to success.
+        Every call gets a fresh `correlation_id` (P0 Part A.5): a caller
+        that lost the response to a call it did *not* give an
+        idempotency_key for cannot use it to safely determine "was this
+        already sent", but it still ties this exact attempt's audit-log
+        row and result together for post-hoc reconciliation. A caller that
+        wants "never duplicate on retry" must pass idempotency_key -- see
+        _send_text_and_verify above.
+
+        Returns `sent` (the tmux-level *text* send succeeded -- true the
+        moment the text bytes are written, independent of what happens to
+        any following Enter), `enter_sent` (whether an Enter keystroke was
+        actually transmitted at all -- False for a BLOCKED abort before
+        Enter, see below), and the authoritative `delivery_state` (one of
+        adapters.DELIVERY_STATES):
+          - TEXT_SENT: press_enter was False. Nothing to confirm.
+          - SUBMIT_CONFIRMED: press_enter was True and the target's own
+            AgentAdapter (adapters.py, selected by pane_current_command)
+            reports adapter-specific evidence this exact Enter was
+            processed -- never a bare "the pane changed" check; a live-
+            redrawing Ink UI's own spinner/cursor/timer tick is explicitly
+            excluded for the adapters known to have that failure mode.
+          - DELIVERY_UNKNOWN: Enter was sent but no adapter evidence
+            confirms it within the verification window. Deliberately
+            conservative: never silently upgraded to CONFIRMED.
+          - BLOCKED: the pinned session identity or pane_current_command
+            changed between the text-send and the point Enter would have
+            been sent (P0 Part A.3) -- Enter is withheld entirely rather
+            than risk it landing on a pane that is no longer the one this
+            attempt started against. Never retargets by session name.
+          - ERROR: the tmux layer itself failed partway through (session
+            vanished, capture failed).
+        `submit_status` (the pre-existing field) is kept, now strictly
+        *derived* from delivery_state (adapters.to_legacy_submit_status)
+        for every existing caller that only ever reads that field.
 
         Never blindly auto-retries Enter -- a second bare Enter risks a
         genuine double submission (e.g. accepting a destructive
         confirmation prompt twice), which is strictly worse than an honest
-        UNCONFIRMED status that a caller (a human, or Supervisor v2 -- see
-        supervisor2.py's execute_send) can act on deliberately. The one
-        exception: for RECOVERY_ELIGIBLE_COMMANDS (reported and reproduced
-        on Codex, most reliably with a long/multi-line prompt, where Enter
-        can land as "insert newline" instead of "submit" inside the
-        composer), exactly one bounded Escape-then-Enter recovery sequence
-        is attempted -- never more than once, and never at all if there is
-        WORKING_EVIDENCE the target is already actively processing (Escape
-        could genuinely interrupt real work). A successful recovery adds
-        `recovery_attempted: true` to the result and still reports
-        SUBMIT_CONFIRMED; a failed one stays SUBMIT_UNCONFIRMED.
+        unconfirmed status a caller (a human, or Supervisor v2's
+        execute_send) can act on deliberately. The one exception: exactly
+        one bounded Escape-then-Enter recovery sequence, gated strictly on
+        the selected adapter's own stuck_composer_evidence (this attempt's
+        before/after pair looks like its specific known composer-swallow
+        signature) AND safe_recovery_allowed (the target is not already
+        evidencing active work, where Escape could genuinely interrupt real
+        work) -- never a generic "anything unconfirmed" trigger, and never
+        for an adapter (GenericShellAdapter, ClaudeAdapter) whose
+        stuck_composer_evidence always returns False.
 
         Verification method: capture the pane's tail exactly as it looks
         right after the text lands but *before* Enter is sent (the
@@ -411,14 +453,38 @@ class TerminalService:
         a real target's own confirmation output can legitimately echo the
         submitted text back (e.g. "SUBMITTED: <text>"), which would falsely
         look like "still pending" under a marker-suffix check. Comparing
-        against the precise pre-Enter snapshot has no such false positive:
-        it only reports CONFIRMED once the pane has genuinely moved on
-        from exactly what "typed but not submitted" looked like.
+        against the precise pre-Enter snapshot has no such false positive.
+        `correlation_id` is generated once by the outer wrapper (_send_
+        text_and_verify) and reused as this attempt's pane-lease owner id
+        too (see lease.py) -- generating it here instead would create a
+        second, different id for the same attempt, breaking that link.
         """
+
+        # P0 Part A.3: resolve identity + pane_current_command *immediately
+        # before* the text send -- the first of the two revalidation points.
+        # A caller-level pin (a binding/grant's pinned identity) is checked
+        # by the caller before this method is ever reached; this is a
+        # second, narrower check scoped to the send itself, catching a
+        # target destroyed/recreated under the same name in the brief
+        # window between that caller-level check and the actual send.
+        try:
+            info_before = self.tmux.get_session(session)
+        except TmuxError:
+            info_before = None
+        if info_before is None:
+            return {"sent": False, "enter_sent": False, "characters": len(text), "press_enter": press_enter,
+                    "correlation_id": correlation_id, "delivery_state": DELIVERY_ERROR,
+                    "submit_status": to_legacy_submit_status(DELIVERY_ERROR),
+                    "error": "SESSION_NOT_FOUND", "session": session}
+        identity_before = SessionIdentity.from_session_info(info_before)
+        command_before = info_before.pane_current_command or ""
+
         self.tmux.send_text(session, text, press_enter=False)
-        result: dict[str, Any] = {"sent": True, "characters": len(text), "press_enter": press_enter}
+        result: dict[str, Any] = {"sent": True, "enter_sent": False, "characters": len(text),
+                                  "press_enter": press_enter, "correlation_id": correlation_id}
         if not press_enter:
-            result["submit_status"] = "TEXT_SENT"
+            result["delivery_state"] = DELIVERY_TEXT_SENT
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_TEXT_SENT)
             return result
         try:
             typed_snapshot = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
@@ -428,64 +494,89 @@ class TerminalService:
         # press_enter=True call -- imported, not duplicated, so there is
         # exactly one place that value is decided.
         time.sleep(SEND_TEXT_ENTER_SETTLE_SECONDS)
+
+        # P0 Part A.3: the *second* revalidation point, immediately before
+        # the Enter keystroke. Abort (never send Enter, never retarget by
+        # name) if either the pinned tmux identity or the foreground
+        # command has moved on since the text landed -- e.g. the process
+        # that was about to receive this Enter has already exited (command
+        # changed) or the session name now answers for an entirely
+        # different pane (identity changed). The text itself was already
+        # sent and stays sent; only the Enter is withheld.
+        try:
+            info_at_enter = self.tmux.get_session(session)
+        except TmuxError:
+            info_at_enter = None
+        identity_at_enter = None if info_at_enter is None else SessionIdentity.from_session_info(info_at_enter)
+        command_at_enter = (info_at_enter.pane_current_command or "") if info_at_enter is not None else ""
+        if (identity_at_enter is None or not identity_before.matches(identity_at_enter)
+                or command_at_enter != command_before):
+            result["delivery_state"] = DELIVERY_BLOCKED
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_BLOCKED)
+            result["error"] = "IDENTITY_CHANGED_MID_SEND"
+            result["submit_reason"] = ("the pinned session identity or foreground command changed between "
+                                       "the text send and the Enter send -- Enter was withheld")
+            return result
+
         self.tmux.send_keys(session, ["Enter"])
+        result["enter_sent"] = True
         if typed_snapshot is None:
             # No reliable pre-Enter baseline to diff against -- verification
             # itself is compromised (a capture failure right after a
             # successful send is unusual but possible, e.g. a fast-closing
-            # session). Report unconfirmed rather than guess either way.
-            result["submit_status"] = "SUBMIT_UNCONFIRMED"
+            # session). Report unknown rather than guess either way.
+            result["delivery_state"] = DELIVERY_UNKNOWN
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
             result["submit_reason"] = "could not capture a pre-submit baseline to verify against"
             return result
 
-        # command/recovery-eligibility determined up front so a slower-to-
-        # respond RECOVERY_ELIGIBLE_COMMANDS target (a real LLM-backed CLI
-        # genuinely takes longer to visibly respond than the 0.6s default)
-        # gets the wider verification window from the very first check, not
-        # only after already being escalated to recovery.
-        try:
-            info = self.tmux.get_session(session)
-            command = (info.pane_current_command or "").casefold() if info is not None else ""
-        except TmuxError:
-            command = ""
-        recovery_eligible = command in RECOVERY_ELIGIBLE_COMMANDS
-        verify_timeout = RECOVERY_VERIFY_TIMEOUT_SECONDS if recovery_eligible else SEND_VERIFY_TIMEOUT_SECONDS
+        adapter = select_adapter(command_at_enter)
+        verify_timeout = (RECOVERY_VERIFY_TIMEOUT_SECONDS if adapter.name in WIDE_VERIFY_ADAPTERS
+                          else SEND_VERIFY_TIMEOUT_SECONDS)
 
-        confirmed, after, reason = self._poll_for_submission(session, typed_snapshot, timeout=verify_timeout)
+        _, after, reason = self._poll_for_submission(session, typed_snapshot, timeout=verify_timeout)
 
-        # Escape+Enter recovery: scoped narrowly to RECOVERY_ELIGIBLE_
-        # COMMANDS (see the module comment there for why), and only when
-        # there is no evidence the target is already actively working
-        # (Escape could genuinely interrupt real work). Triggers unless the
-        # pane shows *genuine* new output (line-count growth) -- the base
-        # "did anything change" signal alone is not enough for these
-        # targets, since a live-redrawing composer's own spinner/cursor
-        # tick can make `confirmed` true without an actual submission.
+        # Escape+Enter recovery: gated strictly on this specific adapter's
+        # own evidence for this specific attempt -- see the adapter
+        # docstrings (adapters.py) for exactly what each requires. Never a
+        # generic "anything unconfirmed" trigger. Checked *before* (takes
+        # precedence over) the base submit_ack_evidence check below: a
+        # composer that redrew without genuine progress can still look
+        # "confirmed" under a bare diff, which is exactly the false
+        # positive recovery exists to catch -- so an adapter proving its
+        # specific stuck-composer signature overrides that bare diff,
+        # rather than only kicking in when the bare check already failed.
         needs_recovery = (
-            recovery_eligible and after is not None
-            and not _shows_genuine_progress(typed_snapshot, after)
+            after is not None
+            and adapter.stuck_composer_evidence(typed_snapshot, after)
+            and adapter.safe_recovery_allowed(after)
         )
-        if needs_recovery and not _shows_working_evidence(after):
+        if needs_recovery:
             pre_recovery_snapshot = after  # diff the recovery's own effect against *this*, not the original
             self.tmux.send_keys(session, ["Escape"])
             time.sleep(SEND_TEXT_ENTER_SETTLE_SECONDS)
             self.tmux.send_keys(session, ["Enter"])
             result["recovery_attempted"] = True
-            confirmed2, after2, reason2 = self._poll_for_submission(session, pre_recovery_snapshot,
-                                                                    timeout=RECOVERY_VERIFY_TIMEOUT_SECONDS)
-            genuine2 = after2 is not None and _shows_genuine_progress(pre_recovery_snapshot, after2)
-            if confirmed2 and genuine2:
-                result["submit_status"] = "SUBMIT_CONFIRMED"
+            _, after2, _ = self._poll_for_submission(session, pre_recovery_snapshot,
+                                                      timeout=RECOVERY_VERIFY_TIMEOUT_SECONDS)
+            confirmed2 = after2 is not None and adapter.submit_ack_evidence(pre_recovery_snapshot, after2)
+            if confirmed2:
+                result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
+                result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
                 result["submit_reason"] = "confirmed after Escape+Enter recovery"
             else:
-                result["submit_status"] = "SUBMIT_UNCONFIRMED"
+                result["delivery_state"] = DELIVERY_UNKNOWN
+                result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
                 result["submit_reason"] = "still unconfirmed after Escape+Enter recovery"
             return result
 
+        confirmed = after is not None and adapter.submit_ack_evidence(typed_snapshot, after)
         if confirmed:
-            result["submit_status"] = "SUBMIT_CONFIRMED"
+            result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
             return result
-        result["submit_status"] = "SUBMIT_UNCONFIRMED"
+        result["delivery_state"] = DELIVERY_UNKNOWN
+        result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
         result["submit_reason"] = reason
         return result
 
@@ -568,12 +659,31 @@ class TerminalService:
         if len(keys) > 100:
             response = {"error": "TOO_MANY_KEYS", "session": session}
             return self._audit_result(response, action=action, session=session, keys=keys)
-        try:
-            self.tmux.send_keys(session, keys)
-            response = {"session": session, "sent": True, "keys": keys}
-        except TmuxError as exc:
-            response = {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
+        response = self._send_keys_leased(session, keys)
         return self._audit_result(response, action=action, session=session, keys=keys)
+
+    def _send_keys_leased(self, session: str, keys: list[str]) -> dict[str, Any]:
+        """P0 Part B: raw key sends (terminal_send_keys) share the exact
+        same durable cross-process pane lease as terminal_send_text -- "any
+        text/key send" (see lease.py) means both, not just the verified
+        text-composition path. No adapter/verification involved here (this
+        is the same unverified raw send terminal_send_keys always was);
+        the lease's only job for this caller is stopping two processes'
+        raw key sequences from interleaving into the same pane."""
+        identity = self.resolve_identity(session)
+        lock_key = f"{identity.session_id}:{identity.pane_id}" if identity is not None else f"name:{session}"
+        correlation_id = uuid.uuid4().hex
+        if not self._acquire_pane_lease(lock_key, correlation_id):
+            return {"session": session, "error": "PANE_BUSY", "correlation_id": correlation_id,
+                    "reason": "another process is currently holding the send lease for this pane"}
+        try:
+            with self._pane_locks.get(lock_key):
+                self.tmux.send_keys(session, keys)
+                return {"session": session, "sent": True, "keys": keys, "correlation_id": correlation_id}
+        except TmuxError as exc:
+            return {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
+        finally:
+            self.leases.release(lock_key, correlation_id)
 
     def _binding_result(self, binding: Binding) -> dict[str, Any]:
         allowed = binding_session_allowed(binding.session, self.config)
@@ -675,22 +785,33 @@ class TerminalService:
         return {"binding": binding, **self.terminal_status(stored.session)}
 
     def _check_binding_identity(self, binding: str, stored: Binding) -> dict[str, Any] | None:
-        """P0-2: refuse to send through a binding whose pinned identity no
-        longer matches what currently answers to its session name -- the
-        name may have been recycled onto an unrelated tmux session, or its
-        pane replaced. A binding pinned before this feature existed (or
-        whose identity couldn't be resolved at bind time) has no pin yet;
-        its first successful send after upgrade lazily adopts whatever
-        identity is live *then* rather than being blocked outright, so
-        this upgrade never silently breaks every pre-existing binding.
-        Returns None if the send may proceed."""
+        """P0-2/P0 Part B.3: refuse to send through a binding whose pinned
+        identity no longer matches what currently answers to its session
+        name -- the name may have been recycled onto an unrelated tmux
+        session, or its pane replaced. Returns None if the send may
+        proceed.
+
+        A binding with no pin yet (created before P0-2 existed, or whose
+        identity couldn't be resolved at bind time) now fails closed for
+        INPUT instead of lazily adopting whatever identity happens to be
+        live at first-send time: silently trusting "whatever answers to
+        this name right now" is exactly the unpinned-identity risk P0
+        Part B's revalidation work exists to close, and grandfathering it
+        in for input specifically was a real gap, not a defensible
+        default. Read (terminal_tail_bound/terminal_status_bound) is
+        unaffected -- neither calls this method, so an old, never-rebound
+        binding stays fully readable; only *sending* through it now
+        requires an explicit rebind (terminal_bind with replace=True, which
+        pins the session's current identity) to migrate off the unpinned
+        state, once, per binding."""
         current = self.resolve_identity(stored.session)
         if stored.pinned_session_id is None:
-            if current is not None:
-                self.bindings.adopt_pin(binding, pinned_session_id=current.session_id,
-                                        pinned_pane_id=current.pane_id,
-                                        pinned_created_epoch=current.created_epoch)
-            return None
+            return {
+                "error": "BINDING_NOT_PINNED", "binding": binding, "session": stored.session,
+                "reason": "this binding predates identity pinning and has never been rebound -- "
+                          "input is refused until it is explicitly rebound (terminal_bind with "
+                          "replace=True) to pin its current tmux identity; read is unaffected",
+            }
         pinned = SessionIdentity(name=stored.session, session_id=stored.pinned_session_id,
                                  pane_id=stored.pinned_pane_id or "",
                                  created_epoch=stored.pinned_created_epoch or 0)

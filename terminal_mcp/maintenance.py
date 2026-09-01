@@ -19,6 +19,7 @@ from typing import Any
 
 from .audit import AuditStore
 from .config import MaintenanceConfig
+from .lease import PaneLeaseStore
 from .supervisor2 import SupervisorV2Store
 
 _LOGGER = logging.getLogger(__name__)
@@ -41,10 +42,16 @@ def checkpoint_wal(path: Path) -> None:
 
 class MaintenanceLoop:
     def __init__(self, *, audit: AuditStore, supervisor2_store: SupervisorV2Store | None,
-                bindings_path: Path | None, config: MaintenanceConfig) -> None:
+                bindings_path: Path | None, config: MaintenanceConfig,
+                leases: PaneLeaseStore | None = None) -> None:
         self._audit = audit
         self._supervisor2_store = supervisor2_store
         self._bindings_path = bindings_path
+        # P0 Part B: leases is a plain, mandatory-by-default dependency
+        # (like the others here) rather than truly optional -- defaults to
+        # the same shared on-disk store every TerminalService uses unless
+        # a caller (tests) injects an isolated one.
+        self._leases = leases or PaneLeaseStore()
         self._config = config
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -75,14 +82,22 @@ class MaintenanceLoop:
                 result["actions_pruned"] = self._supervisor2_store.prune_actions(self._config.action_retention)
             except Exception:
                 _LOGGER.exception("maintenance: action prune failed")
+        try:
+            # Housekeeping only -- acquire()'s own expiry check already
+            # makes an expired row harmless without this ever running (see
+            # lease.py); this just keeps pane_leases from accumulating a
+            # row per pane ever touched, forever.
+            result["leases_pruned"] = self._leases.prune_expired()
+        except Exception:
+            _LOGGER.exception("maintenance: lease prune failed")
         for path in self._db_paths():
             checkpoint_wal(path)
-        if any(result.get(k) for k in ("audit_pruned", "actions_pruned")):
+        if any(result.get(k) for k in ("audit_pruned", "actions_pruned", "leases_pruned")):
             _LOGGER.info("maintenance: pruned rows", extra=result)
         return result
 
     def _db_paths(self) -> list[Path]:
-        paths = [self._audit.path]
+        paths = [self._audit.path, self._leases.path]
         if self._supervisor2_store is not None:
             paths.append(self._supervisor2_store.path)
         if self._bindings_path is not None:

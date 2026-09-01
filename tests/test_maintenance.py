@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from terminal_mcp.audit import AuditStore
 from terminal_mcp.config import MaintenanceConfig, load_config
+from terminal_mcp.lease import PaneLeaseStore
 from terminal_mcp.maintenance import MaintenanceLoop, checkpoint_wal
 from terminal_mcp.supervisor2 import SupervisorV2Store
 
@@ -118,6 +119,7 @@ def test_maintenance_loop_run_once_prunes_across_both_stores(tmp_path):
     config = MaintenanceConfig(audit_retention=2, action_retention=2, idempotency_key_retention_days=30)
     loop = MaintenanceLoop(
         audit=audit, supervisor2_store=v2_store, bindings_path=None, config=config,
+        leases=PaneLeaseStore(tmp_path / "leases.db"),
     )
     result = loop.run_once()
     assert result["audit_pruned"] == 3
@@ -142,6 +144,7 @@ def test_maintenance_loop_survives_a_broken_store(tmp_path):
     config = MaintenanceConfig(audit_retention=100)
     loop = MaintenanceLoop(
         audit=audit, supervisor2_store=ExplodingV2Store(), bindings_path=None, config=config,
+        leases=PaneLeaseStore(tmp_path / "leases.db"),
     )
     result = loop.run_once()  # must not raise
     assert "actions_pruned" not in result
@@ -151,7 +154,8 @@ def test_maintenance_loop_survives_a_broken_store(tmp_path):
 def test_maintenance_loop_starts_and_stops_cleanly(tmp_path):
     audit = AuditStore(tmp_path / "audit.db")
     config = MaintenanceConfig(interval_seconds=60)
-    loop = MaintenanceLoop(audit=audit, supervisor2_store=None, bindings_path=None, config=config)
+    loop = MaintenanceLoop(audit=audit, supervisor2_store=None, bindings_path=None, config=config,
+                          leases=PaneLeaseStore(tmp_path / "leases.db"))
     loop.start()
     try:
         deadline = time.monotonic() + 2

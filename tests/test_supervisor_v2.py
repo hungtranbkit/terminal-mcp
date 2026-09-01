@@ -460,7 +460,12 @@ def test_send_result_never_contains_raw_prompt_text(tmp_path, tmux_session_facto
     assert set(parsed.keys()) <= {
         "session", "binding", "sent", "characters", "press_enter",
         "submit_status", "submit_reason",
+        # P0 Part A: correlation_id is an opaque uuid4 hex (never prompt
+        # content); delivery_state/enter_sent are fixed enum/bool values.
+        "correlation_id", "delivery_state", "enter_sent", "error",
     }
+    if "correlation_id" in parsed:
+        assert isinstance(parsed["correlation_id"], str) and "y" not in parsed["correlation_id"]
     if "submit_reason" in parsed:
         assert parsed["submit_reason"] in (
             "could not capture a pre-submit baseline to verify against",

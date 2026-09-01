@@ -19,8 +19,18 @@ from .schema import Migration, apply_migrations
 # versioned-migration system. A no-op apply: its only job is stamping
 # PRAGMA user_version so future schema changes append Migration(2, ...),
 # Migration(3, ...) here instead of another bare, untracked ALTER TABLE.
+def _add_correlation_id_column(connection: sqlite3.Connection) -> None:
+    connection.execute("ALTER TABLE input_audit ADD COLUMN correlation_id TEXT")
+
+
 AUDIT_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: input_audit + idempotent_sends as of the P1 hardening pass", lambda connection: None),
+    # P0 Part A.5: every send attempt (not just idempotency-keyed ones) now
+    # carries a correlation_id, ties an audit row to the exact adapter-
+    # evidence decision that produced it, and lets a caller reconciling
+    # after a lost response look the attempt up by something narrower than
+    # session+timestamp.
+    Migration(2, "add input_audit.correlation_id for P0 delivery-state reconciliation", _add_correlation_id_column),
 ]
 
 
@@ -104,19 +114,21 @@ class AuditStore:
     def record(self, *, action: str, session: str | None, result: str,
                binding: str | None = None, text: str | None = None,
                keys: list[str] | None = None, press_enter: bool = False,
-               reason: str | None = None, source_transport: str = "mcp") -> None:
+               reason: str | None = None, source_transport: str = "mcp",
+               correlation_id: str | None = None) -> None:
         with self._connection() as connection:
             connection.execute(
                 """INSERT INTO input_audit
                 (timestamp, action, binding, session, text_sha256, text_preview,
-                 text_length, keys, press_enter, result, reason, source_transport, server_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 text_length, keys, press_enter, result, reason, source_transport, server_version,
+                 correlation_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (datetime.now(timezone.utc).isoformat(), action, binding, session,
                  text_fingerprint(text) if text is not None else None,
                  sanitized_preview(text) if text is not None else None,
                  len(text) if text is not None else None,
                  json.dumps(keys) if keys is not None else None, int(press_enter),
-                 result, reason, source_transport, __version__),
+                 result, reason, source_transport, __version__, correlation_id),
             )
 
     def prune(self, retention: int) -> int:
@@ -148,19 +160,40 @@ class AuditStore:
             )
         return cursor.rowcount
 
-    def claim_idempotency_key(self, key: str) -> bool:
+    def claim_idempotency_key(self, key: str, *, stale_after_seconds: float = 30.0) -> bool:
         """Returns True if this call is the one that gets to actually
         perform the action (first claim of this key, ever -- durable
         across process restart since it's on disk); False if another
         caller (a prior completed call, or a concurrent in-flight one)
-        already claimed it first."""
+        already claimed it first.
+
+        P0 Part A.5/B: a claim whose result_json is still NULL after
+        `stale_after_seconds` is reclaimed rather than left blocking
+        forever -- a claimant that crashed (process killed, host restart)
+        between claiming and storing its result would otherwise leave every
+        future retry of that exact key permanently stuck reporting
+        DUPLICATE_IN_PROGRESS for an attempt that will never actually
+        finish. Reclaim is a plain UPDATE gated on both conditions
+        (result_json IS NULL AND created_at < cutoff) so a genuinely
+        in-flight concurrent claim (any age under the threshold) is never
+        disturbed -- this only ever fires for an abandoned claim, and the
+        reclaiming caller becomes the new sole owner exactly as if it had
+        won the original INSERT OR IGNORE race."""
         now = datetime.now(timezone.utc).isoformat()
         with self._connection() as connection:
             cursor = connection.execute(
                 "INSERT OR IGNORE INTO idempotent_sends (idempotency_key, result_json, created_at) VALUES (?, NULL, ?)",
                 (key, now),
             )
-        return cursor.rowcount == 1
+            if cursor.rowcount == 1:
+                return True
+            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)).isoformat()
+            reclaim = connection.execute(
+                "UPDATE idempotent_sends SET created_at = ? "
+                "WHERE idempotency_key = ? AND result_json IS NULL AND created_at < ?",
+                (now, key, cutoff),
+            )
+        return reclaim.rowcount == 1
 
     def store_idempotent_result(self, key: str, result: dict[str, Any]) -> None:
         with self._connection() as connection:

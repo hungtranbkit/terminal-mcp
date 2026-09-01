@@ -20,10 +20,14 @@ class FakeTmux:
         return None if command is None else SessionInfo(name, False, 1, 1, 1, 1, command, False)
 
     def capture_lines(self, session, lines):
-        # Changes as soon as a second call (the separate Enter send-keys)
-        # is recorded, so send-then-verify confirms on its first poll
-        # instead of always timing out against a truly constant fake.
-        return ["ready", "prompt>", f"calls={len(self.sent)}"]
+        # Genuinely grows (a new line per send_text/send_keys call
+        # recorded) rather than just changing content in place -- P0 Part A
+        # adapters (CodexAdapter/ClaudeAdapter) require real line-count
+        # growth as submission evidence, not a bare "did the content
+        # differ" check (see adapters.py), so the fake must model an
+        # actually-growing pane to exercise the same confirm-on-first-poll
+        # path this fixture has always relied on.
+        return ["ready", "prompt>", *[f"call-{i}" for i in range(len(self.sent))]]
 
     def send_text(self, session, text, press_enter):
         self.sent.append((session, text, press_enter))

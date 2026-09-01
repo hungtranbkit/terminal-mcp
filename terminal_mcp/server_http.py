@@ -77,6 +77,7 @@ def main() -> None:
     maintenance_loop = MaintenanceLoop(
         audit=terminal.audit, supervisor2_store=supervisor_v2.store,
         bindings_path=terminal.bindings.path, config=config.maintenance,
+        leases=terminal.leases,
     )
     maintenance_loop.start()
     atexit.register(maintenance_loop.stop)

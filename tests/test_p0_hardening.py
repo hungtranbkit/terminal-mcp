@@ -103,22 +103,32 @@ def test_explicit_rebind_clears_identity_mismatch(tmux_session_factory, tmp_path
     subprocess.run(["tmux", "kill-session", "-t", session], check=False)
 
 
-def test_legacy_binding_without_pin_lazily_adopts_on_first_send(tmux_session_factory, tmp_path):
-    # A binding created before identity pinning existed (pinned_session_id
-    # NULL, e.g. directly via BindingStore.put with no pin) must not be
-    # broken outright by this upgrade -- its first successful send adopts
-    # whatever identity is live *then*.
+def test_legacy_binding_without_pin_fails_closed_on_input_until_rebound(tmux_session_factory, tmp_path):
+    # P0 Part B.3: a binding created before identity pinning existed
+    # (pinned_session_id NULL, e.g. directly via BindingStore.put with no
+    # pin) must fail closed for INPUT -- silently trusting "whatever
+    # answers to this name right now" is exactly the unpinned-identity
+    # risk this feature exists to close, so it is refused, never lazily
+    # adopted. Read is unaffected (a different code path, never checks the
+    # pin). An explicit rebind (replace=True, same "deliberately accept
+    # this target" action as the identity-mismatch-recovery test above)
+    # is the one-time migration off the unpinned state.
     session = tmux_session_factory("test-pin-legacy", "bash -lc 'read x; echo GOT:$x; sleep 30'")
     service = _service(tmp_path)
     service.bindings.put("agent", session, input_enabled=True)  # no pinned_* kwargs -> legacy row
     assert service.bindings.get("agent").pinned_session_id is None
 
+    assert "GOT" not in service.terminal_tail_bound("agent")["output"]  # read still works, unaffected
+    blocked = service.terminal_send_bound("agent", "y", press_enter=True)
+    assert blocked["error"] == "BINDING_NOT_PINNED"
+    assert service.bindings.get("agent").pinned_session_id is None  # never silently adopted
+
+    rebind = service.terminal_bind("agent", session, replace=True, input_enabled=True)
+    assert rebind["replaced"] is True
+    info = service.tmux.get_session(session)
+    assert service.bindings.get("agent").pinned_session_id == info.session_id  # migrated, once, explicitly
     result = service.terminal_send_bound("agent", "y", press_enter=True)
     assert result["sent"] is True
-    adopted = service.bindings.get("agent")
-    assert adopted.pinned_session_id  # now pinned
-    info = service.tmux.get_session(session)
-    assert adopted.pinned_session_id == info.session_id
 
 
 def test_watch_pins_identity_at_watch_time(tmux_session_factory, tmp_path):

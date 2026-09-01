@@ -400,8 +400,13 @@ def test_session_input_sends_text_to_allowed_session(input_config, tmux_session_
     body = response.json()
     # press_enter=False -> submit_status is TEXT_SENT (nothing to confirm),
     # not the fixed dict this asserted before submit_status existed.
+    # correlation_id/delivery_state/enter_sent (P0 Part A) vary per call /
+    # are new fields -- checked for presence/shape, not pinned by value.
+    correlation_id = body.pop("correlation_id")
+    assert isinstance(correlation_id, str) and len(correlation_id) == 32
     assert body == {"session": session, "sent": True, "characters": len("echo hi"),
-                    "press_enter": False, "submit_status": "TEXT_SENT"}
+                    "press_enter": False, "submit_status": "TEXT_SENT",
+                    "delivery_state": "TEXT_SENT", "enter_sent": False}
 
 
 def test_session_input_idempotency_key_prevents_duplicate_send(input_config, tmux_session_factory):
