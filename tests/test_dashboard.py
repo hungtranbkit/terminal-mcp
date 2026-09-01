@@ -526,6 +526,47 @@ def test_sessions_route_deterministic_fallback_and_activity_order(read_config, t
     assert {"test-attn-a", "test-attn-b"} <= names  # no allowed session ever hidden
 
 
+def test_sessions_route_fans_out_correctly_across_many_sessions(read_config, tmux_session_factory):
+    # P1 items #4/#5: the per-row terminal_status() calls now fire
+    # concurrently (anyio task group) instead of serially -- with enough
+    # rows to make a fan-out bug (a race writing into the wrong row, a
+    # dropped row, a state lost/overwritten) plausible if the concurrent
+    # version were wrong, every row's state must still exactly match what
+    # a direct, single terminal_status() call for that same session reports.
+    names = [f"test-fanout-{i}" for i in range(10)]
+    for name in names:
+        tmux_session_factory(name, "bash -lc 'sleep 20'")
+    time.sleep(0.4)
+    client, service = _client(read_config)
+    rows = client.get("/dashboard/api/sessions").json()["sessions"]
+    by_name = {row["name"]: row for row in rows}
+    assert set(names) <= set(by_name)
+    for name in names:
+        direct_state = service.terminal_status(name)["state"]
+        assert by_name[name]["state"] == direct_state
+
+
+def test_concurrent_dashboard_requests_all_succeed(read_config, tmux_session_factory):
+    # A crude but real proof that the async-offload change (P1 item #4)
+    # didn't introduce a race/deadlock: fire a batch of concurrent, mixed
+    # GET requests (sessions list + per-session detail) at the same running
+    # server and confirm every single one comes back successfully. Not a
+    # timing assertion (those are flaky) -- a correctness one.
+    import concurrent.futures
+
+    session = tmux_session_factory("test-concurrent-dash", "bash -lc 'sleep 20'")
+    time.sleep(0.3)
+    client, _ = _client(read_config)
+
+    def _get(path: str) -> int:
+        return client.get(path).status_code
+
+    paths = ["/dashboard/api/sessions", f"/dashboard/api/session?name={session}"] * 8
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        statuses = list(pool.map(_get, paths))
+    assert all(code == 200 for code in statuses)
+
+
 def test_sessions_route_still_denies_unlisted_sessions(read_config, tmux_session_factory):
     # Security regression: the new per-row terminal_status() call and sort
     # only touch presentation of the already-whitelist-filtered list; a

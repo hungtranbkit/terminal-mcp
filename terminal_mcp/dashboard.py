@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from urllib.parse import urlparse
 
+import anyio
 from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
@@ -1085,17 +1086,30 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
     @server.custom_route("/dashboard/api/sessions", methods=["GET"], include_in_schema=False)
     async def sessions(_: Request) -> JSONResponse:
-        listed = terminal.terminal_list_sessions()
+        # P1 items #4/#5: terminal_list_sessions/terminal_status are both
+        # blocking (a real tmux subprocess round-trip, sometimes an sqlite
+        # read) -- run off the event loop via anyio.to_thread so one slow
+        # tmux call can never stall every other concurrent request this
+        # single async server is handling. The per-session terminal_status
+        # calls below are also each an independent tmux subprocess (the
+        # N+1 this route always had) -- fired concurrently in a task group
+        # rather than serially, so N sessions cost ~one round-trip's worth
+        # of wall-clock time instead of N.
+        listed = await anyio.to_thread.run_sync(terminal.terminal_list_sessions)
         rows = listed.get("sessions")
         if isinstance(rows, list):
-            # Reuses the exact same classify_status() heuristic terminal_status()
-            # already applies to a single session — no new/looser interpretation
-            # of pane content, so WAITING_INPUT here means exactly what it means
-            # everywhere else in this project, and UNKNOWN stays UNKNOWN when
-            # evidence is weak, same as always.
-            for row in rows:
-                status = terminal.terminal_status(row["name"])
+            async def _fill_state(row: dict) -> None:
+                # Reuses the exact same classify_status() heuristic terminal_status()
+                # already applies to a single session — no new/looser interpretation
+                # of pane content, so WAITING_INPUT here means exactly what it means
+                # everywhere else in this project, and UNKNOWN stays UNKNOWN when
+                # evidence is weak, same as always.
+                status = await anyio.to_thread.run_sync(terminal.terminal_status, row["name"])
                 row["state"] = status.get("state", "UNKNOWN")
+
+            async with anyio.create_task_group() as tg:
+                for row in rows:
+                    tg.start_soon(_fill_state, row)
             # Stable multi-key sort applied least-significant-key first: name
             # (deterministic fallback for ties) -> activity descending (most
             # recent first) -> attention-needed first. No session is ever
@@ -1108,19 +1122,43 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     @server.custom_route("/dashboard/api/session", methods=["GET"], include_in_schema=False)
     async def session_detail(request: Request) -> JSONResponse:
         name = request.query_params.get("name", "")
-        status = terminal.terminal_status(name)
+        # P1 item #4: both calls below are independent tmux subprocess
+        # round-trips -- run concurrently, off the event loop.
+        status_result: dict = {}
+        tail_result: dict = {}
+
+        async def _status() -> None:
+            status_result.update(await anyio.to_thread.run_sync(terminal.terminal_status, name))
+
+        async def _tail() -> None:
+            # Uses config.default_tail_lines (already the project's one source of truth
+            # for "how many recent lines" — see config.yaml) rather than a hardcoded
+            # count. tmux capture-pane already returns that window oldest-line-first,
+            # newest-line-last, so the dashboard renders it in natural chronological
+            # order with no reordering needed. ansi=True keeps colour/style escape
+            # sequences for the terminal-style renderer; it goes through the exact
+            # same whitelist/permission guard as every other read, and through
+            # redact_ansi_safe (see terminal_mcp/redaction.py) rather than the plain
+            # redactor, so a secret can never survive because it was colour-coded.
+            tail_result.update(await anyio.to_thread.run_sync(lambda: terminal.terminal_tail(name, ansi=True)))
+
+        # Both fire regardless of whether one turns out to be an error (the
+        # original sequential code short-circuited before calling
+        # terminal_tail at all on an errored status) -- a harmless, rare-
+        # path tradeoff: terminal_tail re-checks the whitelist itself
+        # (same defense-in-depth as every other read here) and returns its
+        # own error with no side effects either way, so running both
+        # concurrently costs one redundant tmux call only on the already-
+        # uncommon error path, in exchange for the success path (the
+        # overwhelming majority of requests) needing one round-trip's
+        # worth of wall-clock time instead of two.
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_status)
+            tg.start_soon(_tail)
+
+        status, tail = status_result, tail_result
         if "error" in status:
             return JSONResponse(status, status_code=403 if status["error"] == "ACCESS_DENIED" else 404)
-        # Uses config.default_tail_lines (already the project's one source of truth
-        # for "how many recent lines" — see config.yaml) rather than a hardcoded
-        # count. tmux capture-pane already returns that window oldest-line-first,
-        # newest-line-last, so the dashboard renders it in natural chronological
-        # order with no reordering needed. ansi=True keeps colour/style escape
-        # sequences for the terminal-style renderer; it goes through the exact
-        # same whitelist/permission guard as every other read, and through
-        # redact_ansi_safe (see terminal_mcp/redaction.py) rather than the plain
-        # redactor, so a secret can never survive because it was colour-coded.
-        tail = terminal.terminal_tail(name, ansi=True)
         if "error" in tail:
             return JSONResponse(tail, status_code=404)
         input_allowed = (
@@ -1156,7 +1194,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # Cloudflare Access is configured, distinct from an anonymous one
         # when it is not.
         _log.info("dashboard session_input session=%s identity=%s", name, identity.email if identity else None)
-        result = terminal.terminal_send_text(name, text, press_enter=press_enter, idempotency_key=idempotency_key)
+        result = await anyio.to_thread.run_sync(
+            lambda: terminal.terminal_send_text(name, text, press_enter=press_enter, idempotency_key=idempotency_key)
+        )
         status_code = 200
         if "error" in result:
             status_code = INPUT_ERROR_STATUS.get(result["error"], 400)
@@ -1166,10 +1206,16 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     async def supervisor_summary(_: Request) -> JSONResponse:
         # Read-only: reuses the same SupervisorService the MCP tools use, so
         # the dashboard can never see anything a supervisor_* tool call
-        # couldn't already show (same whitelist-guarded watch data).
-        status = supervisor.status()
-        events = supervisor.list_events(unacknowledged_only=True, limit=20)["events"]
-        return JSONResponse({"status": status, "events": events}, headers={"Cache-Control": "no-store"})
+        # couldn't already show (same whitelist-guarded watch data). Both
+        # calls are sqlite reads -- cheap individually, but still blocking,
+        # so one thread-hop for the pair (P1 item #4) rather than two.
+        def _compute() -> dict:
+            status = supervisor.status()
+            events = supervisor.list_events(unacknowledged_only=True, limit=20)["events"]
+            return {"status": status, "events": events}
+
+        result = await anyio.to_thread.run_sync(_compute)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/supervisor/ack", methods=["POST"], include_in_schema=False)
     async def supervisor_ack(request: Request) -> JSONResponse:
@@ -1186,7 +1232,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         event_id = body.get("id") if isinstance(body, dict) else None
         if not isinstance(event_id, int):
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
-        result = supervisor.ack_event(event_id)
+        result = await anyio.to_thread.run_sync(supervisor.ack_event, event_id)
         status_code = 404 if "error" in result else 200
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
@@ -1195,18 +1241,28 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # Read-only: for every watch with a non-observe_only v2 policy, its
         # policy/counters plus its most recent action (if any) — the same
         # data the supervisor2_* MCP tools expose, nothing extra computed
-        # for this view.
-        rows = []
-        for watch in supervisor.list_watches()["watches"]:
-            policy = supervisor_v2.store.get_policy(watch["watch_key"])
-            if policy["policy_mode"] == "observe_only" and policy["created_at"] is None:
-                continue  # never configured for v2 at all — nothing to show
-            actions = supervisor_v2.store.list_actions(watch_key=watch["watch_key"], limit=1)
-            rows.append({
-                "watch_key": watch["watch_key"], "target": watch["target"], "kind": watch["kind"],
-                "watch_state": watch["state"], "policy": policy,
-                "latest_action": actions[0] if actions else None,
-            })
+        # for this view. All sqlite (P1 item #4: one thread-hop for the
+        # whole loop, not per-call) -- the N+1 shape here is far cheaper
+        # per-iteration than the tmux-backed /sessions route (item #5), so
+        # unlike that route this is left as a single-threaded loop rather
+        # than parallelized: N tiny sqlite reads gain little from fan-out
+        # and a task group's own overhead would likely cost more than it
+        # saves at the sizes this ever runs at (per-watch v2 policies).
+        def _compute() -> list[dict]:
+            rows = []
+            for watch in supervisor.list_watches()["watches"]:
+                policy = supervisor_v2.store.get_policy(watch["watch_key"])
+                if policy["policy_mode"] == "observe_only" and policy["created_at"] is None:
+                    continue  # never configured for v2 at all — nothing to show
+                actions = supervisor_v2.store.list_actions(watch_key=watch["watch_key"], limit=1)
+                rows.append({
+                    "watch_key": watch["watch_key"], "target": watch["target"], "kind": watch["kind"],
+                    "watch_state": watch["state"], "policy": policy,
+                    "latest_action": actions[0] if actions else None,
+                })
+            return rows
+
+        rows = await anyio.to_thread.run_sync(_compute)
         return JSONResponse({"watches": rows}, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/supervisor2/pause", methods=["POST"], include_in_schema=False)
@@ -1226,6 +1282,6 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if not isinstance(target, str) or kind not in ("session", "binding"):
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         kwargs = {"session": target} if kind == "session" else {"binding": target}
-        result = supervisor_v2.set_policy(policy_mode="observe_only", **kwargs)
+        result = await anyio.to_thread.run_sync(lambda: supervisor_v2.set_policy(policy_mode="observe_only", **kwargs))
         status_code = 404 if "error" in result else 200
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
