@@ -46,11 +46,17 @@ input_policy:
 # nothing) and makes the supervisor_* tools' background timer live.
 supervisor:
   enabled: true
-  # v2 (decision/send layer) global kill switch: OFF again pending the P0
-  # hardening pass (identity pinning, per-pane lock, idempotency keys,
-  # revision CAS, confirmed delivery, structured completion verification --
-  # see the P0 hardening commits). v2 detection/observe_only/suggest_only
-  # review still work with this off; only supervisor2_execute_send is
-  # gated by it, so no watch can auto-send while this pass is in progress
-  # even if a per-watch policy were set to approved_auto_continue.
-  v2_enabled: false
+  # v2 (decision/send layer) global kill switch: re-enabled after the full
+  # P0/P0.5 hardening pass (identity pinning, per-pane lock, idempotency
+  # keys, revision CAS, confirmed delivery, structured completion
+  # verification/nonce/trusted verifier hooks, and the stale-policy-on-
+  # reused-name fix immediately preceding this commit) plus a live
+  # re-verification of every gate against a disposable production session
+  # -- see that commit's message for the checklist and evidence. This flag
+  # is still ONLY the global kill switch: flipping it does not itself
+  # enable any auto-send anywhere -- that still requires an operator to
+  # explicitly call supervisor2_set_policy(policy_mode="approved_auto_
+  # continue", ...) on a specific watch, which no watch has by default
+  # (observe_only) and no watch currently has (this environment's
+  # supervisor.db carries no watches/policies as of this change).
+  v2_enabled: true
