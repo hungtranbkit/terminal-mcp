@@ -91,7 +91,7 @@ class AgentAdapter(ABC):
         or the pane shows no evidence a composer is even ready)."""
 
     @abstractmethod
-    def submit_ack_evidence(self, before: list[str], after: list[str]) -> bool:
+    def submit_ack_evidence(self, before: list[str], after: list[str], sent_text: str) -> bool:
         """True only if `after` (captured post-Enter) shows genuine,
         adapter-specific evidence this exact submission was processed --
         never a bare `before != after`, since a live-redrawing Ink-style UI
@@ -103,7 +103,12 @@ class AgentAdapter(ABC):
         compare against here; it exists in the caller's audit trail
         instead, where each attempt's before/after pair is what "the exact
         send attempt" means operationally for a tmux-observed target with
-        no other acknowledgement channel."""
+        no other acknowledgement channel. `sent_text` (P0 zero-gap
+        hardening) is the exact text this attempt typed -- available for an
+        adapter that can strengthen its evidence by requiring the target
+        to demonstrably echo/acknowledge *this* attempt's own content, not
+        just show unrelated progress; an adapter that doesn't need it may
+        ignore it."""
 
     @abstractmethod
     def stuck_composer_evidence(self, before: list[str], after: list[str]) -> bool:
@@ -140,7 +145,7 @@ class GenericShellAdapter(AgentAdapter):
     def can_submit_now(self, lines: list[str]) -> bool:
         return True
 
-    def submit_ack_evidence(self, before: list[str], after: list[str]) -> bool:
+    def submit_ack_evidence(self, before: list[str], after: list[str], sent_text: str) -> bool:
         return after != before
 
     def stuck_composer_evidence(self, before: list[str], after: list[str]) -> bool:
@@ -214,7 +219,7 @@ class CodexAdapter(AgentAdapter):
     def can_submit_now(self, lines: list[str]) -> bool:
         return not _match_any(_WORKING_PATTERNS, _tail(lines, 6))
 
-    def submit_ack_evidence(self, before: list[str], after: list[str]) -> bool:
+    def submit_ack_evidence(self, before: list[str], after: list[str], sent_text: str) -> bool:
         # Genuine line-count growth, not a bare diff -- a live-redrawing
         # composer's own spinner/cursor/elapsed-timer tick changes the
         # captured snapshot on every keystroke *including a swallowed
@@ -233,6 +238,33 @@ class CodexAdapter(AgentAdapter):
         return not _match_any(_WORKING_PATTERNS, _tail(lines, 6))
 
 
+def _normalize_for_match(lines: list[str]) -> str:
+    """Collapse each line's internal whitespace and join with a single
+    space -- makes a wrapped, multi-line echo of one logical piece of text
+    (Claude Code word-wraps a long/multi-line prompt across many terminal
+    columns, each continuation line left-padded) match as one continuous
+    string, the same way it reads as one logical line to a human looking
+    at the pane."""
+    return " ".join(" ".join(line.split()) for line in lines)
+
+
+def _sent_text_echoed(after: list[str], sent_text: str, *, prefix_chars: int = 80) -> bool:
+    """True if a normalized, whitespace-collapsed prefix of `sent_text`
+    appears anywhere in the normalized `after` pane content. A bounded
+    prefix (not the full text) is deliberate: a long prompt can word-wrap
+    across more lines than fit in the bounded capture window this is
+    checked against, so requiring the *entire* text to be simultaneously
+    visible would make a genuinely long, genuinely landed send
+    unverifiable purely due to viewport size -- the same reasoning
+    RECOVERY_VERIFY_TIMEOUT_SECONDS-class adapters already apply
+    elsewhere in this module. A short/empty sent_text after normalization
+    matches trivially true (nothing meaningful to attribute)."""
+    normalized_sent = " ".join(sent_text.split())[:prefix_chars]
+    if not normalized_sent:
+        return True
+    return normalized_sent in _normalize_for_match(after)
+
+
 class ClaudeAdapter(AgentAdapter):
     """Claude Code CLI. Same Ink-rendered working/waiting footer family as
     Codex (directly observed live in this session), so identify_target_
@@ -241,9 +273,29 @@ class ClaudeAdapter(AgentAdapter):
     composer-swallow behavior under this exact race has never been
     reproduced against a real session the way Codex's was, so no recovery
     path is enabled for it (see the P0 final report's NOT VERIFIED list).
-    submit_ack_evidence uses the same genuine-progress rule as Codex rather
-    than a bare diff, since the identical spinner/timer redraw risk applies
-    to any pane snapshot taken while an Ink UI is live."""
+
+    submit_ack_evidence (P0 zero-gap hardening): genuine-progress
+    (_shows_genuine_progress, same rule as Codex) is necessary but, while
+    the target was ALREADY busy at either end of this attempt's window
+    (before or after shows WORKING evidence), not sufficient on its own --
+    an ordinary spinner/elapsed-timer tick from an EARLIER, unrelated
+    in-flight turn can itself change every line but the last within the
+    verify window, coincidentally, regardless of whether *this* attempt's
+    Enter did anything at all. Real, live, repeated testing (short/long/
+    multiline prompts, true zero-gap back-to-back bursts, up to 25
+    sequential sends with no artificial delay -- see
+    test_adapters_real_cli.py) never produced an actual incorrect
+    confirmation from this path, and independently established WHY: Claude
+    Code's own UI reliably echoes the just-sent text verbatim, either into
+    conversation history or into its own "queued messages" display,
+    whenever a send genuinely lands. Requiring that echo specifically (in
+    addition to genuine progress) whenever the busy window makes the
+    coincidental-tick risk real closes the gap in the *evidentiary*
+    reasoning without narrowing the already-real-tested idle-composer case
+    at all, and without adding any delay or extra keystroke -- a send this
+    stricter check cannot confirm reports DELIVERY_UNKNOWN, the existing
+    safe/conservative failure direction, never a false BLOCKED or a
+    dropped send."""
     name = "claude"
 
     def identify_target_state(self, lines: list[str]) -> str:
@@ -257,8 +309,13 @@ class ClaudeAdapter(AgentAdapter):
     def can_submit_now(self, lines: list[str]) -> bool:
         return not _match_any(_WORKING_PATTERNS, _tail(lines, 6))
 
-    def submit_ack_evidence(self, before: list[str], after: list[str]) -> bool:
-        return after != before and _shows_genuine_progress(before, after)
+    def submit_ack_evidence(self, before: list[str], after: list[str], sent_text: str) -> bool:
+        if after == before or not _shows_genuine_progress(before, after):
+            return False
+        was_busy = _match_any(_WORKING_PATTERNS, _tail(before, 6)) or _match_any(_WORKING_PATTERNS, _tail(after, 6))
+        if was_busy:
+            return _sent_text_echoed(after, sent_text)
+        return True
 
     def stuck_composer_evidence(self, before: list[str], after: list[str]) -> bool:
         return False  # never reproduced for Claude -- no recovery enabled, see docstring

@@ -689,7 +689,7 @@ class TerminalService:
             result["recovery_attempted"] = True
             _, after2, _ = self._poll_for_submission(session, pre_recovery_snapshot,
                                                       timeout=RECOVERY_VERIFY_TIMEOUT_SECONDS)
-            confirmed2 = after2 is not None and adapter.submit_ack_evidence(pre_recovery_snapshot, after2)
+            confirmed2 = after2 is not None and adapter.submit_ack_evidence(pre_recovery_snapshot, after2, text)
             if confirmed2:
                 result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
                 result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
@@ -700,7 +700,7 @@ class TerminalService:
                 result["submit_reason"] = "still unconfirmed after Escape+Enter recovery"
             return result
 
-        confirmed = after is not None and adapter.submit_ack_evidence(typed_snapshot, after)
+        confirmed = after is not None and adapter.submit_ack_evidence(typed_snapshot, after, text)
         if confirmed:
             result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
             result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
