@@ -188,24 +188,58 @@ class TerminalService:
         return None
 
     def terminal_list_sessions(self) -> dict[str, Any]:
+        """Full tmux session inventory (every real session, not only
+        statically-whitelisted ones) -- matches dashboard_list_sessions'
+        own discovery scope so any MCP client (Claude Code, ChatGPT via
+        the tunnel, ...) can discover the same sessions an operator can
+        see and grant from the dashboard. Discovery itself is NOT access:
+        `name`/`attached`/`windows`/`created`/`activity` are tmux
+        metadata, never pane content, so listing them for a non-
+        whitelisted/non-granted session leaks nothing a caller couldn't
+        already see by running `tmux ls` themselves on this host -- the
+        actual content/control tools (terminal_tail/terminal_capture/
+        terminal_status/terminal_send_text/terminal_send_keys/
+        terminal_bind and everything built on them) are completely
+        unaffected by this method and keep enforcing session_allowed/
+        input_session_allowed/the per-session grant exactly as before;
+        nothing here bypasses or widens any of those checks.
+
+        `allowed` keeps its pre-existing meaning (the static config.yaml
+        whitelist result). `read_granted`/`input_granted` reflect an
+        explicit per-session dashboard grant (see grants.py), if any --
+        read live off SessionGrantStore on every call, so a grant/revoke
+        issued from the dashboard is reflected here immediately, no
+        restart needed. `read_allowed`/`input_allowed` are the actual,
+        CURRENT effective capability (statically allowed OR granted, and
+        for input also gated on the global terminal_input permission) --
+        the single field a caller should check before attempting a read
+        or a send; a caller that only wants "can I do X right now" never
+        needs to reason about allowed vs. *_granted separately."""
         if (error := require_read(self.config)) is not None:
             return {"error": error, "sessions": []}
         try:
-            sessions = [
-                {
-                    "name": item.name,
-                    "allowed": True,
-                    "attached": item.attached,
-                    "windows": item.windows,
-                    "created": iso_timestamp(item.created_epoch),
-                    "activity": iso_timestamp(item.activity_epoch),
-                }
-                for item in self.tmux.list_sessions()
-                if session_allowed(item.name, self.config)
-            ]
-            return {"sessions": sessions}
+            items = self.tmux.list_sessions()
         except TmuxError as exc:
             return {"error": "TMUX_ERROR", "reason": str(exc), "sessions": []}
+        grants_by_session = {grant.session: grant for grant in self.grants.list()}
+        sessions = []
+        for item in items:
+            allowed = session_allowed(item.name, self.config)
+            grant = grants_by_session.get(item.name)
+            read_granted = bool(grant and grant.read_enabled)
+            input_granted = bool(grant and grant.input_enabled)
+            sessions.append({
+                "name": item.name, "allowed": allowed, "attached": item.attached,
+                "windows": item.windows, "created": iso_timestamp(item.created_epoch),
+                "activity": iso_timestamp(item.activity_epoch),
+                "read_allowed": allowed or read_granted, "read_granted": read_granted,
+                "input_allowed": bool(
+                    self.config.permissions.terminal_input
+                    and (input_session_allowed(item.name, self.config) or input_granted)
+                ),
+                "input_granted": input_granted,
+            })
+        return {"sessions": sessions}
 
     def terminal_tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]:
         """Return sanitized recent output. `ansi` is keyword-only, defaults to
@@ -743,28 +777,36 @@ class TerminalService:
                 "last_output": redact_text("\n".join(lines)), "effective_input": effective}
 
     # -- dashboard-only per-session grants -----------------------------
-    # Everything below is deliberately NEVER exposed as an MCP tool (see
-    # mcp_app.py -- there is no supervisor_grant_*/terminal_grant_* tool
-    # wrapper). Widens what the DASHBOARD specifically (already gated by
-    # Cloudflare Access + CSRF + dashboard.mutations_enabled -- see
-    # dashboard.py) can do for one explicitly-granted session outside the
-    # static config.yaml whitelist; the raw MCP tool surface -- every
-    # method above this point -- is completely unaffected and continues
-    # enforcing session_allowed/input_session_allowed exactly as before.
+    # GRANTING/REVOKING (grant_session_read/grant_session_input below,
+    # and everything that reads/writes an actual grant) is still
+    # deliberately NEVER exposed as an MCP tool (see mcp_app.py -- there
+    # is no supervisor_grant_*/terminal_grant_* tool wrapper). DISCOVERY
+    # is shared: terminal_list_sessions (above, the MCP tool surface) and
+    # dashboard_list_sessions (below) both show the full tmux inventory
+    # plus each session's grant/capability state -- an MCP client (Claude
+    # Code, ChatGPT via the tunnel) can see the exact same sessions and
+    # authorization state an operator sees on the dashboard, including a
+    # session it cannot yet read or control. That is discovery only:
+    # every content/control method (terminal_tail/terminal_status/
+    # terminal_send_text/terminal_bind and the *_granted methods below)
+    # still enforces session_allowed/input_session_allowed/the per-
+    # session grant exactly as before -- seeing a session listed never
+    # grants anything, only supervisor_watch/grant_session_read/
+    # grant_session_input do, and only the latter two are dashboard-only.
 
     def dashboard_list_sessions(self) -> dict[str, Any]:
-        """Unlike terminal_list_sessions (whitelist-filtered, the MCP tool
-        surface), this lists every real tmux session unfiltered -- session
-        NAME/attached/windows/created/activity are tmux metadata, not pane
-        CONTENT, so surfacing them for a non-whitelisted session leaks
-        nothing a dashboard viewer couldn't already see by running `tmux
-        ls` themselves on this host. `allowed` is the existing static-
-        whitelist result (unchanged meaning); `grant` is this session's
-        current dashboard grant, if any; `effective_read`/`effective_input`
-        fold both together -- a whitelisted session is unaffected (already
-        true via `allowed`), a granted-but-not-whitelisted one becomes
-        readable/sendable through the *_granted methods below, nothing
-        else changes for it."""
+        """Same full-inventory discovery as terminal_list_sessions (the
+        MCP tool surface) above, in the shape the dashboard's own JS
+        already expects -- session NAME/attached/windows/created/activity
+        are tmux metadata, not pane CONTENT, so surfacing them for a non-
+        whitelisted session leaks nothing a viewer couldn't already see by
+        running `tmux ls` themselves on this host. `allowed` is the
+        existing static-whitelist result (unchanged meaning); `grant` is
+        this session's current dashboard grant, if any; `effective_read`/
+        `effective_input` fold both together -- a whitelisted session is
+        unaffected (already true via `allowed`), a granted-but-not-
+        whitelisted one becomes readable/sendable through the *_granted
+        methods below, nothing else changes for it."""
         if (error := require_read(self.config)) is not None:
             return {"error": error, "sessions": []}
         try:

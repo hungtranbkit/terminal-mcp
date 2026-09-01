@@ -16,10 +16,22 @@ def test_real_tmux_list_tail_status_and_denial(read_config, tmux_session_factory
     time.sleep(0.8)
     service = TerminalService(read_config)
 
-    names = {item["name"] for item in service.terminal_list_sessions()["sessions"]}
-    assert {"test-running", "test-waiting"} <= names
-    assert "private-session" not in names
+    # terminal_list_sessions discovers the FULL tmux inventory (see
+    # core.py's dashboard-grant feature) -- "private-session" (outside
+    # the static whitelist) is listed too, but strictly as metadata: no
+    # content field anywhere, and its capability flags all say no.
+    rows = {item["name"]: item for item in service.terminal_list_sessions()["sessions"]}
+    assert {"test-running", "test-waiting", "private-session"} <= set(rows)
+    private_row = rows["private-session"]
+    assert private_row["allowed"] is False
+    assert private_row["read_allowed"] is False
+    assert private_row["input_allowed"] is False
+    assert set(private_row) == {"name", "allowed", "attached", "windows", "created",
+                                "activity", "read_allowed", "read_granted",
+                                "input_allowed", "input_granted"}  # no content field, ever
     assert "BUILD STEP 5" in service.terminal_tail("test-running", 20)["output"]
+    # Discovery never grants access -- still the exact same ACCESS_DENIED
+    # a raw, unmodified whitelist check has always produced.
     assert service.terminal_tail("private-session", 20)["error"] == "ACCESS_DENIED"
     assert service.terminal_status("test-waiting")["state"] == "WAITING_INPUT"
     assert service.terminal_status("test-running")["state"] != "WAITING_INPUT"

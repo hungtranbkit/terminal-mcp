@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Terminal MCP lets an MCP client observe and, when explicitly enabled, send constrained input to whitelisted tmux sessions. It supports local STDIO and a loopback-only Streamable HTTP transport intended to sit behind an authenticated HTTPS tunnel.
+Terminal MCP lets an MCP client discover every tmux session on the host, then observe and, when explicitly enabled, send constrained input to whitelisted (or explicitly per-session-granted -- see "Dashboard session grants" below) tmux sessions. It supports local STDIO and a loopback-only Streamable HTTP transport intended to sit behind an authenticated HTTPS tunnel.
 
 ## Architecture
 
@@ -37,16 +37,40 @@ For the remote-capable, loopback-only Streamable HTTP mode:
 # Read-only session dashboard: http://127.0.0.1:8766/dashboard
 ```
 
-The dashboard lists only whitelisted tmux sessions and shows their sanitized
-status and recent output, refreshing every five seconds. It also has a text
-input box per session: sending from it calls the same guarded
-`terminal_send_text` path as the MCP tool, so it is still gated by
-`permissions.terminal_input`, `input_policy` (allowed/denied patterns, current
-pane command, max length), and is recorded in the same input audit log — the
-box is simply disabled client-side (and the server still enforces it) when a
-session doesn't pass those checks. Like the MCP endpoint, the dashboard remains
-bound to loopback and is intended for use directly on the Dell only; the
-Secure MCP Tunnel does not publish it as a general-purpose website.
+The dashboard lists every real tmux session on the host (not only whitelisted
+ones -- discovery is not access) and shows sanitized status and recent output
+for the ones it can actually read, refreshing every five seconds. A session
+outside the static whitelist is still listed (name/attached/windows/activity
+only, never content) but shows as restricted until an operator explicitly
+grants it read (and, separately, input) from the dashboard itself -- see
+"Dashboard session grants" below. It also has a text input box per readable
+session: sending from it calls the same guarded `terminal_send_text`(-shaped)
+path as the MCP tool, so it is still gated by `permissions.terminal_input`,
+`input_policy` (allowed/denied patterns, current pane command, max length),
+and is recorded in the same input audit log — the box is simply hidden
+client-side (and the server still enforces it) when a session doesn't pass
+those checks. Like the MCP endpoint, the dashboard remains bound to loopback
+and is intended for use directly on the Dell only; the Secure MCP Tunnel does
+not publish it as a general-purpose website.
+
+### Dashboard session grants
+
+A session outside `allowed_session_patterns`/`input_policy.allowed_session_
+patterns` is still discoverable everywhere (the dashboard, and
+`terminal_list_sessions` for any MCP client) but starts fully restricted: no
+content, no input. From the dashboard, an operator can explicitly grant it
+**read** (its output becomes visible immediately, no restart) and, separately,
+**input** (requires read already granted; still gated by the global
+`permissions.terminal_input`, `input_policy`'s deny patterns, and the same
+sensitive-current-command check every other input path uses). An input grant
+pins the session's tmux identity at grant time and re-verifies it on every
+send, exactly like a binding — a session recreated under the same name never
+silently keeps a prior grant; re-grant explicitly to accept the new identity.
+Both are revocable independently (revoking read also revokes input). Every
+grant/revoke is audited. This mechanism is dashboard-only: there is no MCP
+tool to grant or revoke — an MCP client only ever sees the *result* (a
+session's `read_allowed`/`read_granted`/`input_allowed`/`input_granted`
+fields in `terminal_list_sessions`), never a way to create one itself.
 
 The HTTP bind address is deliberately fixed to `127.0.0.1`. Do not expose it
 directly or change it to `0.0.0.0`; use an authenticated HTTPS tunnel that maps
@@ -106,13 +130,13 @@ default_tail_lines: 200
 
 ## Security model
 
-- Sessions are denied unless their name matches a whitelist pattern.
-- Sensitive names containing `root`, `ssh`, `password`, `secret`, or `database` require an exact literal whitelist entry.
+- Discovery (`terminal_list_sessions`, the dashboard's session list) shows every real tmux session on the host -- name/attached/windows/created/activity only, tmux metadata, never pane content. Content and input remain denied unless a session's name matches a whitelist pattern, or it has been explicitly granted read/input from the dashboard (see "Dashboard session grants") -- discovery never grants either.
+- Sensitive names containing `root`, `ssh`, `password`, `secret`, or `database` require an exact literal whitelist entry, and can never be dashboard-granted either.
 - Output is sanitized for common API keys, bearer/authorization values, passwords, and tokens.
 - There is no shell execution, arbitrary filesystem access, environment disclosure, process killing, scheduler, or autonomous agent.
 - HTTP mode listens only on loopback and cannot change permissions or whitelist through requests.
 - `terminal_send_text` uses tmux literal mode. `terminal_send_keys` accepts only a fixed V1 key allowlist.
-- Errors do not reveal details about denied sessions.
+- Errors for a denied/ungranted session's content or input reveal nothing beyond that denial (no pane content, no reason tied to its content).
 
 ## Create an agent tmux session
 

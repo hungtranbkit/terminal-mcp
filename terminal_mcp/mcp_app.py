@@ -33,7 +33,18 @@ def build_mcp(service: TerminalService | None = None,
 
     @server.tool()
     def terminal_list_sessions() -> dict:
-        """List whitelisted tmux sessions without exposing denied session details."""
+        """List every real tmux session on the host, not only whitelisted
+        ones -- discovery is not access. Each row's name/attached/windows/
+        created/activity is tmux metadata only, never pane content. Check
+        read_allowed/input_allowed (the actual, current effective
+        capability -- statically whitelisted OR an explicit per-session
+        dashboard grant) before calling terminal_tail/terminal_capture/
+        terminal_status/terminal_send_text/terminal_send_keys on a
+        session outside your own whitelist: those tools enforce the exact
+        same authorization independently and will refuse it regardless of
+        what this listing shows. read_granted/input_granted report only
+        the explicit-grant half of that (false for a plain whitelisted
+        session with no separate grant)."""
         return terminal.terminal_list_sessions()
 
     @server.tool()
