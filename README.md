@@ -180,6 +180,26 @@ created before this hook existed (or if the hook is ever disabled) can be
 opted in by hand: `tmux set-option -t SESSION mouse on`. Rollback: see
 `~/.tmux.conf`'s own comment block.
 
+**Known limitation, confirmed against the installed Codex CLI (v0.151.0):**
+tmux copy-mode (above) freezes and scrolls the *whole pane* and takes
+keyboard focus away from Codex entirely -- there is no tmux-level way to
+scroll only an output region while the composer stays live, because tmux
+copy-mode has no concept of two independent regions within one pane.
+Codex's own closest native feature, `Ctrl+T` ("view transcript" --
+customizable via `/keymap` or `tui.keymap.global.open_transcript` in
+`~/.codex/config.toml`), is a real, useful, *separate* full-screen pager
+(its own alt-screen, deterministic ↑/↓/PgUp/PgDn/Home/End scrolling) --
+but it is modal: opening it hides the composer, and `q`/`Esc` are needed
+to return to it. Neither tmux copy-mode nor Codex's own transcript pager
+currently provides Claude Code's exact experience (composer permanently
+visible and typable while the output above it scrolls independently) --
+that is an upstream Codex TUI architecture limitation, not something
+fixable from tmux config or from terminal-mcp. The dashboard's own
+per-session view (see "Quick start" above) already provides exactly that
+split layout -- a persistently scrollable output pane plus a separate,
+always-focusable input box -- as an existing, no-new-code alternative for
+anyone who wants it.
+
 ## Enable terminal input
 
 Edit only the permission in `config.yaml`:
