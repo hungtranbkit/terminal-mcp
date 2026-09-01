@@ -229,10 +229,33 @@ class CodexAdapter(AgentAdapter):
         return after != before and _shows_genuine_progress(before, after)
 
     def stuck_composer_evidence(self, before: list[str], after: list[str]) -> bool:
-        # Redrew (something changed -- so not a totally silent pane) but no
-        # *genuine* growth -- exactly the "Enter became insert-newline"
-        # signature this adapter exists to catch.
-        return after != before and not _shows_genuine_progress(before, after)
+        # URGENT bugfix (real user report: "text reaches the composer but
+        # sits there until I press Enter myself"): two known Codex
+        # composer-swallow signatures, both meaning "no genuine progress",
+        # covered by the single check below --
+        #  1. Redrew (something changed -- tick/spinner/cursor) but no
+        #     *genuine* growth beyond that -- "Enter became insert-newline"
+        #     / partial-consume.
+        #  2. The pane is BYTE-IDENTICAL to its pre-Enter state through the
+        #     entire verification window -- Enter was a pure no-op swallow.
+        #     This is the textbook signature from the ORIGINAL root-cause
+        #     reproduction (tests/fixtures/laggy_line_reader.py: a debounced
+        #     raw-mode line reader that swallows an Enter arriving mid-
+        #     debounce produces literally zero output -- not even a redraw
+        #     tick) -- yet the previous `after != before` guard here made
+        #     this exact case structurally unrecoverable: a real Codex
+        #     composer that swallows Enter without redrawing anything
+        #     within the verify window fell through to a bare
+        #     DELIVERY_UNKNOWN with no recovery attempt at all, matching
+        #     the reported bug precisely. `not _shows_genuine_progress`
+        #     alone already covers both cases (it is True whenever
+        #     `before[:-1] == after[:-1]`, which includes the exact-match
+        #     case), so the extra `after != before` guard was strictly
+        #     narrowing, never protective -- removing it only ADDS
+        #     eligibility for the recovery attempt safe_recovery_allowed
+        #     below still independently gates (never firing while the
+        #     target shows active-work evidence).
+        return not _shows_genuine_progress(before, after)
 
     def safe_recovery_allowed(self, lines: list[str]) -> bool:
         return not _match_any(_WORKING_PATTERNS, _tail(lines, 6))

@@ -350,3 +350,110 @@ def test_codex_recovery_duplicate_supervisor_send_stays_idempotent(tmux_session_
     assert second == first  # exact replay -- no second send, no second recovery attempt
     pane = service.terminal_tail(session, 10)["output"]
     assert pane.count("SUBMITTED[") == 1
+
+
+# ---------------------------------------------------------------------------
+# URGENT bugfix regression (real user report: "text reaches the Codex
+# composer but sits there until I press Enter myself" -- previous
+# PASS/SUBMIT_CONFIRMED evidence alone was not sufficient). Root cause,
+# confirmed by code inspection cross-referenced against the ORIGINAL
+# root-cause fixture (laggy_line_reader.py, used by
+# test_evidence_raw_tmux_swallows_enter_without_a_settle_gap above): a
+# genuinely swallowed Enter can produce ZERO pane change at all -- not
+# even a redraw tick -- yet CodexAdapter.stuck_composer_evidence required
+# `after != before` to ever consider recovery, which by construction can
+# never be true for that exact case. This was NOT reproduced live against
+# this host's currently-installed real Codex CLI (v0.151.0) across many
+# live attempts (idle, busy-queue, heavy host CPU contention, zero-gap raw
+# sends, long/multiline prompts) -- today's binary appears to always
+# redraw something (a cursor/border tick) within the verification window
+# in practice. That is a property of the currently-installed release, not
+# a guarantee the debounce race this project's own fixture demonstrably
+# reproduces cannot occur -- the fix closes the structural gap
+# (recovery-ineligibility for a zero-change swallow) proven possible by
+# the project's own original reproduction, using a fixture built for this
+# exact regression rather than a live Codex session, since the live CLI
+# does not currently exhibit it on demand. See tests/test_adapters_real_cli.py
+# (run with `pytest -m live_cli`) for the real, installed-CLI evidence
+# this fix does not regress the ordinary, already-real-CLI-verified path.
+# ---------------------------------------------------------------------------
+
+
+def test_codex_zero_change_swallow_recovers_via_escape_then_enter(tmux_session_factory, tmp_path):
+    # Fixture-only (see module-level note above): silently_stuck_then_escape
+    # produces a bare Enter that is a pure no-op -- the pane is
+    # byte-identical to typed_snapshot, the exact signature the pre-fix
+    # `after != before` guard made structurally unrecoverable.
+    session = _codex_session(tmux_session_factory, "test-codex-silent-stuck", "silently_stuck_then_escape")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "hello world", press_enter=True)
+    assert result["sent"] is True
+    assert result["recovery_attempted"] is True
+    assert result["submit_status"] == "SUBMIT_CONFIRMED"
+    pane = service.terminal_tail(session, 10)["output"]
+    assert "SUBMITTED[1]: hello world" in pane
+    assert pane.count("SUBMITTED[") == 1  # exactly one recovery attempt, no loop
+
+
+def test_codex_recovery_withheld_when_composer_now_shows_a_different_draft(tmux_session_factory, tmp_path):
+    # A later, unrelated draft occupies the composer by the time a
+    # recovery decision would fire -- the redraw PATTERN alone looks
+    # identical to an ordinary recoverable stuck composer, but the
+    # content can no longer be attributed to this attempt's own send.
+    # Recovery must be withheld entirely: no Escape, no Enter, honest
+    # DELIVERY_UNKNOWN -- never submit someone else's pending text.
+    session = _codex_session(tmux_session_factory, "test-codex-draft-replaced", "stuck_then_draft_replaced")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "hello world", press_enter=True)
+    assert result["sent"] is True
+    assert result["submit_status"] == "SUBMIT_UNCONFIRMED"
+    assert "withheld" in result["submit_reason"]
+    pane = service.terminal_tail(session, 10)["output"]
+    assert "SUBMITTED[" not in pane  # nothing was ever actually submitted
+    assert "someone else's later draft" in pane  # the replaced draft is still just sitting there, untouched
+
+
+def test_codex_recovery_withheld_when_composer_is_now_empty(tmux_session_factory, tmp_path):
+    # Same principle, different shape: the composer was cleared (e.g. a
+    # cancel) rather than replaced -- the sent text is equally absent, so
+    # this must be withheld for the same reason.
+    session = _codex_session(tmux_session_factory, "test-codex-composer-cleared", "stuck_then_composer_cleared")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "hello world", press_enter=True)
+    assert result["sent"] is True
+    assert result["submit_status"] == "SUBMIT_UNCONFIRMED"
+    assert "withheld" in result["submit_reason"]
+    pane = service.terminal_tail(session, 10)["output"]
+    assert "SUBMITTED[" not in pane
+
+
+def test_codex_delayed_but_genuine_submit_confirms_without_recovery(tmux_session_factory, tmp_path):
+    # Merely slow (~1.5s, well inside the 3s verify window), not stuck --
+    # must confirm off the base check alone, never invoking recovery.
+    session = _codex_session(tmux_session_factory, "test-codex-delayed", "delayed_genuine_submit")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "hello", press_enter=True)
+    assert result["submit_status"] == "SUBMIT_CONFIRMED"
+    assert "recovery_attempted" not in result
+    pane = service.terminal_tail(session, 10)["output"]
+    assert "SUBMITTED[1]: hello" in pane
+
+
+def test_codex_zero_change_swallow_recovery_stays_idempotent_on_retry(tmux_session_factory, tmp_path):
+    # No duplicate execution: a retried call with the same idempotency_key
+    # replays the exact first result rather than sending (or recovering)
+    # a second time, for the newly-recoverable zero-change case too.
+    session = _codex_session(tmux_session_factory, "test-codex-silent-idem", "silently_stuck_then_escape")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    first = service.terminal_send_text(session, "hello", press_enter=True, idempotency_key="silent-recover-key")
+    assert first["recovery_attempted"] is True
+    assert first["submit_status"] == "SUBMIT_CONFIRMED"
+    second = service.terminal_send_text(session, "hello", press_enter=True, idempotency_key="silent-recover-key")
+    assert second == first
+    pane = service.terminal_tail(session, 10)["output"]
+    assert pane.count("SUBMITTED[") == 1

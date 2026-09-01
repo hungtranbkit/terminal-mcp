@@ -6,7 +6,7 @@ import uuid
 from typing import Any
 
 from .adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
-                       DELIVERY_UNKNOWN, select_adapter, to_legacy_submit_status)
+                       DELIVERY_UNKNOWN, _sent_text_echoed, select_adapter, to_legacy_submit_status)
 from .audit import AuditStore
 from .bindings import Binding, BindingStore, valid_binding_name
 from .config import AppConfig
@@ -711,7 +711,55 @@ class TerminalService:
             and adapter.safe_recovery_allowed(after)
         )
         if needs_recovery:
-            pre_recovery_snapshot = after  # diff the recovery's own effect against *this*, not the original
+            # URGENT bugfix hardening (per explicit review): identity-pin
+            # plus "no WORKING evidence" is NOT sufficient by itself to
+            # safely retry Escape+Enter -- a quiet/unchanged screen or a
+            # missing spinner only proves the target isn't visibly busy,
+            # never that THIS attempt's own draft is still the one sitting
+            # in the composer. Before any recovery keystroke, positively
+            # re-verify, from a FRESH capture taken right here (not the
+            # now-several-ms-old `after` the needs_recovery decision above
+            # was made from):
+            #   1. identity/foreground command still match this attempt's
+            #      pinned values (symmetric with the two P0 Part A.3 checks
+            #      already done before the text-send and the first Enter);
+            #   2. the composer still shows the known stuck-composer
+            #      pattern (not, e.g., now confirmed, or now showing active
+            #      work that started between polls); AND
+            #   3. this exact attempt's own sent text is still visibly
+            #      present (_sent_text_echoed) -- proof the pending draft
+            #      is genuinely still OURS, not a different/later one (a
+            #      real user's own edit, or another caller's send) that
+            #      happened to also leave no WORKING evidence.
+            # Any of these failing withholds recovery entirely (no Escape,
+            # no Enter, no retarget by name) rather than risk submitting
+            # someone else's pending text.
+            try:
+                info_at_recovery = self.tmux.get_session(session)
+                recheck_snapshot = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
+            except TmuxError:
+                info_at_recovery = None
+                recheck_snapshot = None
+            identity_at_recovery = (None if info_at_recovery is None
+                                    else SessionIdentity.from_session_info(info_at_recovery))
+            command_at_recovery = ((info_at_recovery.pane_current_command or "")
+                                   if info_at_recovery is not None else "")
+            identity_ok = (identity_at_recovery is not None and identity_before.matches(identity_at_recovery)
+                          and command_at_recovery == command_before)
+            draft_still_pending = (
+                identity_ok and recheck_snapshot is not None
+                and adapter.stuck_composer_evidence(typed_snapshot, recheck_snapshot)
+                and _sent_text_echoed(recheck_snapshot, text)
+            )
+            if not draft_still_pending:
+                result["delivery_state"] = DELIVERY_UNKNOWN
+                result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
+                result["submit_reason"] = (
+                    "recovery was withheld -- could not positively re-verify, immediately before "
+                    "retrying, that this attempt's own draft is still the one pending in the composer"
+                )
+                return result
+            pre_recovery_snapshot = recheck_snapshot  # diff the recovery's own effect against *this*, not the original
             self.tmux.send_keys(session, ["Escape"])
             time.sleep(SEND_TEXT_ENTER_SETTLE_SECONDS)
             self.tmux.send_keys(session, ["Enter"])

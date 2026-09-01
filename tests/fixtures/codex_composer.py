@@ -21,10 +21,37 @@ CODEX_FIXTURE_MODE env var selects behavior:
     (models a recovery attempt that still fails).
   submits_and_shows_working -- a bare Enter submits immediately and the
     pane then shows "esc to interrupt" (already-working evidence).
+  silently_stuck_then_escape -- URGENT bugfix regression: a bare Enter is
+    a PURE no-op swallow -- produces literally ZERO output, not even a
+    redraw tick (the textbook signature from the original root-cause
+    fixture, tests/fixtures/laggy_line_reader.py); Escape immediately
+    followed by Enter still submits normally. Exists because the
+    pre-fix CodexAdapter.stuck_composer_evidence required `after !=
+    before`, which can never be true for this exact case -- this mode
+    proves the fix's broadened check (and only the fix) makes this
+    specific failure recoverable.
+  stuck_then_draft_replaced -- URGENT bugfix regression: a bare Enter
+    redraws the composer (matching the stuck-composer *pattern*
+    identically to stuck_then_escape) but with a DIFFERENT string, never
+    the caller's own sent text -- models a real, later, unrelated draft
+    occupying the composer when a recovery decision is made. Proves
+    recovery is correctly WITHHELD (never dispatches Escape/Enter) when
+    the pending content cannot be positively attributed to this specific
+    send attempt, even though the redraw pattern alone looks identical to
+    a legitimately recoverable stuck composer.
+  delayed_genuine_submit -- a bare Enter DOES submit, but only after a
+    real ~1.5s delay (still well inside the verification window) before
+    writing SUBMITTED -- models a merely slow, not stuck, acceptance;
+    must confirm without ever invoking recovery.
+  stuck_then_composer_cleared -- like stuck_then_draft_replaced, but the
+    composer is emptied rather than replaced with different text (models
+    a cancel) -- the sent text is equally absent, so recovery must be
+    withheld for the same reason.
 """
 import os
 import sys
 import termios
+import time
 import tty
 
 MODE = os.environ.get("CODEX_FIXTURE_MODE", "stuck_then_escape")
@@ -78,6 +105,44 @@ try:
                 escape_pending = False
                 continue
             if MODE == "always_stuck":
+                render_composer()
+                escape_pending = False
+                continue
+            if MODE == "delayed_genuine_submit":
+                time.sleep(1.5)  # merely slow, not stuck -- well inside the 3s verify window
+                submitted += 1
+                sys.stdout.write(f"\r\nSUBMITTED[{submitted}]: {buf}\r\nesc to interrupt\r\n")
+                sys.stdout.flush()
+                buf = ""
+                escape_pending = False
+                continue
+            if MODE == "silently_stuck_then_escape":
+                # Pure no-op swallow: no render_composer() call at all, no
+                # output whatsoever -- the pane is byte-identical to its
+                # pre-Enter state, exactly like a real swallowed Enter in a
+                # debounced line editor (laggy_line_reader.py).
+                if escape_pending:
+                    submitted += 1
+                    sys.stdout.write(f"\r\nSUBMITTED[{submitted}]: {buf}\r\n")
+                    sys.stdout.flush()
+                    buf = ""
+                escape_pending = False
+                continue
+            if MODE == "stuck_then_draft_replaced":
+                # A later, unrelated draft now occupies the composer --
+                # never the caller's own sent text -- but the redraw
+                # PATTERN (in-place, no new line) is identical to an
+                # ordinary recoverable stuck composer.
+                buf = "someone else's later draft, not what was sent"
+                render_composer()
+                escape_pending = False
+                continue
+            if MODE == "stuck_then_composer_cleared":
+                # The composer is genuinely emptied (e.g. modeling a
+                # cancel) rather than replaced with different text -- the
+                # sent text is equally absent either way, so this must be
+                # withheld for the same reason as stuck_then_draft_replaced.
+                buf = ""
                 render_composer()
                 escape_pending = False
                 continue
