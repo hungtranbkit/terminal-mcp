@@ -13,6 +13,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
+from terminal_mcp import __version__
 from terminal_mcp.server_http import HTTP_HOST, HTTP_PATH, HTTP_PORT
 
 
@@ -83,7 +84,7 @@ async def test_stdio_real_handshake_and_tools(tmp_path):
             initialized = await session.initialize()
             tools = await session.list_tools()
     assert initialized.server_info.name == "terminal-mcp"
-    assert initialized.server_info.version == "0.7.0"
+    assert initialized.server_info.version == __version__
     names = {tool.name for tool in tools.tools}
     assert len(names) == 32
     assert {"terminal_tail", "terminal_send_keys", "terminal_bind", "terminal_tail_bound"} <= names
@@ -126,7 +127,7 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
             tools = await session.list_tools()
 
     assert initialized.server_info.name == "terminal-mcp"
-    assert initialized.server_info.version == "0.7.0"
+    assert initialized.server_info.version == __version__
     assert "test-http-secure" in {row["name"] for row in listed["sessions"]}
     assert "sk-live-secret" not in tail["output"]
     assert "<REDACTED>" in tail["output"]
