@@ -658,6 +658,116 @@ async def test_deleted_watchs_auto_continue_policy_never_survives_to_a_reused_na
     assert fresh_policy["approved_template"] is None
 
 
+def test_orphan_open_actions_only_touches_non_terminal_rows(tmp_path):
+    # Unit-level correctness of the SQL itself: terminal-state rows (the
+    # audit trail of what actually happened) are never touched -- only a
+    # STATE TRANSITION for non-terminal rows, never a delete (supervisor_
+    # actions is history, unlike supervisor_policies which is current
+    # config and IS purged outright elsewhere).
+    import sqlite3
+    from datetime import datetime, timezone
+
+    from terminal_mcp.supervisor2 import SupervisorV2Store
+
+    store = SupervisorV2Store(tmp_path / "supervisor.db")
+    now = datetime.now(timezone.utc).isoformat()
+
+    with sqlite3.connect(store.path) as connection:
+        for i, state in enumerate(["observing", "sent", "completed", "claimed"]):
+            connection.execute(
+                """INSERT INTO supervisor_actions
+                (watch_key, event_id, state, created_at, updated_at)
+                VALUES ('session:orphan-test', ?, ?, ?, ?)""",
+                (i, state, now, now),
+            )
+    orphaned = store.orphan_open_actions_for_watch_key("session:orphan-test", "test_reason")
+    assert orphaned == 3  # observing, sent, claimed -- not the already-completed one
+
+    # All four rows still exist (never deleted) -- three now 'blocked' with
+    # the given reason, the pre-existing 'completed' one left byte-for-byte
+    # alone (its own stop_reason, if any, untouched).
+    with sqlite3.connect(store.path) as connection:
+        all_rows = connection.execute(
+            "SELECT event_id, state, stop_reason FROM supervisor_actions WHERE watch_key = 'session:orphan-test' ORDER BY event_id"
+        ).fetchall()
+    assert [r[1] for r in all_rows] == ["blocked", "blocked", "completed", "blocked"]
+    assert all_rows[0][2] == "test_reason"
+    assert all_rows[1][2] == "test_reason"
+    assert all_rows[2][2] is None  # the completed row's stop_reason untouched
+    assert all_rows[3][2] == "test_reason"
+
+    # Running it again is a safe no-op -- nothing left to orphan.
+    assert store.orphan_open_actions_for_watch_key("session:orphan-test", "second_pass") == 0
+
+
+@pytest.mark.anyio
+async def test_deleted_watchs_stuck_action_is_orphaned_and_never_blocks_a_reused_name(tmp_path, tmux_session_factory):
+    # The real-world scenario (audit finding R2): a full claim -> decide ->
+    # approve -> send pipeline leaves an action in 'observing' (non-
+    # terminal). Deleting the watch must not leave that action silently
+    # blocking every future claim on a LATER, unrelated watch that reuses
+    # the exact same name -- before this fix, open_action_for_watch would
+    # keep finding it (still non-terminal) forever, with no way for an
+    # operator to notice why claims kept failing without inspecting sqlite
+    # directly.
+    from terminal_mcp.mcp_app import build_mcp
+
+    name = "test-v2-orphan-reused"
+    session = tmux_session_factory(
+        name,
+        "bash -lc 'echo \"Do you want to continue? [y/N]\"; read x; "
+        "printf \"Continuing...\\nFINAL REPORT\\ndone\\n\"; sleep 30'",
+    )
+    time.sleep(0.3)
+    terminal = TerminalService(_config(), audit=AuditStore(tmp_path / "audit.db"))
+    store = SupervisorStore(tmp_path / "supervisor.db")
+    svc = SupervisorService(terminal, store)
+    v2 = build_supervisor_v2(svc)
+    server = build_mcp(terminal, svc, v2)
+
+    async def call(name_, **kwargs):
+        result = await server.call_tool(name_, kwargs)
+        if result.structured_content is not None:
+            return result.structured_content
+        import json
+        return json.loads(result.content[0].text)
+
+    await call("supervisor_watch", session=session)
+    events = (await call("supervisor_run_once"))["events"]
+    await call("supervisor2_set_policy", session=session, policy_mode="suggest_only")
+    claim = await call("supervisor2_claim_event", event_id=events[0]["id"], claimed_by="orphan-test")
+    await call("supervisor2_submit_decision", action_id=claim["id"], proposed_prompt="y")
+    await call("supervisor2_review_action", action_id=claim["id"], decision="approve")
+    sent = await call("supervisor2_execute_send", action_id=claim["id"])
+    assert sent["sent"] is True
+    time.sleep(1.5)
+    await call("supervisor_run_once")  # advances sent -> observing
+
+    stuck_before = v2.store.get_action(claim["id"])
+    assert stuck_before["state"] == "observing"  # still non-terminal -- the exact stuck shape
+
+    deleted = await call("supervisor_unwatch", session=session, delete=True)
+    assert deleted["deleted"] is True
+
+    stuck_after_delete = v2.store.get_action(claim["id"])
+    assert stuck_after_delete["state"] == "blocked"
+    assert stuck_after_delete["stop_reason"] == "watch_deleted"
+
+    # A brand-new watch reusing the exact same session name must be able
+    # to claim and act normally -- never silently blocked by the old,
+    # now-orphaned action.
+    tmux_session_factory(
+        name, "bash -lc 'echo \"Do you want to continue? [y/N]\"; read x; sleep 30'",
+    )
+    time.sleep(0.3)
+    await call("supervisor_watch", session=session)
+    events2 = (await call("supervisor_run_once"))["events"]
+    await call("supervisor2_set_policy", session=session, policy_mode="suggest_only")
+    new_claim = await call("supervisor2_claim_event", event_id=events2[0]["id"], claimed_by="orphan-test-2")
+    assert "error" not in new_claim
+    assert new_claim["state"] == "claimed"
+
+
 @pytest.mark.anyio
 async def test_reenabling_a_still_existing_watch_keeps_its_policy(tmp_path, tmux_session_factory):
     # The other half of the same fix: a plain disable/re-enable (never

@@ -164,6 +164,14 @@ def build_mcp(service: TerminalService | None = None,
         # policy" flow.
         if result.get("created") and "watch_key" in result:
             supervisor_v2.purge_policy_for_watch_key(result["watch_key"])
+            # Audit-findings fix (R2): a brand-new watch must also never
+            # inherit an action stuck in a non-terminal state (most
+            # dangerously 'sent') left behind by a previous, unrelated
+            # watch that used this same name -- open_action_for_watch
+            # would otherwise treat it as still-open and silently block
+            # every claim on this new watch forever. See
+            # SupervisorV2Store.orphan_open_actions_for_watch_key.
+            supervisor_v2.orphan_actions_for_watch_key(result["watch_key"], "watch_recreated")
         return result
 
     @server.tool()
@@ -174,9 +182,11 @@ def build_mcp(service: TerminalService | None = None,
         result = supervisor.unwatch(binding, session, delete)
         if delete and result.get("deleted") and "watch_key" in result:
             # Same hygiene as supervisor_watch above -- a hard delete also
-            # purges any v2 policy immediately rather than leaving it to be
-            # discovered (and purged) only if/when the name is reused.
+            # purges any v2 policy, and orphans any still-open action,
+            # immediately rather than leaving either to be discovered (and
+            # fixed) only if/when the name is reused.
             supervisor_v2.purge_policy_for_watch_key(result["watch_key"])
+            supervisor_v2.orphan_actions_for_watch_key(result["watch_key"], "watch_deleted")
         return result
 
     @server.tool()

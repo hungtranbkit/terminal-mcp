@@ -347,6 +347,32 @@ class SupervisorV2Store:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def orphan_open_actions_for_watch_key(self, key: str, reason: str) -> int:
+        """Safety hygiene, same reasoning as purge_policy_for_watch_key:
+        watch_key is `kind:target`, and target is an operator-chosen,
+        routinely-REUSED name -- without this, an action stuck in a non-
+        terminal state (most dangerously 'sent', which open_action_for_watch
+        treats as still-open) would silently block every future claim on a
+        LATER, unrelated watch that happens to reuse the same name, with no
+        way for an operator to notice why claims keep failing. A state
+        TRANSITION to 'blocked', not a DELETE: supervisor_actions is this
+        project's audit trail of what a watch's actions actually did, and
+        that history is preserved deliberately (unlike supervisor_policies,
+        which is current config, not history, and is purged outright) --
+        only the row's blocking *state* changes, its own record of what
+        happened (proposed_prompt, send_result, everything) is untouched.
+        Never touches an action already in a terminal state (nothing to
+        fix there) or already 'blocked' for a different reason (avoid
+        clobbering a stop_reason that already explains a real block)."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                f"""UPDATE supervisor_actions SET state = 'blocked', stop_reason = ?, updated_at = ?
+                   WHERE watch_key = ? AND state NOT IN ({','.join('?' * len(TERMINAL_ACTION_STATES))})""",
+                (reason, now, key, *TERMINAL_ACTION_STATES),
+            )
+        return cursor.rowcount
+
     def action_for_event(self, event_id: int) -> dict[str, Any] | None:
         with self._connection() as connection:
             row = connection.execute(
@@ -483,6 +509,16 @@ class SupervisorV2Service:
         it's bookkeeping that rides along with a v1 watch's own creation/
         deletion. See SupervisorV2Store.delete_policy for why this exists."""
         return self.store.delete_policy(key)
+
+    def orphan_actions_for_watch_key(self, key: str, reason: str) -> int:
+        """Same wiring-hook shape as purge_policy_for_watch_key above, for
+        the audit-findings fix (P1 gap R2): an action stuck in a non-
+        terminal state -- most dangerously 'sent', which permanently
+        blocks any future claim on a watch reusing this key -- must never
+        survive a delete/recreate cycle silently. See
+        SupervisorV2Store.orphan_open_actions_for_watch_key for why this is
+        a state transition, not a delete."""
+        return self.store.orphan_open_actions_for_watch_key(key, reason)
 
     # -- claim / decide / approve / send -----------------------------------
 
