@@ -35,6 +35,11 @@ For the remote-capable, loopback-only Streamable HTTP mode:
 .venv/bin/terminal-mcp-http
 # MCP endpoint: http://127.0.0.1:8766/mcp
 # Read-only session dashboard: http://127.0.0.1:8766/dashboard
+# Liveness/readiness/version/metrics (loopback-only, not tunnel-routed):
+#   http://127.0.0.1:8766/health/live
+#   http://127.0.0.1:8766/health/ready    -- tmux + every durable SQLite store; 503 if any is broken
+#   http://127.0.0.1:8766/health/metrics  -- in-process counters (metrics.py); no external backend involved
+#   http://127.0.0.1:8766/version         -- package version + running commit/dirty state
 ```
 
 The dashboard lists every real tmux session on the host (not only whitelisted
@@ -137,6 +142,7 @@ default_tail_lines: 200
 - HTTP mode listens only on loopback and cannot change permissions or whitelist through requests.
 - `terminal_send_text` uses tmux literal mode. `terminal_send_keys` accepts only a fixed V1 key allowlist.
 - Errors for a denied/ungranted session's content or input reveal nothing beyond that denial (no pane content, no reason tied to its content).
+- **Identity model is single-operator by design, not role-based.** Cloudflare Access (when configured -- see the tunnel setup) authenticates *who is allowed to reach the dashboard/tunnel at all* and that identity is recorded in the audit log for every mutation it makes, but every authenticated caller shares the same operator-level capability -- there is no separate viewer/operator/approver permission tier. This is an intentional scope boundary for a personal/small-team single-operator deployment, not an unaddressed gap: adding real RBAC would mean new grant/policy infrastructure this deployment does not need. A future multi-operator deployment should treat this as the first thing to add.
 
 ## Create an agent tmux session
 
@@ -221,6 +227,70 @@ is retained and status becomes `MISSING`.
 New bindings use `read_enabled=true` and `input_enabled=false`. Bound input is
 allowed only when both the local global permission and the binding permission
 are true. Creating a binding never enables global terminal input.
+
+## Backup & Restore
+
+All durable state is SQLite, under `$XDG_STATE_HOME/terminal-mcp/` (default
+`~/.local/state/terminal-mcp/`) unless a `TERMINAL_MCP_*_DB` environment
+variable overrides an individual store's path:
+
+| File | Store | Contents |
+| --- | --- | --- |
+| `audit.db` | `AuditStore` | Every input attempt (hash/length/redacted preview, never full text) |
+| `bindings.db` | `BindingStore` | Chat↔tmux logical bindings and their `input_enabled` state |
+| `grants.db` | `SessionGrantStore` | Dynamic, time-boxed read/input grants outside the static whitelist |
+| `leases.db` | `PaneLeaseStore` | Short-lived per-pane send leases used for the submit-guarantee path |
+| `supervisor.db` | `SupervisorStore` / `SupervisorV2Store` | Watch state, policy decisions, and v2 action/approval history (v1 and v2 share one file) |
+
+Plus `config.yaml` (whitelist, permissions, input policy, supervisor
+config — not itself in a state directory; wherever `--config`/the default
+lookup points it).
+
+All five stores are opened with `PRAGMA journal_mode=WAL`, so a backup taken
+while the service is running can still capture a mid-write `-wal`/`-shm`
+sidecar file — always copy all three files for a given `*.db` (the `.db`
+plus any `.db-wal` / `.db-shm` next to it) together, never the `.db` alone.
+
+**Backup** (safe to run live; SQLite's own consistency guarantees make a
+plain file copy of `.db`+`.db-wal`+`.db-shm` correct, but the built-in
+`.backup` command is preferred since it doesn't depend on the sidecar files
+being copied atomically with the main file):
+
+```bash
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/terminal-mcp"
+BACKUP_DIR="/path/to/backups/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$BACKUP_DIR"
+for db in audit bindings grants leases supervisor; do
+  sqlite3 "$STATE_DIR/$db.db" ".backup '$BACKUP_DIR/$db.db'"
+done
+cp config.yaml "$BACKUP_DIR/"
+```
+
+**Restore** (stop the service first — restoring into a live WAL-mode
+database while the process holds an open connection can be rejected or, in
+the worst case, silently ignored):
+
+```bash
+sudo systemctl stop terminal-mcp   # or however the service is run
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/terminal-mcp"
+for db in audit bindings grants leases supervisor; do
+  rm -f "$STATE_DIR/$db.db" "$STATE_DIR/$db.db-wal" "$STATE_DIR/$db.db-shm"
+  cp "/path/to/backups/<timestamp>/$db.db" "$STATE_DIR/$db.db"
+done
+cp /path/to/backups/<timestamp>/config.yaml ./config.yaml   # review before overwriting a live config
+sudo systemctl start terminal-mcp
+curl -s http://127.0.0.1:8766/health/ready | python3 -m json.tool   # confirm every store re-opens clean
+curl -s http://127.0.0.1:8766/version
+```
+
+Restoring an older `grants.db`/`leases.db` can resurrect grants or leases
+that a newer backup had already revoked/expired; review the restored file's
+contents (or accept the small window of over-permissiveness until natural
+expiry) rather than assuming restore always narrows access.
+
+A missing store file is not an error at startup — every store creates its
+schema on first open — so restoring a subset of files (e.g. `audit.db` only,
+after a disk incident that spared the others) is safe.
 
 ## Known limitations
 
