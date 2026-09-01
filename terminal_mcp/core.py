@@ -10,10 +10,10 @@ from .adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_SUBMIT_CONFIRM
 from .audit import AuditStore
 from .bindings import Binding, BindingStore, valid_binding_name
 from .config import AppConfig
-from .grants import SessionGrantStore
+from .grants import SessionGrant, SessionGrantStore
 from .lease import DEFAULT_LEASE_TTL_SECONDS, PaneLeaseStore
 from .models import SessionIdentity
-from .permissions import (SENSITIVE_SESSION_WORDS, binding_session_allowed, input_session_allowed,
+from .permissions import (SENSITIVE_SESSION_WORDS, input_session_allowed,
                           require_input, require_read, session_allowed, session_input_denied_by_pattern,
                           valid_session_name)
 from .redaction import redact_ansi_safe, redact_text
@@ -115,6 +115,107 @@ class TerminalService:
             return None
         return None if info is None else SessionIdentity.from_session_info(info)
 
+    # -- P0 HOTFIX: canonical authorization decisions --------------------
+    # A single pair of functions every read/input path in this file (and
+    # supervisor.py's session-kind watch()) now goes through, replacing
+    # ad-hoc "session_allowed(...) or ..." duplicated separately across
+    # _guard/_input_guard/terminal_bind/_resolve_binding/_binding_result/
+    # terminal_input_context/terminal_list_sessions/dashboard_list_
+    # sessions. Root cause of the live promptflow bug this exists to fix:
+    # terminal_list_sessions/dashboard_list_sessions compute "allowed OR
+    # granted" for their *display* fields, but every actual read/input
+    # tool (terminal_status/terminal_capture/terminal_input_context/
+    # terminal_bind/terminal_send_text/terminal_send_keys) gated on
+    # session_allowed/input_session_allowed alone via _guard/_input_guard
+    # -- a session authorized only via an active dashboard grant (never
+    # in the static config.yaml whitelist, which is the entire point of a
+    # grant) reported read_allowed=true/input_allowed=true in the list
+    # response while every actual operation still returned ACCESS_DENIED.
+    # These two functions are now the ONLY place that decision is made;
+    # every call site below defers to them rather than re-deriving it.
+
+    def _read_authorized_with_grant(self, session: str, grant: SessionGrant | None) -> bool:
+        """True iff the static read whitelist authorizes `session`, OR an
+        active grant's read_enabled does. `grant` is a parameter (rather
+        than looked up here) so a caller iterating many sessions (the list
+        endpoints) can pass in one bulk SessionGrantStore.list() fetch
+        instead of one query per session -- see _read_authorized below for
+        the single-session convenience wrapper every other call site uses.
+        Sensitive-worded names are refused even with a grant, as defense
+        in depth: grant_session_read already refuses to grant one in the
+        first place, so this should be unreachable, not a new hole."""
+        if session_allowed(session, self.config):
+            return True
+        if any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS):
+            return False
+        return bool(grant and grant.read_enabled)
+
+    def _read_authorized(self, session: str) -> bool:
+        return self._read_authorized_with_grant(session, self.grants.get(session))
+
+    def _input_authorized_with_grant(self, session: str, grant: SessionGrant | None, *,
+                                     revalidate_identity: bool = True) -> tuple[bool, str | None]:
+        """Returns (authorized, specific_error). The hard deny floor
+        (session_input_denied_by_pattern) is checked first and can never
+        be overridden by a grant -- exactly the same absolute floor
+        grant_session_input itself already enforces at grant time, re-
+        checked here at use time too (a deny pattern added to config.yaml
+        after a grant already exists must still take effect immediately).
+        Otherwise: the static input policy OR an active grant whose
+        read_enabled AND input_enabled are both true (a read-only grant
+        never authorizes input -- matches grant_session_input's own "read
+        must already be granted" invariant, and revoking read alone
+        already clears input too, see SessionGrantStore.set_read).
+
+        revalidate_identity=True (every real send/guard path) additionally
+        re-resolves the session's CURRENT tmux identity and compares it
+        against the grant's pinned one, fresh, every single call -- never
+        cached, never trusted from grant time alone. This is what makes a
+        revoked/expired grant fail closed immediately and a same-name-
+        recreated session never inherit an old grant's input authorization
+        (P0-2's identity-pinning invariant, unchanged and un-bypassable
+        via this path). revalidate_identity=False is for the list/
+        discovery endpoints only (terminal_list_sessions/
+        dashboard_list_sessions): a coarse "is this in principle input-
+        capable" signal that avoids a tmux subprocess call per granted
+        session on every poll -- the real send path below always
+        revalidates regardless of what discovery reported, so this
+        shortcut never weakens the actual guarantee, only the display."""
+        if session_input_denied_by_pattern(session, self.config):
+            return False, None
+        if input_session_allowed(session, self.config):
+            return True, None
+        if not grant or not grant.read_enabled or not grant.input_enabled:
+            return False, None
+        if not revalidate_identity:
+            return True, None
+        current = self.resolve_identity(session)
+        if current is None or not grant.pinned_session_id:
+            return False, "IDENTITY_MISMATCH"
+        pinned = SessionIdentity(name=session, session_id=grant.pinned_session_id,
+                                 pane_id=grant.pinned_pane_id or "", created_epoch=grant.pinned_created_epoch or 0)
+        if not pinned.matches(current):
+            return False, "IDENTITY_MISMATCH"
+        return True, None
+
+    def _input_authorized(self, session: str) -> tuple[bool, str | None]:
+        return self._input_authorized_with_grant(session, self.grants.get(session))
+
+    def _bind_authorized(self, session: str) -> bool:
+        """Canonical bind-target authorization: the same 'sensitive names
+        never bindable, even with an exact whitelist entry' floor
+        binding_session_allowed already enforced, plus (new) an active
+        read grant as an alternate path to the same read-level
+        authorization terminal_status/terminal_tail/etc. now accept.
+        Input through a resulting binding stays separately gated by the
+        binding's own input_enabled flag plus _input_guard/
+        _check_binding_identity on every actual send, exactly as before
+        -- this only decides whether the session may be bound/observed
+        through a binding at all."""
+        if any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS):
+            return False
+        return self._read_authorized(session)
+
     def _audit_result(self, response: dict[str, Any], *, action: str,
                       session: str | None, binding: str | None = None,
                       text: str | None = None, keys: list[str] | None = None,
@@ -146,10 +247,16 @@ class TerminalService:
         return response
 
     def _input_guard(self, session: str) -> dict[str, Any] | None:
+        """P0 HOTFIX: now defers to _input_authorized (static policy OR an
+        active, identity-revalidated grant) instead of input_session_
+        allowed alone -- this is the actual fix for the reported bug:
+        every input tool (terminal_send_text/terminal_send_keys/
+        terminal_send_bound) calls through here."""
         if (error := require_input(self.config)) is not None:
             return {"error": error, "session": session}
-        if not input_session_allowed(session, self.config):
-            return {"error": "ACCESS_DENIED", "session": session}
+        authorized, specific_error = self._input_authorized(session)
+        if not authorized:
+            return {"error": specific_error or "ACCESS_DENIED", "session": session}
         try:
             info = self.tmux.get_session(session)
         except TmuxError as exc:
@@ -162,11 +269,18 @@ class TerminalService:
             return {"error": "SENSITIVE_TARGET", "session": session, "current_command": command}
         return None
 
-    def _guard(self, session: str, *, input_action: bool = False) -> dict[str, Any] | None:
-        permission_error = require_input(self.config) if input_action else require_read(self.config)
-        if permission_error:
+    def _guard(self, session: str) -> dict[str, Any] | None:
+        """P0 HOTFIX: now defers to _read_authorized (static policy OR an
+        active read grant) instead of session_allowed alone -- this is
+        the actual fix for the reported bug: every read tool
+        (terminal_tail/terminal_capture/terminal_status/
+        terminal_input_context) calls through here. input_action was
+        never actually passed True by any caller (input has its own,
+        separate _input_guard) -- dropped as dead code, not a behavior
+        change."""
+        if (permission_error := require_read(self.config)) is not None:
             return {"error": permission_error, "session": session}
-        if not session_allowed(session, self.config):
+        if not self._read_authorized(session):
             return {"error": "ACCESS_DENIED", "session": session}
         return None
 
@@ -182,22 +296,37 @@ class TerminalService:
         already see by running `tmux ls` themselves on this host -- the
         actual content/control tools (terminal_tail/terminal_capture/
         terminal_status/terminal_send_text/terminal_send_keys/
-        terminal_bind and everything built on them) are completely
-        unaffected by this method and keep enforcing session_allowed/
-        input_session_allowed/the per-session grant exactly as before;
-        nothing here bypasses or widens any of those checks.
+        terminal_bind and everything built on them) enforce the exact same
+        canonical authorization this listing reports (_read_authorized/
+        _input_authorized, below) -- discovery never bypasses or widens
+        anything; it now simply agrees with what those tools will
+        actually do, which it previously did not (see the P0 HOTFIX note
+        on _read_authorized_with_grant for the bug this fixes).
 
-        `allowed` keeps its pre-existing meaning (the static config.yaml
-        whitelist result). `read_granted`/`input_granted` reflect an
-        explicit per-session dashboard grant (see grants.py), if any --
-        read live off SessionGrantStore on every call, so a grant/revoke
-        issued from the dashboard is reflected here immediately, no
-        restart needed. `read_allowed`/`input_allowed` are the actual,
-        CURRENT effective capability (statically allowed OR granted, and
-        for input also gated on the global terminal_input permission) --
-        the single field a caller should check before attempting a read
-        or a send; a caller that only wants "can I do X right now" never
-        needs to reason about allowed vs. *_granted separately."""
+        `allowed` is kept ONLY as compatibility/derived metadata -- the
+        static config.yaml whitelist result, exactly as before -- and must
+        never be read as an independent, possibly-contradictory gate: a
+        session can perfectly validly show `allowed=false` alongside
+        `read_allowed=true`/`input_allowed=true` (an active dashboard
+        grant, never in the static whitelist -- that is the entire point
+        of a grant), and every actual read/input tool honors read_allowed/
+        input_allowed exactly, via the same canonical _read_authorized/
+        _input_authorized_with_grant this method itself calls -- see the
+        P0 HOTFIX note above _read_authorized_with_grant for the bug this
+        fixes. `read_granted`/`input_granted` reflect an explicit per-
+        session dashboard grant (see grants.py), if any -- read live off
+        SessionGrantStore on every call, so a grant/revoke issued from the
+        dashboard is reflected here immediately, no restart needed.
+        `read_allowed`/`input_allowed` are the actual, CURRENT effective
+        capability (statically allowed OR granted, and for input also
+        gated on the global terminal_input permission) -- the single
+        field a caller should check before attempting a read or a send; a
+        caller that only wants "can I do X right now" never needs to
+        reason about allowed vs. *_granted separately. `effective_read`/
+        `effective_input` are exact aliases of read_allowed/input_allowed
+        kept for naming parity with dashboard_list_sessions -- same
+        values, added rather than renaming the originals to preserve
+        backward compatibility for existing callers."""
         if (error := require_read(self.config)) is not None:
             return {"error": error, "sessions": []}
         try:
@@ -207,20 +336,21 @@ class TerminalService:
         grants_by_session = {grant.session: grant for grant in self.grants.list()}
         sessions = []
         for item in items:
-            allowed = session_allowed(item.name, self.config)
             grant = grants_by_session.get(item.name)
             read_granted = bool(grant and grant.read_enabled)
             input_granted = bool(grant and grant.input_enabled)
+            read_allowed = self._read_authorized_with_grant(item.name, grant)
+            input_allowed = bool(
+                self.config.permissions.terminal_input
+                and self._input_authorized_with_grant(item.name, grant, revalidate_identity=False)[0]
+            )
             sessions.append({
-                "name": item.name, "allowed": allowed, "attached": item.attached,
+                "name": item.name, "allowed": session_allowed(item.name, self.config), "attached": item.attached,
                 "windows": item.windows, "created": iso_timestamp(item.created_epoch),
                 "activity": iso_timestamp(item.activity_epoch),
-                "read_allowed": allowed or read_granted, "read_granted": read_granted,
-                "input_allowed": bool(
-                    self.config.permissions.terminal_input
-                    and (input_session_allowed(item.name, self.config) or input_granted)
-                ),
-                "input_granted": input_granted,
+                "read_allowed": read_allowed, "read_granted": read_granted,
+                "input_allowed": input_allowed, "input_granted": input_granted,
+                "effective_read": read_allowed, "effective_input": input_allowed,
             })
         return {"sessions": sessions}
 
@@ -686,7 +816,12 @@ class TerminalService:
             self.leases.release(lock_key, correlation_id)
 
     def _binding_result(self, binding: Binding) -> dict[str, Any]:
-        allowed = binding_session_allowed(binding.session, self.config)
+        # P0 HOTFIX: `allowed` here is bind-target authorization (static
+        # whitelist OR an active read grant, via _bind_authorized) -- kept
+        # under its pre-existing name for compatibility, same "derived
+        # metadata, not an independent gate" posture as terminal_list_
+        # sessions' own `allowed` field.
+        allowed = self._bind_authorized(binding.session)
         try:
             exists = self.tmux.get_session(binding.session) is not None
         except TmuxError:
@@ -696,7 +831,7 @@ class TerminalService:
             "session_exists": exists, "allowed": allowed,
             "read_enabled": binding.read_enabled, "input_enabled": binding.input_enabled,
             "effective_input": (self.config.permissions.terminal_input and binding.input_enabled
-                                and input_session_allowed(binding.session, self.config)),
+                                and self._input_authorized(binding.session)[0]),
             "created_at": binding.created_at, "updated_at": binding.updated_at,
         }
 
@@ -704,7 +839,7 @@ class TerminalService:
                       read_enabled: bool = True, input_enabled: bool = False) -> dict[str, Any]:
         if not valid_binding_name(binding):
             return {"error": "INVALID_BINDING", "binding": binding}
-        if not binding_session_allowed(session, self.config):
+        if not self._bind_authorized(session):
             return {"error": "ACCESS_DENIED", "binding": binding, "session": session}
         try:
             info = self.tmux.get_session(session)
@@ -755,7 +890,7 @@ class TerminalService:
         stored = self.bindings.get(binding)
         if stored is None:
             return None, {"error": "BINDING_NOT_FOUND", "binding": binding}
-        if not binding_session_allowed(stored.session, self.config):
+        if not self._bind_authorized(stored.session):
             return None, {"error": "ACCESS_DENIED", "binding": binding, "session": stored.session}
         return stored, None
 
@@ -890,7 +1025,7 @@ class TerminalService:
             lines = self.tmux.capture_lines(session, 20)
         except TmuxError as exc:
             return {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
-        effective = (self.config.permissions.terminal_input and input_session_allowed(session, self.config)
+        effective = (self.config.permissions.terminal_input and self._input_authorized(session)[0]
                      and (stored is None or stored.input_enabled)
                      and info.pane_current_command.casefold() not in SENSITIVE_COMMANDS)
         return {"binding": binding, "session": session, "current_command": info.pane_current_command,
@@ -937,19 +1072,18 @@ class TerminalService:
         grants_by_session = {grant.session: grant for grant in self.grants.list()}
         sessions = []
         for item in items:
-            allowed = session_allowed(item.name, self.config)
             grant = grants_by_session.get(item.name)
             grant_read = bool(grant and grant.read_enabled)
             grant_input = bool(grant and grant.input_enabled)
             sessions.append({
-                "name": item.name, "allowed": allowed, "attached": item.attached,
+                "name": item.name, "allowed": session_allowed(item.name, self.config), "attached": item.attached,
                 "windows": item.windows, "created": iso_timestamp(item.created_epoch),
                 "activity": iso_timestamp(item.activity_epoch),
                 "grant": {"read_enabled": grant_read, "input_enabled": grant_input},
-                "effective_read": allowed or grant_read,
+                "effective_read": self._read_authorized_with_grant(item.name, grant),
                 "effective_input": bool(
                     self.config.permissions.terminal_input
-                    and (input_session_allowed(item.name, self.config) or grant_input)
+                    and self._input_authorized_with_grant(item.name, grant, revalidate_identity=False)[0]
                 ),
             })
         return {"sessions": sessions}
@@ -1061,12 +1195,15 @@ class TerminalService:
         if len(text) > self.config.input_policy.max_text_length:
             response = {"error": "INPUT_TOO_LARGE", "session": session, "max_text_length": self.config.input_policy.max_text_length}
             return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
-        current = self.resolve_identity(session)
-        pinned = SessionIdentity(name=session, session_id=grant.pinned_session_id or "",
-                                 pane_id=grant.pinned_pane_id or "", created_epoch=grant.pinned_created_epoch or 0)
-        if current is None or not grant.pinned_session_id or not pinned.matches(current):
+        # P0 HOTFIX: reuses the canonical _input_authorized_with_grant
+        # (the same identity-revalidation this method always did inline)
+        # instead of duplicating the pin-comparison here -- GRANT_REQUIRED
+        # above already covers "no grant at all", so by this point the
+        # only way this can fail is the identity mismatch case.
+        authorized, specific_error = self._input_authorized_with_grant(session, grant)
+        if not authorized:
             response = {
-                "error": "IDENTITY_MISMATCH", "session": session,
+                "error": specific_error or "ACCESS_DENIED", "session": session,
                 "reason": "the session this input grant was issued for no longer matches what "
                           "currently answers to that session name -- re-grant explicitly to accept "
                           "the new target",

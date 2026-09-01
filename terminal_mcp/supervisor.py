@@ -668,9 +668,12 @@ class SupervisorService:
             # to the binding's own pinned identity (bindings.py), checked
             # at send time via terminal_send_bound.
         else:
-            # Same predicate _guard()/terminal_status() already enforce — a
-            # watch can never be created for a session outside the whitelist.
-            if not session_allowed(session, self.terminal.config):
+            # P0 HOTFIX: same canonical decision _guard()/terminal_status()
+            # themselves use (static whitelist OR an active dashboard read
+            # grant) -- a watch can never be created for a session outside
+            # both, but a granted-only session (never in the static
+            # whitelist) is now watchable too, same as it is readable.
+            if not self.terminal._read_authorized(session):
                 return {"error": "ACCESS_DENIED", "session": session}
             kind, target = "session", session
             # P0-2: pin identity at (re-)watch time -- best-effort; a

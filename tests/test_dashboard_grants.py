@@ -7,11 +7,18 @@ GRANTING/REVOKING stays dashboard-only (no MCP tool wrapper anywhere).
 DISCOVERY is shared: terminal_list_sessions (the raw MCP tool surface --
 Claude Code, ChatGPT via the tunnel) shows the full tmux inventory plus
 each session's grant/capability metadata too, same as
-dashboard_list_sessions -- but the actual content/control tools
-(terminal_tail/terminal_status/terminal_send_text/terminal_bind) are
-still exactly as restrictive as before, completely unaffected by any
-grant. See test_dashboard_grant_widens_discovery_but_never_content_or_
-control and the MCP-discovery section below for exactly that boundary.
+dashboard_list_sessions. The actual content/control tools (terminal_tail/
+terminal_status/terminal_send_text/terminal_bind) share the exact same
+canonical authorization decision this listing reports (core.py's
+_read_authorized/_input_authorized -- see the P0 HOTFIX commit) -- a
+grant that widens discovery's read_allowed/input_allowed also widens what
+these tools actually do; a session with no grant and no static whitelist
+entry is still refused everywhere. See test_dashboard_grant_widens_
+discovery_and_the_plain_mcp_tools_consistently and the MCP-discovery
+section below, plus test_p0_grant_authorization_hotfix.py for the full
+regression suite for the live bug this fixed (discovery reporting
+read_allowed/input_allowed=true while the plain tools still returned
+ACCESS_DENIED for a grant-only session).
 """
 from __future__ import annotations
 
@@ -282,43 +289,48 @@ def test_input_grant_still_respects_denied_session_patterns(tmp_path, tmux_sessi
     assert service.grants.get(session).input_enabled is False
 
 
-def test_dashboard_grant_widens_discovery_but_never_content_or_control(tmp_path, tmux_session_factory):
-    # The core security invariant of this whole feature, corrected once
-    # discovery became shared (terminal_list_sessions, the raw MCP tool
-    # surface, now shows the full inventory too -- see core.py): a
-    # dashboard grant widens what a caller can DISCOVER and, through the
-    # *_granted methods specifically, what it can read/send -- it must
-    # NEVER widen the UNGUARDED methods (terminal_tail/terminal_status/
-    # terminal_send_text, still the exact same session_allowed/
-    # input_session_allowed checks as before, completely untouched by
-    # this whole feature) for a session outside the static whitelist.
-    # Discovery alone is never access.
+def test_dashboard_grant_widens_discovery_and_the_plain_mcp_tools_consistently(tmp_path, tmux_session_factory):
+    # P0 HOTFIX: terminal_list_sessions and the actual read/input tools
+    # (terminal_tail/terminal_status/terminal_send_text) now share one
+    # canonical authorization decision (_read_authorized/_input_authorized,
+    # core.py) -- a grant that terminal_list_sessions reports as
+    # read_allowed/input_allowed=true must ALSO make terminal_tail/
+    # terminal_status/terminal_send_text actually succeed, not just the
+    # dashboard-only *_granted methods. This is the exact live bug this
+    # hotfix fixes: discovery previously reported true while the plain
+    # tools still returned ACCESS_DENIED. Discovery alone (no grant yet)
+    # is still never access -- that invariant is unchanged, and is what
+    # the "before any grant" half of this test proves.
     name = "newsession-mcp-isolation"
     session = tmux_session_factory(name, "bash -lc 'sleep 20'")
     time.sleep(0.2)
     client, service = _client(_config(), grants_path=tmp_path / "grants.db")
 
     # Before any grant: discoverable (in both listings), but every
-    # capability field says no, and the unguarded tools refuse it.
+    # capability field says no, and every tool refuses it.
     row_before = next(s for s in service.terminal_list_sessions()["sessions"] if s["name"] == session)
     assert row_before == {
         "name": session, "allowed": False, "attached": False, "windows": 1,
         "created": row_before["created"], "activity": row_before["activity"],
         "read_allowed": False, "read_granted": False,
         "input_allowed": False, "input_granted": False,
+        "effective_read": False, "effective_input": False,
     }
     assert service.terminal_tail(session)["error"] == "ACCESS_DENIED"
+    assert service.terminal_status(session)["error"] == "ACCESS_DENIED"
+    assert service.terminal_capture(session)["error"] == "ACCESS_DENIED"
+    assert service.terminal_send_text(session, "y")["error"] == "ACCESS_DENIED"
 
     client.post("/dashboard/api/session/grant-read", json={"name": session, "enabled": True})
     client.post("/dashboard/api/session/grant-input", json={"name": session, "enabled": True})
 
-    # After granting: terminal_list_sessions (the raw MCP tool) now
-    # reflects the grant as capability metadata -- this is the explicit
-    # point of this feature -- but the UNGUARDED tools are still exactly
-    # as restrictive as before, regardless of the grant.
-    assert service.terminal_tail(session)["error"] == "ACCESS_DENIED"
-    assert service.terminal_status(session)["error"] == "ACCESS_DENIED"
-    assert service.terminal_send_text(session, "y")["error"] == "ACCESS_DENIED"
+    # After granting: terminal_list_sessions reflects the grant, AND the
+    # plain tools now actually succeed -- consistent, not contradictory.
+    assert "error" not in service.terminal_tail(session)
+    assert "error" not in service.terminal_status(session)
+    assert "error" not in service.terminal_capture(session)
+    sent = service.terminal_send_text(session, "y", dry_run=True)
+    assert sent.get("would_send") is True
 
     row_after = next(s for s in service.terminal_list_sessions()["sessions"] if s["name"] == session)
     assert row_after["allowed"] is False  # static whitelist result itself never changes
@@ -326,9 +338,10 @@ def test_dashboard_grant_widens_discovery_but_never_content_or_control(tmp_path,
     assert row_after["read_granted"] is True
     assert row_after["input_allowed"] is True
     assert row_after["input_granted"] is True
-    # The actual, guarded read/send methods a grant DOES widen access
-    # through -- proving the grant is real, just never through the
-    # unguarded tools above.
+    assert row_after["effective_read"] is True
+    assert row_after["effective_input"] is True
+    # The dashboard-only *_granted methods still work too (same canonical
+    # decision underneath, just a different entry point/error shape).
     assert "error" not in service.terminal_tail_granted(session)
     assert service.terminal_send_text_granted(session, "y").get("sent") is True
 
@@ -435,22 +448,34 @@ def test_grant_and_revoke_reflected_immediately_in_list_metadata_no_restart(tmp_
     assert row()["input_allowed"] is False  # revoking read also revoked input
 
 
-def test_terminal_list_sessions_no_regression_for_bound_tools(tmp_path, tmux_session_factory):
-    # No regression of the existing bound-session tools: a binding still
-    # requires the underlying session to be statically whitelisted (a
-    # dashboard grant is a completely separate mechanism, see grants.py's
-    # module docstring for why) -- discovery showing more sessions never
-    # makes a previously-invalid binding target valid.
+def test_terminal_bind_accepts_a_granted_session_denies_an_ungranted_one(tmp_path, tmux_session_factory):
+    # P0 HOTFIX requirement #8: terminal_bind must accept a session whose
+    # required effective permissions are granted (same canonical
+    # _bind_authorized decision terminal_status/etc. now use), while an
+    # otherwise-identical session with NO grant and no static whitelist
+    # entry is still refused -- discovery showing more sessions never
+    # makes a truly unauthorized target bindable; only an actual grant
+    # (or the static whitelist, unchanged) does.
     from terminal_mcp.grants import SessionGrantStore
 
-    granted_only = "newsession-not-bindable"
-    session = tmux_session_factory(granted_only, "bash -lc 'sleep 20'")
+    granted = "newsession-now-bindable"
+    ungranted = "newsession-still-not-bindable"
+    granted_session = tmux_session_factory(granted, "bash -lc 'sleep 20'")
+    ungranted_session = tmux_session_factory(ungranted, "bash -lc 'sleep 20'")
     time.sleep(0.2)
     service = TerminalService(_config(), grants=SessionGrantStore(tmp_path / "grants.db"))
-    service.grant_session_read(session, True, granted_by="test-operator")
-    service.grant_session_input(session, True, granted_by="test-operator")
+    service.grant_session_read(granted_session, True, granted_by="test-operator")
+    service.grant_session_input(granted_session, True, granted_by="test-operator")
 
-    assert service.terminal_bind("still-refused", session)["error"] == "ACCESS_DENIED"
+    assert service.terminal_bind("still-refused", ungranted_session)["error"] == "ACCESS_DENIED"
+
+    bound = service.terminal_bind("now-works", granted_session, input_enabled=True)
+    assert "error" not in bound
+    assert bound["allowed"] is True  # bind-target authorization (canonical), not the raw static whitelist
+    # Existing pinning/remap protections are untouched: a second bind to
+    # the same name without replace=True is still refused.
+    assert service.terminal_bind("now-works", granted_session)["error"] == "BINDING_EXISTS"
+    service.terminal_unbind("now-works")
 
     whitelisted = tmux_session_factory("test-bindable", "bash -lc 'sleep 20'")
     time.sleep(0.2)
