@@ -8,9 +8,11 @@ from typing import Any
 from .audit import AuditStore
 from .bindings import Binding, BindingStore, valid_binding_name
 from .config import AppConfig
+from .grants import SessionGrantStore
 from .models import SessionIdentity
-from .permissions import (binding_session_allowed, input_session_allowed, require_input,
-                          require_read, session_allowed)
+from .permissions import (SENSITIVE_SESSION_WORDS, binding_session_allowed, input_session_allowed,
+                          require_input, require_read, session_allowed, session_input_denied_by_pattern,
+                          valid_session_name)
 from .redaction import redact_ansi_safe, redact_text
 from .status import classify_status
 from .tmux import SEND_TEXT_ENTER_SETTLE_SECONDS, TmuxClient, TmuxError, iso_timestamp
@@ -115,11 +117,13 @@ def _shows_genuine_progress(before: list[str], after: list[str]) -> bool:
 class TerminalService:
     def __init__(self, config: AppConfig, tmux: TmuxClient | None = None,
                  bindings: BindingStore | None = None,
-                 audit: AuditStore | None = None) -> None:
+                 audit: AuditStore | None = None,
+                 grants: SessionGrantStore | None = None) -> None:
         self.config = config
         self.tmux = tmux or TmuxClient()
         self.bindings = bindings or BindingStore()
         self.audit = audit or AuditStore()
+        self.grants = grants or SessionGrantStore()
         self._pane_locks = PaneLockRegistry()
 
     def resolve_identity(self, session: str) -> SessionIdentity | None:
@@ -211,6 +215,14 @@ class TerminalService:
         keeps today's exact plain-text behavior unchanged."""
         if error := self._guard(session):
             return error
+        return self._tail_payload(session, lines, ansi=ansi)
+
+    def _tail_payload(self, session: str, lines: int | None, *, ansi: bool) -> dict[str, Any]:
+        """The actual tail read + redact, with no guard of its own -- every
+        caller (terminal_tail's static-whitelist path, terminal_tail_granted's
+        dashboard-grant path) checks its own authorization first and calls
+        this only once authorized, so the read logic itself exists in
+        exactly one place."""
         requested = self.config.default_tail_lines if lines is None else lines
         if requested < 1:
             return {"error": "INVALID_LINES", "session": session}
@@ -259,6 +271,11 @@ class TerminalService:
     def terminal_status(self, session: str) -> dict[str, Any]:
         if error := self._guard(session):
             return error
+        return self._status_payload(session)
+
+    def _status_payload(self, session: str) -> dict[str, Any]:
+        """The actual status read + classify + redact, with no guard of its
+        own -- see _tail_payload's docstring for why this split exists."""
         try:
             info = self.tmux.get_session(session)
             if info is None:
@@ -724,3 +741,194 @@ class TerminalService:
         return {"binding": binding, "session": session, "current_command": info.pane_current_command,
                 "status": "RUNNING" if not info.pane_dead else "DEAD",
                 "last_output": redact_text("\n".join(lines)), "effective_input": effective}
+
+    # -- dashboard-only per-session grants -----------------------------
+    # Everything below is deliberately NEVER exposed as an MCP tool (see
+    # mcp_app.py -- there is no supervisor_grant_*/terminal_grant_* tool
+    # wrapper). Widens what the DASHBOARD specifically (already gated by
+    # Cloudflare Access + CSRF + dashboard.mutations_enabled -- see
+    # dashboard.py) can do for one explicitly-granted session outside the
+    # static config.yaml whitelist; the raw MCP tool surface -- every
+    # method above this point -- is completely unaffected and continues
+    # enforcing session_allowed/input_session_allowed exactly as before.
+
+    def dashboard_list_sessions(self) -> dict[str, Any]:
+        """Unlike terminal_list_sessions (whitelist-filtered, the MCP tool
+        surface), this lists every real tmux session unfiltered -- session
+        NAME/attached/windows/created/activity are tmux metadata, not pane
+        CONTENT, so surfacing them for a non-whitelisted session leaks
+        nothing a dashboard viewer couldn't already see by running `tmux
+        ls` themselves on this host. `allowed` is the existing static-
+        whitelist result (unchanged meaning); `grant` is this session's
+        current dashboard grant, if any; `effective_read`/`effective_input`
+        fold both together -- a whitelisted session is unaffected (already
+        true via `allowed`), a granted-but-not-whitelisted one becomes
+        readable/sendable through the *_granted methods below, nothing
+        else changes for it."""
+        if (error := require_read(self.config)) is not None:
+            return {"error": error, "sessions": []}
+        try:
+            items = self.tmux.list_sessions()
+        except TmuxError as exc:
+            return {"error": "TMUX_ERROR", "reason": str(exc), "sessions": []}
+        grants_by_session = {grant.session: grant for grant in self.grants.list()}
+        sessions = []
+        for item in items:
+            allowed = session_allowed(item.name, self.config)
+            grant = grants_by_session.get(item.name)
+            grant_read = bool(grant and grant.read_enabled)
+            grant_input = bool(grant and grant.input_enabled)
+            sessions.append({
+                "name": item.name, "allowed": allowed, "attached": item.attached,
+                "windows": item.windows, "created": iso_timestamp(item.created_epoch),
+                "activity": iso_timestamp(item.activity_epoch),
+                "grant": {"read_enabled": grant_read, "input_enabled": grant_input},
+                "effective_read": allowed or grant_read,
+                "effective_input": bool(
+                    self.config.permissions.terminal_input
+                    and (input_session_allowed(item.name, self.config) or grant_input)
+                ),
+            })
+        return {"sessions": sessions}
+
+    def grant_session_read(self, session: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
+        if (error := require_read(self.config)) is not None:
+            return {"error": error, "session": session}
+        if not valid_session_name(session):
+            return {"error": "INVALID_SESSION", "session": session}
+        if enabled:
+            if any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS):
+                return {"error": "SENSITIVE_SESSION_NOT_GRANTABLE", "session": session}
+            try:
+                exists = self.tmux.get_session(session) is not None
+            except TmuxError as exc:
+                return {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
+            if not exists:
+                return {"error": "SESSION_NOT_FOUND", "session": session}
+        grant = self.grants.set_read(session, enabled, granted_by=granted_by)
+        return {"session": session, "read_enabled": grant.read_enabled, "input_enabled": grant.input_enabled}
+
+    def grant_session_input(self, session: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
+        """Read must already be granted -- enforced by SessionGrantStore.
+        set_input itself (returns None if not), not just checked here, so
+        this can never race a concurrent read-revoke into granting input
+        without read. Pins the session's CURRENT identity (session_id/
+        pane_id/created_epoch) at the moment input is granted, exactly
+        like terminal_bind already does for bindings -- re-checked at
+        every send in terminal_send_text_granted, never silently carried
+        forward to a same-named session that gets recreated later."""
+        if (error := require_input(self.config)) is not None:
+            return {"error": error, "session": session}
+        if not valid_session_name(session):
+            return {"error": "INVALID_SESSION", "session": session}
+        existing = self.grants.get(session)
+        if existing is None or not existing.read_enabled:
+            return {"error": "READ_GRANT_REQUIRED", "session": session}
+        if not enabled:
+            grant = self.grants.set_input(session, False, granted_by=granted_by)
+            return {"session": session, "read_enabled": grant.read_enabled, "input_enabled": grant.input_enabled}
+        if any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS):
+            return {"error": "SENSITIVE_SESSION_NOT_GRANTABLE", "session": session}
+        if session_input_denied_by_pattern(session, self.config):
+            return {"error": "ACCESS_DENIED", "session": session}
+        try:
+            info = self.tmux.get_session(session)
+        except TmuxError as exc:
+            return {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
+        if info is None:
+            return {"error": "SESSION_NOT_FOUND", "session": session}
+        command = info.pane_current_command.casefold()
+        allowed_sensitive = {item.casefold() for item in self.config.input_policy.allowed_sensitive_commands}
+        if command in SENSITIVE_COMMANDS and command not in allowed_sensitive:
+            return {"error": "SENSITIVE_TARGET", "session": session, "current_command": command}
+        grant = self.grants.set_input(session, True, granted_by=granted_by,
+                                      pinned_session_id=info.session_id, pinned_pane_id=info.pane_id,
+                                      pinned_created_epoch=info.created_epoch)
+        if grant is None:  # read was revoked concurrently between the check above and here
+            return {"error": "READ_GRANT_REQUIRED", "session": session}
+        return {"session": session, "read_enabled": grant.read_enabled, "input_enabled": grant.input_enabled}
+
+    def _require_read_grant(self, session: str) -> dict[str, Any] | None:
+        if (error := require_read(self.config)) is not None:
+            return {"error": error, "session": session}
+        grant = self.grants.get(session)
+        if grant is None or not grant.read_enabled:
+            return {"error": "READ_RESTRICTED", "session": session}
+        return None
+
+    def terminal_status_granted(self, session: str) -> dict[str, Any]:
+        if error := self._require_read_grant(session):
+            return error
+        return self._status_payload(session)
+
+    def terminal_tail_granted(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]:
+        if error := self._require_read_grant(session):
+            return error
+        return self._tail_payload(session, lines, ansi=ansi)
+
+    def terminal_send_text_granted(self, session: str, text: str, press_enter: bool = False,
+                                   dry_run: bool = False, idempotency_key: str | None = None) -> dict[str, Any]:
+        """Parallel to terminal_send_text, for a dashboard-granted (not
+        statically-whitelisted) session -- reuses the exact same guarded
+        low-level send primitive (_send_text_and_verify: pane lock,
+        idempotency, submit verification), only the authorization check
+        differs. Re-verifies the grant's pinned identity against the
+        session's CURRENT tmux identity right now, at send time, not just
+        at grant time -- a session destroyed and recreated under the same
+        name since the grant was issued gets IDENTITY_MISMATCH, never a
+        silent send to the new, unvetted pane. Unlike a binding, this does
+        NOT lazily adopt an unpinned identity: input grants are always
+        pinned at grant time (grant_session_input requires the session to
+        exist then), so a missing pin here would only mean the grant row
+        is stale/corrupt -- treated as a mismatch, never guessed past."""
+        action = "send_text_granted"
+        if (error := require_input(self.config)) is not None:
+            return self._audit_result({**error, "session": session}, action=action, session=session,
+                                      text=text, press_enter=press_enter)
+        grant = self.grants.get(session)
+        if grant is None or not grant.read_enabled or not grant.input_enabled:
+            response = {"error": "GRANT_REQUIRED", "session": session}
+            return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
+        if not self.config.input_policy.allow_send_text:
+            response = {"error": "ACTION_NOT_ALLOWED", "session": session}
+            return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
+        if "\x00" in text:
+            response = {"error": "INVALID_TEXT", "session": session}
+            return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
+        if len(text) > self.config.input_policy.max_text_length:
+            response = {"error": "INPUT_TOO_LARGE", "session": session, "max_text_length": self.config.input_policy.max_text_length}
+            return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
+        current = self.resolve_identity(session)
+        pinned = SessionIdentity(name=session, session_id=grant.pinned_session_id or "",
+                                 pane_id=grant.pinned_pane_id or "", created_epoch=grant.pinned_created_epoch or 0)
+        if current is None or not grant.pinned_session_id or not pinned.matches(current):
+            response = {
+                "error": "IDENTITY_MISMATCH", "session": session,
+                "reason": "the session this input grant was issued for no longer matches what "
+                          "currently answers to that session name -- re-grant explicitly to accept "
+                          "the new target",
+            }
+            return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
+        try:
+            info = self.tmux.get_session(session)
+        except TmuxError as exc:
+            response = {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
+            return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
+        if info is None:
+            response = {"error": "SESSION_NOT_FOUND", "session": session}
+            return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
+        command = info.pane_current_command.casefold()
+        allowed_sensitive = {item.casefold() for item in self.config.input_policy.allowed_sensitive_commands}
+        if command in SENSITIVE_COMMANDS and command not in allowed_sensitive:
+            response = {"error": "SENSITIVE_TARGET", "session": session, "current_command": command}
+            return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
+        if dry_run:
+            response = {"session": session, "would_send": True, "dry_run": True,
+                        "characters": len(text), "press_enter": press_enter}
+            return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
+        try:
+            response = {"session": session,
+                        **self._send_text_and_verify(session, text, press_enter, idempotency_key=idempotency_key)}
+        except TmuxError as exc:
+            response = {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
+        return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)

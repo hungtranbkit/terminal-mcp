@@ -218,15 +218,21 @@ def test_dashboard_remembers_last_session_name_only():
 
 
 def test_dashboard_auto_selects_remembered_or_first_session_once():
-    # On load: remembered session if it's still in the (already
-    # whitelist-filtered) allowed list, else the first available allowed
-    # session — and only ever on the first load, never fighting a manual
-    # selection/clear on the recurring 5s poll.
+    # On load: remembered session if it's still readable (statically
+    # whitelisted OR explicitly granted), else the first available
+    # readable session — and only ever on the first load, never fighting a
+    # manual selection/clear on the recurring 5s poll. Since the session
+    # listing now includes restricted (not-yet-granted) sessions too (the
+    # dashboard-grant feature), auto-select filters to readableRows first
+    # rather than picking rows[0] blindly, so a first-time viewer is never
+    # auto-opened straight into a locked placeholder.
     assert "let autoSelectAttempted = false;" in DASHBOARD_HTML
     assert "if (!autoSelectAttempted) {" in DASHBOARD_HTML
-    assert "if (!selected && rows.length) {" in DASHBOARD_HTML
+    assert "const readableRows = rows.filter(row => row.effective_read);" in DASHBOARD_HTML
+    assert "if (!selected && readableRows.length) {" in DASHBOARD_HTML
     assert (
-        "const target = (remembered && rows.some(row => row.name === remembered)) ? remembered : rows[0].name;"
+        "const target = (remembered && readableRows.some(row => row.name === remembered)) "
+        "? remembered : readableRows[0].name;"
         in DASHBOARD_HTML
     )
     assert "selectSession(target);" in DASHBOARD_HTML
@@ -456,11 +462,16 @@ def test_session_detail_redacts_secret_even_when_colored(read_config, tmux_sessi
 
 def test_session_detail_ansi_still_enforces_whitelist():
     # Security regression: the ansi=True path is a rendering detail, not a
-    # second, less-guarded read path — an unlisted session is still denied.
+    # second, less-guarded read path — an unlisted, ungranted session is
+    # still denied (READ_RESTRICTED -- the dashboard-grant feature's more
+    # precise error than the old bare ACCESS_DENIED, but still a clean 403
+    # with zero content in the response).
     client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 50, 20))
     response = client.get("/dashboard/api/session?name=private-ansi")
     assert response.status_code == 403
-    assert response.json()["error"] == "ACCESS_DENIED"
+    body = response.json()
+    assert body["error"] == "READ_RESTRICTED"
+    assert "tail" not in body and "status" not in body
 
 
 def test_session_detail_ansi_read_only_input_route_unaffected(read_config):
@@ -567,15 +578,29 @@ def test_concurrent_dashboard_requests_all_succeed(read_config, tmux_session_fac
     assert all(code == 200 for code in statuses)
 
 
-def test_sessions_route_still_denies_unlisted_sessions(read_config, tmux_session_factory):
-    # Security regression: the new per-row terminal_status() call and sort
-    # only touch presentation of the already-whitelist-filtered list; a
-    # session outside the pattern never appears, attention or not.
+def test_sessions_route_lists_unwhitelisted_sessions_as_restricted_not_hidden(read_config, tmux_session_factory):
+    # Dashboard session-discovery feature: a non-whitelisted session now
+    # APPEARS in the list (name/attached/windows/activity are tmux
+    # metadata, not pane content -- safe to show), but is never treated as
+    # readable: allowed/effective_read are both False, state is the
+    # RESTRICTED sentinel (terminal_status is never even called for it),
+    # and it carries no grant. The real security boundary -- no CONTENT
+    # ever reaches an ungranted caller -- is covered by
+    # test_session_detail_ansi_still_enforces_whitelist and the dedicated
+    # grant tests below, not by hiding the row.
     tmux_session_factory("private-attn-check", "bash -lc 'echo Do you want to continue? [y/N]; sleep 20'")
     time.sleep(0.4)
     client, _ = _client(read_config)
     rows = client.get("/dashboard/api/sessions").json()["sessions"]
-    assert all(row["name"] != "private-attn-check" for row in rows)
+    row = next((r for r in rows if r["name"] == "private-attn-check"), None)
+    assert row is not None  # listed, not hidden
+    assert row["allowed"] is False
+    assert row["effective_read"] is False
+    assert row["effective_input"] is False
+    assert row["state"] == "RESTRICTED"
+    assert row["grant"] == {"read_enabled": False, "input_enabled": False}
+    # No pane content anywhere in the listing response for it.
+    assert "last_output" not in row and "output" not in row
 
 
 def test_dashboard_attention_badge_and_sort_wiring_present():
@@ -659,7 +684,11 @@ def test_dashboard_fullscreen_and_mobile_layout_regressions_still_hold():
     # from the previous commits.
     assert "height:100dvh" in DASHBOARD_HTML
     assert "body.fullscreen-terminal header," in DASHBOARD_HTML
-    assert "const target = (remembered && rows.some(row => row.name === remembered)) ? remembered : rows[0].name;" in DASHBOARD_HTML
+    assert (
+        "const target = (remembered && readableRows.some(row => row.name === remembered)) "
+        "? remembered : readableRows[0].name;"
+        in DASHBOARD_HTML
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -692,8 +721,11 @@ def test_dashboard_health_indicator_no_new_backend_route():
     # Purely reactive to the two fetches loadSessions/loadDetail already
     # make — no new endpoint, no extra polling path added for the health
     # indicator specifically (the other fetch()s below belong to the
-    # separate Supervisor Loop v1/v2 features' summary/ack/pause calls).
-    assert DASHBOARD_HTML.count("fetch(") == 7  # sessions, session detail, session/input, supervisor, supervisor/ack, supervisor2, supervisor2/pause
+    # separate Supervisor Loop v1/v2 features' summary/ack/pause calls, and
+    # the dashboard-grant feature's single shared postGrant() helper, whose
+    # one fetch() call serves both grant-read and grant-input via a `path`
+    # parameter rather than a separate literal call site for each).
+    assert DASHBOARD_HTML.count("fetch(") == 8  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause
 
 
 def test_dashboard_fullscreen_preference_persisted_and_restored_once():
@@ -758,6 +790,8 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/sessions": {"GET", "HEAD"},
         "/dashboard/api/session": {"GET", "HEAD"},
         "/dashboard/api/session/input": {"POST"},
+        "/dashboard/api/session/grant-read": {"POST"},
+        "/dashboard/api/session/grant-input": {"POST"},
         "/dashboard/api/supervisor": {"GET", "HEAD"},
         "/dashboard/api/supervisor/ack": {"POST"},
         "/dashboard/api/supervisor2": {"GET", "HEAD"},

@@ -10,7 +10,7 @@ from starlette.responses import HTMLResponse, JSONResponse
 
 from .cf_access import verify_access_assertion
 from .core import TerminalService
-from .permissions import input_session_allowed
+from .permissions import input_session_allowed, session_allowed
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
 
@@ -22,6 +22,12 @@ INPUT_ERROR_STATUS = {
     "INPUT_DISABLED": 403,
     "SENSITIVE_TARGET": 403,
     "SESSION_NOT_FOUND": 404,
+    "GRANT_REQUIRED": 403,
+    "READ_GRANT_REQUIRED": 403,
+    "READ_RESTRICTED": 403,
+    "IDENTITY_MISMATCH": 403,
+    "SENSITIVE_SESSION_NOT_GRANTABLE": 403,
+    "INVALID_SESSION": 400,
 }
 
 
@@ -149,6 +155,10 @@ DASHBOARD_HTML = """<!doctype html>
     #inputBar label { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:12px; white-space:nowrap }
     #inputNote { padding:6px 16px 0; font-size:12px; color:var(--muted) }
     #inputNote.error { color:#ff6b6b }
+    #grantBar { display:flex; align-items:center; gap:8px; padding:8px 16px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); flex-wrap:wrap }
+    #grantBar button { background:#2b3f66; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:6px 12px; cursor:pointer; font:inherit; font-size:12px }
+    #grantBar button.revoke { background:#3a2430 }
+    .lock-badge { background:#3a2430; color:#ff9f9f; border-radius:4px; padding:1px 6px; font-size:10px; margin-left:6px; vertical-align:middle }
     /* Matched on EITHER dimension, not just width: a phone rotated to
        landscape can easily exceed 760px of width (e.g. 852px on an iPhone
        15 Pro) while its height drops well under 760px, and a naive
@@ -285,6 +295,7 @@ DASHBOARD_HTML = """<!doctype html>
     <section class="panel" id="sessionsPanel"><div class="panel-title">SESSIONS <span id="count"></span></div><div id="sessions"></div></section>
     <section class="panel detail">
       <div id="summary" class="muted">Chọn một session để xem output.</div>
+      <div id="grantBar" hidden></div>
       <div class="term">
         <div class="term-bar">
           <button id="sessionsToggle" class="sessions-toggle term-btn" type="button">☰ Sessions</button>
@@ -338,6 +349,7 @@ DASHBOARD_HTML = """<!doctype html>
     const sessionsEl = document.querySelector('#sessions');
     const outputEl = document.querySelector('#output');
     const summaryEl = document.querySelector('#summary');
+    const grantBarEl = document.querySelector('#grantBar');
     const liveBadgeEl = document.querySelector('#liveBadge');
     const supervisorBadgeEl = document.querySelector('#supervisorBadge');
     const supervisorPanelEl = document.querySelector('#supervisorPanel');
@@ -887,6 +899,49 @@ DASHBOARD_HTML = """<!doctype html>
     }
     let autoSelectAttempted = false;
 
+    // ---- per-session read/input grants (dashboard-only; see grants.py) ----
+    // Built with createElement/textContent only, same no-raw-HTML posture
+    // as the rest of this file (see the supervisor panel's own comment on
+    // this above).
+    async function postGrant(path, name, enabled) {
+      const response = await fetch(path, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name, enabled}),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (data && data.error) {
+        setInputNote(`${enabled ? 'Cấp' : 'Thu hồi'} quyền thất bại: ${clean(data.error)}`, false);
+      }
+      await loadSessions(); await loadDetail();
+    }
+    function renderGrantBar(name, allowed, grant, restricted) {
+      grantBarEl.replaceChildren();
+      if (allowed) { grantBarEl.hidden = true; return; } // statically whitelisted -- nothing to grant/revoke, ever
+      grantBarEl.hidden = false;
+      const label = document.createElement('span');
+      label.textContent = restricted
+        ? 'Session này chưa được cấp quyền.'
+        : (grant && grant.input_enabled ? 'Đã cấp quyền xem + nhập liệu.' : 'Đã cấp quyền xem output.');
+      grantBarEl.append(label);
+      if (restricted || !(grant && grant.read_enabled)) {
+        const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = 'Cho phép xem output';
+        btn.onclick = () => postGrant('/dashboard/api/session/grant-read', name, true);
+        grantBarEl.append(btn);
+        return; // input controls make no sense before read is granted
+      }
+      const revokeReadBtn = document.createElement('button'); revokeReadBtn.type = 'button'; revokeReadBtn.className = 'revoke';
+      revokeReadBtn.textContent = 'Thu hồi quyền xem'; revokeReadBtn.onclick = () => postGrant('/dashboard/api/session/grant-read', name, false);
+      if (grant && grant.input_enabled) {
+        const revokeInputBtn = document.createElement('button'); revokeInputBtn.type = 'button'; revokeInputBtn.className = 'revoke';
+        revokeInputBtn.textContent = 'Thu hồi quyền nhập liệu'; revokeInputBtn.onclick = () => postGrant('/dashboard/api/session/grant-input', name, false);
+        grantBarEl.append(revokeInputBtn, revokeReadBtn);
+      } else {
+        const grantInputBtn = document.createElement('button'); grantInputBtn.type = 'button';
+        grantInputBtn.textContent = 'Cho phép nhập liệu'; grantInputBtn.onclick = () => postGrant('/dashboard/api/session/grant-input', name, true);
+        grantBarEl.append(grantInputBtn, revokeReadBtn);
+      }
+    }
+
     // Shared by a manual click and the on-load auto-select below so both
     // apply the exact same side effects (auto-follow reset, drawer close,
     // input-control refresh, and persisting the choice for next visit).
@@ -904,16 +959,17 @@ DASHBOARD_HTML = """<!doctype html>
 
       // On first load only (never on the recurring 5s poll, which must not
       // fight a user's manual choice to switch sessions or clear the
-      // selection): auto-open the remembered session if it still exists and
-      // is allowed, else the first available allowed session. `rows` here
-      // is already exactly "the allowed sessions" (terminal_list_sessions
-      // only ever returns whitelisted ones), so rows[0] already satisfies
-      // "first available allowed session" with no extra filtering needed.
+      // selection): auto-open the remembered session if it still exists,
+      // else the first session that's actually readable (a restricted row
+      // is real and listed now -- see dashboard_list_sessions -- but
+      // auto-opening one would only greet a first-time viewer with a
+      // locked placeholder instead of real output).
+      const readableRows = rows.filter(row => row.effective_read);
       if (!autoSelectAttempted) {
         autoSelectAttempted = true;
-        if (!selected && rows.length) {
+        if (!selected && readableRows.length) {
           const remembered = recalledSession();
-          const target = (remembered && rows.some(row => row.name === remembered)) ? remembered : rows[0].name;
+          const target = (remembered && readableRows.some(row => row.name === remembered)) ? remembered : readableRows[0].name;
           selectSession(target);
         }
       }
@@ -930,6 +986,12 @@ DASHBOARD_HTML = """<!doctype html>
         if (needsAttention) {
           const badge = document.createElement('span'); badge.className = 'attn-badge'; badge.textContent = '⚠ NEEDS INPUT';
           name.append(' ', badge);
+        } else if (!row.effective_read) {
+          // Newly-discovered, not-yet-granted session -- still listed
+          // (name/attached/windows/activity are tmux metadata, never pane
+          // content), just visibly marked as not readable yet.
+          const badge = document.createElement('span'); badge.className = 'lock-badge'; badge.textContent = '🔒 restricted';
+          name.append(' ', badge);
         }
         const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = `${row.windows} window · ${row.attached ? 'attached' : 'detached'}`;
         button.append(name, meta);
@@ -939,7 +1001,7 @@ DASHBOARD_HTML = """<!doctype html>
       if (selected && !rows.some(row => row.name === selected)) {
         selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
         if (fullscreenTerminal) setFullscreen(false, { persist: false }); // forced exit — the remembered preference is unrelated and must survive
-        summaryEl.textContent = 'Session không còn tồn tại.'; outputEl.replaceChildren();
+        summaryEl.textContent = 'Session không còn tồn tại.'; outputEl.replaceChildren(); grantBarEl.hidden = true;
       }
     }
     async function loadDetail() {
@@ -947,10 +1009,27 @@ DASHBOARD_HTML = """<!doctype html>
       const response = await fetch(`/dashboard/api/session?name=${encodeURIComponent(selected)}`, {cache:'no-store'});
       const data = await response.json();
       if (data.error) {
-        summaryEl.textContent = `${data.error}: ${selected}`; outputEl.replaceChildren();
+        if (data.error === 'READ_RESTRICTED') {
+          // Locked placeholder, not a generic error line -- this session
+          // is real (it's in the list) and its output becomes visible the
+          // instant read is granted, no page reload needed.
+          summaryEl.replaceChildren();
+          const strong = document.createElement('strong'); strong.textContent = selected + ' · ';
+          const note = document.createElement('span'); note.className = 'muted'; note.textContent = 'chưa được cấp quyền xem';
+          summaryEl.append(strong, note);
+          outputEl.replaceChildren();
+          const placeholder = document.createElement('div'); placeholder.className = 'muted';
+          placeholder.textContent = '🔒 Output bị khoá. Cấp quyền "xem output" bên dưới để xem nội dung session này.';
+          outputEl.append(placeholder);
+          renderGrantBar(selected, false, null, true);
+        } else {
+          summaryEl.textContent = `${data.error}: ${selected}`; outputEl.replaceChildren();
+          grantBarEl.hidden = true;
+        }
         inputAllowed = false; refreshInputControls(); refreshTermControls();
         return;
       }
+      renderGrantBar(selected, Boolean(data.allowed), data.grant || null, false);
       summaryEl.replaceChildren();
       const strong = document.createElement('strong'); strong.textContent = selected + ' · ';
       // Session status (RUNNING / WAITING_INPUT / PLAN_APPROVAL / ... and its
@@ -1086,25 +1165,40 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
     @server.custom_route("/dashboard/api/sessions", methods=["GET"], include_in_schema=False)
     async def sessions(_: Request) -> JSONResponse:
-        # P1 items #4/#5: terminal_list_sessions/terminal_status are both
+        # P1 items #4/#5: dashboard_list_sessions/terminal_status are both
         # blocking (a real tmux subprocess round-trip, sometimes an sqlite
         # read) -- run off the event loop via anyio.to_thread so one slow
         # tmux call can never stall every other concurrent request this
-        # single async server is handling. The per-session terminal_status
-        # calls below are also each an independent tmux subprocess (the
-        # N+1 this route always had) -- fired concurrently in a task group
-        # rather than serially, so N sessions cost ~one round-trip's worth
-        # of wall-clock time instead of N.
-        listed = await anyio.to_thread.run_sync(terminal.terminal_list_sessions)
+        # single async server is handling. The per-session status calls
+        # below are also each an independent tmux subprocess (the N+1 this
+        # route always had) -- fired concurrently in a task group rather
+        # than serially, so N sessions cost ~one round-trip's worth of
+        # wall-clock time instead of N.
+        #
+        # dashboard_list_sessions() lists EVERY real tmux session, not just
+        # whitelisted ones -- session name/attached/windows/created/
+        # activity are tmux metadata, not pane CONTENT, so this is safe to
+        # show for a non-whitelisted session too (a dashboard viewer could
+        # already see the same by running `tmux ls`). Each row's
+        # effective_read says whether content is actually reachable
+        # (statically whitelisted, or explicitly granted); a row that
+        # isn't gets state="RESTRICTED" -- terminal_status/_granted is
+        # never even called for it, so no content-classification heuristic
+        # runs against a pane this viewer has no access to.
+        listed = await anyio.to_thread.run_sync(terminal.dashboard_list_sessions)
         rows = listed.get("sessions")
         if isinstance(rows, list):
             async def _fill_state(row: dict) -> None:
-                # Reuses the exact same classify_status() heuristic terminal_status()
-                # already applies to a single session — no new/looser interpretation
-                # of pane content, so WAITING_INPUT here means exactly what it means
-                # everywhere else in this project, and UNKNOWN stays UNKNOWN when
-                # evidence is weak, same as always.
-                status = await anyio.to_thread.run_sync(terminal.terminal_status, row["name"])
+                if not row.get("effective_read"):
+                    row["state"] = "RESTRICTED"
+                    return
+                # Reuses the exact same classify_status() heuristic terminal_status()/
+                # terminal_status_granted() already applies to a single session — no
+                # new/looser interpretation of pane content, so WAITING_INPUT here
+                # means exactly what it means everywhere else in this project, and
+                # UNKNOWN stays UNKNOWN when evidence is weak, same as always.
+                fetch = terminal.terminal_status if row["allowed"] else terminal.terminal_status_granted
+                status = await anyio.to_thread.run_sync(fetch, row["name"])
                 row["state"] = status.get("state", "UNKNOWN")
 
             async with anyio.create_task_group() as tg:
@@ -1122,13 +1216,31 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     @server.custom_route("/dashboard/api/session", methods=["GET"], include_in_schema=False)
     async def session_detail(request: Request) -> JSONResponse:
         name = request.query_params.get("name", "")
+        # A statically-whitelisted session keeps its EXACT existing path
+        # (terminal_status/terminal_tail, completely untouched) -- a
+        # dashboard-granted-but-not-whitelisted one uses the parallel
+        # *_granted methods instead (same guard shape, checks the grant
+        # instead of the static whitelist). A session that is neither
+        # never reaches terminal_status/_granted at all: a clear,
+        # explicit READ_RESTRICTED response, never a silent failure or a
+        # generic 404 that could be mistaken for "session doesn't exist".
+        if not session_allowed(name, terminal.config) and not (
+            (grant := terminal.grants.get(name)) is not None and grant.read_enabled
+        ):
+            return JSONResponse({"error": "READ_RESTRICTED", "session": name}, status_code=403,
+                                headers={"Cache-Control": "no-store"})
+        use_granted = not session_allowed(name, terminal.config)
+        status_fn = terminal.terminal_status_granted if use_granted else terminal.terminal_status
+        tail_fn = (lambda: terminal.terminal_tail_granted(name, ansi=True)) if use_granted \
+            else (lambda: terminal.terminal_tail(name, ansi=True))
+
         # P1 item #4: both calls below are independent tmux subprocess
         # round-trips -- run concurrently, off the event loop.
         status_result: dict = {}
         tail_result: dict = {}
 
         async def _status() -> None:
-            status_result.update(await anyio.to_thread.run_sync(terminal.terminal_status, name))
+            status_result.update(await anyio.to_thread.run_sync(status_fn, name))
 
         async def _tail() -> None:
             # Uses config.default_tail_lines (already the project's one source of truth
@@ -1140,33 +1252,44 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             # same whitelist/permission guard as every other read, and through
             # redact_ansi_safe (see terminal_mcp/redaction.py) rather than the plain
             # redactor, so a secret can never survive because it was colour-coded.
-            tail_result.update(await anyio.to_thread.run_sync(lambda: terminal.terminal_tail(name, ansi=True)))
+            tail_result.update(await anyio.to_thread.run_sync(tail_fn))
 
         # Both fire regardless of whether one turns out to be an error (the
         # original sequential code short-circuited before calling
         # terminal_tail at all on an errored status) -- a harmless, rare-
-        # path tradeoff: terminal_tail re-checks the whitelist itself
-        # (same defense-in-depth as every other read here) and returns its
-        # own error with no side effects either way, so running both
-        # concurrently costs one redundant tmux call only on the already-
-        # uncommon error path, in exchange for the success path (the
-        # overwhelming majority of requests) needing one round-trip's
-        # worth of wall-clock time instead of two.
+        # path tradeoff: terminal_tail/_granted re-checks its own
+        # authorization itself (same defense-in-depth as every other read
+        # here) and returns its own error with no side effects either way,
+        # so running both concurrently costs one redundant tmux call only
+        # on the already-uncommon error path, in exchange for the success
+        # path (the overwhelming majority of requests) needing one round-
+        # trip's worth of wall-clock time instead of two.
         async with anyio.create_task_group() as tg:
             tg.start_soon(_status)
             tg.start_soon(_tail)
 
         status, tail = status_result, tail_result
         if "error" in status:
-            return JSONResponse(status, status_code=403 if status["error"] == "ACCESS_DENIED" else 404)
+            return JSONResponse(status, status_code=403 if status["error"] in
+                                ("ACCESS_DENIED", "READ_RESTRICTED") else 404)
         if "error" in tail:
-            return JSONResponse(tail, status_code=404)
-        input_allowed = (
+            return JSONResponse(tail, status_code=403 if tail["error"] == "READ_RESTRICTED" else 404)
+        # effective_input mirrors dashboard_list_sessions' own definition:
+        # statically allowed (unchanged meaning) OR an active input grant
+        # -- the dashboard only ever reveals its input composer when this
+        # is true, never merely because read succeeded.
+        grant = terminal.grants.get(name)
+        input_allowed = bool(
             terminal.config.permissions.terminal_input
-            and input_session_allowed(name, terminal.config)
+            and (input_session_allowed(name, terminal.config) or (grant is not None and grant.input_enabled))
         )
         return JSONResponse(
-            {"session": name, "status": status, "tail": tail, "input_allowed": input_allowed},
+            {
+                "session": name, "status": status, "tail": tail, "input_allowed": input_allowed,
+                "allowed": session_allowed(name, terminal.config),
+                "grant": {"read_enabled": bool(grant and grant.read_enabled),
+                         "input_enabled": bool(grant and grant.input_enabled)},
+            },
             headers={"Cache-Control": "no-store"},
         )
 
@@ -1194,12 +1317,91 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # Cloudflare Access is configured, distinct from an anonymous one
         # when it is not.
         _log.info("dashboard session_input session=%s identity=%s", name, identity.email if identity else None)
+        # A statically input-whitelisted session keeps its EXACT existing
+        # send path (terminal_send_text, completely untouched) -- any
+        # session with a read grant that ISN'T input-whitelisted (whether
+        # or not input is currently enabled on that grant -- an input-
+        # revoked grant correctly gets terminal_send_text_granted's own
+        # explicit GRANT_REQUIRED from this route, rather than falling
+        # back to terminal_send_text's generic ACCESS_DENIED, which would
+        # be equally safe but a less informative reason for a caller who
+        # just revoked their own grant) routes through the parallel
+        # terminal_send_text_granted, which re-verifies the grant's
+        # pinned identity against the session's current tmux identity at
+        # send time.
+        grant = terminal.grants.get(name)
+        use_granted = grant is not None and not input_session_allowed(name, terminal.config)
+        send_fn = terminal.terminal_send_text_granted if use_granted else terminal.terminal_send_text
         result = await anyio.to_thread.run_sync(
-            lambda: terminal.terminal_send_text(name, text, press_enter=press_enter, idempotency_key=idempotency_key)
+            lambda: send_fn(name, text, press_enter=press_enter, idempotency_key=idempotency_key)
         )
         status_code = 200
         if "error" in result:
             status_code = INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/grant-read", methods=["POST"], include_in_schema=False)
+    async def session_grant_read(request: Request) -> JSONResponse:
+        # Grants a session outside the static whitelist read access from
+        # the dashboard specifically -- see core.py's grant_session_read
+        # for the full guard chain (sensitive-name floor, session must
+        # currently exist). Revoking read (enabled=false) also revokes
+        # any input grant for the same session -- input without read makes
+        # no sense and is never left dangling (SessionGrantStore.set_read).
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        enabled = body.get("enabled") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name or not isinstance(enabled, bool):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        granted_by = identity.email if identity else None
+        _log.info("dashboard grant_read session=%s enabled=%s identity=%s", name, enabled, granted_by)
+        result = await anyio.to_thread.run_sync(
+            lambda: terminal.grant_session_read(name, enabled, granted_by=granted_by)
+        )
+        terminal.audit.record(
+            action="grant_read", session=name, result="GRANTED" if (enabled and "error" not in result)
+            else ("REVOKED" if "error" not in result else "BLOCKED"),
+            reason=result.get("error") or granted_by, source_transport="dashboard",
+        )
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/grant-input", methods=["POST"], include_in_schema=False)
+    async def session_grant_input(request: Request) -> JSONResponse:
+        # Same shape as grant-read above, for input specifically -- see
+        # core.py's grant_session_input: requires read already granted,
+        # still respects the global terminal_input gate, input_policy
+        # deny patterns, the sensitive-current-command guard, and pins
+        # the session's identity at the moment of grant (re-verified at
+        # every send by terminal_send_text_granted).
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        enabled = body.get("enabled") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name or not isinstance(enabled, bool):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        granted_by = identity.email if identity else None
+        _log.info("dashboard grant_input session=%s enabled=%s identity=%s", name, enabled, granted_by)
+        result = await anyio.to_thread.run_sync(
+            lambda: terminal.grant_session_input(name, enabled, granted_by=granted_by)
+        )
+        terminal.audit.record(
+            action="grant_input", session=name, result="GRANTED" if (enabled and "error" not in result)
+            else ("REVOKED" if "error" not in result else "BLOCKED"),
+            reason=result.get("error") or granted_by, source_transport="dashboard",
+        )
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/supervisor", methods=["GET"], include_in_schema=False)

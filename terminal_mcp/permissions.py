@@ -44,6 +44,21 @@ def input_session_allowed(session: str, config: AppConfig) -> bool:
     return any(fnmatch.fnmatchcase(session, pattern) for pattern in policy.allowed_session_patterns)
 
 
+def session_input_denied_by_pattern(session: str, config: AppConfig) -> bool:
+    """The denial half of input_session_allowed, usable independently by
+    the dashboard's per-session grant path (core.py's
+    grant_session_input/terminal_send_text_granted): a session outside
+    input_policy.allowed_session_patterns entirely (the ordinary case for
+    a grant target -- that's the whole point of a grant) must still never
+    bypass an EXPLICIT deny pattern. Same absolute floor
+    input_session_allowed already enforces for the static-whitelist path,
+    applied here too -- deliberately NOT the same function, so a change to
+    one can never accidentally alter the other's behavior."""
+    if not valid_session_name(session):
+        return True
+    return any(fnmatch.fnmatchcase(session, pattern) for pattern in config.input_policy.denied_session_patterns)
+
+
 def require_read(config: AppConfig) -> str | None:
     return None if config.permissions.terminal_read else "READ_DISABLED"
 
