@@ -158,6 +158,28 @@ codex
 
 Detach with `Ctrl-b d` and reattach with `tmux attach -t SESSION`.
 
+### Mouse-wheel scrolling in a Codex session
+
+Any session whose name matches `codex*` gets tmux's per-session `mouse`
+option turned on automatically (a host-level `~/.tmux.conf` hook, applied
+the moment the session is created -- see that file's own comments for the
+full root-cause writeup). This is scoped to Codex sessions only: it is a
+per-*session* tmux option, not the server-wide default (which stays
+`off`), so a Claude Code session's mouse/scroll behavior is unaffected
+either way. With it on, tmux's own stock wheel bindings route Codex's
+scroll into tmux's native copy-mode -- a fixed 5 lines per wheel step,
+real pager behavior, instead of erratic jumps -- because Codex (unlike
+Claude Code) runs in the primary screen and does not request its own
+mouse tracking, so tmux would otherwise never mediate its scrolling at
+all. Exit copy-mode (return to the live view) by scrolling all the way
+back down, pressing `q`, or `tmux send-keys -t SESSION -X cancel`; while
+in copy-mode, `terminal_send_text`/`terminal_send_bound` correctly refuse
+input with `PANE_IN_COPY_MODE` rather than ever falsely reporting a send
+as confirmed (unchanged from the existing copy-mode guard). A session
+created before this hook existed (or if the hook is ever disabled) can be
+opted in by hand: `tmux set-option -t SESSION mouse on`. Rollback: see
+`~/.tmux.conf`'s own comment block.
+
 ## Enable terminal input
 
 Edit only the permission in `config.yaml`:
