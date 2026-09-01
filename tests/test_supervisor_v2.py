@@ -1,8 +1,20 @@
 from __future__ import annotations
 
+import sys
 import time
 
 import pytest
+
+# P0 Part C: a trivially-passing, real (not mocked) independent-verifier
+# test_command -- a watch under approved_auto_continue policy now requires
+# one configured before it can reach VERIFIED_DONE (see supervisor.py's
+# SupervisorService._is_autonomous / _run_verification). Every pre-
+# existing approved_auto_continue -> VERIFIED_DONE test below configures
+# this so its actual subject (the v2 claim/decide/send/observe pipeline)
+# stays exercised unchanged; verifier.py's own behavior (pass/fail/BLOCKED/
+# git checks) has its own dedicated coverage in test_verifier.py and
+# test_supervisor_completion_verification.py.
+_TRIVIAL_PASSING_VERIFIER = [sys.executable, "-c", "exit(0)"]
 
 from terminal_mcp.audit import AuditStore
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig, SupervisorConfig
@@ -493,6 +505,7 @@ def test_full_e2e_approved_auto_continue_reaches_done(tmp_path, tmux_session_fac
     assert events[0]["event_type"] == "attention_required"
 
     v2.set_policy(session=session, policy_mode="approved_auto_continue", approved_template="y")
+    svc.set_verifier_policy(session=session, test_command=_TRIVIAL_PASSING_VERIFIER)
     actionable = v2.list_actionable_events()["events"]
     assert len(actionable) == 1
 
@@ -593,6 +606,8 @@ async def test_supervisor2_tools_full_pipeline_via_mcp(tmp_path, tmux_session_fa
     events = (await call("supervisor_run_once"))["events"]
     policy = await call("supervisor2_set_policy", session=session, policy_mode="approved_auto_continue", approved_template="y")
     assert policy["policy_mode"] == "approved_auto_continue"
+    verifier = await call("supervisor_set_verifier_policy", session=session, test_command=_TRIVIAL_PASSING_VERIFIER)
+    assert verifier["configured"] is True
     actionable = (await call("supervisor2_list_actionable_events"))["events"]
     assert len(actionable) == 1
     claim = await call("supervisor2_claim_event", event_id=actionable[0]["id"], claimed_by="mcp-demo")
@@ -911,6 +926,7 @@ def test_full_v2_pipeline_survives_a_simulated_process_restart(tmp_path, tmux_se
     svca.watch(session=session)
     events = svca.run_once()["events"]
     v2a.set_policy(session=session, policy_mode="approved_auto_continue", approved_template="y")
+    svca.set_verifier_policy(session=session, test_command=_TRIVIAL_PASSING_VERIFIER)
     actionable = v2a.list_actionable_events()["events"]
     claim = v2a.claim_event(actionable[0]["id"], claimed_by="pre-restart")
     v2a.submit_decision(claim["id"], "y", "continue")
@@ -1194,6 +1210,7 @@ def test_nonce_verified_marker_reconciles_as_verified_done_and_resets_chain(tmp_
     assert events[0]["event_type"] == "attention_required"
 
     v2.set_policy(session=session, policy_mode="approved_auto_continue", approved_template="y")
+    svc.set_verifier_policy(session=session, test_command=_TRIVIAL_PASSING_VERIFIER)
     actionable = v2.list_actionable_events()["events"]
     claim = v2.claim_event(actionable[0]["id"], claimed_by="e2e-nonce")
     v2.submit_decision(claim["id"], "y", "continue per approved template")

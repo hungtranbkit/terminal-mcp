@@ -85,10 +85,40 @@ DONE_PATTERNS = tuple(
     )
 )
 SUPERVISOR_STATES = (
-    "RUNNING", "IDLE", "WAITING_INPUT",
-    "COMPLETION_CANDIDATE", "VERIFIED_DONE",
+    "RUNNING", "IDLE", "WAITING_INPUT", "BLOCKED", "FAILED",
+    "COMPLETION_CANDIDATE", "VERIFYING", "VERIFIED_DONE",
     "ERROR", "UNKNOWN",
 )
+# P0 Part C: three states added on top of the original seven, none of them
+# ever produced by classify_supervisor_state itself (which only knows
+# about pane-output patterns) -- they exist purely as targets of
+# supervisor.py's own promotion state machine (_handle_completion_candidate)
+# once independent verification is involved, for a watch under autonomous
+# policy (see supervisor.py's SupervisorService.autonomous_check):
+#   VERIFYING -- a COMPLETION_CANDIDATE that has cleared the existing
+#     nonce/quiet-window+self-reported-evidence gate for an *autonomous*
+#     watch is not promoted straight to VERIFIED_DONE the way a non-
+#     autonomous watch's would be; it moves here while an independent
+#     verifier (verifier.py -- real git/test-command execution outside the
+#     target pane, never prose-derived) actually runs. Durable: written to
+#     the watches table before the verifier runs, so a crash mid-
+#     verification leaves an observable VERIFYING row a later poll safely
+#     re-verifies, rather than a silent gap.
+#   FAILED -- an autonomous watch's independent verifier ran and reported
+#     a definitive fail (non-zero test exit, dirty worktree where clean
+#     was required, commit/worktree mismatch). Terminal: never auto-
+#     promotes to VERIFIED_DONE from here; an operator must intervene
+#     (fix and re-watch) and the v2 policy is blocked so no further
+#     autonomous action is taken against a claim independent verification
+#     just rejected.
+#   BLOCKED -- an autonomous watch reached the completion gate with no
+#     independent verifier configured at all (or one that could not run --
+#     e.g. a misconfigured/unreachable worktree). Prohibits exactly the
+#     thing P0 Part C exists to prohibit: quiet-window/prose-only
+#     promotion to VERIFIED_DONE for a watch that can actually act
+#     autonomously. Also terminal until an operator configures a verifier
+#     policy (or downgrades the watch out of autonomous policy) and
+#     re-watches.
 # "DONE" is no longer a value classify_supervisor_state (or anything built
 # on it) ever produces -- it is legacy-only, available strictly through
 # to_legacy_state()/to_legacy_event_type() below, never as the primary
@@ -98,7 +128,11 @@ SUPERVISOR_STATES = (
 # quiet window held, no regression, any configured nonce/verifier passed)
 # as genuinely different things -- prose alone was never proof, and
 # treating it as interchangeable with "DONE" is exactly the false-positive
-# risk this two-state split exists to eliminate.
+# risk this two-state split exists to eliminate. VERIFYING/BLOCKED/FAILED
+# (P0 Part C) are new, distinct states with no legacy equivalent at all --
+# to_legacy_state deliberately leaves them exactly as themselves rather
+# than folding them into "DONE" (VERIFYING/BLOCKED are explicitly NOT
+# done) or inventing a legacy meaning that never existed.
 LEGACY_DONE_STATES = ("COMPLETION_CANDIDATE", "VERIFIED_DONE")
 
 

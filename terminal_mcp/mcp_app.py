@@ -186,6 +186,47 @@ def build_mcp(service: TerminalService | None = None,
         return result
 
     @server.tool()
+    def supervisor_set_verifier_policy(binding: str | None = None, session: str | None = None, *,
+                                       worktree: str | None = None, require_git_clean: bool = False,
+                                       require_commit_matches: str | None = None,
+                                       test_command: list[str] | None = None,
+                                       timeout_seconds: float | None = None,
+                                       checklist: list[str] | None = None) -> dict:
+        """P0 Part C: configure the independent completion verifier for an
+        existing watch. This is the ONLY way a real command ever gets
+        executed by this codebase -- worktree/test_command are never
+        derived from anything the watched pane prints, only from exactly
+        what this call's caller (a human operator, or an MCP client acting
+        on their explicit instruction) passes here.
+
+        worktree: an absolute path this server can read (and, if
+        test_command is set, run a subprocess in). require_git_clean: fail
+        verification if `git status --porcelain` is non-empty.
+        require_commit_matches: fail unless the worktree's current HEAD
+        equals this exact SHA (pin verification to a specific commit this
+        attempt is tied to). test_command: a literal argv list (e.g.
+        ["pytest", "-q"]) -- NEVER a shell string; run with shell=False,
+        cwd=worktree, bounded by timeout_seconds (default: the server's
+        configured verifier_timeout_seconds). checklist: names cross-
+        checked against a "checklist" evidence marker's own content --
+        still self-reported by the agent (there is no independent way to
+        verify a checklist), listed here only so it is at least an
+        explicit, operator-approved set rather than an unconstrained one.
+
+        Only matters for a watch under Supervisor v2's approved_auto_continue
+        policy AND with v2 globally enabled (config.yaml's
+        supervisor.v2_enabled) -- such a watch cannot reach VERIFIED_DONE on
+        quiet-window/prose evidence alone; it requires this policy to be
+        configured and passing. Every other watch (the default) is
+        unaffected -- configuring this here is inert until the watch is also
+        autonomous by both of those measures."""
+        return supervisor.set_verifier_policy(
+            binding, session, worktree=worktree, require_git_clean=require_git_clean,
+            require_commit_matches=require_commit_matches, test_command=test_command,
+            timeout_seconds=timeout_seconds, checklist=checklist,
+        )
+
+    @server.tool()
     def supervisor_unwatch(binding: str | None = None, session: str | None = None,
                            delete: bool = False) -> dict:
         """Disable (or, with delete=true, remove) a watch. Disabled watches stop

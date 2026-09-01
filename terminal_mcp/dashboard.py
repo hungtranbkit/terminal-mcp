@@ -117,6 +117,12 @@ DASHBOARD_HTML = """<!doctype html>
     .attn-badge { display:inline-block; background:var(--amber); color:#231a00; font-size:11px; font-weight:700; padding:1px 6px; border-radius:4px; vertical-align:middle }
     .detail { display:grid; grid-template-rows:auto minmax(0,1fr) auto auto; min-width:0; min-height:0 } #summary { padding:14px 16px; border-bottom:1px solid var(--line) }
     .state-WAITING_INPUT { color:var(--amber) } .state-RUNNING { color:var(--green) }
+    /* P0 Part C states: VERIFYING (independent verification in progress --
+       amber, same "needs a look" weight as WAITING_INPUT); FAILED/BLOCKED
+       (an autonomous watch's verifier rejected promotion, or none was
+       configured -- red, distinct from ERROR's transient-pane-pattern
+       meaning: these mean automation stopped and needs an operator). */
+    .state-VERIFYING { color:var(--amber) } .state-FAILED,.state-BLOCKED { color:#ff6b6b }
     /* Terminal-style pane: a small chrome bar (title + follow/jump controls)
        above a dark, monospace, ANSI-rendering scrollback view. */
     .term { display:flex; flex-direction:column; min-height:0 }
@@ -405,7 +411,9 @@ DASHBOARD_HTML = """<!doctype html>
     // the state_counts this renders come from the real, primary vocabulary
     // (COMPLETION_CANDIDATE: prose/marker evidence seen, not yet
     // corroborated; VERIFIED_DONE: independently corroborated).
-    const SUPERVISOR_STATE_ORDER = ['RUNNING', 'WAITING_INPUT', 'COMPLETION_CANDIDATE', 'VERIFIED_DONE', 'ERROR', 'IDLE', 'UNKNOWN'];
+    // P0 Part C: VERIFYING/FAILED/BLOCKED added -- see status.py's
+    // SUPERVISOR_STATES docstring for what each means.
+    const SUPERVISOR_STATE_ORDER = ['RUNNING', 'WAITING_INPUT', 'COMPLETION_CANDIDATE', 'VERIFYING', 'VERIFIED_DONE', 'FAILED', 'BLOCKED', 'ERROR', 'IDLE', 'UNKNOWN'];
     function toggleSupervisorPanel(open) {
       supervisorVisible = open;
       document.body.classList.toggle('supervisor-visible', open);
@@ -433,7 +441,11 @@ DASHBOARD_HTML = """<!doctype html>
       }
       const status = data.status || {}; const events = data.events || [];
       const counts = status.state_counts || {};
-      const attentionCount = (counts.WAITING_INPUT || 0) + (counts.ERROR || 0) + (status.stalled_count || 0);
+      // P0 Part C: FAILED/BLOCKED both mean an autonomous watch's
+      // automation has halted pending an operator -- same "needs a look"
+      // weight as WAITING_INPUT/ERROR.
+      const attentionCount = (counts.WAITING_INPUT || 0) + (counts.ERROR || 0) + (status.stalled_count || 0)
+                            + (counts.FAILED || 0) + (counts.BLOCKED || 0);
 
       // Zero watches at all (e.g. supervisor.enabled:false and nobody has
       // called supervisor_watch) -> no badge, nothing extra on screen.

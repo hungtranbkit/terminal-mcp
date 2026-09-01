@@ -23,6 +23,7 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_list_input_audit",
         "terminal_input_context",
         "supervisor_watch",
+        "supervisor_set_verifier_policy",
         "supervisor_unwatch",
         "supervisor_list_watches",
         "supervisor_get_completion_token",

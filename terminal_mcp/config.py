@@ -55,6 +55,11 @@ class SupervisorConfig:
     # single-use nonce (see supervisor.py) skips this wait -- that is
     # already stronger, harder-to-spoof evidence than elapsed silence.
     completion_verify_quiet_seconds: int = 10
+    # P0 Part C: default bound for a per-watch verifier's test_command
+    # (verifier.py) -- a watch can override this via its own
+    # verifier_timeout_seconds when configured, this is only the default
+    # used when it doesn't specify one.
+    verifier_timeout_seconds: float = 120.0
 
 
 @dataclass(frozen=True)

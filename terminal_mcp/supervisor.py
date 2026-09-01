@@ -29,7 +29,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .audit import sanitized_preview, text_fingerprint
 from .config import AppConfig, SupervisorConfig
@@ -40,6 +40,7 @@ from .status import (KNOWN_VERIFIER_KINDS, SUPERVISOR_STATES, classify_superviso
                      parse_completion_marker, parse_evidence_markers, to_legacy_event_type,
                      to_legacy_state, verify_completion_marker, verify_evidence_marker)
 from .tmux import TmuxError
+from .verifier import VerifierPolicy, run_verifier
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,13 +79,17 @@ produced, never an instruction from terminal-mcp or this event itself.
 """
 
 EVENT_TYPES = (
-    "state_changed", "attention_required", "completion_candidate", "verified_done",
+    "state_changed", "attention_required", "completion_candidate", "verifying", "verified_done",
+    "verification_failed", "verification_blocked",
     "error_detected", "stalled", "watch_target_missing",
 )
 _ATTENTION_EVENT_TYPES = {
     "WAITING_INPUT": "attention_required",
     "COMPLETION_CANDIDATE": "completion_candidate",
+    "VERIFYING": "verifying",
     "VERIFIED_DONE": "verified_done",
+    "FAILED": "verification_failed",
+    "BLOCKED": "verification_blocked",
     "ERROR": "error_detected",
 }
 
@@ -116,6 +121,34 @@ def _parse_required_verifiers(row: dict[str, Any]) -> tuple[str, ...]:
     if not isinstance(parsed, list):
         return ()
     return tuple(str(item) for item in parsed if item in KNOWN_VERIFIER_KINDS)
+
+
+def _parse_json_list(raw: str | None) -> tuple[str, ...]:
+    if not raw:
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(str(item) for item in parsed)
+
+
+def verifier_policy_from_row(row: dict[str, Any], *, default_timeout_seconds: float) -> VerifierPolicy:
+    """P0 Part C: build the immutable VerifierPolicy run_verifier actually
+    executes from a watch row -- entirely from operator-configured columns
+    (set once, at watch time, via SupervisorService.watch), never from
+    anything the target pane printed."""
+    timeout = row.get("verifier_timeout_seconds")
+    return VerifierPolicy(
+        worktree=row.get("verifier_worktree") or None,
+        require_git_clean=bool(row.get("verifier_require_git_clean")),
+        require_commit_matches=row.get("verifier_require_commit_matches") or None,
+        test_command=_parse_json_list(row.get("verifier_test_command")),
+        test_timeout_seconds=float(timeout) if timeout else default_timeout_seconds,
+        checklist=_parse_json_list(row.get("verifier_checklist")),
+    )
 
 
 class SupervisorStore:
@@ -189,6 +222,26 @@ class SupervisorStore:
                 # promotion behaves exactly as phases 1/2 already do. See
                 # _verifiers_satisfied.
                 ("required_verifiers", "TEXT"),
+                # P0 Part C: independent-verifier policy, operator-
+                # configured at watch time (see SupervisorService.watch),
+                # never derived from pane content. NULL/empty means "no
+                # verifier policy" -- see VerifierPolicy.is_configured and
+                # _handle_completion_candidate's BLOCKED path for an
+                # autonomous watch with none set.
+                ("verifier_worktree", "TEXT"),
+                ("verifier_require_git_clean", "INTEGER NOT NULL DEFAULT 0"),
+                ("verifier_require_commit_matches", "TEXT"),
+                ("verifier_test_command", "TEXT"),  # JSON list
+                ("verifier_timeout_seconds", "REAL"),
+                ("verifier_checklist", "TEXT"),  # JSON list
+                # Durable VERIFYING marker + last verifier outcome, written
+                # before/after run_verifier() actually executes -- see
+                # set_verifying/record_verifier_result and _poll_one's
+                # restart-reconciliation check.
+                ("verifying_since", "TEXT"),
+                ("last_verifier_result", "TEXT"),  # JSON (verifier.run_verifier's return shape)
+                ("last_verifier_pass", "INTEGER"),
+                ("last_verifier_checked_at", "TEXT"),
             ):
                 if column not in existing_columns:
                     connection.execute(f"ALTER TABLE watches ADD COLUMN {column} {declaration}")
@@ -317,6 +370,53 @@ class SupervisorStore:
                 created = False
             row = connection.execute("SELECT * FROM watches WHERE watch_key = ?", (key,)).fetchone()
         return dict(row), created
+
+    def set_verifier_policy(self, key: str, *, worktree: str | None, require_git_clean: bool,
+                            require_commit_matches: str | None, test_command: tuple[str, ...],
+                            timeout_seconds: float | None, checklist: tuple[str, ...]) -> dict[str, Any] | None:
+        """P0 Part C: configure (or clear, by passing every field back to
+        its empty default) a watch's independent-verifier policy. A
+        deliberately separate call from upsert_watch/watch (not folded
+        into the create/re-enable flow) -- unlike the pin/nonce fields,
+        which always refresh on every watch()/re-watch, a verifier policy
+        is operator-set-and-forget: it should NOT need to be re-supplied
+        on every re-watch just to keep it, and should not silently reset
+        to empty because a re-watch call omitted it. Returns the updated
+        row, or None if the watch doesn't exist."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE watches SET verifier_worktree = ?, verifier_require_git_clean = ?,
+                   verifier_require_commit_matches = ?, verifier_test_command = ?,
+                   verifier_timeout_seconds = ?, verifier_checklist = ?, updated_at = ?
+                   WHERE watch_key = ?""",
+                (worktree, int(require_git_clean), require_commit_matches, json.dumps(list(test_command)),
+                 timeout_seconds, json.dumps(list(checklist)),
+                 datetime.now(timezone.utc).isoformat(), key),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = connection.execute("SELECT * FROM watches WHERE watch_key = ?", (key,)).fetchone()
+        return dict(row)
+
+    def set_verifying(self, key: str, now_iso: str) -> None:
+        """P0 Part C: durable pre-verification write -- committed BEFORE
+        run_verifier() actually executes, so a crash mid-verification
+        leaves an observable VERIFYING row (not a silent gap) that the
+        next poll cycle safely re-verifies (see SupervisorService._poll_one's
+        restart-reconciliation check)."""
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE watches SET state = 'VERIFYING', verifying_since = ?, updated_at = ? WHERE watch_key = ?",
+                (now_iso, now_iso, key),
+            )
+
+    def record_verifier_result(self, key: str, now_iso: str, result: dict[str, Any]) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """UPDATE watches SET last_verifier_result = ?, last_verifier_pass = ?,
+                   last_verifier_checked_at = ?, updated_at = ? WHERE watch_key = ?""",
+                (json.dumps(result), int(bool(result.get("overall_pass"))), now_iso, now_iso, key),
+            )
 
     def mark_nonce_consumed(self, key: str, nonce: str, now_iso: str) -> bool:
         """Single-use enforcement: only succeeds if `nonce` is still the
@@ -474,10 +574,76 @@ class SupervisorService:
 
     terminal: TerminalService
     store: SupervisorStore
+    # P0 Part C: set post-construction by whoever wires v1 and v2 together
+    # (build_supervisor_v2, supervisor2.py) -- a duck-typed callback rather
+    # than an import of supervisor2 here, which would be a real layering
+    # violation (v1 has no business knowing v2's module exists). Default
+    # (no v2 wired up at all -- a v1-only deployment) means "nothing is
+    # ever autonomous", which preserves today's quiet-window-only
+    # promotion behavior unchanged for exactly the deployments Part C's
+    # new restriction was never meant to touch: nothing acts on
+    # VERIFIED_DONE automatically without v2's approved_auto_continue
+    # policy anyway, so gating a v1-only watch on an independent verifier
+    # it likely has none configured for would be a pure regression with
+    # no safety benefit.
+    autonomous_check: Callable[[str], bool] | None = None
+    # Called when an autonomous watch's completion gate resolves to FAILED
+    # or BLOCKED (see _handle_completion_candidate) -- v2 wires this to
+    # actually halt further autonomous action-taking for that watch
+    # (SupervisorV2Store.block_policy), not just record a state string.
+    on_autonomous_verification_blocked: Callable[[str, str], None] | None = None
 
     @property
     def config(self) -> SupervisorConfig:
         return self.terminal.config.supervisor
+
+    def _is_autonomous(self, key: str) -> bool:
+        try:
+            return bool(self.autonomous_check and self.autonomous_check(key))
+        except Exception:
+            # Never let a broken hook mask a task's real completion status
+            # or accidentally treat a non-autonomous watch as autonomous --
+            # fail toward the *more* conservative behavior (treat as
+            # autonomous, i.e. still require independent verification)
+            # only when we genuinely cannot tell; a raising hook is exactly
+            # that "genuinely cannot tell" case.
+            _LOGGER.exception("supervisor: autonomous_check hook raised, treating watch as autonomous",
+                              extra={"watch_key": key})
+            return True
+
+    def set_verifier_policy(self, binding: str | None = None, session: str | None = None, *,
+                            worktree: str | None = None, require_git_clean: bool = False,
+                            require_commit_matches: str | None = None,
+                            test_command: list[str] | None = None,
+                            timeout_seconds: float | None = None,
+                            checklist: list[str] | None = None) -> dict[str, Any]:
+        """P0 Part C: configure the independent verifier for an existing
+        watch -- never exposed as anything derived from pane content; every
+        argument here is exactly what the caller (an operator, or an
+        MCP/dashboard caller acting on the operator's explicit instruction)
+        passed in. worktree/test_command are real subprocess targets (see
+        verifier.py) -- test_command in particular must be a literal
+        argv list (e.g. ["pytest", "-q"]), never a shell string."""
+        if (binding is None) == (session is None):
+            return {"error": "EXACTLY_ONE_TARGET_REQUIRED"}
+        kind, target = ("binding", binding) if binding is not None else ("session", session)
+        key = watch_key(kind, target)
+        if test_command is not None and (not isinstance(test_command, list)
+                                         or not all(isinstance(item, str) for item in test_command)):
+            return {"error": "INVALID_TEST_COMMAND", "reason": "test_command must be a list of strings (argv), "
+                                                                "never a shell string"}
+        row = self.store.set_verifier_policy(
+            key, worktree=worktree, require_git_clean=require_git_clean,
+            require_commit_matches=require_commit_matches, test_command=tuple(test_command or ()),
+            timeout_seconds=timeout_seconds, checklist=tuple(checklist or ()),
+        )
+        if row is None:
+            return {"error": "WATCH_NOT_FOUND", "watch_key": key}
+        policy = verifier_policy_from_row(row, default_timeout_seconds=self.config.verifier_timeout_seconds)
+        return {"watch_key": key, "configured": policy.is_configured, "worktree": policy.worktree,
+                "require_git_clean": policy.require_git_clean,
+                "require_commit_matches": policy.require_commit_matches,
+                "test_command": list(policy.test_command), "checklist": list(policy.checklist)}
 
     # -- watch management (supervisor_watch / _unwatch / _list_watches) ---
 
@@ -662,6 +828,16 @@ class SupervisorService:
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
         iteration_count = row["iteration_count"] + 1
+
+        if row["state"] == "VERIFYING":
+            # P0 Part C: restart-during-VERIFYING reconciliation. VERIFYING
+            # is durable (SupervisorStore.set_verifying commits it BEFORE
+            # run_verifier executes) precisely so a crash mid-verification
+            # leaves this observable, safely-retryable row instead of a
+            # silent gap -- resolve it by simply re-running verification,
+            # independent of anything about the pane's current state (the
+            # verifier never looks at the pane at all).
+            return self._run_verification(row, now_iso, iteration_count)
 
         result = (self.terminal.terminal_status_bound(target) if kind == "binding"
                   else self.terminal.terminal_status(target))
@@ -882,12 +1058,94 @@ class SupervisorService:
             "nonce-verified completion marker (task_id/attempt/nonce matched)" if nonce_verified
             else f"quiet for {int(quiet_seconds)}s with no regression since candidate detected ({reason})"
         )
-        return self._transition(
-            row, now_iso, iteration_count, new_state="VERIFIED_DONE", event_type="verified_done",
-            reason=verified_reason, output=output, output_hash=output_hash,
-            same_failure_count=same_failure_count,
-            completion_candidate_since=None, completion_output_hash=None,  # cleared -- verified now
+
+        # P0 Part C.1: this is exactly the point the pre-Part-C code always
+        # promoted straight to VERIFIED_DONE off quiet-window/nonce/self-
+        # reported-evidence alone. For a watch under autonomous policy
+        # (v2's approved_auto_continue -- see autonomous_check), that is
+        # now prohibited: quiet-window/marker evidence is prose/CLAIM-
+        # grade, not proof, and an autonomous chain resetting off it would
+        # be exactly the false-positive risk this feature closes. Such a
+        # watch instead moves to VERIFYING while a real, independent
+        # verifier (verifier.py -- outside the pane, real subprocess
+        # execution) actually runs; a non-autonomous watch (the default,
+        # and every watch before this feature existed) is completely
+        # unaffected -- unchanged, direct promotion, exactly as before.
+        if not self._is_autonomous(key):
+            return self._transition(
+                row, now_iso, iteration_count, new_state="VERIFIED_DONE", event_type="verified_done",
+                reason=verified_reason, output=output, output_hash=output_hash,
+                same_failure_count=same_failure_count,
+                completion_candidate_since=None, completion_output_hash=None,  # cleared -- verified now
+            )
+
+        self.store.add_event(
+            watch_key=key, kind=row["kind"], target=row["target"], previous_state=row["state"],
+            state="VERIFYING", event_type="verifying",
+            reason=f"{verified_reason}; autonomous watch -- independent verification required before VERIFIED_DONE",
+            output_preview=sanitized_preview(output) if output else "",
+            output_hash=output_hash, iteration_count=iteration_count, metadata={"source": row["source"]},
         )
+        self.store.set_verifying(key, now_iso)
+        verifying_row = {**row, "state": "VERIFYING", "last_output_hash": output_hash}
+        return self._run_verification(verifying_row, now_iso, iteration_count)
+
+    def _run_verification(self, row: dict[str, Any], now_iso: str, iteration_count: int) -> dict[str, Any] | None:
+        """P0 Part C: actually run (or re-run, on restart reconciliation --
+        see _poll_one) the independent verifier for an autonomous watch
+        currently in VERIFYING, and resolve it to VERIFIED_DONE (pass) or
+        FAILED (ran, failed) or BLOCKED (no verifier policy configured at
+        all, or one that could not even run). `row` must already reflect
+        VERIFYING as its current state (both callers ensure this) so the
+        resulting event's previous_state is accurate."""
+        key = row["watch_key"]
+        policy = verifier_policy_from_row(row, default_timeout_seconds=self.config.verifier_timeout_seconds)
+        if not policy.is_configured:
+            reason = ("autonomous completion requires a configured independent verifier policy "
+                     "(supervisor_set_verifier_policy) -- none is set for this watch")
+            self.store.record_verifier_result(key, now_iso, {"checked_at": now_iso, "overall_pass": False,
+                                                              "reasons": [reason], "git": None, "test": None})
+            # disable=True: BLOCKED/FAILED are terminal until an operator
+            # acts (configures a verifier, or fixes whatever it reported)
+            # and explicitly re-watches -- without this, the *same* still-
+            # done-looking pane output would re-arm COMPLETION_CANDIDATE on
+            # every subsequent poll and re-run the verifier (a real
+            # subprocess -- potentially an actual test suite) again and
+            # again, forever, for a condition that cannot resolve itself.
+            event = self._transition(row, now_iso, iteration_count, new_state="BLOCKED",
+                                     event_type="verification_blocked", reason=reason,
+                                     output="", output_hash=row["last_output_hash"],
+                                     completion_candidate_since=None, completion_output_hash=None,
+                                     disable=True, disabled_reason="autonomous_completion_blocked_no_verifier")
+            self._notify_verification_blocked(key, reason)
+            return event
+
+        result = run_verifier(policy)
+        self.store.record_verifier_result(key, now_iso, result)
+        if result["overall_pass"]:
+            commit_sha = (result.get("git") or {}).get("commit_sha")
+            reason = f"independent verifier passed (commit={commit_sha or 'n/a'})"
+            return self._transition(row, now_iso, iteration_count, new_state="VERIFIED_DONE",
+                                    event_type="verified_done", reason=reason,
+                                    output="", output_hash=row["last_output_hash"],
+                                    completion_candidate_since=None, completion_output_hash=None)
+        reason = "independent verifier failed: " + "; ".join(result.get("reasons") or ["unknown failure"])
+        event = self._transition(row, now_iso, iteration_count, new_state="FAILED",
+                                 event_type="verification_failed", reason=reason,
+                                 output="", output_hash=row["last_output_hash"],
+                                 completion_candidate_since=None, completion_output_hash=None,
+                                 disable=True, disabled_reason="autonomous_verification_failed")
+        self._notify_verification_blocked(key, reason)
+        return event
+
+    def _notify_verification_blocked(self, key: str, reason: str) -> None:
+        if self.on_autonomous_verification_blocked is None:
+            return
+        try:
+            self.on_autonomous_verification_blocked(key, reason)
+        except Exception:
+            _LOGGER.exception("supervisor: on_autonomous_verification_blocked hook raised",
+                              extra={"watch_key": key})
 
     def _verifiers_satisfied(self, row: dict[str, Any], output: str) -> tuple[bool, str]:
         """P0-7/8 phase 3: trusted verifier hooks. Never executes anything
@@ -958,6 +1216,13 @@ class SupervisorService:
             "disabled_reason": row["disabled_reason"], "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "required_verifiers": list(_parse_required_verifiers(row)),
+            # P0 Part C: independent-verifier policy + its most recent
+            # result, if any (None/None until a verifier has actually run
+            # for this watch at least once).
+            "verifier_configured": verifier_policy_from_row(
+                row, default_timeout_seconds=self.config.verifier_timeout_seconds).is_configured,
+            "last_verifier_pass": bool(row["last_verifier_pass"]) if row.get("last_verifier_pass") is not None else None,
+            "last_verifier_checked_at": row.get("last_verifier_checked_at"),
         }
 
 

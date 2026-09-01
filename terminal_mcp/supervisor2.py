@@ -856,4 +856,21 @@ class SupervisorV2Service:
 
 
 def build_supervisor_v2(v1: SupervisorService) -> SupervisorV2Service:
-    return SupervisorV2Service(v1, SupervisorV2Store(v1.store.path))
+    v2_store = SupervisorV2Store(v1.store.path)
+    # P0 Part C: wire v1's completion-verification gate to v2's actual
+    # autonomy state -- a watch counts as "autonomous" (independent
+    # verifier required before VERIFIED_DONE, see supervisor.py's
+    # SupervisorService._is_autonomous) only when BOTH the global v2 kill
+    # switch is on AND this specific watch's own policy is
+    # approved_auto_continue, exactly the same two-gate requirement
+    # execute_send itself already enforces (config.py's SupervisorConfig.
+    # v2_enabled docstring) -- a watch merely *configured* for autonomy
+    # while the global switch is off is not actually autonomous right now,
+    # and should not pay the independent-verification requirement for a
+    # capability it cannot currently exercise.
+    v1.autonomous_check = (
+        lambda key: v1.terminal.config.supervisor.v2_enabled
+        and v2_store.get_policy(key)["policy_mode"] == "approved_auto_continue"
+    )
+    v1.on_autonomous_verification_blocked = lambda key, reason: v2_store.block_policy(key, reason)
+    return SupervisorV2Service(v1, v2_store)

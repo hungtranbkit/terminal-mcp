@@ -181,9 +181,11 @@ Restart the MCP child process after changing configuration. Enabling input lets 
 - `terminal_send_bound`
 - `terminal_list_input_audit`
 - `terminal_input_context`
-- `supervisor_watch`, `supervisor_unwatch`, `supervisor_list_watches`,
-  `supervisor_status`, `supervisor_list_events`, `supervisor_ack_event`,
-  `supervisor_run_once` — see "Supervisor Loop v1" below
+- `supervisor_watch`, `supervisor_set_verifier_policy`, `supervisor_unwatch`,
+  `supervisor_list_watches`, `supervisor_status`, `supervisor_list_events`,
+  `supervisor_ack_event`, `supervisor_run_once` — see "Supervisor Loop v1"
+  below, and "Independent completion verification" for
+  `supervisor_set_verifier_policy`
 
 ## Chat ↔ tmux logical binding
 
@@ -457,4 +459,46 @@ not touch or resize the main terminal viewer.
 Still fully manual/opt-in end to end: a fresh install defaults every watch to
 `observe_only`, and even `approved_auto_continue` only ever sends the one
 exact template a human configured for that watch.
+
+## Independent completion verification
+
+For a watch under `approved_auto_continue` policy (with v2's global
+`supervisor.v2_enabled` also on — both gates, same as `execute_send`
+requires), prose/marker "done" evidence alone is **not** sufficient to reach
+`VERIFIED_DONE` and reset the auto-continue chain: quiet-window/nonce
+evidence that would promote any other watch instead moves this one through a
+new `VERIFYING` state while a real, independent verifier runs *outside* the
+target pane. Every other watch (the default) is completely unaffected —
+unchanged, direct promotion, exactly as described above.
+
+Configure the verifier once per watch with `supervisor_set_verifier_policy`:
+
+```text
+supervisor_set_verifier_policy(
+  session="claude-mesflow",
+  worktree="/home/you/project",      # real subprocess cwd, `git -C` target
+  require_git_clean=true,            # fail if `git status --porcelain` is non-empty
+  require_commit_matches="<sha>",    # optional: pin to a specific commit
+  test_command=["pytest", "-q"],     # a literal argv list -- never a shell string
+  timeout_seconds=300,
+)
+```
+
+Only `git rev-parse`/`git status`/`git diff --stat` (read-only) and, if
+configured, that one fixed `test_command` ever run — always
+`subprocess.run(..., shell=False)`, always a fixed argument list, never
+anything parsed out of what the watched pane printed. An autonomous watch
+with **no** verifier policy configured goes to `BLOCKED` rather than ever
+reaching `VERIFIED_DONE` on prose alone — this is the actual enforcement of
+"independent verification required", not an oversight to work around.
+
+**New states:** `VERIFYING` (a real verifier run in progress — durable,
+survives a process restart mid-run, the next poll safely re-verifies),
+`FAILED` (the verifier ran and rejected the claim -- e.g. a failing test, a
+dirty worktree, a commit mismatch), `BLOCKED` (autonomous, but no verifier
+configured, or one that couldn't even run). Both `FAILED` and `BLOCKED`
+disable the watch (no repeated re-verification against unchanged pane
+output) and set the v2 policy's `blocked_reason`, so no further autonomous
+send happens until an operator fixes the underlying issue and explicitly
+`supervisor_watch`s the target again.
 # terminal-mcp
