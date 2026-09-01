@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import logging
+from urllib.parse import urlparse
+
 from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
+from .cf_access import verify_access_assertion
 from .core import TerminalService
 from .permissions import input_session_allowed
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
+
+_log = logging.getLogger(__name__)
 
 
 INPUT_ERROR_STATUS = {
@@ -1019,22 +1025,56 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     if supervisor_v2 is None:
         supervisor_v2 = build_supervisor_v2(supervisor)
 
-    def _mutations_blocked() -> JSONResponse | None:
-        # Independent boundary in front of every dashboard POST route
-        # (session input, supervisor ack, supervisor2 pause) -- checked
-        # before any of them touch terminal/supervisor/supervisor_v2 at
-        # all. This is *in addition to*, never instead of, the guards
-        # those calls already enforce themselves (terminal_input,
-        # whitelist, input_policy, binding input_enabled, etc.) -- an
-        # operator who wants a strictly read-only dashboard (e.g. published
-        # over a public tunnel) now has one flag that turns off every
-        # mutation route regardless of what permissions/input_policy say,
-        # without having to disable terminal_input itself (which the MCP
-        # control plane may still need).
-        if terminal.config.dashboard.mutations_enabled:
-            return None
-        return JSONResponse({"error": "DASHBOARD_MUTATIONS_DISABLED"}, status_code=403,
-                            headers={"Cache-Control": "no-store"})
+    def _origin_allowed(request: Request) -> bool:
+        # CSRF defense (P1 hardening item #3), always on, no config
+        # required: the dashboard's own JS always sends Origin (fetch()
+        # does, on every request, same-origin included) or falls back to
+        # Referer, and no legitimate cross-site caller has any reason to
+        # POST to a mutation route -- so a missing or cross-origin Origin/
+        # Referer is refused outright, before this request touches
+        # anything. The request's own Host header is always an accepted
+        # origin (this is what "same-origin" means); dashboard.allowed_
+        # origins lets an operator add more (e.g. behind a proxy that
+        # rewrites Host).
+        origin = request.headers.get("origin") or request.headers.get("referer")
+        if not origin:
+            return False
+        parsed = urlparse(origin)
+        origin_value = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+        if not origin_value:
+            return False
+        host = request.headers.get("host", "")
+        same_origin = {f"https://{host}", f"http://{host}"}
+        return origin_value in same_origin or origin_value in terminal.config.dashboard.allowed_origins
+
+    def _mutation_guard(request: Request):
+        """Independent boundary in front of every dashboard POST route
+        (session input, supervisor ack, supervisor2 pause) -- checked
+        before any of them touch terminal/supervisor/supervisor_v2 at all.
+        This is *in addition to*, never instead of, the guards those calls
+        already enforce themselves (terminal_input, whitelist,
+        input_policy, binding input_enabled, etc.). Returns (response,
+        identity): response is non-None exactly when the request is
+        blocked (caller returns it immediately); identity is the verified
+        Cloudflare Access AccessIdentity when cloudflare_access_team_domain/
+        audience are configured (P1 item #2), else always None -- see
+        cf_access.py. Order matters: cheapest/most-global checks first."""
+        if not terminal.config.dashboard.mutations_enabled:
+            return JSONResponse({"error": "DASHBOARD_MUTATIONS_DISABLED"}, status_code=403,
+                                headers={"Cache-Control": "no-store"}), None
+        if not _origin_allowed(request):
+            return JSONResponse({"error": "ORIGIN_NOT_ALLOWED"}, status_code=403,
+                                headers={"Cache-Control": "no-store"}), None
+        team_domain = terminal.config.dashboard.cloudflare_access_team_domain
+        audience = terminal.config.dashboard.cloudflare_access_audience
+        if team_domain and audience:
+            token = request.headers.get("cf-access-jwt-assertion") or request.cookies.get("CF_Authorization")
+            identity = verify_access_assertion(token, team_domain=team_domain, audience=audience)
+            if identity is None:
+                return JSONResponse({"error": "CLOUDFLARE_ACCESS_VERIFICATION_FAILED"}, status_code=403,
+                                    headers={"Cache-Control": "no-store"}), None
+            return None, identity
+        return None, None
 
     @server.custom_route("/dashboard", methods=["GET"], include_in_schema=False)
     async def dashboard(_: Request) -> HTMLResponse:
@@ -1094,7 +1134,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
     @server.custom_route("/dashboard/api/session/input", methods=["POST"], include_in_schema=False)
     async def session_input(request: Request) -> JSONResponse:
-        if (blocked := _mutations_blocked()) is not None:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
             return blocked
         try:
             body = await request.json()
@@ -1108,6 +1149,13 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         if idempotency_key is not None and not isinstance(idempotency_key, str):
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        # Identity attribution (P1 item #1's smallest-compatible-equivalent):
+        # never gates the send itself (terminal_send_text's own guards are
+        # unchanged and unaffected either way) -- just makes a dashboard-
+        # driven send attributable to a verified identity in the logs when
+        # Cloudflare Access is configured, distinct from an anonymous one
+        # when it is not.
+        _log.info("dashboard session_input session=%s identity=%s", name, identity.email if identity else None)
         result = terminal.terminal_send_text(name, text, press_enter=press_enter, idempotency_key=idempotency_key)
         status_code = 200
         if "error" in result:
@@ -1128,7 +1176,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # Simple safe local metadata action only: this only ever calls
         # SupervisorStore.ack_event, which just stamps acknowledged_at in
         # SQLite. No terminal_send/tmux call is reachable from this route.
-        if (blocked := _mutations_blocked()) is not None:
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
             return blocked
         try:
             body = await request.json()
@@ -1165,7 +1214,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # STOP/PAUSE only: sets policy_mode back to observe_only. Local
         # metadata only, same as the v1 ack route — no terminal_send/tmux
         # call is reachable from this route either.
-        if (blocked := _mutations_blocked()) is not None:
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
             return blocked
         try:
             body = await request.json()

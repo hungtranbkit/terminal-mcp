@@ -54,3 +54,23 @@ supervisor:
   # per-watch policy_mode (which itself defaults to observe_only per watch).
   # Both gates must be explicitly opted into before v2 can ever send text.
   v2_enabled: false
+
+# Dashboard: mutations_enabled (default true) is a separate, additional
+# on/off switch for the dashboard's own POST routes (session input,
+# supervisor ack, supervisor2 pause) -- set it false to publish a
+# strictly read-only dashboard regardless of permissions/input_policy.
+# cloudflare_access_team_domain/audience are optional and OFF by default
+# (no-op unless both are set): if this dashboard is published through a
+# Cloudflare Tunnel hostname that also has a Cloudflare Access
+# application in front of it, set these to the Access team's domain
+# (from https://<team>.cloudflareaccess.com) and the Access
+# Application's AUD tag (Zero Trust dashboard -> Access -> Applications
+# -> your app -> Application Audience (AUD) Tag) so mutation routes
+# cryptographically verify the Cf-Access-Jwt-Assertion header instead of
+# trusting the edge redirect alone. allowed_origins adds extra trusted
+# Origins for the always-on CSRF check beyond the request's own Host.
+# dashboard:
+#   mutations_enabled: true
+#   cloudflare_access_team_domain: "your-team.cloudflareaccess.com"
+#   cloudflare_access_audience: "the-access-application-aud-tag"
+#   allowed_origins: []

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from starlette.testclient import TestClient
 
-from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig, load_config
+from terminal_mcp.config import AppConfig, DashboardConfig, InputPolicyConfig, PermissionsConfig, load_config
 from terminal_mcp.core import TerminalService
 from terminal_mcp.dashboard import DASHBOARD_HTML, register_dashboard
 from terminal_mcp.mcp_app import build_mcp
@@ -353,7 +353,13 @@ def _client(config: AppConfig) -> tuple[TestClient, TerminalService]:
     service = TerminalService(config)
     server = build_mcp(service)
     register_dashboard(server, service)
-    return TestClient(server.streamable_http_app()), service
+    # Origin defaulted to match TestClient's own base_url ("http://testserver")
+    # so every existing test keeps sending a same-origin request by default,
+    # exactly like a real browser's fetch() would from the dashboard's own
+    # page -- the CSRF/Origin check itself (dashboard.py's _origin_allowed)
+    # is exercised by its own dedicated tests instead of every other test
+    # in this file having to add the header itself.
+    return TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"}), service
 
 
 def test_session_input_blocked_when_input_permission_disabled(read_config):
@@ -878,6 +884,178 @@ def test_load_config_defaults_dashboard_mutations_enabled_true_when_omitted(tmp_
     )
     config = load_config(config_path)
     assert config.dashboard.mutations_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# P1 hardening #3: CSRF/Origin defense on mutation routes
+# ---------------------------------------------------------------------------
+
+
+def test_mutation_blocked_with_no_origin_or_referer_header(input_config, tmux_session_factory):
+    session = tmux_session_factory("test-dashboard-noorigin", "bash -lc 'read x; sleep 10'")
+    service = TerminalService(input_config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app())  # no default Origin header this time
+    response = client.post("/dashboard/api/session/input", json={"name": session, "text": "y"})
+    assert response.status_code == 403
+    assert response.json()["error"] == "ORIGIN_NOT_ALLOWED"
+
+
+def test_mutation_blocked_with_cross_origin_header(input_config, tmux_session_factory):
+    session = tmux_session_factory("test-dashboard-xorigin", "bash -lc 'read x; sleep 10'")
+    client, _ = _client(input_config)
+    response = client.post(
+        "/dashboard/api/session/input", json={"name": session, "text": "y"},
+        headers={"Origin": "https://evil.example.com"},
+    )
+    assert response.status_code == 403
+    assert response.json()["error"] == "ORIGIN_NOT_ALLOWED"
+
+
+def test_mutation_allowed_via_referer_fallback_when_origin_absent(input_config, tmux_session_factory):
+    session = tmux_session_factory("test-dashboard-referer", "bash -lc 'read x; sleep 10'")
+    service = TerminalService(input_config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app())
+    response = client.post(
+        "/dashboard/api/session/input", json={"name": session, "text": "y"},
+        headers={"Referer": "http://testserver/dashboard"},
+    )
+    assert response.status_code == 200  # never even reaches ORIGIN_NOT_ALLOWED
+
+
+def test_mutation_allowed_from_an_explicitly_configured_extra_origin(tmux_session_factory):
+    session = tmux_session_factory("test-dashboard-extraorigin", "bash -lc 'read x; sleep 10'")
+    config = AppConfig(
+        PermissionsConfig(True, True), ("test-*", "agent-*"), 50, 20,
+        InputPolicyConfig(allowed_session_patterns=("test-*",)),
+        dashboard=DashboardConfig(allowed_origins=("https://proxy.example.com",)),
+    )
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app())
+    response = client.post(
+        "/dashboard/api/session/input", json={"name": session, "text": "y"},
+        headers={"Origin": "https://proxy.example.com"},
+    )
+    assert response.status_code == 200
+
+
+def test_load_config_parses_dashboard_allowed_origins(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "allowed_session_patterns: ['test-*']\n"
+        "dashboard:\n  allowed_origins: ['https://a.example.com', 'https://b.example.com']\n"
+    )
+    config = load_config(config_path)
+    assert config.dashboard.allowed_origins == ("https://a.example.com", "https://b.example.com")
+
+
+# ---------------------------------------------------------------------------
+# P1 hardening #2: Cloudflare Access identity verification (opt-in, no-op
+# unless both cloudflare_access_team_domain and _audience are configured --
+# verified against `read_config`/`input_config`, neither of which set them).
+# ---------------------------------------------------------------------------
+
+
+def _cf_access_config(**dashboard_overrides) -> AppConfig:
+    return AppConfig(
+        PermissionsConfig(True, True), ("test-*", "agent-*"), 50, 20,
+        InputPolicyConfig(allowed_session_patterns=("test-*",)),
+        dashboard=DashboardConfig(
+            cloudflare_access_team_domain="test-team.cloudflareaccess.com",
+            cloudflare_access_audience="test-aud",
+            **dashboard_overrides,
+        ),
+    )
+
+
+def test_cloudflare_access_not_configured_is_a_complete_noop(input_config, tmux_session_factory):
+    # input_config has neither cloudflare_access_team_domain nor _audience
+    # set -- no Cf-Access-Jwt-Assertion header is required or checked at all.
+    session = tmux_session_factory("test-dashboard-noaccess", "bash -lc 'read x; sleep 10'")
+    client, _ = _client(input_config)
+    response = client.post("/dashboard/api/session/input", json={"name": session, "text": "y"})
+    assert response.status_code == 200
+
+
+def test_cloudflare_access_configured_blocks_mutation_with_no_assertion(tmux_session_factory, monkeypatch):
+    session = tmux_session_factory("test-dashboard-cfnoassert", "bash -lc 'read x; sleep 10'")
+    config = _cf_access_config()
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})
+    response = client.post("/dashboard/api/session/input", json={"name": session, "text": "y"})
+    assert response.status_code == 403
+    assert response.json()["error"] == "CLOUDFLARE_ACCESS_VERIFICATION_FAILED"
+
+
+def test_cloudflare_access_configured_blocks_mutation_with_invalid_assertion(tmux_session_factory, monkeypatch):
+    import terminal_mcp.dashboard as dashboard_module
+
+    monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: None)
+    session = tmux_session_factory("test-dashboard-cfbad", "bash -lc 'read x; sleep 10'")
+    config = _cf_access_config()
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})
+    response = client.post(
+        "/dashboard/api/session/input", json={"name": session, "text": "y"},
+        headers={"Cf-Access-Jwt-Assertion": "not-a-real-token"},
+    )
+    assert response.status_code == 403
+    assert response.json()["error"] == "CLOUDFLARE_ACCESS_VERIFICATION_FAILED"
+
+
+def test_cloudflare_access_configured_allows_mutation_with_verified_assertion(tmux_session_factory, monkeypatch):
+    import terminal_mcp.dashboard as dashboard_module
+    from terminal_mcp.cf_access import AccessIdentity
+
+    identity = AccessIdentity(email="operator@example.com", subject="user-1", raw_claims={})
+    monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
+    session = tmux_session_factory("test-dashboard-cfok", "bash -lc 'read x; sleep 10'")
+    config = _cf_access_config()
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})
+    response = client.post(
+        "/dashboard/api/session/input", json={"name": session, "text": "y"},
+        headers={"Cf-Access-Jwt-Assertion": "a-token-that-would-verify"},
+    )
+    assert response.status_code == 200
+
+
+def test_cloudflare_access_accepts_cf_authorization_cookie_fallback(tmux_session_factory, monkeypatch):
+    import terminal_mcp.dashboard as dashboard_module
+    from terminal_mcp.cf_access import AccessIdentity
+
+    identity = AccessIdentity(email="operator@example.com", subject="user-1", raw_claims={})
+    monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
+    session = tmux_session_factory("test-dashboard-cfcookie", "bash -lc 'read x; sleep 10'")
+    config = _cf_access_config()
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"},
+                        cookies={"CF_Authorization": "cookie-token"})
+    response = client.post("/dashboard/api/session/input", json={"name": session, "text": "y"})
+    assert response.status_code == 200
+
+
+def test_load_config_rejects_blank_cloudflare_access_fields(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "allowed_session_patterns: ['test-*']\n"
+        "dashboard:\n  cloudflare_access_team_domain: ''\n"
+    )
+    with pytest.raises(ValueError, match="cloudflare_access_team_domain"):
+        load_config(config_path)
 
 
 def test_dashboard_state_order_includes_completion_candidate_and_verified_done():

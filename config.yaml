@@ -60,3 +60,14 @@ supervisor:
   # (observe_only) and no watch currently has (this environment's
   # supervisor.db carries no watches/policies as of this change).
   v2_enabled: true
+
+# P1 hardening item #2: this deployment's dashboard hostname
+# (terminal-dashboard.mesflow.net) sits behind a real Cloudflare Access
+# application (confirmed live: an unauthenticated request 302s to
+# falling-field-15e3.cloudflareaccess.com's login page) -- these two
+# values let the app itself cryptographically verify the Cf-Access-Jwt-
+# Assertion header Access attaches once a browser has logged in, instead
+# of trusting the edge redirect alone. See cf_access.py.
+dashboard:
+  cloudflare_access_team_domain: "falling-field-15e3.cloudflareaccess.com"
+  cloudflare_access_audience: "2c67fa84f87699170bd7b68a9591e58a586fab4e2689932118a02a662bd28c32"
