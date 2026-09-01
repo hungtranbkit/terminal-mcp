@@ -1,0 +1,83 @@
+[Unit]
+Description=Terminal MCP loopback Streamable HTTP server
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/dell/workspace/terminal-mcp
+Environment=TERMINAL_MCP_CONFIG=/home/dell/workspace/terminal-mcp/config.yaml
+ExecStart=/home/dell/workspace/terminal-mcp/.venv/bin/terminal-mcp-http
+Restart=on-failure
+RestartSec=3
+
+# --- P1 hardening item #12: resource limits + sandboxing ------------------
+# Conservative on purpose, and live-verified (real tmux sessions, real
+# sqlite writes, full dashboard/health smoke test, restart) against a real
+# deployment before being adopted here. PrivateTmp is deliberately NOT
+# set: this service needs real access to the user's actual tmux server
+# socket (typically /tmp/tmux-$UID/default) to do its job at all --
+# PrivateTmp would put it in its own private /tmp, cut off from that
+# socket, and silently break every tmux observation/control path.
+#
+# Resource ceilings: generous headroom above this service's real steady-
+# state usage (observed ~60MB RSS, a handful of threads) -- meant to catch
+# a genuine leak/runaway, not constrain normal operation.
+MemoryMax=512M
+TasksMax=256
+CPUQuota=200%
+
+# Filesystem: /usr, /boot, /etc read-only (ProtectSystem=full leaves /tmp
+# and /var alone, unlike =strict); the entire home tree read-only
+# (ProtectHome=read-only) except this service's own sqlite state
+# directory, explicitly re-opened for writes. /tmp (and therefore the
+# tmux socket) is untouched by either setting. Both are pure mount-
+# namespace operations -- no capability drop required, confirmed working
+# below.
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/terminal-mcp
+
+# The one privilege-hardening directive confirmed to work in every
+# environment this was tested against, including a nested/sandboxed one
+# (see the note below) -- a plain per-process prctl flag, no capability
+# drop or new namespace required.
+NoNewPrivileges=yes
+
+# --- Deliberately NOT included, and why -----------------------------------
+# Everything below this line was tested live against this exact unit and
+# found to make the service fail to start in this deployment's actual
+# runtime (a nested/sandboxed container environment): CapabilityBoundingSet=,
+# ProtectKernelTunables=, ProtectKernelModules=, ProtectControlGroups=,
+# ProtectClock=, ProtectHostname=, RestrictSUIDSGID=, RestrictNamespaces=,
+# LockPersonality= all failed identically:
+#   "Failed to drop capabilities: Operation not permitted"
+#   "Failed at step CAPABILITIES spawning ...: Operation not permitted"
+# systemd.exec(5) documents that most of these directives implicitly
+# restrict the process's capability bounding set as part of their
+# enforcement (not just the ones that look capability-related by name) --
+# in an environment whose own container/sandbox already restricts what
+# capabilities systemd itself may drop (commonly missing CAP_SETPCAP),
+# ANY of them can hit this same wall, not only an explicit
+# CapabilityBoundingSet=. If your systemd --user instance runs on a plain
+# host (not nested in another container/sandbox), all of the above are
+# very likely safe to add -- test one at a time with `systemctl --user
+# restart` + `journalctl --user -u terminal-mcp-http -n 20`, watching
+# specifically for "Failed to drop capabilities", and keep only what
+# starts cleanly and passes /health/ready afterward.
+#
+#   PrivateTmp=yes        -- would cut off the real tmux socket regardless
+#                             of the capability question (see above).
+#   SystemCallFilter=...  -- not attempted here; a wrong/incomplete
+#                             allowlist across tmux subprocess spawning +
+#                             uvicorn's networking + sqlite's file I/O
+#                             risks a hard-to-diagnose crash, and this
+#                             environment's own capability restrictions
+#                             make it likely to hit the same wall anyway.
+#   MemoryDenyWriteExecute=yes -- some cryptography (PyJWT[crypto]) code
+#                             paths can need W+X pages for accelerated
+#                             implementations; not worth the risk of a
+#                             subtle, intermittent crash for this pass.
+# ----------------------------------------------------------------------
+
+[Install]
+WantedBy=default.target
