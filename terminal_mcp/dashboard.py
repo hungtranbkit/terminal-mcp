@@ -116,7 +116,17 @@ DASHBOARD_HTML = """<!doctype html>
        places — driven entirely by classify_status()'s existing state string,
        nothing new is inferred from pane content here. */
     .attn-badge { display:inline-block; background:var(--amber); color:#231a00; font-size:11px; font-weight:700; padding:1px 6px; border-radius:4px; vertical-align:middle }
-    .detail { display:grid; grid-template-rows:auto minmax(0,1fr) auto auto; min-width:0; min-height:0 } #summary { padding:14px 16px; border-bottom:1px solid var(--line) }
+    /* Layout bugfix (real-device report): .detail's 6 direct children in
+       DOM order are #sessionTabs, #summary, #grantBar, .term, #inputNote,
+       #inputBar -- grid-template-rows must list exactly 6 tracks, in that
+       order, with .term (the actual output viewport) as the one flexible
+       track. It previously listed only 4 (a leftover from before
+       #sessionTabs/#grantBar existed), which silently handed .term's
+       intended growing row to #summary instead and let its content
+       overflow into the rows below -- the reported overlap. */
+    .detail { display:grid; grid-template-rows:auto auto auto minmax(0,1fr) auto auto; min-width:0; min-height:0 }
+    #grantBar[hidden] { display:none } /* the plain #grantBar{display:flex} rule below would otherwise outrank the UA's own [hidden] default */
+    #summary { grid-row:2; padding:14px 16px; border-bottom:1px solid var(--line) }
     .state-WAITING_INPUT { color:var(--amber) } .state-RUNNING { color:var(--green) }
     /* P0 Part C states: VERIFYING (independent verification in progress --
        amber, same "needs a look" weight as WAITING_INPUT); FAILED/BLOCKED
@@ -126,7 +136,7 @@ DASHBOARD_HTML = """<!doctype html>
     .state-VERIFYING { color:var(--amber) } .state-FAILED,.state-BLOCKED { color:#ff6b6b }
     /* Terminal-style pane: a small chrome bar (title + follow/jump controls)
        above a dark, monospace, ANSI-rendering scrollback view. */
-    .term { display:flex; flex-direction:column; min-height:0 }
+    .term { grid-row:4; display:flex; flex-direction:column; min-height:0 }
     .term-bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 10px; padding:7px 12px; background:#0e1526; border-bottom:1px solid var(--line) }
     .term-dots { display:flex; gap:6px; flex:0 0 auto }
     .term-dots i { width:10px; height:10px; border-radius:50%; display:inline-block }
@@ -155,14 +165,14 @@ DASHBOARD_HTML = """<!doctype html>
        win over a class selector. */
     .search-current { background:#ffd645 !important; color:#111 !important; border-radius:2px }
     #output { flex:1; min-height:0; margin:0; padding:14px 18px; overflow:auto; white-space:pre-wrap; word-break:break-word; line-height:1.45; font-family:var(--mono); background:var(--term-bg); color:#dce5f5 }
-    #inputBar { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line) }
+    #inputBar { grid-row:6; display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line) }
     #inputBar input[type=text] { flex:1; background:#0e1526; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:9px 11px; font:inherit }
     #inputBar button { background:#2b3f66; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:9px 14px; cursor:pointer; font:inherit }
     #inputBar button:disabled { opacity:.5; cursor:not-allowed }
     #inputBar label { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:12px; white-space:nowrap }
-    #inputNote { padding:6px 16px 0; font-size:12px; color:var(--muted) }
+    #inputNote { grid-row:5; padding:6px 16px 0; font-size:12px; color:var(--muted) }
     #inputNote.error { color:#ff6b6b }
-    #grantBar { display:flex; align-items:center; gap:8px; padding:8px 16px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); flex-wrap:wrap }
+    #grantBar { grid-row:3; display:flex; align-items:center; gap:8px; padding:8px 16px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); flex-wrap:wrap }
     #grantBar button { background:#2b3f66; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:6px 12px; cursor:pointer; font:inherit; font-size:12px }
     #grantBar button.revoke { background:#3a2430 }
     #grantBar button:disabled { opacity:.5; cursor:not-allowed }
@@ -174,11 +184,12 @@ DASHBOARD_HTML = """<!doctype html>
        scrollbar and touch-drag (`-webkit-overflow-scrolling`) so mobile
        gets swipe for free from the platform, no custom JS needed. */
     #sessionTabs {
+      grid-row:1;
       display:flex; align-items:stretch; gap:2px; padding:4px 6px 0;
       overflow-x:auto; overflow-y:hidden; scrollbar-width:thin; -webkit-overflow-scrolling:touch;
       border-bottom:1px solid var(--line); background:var(--panel);
     }
-    #sessionTabs:empty { display:none }
+    #sessionTabs:empty, #sessionTabs[hidden] { display:none }
     .session-tab {
       display:flex; align-items:center; gap:6px; flex:0 0 auto; max-width:220px;
       padding:7px 8px 7px 12px; border-radius:8px 8px 0 0; border:1px solid var(--line); border-bottom:none;
@@ -1047,9 +1058,19 @@ DASHBOARD_HTML = """<!doctype html>
       if (readResult && readResult.error) return;
       await postGrant('/dashboard/api/session/grant-input', name, true);
     }
+    // UI hotfix (real-device report): the grant/revoke controls crowded
+    // and overlapped the session status/tab/output area on a narrow
+    // phone. Presentation-only -- the backend grant-read/grant-input
+    // routes, authorization model, audit trail, and identity pinning are
+    // completely unaffected either way; a grant made earlier (e.g. via
+    // the API directly) still applies exactly as before, only its OWN
+    // UI is hidden. Flip back to true to re-enable the UI later.
+    const SHOW_GRANT_CONTROLS = false;
     function renderGrantBar(name, allowed, grant, restricted, inputBlockReason) {
       grantBarEl.replaceChildren();
-      if (allowed) { grantBarEl.hidden = true; return; } // statically whitelisted -- nothing to grant/revoke, ever
+      grantBarEl.hidden = true;
+      if (!SHOW_GRANT_CONTROLS) return;
+      if (allowed) { return; } // statically whitelisted -- nothing to grant/revoke, ever
       grantBarEl.hidden = false;
       const readOn = Boolean(grant && grant.read_enabled);
       const inputOn = Boolean(grant && grant.input_enabled);
@@ -1496,7 +1517,7 @@ DASHBOARD_HTML = """<!doctype html>
           summaryEl.append(strong, note);
           outputEl.replaceChildren();
           const placeholder = document.createElement('div'); placeholder.className = 'muted';
-          placeholder.textContent = '🔒 Output bị khoá. Cấp quyền "xem output" bên dưới để xem nội dung session này.';
+          placeholder.textContent = '🔒 Output bị khoá. Session này chưa được cấp quyền xem.';
           outputEl.append(placeholder);
           renderGrantBar(selected, false, null, true, data.input_block_reason || null);
         } else {

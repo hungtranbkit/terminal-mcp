@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import re
 import time
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 import pytest
 from starlette.testclient import TestClient
 
+from terminal_mcp import dashboard as dashboard_module
 from terminal_mcp.config import AppConfig, DashboardConfig, InputPolicyConfig, PermissionsConfig, load_config
 from terminal_mcp.core import TerminalService
 from terminal_mcp.dashboard import DASHBOARD_HTML, register_dashboard
@@ -770,6 +772,68 @@ def test_dashboard_auth_required_distinguished_from_offline():
     # cycle depends on for the health badge -- go through the wrapper.
     assert "await fetchJSON('/dashboard/api/sessions'" in DASHBOARD_HTML
     assert "await fetchJSON(`/dashboard/api/session?name=" in DASHBOARD_HTML
+
+
+def test_dashboard_grant_controls_hidden_from_normal_rendering():
+    # UI hotfix (real-device report): the grant/revoke controls are
+    # presentation-hidden -- the toggle is a single, easily-reversible
+    # constant, and the render function unconditionally hides the bar and
+    # returns before ever building any button, regardless of what state
+    # it would otherwise show.
+    assert "const SHOW_GRANT_CONTROLS = false;" in DASHBOARD_HTML
+    fn = DASHBOARD_HTML.split("function renderGrantBar(", 1)[1].split("\n    }", 1)[0]
+    assert "grantBarEl.hidden = true;" in fn
+    assert "if (!SHOW_GRANT_CONTROLS) return;" in fn
+    # The backend this UI would otherwise drive is completely untouched --
+    # grant_session_read/grant_session_input are still called exactly as
+    # before, from the (still-registered, still-reachable-by-API) POST
+    # routes -- only their OWN presentation is hidden. These live in
+    # dashboard.py's Python source (the route registration), not in the
+    # DASHBOARD_HTML string, so check the module source directly.
+    module_source = inspect.getsource(dashboard_module)
+    assert "terminal.grant_session_read(name, enabled" in module_source
+    assert "terminal.grant_session_input(name, enabled" in module_source
+    assert '"/dashboard/api/session/grant-read", methods=["POST"]' in module_source
+    assert '"/dashboard/api/session/grant-input", methods=["POST"]' in module_source
+
+
+def test_dashboard_grantbar_hidden_attribute_actually_hides_it():
+    # A plain `#grantBar { display:flex; ... }` rule (needed for its own
+    # visible layout when shown) would otherwise outrank the browser's
+    # default `[hidden] { display:none }` UA rule by specificity, leaving
+    # an "empty but still visually present" bar even while .hidden is set
+    # -- exactly the kind of subtle bug this hotfix exists to close. Same
+    # class of fix applied to #sessionTabs for the (rarer) all-detached
+    # case too.
+    assert "#grantBar[hidden] { display:none }" in DASHBOARD_HTML
+    assert "#sessionTabs[hidden] { display:none }" in DASHBOARD_HTML
+
+
+def test_dashboard_detail_grid_rows_match_children_one_to_one():
+    # DOM/CSS layout contract, the direct cause of the real overlap this
+    # hotfix fixes: .detail's grid-template-rows previously listed 4
+    # tracks for what had grown to 6 direct children (#sessionTabs,
+    # #summary, #grantBar, .term, #inputNote, #inputBar) -- auto-placement
+    # silently handed the one flexible (minmax(0,1fr)) track to #summary
+    # instead of .term (the actual output viewport), which then let
+    # #summary's content overflow into the rows below it. Two invariants
+    # are asserted here so this can't silently regress again: the
+    # explicit row-track COUNT must equal 6, and every one of the 6
+    # children must carry its own explicit `grid-row:N` (not rely on
+    # sequential auto-placement, which reassigns everyone once any one of
+    # them toggles display:none -- e.g. the now-permanently-hidden
+    # #grantBar above).
+    detail_rule = re.search(r"\.detail \{ display:grid; grid-template-rows:([^;]+);", DASHBOARD_HTML)
+    assert detail_rule is not None
+    tracks = detail_rule.group(1).split()
+    assert len(tracks) == 6
+    assert tracks == ["auto", "auto", "auto", "minmax(0,1fr)", "auto", "auto"]  # .term (position 4) is the ONE growing track
+    expected_grid_rows = {
+        "#sessionTabs": 1, "#summary": 2, "#grantBar": 3, ".term": 4, "#inputNote": 5, "#inputBar": 6,
+    }
+    for selector, row in expected_grid_rows.items():
+        assert f"grid-row:{row};" in DASHBOARD_HTML or f"grid-row:{row} " in DASHBOARD_HTML, \
+            f"{selector} must explicitly claim grid-row {row}"
 
 
 def test_dashboard_fullscreen_preference_persisted_and_restored_once():
