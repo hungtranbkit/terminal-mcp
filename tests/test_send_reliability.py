@@ -457,3 +457,100 @@ def test_codex_zero_change_swallow_recovery_stays_idempotent_on_retry(tmux_sessi
     assert second == first
     pane = service.terminal_tail(session, 10)["output"]
     assert pane.count("SUBMITTED[") == 1
+
+
+# ---------------------------------------------------------------------------
+# URGENT bugfix (real user report, both Claude and Codex): "prompt text
+# lands in the composer but never submits until I press Enter myself".
+# Root cause, confirmed by code inspection: AgentAdapter.can_submit_now/
+# identify_target_state existed on every adapter but neither was EVER
+# consulted by _send_text_and_verify_locked before committing to send --
+# a target currently showing a menu/approval/confirmation prompt (the
+# same TARGET_WAITING classification adapters.py already uses for status
+# reporting) is not its normal prompt composer: Enter there answers THAT
+# prompt instead of submitting a new message, and the caller's actual
+# text was never delivered at all. Fixed by checking BEFORE sending
+# anything (press_enter=True only) whether the target currently shows a
+# TARGET_WAITING pattern, and refusing the entire send (neither text nor
+# Enter) with an explicit TARGET_AWAITING_APPROVAL error if so.
+# ---------------------------------------------------------------------------
+
+WAITING_PROMPT_PATH = FIXTURES_DIR / "waiting_prompt.py"
+
+
+def _waiting_prompt_session(tmux_session_factory, name: str, command: str) -> str:
+    # exec -a <command> so tmux's own #{pane_current_command} genuinely
+    # reports "codex"/"claude", exactly like the real CLIs -- same
+    # technique codex_composer.py already uses.
+    tmux_session_factory(name, f"bash -lc 'exec -a {command} python3 -u {WAITING_PROMPT_PATH}'")
+    return name
+
+
+def test_codex_send_refused_when_target_shows_approval_prompt(tmux_session_factory, tmp_path):
+    session = _waiting_prompt_session(tmux_session_factory, "test-codex-waiting-prompt", "codex")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    before = service.terminal_tail(session, 10)["output"]
+
+    result = service.terminal_send_text(session, "a new unrelated prompt", press_enter=True)
+    assert result["sent"] is False
+    assert result["enter_sent"] is False
+    assert result["error"] == "TARGET_AWAITING_APPROVAL"
+    assert result["delivery_state"] == "BLOCKED"
+
+    after = service.terminal_tail(session, 10)["output"]
+    assert after == before  # nothing was typed, no stray Enter answered the real prompt
+    assert "a new unrelated prompt" not in after
+    assert "APPROVED=" not in after  # the prompt was never (accidentally) answered
+
+
+def test_claude_send_refused_when_target_shows_approval_prompt(tmux_session_factory, tmp_path):
+    # Same fix, same shared _WAITING_PATTERNS -- verified for Claude too,
+    # not just Codex, since the reported bug affected both.
+    session = _waiting_prompt_session(tmux_session_factory, "test-claude-waiting-prompt", "claude")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "a new unrelated prompt", press_enter=True)
+    assert result["error"] == "TARGET_AWAITING_APPROVAL"
+    assert result["sent"] is False
+
+
+def test_send_bound_also_refused_when_target_shows_approval_prompt(tmux_session_factory, tmp_path):
+    from terminal_mcp.bindings import BindingStore
+
+    session = _waiting_prompt_session(tmux_session_factory, "test-bound-waiting-prompt", "codex")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    service.bindings = BindingStore(tmp_path / "bindings.db")
+    assert "error" not in service.terminal_bind("waiting-bound", session, input_enabled=True)
+    result = service.terminal_send_bound("waiting-bound", "a new unrelated prompt", press_enter=True)
+    assert result["error"] == "TARGET_AWAITING_APPROVAL"
+    assert result["sent"] is False
+
+
+def test_text_only_send_unaffected_by_approval_prompt_check(tmux_session_factory, tmp_path):
+    # press_enter=False has nothing to "submit" -- the new check is scoped
+    # to press_enter=True only, exactly as documented; a plain append must
+    # stay exactly as permissive as it always was.
+    session = _waiting_prompt_session(tmux_session_factory, "test-codex-waiting-textonly", "codex")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "just typed, no enter", press_enter=False)
+    assert result["sent"] is True
+    assert result["submit_status"] == "TEXT_SENT"
+    assert "just typed, no enter" in service.terminal_tail(session, 10)["output"]
+
+
+def test_codex_normal_composer_send_still_works_after_approval_prompt_fix(tmux_session_factory, tmp_path):
+    # Regression check: the new pre-send check must never false-positive
+    # on an ordinary idle composer -- reuses the existing real-shape
+    # fixture already covered by test_codex_normal_submit_confirms_
+    # without_recovery, asserted again here specifically alongside the new
+    # fix to prove it doesn't regress the common case.
+    session = _codex_session(tmux_session_factory, "test-codex-normal-after-fix", "submits_and_shows_working")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "hello", press_enter=True)
+    assert result["sent"] is True
+    assert result["submit_status"] == "SUBMIT_CONFIRMED"
+    assert "error" not in result

@@ -6,7 +6,8 @@ import uuid
 from typing import Any
 
 from .adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
-                       DELIVERY_UNKNOWN, _sent_text_echoed, select_adapter, to_legacy_submit_status)
+                       DELIVERY_UNKNOWN, TARGET_WAITING, _sent_text_echoed, select_adapter,
+                       to_legacy_submit_status)
 from .audit import AuditStore
 from .bindings import Binding, BindingStore, valid_binding_name
 from .config import AppConfig
@@ -637,6 +638,46 @@ class TerminalService:
                     "error": "SESSION_NOT_FOUND", "session": session}
         identity_before = SessionIdentity.from_session_info(info_before)
         command_before = info_before.pane_current_command or ""
+        adapter = select_adapter(command_before)
+
+        # URGENT bugfix (real report: text lands in the composer but never
+        # submits until a human presses Enter -- for BOTH Claude and Codex):
+        # root cause is that this method never actually checked WHAT the
+        # target was showing before committing to send -- can_submit_now/
+        # identify_target_state existed on every adapter but neither was
+        # ever consulted here. A target showing a menu/approval/confirmation
+        # prompt (adapters.py's TARGET_WAITING -- "do you want to
+        # continue"/"[y/n]"/"waiting for input"/etc, the SAME shared pattern
+        # set both adapters already use for status classification) is not
+        # its normal prompt composer: Enter there interacts with THAT
+        # prompt (e.g. accepts/declines it) instead of submitting a new
+        # message, and the caller's actual text was never delivered to the
+        # composer at all -- exactly the reported symptom, and worse, a
+        # stray Enter could silently answer an unrelated approval prompt.
+        # Checked only for press_enter=True (a text-only append has nothing
+        # to "submit" and stays exactly as permissive as before) and
+        # checked BEFORE anything is sent -- neither the text nor the Enter
+        # -- rather than typing into an ambiguous state and only deciding
+        # about Enter afterward. Never depends on tmux/OS focus (the
+        # ostensible cause in the bug report): this reads the pane's own
+        # content directly, the same way every other status check in this
+        # project already does, regardless of what has UI focus anywhere.
+        if press_enter:
+            try:
+                pre_send_snapshot = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
+            except TmuxError:
+                pre_send_snapshot = None
+            if pre_send_snapshot is not None and adapter.identify_target_state(pre_send_snapshot) == TARGET_WAITING:
+                return {
+                    "sent": False, "enter_sent": False, "characters": len(text), "press_enter": press_enter,
+                    "correlation_id": correlation_id, "delivery_state": DELIVERY_BLOCKED,
+                    "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED),
+                    "error": "TARGET_AWAITING_APPROVAL",
+                    "submit_reason": ("the target's current output looks like a menu/approval/confirmation "
+                                      "prompt, not its normal prompt composer -- sending would risk answering "
+                                      "that prompt instead of submitting a new message, so neither the text nor "
+                                      "Enter was sent; resolve the pending prompt first, then retry"),
+                }
 
         self.tmux.send_text(session, text, press_enter=False)
         result: dict[str, Any] = {"sent": True, "enter_sent": False, "characters": len(text),
@@ -689,7 +730,10 @@ class TerminalService:
             result["submit_reason"] = "could not capture a pre-submit baseline to verify against"
             return result
 
-        adapter = select_adapter(command_at_enter)
+        # `adapter` was already selected from command_before, above -- reused
+        # here rather than recomputed from command_at_enter, which the
+        # identity-match check just above already guarantees is identical
+        # (this method returns before reaching here otherwise).
         verify_timeout = (RECOVERY_VERIFY_TIMEOUT_SECONDS if adapter.name in WIDE_VERIFY_ADAPTERS
                           else SEND_VERIFY_TIMEOUT_SECONDS)
 
