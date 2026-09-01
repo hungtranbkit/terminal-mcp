@@ -18,6 +18,46 @@ from terminal_mcp.supervisor2 import SupervisorV2Store
 # ---------------------------------------------------------------------------
 
 
+def _journal_mode(path) -> str:
+    connection = sqlite3.connect(path)
+    try:
+        return connection.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        connection.close()
+
+
+def test_audit_store_uses_wal_journal_mode(tmp_path):
+    # P0 audit re-pass finding: AuditStore was the one store in this
+    # project that never set PRAGMA journal_mode=WAL, unlike bindings/
+    # grants/lease/supervisor/supervisor2 -- left on SQLite's default
+    # rollback-journal mode, which blocks readers against writers (and
+    # vice versa) far more than WAL does, on the exact hot path (every
+    # terminal_send_text/_keys call) the P0 Part B concurrent-access work
+    # otherwise made safe for every other store.
+    store = AuditStore(tmp_path / "audit.db")
+    store.record(action="send_text", session="s", result="SENT")  # force the file to actually exist
+    assert _journal_mode(store.path) == "wal"
+
+
+def test_every_durable_store_uses_wal_journal_mode(tmp_path):
+    # Guard against this exact class of gap recurring -- either in
+    # audit.py again, or in a future new store that forgets it.
+    from terminal_mcp.bindings import BindingStore
+    from terminal_mcp.grants import SessionGrantStore
+    from terminal_mcp.supervisor import SupervisorStore
+
+    stores = {
+        "audit": AuditStore(tmp_path / "audit.db"),
+        "bindings": BindingStore(tmp_path / "bindings.db"),
+        "grants": SessionGrantStore(tmp_path / "grants.db"),
+        "lease": PaneLeaseStore(tmp_path / "leases.db"),
+        "supervisor": SupervisorStore(tmp_path / "supervisor.db"),
+        "supervisor2": SupervisorV2Store(tmp_path / "supervisor.db"),
+    }
+    for name, store in stores.items():
+        assert _journal_mode(store.path) == "wal", f"{name} store is not in WAL mode"
+
+
 def test_audit_prune_keeps_only_the_most_recent_n_rows(tmp_path):
     store = AuditStore(tmp_path / "audit.db")
     for i in range(10):

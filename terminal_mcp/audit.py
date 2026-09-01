@@ -57,6 +57,22 @@ class AuditStore:
         self.path = Path(path) if path is not None else default_audit_path()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with self._connection() as connection:
+            # P0 audit re-pass: every other store in this project (bindings/
+            # grants/lease/supervisor/supervisor2) sets WAL mode; this one
+            # was missed. WAL is a property of the database FILE, not the
+            # connection, so setting it once here (matching bindings.py/
+            # grants.py's exact pattern) is sufficient -- it persists across
+            # every future connection/process, never needs repeating per-
+            # connect. Matters specifically for this store: audit.record()
+            # runs on every terminal_send_text/_keys call, a genuinely hot
+            # path, from potentially several processes at once (HTTP,
+            # STDIO, dashboard, Supervisor v2) -- the P0 Part B concurrent-
+            # access work already covers every other store's readers/
+            # writers not blocking each other under that exact load; this
+            # store had been left on SQLite's default rollback-journal mode,
+            # which blocks readers against writers (and vice versa) far more
+            # than WAL does.
+            connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS input_audit (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
