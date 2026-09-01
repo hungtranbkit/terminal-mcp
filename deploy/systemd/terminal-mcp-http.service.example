@@ -37,42 +37,56 @@ ProtectSystem=full
 ProtectHome=read-only
 ReadWritePaths=%h/.local/state/terminal-mcp
 
-# The one privilege-hardening directive confirmed to work in every
-# environment this was tested against, including a nested/sandboxed one
-# (see the note below) -- a plain per-process prctl flag, no capability
-# drop or new namespace required.
+# A plain per-process prctl flag, no capability drop or new namespace
+# required -- confirmed working here (see below for why that distinction
+# matters on this particular host).
 NoNewPrivileges=yes
 
+# Seccomp syscall allowlist -- systemd's own curated, broad "typical
+# network service that also spawns subprocesses" profile (this service's
+# real shape: uvicorn's networking, sqlite's file I/O, and tmux spawned
+# via subprocess.run for every observe/control call). A conservative
+# ALLOWlist (default-deny outside the group), not a hand-picked narrow
+# one -- deliberately preferred over enumerating individual syscalls,
+# which risks silently missing one this project's own dependencies need.
+# Live-verified on a disposable staging instance (isolated port/state
+# dir/systemd unit, same binary) before being adopted here: clean start,
+# zero seccomp/journal denials, and a full functional pass -- tmux list/
+# tail/status/capture, a real guarded terminal_send_text AND
+# terminal_send_bound, bind/unbind, a full supervisor_watch -> run_once
+# poll cycle producing a real sqlite-persisted event, and the dashboard
+# routes -- all against the actual sandboxed process, not assumed safe.
+SystemCallFilter=@system-service
+
 # --- Deliberately NOT included, and why -----------------------------------
-# Everything below this line was tested live against this exact unit and
-# found to make the service fail to start in this deployment's actual
-# runtime (a nested/sandboxed container environment): CapabilityBoundingSet=,
-# ProtectKernelTunables=, ProtectKernelModules=, ProtectControlGroups=,
-# ProtectClock=, ProtectHostname=, RestrictSUIDSGID=, RestrictNamespaces=,
-# LockPersonality= all failed identically:
+# This host's systemd --user instance cannot create the mount/user
+# namespaces most Protect*=/Restrict*=/LockPersonality= directives need
+# (confirmed precisely, not guessed: `apparmor_restrict_unprivileged_
+# userns` is enabled system-wide here -- `unshare --mount` fails with
+# "Operation not permitted" for this user even outside systemd entirely).
+# CapabilityBoundingSet=, ProtectKernelTunables=, ProtectKernelModules=,
+# ProtectControlGroups=, ProtectClock=, ProtectHostname=, RestrictSUIDSGID=,
+# RestrictNamespaces=, LockPersonality= were each tested live against this
+# exact unit and failed identically:
 #   "Failed to drop capabilities: Operation not permitted"
 #   "Failed at step CAPABILITIES spawning ...: Operation not permitted"
-# systemd.exec(5) documents that most of these directives implicitly
-# restrict the process's capability bounding set as part of their
-# enforcement (not just the ones that look capability-related by name) --
-# in an environment whose own container/sandbox already restricts what
-# capabilities systemd itself may drop (commonly missing CAP_SETPCAP),
-# ANY of them can hit this same wall, not only an explicit
-# CapabilityBoundingSet=. If your systemd --user instance runs on a plain
-# host (not nested in another container/sandbox), all of the above are
-# very likely safe to add -- test one at a time with `systemctl --user
-# restart` + `journalctl --user -u terminal-mcp-http -n 20`, watching
-# specifically for "Failed to drop capabilities", and keep only what
-# starts cleanly and passes /health/ready afterward.
+# systemd.exec(5) documents that most of them implicitly restrict the
+# capability bounding set as part of their enforcement (not only the ones
+# that look capability-related by name), which is what actually fails
+# here -- this is an AppArmor policy restricting unprivileged namespace
+# creation, not a capability/seccomp restriction, which is exactly why
+# SystemCallFilter= above (seccomp via NNP, no new namespace needed) works
+# fine even though those others don't. If your host does not set
+# apparmor_restrict_unprivileged_userns (check `cat /proc/sys/kernel/
+# apparmor_restrict_unprivileged_userns`) or runs systemd --system (root)
+# rather than --user, the directives above are very likely safe to add --
+# test one at a time with `systemctl restart` + `journalctl -u
+# terminal-mcp-http -n 20`, watching specifically for "Failed to drop
+# capabilities", and keep only what starts cleanly and passes
+# /health/ready afterward.
 #
 #   PrivateTmp=yes        -- would cut off the real tmux socket regardless
-#                             of the capability question (see above).
-#   SystemCallFilter=...  -- not attempted here; a wrong/incomplete
-#                             allowlist across tmux subprocess spawning +
-#                             uvicorn's networking + sqlite's file I/O
-#                             risks a hard-to-diagnose crash, and this
-#                             environment's own capability restrictions
-#                             make it likely to hit the same wall anyway.
+#                             of the capability/namespace question above.
 #   MemoryDenyWriteExecute=yes -- some cryptography (PyJWT[crypto]) code
 #                             paths can need W+X pages for accelerated
 #                             implementations; not worth the risk of a
