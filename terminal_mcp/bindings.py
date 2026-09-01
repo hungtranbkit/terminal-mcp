@@ -8,6 +8,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .schema import Migration, apply_migrations
+
+# P1 hardening item #10: see audit.py's AUDIT_MIGRATIONS docstring -- same
+# baseline-then-append pattern.
+BINDINGS_MIGRATIONS: list[Migration] = [
+    Migration(1, "baseline: bindings table (incl. pinned_* columns) as of the P1 hardening pass",
+             lambda connection: None),
+]
 
 BINDING_NAME_RE = re.compile(r"^[a-z0-9_.-]{1,64}$")
 
@@ -102,6 +110,7 @@ class BindingStore:
             ):
                 if column not in existing_columns:
                     connection.execute(f"ALTER TABLE bindings ADD COLUMN {column} {declaration}")
+            apply_migrations(connection, BINDINGS_MIGRATIONS)
         try:
             self.path.chmod(0o600)
         except OSError:

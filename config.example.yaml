@@ -74,3 +74,16 @@ supervisor:
 #   cloudflare_access_team_domain: "your-team.cloudflareaccess.com"
 #   cloudflare_access_audience: "the-access-application-aud-tag"
 #   allowed_origins: []
+
+# Periodic SQLite maintenance: retention pruning (audit.db's input_audit/
+# idempotent_sends, supervisor.db's supervisor_actions -- supervisor_events
+# already has its own event_retention above, pruned every v1 poll cycle)
+# and WAL checkpointing, on a background interval independent of whether
+# Supervisor Loop v1 is enabled (audit.db accumulates from any
+# terminal_send_text/_keys call regardless). All optional; these are the
+# defaults.
+# maintenance:
+#   interval_seconds: 1800
+#   audit_retention: 20000
+#   action_retention: 5000
+#   idempotency_key_retention_days: 30

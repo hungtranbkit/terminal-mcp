@@ -5,12 +5,23 @@ import hashlib
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .redaction import redact_text
+from .schema import Migration, apply_migrations
+
+# P1 hardening item #10: version 1 is the baseline -- everything above
+# (input_audit/idempotent_sends, including every column the pre-existing
+# ad-hoc pattern already added) as of this db's first open under the
+# versioned-migration system. A no-op apply: its only job is stamping
+# PRAGMA user_version so future schema changes append Migration(2, ...),
+# Migration(3, ...) here instead of another bare, untracked ALTER TABLE.
+AUDIT_MIGRATIONS: list[Migration] = [
+    Migration(1, "baseline: input_audit + idempotent_sends as of the P1 hardening pass", lambda connection: None),
+]
 
 
 def default_audit_path() -> Path:
@@ -62,6 +73,7 @@ class AuditStore:
                     created_at TEXT NOT NULL
                 )
             """)
+            apply_migrations(connection, AUDIT_MIGRATIONS)
         try:
             self.path.chmod(0o600)
         except OSError:
@@ -106,6 +118,35 @@ class AuditStore:
                  json.dumps(keys) if keys is not None else None, int(press_enter),
                  result, reason, source_transport, __version__),
             )
+
+    def prune(self, retention: int) -> int:
+        """P1 hardening item #9: input_audit has no other retention limit
+        -- every terminal_send_text/_keys call ever recorded stays forever
+        otherwise. Same "keep the most recent N rows" shape as
+        SupervisorStore.prune_events; called periodically (not on this
+        hot record() path itself -- see maintenance.py) so a busy send
+        volume never pays this DELETE's cost per-call."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM input_audit WHERE id NOT IN "
+                "(SELECT id FROM input_audit ORDER BY id DESC LIMIT ?)",
+                (retention,),
+            )
+        return cursor.rowcount
+
+    def prune_idempotency_keys(self, older_than_days: int) -> int:
+        """Unlike input_audit's "keep the most recent N" shape, this is
+        time-based: an idempotency key only needs to outlive a plausible
+        retry window (a caller re-sending the exact same key after a
+        dropped response), not stay forever -- but it must never be
+        pruned so aggressively that a legitimate delayed retry sees a
+        fresh, un-deduplicated send instead of its original stored result."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM idempotent_sends WHERE created_at < ?", (cutoff,),
+            )
+        return cursor.rowcount
 
     def claim_idempotency_key(self, key: str) -> bool:
         """Returns True if this call is the one that gets to actually

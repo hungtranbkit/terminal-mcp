@@ -10,6 +10,7 @@ from .core import TerminalService
 from .dashboard import register_dashboard
 from .health import register_health
 from .logging_setup import RequestIdMiddleware, SecurityHeadersMiddleware, configure_logging
+from .maintenance import MaintenanceLoop
 from .mcp_app import build_mcp
 from .supervisor import SupervisorLoop, SupervisorService, SupervisorStore
 from .supervisor2 import build_supervisor_v2
@@ -67,6 +68,18 @@ def main() -> None:
         loop = SupervisorLoop(supervisor_v2)
         loop.start()
         atexit.register(loop.stop)
+
+    # P1 hardening item #9: unconditional, unlike the supervisor loop
+    # above -- audit.db accumulates from any terminal_send_text/_keys call
+    # regardless of whether Supervisor Loop v1 is enabled, so its
+    # retention/WAL maintenance is baseline hygiene, not gated behind that
+    # unrelated opt-in.
+    maintenance_loop = MaintenanceLoop(
+        audit=terminal.audit, supervisor2_store=supervisor_v2.store,
+        bindings_path=terminal.bindings.path, config=config.maintenance,
+    )
+    maintenance_loop.start()
+    atexit.register(maintenance_loop.stop)
 
     anyio.run(lambda: _serve(server))
 

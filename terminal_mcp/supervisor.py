@@ -35,12 +35,24 @@ from .audit import sanitized_preview, text_fingerprint
 from .config import AppConfig, SupervisorConfig
 from .core import TerminalService
 from .permissions import session_allowed
+from .schema import Migration, apply_migrations
 from .status import (KNOWN_VERIFIER_KINDS, SUPERVISOR_STATES, classify_supervisor_state,
                      parse_completion_marker, parse_evidence_markers, to_legacy_event_type,
                      to_legacy_state, verify_completion_marker, verify_evidence_marker)
 from .tmux import TmuxError
 
 _LOGGER = logging.getLogger(__name__)
+
+# P1 hardening item #10: SQL schema version tracking (PRAGMA user_version),
+# distinct from EVENT_SCHEMA_VERSION below (that one versions the JSON
+# *shape* of one persisted event for API consumers; this one versions the
+# actual SQL tables) -- see schema.py's module docstring for the baseline-
+# then-append pattern this follows.
+SUPERVISOR_MIGRATIONS: list[Migration] = [
+    Migration(1, "baseline: watches + supervisor_events (incl. every P0-2/P0-7/P0-8 column "
+                "already added by the pre-existing ad-hoc pattern) as of the P1 hardening pass",
+             lambda connection: None),
+]
 
 EVENT_SCHEMA_VERSION = 1
 """JSON shape of one persisted event, stable for a future v2 webhook
@@ -200,6 +212,7 @@ class SupervisorStore:
                 )
                 """
             )
+            apply_migrations(connection, SUPERVISOR_MIGRATIONS)
         try:
             self.path.chmod(0o600)
         except OSError:

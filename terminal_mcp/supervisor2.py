@@ -43,7 +43,20 @@ from typing import Any
 from .audit import sanitized_preview, text_fingerprint
 from .models import SessionIdentity
 from .redaction import redact_text
+from .schema import Migration, apply_migrations
 from .supervisor import SupervisorService, SupervisorStore, watch_key as make_watch_key
+
+# P1 hardening item #10: see audit.py's AUDIT_MIGRATIONS docstring -- same
+# baseline-then-append pattern, this store's own version counter (this is
+# the same physical db FILE as SUPERVISOR_MIGRATIONS/v1, sharing one
+# PRAGMA user_version -- v1's migrations always run first since
+# SupervisorStore is constructed before SupervisorV2Store in every code
+# path that builds both, so v2's baseline correctly layers on top rather
+# than racing it).
+SUPERVISOR_V2_MIGRATIONS: list[Migration] = [
+    Migration(2, "baseline: supervisor_policies + supervisor_actions (incl. expected_output_hash) "
+                "as of the P1 hardening pass", lambda connection: None),
+]
 
 POLICY_MODES = ("observe_only", "suggest_only", "approved_auto_continue")
 ACTION_STATES = (
@@ -165,6 +178,7 @@ class SupervisorV2Store:
             # from that earlier revision, if already migrated onto an
             # existing db, are simply unused now -- harmless to leave in
             # place, not worth a destructive column-drop migration.
+            apply_migrations(connection, SUPERVISOR_V2_MIGRATIONS)
         try:
             self.path.chmod(0o600)
         except OSError:
@@ -372,6 +386,20 @@ class SupervisorV2Store:
         with self._connection() as connection:
             row = connection.execute("SELECT * FROM supervisor_actions WHERE id = ?", (action_id,)).fetchone()
         return dict(row) if row is not None else None
+
+    def prune_actions(self, retention: int) -> int:
+        """P1 hardening item #9: supervisor_actions has no other retention
+        limit -- every claim/decide/approve/send attempt, across every
+        watch, ever, stays forever otherwise. Same "keep the most recent
+        N rows" shape as SupervisorStore.prune_events/AuditStore.prune;
+        called periodically from maintenance.py, not from any hot path."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM supervisor_actions WHERE id NOT IN "
+                "(SELECT id FROM supervisor_actions ORDER BY id DESC LIMIT ?)",
+                (retention,),
+            )
+        return cursor.rowcount
 
     def list_actions(self, *, watch_key: str | None = None, state: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 500))

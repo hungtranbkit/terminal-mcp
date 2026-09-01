@@ -97,6 +97,22 @@ class DashboardConfig:
 
 
 @dataclass(frozen=True)
+class MaintenanceConfig:
+    # P1 hardening item #9: periodic retention pruning (audit.db's
+    # input_audit/idempotent_sends, supervisor.db's supervisor_actions --
+    # supervisor_events already has its own event_retention, pruned every
+    # v1 poll cycle) and WAL checkpointing, on a fixed background
+    # interval independent of whether Supervisor Loop v1 is enabled (this
+    # is baseline database hygiene every deployment needs -- audit.db
+    # accumulates from any terminal_send_text/_keys call regardless).
+    # See maintenance.py.
+    interval_seconds: int = 1800
+    audit_retention: int = 20_000
+    action_retention: int = 5_000
+    idempotency_key_retention_days: int = 30
+
+
+@dataclass(frozen=True)
 class AppConfig:
     permissions: PermissionsConfig
     allowed_session_patterns: tuple[str, ...]
@@ -105,6 +121,7 @@ class AppConfig:
     input_policy: InputPolicyConfig = InputPolicyConfig()
     supervisor: SupervisorConfig = SupervisorConfig()
     dashboard: DashboardConfig = DashboardConfig()
+    maintenance: MaintenanceConfig = MaintenanceConfig()
 
 
 DEFAULT_PATTERNS = ("claude-*", "codex-*", "agent-*", "test-*")
@@ -205,6 +222,30 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             completion_verify_quiet_seconds=completion_verify_quiet_seconds,
         ),
         dashboard=_load_dashboard_config(raw.get("dashboard", {})),
+        maintenance=_load_maintenance_config(raw.get("maintenance", {})),
+    )
+
+
+def _load_maintenance_config(maintenance_raw: object) -> MaintenanceConfig:
+    if not isinstance(maintenance_raw, dict):
+        maintenance_raw = {}
+    interval = int(maintenance_raw.get("interval_seconds", MaintenanceConfig.interval_seconds))
+    audit_retention = int(maintenance_raw.get("audit_retention", MaintenanceConfig.audit_retention))
+    action_retention = int(maintenance_raw.get("action_retention", MaintenanceConfig.action_retention))
+    idempotency_days = int(maintenance_raw.get(
+        "idempotency_key_retention_days", MaintenanceConfig.idempotency_key_retention_days,
+    ))
+    if interval < 60:
+        raise ValueError("maintenance.interval_seconds must be at least 60")
+    if audit_retention < 1:
+        raise ValueError("maintenance.audit_retention must be at least 1")
+    if action_retention < 1:
+        raise ValueError("maintenance.action_retention must be at least 1")
+    if idempotency_days < 1:
+        raise ValueError("maintenance.idempotency_key_retention_days must be at least 1")
+    return MaintenanceConfig(
+        interval_seconds=interval, audit_retention=audit_retention,
+        action_retention=action_retention, idempotency_key_retention_days=idempotency_days,
     )
 
 
