@@ -5,6 +5,7 @@ import atexit
 from .config import load_config
 from .core import TerminalService
 from .dashboard import register_dashboard
+from .health import register_health
 from .mcp_app import build_mcp
 from .supervisor import SupervisorLoop, SupervisorService, SupervisorStore
 from .supervisor2 import build_supervisor_v2
@@ -24,6 +25,7 @@ def main() -> None:
     supervisor_v2 = build_supervisor_v2(supervisor)
     server = build_mcp(terminal, supervisor, supervisor_v2)
     register_dashboard(server, terminal, supervisor, supervisor_v2)
+    register_health(server, terminal)
 
     # Supervisor tools (watch/status/events/run_once, and the v2 policy/
     # claim/decide/approve/send tools) are always available — only the
