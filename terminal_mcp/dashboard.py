@@ -1139,6 +1139,28 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         same_origin = {f"https://{host}", f"http://{host}"}
         return origin_value in same_origin or origin_value in terminal.config.dashboard.allowed_origins
 
+    def _cloudflare_access_guard(request: Request):
+        """The Cloudflare Access JWT verification step alone (P1 item #2)
+        -- shared by _mutation_guard (POST routes, layered under
+        mutations_enabled + CSRF/Origin below) and _read_guard (GET
+        routes, which need neither of those -- see _read_guard). Returns
+        (response, identity): response is non-None exactly when the
+        request is blocked; identity is the verified AccessIdentity when
+        configured, else always None. No-op (request always allowed,
+        identity always None) unless cloudflare_access_team_domain/
+        audience are both configured -- every CF Access usage in this
+        project is the same opt-in, no-op-unless-configured shape."""
+        team_domain = terminal.config.dashboard.cloudflare_access_team_domain
+        audience = terminal.config.dashboard.cloudflare_access_audience
+        if not (team_domain and audience):
+            return None, None
+        token = request.headers.get("cf-access-jwt-assertion") or request.cookies.get("CF_Authorization")
+        identity = verify_access_assertion(token, team_domain=team_domain, audience=audience)
+        if identity is None:
+            return JSONResponse({"error": "CLOUDFLARE_ACCESS_VERIFICATION_FAILED"}, status_code=403,
+                                headers={"Cache-Control": "no-store"}), None
+        return None, identity
+
     def _mutation_guard(request: Request):
         """Independent boundary in front of every dashboard POST route
         (session input, supervisor ack, supervisor2 pause) -- checked
@@ -1157,26 +1179,46 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if not _origin_allowed(request):
             return JSONResponse({"error": "ORIGIN_NOT_ALLOWED"}, status_code=403,
                                 headers={"Cache-Control": "no-store"}), None
-        team_domain = terminal.config.dashboard.cloudflare_access_team_domain
-        audience = terminal.config.dashboard.cloudflare_access_audience
-        if team_domain and audience:
-            token = request.headers.get("cf-access-jwt-assertion") or request.cookies.get("CF_Authorization")
-            identity = verify_access_assertion(token, team_domain=team_domain, audience=audience)
-            if identity is None:
-                return JSONResponse({"error": "CLOUDFLARE_ACCESS_VERIFICATION_FAILED"}, status_code=403,
-                                    headers={"Cache-Control": "no-store"}), None
-            return None, identity
-        return None, None
+        return _cloudflare_access_guard(request)
+
+    def _read_guard(request: Request):
+        """P0 audit re-pass finding: GET/read routes (the dashboard page
+        itself and every /dashboard/api/* GET) previously had NO app-level
+        authentication at all -- only the POST/mutation routes went
+        through _mutation_guard. Read access (session listings, pane
+        content, supervisor status) relied entirely on network/tunnel
+        topology (only reachable through a Cloudflare-Access-protected
+        hostname) for protection -- exactly the gap cf_access.py's own
+        module docstring warns against: edge-level Access enforcement
+        'says nothing to THIS application about a request that does
+        arrive here'. This is the CF Access check alone -- deliberately
+        NOT _mutation_guard's other two checks: no CSRF/Origin check (a
+        normal top-level GET navigation, e.g. loading the dashboard URL
+        directly in a browser, does not reliably send an Origin header,
+        and Referer is not a meaningful CSRF signal for a plain read
+        either way), and no mutations_enabled gate (reading must stay
+        available independent of whether writes are enabled -- this is
+        the 'read-only dashboard' tunnel's whole purpose, per its own
+        systemd unit description). Same no-op-unless-configured shape as
+        every other CF Access usage here: with no team_domain/audience
+        configured, GET routes are completely unaffected by this."""
+        return _cloudflare_access_guard(request)
 
     @server.custom_route("/dashboard", methods=["GET"], include_in_schema=False)
-    async def dashboard(_: Request) -> HTMLResponse:
+    async def dashboard(request: Request) -> HTMLResponse | JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
         return HTMLResponse(
             DASHBOARD_HTML,
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
     @server.custom_route("/dashboard/api/sessions", methods=["GET"], include_in_schema=False)
-    async def sessions(_: Request) -> JSONResponse:
+    async def sessions(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
         # P1 items #4/#5: dashboard_list_sessions/terminal_status are both
         # blocking (a real tmux subprocess round-trip, sometimes an sqlite
         # read) -- run off the event loop via anyio.to_thread so one slow
@@ -1227,6 +1269,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
     @server.custom_route("/dashboard/api/session", methods=["GET"], include_in_schema=False)
     async def session_detail(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
         name = request.query_params.get("name", "")
         # A statically-whitelisted session keeps its EXACT existing path
         # (terminal_status/terminal_tail, completely untouched) -- a
@@ -1417,7 +1462,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/supervisor", methods=["GET"], include_in_schema=False)
-    async def supervisor_summary(_: Request) -> JSONResponse:
+    async def supervisor_summary(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
         # Read-only: reuses the same SupervisorService the MCP tools use, so
         # the dashboard can never see anything a supervisor_* tool call
         # couldn't already show (same whitelist-guarded watch data). Both
@@ -1451,7 +1499,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/supervisor2", methods=["GET"], include_in_schema=False)
-    async def supervisor2_summary(_: Request) -> JSONResponse:
+    async def supervisor2_summary(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
         # Read-only: for every watch with a non-observe_only v2 policy, its
         # policy/counters plus its most recent action (if any) — the same
         # data the supervisor2_* MCP tools expose, nothing extra computed

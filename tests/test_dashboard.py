@@ -1128,6 +1128,102 @@ def test_cloudflare_access_accepts_cf_authorization_cookie_fallback(tmux_session
     assert response.status_code == 200
 
 
+# ---------------------------------------------------------------------------
+# P0 audit re-pass: GET/read routes previously had NO app-level auth at all
+# -- only the POST/mutation routes went through _mutation_guard, relying
+# entirely on network/tunnel topology for read protection. _read_guard
+# closes that gap with the CF Access check alone (no CSRF/Origin, no
+# mutations_enabled gate -- see _read_guard's own docstring for why).
+# ---------------------------------------------------------------------------
+
+_GET_ROUTES = ("/dashboard", "/dashboard/api/sessions", "/dashboard/api/session",
+              "/dashboard/api/supervisor", "/dashboard/api/supervisor2")
+
+
+def test_cloudflare_access_not_configured_get_routes_are_noop(input_config, tmux_session_factory):
+    # input_config has neither cloudflare_access_team_domain nor _audience
+    # set -- every GET route behaves exactly as before this fix.
+    session = tmux_session_factory("test-dashboard-cf-get-noop", "bash -lc 'sleep 10'")
+    client, _ = _client(input_config)
+    for path in _GET_ROUTES:
+        response = client.get(path, params={"name": session} if path.endswith("/session") else None)
+        assert response.status_code == 200, (path, response.text)
+
+
+def test_cloudflare_access_configured_blocks_get_routes_with_no_assertion(tmux_session_factory):
+    config = _cf_access_config()
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app())
+    for path in _GET_ROUTES:
+        response = client.get(path, params={"name": "whatever"} if path.endswith("/session") else None)
+        assert response.status_code == 403, path
+        assert response.json()["error"] == "CLOUDFLARE_ACCESS_VERIFICATION_FAILED"
+
+
+def test_cloudflare_access_configured_allows_get_routes_with_verified_assertion(tmux_session_factory, monkeypatch):
+    import terminal_mcp.dashboard as dashboard_module
+    from terminal_mcp.cf_access import AccessIdentity
+
+    identity = AccessIdentity(email="viewer@example.com", subject="user-2", raw_claims={})
+    monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
+    session = tmux_session_factory("test-dashboard-cf-get-ok", "bash -lc 'sleep 10'")
+    config = _cf_access_config()
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(),
+                        headers={"Cf-Access-Jwt-Assertion": "a-token-that-would-verify"})
+    for path in _GET_ROUTES:
+        response = client.get(path, params={"name": session} if path.endswith("/session") else None)
+        assert response.status_code == 200, (path, response.text)
+
+
+def test_cloudflare_access_get_routes_never_require_an_origin_header(tmux_session_factory, monkeypatch):
+    # Unlike POST/mutation routes, a GET (a normal top-level navigation
+    # loading the dashboard URL directly) does not reliably send Origin --
+    # _read_guard must never require it, only _mutation_guard does.
+    import terminal_mcp.dashboard as dashboard_module
+    from terminal_mcp.cf_access import AccessIdentity
+
+    identity = AccessIdentity(email="viewer@example.com", subject="user-3", raw_claims={})
+    monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
+    config = _cf_access_config()
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    # No Origin header at all, on purpose.
+    client = TestClient(server.streamable_http_app(),
+                        headers={"Cf-Access-Jwt-Assertion": "a-token-that-would-verify"})
+    response = client.get("/dashboard")
+    assert response.status_code == 200
+
+
+def test_cloudflare_access_get_routes_work_even_when_mutations_disabled(tmux_session_factory, monkeypatch):
+    # Reading must stay available independent of dashboard.mutations_
+    # enabled -- that flag is a *write*-path gate, and this is the
+    # "read-only dashboard" tunnel's whole purpose.
+    import terminal_mcp.dashboard as dashboard_module
+    from terminal_mcp.cf_access import AccessIdentity
+
+    identity = AccessIdentity(email="viewer@example.com", subject="user-4", raw_claims={})
+    monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
+    config = _cf_access_config(mutations_enabled=False)
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(),
+                        headers={"Cf-Access-Jwt-Assertion": "a-token-that-would-verify"})
+    response = client.get("/dashboard/api/sessions")
+    assert response.status_code == 200
+    # The write path is still correctly refused.
+    post_response = client.post("/dashboard/api/supervisor/ack", json={"id": 1},
+                                headers={"Origin": "http://testserver"})
+    assert post_response.status_code == 403
+    assert post_response.json()["error"] == "DASHBOARD_MUTATIONS_DISABLED"
+
+
 def test_load_config_rejects_blank_cloudflare_access_fields(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
