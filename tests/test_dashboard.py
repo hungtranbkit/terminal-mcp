@@ -719,18 +719,48 @@ def test_dashboard_health_indicator_never_clears_last_rendered_output():
     refresh_fn = DASHBOARD_HTML.split("async function refresh() {", 1)[1].split("\n    refresh();", 1)[0]
     assert "outputEl.replaceChildren()" not in refresh_fn
     assert "outputEl.textContent = ''" not in refresh_fn
-    assert "catch (error) { setConnectionState(false); }" in DASHBOARD_HTML
+    # A genuine network/server failure (not an auth redirect -- see
+    # AuthRequiredError below) must still land on setConnectionState(false).
+    assert "} else { setConnectionState(false); }" in DASHBOARD_HTML
 
 
 def test_dashboard_health_indicator_no_new_backend_route():
     # Purely reactive to the two fetches loadSessions/loadDetail already
     # make — no new endpoint, no extra polling path added for the health
     # indicator specifically (the other fetch()s below belong to the
-    # separate Supervisor Loop v1/v2 features' summary/ack/pause calls, and
-    # the dashboard-grant feature's single shared postGrant() helper, whose
-    # one fetch() call serves both grant-read and grant-input via a `path`
-    # parameter rather than a separate literal call site for each).
-    assert DASHBOARD_HTML.count("fetch(") == 8  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause
+    # separate Supervisor Loop v1/v2 features' summary/ack/pause calls, the
+    # dashboard-grant feature's single shared postGrant() helper, whose one
+    # fetch() call serves both grant-read and grant-input via a `path`
+    # parameter rather than a separate literal call site for each, and the
+    # shared fetchJSON() wrapper loadSessions/loadDetail now both go
+    # through -- one more literal "fetch(" substring for that wrapper's own
+    # internal call, not a new call SITE or endpoint).
+    assert DASHBOARD_HTML.count("fetch(") == 9  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch()
+
+
+def test_dashboard_auth_required_distinguished_from_offline():
+    # URGENT incident fix: an expired Cloudflare Access browser session
+    # (fetch() transparently following a redirect to Access's own login
+    # page, landing here as a normal 200 HTML response, not a network
+    # error) must be reported as a sign-in problem, never mislabeled as a
+    # server/tunnel outage -- but ONLY on positive evidence of that
+    # specific redirect (never merely "response wasn't JSON", which a real
+    # 502/503/proxy-error page also is).
+    assert "class AuthRequiredError extends Error {}" in DASHBOARD_HTML
+    assert "async function fetchJSON(url, options)" in DASHBOARD_HTML
+    assert "hostname.endsWith('cloudflareaccess.com')" in DASHBOARD_HTML
+    assert "response.status === 401" in DASHBOARD_HTML
+    assert "function setAuthRequiredState()" in DASHBOARD_HTML
+    assert "SIGN-IN REQUIRED" in DASHBOARD_HTML
+    assert "if (error instanceof AuthRequiredError) { setAuthRequiredState(); }" in DASHBOARD_HTML
+    # Any other non-2xx/non-JSON response still falls through to a plain
+    # Error -- reported as OFFLINE (setConnectionState(false)), same as a
+    # real outage always has been, never assumed to be an auth problem.
+    assert "if (!response.ok || !contentType.includes('application/json'))" in DASHBOARD_HTML
+    # Both loadSessions and loadDetail -- the two fetches every refresh()
+    # cycle depends on for the health badge -- go through the wrapper.
+    assert "await fetchJSON('/dashboard/api/sessions'" in DASHBOARD_HTML
+    assert "await fetchJSON(`/dashboard/api/session?name=" in DASHBOARD_HTML
 
 
 def test_dashboard_fullscreen_preference_persisted_and_restored_once():

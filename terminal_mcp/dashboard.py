@@ -55,6 +55,7 @@ DASHBOARD_HTML = """<!doctype html>
     header { flex:0 0 auto; display:flex; justify-content:space-between; gap:16px; align-items:center; padding:22px 28px; border-bottom:1px solid var(--line) }
     h1 { margin:0; font-size:20px } .muted { color:var(--muted) } .live { color:var(--green) }
     .live.reconnecting { color:var(--amber) } .live.offline { color:#ff6b6b }
+    .live.auth-required { color:#ffb347 }
     .header-right { display:flex; align-items:center; gap:10px }
     /* Compact by default (hidden entirely — see JS — when there are zero
        watches, so a supervisor.enabled:false deployment shows nothing extra
@@ -1021,9 +1022,49 @@ DASHBOARD_HTML = """<!doctype html>
       closeSearch(); // a search from a different session's content wouldn't make sense to keep open
     }
 
+    // URGENT incident fix: an expired Cloudflare Access browser session
+    // makes every /dashboard/api/* fetch() land on Access's own login page
+    // instead of this app's JSON -- fetch() follows that redirect
+    // transparently (a normal 200 response, not a network error), so the
+    // previous plain `response.json()` call threw a generic parse
+    // exception indistinguishable from a real server/tunnel outage,
+    // mislabeling a sign-in problem as "● OFFLINE".
+    //
+    // Deliberately requires POSITIVE evidence of an Access sign-in
+    // redirect (the final URL landed on *.cloudflareaccess.com, or the
+    // response carries Access's own `WWW-Authenticate: Cloudflare-Access`
+    // challenge header, or a bare 401) before ever calling this "sign-in
+    // required" -- an earlier version treated ANY non-JSON body as a sign-
+    // in problem, which is wrong: a 502/503 from Cloudflare itself, an
+    // nginx/proxy error page, or any other real backend failure is also
+    // non-JSON, and mislabeling those as "sign in again" would send an
+    // operator chasing the wrong fix for an actual outage. Every other
+    // non-2xx/non-JSON/network/timeout failure still falls through to the
+    // existing generic Error path below -- reported as OFFLINE, exactly
+    // as before this fix, never silently swallowed either way.
+    class AuthRequiredError extends Error {}
+    async function fetchJSON(url, options) {
+      const response = await fetch(url, options);
+      let landedOnAccessLogin = false;
+      if (response.redirected) {
+        try { landedOnAccessLogin = new URL(response.url).hostname.endsWith('cloudflareaccess.com'); }
+        catch (error) { /* response.url malformed/opaque -- fall through to the other signals below */ }
+      }
+      const accessChallengeHeader = (response.headers.get('www-authenticate') || '').includes('Cloudflare-Access');
+      if (landedOnAccessLogin || accessChallengeHeader || response.status === 401) {
+        throw new AuthRequiredError(`sign-in required for ${url} (status ${response.status})`);
+      }
+      const contentType = response.headers.get('content-type') || '';
+      if (!response.ok || !contentType.includes('application/json')) {
+        throw new Error(`unexpected response from ${url}: status ${response.status}, `
+          + `content-type ${contentType || '(none)'}`);
+      }
+      return response.json();
+    }
+
     async function loadSessions() {
-      const response = await fetch('/dashboard/api/sessions', {cache:'no-store'});
-      const data = await response.json(); const rows = data.sessions || [];
+      const data = await fetchJSON('/dashboard/api/sessions', {cache:'no-store'});
+      const rows = data.sessions || [];
       document.querySelector('#count').textContent = `(${rows.length})`;
 
       // On first load only (never on the recurring 5s poll, which must not
@@ -1075,8 +1116,7 @@ DASHBOARD_HTML = """<!doctype html>
     }
     async function loadDetail() {
       if (!selected) return;
-      const response = await fetch(`/dashboard/api/session?name=${encodeURIComponent(selected)}`, {cache:'no-store'});
-      const data = await response.json();
+      const data = await fetchJSON(`/dashboard/api/session?name=${encodeURIComponent(selected)}`, {cache:'no-store'});
       if (data.error) {
         if (data.error === 'READ_RESTRICTED') {
           // Locked placeholder, not a generic error line -- this session
@@ -1143,6 +1183,19 @@ DASHBOARD_HTML = """<!doctype html>
         if (selected) outputEl.classList.add('stale');
       }
     }
+    // Distinct from setConnectionState(false): a stale/expired Cloudflare
+    // Access browser session is not a server, tunnel, or network outage --
+    // telling an operator to "reload and sign in again" is the correct,
+    // actionable fix, and reporting it as OFFLINE would send them chasing
+    // a service outage that does not exist. Every 5s retry (refresh()
+    // below) re-checks and clears this the moment a fresh sign-in makes
+    // the API return JSON again, exactly like the OFFLINE path recovers.
+    function setAuthRequiredState() {
+      consecutiveFailures = 0;
+      liveBadgeEl.textContent = '● SIGN-IN REQUIRED — reload the page';
+      liveBadgeEl.className = 'live auth-required';
+      if (selected) outputEl.classList.add('stale');
+    }
     // Restored only once, right after the very first successful load — by
     // then the restored/first session is already selected, rendered, and
     // scrolled to its latest line (see loadDetail's switchedSession path),
@@ -1158,7 +1211,9 @@ DASHBOARD_HTML = """<!doctype html>
           fullscreenRestoreAttempted = true;
           if (selected && recalledFullscreen()) setFullscreen(true, { persist: false });
         }
-      } catch (error) { setConnectionState(false); }
+      } catch (error) {
+        if (error instanceof AuthRequiredError) { setAuthRequiredState(); } else { setConnectionState(false); }
+      }
     }
     refresh(); setInterval(refresh, 5000);
   </script>
