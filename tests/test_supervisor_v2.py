@@ -736,6 +736,103 @@ def test_run_once_does_not_leak_file_descriptors(tmp_path, tmux_session_factory)
 
 
 # ---------------------------------------------------------------------------
+# P1 hardening item #14: concurrency/restart/soak coverage
+# ---------------------------------------------------------------------------
+
+
+def test_run_once_memory_stays_bounded_across_many_cycles(tmp_path, tmux_session_factory):
+    # Complements the fd-count soak test above with an actual memory-growth
+    # check across the same shape of sustained polling -- an fd leak isn't
+    # the only way a "runs forever" background loop can misbehave; an
+    # unbounded in-memory accumulation (a list/dict that only ever grows)
+    # would show here even with fds flat.
+    import gc
+    import resource
+
+    session = tmux_session_factory("test-v2-memsoak", _wait_prompt(""))
+    time.sleep(0.3)
+    v2, svc = _v2(tmp_path)
+    svc.watch(session=session)
+
+    def rss_kb() -> int:
+        gc.collect()
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+    for _ in range(20):  # warm up allocations (module imports, connection
+        v2.run_once()  # pools, etc.) before taking the real baseline
+
+    baseline = rss_kb()
+    for _ in range(200):
+        v2.run_once()
+    after = rss_kb()
+    growth_kb = after - baseline
+    # ru_maxrss is a HIGH-water mark, not current usage, so this is a
+    # deliberately loose bound (a genuine unbounded-list-style leak over
+    # 200 cycles would show as tens of MB, not a few hundred KB of normal
+    # allocator noise/fragmentation).
+    assert growth_kb < 50_000, (
+        f"RSS high-water mark grew {growth_kb}KB across 200 run_once() cycles -- possible memory leak"
+    )
+
+
+def test_full_v2_pipeline_survives_a_simulated_process_restart(tmp_path, tmux_session_factory):
+    # Every restart test elsewhere in this suite covers ONE piece in
+    # isolation (v1 watches/events persistence, or an idempotency key
+    # alone) -- this exercises a full claim -> decide -> approve -> send ->
+    # observing v2 action mid-flight, then simulates a real process
+    # restart (a fresh TerminalService/SupervisorStore/SupervisorService/
+    # SupervisorV2Store/SupervisorV2Service quintet -- exactly what a new
+    # process opening the same db paths after a systemd restart would
+    # construct), and confirms the SECOND "process" picks up exactly where
+    # the first left off: no duplicated action, no re-sent text, no lost
+    # policy/counters, and the chain still completes and resets correctly.
+    session = tmux_session_factory(
+        "test-v2-restart-e2e",
+        "bash -lc 'echo \"Do you want to continue? [y/N]\"; read x; "
+        "printf \"Continuing...\\nFINAL REPORT\\ndone\\n\"; sleep 30'",
+    )
+    time.sleep(0.3)
+    v2a, svca = _v2(tmp_path)
+    svca.watch(session=session)
+    events = svca.run_once()["events"]
+    v2a.set_policy(session=session, policy_mode="approved_auto_continue", approved_template="y")
+    actionable = v2a.list_actionable_events()["events"]
+    claim = v2a.claim_event(actionable[0]["id"], claimed_by="pre-restart")
+    v2a.submit_decision(claim["id"], "y", "continue")
+    sent = v2a.execute_send(claim["id"])
+    assert sent["sent"] is True
+    time.sleep(1.0)
+    v2a.run_once()  # advance to COMPLETION_CANDIDATE / action -> observing pre-restart
+
+    action_before = v2a.store.get_action(claim["id"])
+    policy_before = v2a.get_policy(session=session)
+
+    # --- simulated restart: a brand new "process" opens the same files ---
+    v2b, svcb = _v2(tmp_path)
+
+    action_after_restart = v2b.store.get_action(claim["id"])
+    policy_after_restart = v2b.get_policy(session=session)
+    assert action_after_restart == action_before
+    assert policy_after_restart == policy_before
+
+    # A duplicate execute_send against the SAME action after "restart"
+    # must still be refused -- the CAS state machine survived intact, not
+    # reset to something that would allow a second real send.
+    duplicate = v2b.execute_send(claim["id"])
+    assert duplicate.get("error") == "ALREADY_SENT_OR_NOT_APPROVED"
+
+    # The chain continues to completion correctly post-restart.
+    from terminal_mcp.config import SupervisorConfig
+    time.sleep(SupervisorConfig().completion_verify_quiet_seconds + 1)
+    result = v2b.run_once()
+    reconciled = result["v2_reconciled"]
+    assert any(r["action_id"] == claim["id"] and r["result"] == "verified_done" for r in reconciled)
+    action_final = v2b.store.get_action(claim["id"])
+    assert action_final["state"] == "completed"
+    assert v2b.get_policy(session=session)["auto_action_count"] == 0  # chain reset
+
+
+# ---------------------------------------------------------------------------
 # P0-5: revision CAS immediately before send
 # ---------------------------------------------------------------------------
 
