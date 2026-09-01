@@ -541,6 +541,30 @@ def test_text_only_send_unaffected_by_approval_prompt_check(tmux_session_factory
     assert "just typed, no enter" in service.terminal_tail(session, 10)["output"]
 
 
+def test_claude_send_refused_for_a_multi_choice_selection_menu(tmux_session_factory, tmp_path):
+    # Found LIVE in production (a real, attended Claude Code session):
+    # Claude Code's own AskUserQuestion-style multi-choice menu -- numbered
+    # options, arrow-key/Tab navigation, Enter accepts the highlighted
+    # choice -- is not a y/n approval dialog, so the original
+    # TARGET_WAITING patterns alone did not catch it. This reproduces that
+    # exact real menu shape (own fixture, not send_keys simulation of the
+    # bug) and confirms it is now refused the same way.
+    session = "test-claude-menu-prompt"
+    menu_path = FIXTURES_DIR / "menu_prompt.py"
+    tmux_session_factory(session, f"bash -lc 'exec -a claude python3 -u {menu_path}'")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    before = service.terminal_tail(session, 10)["output"]
+
+    result = service.terminal_send_text(session, "a new unrelated prompt", press_enter=True)
+    assert result["error"] == "TARGET_AWAITING_APPROVAL"
+    assert result["sent"] is False
+
+    after = service.terminal_tail(session, 10)["output"]
+    assert after == before  # the real menu was never disturbed, no option was selected
+    assert "CHOSE=" not in after
+
+
 def test_codex_normal_composer_send_still_works_after_approval_prompt_fix(tmux_session_factory, tmp_path):
     # Regression check: the new pre-send check must never false-positive
     # on an ordinary idle composer -- reuses the existing real-shape

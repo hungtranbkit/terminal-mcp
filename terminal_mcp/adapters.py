@@ -175,6 +175,19 @@ _WAITING_PATTERNS = tuple(
     for pattern in (
         r"do you want to continue", r"press enter", r"\[y/n\]", r"\[Y/n\]",
         r"continue\?\s*$", r"\bapprove\b", r"\bpermission\b", r"waiting for input",
+        # URGENT bugfix follow-up: found LIVE, in production, against a
+        # real attended Claude Code session (mesflow) -- an interactive
+        # multi-choice selection widget (Claude Code's own AskUserQuestion-
+        # style menu: numbered options, arrow-key/Tab navigation, Enter to
+        # accept the highlighted choice) that the original y/n-shaped
+        # patterns above never matched, so a send arriving while one is
+        # open would fall through as TARGET_UNKNOWN -- not yet caught by
+        # the pre-send TARGET_AWAITING_APPROVAL check -- and Enter would
+        # select whichever option the menu currently highlights instead of
+        # submitting a new message. These are the menu's own UI-chrome
+        # strings (never plausible inside the model's own conversational
+        # text), not the y/n phrasing above.
+        r"enter to select", r"tab/arrow keys to navigate", r"esc to cancel",
     )
 )
 
