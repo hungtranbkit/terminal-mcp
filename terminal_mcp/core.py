@@ -12,6 +12,7 @@ from .bindings import Binding, BindingStore, valid_binding_name
 from .config import AppConfig
 from .grants import SessionGrant, SessionGrantStore
 from .lease import DEFAULT_LEASE_TTL_SECONDS, PaneLeaseStore
+from .metrics import record_delivery_outcome
 from .models import SessionIdentity
 from .permissions import (SENSITIVE_SESSION_WORDS, input_session_allowed,
                           require_input, require_read, session_allowed, session_input_denied_by_pattern,
@@ -244,6 +245,7 @@ class TerminalService:
                           keys=keys, press_enter=press_enter, result=result,
                           reason=error or response.get("reason") or response.get("submit_reason"),
                           correlation_id=response.get("correlation_id"))
+        record_delivery_outcome(response)
         return response
 
     def _input_guard(self, session: str) -> dict[str, Any] | None:

@@ -49,7 +49,7 @@ def main() -> None:
     supervisor_v2 = build_supervisor_v2(supervisor)
     server = build_mcp(terminal, supervisor, supervisor_v2)
     register_dashboard(server, terminal, supervisor, supervisor_v2)
-    register_health(server, terminal)
+    register_health(server, terminal, supervisor)
 
     # Supervisor tools (watch/status/events/run_once, and the v2 policy/
     # claim/decide/approve/send tools) are always available — only the

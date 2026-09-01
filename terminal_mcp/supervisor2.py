@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .audit import sanitized_preview, text_fingerprint
+from .metrics import increment
 from .models import SessionIdentity
 from .redaction import redact_text
 from .schema import Migration, apply_migrations
@@ -335,6 +336,7 @@ class SupervisorV2Store:
                 "UPDATE supervisor_policies SET blocked_reason = ?, updated_at = ? WHERE watch_key = ?",
                 (reason, now, key),
             )
+        increment("supervisor.policy_blocked")
 
     # -- actions --------------------------------------------------------
 
@@ -457,7 +459,10 @@ class SupervisorV2Store:
                 f"UPDATE supervisor_actions SET {set_clause} WHERE id = ? AND state = ?",
                 (*fields.values(), action_id, expected_state),
             )
-        return cursor.rowcount == 1
+        applied = cursor.rowcount == 1
+        if applied and fields.get("state") == "failed":
+            increment("supervisor.action_failed")
+        return applied
 
 
 @dataclass
