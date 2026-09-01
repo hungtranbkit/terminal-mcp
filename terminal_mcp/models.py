@@ -19,6 +19,14 @@ class SessionInfo:
     # and recreated. See SessionIdentity (core.py) / P0-2 identity pinning.
     session_id: str = ""
     pane_id: str = ""
+    # tmux's own "#{pane_in_mode}" -- true while the pane is in copy-mode
+    # (a human scrolled it, or an errant key sequence entered it) or any
+    # other tmux client mode. In this state tmux itself intercepts
+    # keystrokes for its own scrollback/search/selection UI -- they never
+    # reach the underlying program's pty at all, regardless of what
+    # pane_current_command reports (the foreground process is unaffected
+    # and unaware). See _input_guard (core.py) / P0 audit finding #14.
+    pane_in_mode: bool = False
 
 
 @dataclass(frozen=True)

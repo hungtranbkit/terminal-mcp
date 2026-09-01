@@ -263,6 +263,33 @@ class TerminalService:
             return {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
         if info is None:
             return {"error": "SESSION_NOT_FOUND", "session": session}
+        # P0 audit finding #14: a pane in tmux copy-mode (a human manually
+        # scrolled it, or an errant key sequence entered it) intercepts
+        # EVERY keystroke -- text or key -- for its own scrollback/search/
+        # selection UI; none of it ever reaches the underlying program's
+        # pty, regardless of what pane_current_command reports (the
+        # foreground process is unaffected and unaware, so this is
+        # invisible to every other check here). Without this, a send in
+        # this state silently comes back as generic DELIVERY_UNKNOWN with
+        # no indication of why, indefinitely, until something exits copy-
+        # mode out of band. Refused outright and uniformly for every input
+        # path (terminal_send_text/_bound and terminal_send_keys alike --
+        # an allowlisted key is exactly as swallowed by tmux's copy-mode
+        # keytable as free text would be, so there is no safer subset to
+        # carve out here) with a clear, specific diagnostic instead.
+        # Deliberately never auto-exits copy-mode itself -- that would be
+        # exactly the kind of blind, unrequested recovery action this
+        # project's send guards otherwise avoid; resolving it (e.g.
+        # `tmux attach` and pressing `q`, or `tmux send-keys -X cancel`
+        # run directly by an operator) is an out-of-band action, not
+        # something this guarded pipeline performs on a caller's behalf.
+        if info.pane_in_mode:
+            return {"error": "PANE_IN_COPY_MODE", "session": session,
+                    "reason": "the target pane is in tmux copy-mode (scrollback/search/selection) -- "
+                              "every keystroke would be intercepted by tmux itself and never reach the "
+                              "underlying program; an operator must exit copy-mode out of band (e.g. "
+                              "attach and press 'q', or run `tmux send-keys -t <session> -X cancel` "
+                              "directly) before input can proceed again"}
         command = info.pane_current_command.casefold()
         allowed = {item.casefold() for item in self.config.input_policy.allowed_sensitive_commands}
         if command in SENSITIVE_COMMANDS and command not in allowed:
@@ -1027,10 +1054,12 @@ class TerminalService:
             return {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
         effective = (self.config.permissions.terminal_input and self._input_authorized(session)[0]
                      and (stored is None or stored.input_enabled)
-                     and info.pane_current_command.casefold() not in SENSITIVE_COMMANDS)
+                     and info.pane_current_command.casefold() not in SENSITIVE_COMMANDS
+                     and not info.pane_in_mode)
         return {"binding": binding, "session": session, "current_command": info.pane_current_command,
                 "status": "RUNNING" if not info.pane_dead else "DEAD",
-                "last_output": redact_text("\n".join(lines)), "effective_input": effective}
+                "last_output": redact_text("\n".join(lines)), "effective_input": effective,
+                "pane_in_mode": info.pane_in_mode}
 
     # -- dashboard-only per-session grants -----------------------------
     # GRANTING/REVOKING (grant_session_read/grant_session_input below,
@@ -1216,6 +1245,17 @@ class TerminalService:
             return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
         if info is None:
             response = {"error": "SESSION_NOT_FOUND", "session": session}
+            return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
+        # P0 audit finding #14: same copy-mode refusal as _input_guard --
+        # this path (grant-based send) doesn't route through _input_guard
+        # at all, so it needs its own check to get the same guarantee.
+        if info.pane_in_mode:
+            response = {"error": "PANE_IN_COPY_MODE", "session": session,
+                       "reason": "the target pane is in tmux copy-mode (scrollback/search/selection) -- "
+                                 "every keystroke would be intercepted by tmux itself and never reach the "
+                                 "underlying program; an operator must exit copy-mode out of band (e.g. "
+                                 "attach and press 'q', or run `tmux send-keys -t <session> -X cancel` "
+                                 "directly) before input can proceed again"}
             return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
         command = info.pane_current_command.casefold()
         allowed_sensitive = {item.casefold() for item in self.config.input_policy.allowed_sensitive_commands}
