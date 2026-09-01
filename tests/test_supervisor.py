@@ -781,6 +781,51 @@ def test_background_loop_survives_a_poll_exception_and_records_it(tmp_path):
         _LAST_POLL_ERROR[0] = None
 
 
+def test_run_once_isolates_one_watch_exception_from_the_rest(tmp_path, tmux_session_factory):
+    # P1 hardening item #7/#8: an unexpected exception polling one watch
+    # must never abort the rest of that cycle -- every other enabled
+    # watch would otherwise silently starve (and, if the same watch keeps
+    # failing, potentially indefinitely, since the loop would abort at the
+    # same point every cycle).
+    good = tmux_session_factory(
+        "test-sup-isolate-good", "bash -lc 'echo \"Do you want to continue? [y/N]\"; sleep 20'"
+    )
+    bad = tmux_session_factory("test-sup-isolate-bad", "bash -lc 'sleep 20'")
+    time.sleep(0.3)
+    svc = _service(tmp_path)
+    svc.watch(session=good)
+    svc.watch(session=bad)
+
+    original_status = svc.terminal.terminal_status
+
+    def _boom(session, *a, **kw):
+        if session == bad:
+            raise RuntimeError("synthetic per-watch failure")
+        return original_status(session, *a, **kw)
+
+    svc.terminal.terminal_status = _boom
+    try:
+        result = svc.run_once()
+    finally:
+        svc.terminal.terminal_status = original_status
+
+    # The good watch still produced its event.
+    assert any(e["state"] == "WAITING_INPUT" for e in result["events"])
+    good_watch = svc.store.get_watch(watch_key("session", good))
+    assert good_watch["state"] == "WAITING_INPUT"
+    # The bad watch's row is left untouched by the failed poll (no
+    # bookkeeping mutated on an exception path that never got far enough
+    # to know what actually happened).
+    bad_watch = svc.store.get_watch(watch_key("session", bad))
+    assert bad_watch["state"] == "UNKNOWN"
+    assert bad_watch["enabled"] == 1  # never disabled by an unrelated exception
+
+    # A later poll, once the underlying issue clears on its own, recovers
+    # normally -- this was never a permanent disable, just a skipped cycle.
+    result2 = svc.run_once()
+    assert result2 is not None  # the loop itself completed without raising
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"

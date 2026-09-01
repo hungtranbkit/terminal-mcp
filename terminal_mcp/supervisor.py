@@ -595,7 +595,28 @@ class SupervisorService:
         for row in self.store.list_watches():
             if not row["enabled"]:
                 continue
-            event = self._poll_one(row)
+            try:
+                event = self._poll_one(row)
+            except Exception:
+                # P1 item #7/#8: isolate one watch's failure to that watch
+                # -- never let an unexpected exception for a single target
+                # abort the rest of this poll cycle (every OTHER enabled
+                # watch would otherwise silently starve, potentially
+                # indefinitely if the same watch fails again next cycle
+                # too, since the loop would abort at the same point every
+                # time). Logged with the failing watch's own identity as
+                # structured fields (see logging_setup.py's JSON
+                # formatter) so it's directly correlatable, not folded
+                # into the generic "poll cycle failed" catch-all in
+                # SupervisorLoop._run -- this watch's row is left
+                # otherwise untouched (no state/failure-count bookkeeping
+                # mutated on an exception path that never got far enough
+                # to know what really happened).
+                _LOGGER.exception(
+                    "supervisor: polling one watch raised, skipping it for this cycle only",
+                    extra={"watch_key": row["watch_key"], "kind": row["kind"], "target": row["target"]},
+                )
+                continue
             if event is not None:
                 events.append(event)
         self.store.prune_events(self.config.event_retention)

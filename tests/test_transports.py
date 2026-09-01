@@ -145,6 +145,64 @@ def test_http_bind_is_fixed_loopback():
     assert HTTP_PATH == "/mcp"
 
 
+def test_real_server_http_main_wires_request_id_and_security_headers(tmp_path_factory):
+    # Unlike the http_server fixture above (which calls build_mcp().run()
+    # directly, bypassing server_http.main() entirely), this spawns the
+    # REAL production entrypoint -- the only path that actually adds
+    # RequestIdMiddleware/SecurityHeadersMiddleware (P1 items #7/#11),
+    # since server.run() itself exposes no middleware hook. HTTP_PORT is
+    # patched in-process (before main() is called, in the SAME subprocess)
+    # rather than hardcoded, so this can never collide with the real
+    # production service's fixed port 8766.
+    with socket.socket() as probe:
+        probe.bind((HTTP_HOST, 0))
+        port = probe.getsockname()[1]
+    env = os.environ.copy()
+    root = __import__("pathlib").Path(__file__).parents[1]
+    env["TERMINAL_MCP_CONFIG"] = str(root / "config.yaml")
+    env["TERMINAL_MCP_BINDINGS_DB"] = str(tmp_path_factory.mktemp("mainpath-bindings") / "bindings.db")
+    env["TERMINAL_MCP_AUDIT_DB"] = str(tmp_path_factory.mktemp("mainpath-audit") / "audit.db")
+    env["TERMINAL_MCP_SUPERVISOR_DB"] = str(tmp_path_factory.mktemp("mainpath-supervisor") / "supervisor.db")
+    launch = f"import terminal_mcp.server_http as m; m.HTTP_PORT = {port}; m.main()"
+    process = subprocess.Popen(
+        [sys.executable, "-c", launch], cwd=root, env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        import urllib.request
+
+        wait_for_port(HTTP_HOST, port)
+        with urllib.request.urlopen(f"http://{HTTP_HOST}:{port}/health/live", timeout=5) as resp:
+            assert resp.status == 200
+            assert json.loads(resp.read()) == {"status": "ok"}
+            # resp.headers (email.message.Message) is case-insensitive on
+            # .get() -- the middleware sends lowercase header names, an
+            # HTTP client is free to send/report any case, so look up via
+            # the object itself rather than a plain dict (which would lose
+            # that case-insensitivity).
+            request_id = resp.headers.get("X-Request-Id")
+            csp = resp.headers.get("Content-Security-Policy", "")
+            nosniff = resp.headers.get("X-Content-Type-Options")
+            referrer_policy = resp.headers.get("Referrer-Policy")
+        assert request_id and len(request_id) >= 8
+        assert "default-src 'self'" in csp
+        assert nosniff == "nosniff"
+        assert referrer_policy == "no-referrer"
+
+        # A caller-supplied request id is forwarded, not replaced.
+        req = urllib.request.Request(f"http://{HTTP_HOST}:{port}/version", headers={"X-Request-Id": "e2e-fixed-id"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.headers.get("X-Request-Id") == "e2e-fixed-id"
+
+        assert process.poll() is None
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
