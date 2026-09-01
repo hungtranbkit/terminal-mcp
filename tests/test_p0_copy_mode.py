@@ -17,6 +17,7 @@ from terminal_mcp.bindings import BindingStore
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig
 from terminal_mcp.core import TerminalService
 from terminal_mcp.grants import SessionGrantStore
+from terminal_mcp.lease import PaneLeaseStore
 
 
 def _service(tmp_path) -> TerminalService:
@@ -27,6 +28,7 @@ def _service(tmp_path) -> TerminalService:
     return TerminalService(
         config, audit=AuditStore(tmp_path / "audit.db"),
         bindings=BindingStore(tmp_path / "bindings.db"), grants=SessionGrantStore(tmp_path / "grants.db"),
+        leases=PaneLeaseStore(tmp_path / "leases.db"),
     )
 
 
@@ -149,3 +151,78 @@ def test_not_in_copy_mode_is_completely_unaffected(tmux_session_factory, tmp_pat
     result = service.terminal_send_text(session, "normal-send", press_enter=True)
     assert result["delivery_state"] == "SUBMIT_CONFIRMED"
     assert "error" not in result
+
+
+def test_explicit_exit_copy_mode_then_real_send_reaches_program(tmux_session_factory, tmp_path):
+    session = tmux_session_factory("test-copymode-explicit", "bash -lc 'read v; echo GOT=$v; sleep 20'")
+    time.sleep(0.2)
+    service = _service(tmp_path)
+    _enter_copy_mode(session)
+
+    blocked = service.terminal_send_text(session, "explicit-flow", press_enter=True)
+    assert blocked["error"] == "PANE_IN_COPY_MODE"
+    exited = service.terminal_exit_copy_mode(session=session)
+    assert exited["status"] == "COPY_MODE_EXITED"
+    assert exited["copy_mode_exited"] is True
+    assert service.tmux.get_session(session).pane_in_mode is False
+
+    sent = service.terminal_send_text(session, "explicit-flow", press_enter=True)
+    assert sent["delivery_state"] == "SUBMIT_CONFIRMED"
+    time.sleep(0.2)
+    assert "GOT=explicit-flow" in service.terminal_tail(session, 20)["output"]
+    events = service.terminal_list_input_audit(session=session)["events"]
+    exit_event = next(e for e in events if e["action"] == "exit_copy_mode")
+    assert exit_event["result"] == "SUCCEEDED"
+    assert exit_event["preview"] is None
+
+
+def test_exit_copy_mode_by_pinned_binding(tmux_session_factory, tmp_path):
+    session = tmux_session_factory("test-copymode-bound-exit", "bash -lc 'sleep 20'")
+    time.sleep(0.2)
+    service = _service(tmp_path)
+    assert "error" not in service.terminal_bind("copy-exit", session, input_enabled=True)
+    _enter_copy_mode(session)
+    result = service.terminal_exit_copy_mode(binding="copy-exit")
+    assert result["binding"] == "copy-exit"
+    assert result["status"] == "COPY_MODE_EXITED"
+    assert service.tmux.get_session(session).pane_in_mode is False
+
+
+def test_exit_copy_mode_not_in_mode_is_audited_noop(tmux_session_factory, tmp_path):
+    session = tmux_session_factory("test-copymode-noop", "bash -lc 'sleep 20'")
+    time.sleep(0.2)
+    service = _service(tmp_path)
+    result = service.terminal_exit_copy_mode(session=session)
+    assert result == {"session": session, "copy_mode_exited": False, "status": "NOT_IN_COPY_MODE"}
+    event = service.terminal_list_input_audit(session=session)["events"][0]
+    assert event["action"] == "exit_copy_mode"
+    assert event["result"] == "NOOP"
+
+
+def test_exit_copy_mode_denies_forbidden_session_and_binding(tmux_session_factory, tmp_path):
+    service = _service(tmp_path)
+    forbidden = tmux_session_factory("private-copy-mode", "bash -lc 'sleep 20'")
+    time.sleep(0.2)
+    _enter_copy_mode(forbidden)
+    assert service.terminal_exit_copy_mode(session=forbidden)["error"] == "ACCESS_DENIED"
+    assert service.terminal_exit_copy_mode(binding="missing-binding")["error"] == "BINDING_NOT_FOUND"
+
+    allowed = tmux_session_factory("test-copy-disabled-binding", "bash -lc 'sleep 20'")
+    time.sleep(0.2)
+    assert "error" not in service.terminal_bind("copy-disabled", allowed, input_enabled=False)
+    _enter_copy_mode(allowed)
+    assert service.terminal_exit_copy_mode(binding="copy-disabled")["error"] == "BINDING_INPUT_DISABLED"
+
+
+def test_exit_copy_mode_stale_binding_and_missing_session_fail_safe(tmux_session_factory, tmp_path):
+    service = _service(tmp_path)
+    session = tmux_session_factory("test-copy-stale", "bash -lc 'sleep 20'")
+    time.sleep(0.2)
+    assert "error" not in service.terminal_bind("copy-stale", session, input_enabled=True)
+    subprocess.run(["tmux", "kill-session", "-t", session], check=True)
+    subprocess.run(["tmux", "new-session", "-d", "-s", session, "bash -lc 'sleep 20'"], check=True)
+    time.sleep(0.2)
+    _enter_copy_mode(session)
+    assert service.terminal_exit_copy_mode(binding="copy-stale")["error"] == "IDENTITY_MISMATCH"
+    subprocess.run(["tmux", "kill-session", "-t", session], check=True)
+    assert service.terminal_exit_copy_mode(session=session)["error"] == "SESSION_NOT_FOUND"

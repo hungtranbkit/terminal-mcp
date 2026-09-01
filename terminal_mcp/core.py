@@ -892,6 +892,120 @@ class TerminalService:
         finally:
             self.leases.release(lock_key, correlation_id)
 
+    def terminal_exit_copy_mode(self, *, session: str | None = None,
+                                binding: str | None = None) -> dict[str, Any]:
+        """Explicitly cancel tmux copy-mode for one authorized target.
+
+        This is intentionally separate from terminal_send_text/send_keys:
+        input remains blocked while an operator is scrolling/searching, and
+        a caller must explicitly request this state-changing tmux operation.
+        No key is ever written to the underlying pane PTY.
+        """
+        action = "exit_copy_mode"
+        if (session is None) == (binding is None):
+            response = {"error": "EXACTLY_ONE_TARGET_REQUIRED"}
+            return self._audit_result(response, action=action, session=session, binding=binding)
+
+        stored = None
+        if binding is not None:
+            stored, error = self._resolve_binding(binding)
+            if error:
+                return self._audit_result(error, action=action, session=error.get("session"), binding=binding)
+            session = stored.session
+            if not stored.input_enabled:
+                response = {"error": "BINDING_INPUT_DISABLED", "binding": binding, "session": session}
+                return self._audit_result(response, action=action, session=session, binding=binding)
+
+        if (permission_error := require_input(self.config)) is not None:
+            response = {"error": permission_error, "session": session}
+            if binding is not None:
+                response["binding"] = binding
+            return self._audit_result(response, action=action, session=session, binding=binding)
+        authorized, specific_error = self._input_authorized(session)
+        if not authorized:
+            response = {"error": specific_error or "ACCESS_DENIED", "session": session}
+            if binding is not None:
+                response["binding"] = binding
+            return self._audit_result(response, action=action, session=session, binding=binding)
+
+        try:
+            info = self.tmux.get_session(session)
+        except TmuxError as exc:
+            response = {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
+            return self._audit_result(response, action=action, session=session, binding=binding)
+        if info is None:
+            response = {"error": "SESSION_NOT_FOUND", "session": session}
+            return self._audit_result(response, action=action, session=session, binding=binding)
+        identity = SessionIdentity.from_session_info(info)
+
+        if stored is not None and (identity_error := self._check_binding_identity(binding, stored)) is not None:
+            return self._audit_result(identity_error, action=action, session=session, binding=binding)
+        command = info.pane_current_command.casefold()
+        allowed_sensitive = {item.casefold() for item in self.config.input_policy.allowed_sensitive_commands}
+        if command in SENSITIVE_COMMANDS and command not in allowed_sensitive:
+            response = {"error": "SENSITIVE_TARGET", "session": session, "current_command": command}
+            return self._audit_result(response, action=action, session=session, binding=binding)
+        if not info.pane_in_mode:
+            response = {"session": session, "copy_mode_exited": False, "status": "NOT_IN_COPY_MODE"}
+            if binding is not None:
+                response["binding"] = binding
+            self.audit.record(action=action, binding=binding, session=session, result="NOOP",
+                              reason="NOT_IN_COPY_MODE", source_transport="mcp")
+            return response
+
+        lock_key = f"{identity.session_id}:{identity.pane_id}"
+        correlation_id = uuid.uuid4().hex
+        if not self._acquire_pane_lease(lock_key, correlation_id):
+            response = {"error": "PANE_BUSY", "session": session, "correlation_id": correlation_id,
+                        "reason": "another process is currently holding the send lease for this pane"}
+            return self._audit_result(response, action=action, session=session, binding=binding)
+        try:
+            with self._pane_locks.get(lock_key):
+                current = self.tmux.get_session(session)
+                current_identity = None if current is None else SessionIdentity.from_session_info(current)
+                if current_identity is None or not identity.matches(current_identity):
+                    response = {"error": "IDENTITY_MISMATCH", "session": session,
+                                "reason": "the session/pane changed before copy-mode could be cancelled",
+                                "correlation_id": correlation_id}
+                    return self._audit_result(response, action=action, session=session, binding=binding)
+                if not current.pane_in_mode:
+                    response = {"session": session, "copy_mode_exited": False,
+                                "status": "NOT_IN_COPY_MODE", "correlation_id": correlation_id}
+                    if binding is not None:
+                        response["binding"] = binding
+                    self.audit.record(action=action, binding=binding, session=session, result="NOOP",
+                                      reason="NOT_IN_COPY_MODE", source_transport="mcp",
+                                      correlation_id=correlation_id)
+                    return response
+
+                self.tmux.exit_copy_mode(session)
+                after = self.tmux.get_session(session)
+                after_identity = None if after is None else SessionIdentity.from_session_info(after)
+                if after_identity is None or not identity.matches(after_identity):
+                    response = {"error": "IDENTITY_MISMATCH", "session": session,
+                                "reason": "the session/pane changed while copy-mode was being cancelled",
+                                "correlation_id": correlation_id}
+                    return self._audit_result(response, action=action, session=session, binding=binding)
+                if after.pane_in_mode:
+                    response = {"error": "COPY_MODE_EXIT_FAILED", "session": session,
+                                "reason": "tmux accepted cancel but the pane remains in copy-mode",
+                                "correlation_id": correlation_id}
+                    return self._audit_result(response, action=action, session=session, binding=binding)
+                response = {"session": session, "copy_mode_exited": True,
+                            "status": "COPY_MODE_EXITED", "correlation_id": correlation_id}
+                if binding is not None:
+                    response["binding"] = binding
+                self.audit.record(action=action, binding=binding, session=session, result="SUCCEEDED",
+                                  reason="COPY_MODE_EXITED", source_transport="mcp",
+                                  correlation_id=correlation_id)
+                return response
+        except TmuxError as exc:
+            response = {"error": "COPY_MODE_EXIT_FAILED", "session": session,
+                        "reason": str(exc), "correlation_id": correlation_id}
+            return self._audit_result(response, action=action, session=session, binding=binding)
+        finally:
+            self.leases.release(lock_key, correlation_id)
+
     def _binding_result(self, binding: Binding) -> dict[str, Any]:
         # P0 HOTFIX: `allowed` here is bind-target authorization (static
         # whitelist OR an active read grant, via _bind_authorized) -- kept
@@ -1154,17 +1268,31 @@ class TerminalService:
             grant = grants_by_session.get(item.name)
             grant_read = bool(grant and grant.read_enabled)
             grant_input = bool(grant and grant.input_enabled)
-            sessions.append({
-                "name": item.name, "allowed": session_allowed(item.name, self.config), "attached": item.attached,
+            allowed = session_allowed(item.name, self.config)
+            effective_input = bool(
+                self.config.permissions.terminal_input
+                and self._input_authorized_with_grant(item.name, grant, revalidate_identity=False)[0]
+            )
+            row = {
+                "name": item.name, "allowed": allowed, "attached": item.attached,
                 "windows": item.windows, "created": iso_timestamp(item.created_epoch),
                 "activity": iso_timestamp(item.activity_epoch),
                 "grant": {"read_enabled": grant_read, "input_enabled": grant_input},
                 "effective_read": self._read_authorized_with_grant(item.name, grant),
-                "effective_input": bool(
-                    self.config.permissions.terminal_input
-                    and self._input_authorized_with_grant(item.name, grant, revalidate_identity=False)[0]
-                ),
-            })
+                "effective_input": effective_input,
+            }
+            # UX gap fix: an operator needs to know WHY the input-grant
+            # control is (or would be) blocked, not just that it is --
+            # only computed when it's actually relevant (statically input-
+            # whitelisted sessions are never grant-blocked; a session
+            # already effectively input-capable has nothing to explain).
+            # Reuses item.pane_current_command already fetched by this
+            # same list_sessions() call -- no extra per-session tmux
+            # round-trip, same N+1 discipline as the rest of this route.
+            if not allowed and not effective_input:
+                row["input_block_reason"] = self._input_grant_block_reason(
+                    item.name, pane_current_command=item.pane_current_command)
+            sessions.append(row)
         return {"sessions": sessions}
 
     def grant_session_read(self, session: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
@@ -1183,6 +1311,47 @@ class TerminalService:
                 return {"error": "SESSION_NOT_FOUND", "session": session}
         grant = self.grants.set_read(session, enabled, granted_by=granted_by)
         return {"session": session, "read_enabled": grant.read_enabled, "input_enabled": grant.input_enabled}
+
+    def _input_grant_block_reason(self, session: str, *, pane_current_command: str | None = None) -> str | None:
+        """Read-only superset of the eligibility checks grant_session_
+        input's enable=True branch enforces before actually mutating --
+        factored out so the dashboard can tell an operator WHY input
+        can't (yet) be granted for a session, using the exact same
+        decision grant_session_input itself would make, never a second,
+        possibly-divergent copy of this logic (the "keep dashboard
+        permission calculations consistent" requirement this exists for).
+        Returns None if input could be granted for this session right now
+        (independent of whether read is already granted -- callers that
+        care about that ordering check it separately, same as
+        grant_session_input does).
+
+        `pane_current_command`: pass this to skip this call's own tmux
+        round-trip when the caller already has fresh SessionInfo for
+        every session in one listing pass (dashboard_list_sessions) --
+        omit it (the default) to have this look the session up itself,
+        which then also doubles as the SESSION_NOT_FOUND check a single-
+        session caller (grant_session_input) needs anyway."""
+        if (error := require_input(self.config)) is not None:
+            return error
+        if not valid_session_name(session):
+            return "INVALID_SESSION"
+        if any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS):
+            return "SENSITIVE_SESSION_NOT_GRANTABLE"
+        if session_input_denied_by_pattern(session, self.config):
+            return "ACCESS_DENIED"
+        if pane_current_command is None:
+            try:
+                info = self.tmux.get_session(session)
+            except TmuxError:
+                return "SESSION_NOT_FOUND"
+            if info is None:
+                return "SESSION_NOT_FOUND"
+            pane_current_command = info.pane_current_command
+        command = pane_current_command.casefold()
+        allowed_sensitive = {item.casefold() for item in self.config.input_policy.allowed_sensitive_commands}
+        if command in SENSITIVE_COMMANDS and command not in allowed_sensitive:
+            return "SENSITIVE_TARGET"
+        return None
 
     def grant_session_input(self, session: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
         """Read must already be granted -- enforced by SessionGrantStore.
@@ -1203,20 +1372,14 @@ class TerminalService:
         if not enabled:
             grant = self.grants.set_input(session, False, granted_by=granted_by)
             return {"session": session, "read_enabled": grant.read_enabled, "input_enabled": grant.input_enabled}
-        if any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS):
-            return {"error": "SENSITIVE_SESSION_NOT_GRANTABLE", "session": session}
-        if session_input_denied_by_pattern(session, self.config):
-            return {"error": "ACCESS_DENIED", "session": session}
+        if (reason := self._input_grant_block_reason(session)) is not None:
+            return {"error": reason, "session": session}
         try:
             info = self.tmux.get_session(session)
         except TmuxError as exc:
             return {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
-        if info is None:
+        if info is None:  # vanished between the check above and here
             return {"error": "SESSION_NOT_FOUND", "session": session}
-        command = info.pane_current_command.casefold()
-        allowed_sensitive = {item.casefold() for item in self.config.input_policy.allowed_sensitive_commands}
-        if command in SENSITIVE_COMMANDS and command not in allowed_sensitive:
-            return {"error": "SENSITIVE_TARGET", "session": session, "current_command": command}
         grant = self.grants.set_input(session, True, granted_by=granted_by,
                                       pinned_session_id=info.session_id, pinned_pane_id=info.pane_id,
                                       pinned_created_epoch=info.created_epoch)

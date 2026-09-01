@@ -89,6 +89,17 @@ def build_mcp(service: TerminalService | None = None,
         return terminal.terminal_send_keys(session, keys, confirm_sensitive)
 
     @server.tool()
+    def terminal_exit_copy_mode(session: str | None = None,
+                                binding: str | None = None) -> dict:
+        """Explicitly exit tmux copy-mode for exactly one authorized session
+        or input-enabled binding. This executes only tmux's mode command
+        ``send-keys -X cancel``; it never sends q, Escape, or any arbitrary
+        key to the underlying program. Returns NOT_IN_COPY_MODE as a no-op
+        when no mode is active. Ordinary input remains blocked with
+        PANE_IN_COPY_MODE until this tool is called explicitly."""
+        return terminal.terminal_exit_copy_mode(session=session, binding=binding)
+
+    @server.tool()
     def terminal_bind(binding: str, session: str, replace: bool = False,
                       read_enabled: bool = True, input_enabled: bool = False) -> dict:
         """Persist a logical binding to an existing, allowed tmux session."""

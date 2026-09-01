@@ -164,6 +164,8 @@ DASHBOARD_HTML = """<!doctype html>
     #grantBar { display:flex; align-items:center; gap:8px; padding:8px 16px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); flex-wrap:wrap }
     #grantBar button { background:#2b3f66; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:6px 12px; cursor:pointer; font:inherit; font-size:12px }
     #grantBar button.revoke { background:#3a2430 }
+    #grantBar button:disabled { opacity:.5; cursor:not-allowed }
+    #grantBar .block-reason { color:#ff9f9f; font-size:11px }
     .lock-badge { background:#3a2430; color:#ff9f9f; border-radius:4px; padding:1px 6px; font-size:10px; margin-left:6px; vertical-align:middle }
     /* Matched on EITHER dimension, not just width: a phone rotated to
        landscape can easily exceed 760px of width (e.g. 852px on an iPhone
@@ -915,6 +917,20 @@ DASHBOARD_HTML = """<!doctype html>
     // Built with createElement/textContent only, same no-raw-HTML posture
     // as the rest of this file (see the supervisor panel's own comment on
     // this above).
+    // Human-facing labels for the same reason codes grant_session_input/
+    // _input_grant_block_reason already return -- purely a display
+    // mapping, never a second copy of the actual authorization decision
+    // (that stays server-side, computed exactly once, in core.py).
+    const INPUT_BLOCK_LABELS = {
+      INPUT_DISABLED: 'nhập liệu đang tắt toàn cục (permissions.terminal_input trong config.yaml)',
+      ACCESS_DENIED: 'tên session khớp một mẫu bị cấm (input_policy.denied_session_patterns)',
+      SENSITIVE_TARGET: 'lệnh đang chạy trong session là mục tiêu nhạy cảm (ssh/mysql/psql/sudo/passwd)',
+      SENSITIVE_SESSION_NOT_GRANTABLE: 'tên session chứa từ nhạy cảm (root/ssh/password/secret/database)',
+      SESSION_NOT_FOUND: 'session tmux này không còn tồn tại',
+      INVALID_SESSION: 'tên session không hợp lệ',
+    };
+    function inputBlockLabel(reason) { return INPUT_BLOCK_LABELS[reason] || reason; }
+
     async function postGrant(path, name, enabled) {
       const response = await fetch(path, {
         method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -925,32 +941,73 @@ DASHBOARD_HTML = """<!doctype html>
         setInputNote(`${enabled ? 'Cấp' : 'Thu hồi'} quyền thất bại: ${clean(data.error)}`, false);
       }
       await loadSessions(); await loadDetail();
+      return data;
     }
-    function renderGrantBar(name, allowed, grant, restricted) {
+    // "Discover session -> enable Xem output and Gửi prompt in one clear
+    // UI" -- reuses the two existing grant endpoints back to back behind
+    // one click rather than adding a combined mutation endpoint (no
+    // parallel permissions model). If the read grant itself fails, stop
+    // there -- postGrant already surfaced why, and there is nothing valid
+    // to follow it with.
+    async function grantReadAndInput(name) {
+      const readResult = await postGrant('/dashboard/api/session/grant-read', name, true);
+      if (readResult && readResult.error) return;
+      await postGrant('/dashboard/api/session/grant-input', name, true);
+    }
+    function renderGrantBar(name, allowed, grant, restricted, inputBlockReason) {
       grantBarEl.replaceChildren();
       if (allowed) { grantBarEl.hidden = true; return; } // statically whitelisted -- nothing to grant/revoke, ever
       grantBarEl.hidden = false;
+      const readOn = Boolean(grant && grant.read_enabled);
+      const inputOn = Boolean(grant && grant.input_enabled);
+
       const label = document.createElement('span');
-      label.textContent = restricted
-        ? 'Session này chưa được cấp quyền.'
-        : (grant && grant.input_enabled ? 'Đã cấp quyền xem + nhập liệu.' : 'Đã cấp quyền xem output.');
+      label.textContent = restricted ? 'Session này chưa được cấp quyền.'
+        : (inputOn ? 'Đã cấp quyền xem + nhập liệu.' : 'Đã cấp quyền xem output.');
       grantBarEl.append(label);
-      if (restricted || !(grant && grant.read_enabled)) {
-        const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = 'Cho phép xem output';
-        btn.onclick = () => postGrant('/dashboard/api/session/grant-read', name, true);
-        grantBarEl.append(btn);
-        return; // input controls make no sense before read is granted
-      }
-      const revokeReadBtn = document.createElement('button'); revokeReadBtn.type = 'button'; revokeReadBtn.className = 'revoke';
-      revokeReadBtn.textContent = 'Thu hồi quyền xem'; revokeReadBtn.onclick = () => postGrant('/dashboard/api/session/grant-read', name, false);
-      if (grant && grant.input_enabled) {
-        const revokeInputBtn = document.createElement('button'); revokeInputBtn.type = 'button'; revokeInputBtn.className = 'revoke';
-        revokeInputBtn.textContent = 'Thu hồi quyền nhập liệu'; revokeInputBtn.onclick = () => postGrant('/dashboard/api/session/grant-input', name, false);
-        grantBarEl.append(revokeInputBtn, revokeReadBtn);
+
+      // Xem output -- always the first, plain toggle.
+      const readBtn = document.createElement('button'); readBtn.type = 'button';
+      if (readOn) {
+        readBtn.className = 'revoke'; readBtn.textContent = '👁 Thu hồi quyền xem';
+        readBtn.onclick = () => postGrant('/dashboard/api/session/grant-read', name, false);
       } else {
-        const grantInputBtn = document.createElement('button'); grantInputBtn.type = 'button';
-        grantInputBtn.textContent = 'Cho phép nhập liệu'; grantInputBtn.onclick = () => postGrant('/dashboard/api/session/grant-input', name, true);
-        grantBarEl.append(grantInputBtn, revokeReadBtn);
+        readBtn.textContent = '👁 Cho phép xem output';
+        readBtn.onclick = () => postGrant('/dashboard/api/session/grant-read', name, true);
+      }
+      grantBarEl.append(readBtn);
+
+      // Gửi prompt -- ALWAYS rendered beside the read control, from the
+      // very first time a never-granted session is opened, per the
+      // explicit "obvious per-session input permission control beside
+      // read access" request -- never appearing only after a first,
+      // separate read-grant click/reload.
+      const inputBtn = document.createElement('button'); inputBtn.type = 'button';
+      if (inputOn) {
+        inputBtn.className = 'revoke'; inputBtn.textContent = '⌨ Thu hồi quyền gửi prompt';
+        inputBtn.onclick = () => postGrant('/dashboard/api/session/grant-input', name, false);
+      } else if (inputBlockReason) {
+        // Granting read alone must never look like it silently grants
+        // write -- shown, disabled, with the exact policy reason, rather
+        // than hidden (hidden would look like "not possible" instead of
+        // "blocked by this specific, named policy").
+        inputBtn.textContent = '⌨ Cho phép gửi prompt'; inputBtn.disabled = true;
+        inputBtn.title = `Bị chặn: ${inputBlockLabel(inputBlockReason)}`;
+      } else if (readOn) {
+        inputBtn.textContent = '⌨ Cho phép gửi prompt';
+        inputBtn.onclick = () => postGrant('/dashboard/api/session/grant-input', name, true);
+      } else {
+        // Read not granted yet either -- one click still grants both,
+        // read first then input, in the same visible action.
+        inputBtn.textContent = '⌨ Cho phép xem + gửi prompt';
+        inputBtn.onclick = () => grantReadAndInput(name);
+      }
+      grantBarEl.append(inputBtn);
+
+      if (inputBlockReason && !inputOn) {
+        const reasonEl = document.createElement('span'); reasonEl.className = 'block-reason';
+        reasonEl.textContent = `Gửi prompt bị chặn: ${inputBlockLabel(inputBlockReason)}`;
+        grantBarEl.append(reasonEl);
       }
     }
 
@@ -1033,7 +1090,7 @@ DASHBOARD_HTML = """<!doctype html>
           const placeholder = document.createElement('div'); placeholder.className = 'muted';
           placeholder.textContent = '🔒 Output bị khoá. Cấp quyền "xem output" bên dưới để xem nội dung session này.';
           outputEl.append(placeholder);
-          renderGrantBar(selected, false, null, true);
+          renderGrantBar(selected, false, null, true, data.input_block_reason || null);
         } else {
           summaryEl.textContent = `${data.error}: ${selected}`; outputEl.replaceChildren();
           grantBarEl.hidden = true;
@@ -1041,7 +1098,7 @@ DASHBOARD_HTML = """<!doctype html>
         inputAllowed = false; refreshInputControls(); refreshTermControls();
         return;
       }
-      renderGrantBar(selected, Boolean(data.allowed), data.grant || null, false);
+      renderGrantBar(selected, Boolean(data.allowed), data.grant || null, false, data.input_block_reason || null);
       summaryEl.replaceChildren();
       const strong = document.createElement('strong'); strong.textContent = selected + ' · ';
       // Session status (RUNNING / WAITING_INPUT / PLAN_APPROVAL / ... and its
@@ -1284,8 +1341,15 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if not session_allowed(name, terminal.config) and not (
             (grant := terminal.grants.get(name)) is not None and grant.read_enabled
         ):
-            return JSONResponse({"error": "READ_RESTRICTED", "session": name}, status_code=403,
-                                headers={"Cache-Control": "no-store"})
+            # Proactive, not just reactive: an operator opening a
+            # never-granted session sees up front whether input would ALSO
+            # be blocked by policy once read is granted, rather than only
+            # discovering it after a first click.
+            block_reason = await anyio.to_thread.run_sync(terminal._input_grant_block_reason, name)
+            return JSONResponse(
+                {"error": "READ_RESTRICTED", "session": name, "input_block_reason": block_reason},
+                status_code=403, headers={"Cache-Control": "no-store"},
+            )
         use_granted = not session_allowed(name, terminal.config)
         status_fn = terminal.terminal_status_granted if use_granted else terminal.terminal_status
         tail_fn = (lambda: terminal.terminal_tail_granted(name, ansi=True)) if use_granted \
@@ -1340,15 +1404,19 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             terminal.config.permissions.terminal_input
             and (input_session_allowed(name, terminal.config) or (grant is not None and grant.input_enabled))
         )
-        return JSONResponse(
-            {
-                "session": name, "status": status, "tail": tail, "input_allowed": input_allowed,
-                "allowed": session_allowed(name, terminal.config),
-                "grant": {"read_enabled": bool(grant and grant.read_enabled),
-                         "input_enabled": bool(grant and grant.input_enabled)},
-            },
-            headers={"Cache-Control": "no-store"},
-        )
+        allowed = session_allowed(name, terminal.config)
+        body = {
+            "session": name, "status": status, "tail": tail, "input_allowed": input_allowed,
+            "allowed": allowed,
+            "grant": {"read_enabled": bool(grant and grant.read_enabled),
+                     "input_enabled": bool(grant and grant.input_enabled)},
+        }
+        # Same UX-gap fix as dashboard_list_sessions: only relevant (and
+        # only computed) when there is actually something to explain.
+        if not allowed and not input_allowed:
+            body["input_block_reason"] = await anyio.to_thread.run_sync(
+                terminal._input_grant_block_reason, name)
+        return JSONResponse(body, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/session/input", methods=["POST"], include_in_schema=False)
     async def session_input(request: Request) -> JSONResponse:

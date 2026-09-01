@@ -13,6 +13,7 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_status",
         "terminal_send_text",
         "terminal_send_keys",
+        "terminal_exit_copy_mode",
         "terminal_bind",
         "terminal_get_binding",
         "terminal_list_bindings",

@@ -126,6 +126,18 @@ class TmuxClient:
         for key in keys:
             self._run(["send-keys", "-t", session, key])
 
+    def exit_copy_mode(self, session: str) -> None:
+        """Cancel tmux's active pane mode without writing a key to the PTY.
+
+        This deliberately uses tmux's ``-X cancel`` mode command rather
+        than sending ``q``/Escape (which could reach the underlying process
+        if the pane left copy-mode between observation and action).
+        Authorization, identity pinning, serialization, and post-action
+        verification live in TerminalService; this layer only exposes the
+        one narrowly-scoped tmux primitive.
+        """
+        self._run(["send-keys", "-t", session, "-X", "cancel"])
+
 
 def parse_session_line(line: str) -> SessionInfo:
     parts = line.split("|", 10)
@@ -153,4 +165,3 @@ def parse_session_line(line: str) -> SessionInfo:
 
 def iso_timestamp(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
-
