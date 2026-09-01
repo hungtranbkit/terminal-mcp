@@ -151,14 +151,33 @@ def build_mcp(service: TerminalService | None = None,
         fresh watch: no required verifiers (unaffected, current behavior).
         Omitted on a re-watch: whatever was already configured is left
         alone. Pass an explicit list (including []) to set or clear it."""
-        return supervisor.watch(binding, session, required_verifiers)
+        result = supervisor.watch(binding, session, required_verifiers)
+        # Safety hygiene, not a v1/v2 layering violation (only this wiring
+        # layer touches both): a watch_key is `kind:target`, and target is
+        # an operator-chosen, commonly-reused name (a tmux session gets
+        # recreated under the same name constantly). A brand-new watch
+        # (created=True) must never silently inherit a stale v2 policy --
+        # up to and including approved_auto_continue with a real template
+        # -- left behind by a PREVIOUS, unrelated watch that used the same
+        # name and was later deleted. A re-enable of a still-existing watch
+        # (created=False) is untouched: that's the normal "pause keeps its
+        # policy" flow.
+        if result.get("created") and "watch_key" in result:
+            supervisor_v2.purge_policy_for_watch_key(result["watch_key"])
+        return result
 
     @server.tool()
     def supervisor_unwatch(binding: str | None = None, session: str | None = None,
                            delete: bool = False) -> dict:
         """Disable (or, with delete=true, remove) a watch. Disabled watches stop
         polling until explicitly re-watched."""
-        return supervisor.unwatch(binding, session, delete)
+        result = supervisor.unwatch(binding, session, delete)
+        if delete and result.get("deleted") and "watch_key" in result:
+            # Same hygiene as supervisor_watch above -- a hard delete also
+            # purges any v2 policy immediately rather than leaving it to be
+            # discovered (and purged) only if/when the name is reused.
+            supervisor_v2.purge_policy_for_watch_key(result["watch_key"])
+        return result
 
     @server.tool()
     def supervisor_list_watches() -> dict:

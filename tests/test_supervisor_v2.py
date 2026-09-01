@@ -613,6 +613,87 @@ async def test_supervisor2_tools_full_pipeline_via_mcp(tmp_path, tmux_session_fa
     assert next(w for w in watches if w["target"] == session)["state"] == "VERIFIED_DONE"
 
 
+@pytest.mark.anyio
+async def test_deleted_watchs_auto_continue_policy_never_survives_to_a_reused_name(tmp_path, tmux_session_factory):
+    # Safety-hygiene regression, ahead of re-enabling v2_enabled in
+    # production: watch_key is `kind:target`, and `target` is an operator-
+    # chosen, commonly-REUSED name (a tmux session recreated under the same
+    # name is completely ordinary). A policy configured for one watch --
+    # up to and including approved_auto_continue with a real template --
+    # must never silently apply to a later, unrelated watch that happens to
+    # reuse the exact same name after the first one was deleted, without
+    # set_policy ever having been called for the new one.
+    from terminal_mcp.mcp_app import build_mcp
+
+    name = "test-v2-reused-name"
+    session = tmux_session_factory(name, "bash -lc 'sleep 30'")
+    time.sleep(0.2)
+    terminal = TerminalService(_config(), audit=AuditStore(tmp_path / "audit.db"))
+    store = SupervisorStore(tmp_path / "supervisor.db")
+    svc = SupervisorService(terminal, store)
+    v2 = build_supervisor_v2(svc)
+    server = build_mcp(terminal, svc, v2)
+
+    async def call(name_, **kwargs):
+        result = await server.call_tool(name_, kwargs)
+        if result.structured_content is not None:
+            return result.structured_content
+        import json
+        return json.loads(result.content[0].text)
+
+    await call("supervisor_watch", session=session)
+    policy = await call("supervisor2_set_policy", session=session,
+                        policy_mode="approved_auto_continue", approved_template="y")
+    assert policy["policy_mode"] == "approved_auto_continue"
+
+    deleted = await call("supervisor_unwatch", session=session, delete=True)
+    assert deleted["deleted"] is True
+
+    # A later watch reusing the exact same session name -- no set_policy
+    # call made for it at all -- must come back to the safe observe_only
+    # default, never inheriting the deleted watch's auto-send policy.
+    await call("supervisor_watch", session=session)
+    fresh_policy = await call("supervisor2_get_policy", session=session)
+    assert fresh_policy["policy_mode"] == "observe_only"
+    assert fresh_policy["approved_template"] is None
+
+
+@pytest.mark.anyio
+async def test_reenabling_a_still_existing_watch_keeps_its_policy(tmp_path, tmux_session_factory):
+    # The other half of the same fix: a plain disable/re-enable (never
+    # deleted) is the normal "pause, then resume" flow and must NOT purge
+    # the policy -- only a hard delete (or reuse of a name after one) does.
+    from terminal_mcp.mcp_app import build_mcp
+
+    session = tmux_session_factory("test-v2-pause-resume", "bash -lc 'sleep 30'")
+    time.sleep(0.2)
+    terminal = TerminalService(_config(), audit=AuditStore(tmp_path / "audit.db"))
+    store = SupervisorStore(tmp_path / "supervisor.db")
+    svc = SupervisorService(terminal, store)
+    v2 = build_supervisor_v2(svc)
+    server = build_mcp(terminal, svc, v2)
+
+    async def call(name_, **kwargs):
+        result = await server.call_tool(name_, kwargs)
+        if result.structured_content is not None:
+            return result.structured_content
+        import json
+        return json.loads(result.content[0].text)
+
+    await call("supervisor_watch", session=session)
+    await call("supervisor2_set_policy", session=session,
+              policy_mode="approved_auto_continue", approved_template="y")
+
+    disabled = await call("supervisor_unwatch", session=session)  # delete=False
+    assert disabled["disabled"] is True
+
+    resumed = await call("supervisor_watch", session=session)  # created is False -- re-enable
+    assert resumed["created"] is False
+    policy = await call("supervisor2_get_policy", session=session)
+    assert policy["policy_mode"] == "approved_auto_continue"
+    assert policy["approved_template"] == "y"
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"

@@ -234,6 +234,23 @@ class SupervisorV2Store:
             )
         return self.get_policy(key)
 
+    def delete_policy(self, key: str) -> bool:
+        """Purge a watch_key's policy row outright (not reset-to-default —
+        gone, so get_policy falls back to its safe observe_only default on
+        next read). watch_key is `kind:target`, and target is an operator-
+        chosen name (a tmux session name, a binding name) that regularly
+        gets reused -- without this, a policy configured for one watch
+        (up to and including approved_auto_continue with a real template)
+        would silently survive that watch being deleted and outlive it to
+        apply to a LATER, unrelated watch that happens to reuse the exact
+        same name, with no set_policy call ever made for it. Called on a
+        hard delete (supervisor_unwatch delete=True) and on brand-new watch
+        creation (never on a plain re-enable of a still-existing watch --
+        that's the normal "pause/resume keeps its policy" flow)."""
+        with self._connection() as connection:
+            cursor = connection.execute("DELETE FROM supervisor_policies WHERE watch_key = ?", (key,))
+        return cursor.rowcount > 0
+
     def _touch_policy_defaults(self, key: str) -> None:
         # Ensure a row exists before an UPDATE-only bookkeeping write (e.g.
         # incrementing no_progress_count) so that write isn't silently a no-op.
@@ -428,6 +445,16 @@ class SupervisorV2Service:
         if error:
             return error
         return self.store.get_policy(key)
+
+    def purge_policy_for_watch_key(self, key: str) -> bool:
+        """Internal wiring hook (called from mcp_app.py's supervisor_watch/
+        supervisor_unwatch tool wrappers, which see both v1 and v2 and are
+        the only layer allowed to bridge them -- v1's SupervisorService
+        itself must never depend on v2). Not a public MCP tool: nothing
+        about this is a decision an external caller should make directly,
+        it's bookkeeping that rides along with a v1 watch's own creation/
+        deletion. See SupervisorV2Store.delete_policy for why this exists."""
+        return self.store.delete_policy(key)
 
     # -- claim / decide / approve / send -----------------------------------
 
