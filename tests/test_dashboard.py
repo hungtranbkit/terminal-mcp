@@ -228,7 +228,7 @@ def test_dashboard_auto_selects_remembered_or_first_session_once():
     # auto-opened straight into a locked placeholder.
     assert "let autoSelectAttempted = false;" in DASHBOARD_HTML
     assert "if (!autoSelectAttempted) {" in DASHBOARD_HTML
-    assert "const readableRows = rows.filter(row => row.effective_read);" in DASHBOARD_HTML
+    assert "const readableRows = rows.filter(row => row.effective_read && !detachedSessions.has(row.name));" in DASHBOARD_HTML
     assert "if (!selected && readableRows.length) {" in DASHBOARD_HTML
     assert (
         "const target = (remembered && readableRows.some(row => row.name === remembered)) "
@@ -671,12 +671,13 @@ def test_dashboard_copy_uses_plain_text_never_ansi_markup():
 
 
 def test_dashboard_search_and_copy_do_not_persist_content():
-    # Only three lightweight UI preferences are ever written to localStorage
+    # Only four lightweight UI preferences are ever written to localStorage
     # anywhere in this file: the last-viewed session *name*, the font-size
-    # number, and the fullscreen on/off flag — never search terms, copied
-    # text, or any rendered output/session content.
+    # number, the fullscreen on/off flag, and the set of session *names*
+    # detached from the tab bar — never search terms, copied text, or any
+    # rendered output/session content.
     keys = set(re.findall(r"localStorage\.(?:setItem|getItem)\(([A-Za-z_]+)", DASHBOARD_HTML))
-    assert keys == {"LAST_SESSION_KEY", "FONT_SIZE_KEY", "FULLSCREEN_KEY"}
+    assert keys == {"LAST_SESSION_KEY", "FONT_SIZE_KEY", "FULLSCREEN_KEY", "DETACHED_KEY"}
 
 
 def test_dashboard_new_controls_disabled_without_a_selected_session():
@@ -748,15 +749,23 @@ def test_dashboard_auth_required_distinguished_from_offline():
     # 502/503/proxy-error page also is).
     assert "class AuthRequiredError extends Error {}" in DASHBOARD_HTML
     assert "async function fetchJSON(url, options)" in DASHBOARD_HTML
-    assert "hostname.endsWith('cloudflareaccess.com')" in DASHBOARD_HTML
+    # Exact-hostname or proper-subdomain match only -- a naive
+    # `.endsWith('cloudflareaccess.com')` would also match a lookalike host
+    # like "notcloudflareaccess.com".
+    assert "host === 'cloudflareaccess.com' || host.endsWith('.cloudflareaccess.com')" in DASHBOARD_HTML
     assert "response.status === 401" in DASHBOARD_HTML
     assert "function setAuthRequiredState()" in DASHBOARD_HTML
     assert "SIGN-IN REQUIRED" in DASHBOARD_HTML
     assert "if (error instanceof AuthRequiredError) { setAuthRequiredState(); }" in DASHBOARD_HTML
-    # Any other non-2xx/non-JSON response still falls through to a plain
-    # Error -- reported as OFFLINE (setConnectionState(false)), same as a
-    # real outage always has been, never assumed to be an auth problem.
-    assert "if (!response.ok || !contentType.includes('application/json'))" in DASHBOARD_HTML
+    # A non-JSON body still falls through to a plain Error -- reported as
+    # OFFLINE (setConnectionState(false)), same as a real outage always has
+    # been. Status code ALONE must never trigger this: this app's own
+    # routes legitimately answer denials (403 READ_RESTRICTED, etc) with a
+    # genuine JSON body, which every caller already reads via `data.error`
+    # -- treating a non-2xx JSON response as a hard failure here would
+    # break that entirely (a real regression caught live before shipping).
+    assert "if (!contentType.includes('application/json'))" in DASHBOARD_HTML
+    assert "!response.ok" not in DASHBOARD_HTML
     # Both loadSessions and loadDetail -- the two fetches every refresh()
     # cycle depends on for the health badge -- go through the wrapper.
     assert "await fetchJSON('/dashboard/api/sessions'" in DASHBOARD_HTML

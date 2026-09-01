@@ -167,6 +167,49 @@ DASHBOARD_HTML = """<!doctype html>
     #grantBar button.revoke { background:#3a2430 }
     #grantBar button:disabled { opacity:.5; cursor:not-allowed }
     #grantBar .block-reason { color:#ff9f9f; font-size:11px }
+    /* Browser-like session tabs -- always visible above output, one click
+       switches session (no sidebar-open step). A single, horizontally-
+       scrollable row (never wraps -- wrapping would push output down by a
+       variable amount every time the tab count changes); thin/overlay
+       scrollbar and touch-drag (`-webkit-overflow-scrolling`) so mobile
+       gets swipe for free from the platform, no custom JS needed. */
+    #sessionTabs {
+      display:flex; align-items:stretch; gap:2px; padding:4px 6px 0;
+      overflow-x:auto; overflow-y:hidden; scrollbar-width:thin; -webkit-overflow-scrolling:touch;
+      border-bottom:1px solid var(--line); background:var(--panel);
+    }
+    #sessionTabs:empty { display:none }
+    .session-tab {
+      display:flex; align-items:center; gap:6px; flex:0 0 auto; max-width:220px;
+      padding:7px 8px 7px 12px; border-radius:8px 8px 0 0; border:1px solid var(--line); border-bottom:none;
+      background:#0f1730; color:var(--muted); cursor:pointer; font-size:12px; white-space:nowrap; user-select:none;
+    }
+    .session-tab:hover { color:var(--text) }
+    .session-tab.active { background:var(--term-bg); color:var(--text); border-color:var(--line) }
+    .session-tab.needs-attention { border-color:var(--amber) }
+    .session-tab.needs-attention:not(.active) { background:rgba(255,200,87,.1) }
+    .session-tab .tab-name { overflow:hidden; text-overflow:ellipsis; max-width:150px }
+    .session-tab .tab-close {
+      flex:0 0 auto; width:16px; height:16px; line-height:16px; text-align:center; border-radius:4px;
+      color:var(--muted); font-size:12px; padding:0;
+    }
+    .session-tab .tab-close:hover { background:#3a2430; color:#ff9f9f }
+    .session-tab-add {
+      flex:0 0 auto; padding:7px 10px; border-radius:8px 8px 0 0; border:1px dashed var(--line);
+      background:transparent; color:var(--muted); cursor:pointer; font-size:14px; align-self:center;
+    }
+    .session-tab-add:hover { color:var(--text); border-color:var(--muted) }
+    #detachedMenu {
+      position:absolute; z-index:20; margin-top:4px; min-width:220px; max-width:320px; max-height:50vh; overflow:auto;
+      background:var(--panel); border:1px solid var(--line); border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.4);
+      padding:6px;
+    }
+    #detachedMenu button {
+      display:block; width:100%; text-align:left; background:transparent; border:none; color:var(--text);
+      padding:8px 10px; border-radius:6px; cursor:pointer; font:inherit; font-size:12px;
+    }
+    #detachedMenu button:hover { background:#19243b }
+    #detachedMenu .muted-item { color:var(--muted); padding:8px 10px; font-size:12px }
     .lock-badge { background:#3a2430; color:#ff9f9f; border-radius:4px; padding:1px 6px; font-size:10px; margin-left:6px; vertical-align:middle }
     /* Matched on EITHER dimension, not just width: a phone rotated to
        landscape can easily exceed 760px of width (e.g. 852px on an iPhone
@@ -185,6 +228,9 @@ DASHBOARD_HTML = """<!doctype html>
          desktop-sized versions. */
       header { padding:8px 12px; gap:8px }
       h1 { font-size:15px }
+      #sessionTabs { padding:3px 4px 0; gap:1px }
+      .session-tab { padding:6px 6px 6px 10px; font-size:11.5px; max-width:150px }
+      .session-tab .tab-name { max-width:100px }
       header .muted { font-size:10px; line-height:1.25 }
       header .live { font-size:11px }
       .header-right { gap:6px }
@@ -303,6 +349,7 @@ DASHBOARD_HTML = """<!doctype html>
   <main>
     <section class="panel" id="sessionsPanel"><div class="panel-title">SESSIONS <span id="count"></span></div><div id="sessions"></div></section>
     <section class="panel detail">
+      <div id="sessionTabs" class="session-tabs" role="tablist" aria-label="Sessions" hidden></div>
       <div id="summary" class="muted">Chọn một session để xem output.</div>
       <div id="grantBar" hidden></div>
       <div class="term">
@@ -355,7 +402,11 @@ DASHBOARD_HTML = """<!doctype html>
     let lastRenderedSession = null;
     let sidebarForcedOpen = false;
     let fullscreenTerminal = false;
+    let lastKnownRows = []; // the most recent /dashboard/api/sessions rows, for immediate tab re-render (see selectSession)
+    let loadDetailSequence = 0; // generation counter -- see loadDetail's own guard for why a session-name check alone isn't enough
+    let detachedMenuOpen = false;
     const sessionsEl = document.querySelector('#sessions');
+    const sessionTabsEl = document.querySelector('#sessionTabs');
     const outputEl = document.querySelector('#output');
     const summaryEl = document.querySelector('#summary');
     const grantBarEl = document.querySelector('#grantBar');
@@ -883,23 +934,52 @@ DASHBOARD_HTML = """<!doctype html>
     }
     async function sendInput() {
       if (!selected || !inputTextEl.value) return;
+      // Captured once, synchronously, before any await -- the explicit
+      // send target and its text must never drift to whatever session
+      // happens to be selected by the time the network round-trip
+      // finishes (the request body below already used `selected` this
+      // same way; this also fixes what happens to the UI AFTER the
+      // response comes back, which previously always assumed nothing had
+      // changed).
+      const targetSession = selected;
+      const sentText = inputTextEl.value;
       inputSendEl.disabled = true;
       try {
         const response = await fetch('/dashboard/api/session/input', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
-            name: selected, text: inputTextEl.value, press_enter: inputEnterEl.checked,
+            name: targetSession, text: sentText, press_enter: inputEnterEl.checked,
             idempotency_key: newIdempotencyKey(),
           }),
         });
         const data = await response.json();
-        if (data.error) { setInputNote(`${data.error}${data.reason ? ': ' + data.reason : ''}`, true); }
-        else { inputTextEl.value = ''; setInputNote(''); }
+        if (data.error) {
+          if (selected === targetSession) { setInputNote(`${data.error}${data.reason ? ': ' + data.reason : ''}`, true); }
+          // else: the user has since switched away from targetSession --
+          // an error for a now-invisible session must never paint onto
+          // whichever different tab is currently showing.
+        } else {
+          // Clear only the EXACT submitted text, never newer typing in the
+          // same session: the box stays editable while a send is in
+          // flight, so the user may already be composing their NEXT
+          // message by the time this response arrives -- wiping the box
+          // unconditionally would destroy that unsent work. Compare
+          // against what was actually sent before clearing either the
+          // live box (still on targetSession) or the stored draft
+          // (switched away and, less commonly, something already wrote a
+          // new draft for it while gone).
+          if (selected === targetSession) {
+            if (inputTextEl.value === sentText) { inputTextEl.value = ''; drafts.set(targetSession, ''); }
+            setInputNote('');
+          } else if (drafts.get(targetSession) === sentText) {
+            drafts.set(targetSession, '');
+          }
+        }
       } catch (error) {
-        setInputNote('Không thể gửi: ' + error, true);
+        if (selected === targetSession) { setInputNote('Không thể gửi: ' + error, true); }
       } finally {
-        refreshInputControls();
-        await loadDetail();
+        refreshInputControls(); // always safe -- reflects whichever session is CURRENTLY selected
+        if (selected === targetSession) { await loadDetail(); }
       }
     }
     inputSendEl.onclick = sendInput;
@@ -933,15 +1013,27 @@ DASHBOARD_HTML = """<!doctype html>
     function inputBlockLabel(reason) { return INPUT_BLOCK_LABELS[reason] || reason; }
 
     async function postGrant(path, name, enabled) {
+      // `name` is the explicit, captured-at-click mutation target (each
+      // button's own onclick closes over the specific session it was
+      // rendered for) -- the request itself was always correctly scoped.
+      // What was missing: a LATE result must not display error text as if
+      // it were about whatever session the user is looking at NOW, if
+      // they've since switched away from the one this mutation was for.
       const response = await fetch(path, {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({name, enabled}),
       });
       const data = await response.json().catch(() => ({}));
-      if (data && data.error) {
+      if (data && data.error && selected === name) {
         setInputNote(`${enabled ? 'Cấp' : 'Thu hồi'} quyền thất bại: ${clean(data.error)}`, false);
       }
-      await loadSessions(); await loadDetail();
+      await loadSessions();
+      // loadDetail() always refreshes whatever session is CURRENTLY
+      // selected (its own generation-sequence guard already ties it to
+      // that, never to this mutation's `name`) -- correct either way:
+      // same session, the grant change becomes visible; a different one,
+      // this mutation's result never touches its grantBar/output at all.
+      await loadDetail();
       return data;
     }
     // "Discover session -> enable Xem output and Gửi prompt in one clear
@@ -1012,14 +1104,50 @@ DASHBOARD_HTML = """<!doctype html>
       }
     }
 
-    // Shared by a manual click and the on-load auto-select below so both
-    // apply the exact same side effects (auto-follow reset, drawer close,
-    // input-control refresh, and persisting the choice for next visit).
+    // Per-session unsent-draft text -- session-switch/detach race fix:
+    // the single shared #inputText box previously kept whatever was typed
+    // for the PREVIOUS session visible (and editable, and sendable) under
+    // a newly-selected, unrelated session. In-memory only (not persisted
+    // across a reload -- the box itself never was, either, before this).
+    const drafts = new Map();
+
+    // Shared by a manual click, a tab click, and the on-load auto-select
+    // below so all three apply the exact same side effects (auto-follow
+    // reset, drawer close, input-control refresh, and persisting the
+    // choice for next visit).
     function selectSession(name) {
+      // Re-selecting the ALREADY-active tab (clicking it again, or a
+      // redundant programmatic call) must be a complete no-op: it must
+      // never overwrite an in-progress, not-yet-saved draft with the
+      // last-saved value for the same session, and must never reset
+      // auto-follow/scroll/search state the user hasn't actually left.
+      if (selected === name) return;
+      if (selected) { drafts.set(selected, inputTextEl.value); }
       selected = name; inputAllowed = false; sidebarForcedOpen = false; // opening a session always closes the mobile drawer again
+      inputTextEl.value = drafts.get(name) || '';
+      // The previous session's output must never remain visible under the
+      // new session's name while its own detail fetch is still in flight
+      // (a tab click must not have to wait for the next 5s poll either).
+      summaryEl.textContent = name; outputEl.replaceChildren();
+      const loading = document.createElement('div'); loading.className = 'muted'; loading.textContent = 'Đang tải…';
+      outputEl.appendChild(loading);
+      // The previous session's grant controls (and their read/input-
+      // enabled labeling) must never remain visible/clickable under the
+      // new session's name either -- hidden until this target's own
+      // detail arrives and renderGrantBar repaints it for real.
+      grantBarEl.hidden = true; grantBarEl.replaceChildren();
       setAutoFollow(true); refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
       rememberSession(name);
       closeSearch(); // a search from a different session's content wouldn't make sense to keep open
+      renderSessionTabs(lastKnownRows); // reflect the new active tab immediately, not just on the next 5s poll
+      // Fire immediately; loadDetail's own generation-sequence guard (see
+      // below) discards this if the user switches again before it
+      // resolves. A rejected fetch here is swallowed deliberately -- the
+      // ordinary 5s poll (refresh()'s own try/catch) is what surfaces a
+      // genuine OFFLINE/SIGN-IN-REQUIRED state; this one-off call must
+      // never throw unhandled just because a click happened to race a
+      // real outage.
+      loadDetail().catch(() => {});
     }
 
     // URGENT incident fix: an expired Cloudflare Access browser session
@@ -1039,42 +1167,262 @@ DASHBOARD_HTML = """<!doctype html>
     // nginx/proxy error page, or any other real backend failure is also
     // non-JSON, and mislabeling those as "sign in again" would send an
     // operator chasing the wrong fix for an actual outage. Every other
-    // non-2xx/non-JSON/network/timeout failure still falls through to the
+    // non-JSON/network/timeout failure still falls through to the
     // existing generic Error path below -- reported as OFFLINE, exactly
-    // as before this fix, never silently swallowed either way.
+    // as before this fix, never silently swallowed either way. A non-2xx
+    // status with a genuine JSON body is NOT treated as a failure here at
+    // all -- this app's own routes legitimately answer denials that way
+    // (403 READ_RESTRICTED, etc), and every caller already reads
+    // `data.error` itself; only the response's CONTENT determines
+    // success/failure at this layer, never its status code alone.
     class AuthRequiredError extends Error {}
     async function fetchJSON(url, options) {
       const response = await fetch(url, options);
       let landedOnAccessLogin = false;
       if (response.redirected) {
-        try { landedOnAccessLogin = new URL(response.url).hostname.endsWith('cloudflareaccess.com'); }
+        try {
+          const host = new URL(response.url).hostname;
+          landedOnAccessLogin = host === 'cloudflareaccess.com' || host.endsWith('.cloudflareaccess.com');
+        }
         catch (error) { /* response.url malformed/opaque -- fall through to the other signals below */ }
       }
       const accessChallengeHeader = (response.headers.get('www-authenticate') || '').includes('Cloudflare-Access');
       if (landedOnAccessLogin || accessChallengeHeader || response.status === 401) {
         throw new AuthRequiredError(`sign-in required for ${url} (status ${response.status})`);
       }
+      // Status code alone is NOT the signal for "this is a real failure":
+      // this app's own routes legitimately answer with a non-2xx status
+      // (403 READ_RESTRICTED/ACCESS_DENIED, 400 INVALID_SESSION, ...) as
+      // their NORMAL, documented way of reporting a denial -- the JSON
+      // body itself (an `{"error": ...}` payload) is the actual data every
+      // caller here (loadSessions/loadDetail/postGrant/...) already reads
+      // and handles via `data.error`. This does NOT mean "any status
+      // succeeds", though: this app's own routes never intentionally
+      // answer with a 5xx (checked -- every status_code= in this file is
+      // 200/400/403/404), so a 5xx is unconditionally a genuine failure
+      // regardless of its body -- a JSON envelope on a 500 (a generic
+      // framework error page, say) must still be reported as a real
+      // failure, never silently parsed as if it were valid application
+      // data with an empty/happy shape.
+      if (response.status >= 500) {
+        throw new Error(`server error from ${url}: status ${response.status}`);
+      }
+      // Only a body that ISN'T JSON at all (a proxy/gateway error page, an
+      // nginx 502, etc, regardless of status code) is treated as a real,
+      // generic failure past this point.
       const contentType = response.headers.get('content-type') || '';
-      if (!response.ok || !contentType.includes('application/json')) {
+      if (!contentType.includes('application/json')) {
         throw new Error(`unexpected response from ${url}: status ${response.status}, `
           + `content-type ${contentType || '(none)'}`);
       }
       return response.json();
     }
 
+    // Detach = reversible remove/hide the session's TAB from this browser's
+    // view only -- never kill-session, never clear its history/input,
+    // never revoke any grant, never disconnect another client attached to
+    // it. Scoped to THIS browser via localStorage (same storage class the
+    // remembered-session/fullscreen preferences above already use); a
+    // detached session is still fully visible/selectable from the
+    // sidebar's own full session list (which never hides anything, and
+    // never auto-detaches by name/pattern -- selecting it there
+    // reattaches it, same as the "+" menu below), so it is never actually
+    // lost, only out of the tab row until brought back.
+    const DETACHED_KEY = 'terminal-mcp:detached-sessions';
+    function loadDetached() {
+      try { return new Set(JSON.parse(localStorage.getItem(DETACHED_KEY) || '[]')); }
+      catch (error) { return new Set(); }
+    }
+    function saveDetached(set) {
+      try { localStorage.setItem(DETACHED_KEY, JSON.stringify([...set])); }
+      catch (error) { /* private mode / storage disabled: not essential, ignore */ }
+    }
+    let detachedSessions = loadDetached(); // never pre-populated -- nothing is auto-detached by name or pattern, ever
+
+    function detachSession(name) {
+      // Save the outgoing draft explicitly, BEFORE `selected` changes --
+      // detaching must preserve it (reattaching later restores it) exactly
+      // like an ordinary tab switch does, never discard it.
+      if (selected === name) { drafts.set(name, inputTextEl.value); }
+      detachedSessions.add(name);
+      saveDetached(detachedSessions);
+      if (selected === name) {
+        // Move to a safe adjacent (still-attached) tab rather than leave
+        // `selected` pointing at a name that no longer has a tab.
+        const remaining = lastKnownRows.filter(row => !detachedSessions.has(row.name));
+        if (remaining.length) {
+          selectSession(remaining[0].name);
+        } else {
+          selected = null; inputAllowed = false;
+          refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
+          summaryEl.textContent = 'Tất cả session đã được gỡ khỏi tab. Bấm "+" hoặc chọn từ danh sách bên trái để mở lại.';
+          outputEl.replaceChildren(); grantBarEl.hidden = true;
+        }
+      }
+      renderSessionTabs(lastKnownRows);
+    }
+    function reattachSession(name) {
+      detachedSessions.delete(name);
+      saveDetached(detachedSessions);
+      closeDetachedMenu();
+      selectSession(name);
+    }
+    function closeDetachedMenu() {
+      detachedMenuOpen = false;
+      document.querySelector('#detachedMenu')?.remove();
+    }
+    function toggleDetachedMenu(anchorEl, rows) {
+      if (detachedMenuOpen) { closeDetachedMenu(); return; }
+      detachedMenuOpen = true;
+      const menu = document.createElement('div');
+      menu.id = 'detachedMenu';
+      const detachedRows = rows.filter(row => detachedSessions.has(row.name));
+      if (!detachedRows.length) {
+        const empty = document.createElement('div'); empty.className = 'muted-item';
+        empty.textContent = 'Không có session nào đã gỡ.'; menu.appendChild(empty);
+      } else {
+        for (const row of detachedRows) {
+          const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = `↩ ${row.name}`;
+          btn.onclick = () => reattachSession(row.name);
+          menu.appendChild(btn);
+        }
+      }
+      document.body.appendChild(menu);
+      const rect = anchorEl.getBoundingClientRect();
+      menu.style.left = `${Math.round(rect.left + window.scrollX)}px`;
+      menu.style.top = `${Math.round(rect.bottom + window.scrollY)}px`;
+      // One-shot outside-click close -- deferred to the next tick so the
+      // very click that opened the menu doesn't also immediately close it.
+      setTimeout(() => {
+        document.addEventListener('click', function handler(event) {
+          if (!menu.contains(event.target)) { closeDetachedMenu(); document.removeEventListener('click', handler); }
+        });
+      }, 0);
+    }
+
+    // Browser-like tabs: one click switches session (no sidebar-open step).
+    // Keyboard: each tab is a real <button> (native Tab-order + Enter/
+    // Space activation); Delete/Backspace while a tab is focused detaches
+    // it too, since the small "×" glyph alone is a poor keyboard target.
+    // Stable tab order, independent of the API's own attention/activity
+    // sort (rows arrive re-sorted on every poll -- looping them directly
+    // would reorder the tab row itself every 5s, which real browser tabs
+    // never do). A name already known keeps its position; a genuinely new
+    // one is appended once, in alphabetical position among other newcomers
+    // of the same poll (deterministic, never "wherever the API happened to
+    // rank it this cycle"). Detaching/reattaching never reorders either --
+    // it only changes which known names are currently visible.
+    let tabOrder = [];
+    // name -> {tab, nameEl, closeBtn} -- cached across renders so an
+    // unchanged tab set patches in place (active/attention class only)
+    // instead of destroying and recreating every DOM node, which would
+    // otherwise reset horizontal scroll position and steal keyboard focus
+    // away from whatever tab the user has focused, on every single poll.
+    let tabElements = new Map();
+    let lastRenderedTabOrder = null; // the exact visible (attached) ordered-name-list last painted, for the skip-rebuild check
+
+    function updateTabElement(tab, refs, row) {
+      const isActive = selected === row.name;
+      const needsAttention = row.state === 'WAITING_INPUT';
+      tab.className = 'session-tab' + (isActive ? ' active' : '') + (needsAttention ? ' needs-attention' : '');
+      tab.setAttribute('aria-selected', isActive ? 'true' : 'false');
+      refs.attnEl.hidden = !needsAttention;
+    }
+
+    function makeTab(row) {
+      const tab = document.createElement('button');
+      tab.type = 'button';
+      tab.setAttribute('role', 'tab');
+      const nameEl = document.createElement('span'); nameEl.className = 'tab-name'; nameEl.textContent = row.name;
+      tab.appendChild(nameEl);
+      const attnEl = document.createElement('span'); attnEl.textContent = '⚠'; attnEl.hidden = true;
+      tab.appendChild(attnEl);
+      const closeBtn = document.createElement('span'); closeBtn.className = 'tab-close'; closeBtn.textContent = '×';
+      closeBtn.title = `Gỡ tab "${row.name}" (không xoá session, không thu hồi quyền)`;
+      closeBtn.onclick = (event) => { event.stopPropagation(); detachSession(row.name); };
+      tab.appendChild(closeBtn);
+      tab.onclick = () => { if (selected !== row.name) selectSession(row.name); };
+      tab.onkeydown = (event) => {
+        if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); detachSession(row.name); }
+      };
+      const refs = {tab, attnEl};
+      tabElements.set(row.name, refs);
+      return tab;
+    }
+
+    function renderSessionTabs(rows) {
+      lastKnownRows = rows;
+      const rowsByName = new Map(rows.map(row => [row.name, row]));
+
+      // Grow tabOrder with any genuinely new names, alphabetically among
+      // this poll's newcomers; drop names that no longer exist at all
+      // (a session actually gone from discovery -- if it reappears later
+      // it re-enters as "new" again, which is fine).
+      const known = new Set(tabOrder);
+      const newcomers = rows.map(row => row.name).filter(name => !known.has(name)).sort();
+      tabOrder = tabOrder.filter(name => rowsByName.has(name)).concat(newcomers);
+      const tabOrderSet = new Set(tabOrder);
+      for (const name of [...tabElements.keys()]) { if (!tabOrderSet.has(name)) tabElements.delete(name); }
+
+      const visibleOrder = tabOrder.filter(name => rowsByName.has(name) && !detachedSessions.has(name));
+      sessionTabsEl.hidden = rows.length === 0;
+
+      const orderUnchanged = lastRenderedTabOrder !== null
+        && visibleOrder.length === lastRenderedTabOrder.length
+        && visibleOrder.every((name, i) => name === lastRenderedTabOrder[i]);
+
+      if (orderUnchanged) {
+        // Same tabs, same order -- patch active/attention state on the
+        // EXISTING nodes only. Scroll position and focus are untouched
+        // because no node is destroyed or replaced.
+        for (const name of visibleOrder) {
+          const refs = tabElements.get(name);
+          if (refs) { updateTabElement(refs.tab, refs, rowsByName.get(name)); }
+        }
+        lastRenderedTabOrder = visibleOrder;
+        return;
+      }
+
+      // Tab set/order actually changed (a session appeared, disappeared,
+      // was detached, or was reattached) -- full rebuild is unavoidable
+      // and acceptable only in that case.
+      sessionTabsEl.replaceChildren();
+      for (const name of visibleOrder) {
+        const row = rowsByName.get(name);
+        let refs = tabElements.get(name);
+        const tab = refs ? refs.tab : makeTab(row);
+        refs = tabElements.get(name);
+        updateTabElement(tab, refs, row);
+        sessionTabsEl.appendChild(tab);
+      }
+      const addBtn = document.createElement('button');
+      addBtn.type = 'button'; addBtn.className = 'session-tab-add'; addBtn.title = 'Mở lại session đã gỡ';
+      addBtn.textContent = '+';
+      addBtn.onclick = (event) => { event.stopPropagation(); toggleDetachedMenu(addBtn, rows); };
+      sessionTabsEl.appendChild(addBtn);
+      lastRenderedTabOrder = visibleOrder;
+    }
+
     async function loadSessions() {
       const data = await fetchJSON('/dashboard/api/sessions', {cache:'no-store'});
       const rows = data.sessions || [];
-      document.querySelector('#count').textContent = `(${rows.length})`;
+      // A 200 response can still legitimately carry data.error (e.g.
+      // READ_DISABLED globally, alongside a correctly-empty `sessions: []`)
+      // -- this is real, correct information ("reading is off"), not
+      // "there simply are no sessions", and must never render identically
+      // to a genuinely healthy empty state.
+      document.querySelector('#count').textContent = data.error ? `(${clean(data.error)})` : `(${rows.length})`;
 
       // On first load only (never on the recurring 5s poll, which must not
       // fight a user's manual choice to switch sessions or clear the
-      // selection): auto-open the remembered session if it still exists,
-      // else the first session that's actually readable (a restricted row
-      // is real and listed now -- see dashboard_list_sessions -- but
-      // auto-opening one would only greet a first-time viewer with a
-      // locked placeholder instead of real output).
-      const readableRows = rows.filter(row => row.effective_read);
+      // selection): auto-open the remembered session if it still exists
+      // and isn't detached, else the first attached, readable session (a
+      // restricted row is real and listed now -- see
+      // dashboard_list_sessions -- but auto-opening one would only greet
+      // a first-time viewer with a locked placeholder instead of real
+      // output; a detached one is real too, but the whole point of
+      // detaching is staying out of the way until explicitly reattached).
+      const readableRows = rows.filter(row => row.effective_read && !detachedSessions.has(row.name));
       if (!autoSelectAttempted) {
         autoSelectAttempted = true;
         if (!selected && readableRows.length) {
@@ -1084,6 +1432,7 @@ DASHBOARD_HTML = """<!doctype html>
         }
       }
 
+      renderSessionTabs(rows);
       sessionsEl.replaceChildren();
       for (const row of rows) {
         // Rows already arrive sorted attention-first, then most-recent-
@@ -1105,7 +1454,15 @@ DASHBOARD_HTML = """<!doctype html>
         }
         const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = `${row.windows} window · ${row.attached ? 'attached' : 'detached'}`;
         button.append(name, meta);
-        button.onclick = () => { selectSession(row.name); loadSessions(); loadDetail(); };
+        button.onclick = () => {
+          // The full sidebar list never hides anything -- picking a
+          // detached session here is exactly "obvious reattach via the
+          // detached sessions list": bring its tab back, then select it.
+          if (detachedSessions.has(row.name)) {
+            detachedSessions.delete(row.name); saveDetached(detachedSessions); renderSessionTabs(lastKnownRows);
+          }
+          selectSession(row.name); loadSessions(); // selectSession itself already fires loadDetail() immediately
+        };
         sessionsEl.append(button);
       }
       if (selected && !rows.some(row => row.name === selected)) {
@@ -1116,7 +1473,18 @@ DASHBOARD_HTML = """<!doctype html>
     }
     async function loadDetail() {
       if (!selected) return;
-      const data = await fetchJSON(`/dashboard/api/session?name=${encodeURIComponent(selected)}`, {cache:'no-store'});
+      const requestedSession = selected;
+      // Generation counter, not just a session-name check: a plain "is
+      // `selected` still this name" guard alone misses A -> B -> A --
+      // switching back to A starts a SECOND, fresh request for A while an
+      // earlier, now-stale one for A is still in flight; both would pass
+      // a name-only check, and the older one resolving last could paint
+      // outdated content over the newer fetch's result. Only the request
+      // holding the CURRENT sequence number when its response arrives is
+      // allowed to render.
+      const mySequence = ++loadDetailSequence;
+      const data = await fetchJSON(`/dashboard/api/session?name=${encodeURIComponent(requestedSession)}`, {cache:'no-store'});
+      if (selected !== requestedSession || mySequence !== loadDetailSequence) return; // stale -- session changed, or a newer request for it has since started
       if (data.error) {
         if (data.error === 'READ_RESTRICTED') {
           // Locked placeholder, not a generic error line -- this session
