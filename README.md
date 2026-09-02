@@ -77,6 +77,48 @@ tool to grant or revoke — an MCP client only ever sees the *result* (a
 session's `read_allowed`/`read_granted`/`input_allowed`/`input_granted`
 fields in `terminal_list_sessions`), never a way to create one itself.
 
+### Password login
+
+The dashboard is also reachable through a second, independent path for
+whoever cannot complete Cloudflare Access: a local username/password login
+at `https://terminal-login.mesflow.net/login`, backed by `webauth.py`/
+`webauth_dashboard.py`. It is a completely separate mechanism from
+Cloudflare Access -- neither trusts the other's signal, and a forged
+Cloudflare header sent to this hostname does nothing. Its own tunnel
+ingress rule allow-lists only `/login`, `/logout`, and `/app(?:/.*)?` on
+this hostname; `/mcp`, `/health/*`, `/version`, and `/dashboard/*` are not
+reachable through it at all -- the old `terminal-dashboard.mesflow.net`
+Cloudflare-Access-gated URL is completely unaffected and still required
+for that path.
+
+Logging in here never grants a tmux session read/input on its own -- once
+authenticated, `/app` is the exact same dashboard (session tabs, detach,
+grants) reachable at `/dashboard`, under the exact same
+`allowed_session_patterns`/grant/input-policy rules as every other entry
+point.
+
+The first time the server starts with no local account yet, it creates
+one (`admin`) with a strong random password, written once to a mode-600
+file next to `webauth.db` (state directory, e.g.
+`~/.local/state/terminal-mcp/webauth-bootstrap.txt`) -- never logged,
+never printed, never committed. Logging in with it immediately forces a
+short in-app password-change form (`/app/password`) before anything else
+is reachable; changing it there deletes the bootstrap file automatically
+and issues a fresh session. To manage accounts from a local shell instead:
+
+```bash
+terminal-mcp-webauth list-users
+terminal-mcp-webauth create-user <username>   # prompts via getpass
+terminal-mcp-webauth set-password <username>  # prompts via getpass; invalidates that user's other sessions
+```
+
+Session cookies are `HttpOnly`/`Secure`/`SameSite=Strict`, last 12 hours,
+and are stored server-side only as a SHA-256 hash. Login and every
+mutation under `/app/api/*` require a same-origin Origin/Referer header
+(the same CSRF posture as the `/dashboard/api/*` path). Repeated failed
+logins back off exponentially (capped at 15 minutes), keyed by source IP
+-- never a lasting lockout an operator would need to manually clear.
+
 The HTTP bind address is deliberately fixed to `127.0.0.1`. Do not expose it
 directly or change it to `0.0.0.0`; use an authenticated HTTPS tunnel that maps
 only its MCP route.
