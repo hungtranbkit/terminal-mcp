@@ -165,6 +165,7 @@ def test_real_server_http_main_wires_request_id_and_security_headers(tmp_path_fa
     env["TERMINAL_MCP_BINDINGS_DB"] = str(tmp_path_factory.mktemp("mainpath-bindings") / "bindings.db")
     env["TERMINAL_MCP_AUDIT_DB"] = str(tmp_path_factory.mktemp("mainpath-audit") / "audit.db")
     env["TERMINAL_MCP_SUPERVISOR_DB"] = str(tmp_path_factory.mktemp("mainpath-supervisor") / "supervisor.db")
+    env["TERMINAL_MCP_WEBAUTH_DB"] = str(tmp_path_factory.mktemp("mainpath-webauth") / "webauth.db")
     launch = f"import terminal_mcp.server_http as m; m.HTTP_PORT = {port}; m.main()"
     process = subprocess.Popen(
         [sys.executable, "-c", launch], cwd=root, env=env,
