@@ -475,6 +475,12 @@ def test_send_result_never_contains_raw_prompt_text(tmp_path, tmux_session_facto
         # P0 Part A: correlation_id is an opaque uuid4 hex (never prompt
         # content); delivery_state/enter_sent are fixed enum/bool values.
         "correlation_id", "delivery_state", "enter_sent", "error",
+        # Prompt-submission reliability upgrade (P6): submission_id is an
+        # alias of correlation_id (same opaque uuid4 hex); agent_type/
+        # evidence/stage are fixed enum values or lists of them;
+        # activation_attempts is a small int (0/1/2) -- none of these can
+        # ever carry raw prompt content either.
+        "submission_id", "agent_type", "evidence", "activation_attempts", "stage",
     }
     if "correlation_id" in parsed:
         assert isinstance(parsed["correlation_id"], str) and "y" not in parsed["correlation_id"]

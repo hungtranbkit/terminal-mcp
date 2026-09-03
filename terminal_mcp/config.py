@@ -11,6 +11,20 @@ import yaml
 class PermissionsConfig:
     terminal_read: bool = True
     terminal_input: bool = False
+    # Prompt-submission reliability upgrade, permission-model normalization
+    # (see docs/prompt-submission.md): the three concepts a caller actually
+    # cares about are `read` (terminal_read), `send_prompt` (terminal_input
+    # gating terminal_send_text/_bound -- the verified, adapter-guarded
+    # composition path input_policy.allow_send_text already scopes further),
+    # and `send_keys` (raw, unverified key sequences -- already restricted
+    # to a fixed vocabulary by input_policy.allow_keys/sensitive_keys_
+    # require_confirmation). What was missing was a way to disable raw
+    # send_keys specifically while keeping send_prompt enabled -- both were
+    # gated ONLY by the single terminal_input flag. Defaults to True (every
+    # existing config.yaml keeps its exact current behavior unchanged); set
+    # False to disable terminal_send_keys entirely while terminal_send_text/
+    # terminal_send_bound (send_prompt) keep working.
+    allow_send_keys: bool = True
 
 
 @dataclass(frozen=True)
@@ -127,6 +141,16 @@ class AppConfig:
     supervisor: SupervisorConfig = SupervisorConfig()
     dashboard: DashboardConfig = DashboardConfig()
     maintenance: MaintenanceConfig = MaintenanceConfig()
+    # Loop-protection metadata schema (see docs/prompt-submission.md, P11):
+    # terminal_send_text/_granted accept optional origin/trace_id/parent_
+    # turn_id/depth kwargs (all unused by every current caller -- MCP tools,
+    # dashboard, Supervisor v2 -- so this changes no existing behavior).
+    # This is the one number actually enforced today: a caller that DOES
+    # pass depth > this value is refused (AGENT_BRIDGE_DEPTH_EXCEEDED),
+    # fail-closed, before anything is sent. Sized for one bridge hop (e.g.
+    # a future ChatGPT-Web-adapter turn re-entering a Codex/Claude session)
+    # without allowing an unbounded agent-to-agent forwarding chain.
+    max_agent_bridge_depth: int = 2
 
 
 DEFAULT_PATTERNS = ("claude-*", "codex-*", "agent-*", "test-*")
@@ -194,12 +218,17 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         raise ValueError("supervisor.event_retention must be between 1 and 100000")
     if completion_verify_quiet_seconds < 1:
         raise ValueError("supervisor.completion_verify_quiet_seconds must be at least 1")
+    max_agent_bridge_depth = int(raw.get("max_agent_bridge_depth", 2))
+    if max_agent_bridge_depth < 0:
+        raise ValueError("max_agent_bridge_depth must be at least 0")
 
     return AppConfig(
         permissions=PermissionsConfig(
             terminal_read=bool(permissions.get("terminal_read", True)),
             terminal_input=bool(permissions.get("terminal_input", False)),
+            allow_send_keys=bool(permissions.get("allow_send_keys", True)),
         ),
+        max_agent_bridge_depth=max_agent_bridge_depth,
         allowed_session_patterns=tuple(patterns),
         max_capture_lines=max_lines,
         default_tail_lines=tail_lines,

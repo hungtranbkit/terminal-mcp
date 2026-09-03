@@ -483,9 +483,14 @@ def test_session_input_sends_text_to_allowed_session(input_config, tmux_session_
     # are new fields -- checked for presence/shape, not pinned by value.
     correlation_id = body.pop("correlation_id")
     assert isinstance(correlation_id, str) and len(correlation_id) == 32
+    # submission_id is an additive alias of correlation_id (prompt-
+    # submission reliability upgrade, P6) -- popped the same way, checked
+    # for the same value, not pinned into the literal dict below.
+    assert body.pop("submission_id") == correlation_id
     assert body == {"session": session, "sent": True, "characters": len("echo hi"),
                     "press_enter": False, "submit_status": "TEXT_SENT",
-                    "delivery_state": "TEXT_SENT", "enter_sent": False}
+                    "delivery_state": "TEXT_SENT", "enter_sent": False,
+                    "agent_type": "generic", "evidence": ["TEXT_SENT"], "activation_attempts": 0}
 
 
 def test_session_input_idempotency_key_prevents_duplicate_send(input_config, tmux_session_factory):

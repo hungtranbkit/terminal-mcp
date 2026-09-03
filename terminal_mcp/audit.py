@@ -23,6 +23,13 @@ def _add_correlation_id_column(connection: sqlite3.Connection) -> None:
     connection.execute("ALTER TABLE input_audit ADD COLUMN correlation_id TEXT")
 
 
+def _add_loop_protection_columns(connection: sqlite3.Connection) -> None:
+    connection.execute("ALTER TABLE input_audit ADD COLUMN origin TEXT")
+    connection.execute("ALTER TABLE input_audit ADD COLUMN trace_id TEXT")
+    connection.execute("ALTER TABLE input_audit ADD COLUMN parent_turn_id TEXT")
+    connection.execute("ALTER TABLE input_audit ADD COLUMN depth INTEGER")
+
+
 AUDIT_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: input_audit + idempotent_sends as of the P1 hardening pass", lambda connection: None),
     # P0 Part A.5: every send attempt (not just idempotency-keyed ones) now
@@ -31,6 +38,14 @@ AUDIT_MIGRATIONS: list[Migration] = [
     # after a lost response look the attempt up by something narrower than
     # session+timestamp.
     Migration(2, "add input_audit.correlation_id for P0 delivery-state reconciliation", _add_correlation_id_column),
+    # Prompt-submission reliability upgrade, P11: schema-only prep for
+    # future agent-bridge loop protection (e.g. a ChatGPT-Web-adapter turn
+    # re-entering a Codex/Claude session) -- all four columns are optional
+    # and NULL for every current caller (terminal_send_text/_granted accept
+    # them but nothing sets them yet outside tests). See
+    # docs/prompt-submission.md.
+    Migration(3, "add input_audit.origin/trace_id/parent_turn_id/depth for P11 loop-protection metadata",
+               _add_loop_protection_columns),
 ]
 
 
@@ -131,20 +146,23 @@ class AuditStore:
                binding: str | None = None, text: str | None = None,
                keys: list[str] | None = None, press_enter: bool = False,
                reason: str | None = None, source_transport: str = "mcp",
-               correlation_id: str | None = None) -> None:
+               correlation_id: str | None = None, origin: str | None = None,
+               trace_id: str | None = None, parent_turn_id: str | None = None,
+               depth: int | None = None) -> None:
         with self._connection() as connection:
             connection.execute(
                 """INSERT INTO input_audit
                 (timestamp, action, binding, session, text_sha256, text_preview,
                  text_length, keys, press_enter, result, reason, source_transport, server_version,
-                 correlation_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 correlation_id, origin, trace_id, parent_turn_id, depth)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (datetime.now(timezone.utc).isoformat(), action, binding, session,
                  text_fingerprint(text) if text is not None else None,
                  sanitized_preview(text) if text is not None else None,
                  len(text) if text is not None else None,
                  json.dumps(keys) if keys is not None else None, int(press_enter),
-                 result, reason, source_transport, __version__, correlation_id),
+                 result, reason, source_transport, __version__, correlation_id,
+                 origin, trace_id, parent_turn_id, depth),
             )
 
     def prune(self, retention: int) -> int:

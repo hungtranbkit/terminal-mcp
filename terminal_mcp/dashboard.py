@@ -1041,6 +1041,12 @@ DASHBOARD_HTML = """<!doctype html>
       const targetSession = selected;
       const sentText = inputTextEl.value;
       inputSendEl.disabled = true;
+      // "Sending..." -- P13: brief in-flight feedback only, no retry logic
+      // here or anywhere else client-side; a retry (if the operator wants
+      // one) is a fresh, ordinary sendInput() call, and idempotency_key
+      // (newIdempotencyKey() below) already makes a genuine network-level
+      // double-submit of the SAME attempt safe at the backend layer.
+      if (selected === targetSession) { setInputNote('Đang gửi…', false); }
       try {
         const response = await fetch('/dashboard/api/session/input', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -1051,7 +1057,13 @@ DASHBOARD_HTML = """<!doctype html>
         });
         const data = await response.json();
         if (data.error) {
-          if (selected === targetSession) { setInputNote(`${data.error}${data.reason ? ': ' + data.reason : ''}`, true); }
+          if (selected === targetSession) {
+            // "Failed" -- short reason inline; data itself (delivery_state/
+            // submission_id/evidence/activation_attempts, when present) is
+            // the "diagnostics" a caller inspecting the raw response/audit
+            // log already has -- no separate diagnostics UI added here.
+            setInputNote(`Gửi thất bại: ${data.error}${data.reason ? ' -- ' + data.reason : ''}`, true);
+          }
           // else: the user has since switched away from targetSession --
           // an error for a now-invisible session must never paint onto
           // whichever different tab is currently showing.
@@ -1067,7 +1079,19 @@ DASHBOARD_HTML = """<!doctype html>
           // new draft for it while gone).
           if (selected === targetSession) {
             if (inputTextEl.value === sentText) { inputTextEl.value = ''; drafts.set(targetSession, ''); }
-            setInputNote('');
+            // "Accepted" vs "Unknown" -- SUBMIT_CONFIRMED/TEXT_SENT (a
+            // plain append, nothing to confirm) clear the note entirely;
+            // DELIVERY_UNKNOWN (Enter was sent but no adapter evidence
+            // confirmed it within the verification window -- see
+            // core.py's _send_text_and_verify_locked) stays visible and
+            // does NOT auto-clear, so an operator does not miss a real
+            // "did this actually run?" case merely because the HTTP call
+            // itself returned 200. Never auto-retried from here.
+            if (data.delivery_state === 'DELIVERY_UNKNOWN') {
+              setInputNote(`Không rõ đã nhận hay chưa (Unknown)${data.submit_reason ? ' -- ' + data.submit_reason : ''}`, true);
+            } else {
+              setInputNote('');
+            }
           } else if (drafts.get(targetSession) === sentText) {
             drafts.set(targetSession, '');
           }

@@ -221,7 +221,9 @@ class TerminalService:
     def _audit_result(self, response: dict[str, Any], *, action: str,
                       session: str | None, binding: str | None = None,
                       text: str | None = None, keys: list[str] | None = None,
-                      press_enter: bool = False) -> dict[str, Any]:
+                      press_enter: bool = False, origin: str | None = None,
+                      trace_id: str | None = None, parent_turn_id: str | None = None,
+                      depth: int | None = None) -> dict[str, Any]:
         error = response.get("error")
         if error:
             result = "BLOCKED"
@@ -245,7 +247,8 @@ class TerminalService:
         self.audit.record(action=action, binding=binding, session=session, text=text,
                           keys=keys, press_enter=press_enter, result=result,
                           reason=error or response.get("reason") or response.get("submit_reason"),
-                          correlation_id=response.get("correlation_id"))
+                          correlation_id=response.get("correlation_id"),
+                          origin=origin, trace_id=trace_id, parent_turn_id=parent_turn_id, depth=depth)
         record_delivery_outcome(response)
         return response
 
@@ -491,6 +494,78 @@ class TerminalService:
                 return True
         return False
 
+    # Evidence-code vocabulary for the `evidence` receipt field (P6/P2,
+    # docs/prompt-submission.md) -- deliberately just ONE honest code per
+    # case rather than a richer taxonomy (INPUT_CLEARED/AGENT_RUNNING/
+    # TURN_CREATED/PROMPT_ECHOED) this project's adapters cannot actually
+    # distinguish today: every adapter's submit_ack_evidence ultimately
+    # answers one yes/no question -- "did genuine pane output move past the
+    # pre-Enter baseline" -- so OUTPUT_CHANGED is the only claim that is
+    # always true of what was actually checked. Never invents evidence a
+    # caller did not really observe.
+    _EVIDENCE_OUTPUT_CHANGED = "OUTPUT_CHANGED"
+    _EVIDENCE_RECOVERY = "RECOVERY_ESCAPE_ENTER"
+    _EVIDENCE_TEXT_SENT = "TEXT_SENT"
+
+    def _enrich_receipt(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Adds a small set of additive, backward-compatible receipt fields
+        (P6) on top of whatever _send_text_and_verify_locked/the pane-lease
+        short-circuits above already produced -- every existing field
+        (sent/enter_sent/delivery_state/submit_status/correlation_id/error/
+        submit_reason/...) is completely unchanged; nothing here can alter
+        a caller's existing behavior, only add fields a caller that knows
+        to look for them can use.
+
+          submission_id   -- alias of correlation_id, the vocabulary this
+                             upgrade's design doc (docs/prompt-submission.md)
+                             uses; kept as a second key rather than a rename
+                             so no existing caller/test reading
+                             `correlation_id` needs to change.
+          evidence         -- a short list of the evidence codes above; []
+                             when delivery_state proves nothing (BLOCKED/
+                             ERROR/DELIVERY_UNKNOWN).
+          activation_attempts -- 0 (Enter never sent), 1 (sent once), or 2
+                             (the one bounded Escape+Enter recovery retry
+                             also ran) -- never more; see the "never resend
+                             a prompt" rule this module already enforces.
+          stage            -- set only on a failure/ambiguous outcome, one
+                             of WRITE/ACTIVATE/ACCEPTANCE (P8 diagnostics) --
+                             omitted entirely on a confirmed or plain
+                             TEXT_SENT result, since there is nothing to
+                             diagnose there.
+        """
+        if "correlation_id" in result:
+            result.setdefault("submission_id", result["correlation_id"])
+        delivery_state = result.get("delivery_state")
+        enter_sent = bool(result.get("enter_sent"))
+        recovered = bool(result.get("recovery_attempted"))
+        result.setdefault("activation_attempts", (2 if recovered else 1) if enter_sent else 0)
+        if delivery_state == DELIVERY_TEXT_SENT:
+            result.setdefault("evidence", [self._EVIDENCE_TEXT_SENT])
+        elif delivery_state == DELIVERY_SUBMIT_CONFIRMED:
+            evidence = [self._EVIDENCE_OUTPUT_CHANGED]
+            if recovered:
+                evidence.append(self._EVIDENCE_RECOVERY)
+            result.setdefault("evidence", evidence)
+        else:
+            result.setdefault("evidence", [])
+        error = result.get("error")
+        if delivery_state in (DELIVERY_UNKNOWN, DELIVERY_BLOCKED, DELIVERY_ERROR) or error:
+            if not result.get("sent"):
+                # Text itself was never confirmed written -- PANE_BUSY,
+                # SESSION_NOT_FOUND, TARGET_AWAITING_APPROVAL, or a plain
+                # tmux-layer ERROR all land here.
+                result.setdefault("stage", "WRITE")
+            elif not enter_sent:
+                # Text landed; Enter was withheld (IDENTITY_CHANGED_MID_
+                # SEND) or never applicable to this failure.
+                result.setdefault("stage", "ACTIVATE")
+            else:
+                # Enter was sent (once or with recovery) but no adapter
+                # evidence confirmed the target actually processed it.
+                result.setdefault("stage", "ACCEPTANCE")
+        return result
+
     def _send_text_and_verify(self, session: str, text: str, press_enter: bool, *,
                               idempotency_key: str | None = None) -> dict[str, Any]:
         """P0-3/P0-4/P0 Part B wrapper around _send_text_and_verify_locked:
@@ -530,9 +605,10 @@ class TerminalService:
         lock_key = f"{identity.session_id}:{identity.pane_id}" if identity is not None else f"name:{session}"
         correlation_id = uuid.uuid4().hex
         if not self._acquire_pane_lease(lock_key, correlation_id):
-            result = {"session": session, "error": "PANE_BUSY", "correlation_id": correlation_id,
-                      "delivery_state": DELIVERY_BLOCKED, "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED),
-                      "submit_reason": "another process is currently holding the send lease for this pane"}
+            result = self._enrich_receipt({
+                "session": session, "error": "PANE_BUSY", "correlation_id": correlation_id,
+                "delivery_state": DELIVERY_BLOCKED, "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED),
+                "submit_reason": "another process is currently holding the send lease for this pane"})
             if idempotency_key is not None:
                 self.audit.store_idempotent_result(idempotency_key, result)
             return result
@@ -541,6 +617,7 @@ class TerminalService:
                 result = self._send_text_and_verify_locked(session, text, press_enter, correlation_id=correlation_id)
         finally:
             self.leases.release(lock_key, correlation_id)
+        result = self._enrich_receipt(result)
         if idempotency_key is not None:
             self.audit.store_idempotent_result(idempotency_key, result)
         return result
@@ -671,7 +748,7 @@ class TerminalService:
                 return {
                     "sent": False, "enter_sent": False, "characters": len(text), "press_enter": press_enter,
                     "correlation_id": correlation_id, "delivery_state": DELIVERY_BLOCKED,
-                    "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED),
+                    "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED), "agent_type": adapter.name,
                     "error": "TARGET_AWAITING_APPROVAL",
                     "submit_reason": ("the target's current output looks like a menu/approval/confirmation "
                                       "prompt, not its normal prompt composer -- sending would risk answering "
@@ -681,7 +758,8 @@ class TerminalService:
 
         self.tmux.send_text(session, text, press_enter=False)
         result: dict[str, Any] = {"sent": True, "enter_sent": False, "characters": len(text),
-                                  "press_enter": press_enter, "correlation_id": correlation_id}
+                                  "press_enter": press_enter, "correlation_id": correlation_id,
+                                  "agent_type": adapter.name}
         if not press_enter:
             result["delivery_state"] = DELIVERY_TEXT_SENT
             result["submit_status"] = to_legacy_submit_status(DELIVERY_TEXT_SENT)
@@ -861,13 +939,32 @@ class TerminalService:
             time.sleep(SEND_VERIFY_POLL_INTERVAL_SECONDS)
 
     def terminal_send_text(self, session: str, text: str, press_enter: bool = False,
-                           dry_run: bool = False, idempotency_key: str | None = None) -> dict[str, Any]:
+                           dry_run: bool = False, idempotency_key: str | None = None, *,
+                           origin: str | None = None, trace_id: str | None = None,
+                           parent_turn_id: str | None = None, depth: int = 0) -> dict[str, Any]:
         """idempotency_key (P0-4, optional): if provided, a repeat call
         with the same key never sends twice -- it returns the original
         stored result instead, durable across a process restart. Manual/
         dashboard callers can generate one (e.g. a UUID) for this
-        guarantee; omitted entirely, behavior is unchanged from before."""
+        guarantee; omitted entirely, behavior is unchanged from before.
+
+        origin/trace_id/parent_turn_id/depth (P11 loop-protection metadata,
+        docs/prompt-submission.md): schema preparation for a future agent-
+        bridge (e.g. a ChatGPT-Web adapter turn re-entering a Codex/Claude
+        session) -- unused by every current caller (every MCP tool,
+        dashboard, Supervisor v2 all omit them, so behavior is completely
+        unchanged). `depth` is the one value actually enforced today: a
+        caller passing depth greater than config.max_agent_bridge_depth is
+        refused fail-closed, before anything is sent, rather than silently
+        allowing an unbounded agent-to-agent forwarding chain. The other
+        three are recorded to the audit log (never exposed to any tool
+        schema) purely for future cross-system trace reconciliation."""
         action = "send_text"
+        if depth > self.config.max_agent_bridge_depth:
+            response = {"error": "AGENT_BRIDGE_DEPTH_EXCEEDED", "session": session, "depth": depth,
+                        "max_agent_bridge_depth": self.config.max_agent_bridge_depth}
+            return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter,
+                                      origin=origin, trace_id=trace_id, parent_turn_id=parent_turn_id, depth=depth)
         if error := self._input_guard(session):
             return self._audit_result(error, action=action, session=session, text=text, press_enter=press_enter)
         if not self.config.input_policy.allow_send_text:
@@ -888,13 +985,22 @@ class TerminalService:
                         **self._send_text_and_verify(session, text, press_enter, idempotency_key=idempotency_key)}
         except TmuxError as exc:
             response = {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
-        return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
+        return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter,
+                                  origin=origin, trace_id=trace_id, parent_turn_id=parent_turn_id, depth=depth)
 
     def terminal_send_keys(self, session: str, keys: list[str],
                            confirm_sensitive: bool = False) -> dict[str, Any]:
         action = "send_keys"
         if error := self._input_guard(session):
             return self._audit_result(error, action=action, session=session, keys=keys)
+        # Permission-model normalization (P9, docs/prompt-submission.md):
+        # raw key sends are a distinct capability from text/prompt
+        # submission (terminal_send_text/_bound) -- a deployment can now
+        # disable this specific path while send_prompt keeps working.
+        # Defaults to True: every existing config.yaml is unaffected.
+        if not self.config.permissions.allow_send_keys:
+            response = {"error": "SEND_KEYS_DISABLED", "session": session}
+            return self._audit_result(response, action=action, session=session, keys=keys)
         allowed = set(self.config.input_policy.allow_keys)
         sensitive = set(self.config.input_policy.sensitive_keys_require_confirmation)
         invalid = [key for key in keys if key not in allowed and key not in sensitive]
@@ -1450,7 +1556,9 @@ class TerminalService:
         return self._tail_payload(session, lines, ansi=ansi)
 
     def terminal_send_text_granted(self, session: str, text: str, press_enter: bool = False,
-                                   dry_run: bool = False, idempotency_key: str | None = None) -> dict[str, Any]:
+                                   dry_run: bool = False, idempotency_key: str | None = None, *,
+                                   origin: str | None = None, trace_id: str | None = None,
+                                   parent_turn_id: str | None = None, depth: int = 0) -> dict[str, Any]:
         """Parallel to terminal_send_text, for a dashboard-granted (not
         statically-whitelisted) session -- reuses the exact same guarded
         low-level send primitive (_send_text_and_verify: pane lock,
@@ -1465,6 +1573,11 @@ class TerminalService:
         exist then), so a missing pin here would only mean the grant row
         is stale/corrupt -- treated as a mismatch, never guessed past."""
         action = "send_text_granted"
+        if depth > self.config.max_agent_bridge_depth:
+            response = {"error": "AGENT_BRIDGE_DEPTH_EXCEEDED", "session": session, "depth": depth,
+                        "max_agent_bridge_depth": self.config.max_agent_bridge_depth}
+            return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter,
+                                      origin=origin, trace_id=trace_id, parent_turn_id=parent_turn_id, depth=depth)
         if (error := require_input(self.config)) is not None:
             return self._audit_result({**error, "session": session}, action=action, session=session,
                                       text=text, press_enter=press_enter)
@@ -1528,4 +1641,5 @@ class TerminalService:
                         **self._send_text_and_verify(session, text, press_enter, idempotency_key=idempotency_key)}
         except TmuxError as exc:
             response = {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
-        return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
+        return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter,
+                                  origin=origin, trace_id=trace_id, parent_turn_id=parent_turn_id, depth=depth)
