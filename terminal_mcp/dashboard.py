@@ -107,10 +107,38 @@ DASHBOARD_HTML = """<!doctype html>
        of which breakpoint/visibility state is active. */
     .sessions-toggle { display:none }
     #sidebarBackdrop { display:none }
-    #sessions { padding:8px; overflow:auto; max-height:100% } button.session { width:100%; text-align:left; color:inherit; background:transparent; border:1px solid transparent; border-radius:8px; padding:11px; cursor:pointer }
-    button.session:hover, button.session.active { background:#19243b; border-color:#344360 }
-    button.session.needs-attention { border-color:var(--amber); background:rgba(255,200,87,.08) }
+    #sessions { padding:8px; overflow:auto; max-height:100% }
+    /* .session is a <div role="button"> now, not a <button> -- it has to
+       host a real, independently-clickable <button> child (.perm-btn, the
+       row's own "Quyền truy cập" entry point) and a <input type=checkbox>
+       (bulk-select), neither of which is legal inside a <button>. Keyboard
+       activation (Enter/Space) is wired explicitly in JS to compensate for
+       giving up the native <button> semantics. */
+    .session { display:flex; align-items:flex-start; gap:8px; width:100%; text-align:left; color:inherit; background:transparent; border:1px solid transparent; border-radius:8px; padding:11px; cursor:pointer }
+    .session:hover, .session.active { background:#19243b; border-color:#344360 }
+    .session.needs-attention { border-color:var(--amber); background:rgba(255,200,87,.08) }
+    .session .sess-check { flex:0 0 auto; margin-top:3px }
+    .session .sess-main { flex:1; min-width:0 }
+    /* One lock/eye/unlock icon per grantable (non-whitelisted) row only --
+       a statically-whitelisted session never renders this at all, nothing
+       to grant/revoke for it, ever. */
+    .session .perm-btn { flex:0 0 auto; align-self:center; background:transparent; border:1px solid var(--line); border-radius:6px; color:var(--muted); padding:3px 7px; font-size:12px; cursor:pointer; line-height:1 }
+    .session .perm-btn:hover { color:var(--text); border-color:var(--muted) }
     .name { font-weight:700 } .meta { font-size:12px; color:var(--muted); margin-top:4px }
+    .attach-dot { display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--line); margin-right:5px; vertical-align:middle }
+    .attach-dot.on { background:var(--green) }
+    /* Compact bulk-select bar above the session list -- only ever shown
+       while 1+ grantable rows are checked (see #bulkBar[hidden] below);
+       zero footprint otherwise, per the "gọn, không làm dashboard chật"
+       requirement. */
+    #bulkStatus { padding:4px 12px 0; font-size:11px; color:var(--muted) }
+    #bulkStatus[hidden] { display:none }
+    .bulk-bar { display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:8px 12px; border-bottom:1px solid var(--line); font-size:11px; color:var(--muted) }
+    .bulk-bar[hidden] { display:none }
+    .bulk-bar button { background:#2b3f66; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 8px; cursor:pointer; font:inherit; font-size:11px }
+    .bulk-bar button.danger { background:#3a2430 }
+    .bulk-bar button.link { background:transparent; border:none; color:var(--muted); text-decoration:underline; padding:4px 2px }
+    .bulk-bar button:disabled { opacity:.5; cursor:not-allowed }
     /* Compact attention badge: reused identically in the session list and the
        viewer header (#summary) so a WAITING_INPUT session is obvious in both
        places — driven entirely by classify_status()'s existing state string,
@@ -172,11 +200,40 @@ DASHBOARD_HTML = """<!doctype html>
     #inputBar label { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:12px; white-space:nowrap }
     #inputNote { grid-row:5; padding:6px 16px 0; font-size:12px; color:var(--muted) }
     #inputNote.error { color:#ff6b6b }
+    /* Compact single-line entry point only now -- "Quyền: <label>" plus one
+       "🔐 Quyền truy cập" button that opens #permModal, which does all the
+       actual granting/revoking. Kept deliberately this thin (not the old
+       multi-button inline bar) so re-enabling it can never reintroduce the
+       real mobile overlap bug that #permModal's own separate, off-grid
+       overlay design structurally avoids. */
     #grantBar { grid-row:3; display:flex; align-items:center; gap:8px; padding:8px 16px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); flex-wrap:wrap }
     #grantBar button { background:#2b3f66; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:6px 12px; cursor:pointer; font:inherit; font-size:12px }
-    #grantBar button.revoke { background:#3a2430 }
-    #grantBar button:disabled { opacity:.5; cursor:not-allowed }
-    #grantBar .block-reason { color:#ff9f9f; font-size:11px }
+    /* Quyền truy cập modal -- the single reusable UI for granting/revoking
+       a non-whitelisted session's read/input grant, opened from a session
+       row's lock icon, a tab's own icon, this compact bar's button, or the
+       bulk-select bar. Fixed-overlay + backdrop + body-class pattern,
+       identical to #supervisorPanel above and for the same reason: living
+       OUTSIDE .detail's own grid, it can never disturb that grid's fragile
+       track count (see the comment on .detail above) regardless of what
+       this modal itself ends up containing. */
+    #permBackdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:30 }
+    #permModal {
+      display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:31;
+      width:min(360px, calc(100vw - 32px)); max-height:80vh; overflow:auto;
+      background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 20px 50px rgba(0,0,0,.6);
+    }
+    body.perm-modal-visible #permBackdrop, body.perm-modal-visible #permModal { display:block }
+    #permModal .pm-head { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px }
+    #permModal .pm-head strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    #permModal .pm-body { padding:14px 16px; display:flex; flex-direction:column; gap:10px }
+    .pm-state { font-size:12px; color:var(--muted) }
+    .pm-presets { display:flex; flex-direction:column; gap:8px }
+    .pm-presets button { background:#2b3f66; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:10px 12px; cursor:pointer; font:inherit; font-size:13px; text-align:left }
+    .pm-presets button.current { border-color:var(--green) }
+    .pm-presets button.danger { background:#3a2430 }
+    .pm-presets button:disabled { opacity:.5; cursor:not-allowed }
+    .pm-block { color:#ff9f9f; font-size:11px }
+    .pm-error { color:#ff6b6b; font-size:12px }
     /* Browser-like session tabs -- always visible above output, one click
        switches session (no sidebar-open step). A single, horizontally-
        scrollable row (never wraps -- wrapping would push output down by a
@@ -200,6 +257,10 @@ DASHBOARD_HTML = """<!doctype html>
     .session-tab.needs-attention { border-color:var(--amber) }
     .session-tab.needs-attention:not(.active) { background:rgba(255,200,87,.1) }
     .session-tab .tab-name { overflow:hidden; text-overflow:ellipsis; max-width:150px }
+    /* Only rendered for a grantable (non-whitelisted) session's tab -- see
+       updateTabElement -- so a normal whitelisted tab shows nothing extra. */
+    .session-tab .tab-perm { flex:0 0 auto; font-size:11px; cursor:pointer; padding:0 1px }
+    .session-tab .tab-perm[hidden] { display:none }
     .session-tab .tab-close {
       flex:0 0 auto; width:16px; height:16px; line-height:16px; text-align:center; border-radius:4px;
       color:var(--muted); font-size:12px; padding:0;
@@ -329,6 +390,7 @@ DASHBOARD_HTML = """<!doctype html>
          block — it is pure presentation. */
       body.fullscreen-terminal header,
       body.fullscreen-terminal #summary,
+      body.fullscreen-terminal #grantBar,
       body.fullscreen-terminal #inputNote,
       body.fullscreen-terminal #inputBar,
       body.fullscreen-terminal .sessions-toggle,
@@ -358,7 +420,7 @@ DASHBOARD_HTML = """<!doctype html>
     </div>
   </header>
   <main>
-    <section class="panel" id="sessionsPanel"><div class="panel-title">SESSIONS <span id="count"></span></div><div id="sessions"></div></section>
+    <section class="panel" id="sessionsPanel"><div class="panel-title">SESSIONS <span id="count"></span></div><div id="bulkStatus" hidden></div><div id="bulkBar" class="bulk-bar" hidden></div><div id="sessions"></div></section>
     <section class="panel detail">
       <div id="sessionTabs" class="session-tabs" role="tablist" aria-label="Sessions" hidden></div>
       <div id="summary" class="muted">Chọn một session để xem output.</div>
@@ -406,6 +468,19 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="sp-events" id="supervisorEvents"></div>
     <div class="sp-v2" id="supervisorV2"></div>
   </div>
+  <div id="permBackdrop"></div>
+  <div id="permModal" role="dialog" aria-modal="true" aria-labelledby="permModalTitle">
+    <div class="pm-head">
+      <strong id="permModalTitle"></strong>
+      <button id="permModalCloseBtn" class="term-btn" type="button">✕</button>
+    </div>
+    <div class="pm-body">
+      <div class="pm-state" id="permModalState"></div>
+      <div class="pm-presets" id="permModalPresets"></div>
+      <div class="pm-block" id="permModalBlock"></div>
+      <div class="pm-error" id="permModalError"></div>
+    </div>
+  </div>
   <script>
     let selected = null;
     let inputAllowed = false;
@@ -421,6 +496,16 @@ DASHBOARD_HTML = """<!doctype html>
     const outputEl = document.querySelector('#output');
     const summaryEl = document.querySelector('#summary');
     const grantBarEl = document.querySelector('#grantBar');
+    const bulkBarEl = document.querySelector('#bulkBar');
+    const bulkStatusEl = document.querySelector('#bulkStatus');
+    const permBackdropEl = document.querySelector('#permBackdrop');
+    const permModalEl = document.querySelector('#permModal');
+    const permModalTitleEl = document.querySelector('#permModalTitle');
+    const permModalStateEl = document.querySelector('#permModalState');
+    const permModalPresetsEl = document.querySelector('#permModalPresets');
+    const permModalBlockEl = document.querySelector('#permModalBlock');
+    const permModalErrorEl = document.querySelector('#permModalError');
+    const permModalCloseBtnEl = document.querySelector('#permModalCloseBtn');
     const liveBadgeEl = document.querySelector('#liveBadge');
     const supervisorBadgeEl = document.querySelector('#supervisorBadge');
     const supervisorPanelEl = document.querySelector('#supervisorPanel');
@@ -1008,7 +1093,23 @@ DASHBOARD_HTML = """<!doctype html>
     // ---- per-session read/input grants (dashboard-only; see grants.py) ----
     // Built with createElement/textContent only, same no-raw-HTML posture
     // as the rest of this file (see the supervisor panel's own comment on
-    // this above).
+    // this above). Exactly TWO ideas are ever shown to the operator here --
+    // "Xem output" (read) and "Gửi prompt" (input) -- the underlying
+    // allowed/whitelist/read_granted/input_granted vocabulary never
+    // surfaces; a statically-whitelisted session (row.allowed) never shows
+    // any grant control anywhere (row, tab, card, bulk-select) because it
+    // has nothing to grant/revoke, ever -- that decision is made in one
+    // place (grantable() below) and reused everywhere a control might
+    // render, so it can never drift between the row/tab/card/bulk paths.
+    //
+    // Entry points, all opening the SAME #permModal:
+    //   - a lock/eye/unlock icon on each grantable session's row (loadSessions)
+    //   - the same icon on each grantable session's tab (makeTab/updateTabElement)
+    //   - a compact "🔐 Quyền truy cập" line in the open session's own card,
+    //     replacing the old always-multi-button inline bar (#grantBar below)
+    //   - the bulk-select bar's own preset buttons, which apply directly
+    //     without opening the modal at all (see renderBulkBar)
+    //
     // Human-facing labels for the same reason codes grant_session_input/
     // _input_grant_block_reason already return -- purely a display
     // mapping, never a second copy of the actual authorization decision
@@ -1022,107 +1123,195 @@ DASHBOARD_HTML = """<!doctype html>
       INVALID_SESSION: 'tên session không hợp lệ',
     };
     function inputBlockLabel(reason) { return INPUT_BLOCK_LABELS[reason] || reason; }
+    function grantable(row) { return !row.allowed; } // the one, reused "has anything to grant" test
+    // 'full' (xem + gửi) | 'read' (chỉ xem) | 'none' (chưa cấp quyền) --
+    // derived from the durable grant itself (grants.py), NOT from
+    // effective_read/effective_input (which fold in the static whitelist
+    // too -- irrelevant here since this is only ever called for a
+    // grantable, i.e. non-whitelisted, row).
+    function grantState(row) {
+      if (row.grant && row.grant.input_enabled) return 'full';
+      if (row.grant && row.grant.read_enabled) return 'read';
+      return 'none';
+    }
+    function grantStateLabel(state) {
+      return state === 'full' ? 'Xem + gửi' : state === 'read' ? 'Chỉ xem' : 'Chưa cấp quyền';
+    }
+    function effectiveLabel(row) {
+      if (row.effective_input) return 'Xem + gửi';
+      if (row.effective_read) return 'Chỉ xem';
+      return 'Không truy cập';
+    }
+    function permIcon(row) {
+      const state = grantState(row);
+      return state === 'full' ? '🔓' : state === 'read' ? '👁' : '🔒';
+    }
 
-    async function postGrant(path, name, enabled) {
-      // `name` is the explicit, captured-at-click mutation target (each
-      // button's own onclick closes over the specific session it was
-      // rendered for) -- the request itself was always correctly scoped.
-      // What was missing: a LATE result must not display error text as if
-      // it were about whatever session the user is looking at NOW, if
-      // they've since switched away from the one this mutation was for.
+    // Bulk-select set (row checkboxes; see loadSessions) -- session names
+    // currently checked for the bulk action bar below. Only ever contains
+    // grantable() names (a whitelisted row never renders a checkbox).
+    const bulkSelected = new Set();
+
+    // One raw grant-read/grant-input mutation, no refresh of its own --
+    // applyPreset below does exactly ONE combined loadSessions()+loadDetail()
+    // refresh after every session in a preset (whether that's 1 or many)
+    // is done, rather than one refresh per individual read/input call.
+    async function postGrantRaw(path, name, enabled) {
       const response = await fetch(path, {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({name, enabled}),
       });
-      const data = await response.json().catch(() => ({}));
-      if (data && data.error && selected === name) {
-        setInputNote(`${enabled ? 'Cấp' : 'Thu hồi'} quyền thất bại: ${clean(data.error)}`, false);
+      return response.json().catch(() => ({}));
+    }
+    // Applies preset ('full' | 'read' | 'none') to every session in
+    // `names`, then refreshes from the backend -- the ONE place any grant
+    // mutation actually happens, used by the modal's own preset buttons
+    // and the bulk-select bar alike, so their outcome (and its real,
+    // server-confirmed effective_read/effective_input) can never diverge.
+    // 'read' explicitly revokes input too if it was on (a real downgrade,
+    // not just "grant read and leave input untouched"); 'none' revokes
+    // read, which grants.py's own set_read already cascades into revoking
+    // input too -- see grants.py.
+    async function applyPreset(names, preset) {
+      const failures = [];
+      for (const name of names) {
+        if (preset === 'none') {
+          const r = await postGrantRaw('/dashboard/api/session/grant-read', name, false);
+          if (r && r.error) failures.push(`${name}: ${clean(r.error)}`);
+          continue;
+        }
+        const r1 = await postGrantRaw('/dashboard/api/session/grant-read', name, true);
+        if (r1 && r1.error) { failures.push(`${name}: ${clean(r1.error)}`); continue; }
+        if (preset === 'read') {
+          const current = lastKnownRows.find(x => x.name === name);
+          if (current && current.grant && current.grant.input_enabled) {
+            await postGrantRaw('/dashboard/api/session/grant-input', name, false);
+          }
+        } else { // 'full'
+          const r2 = await postGrantRaw('/dashboard/api/session/grant-input', name, true);
+          if (r2 && r2.error) failures.push(`${name}: ${clean(r2.error)}`);
+        }
       }
       await loadSessions();
-      // loadDetail() always refreshes whatever session is CURRENTLY
-      // selected (its own generation-sequence guard already ties it to
-      // that, never to this mutation's `name`) -- correct either way:
-      // same session, the grant change becomes visible; a different one,
-      // this mutation's result never touches its grantBar/output at all.
-      await loadDetail();
-      return data;
+      if (selected && names.includes(selected)) await loadDetail();
+      return failures;
     }
-    // "Discover session -> enable Xem output and Gửi prompt in one clear
-    // UI" -- reuses the two existing grant endpoints back to back behind
-    // one click rather than adding a combined mutation endpoint (no
-    // parallel permissions model). If the read grant itself fails, stop
-    // there -- postGrant already surfaced why, and there is nothing valid
-    // to follow it with.
-    async function grantReadAndInput(name) {
-      const readResult = await postGrant('/dashboard/api/session/grant-read', name, true);
-      if (readResult && readResult.error) return;
-      await postGrant('/dashboard/api/session/grant-input', name, true);
+
+    // ---- #permModal: the one reusable grant/revoke UI ----------------------
+    let permModalNames = null; // the session name(s) the open modal targets
+    function closePermModal() {
+      document.body.classList.remove('perm-modal-visible');
+      permModalNames = null;
     }
-    // UI hotfix (real-device report): the grant/revoke controls crowded
-    // and overlapped the session status/tab/output area on a narrow
-    // phone. Presentation-only -- the backend grant-read/grant-input
-    // routes, authorization model, audit trail, and identity pinning are
-    // completely unaffected either way; a grant made earlier (e.g. via
-    // the API directly) still applies exactly as before, only its OWN
-    // UI is hidden. Flip back to true to re-enable the UI later.
-    const SHOW_GRANT_CONTROLS = false;
-    function renderGrantBar(name, allowed, grant, restricted, inputBlockReason) {
+    permModalCloseBtnEl.onclick = closePermModal;
+    permBackdropEl.onclick = closePermModal;
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && document.body.classList.contains('perm-modal-visible')) closePermModal();
+    });
+
+    function renderPermModalBody(names) {
+      const rows = names.map(n => lastKnownRows.find(r => r.name === n)).filter(Boolean);
+      const bulk = names.length > 1;
+      permModalTitleEl.textContent = bulk ? `${names.length} session đã chọn` : names[0];
+      permModalBlockEl.textContent = '';
+      permModalErrorEl.textContent = '';
+      if (!bulk) {
+        const row = rows[0];
+        if (!row) { permModalStateEl.textContent = 'Session không còn tồn tại.'; permModalPresetsEl.replaceChildren(); return; }
+        const state = grantState(row);
+        const granted = grantStateLabel(state);
+        const effective = effectiveLabel(row);
+        permModalStateEl.textContent = granted === effective ? `Hiện tại: ${granted}` : `Đã cấp: ${granted} · Hiệu lực thực tế: ${effective}`;
+        if (row.input_block_reason && state !== 'full') {
+          permModalBlockEl.textContent = `Gửi prompt bị chặn: ${inputBlockLabel(row.input_block_reason)}`;
+        }
+      } else {
+        permModalStateEl.textContent = `Áp dụng một hành động cho cả ${names.length} session.`;
+      }
+
+      permModalPresetsEl.replaceChildren();
+      const presets = [
+        {key: 'full', label: '🔓 Xem + gửi'},
+        {key: 'read', label: '👁 Chỉ xem'},
+        {key: 'none', label: '🔒 Thu hồi'},
+      ];
+      for (const preset of presets) {
+        const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = preset.label;
+        const classes = [];
+        if (!bulk && grantState(rows[0]) === preset.key) classes.push('current');
+        if (preset.key === 'none') classes.push('danger');
+        if (classes.length) btn.className = classes.join(' ');
+        btn.onclick = async () => {
+          permModalPresetsEl.querySelectorAll('button').forEach(b => b.disabled = true);
+          const failures = await applyPreset(names, preset.key);
+          permModalErrorEl.textContent = failures.length ? `Một số session thất bại: ${failures.join('; ')}` : '';
+          if (bulk) { bulkSelected.clear(); renderBulkBar(); closePermModal(); }
+          else renderPermModalBody(names); // stay open, show the refreshed real state
+        };
+        permModalPresetsEl.appendChild(btn);
+      }
+    }
+
+    async function openPermModal(names) {
+      if (typeof names === 'string') names = [names];
+      permModalNames = names;
+      document.body.classList.add('perm-modal-visible');
+      permModalTitleEl.textContent = names.length > 1 ? `${names.length} session đã chọn` : names[0];
+      permModalStateEl.textContent = 'Đang tải…';
+      permModalPresetsEl.replaceChildren(); permModalBlockEl.textContent = ''; permModalErrorEl.textContent = '';
+      await loadSessions(); // fresh grant/effective state before showing presets, every time
+      if (permModalNames === names) renderPermModalBody(names); // still open (not closed while awaiting)
+    }
+
+    // ---- bulk-select bar ---------------------------------------------------
+    // Applies a preset directly to every checked session, WITHOUT opening
+    // #permModal -- "chọn nhiều session -> một hành động", no extra step.
+    function renderBulkBar() {
+      bulkBarEl.hidden = bulkSelected.size === 0;
+      bulkBarEl.replaceChildren();
+      if (bulkSelected.size === 0) return;
+      const label = document.createElement('span'); label.textContent = `${bulkSelected.size} đã chọn:`;
+      const fullBtn = document.createElement('button'); fullBtn.type = 'button'; fullBtn.textContent = '🔓 Xem + gửi';
+      const readBtn = document.createElement('button'); readBtn.type = 'button'; readBtn.textContent = '👁 Chỉ xem';
+      const revokeBtn = document.createElement('button'); revokeBtn.type = 'button'; revokeBtn.className = 'danger'; revokeBtn.textContent = '🔒 Thu hồi';
+      const clearBtn = document.createElement('button'); clearBtn.type = 'button'; clearBtn.className = 'link'; clearBtn.textContent = 'Bỏ chọn';
+      const allBtns = [fullBtn, readBtn, revokeBtn, clearBtn];
+      const run = (preset) => async () => {
+        const names = [...bulkSelected];
+        allBtns.forEach(b => b.disabled = true);
+        bulkStatusEl.hidden = false; bulkStatusEl.textContent = `Đang áp dụng cho ${names.length} session…`;
+        const failures = await applyPreset(names, preset);
+        bulkSelected.clear(); renderBulkBar();
+        bulkStatusEl.hidden = failures.length === 0;
+        if (failures.length) bulkStatusEl.textContent = `Một số session thất bại: ${failures.join('; ')}`;
+      };
+      fullBtn.onclick = run('full');
+      readBtn.onclick = run('read');
+      revokeBtn.onclick = run('none');
+      clearBtn.onclick = () => { bulkSelected.clear(); renderBulkBar(); loadSessions(); };
+      bulkBarEl.append(label, fullBtn, readBtn, revokeBtn, clearBtn);
+    }
+
+    // Compact single-line entry point in the currently-open session's own
+    // card (#grantBar, grid-row:3 -- see .detail's own comment above);
+    // never shown for a statically-whitelisted session, which has nothing
+    // to grant/revoke. Deliberately thin (one label + one button opening
+    // #permModal) rather than the old multi-button inline bar, so this can
+    // never reintroduce the real mobile overlap bug #permModal's own
+    // separate overlay design structurally avoids.
+    function renderGrantBar(name, allowed, grant, restricted, inputBlockReason, effectiveInput) {
       grantBarEl.replaceChildren();
       grantBarEl.hidden = true;
-      if (!SHOW_GRANT_CONTROLS) return;
-      if (allowed) { return; } // statically whitelisted -- nothing to grant/revoke, ever
+      if (allowed) return; // statically whitelisted -- nothing to grant/revoke, ever
       grantBarEl.hidden = false;
-      const readOn = Boolean(grant && grant.read_enabled);
-      const inputOn = Boolean(grant && grant.input_enabled);
-
+      const state = grant && grant.input_enabled ? 'full' : grant && grant.read_enabled ? 'read' : 'none';
+      const granted = grantStateLabel(state);
+      const effective = restricted ? 'Không truy cập' : (effectiveInput ? 'Xem + gửi' : 'Chỉ xem');
       const label = document.createElement('span');
-      label.textContent = restricted ? 'Session này chưa được cấp quyền.'
-        : (inputOn ? 'Đã cấp quyền xem + nhập liệu.' : 'Đã cấp quyền xem output.');
-      grantBarEl.append(label);
-
-      // Xem output -- always the first, plain toggle.
-      const readBtn = document.createElement('button'); readBtn.type = 'button';
-      if (readOn) {
-        readBtn.className = 'revoke'; readBtn.textContent = '👁 Thu hồi quyền xem';
-        readBtn.onclick = () => postGrant('/dashboard/api/session/grant-read', name, false);
-      } else {
-        readBtn.textContent = '👁 Cho phép xem output';
-        readBtn.onclick = () => postGrant('/dashboard/api/session/grant-read', name, true);
-      }
-      grantBarEl.append(readBtn);
-
-      // Gửi prompt -- ALWAYS rendered beside the read control, from the
-      // very first time a never-granted session is opened, per the
-      // explicit "obvious per-session input permission control beside
-      // read access" request -- never appearing only after a first,
-      // separate read-grant click/reload.
-      const inputBtn = document.createElement('button'); inputBtn.type = 'button';
-      if (inputOn) {
-        inputBtn.className = 'revoke'; inputBtn.textContent = '⌨ Thu hồi quyền gửi prompt';
-        inputBtn.onclick = () => postGrant('/dashboard/api/session/grant-input', name, false);
-      } else if (inputBlockReason) {
-        // Granting read alone must never look like it silently grants
-        // write -- shown, disabled, with the exact policy reason, rather
-        // than hidden (hidden would look like "not possible" instead of
-        // "blocked by this specific, named policy").
-        inputBtn.textContent = '⌨ Cho phép gửi prompt'; inputBtn.disabled = true;
-        inputBtn.title = `Bị chặn: ${inputBlockLabel(inputBlockReason)}`;
-      } else if (readOn) {
-        inputBtn.textContent = '⌨ Cho phép gửi prompt';
-        inputBtn.onclick = () => postGrant('/dashboard/api/session/grant-input', name, true);
-      } else {
-        // Read not granted yet either -- one click still grants both,
-        // read first then input, in the same visible action.
-        inputBtn.textContent = '⌨ Cho phép xem + gửi prompt';
-        inputBtn.onclick = () => grantReadAndInput(name);
-      }
-      grantBarEl.append(inputBtn);
-
-      if (inputBlockReason && !inputOn) {
-        const reasonEl = document.createElement('span'); reasonEl.className = 'block-reason';
-        reasonEl.textContent = `Gửi prompt bị chặn: ${inputBlockLabel(inputBlockReason)}`;
-        grantBarEl.append(reasonEl);
-      }
+      label.textContent = granted === effective ? `Quyền: ${effective}` : `Đã cấp: ${granted} · Hiệu lực: ${effective}`;
+      const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = '🔐 Quyền truy cập';
+      btn.onclick = () => openPermModal(name);
+      grantBarEl.append(label, btn);
     }
 
     // Per-session unsent-draft text -- session-switch/detach race fix:
@@ -1348,6 +1537,10 @@ DASHBOARD_HTML = """<!doctype html>
       tab.className = 'session-tab' + (isActive ? ' active' : '') + (needsAttention ? ' needs-attention' : '');
       tab.setAttribute('aria-selected', isActive ? 'true' : 'false');
       refs.attnEl.hidden = !needsAttention;
+      // Perm icon only for a grantable (non-whitelisted) session -- a
+      // whitelisted tab shows nothing extra, ever.
+      refs.permEl.hidden = !grantable(row);
+      if (!refs.permEl.hidden) refs.permEl.textContent = permIcon(row);
     }
 
     function makeTab(row) {
@@ -1358,6 +1551,9 @@ DASHBOARD_HTML = """<!doctype html>
       tab.appendChild(nameEl);
       const attnEl = document.createElement('span'); attnEl.textContent = '⚠'; attnEl.hidden = true;
       tab.appendChild(attnEl);
+      const permEl = document.createElement('span'); permEl.className = 'tab-perm'; permEl.title = 'Quyền truy cập'; permEl.hidden = true;
+      permEl.onclick = (event) => { event.stopPropagation(); openPermModal(row.name); };
+      tab.appendChild(permEl);
       const closeBtn = document.createElement('span'); closeBtn.className = 'tab-close'; closeBtn.textContent = '×';
       closeBtn.title = `Gỡ tab "${row.name}" (không xoá session, không thu hồi quyền)`;
       closeBtn.onclick = (event) => { event.stopPropagation(); detachSession(row.name); };
@@ -1366,7 +1562,7 @@ DASHBOARD_HTML = """<!doctype html>
       tab.onkeydown = (event) => {
         if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); detachSession(row.name); }
       };
-      const refs = {tab, attnEl};
+      const refs = {tab, attnEl, permEl};
       tabElements.set(row.name, refs);
       return tab;
     }
@@ -1454,14 +1650,44 @@ DASHBOARD_HTML = """<!doctype html>
       }
 
       renderSessionTabs(rows);
+      // Drop any bulk-selected name that's gone or no longer grantable
+      // (session vanished, or became statically whitelisted) -- never
+      // leaves a stale, unactionable checkbox state behind.
+      const rowsByName = new Map(rows.map(row => [row.name, row]));
+      let bulkChanged = false;
+      for (const name of [...bulkSelected]) {
+        const row = rowsByName.get(name);
+        if (!row || !grantable(row)) { bulkSelected.delete(name); bulkChanged = true; }
+      }
+      if (bulkChanged) renderBulkBar();
       sessionsEl.replaceChildren();
       for (const row of rows) {
         // Rows already arrive sorted attention-first, then most-recent-
         // activity, then name (see the /dashboard/api/sessions route) — no
         // client-side reordering here, just rendering in the given order.
         const needsAttention = row.state === 'WAITING_INPUT';
-        const button = document.createElement('button');
-        button.className = 'session' + (selected === row.name ? ' active' : '') + (needsAttention ? ' needs-attention' : '');
+        const canGrant = grantable(row);
+        // A <div role="button">, not a real <button> -- it hosts a real
+        // <button> (perm-btn) and an <input type=checkbox>, neither legal
+        // inside a <button>. onkeydown below restores Enter/Space
+        // activation that a native <button> would have given for free.
+        const div = document.createElement('div');
+        div.className = 'session' + (selected === row.name ? ' active' : '') + (needsAttention ? ' needs-attention' : '');
+        div.setAttribute('role', 'button'); div.tabIndex = 0;
+
+        if (canGrant) {
+          const check = document.createElement('input'); check.type = 'checkbox'; check.className = 'sess-check';
+          check.checked = bulkSelected.has(row.name);
+          check.setAttribute('aria-label', `Chọn ${row.name} để thao tác hàng loạt`);
+          check.onclick = (event) => event.stopPropagation(); // never trigger the row's own select-session activation
+          check.onchange = () => {
+            if (check.checked) bulkSelected.add(row.name); else bulkSelected.delete(row.name);
+            renderBulkBar();
+          };
+          div.append(check);
+        }
+
+        const main = document.createElement('div'); main.className = 'sess-main';
         const name = document.createElement('div'); name.className = 'name'; name.textContent = row.name;
         if (needsAttention) {
           const badge = document.createElement('span'); badge.className = 'attn-badge'; badge.textContent = '⚠ NEEDS INPUT';
@@ -1469,13 +1695,25 @@ DASHBOARD_HTML = """<!doctype html>
         } else if (!row.effective_read) {
           // Newly-discovered, not-yet-granted session -- still listed
           // (name/attached/windows/activity are tmux metadata, never pane
-          // content), just visibly marked as not readable yet.
-          const badge = document.createElement('span'); badge.className = 'lock-badge'; badge.textContent = '🔒 restricted';
+          // content), just visibly marked as not readable yet. Admin can
+          // grant it directly via the perm-btn on this same row.
+          const badge = document.createElement('span'); badge.className = 'lock-badge'; badge.textContent = '🔒 Chưa cấp quyền';
           name.append(' ', badge);
         }
-        const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = `${row.windows} window · ${row.attached ? 'attached' : 'detached'}`;
-        button.append(name, meta);
-        button.onclick = () => {
+        const meta = document.createElement('div'); meta.className = 'meta';
+        const dot = document.createElement('span'); dot.className = 'attach-dot' + (row.attached ? ' on' : '');
+        meta.append(dot, document.createTextNode(`${row.windows} window · ${row.attached ? 'attached' : 'detached'}`));
+        main.append(name, meta);
+        div.append(main);
+
+        if (canGrant) {
+          const permBtn = document.createElement('button'); permBtn.type = 'button'; permBtn.className = 'perm-btn';
+          permBtn.textContent = permIcon(row); permBtn.title = 'Quyền truy cập';
+          permBtn.onclick = (event) => { event.stopPropagation(); openPermModal(row.name); };
+          div.append(permBtn);
+        }
+
+        const activate = () => {
           // The full sidebar list never hides anything -- picking a
           // detached session here is exactly "obvious reattach via the
           // detached sessions list": bring its tab back, then select it.
@@ -1484,7 +1722,11 @@ DASHBOARD_HTML = """<!doctype html>
           }
           selectSession(row.name); loadSessions(); // selectSession itself already fires loadDetail() immediately
         };
-        sessionsEl.append(button);
+        div.onclick = activate;
+        div.onkeydown = (event) => {
+          if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activate(); }
+        };
+        sessionsEl.append(div);
       }
       if (selected && !rows.some(row => row.name === selected)) {
         selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
@@ -1519,7 +1761,7 @@ DASHBOARD_HTML = """<!doctype html>
           const placeholder = document.createElement('div'); placeholder.className = 'muted';
           placeholder.textContent = '🔒 Output bị khoá. Session này chưa được cấp quyền xem.';
           outputEl.append(placeholder);
-          renderGrantBar(selected, false, null, true, data.input_block_reason || null);
+          renderGrantBar(selected, false, null, true, data.input_block_reason || null, false);
         } else {
           summaryEl.textContent = `${data.error}: ${selected}`; outputEl.replaceChildren();
           grantBarEl.hidden = true;
@@ -1527,7 +1769,7 @@ DASHBOARD_HTML = """<!doctype html>
         inputAllowed = false; refreshInputControls(); refreshTermControls();
         return;
       }
-      renderGrantBar(selected, Boolean(data.allowed), data.grant || null, false, data.input_block_reason || null);
+      renderGrantBar(selected, Boolean(data.allowed), data.grant || null, false, data.input_block_reason || null, Boolean(data.input_allowed));
       summaryEl.replaceChildren();
       const strong = document.createElement('strong'); strong.textContent = selected + ' · ';
       // Session status (RUNNING / WAITING_INPUT / PLAN_APPROVAL / ... and its

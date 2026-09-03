@@ -189,6 +189,14 @@ def test_dashboard_fullscreen_hides_chrome_and_fills_terminal_on_mobile():
     # #output are completely untouched by any of this (pure presentation).
     assert "body.fullscreen-terminal header," in DASHBOARD_HTML
     assert "body.fullscreen-terminal #summary," in DASHBOARD_HTML
+    # Regression guard: #grantBar went from always-empty (SHOW_GRANT_
+    # CONTROLS=false) to real, often-visible content once the permission
+    # modal work re-enabled it -- it was never in this hidden list before
+    # (harmless while always empty), so re-enabling it without adding it
+    # here would have made fullscreen mode visibly leak the permission bar
+    # instead of showing "essentially only the terminal pane", exactly the
+    # bug a real agent-browser screenshot caught before this test existed.
+    assert "body.fullscreen-terminal #grantBar," in DASHBOARD_HTML
     assert "body.fullscreen-terminal #inputBar," in DASHBOARD_HTML
     assert "body.fullscreen-terminal .sessions-toggle," in DASHBOARD_HTML
     assert "body.fullscreen-terminal .detail { grid-template-rows:minmax(0,1fr) }" in DASHBOARD_HTML
@@ -774,22 +782,37 @@ def test_dashboard_auth_required_distinguished_from_offline():
     assert "await fetchJSON(`/dashboard/api/session?name=" in DASHBOARD_HTML
 
 
-def test_dashboard_grant_controls_hidden_from_normal_rendering():
-    # UI hotfix (real-device report): the grant/revoke controls are
-    # presentation-hidden -- the toggle is a single, easily-reversible
-    # constant, and the render function unconditionally hides the bar and
-    # returns before ever building any button, regardless of what state
-    # it would otherwise show.
-    assert "const SHOW_GRANT_CONTROLS = false;" in DASHBOARD_HTML
-    fn = DASHBOARD_HTML.split("function renderGrantBar(", 1)[1].split("\n    }", 1)[0]
-    assert "grantBarEl.hidden = true;" in fn
-    assert "if (!SHOW_GRANT_CONTROLS) return;" in fn
-    # The backend this UI would otherwise drive is completely untouched --
-    # grant_session_read/grant_session_input are still called exactly as
-    # before, from the (still-registered, still-reachable-by-API) POST
-    # routes -- only their OWN presentation is hidden. These live in
-    # dashboard.py's Python source (the route registration), not in the
-    # DASHBOARD_HTML string, so check the module source directly.
+def test_dashboard_grant_controls_have_an_obvious_entry_point():
+    # UX fix: a new, not-yet-granted session must have an obvious, direct
+    # path to being granted from the dashboard -- the SHOW_GRANT_CONTROLS
+    # kill switch from the earlier mobile-overlap hotfix is gone entirely;
+    # granting is reachable from the session row (lock icon), its tab, its
+    # own open card (#grantBar), and the bulk-select bar, all opening the
+    # same #permModal.
+    assert "SHOW_GRANT_CONTROLS" not in DASHBOARD_HTML
+    assert "function openPermModal(" in DASHBOARD_HTML
+    assert "function renderPermModalBody(" in DASHBOARD_HTML
+    assert "function applyPreset(" in DASHBOARD_HTML
+    # Exactly two ideas are ever exposed to the operator -- never the raw
+    # allowed/whitelist/read_granted/input_granted vocabulary.
+    assert "🔓 Xem + gửi" in DASHBOARD_HTML
+    assert "👁 Chỉ xem" in DASHBOARD_HTML
+    assert "🔒 Thu hồi" in DASHBOARD_HTML
+    # A never-granted session is still listed, with a badge, not hidden.
+    assert "🔒 Chưa cấp quyền" in DASHBOARD_HTML
+    # Per-row lock icon + checkbox, gated on `grantable()` (never for a
+    # statically-whitelisted row, which has nothing to grant/revoke).
+    assert "function grantable(row) { return !row.allowed; }" in DASHBOARD_HTML
+    assert "className = 'perm-btn'" in DASHBOARD_HTML
+    assert "className = 'sess-check'" in DASHBOARD_HTML
+    # Bulk-select bar applies a preset directly to every checked session.
+    assert "function renderBulkBar()" in DASHBOARD_HTML
+    assert "const bulkSelected = new Set();" in DASHBOARD_HTML
+    # Backend this UI drives is unchanged -- grant_session_read/
+    # grant_session_input are still called exactly as before, from the
+    # same POST routes. These live in dashboard.py's Python source (the
+    # route registration), not in DASHBOARD_HTML, so check the module
+    # source directly.
     module_source = inspect.getsource(dashboard_module)
     assert "terminal.grant_session_read(name, enabled" in module_source
     assert "terminal.grant_session_input(name, enabled" in module_source
