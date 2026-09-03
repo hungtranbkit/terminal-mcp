@@ -71,3 +71,37 @@ supervisor:
 dashboard:
   cloudflare_access_team_domain: "falling-field-15e3.cloudflareaccess.com"
   cloudflare_access_audience: "2c67fa84f87699170bd7b68a9591e58a586fab4e2689932118a02a662bd28c32"
+  # Web terminal (xterm.js over a WebSocket, attaching a browser directly
+  # to an existing tmux session's real pty -- webterm.py/dashboard.py's
+  # "Open Terminal" button). Opt-in, same posture as session_lifecycle.
+  web_terminal_enabled: true
+
+# Session lifecycle: create/detach/delete real tmux sessions, from the
+# dashboard's "Tạo session"/"Tách"/"Xóa session" controls and from the
+# terminal_create_session/_detach_session/_delete_session MCP tools
+# (e.g. a ChatGPT client asking to open a new Claude/Codex session). See
+# README's "Create an agent tmux session" for the same two launcher
+# binaries referenced below -- this only lets an authorized caller start
+# them under a name/cwd of their choosing, never any other command.
+# allowed_cwd_roots is this host's actual workspace layout; protected_
+# sessions adds this deployment's other real, attended, must-never-be-
+# deleted-from-here sessions on top of the always-protected
+# "terminal-mcp" (see permissions/audit history for why each is listed).
+session_lifecycle:
+  enabled: true
+  allowed_cwd_roots:
+    - /home/dell/workspace
+    - /home/dell
+  protected_sessions:
+    - terminal-mcp
+    - codex-main
+    - projectflow-main
+    - promptflow
+    - mesflow
+    - nail
+    - server-hub
+  launch_commands:
+    claude: claude
+    codex: codex
+  create_ready_timeout_seconds: 6
+  default_grant_mode: none

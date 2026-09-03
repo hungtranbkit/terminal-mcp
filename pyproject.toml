@@ -14,6 +14,12 @@ dependencies = [
   "PyJWT[crypto]>=2,<3",
   "uvicorn>=0.30,<1",
   "anyio>=4,<5",
+  # Only needed for uvicorn's WebSocket upgrade support (the web terminal
+  # feature, webterm.py/dashboard.py's /dashboard/ws/terminal +
+  # webauth_dashboard.py's /app/ws/terminal) -- uvicorn has no built-in
+  # WebSocket implementation of its own and silently 403s any upgrade
+  # request without one of websockets/wsproto installed.
+  "websockets>=13,<14",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +32,9 @@ terminal-mcp-webauth = "terminal_mcp.webauth_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["terminal_mcp*"]
+
+[tool.setuptools.package-data]
+terminal_mcp = ["vendor/xterm/*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "terminal_mcp.__version__"}

@@ -40,14 +40,18 @@ from urllib.parse import urlparse
 import anyio
 from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.routing import WebSocketRoute
+from starlette.websockets import WebSocket
 
 from .core import TerminalService
-from .dashboard import DASHBOARD_HTML, INPUT_ERROR_STATUS, SESSIONS_ADMIN_HTML
-from .permissions import input_session_allowed, session_allowed
+from .dashboard import DASHBOARD_HTML, INPUT_ERROR_STATUS, SESSIONS_ADMIN_HTML, WEBTERM_HTML
+from .permissions import input_session_allowed, session_allowed, valid_session_name
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
 from .webauth import SESSION_COOKIE_NAME, SESSION_TTL, WebAuthStore
+from .webterm import WebTerminalProcess, pump_websocket
+from .webterm_assets import ASSETS
 
 _log = logging.getLogger(__name__)
 
@@ -80,10 +84,21 @@ APP_SESSIONS_ADMIN_HTML = (
     SESSIONS_ADMIN_HTML.replace("/dashboard/api/", "/app/api/")
     .replace('href="/dashboard"', 'href="/app"')
     .replace("`/dashboard#", "`/app#")
+    .replace("const WEBTERM_PAGE = '/dashboard/terminal';", "const WEBTERM_PAGE = '/app/terminal';")
     .replace(
         '<span class="live" id="liveBadge">● LIVE</span>',
         f'<span class="live" id="liveBadge">● LIVE</span> {_LOGOUT_BUTTON}',
     )
+)
+# The web terminal page itself (webterm.py) -- same complete-substring-
+# rewrite convention as every other page above: /dashboard/assets/* (the
+# vendored xterm.js/css) and /dashboard/ws/terminal both need an /app/
+# counterpart route (registered below) since the webauth tunnel's ingress
+# only forwards /login, /logout, /app -- see this module's own docstring.
+APP_WEBTERM_HTML = (
+    WEBTERM_HTML.replace('href="/dashboard/sessions"', 'href="/app/sessions"')
+    .replace("/dashboard/assets/", "/app/assets/")
+    .replace("const WS_PATH = '/dashboard/ws/terminal';", "const WS_PATH = '/app/ws/terminal';")
 )
 
 _PAGE_STYLE = """
@@ -525,6 +540,151 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
         )
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    # -- Session lifecycle: create/detach/delete -- same TerminalService
+    # methods dashboard.py's /dashboard/api/session/* routes and the MCP
+    # tools use; see dashboard.py's own routes for the fuller comments.
+
+    @server.custom_route("/app/api/session/create", methods=["POST"], include_in_schema=False)
+    async def app_session_create(request: Request):
+        blocked, user = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        agent_type = body.get("agent_type", "shell") if isinstance(body, dict) else None
+        cwd = body.get("cwd") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name or not isinstance(agent_type, str):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        if cwd is not None and not isinstance(cwd, str):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        granted_by = f"webauth:{user.username}"
+        _log.info("webauth create_session name=%s agent_type=%s username=%s", name, agent_type, user.username)
+        result = await anyio.to_thread.run_sync(
+            lambda: terminal.terminal_create_session(name, agent_type, cwd, requested_by=granted_by)
+        )
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/app/api/session/detach", methods=["POST"], include_in_schema=False)
+    async def app_session_detach(request: Request):
+        blocked, user = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        _log.info("webauth detach_session name=%s username=%s", name, user.username)
+        result = await anyio.to_thread.run_sync(terminal.terminal_detach_session, name)
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/app/api/session/delete", methods=["POST"], include_in_schema=False)
+    async def app_session_delete(request: Request):
+        blocked, user = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        _log.info("webauth delete_session name=%s username=%s", name, user.username)
+        result = await anyio.to_thread.run_sync(terminal.terminal_delete_session, name)
+        if "error" not in result:
+            await anyio.to_thread.run_sync(lambda: supervisor.unwatch(session=name, delete=False))
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    # -- Web terminal: xterm.js over a WebSocket, attached directly to an
+    # existing tmux session's real pty -- same feature, same
+    # TerminalService.terminal_web_terminal_access authorization decision
+    # (core.py), same WebTerminalProcess/pump_websocket (webterm.py) as
+    # dashboard.py's /dashboard/ws/terminal; only the auth layer in front
+    # of it differs (this module's cookie session, not Cloudflare Access),
+    # exactly like every other route pair in this file.
+
+    @server.custom_route("/app/assets/{filename}", methods=["GET"], include_in_schema=False)
+    async def app_webterm_asset(request: Request):
+        # Same public-static-asset posture as dashboard.py's
+        # /dashboard/assets/{filename} -- no session content, so
+        # deliberately not behind _require_session_api.
+        asset = ASSETS.get(request.path_params["filename"])
+        if asset is None:
+            return Response(status_code=404)
+        content, content_type = asset
+        return Response(content, media_type=content_type,
+                        headers={"Cache-Control": "public, max-age=86400, immutable"})
+
+    @server.custom_route("/app/terminal", methods=["GET"], include_in_schema=False)
+    async def app_webterm_page(request: Request):
+        blocked, user = _require_session_page(request)
+        if blocked is not None:
+            return blocked
+        if user.must_change_password:
+            return RedirectResponse("/app/password", status_code=303)
+        return HTMLResponse(APP_WEBTERM_HTML, headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
+
+    async def app_terminal_ws(websocket: WebSocket) -> None:
+        if not _origin_allowed(websocket, terminal.config.dashboard.allowed_origins):
+            await websocket.close(code=4403)
+            return
+        # _session_user is the exact same closure /app/api/* routes use --
+        # only touches .cookies (present on WebSocket too), so this is
+        # true reuse, not a parallel copy of the session-lookup logic.
+        user = _session_user(websocket)
+        if user is None:
+            await websocket.close(code=4401)
+            return
+        if user.must_change_password:
+            await websocket.close(code=4403)
+            return
+        session = websocket.query_params.get("session", "")
+        takeover_requested = websocket.query_params.get("takeover") == "1"
+        if not valid_session_name(session):
+            await websocket.close(code=4400)
+            return
+        access = await anyio.to_thread.run_sync(terminal.terminal_web_terminal_access, session)
+        if "error" in access:
+            code = 4404 if access["error"] == "SESSION_NOT_FOUND" else 4403
+            await websocket.close(code=code)
+            return
+        input_enabled = bool(access["input"])
+        takeover = takeover_requested and input_enabled
+        await websocket.accept()
+        _log.info("webauth web_terminal_open session=%s input=%s takeover=%s username=%s",
+                  session, input_enabled, takeover, user.username)
+        terminal.audit.record(action="web_terminal_open", session=session, result="OPENED",
+                              reason=f"input={input_enabled} takeover={takeover} webauth:{user.username}",
+                              source_transport="dashboard")
+        proc = await anyio.to_thread.run_sync(
+            lambda: WebTerminalProcess(terminal.tmux.binary, session, readonly=not input_enabled, takeover=takeover)
+        )
+        try:
+            await websocket.send_json({"type": "ready", "session": session, "readonly": not input_enabled,
+                                       "attached": access.get("attached", False)})
+            await pump_websocket(websocket, proc)
+        finally:
+            await anyio.to_thread.run_sync(proc.close)
+            terminal.audit.record(action="web_terminal_close", session=session, result="CLOSED",
+                                  source_transport="dashboard")
+
+    # Same "no WebSocket-route decorator on MCPServer.custom_route" reason
+    # dashboard.py's own /dashboard/ws/terminal registration documents --
+    # appended to the exact same _custom_starlette_routes list every
+    # @server.custom_route call (both modules) already populates.
+    server._custom_starlette_routes.append(
+        WebSocketRoute("/app/ws/terminal", endpoint=app_terminal_ws, name="app_terminal_ws")
+    )
 
     @server.custom_route("/app/api/supervisor", methods=["GET"], include_in_schema=False)
     async def app_supervisor_summary(request: Request):

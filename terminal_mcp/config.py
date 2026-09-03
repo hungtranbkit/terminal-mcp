@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -113,6 +114,62 @@ class DashboardConfig:
     # (e.g. a reverse proxy that rewrites Host) beyond the request's own
     # Host header, which is always accepted.
     allowed_origins: tuple[str, ...] = ()
+    # Web terminal (xterm.js over WebSocket, attaching a browser directly
+    # to an existing tmux session's real pty -- webterm.py). Disabled by
+    # default, same opt-in posture as session_lifecycle.enabled: this
+    # spawns a real OS process (`tmux attach-session`) with a live,
+    # bidirectional pty, not just another read of already-captured pane
+    # text, so an existing deployment's config.yaml keeps its exact
+    # current behavior until an operator explicitly opts in here. Gates
+    # BOTH dashboard variants identically (TerminalService.
+    # terminal_web_terminal_access, the one place this flag is checked --
+    # see core.py) -- there is no separate flag per dashboard.
+    web_terminal_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class SessionLifecycleConfig:
+    """New tmux session create/detach/delete (dashboard + the parallel
+    terminal_create_session/_detach_session/_delete_session MCP tools --
+    core.py's SessionLifecycleService is the ONE implementation both
+    callers share; see lifecycle.py). Disabled by default, same posture
+    as terminal_input: this is a capability that creates real processes,
+    not read-only observation, so an existing deployment's config.yaml
+    keeps its exact current behavior (no lifecycle tools/routes usable)
+    until an operator explicitly opts in here.
+
+    allowed_cwd_roots: absolute paths a requested working_directory must
+    resolve (symlinks followed) inside of -- empty (the default) falls
+    back to `(str(Path.home()),)` at use time (see lifecycle.py), never
+    to "/" or an unbounded root. protected_sessions: never deletable via
+    this feature, regardless of caller -- "terminal-mcp" (this project's
+    own controlling session) is always in the effective set even if an
+    operator's list omits it; see _load_session_lifecycle_config below.
+    launch_commands: agent_type -> the exact literal argv token run as
+    the new session's initial command (never client-supplied -- see
+    README's "Create an agent tmux session" for the same two binaries
+    invoked here, "claude"/"codex"). "shell" always ignores this and
+    starts the session's plain default shell, no entry needed."""
+    enabled: bool = False
+    allowed_cwd_roots: tuple[str, ...] = ()
+    protected_sessions: tuple[str, ...] = ("terminal-mcp",)
+    launch_commands: tuple[tuple[str, str], ...] = (("claude", "claude"), ("codex", "codex"))
+    create_ready_timeout_seconds: float = 5.0
+    default_grant_mode: str = "none"
+
+    def __post_init__(self) -> None:
+        # The "terminal-mcp is always protected, even if omitted" guarantee
+        # (see the class docstring and _load_session_lifecycle_config's own
+        # comment) previously lived ONLY in the YAML-loading function below
+        # -- true for a config read from config.yaml, but silently false for
+        # any other construction path (tests building SessionLifecycleConfig
+        # directly, or a future embedder assembling AppConfig in Python).
+        # Enforced here instead, on the dataclass itself, so it holds no
+        # matter how this config object came to exist -- frozen dataclasses
+        # still allow this one exception via object.__setattr__, exactly
+        # the pattern __post_init__ exists for.
+        if "terminal-mcp" not in self.protected_sessions:
+            object.__setattr__(self, "protected_sessions", (*self.protected_sessions, "terminal-mcp"))
 
 
 @dataclass(frozen=True)
@@ -141,6 +198,7 @@ class AppConfig:
     supervisor: SupervisorConfig = SupervisorConfig()
     dashboard: DashboardConfig = DashboardConfig()
     maintenance: MaintenanceConfig = MaintenanceConfig()
+    session_lifecycle: SessionLifecycleConfig = SessionLifecycleConfig()
     # Loop-protection metadata schema (see docs/prompt-submission.md, P11):
     # terminal_send_text/_granted accept optional origin/trace_id/parent_
     # turn_id/depth kwargs (all unused by every current caller -- MCP tools,
@@ -257,6 +315,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ),
         dashboard=_load_dashboard_config(raw.get("dashboard", {})),
         maintenance=_load_maintenance_config(raw.get("maintenance", {})),
+        session_lifecycle=_load_session_lifecycle_config(raw.get("session_lifecycle", {})),
     )
 
 
@@ -283,6 +342,45 @@ def _load_maintenance_config(maintenance_raw: object) -> MaintenanceConfig:
     )
 
 
+_SAFE_LAUNCH_TOKEN = re.compile(r"^[A-Za-z0-9_./-]{1,128}$")
+
+
+def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    enabled = bool(raw.get("enabled", False))
+    roots = raw.get("allowed_cwd_roots", [])
+    if not isinstance(roots, list) or not all(isinstance(r, str) and r for r in roots):
+        raise ValueError("session_lifecycle.allowed_cwd_roots must be a list of strings")
+    protected = raw.get("protected_sessions", ["terminal-mcp"])
+    if not isinstance(protected, list) or not all(isinstance(p, str) and p for p in protected):
+        raise ValueError("session_lifecycle.protected_sessions must be a list of strings")
+    # "terminal-mcp" (this server's own controlling session) is always
+    # protected -- an operator's config can only ADD names, never remove
+    # this one, so a misconfigured/emptied list can never make this
+    # project's own session deletable from its own dashboard/MCP surface.
+    protected_set = tuple(dict.fromkeys([*protected, "terminal-mcp"]))
+    launch_raw = raw.get("launch_commands", {"claude": "claude", "codex": "codex"})
+    if not isinstance(launch_raw, dict) or not all(
+        isinstance(k, str) and k and isinstance(v, str) and v for k, v in launch_raw.items()
+    ):
+        raise ValueError("session_lifecycle.launch_commands must be a mapping of agent_type -> command")
+    for agent_type, command in launch_raw.items():
+        if not _SAFE_LAUNCH_TOKEN.fullmatch(command):
+            raise ValueError(f"session_lifecycle.launch_commands[{agent_type!r}] is not a safe launcher token")
+    timeout = float(raw.get("create_ready_timeout_seconds", SessionLifecycleConfig.create_ready_timeout_seconds))
+    if not 0.5 <= timeout <= 60:
+        raise ValueError("session_lifecycle.create_ready_timeout_seconds must be between 0.5 and 60")
+    grant_mode = raw.get("default_grant_mode", SessionLifecycleConfig.default_grant_mode)
+    if grant_mode not in ("none", "read", "read_send"):
+        raise ValueError("session_lifecycle.default_grant_mode must be one of: none, read, read_send")
+    return SessionLifecycleConfig(
+        enabled=enabled, allowed_cwd_roots=tuple(roots), protected_sessions=protected_set,
+        launch_commands=tuple(sorted(launch_raw.items())), create_ready_timeout_seconds=timeout,
+        default_grant_mode=grant_mode,
+    )
+
+
 def _load_dashboard_config(dashboard_raw: object) -> DashboardConfig:
     if not isinstance(dashboard_raw, dict):
         dashboard_raw = {}
@@ -300,4 +398,5 @@ def _load_dashboard_config(dashboard_raw: object) -> DashboardConfig:
         cloudflare_access_team_domain=team_domain,
         cloudflare_access_audience=audience,
         allowed_origins=tuple(origins),
+        web_terminal_enabled=bool(dashboard_raw.get("web_terminal_enabled", False)),
     )

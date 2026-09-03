@@ -74,6 +74,30 @@ supervisor:
 #   cloudflare_access_team_domain: "your-team.cloudflareaccess.com"
 #   cloudflare_access_audience: "the-access-application-aud-tag"
 #   allowed_origins: []
+#   web_terminal_enabled: false   # xterm.js "Open Terminal" over a WebSocket
+
+# Session lifecycle: create/detach/delete real tmux sessions from the
+# dashboard's "Tạo session"/"Tách"/"Xóa session" controls and from the
+# terminal_create_session/_detach_session/_delete_session MCP tools.
+# Disabled by default -- same opt-in posture as terminal_input, since this
+# creates real processes rather than only observing existing ones.
+# allowed_cwd_roots: absolute paths a requested working_directory must
+# resolve inside of (symlinks followed) -- empty/omitted falls back to
+# this server process's own home directory only, never "/". protected_
+# sessions: names that can never be deleted through this feature --
+# "terminal-mcp" is always included even if omitted here. launch_commands:
+# agent_type -> the exact literal binary run as the session's initial
+# command for "claude"/"codex" (never anything a caller supplies as
+# text) -- "shell" always starts the session's plain default shell.
+# session_lifecycle:
+#   enabled: false
+#   allowed_cwd_roots: []
+#   protected_sessions: [terminal-mcp]
+#   launch_commands:
+#     claude: claude
+#     codex: codex
+#   create_ready_timeout_seconds: 5
+#   default_grant_mode: none   # none | read | read_send
 
 # Periodic SQLite maintenance: retention pruning (audit.db's input_audit/
 # idempotent_sends, supervisor.db's supervisor_actions -- supervisor_events

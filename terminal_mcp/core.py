@@ -13,11 +13,12 @@ from .bindings import Binding, BindingStore, valid_binding_name
 from .config import AppConfig
 from .grants import SessionGrant, SessionGrantStore
 from .lease import DEFAULT_LEASE_TTL_SECONDS, PaneLeaseStore
+from .lifecycle import SessionLifecycleService
 from .metrics import record_delivery_outcome
 from .models import SessionIdentity
 from .permissions import (SENSITIVE_SESSION_WORDS, input_session_allowed,
-                          require_input, require_read, session_allowed, session_input_denied_by_pattern,
-                          valid_session_name)
+                          require_input, require_read, require_session_lifecycle, session_allowed,
+                          session_input_denied_by_pattern, valid_session_name)
 from .redaction import redact_ansi_safe, redact_text
 from .status import classify_status
 from .tmux import SEND_TEXT_ENTER_SETTLE_SECONDS, TmuxClient, TmuxError, iso_timestamp
@@ -109,6 +110,11 @@ class TerminalService:
         # only ever serializes *within this one process*.
         self.leases = leases or PaneLeaseStore()
         self._pane_locks = PaneLockRegistry()
+        # Session create/detach/delete -- see lifecycle.py's module
+        # docstring for why this is composed here rather than folded into
+        # this already-large class: one small, independently-testable
+        # object, shared by both the dashboard routes and the MCP tools.
+        self.lifecycle = SessionLifecycleService(config, self.tmux)
 
     def resolve_identity(self, session: str) -> SessionIdentity | None:
         try:
@@ -1443,7 +1449,64 @@ class TerminalService:
                 row["input_block_reason"] = self._input_grant_block_reason(
                     item.name, pane_current_command=item.pane_current_command)
             sessions.append(row)
-        return {"sessions": sessions}
+        # Read-only convenience for the "Xóa session" UI (never the actual
+        # enforcement -- terminal_delete_session's own protected_sessions
+        # check is what actually refuses a delete, regardless of what a
+        # client does or doesn't disable in its own UI based on this list).
+        return {"sessions": sessions,
+               "session_lifecycle_enabled": self.config.session_lifecycle.enabled,
+               "protected_sessions": list(self.config.session_lifecycle.protected_sessions),
+               "web_terminal_enabled": self.config.dashboard.web_terminal_enabled}
+
+    def terminal_web_terminal_access(self, session: str) -> dict[str, Any]:
+        """Authorization + existence resolution for the web terminal
+        (xterm.js over a WebSocket, attaching a browser directly to an
+        existing tmux session's real pty -- webterm.py). This is the ONE
+        place that decision is made; both dashboard.py's /dashboard/ws/
+        terminal and webauth_dashboard.py's /app/ws/terminal call this
+        and nothing else to decide whether to spawn a WebTerminalProcess
+        at all, and whether it opens read-only or interactive -- reuses
+        the exact same canonical _read_authorized_with_grant/
+        _input_authorized_with_grant every other read/input surface in
+        this file already goes through, so "can this viewer open a web
+        terminal, and can they type into it" can never diverge from what
+        terminal_tail/terminal_send_text would themselves decide for the
+        same caller and session.
+
+        Returns either {"error": ...} (refuse outright -- the caller must
+        never construct a WebTerminalProcess) or {"exists": True,
+        "input": bool, "attached": bool} (open -- `input` decides
+        interactive vs. tmux `-r` read-only; there is no separate "read"
+        key because reaching this point at all already proves read access:
+        ACCESS_DENIED is returned before existence is even checked).
+
+        Never creates, mutates, or attaches to anything itself -- purely a
+        decision, exactly like _guard/_input_guard themselves; unlike
+        those, it also confirms the session currently EXISTS (SESSION_
+        NOT_FOUND), which the caller cannot skip: the web terminal must
+        fail closed on a since-deleted/renamed session rather than let
+        tmux's own attach-session error surface as some generic pty
+        failure."""
+        if not self.config.dashboard.web_terminal_enabled:
+            return {"error": "WEB_TERMINAL_DISABLED"}
+        if (error := require_read(self.config)) is not None:
+            return {"error": error}
+        if not valid_session_name(session):
+            return {"error": "INVALID_SESSION_NAME"}
+        grant = self.grants.get(session)
+        if not self._read_authorized_with_grant(session, grant):
+            return {"error": "ACCESS_DENIED"}
+        try:
+            info = self.tmux.get_session(session)
+        except TmuxError as exc:
+            return {"error": "TMUX_ERROR", "reason": str(exc)}
+        if info is None:
+            return {"error": "SESSION_NOT_FOUND"}
+        input_enabled = bool(
+            self.config.permissions.terminal_input
+            and self._input_authorized_with_grant(session, grant)[0]
+        )
+        return {"exists": True, "input": input_enabled, "attached": info.attached}
 
     def grant_session_read(self, session: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
         if (error := require_read(self.config)) is not None:
@@ -1643,3 +1706,138 @@ class TerminalService:
             response = {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
         return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter,
                                   origin=origin, trace_id=trace_id, parent_turn_id=parent_turn_id, depth=depth)
+
+    # -- Session lifecycle: create/detach/delete -------------------------
+    # The ONE implementation shared by the dashboard's "Tạo session"/
+    # "Tách"/"Xóa session" routes (dashboard.py, webauth_dashboard.py) and
+    # the terminal_create_session/_detach_session/_delete_session MCP
+    # tools (mcp_app.py) -- see lifecycle.py's module docstring. This
+    # layer owns permission-gating (require_session_lifecycle), audit
+    # logging, and the optional grant/binding/initial_prompt composition
+    # a create call may ask for; SessionLifecycleService.create/detach/
+    # delete own the actual tmux decisions and never audit or authorize
+    # anything themselves.
+
+    def terminal_create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
+                                initial_prompt: str | None = None, grant_mode: str = "none",
+                                binding: str | None = None, requested_by: str | None = None) -> dict[str, Any]:
+        """Create a new detached tmux session running a plain shell, or
+        Claude/Codex via a server-side-only launcher (config.session_
+        lifecycle.launch_commands -- agent_type never becomes a command
+        line, only a lookup key). Never auto-grants read/input just
+        because creation succeeded: grant_mode is an explicit, separate
+        opt-in ("none" the default -- caller gets a session, nothing more;
+        "read"/"read_send" additionally call the exact same grant_session_
+        read/grant_session_input this class always used, so a grant here
+        is refused exactly when a manual dashboard grant would be, e.g. a
+        sensitive-worded name or a denied input pattern). initial_prompt,
+        when given, is sent ONLY after the session reaches state=READY,
+        through terminal_send_text -- the same pane-locked, idempotency-
+        aware, adapter-verified submission path every other prompt in
+        this project goes through, never a raw send-keys shortcut; if the
+        caller's own effective permission doesn't yet cover this session
+        (no static whitelist match and grant_mode left at "none"), that
+        send comes back ACCESS_DENIED same as it would for any other
+        ungranted session -- creating a session never silently bypasses
+        that. binding, when given, calls terminal_bind (fails closed on a
+        name collision exactly like terminal_bind always has, never
+        remaps an existing binding out from under it)."""
+        action = "create_session"
+        if (error := require_session_lifecycle(self.config)) is not None:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason=error)
+            return {"error": error, "session": name}
+        if grant_mode not in ("none", "read", "read_send"):
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_GRANT_MODE")
+            return {"error": "INVALID_GRANT_MODE", "session": name}
+        result = self.lifecycle.create(name, agent_type, cwd)
+        ok = "error" not in result
+        self.audit.record(action=action, session=name, result="CREATED" if ok else "BLOCKED",
+                          reason=result.get("error") or f"agent_type={agent_type}")
+        if not ok:
+            return result
+
+        grant_result: dict[str, Any] | None = None
+        if grant_mode != "none":
+            read_result = self.grant_session_read(name, True, granted_by=requested_by)
+            if "error" not in read_result and grant_mode == "read_send":
+                input_result = self.grant_session_input(name, True, granted_by=requested_by)
+                grant_result = {"read": read_result, "input": input_result}
+            else:
+                grant_result = {"read": read_result}
+        result["grant"] = grant_result
+
+        binding_result: dict[str, Any] | None = None
+        if binding:
+            binding_result = self.terminal_bind(binding, name)
+        result["binding"] = binding_result
+
+        if initial_prompt:
+            if result.get("state") == "READY":
+                result["initial_prompt_result"] = self.terminal_send_text(name, initial_prompt, press_enter=True)
+            else:
+                result["initial_prompt_result"] = {
+                    "error": "SESSION_NOT_READY", "session": name, "state": result.get("state"),
+                }
+        return result
+
+    def terminal_detach_session(self, name: str) -> dict[str, Any]:
+        """Detach any attached tmux client from `name` -- never kills the
+        session/process, never loses output/state. Idempotent: a session
+        that isn't currently attached returns its current state, not an
+        error."""
+        action = "detach_session"
+        if (error := require_session_lifecycle(self.config)) is not None:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason=error)
+            return {"error": error, "session": name}
+        if not valid_session_name(name):
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_SESSION_NAME")
+            return {"error": "INVALID_SESSION_NAME", "session": name}
+        result = self.lifecycle.detach(name)
+        ok = "error" not in result
+        self.audit.record(action=action, session=name, result="DETACHED" if ok else "BLOCKED",
+                          reason=result.get("error") or result.get("action"))
+        return result
+
+    def terminal_delete_session(self, name: str) -> dict[str, Any]:
+        """Terminate and remove exactly one tmux session (`kill-session`,
+        never `kill-server`) -- the protected set (config.session_
+        lifecycle.protected_sessions, always including "terminal-mcp")
+        can never be deleted through this path. Idempotent: a session
+        already gone returns a success-shaped result, not an error. On an
+        actual (or already-confirmed) deletion, cleans up any binding
+        pointing at this session (deleted -- a binding to a session that
+        no longer exists is never left dangling) and any active grant
+        (revoked via the same grant_session_read(False) path a manual
+        dashboard revoke uses, which keeps the grant ROW as history but
+        marks it disabled, rather than deleting it outright)."""
+        action = "delete_session"
+        if (error := require_session_lifecycle(self.config)) is not None:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason=error)
+            return {"error": error, "session": name}
+        if not valid_session_name(name):
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_SESSION_NAME")
+            return {"error": "INVALID_SESSION_NAME", "session": name}
+        result = self.lifecycle.delete(name, protected_sessions=self.config.session_lifecycle.protected_sessions)
+        ok = "error" not in result
+        if ok:
+            self._cleanup_after_session_gone(name)
+        self.audit.record(action=action, session=name, result="DELETED" if ok else "BLOCKED",
+                          reason=result.get("error") or result.get("action"))
+        return result
+
+    def _cleanup_after_session_gone(self, session: str) -> None:
+        """Called once terminal_delete_session has confirmed `session` no
+        longer exists (whether this call killed it or it was already
+        gone) -- never leaves a binding pointing at a vanished session,
+        and never leaves an active grant for one either. Supervisor watch
+        cleanup lives one layer up (mcp_app.py/dashboard.py, which are the
+        callers that actually have a SupervisorService reference -- the
+        same "coordinate across two composed services at the wiring
+        layer" pattern supervisor_watch/supervisor_unwatch already use in
+        mcp_app.py for v1/v2 policy purge, not a new precedent)."""
+        for binding in self.bindings.list():
+            if binding.session == session:
+                self.bindings.delete(binding.name)
+        grant = self.grants.get(session)
+        if grant is not None and (grant.read_enabled or grant.input_enabled):
+            self.grants.set_read(session, False, granted_by="system:session_deleted")

@@ -14,6 +14,21 @@ def valid_session_name(session: str) -> bool:
     return bool(SAFE_SESSION_RE.fullmatch(session))
 
 
+def valid_new_session_name(session: str) -> bool:
+    """Stricter than valid_session_name -- for a NAME BEING CREATED
+    (session lifecycle's create only; every other caller of
+    valid_session_name is unaffected and unchanged). SAFE_SESSION_RE
+    already excludes shell metacharacters/path separators entirely (the
+    charset is [A-Za-z0-9_.-] only), so the injection floor is the same
+    one every existing session-name check already relies on -- this adds
+    two narrower create-time rules on top: a name tmux's own `-t`
+    addressing could otherwise misparse (a leading '-' looks like a flag,
+    a leading '.' is reserved for tmux's own relative-pane/window syntax
+    in some target forms) is refused outright, never passed to `tmux
+    new-session -s` at all."""
+    return valid_session_name(session) and not session.startswith("-") and not session.startswith(".")
+
+
 def session_allowed(session: str, config: AppConfig) -> bool:
     if not valid_session_name(session):
         return False
@@ -65,3 +80,11 @@ def require_read(config: AppConfig) -> str | None:
 
 def require_input(config: AppConfig) -> str | None:
     return None if config.permissions.terminal_input else "INPUT_DISABLED"
+
+
+def require_session_lifecycle(config: AppConfig) -> str | None:
+    """Own, independent gate for create/detach/delete -- deliberately not
+    piggybacked on terminal_read (a deployment can read everything and
+    still never be able to spin up new processes) or terminal_input.
+    Disabled unless config.session_lifecycle.enabled is explicitly true."""
+    return None if config.session_lifecycle.enabled else "SESSION_LIFECYCLE_DISABLED"

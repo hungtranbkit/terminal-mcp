@@ -22,7 +22,10 @@ def test_dashboard_routes_are_registered(read_config):
     server = build_mcp(service)
     register_dashboard(server, service)
 
-    routes = {route.path: set(route.methods) for route in server._custom_starlette_routes}
+    # Only Route entries have .methods -- the web terminal's WebSocketRoute
+    # (/dashboard/ws/terminal) doesn't, and isn't what this test is about.
+    routes = {route.path: set(route.methods) for route in server._custom_starlette_routes
+              if hasattr(route, "methods")}
     assert routes["/dashboard"] == {"GET", "HEAD"}
     assert routes["/dashboard/sessions"] == {"GET", "HEAD"}
     assert routes["/dashboard/api/sessions"] == {"GET", "HEAD"}
@@ -984,12 +987,14 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
     # This whole batch (health indicator, remembered fullscreen, mobile input
     # polish) is presentation-only: the same routes as before that batch,
     # with the same methods, still registered — no new endpoint was added
-    # for it. (The two /dashboard/api/supervisor* routes below belong to the
-    # separate Supervisor Loop v1 feature, not this batch.)
+    # for it. (The two /dashboard/api/supervisor* routes, the session_
+    # lifecycle create/detach/delete routes, and the web terminal's own
+    # routes below belong to later, separate features, not this batch.)
     service = TerminalService(read_config)
     server = build_mcp(service)
     register_dashboard(server, service)
-    routes = {route.path: set(route.methods) for route in server._custom_starlette_routes}
+    routes = {route.path: set(route.methods) for route in server._custom_starlette_routes
+              if hasattr(route, "methods")}
     assert routes == {
         "/dashboard": {"GET", "HEAD"},
         "/dashboard/sessions": {"GET", "HEAD"},
@@ -998,11 +1003,20 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/session/input": {"POST"},
         "/dashboard/api/session/grant-read": {"POST"},
         "/dashboard/api/session/grant-input": {"POST"},
+        "/dashboard/api/session/create": {"POST"},
+        "/dashboard/api/session/detach": {"POST"},
+        "/dashboard/api/session/delete": {"POST"},
+        "/dashboard/assets/{filename}": {"GET", "HEAD"},
+        "/dashboard/terminal": {"GET", "HEAD"},
         "/dashboard/api/supervisor": {"GET", "HEAD"},
         "/dashboard/api/supervisor/ack": {"POST"},
         "/dashboard/api/supervisor2": {"GET", "HEAD"},
         "/dashboard/api/supervisor2/pause": {"POST"},
     }
+    # The web terminal's WebSocket route is registered too, just outside
+    # this HTTP-methods-only dict (WebSocketRoute has no .methods).
+    ws_paths = {route.path for route in server._custom_starlette_routes if not hasattr(route, "methods")}
+    assert ws_paths == {"/dashboard/ws/terminal"}
 
 
 def test_dashboard_supervisor_batch_input_route_still_gated(read_config):

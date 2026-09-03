@@ -126,6 +126,39 @@ class TmuxClient:
         for key in keys:
             self._run(["send-keys", "-t", session, key])
 
+    def new_session(self, name: str, cwd: str, command: str | None = None) -> None:
+        """Create ONE new detached session -- `-d` (never attaches this
+        process itself to it) and `-c cwd` (the session's starting working
+        directory, already resolved/allowlist-checked by the caller --
+        see lifecycle.py). `command`, when given, is the session's
+        initial program (e.g. "claude"/"codex", from config.session_
+        lifecycle.launch_commands -- never client-supplied text); omitted,
+        the session starts the pane's normal default shell, exactly like
+        a bare `tmux new -s NAME`."""
+        args = ["new-session", "-d", "-s", name, "-c", cwd]
+        if command:
+            args.append(command)
+        self._run(args)
+
+    def detach_session(self, name: str) -> None:
+        """Detach every client currently attached to `name` -- does not
+        touch the session/pane/process itself in any way (no output or
+        state is lost, nothing is killed). Callers (lifecycle.py) check
+        session.attached first and skip calling this at all when nothing
+        is attached, so idempotency for the "already detached" case is
+        handled one layer up, not by relying on tmux's own exit code
+        here."""
+        self._run(["detach-client", "-s", name])
+
+    def kill_session(self, name: str) -> None:
+        """Terminate exactly ONE session and its process(es) -- `kill-
+        session -t`, never `kill-server` (which would tear down every
+        session on the host, including this project's own controlling
+        one). Callers (lifecycle.py) check the session still exists
+        first, so idempotency for the "already gone" case is handled one
+        layer up."""
+        self._run(["kill-session", "-t", name])
+
     def exit_copy_mode(self, session: str) -> None:
         """Cancel tmux's active pane mode without writing a key to the PTY.
 

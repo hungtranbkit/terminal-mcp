@@ -6,13 +6,17 @@ from urllib.parse import urlparse
 import anyio
 from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.routing import WebSocketRoute
+from starlette.websockets import WebSocket
 
 from .cf_access import verify_access_assertion
 from .core import TerminalService
-from .permissions import input_session_allowed, session_allowed
+from .permissions import input_session_allowed, session_allowed, valid_session_name
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
+from .webterm import WebTerminalProcess, pump_websocket
+from .webterm_assets import ASSETS
 
 _log = logging.getLogger(__name__)
 
@@ -28,6 +32,24 @@ INPUT_ERROR_STATUS = {
     "IDENTITY_MISMATCH": 403,
     "SENSITIVE_SESSION_NOT_GRANTABLE": 403,
     "INVALID_SESSION": 400,
+    # Session lifecycle (create/detach/delete) error -> status mapping --
+    # same table, same convention as every code above it.
+    "SESSION_LIFECYCLE_DISABLED": 403,
+    "INVALID_SESSION_NAME": 400,
+    "SENSITIVE_SESSION_NOT_CREATABLE": 403,
+    "INVALID_AGENT_TYPE": 400,
+    "INVALID_GRANT_MODE": 400,
+    "SESSION_ALREADY_EXISTS": 409,
+    "INVALID_CWD": 400,
+    "CWD_NOT_FOUND": 400,
+    "CWD_NOT_ALLOWED": 403,
+    "NO_ALLOWED_CWD_ROOTS": 500,
+    "LAUNCHER_NOT_CONFIGURED": 500,
+    "LAUNCH_FAILED": 502,
+    "SESSION_PROTECTED": 403,
+    "TMUX_ERROR": 502,
+    # Web terminal (webterm.py) error -> status mapping, same table/convention.
+    "WEB_TERMINAL_DISABLED": 403,
 }
 
 
@@ -1726,8 +1748,16 @@ DASHBOARD_HTML = """<!doctype html>
           name.append(' ', badge);
         }
         const meta = document.createElement('div'); meta.className = 'meta';
-        const dot = document.createElement('span'); dot.className = 'attach-dot' + (row.attached ? ' on' : '');
-        meta.append(dot, document.createTextNode(`${row.windows} window · ${row.attached ? 'attached' : 'detached'}`));
+        // Two independent axes, never conflated: the process/session
+        // itself (a session in this list always IS running -- tmux drops
+        // a dead pane's session from its own listing, this is never a
+        // "the process died" signal) vs. whether any terminal CLIENT
+        // (a real terminal, or this dashboard's own Open Terminal) is
+        // currently attached to watch it. A detached session is not a
+        // dead one -- see the Open Terminal button below for reattaching.
+        const dot = document.createElement('span'); dot.className = 'attach-dot on';
+        meta.append(dot, document.createTextNode(
+          `● Running · ${row.windows} window · ${row.attached ? 'Terminal attached' : 'No terminal attached'}`));
         main.append(name, meta);
         div.append(main);
 
@@ -1961,6 +1991,37 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     .pm-presets button:disabled { opacity:.5; cursor:not-allowed }
     .pm-block { color:#ff9f9f; font-size:11px }
     .pm-error { color:#ff6b6b; font-size:12px }
+    .toolbar button.primary { background:var(--accent); border:1px solid var(--accent); border-radius:8px; color:#fff; padding:7px 14px; cursor:pointer; font:inherit; font-size:13px; font-weight:600 }
+    .toolbar button.primary:hover { filter:brightness(1.08) }
+    .toolbar button.primary:disabled { opacity:.5; cursor:not-allowed; filter:none }
+    .row-actions button.danger { border-color:#ff6b6b; color:#ff9f9f }
+    .row-actions button:disabled { opacity:.4; cursor:not-allowed }
+    /* Create-session modal -- same component/behavior as #permModal above. */
+    #csBackdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:30 }
+    #csModal {
+      display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:31;
+      width:min(420px, calc(100vw - 32px)); max-height:85vh; overflow:auto;
+      background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 20px 50px rgba(0,0,0,.6);
+    }
+    body.cs-modal-visible #csBackdrop, body.cs-modal-visible #csModal { display:block }
+    #csModal .cs-head { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center }
+    #csModal .cs-body { padding:16px; display:flex; flex-direction:column; gap:12px }
+    #csModal label { font-size:12px; color:var(--muted) }
+    #csModal input[type=text], #csModal select {
+      width:100%; margin-top:4px; padding:9px 10px; border-radius:8px; border:1px solid var(--line);
+      background:#0f1730; color:var(--text); font:inherit; font-size:13px;
+    }
+    #csModal .cs-agent-choices { display:flex; gap:8px }
+    #csModal .cs-agent-choices button {
+      flex:1; padding:9px 6px; border-radius:8px; border:1px solid var(--line); background:#19243b;
+      color:var(--text); cursor:pointer; font:inherit; font-size:13px;
+    }
+    #csModal .cs-agent-choices button.selected { border-color:var(--accent); color:var(--accent) }
+    #csModal .cs-submit { background:var(--accent); border:none; border-radius:8px; color:#fff; padding:10px; cursor:pointer; font:inherit; font-size:14px; font-weight:600 }
+    #csModal .cs-submit:disabled { opacity:.5; cursor:not-allowed }
+    #csModal button.close { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 9px; cursor:pointer; font:inherit }
+    #csModal .cs-error { color:#ff6b6b; font-size:12px; min-height:14px }
+    #csModal .cs-hint { color:var(--muted); font-size:11px }
     @media (max-width:760px) {
       header { padding:12px 14px } .toolbar { padding:8px 14px } main { padding:0 14px 14px }
       #bulkBar { padding:8px 14px }
@@ -1976,6 +2037,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     </div>
   </header>
   <div class="toolbar">
+    <button id="newSessionBtn" class="primary" type="button">+ Tạo session</button>
     <input type="text" id="searchBox" placeholder="Tìm theo tên session...">
     <label><input type="checkbox" id="onlyGrantable"> Chỉ hiện session chưa whitelist</label>
     <span id="count"></span>
@@ -2004,6 +2066,35 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       <div class="pm-error" id="permModalError"></div>
     </div>
   </div>
+  <div id="csBackdrop"></div>
+  <div id="csModal" role="dialog" aria-modal="true" aria-labelledby="csModalTitle">
+    <div class="cs-head">
+      <strong id="csModalTitle">Tạo session mới</strong>
+      <button id="csModalCloseBtn" class="close" type="button">✕</button>
+    </div>
+    <form class="cs-body" id="csForm">
+      <div>
+        <label for="csName">Tên session (bắt buộc)</label>
+        <input type="text" id="csName" maxlength="128" placeholder="vd: codex-my-task" autocomplete="off" required>
+        <div class="cs-hint">Chỉ chữ/số/._- , không dấu cách, không ký tự shell.</div>
+      </div>
+      <div>
+        <label>Loại session</label>
+        <div class="cs-agent-choices" id="csAgentChoices">
+          <button type="button" data-agent="shell" class="selected">Shell</button>
+          <button type="button" data-agent="claude">Claude</button>
+          <button type="button" data-agent="codex">Codex</button>
+        </div>
+      </div>
+      <div>
+        <label for="csCwd">Working directory (tuỳ chọn)</label>
+        <input type="text" id="csCwd" maxlength="512" placeholder="để trống = mặc định" autocomplete="off">
+        <div class="cs-hint">Phải nằm trong thư mục được phép cấu hình sẵn trên server.</div>
+      </div>
+      <div class="cs-error" id="csError"></div>
+      <button type="submit" class="cs-submit" id="csSubmitBtn">Tạo session</button>
+    </form>
+  </div>
   <script>
     const tbodyEl = document.querySelector('#tbody');
     const countEl = document.querySelector('#count');
@@ -2018,6 +2109,15 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     const permModalBlockEl = document.querySelector('#permModalBlock');
     const permModalErrorEl = document.querySelector('#permModalError');
     const permModalCloseBtnEl = document.querySelector('#permModalCloseBtn');
+    const newSessionBtnEl = document.querySelector('#newSessionBtn');
+    const csBackdropEl = document.querySelector('#csBackdrop');
+    const csFormEl = document.querySelector('#csForm');
+    const csNameEl = document.querySelector('#csName');
+    const csCwdEl = document.querySelector('#csCwd');
+    const csAgentChoicesEl = document.querySelector('#csAgentChoices');
+    const csErrorEl = document.querySelector('#csError');
+    const csSubmitBtnEl = document.querySelector('#csSubmitBtn');
+    const csModalCloseBtnEl = document.querySelector('#csModalCloseBtn');
 
     function clean(value) { return value == null ? '' : String(value); }
 
@@ -2079,6 +2179,110 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
 
     let lastKnownRows = [];
     const bulkSelected = new Set();
+    let protectedSessions = new Set();
+    let sessionLifecycleEnabled = true; // optimistic default until the first /dashboard/api/sessions response is seen
+    let webTerminalEnabled = true; // same optimistic-default convention as sessionLifecycleEnabled above
+    const WEBTERM_PAGE = '/dashboard/terminal';
+
+    // -- Create-session modal ---------------------------------------------
+    let csSelectedAgent = 'shell';
+    function closeCreateModal() {
+      document.body.classList.remove('cs-modal-visible');
+      csErrorEl.textContent = ''; csFormEl.reset();
+      csSelectedAgent = 'shell';
+      csAgentChoicesEl.querySelectorAll('button').forEach(b => b.classList.toggle('selected', b.dataset.agent === 'shell'));
+    }
+    function openCreateModal() {
+      csErrorEl.textContent = '';
+      document.body.classList.add('cs-modal-visible');
+      csNameEl.focus();
+    }
+    newSessionBtnEl.onclick = openCreateModal;
+    csModalCloseBtnEl.onclick = closeCreateModal;
+    csBackdropEl.onclick = closeCreateModal;
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && document.body.classList.contains('cs-modal-visible')) closeCreateModal();
+    });
+    csAgentChoicesEl.querySelectorAll('button').forEach(btn => {
+      btn.onclick = () => {
+        csSelectedAgent = btn.dataset.agent;
+        csAgentChoicesEl.querySelectorAll('button').forEach(b => b.classList.toggle('selected', b === btn));
+      };
+    });
+    // Client-side mirror of permissions.py's SAFE_SESSION_RE -- pure UX
+    // (an early, friendly error instead of a round-trip); the server
+    // enforces this same shape independently and authoritatively no
+    // matter what this check does or doesn't catch.
+    const SAFE_SESSION_NAME_RE = /^[A-Za-z0-9_.-]{1,128}$/;
+    csFormEl.onsubmit = async (event) => {
+      event.preventDefault();
+      const name = csNameEl.value.trim();
+      const cwd = csCwdEl.value.trim();
+      csErrorEl.textContent = '';
+      if (!SAFE_SESSION_NAME_RE.test(name) || name.startsWith('-') || name.startsWith('.')) {
+        csErrorEl.textContent = 'Tên session không hợp lệ (chỉ chữ/số/._- , không bắt đầu bằng "-" hoặc ".").';
+        return;
+      }
+      csSubmitBtnEl.disabled = true; csSubmitBtnEl.textContent = 'Đang tạo…';
+      try {
+        const response = await fetch('/dashboard/api/session/create', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null}),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (result && result.error) {
+          csErrorEl.textContent = `Lỗi: ${clean(result.error)}${result.reason ? ' -- ' + clean(result.reason) : ''}`;
+          return;
+        }
+        closeCreateModal();
+        await load();
+      } catch (error) {
+        csErrorEl.textContent = `Lỗi mạng: ${clean(error && error.message)}`;
+      } finally {
+        csSubmitBtnEl.disabled = false; csSubmitBtnEl.textContent = 'Tạo session';
+      }
+    };
+
+    // Real tmux detach-client -- distinct from the "Gỡ tab" column above,
+    // which only hides a session from THIS BROWSER's view (localStorage,
+    // never touches tmux). This calls the actual server-side detach.
+    async function detachSessionReal(name, btn) {
+      btn.disabled = true;
+      try {
+        const response = await fetch('/dashboard/api/session/detach', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name}),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (result && result.error) { alert(`Không tách được "${name}": ${clean(result.error)}`); }
+        await load();
+      } catch (error) {
+        alert(`Lỗi mạng khi tách "${name}": ${clean(error && error.message)}`);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    // Dừng & xóa hẳn session -- terminate the process, never recoverable.
+    async function deleteSessionReal(name, btn) {
+      const confirmed = confirm(
+        `Xóa (dừng & xóa) session "${name}"?\n\nToàn bộ tiến trình đang chạy trong session này sẽ bị dừng. `
+        + `Không thể hoàn tác.`
+      );
+      if (!confirmed) return;
+      btn.disabled = true;
+      try {
+        const response = await fetch('/dashboard/api/session/delete', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name}),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (result && result.error) { alert(`Không xóa được "${name}": ${clean(result.error)}`); }
+        await load();
+      } catch (error) {
+        alert(`Lỗi mạng khi xóa "${name}": ${clean(error && error.message)}`);
+      } finally {
+        btn.disabled = false;
+      }
+    }
 
     async function postGrantRaw(path, name, enabled) {
       const response = await fetch(path, {
@@ -2251,9 +2455,16 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         tdPerm.appendChild(permBadge);
         tr.appendChild(tdPerm);
 
+        // Process/session liveness ("● Running" -- always true for a row
+        // in this list; tmux drops a dead pane's session from its own
+        // listing) is a separate axis from terminal CLIENT attachment
+        // (real terminal or this dashboard's Open Terminal) -- a
+        // detached session is not a dead one, so this never says just
+        // "detached" as if it were.
         const tdAttach = document.createElement('td');
-        const dot = document.createElement('span'); dot.className = 'attach-dot' + (row.attached ? ' on' : '');
-        tdAttach.append(dot, document.createTextNode(row.attached ? 'attached' : 'detached'));
+        const dot = document.createElement('span'); dot.className = 'attach-dot on';
+        tdAttach.append(dot, document.createTextNode(
+          `Running · ${row.attached ? 'Terminal attached' : 'No terminal attached'}`));
         tr.appendChild(tdAttach);
 
         const tdWindows = document.createElement('td'); tdWindows.textContent = row.windows;
@@ -2286,6 +2497,56 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         const openBtn = document.createElement('a'); openBtn.textContent = '↗ Mở'; openBtn.href = `/dashboard#${encodeURIComponent(row.name)}`;
         openBtn.style.cssText = 'background:#19243b;border:1px solid var(--line);border-radius:6px;color:inherit;padding:4px 9px;text-decoration:none;font-size:12px';
         actions.appendChild(openBtn);
+
+        // Open Terminal: a real, interactive xterm.js session attached
+        // directly to this tmux session's own pty (webterm.py) -- distinct
+        // from "↗ Mở" above, which only shows already-captured pane TEXT
+        // through the polling API. Requires read access (row.effective_read)
+        // same as "↗ Mở"; whether typing works once open is a separate,
+        // server-enforced decision (row.effective_input) the terminal page
+        // itself surfaces live, never assumed here. Made visually prominent
+        // for a detached session specifically (requirement: "với session
+        // detached nút Open Terminal nổi bật") -- accent-colored instead of
+        // the flat row-action grey every other button here uses.
+        if (row.effective_read) {
+          const termBtn = document.createElement('a');
+          termBtn.textContent = row.attached ? '🖥 Mở Terminal' : '🖥 Mở Terminal ⚡';
+          termBtn.href = `${WEBTERM_PAGE}?session=${encodeURIComponent(row.name)}`;
+          termBtn.title = row.effective_input
+            ? 'Mở web terminal thật (xterm.js), gắn trực tiếp vào tmux session này -- gõ được'
+            : 'Mở web terminal thật (xterm.js) ở chế độ CHỈ XEM -- chưa có quyền input';
+          const prominent = !row.attached;
+          termBtn.style.cssText = prominent
+            ? 'background:var(--accent);border:1px solid var(--accent);border-radius:6px;color:#fff;padding:4px 9px;text-decoration:none;font-size:12px;font-weight:600'
+            : 'background:#19243b;border:1px solid var(--line);border-radius:6px;color:inherit;padding:4px 9px;text-decoration:none;font-size:12px';
+          if (!webTerminalEnabled) {
+            termBtn.removeAttribute('href');
+            termBtn.style.opacity = '.4'; termBtn.style.cursor = 'not-allowed';
+            termBtn.title = 'Tính năng web terminal đang tắt (dashboard.web_terminal_enabled trong config.yaml)';
+          }
+          actions.appendChild(termBtn);
+        }
+
+        // Real tmux detach/delete -- gated on session_lifecycle_enabled
+        // (server-side truth, mirrored here only so the button correctly
+        // shows as disabled instead of round-tripping to a guaranteed
+        // SESSION_LIFECYCLE_DISABLED). Delete is additionally disabled
+        // for any protected session (always includes "terminal-mcp").
+        const tachBtn = document.createElement('button'); tachBtn.type = 'button'; tachBtn.textContent = '⏏ Tách';
+        tachBtn.title = 'Ngắt kết nối tmux client thật (không kill session, không mất dữ liệu)';
+        tachBtn.disabled = !sessionLifecycleEnabled;
+        tachBtn.onclick = () => detachSessionReal(row.name, tachBtn);
+        actions.appendChild(tachBtn);
+
+        const isProtected = protectedSessions.has(row.name);
+        const xoaBtn = document.createElement('button'); xoaBtn.type = 'button'; xoaBtn.className = 'danger';
+        xoaBtn.textContent = '🗑 Xóa session';
+        xoaBtn.title = isProtected ? 'Session này được bảo vệ, không thể xóa qua dashboard'
+          : 'Dừng & xóa hẳn session này (không thể hoàn tác)';
+        xoaBtn.disabled = !sessionLifecycleEnabled || isProtected;
+        xoaBtn.onclick = () => deleteSessionReal(row.name, xoaBtn);
+        actions.appendChild(xoaBtn);
+
         tdActions.appendChild(actions);
         tr.appendChild(tdActions);
 
@@ -2297,6 +2558,12 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       const data = await fetchJSON('/dashboard/api/sessions', {cache:'no-store'});
       const rows = data.sessions || [];
       lastKnownRows = rows;
+      protectedSessions = new Set(data.protected_sessions || ['terminal-mcp']);
+      sessionLifecycleEnabled = data.session_lifecycle_enabled !== false;
+      webTerminalEnabled = data.web_terminal_enabled === true;
+      newSessionBtnEl.disabled = !sessionLifecycleEnabled;
+      newSessionBtnEl.title = sessionLifecycleEnabled ? ''
+        : 'Tính năng tạo session đang tắt (session_lifecycle.enabled: false trong config.yaml)';
       countEl.textContent = data.error ? `(${clean(data.error)})` : `(${rows.length} session)`;
       // Bulk selection never keeps a stale/no-longer-grantable name.
       const byName = new Map(rows.map(r => [r.name, r]));
@@ -2325,6 +2592,266 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       }
     }
     refresh(); setInterval(refresh, 5000);
+  </script>
+</body>
+</html>"""
+
+
+# Web terminal (xterm.js over a WebSocket -- webterm.py). A standalone
+# page, deliberately NOT folded into DASHBOARD_HTML's own tab UI: this is
+# the one screen in the whole dashboard that genuinely needs a dedicated,
+# fullscreen, mobile-first layout (fit-to-viewport, on-screen-keyboard-
+# aware resize, no other dashboard chrome competing for space) rather
+# than sharing DASHBOARD_HTML's multi-tab shell -- see the task's own
+# "không redesign lớn dashboard" constraint: this adds one new page and
+# one new row-action button (below, in SESSIONS_ADMIN_HTML/
+# APP_SESSIONS_ADMIN_HTML), nothing about any existing screen changes.
+# `?session=NAME` (required) and `&takeover=1` (optional) are read
+# client-side from location.search, same query-param convention
+# session_detail's own /dashboard/api/session?name= already uses --
+# never server-templated, so this exact same static HTML document is
+# reused for every session, and webauth_dashboard.py's APP_WEBTERM_HTML
+# is this string with the same handful of literal-substring rewrites
+# every other page here already gets (see that module).
+WEBTERM_HTML = """<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+  <title>Terminal</title>
+  <link rel="stylesheet" href="/dashboard/assets/xterm.css">
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --err:#ff6b6b; --accent:#5b8cff; --mono: ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace; }
+    * { box-sizing:border-box }
+    html, body { height:100vh; height:100dvh; overflow:hidden }
+    body { margin:0; font:13px/1.4 var(--mono); background:var(--bg); color:var(--text); display:flex; flex-direction:column }
+    header { flex:0 0 auto; display:flex; align-items:center; gap:8px; padding:8px 10px; border-bottom:1px solid var(--line); flex-wrap:wrap; padding-top:max(8px, env(safe-area-inset-top)) }
+    a.back { color:var(--muted); text-decoration:none; font-size:12px; border:1px solid var(--line); border-radius:999px; padding:4px 9px; flex:0 0 auto }
+    a.back:hover { color:var(--text); border-color:var(--muted) }
+    .sess-name { font-weight:700; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:38vw }
+    .pill { display:inline-flex; align-items:center; gap:4px; border-radius:999px; padding:2px 8px; font-size:11px; border:1px solid var(--line); color:var(--muted); white-space:nowrap }
+    .pill.on { color:var(--green); border-color:var(--green) }
+    .pill.warn { color:var(--amber); border-color:var(--amber) }
+    .pill.err { color:var(--err); border-color:var(--err) }
+    .spacer { flex:1 }
+    .hdr-btn { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:5px 9px; cursor:pointer; font:inherit; font-size:12px; flex:0 0 auto }
+    .hdr-btn:hover { background:#233252 }
+    .hdr-btn:disabled { opacity:.4; cursor:not-allowed }
+    #termWrap { flex:1; min-height:0; position:relative; background:#000; padding:4px 6px }
+    #termHost { width:100%; height:100% }
+    .xterm { padding:2px }
+    #banner { flex:0 0 auto; display:none; padding:7px 12px; font-size:12px; text-align:center }
+    #banner.show { display:block }
+    #banner.reconnecting { background:rgba(255,200,87,.15); color:var(--amber) }
+    #banner.error { background:rgba(255,107,107,.15); color:var(--err) }
+    #banner button { margin-left:10px; background:transparent; border:1px solid currentColor; border-radius:6px; color:inherit; padding:2px 8px; cursor:pointer; font:inherit; font-size:11px }
+    #fontRow { display:flex; gap:2px }
+  </style>
+</head>
+<body>
+  <header>
+    <a class="back" href="/dashboard/sessions">← Sessions</a>
+    <span class="sess-name" id="sessName"></span>
+    <span class="pill" id="connPill">● đang kết nối…</span>
+    <span class="pill" id="modePill" style="display:none"></span>
+    <span class="pill" id="attachPill" style="display:none"></span>
+    <div class="spacer"></div>
+    <div id="fontRow">
+      <button class="hdr-btn" id="fontMinusBtn" type="button" title="Chữ nhỏ hơn">A-</button>
+      <button class="hdr-btn" id="fontPlusBtn" type="button" title="Chữ lớn hơn">A+</button>
+    </div>
+    <button class="hdr-btn" id="takeoverBtn" type="button" style="display:none" title="Ngắt client khác đang gắn vào session này và chiếm quyền">⚡ Chiếm quyền</button>
+  </header>
+  <div id="banner"></div>
+  <div id="termWrap"><div id="termHost"></div></div>
+  <script src="/dashboard/assets/xterm.js"></script>
+  <script src="/dashboard/assets/xterm-addon-fit.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const sessionName = params.get('session') || '';
+    let takeover = params.get('takeover') === '1';
+    document.getElementById('sessName').textContent = sessionName || '(thiếu tên session)';
+
+    const connPillEl = document.getElementById('connPill');
+    const modePillEl = document.getElementById('modePill');
+    const attachPillEl = document.getElementById('attachPill');
+    const bannerEl = document.getElementById('banner');
+    const takeoverBtnEl = document.getElementById('takeoverBtn');
+    const WS_PATH = '/dashboard/ws/terminal';
+
+    const FONT_KEY = 'terminal-mcp:webterm-font-size';
+    function loadFontSize() {
+      const raw = parseInt(localStorage.getItem(FONT_KEY) || '14', 10);
+      return Number.isFinite(raw) ? Math.min(24, Math.max(9, raw)) : 14;
+    }
+    let fontSize = loadFontSize();
+
+    const term = new Terminal({
+      cursorBlink: true, fontSize, fontFamily: "ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace",
+      scrollback: 5000, theme: { background: '#000000' }, allowProposedApi: true,
+    });
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(document.getElementById('termHost'));
+    fitAddon.fit();
+
+    function applyFontSize(next) {
+      fontSize = Math.min(24, Math.max(9, next));
+      term.options.fontSize = fontSize;
+      try { localStorage.setItem(FONT_KEY, String(fontSize)); } catch (error) { /* private mode -- non-essential */ }
+      fitAddon.fit();
+      sendResize();
+    }
+    document.getElementById('fontMinusBtn').onclick = () => applyFontSize(fontSize - 1);
+    document.getElementById('fontPlusBtn').onclick = () => applyFontSize(fontSize + 1);
+
+    if (!sessionName) {
+      connPillEl.textContent = '● lỗi'; connPillEl.className = 'pill err';
+      bannerEl.textContent = 'Thiếu tham số ?session=<tên session>.';
+      bannerEl.className = 'show error';
+      term.write('\\r\\n\\x1b[31mThiếu tham số session.\\x1b[0m\\r\\n');
+      throw new Error('missing session param');
+    }
+
+    let ws = null;
+    let closedByUser = false;
+    let reconnectAttempt = 0;
+    let reconnectTimer = null;
+    let readonlyMode = false;
+    const textEncoder = new TextEncoder();
+
+    function wsUrl() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const q = new URLSearchParams({ session: sessionName });
+      if (takeover) q.set('takeover', '1');
+      return `${proto}//${location.host}${WS_PATH}?${q.toString()}`;
+    }
+
+    function sendResize() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+      }
+    }
+
+    function setBanner(text, kind) {
+      if (!text) { bannerEl.className = ''; bannerEl.textContent = ''; return; }
+      bannerEl.textContent = text; bannerEl.className = `show ${kind || ''}`;
+    }
+
+    function scheduleReconnect() {
+      if (closedByUser) return;
+      reconnectAttempt += 1;
+      const delayMs = Math.min(10000, 1000 * Math.pow(2, Math.min(4, reconnectAttempt - 1)));
+      connPillEl.textContent = '● mất kết nối'; connPillEl.className = 'pill err';
+      setBanner(`Mất kết nối -- thử lại sau ${Math.round(delayMs / 1000)}s… (session tmux vẫn đang chạy)`, 'reconnecting');
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, delayMs);
+    }
+
+    function connect() {
+      clearTimeout(reconnectTimer);
+      connPillEl.textContent = '● đang kết nối…'; connPillEl.className = 'pill';
+      ws = new WebSocket(wsUrl());
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        reconnectAttempt = 0;
+        setBanner('', '');
+        sendResize();
+      };
+
+      ws.onmessage = (event) => {
+        if (typeof event.data === 'string') {
+          let payload = null;
+          try { payload = JSON.parse(event.data); } catch (error) { return; }
+          if (!payload || typeof payload !== 'object') return;
+          if (payload.type === 'ready') {
+            readonlyMode = !!payload.readonly;
+            connPillEl.textContent = '● LIVE'; connPillEl.className = 'pill on';
+            modePillEl.style.display = '';
+            if (readonlyMode) {
+              modePillEl.textContent = '👁 Chỉ xem'; modePillEl.className = 'pill warn';
+              term.options.disableStdin = true;
+            } else {
+              modePillEl.textContent = '⌨ Có thể gõ'; modePillEl.className = 'pill on';
+              term.options.disableStdin = false;
+            }
+            if (typeof payload.attached === 'boolean') {
+              attachPillEl.style.display = '';
+              attachPillEl.textContent = payload.attached ? '● attached (nơi khác)' : '○ detached';
+              attachPillEl.className = payload.attached ? 'pill warn' : 'pill';
+              takeoverBtnEl.style.display = (payload.attached && !readonlyMode && !takeover) ? '' : 'none';
+            }
+          } else if (payload.type === 'closed') {
+            setBanner('Phiên attach đã kết thúc (tiến trình tmux thoát hoặc session bị đóng).', 'error');
+          }
+          return;
+        }
+        term.write(new Uint8Array(event.data));
+      };
+
+      ws.onclose = (event) => {
+        if (closedByUser) return;
+        if (event.code >= 4400 && event.code < 4500) {
+          // Server-side refusal (auth/permission/not-found) -- never a
+          // transient network blip, so retrying forever would just spam
+          // an unauthorized/nonexistent target. Shown once, no auto-retry.
+          connPillEl.textContent = '● từ chối'; connPillEl.className = 'pill err';
+          const reasons = {
+            4401: 'Chưa đăng nhập.', 4403: 'Không có quyền mở terminal cho session này (hoặc tính năng đang tắt).',
+            4404: 'Session không còn tồn tại.',
+          };
+          setBanner(reasons[event.code] || `Kết nối bị từ chối (mã ${event.code}).`, 'error');
+          return;
+        }
+        scheduleReconnect();
+      };
+      ws.onerror = () => { /* onclose always follows; handled there */ };
+    }
+
+    term.onData((data) => {
+      if (readonlyMode) return;
+      ws && ws.readyState === WebSocket.OPEN && ws.send(textEncoder.encode(data));
+    });
+
+    takeoverBtnEl.onclick = () => {
+      if (!confirm('Chiếm quyền sẽ ngắt kết nối của client khác đang gắn vào session này (không mất dữ liệu, chỉ ngắt kết nối xem). Tiếp tục?')) return;
+      takeover = true;
+      closedByUser = true;
+      if (ws) ws.close();
+      closedByUser = false;
+      connect();
+    };
+
+    // Re-fit on any viewport change: orientation flip, iOS on-screen
+    // keyboard show/hide (which resizes window.visualViewport, NOT
+    // window itself, on iOS Safari), or the container simply changing
+    // size. Debounced (rAF) so a flurry of resize events -- normal
+    // during an iOS keyboard animation -- sends at most one resize
+    // message per frame instead of flooding the pty.
+    let fitPending = false;
+    function requestFit() {
+      if (fitPending) return;
+      fitPending = true;
+      requestAnimationFrame(() => {
+        fitPending = false;
+        try { fitAddon.fit(); } catch (error) { /* host not laid out yet -- next event will retry */ }
+        sendResize();
+      });
+    }
+    window.addEventListener('resize', requestFit);
+    if (window.visualViewport) window.visualViewport.addEventListener('resize', requestFit);
+    new ResizeObserver(requestFit).observe(document.getElementById('termWrap'));
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && (!ws || ws.readyState === WebSocket.CLOSED) && !closedByUser) {
+        reconnectAttempt = 0;
+        connect();
+      }
+    });
+    window.addEventListener('beforeunload', () => { closedByUser = true; if (ws) ws.close(); });
+
+    connect();
   </script>
 </body>
 </html>"""
@@ -2706,6 +3233,179 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         )
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    # -- Session lifecycle: create/detach/delete. Same TerminalService.
+    # terminal_create_session/_detach_session/_delete_session the MCP
+    # tools call (mcp_app.py) -- one implementation, two entry points.
+    # SESSION_LIFECYCLE_DISABLED (403) unless an operator has explicitly
+    # set session_lifecycle.enabled: true in config.yaml.
+
+    @server.custom_route("/dashboard/api/session/create", methods=["POST"], include_in_schema=False)
+    async def session_create(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        agent_type = body.get("agent_type", "shell") if isinstance(body, dict) else None
+        cwd = body.get("cwd") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name or not isinstance(agent_type, str):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        if cwd is not None and not isinstance(cwd, str):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        granted_by = identity.email if identity else None
+        _log.info("dashboard create_session name=%s agent_type=%s identity=%s", name, agent_type, granted_by)
+        # The dashboard's "Tạo session" button never requests a grant or an
+        # initial prompt -- explicit, separate opt-ins this route simply
+        # doesn't expose (see core.py's terminal_create_session docstring:
+        # creation itself never implies access). An operator who wants the
+        # new session readable/sendable still grants it explicitly, same
+        # as any other non-whitelisted session.
+        result = await anyio.to_thread.run_sync(
+            lambda: terminal.terminal_create_session(name, agent_type, cwd, requested_by=granted_by)
+        )
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/detach", methods=["POST"], include_in_schema=False)
+    async def session_detach(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        _log.info("dashboard detach_session name=%s identity=%s", name, identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(terminal.terminal_detach_session, name)
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/delete", methods=["POST"], include_in_schema=False)
+    async def session_delete(request: Request) -> JSONResponse:
+        # The UI-level "are you sure, this kills SESSION_NAME" confirmation
+        # is the browser's confirm() dialog (see SESSIONS_ADMIN_HTML) --
+        # this route's own safety floor is auth+CSRF (same _mutation_guard
+        # as every other mutation here) plus core.py's protected_sessions
+        # check, which is enforced regardless of what any client sends.
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        _log.info("dashboard delete_session name=%s identity=%s", name, identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(terminal.terminal_delete_session, name)
+        if "error" not in result:
+            await anyio.to_thread.run_sync(lambda: supervisor.unwatch(session=name, delete=False))
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    # -- Web terminal: xterm.js over a WebSocket, attached directly to an
+    # existing tmux session's real pty (webterm.py). See WEBTERM_HTML's
+    # own module-level comment for why this is a standalone page rather
+    # than folded into DASHBOARD_HTML, and TerminalService.
+    # terminal_web_terminal_access (core.py) for the one place read/input
+    # authorization for this feature is actually decided -- this route
+    # calls that and nothing else, exactly like every other route here
+    # defers its authorization decision to TerminalService.
+
+    @server.custom_route("/dashboard/assets/{filename}", methods=["GET"], include_in_schema=False)
+    async def webterm_asset(request: Request) -> Response:
+        # Static, versioned-by-vendored-file bytes (xterm.js/css, the fit
+        # addon) -- no session content, nothing request-specific, so this
+        # is deliberately NOT behind _read_guard: an operator's Cloudflare
+        # Access/webauth login gate exists to protect tmux pane content
+        # and session control, not a copy of a public JS library. Immutable
+        # cache: the URL never changes without a code deploy (no cache-
+        # busting query string), so a long max-age is safe and correct.
+        asset = ASSETS.get(request.path_params["filename"])
+        if asset is None:
+            return Response(status_code=404)
+        content, content_type = asset
+        return Response(content, media_type=content_type,
+                        headers={"Cache-Control": "public, max-age=86400, immutable"})
+
+    @server.custom_route("/dashboard/terminal", methods=["GET"], include_in_schema=False)
+    async def webterm_page(request: Request) -> HTMLResponse | JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(
+            WEBTERM_HTML,
+            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
+        )
+
+    async def dashboard_terminal_ws(websocket: WebSocket) -> None:
+        # _read_guard/_origin_allowed are plain functions of .headers/
+        # .cookies -- a Starlette WebSocket exposes both with the exact
+        # same interface a Request does, so these are the SAME closures
+        # every HTTP route above already uses, not a parallel copy of the
+        # auth/CSRF decision. Checked before accept(): the ASGI websocket
+        # handshake protocol treats close() before accept() as refusing
+        # the handshake itself (surfaces to the browser as a failed
+        # connection, close code included), never as an accepted socket
+        # that then immediately closes.
+        blocked, _identity = _read_guard(websocket)
+        if blocked is not None:
+            await websocket.close(code=4401)
+            return
+        if not _origin_allowed(websocket):
+            await websocket.close(code=4403)
+            return
+        session = websocket.query_params.get("session", "")
+        takeover_requested = websocket.query_params.get("takeover") == "1"
+        if not valid_session_name(session):
+            await websocket.close(code=4400)
+            return
+        access = await anyio.to_thread.run_sync(terminal.terminal_web_terminal_access, session)
+        if "error" in access:
+            code = 4404 if access["error"] == "SESSION_NOT_FOUND" else 4403
+            await websocket.close(code=code)
+            return
+        input_enabled = bool(access["input"])
+        # Takeover (tmux `-d`, detaching any other attached client) is a
+        # disruptive, explicit choice (see WEBTERM_HTML's confirm()
+        # prompt) -- only ever honored for a caller who already has input
+        # authorization; a read-only viewer's takeover=1 is silently
+        # dropped rather than granted, never upgraded into one.
+        takeover = takeover_requested and input_enabled
+        await websocket.accept()
+        terminal.audit.record(action="web_terminal_open", session=session, result="OPENED",
+                              reason=f"input={input_enabled} takeover={takeover}", source_transport="dashboard")
+        proc = await anyio.to_thread.run_sync(
+            lambda: WebTerminalProcess(terminal.tmux.binary, session, readonly=not input_enabled, takeover=takeover)
+        )
+        try:
+            await websocket.send_json({"type": "ready", "session": session, "readonly": not input_enabled,
+                                       "attached": access.get("attached", False)})
+            await pump_websocket(websocket, proc)
+        finally:
+            await anyio.to_thread.run_sync(proc.close)
+            terminal.audit.record(action="web_terminal_close", session=session, result="CLOSED",
+                                  source_transport="dashboard")
+
+    # MCPServer.custom_route only supports plain HTTP (Route) -- it has no
+    # WebSocket-route decorator. streamable_http_app() builds the actual
+    # Starlette app from `_custom_starlette_routes` verbatim
+    # (`routes.extend(custom_starlette_routes)` into `Starlette(routes=
+    # routes, ...)`), which accepts any Starlette BaseRoute, so appending
+    # a WebSocketRoute directly to that same list -- the one every
+    # @server.custom_route call above already populates -- works exactly
+    # like a supported route type, without a parallel app/server instance.
+    server._custom_starlette_routes.append(
+        WebSocketRoute("/dashboard/ws/terminal", endpoint=dashboard_terminal_ws, name="dashboard_terminal_ws")
+    )
 
     @server.custom_route("/dashboard/api/supervisor", methods=["GET"], include_in_schema=False)
     async def supervisor_summary(request: Request) -> JSONResponse:

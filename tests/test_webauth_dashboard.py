@@ -70,7 +70,11 @@ def test_webauth_routes_registered_alongside_cf_dashboard(tmp_path):
     server, _service, _webauth = _build(tmp_path)
     routes: dict[str, set[str]] = {}
     for route in server._custom_starlette_routes:
-        routes.setdefault(route.path, set()).update(route.methods)
+        # WebSocketRoute (/app/ws/terminal, /dashboard/ws/terminal) has no
+        # .methods -- not what this HTTP-route-registration test is about.
+        methods = getattr(route, "methods", None)
+        if methods is not None:
+            routes.setdefault(route.path, set()).update(methods)
     assert routes["/login"] >= {"GET", "HEAD", "POST"}
     assert routes["/logout"] == {"POST"}
     assert routes["/app"] == {"GET", "HEAD"}

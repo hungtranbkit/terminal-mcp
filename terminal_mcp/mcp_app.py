@@ -157,6 +157,74 @@ def build_mcp(service: TerminalService | None = None,
         """Inspect the last 20 lines and effective permission before sending input."""
         return terminal.terminal_input_context(session, binding)
 
+    # -- Session lifecycle: create/detach/delete. Disabled unless
+    # config.session_lifecycle.enabled is explicitly true (SESSION_
+    # LIFECYCLE_DISABLED otherwise) -- same opt-in posture as terminal_
+    # input. Shares one implementation (TerminalService.lifecycle /
+    # SessionLifecycleService) with the dashboard's own "Tạo session"/
+    # "Tách"/"Xóa session" controls -- neither surface has its own copy
+    # of the tmux/validation logic. ---------------------------------------
+
+    @server.tool()
+    def terminal_create_session(name: str, agent_type: str = "shell", working_directory: str | None = None,
+                                initial_prompt: str | None = None, grant_mode: str = "none",
+                                binding: str | None = None) -> dict:
+        """Create a new, detached tmux session -- agent_type is "shell"
+        (plain default shell), "claude", or "codex" (launched via a fixed,
+        server-side-only command from config, never anything this caller
+        supplies as text). working_directory is optional and must resolve
+        inside config.session_lifecycle.allowed_cwd_roots. Returns a
+        receipt with state: READY (the expected process is confirmed
+        running), CREATED (session exists, still starting -- not a
+        failure), or FAILED (nothing usable was created; any disposable
+        session this call itself made is already cleaned up). Duplicate
+        names fail explicitly (SESSION_ALREADY_EXISTS) -- this never
+        attaches to or overwrites an existing session.
+
+        grant_mode ("none" default | "read" | "read_send"): creating a
+        session NEVER implicitly grants you read/input on it -- pass
+        "read" or "read_send" to also request the same dashboard-style
+        grant grant_session_read/_input would give, subject to the exact
+        same rules (refused for a sensitive-worded name, a denied input
+        pattern, etc). initial_prompt, if given, is sent only once the
+        session reaches state=READY, through the same verified terminal_
+        send_text path every other prompt in this project uses -- if your
+        effective permission doesn't cover this session yet, that send
+        comes back ACCESS_DENIED, exactly like any other ungranted
+        session. binding, if given, additionally calls terminal_bind."""
+        return terminal.terminal_create_session(
+            name, agent_type, working_directory, initial_prompt=initial_prompt,
+            grant_mode=grant_mode, binding=binding, requested_by="mcp",
+        )
+
+    @server.tool()
+    def terminal_detach_session(name: str) -> dict:
+        """Detach any tmux client attached to `name` -- never kills the
+        session or its process, never loses output/state. Idempotent: a
+        session that is already not attached returns its current state,
+        not an error."""
+        return terminal.terminal_detach_session(name)
+
+    @server.tool()
+    def terminal_delete_session(name: str) -> dict:
+        """Terminate and remove exactly one tmux session (never affects
+        any other session, never uses tmux kill-server). The configured
+        protected session(s) -- always including "terminal-mcp" itself --
+        can never be deleted this way. Idempotent: a session already gone
+        returns a success-shaped result, not an error. Cleans up any
+        binding/grant that pointed at this session; a still-enabled
+        supervisor watch on it is disabled (its history is kept, not
+        deleted) rather than left pointing at a session that no longer
+        exists."""
+        result = terminal.terminal_delete_session(name)
+        if "error" not in result:
+            # Same wiring-layer coordination supervisor_watch/supervisor_
+            # unwatch above already do for v1/v2 policy purge -- disable
+            # (never hard-delete: keep the watch's history), only once
+            # the session is actually confirmed gone.
+            supervisor.unwatch(session=name, delete=False)
+        return result
+
     # -- Supervisor Loop v1: detection + a durable event queue only. Never
     # sends input, never executes a shell command; the underlying watch/poll
     # path is the same whitelist-guarded terminal_status(_bound) above. ----
