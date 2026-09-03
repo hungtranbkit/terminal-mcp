@@ -415,6 +415,7 @@ DASHBOARD_HTML = """<!doctype html>
   <header>
     <div><h1>Terminal MCP</h1><div class="muted">Whitelisted tmux session monitor</div></div>
     <div class="header-right">
+      <a href="/dashboard/sessions" class="supervisor-badge" id="sessionsAdminLink" style="text-decoration:none">⚙ Quản lý</a>
       <button id="supervisorBadge" class="supervisor-badge" type="button" hidden></button>
       <span class="live" id="liveBadge">● LIVE</span>
     </div>
@@ -1852,6 +1853,459 @@ DASHBOARD_HTML = """<!doctype html>
 </html>"""
 
 
+# A separate, dedicated admin screen -- "Quản lý session": one table with
+# every real tmux session (never filtered/hidden), its permission state,
+# attach state, and a detach toggle, plus bulk-select. Reads the exact
+# same /dashboard/api/sessions data DASHBOARD_HTML's sidebar already uses
+# (no new backend endpoint) and reuses the identical grant/revoke
+# semantics (grant-read/grant-input, same three presets, same "Xem
+# output"/"Gửi prompt" vocabulary) -- this is genuinely the same
+# capability as the main page's row/tab/card icons and bulk bar, just
+# surfaced as its own full-width, sortable-by-nothing-fancy table for
+# when the session count grows past what a sidebar comfortably shows.
+# Detach here writes the SAME localStorage key (terminal-mcp:detached-
+# sessions) the main dashboard's tabs already read, so toggling it here
+# is immediately reflected in the main page's tab strip and vice versa.
+SESSIONS_ADMIN_HTML = """<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Quản lý session</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --accent:#5b8cff; --mono: ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace; }
+    * { box-sizing:border-box }
+    html, body { height:100vh; height:100dvh; overflow:hidden }
+    body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text); display:flex; flex-direction:column }
+    header { flex:0 0 auto; display:flex; justify-content:space-between; gap:16px; align-items:center; padding:18px 24px; border-bottom:1px solid var(--line); flex-wrap:wrap }
+    h1 { margin:0; font-size:18px } .muted { color:var(--muted) } .live { color:var(--green); font-size:12px }
+    .live.offline { color:#ff6b6b } .live.reconnecting { color:var(--amber) } .live.auth-required { color:#ffb347 }
+    a.back { color:var(--muted); text-decoration:none; font-size:12px; border:1px solid var(--line); border-radius:999px; padding:4px 10px }
+    a.back:hover { color:var(--text); border-color:var(--muted) }
+    .toolbar { flex:0 0 auto; display:flex; align-items:center; gap:10px; padding:10px 24px; border-bottom:1px solid var(--line); flex-wrap:wrap }
+    .toolbar input[type=text] { background:#0f1730; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:7px 10px; font:inherit; font-size:13px; min-width:200px }
+    .toolbar label { display:flex; align-items:center; gap:6px; color:var(--muted); font-size:12px }
+    #count { color:var(--muted); font-size:12px; margin-left:auto }
+    #bulkBar { flex:0 0 auto; display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:8px 24px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted) }
+    #bulkBar[hidden] { display:none }
+    #bulkBar button { background:#2b3f66; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:5px 10px; cursor:pointer; font:inherit; font-size:12px }
+    #bulkBar button.danger { background:#3a2430 }
+    #bulkBar button.link { background:transparent; border:none; color:var(--muted); text-decoration:underline }
+    #bulkBar button:disabled { opacity:.5; cursor:not-allowed }
+    main { flex:1; min-height:0; overflow:auto; padding:0 24px 24px }
+    table { width:100%; border-collapse:collapse; font-size:13px; min-width:760px }
+    thead th { position:sticky; top:0; background:var(--bg); text-align:left; color:var(--muted); font-weight:600; padding:10px 8px; border-bottom:1px solid var(--line); white-space:nowrap }
+    tbody td { padding:9px 8px; border-bottom:1px solid var(--line); vertical-align:middle }
+    tbody tr:hover { background:#121a2d }
+    tbody tr.needs-attention { background:rgba(255,200,87,.06) }
+    .sess-name { font-weight:700 }
+    .attn-badge { display:inline-block; background:var(--amber); color:#231a00; font-size:10px; font-weight:700; padding:1px 6px; border-radius:4px; margin-left:6px; vertical-align:middle }
+    .perm-badge { display:inline-block; border-radius:999px; padding:2px 9px; font-size:11px; border:1px solid var(--line); white-space:nowrap }
+    .perm-badge.whitelist { color:var(--muted) }
+    .perm-badge.full { color:var(--green); border-color:var(--green) }
+    .perm-badge.read { color:#8fb8ff; border-color:#8fb8ff }
+    .perm-badge.none { color:#ff9f9f; border-color:#ff9f9f }
+    .attach-dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--line); margin-right:5px; vertical-align:middle }
+    .attach-dot.on { background:var(--green) }
+    .row-actions { display:flex; gap:6px; align-items:center; white-space:nowrap }
+    .row-actions button { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 9px; cursor:pointer; font:inherit; font-size:12px }
+    .row-actions button:hover { background:#233252 }
+    .row-actions button.on { border-color:var(--amber); color:var(--amber) }
+    .empty-row td { text-align:center; color:var(--muted); padding:32px 8px }
+    /* Permission modal -- identical component/behavior to the main
+       dashboard's own #permModal (see DASHBOARD_HTML), duplicated here
+       deliberately rather than shared (this is a standalone page, no
+       shared JS module mechanism in this project -- see other pages'
+       own precedent for small, self-contained duplication over a new
+       cross-page dependency). */
+    #permBackdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:30 }
+    #permModal {
+      display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:31;
+      width:min(360px, calc(100vw - 32px)); max-height:80vh; overflow:auto;
+      background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 20px 50px rgba(0,0,0,.6);
+    }
+    body.perm-modal-visible #permBackdrop, body.perm-modal-visible #permModal { display:block }
+    #permModal .pm-head { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px }
+    #permModal .pm-head strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    #permModal .pm-body { padding:14px 16px; display:flex; flex-direction:column; gap:10px }
+    #permModal button.close { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 9px; cursor:pointer; font:inherit }
+    .pm-state { font-size:12px; color:var(--muted) }
+    .pm-presets { display:flex; flex-direction:column; gap:8px }
+    .pm-presets button { background:#2b3f66; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:10px 12px; cursor:pointer; font:inherit; font-size:13px; text-align:left }
+    .pm-presets button.current { border-color:var(--green) }
+    .pm-presets button.danger { background:#3a2430 }
+    .pm-presets button:disabled { opacity:.5; cursor:not-allowed }
+    .pm-block { color:#ff9f9f; font-size:11px }
+    .pm-error { color:#ff6b6b; font-size:12px }
+    @media (max-width:760px) {
+      header { padding:12px 14px } .toolbar { padding:8px 14px } main { padding:0 14px 14px }
+      #bulkBar { padding:8px 14px }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>Quản lý session</h1><div class="muted">Toàn bộ session tmux thật, quyền, và trạng thái detach</div></div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <a class="back" href="/dashboard">← Terminal</a>
+      <span class="live" id="liveBadge">● LIVE</span>
+    </div>
+  </header>
+  <div class="toolbar">
+    <input type="text" id="searchBox" placeholder="Tìm theo tên session...">
+    <label><input type="checkbox" id="onlyGrantable"> Chỉ hiện session chưa whitelist</label>
+    <span id="count"></span>
+  </div>
+  <div id="bulkBar" hidden></div>
+  <main>
+    <table>
+      <thead>
+        <tr>
+          <th></th><th>Session</th><th>Quyền</th><th>Trạng thái</th><th>Windows</th><th>Hoạt động gần nhất</th><th>Detach</th><th>Hành động</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </main>
+  <div id="permBackdrop"></div>
+  <div id="permModal" role="dialog" aria-modal="true" aria-labelledby="permModalTitle">
+    <div class="pm-head">
+      <strong id="permModalTitle"></strong>
+      <button id="permModalCloseBtn" class="close" type="button">✕</button>
+    </div>
+    <div class="pm-body">
+      <div class="pm-state" id="permModalState"></div>
+      <div class="pm-presets" id="permModalPresets"></div>
+      <div class="pm-block" id="permModalBlock"></div>
+      <div class="pm-error" id="permModalError"></div>
+    </div>
+  </div>
+  <script>
+    const tbodyEl = document.querySelector('#tbody');
+    const countEl = document.querySelector('#count');
+    const searchEl = document.querySelector('#searchBox');
+    const onlyGrantableEl = document.querySelector('#onlyGrantable');
+    const bulkBarEl = document.querySelector('#bulkBar');
+    const liveBadgeEl = document.querySelector('#liveBadge');
+    const permBackdropEl = document.querySelector('#permBackdrop');
+    const permModalTitleEl = document.querySelector('#permModalTitle');
+    const permModalStateEl = document.querySelector('#permModalState');
+    const permModalPresetsEl = document.querySelector('#permModalPresets');
+    const permModalBlockEl = document.querySelector('#permModalBlock');
+    const permModalErrorEl = document.querySelector('#permModalError');
+    const permModalCloseBtnEl = document.querySelector('#permModalCloseBtn');
+
+    function clean(value) { return value == null ? '' : String(value); }
+
+    // Same positive-evidence-of-a-sign-in-redirect fetch wrapper as the
+    // main dashboard (see DASHBOARD_HTML's own fetchJSON for the full
+    // rationale) -- kept byte-identical in spirit, duplicated for the
+    // same "standalone page" reason as the modal above.
+    class AuthRequiredError extends Error {}
+    async function fetchJSON(url, options) {
+      const response = await fetch(url, options);
+      let landedOnAccessLogin = false;
+      if (response.redirected) {
+        try {
+          const host = new URL(response.url).hostname;
+          landedOnAccessLogin = host === 'cloudflareaccess.com' || host.endsWith('.cloudflareaccess.com');
+        } catch (error) { /* opaque/malformed response.url -- fall through */ }
+      }
+      const accessChallengeHeader = (response.headers.get('www-authenticate') || '').includes('Cloudflare-Access');
+      if (landedOnAccessLogin || accessChallengeHeader || response.status === 401) {
+        throw new AuthRequiredError(`sign-in required for ${url} (status ${response.status})`);
+      }
+      if (response.status >= 500) throw new Error(`server error from ${url}: status ${response.status}`);
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        throw new Error(`unexpected response from ${url}: status ${response.status}, content-type ${contentType || '(none)'}`);
+      }
+      return response.json();
+    }
+
+    const DETACHED_KEY = 'terminal-mcp:detached-sessions';
+    function loadDetached() {
+      try { return new Set(JSON.parse(localStorage.getItem(DETACHED_KEY) || '[]')); }
+      catch (error) { return new Set(); }
+    }
+    function saveDetached(set) {
+      try { localStorage.setItem(DETACHED_KEY, JSON.stringify([...set])); }
+      catch (error) { /* private mode / storage disabled: not essential, ignore */ }
+    }
+    let detachedSessions = loadDetached();
+
+    function grantable(row) { return !row.allowed; }
+    function grantState(row) {
+      if (row.grant && row.grant.input_enabled) return 'full';
+      if (row.grant && row.grant.read_enabled) return 'read';
+      return 'none';
+    }
+    function grantStateLabel(state) {
+      return state === 'full' ? 'Xem + gửi' : state === 'read' ? 'Chỉ xem' : 'Chưa cấp quyền';
+    }
+    const INPUT_BLOCK_LABELS = {
+      INPUT_DISABLED: 'nhập liệu đang tắt toàn cục (permissions.terminal_input trong config.yaml)',
+      ACCESS_DENIED: 'tên session khớp một mẫu bị cấm (input_policy.denied_session_patterns)',
+      SENSITIVE_TARGET: 'lệnh đang chạy trong session là mục tiêu nhạy cảm (ssh/mysql/psql/sudo/passwd)',
+      SENSITIVE_SESSION_NOT_GRANTABLE: 'tên session chứa từ nhạy cảm (root/ssh/password/secret/database)',
+      SESSION_NOT_FOUND: 'session tmux này không còn tồn tại',
+      INVALID_SESSION: 'tên session không hợp lệ',
+    };
+    function inputBlockLabel(reason) { return INPUT_BLOCK_LABELS[reason] || reason; }
+
+    let lastKnownRows = [];
+    const bulkSelected = new Set();
+
+    async function postGrantRaw(path, name, enabled) {
+      const response = await fetch(path, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name, enabled}),
+      });
+      return response.json().catch(() => ({}));
+    }
+    async function applyPreset(names, preset) {
+      const failures = [];
+      for (const name of names) {
+        if (preset === 'none') {
+          const r = await postGrantRaw('/dashboard/api/session/grant-read', name, false);
+          if (r && r.error) failures.push(`${name}: ${clean(r.error)}`);
+          continue;
+        }
+        const r1 = await postGrantRaw('/dashboard/api/session/grant-read', name, true);
+        if (r1 && r1.error) { failures.push(`${name}: ${clean(r1.error)}`); continue; }
+        if (preset === 'read') {
+          const current = lastKnownRows.find(x => x.name === name);
+          if (current && current.grant && current.grant.input_enabled) {
+            await postGrantRaw('/dashboard/api/session/grant-input', name, false);
+          }
+        } else {
+          const r2 = await postGrantRaw('/dashboard/api/session/grant-input', name, true);
+          if (r2 && r2.error) failures.push(`${name}: ${clean(r2.error)}`);
+        }
+      }
+      await load();
+      return failures;
+    }
+
+    let permModalNames = null;
+    function closePermModal() { document.body.classList.remove('perm-modal-visible'); permModalNames = null; }
+    permModalCloseBtnEl.onclick = closePermModal;
+    permBackdropEl.onclick = closePermModal;
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && document.body.classList.contains('perm-modal-visible')) closePermModal();
+    });
+
+    function renderPermModalBody(names) {
+      const rows = names.map(n => lastKnownRows.find(r => r.name === n)).filter(Boolean);
+      const bulk = names.length > 1;
+      permModalTitleEl.textContent = bulk ? `${names.length} session đã chọn` : names[0];
+      permModalBlockEl.textContent = ''; permModalErrorEl.textContent = '';
+      if (!bulk) {
+        const row = rows[0];
+        if (!row) { permModalStateEl.textContent = 'Session không còn tồn tại.'; permModalPresetsEl.replaceChildren(); return; }
+        const state = grantState(row);
+        const granted = grantStateLabel(state);
+        const effective = row.effective_input ? 'Xem + gửi' : row.effective_read ? 'Chỉ xem' : 'Không truy cập';
+        permModalStateEl.textContent = granted === effective ? `Hiện tại: ${granted}` : `Đã cấp: ${granted} · Hiệu lực thực tế: ${effective}`;
+        if (row.input_block_reason && state !== 'full') {
+          permModalBlockEl.textContent = `Gửi prompt bị chặn: ${inputBlockLabel(row.input_block_reason)}`;
+        }
+      } else {
+        permModalStateEl.textContent = `Áp dụng một hành động cho cả ${names.length} session.`;
+      }
+      permModalPresetsEl.replaceChildren();
+      const presets = [{key:'full', label:'🔓 Xem + gửi'}, {key:'read', label:'👁 Chỉ xem'}, {key:'none', label:'🔒 Thu hồi'}];
+      for (const preset of presets) {
+        const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = preset.label;
+        const classes = [];
+        if (!bulk && grantState(rows[0]) === preset.key) classes.push('current');
+        if (preset.key === 'none') classes.push('danger');
+        if (classes.length) btn.className = classes.join(' ');
+        btn.onclick = async () => {
+          permModalPresetsEl.querySelectorAll('button').forEach(b => b.disabled = true);
+          const failures = await applyPreset(names, preset.key);
+          permModalErrorEl.textContent = failures.length ? `Một số session thất bại: ${failures.join('; ')}` : '';
+          if (bulk) { bulkSelected.clear(); renderBulkBar(); closePermModal(); }
+          else renderPermModalBody(names);
+        };
+        permModalPresetsEl.appendChild(btn);
+      }
+    }
+    async function openPermModal(names) {
+      if (typeof names === 'string') names = [names];
+      permModalNames = names;
+      document.body.classList.add('perm-modal-visible');
+      permModalTitleEl.textContent = names.length > 1 ? `${names.length} session đã chọn` : names[0];
+      permModalStateEl.textContent = 'Đang tải…';
+      permModalPresetsEl.replaceChildren(); permModalBlockEl.textContent = ''; permModalErrorEl.textContent = '';
+      await load();
+      if (permModalNames === names) renderPermModalBody(names);
+    }
+
+    function renderBulkBar() {
+      bulkBarEl.hidden = bulkSelected.size === 0;
+      bulkBarEl.replaceChildren();
+      if (bulkSelected.size === 0) return;
+      const label = document.createElement('span'); label.textContent = `${bulkSelected.size} đã chọn:`;
+      const fullBtn = document.createElement('button'); fullBtn.type='button'; fullBtn.textContent='🔓 Xem + gửi';
+      const readBtn = document.createElement('button'); readBtn.type='button'; readBtn.textContent='👁 Chỉ xem';
+      const revokeBtn = document.createElement('button'); revokeBtn.type='button'; revokeBtn.className='danger'; revokeBtn.textContent='🔒 Thu hồi';
+      const clearBtn = document.createElement('button'); clearBtn.type='button'; clearBtn.className='link'; clearBtn.textContent='Bỏ chọn';
+      const status = document.createElement('span'); status.className = 'muted';
+      const allBtns = [fullBtn, readBtn, revokeBtn, clearBtn];
+      const run = (preset) => async () => {
+        const names = [...bulkSelected];
+        allBtns.forEach(b => b.disabled = true);
+        status.textContent = `Đang áp dụng cho ${names.length} session…`;
+        const failures = await applyPreset(names, preset);
+        bulkSelected.clear(); renderBulkBar();
+        if (failures.length) { bulkBarEl.hidden = false; bulkBarEl.appendChild(status); status.textContent = `Một số session thất bại: ${failures.join('; ')}`; }
+      };
+      fullBtn.onclick = run('full'); readBtn.onclick = run('read'); revokeBtn.onclick = run('none');
+      clearBtn.onclick = () => { bulkSelected.clear(); renderBulkBar(); };
+      bulkBarEl.append(label, fullBtn, readBtn, revokeBtn, clearBtn);
+    }
+
+    function timeAgo(iso) {
+      if (!iso) return '—';
+      const ms = Date.now() - new Date(iso).getTime();
+      if (!Number.isFinite(ms) || ms < 0) return iso;
+      const s = Math.floor(ms / 1000);
+      if (s < 60) return `${s}s trước`;
+      const m = Math.floor(s / 60);
+      if (m < 60) return `${m}p trước`;
+      const h = Math.floor(m / 60);
+      if (h < 24) return `${h}g trước`;
+      return `${Math.floor(h / 24)}ngày trước`;
+    }
+
+    function renderRows(rows) {
+      tbodyEl.replaceChildren();
+      const query = searchEl.value.trim().toLowerCase();
+      const filtered = rows.filter(row => {
+        if (query && !row.name.toLowerCase().includes(query)) return false;
+        if (onlyGrantableEl.checked && !grantable(row)) return false;
+        return true;
+      });
+      if (!filtered.length) {
+        const tr = document.createElement('tr'); tr.className = 'empty-row';
+        const td = document.createElement('td'); td.colSpan = 8;
+        td.textContent = rows.length ? 'Không có session khớp bộ lọc.' : 'Không có session nào.';
+        tr.appendChild(td); tbodyEl.appendChild(tr);
+        return;
+      }
+      for (const row of filtered) {
+        const tr = document.createElement('tr');
+        if (row.state === 'WAITING_INPUT') tr.className = 'needs-attention';
+
+        const tdCheck = document.createElement('td');
+        if (grantable(row)) {
+          const check = document.createElement('input'); check.type = 'checkbox'; check.checked = bulkSelected.has(row.name);
+          check.setAttribute('aria-label', `Chọn ${row.name}`);
+          check.onchange = () => { if (check.checked) bulkSelected.add(row.name); else bulkSelected.delete(row.name); renderBulkBar(); };
+          tdCheck.appendChild(check);
+        }
+        tr.appendChild(tdCheck);
+
+        const tdName = document.createElement('td');
+        const nameSpan = document.createElement('span'); nameSpan.className = 'sess-name'; nameSpan.textContent = row.name;
+        tdName.appendChild(nameSpan);
+        if (row.state === 'WAITING_INPUT') {
+          const badge = document.createElement('span'); badge.className = 'attn-badge'; badge.textContent = '⚠ CẦN INPUT';
+          tdName.appendChild(badge);
+        }
+        tr.appendChild(tdName);
+
+        const tdPerm = document.createElement('td');
+        const permBadge = document.createElement('span'); permBadge.className = 'perm-badge';
+        if (!grantable(row)) { permBadge.classList.add('whitelist'); permBadge.textContent = 'Whitelist tĩnh'; }
+        else {
+          const state = grantState(row);
+          permBadge.classList.add(state);
+          permBadge.textContent = grantStateLabel(state);
+        }
+        tdPerm.appendChild(permBadge);
+        tr.appendChild(tdPerm);
+
+        const tdAttach = document.createElement('td');
+        const dot = document.createElement('span'); dot.className = 'attach-dot' + (row.attached ? ' on' : '');
+        tdAttach.append(dot, document.createTextNode(row.attached ? 'attached' : 'detached'));
+        tr.appendChild(tdAttach);
+
+        const tdWindows = document.createElement('td'); tdWindows.textContent = row.windows;
+        tr.appendChild(tdWindows);
+
+        const tdActivity = document.createElement('td'); tdActivity.textContent = timeAgo(row.activity);
+        tr.appendChild(tdActivity);
+
+        const tdDetach = document.createElement('td');
+        const isDetached = detachedSessions.has(row.name);
+        const detachBtn = document.createElement('button');
+        detachBtn.type = 'button'; detachBtn.textContent = isDetached ? 'Gỡ tab' : 'Bấm để gỡ tab';
+        if (isDetached) detachBtn.className = 'on';
+        detachBtn.title = 'Chỉ ẩn/hiện tab trên trình duyệt này -- không đụng session tmux hay quyền thật';
+        detachBtn.onclick = () => {
+          if (detachedSessions.has(row.name)) detachedSessions.delete(row.name); else detachedSessions.add(row.name);
+          saveDetached(detachedSessions);
+          renderRows(lastKnownRows);
+        };
+        tdDetach.appendChild(detachBtn);
+        tr.appendChild(tdDetach);
+
+        const tdActions = document.createElement('td');
+        const actions = document.createElement('div'); actions.className = 'row-actions';
+        if (grantable(row)) {
+          const permBtn = document.createElement('button'); permBtn.type = 'button'; permBtn.textContent = '🔐 Quyền';
+          permBtn.onclick = () => openPermModal(row.name);
+          actions.appendChild(permBtn);
+        }
+        const openBtn = document.createElement('a'); openBtn.textContent = '↗ Mở'; openBtn.href = `/dashboard#${encodeURIComponent(row.name)}`;
+        openBtn.style.cssText = 'background:#19243b;border:1px solid var(--line);border-radius:6px;color:inherit;padding:4px 9px;text-decoration:none;font-size:12px';
+        actions.appendChild(openBtn);
+        tdActions.appendChild(actions);
+        tr.appendChild(tdActions);
+
+        tbodyEl.appendChild(tr);
+      }
+    }
+
+    async function load() {
+      const data = await fetchJSON('/dashboard/api/sessions', {cache:'no-store'});
+      const rows = data.sessions || [];
+      lastKnownRows = rows;
+      countEl.textContent = data.error ? `(${clean(data.error)})` : `(${rows.length} session)`;
+      // Bulk selection never keeps a stale/no-longer-grantable name.
+      const byName = new Map(rows.map(r => [r.name, r]));
+      let bulkChanged = false;
+      for (const name of [...bulkSelected]) {
+        const row = byName.get(name);
+        if (!row || !grantable(row)) { bulkSelected.delete(name); bulkChanged = true; }
+      }
+      if (bulkChanged) renderBulkBar();
+      renderRows(rows);
+    }
+
+    searchEl.oninput = () => renderRows(lastKnownRows);
+    onlyGrantableEl.onchange = () => renderRows(lastKnownRows);
+
+    async function refresh() {
+      try {
+        await load();
+        liveBadgeEl.textContent = '● LIVE'; liveBadgeEl.className = 'live';
+      } catch (error) {
+        if (error instanceof AuthRequiredError) {
+          liveBadgeEl.textContent = '● SIGN-IN REQUIRED'; liveBadgeEl.className = 'live auth-required';
+        } else {
+          liveBadgeEl.textContent = '● OFFLINE'; liveBadgeEl.className = 'live offline';
+        }
+      }
+    }
+    refresh(); setInterval(refresh, 5000);
+  </script>
+</body>
+</html>"""
+
+
 def register_dashboard(server: MCPServer, terminal: TerminalService,
                        supervisor: SupervisorService | None = None,
                        supervisor_v2: SupervisorV2Service | None = None) -> None:
@@ -1954,6 +2408,20 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return blocked
         return HTMLResponse(
             DASHBOARD_HTML,
+            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
+        )
+
+    @server.custom_route("/dashboard/sessions", methods=["GET"], include_in_schema=False)
+    async def dashboard_sessions_admin(request: Request) -> HTMLResponse | JSONResponse:
+        # Same read guard as /dashboard itself -- this is a second VIEW of
+        # the exact same /dashboard/api/sessions data and the exact same
+        # grant-read/grant-input mutation routes, not a new privilege
+        # surface. See SESSIONS_ADMIN_HTML's own module-level comment.
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(
+            SESSIONS_ADMIN_HTML,
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 

@@ -43,7 +43,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from .core import TerminalService
-from .dashboard import DASHBOARD_HTML, INPUT_ERROR_STATUS
+from .dashboard import DASHBOARD_HTML, INPUT_ERROR_STATUS, SESSIONS_ADMIN_HTML
 from .permissions import input_session_allowed, session_allowed
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
@@ -58,12 +58,32 @@ _log = logging.getLogger(__name__)
 # source, so this can never silently drift out of sync as new API calls
 # are added to dashboard.py's own JS). A logout control is appended to
 # the page chrome; nothing else about the markup differs.
-APP_DASHBOARD_HTML = DASHBOARD_HTML.replace("/dashboard/api/", "/app/api/").replace(
-    '<span class="live" id="liveBadge">● LIVE</span>',
-    '<span class="live" id="liveBadge">● LIVE</span> '
+_LOGOUT_BUTTON = (
     '<form method="POST" action="/logout" style="display:inline"><button type="submit" '
     'style="background:#2b3f66;border:1px solid #26324b;border-radius:8px;color:#eef2ff;'
-    'padding:4px 10px;cursor:pointer;font:inherit;font-size:12px">Đăng xuất</button></form>',
+    'padding:4px 10px;cursor:pointer;font:inherit;font-size:12px">Đăng xuất</button></form>'
+)
+APP_DASHBOARD_HTML = (
+    DASHBOARD_HTML.replace("/dashboard/api/", "/app/api/")
+    .replace('href="/dashboard/sessions"', 'href="/app/sessions"')
+    .replace(
+        '<span class="live" id="liveBadge">● LIVE</span>',
+        f'<span class="live" id="liveBadge">● LIVE</span> {_LOGOUT_BUTTON}',
+    )
+)
+# Same page, mounted under /app/sessions -- see SESSIONS_ADMIN_HTML's own
+# module-level comment in dashboard.py for why this is a full duplicate
+# view of the same data/mutations rather than a new privilege surface.
+# The row-level "↗ Mở" link and the back-to-terminal link both point at
+# /dashboard normally; rewritten to /app the same way the API prefix is.
+APP_SESSIONS_ADMIN_HTML = (
+    SESSIONS_ADMIN_HTML.replace("/dashboard/api/", "/app/api/")
+    .replace('href="/dashboard"', 'href="/app"')
+    .replace("`/dashboard#", "`/app#")
+    .replace(
+        '<span class="live" id="liveBadge">● LIVE</span>',
+        f'<span class="live" id="liveBadge">● LIVE</span> {_LOGOUT_BUTTON}',
+    )
 )
 
 _PAGE_STYLE = """
@@ -274,6 +294,18 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
         if user.must_change_password:
             return RedirectResponse("/app/password", status_code=303)
         return HTMLResponse(APP_DASHBOARD_HTML, headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
+
+    @server.custom_route("/app/sessions", methods=["GET"], include_in_schema=False)
+    async def app_sessions_admin_page(request: Request):
+        # Same session requirement as /app itself -- a forced-change
+        # session is redirected to /app/password just like /app is,
+        # never allowed to reach this second view of the same data either.
+        blocked, user = _require_session_page(request)
+        if blocked is not None:
+            return blocked
+        if user.must_change_password:
+            return RedirectResponse("/app/password", status_code=303)
+        return HTMLResponse(APP_SESSIONS_ADMIN_HTML, headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
 
     @server.custom_route("/app/password", methods=["GET"], include_in_schema=False)
     async def app_password_page(request: Request):

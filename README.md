@@ -35,6 +35,7 @@ For the remote-capable, loopback-only Streamable HTTP mode:
 .venv/bin/terminal-mcp-http
 # MCP endpoint: http://127.0.0.1:8766/mcp
 # Read-only session dashboard: http://127.0.0.1:8766/dashboard
+# Session management table (grants, detach):   http://127.0.0.1:8766/dashboard/sessions
 # Liveness/readiness/version/metrics (loopback-only, not tunnel-routed):
 #   http://127.0.0.1:8766/health/live
 #   http://127.0.0.1:8766/health/ready    -- tmux + every durable SQLite store; 503 if any is broken
@@ -76,6 +77,28 @@ grant/revoke is audited. This mechanism is dashboard-only: there is no MCP
 tool to grant or revoke — an MCP client only ever sees the *result* (a
 session's `read_allowed`/`read_granted`/`input_allowed`/`input_granted`
 fields in `terminal_list_sessions`), never a way to create one itself.
+
+Every one of these controls -- a lock icon on each session's row/tab, a
+compact entry point in its own open card, and a bulk-select bar for
+several at once -- opens the same "Quyền truy cập" modal, exposing just
+two ideas (**Xem output** / **Gửi prompt**) with three one-click presets
+(Xem + gửi / Chỉ xem / Thu hồi). A newly-discovered session is never
+hidden, only badged "Chưa cấp quyền" until granted.
+
+### Session management screen
+
+`/dashboard/sessions` (linked from the main dashboard's "⚙ Quản lý"
+button) is a dedicated, table-shaped view of every real tmux session --
+useful once the session count grows past what the sidebar comfortably
+shows. It reads the exact same `/dashboard/api/sessions` data and drives
+the exact same grant-read/grant-input routes as the main page (same
+"Quyền truy cập" modal, same bulk bar) -- a second view of the same
+capability, not a new privilege surface. It adds a name filter, a "chỉ
+hiện session chưa whitelist" toggle, and a detach control per row (the
+same client-side, localStorage-only concept the main page's tabs already
+use -- toggling it here is immediately reflected in the main page's tab
+strip in the same browser, and vice versa, since both read/write the
+same key).
 
 ### Password login
 

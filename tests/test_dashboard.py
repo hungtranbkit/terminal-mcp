@@ -11,7 +11,7 @@ from starlette.testclient import TestClient
 from terminal_mcp import dashboard as dashboard_module
 from terminal_mcp.config import AppConfig, DashboardConfig, InputPolicyConfig, PermissionsConfig, load_config
 from terminal_mcp.core import TerminalService
-from terminal_mcp.dashboard import DASHBOARD_HTML, register_dashboard
+from terminal_mcp.dashboard import DASHBOARD_HTML, SESSIONS_ADMIN_HTML, register_dashboard
 from terminal_mcp.mcp_app import build_mcp
 
 REPO_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -24,9 +24,78 @@ def test_dashboard_routes_are_registered(read_config):
 
     routes = {route.path: set(route.methods) for route in server._custom_starlette_routes}
     assert routes["/dashboard"] == {"GET", "HEAD"}
+    assert routes["/dashboard/sessions"] == {"GET", "HEAD"}
     assert routes["/dashboard/api/sessions"] == {"GET", "HEAD"}
     assert routes["/dashboard/api/session"] == {"GET", "HEAD"}
     assert routes["/dashboard/api/session/input"] == {"POST"}
+
+
+def test_sessions_admin_page_reachable_and_uses_the_same_api(tmp_path, tmux_session_factory):
+    # /dashboard/sessions is a second VIEW of the same data/mutations, not
+    # a new privilege surface -- same read guard as /dashboard, same
+    # /dashboard/api/sessions fetch, same grant-read/grant-input routes.
+    tmux_session_factory("test-admin-screen")
+    service = TerminalService(AppConfig(
+        PermissionsConfig(True, True), ("test-*",), 50, 20,
+        InputPolicyConfig(allowed_session_patterns=("test-*",)),
+    ))
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app())
+    r = client.get("/dashboard/sessions")
+    assert r.status_code == 200
+    assert "Quản lý session" in r.text
+    assert "/dashboard/api/sessions" in r.text
+    assert "/dashboard/api/session/grant-read" in r.text
+    assert "/dashboard/api/session/grant-input" in r.text
+
+
+def test_sessions_admin_page_respects_the_same_cf_access_guard():
+    config = load_config(REPO_CONFIG_PATH)
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app())
+    r = client.get("/dashboard/sessions", follow_redirects=False)
+    assert r.status_code == 403
+    assert r.json()["error"] == "CLOUDFLARE_ACCESS_VERIFICATION_FAILED"
+
+
+def test_sessions_admin_html_shows_every_session_never_hides_ungranted(tmux_session_factory):
+    # A never-granted session must be listed with a badge, not filtered
+    # out by default -- the "chỉ hiện session chưa whitelist" checkbox is
+    # an opt-in narrowing filter, not the default view.
+    assert 'id="onlyGrantable"' in SESSIONS_ADMIN_HTML
+    assert "Chỉ hiện session chưa whitelist" in SESSIONS_ADMIN_HTML
+    assert "onlyGrantableEl.checked && !grantable(row)) return false;" in SESSIONS_ADMIN_HTML
+    assert "rows.length ? 'Không có session khớp bộ lọc.'" in SESSIONS_ADMIN_HTML
+
+
+def test_sessions_admin_reuses_the_permission_modal_and_bulk_bar():
+    assert "function openPermModal(" in SESSIONS_ADMIN_HTML
+    assert "function applyPreset(" in SESSIONS_ADMIN_HTML
+    assert "function renderBulkBar(" in SESSIONS_ADMIN_HTML
+    assert "🔓 Xem + gửi" in SESSIONS_ADMIN_HTML
+    assert "👁 Chỉ xem" in SESSIONS_ADMIN_HTML
+    assert "🔒 Thu hồi" in SESSIONS_ADMIN_HTML
+
+
+def test_sessions_admin_detach_toggle_shares_the_same_localstorage_key():
+    # Detach state must stay in sync with the main dashboard's own tab
+    # strip within the same browser -- both pages read/write the exact
+    # same key.
+    assert "const DETACHED_KEY = 'terminal-mcp:detached-sessions';" in SESSIONS_ADMIN_HTML
+    assert "const DETACHED_KEY = 'terminal-mcp:detached-sessions';" in DASHBOARD_HTML
+
+
+def test_dashboard_has_a_nav_link_to_the_sessions_admin_screen():
+    assert 'href="/dashboard/sessions"' in DASHBOARD_HTML
+    assert 'id="sessionsAdminLink"' in DASHBOARD_HTML
+
+
+def test_sessions_admin_uses_safe_dom_rendering():
+    assert "innerHTML" not in SESSIONS_ADMIN_HTML
+    assert "textContent" in SESSIONS_ADMIN_HTML
 
 
 def test_dashboard_uses_safe_dom_rendering():
@@ -918,6 +987,7 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
     routes = {route.path: set(route.methods) for route in server._custom_starlette_routes}
     assert routes == {
         "/dashboard": {"GET", "HEAD"},
+        "/dashboard/sessions": {"GET", "HEAD"},
         "/dashboard/api/sessions": {"GET", "HEAD"},
         "/dashboard/api/session": {"GET", "HEAD"},
         "/dashboard/api/session/input": {"POST"},
