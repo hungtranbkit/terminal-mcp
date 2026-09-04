@@ -233,6 +233,35 @@ def test_submission_origin_child_increments_depth_and_keeps_trace_id():
     assert child.parent_turn_id == "turn-1"
 
 
+# ---------------------------------------------------------------------------
+# ask_chatgpt bridge Phase A (docs/ask-chatgpt-bridge.md §4): the
+# ChatGptBridgeTransport Protocol addition on top of PromptTransport above.
+# The rest of Phase A's own behavior (state machine, capability store,
+# permission/loop-protection gates) is covered by
+# tests/test_ask_chatgpt_bridge.py; this file only proves the Protocol
+# shape itself, matching test_tmux_prompt_transport_satisfies_the_protocol_
+# shape's own pattern above.
+# ---------------------------------------------------------------------------
+
+def test_mock_bridge_transport_satisfies_the_chatgpt_bridge_transport_protocol_shape():
+    from terminal_mcp.bridge import MockBridgeTransport
+    from terminal_mcp.prompt_transport import ChatGptBridgeTransport
+
+    assert isinstance(MockBridgeTransport(), ChatGptBridgeTransport)
+
+
+def test_chatgpt_web_transport_still_unimplemented_after_bridge_protocol_addition():
+    # ChatGptBridgeTransport is an ADDITION alongside ChatGptWebTransport,
+    # not a change to it -- the stub still raises exactly as before.
+    from terminal_mcp.prompt_transport import ChatGptWebTransport
+
+    try:
+        ChatGptWebTransport()
+        assert False, "expected NotImplementedError"
+    except NotImplementedError:
+        pass
+
+
 def test_no_playwright_or_browser_automation_dependency_declared():
     # P10/P15: this phase must not introduce a browser-automation
     # dependency anywhere in the production dependency list.

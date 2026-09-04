@@ -26,6 +26,18 @@ class PermissionsConfig:
     # False to disable terminal_send_keys entirely while terminal_send_text/
     # terminal_send_bound (send_prompt) keep working.
     allow_send_keys: bool = True
+    # ask_chatgpt bridge (docs/ask-chatgpt-bridge.md §7): independent of
+    # every field above, same reasoning as allow_send_keys's own split from
+    # terminal_input -- "can send text to a tmux pane" must never imply
+    # "can drive a browser session against a third-party product," even
+    # though both are mechanically "sending text somewhere." This is the
+    # single global on/off switch for the whole feature; AskChatGptConfig
+    # below only ever holds *operational* parameters (timeouts, allowed
+    # modes/models, the tool round-trip allowlist), never a second enabled
+    # flag -- one gate, checked first, not two to keep in sync. Defaults
+    # False: every existing deployment is completely unaffected until an
+    # operator explicitly opts in.
+    ask_chatgpt: bool = False
 
 
 @dataclass(frozen=True)
@@ -173,6 +185,77 @@ class SessionLifecycleConfig:
 
 
 @dataclass(frozen=True)
+class AskChatGptConfig:
+    """ask_chatgpt bridge operational parameters (docs/ask-chatgpt-
+    bridge.md, Phase A) -- everything EXCEPT the on/off decision, which is
+    `permissions.ask_chatgpt` alone (see that field's own docstring for
+    why this dataclass deliberately has no second `enabled` field).
+
+    bridge_turn_ttl_seconds: fixed TTL from claim time (same fixed-TTL-
+    no-renewal-thread posture as lease.py's DEFAULT_LEASE_TTL_SECONDS) --
+    a claimed bridge_turns row still non-terminal past this age is swept
+    to CANCELLED (reason=CAPABILITY_EXPIRED) by BridgeService.
+    sweep_expired(), never left claimed forever.
+
+    default_mode/default_model/default_effort: resolved for an ask_chatgpt
+    call that omits the corresponding field -- NEVER inferred from the
+    prompt itself (docs/ask-chatgpt-bridge.md §2's "no silent fallback").
+    allowed_modes/allowed_models/allowed_efforts: when non-empty, an
+    explicitly-*requested* value outside this set is FAILED
+    (MODE_NOT_AVAILABLE/MODEL_NOT_AVAILABLE/EFFORT_NOT_AVAILABLE) rather
+    than silently substituted -- empty (the default) means "any value is
+    accepted as given," since this project has no way yet to know what a
+    real deployment's actual choices are (Phase D's problem).
+
+    round_trip_allowed_tools: frozen onto each bridge_turns row at claim
+    time (§6/§7) -- the tool-round-trip allowlist a Phase E broker would
+    enforce. Empty by default: no round-trip tool capability exists at
+    all until an operator both enables this feature AND explicitly names
+    tools here. "terminal_send_keys" can NEVER appear in the effective
+    set regardless of config -- enforced below, in code, not just in this
+    docstring, exactly like allow_send_keys existing specifically so raw
+    key-injection can be independently disabled; a capability born from a
+    browser-driven, third-party-hosted conversation is the caller this
+    project should trust LEAST with raw keys.
+
+    max_concurrent_turns: bounded concurrency (§11) -- a genuinely NEW
+    claim (never a same-idempotency_key replay, which always proceeds
+    immediately regardless of this bound) waits, polling, for a free slot
+    until timeout_seconds elapses, then fails QUEUE_TIMEOUT rather than
+    exceeding the bound or dropping the request silently. Conservative
+    default (1): this project has no evidence yet for what any given host
+    can actually sustain (docs/ask-chatgpt-bridge.md §2 explicitly
+    declines to copy codex-chatgpt-web's "five" without such evidence).
+
+    min_timeout_seconds/max_timeout_seconds: bounds a caller's requested
+    timeout_seconds must fall within -- same "never let a caller-supplied
+    number be unboundedly small or large" posture as
+    session_lifecycle.create_ready_timeout_seconds' own [0.5, 60] clamp."""
+    bridge_turn_ttl_seconds: float = 300.0
+    default_mode: str | None = None
+    default_model: str | None = None
+    default_effort: str | None = None
+    allowed_modes: tuple[str, ...] = ()
+    allowed_models: tuple[str, ...] = ()
+    allowed_efforts: tuple[str, ...] = ()
+    round_trip_allowed_tools: tuple[str, ...] = ()
+    max_concurrent_turns: int = 1
+    min_timeout_seconds: float = 5.0
+    max_timeout_seconds: float = 120.0
+
+    def __post_init__(self) -> None:
+        # See this class's own docstring on round_trip_allowed_tools --
+        # this is the "in code, not just documented" half of that promise.
+        # Frozen dataclass: object.__setattr__ is the sanctioned exception,
+        # same pattern as SessionLifecycleConfig.__post_init__ above.
+        if "terminal_send_keys" in self.round_trip_allowed_tools:
+            object.__setattr__(
+                self, "round_trip_allowed_tools",
+                tuple(tool for tool in self.round_trip_allowed_tools if tool != "terminal_send_keys"),
+            )
+
+
+@dataclass(frozen=True)
 class MaintenanceConfig:
     # P1 hardening item #9: periodic retention pruning (audit.db's
     # input_audit/idempotent_sends, supervisor.db's supervisor_actions --
@@ -199,6 +282,7 @@ class AppConfig:
     dashboard: DashboardConfig = DashboardConfig()
     maintenance: MaintenanceConfig = MaintenanceConfig()
     session_lifecycle: SessionLifecycleConfig = SessionLifecycleConfig()
+    ask_chatgpt: AskChatGptConfig = AskChatGptConfig()
     # Loop-protection metadata schema (see docs/prompt-submission.md, P11):
     # terminal_send_text/_granted accept optional origin/trace_id/parent_
     # turn_id/depth kwargs (all unused by every current caller -- MCP tools,
@@ -285,6 +369,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             terminal_read=bool(permissions.get("terminal_read", True)),
             terminal_input=bool(permissions.get("terminal_input", False)),
             allow_send_keys=bool(permissions.get("allow_send_keys", True)),
+            ask_chatgpt=bool(permissions.get("ask_chatgpt", False)),
         ),
         max_agent_bridge_depth=max_agent_bridge_depth,
         allowed_session_patterns=tuple(patterns),
@@ -316,6 +401,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         dashboard=_load_dashboard_config(raw.get("dashboard", {})),
         maintenance=_load_maintenance_config(raw.get("maintenance", {})),
         session_lifecycle=_load_session_lifecycle_config(raw.get("session_lifecycle", {})),
+        ask_chatgpt=_load_ask_chatgpt_config(raw.get("ask_chatgpt", {})),
     )
 
 
@@ -378,6 +464,47 @@ def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
         enabled=enabled, allowed_cwd_roots=tuple(roots), protected_sessions=protected_set,
         launch_commands=tuple(sorted(launch_raw.items())), create_ready_timeout_seconds=timeout,
         default_grant_mode=grant_mode,
+    )
+
+
+def _load_ask_chatgpt_config(raw: object) -> AskChatGptConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def optional_string(name: str) -> str | None:
+        value = raw.get(name)
+        if value is not None and not (isinstance(value, str) and value.strip()):
+            raise ValueError(f"ask_chatgpt.{name} must be a non-empty string")
+        return value
+
+    def string_tuple(name: str) -> tuple[str, ...]:
+        value = raw.get(name, [])
+        if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+            raise ValueError(f"ask_chatgpt.{name} must be a list of strings")
+        return tuple(value)
+
+    ttl = float(raw.get("bridge_turn_ttl_seconds", AskChatGptConfig.bridge_turn_ttl_seconds))
+    if not 5 <= ttl <= 3600:
+        raise ValueError("ask_chatgpt.bridge_turn_ttl_seconds must be between 5 and 3600")
+    max_concurrent = int(raw.get("max_concurrent_turns", AskChatGptConfig.max_concurrent_turns))
+    if max_concurrent < 1:
+        raise ValueError("ask_chatgpt.max_concurrent_turns must be at least 1")
+    min_timeout = float(raw.get("min_timeout_seconds", AskChatGptConfig.min_timeout_seconds))
+    max_timeout = float(raw.get("max_timeout_seconds", AskChatGptConfig.max_timeout_seconds))
+    if not 0 < min_timeout <= max_timeout:
+        raise ValueError("ask_chatgpt.min_timeout_seconds must be > 0 and <= max_timeout_seconds")
+    return AskChatGptConfig(
+        bridge_turn_ttl_seconds=ttl,
+        default_mode=optional_string("default_mode"),
+        default_model=optional_string("default_model"),
+        default_effort=optional_string("default_effort"),
+        allowed_modes=string_tuple("allowed_modes"),
+        allowed_models=string_tuple("allowed_models"),
+        allowed_efforts=string_tuple("allowed_efforts"),
+        round_trip_allowed_tools=string_tuple("round_trip_allowed_tools"),
+        max_concurrent_turns=max_concurrent,
+        min_timeout_seconds=min_timeout,
+        max_timeout_seconds=max_timeout,
     )
 
 

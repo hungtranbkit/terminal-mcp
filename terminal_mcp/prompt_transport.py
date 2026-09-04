@@ -215,3 +215,100 @@ class ChatGptWebTransport:
             "docs/chatgpt-web-adapter-plan.md), not an implemented transport -- "
             "no browser automation dependency exists in this project yet."
         )
+
+
+# ---------------------------------------------------------------------------
+# ask_chatgpt bridge (P16 Phase A) -- see docs/ask-chatgpt-bridge.md for the
+# full design. ChatGptBridgeTransport is an ADDITION on top of PromptTransport
+# above, not a competing vocabulary: a real implementation (ChatGptWebTransport,
+# Phase D) would compose an inner PromptTransport-shaped object for its
+# write/verify/activate/prove_accepted steps; this Protocol is the outer
+# turn lifecycle around it -- Temporary-Chat-equivalent resolution, response
+# collection, and a real cancel -- that a local tmux pane never needed.
+#
+# Nothing here is wired into bridge.py's BridgeService by default choice --
+# bridge.py's MockBridgeTransport (Phase A/B, no browser/network) is the
+# only implementation exercised by this project's own tests today.
+# ---------------------------------------------------------------------------
+
+
+class BridgeTransportError(Exception):
+    """Raised by a ChatGptBridgeTransport method for a DEFINITE, pre-
+    activation failure only (e.g. the composer never appeared, the read-
+    back didn't match, the send control never became enabled) -- never for
+    an ambiguous outcome. An ambiguous outcome (activation happened, but
+    no positive evidence proves it was accepted) is expressed by
+    proveAccepted() returning False, not by raising -- see docs/ask-
+    chatgpt-bridge.md §5's activation-ambiguity boundary: BridgeService
+    (bridge.py) maps a raised BridgeTransportError to bridge state FAILED
+    and a proveAccepted()-returned-False to bridge state UNKNOWN, and only
+    UNKNOWN carries the "never resend under this idempotency_key" rule --
+    a FAILED caught before any click is safe to treat as not-yet-attempted."""
+
+    def __init__(self, reason: str, *, detail: str | None = None) -> None:
+        super().__init__(reason if detail is None else f"{reason}: {detail}")
+        self.reason = reason
+        self.detail = detail
+
+
+@dataclass
+class BridgeTurnContext:
+    """Everything prepareTurn() needs to resolve (open or reuse) the
+    correct task-bound Temporary Chat -- deliberately NOT the prompt text
+    itself (that belongs to submit(), a separate step: prepareTurn()
+    prepares the destination, it never sends anything)."""
+    bridge_turn_id: str
+    source_session: str | None
+    binding: str | None
+    mode: str | None
+    model: str | None
+    effort: str | None
+
+
+@dataclass
+class BridgeTurnHandle:
+    """What prepareTurn() hands back -- opaque to BridgeService beyond
+    bridge_turn_id (used to correlate every later call to this same
+    turn); a real transport's `tab_id`/session-reference lives here, never
+    surfaced to any MCP caller or persisted beyond this in-memory object."""
+    bridge_turn_id: str
+    tab_id: str | None = None
+
+
+@dataclass
+class BridgeSubmission:
+    """What submit() hands back once the write+verify+activate sequence
+    has run -- `activated` distinguishes a FAILED-before-any-click outcome
+    (activated=False, safe to retry under a NEW idempotency_key with no
+    ambiguity at all) from the activation-ambiguity boundary itself
+    (activated=True, proveAccepted() undecided -> UNKNOWN, see
+    BridgeTransportError's own docstring above)."""
+    bridge_turn_id: str
+    prompt: str
+    activated: bool = False
+
+
+@dataclass
+class BridgeResponse:
+    """collectResponse()'s return value -- full response text, handed only
+    to BridgeService (never logged/persisted in full -- see docs/ask-
+    chatgpt-bridge.md §9; BridgeService is what computes the sha256/
+    preview that actually gets stored)."""
+    text: str
+
+
+@runtime_checkable
+class ChatGptBridgeTransport(Protocol):
+    """The ask_chatgpt turn-lifecycle extension point (docs/ask-chatgpt-
+    bridge.md §4). MockBridgeTransport (bridge.py) is the only
+    implementation today; ChatGptWebTransport becomes the real one in
+    Phase D, still raising NotImplementedError until then."""
+
+    def prepareTurn(self, context: BridgeTurnContext) -> BridgeTurnHandle: ...
+    def submit(self, handle: BridgeTurnHandle, prompt: str,
+               metadata: "SubmissionOrigin") -> BridgeSubmission: ...
+    def proveAccepted(self, submission: BridgeSubmission) -> bool: ...
+    def observe(self, submission: BridgeSubmission) -> str: ...
+    def collectResponse(self, submission: BridgeSubmission) -> BridgeResponse: ...
+    def cancel(self, submission: BridgeSubmission) -> bool: ...
+    def close(self, handle: BridgeTurnHandle) -> None: ...

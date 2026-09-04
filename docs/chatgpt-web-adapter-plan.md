@@ -8,6 +8,14 @@ upgrade's own explicit instruction to prepare an extension point
 (`terminal_mcp/prompt_transport.py`'s `PromptTransport` Protocol and
 `ChatGptWebTransport` stub) without building the thing itself yet.
 
+**See `docs/ask-chatgpt-bridge.md` for the concrete follow-on design** —
+the `ask_chatgpt` semantic service, its own state machine, turn/capability
+ownership, permission model, and phased rollout, built as an addition on
+top of the `PromptTransport` extension point this note describes, not a
+parallel design. This note stays as-is for the general "why later, not
+yet" rationale and the reference-project mapping table; anything more
+specific belongs in the newer document.
+
 ## Why this is a separate, later phase
 
 Everything this repository does to Codex/Claude Code sessions today is
