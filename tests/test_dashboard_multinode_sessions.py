@@ -391,9 +391,12 @@ def test_reopen_explicit_node_moves_it(tmp_path):
 def test_create_default_grant_mode_is_none_unchanged_from_before(tmp_path):
     client, controller, service = _client(tmp_path)
     _heartbeat_local(controller)
-    r = client.post("/dashboard/api/session/create", json={"name": "mn-nogrant", "agent_type": "shell"})
-    assert r.status_code == 200, r.text
-    assert service.grants.get("mn-nogrant") is None
+    try:
+        r = client.post("/dashboard/api/session/create", json={"name": "mn-nogrant", "agent_type": "shell"})
+        assert r.status_code == 200, r.text
+        assert service.grants.get("mn-nogrant") is None
+    finally:
+        _kill_tmux("mn-nogrant")
 
 
 def test_create_grant_mode_read_grants_read_only_not_input(tmp_path):

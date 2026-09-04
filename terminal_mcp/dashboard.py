@@ -160,6 +160,11 @@ DASHBOARD_HTML = """<!doctype html>
        attention, otherwise a quiet muted count. */
     .supervisor-badge { background:transparent; border:1px solid var(--line); color:var(--muted); border-radius:999px; padding:4px 10px; font:12px var(--mono); cursor:pointer; white-space:nowrap }
     .supervisor-badge.attention { border-color:var(--amber); color:var(--amber) }
+    /* "Đã kill" toggle's own header styling (relocated out of the tab
+       strip, task item 3) -- same pill shape as the other header-right
+       badges it now sits beside. */
+    .header-icon-btn { background:transparent; border:1px solid var(--line); border-radius:999px; color:var(--muted); cursor:pointer; padding:4px 10px; font:12px var(--mono); white-space:nowrap }
+    .header-icon-btn:hover { color:var(--text); background:#171f33 }
     /* Connection health banner (task: "self-healing, có chẩn đoán rõ") --
        one quiet, always-present label (never a popup/toast), colored only
        when something isn't simply "Connected". #connHealthBadge[hidden]
@@ -431,22 +436,23 @@ DASHBOARD_HTML = """<!doctype html>
     #killModal .km-actions button.danger { background:#3a2430; border-color:#ff9f9f; color:#ff9f9f }
     #killModal .km-actions button.danger:disabled { opacity:.4; cursor:not-allowed }
     #killModal .km-error { color:#ff6b6b; font-size:12px }
-    /* ---- Tab bar row + killed-sessions reopen menu --------------------
-       .tabbar itself scrolls horizontally (see its own rule above);
-       .tabbar-side-btn is a FIXED trailing sibling (never scrolls away)
-       reusing the same .menu/.menu-panel dropdown component as the
-       header/term-bar menus -- compact, zero footprint until there's
-       actually a killed session to reopen (task's own original design
-       intent, unchanged), never a second navigation surface for LIVE
-       sessions (only ever lists sessions that no longer exist). */
-    /* min-width:0 is load-bearing, not decorative (task item 2's real
-       root cause, confirmed live): .tabbar-row is a grid item of `main`
-       (grid-template-rows:auto minmax(0,1fr)) -- a grid/flex item's
-       default min-width is `auto`, i.e. "never shrink below your own
-       content's natural width", not 0. Without this override,
-       .tabbar-row grew to fit ALL of #tabbar + the side buttons
-       unwrapped (measured 1599px on a 390px-wide phone viewport) instead
-       of being clamped to main's actual column width -- so #tabbar's own
+    /* ---- Tab bar row -----------------------------------------------------
+       .tabbar itself scrolls horizontally (see its own rule above). The
+       row holds ONLY the tab strip now -- New session/Đã kill used to be
+       fixed trailing siblings here, but on a narrow (mobile) screen that
+       ate real width away from the one thing this row exists for, so
+       both moved into the header instead (task's own explicit "dải
+       ngang phải ưu tiên session tabs 100% chiều rộng"; killed-sessions
+       reopen still reuses the same .menu/.menu-panel dropdown component
+       as the header/term-bar menus, just relocated -- see header HTML).
+       min-width:0 below is load-bearing, not decorative (found live):
+       .tabbar-row is a grid item of `main` (grid-template-rows:auto
+       minmax(0,1fr)) -- a grid/flex item's default min-width is `auto`,
+       i.e. "never shrink below your own content's natural width", not 0.
+       Without this override, .tabbar-row grew to fit its content
+       unwrapped (measured 1599px on a 390px-wide phone viewport, back
+       when it still had those trailing siblings) instead of being
+       clamped to main's actual column width -- so #tabbar's own
        `flex:1; min-width:0` (already correct) never had anything to
        shrink AGAINST, and overflow-x:auto on it never actually engaged;
        the tab strip just silently ran off the right edge of the screen
@@ -454,12 +460,6 @@ DASHBOARD_HTML = """<!doctype html>
        tab strip's content width (mobile, not just very narrow desktop). */
     .tabbar-row { display:flex; align-items:stretch; background:var(--panel); border-bottom:1px solid var(--line); min-width:0 }
     .tabbar-row .tabbar { flex:1; min-width:0; border-bottom:none }
-    .tabbar-side-btn {
-      flex:0 0 auto; background:transparent; border:none; border-left:1px solid var(--line); color:var(--muted); cursor:pointer;
-      padding:0 14px; font:12px var(--mono); white-space:nowrap;
-      display:flex; align-items:center; text-decoration:none; /* also used on the "+ New session" <a> */
-    }
-    .tabbar-side-btn:hover { color:var(--text); background:#171f33 }
     .killed-panel { min-width:260px; max-width:min(360px, calc(100vw - 24px)); max-height:60vh; overflow:auto }
     .killed-row { padding:8px 8px; border-radius:8px; font-size:12px }
     .killed-row + .killed-row { border-top:1px solid var(--line) }
@@ -488,6 +488,9 @@ DASHBOARD_HTML = """<!doctype html>
       header .live { font-size:11px }
       .header-right { gap:6px }
       .supervisor-badge { padding:3px 8px; font-size:10px }
+      /* Layout/spacing only (task's own "không chỉnh font/typography") --
+         no font-size override here, unlike the sibling rule above. */
+      .header-icon-btn { padding:3px 8px }
       #supervisorPanel { top:52px; right:8px; width:min(320px, calc(100vw - 16px)) }
       #summary {
         padding:8px 12px; font-size:12px; line-height:1.3;
@@ -499,8 +502,25 @@ DASHBOARD_HTML = """<!doctype html>
          compact, always-visible mobile navigation (task item 5: "tab bar
          compact, terminal full-screen, không sidebar chiếm chỗ") with no
          separate drawer/backdrop mechanism needed at all. */
-      .tab { max-width:140px; padding:8px 8px 8px 10px }
-      .tab-name { font-size:12.5px }
+      /* Real bug reported live from an actual phone screenshot: the old
+         max-width:140px here (no min-width at all) let a tab's own
+         flex-shrink:0 do nothing useful -- .tab-name (no width of its
+         own, just overflow:hidden/ellipsis) absorbed almost the entire
+         squeeze, so a name like "quan_ly_ban_hang" or even "terminal-mcp"
+         ellipsized down to a few characters despite plenty of horizontal
+         scroll room being available (task's own explicit "không
+         flex-shrink thành vài chục px" -- more sessions must mean more
+         SCROLLING, per item 5, never smaller tabs). min-width (not just
+         max-width) is what actually fixes this: it puts a floor under
+         each tab regardless of how many others exist, matching the
+         task's own 110-160px range scaled by viewport (clamp, not a
+         fixed number, so 320/390/430px all land sensibly in range
+         without three separate hand-tuned breakpoints); .tab-name gets
+         its own explicit max-width (task's own 180-220px) so how much of
+         a genuinely long name shows is a deliberate, predictable bound
+         rather than whatever's left over after the dot/close button. */
+      .tab { min-width:clamp(110px, 30vw, 160px); max-width:220px; padding:8px 8px 8px 10px }
+      .tab-name { font-size:12.5px; max-width:200px }
       .detail { min-height:0 }
       /* Smaller, tighter terminal text fits substantially more real output on
          a phone screen without hurting readability; desktop sizing (14px/1.45
@@ -584,6 +604,22 @@ DASHBOARD_HTML = """<!doctype html>
       <button id="supervisorBadge" class="supervisor-badge" type="button" hidden></button>
       <span class="supervisor-badge" id="connHealthBadge" title="Kết nối OpenAI Secure MCP Tunnel" hidden></span>
       <span class="live" id="liveBadge">● LIVE</span>
+      <!-- Task (mobile tab strip fix) item 3: "+ New session" / "Đã kill"
+           must never compete with session tabs for horizontal room on a
+           narrow strip -- moved here, into the header's own right-side
+           action row (never part of the scrollable #tabbar), so the tab
+           strip can dedicate its full width to sessions. killedMenu is
+           the same dynamic toggle+panel it always was, just relocated
+           (its JS references it by id, unaffected by DOM position).
+           "+ New session" itself is gone as a separate control: "⚙ Quản
+           lý session" below already goes to the exact same place
+           (/dashboard/sessions) -- keeping both was pure duplication a
+           narrow screen can't afford; nothing is less reachable than
+           before. -->
+      <div class="menu" id="killedMenu">
+        <button class="header-icon-btn" id="killedToggle" type="button" hidden aria-haspopup="true" aria-expanded="false"><span id="killedToggleLabel"></span></button>
+        <div class="menu-panel killed-panel" id="killedList" role="menu"></div>
+      </div>
       <!-- Task item 3: rarely-used navigation (admin screens) lives in one
            "⋯" menu instead of a row of separate buttons -- LIVE/conn-health/
            Supervisor stay directly visible above since they're STATUS, not
@@ -604,25 +640,12 @@ DASHBOARD_HTML = """<!doctype html>
          above for why that specific duplication was removed once already
          in this project's own history). One click switches; a hover-only
          "✕" opens the SAME typed-confirmation kill flow as before (see
-         makeTabCloseButton) -- there is no separate, weaker "close tab". -->
+         makeTabCloseButton) -- there is no separate, weaker "close tab".
+         The strip itself now holds ONLY session tabs (task's own explicit
+         "dải ngang phải ưu tiên session tabs 100% chiều rộng") -- New
+         session/Đã kill moved to the header, see above. -->
     <div class="tabbar-row">
       <nav class="tabbar" id="tabbar" role="tablist" aria-label="Sessions"></nav>
-      <!-- Task item 1: the tab bar itself had no session-creation entry
-           point at all -- the Create Session form (with its full node
-           selector, agent-type filter, submit-time revalidation) already
-           exists and works on /dashboard/sessions (verified live, real
-           browser, real production node data), it just wasn't reachable
-           from here without already knowing about that separate admin
-           page. Rather than duplicate that whole form's logic into a
-           second copy here (new feature surface, and the task's own
-           "không redesign lớn"), this is a direct, one-click Windows-
-           Terminal-style "+" straight to it -- same admin page the "⚙
-           Quản lý session" menu item already links to. -->
-      <a class="tabbar-side-btn" id="newSessionLinkBtn" href="/dashboard/sessions" title="Tạo session mới (node/host, agent type, ...)">+ New session</a>
-      <div class="menu" id="killedMenu">
-        <button class="tabbar-side-btn" id="killedToggle" type="button" hidden aria-haspopup="true" aria-expanded="false"><span id="killedToggleLabel"></span></button>
-        <div class="menu-panel killed-panel" id="killedList" role="menu"></div>
-      </div>
     </div>
     <section class="panel detail">
       <div id="summary" class="muted">Chọn một session để xem output.</div>
