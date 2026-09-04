@@ -292,6 +292,39 @@ class RemoteNodeConfig:
 
 
 @dataclass(frozen=True)
+class DiscoveryConfig:
+    """LAN device discovery (lan_discovery.py) -- Nodes page "Discover
+    devices" feature. Every numeric here is a safety knob (task's own
+    explicit "rate limit/concurrency cap/timeout"), never something a
+    scan can exceed regardless of how many/large the local NICs' own
+    subnets are -- see lan_discovery.local_ipv4_subnets/DiscoveryService
+    for how each one is actually enforced."""
+    enabled: bool = True
+    agent_port: int = 8790
+    concurrency: int = 32
+    host_timeout_seconds: float = 0.35
+    max_hosts_per_scan: int = 512
+    overall_timeout_seconds: float = 45.0
+    cooldown_seconds: float = 5.0
+
+
+@dataclass(frozen=True)
+class RemoteConnectConfig:
+    """Remote node connect/bootstrap (remote_connect.py) -- SSH-based
+    onboarding for a node found by LAN discovery, a manually-typed
+    hostname/IP, or a Cloudflare Access SSH hostname.
+    allow_public_manual_add: off by default (task's own explicit SSRF
+    requirement) -- an operator deliberately choosing to connect to a
+    public-IP LAN-SSH target must opt in here first; a Cloudflare Access
+    hostname is never subject to this check at all (see
+    remote_connect.validate_cloudflare_hostname's own docstring for
+    why)."""
+    allow_public_manual_add: bool = False
+    ssh_connect_timeout_seconds: float = 10.0
+    bootstrap_timeout_seconds: float = 60.0
+
+
+@dataclass(frozen=True)
 class NodesConfig:
     """Multi-node session management (controller.py/node_registry.py/
     scheduler.py). overload_thresholds/heartbeat_thresholds are the exact
@@ -303,6 +336,8 @@ class NodesConfig:
     overload_thresholds: OverloadThresholds = OverloadThresholds()
     heartbeat_thresholds: NodeHeartbeatThresholds = NodeHeartbeatThresholds()
     remote_nodes: tuple[RemoteNodeConfig, ...] = ()
+    discovery: DiscoveryConfig = DiscoveryConfig()
+    remote_connect: RemoteConnectConfig = RemoteConnectConfig()
 
 
 @dataclass(frozen=True)
@@ -471,8 +506,40 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             max_sessions=max_sessions,
             timeout_seconds=float(entry.get("timeout_seconds", 10.0)),
         ))
+    discovery_raw = nodes_raw.get("discovery", {})
+    if not isinstance(discovery_raw, dict):
+        raise ValueError("nodes.discovery must be a mapping")
+    discovery_defaults = DiscoveryConfig()
+    discovery_config = DiscoveryConfig(
+        enabled=bool(discovery_raw.get("enabled", discovery_defaults.enabled)),
+        agent_port=int(discovery_raw.get("agent_port", discovery_defaults.agent_port)),
+        concurrency=int(discovery_raw.get("concurrency", discovery_defaults.concurrency)),
+        host_timeout_seconds=float(discovery_raw.get("host_timeout_seconds", discovery_defaults.host_timeout_seconds)),
+        max_hosts_per_scan=int(discovery_raw.get("max_hosts_per_scan", discovery_defaults.max_hosts_per_scan)),
+        overall_timeout_seconds=float(discovery_raw.get("overall_timeout_seconds", discovery_defaults.overall_timeout_seconds)),
+        cooldown_seconds=float(discovery_raw.get("cooldown_seconds", discovery_defaults.cooldown_seconds)),
+    )
+    if discovery_config.concurrency < 1 or discovery_config.max_hosts_per_scan < 1:
+        raise ValueError("nodes.discovery.concurrency and max_hosts_per_scan must be at least 1")
+    if discovery_config.host_timeout_seconds <= 0 or discovery_config.overall_timeout_seconds <= 0:
+        raise ValueError("nodes.discovery timeouts must be positive")
+
+    remote_connect_raw = nodes_raw.get("remote_connect", {})
+    if not isinstance(remote_connect_raw, dict):
+        raise ValueError("nodes.remote_connect must be a mapping")
+    remote_connect_defaults = RemoteConnectConfig()
+    remote_connect_config = RemoteConnectConfig(
+        allow_public_manual_add=bool(remote_connect_raw.get("allow_public_manual_add",
+                                                            remote_connect_defaults.allow_public_manual_add)),
+        ssh_connect_timeout_seconds=float(remote_connect_raw.get("ssh_connect_timeout_seconds",
+                                                                 remote_connect_defaults.ssh_connect_timeout_seconds)),
+        bootstrap_timeout_seconds=float(remote_connect_raw.get("bootstrap_timeout_seconds",
+                                                               remote_connect_defaults.bootstrap_timeout_seconds)),
+    )
+
     nodes_config = NodesConfig(overload_thresholds=overload_thresholds, heartbeat_thresholds=heartbeat_thresholds,
-                               remote_nodes=tuple(remote_nodes))
+                               remote_nodes=tuple(remote_nodes), discovery=discovery_config,
+                               remote_connect=remote_connect_config)
 
     return AppConfig(
         permissions=PermissionsConfig(

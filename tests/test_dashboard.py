@@ -1195,6 +1195,17 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/node/test-connection": {"POST"},
         "/dashboard/api/node/generate-onboarding": {"POST"},
         "/dashboard/api/nodes/{node_id}/heartbeat": {"POST"},
+        # LAN discovery + remote connect/bootstrap (Scan LAN / Add Remote
+        # SSH / Add via Cloudflare Tunnel / Add by Agent Token) -- another
+        # later, separate feature, same as the nodes routes above.
+        "/dashboard/api/nodes/discovery/status": {"GET", "HEAD"},
+        "/dashboard/api/nodes/discovery/scan": {"POST"},
+        "/dashboard/api/nodes/discovery/cancel": {"POST"},
+        "/dashboard/api/nodes/connect/ssh/trust-hostkey": {"POST"},
+        "/dashboard/api/nodes/connect/ssh/test": {"POST"},
+        "/dashboard/api/nodes/connect/ssh/bootstrap": {"POST"},
+        "/dashboard/api/nodes/connect/windows/bootstrap": {"POST"},
+        "/dashboard/api/nodes/connect/agent-token": {"POST"},
         "/dashboard/nodes": {"GET", "HEAD"},
     }
     # The web terminal's WebSocket route is registered too, just outside

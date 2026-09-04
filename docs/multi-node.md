@@ -368,6 +368,118 @@ steps as any other remote node onboarding.
 - **The PowerShell installer is unexecuted** -- manually reviewed only,
   see its own subsection above.
 
+## LAN discovery + remote connect (Nodes page "Connect Node")
+
+One-click node onboarding, added on top of everything above without
+changing any of it — `ControllerService.register_remote_node` (the same
+method `server_http.py`'s own config.yaml-driven startup loop already
+called) is now ALSO called directly from live dashboard routes, so a
+node can be connected at runtime, no config.yaml edit + restart required.
+
+**Files**: `lan_discovery.py` (subnet enumeration + scan engine),
+`remote_connect.py` (SSH target/argv/host-key-pinning/bootstrap/Windows-
+manual-fallback), `connection_store.py` (durable connect metadata + a
+0600 bearer-token file per node, never the secret itself in the sqlite
+row), plus new routes/UI in `dashboard.py` (`/dashboard/api/nodes/
+discovery/*`, `/dashboard/api/nodes/connect/*`, a "Connect Node" panel on
+`/dashboard/nodes`).
+
+**Discovery**: pure stdlib + asyncio, no new dependency. Subnets come
+from parsing this host's own `ip -o -4 addr show`/`ip -o link show up`
+(UP, non-loopback NICs only), filtered to RFC1918+link-local
+(`lan_discovery.is_lan_scannable`) and capped in size
+(`nodes.discovery.max_hosts_per_scan`, default 512) — a subnet too big to
+scan safely is skipped entirely, never silently narrowed. Online-host
+evidence is the kernel's own ARP/neighbor table (`ip neigh show`,
+read-only) plus a FIXED, small TCP-connect probe set (node-agent port +
+22/5985/5986 — never a port sweep), bounded by a concurrency semaphore, a
+per-host timeout, and an overall wall-clock budget
+(`asyncio.wait_for`). Exactly one scan runs at a time, rate-limited by a
+cooldown between scans. Results are classified Already connected /
+Connectable (agent's own `/v1/health` answered) / Needs setup (SSH or
+WinRM port open, no agent) / Unknown (ARP-alive, nothing else) — never a
+fake state invented beyond what was actually observed.
+
+**Connect methods** (all converge on the same `register_remote_node` +
+`ConnectionStore.save`/`write_token` pair):
+- **Add by Agent Token** — the node-agent is already running (deployed
+  earlier by hand, or by a discovery "Connect" click on a Connectable
+  row); the operator pastes its existing bearer token; this route
+  verifies it with a real `/v1/health` call before ever registering.
+- **Add Remote SSH** (`transport_type=lan_ssh`) / **Add via Cloudflare
+  Tunnel** (`transport_type=cloudflare_ssh`) — same SSH machinery, only
+  the transport differs: `cloudflare_ssh` uses `-o
+  ProxyCommand="cloudflared access ssh --hostname %h"`, a FIXED constant
+  template (OpenSSH's own `%h` token, substituted by ssh itself — never
+  the operator's hostname spliced into that shell-parsed string). Host
+  key: `Test Connection` runs `ssh-keyscan` (no full handshake) and
+  returns the presented `SHA256:` fingerprint; a NEW key requires an
+  explicit `Trust & pin` click before anything else proceeds; a CHANGED
+  key hard-fails (`host_key_mismatch`) with no auto-accept path at all,
+  ever. Bootstrap runs ONE fixed, server-authored script
+  (`remote_connect.BOOTSTRAP_SCRIPT_LINUX`) over that pinned connection —
+  the browser sends only structured fields (`node_id`, `controller_url`,
+  a freshly server-generated token), never shell text; a password
+  credential is fed through a small pty-driven prompt-answer helper (no
+  paramiko/sshpass dependency), never logged or persisted. On success the
+  new agent's own `/v1/health` is polled for real before it's ever
+  registered.
+- **Windows** — always returns manual copy-paste instructions
+  (`remote_connect.windows_bootstrap_guidance`, pointing at the same
+  `deploy/install-node-agent.ps1` config-driven onboarding already uses).
+  This project has no real Windows host to verify a live WinRM/
+  PowerShell-remoting install against (same honesty policy as the
+  "Windows node support" section above) — it never claims to have done
+  one.
+
+**A real bug found and fixed while building this**: `dashboard.py`'s
+`node_heartbeat` route authenticates an inbound push by re-reading an env
+var named `TERMINAL_MCP_NODE_TOKEN_<NODE_ID>` — but only
+`node_generate_onboarding` (not `node_heartbeat`'s own lookup) replaced
+`-` with `_` in that name, so a hyphenated `node_id` (e.g. `m-910`) would
+generate one env var at onboarding time and look up a different, invalid
+one at heartbeat time, silently rejecting every heartbeat from that node
+forever. Fixed by centralizing the naming convention in one function
+(`node_token_env_var`), used by both call sites plus this feature's own
+routes (which set that same env var in-process at connect time, so a
+node's heartbeat verifies immediately — no separate manual `export`
+step). `server_http.py`'s startup also re-registers every previously-
+connected node (from `ConnectionStore`, using its saved 0600 token file —
+no credential re-entry) and re-sets this same env var, so a controller
+restart never loses a discovery/SSH-connected node's ability to receive
+heartbeats.
+
+**Cloudflare-tunnel SSH's own real limitation, disclosed rather than
+hidden**: after bootstrapping a node over `cloudflared access ssh`, the
+CONTROLLER still needs an ordinary `http(s)://host:port` to reach that
+node's own agent afterward for status/tail/send/kill/etc — SSH-only
+Cloudflare Access does not also proxy the agent's separate HTTP port.
+The bootstrap route requires an explicit `agent_endpoint_host` for this
+transport (a direct LAN/VPN address, or a second Cloudflare Access TCP
+application the operator has already configured for that port) rather
+than silently guessing or failing to mention it — this feature has no
+Cloudflare account-API integration anywhere and cannot auto-provision
+that second Access application itself.
+
+**Security model**: every point from this feature's own task spec, as
+implemented — see `remote_connect.py`'s own module docstring for the
+full, itemized rationale (SSRF-safe validation on every hostname/IP,
+argv-only subprocess calls with exactly one fixed shell-parsed string
+containing no user bytes, credential never persisted/logged, host-key
+pin-not-auto-trust, server-templated bootstrap script only). CSRF/origin
++ Cloudflare Access guards are the SAME `_mutation_guard`/`_read_guard`
+every other dashboard route already uses — no separate auth model for
+this feature.
+
+**Not done**: a dedicated queryable audit table for connect attempts
+(logged via the same structured `_log.info`/`_log.warning` calls the
+existing node routes already use, redacted the same way — no new
+`audit.db`-style store, matching the "No per-node audit database" known
+limitation above); MAC-vendor (OUI) lookup in the scan table (shown as a
+bare MAC address only, no vendor guess — adding an OUI database was
+judged not worth a new bundled data file for this); a live WinRM/
+PowerShell-remoting bootstrap (see above).
+
 ## Kill / Reopen / Move semantics
 
 - **Kill/Reopen**: unchanged from the existing single-node feature, just

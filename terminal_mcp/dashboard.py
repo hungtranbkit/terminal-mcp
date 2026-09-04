@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import secrets
+from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import anyio
@@ -15,9 +16,10 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
-from . import tunnel_diagnostics
+from . import lan_discovery, remote_connect, tunnel_diagnostics
 from .cf_access import verify_access_assertion
 from .agent_availability import available_agent_types
+from .connection_store import ConnectionStore, generate_node_token
 from .controller import ControllerService, build_default_controller
 from .node_client import RemoteNodeClient
 from .core import TerminalService
@@ -29,6 +31,22 @@ from .webterm import WebTerminalProcess, pump_websocket
 from .webterm_assets import ASSETS
 
 _log = logging.getLogger(__name__)
+
+
+def node_token_env_var(node_id: str) -> str:
+    """The ONE naming convention for a remote node's heartbeat-auth env
+    var -- shared by node_generate_onboarding (what it tells an operator
+    to export), node_heartbeat (what it reads to verify an inbound
+    push), and the LAN-discovery/remote-connect routes below (which set
+    it themselves at runtime, in-process, instead of asking an operator
+    to export it by hand). Real bug fixed while adding those routes:
+    node_generate_onboarding already replaced '-' with '_' (env var names
+    don't take hyphens); node_heartbeat's own lookup did not, so a
+    hyphenated node_id (e.g. "m-910") would generate one env var name at
+    onboarding time and look up a DIFFERENT (invalid) one at heartbeat
+    time -- silently rejecting every heartbeat from that node forever.
+    Centralized here so the two can never drift apart again."""
+    return f"TERMINAL_MCP_NODE_TOKEN_{node_id.upper().replace('-', '_')}"
 
 
 INPUT_ERROR_STATUS = {
@@ -2871,6 +2889,32 @@ NODES_ADMIN_HTML = """<!doctype html>
     #detail .d-msg { font-size:12px; margin-top:8px; min-height:14px }
     #detail .d-msg.error { color:var(--red) } #detail .d-msg.ok { color:var(--green) }
     #detail .d-sessions-error { color:var(--red); font-size:12px; margin-top:10px }
+    /* -- Connect Node panel (LAN discovery + SSH/Cloudflare/agent-token
+       connect, task's own "bổ sung LAN discovery + Cloudflare SSH")
+       -- reuses every existing token/class above (no new font, no new
+       color scale), just new layout for this one panel. */
+    .cx-tabs { display:flex; gap:6px; flex-wrap:wrap; margin-top:12px }
+    .cx-tab { background:#0f1730; border:1px solid var(--line); border-radius:999px; color:var(--muted); padding:6px 14px; cursor:pointer; font:inherit; font-size:12px }
+    .cx-tab.active { color:var(--text); border-color:var(--accent); background:#16223d }
+    .cx-pane { margin-top:14px } .cx-pane[hidden] { display:none }
+    .cx-field { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted) }
+    .cx-field input[type=text], .cx-field input[type=password], .cx-field input[type=number], .cx-field select, .cx-field textarea {
+      padding:7px 9px; border-radius:6px; border:1px solid var(--line); background:#0f1730; color:var(--text); font:inherit; font-size:12px;
+    }
+    .cx-field textarea { min-height:70px; resize:vertical }
+    .cx-row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end }
+    .cx-radio { display:flex; gap:14px; font-size:12px; color:var(--muted) }
+    .cx-radio label { display:flex; align-items:center; gap:5px; cursor:pointer }
+    .cx-status { display:inline-block; border-radius:999px; padding:2px 9px; font-size:11px; border:1px solid var(--line) }
+    .cx-status.ok, .cx-status.already_connected, .cx-status.connectable { color:var(--green); border-color:var(--green) }
+    .cx-status.needs_setup { color:var(--amber); border-color:var(--amber) }
+    .cx-status.unknown, .cx-status.host_key_new { color:var(--muted) }
+    .cx-status.err, .cx-status.host_key_mismatch, .cx-status.auth_fail, .cx-status.unreachable { color:var(--red); border-color:var(--red) }
+    #cxScanTable { width:100%; border-collapse:collapse; font-size:12px; margin-top:10px }
+    #cxScanTable thead th { text-align:left; color:var(--muted); font-weight:600; padding:6px 8px; border-bottom:1px solid var(--line) }
+    #cxScanTable tbody td { padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top }
+    #cxScanTable button { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 10px; cursor:pointer; font:inherit; font-size:11px }
+    #cxScanTable button:hover { background:#233252 }
     @media (max-width:760px) {
       header { padding:12px 14px } main { padding:14px } #cards { grid-template-columns:1fr }
     }
@@ -2880,6 +2924,7 @@ NODES_ADMIN_HTML = """<!doctype html>
   <header>
     <div><h1>Quản lý node</h1><div class="muted">Trạng thái, tài nguyên và session theo từng node</div></div>
     <div style="display:flex;align-items:center;gap:10px">
+      <button class="icon-btn" id="connectNodeBtn" type="button">+ Connect Node</button>
       <button class="icon-btn" id="addNodeBtn" type="button">+ Thêm node</button>
       <button class="icon-btn" id="refreshBtn" type="button">⟳ Refresh</button>
       <a class="back" href="/dashboard">← Terminal</a>
@@ -2904,6 +2949,156 @@ NODES_ADMIN_HTML = """<!doctype html>
         <button class="icon-btn" id="obGenerateBtn" type="button" style="align-self:flex-end">Generate</button>
       </div>
       <div id="obResult" style="margin-top:12px"></div>
+    </div>
+    <div id="connectPanel" hidden style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+        <strong>Connect Node</strong>
+        <button class="icon-btn" id="connectCloseBtn" type="button">✕</button>
+      </div>
+      <div class="cx-tabs" role="tablist">
+        <button class="cx-tab active" data-cx-pane="cxScan" type="button" role="tab">Scan LAN</button>
+        <button class="cx-tab" data-cx-pane="cxSsh" type="button" role="tab">Add Remote SSH</button>
+        <button class="cx-tab" data-cx-pane="cxCloudflare" type="button" role="tab">Add via Cloudflare Tunnel</button>
+        <button class="cx-tab" data-cx-pane="cxToken" type="button" role="tab">Add by Agent Token</button>
+      </div>
+
+      <!-- Scan LAN -->
+      <div class="cx-pane" id="cxScan">
+        <div class="cx-row">
+          <button class="icon-btn" id="cxScanBtn" type="button">🔍 Scan LAN</button>
+          <button class="icon-btn" id="cxScanCancelBtn" type="button" hidden>Cancel scan</button>
+          <span class="muted" id="cxScanState" style="font-size:12px"></span>
+        </div>
+        <div class="muted" style="font-size:11px;margin-top:8px">
+          Chỉ quét các subnet private/link-local của chính NIC controller này (không quét internet); mỗi lần quét bị
+          rate-limit và giới hạn concurrency/timeout -- xem docs/multi-node.md.
+        </div>
+        <div style="overflow-x:auto">
+          <table id="cxScanTable" hidden>
+            <thead><tr><th>IP</th><th>Hostname</th><th>MAC</th><th>OS (khả năng)</th><th>Ports</th><th>Trạng thái</th><th></th></tr></thead>
+            <tbody id="cxScanBody"></tbody>
+          </table>
+        </div>
+        <div class="d-empty" id="cxScanEmpty">Chưa quét lần nào.</div>
+      </div>
+
+      <!-- Add Remote SSH (direct LAN/IP) -->
+      <div class="cx-pane" id="cxSsh" hidden>
+        <input type="hidden" id="cxSshTransport" value="lan_ssh">
+        <div class="cx-row">
+          <label class="cx-field">Host/IP<input type="text" id="cxSshHost" placeholder="192.168.1.50"></label>
+          <label class="cx-field" style="width:90px">Port<input type="number" id="cxSshPort" value="22"></label>
+          <label class="cx-field">Username<input type="text" id="cxSshUser" placeholder="pi"></label>
+        </div>
+        <div class="cx-row" style="margin-top:10px">
+          <div class="cx-radio">
+            <label><input type="radio" name="cxSshAuth" value="key" checked> SSH key (ưu tiên)</label>
+            <label><input type="radio" name="cxSshAuth" value="password"> Password</label>
+          </div>
+        </div>
+        <label class="cx-field" id="cxSshKeyWrap" style="margin-top:8px">Private key (PEM, dán trực tiếp -- không lưu lại)<textarea id="cxSshKey" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></label>
+        <label class="cx-field" id="cxSshPassWrap" style="margin-top:8px" hidden>Password (không lưu lại)<input type="password" id="cxSshPass"></label>
+        <div class="cx-row" style="margin-top:10px">
+          <button class="icon-btn" id="cxSshTestBtn" type="button">Test Connection</button>
+          <span id="cxSshTestResult"></span>
+        </div>
+        <div id="cxSshTrustBox" hidden style="margin-top:8px">
+          <div class="muted" style="font-size:11px">Host key mới, chưa được tin cậy:</div>
+          <pre id="cxSshFingerprint" style="white-space:pre-wrap;word-break:break-all;background:#0f1730;border:1px solid var(--line);border-radius:6px;padding:8px;font-size:11px;margin:4px 0"></pre>
+          <button class="icon-btn" id="cxSshTrustBtn" type="button">✓ Trust &amp; pin host key</button>
+        </div>
+        <div id="cxSshBootstrapBox" hidden style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+          <div class="cx-radio">
+            <label><input type="radio" name="cxSshOs" value="linux" checked> Linux/Unix</label>
+            <label><input type="radio" name="cxSshOs" value="windows"> Windows (OpenSSH)</label>
+          </div>
+          <div class="cx-row" style="margin-top:8px">
+            <label class="cx-field">Node ID<input type="text" id="cxSshNodeId" placeholder="pi-01"></label>
+            <label class="cx-field">Display name<input type="text" id="cxSshDisplayName" placeholder="(tuỳ chọn)"></label>
+          </div>
+          <div class="cx-row" style="margin-top:8px">
+            <label class="cx-field">Controller URL (để node mới push heartbeat về)<input type="text" id="cxSshControllerUrl" placeholder="http://192.168.1.10:8766"></label>
+            <label class="cx-field">Bind host (agent HTTP -- mặc định = host ở trên)<input type="text" id="cxSshBindHost" placeholder="(tuỳ chọn)"></label>
+          </div>
+          <div class="cx-row" style="margin-top:10px">
+            <button class="icon-btn" id="cxSshBootstrapBtn" type="button">🚀 Bootstrap &amp; Connect</button>
+          </div>
+          <div class="d-msg" id="cxSshBootstrapMsg"></div>
+        </div>
+      </div>
+
+      <!-- Add via Cloudflare Tunnel -->
+      <div class="cx-pane" id="cxCloudflare" hidden>
+        <input type="hidden" id="cxCfTransport" value="cloudflare_ssh">
+        <div class="muted" style="font-size:11px">Dùng khi máy đích không mở port 22 public -- SSH được tunnel qua Cloudflare Access
+          (`cloudflared access ssh --hostname &lt;hostname&gt;`). Cần cloudflared đã cài trên controller này và Access
+          application SSH đã cấu hình cho hostname bên dưới.</div>
+        <div class="cx-row" style="margin-top:10px">
+          <label class="cx-field">Cloudflare Access SSH hostname<input type="text" id="cxCfHost" placeholder="ssh.m910.example.com"></label>
+          <label class="cx-field" style="width:90px">Port<input type="number" id="cxCfPort" value="22"></label>
+          <label class="cx-field">Username<input type="text" id="cxCfUser" placeholder="pi"></label>
+        </div>
+        <div class="cx-row" style="margin-top:10px">
+          <div class="cx-radio">
+            <label><input type="radio" name="cxCfAuth" value="key" checked> SSH key (ưu tiên)</label>
+            <label><input type="radio" name="cxCfAuth" value="password"> Password</label>
+          </div>
+        </div>
+        <label class="cx-field" id="cxCfKeyWrap" style="margin-top:8px">Private key (PEM, dán trực tiếp -- không lưu lại)<textarea id="cxCfKey" spellcheck="false"></textarea></label>
+        <label class="cx-field" id="cxCfPassWrap" style="margin-top:8px" hidden>Password (không lưu lại)<input type="password" id="cxCfPass"></label>
+        <div class="cx-row" style="margin-top:10px">
+          <button class="icon-btn" id="cxCfTestBtn" type="button">Test Connection</button>
+          <span id="cxCfTestResult"></span>
+        </div>
+        <div id="cxCfTrustBox" hidden style="margin-top:8px">
+          <div class="muted" style="font-size:11px">Host key mới, chưa được tin cậy:</div>
+          <pre id="cxCfFingerprint" style="white-space:pre-wrap;word-break:break-all;background:#0f1730;border:1px solid var(--line);border-radius:6px;padding:8px;font-size:11px;margin:4px 0"></pre>
+          <button class="icon-btn" id="cxCfTrustBtn" type="button">✓ Trust &amp; pin host key</button>
+        </div>
+        <div id="cxCfBootstrapBox" hidden style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+          <div class="cx-radio">
+            <label><input type="radio" name="cxCfOs" value="linux" checked> Linux/Unix</label>
+            <label><input type="radio" name="cxCfOs" value="windows"> Windows (OpenSSH)</label>
+          </div>
+          <div class="cx-row" style="margin-top:8px">
+            <label class="cx-field">Node ID<input type="text" id="cxCfNodeId" placeholder="m910"></label>
+            <label class="cx-field">Display name<input type="text" id="cxCfDisplayName" placeholder="(tuỳ chọn)"></label>
+          </div>
+          <div class="cx-row" style="margin-top:8px">
+            <label class="cx-field">Controller URL (để node mới push heartbeat về)<input type="text" id="cxCfControllerUrl" placeholder="http://controller-host:8766"></label>
+            <label class="cx-field">Agent endpoint host (bắt buộc cho Linux -- xem ghi chú)<input type="text" id="cxCfAgentEndpointHost" placeholder="LAN/VPN IP, hoặc host:port của Access TCP app khác"></label>
+          </div>
+          <div class="muted" style="font-size:11px;margin-top:6px">Sau khi cài agent qua SSH-over-tunnel, controller cần một địa chỉ
+            HTTP thật để nói chuyện với agent đó -- Cloudflare Access SSH KHÔNG tự động cấp đường đó. Dùng IP LAN/VPN trực tiếp nếu có,
+            hoặc một Cloudflare Access TCP application riêng bạn đã cấu hình cho port agent (tự thiết lập trên Cloudflare Zero Trust,
+            tính năng này không tự tạo hộ).</div>
+          <div class="cx-row" style="margin-top:10px">
+            <button class="icon-btn" id="cxCfBootstrapBtn" type="button">🚀 Bootstrap &amp; Connect</button>
+          </div>
+          <div class="d-msg" id="cxCfBootstrapMsg"></div>
+        </div>
+      </div>
+
+      <!-- Add by Agent Token -->
+      <div class="cx-pane" id="cxToken" hidden>
+        <div class="cx-row">
+          <label class="cx-field">Node ID<input type="text" id="cxTokNodeId" placeholder="m910"></label>
+          <label class="cx-field">Display name<input type="text" id="cxTokDisplayName" placeholder="(tuỳ chọn)"></label>
+        </div>
+        <div class="cx-row" style="margin-top:8px">
+          <label class="cx-field">Endpoint<input type="text" id="cxTokEndpoint" placeholder="http://192.168.1.50:8790"></label>
+          <label class="cx-field">Token<input type="password" id="cxTokToken"></label>
+        </div>
+        <div class="cx-row" style="margin-top:10px">
+          <button class="icon-btn" id="cxTokConnectBtn" type="button">🔗 Connect</button>
+        </div>
+        <div class="d-msg" id="cxTokMsg"></div>
+      </div>
+
+      <div id="cxWindowsBox" hidden style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+        <div class="d-msg ok">Không có cài đặt WinRM/PowerShell-remoting tự động (task's own honesty policy) -- làm theo hướng dẫn thủ công dưới đây.</div>
+        <div id="cxWindowsInstructions" style="margin-top:8px;font-size:12px"></div>
+      </div>
     </div>
     <div id="cards"><div class="empty">Đang tải...</div></div>
     <div id="detail" hidden></div>
@@ -3088,6 +3283,290 @@ NODES_ADMIN_HTML = """<!doctype html>
         ${pre('3) Export biến môi trường nơi terminal-mcp-http.service đọc env (rồi safe-restart):', r.data.env_var + '=' + r.data.token)}
         <div class="muted" style="font-size:11px;margin-top:6px">4) Xác minh: terminal-mcp-doctor nodes -- ${nodeId} phải chuyển status=online trong vài giây sau khi node-agent kết nối.</div>`;
     });
+
+    // ======================================================================
+    // Connect Node: Scan LAN / Add Remote SSH / Add via Cloudflare Tunnel /
+    // Add by Agent Token. Discovered-device fields (hostname via reverse
+    // DNS, MAC, agent_info) come from OTHER machines on the network, not
+    // this operator -- unlike the rest of this admin-authored-data page
+    // (which uses innerHTML template strings throughout), every one of
+    // those fields is rendered via createElement/textContent ONLY, never
+    // innerHTML, so a hostile device's own PTR record or /v1/health
+    // response body can never be interpreted as markup here.
+    // ======================================================================
+    (function () {
+      const panel = document.getElementById('connectPanel');
+      document.getElementById('connectNodeBtn').addEventListener('click', () => { panel.hidden = false; });
+      document.getElementById('connectCloseBtn').addEventListener('click', () => { panel.hidden = true; });
+
+      for (const tab of document.querySelectorAll('.cx-tab')) {
+        tab.addEventListener('click', () => {
+          for (const t of document.querySelectorAll('.cx-tab')) t.classList.remove('active');
+          tab.classList.add('active');
+          for (const pane of document.querySelectorAll('.cx-pane')) pane.hidden = true;
+          document.getElementById(tab.dataset.cxPane).hidden = false;
+        });
+      }
+
+      function wireAuthToggle(radioName, keyWrapId, passWrapId) {
+        for (const radio of document.querySelectorAll(`input[name="${radioName}"]`)) {
+          radio.addEventListener('change', () => {
+            const isKey = document.querySelector(`input[name="${radioName}"]:checked`).value === 'key';
+            document.getElementById(keyWrapId).hidden = !isKey;
+            document.getElementById(passWrapId).hidden = isKey;
+          });
+        }
+      }
+      wireAuthToggle('cxSshAuth', 'cxSshKeyWrap', 'cxSshPassWrap');
+      wireAuthToggle('cxCfAuth', 'cxCfKeyWrap', 'cxCfPassWrap');
+
+      function credentialBody(prefix) {
+        const authRadio = document.querySelector(`input[name="cx${prefix}Auth"]:checked`);
+        const cred = {};
+        if (!authRadio) return null;
+        if (authRadio.value === 'key') {
+          const key = document.getElementById(`cx${prefix}Key`).value;
+          if (!key.trim()) return null;
+          cred.private_key_pem = key;
+        } else {
+          const pass = document.getElementById(`cx${prefix}Pass`).value;
+          if (!pass) return null;
+          cred.password = pass;
+        }
+        return cred;
+      }
+
+      function showWindowsGuidance(nodeId, hostname, controllerUrl) {
+        if (!nodeId || !hostname || !controllerUrl) {
+          alert('Cần Node ID, Host/hostname, và Controller URL để tạo hướng dẫn Windows.');
+          return;
+        }
+        api('/dashboard/api/nodes/connect/windows/bootstrap', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ node_id: nodeId, hostname, controller_url: controllerUrl }),
+        }).then(r => {
+          const box = document.getElementById('cxWindowsBox');
+          const list = document.getElementById('cxWindowsInstructions');
+          list.replaceChildren();
+          if (!r.ok) {
+            const err = document.createElement('div'); err.className = 'd-msg error';
+            err.textContent = r.data.detail || r.data.error || 'Lỗi'; list.append(err);
+            box.hidden = false; return;
+          }
+          for (const line of (r.data.instructions || [])) {
+            const p = document.createElement('div'); p.textContent = line; list.append(p);
+          }
+          const pre = document.createElement('pre');
+          pre.style.cssText = 'white-space:pre-wrap;word-break:break-all;background:#0f1730;border:1px solid var(--line);border-radius:6px;padding:8px;font-size:11px;margin-top:8px;user-select:all';
+          pre.textContent = r.data.install_command || '';
+          list.append(pre);
+          const tokenNote = document.createElement('div'); tokenNote.className = 'muted';
+          tokenNote.style.fontSize = '11px'; tokenNote.style.marginTop = '6px';
+          tokenNote.textContent = 'Token được tạo MỘT LẦN duy nhất, đã nằm trong lệnh trên -- không hiển thị lại.';
+          list.append(tokenNote);
+          box.hidden = false;
+        });
+      }
+
+      // -- Scan LAN ------------------------------------------------------
+      let scanPollTimer = null;
+      const scanBtn = document.getElementById('cxScanBtn');
+      const scanCancelBtn = document.getElementById('cxScanCancelBtn');
+      const scanStateEl = document.getElementById('cxScanState');
+      const scanTable = document.getElementById('cxScanTable');
+      const scanBody = document.getElementById('cxScanBody');
+      const scanEmpty = document.getElementById('cxScanEmpty');
+
+      function statusLabel(status) {
+        return { already_connected: 'Đã kết nối', connectable: 'Có thể kết nối (agent)',
+                needs_setup: 'Cần cài đặt', unknown: 'Không rõ' }[status] || status;
+      }
+
+      function renderScanDevices(devices) {
+        scanBody.replaceChildren();
+        if (!devices.length) { scanTable.hidden = true; scanEmpty.hidden = false; return; }
+        scanTable.hidden = false; scanEmpty.hidden = true;
+        for (const device of devices) {
+          const tr = document.createElement('tr');
+          const cells = [device.ip, device.hostname || '—', device.mac || '—',
+                        device.os_guess ? (device.os_guess === 'windows' ? '🪟 Windows (khả năng)' : '🐧 Linux/Unix (khả năng)') : '—',
+                        (device.open_ports || []).join(', ') || '—'];
+          for (const value of cells) {
+            const td = document.createElement('td'); td.textContent = value; tr.append(td);
+          }
+          const statusTd = document.createElement('td');
+          const statusSpan = document.createElement('span');
+          statusSpan.className = 'cx-status ' + device.status; statusSpan.textContent = statusLabel(device.status);
+          statusTd.append(statusSpan); tr.append(statusTd);
+          const actionTd = document.createElement('td');
+          if (device.status !== 'already_connected') {
+            const connectBtn = document.createElement('button'); connectBtn.type = 'button'; connectBtn.textContent = 'Connect';
+            connectBtn.addEventListener('click', () => prefillFromScan(device));
+            actionTd.append(connectBtn);
+          }
+          tr.append(actionTd);
+          scanBody.append(tr);
+        }
+      }
+
+      function prefillFromScan(device) {
+        if (device.agent_reachable) {
+          for (const t of document.querySelectorAll('.cx-tab')) t.classList.remove('active');
+          document.querySelector('[data-cx-pane="cxToken"]').classList.add('active');
+          for (const pane of document.querySelectorAll('.cx-pane')) pane.hidden = true;
+          document.getElementById('cxToken').hidden = false;
+          document.getElementById('cxTokEndpoint').value = `http://${device.ip}:8790`;
+          if (device.agent_info && device.agent_info.node_id) document.getElementById('cxTokNodeId').value = device.agent_info.node_id;
+          return;
+        }
+        for (const t of document.querySelectorAll('.cx-tab')) t.classList.remove('active');
+        document.querySelector('[data-cx-pane="cxSsh"]').classList.add('active');
+        for (const pane of document.querySelectorAll('.cx-pane')) pane.hidden = true;
+        document.getElementById('cxSsh').hidden = false;
+        document.getElementById('cxSshHost').value = device.ip;
+        if (device.os_guess === 'windows') {
+          const radio = document.querySelector('input[name="cxSshOs"][value="windows"]');
+          if (radio) radio.checked = true;
+        }
+      }
+
+      function pollScan() {
+        api('/dashboard/api/nodes/discovery/status').then(r => {
+          if (!r.ok) return;
+          const result = r.data;
+          if (result.state === 'running') {
+            scanStateEl.textContent = `Đang quét ${(result.subnets || []).join(', ') || '...'}`;
+            scanCancelBtn.hidden = false; scanBtn.disabled = true;
+            scanPollTimer = setTimeout(pollScan, 1200);
+          } else {
+            scanBtn.disabled = false; scanCancelBtn.hidden = true;
+            const count = (result.devices || []).length;
+            scanStateEl.textContent = result.state === 'never_run' ? ''
+              : `${result.state === 'done' ? 'Xong' : result.state}${result.truncated ? ' (bị cắt bớt do giới hạn quét)' : ''} -- ${count} thiết bị`;
+            renderScanDevices(result.devices || []);
+          }
+        });
+      }
+      scanBtn.addEventListener('click', () => {
+        api('/dashboard/api/nodes/discovery/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+          .then(() => { clearTimeout(scanPollTimer); pollScan(); });
+      });
+      scanCancelBtn.addEventListener('click', () => {
+        api('/dashboard/api/nodes/discovery/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+          .then(() => pollScan());
+      });
+      pollScan();
+
+      // -- Add Remote SSH / Add via Cloudflare Tunnel (shared logic,
+      // parameterized by field-id prefix "Ssh"/"Cf") --------------------
+      function wireSshFlow(prefix, transportType) {
+        const hostEl = document.getElementById(`cx${prefix}Host`);
+        const portEl = document.getElementById(`cx${prefix}Port`);
+        const userEl = document.getElementById(`cx${prefix}User`);
+        const testBtn = document.getElementById(`cx${prefix}TestBtn`);
+        const resultEl = document.getElementById(`cx${prefix}TestResult`);
+        const trustBox = document.getElementById(`cx${prefix}TrustBox`);
+        const fingerprintEl = document.getElementById(`cx${prefix}Fingerprint`);
+        const trustBtn = document.getElementById(`cx${prefix}TrustBtn`);
+        const bootstrapBox = document.getElementById(`cx${prefix}BootstrapBox`);
+        const bootstrapBtn = document.getElementById(`cx${prefix}BootstrapBtn`);
+        const bootstrapMsg = document.getElementById(`cx${prefix}BootstrapMsg`);
+
+        function targetBody() {
+          return { transport_type: transportType, host: hostEl.value.trim(),
+                  port: portEl.value ? Number(portEl.value) : undefined, username: userEl.value.trim() };
+        }
+
+        function runTest() {
+          const body = targetBody();
+          const cred = credentialBody(prefix);
+          if (cred) body.credential = cred;
+          resultEl.textContent = 'Đang kiểm tra...';
+          trustBox.hidden = true; bootstrapBox.hidden = true;
+          return api(`/dashboard/api/nodes/connect/ssh/test`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+          }).then(r => {
+            const stage = r.data.stage || (r.ok ? 'ok' : 'unreachable');
+            const span = document.createElement('span'); span.className = 'cx-status ' + stage;
+            span.textContent = stage + (r.data.detail ? `: ${r.data.detail}` : '');
+            resultEl.replaceChildren(span);
+            if (stage === 'host_key_new') {
+              fingerprintEl.textContent = r.data.fingerprint || '';
+              trustBox.hidden = false;
+            } else if (stage === 'ok') {
+              bootstrapBox.hidden = false;
+            }
+            return r;
+          });
+        }
+        testBtn.addEventListener('click', runTest);
+        trustBtn.addEventListener('click', () => {
+          api('/dashboard/api/nodes/connect/ssh/trust-hostkey', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(targetBody()),
+          }).then(r => {
+            if (r.ok) { trustBox.hidden = true; runTest(); }
+            else alert(r.data.detail || r.data.error || 'Lỗi trust host key');
+          });
+        });
+        bootstrapBtn.addEventListener('click', () => {
+          const osChoice = document.querySelector(`input[name="cx${prefix}Os"]:checked`).value;
+          const nodeId = document.getElementById(`cx${prefix}NodeId`).value.trim();
+          const displayName = document.getElementById(`cx${prefix}DisplayName`).value.trim();
+          const controllerUrl = document.getElementById(`cx${prefix}ControllerUrl`).value.trim();
+          if (osChoice === 'windows') {
+            showWindowsGuidance(nodeId, hostEl.value.trim(), controllerUrl);
+            return;
+          }
+          const cred = credentialBody(prefix);
+          if (!nodeId || !controllerUrl || !cred) {
+            bootstrapMsg.className = 'd-msg error'; bootstrapMsg.textContent = 'Cần Node ID, Controller URL, và credential (key/password).';
+            return;
+          }
+          const body = Object.assign(targetBody(), { credential: cred, node_id: nodeId, display_name: displayName, controller_url: controllerUrl });
+          if (prefix === 'Ssh') {
+            const bindHost = document.getElementById('cxSshBindHost').value.trim();
+            if (bindHost) body.bind_host = bindHost;
+          } else {
+            body.agent_endpoint_host = document.getElementById('cxCfAgentEndpointHost').value.trim();
+          }
+          bootstrapMsg.className = 'd-msg'; bootstrapMsg.textContent = 'Đang bootstrap (có thể mất tới 1 phút)...';
+          bootstrapBtn.disabled = true;
+          api('/dashboard/api/nodes/connect/ssh/bootstrap', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+          }).then(r => {
+            bootstrapBtn.disabled = false;
+            if (r.ok) {
+              bootstrapMsg.className = 'd-msg ok'; bootstrapMsg.textContent = `Đã kết nối node ${r.data.node_id} (${r.data.endpoint}).`;
+              loadAll();
+            } else {
+              bootstrapMsg.className = 'd-msg error';
+              bootstrapMsg.textContent = (r.data.detail || r.data.error || 'Lỗi') +
+                (r.data.stderr ? ` -- stderr: ${r.data.stderr.slice(0, 300)}` : '');
+            }
+          });
+        });
+      }
+      wireSshFlow('Ssh', 'lan_ssh');
+      wireSshFlow('Cf', 'cloudflare_ssh');
+
+      // -- Add by Agent Token ---------------------------------------------
+      document.getElementById('cxTokConnectBtn').addEventListener('click', () => {
+        const nodeId = document.getElementById('cxTokNodeId').value.trim();
+        const displayName = document.getElementById('cxTokDisplayName').value.trim();
+        const endpoint = document.getElementById('cxTokEndpoint').value.trim();
+        const token = document.getElementById('cxTokToken').value;
+        const msg = document.getElementById('cxTokMsg');
+        if (!nodeId || !endpoint || !token) { msg.className = 'd-msg error'; msg.textContent = 'Cần Node ID, Endpoint, Token.'; return; }
+        msg.className = 'd-msg'; msg.textContent = 'Đang kết nối...';
+        api('/dashboard/api/nodes/connect/agent-token', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ node_id: nodeId, display_name: displayName, endpoint, token }),
+        }).then(r => {
+          if (r.ok) { msg.className = 'd-msg ok'; msg.textContent = `Đã kết nối node ${r.data.node_id}.`; loadAll(); }
+          else { msg.className = 'd-msg error'; msg.textContent = r.data.detail || r.data.error || 'Lỗi'; }
+        });
+      });
+    })();
 
     loadAll(); setInterval(loadAll, 8000);
   </script>
@@ -3387,7 +3866,8 @@ WEBTERM_HTML = """<!doctype html>
 def register_dashboard(server: MCPServer, terminal: TerminalService,
                        supervisor: SupervisorService | None = None,
                        supervisor_v2: SupervisorV2Service | None = None,
-                       controller: ControllerService | None = None) -> None:
+                       controller: ControllerService | None = None,
+                       connection_store: ConnectionStore | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -3404,6 +3884,25 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # build_default_controller's own docstring for why this is a
         # PRIVATE temp registry, never the real production nodes.db path.
         controller = build_default_controller(terminal)
+    if connection_store is None:
+        # Same private-temp-file discipline as build_default_controller's
+        # own registry default just above (see that docstring for the
+        # real production-state-pollution incident this guards against --
+        # this feature's own ConnectionStore is exactly the same class of
+        # risk: every test/ad-hoc caller of register_dashboard must never
+        # write into the real ~/.local/state/terminal-mcp/connections.db).
+        # server_http.py's real main() always passes an explicit,
+        # persistent ConnectionStore instead of relying on this fallback.
+        import tempfile
+        connection_store = ConnectionStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-connections-")) / "connections.db")
+    discovery_config = terminal.config.nodes.discovery
+    discovery = lan_discovery.DiscoveryService(
+        agent_port=discovery_config.agent_port, concurrency=discovery_config.concurrency,
+        host_timeout=discovery_config.host_timeout_seconds, max_hosts_per_scan=discovery_config.max_hosts_per_scan,
+        overall_timeout_seconds=discovery_config.overall_timeout_seconds, cooldown_seconds=discovery_config.cooldown_seconds,
+    )
+    host_key_store = remote_connect.HostKeyStore()
+    ssh_known_hosts_dir = connection_store.path.parent / "ssh_known_hosts"
 
     def _origin_allowed(request: Request) -> bool:
         # CSRF defense (P1 hardening item #3), always on, no config
@@ -4322,7 +4821,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                                 status_code=400)
         display_name = display_name or node_id
         token = secrets.token_hex(32)
-        env_var = f"TERMINAL_MCP_NODE_TOKEN_{node_id.upper().replace('-', '_')}"
+        env_var = node_token_env_var(node_id)
         config_yaml_block = (
             "nodes:\n  remote:\n"
             f"    - node_id: {node_id}\n"
@@ -4348,6 +4847,353 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             "config_yaml_block": config_yaml_block, "install_command": install_command,
         }, headers={"Cache-Control": "no-store"})
 
+    # ======================================================================
+    # LAN device discovery + remote connect/bootstrap (Nodes page "Connect
+    # Node": Scan LAN / Add Remote SSH / Add via Cloudflare Tunnel / Add by
+    # Agent Token). Every route below is a POST/GET under
+    # /dashboard/api/nodes/discovery/* or /dashboard/api/nodes/connect/*,
+    # through the SAME _mutation_guard/_read_guard as every other node
+    # route above -- no separate auth model. Every mutation route logs
+    # only non-secret identifiers (node_id/host/transport_type/username/
+    # result) via _log, matching this file's own existing node_drain/
+    # node_test_connection/node_generate_onboarding convention -- never a
+    # password/private key/token in a log line (task's own "audit
+    # connection attempts nhưng redact secret").
+    # ======================================================================
+
+    def _remote_connect_config():
+        return terminal.config.nodes.remote_connect
+
+    @server.custom_route("/dashboard/api/nodes/discovery/status", methods=["GET"], include_in_schema=False)
+    async def discovery_status(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        result = discovery.status()
+        if result is None:
+            return JSONResponse({"scan_id": None, "state": "never_run"}, headers={"Cache-Control": "no-store"})
+        return JSONResponse(result.to_dict(), headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/discovery/scan", methods=["POST"], include_in_schema=False)
+    async def discovery_scan(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        if not terminal.config.nodes.discovery.enabled:
+            return JSONResponse({"error": "DISCOVERY_DISABLED"}, status_code=403, headers={"Cache-Control": "no-store"})
+        known_endpoints = {node.id: node.endpoint for node in controller.list_nodes() if node.endpoint != "local"}
+        result, started = discovery.start_scan(known_endpoints=known_endpoints)
+        _log.info("dashboard discovery_scan scan_id=%s started=%s identity=%s",
+                 result.scan_id, started, identity.email if identity else None)
+        payload = result.to_dict()
+        payload["started"] = started
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/discovery/cancel", methods=["POST"], include_in_schema=False)
+    async def discovery_cancel(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        cancelled = await discovery.cancel()
+        _log.info("dashboard discovery_cancel cancelled=%s identity=%s", cancelled, identity.email if identity else None)
+        return JSONResponse({"cancelled": cancelled}, headers={"Cache-Control": "no-store"})
+
+    def _validate_ssh_target(body: dict) -> tuple[remote_connect.SshTarget | None, JSONResponse | None]:
+        transport_type = body.get("transport_type")
+        if transport_type not in (remote_connect.TRANSPORT_LAN_SSH, remote_connect.TRANSPORT_CLOUDFLARE_SSH):
+            return None, JSONResponse({"error": "INVALID_REQUEST", "detail": "transport_type must be lan_ssh or cloudflare_ssh"},
+                                      status_code=400)
+        try:
+            if transport_type == remote_connect.TRANSPORT_LAN_SSH:
+                host = remote_connect.validate_hostname_or_ip(
+                    body.get("host", ""), allow_public=_remote_connect_config().allow_public_manual_add)
+            else:
+                host = remote_connect.validate_cloudflare_hostname(body.get("host", ""))
+            username = remote_connect.validate_username(body.get("username", ""))
+            port = remote_connect.validate_port(body.get("port"), default=22)
+        except remote_connect.ValidationError as exc:
+            return None, JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
+        return remote_connect.SshTarget(transport_type=transport_type, host=host, port=port, username=username), None
+
+    def _credential_from_body(body: dict) -> tuple[remote_connect.SshCredential | None, JSONResponse | None]:
+        raw = body.get("credential") or {}
+        if not isinstance(raw, dict):
+            return None, JSONResponse({"error": "INVALID_REQUEST", "detail": "credential must be an object"}, status_code=400)
+        try:
+            username = remote_connect.validate_username(body.get("username", ""))
+            credential = remote_connect.SshCredential(
+                username=username, password=raw.get("password") or None,
+                private_key_pem=raw.get("private_key_pem") or None, key_passphrase=raw.get("key_passphrase") or None,
+            )
+        except remote_connect.ValidationError as exc:
+            return None, JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
+        return credential, None
+
+    def _pinned_fingerprint_for(target: remote_connect.SshTarget) -> str | None:
+        for saved in connection_store.list():
+            if (saved.transport_type == target.transport_type and saved.hostname == target.host
+                    and (saved.port or 22) == target.port):
+                return saved.host_key_fingerprint
+        return host_key_store.pinned_for(target)
+
+    @server.custom_route("/dashboard/api/nodes/connect/ssh/trust-hostkey", methods=["POST"], include_in_schema=False)
+    async def connect_ssh_trust_hostkey(request: Request) -> JSONResponse:
+        # The ONE explicit "approve this host key" action (task item 4) --
+        # never invoked implicitly by test/bootstrap. A fingerprint
+        # already pinned for this exact target is silently re-confirmed
+        # (idempotent), but a CHANGED fingerprint still requires this same
+        # explicit call again -- there is no separate "auto-update".
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        target, error = _validate_ssh_target(body if isinstance(body, dict) else {})
+        if error is not None:
+            return error
+
+        def _probe():
+            return remote_connect.probe_host_key(target)
+        probe = await anyio.to_thread.run_sync(_probe)
+        if not probe.ok:
+            return JSONResponse({"error": probe.error_class or "UNREACHABLE", "detail": probe.error}, status_code=502)
+        host_key_store.trust(target, probe.fingerprint)
+        _log.info("dashboard connect_ssh_trust_hostkey transport=%s host=%s port=%s fingerprint=%s identity=%s",
+                 target.transport_type, target.host, target.port, probe.fingerprint, identity.email if identity else None)
+        return JSONResponse({"trusted": True, "fingerprint": probe.fingerprint}, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/connect/ssh/test", methods=["POST"], include_in_schema=False)
+    async def connect_ssh_test(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        target, error = _validate_ssh_target(body)
+        if error is not None:
+            return error
+        pinned = _pinned_fingerprint_for(target)
+        has_credential = bool(body.get("credential"))
+
+        def _run_test():
+            if has_credential:
+                return None  # handled below, after we know pinned/probe status
+            return remote_connect.test_connection(target, known_hosts_dir=ssh_known_hosts_dir,
+                                                  host_key_store=host_key_store, pinned_fingerprint=pinned)
+
+        if not has_credential:
+            result = await anyio.to_thread.run_sync(_run_test)
+        else:
+            credential, cred_error = _credential_from_body(body)
+            if cred_error is not None:
+                return cred_error
+            if pinned is None:
+                key_only = await anyio.to_thread.run_sync(
+                    lambda: remote_connect.test_connection(target, known_hosts_dir=ssh_known_hosts_dir,
+                                                           host_key_store=host_key_store, pinned_fingerprint=None))
+                result = key_only
+            else:
+                result = await anyio.to_thread.run_sync(
+                    lambda: remote_connect.test_connection_with_credential(
+                        target, credential, known_hosts_dir=ssh_known_hosts_dir, pinned_fingerprint=pinned,
+                        timeout=_remote_connect_config().ssh_connect_timeout_seconds * 2))
+        _log.info("dashboard connect_ssh_test transport=%s host=%s port=%s stage=%s ok=%s identity=%s",
+                 target.transport_type, target.host, target.port, result.stage, result.ok,
+                 identity.email if identity else None)
+        return JSONResponse({
+            "stage": result.stage, "ok": result.ok, "fingerprint": result.fingerprint, "detail": result.detail,
+        }, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/connect/ssh/bootstrap", methods=["POST"], include_in_schema=False)
+    async def connect_ssh_bootstrap(request: Request) -> JSONResponse:
+        # Linux only -- see connect_windows_bootstrap for why Windows
+        # always returns manual guidance instead of a live install here.
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        target, error = _validate_ssh_target(body)
+        if error is not None:
+            return error
+        try:
+            node_id = remote_connect.validate_node_id(body.get("node_id", ""))
+        except remote_connect.ValidationError as exc:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
+        if controller.node_status(node_id) is not None:
+            return JSONResponse({"error": "NODE_ALREADY_EXISTS", "node_id": node_id}, status_code=409)
+        credential, cred_error = _credential_from_body(body)
+        if cred_error is not None:
+            return cred_error
+        pinned = _pinned_fingerprint_for(target)
+        if pinned is None:
+            return JSONResponse({"error": "HOST_KEY_NOT_TRUSTED",
+                                 "detail": "call /dashboard/api/nodes/connect/ssh/trust-hostkey first"},
+                                status_code=409)
+        controller_url = body.get("controller_url")
+        if not isinstance(controller_url, str) or not controller_url.strip():
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "controller_url is required -- must be an "
+                                 "address the NEW node's own heartbeat loop can reach back to this controller on"},
+                                status_code=400)
+        if target.transport_type == remote_connect.TRANSPORT_LAN_SSH:
+            bind_host = body.get("bind_host") or target.host
+        else:
+            bind_host = body.get("agent_endpoint_host")
+            if not bind_host:
+                return JSONResponse({"error": "AGENT_ENDPOINT_REQUIRED", "detail": (
+                    "a Cloudflare-tunnel SSH target has no direct network address for this controller to reach "
+                    "the new agent's own HTTP API afterward -- supply agent_endpoint_host (a directly-reachable "
+                    "LAN/VPN address for that host, or a second Cloudflare Access TCP hostname/local sidecar port "
+                    "you've already set up for the agent's own port; this feature cannot auto-provision that "
+                    "second Access application)")}, status_code=400)
+        token = generate_node_token()
+        agent_port = terminal.config.nodes.discovery.agent_port
+
+        def _bootstrap():
+            return remote_connect.run_linux_bootstrap(
+                target, credential, node_id=node_id, controller_url=controller_url, token=token,
+                bind_host=bind_host, known_hosts_dir=ssh_known_hosts_dir, pinned_fingerprint=pinned,
+                timeout=_remote_connect_config().bootstrap_timeout_seconds,
+            )
+        bootstrap_result = await anyio.to_thread.run_sync(_bootstrap)
+        _log.info("dashboard connect_ssh_bootstrap node_id=%s transport=%s host=%s ok=%s identity=%s",
+                 node_id, target.transport_type, target.host, bootstrap_result.ok, identity.email if identity else None)
+        if not bootstrap_result.ok:
+            return JSONResponse({
+                "error": "BOOTSTRAP_FAILED", "stdout": bootstrap_result.stdout[-4000:],
+                "stderr": bootstrap_result.stderr[-4000:], "returncode": bootstrap_result.returncode,
+            }, status_code=502, headers={"Cache-Control": "no-store"})
+
+        endpoint = f"http://{bind_host}:{agent_port}"
+
+        def _health_probe() -> bool:
+            client = RemoteNodeClient(endpoint, token, timeout=5.0)
+            for _attempt in range(5):
+                ok, _latency, _detail = client.ping()
+                if ok:
+                    return True
+                import time as _time
+                _time.sleep(1.5)
+            return False
+
+        healthy = await anyio.to_thread.run_sync(_health_probe)
+        if not healthy:
+            return JSONResponse({
+                "error": "AGENT_NOT_REACHABLE_AFTER_BOOTSTRAP", "endpoint": endpoint,
+                "detail": "the bootstrap script reported success but the new agent's /v1/health never answered "
+                         "-- check bind_host/firewall, or the printed node-agent.log on the remote host",
+                "stdout": bootstrap_result.stdout[-4000:],
+            }, status_code=502, headers={"Cache-Control": "no-store"})
+
+        token_file = connection_store.write_token(node_id, token)
+        connection_store.save(node_id, transport_type=target.transport_type, endpoint=endpoint, hostname=target.host,
+                              username=target.username, port=target.port, host_key_fingerprint=pinned,
+                              token_file=token_file)
+        controller.register_remote_node(node_id, display_name=body.get("display_name") or node_id,
+                                        hostname=target.host, endpoint=endpoint, token=token)
+        # The new agent's own heartbeat loop pushes to node_heartbeat
+        # (below), which authenticates via THIS env var -- see
+        # node_token_env_var's own docstring. Set in-process (this
+        # controller's own os.environ, not the shell's) so the very next
+        # heartbeat push already verifies correctly, no separate manual
+        # export step needed for a discovery/SSH-connected node.
+        os.environ[node_token_env_var(node_id)] = token
+        node = controller.node_status(node_id)
+        return JSONResponse({"ok": True, "node_id": node_id, "endpoint": endpoint,
+                            "node": _node_to_dict(node) if node else None}, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/connect/windows/bootstrap", methods=["POST"], include_in_schema=False)
+    async def connect_windows_bootstrap(request: Request) -> JSONResponse:
+        # Always manual guidance -- see remote_connect.windows_bootstrap_
+        # guidance's own docstring for why this never claims a live
+        # WinRM/PowerShell-remoting install.
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            node_id = remote_connect.validate_node_id(body.get("node_id", ""))
+        except remote_connect.ValidationError as exc:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
+        hostname = (body.get("hostname") or "").strip()
+        controller_url = (body.get("controller_url") or "").strip()
+        if not hostname or not controller_url:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "hostname and controller_url are required"},
+                                status_code=400)
+        token = generate_node_token()
+        guidance = remote_connect.windows_bootstrap_guidance(node_id=node_id, controller_url=controller_url,
+                                                              token=token, hostname=hostname)
+        _log.info("dashboard connect_windows_bootstrap node_id=%s hostname=%s identity=%s",
+                 node_id, hostname, identity.email if identity else None)
+        return JSONResponse(guidance, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/connect/agent-token", methods=["POST"], include_in_schema=False)
+    async def connect_agent_token(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            node_id = remote_connect.validate_node_id(body.get("node_id", ""))
+        except remote_connect.ValidationError as exc:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
+        endpoint = (body.get("endpoint") or "").strip()
+        token = body.get("token") or ""
+        if not endpoint.startswith(("http://", "https://")) or not token:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "endpoint (http(s)://host:port) and token are required"},
+                                status_code=400)
+        if controller.node_status(node_id) is not None:
+            return JSONResponse({"error": "NODE_ALREADY_EXISTS", "node_id": node_id}, status_code=409)
+        host_part = re.sub(r"^https?://", "", endpoint).split("/", 1)[0].split(":", 1)[0]
+        try:
+            remote_connect.validate_hostname_or_ip(host_part, allow_public=_remote_connect_config().allow_public_manual_add)
+        except remote_connect.ValidationError as exc:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
+
+        def _probe() -> tuple[bool, str | None]:
+            client = RemoteNodeClient(endpoint, token, timeout=8.0)
+            ok, _latency, detail = client.ping()
+            return ok, detail
+        healthy, detail = await anyio.to_thread.run_sync(_probe)
+        _log.info("dashboard connect_agent_token node_id=%s endpoint=%s healthy=%s identity=%s",
+                 node_id, endpoint, healthy, identity.email if identity else None)
+        if not healthy:
+            return JSONResponse({"error": "AGENT_NOT_REACHABLE", "detail": detail}, status_code=502,
+                                headers={"Cache-Control": "no-store"})
+
+        token_file = connection_store.write_token(node_id, token)
+        connection_store.save(node_id, transport_type="agent_token", endpoint=endpoint, hostname=host_part,
+                              token_file=token_file)
+        controller.register_remote_node(node_id, display_name=body.get("display_name") or node_id,
+                                        hostname=host_part, endpoint=endpoint, token=token)
+        # See node_token_env_var's own docstring -- makes the node's
+        # (already-running) heartbeat loop verify successfully against
+        # THIS controller the moment its next push arrives.
+        os.environ[node_token_env_var(node_id)] = token
+        node = controller.node_status(node_id)
+        return JSONResponse({"ok": True, "node_id": node_id, "endpoint": endpoint,
+                            "node": _node_to_dict(node) if node else None}, headers={"Cache-Control": "no-store"})
+
     @server.custom_route("/dashboard/api/nodes/{node_id}/heartbeat", methods=["POST"], include_in_schema=False)
     async def node_heartbeat(request: Request) -> JSONResponse:
         # Machine-to-machine (a remote node's own terminal-node-agent
@@ -4358,7 +5204,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # before touching the registry at all -- never silently accepted
         # as "must be the local node" or similarly guessed.
         node_id = request.path_params["node_id"]
-        expected_token = os.environ.get(f"TERMINAL_MCP_NODE_TOKEN_{node_id.upper()}")
+        expected_token = os.environ.get(node_token_env_var(node_id))
         header = request.headers.get("authorization", "")
         presented = header[len("Bearer "):] if header.startswith("Bearer ") else ""
         if not expected_token or not hmac.compare_digest(presented, expected_token):

@@ -10,9 +10,10 @@ import anyio
 import uvicorn
 
 from .config import load_config
+from .connection_store import ConnectionStore
 from .controller import ControllerService
 from .core import TerminalService
-from .dashboard import register_dashboard
+from .dashboard import node_token_env_var, register_dashboard
 from .health import register_health
 from .logging_setup import RequestIdMiddleware, SecurityHeadersMiddleware, configure_logging
 from .maintenance import MaintenanceLoop
@@ -183,8 +184,48 @@ def main() -> None:
                                         endpoint=remote.endpoint, token=token, max_sessions=remote.max_sessions,
                                         timeout=remote.timeout_seconds)
         _log.info("nodes: registered remote node %r (%s)", remote.node_id, remote.endpoint)
+
+    # ONE explicit, persistent (real default ~/.local/state/terminal-mcp/
+    # connections.db) ConnectionStore, same "never fall into the private-
+    # temp-file test default" discipline as ControllerService/NodeRegistry
+    # just above -- see dashboard.py's register_dashboard docstring for
+    # why that fallback exists and must never be the production path.
+    connection_store = ConnectionStore()
+    # Re-hydrate any node connected at runtime via the LAN-discovery/
+    # remote-connect dashboard feature (LAN SSH, Cloudflare-tunnel SSH, or
+    # agent-token) from ITS last run -- task's own "controller restart
+    # không làm mất remote session đang chạy": the remote node-agent
+    # process itself lives on a separate host and was never touched by
+    # this restart; this only re-establishes THIS controller's own
+    # client/registration for it, using the bearer token already saved to
+    # a local 0600 file at connect time (see connection_store.py) -- no
+    # credential re-entry, no operator action needed. A config.yaml-
+    # declared remote node (the loop just above) always wins if the same
+    # node_id appears in both places.
+    config_node_ids = {remote.node_id for remote in config.nodes.remote_nodes}
+    for saved in connection_store.list():
+        if saved.node_id in config_node_ids:
+            continue
+        token = connection_store.read_token(saved.token_file) if saved.token_file else None
+        if not token:
+            _log.warning("nodes: skipping saved connection %r -- token file missing/unreadable "
+                        "(re-connect it from the Nodes page)", saved.node_id)
+            continue
+        controller.register_remote_node(saved.node_id, display_name=saved.node_id,
+                                        hostname=saved.hostname or saved.node_id, endpoint=saved.endpoint,
+                                        token=token)
+        # Same env var dashboard.py's node_heartbeat route re-reads on
+        # every inbound push from this node -- see its own
+        # node_token_env_var docstring. Without this, the node would
+        # re-register successfully here but every one of its real
+        # heartbeat pushes would still be rejected as UNAUTHORIZED after
+        # a restart.
+        os.environ[node_token_env_var(saved.node_id)] = token
+        _log.info("nodes: re-registered previously-connected node %r (%s, transport=%s)",
+                 saved.node_id, saved.endpoint, saved.transport_type)
+
     server = build_mcp(terminal, supervisor, supervisor_v2, controller)
-    register_dashboard(server, terminal, supervisor, supervisor_v2, controller)
+    register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store)
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2)

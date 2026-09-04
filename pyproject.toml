@@ -51,8 +51,9 @@ version = {attr = "terminal_mcp.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra -m \"not live_cli and not real_network\""
+addopts = "-ra -m \"not live_cli and not real_network and not real_ssh\""
 markers = [
   "live_cli: exercises a real, locally-installed Codex/Claude Code CLI binary in a disposable tmux session (real API calls, real cost/latency, not run by default -- see tests/test_adapters_real_cli.py). Run explicitly with `pytest -m live_cli`.",
   "real_network: performs a real DNS/TCP/TLS probe against a real external host (api.openai.com) -- not run by default so the suite stays deterministic on a host/CI runner without real internet access. Run explicitly with `pytest -m real_network`.",
+  "real_ssh: exercises a real local sshd (127.0.0.1) via ssh-keyscan/ssh-keygen/ssh -- no internet access needed, but skipped unless one is actually running with this operator's own key already authorized (see tests/test_remote_connect.py), and not run by default since the result depends on this host's own sshd/key configuration. Run explicitly with `pytest -m real_ssh`.",
 ]
