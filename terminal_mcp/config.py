@@ -7,6 +7,8 @@ from pathlib import Path
 
 import yaml
 
+from .node_models import NodeHeartbeatThresholds, OverloadThresholds
+
 
 @dataclass(frozen=True)
 class PermissionsConfig:
@@ -272,6 +274,38 @@ class MaintenanceConfig:
 
 
 @dataclass(frozen=True)
+class RemoteNodeConfig:
+    """One operator-declared remote node (task item 15's "cấu hình đăng
+    ký" -- the config-driven half of remote registration; the node's own
+    terminal-node-agent process, task item 2, is the other half). Never
+    holds the shared secret itself -- `token_env` names the environment
+    variable this process reads it from at startup (same posture as every
+    other bearer-token secret in this project), so config.yaml itself
+    stays safe to read/back up/commit without leaking a credential."""
+    node_id: str
+    display_name: str
+    hostname: str
+    endpoint: str
+    token_env: str
+    max_sessions: int | None = None
+    timeout_seconds: float = 10.0
+
+
+@dataclass(frozen=True)
+class NodesConfig:
+    """Multi-node session management (controller.py/node_registry.py/
+    scheduler.py). overload_thresholds/heartbeat_thresholds are the exact
+    same dataclasses NodeRegistry itself uses -- this is purely where an
+    operator overrides their defaults, never a second copy of the logic.
+    remote_nodes lists nodes to auto-register at startup (server_http.py);
+    an empty tuple (the default) is exactly today's single-local-node
+    deployment, unchanged."""
+    overload_thresholds: OverloadThresholds = OverloadThresholds()
+    heartbeat_thresholds: NodeHeartbeatThresholds = NodeHeartbeatThresholds()
+    remote_nodes: tuple[RemoteNodeConfig, ...] = ()
+
+
+@dataclass(frozen=True)
 class AppConfig:
     permissions: PermissionsConfig
     allowed_session_patterns: tuple[str, ...]
@@ -283,6 +317,7 @@ class AppConfig:
     maintenance: MaintenanceConfig = MaintenanceConfig()
     session_lifecycle: SessionLifecycleConfig = SessionLifecycleConfig()
     ask_chatgpt: AskChatGptConfig = AskChatGptConfig()
+    nodes: NodesConfig = NodesConfig()
     # Loop-protection metadata schema (see docs/prompt-submission.md, P11):
     # terminal_send_text/_granted accept optional origin/trace_id/parent_
     # turn_id/depth kwargs (all unused by every current caller -- MCP tools,
@@ -364,6 +399,81 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     if max_agent_bridge_depth < 0:
         raise ValueError("max_agent_bridge_depth must be at least 0")
 
+    nodes_raw = raw.get("nodes", {})
+    if not isinstance(nodes_raw, dict):
+        raise ValueError("nodes must be a mapping")
+    overload_raw = nodes_raw.get("overload_thresholds", {})
+    if not isinstance(overload_raw, dict):
+        raise ValueError("nodes.overload_thresholds must be a mapping")
+    overload_defaults = OverloadThresholds()
+    overload_thresholds = OverloadThresholds(
+        ram_busy_percent=float(overload_raw.get("ram_busy_percent", overload_defaults.ram_busy_percent)),
+        ram_overloaded_percent=float(overload_raw.get("ram_overloaded_percent", overload_defaults.ram_overloaded_percent)),
+        swap_overloaded_percent=float(overload_raw.get("swap_overloaded_percent", overload_defaults.swap_overloaded_percent)),
+        cpu_busy_percent=float(overload_raw.get("cpu_busy_percent", overload_defaults.cpu_busy_percent)),
+        cpu_overloaded_percent=float(overload_raw.get("cpu_overloaded_percent", overload_defaults.cpu_overloaded_percent)),
+        sustained_seconds=float(overload_raw.get("sustained_seconds", overload_defaults.sustained_seconds)),
+        load_factor_busy=float(overload_raw.get("load_factor_busy", overload_defaults.load_factor_busy)),
+        disk_free_overloaded_percent=float(overload_raw.get("disk_free_overloaded_percent", overload_defaults.disk_free_overloaded_percent)),
+        smoothing_alpha=float(overload_raw.get("smoothing_alpha", overload_defaults.smoothing_alpha)),
+    )
+    if not 0.0 < overload_thresholds.smoothing_alpha <= 1.0:
+        raise ValueError("nodes.overload_thresholds.smoothing_alpha must be between 0 (exclusive) and 1")
+    if overload_thresholds.sustained_seconds < 0:
+        raise ValueError("nodes.overload_thresholds.sustained_seconds must be at least 0")
+
+    heartbeat_raw = nodes_raw.get("heartbeat", {})
+    if not isinstance(heartbeat_raw, dict):
+        raise ValueError("nodes.heartbeat must be a mapping")
+    heartbeat_defaults = NodeHeartbeatThresholds()
+    heartbeat_thresholds = NodeHeartbeatThresholds(
+        degraded_after_seconds=float(heartbeat_raw.get("degraded_after_seconds", heartbeat_defaults.degraded_after_seconds)),
+        offline_after_seconds=float(heartbeat_raw.get("offline_after_seconds", heartbeat_defaults.offline_after_seconds)),
+    )
+    if heartbeat_thresholds.degraded_after_seconds <= 0 or heartbeat_thresholds.offline_after_seconds <= 0:
+        raise ValueError("nodes.heartbeat thresholds must be positive")
+    if heartbeat_thresholds.offline_after_seconds < heartbeat_thresholds.degraded_after_seconds:
+        raise ValueError("nodes.heartbeat.offline_after_seconds must be >= degraded_after_seconds")
+
+    remote_raw = nodes_raw.get("remote", [])
+    if not isinstance(remote_raw, list):
+        raise ValueError("nodes.remote must be a list")
+    seen_node_ids: set[str] = set()
+    remote_nodes: list[RemoteNodeConfig] = []
+    for index, entry in enumerate(remote_raw):
+        if not isinstance(entry, dict):
+            raise ValueError(f"nodes.remote[{index}] must be a mapping")
+        node_id = entry.get("node_id")
+        endpoint = entry.get("endpoint")
+        token_env = entry.get("token_env")
+        if not isinstance(node_id, str) or not node_id:
+            raise ValueError(f"nodes.remote[{index}].node_id is required and must be a non-empty string")
+        if node_id == "local":
+            raise ValueError(f"nodes.remote[{index}].node_id cannot be 'local' -- that id is reserved for this host")
+        if node_id in seen_node_ids:
+            raise ValueError(f"nodes.remote contains node_id {node_id!r} more than once")
+        seen_node_ids.add(node_id)
+        if not isinstance(endpoint, str) or not endpoint:
+            raise ValueError(f"nodes.remote[{index}].endpoint is required and must be a non-empty string")
+        if not isinstance(token_env, str) or not token_env:
+            raise ValueError(f"nodes.remote[{index}].token_env is required and must be a non-empty string "
+                             "(names the environment variable holding this node's shared secret -- "
+                             "the secret itself never lives in config.yaml)")
+        max_sessions = entry.get("max_sessions")
+        if max_sessions is not None and (not isinstance(max_sessions, int) or max_sessions < 1):
+            raise ValueError(f"nodes.remote[{index}].max_sessions must be a positive integer if given")
+        remote_nodes.append(RemoteNodeConfig(
+            node_id=node_id,
+            display_name=entry.get("display_name") or node_id,
+            hostname=entry.get("hostname") or node_id,
+            endpoint=endpoint,
+            token_env=token_env,
+            max_sessions=max_sessions,
+            timeout_seconds=float(entry.get("timeout_seconds", 10.0)),
+        ))
+    nodes_config = NodesConfig(overload_thresholds=overload_thresholds, heartbeat_thresholds=heartbeat_thresholds,
+                               remote_nodes=tuple(remote_nodes))
+
     return AppConfig(
         permissions=PermissionsConfig(
             terminal_read=bool(permissions.get("terminal_read", True)),
@@ -402,6 +512,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         maintenance=_load_maintenance_config(raw.get("maintenance", {})),
         session_lifecycle=_load_session_lifecycle_config(raw.get("session_lifecycle", {})),
         ask_chatgpt=_load_ask_chatgpt_config(raw.get("ask_chatgpt", {})),
+        nodes=nodes_config,
     )
 
 

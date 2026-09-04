@@ -31,6 +31,7 @@ terminal-mcp-http = "terminal_mcp.server_http:main"
 terminal-mcp-webauth = "terminal_mcp.webauth_cli:main"
 terminal-mcp-doctor = "terminal_mcp.doctor:main"
 terminal-mcp-tunnel-watchdog = "terminal_mcp.tunnel_watchdog:main"
+terminal-node-agent = "terminal_mcp.node_agent:main"
 
 [tool.setuptools.packages.find]
 include = ["terminal_mcp*"]

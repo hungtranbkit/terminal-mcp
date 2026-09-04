@@ -111,3 +111,34 @@ supervisor:
 #   audit_retention: 20000
 #   action_retention: 5000
 #   idempotency_key_retention_days: 30
+
+# Multi-node session management (docs/multi-node.md) -- optional, empty
+# by default (today's single-node deployment is unaffected by this
+# section existing or not). overload_thresholds/heartbeat control the
+# fleet-health heuristic every node (including the local one) is judged
+# by; remote declares worker nodes (e.g. a second machine running
+# `terminal-node-agent`, see deploy/install-node-agent.sh) to auto-
+# register at startup. A remote node's shared secret NEVER lives in this
+# file -- token_env only names the environment variable it's read from.
+# nodes:
+#   overload_thresholds:
+#     ram_busy_percent: 80
+#     ram_overloaded_percent: 90
+#     swap_overloaded_percent: 20
+#     cpu_busy_percent: 85
+#     cpu_overloaded_percent: 95
+#     sustained_seconds: 300
+#     load_factor_busy: 1.2
+#     disk_free_overloaded_percent: 10
+#     smoothing_alpha: 0.4
+#   heartbeat:
+#     degraded_after_seconds: 60
+#     offline_after_seconds: 180
+#   remote:
+#     - node_id: m910
+#       display_name: "M910 Workstation"
+#       hostname: "m910.local"
+#       endpoint: "http://192.168.1.50:8790"
+#       token_env: TERMINAL_MCP_NODE_TOKEN_M910
+#       max_sessions: 20
+#       timeout_seconds: 10.0

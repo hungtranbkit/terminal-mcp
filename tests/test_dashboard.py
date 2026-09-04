@@ -1052,6 +1052,14 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/supervisor/ack": {"POST"},
         "/dashboard/api/supervisor2": {"GET", "HEAD"},
         "/dashboard/api/supervisor2/pause": {"POST"},
+        # Nodes (multi-node session management, controller.py/node_registry.py) --
+        # a later, separate feature, same as the supervisor routes above.
+        "/dashboard/api/nodes": {"GET", "HEAD"},
+        "/dashboard/api/node": {"GET", "HEAD"},
+        "/dashboard/api/node/drain": {"POST"},
+        "/dashboard/api/node/test-connection": {"POST"},
+        "/dashboard/api/nodes/{node_id}/heartbeat": {"POST"},
+        "/dashboard/nodes": {"GET", "HEAD"},
     }
     # The web terminal's WebSocket route is registered too, just outside
     # this HTTP-methods-only dict (WebSocketRoute has no .methods).

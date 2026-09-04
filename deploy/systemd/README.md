@@ -231,3 +231,34 @@ systemctl --user daemon-reload
 systemctl --user restart terminal-mcp-tunnel.service
 systemctl --user disable --now terminal-mcp-tunnel-watchdog.timer
 ```
+
+# terminal-node-agent.service (multi-node session management)
+
+`terminal-node-agent.service.example` is the systemd user unit for
+`terminal-node-agent` -- the lightweight process a WORKER node (e.g. the
+Lenovo M910) runs, NOT the controller (this Dell). It exposes only the
+narrow tmux operation set `node_client.py`'s `NodeClient` Protocol
+defines, bearer-token authenticated, and pushes a periodic heartbeat to
+the controller's `/dashboard/api/nodes/{node_id}/heartbeat` route.
+
+**Don't hand-edit this .example file** -- use `deploy/install-node-agent.sh`
+instead (run ON the worker node itself): it clones/updates the repo,
+creates the venv, generates this node's own bearer token (written to a
+mode-600 `node-agent.env`, never into the unit file), writes and enables
+the real systemd unit from this template, and finally prints the exact
+`config.yaml` block plus environment variable to add on the controller
+side. See `docs/multi-node.md` for the full architecture and the exact
+manual step-by-step if you'd rather not use the script.
+
+```bash
+# On the worker node (M910), NOT on the controller:
+git clone <this-repo-url> ~/terminal-mcp   # or scp/rsync an existing checkout over
+cd ~/terminal-mcp
+./deploy/install-node-agent.sh --controller http://<dell-lan-ip>:8766 --node-id m910
+```
+
+Same hardening posture as `terminal-mcp-http.service.example` above
+(`ProtectSystem=full`, `ProtectHome=read-only`, `NoNewPrivileges=yes`,
+`SystemCallFilter=@system-service`) -- adjust/drop any directive your
+worker node's own kernel/systemd doesn't support, exactly as documented
+above for the AppArmor-restricted case on this host.

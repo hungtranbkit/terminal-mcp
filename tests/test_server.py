@@ -46,6 +46,9 @@ async def test_server_registers_v1_and_binding_tools():
         "supervisor2_review_action",
         "supervisor2_execute_send",
         "supervisor2_list_actions",
+        "terminal_list_nodes",
+        "terminal_node_status",
+        "terminal_node_sessions",
     }
 
 

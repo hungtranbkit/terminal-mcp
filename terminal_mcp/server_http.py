@@ -10,12 +10,15 @@ import anyio
 import uvicorn
 
 from .config import load_config
+from .controller import ControllerService
 from .core import TerminalService
 from .dashboard import register_dashboard
 from .health import register_health
 from .logging_setup import RequestIdMiddleware, SecurityHeadersMiddleware, configure_logging
 from .maintenance import MaintenanceLoop
 from .mcp_app import build_mcp
+from .node_client import LocalNodeClient
+from .node_registry import NodeRegistry
 from .supervisor import SupervisorLoop, SupervisorService, SupervisorStore
 from .supervisor2 import build_supervisor_v2
 from .webauth import WebAuthStore
@@ -150,8 +153,38 @@ def main() -> None:
     terminal = TerminalService(config)
     supervisor = SupervisorService(terminal, SupervisorStore())
     supervisor_v2 = build_supervisor_v2(supervisor)
-    server = build_mcp(terminal, supervisor, supervisor_v2)
-    register_dashboard(server, terminal, supervisor, supervisor_v2)
+    # ONE explicit, persistent (real default ~/.local/state/terminal-mcp/
+    # nodes.db path) ControllerService, shared by both build_mcp and
+    # register_dashboard -- the actual production deployment never falls
+    # into either function's own private-temp-registry fallback default
+    # (see controller.py's build_default_controller docstring for why
+    # that fallback exists and why it must never be the production path).
+    # A single shared instance also means the MCP tool surface and the
+    # dashboard see the exact same node registry state and session-
+    # location cache, not two independently-drifting copies.
+    workspace_root = (config.session_lifecycle.allowed_cwd_roots[0]
+                      if config.session_lifecycle.allowed_cwd_roots else "/")
+    registry = NodeRegistry(overload_thresholds=config.nodes.overload_thresholds,
+                            heartbeat_thresholds=config.nodes.heartbeat_thresholds)
+    controller = ControllerService(registry, local_client=LocalNodeClient(terminal),
+                                   local_workspace_root=workspace_root)
+    for remote in config.nodes.remote_nodes:
+        # Fail SOFT, not startup-fatal: a misconfigured/not-yet-deployed
+        # remote node (token not exported yet, typo'd endpoint) must never
+        # take down the whole controller -- it just never leaves OFFLINE
+        # until the operator finishes onboarding it (task item 10's own
+        # "registry never disappears / marks stale" applies here too).
+        token = os.environ.get(remote.token_env)
+        if not token:
+            _log.warning("nodes: skipping remote node %r -- environment variable %s is not set "
+                        "(this node will not be registered until it is)", remote.node_id, remote.token_env)
+            continue
+        controller.register_remote_node(remote.node_id, display_name=remote.display_name, hostname=remote.hostname,
+                                        endpoint=remote.endpoint, token=token, max_sessions=remote.max_sessions,
+                                        timeout=remote.timeout_seconds)
+        _log.info("nodes: registered remote node %r (%s)", remote.node_id, remote.endpoint)
+    server = build_mcp(terminal, supervisor, supervisor_v2, controller)
+    register_dashboard(server, terminal, supervisor, supervisor_v2, controller)
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2)

@@ -86,7 +86,7 @@ async def test_stdio_real_handshake_and_tools(tmp_path):
     assert initialized.server_info.name == "terminal-mcp"
     assert initialized.server_info.version == __version__
     names = {tool.name for tool in tools.tools}
-    assert len(names) == 39
+    assert len(names) == 42  # +terminal_list_nodes/terminal_node_status/terminal_node_sessions (multi-node, task item 9)
     assert {"terminal_tail", "terminal_send_keys", "terminal_exit_copy_mode",
             "terminal_bind", "terminal_tail_bound"} <= names
 
@@ -139,7 +139,76 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
     # global INPUT_DISABLED gate; INPUT_DISABLED itself stays covered in test_permissions.py.
     assert text_disabled["error"] == "ACCESS_DENIED"
     assert keys_disabled["error"] == "ACCESS_DENIED"
-    assert len(tools.tools) == 39
+    assert len(tools.tools) == 42  # +terminal_list_nodes/terminal_node_status/terminal_node_sessions (multi-node, task item 9)
+
+
+@pytest.mark.anyio
+async def test_http_real_node_tools_full_lifecycle_round_trip(http_server):
+    # Real end-to-end smoke test (task item 14's own "real smoke tối
+    # thiểu"): the actual terminal-mcp-http subprocess, the real MCP
+    # transport, real tmux -- terminal_list_nodes must show the local Dell
+    # node healthy, terminal_create_session(node="auto") must place a
+    # disposable session on it (there being only one node to place on
+    # today), and every routed tool (tail/status/send_text/kill/reopen/
+    # list_killed_sessions/node_sessions) must carry node_id="local"
+    # exactly as controller.py's own Phase A/B guarantee promises.
+    _, port = http_server
+    url = f"http://{HTTP_HOST}:{port}{HTTP_PATH}"
+    name = "terminal-mcp-nodesmoke"
+    try:
+        async with streamable_http_client(url) as streams:
+            async with ClientSession(*streams) as session:
+                await session.initialize()
+
+                node_rows = result_json(await session.call_tool("terminal_list_nodes", {}))
+                if isinstance(node_rows, dict):
+                    node_rows = node_rows.get("result", node_rows)
+                assert any(row["id"] == "local" and row["status"] == "online" for row in node_rows)
+
+                node_status = result_json(await session.call_tool("terminal_node_status", {"node_id": "local"}))
+                assert node_status["id"] == "local"
+                assert node_status["status"] == "online"
+
+                missing_node = result_json(await session.call_tool("terminal_node_status", {"node_id": "ghost-node"}))
+                assert missing_node["error"] == "NODE_NOT_FOUND"
+
+                created = result_json(await session.call_tool(
+                    "terminal_create_session",
+                    {"name": name, "agent_type": "shell", "node": "auto"},
+                ))
+                assert created["state"] == "READY"
+                assert created["node_id"] == "local"
+                assert created["node_name"] == "Local"
+
+                status = result_json(await session.call_tool("terminal_status", {"session": name}))
+                assert status["node_id"] == "local"
+
+                sent = result_json(await session.call_tool(
+                    "terminal_send_text", {"session": name, "text": "echo node-smoke-ok", "press_enter": True},
+                ))
+                assert sent["node_id"] == "local"
+                assert sent.get("error") is None
+
+                tail = result_json(await session.call_tool("terminal_tail", {"session": name, "lines": 20}))
+                assert tail["node_id"] == "local"
+
+                node_sessions = result_json(await session.call_tool("terminal_node_sessions", {"node_id": "local"}))
+                assert any(row["name"] == name for row in node_sessions["sessions"])
+
+                killed = result_json(await session.call_tool(
+                    "terminal_kill_session", {"name": name, "confirm_name": name},
+                ))
+                assert killed.get("error") is None
+                assert killed["node_id"] == "local"
+
+                killed_list = result_json(await session.call_tool("terminal_list_killed_sessions", {}))
+                assert any(row["name"] == name for row in killed_list["killed_sessions"])
+
+                reopened = result_json(await session.call_tool("terminal_reopen_session", {"name": name}))
+                assert reopened.get("error") is None
+                assert reopened["node_id"] == "local"
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
 
 
 def test_http_bind_is_fixed_loopback():

@@ -1,0 +1,55 @@
+[Unit]
+Description=Terminal MCP node agent (multi-node session management -- runs on a WORKER node, not the controller)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/YOUR_USER/terminal-mcp
+# The node's own shared secret -- generate one per node (e.g. `openssl
+# rand -hex 32`), put it ONLY in this EnvironmentFile (mode 600, never in
+# this unit file itself, never committed anywhere), and register the same
+# value on the controller side as TERMINAL_MCP_NODE_TOKEN_<NODE_ID> (see
+# install-node-agent.sh's own printed instructions).
+EnvironmentFile=/home/YOUR_USER/terminal-mcp/node-agent.env
+Environment=TERMINAL_MCP_CONFIG=/home/YOUR_USER/terminal-mcp/config.yaml
+ExecStart=/home/YOUR_USER/terminal-mcp/.venv/bin/terminal-node-agent \
+  --node-id CHANGE_ME \
+  --controller-url http://CONTROLLER_HOST:8766 \
+  --host 127.0.0.1 \
+  --port 8790
+Restart=always
+RestartSec=3
+# Same steps-then-cap backoff shape as terminal-mcp-tunnel.service.example
+# -- a controller that's down for a while (a Dell reboot, a network
+# blip) must never turn this into a hot-restart loop on the node.
+RestartSteps=6
+RestartMaxDelaySec=60
+StartLimitIntervalSec=300
+StartLimitBurst=8
+
+# --- Hardening, same posture as terminal-mcp-http.service.example -------
+# PrivateTmp deliberately NOT set: this process needs real access to
+# ITS OWN node's tmux server socket (typically /tmp/tmux-$UID/default).
+MemoryMax=512M
+TasksMax=256
+CPUQuota=200%
+ProtectSystem=full
+ProtectHome=read-only
+# This node's own sqlite state (bindings/audit/killed-sessions dbs) --
+# adjust if this node's config.yaml points those elsewhere.
+ReadWritePaths=%h/.local/state/terminal-mcp
+NoNewPrivileges=yes
+SystemCallFilter=@system-service
+
+# --- Network exposure: LAN/VPN-only, matching task item 2's own "bind
+# private/LAN hoặc tunnel, có auth bắt buộc" -- --host above is 127.0.0.1
+# by default; bind to this node's LAN address (or a VPN/SSH-tunnel
+# interface) ONLY if the controller genuinely needs to reach it that way,
+# and put a firewall in front of the port regardless. NEVER 0.0.0.0
+# without a firewall rule restricting who can reach it -- the bearer
+# token is this service's ONLY access control; nothing else stands
+# between an open port and full read/limited-write tmux access on this
+# node once the token leaks or is guessed.
+
+[Install]
+WantedBy=default.target

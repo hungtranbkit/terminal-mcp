@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hmac
 import logging
+import os
 from urllib.parse import urlparse
 
 import anyio
@@ -12,7 +14,9 @@ from starlette.websockets import WebSocket
 
 from . import tunnel_diagnostics
 from .cf_access import verify_access_assertion
+from .controller import ControllerService, build_default_controller
 from .core import TerminalService
+from .node_models import node_to_dict
 from .permissions import input_session_allowed, session_allowed, valid_session_name
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
@@ -54,7 +58,15 @@ INPUT_ERROR_STATUS = {
     # Kill/Reopen (core.py's terminal_kill_session/terminal_reopen_session).
     "CONFIRMATION_MISMATCH": 400,
     "REOPEN_METADATA_INCOMPLETE": 422,
+    # Nodes (multi-node session management, controller.py/node_registry.py).
+    "NODE_NOT_FOUND": 404,
+    "NODE_UNREACHABLE": 502,
+    "AMBIGUOUS_SESSION": 409,
+    "NO_ELIGIBLE_NODE": 503,
 }
+
+
+_node_to_dict = node_to_dict  # local alias -- every route below predates the move to node_models.py
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -169,6 +181,7 @@ DASHBOARD_HTML = """<!doctype html>
     .session .row-actions button.danger { color:#ff9f9f; border-color:#5a2f38 }
     .session .row-actions button.danger:hover { color:#fff; background:#3a2430; border-color:#ff9f9f }
     .name { font-weight:700 } .meta { font-size:12px; color:var(--muted); margin-top:4px }
+    .node-label { font-weight:400; font-size:11px; color:var(--muted); margin-left:8px }
     .attach-dot { display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--line); margin-right:5px; vertical-align:middle }
     .attach-dot.on { background:var(--green) }
     /* Compact attention badge: reused identically in the session list and the
@@ -441,6 +454,7 @@ DASHBOARD_HTML = """<!doctype html>
     <div><h1>Terminal MCP</h1><div class="muted">Whitelisted tmux session monitor</div></div>
     <div class="header-right">
       <a href="/dashboard/sessions" class="supervisor-badge" id="sessionsAdminLink" style="text-decoration:none">⚙ Quản lý</a>
+      <a href="/dashboard/nodes" class="supervisor-badge" id="nodesAdminLink" style="text-decoration:none">🖥 Nodes</a>
       <button id="supervisorBadge" class="supervisor-badge" type="button" hidden></button>
       <span class="supervisor-badge" id="connHealthBadge" title="Kết nối OpenAI Secure MCP Tunnel" hidden></span>
       <span class="live" id="liveBadge">● LIVE</span>
@@ -1539,6 +1553,17 @@ DASHBOARD_HTML = """<!doctype html>
 
         const main = document.createElement('div'); main.className = 'sess-main';
         const name = document.createElement('div'); name.className = 'name'; name.textContent = row.name;
+        // Node label (multi-node session management, task item 16): flat,
+        // minimal -- just the node's display name next to the session
+        // name (e.g. "mesflow  Dell"), never a second grouped/nested list.
+        // Only rendered once a row actually carries node_name (today's
+        // single-local-node deployment always does, via /dashboard/api/
+        // sessions -- see that route's own comment); absent entirely
+        // costs nothing and changes no layout.
+        if (row.node_name) {
+          const nodeLabel = document.createElement('span'); nodeLabel.className = 'node-label'; nodeLabel.textContent = row.node_name;
+          name.appendChild(nodeLabel);
+        }
         if (needsAttention) {
           const badge = document.createElement('span'); badge.className = 'attn-badge'; badge.textContent = '⚠ NEEDS INPUT';
           name.append(' ', badge);
@@ -2558,6 +2583,244 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
 </html>"""
 
 
+# Node management (task item 4/16, multi-node session management) -- a
+# third dedicated admin screen, same "own page, not folded into
+# DASHBOARD_HTML's tab UI" precedent SESSIONS_ADMIN_HTML already set.
+# Reads /dashboard/api/nodes (overview cards) and /dashboard/api/node?id=
+# (detail: full metrics + that node's own session list), and the two
+# mutation routes /dashboard/api/node/drain and /dashboard/api/node/test-
+# connection -- no new backend beyond what dashboard.py already registers
+# below. On a single-node deployment (today) this always shows exactly
+# one card ("local") -- genuinely useful even then, as the same "why is
+# capacity_status busy/overloaded" visibility terminal_list_nodes gives
+# ChatGPT/Claude, just for a human. Deliberately NOT auto-polished with
+# charts/history -- current values + a manual/interval refresh, matching
+# the task's own "không cần biểu đồ phức tạp, số liệu rõ ràng là đủ" (an
+# explicit, not literal-elsewhere-quoted, scope cut: keep this simple).
+NODES_ADMIN_HTML = """<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Quản lý node</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#5b8cff; --mono: ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace; }
+    * { box-sizing:border-box }
+    html, body { height:100vh; height:100dvh; overflow:hidden }
+    body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text); display:flex; flex-direction:column }
+    header { flex:0 0 auto; display:flex; justify-content:space-between; gap:16px; align-items:center; padding:18px 24px; border-bottom:1px solid var(--line); flex-wrap:wrap }
+    h1 { margin:0; font-size:18px } .muted { color:var(--muted) }
+    .live { color:var(--green); font-size:12px } .live.offline { color:var(--red) } .live.auth-required { color:#ffb347 }
+    a.back { color:var(--muted); text-decoration:none; font-size:12px; border:1px solid var(--line); border-radius:999px; padding:4px 10px }
+    a.back:hover { color:var(--text); border-color:var(--muted) }
+    button.icon-btn { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:5px 11px; cursor:pointer; font:inherit; font-size:12px }
+    button.icon-btn:hover { background:#233252 }
+    main { flex:1; min-height:0; overflow:auto; padding:18px 24px 24px }
+    #cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:14px }
+    .node-card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; cursor:pointer; transition:border-color .15s }
+    .node-card:hover { border-color:var(--accent) }
+    .node-card.selected { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) }
+    .node-card .nc-head { display:flex; justify-content:space-between; align-items:center; gap:8px }
+    .node-card .nc-name { font-weight:700; font-size:15px }
+    .node-card .nc-host { color:var(--muted); font-size:11px }
+    .status-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle }
+    .status-dot.online { background:var(--green) } .status-dot.degraded { background:var(--amber) } .status-dot.offline { background:var(--red) }
+    .badge { display:inline-block; border-radius:999px; padding:2px 9px; font-size:11px; border:1px solid var(--line); white-space:nowrap }
+    .badge.healthy { color:var(--green); border-color:var(--green) }
+    .badge.busy { color:var(--amber); border-color:var(--amber) }
+    .badge.overloaded { color:var(--red); border-color:var(--red) }
+    .badge.unknown { color:var(--muted) }
+    .badge.draining { color:var(--amber); border-color:var(--amber) }
+    .nc-metrics { display:grid; grid-template-columns:1fr 1fr; gap:6px 12px; margin-top:10px; font-size:12px }
+    .metric-row { display:flex; justify-content:space-between; color:var(--muted) }
+    .metric-row b { color:var(--text); font-weight:600 }
+    .meter { height:5px; border-radius:3px; background:#0f1730; overflow:hidden; margin-top:2px }
+    .meter > div { height:100%; background:var(--accent) }
+    .meter.warn > div { background:var(--amber) } .meter.danger > div { background:var(--red) }
+    .nc-foot { margin-top:10px; display:flex; justify-content:space-between; align-items:center; font-size:11px; color:var(--muted) }
+    .empty { text-align:center; color:var(--muted); padding:48px 8px }
+    #detail { margin-top:20px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px }
+    #detail[hidden] { display:none }
+    #detail .d-head { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap }
+    #detail h2 { margin:0 0 2px; font-size:16px }
+    #detail .d-actions { display:flex; gap:8px; flex-wrap:wrap }
+    #detail .d-actions button { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:6px 12px; cursor:pointer; font:inherit; font-size:12px }
+    #detail .d-actions button:hover { background:#233252 }
+    #detail .d-actions button.danger { border-color:var(--red); color:#ff9f9f }
+    #detail .d-actions button:disabled { opacity:.5; cursor:not-allowed }
+    #detail table { width:100%; border-collapse:collapse; font-size:12px; margin-top:14px }
+    #detail thead th { text-align:left; color:var(--muted); font-weight:600; padding:6px 8px; border-bottom:1px solid var(--line) }
+    #detail tbody td { padding:6px 8px; border-bottom:1px solid var(--line) }
+    #detail .d-empty { color:var(--muted); font-size:12px; padding:10px 0 }
+    #detail .d-msg { font-size:12px; margin-top:8px; min-height:14px }
+    #detail .d-msg.error { color:var(--red) } #detail .d-msg.ok { color:var(--green) }
+    #detail .d-sessions-error { color:var(--red); font-size:12px; margin-top:10px }
+    @media (max-width:760px) {
+      header { padding:12px 14px } main { padding:14px } #cards { grid-template-columns:1fr }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>Quản lý node</h1><div class="muted">Trạng thái, tài nguyên và session theo từng node</div></div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <button class="icon-btn" id="refreshBtn" type="button">⟳ Refresh</button>
+      <a class="back" href="/dashboard">← Terminal</a>
+      <span class="live" id="liveBadge">● LIVE</span>
+    </div>
+  </header>
+  <main>
+    <div id="cards"><div class="empty">Đang tải...</div></div>
+    <div id="detail" hidden></div>
+  </main>
+  <script>
+    let selectedNodeId = null;
+    let nodesCache = [];
+
+    function pct(value) { return (value === null || value === undefined) ? '—' : value.toFixed(0) + '%'; }
+    function meterClass(value) { if (value === null || value === undefined) return ''; if (value >= 90) return 'danger'; if (value >= 75) return 'warn'; return ''; }
+    function fmtBytes(n) {
+      if (n === null || n === undefined) return '—';
+      const units = ['B','KB','MB','GB','TB']; let i = 0; let v = n;
+      while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+      return v.toFixed(1) + units[i];
+    }
+    function heartbeatAge(iso) {
+      if (!iso) return 'never';
+      const secs = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+      if (secs < 60) return Math.round(secs) + 's ago';
+      if (secs < 3600) return Math.round(secs / 60) + 'm ago';
+      return Math.round(secs / 3600) + 'h ago';
+    }
+
+    class AuthRequiredError extends Error {}
+    async function api(path, options) {
+      const response = await fetch(path, options);
+      if (response.status === 401 || response.status === 403) {
+        const body = await response.json().catch(() => ({}));
+        if (body.error === 'CLOUDFLARE_ACCESS_VERIFICATION_FAILED' || body.error === 'AUTH_REQUIRED') {
+          throw new AuthRequiredError(body.error);
+        }
+      }
+      const data = await response.json().catch(() => ({}));
+      return { ok: response.ok, status: response.status, data };
+    }
+
+    function nodeCardHtml(node) {
+      const capBadge = node.capacity_status || 'unknown';
+      const draining = node.draining ? '<span class="badge draining">draining</span>' : '';
+      return `
+        <div class="node-card${node.id === selectedNodeId ? ' selected' : ''}" data-node-id="${node.id}">
+          <div class="nc-head">
+            <div><span class="status-dot ${node.status}"></span><span class="nc-name">${node.display_name}</span>
+              <div class="nc-host">${node.id} · ${node.hostname}</div></div>
+            <div style="display:flex;gap:6px;align-items:center"><span class="badge ${capBadge}">${capBadge}</span>${draining}</div>
+          </div>
+          <div class="nc-metrics">
+            <div>
+              <div class="metric-row"><span>CPU</span><b>${pct(node.cpu_percent)}</b></div>
+              <div class="meter ${meterClass(node.cpu_percent)}"><div style="width:${node.cpu_percent || 0}%"></div></div>
+            </div>
+            <div>
+              <div class="metric-row"><span>RAM</span><b>${pct(node.ram_percent)}</b></div>
+              <div class="meter ${meterClass(node.ram_percent)}"><div style="width:${node.ram_percent || 0}%"></div></div>
+            </div>
+            <div>
+              <div class="metric-row"><span>Swap</span><b>${pct(node.swap_percent)}</b></div>
+              <div class="meter ${meterClass(node.swap_percent)}"><div style="width:${node.swap_percent || 0}%"></div></div>
+            </div>
+            <div>
+              <div class="metric-row"><span>Disk</span><b>${pct(node.disk_percent)}</b></div>
+              <div class="meter ${meterClass(node.disk_percent)}"><div style="width:${node.disk_percent || 0}%"></div></div>
+            </div>
+          </div>
+          <div class="nc-foot">
+            <span>${node.tmux_session_count ?? 0} session${(node.tmux_session_count ?? 0) === 1 ? '' : 's'}</span>
+            <span>heartbeat: ${heartbeatAge(node.last_heartbeat_at)}</span>
+          </div>
+          ${(node.overload_reasons && node.overload_reasons.length) ? `<div class="d-sessions-error" style="margin-top:8px">${node.overload_reasons.join('; ')}</div>` : ''}
+        </div>`;
+    }
+
+    function renderCards() {
+      const container = document.getElementById('cards');
+      if (!nodesCache.length) { container.innerHTML = '<div class="empty">Chưa có node nào đăng ký.</div>'; return; }
+      container.innerHTML = nodesCache.map(nodeCardHtml).join('');
+      container.querySelectorAll('.node-card').forEach((card) => {
+        card.addEventListener('click', () => { selectedNodeId = card.dataset.nodeId; renderCards(); loadDetail(selectedNodeId); });
+      });
+    }
+
+    async function loadDetail(nodeId) {
+      const detail = document.getElementById('detail');
+      detail.hidden = false;
+      detail.innerHTML = '<div class="d-empty">Đang tải chi tiết...</div>';
+      const result = await api('/dashboard/api/node?id=' + encodeURIComponent(nodeId));
+      if (!result.ok) { detail.innerHTML = `<div class="d-sessions-error">${result.data.error || 'Không tải được'}</div>`; return; }
+      const node = result.data.node;
+      const sessions = result.data.sessions || [];
+      const isLocal = node.endpoint === 'local';
+      detail.innerHTML = `
+        <div class="d-head">
+          <div><h2>${node.display_name} <span class="muted" style="font-weight:400">(${node.id})</span></h2>
+            <div class="muted">${node.hostname} · ${node.endpoint} · agent_version=${node.agent_version || '—'}</div></div>
+          <div class="d-actions">
+            <button id="refreshDetailBtn" type="button">⟳ Refresh</button>
+            <button id="testConnBtn" type="button"${isLocal ? ' disabled title="Node local luôn kết nối"' : ''}>Test connection</button>
+            <button id="drainBtn" type="button">${node.draining ? 'Resume (nhận session mới)' : 'Drain (ngừng nhận session mới)'}</button>
+          </div>
+        </div>
+        <div class="d-msg" id="detailMsg"></div>
+        <table>
+          <thead><tr><th>Session</th><th>Node</th><th>Windows</th><th>Đã đính kèm</th></tr></thead>
+          <tbody>
+            ${sessions.length ? sessions.map((s) => `<tr><td>${s.name}</td><td>${s.node_id || node.id}</td><td>${s.windows ?? '—'}</td><td>${s.attached ? 'có' : 'không'}</td></tr>`).join('')
+                              : '<tr><td colspan="4" class="d-empty">' + (result.data.sessions_error ? 'Không lấy được danh sách session: ' + result.data.sessions_error : 'Không có session nào trên node này') + '</td></tr>'}
+          </tbody>
+        </table>`;
+      document.getElementById('refreshDetailBtn').addEventListener('click', () => loadDetail(nodeId));
+      document.getElementById('testConnBtn').addEventListener('click', async () => {
+        const msg = document.getElementById('detailMsg');
+        msg.textContent = 'Đang kiểm tra...'; msg.className = 'd-msg';
+        const r = await api('/dashboard/api/node/test-connection', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ node_id: nodeId }),
+        });
+        if (r.ok && r.data.ok) { msg.textContent = `OK — latency ${r.data.latency_ms?.toFixed(0) ?? '?'}ms`; msg.className = 'd-msg ok'; }
+        else { msg.textContent = 'Thất bại: ' + (r.data.detail || r.data.error || 'unknown'); msg.className = 'd-msg error'; }
+      });
+      document.getElementById('drainBtn').addEventListener('click', async () => {
+        const nextDraining = !node.draining;
+        const r = await api('/dashboard/api/node/drain', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ node_id: nodeId, draining: nextDraining }),
+        });
+        const msg = document.getElementById('detailMsg');
+        if (r.ok) { msg.textContent = nextDraining ? 'Node đã chuyển sang draining.' : 'Node đã resume.'; msg.className = 'd-msg ok'; loadAll(); loadDetail(nodeId); }
+        else { msg.textContent = 'Thất bại: ' + (r.data.error || 'unknown'); msg.className = 'd-msg error'; }
+      });
+    }
+
+    async function loadAll() {
+      const liveBadgeEl = document.getElementById('liveBadge');
+      try {
+        const result = await api('/dashboard/api/nodes');
+        if (!result.ok) throw new Error(result.data.error || 'failed');
+        nodesCache = result.data.nodes || [];
+        renderCards();
+        liveBadgeEl.textContent = '● LIVE'; liveBadgeEl.className = 'live';
+      } catch (error) {
+        if (error instanceof AuthRequiredError) { liveBadgeEl.textContent = '● SIGN-IN REQUIRED'; liveBadgeEl.className = 'live auth-required'; }
+        else { liveBadgeEl.textContent = '● OFFLINE'; liveBadgeEl.className = 'live offline'; }
+      }
+    }
+
+    document.getElementById('refreshBtn').addEventListener('click', () => { loadAll(); if (selectedNodeId) loadDetail(selectedNodeId); });
+    loadAll(); setInterval(loadAll, 8000);
+  </script>
+</body>
+</html>"""
+
+
 # Web terminal (xterm.js over a WebSocket -- webterm.py). A standalone
 # page, deliberately NOT folded into DASHBOARD_HTML's own tab UI: this is
 # the one screen in the whole dashboard that genuinely needs a dedicated,
@@ -2820,11 +3083,24 @@ WEBTERM_HTML = """<!doctype html>
 
 def register_dashboard(server: MCPServer, terminal: TerminalService,
                        supervisor: SupervisorService | None = None,
-                       supervisor_v2: SupervisorV2Service | None = None) -> None:
+                       supervisor_v2: SupervisorV2Service | None = None,
+                       controller: ControllerService | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
         supervisor_v2 = build_supervisor_v2(supervisor)
+    if controller is None:
+        # Single-node default (Phase A/B backward compatibility, task
+        # item 11): every EXISTING caller of register_dashboard (tests,
+        # webauth_dashboard.py, and server_http.py unless it explicitly
+        # builds a real multi-node ControllerService) gets a controller
+        # wrapping ONLY this same `terminal` instance as the local node
+        # -- routed operations resolve to it directly, identical
+        # behavior/response shape to calling `terminal` methods straight,
+        # plus the additive node_id/node_name fields. See
+        # build_default_controller's own docstring for why this is a
+        # PRIVATE temp registry, never the real production nodes.db path.
+        controller = build_default_controller(terminal)
 
     def _origin_allowed(request: Request) -> bool:
         # CSRF defense (P1 hardening item #3), always on, no config
@@ -2937,6 +3213,20 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
+    @server.custom_route("/dashboard/nodes", methods=["GET"], include_in_schema=False)
+    async def dashboard_nodes_admin(request: Request) -> HTMLResponse | JSONResponse:
+        # Same read guard as /dashboard itself -- a VIEW over the existing
+        # /dashboard/api/nodes(/node) data and the existing drain/test-
+        # connection mutation routes, not a new privilege surface. See
+        # NODES_ADMIN_HTML's own module-level comment.
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(
+            NODES_ADMIN_HTML,
+            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
+        )
+
     @server.custom_route("/dashboard/api/sessions", methods=["GET"], include_in_schema=False)
     async def sessions(request: Request) -> JSONResponse:
         blocked, _identity = _read_guard(request)
@@ -2965,6 +3255,22 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         listed = await anyio.to_thread.run_sync(terminal.dashboard_list_sessions)
         rows = listed.get("sessions")
         if isinstance(rows, list):
+            # Node label (task item 16): this route is still local-node-
+            # only (it calls terminal.dashboard_list_sessions() directly,
+            # for its richer per-session grant/permission fields --
+            # controller.terminal_list_sessions()'s fleet-wide merge has a
+            # narrower shape that doesn't carry those), so every row here
+            # genuinely IS on the local node today; tagged explicitly
+            # rather than left for the client to assume. Merging in
+            # remote nodes' own sessions with the same grant-aware detail
+            # is intentionally deferred past this phase -- see
+            # docs/multi-node.md's own Known Limitations.
+            local_node = controller.node_status(controller.local_node_id)
+            local_node_name = local_node.display_name if local_node else controller.local_node_id
+            for row in rows:
+                row.setdefault("node_id", controller.local_node_id)
+                row.setdefault("node_name", local_node_name)
+
             async def _fill_state(row: dict) -> None:
                 if not row.get("effective_read"):
                     row["state"] = "RESTRICTED"
@@ -3459,6 +3765,147 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
         result = await anyio.to_thread.run_sync(_compute)
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    # -- Nodes (multi-node session management) -------------------------------
+    # See controller.py's own module docstring for the full design. Every
+    # GET here refreshes the LOCAL node's own heartbeat first (cheap --
+    # a few /proc reads, no network -- see ControllerService.
+    # refresh_local_heartbeat's own docstring for why this needs no
+    # background thread) so the dashboard never shows a stale/never-
+    # heartbeated local node; a REMOTE node's freshness depends entirely
+    # on its own push (node_agent.py's heartbeat loop) -- this route
+    # never blocks on, or synchronously polls, a remote node.
+    def _refresh_local_heartbeat() -> None:
+        # A real tmux listing (terminal.tmux, not terminal_list_sessions()'s
+        # own dashboard-facing row shape, which deliberately never exposes
+        # pane_current_command past its narrow internal use) -- the same
+        # source of truth node_agent.py's heartbeat loop uses for a remote
+        # node, so a node's agent_counts always means the same thing
+        # regardless of which node reported it.
+        try:
+            items = terminal.tmux.list_sessions()
+        except Exception:  # noqa: BLE001 -- a metrics refresh must never break a dashboard read
+            items = []
+        agent_counts: dict[str, int] = {}
+        for item in items:
+            command = (item.pane_current_command or "").casefold()
+            if command:
+                agent_counts[command] = agent_counts.get(command, 0) + 1
+        agent_types = ["shell"] + [agent_type for agent_type, _cmd in terminal.config.session_lifecycle.launch_commands]
+        controller.refresh_local_heartbeat(
+            tmux_session_count=len(items), agent_counts=agent_counts,
+            agent_types=tuple(agent_types), agent_version=None,
+        )
+
+    @server.custom_route("/dashboard/api/nodes", methods=["GET"], include_in_schema=False)
+    async def nodes_list(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+
+        def _compute() -> dict:
+            _refresh_local_heartbeat()
+            nodes = controller.list_nodes()
+            return {"nodes": [_node_to_dict(n) for n in nodes]}
+
+        result = await anyio.to_thread.run_sync(_compute)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/node", methods=["GET"], include_in_schema=False)
+    async def node_detail(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.query_params.get("id", "")
+        if not node_id:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+
+        def _compute() -> dict:
+            if node_id == controller.local_node_id:
+                _refresh_local_heartbeat()
+            node = controller.node_status(node_id)
+            if node is None:
+                return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+            sessions = controller.node_sessions(node_id)
+            return {"node": _node_to_dict(node), "sessions": sessions.get("sessions", []),
+                   "sessions_error": sessions.get("error")}
+
+        result = await anyio.to_thread.run_sync(_compute)
+        status_code = 404 if result.get("error") == "NODE_NOT_FOUND" else 200
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/node/drain", methods=["POST"], include_in_schema=False)
+    async def node_drain(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        node_id = body.get("node_id") if isinstance(body, dict) else None
+        draining = bool(body.get("draining", True)) if isinstance(body, dict) else True
+        if not isinstance(node_id, str) or not node_id:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        _log.info("dashboard node_drain node_id=%s draining=%s identity=%s", node_id, draining,
+                 identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(lambda: controller.set_draining(node_id, draining))
+        status_code = 200 if "error" not in result else 404
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/node/test-connection", methods=["POST"], include_in_schema=False)
+    async def node_test_connection(request: Request) -> JSONResponse:
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        node_id = body.get("node_id") if isinstance(body, dict) else None
+        if not isinstance(node_id, str) or not node_id:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        result = await anyio.to_thread.run_sync(lambda: controller.test_connection(node_id))
+        status_code = 200 if "error" not in result else 404
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/heartbeat", methods=["POST"], include_in_schema=False)
+    async def node_heartbeat(request: Request) -> JSONResponse:
+        # Machine-to-machine (a remote node's own terminal-node-agent
+        # process pushing its heartbeat) -- NOT a browser, so this is
+        # bearer-token authenticated (per-node shared secret, task item
+        # 2), never the Cloudflare Access / webauth cookie guards every
+        # other dashboard route uses. A missing/wrong token is refused
+        # before touching the registry at all -- never silently accepted
+        # as "must be the local node" or similarly guessed.
+        node_id = request.path_params["node_id"]
+        expected_token = os.environ.get(f"TERMINAL_MCP_NODE_TOKEN_{node_id.upper()}")
+        header = request.headers.get("authorization", "")
+        presented = header[len("Bearer "):] if header.startswith("Bearer ") else ""
+        if not expected_token or not hmac.compare_digest(presented, expected_token):
+            return JSONResponse({"error": "UNAUTHORIZED"}, status_code=401)
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+
+        def _compute() -> dict:
+            from .host_metrics import NodeMetrics
+            metrics_raw = body.get("metrics") or {}
+            metrics = NodeMetrics(**{k: metrics_raw.get(k) for k in NodeMetrics.__dataclass_fields__})
+            node = controller.receive_remote_heartbeat(
+                node_id, metrics=metrics, tmux_session_count=int(body.get("tmux_session_count") or 0),
+                agent_counts=dict(body.get("agent_counts") or {}),
+                agent_types=tuple(body.get("agent_types") or ()),
+                agent_version=body.get("agent_version"), labels=tuple(body.get("labels") or ()),
+            )
+            if node is None:
+                return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+            return {"ok": True, "node_id": node_id}
+
+        result = await anyio.to_thread.run_sync(_compute)
+        status_code = 200 if "error" not in result else 404
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/supervisor", methods=["GET"], include_in_schema=False)
     async def supervisor_summary(request: Request) -> JSONResponse:
