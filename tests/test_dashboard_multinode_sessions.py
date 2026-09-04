@@ -372,3 +372,64 @@ def test_reopen_explicit_node_moves_it(tmp_path):
     assert r.status_code == 200, r.text
     assert r.json()["node_id"] == "target-x"
     assert r.json()["moved_from"] == "origin-x"
+
+
+# ---------------------------------------------------------------------------
+# grant_mode on create -- real usability gap reported live: the dashboard's
+# Create Session form never requested a grant, so a session created there
+# always started completely unreadable/un-sendable, forcing a separate
+# grant round-trip afterward for the common case of wanting to use the
+# session you just made. Still opt-in/explicit (defaults to "none",
+# unchanged behavior) -- these tests use "mn-nogrant" (matches this file's
+# own statically-whitelisted "mn-*" pattern -- already readable regardless
+# of any grant) only for the "none"/default case, and a name OUTSIDE that
+# pattern for "read"/"read_send" so the grant's actual effect is the only
+# thing making it readable/sendable, not the static whitelist.
+# ---------------------------------------------------------------------------
+
+
+def test_create_default_grant_mode_is_none_unchanged_from_before(tmp_path):
+    client, controller, service = _client(tmp_path)
+    _heartbeat_local(controller)
+    r = client.post("/dashboard/api/session/create", json={"name": "mn-nogrant", "agent_type": "shell"})
+    assert r.status_code == 200, r.text
+    assert service.grants.get("mn-nogrant") is None
+
+
+def test_create_grant_mode_read_grants_read_only_not_input(tmp_path):
+    client, controller, service = _client(tmp_path)
+    _heartbeat_local(controller)
+    try:
+        r = client.post("/dashboard/api/session/create",
+                        json={"name": "not-mn-prefixed-read", "agent_type": "shell", "grant_mode": "read"})
+        assert r.status_code == 200, r.text
+        grant = service.grants.get("not-mn-prefixed-read")
+        assert grant is not None
+        assert grant.read_enabled is True
+        assert grant.input_enabled is False
+    finally:
+        _kill_tmux("not-mn-prefixed-read")
+
+
+def test_create_grant_mode_read_send_grants_both(tmp_path):
+    client, controller, service = _client(tmp_path)
+    _heartbeat_local(controller)
+    try:
+        r = client.post("/dashboard/api/session/create",
+                        json={"name": "not-mn-prefixed-readsend", "agent_type": "shell", "grant_mode": "read_send"})
+        assert r.status_code == 200, r.text
+        grant = service.grants.get("not-mn-prefixed-readsend")
+        assert grant is not None
+        assert grant.read_enabled is True
+        assert grant.input_enabled is True
+    finally:
+        _kill_tmux("not-mn-prefixed-readsend")
+
+
+def test_create_grant_mode_invalid_value_rejected(tmp_path):
+    client, controller, _service = _client(tmp_path)
+    _heartbeat_local(controller)
+    r = client.post("/dashboard/api/session/create",
+                    json={"name": "mn-badgrant", "agent_type": "shell", "grant_mode": "everything"})
+    assert r.status_code == 400
+    assert r.json()["error"] == "INVALID_GRANT_MODE"

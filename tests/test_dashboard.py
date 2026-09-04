@@ -1696,9 +1696,22 @@ def test_sessions_admin_node_capability_filter_mirrors_scheduler_eligibility():
 
 
 def test_sessions_admin_create_sends_node_field_and_refetches_on_agent_change():
-    assert "body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode})" in SESSIONS_ADMIN_HTML
+    assert "body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, grant_mode: csGrantEl.value})" in SESSIONS_ADMIN_HTML
     assert "renderNodeOptions(); // re-filter the SAME cached node list -- no re-fetch needed just for this" in SESSIONS_ADMIN_HTML
     assert "loadNodesForCreateModal(); // fresh every open" in SESSIONS_ADMIN_HTML
+
+
+def test_sessions_admin_create_form_has_a_grant_mode_selector():
+    # Real usability gap reported live: Create Session never requested a
+    # grant, so a session created via the dashboard always started
+    # completely unreadable/un-sendable, forcing a separate grant round-
+    # trip afterward for the overwhelmingly common case of wanting to use
+    # the session you just created. Defaults to "none" (unchanged
+    # behavior unless the operator explicitly picks something else).
+    assert 'id="csGrant"' in SESSIONS_ADMIN_HTML
+    assert '<option value="none">Không cấp (mặc định)' in SESSIONS_ADMIN_HTML
+    assert '<option value="read">Chỉ xem</option>' in SESSIONS_ADMIN_HTML
+    assert '<option value="read_send">Xem + Gửi lệnh</option>' in SESSIONS_ADMIN_HTML
 
 
 def test_sessions_admin_create_revalidates_explicit_node_at_submit_time():

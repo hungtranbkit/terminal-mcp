@@ -2483,6 +2483,15 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         <input type="text" id="csCwd" maxlength="512" placeholder="để trống = mặc định" autocomplete="off">
         <div class="cs-hint">Phải nằm trong thư mục được phép cấu hình sẵn trên server.</div>
       </div>
+      <div>
+        <label for="csGrant">Quyền truy cập cho bạn</label>
+        <select id="csGrant">
+          <option value="none">Không cấp (mặc định) -- cấp riêng sau</option>
+          <option value="read">Chỉ xem</option>
+          <option value="read_send">Xem + Gửi lệnh</option>
+        </select>
+        <div class="cs-hint">Tạo session không tự cấp quyền -- chọn ở đây nếu muốn xem/dùng ngay, hoặc để mặc định rồi cấp sau trong danh sách.</div>
+      </div>
       <div class="cs-error" id="csError"></div>
       <button type="submit" class="cs-submit" id="csSubmitBtn">Tạo session</button>
     </form>
@@ -2506,6 +2515,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     const csFormEl = document.querySelector('#csForm');
     const csNameEl = document.querySelector('#csName');
     const csCwdEl = document.querySelector('#csCwd');
+    const csGrantEl = document.querySelector('#csGrant');
     const csAgentChoicesEl = document.querySelector('#csAgentChoices');
     const csNodeEl = document.querySelector('#csNode');
     const csNodeHintEl = document.querySelector('#csNodeHint');
@@ -2695,7 +2705,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       try {
         const response = await fetch('/dashboard/api/session/create', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode}),
+          body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, grant_mode: csGrantEl.value}),
         });
         const result = await response.json().catch(() => ({}));
         if (result && result.error) {
@@ -4659,16 +4669,29 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         if cwd is not None and not isinstance(cwd, str):
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        # Real usability gap reported live: the dashboard's "Tạo session"
+        # button never requested a grant, so a session created here always
+        # started completely unreadable/un-sendable -- the operator had to
+        # go find it in the list afterward and grant it separately, a real
+        # extra round-trip for what's overwhelmingly the common case (you
+        # just created it, you obviously want to see/use it). Still an
+        # explicit, opt-in choice, defaulting to "none" (unchanged
+        # behavior for anyone not using the new field) -- creation itself
+        # still never IMPLIES access; this only lets the operator ask for
+        # it in the same step instead of a separate one. Goes through the
+        # exact same grant_session_read/_input path terminal_create_
+        # session already used for grant_mode="read"/"read_send" (e.g. the
+        # MCP tool's own initial_prompt flow) -- same refusal rules (a
+        # sensitive-worded name, a denied input pattern) apply here too.
+        grant_mode = body.get("grant_mode", "none") if isinstance(body, dict) else "none"
+        if grant_mode not in ("none", "read", "read_send"):
+            return JSONResponse({"error": "INVALID_GRANT_MODE", "session": name}, status_code=400)
         granted_by = identity.email if identity else None
-        _log.info("dashboard create_session name=%s agent_type=%s node=%s identity=%s", name, agent_type, node, granted_by)
-        # The dashboard's "Tạo session" button never requests a grant or an
-        # initial prompt -- explicit, separate opt-ins this route simply
-        # doesn't expose (see core.py's terminal_create_session docstring:
-        # creation itself never implies access). An operator who wants the
-        # new session readable/sendable still grants it explicitly, same
-        # as any other non-whitelisted session.
+        _log.info("dashboard create_session name=%s agent_type=%s node=%s grant_mode=%s identity=%s",
+                 name, agent_type, node, grant_mode, granted_by)
         result = await anyio.to_thread.run_sync(
-            lambda: _routed(lambda: controller.terminal_create_session(name, agent_type, cwd, node=node, requested_by=granted_by))
+            lambda: _routed(lambda: controller.terminal_create_session(
+                name, agent_type, cwd, node=node, grant_mode=grant_mode, requested_by=granted_by))
         )
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
