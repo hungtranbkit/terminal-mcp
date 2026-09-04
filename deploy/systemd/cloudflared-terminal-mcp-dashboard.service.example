@@ -1,0 +1,15 @@
+[Unit]
+Description=Cloudflare Tunnel for Terminal MCP read-only dashboard
+After=network-online.target terminal-mcp-http.service
+Wants=network-online.target terminal-mcp-http.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cloudflared --no-autoupdate --config %h/.cloudflared/terminal-mcp-dashboard-config.yml tunnel run
+Restart=always
+RestartSec=5s
+StartLimitIntervalSec=300
+StartLimitBurst=8
+
+[Install]
+WantedBy=default.target

@@ -232,6 +232,49 @@ systemctl --user restart terminal-mcp-tunnel.service
 systemctl --user disable --now terminal-mcp-tunnel-watchdog.timer
 ```
 
+# cloudflared-terminal-mcp-dashboard.service (dashboard tunnel)
+
+`cloudflared-terminal-mcp-dashboard.service.example` is the systemd user
+unit for the **separate** Cloudflare Tunnel that serves the browser-facing
+dashboard (`terminal-dashboard.mesflow.net`/`terminal-login.mesflow.net`)
+-- distinct from `terminal-mcp-tunnel.service` above (the OpenAI Secure
+MCP Tunnel ChatGPT actually connects through).
+
+**Real incident, found and fixed (not guessed)**: this unit originally had
+`Requires=terminal-mcp-http.service` and `Restart=on-failure`. `Requires=`
+stops this unit whenever `terminal-mcp-http.service` stops (correct), but
+does **not** reliably restart it again afterward -- confirmed by
+`journalctl`: `terminal-mcp-http.service` cleanly restarted three times in
+an 11-minute window while this unit stayed stopped the entire time (down
+12:35:39 → 12:46:55, a real ~11-minute dashboard outage from a systemd
+dependency interaction, not a crash or a code bug). `Restart=on-failure`
+never helps here either, since a `Requires=`-propagated stop exits
+cleanly (not a "failure"), so the unit just sits `inactive (dead)` until
+something else explicitly starts it again.
+
+**Fix**: `Requires=` → `Wants=` (soft dependency -- `After=` ordering is
+kept, but this unit is never force-stopped just because
+`terminal-mcp-http.service` restarts) plus `Restart=always` with a
+`StartLimitIntervalSec=300`/`StartLimitBurst=8` ceiling (same pattern as
+`terminal-mcp-tunnel.service` above) so this tunnel is fully self-healing
+from any stop reason -- crash, network blip, or an upstream restart --
+independent of any other unit's lifecycle. Reproduced and verified live:
+three rapid `systemctl --user restart terminal-mcp-http.service` calls in
+a row now leave this unit's PID and start time completely unchanged, and
+the public dashboard URL stays reachable (302 to the CF Access login
+page, never a connection error) throughout.
+
+Install/update:
+
+```bash
+cp deploy/systemd/cloudflared-terminal-mcp-dashboard.service.example \
+   ~/.config/systemd/user/cloudflared-terminal-mcp-dashboard.service
+# Edit the --config path if this host's cloudflared config lives
+# somewhere other than ~/.cloudflared/terminal-mcp-dashboard-config.yml.
+systemctl --user daemon-reload
+systemctl --user restart cloudflared-terminal-mcp-dashboard.service
+```
+
 # terminal-node-agent.service (multi-node session management)
 
 `terminal-node-agent.service.example` is the systemd user unit for
