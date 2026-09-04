@@ -345,9 +345,12 @@ steps as any other remote node onboarding.
 
 ### Windows known limitations
 
-- **Not live-verified against a real Windows machine** -- see each
-  subsection above for exactly what could and couldn't be exercised
-  without one.
+- **Now live-verified against a real Windows machine** (`dell-5530`,
+  Windows 11, see "Windows node 24/7 stability" below) -- session
+  create/status/kill, heartbeat/registration, and the onboarding script
+  have all been exercised end to end against real hardware. The
+  sub-bullets below record what remains an approximation or unverified
+  even after that.
 - **No separate persistent server the way tmux has one.** A session's
   process is a child of this ONE node-agent process; if that process
   itself is killed/crashes (not a browser disconnect -- the AGENT
@@ -367,6 +370,91 @@ steps as any other remote node onboarding.
   environment cannot provide either.
 - **The PowerShell installer is unexecuted** -- manually reviewed only,
   see its own subsection above.
+
+### Windows node 24/7 stability (`deploy/configure-windows-node-stability.ps1`)
+
+A worker node that goes to sleep, drops off the LAN, or only starts its
+agent when someone happens to log in defeats the point of a "remote
+node" -- it just becomes a machine that occasionally works. This script
+hardens an already-onboarded Windows node (run `install-node-agent.ps1`
+first) for unattended operation. Run it from an elevated
+PowerShell/SSH session on the node itself:
+
+```powershell
+.\configure-windows-node-stability.ps1 -NodeAgentTaskName TerminalMcpNodeAgent-<node-id>
+```
+
+It is idempotent (safe to re-run; each section reports `[OK]`
+unchanged, `[CHANGED]`, or `[SKIPPED]` with a reason) and covers:
+
+- **Power (AC only, battery/DC policy never touched):** sleep,
+  hibernate, and display-off all forced to Never while plugged in; lid
+  action set to "do nothing" *if* the hardware/driver exposes that
+  setting at all (many docked/desktop-mode drivers don't -- reported as
+  skipped, not silently ignored).
+- **NIC/USB power saving:** attempts to disable "allow the computer to
+  turn off this device" per adapter and USB selective suspend on AC;
+  both no-op cleanly (and say so) on hardware/schemes that don't expose
+  the setting, which is common on some Wi-Fi drivers.
+- **Windows Update:** Active Hours verified/set to a wide daily window
+  (default 06:00-23:00) so a background auto-reboot is less likely
+  mid-task -- Windows Update itself is never disabled.
+- **sshd:** verified only (service `StartType`, firewall rule scope) --
+  **deliberately never modified**. This is the single highest-risk
+  change the script could make (get it wrong and you lock yourself out
+  of the very access path you're using to run it), so any firewall
+  narrowing is a separate, human-reviewed decision. As of the last
+  live check, this node's sshd firewall rules are `RemoteAddress=Any`
+  (not LAN-scoped) -- functionally fine for a private LAN not exposed
+  to the Internet, but worth deliberately narrowing to the node's own
+  subnet later if wanted.
+- **Node-agent Scheduled Task persistence (the core fix):** the task
+  `install-node-agent.ps1` creates uses an `AtLogOn` trigger with
+  `LogonType=Interactive`, meaning it only starts once someone actually
+  logs in interactively -- after an unattended reboot with no auto-logon
+  configured, the agent simply never starts. This script adds an
+  `AtStartup` trigger (fires on boot, no logon needed) and switches the
+  task's `LogonType` from `Interactive` to `S4U` ("run whether user is
+  logged on or not", still running as the *same* unprivileged node-agent
+  user -- **never SYSTEM**, since an agent session spawned under SYSTEM
+  would hand anyone with dashboard access to that node SYSTEM-level
+  shell access). Existing `RestartCount`/`RestartInterval`
+  crash-recovery settings are left alone if already reasonable.
+
+Live-verified on `dell-5530`: after applying the script and cleanly
+restarting the Scheduled Task (`Stop-ScheduledTask`/kill orphaned
+`python.exe`/`Start-ScheduledTask` -- *not* a reboot, since the task
+explicitly avoided rebooting a machine it might not be able to recover
+without physical access), the agent came back healthy under the new
+S4U identity and a real session was created through the production
+controller end to end (`state: READY`, real
+`pane_current_command: powershell.exe`, real PID), proving ConPTY
+session-spawning still works without an interactive logon session --
+this was the main functional risk of the `LogonType` change, since
+S4U logon sessions have no interactive window station and older
+console APIs depend on one; ConPTY is specifically designed not to.
+
+**Reboot-dependent verification not performed:** the `AtStartup`
+trigger firing after a *real* OS reboot (as opposed to a Scheduled Task
+restart) was not tested, per this task's own explicit instruction not
+to reboot a remote machine when there's any risk of losing access. The
+task definition and trigger are confirmed correct via
+`Get-ScheduledTask`; a full reboot is the only way to prove it
+end-to-end and should be done deliberately, with physical/console
+access available as a fallback, not unattended.
+
+**Separate gap found and fixed while verifying (deployment config, not
+code):** the Windows node's own deployed `config.yaml` was a literal
+copy of the Linux controller's, including its `session_lifecycle.
+allowed_cwd_roots` (`/home/dell/workspace`, `/home/dell`) -- Linux
+paths that can never match a Windows cwd, so remote session creation
+against this node failed `CWD_NOT_ALLOWED` for any cwd at all. Fixed
+by editing that one node's `config.yaml` to real Windows paths
+(`C:\Users\tranv\terminal-mcp`, `C:\Users\tranv`); this is a
+per-node deployment artifact, not a repo file, so there's nothing to
+generalize here beyond noting it for the next Windows node's own
+onboarding checklist: **verify `allowed_cwd_roots` was adapted to
+Windows paths, not just copied**.
 
 ## LAN discovery + remote connect (Nodes page "Connect Node")
 
