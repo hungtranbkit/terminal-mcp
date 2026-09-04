@@ -959,15 +959,46 @@ Cloudflare-side setup:
    `CLOUDFLARE_PROXY_COMMAND` template, host-key pinning, "Trust & pin"
    required) already works against ANY hostname with such a tunnel --
    no M910-specific code would be needed.
-3. **Left deliberately untouched**: M910's own `ufw` (currently
-   inactive -- no host firewall enforcement at all, LAN-only exposure
-   in practice since nothing forwards its ports from the router) and
-   sshd config. A Cloudflare Tunnel doesn't need port 22 opened to the
-   internet at all, so setting one up changes nothing here either way;
-   enabling `ufw` is a separate, real hardening step this task didn't
-   ask for and this report flags rather than applies, for the same
-   reason the Windows node's own SSH firewall rules were left alone --
-   getting it wrong risks locking out the only access path in use.
+3. `ufw` on M910 is now active, scoped to the LAN (see below) -- a
+   Cloudflare Tunnel doesn't need port 22 opened to the internet at
+   all, so setting one up changes nothing here either way. sshd config
+   itself remains untouched, same reasoning as the Windows node's own
+   SSH firewall rules.
+
+### M910's `ufw` (enabled, LAN-scoped -- user-requested follow-up)
+
+`ufw` was inactive on M910 (no host firewall enforcement at all --
+LAN-only exposure in practice only because nothing forwards its ports
+from the router). Enabled with one blanket rule rather than a
+per-terminal-mcp-port allowlist, after surveying every service actually
+listening on this host first:
+
+```
+ufw allow from 192.168.1.0/24 comment 'trust the whole LAN subnet'
+ufw default deny incoming
+ufw default allow outgoing
+ufw enable
+```
+
+Chosen over a narrow "just 22 and 8790" rule because M910 runs several
+*other*, unrelated real services this task didn't own the right to
+reconfigure: `mesflow-bootstrap` (8098), `openclaw-ops-dashboard`
+(8791), `ollama` (11434, bound to all interfaces), CUPS, and
+`wsdd`/`avahi` LAN discovery. A per-port allowlist would have silently
+cut LAN access to all of those; "trust the LAN subnet, deny everything
+else" blocks WAN/Internet exposure (the actual goal) without touching
+any of them. `cloudflared` is already running on this host as an
+outbound tunnel client (`/etc/cloudflared/config.yml`, for other
+services, unrelated to terminal-mcp) -- outbound-initiated, so
+unaffected by this change either direction; no global IPv6 address
+exists on this host to separately worry about.
+
+Live-verified after enabling: a genuinely fresh SSH connection (not
+reusing the one that applied the rule) succeeded, `terminal-node-agent`
+stayed reachable on 8790, `terminal-mcp-doctor nodes` still showed
+`m910` online, and both `mesflow-bootstrap` and
+`openclaw-ops-dashboard` still answered real HTTP responses from the
+LAN afterward.
 
 ### Known, pre-existing, out-of-scope observations (not changed)
 
