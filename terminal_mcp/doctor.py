@@ -117,6 +117,11 @@ def cmd_nodes(args: argparse.Namespace) -> int:
             "last_heartbeat_at": node.last_heartbeat_at,
             "cpu_percent": node.cpu_percent_smoothed if node.cpu_percent_smoothed is not None else node.cpu_percent,
             "ram_percent": node.ram_percent_smoothed if node.ram_percent_smoothed is not None else node.ram_percent,
+            # Multi-node Windows support -- capability report (task's own
+            # explicit field list).
+            "platform": node.platform, "session_backend": node.session_backend,
+            "shell_capabilities": list(node.shell_capabilities), "wsl_available": node.wsl_available,
+            "claude_available": "claude" in node.agent_types, "codex_available": "codex" in node.agent_types,
         }
         if node.id != controller.local_node_id:
             row["test_connection"] = controller.test_connection(node.id)
@@ -136,9 +141,21 @@ def _print_nodes_human(result: dict) -> None:
     print("Terminal MCP node fleet")
     for row in result["nodes"]:
         marker = "*" if row["id"] == "local" else " "
-        print(f"  [{marker}] {row['id']} ({row['display_name']}): status={row['status']} "
-             f"capacity={row['capacity_status']} sessions={row['tmux_session_count']} "
+        os_icon = "win" if row["platform"] == "windows" else "linux"
+        print(f"  [{marker}] {row['id']} ({row['display_name']}) [{os_icon}/{row['session_backend']}]: "
+             f"status={row['status']} capacity={row['capacity_status']} sessions={row['tmux_session_count']} "
              f"cpu={row['cpu_percent']} ram={row['ram_percent']} draining={row['draining']}")
+        capabilities = []
+        if row["claude_available"]:
+            capabilities.append("claude")
+        if row["codex_available"]:
+            capabilities.append("codex")
+        if row["wsl_available"]:
+            capabilities.append("wsl")
+        if row["shell_capabilities"]:
+            capabilities.append("shells=" + ",".join(row["shell_capabilities"]))
+        if capabilities:
+            print(f"        capabilities: {', '.join(capabilities)}")
         if row["overload_reasons"]:
             print(f"        overload_reasons: {', '.join(row['overload_reasons'])}")
         if "test_connection" in row:

@@ -92,3 +92,26 @@ def test_local_node_never_gets_a_test_connection_probe(tmp_path, monkeypatch, ca
     doctor.main(["nodes", "--json", "--config", config_path])
     result = json.loads(capsys.readouterr().out)
     assert "test_connection" not in result["nodes"][0]
+
+
+def test_local_node_capability_report_includes_platform_and_backend(tmp_path, monkeypatch, capsys):
+    # Task's own explicit capability report field list -- available via
+    # the CLI, not only the dashboard.
+    monkeypatch.setenv("TERMINAL_MCP_NODE_REGISTRY_DB", str(tmp_path / "nodes.db"))
+    config_path = _write_config(tmp_path)
+    doctor.main(["nodes", "--json", "--config", config_path])
+    row = json.loads(capsys.readouterr().out)["nodes"][0]
+    assert row["platform"] == "linux"
+    assert row["session_backend"] == "tmux"
+    assert row["wsl_available"] is False
+    assert isinstance(row["shell_capabilities"], list)
+    assert isinstance(row["claude_available"], bool)
+    assert isinstance(row["codex_available"], bool)
+
+
+def test_human_output_shows_os_and_backend(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("TERMINAL_MCP_NODE_REGISTRY_DB", str(tmp_path / "nodes.db"))
+    config_path = _write_config(tmp_path)
+    doctor.main(["nodes", "--config", config_path])
+    out = capsys.readouterr().out
+    assert "[linux/tmux]" in out
