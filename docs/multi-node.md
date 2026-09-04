@@ -651,16 +651,17 @@ dashboard-cleanup task's own constraint.
   the network." See **Bringing up the M910** below for the exact remaining
   steps — they're operational (run the install script on that machine),
   not further development.
-- **`terminal_move_session` has no MCP/dashboard trigger yet** — backend +
-  tests only (see above for why).
-- **The rich, grant-aware sidebar session list (`/dashboard/api/sessions`)
-  stays local-node-only for now** — it calls `TerminalService.
-  dashboard_list_sessions()` directly for its richer per-session
-  read/input-grant fields, which `ControllerService.terminal_list_sessions()`'s
-  narrower fleet-wide merge doesn't carry. Every row it returns today
-  genuinely IS on the local node (tagged as such), so nothing is
-  mislabeled — merging in a remote node's own sessions with the same
-  grant-aware detail is deferred, not silently dropped.
+- **`terminal_move_session` (moving a LIVE, still-running session to a
+  different node) has no MCP/dashboard trigger yet** — backend + tests
+  only (see above for why). "↩▾ Reopen elsewhere" (Create Session UX,
+  above) covers the adjacent-but-different case of an already-KILLED
+  session being reopened on a different node instead — that path calls
+  `terminal_create_session`, not `terminal_move_session`, since there is
+  no live source process to protect/stop for something already killed.
+- ~~The rich, grant-aware sidebar session list stays local-node-only~~ —
+  **fixed** (Create Session UX work, above): `/dashboard/api/sessions`
+  now additionally merges in every remote node's own sessions, using
+  that node's own real `terminal_list_sessions()` authorization fields.
 - **Bindings and Supervisor stay local-node-scoped** — both operate on
   session names within this one process's own stores; a binding/watch on
   a session that later moves to another node is not automatically
@@ -679,6 +680,81 @@ dashboard-cleanup task's own constraint.
   of its own at all. A password-login user sees no multi-node UI or API;
   extending that surface to match is deferred, not silently broken (there
   was nothing there for it to break).
+
+## Create Session node selector (dashboard + MCP/API)
+
+The dashboard's own "Tạo session" form (`/dashboard/sessions`) now has an
+explicit Node/Host selector (default: Auto), and every dashboard session
+lifecycle route (create/detach/delete/kill/reopen) is routed through
+`ControllerService` instead of calling `TerminalService` directly — a
+real, pre-existing gap fixed here: these routes predated the controller/
+multi-node work and had never been updated, so an operator picking an
+explicit remote node from any future UI would have silently created on
+the LOCAL node regardless. `mcp_app.py`'s own MCP tools were already
+correctly routed through `controller.` from the start (see `docs/multi-
+node.md`'s own history) — this brings the dashboard up to the same
+standard, not a new capability.
+
+- **Node dropdown**: Auto (Recommended) + Local + every registered node,
+  each showing `Name · OS · Health · RAM%`. Disabled (with a short
+  reason) when the node lacks the currently-selected agent_type's own
+  capability — the SAME rule scheduler.py's own `_eligible` check uses
+  (`shell` needs nothing special; `claude`/`codex` must be in that
+  node's own reported `agent_types`), never a second, independently-
+  drifting notion of "supported". Re-fetched fresh every time the modal
+  opens (no reload needed for a newly-registered node to show up).
+- **Submit-time revalidation**: an explicitly-picked node is re-checked
+  right before the actual POST (a fresh `/dashboard/api/nodes` fetch) --
+  offline/lost-capability since the form opened is caught with a clear
+  inline error instead of a raw server rejection; an overloaded node
+  gets a one-time warning requiring a second submit to confirm rather
+  than either silently blocking or silently proceeding.
+- **No silent fallback**: an explicit node that's offline, unreachable,
+  or platform-mismatched fails clearly (`NODE_UNREACHABLE`/
+  `PLATFORM_MISMATCH`, never creates on local instead) — including a
+  real gap found while wiring this up: `terminal_create_session`'s
+  explicit-node branch had NO online-status check at all before this
+  (unlike Auto placement's own `choose_node`/`_eligible` gate, and
+  unlike `terminal_move_session`'s own target-node check) — an operator
+  picking a node the dashboard itself would already show as offline got
+  whatever a raw network failure happened to produce instead of a fast,
+  clear rejection. Fixed the same way `terminal_move_session` already
+  does it: fail BEFORE the network call, never after.
+- **Session metadata**: every create response carries `node_id`/
+  `node_name`; `/dashboard/api/sessions` now additionally merges in
+  REMOTE nodes' own sessions (previously local-node-only, see the old
+  "Known limitations" entry this supersedes) with a small `node-badge`
+  label next to the name for anything not on `local` — using each
+  remote node's own real `effective_read`/`effective_input`/`allowed`
+  fields (`TerminalService.terminal_list_sessions`, which already
+  computes them per that node's own grants/permissions, just via a
+  narrower method than `dashboard_list_sessions`'s richer local-only
+  shape), not a fabricated "always visible" assumption.
+- **Reopen**: defaults to the SAME node a session was killed on --
+  resolved via that node's own killed-sessions list (`_find_killed_
+  session_node`), NEVER the live-session `resolve_session`/`_route`
+  path a real bug used to route through: a killed session, by
+  definition, is never in ANY node's live tmux listing, so that
+  resolution always reported `SESSION_NOT_FOUND` for exactly the case
+  reopen exists to handle (only masked before because the dashboard
+  called `TerminalService.terminal_reopen_session` directly, bypassing
+  the controller entirely). "↩▾ Reopen elsewhere" (dashboard) / an
+  explicit `node` argument (`terminal_reopen_session` MCP tool) moves it
+  to a different node instead, using the killed session's own
+  remembered `agent_type`/`cwd` as defaults — functionally a fresh
+  `terminal_create_session` on the new node, with the same "target-
+  first, fail loud" guarantee `terminal_move_session` already has (a
+  second real bug fixed here: the move path needs to invalidate the old,
+  now-stale session-location cache entry before create_session's own
+  duplicate check runs, or that check incorrectly reports
+  `SESSION_ALREADY_EXISTS` on the node it was just killed on).
+
+Tests: `tests/test_controller.py` (auto/explicit/offline/unreachable
+create, all seven `terminal_reopen_session` scenarios), `tests/
+test_dashboard_multinode_sessions.py` (the same scenarios through the
+real HTTP routes, plus kill/detach routing to the right node and
+Windows-node platform tagging), `tests/test_dashboard.py` (node
+selector/capability-filter/revalidation UI source-presence checks).
 
 ## Bringing up the M910 (exact steps)
 

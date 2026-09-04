@@ -86,6 +86,9 @@ INPUT_ERROR_STATUS = {
     "NODE_UNREACHABLE": 502,
     "AMBIGUOUS_SESSION": 409,
     "NO_ELIGIBLE_NODE": 503,
+    "PLATFORM_MISMATCH": 400,
+    "AGENT_TYPE_NOT_AVAILABLE_ON_TARGET": 409,
+    "NODE_DRAINING": 409,
 }
 
 
@@ -1948,6 +1951,15 @@ DASHBOARD_HTML = """<!doctype html>
         const reopenBtn = document.createElement('button'); reopenBtn.type = 'button'; reopenBtn.textContent = '↩ Reopen';
         reopenBtn.onclick = () => reopenKilledSession(entry);
         row.append(reopenBtn);
+        // Task item 9: "cho phép đổi node nếu user chọn Move/Reopen
+        // elsewhere" -- default Reopen above always stays on the same
+        // node (server-side default); this is the explicit, separate
+        // opt-in to pick a different one. A plain prompt() pair, same
+        // minimal-UI convention as the incomplete-metadata path above --
+        // this is a rare/advanced action, not worth a dedicated modal.
+        const moveBtn = document.createElement('button'); moveBtn.type = 'button'; moveBtn.textContent = '↩▾ Reopen elsewhere';
+        moveBtn.onclick = () => reopenKilledSessionElsewhere(entry);
+        row.append(moveBtn);
         killedListEl.appendChild(row);
       }
     }
@@ -1981,6 +1993,46 @@ DASHBOARD_HTML = """<!doctype html>
       const result = await response.json().catch(() => ({}));
       if (result && result.error) {
         window.alert(`Reopen thất bại: ${clean(result.error)}${result.missing ? ' (thiếu: ' + result.missing.join(', ') + ')' : ''}`);
+        return;
+      }
+      await loadSessions();
+      selectSession(entry.name);
+    }
+
+    // Task item 9: "cho phép đổi node nếu user chọn Move/Reopen
+    // elsewhere" -- fetches the current node list fresh (never cached;
+    // this is a rare action, correctness here matters more than one
+    // extra request) so the prompt always reflects real, current
+    // node ids -- never a stale list from whenever the page first loaded.
+    async function reopenKilledSessionElsewhere(entry) {
+      let nodes = [];
+      try {
+        const response = await fetch('/dashboard/api/nodes', {cache: 'no-store'});
+        const data = await response.json().catch(() => ({}));
+        nodes = (data && data.nodes) || [];
+      } catch (error) { /* fall through -- the prompt below still works with an empty list */ }
+      const choices = nodes.map(n => `${n.id}${n.id === 'local' ? ' (Local/Dell)' : ''} [${n.status}]`).join(`\n`);
+      const targetNode = window.prompt(
+        `Reopen "${entry.name}" trên node nào?\nNode hiện có:\n${choices || '(không tải được danh sách node)'}\n\nNhập node_id:`, '');
+      if (!targetNode) return;
+      let agentType = entry.agent_type || null, workingDirectory = entry.working_directory || null;
+      if (!entry.metadata_complete) {
+        agentType = window.prompt(`Không đủ metadata để tự reopen "${entry.name}".\nNhập agent_type (shell / claude / codex):`, 'shell');
+        if (!agentType) return;
+        if (agentType !== 'shell') {
+          workingDirectory = window.prompt('Nhập working_directory an toàn (trong allowed_cwd_roots của node đích):', '');
+          if (!workingDirectory) return;
+        }
+      }
+      const body = {name: entry.name, node: targetNode};
+      if (agentType) body.agent_type = agentType;
+      if (workingDirectory) body.working_directory = workingDirectory;
+      const response = await fetch('/dashboard/api/session/reopen', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (result && result.error) {
+        window.alert(`Reopen elsewhere thất bại: ${clean(result.error)}${result.detail ? ' -- ' + clean(result.detail) : ''}`);
         return;
       }
       await loadSessions();
@@ -2187,6 +2239,10 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     tbody tr.needs-attention { background:rgba(255,200,87,.06) }
     .sess-name { font-weight:700 }
     .attn-badge { display:inline-block; background:var(--amber); color:#231a00; font-size:10px; font-weight:700; padding:1px 6px; border-radius:4px; margin-left:6px; vertical-align:middle }
+    /* Node label (task item 6: "sidebar hiển thị node label nhỏ") -- a
+       compact pill, same shape as .perm-badge but a distinct muted tone
+       so it never reads as a permission state. */
+    .node-badge { display:inline-block; border-radius:999px; padding:1px 7px; font-size:10px; border:1px solid var(--line); color:var(--muted); margin-left:6px; vertical-align:middle; white-space:nowrap }
     .perm-badge { display:inline-block; border-radius:999px; padding:2px 9px; font-size:11px; border:1px solid var(--line); white-space:nowrap }
     .perm-badge.whitelist { color:var(--muted) }
     .perm-badge.full { color:var(--green); border-color:var(--green) }
@@ -2320,6 +2376,11 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         </div>
       </div>
       <div>
+        <label for="csNode">Node/Host</label>
+        <select id="csNode"><option value="auto">Auto (Recommended)</option></select>
+        <div class="cs-hint" id="csNodeHint"></div>
+      </div>
+      <div>
         <label for="csCwd">Working directory (tuỳ chọn)</label>
         <input type="text" id="csCwd" maxlength="512" placeholder="để trống = mặc định" autocomplete="off">
         <div class="cs-hint">Phải nằm trong thư mục được phép cấu hình sẵn trên server.</div>
@@ -2348,6 +2409,8 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     const csNameEl = document.querySelector('#csName');
     const csCwdEl = document.querySelector('#csCwd');
     const csAgentChoicesEl = document.querySelector('#csAgentChoices');
+    const csNodeEl = document.querySelector('#csNode');
+    const csNodeHintEl = document.querySelector('#csNodeHint');
     const csErrorEl = document.querySelector('#csError');
     const csSubmitBtnEl = document.querySelector('#csSubmitBtn');
     const csModalCloseBtnEl = document.querySelector('#csModalCloseBtn');
@@ -2408,6 +2471,66 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
 
     // -- Create-session modal ---------------------------------------------
     let csSelectedAgent = 'shell';
+    let csNodesCache = []; // last-fetched /dashboard/api/nodes rows, reused when the agent-type choice changes
+
+    // Multi-node create-session UX (task's own item 1-8): node select
+    // defaults to Auto, options are Local + every registered remote node,
+    // filtered/disabled by whether the CURRENTLY-selected agent type is
+    // actually available there -- mirrors scheduler.py's own _eligible
+    // capability check exactly (agent_type "shell" needs nothing special;
+    // anything else must appear in that node's own reported agent_types),
+    // never a second, independently-drifting notion of "supported".
+    function nodeCapable(node, agentType) {
+      return agentType === 'shell' || (node.agent_types || []).includes(agentType);
+    }
+    function nodeSummaryLabel(node) {
+      const os = node.platform === 'windows' ? 'Windows' : 'Linux';
+      const health = node.status !== 'online' ? 'Offline'
+        : node.capacity_status === 'overloaded' ? 'Overloaded'
+        : node.capacity_status === 'busy' ? 'Busy'
+        : node.capacity_status === 'healthy' ? 'Healthy' : 'Unknown';
+      const ram = (node.ram_percent === null || node.ram_percent === undefined) ? '' : ` · RAM ${Math.round(node.ram_percent)}%`;
+      return `${node.display_name || node.id} · ${os} · ${health}${ram}`;
+    }
+    function renderNodeOptions() {
+      const previous = csNodeEl.value || 'auto';
+      csNodeEl.replaceChildren();
+      const autoOpt = document.createElement('option'); autoOpt.value = 'auto'; autoOpt.textContent = 'Auto (Recommended)';
+      csNodeEl.append(autoOpt);
+      for (const node of csNodesCache) {
+        const opt = document.createElement('option');
+        opt.value = node.id;
+        opt.textContent = (node.id === 'local' ? 'Local/Dell' : node.display_name || node.id) + ' — ' + nodeSummaryLabel(node);
+        const capable = nodeCapable(node, csSelectedAgent);
+        const online = node.status === 'online';
+        if (!capable) {
+          opt.disabled = true;
+          opt.textContent += `  (thiếu agent_type=${csSelectedAgent})`;
+        } else if (!online) {
+          opt.disabled = true;
+          opt.textContent += '  (offline)';
+        }
+        csNodeEl.append(opt);
+      }
+      // A previously-picked node that's now missing/disabled falls back to
+      // Auto rather than silently submitting against a stale selection.
+      const stillValid = [...csNodeEl.options].some(o => o.value === previous && !o.disabled);
+      csNodeEl.value = stillValid ? previous : 'auto';
+      csNodeHintEl.textContent = csNodeEl.value === 'auto'
+        ? 'Scheduler tự chọn node phù hợp còn healthy nhất.'
+        : '';
+    }
+    async function loadNodesForCreateModal() {
+      try {
+        const response = await fetch('/dashboard/api/nodes', {cache: 'no-store'});
+        const data = await response.json().catch(() => ({}));
+        csNodesCache = (data && data.nodes) || [];
+      } catch (error) {
+        csNodesCache = [];
+      }
+      renderNodeOptions();
+    }
+
     function closeCreateModal() {
       document.body.classList.remove('cs-modal-visible');
       csErrorEl.textContent = ''; csFormEl.reset();
@@ -2418,6 +2541,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       csErrorEl.textContent = '';
       document.body.classList.add('cs-modal-visible');
       csNameEl.focus();
+      loadNodesForCreateModal(); // fresh every open -- item 13: newly-registered nodes show up with no reload needed
     }
     newSessionBtnEl.onclick = openCreateModal;
     csModalCloseBtnEl.onclick = closeCreateModal;
@@ -2429,6 +2553,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       btn.onclick = () => {
         csSelectedAgent = btn.dataset.agent;
         csAgentChoicesEl.querySelectorAll('button').forEach(b => b.classList.toggle('selected', b === btn));
+        renderNodeOptions(); // re-filter the SAME cached node list -- no re-fetch needed just for this
       };
     });
     // Client-side mirror of permissions.py's SAFE_SESSION_RE -- pure UX
@@ -2440,16 +2565,39 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       event.preventDefault();
       const name = csNameEl.value.trim();
       const cwd = csCwdEl.value.trim();
+      const chosenNode = csNodeEl.value || 'auto';
       csErrorEl.textContent = '';
       if (!SAFE_SESSION_NAME_RE.test(name) || name.startsWith('-') || name.startsWith('.')) {
         csErrorEl.textContent = 'Tên session không hợp lệ (chỉ chữ/số/._- , không bắt đầu bằng "-" hoặc ".").';
         return;
       }
+      // Task item 7: re-validate the explicit node choice right before
+      // submit -- it may have gone offline/overloaded/lost capability in
+      // the time the form was open. Auto is always re-checked by the
+      // server's own scheduler regardless, so only an EXPLICIT pick needs
+      // this extra round-trip.
+      if (chosenNode !== 'auto') {
+        await loadNodesForCreateModal();
+        const fresh = csNodesCache.find(n => n.id === chosenNode);
+        if (!fresh || fresh.status !== 'online' || !nodeCapable(fresh, csSelectedAgent)) {
+          csErrorEl.textContent = `Node "${chosenNode}" không còn khả dụng (offline hoặc thiếu capability) -- chọn Auto hoặc node khác.`;
+          csNodeEl.value = 'auto';
+          return;
+        }
+        if (fresh.capacity_status === 'overloaded') {
+          csErrorEl.textContent = `⚠ Node "${chosenNode}" đang overloaded -- vẫn có thể tạo, nhưng cân nhắc chọn Auto/node khác. Bấm "Tạo session" lần nữa để xác nhận.`;
+          csErrorEl.dataset.overloadedConfirm = chosenNode;
+          if (csErrorEl.dataset.lastOverloadedConfirm !== chosenNode) {
+            csErrorEl.dataset.lastOverloadedConfirm = chosenNode;
+            return; // first submit just warns; a second submit (same node) proceeds
+          }
+        }
+      }
       csSubmitBtnEl.disabled = true; csSubmitBtnEl.textContent = 'Đang tạo…';
       try {
         const response = await fetch('/dashboard/api/session/create', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null}),
+          body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode}),
         });
         const result = await response.json().catch(() => ({}));
         if (result && result.error) {
@@ -2672,6 +2820,15 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         const tdName = document.createElement('td');
         const nameSpan = document.createElement('span'); nameSpan.className = 'sess-name'; nameSpan.textContent = row.name;
         tdName.appendChild(nameSpan);
+        // Node label (task item 6) -- only shown for a NON-local node
+        // (the obvious default on a single-node deployment needs no
+        // label; a remote node's own session does, so an operator always
+        // knows where it actually runs before Kill/Delete/Access).
+        if (row.node_id && row.node_id !== 'local') {
+          const nodeBadge = document.createElement('span'); nodeBadge.className = 'node-badge';
+          nodeBadge.textContent = row.node_name || row.node_id;
+          tdName.appendChild(nodeBadge);
+        }
         if (row.state === 'WAITING_INPUT') {
           const badge = document.createElement('span'); badge.className = 'attn-badge'; badge.textContent = '⚠ CẦN INPUT';
           tdName.appendChild(badge);
@@ -4074,16 +4231,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         listed = await anyio.to_thread.run_sync(terminal.dashboard_list_sessions)
         rows = listed.get("sessions")
         if isinstance(rows, list):
-            # Node label (task item 16): this route is still local-node-
-            # only (it calls terminal.dashboard_list_sessions() directly,
-            # for its richer per-session grant/permission fields --
-            # controller.terminal_list_sessions()'s fleet-wide merge has a
-            # narrower shape that doesn't carry those), so every row here
-            # genuinely IS on the local node today; tagged explicitly
-            # rather than left for the client to assume. Merging in
-            # remote nodes' own sessions with the same grant-aware detail
-            # is intentionally deferred past this phase -- see
-            # docs/multi-node.md's own Known Limitations.
+            # Node label (task item 6/16): every LOCAL row is tagged
+            # explicitly (never left for the client to assume) --
             local_node = controller.node_status(controller.local_node_id)
             local_node_name = local_node.display_name if local_node else controller.local_node_id
             for row in rows:
@@ -4106,6 +4255,43 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             async with anyio.create_task_group() as tg:
                 for row in rows:
                     tg.start_soon(_fill_state, row)
+
+            # -- Remote-node sessions (task item 6: "sidebar hiển thị node
+            # label"; item 10: sessions on a remote node must be visible
+            # to route Kill/Delete correctly) -- additive merge on top of
+            # the local list above, never replacing it. Each remote row
+            # already carries real effective_read/effective_input/allowed
+            # (computed by THAT node's own TerminalService.
+            # terminal_list_sessions -- the same authorization fields
+            # dashboard_list_sessions reports locally, just via the
+            # narrower fleet-wide NodeClient surface, which is the reason
+            # this was deferred before: it's a genuinely different method
+            # than dashboard_list_sessions, not an unauthenticated one --
+            # see docs/multi-node.md's own note on this). What it does NOT
+            # carry: dashboard-specific fields (kill_reopen_ready,
+            # classify_status state) -- filled in here the same way local
+            # rows are, via a qualified "node/session" status call so a
+            # same-named session on two different nodes can never be
+            # confused.
+            fleet = await anyio.to_thread.run_sync(controller.terminal_list_sessions)
+            remote_rows = [row for row in fleet.get("sessions", []) if row.get("node_id") != controller.local_node_id]
+            for row in remote_rows:
+                row.setdefault("kill_reopen_ready", True)
+                row["grant"] = {"read_enabled": row.get("read_granted", False), "input_enabled": row.get("input_granted", False)}
+
+            async def _fill_remote_state(row: dict) -> None:
+                if not row.get("effective_read"):
+                    row["state"] = "RESTRICTED"
+                    return
+                qualified = f"{row['node_id']}/{row['name']}"
+                status = await anyio.to_thread.run_sync(controller.terminal_status, qualified)
+                row["state"] = status.get("state", "UNKNOWN")
+
+            async with anyio.create_task_group() as tg:
+                for row in remote_rows:
+                    tg.start_soon(_fill_remote_state, row)
+            rows.extend(remote_rows)
+
             # Stable multi-key sort applied least-significant-key first: name
             # (deterministic fallback for ties) -> activity descending (most
             # recent first) -> attention-needed first. No session is ever
@@ -4320,11 +4506,27 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
-    # -- Session lifecycle: create/detach/delete. Same TerminalService.
-    # terminal_create_session/_detach_session/_delete_session the MCP
-    # tools call (mcp_app.py) -- one implementation, two entry points.
-    # SESSION_LIFECYCLE_DISABLED (403) unless an operator has explicitly
-    # set session_lifecycle.enabled: true in config.yaml.
+    # -- Session lifecycle: create/detach/delete/kill/reopen -- routed
+    # through `controller`, the SAME multi-node-aware entry point
+    # mcp_app.py's own MCP tools already used (one implementation, two
+    # entry points -- see controller.py's own module docstring for the
+    # Phase A/B "local node behaves exactly like calling TerminalService
+    # directly" guarantee this relies on). SESSION_LIFECYCLE_DISABLED
+    # (403) unless an operator has explicitly set session_lifecycle.
+    # enabled: true in config.yaml.
+    def _routed(call):
+        """Every lifecycle mutation below needs the LOCAL node's own
+        heartbeat fresh before it can even be considered ONLINE for
+        resolve_session/choose_node -- unlike the GET routes above (which
+        always refresh it themselves), a mutation isn't guaranteed to run
+        after a recent GET that already did. Real bug caught wiring this:
+        a bare TestClient hitting /session/create first, with no prior
+        /nodes or /sessions poll, got NO_ELIGIBLE_NODE even for node=
+        "auto" on a genuinely healthy single local node -- because that
+        node had simply never heartbeated yet. One shared wrapper so this
+        can never be forgotten on a future new lifecycle route either."""
+        _refresh_local_heartbeat()
+        return call()
 
     @server.custom_route("/dashboard/api/session/create", methods=["POST"], include_in_schema=False)
     async def session_create(request: Request) -> JSONResponse:
@@ -4338,12 +4540,29 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         name = body.get("name") if isinstance(body, dict) else None
         agent_type = body.get("agent_type", "shell") if isinstance(body, dict) else None
         cwd = body.get("cwd") if isinstance(body, dict) else None
+        # Multi-node create-session UX (task's own item 1-5/11): "node"
+        # defaults to "auto" (the scheduler picks -- task item 4's own
+        # "Auto phải gọi scheduler hiện có, không hardcode local"), or an
+        # explicit node_id from /dashboard/api/nodes. Routed through
+        # `controller`, never `terminal` directly -- real bug fixed here:
+        # every dashboard lifecycle route (create/detach/delete/kill/
+        # reopen) called `terminal.` directly before this, completely
+        # bypassing the controller/multi-node layer that mcp_app.py's own
+        # MCP tools already used correctly -- an explicit node selection
+        # from THIS form would have silently created on the LOCAL node
+        # regardless of what the operator picked (item 5's own explicit
+        # "không silently fallback sang local nếu node lỗi" -- the old
+        # code did exactly that, unconditionally, every time).
+        node = body.get("node") if isinstance(body, dict) else None
+        if node is not None and not isinstance(node, str):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        node = node.strip() if isinstance(node, str) and node.strip() else "auto"
         if not isinstance(name, str) or not name or not isinstance(agent_type, str):
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         if cwd is not None and not isinstance(cwd, str):
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         granted_by = identity.email if identity else None
-        _log.info("dashboard create_session name=%s agent_type=%s identity=%s", name, agent_type, granted_by)
+        _log.info("dashboard create_session name=%s agent_type=%s node=%s identity=%s", name, agent_type, node, granted_by)
         # The dashboard's "Tạo session" button never requests a grant or an
         # initial prompt -- explicit, separate opt-ins this route simply
         # doesn't expose (see core.py's terminal_create_session docstring:
@@ -4351,7 +4570,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # new session readable/sendable still grants it explicitly, same
         # as any other non-whitelisted session.
         result = await anyio.to_thread.run_sync(
-            lambda: terminal.terminal_create_session(name, agent_type, cwd, requested_by=granted_by)
+            lambda: _routed(lambda: controller.terminal_create_session(name, agent_type, cwd, node=node, requested_by=granted_by))
         )
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
@@ -4369,7 +4588,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if not isinstance(name, str) or not name:
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         _log.info("dashboard detach_session name=%s identity=%s", name, identity.email if identity else None)
-        result = await anyio.to_thread.run_sync(terminal.terminal_detach_session, name)
+        # Routed through controller (task item 10: "Kill/Delete chỉ tác
+        # động đúng session trên đúng node") -- resolves to whichever
+        # node this session actually lives on, local or remote.
+        result = await anyio.to_thread.run_sync(lambda: _routed(lambda: controller.terminal_detach_session(name)))
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
@@ -4391,7 +4613,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if not isinstance(name, str) or not name:
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         _log.info("dashboard delete_session name=%s identity=%s", name, identity.email if identity else None)
-        result = await anyio.to_thread.run_sync(terminal.terminal_delete_session, name)
+        # Routed through controller (task item 10) -- see session_detach's
+        # own comment just above.
+        result = await anyio.to_thread.run_sync(lambda: _routed(lambda: controller.terminal_delete_session(name)))
         if "error" not in result:
             await anyio.to_thread.run_sync(lambda: supervisor.unwatch(session=name, delete=False))
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
@@ -4417,7 +4641,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         requested_by = identity.email if identity else "dashboard"
         _log.info("dashboard kill_session name=%s identity=%s", name, identity.email if identity else None)
         result = await anyio.to_thread.run_sync(
-            lambda: terminal.terminal_kill_session(name, confirm_name, requested_by=requested_by)
+            # Routed through controller (task item 10) -- see
+            # session_detach's own comment for why every dashboard
+            # lifecycle route needed this same fix.
+            lambda: _routed(lambda: controller.terminal_kill_session(name, confirm_name, requested_by=requested_by))
         )
         if "error" not in result:
             await anyio.to_thread.run_sync(lambda: supervisor.unwatch(session=name, delete=False))
@@ -4440,17 +4667,31 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         name = body.get("name") if isinstance(body, dict) else None
         agent_type = body.get("agent_type") if isinstance(body, dict) else None
         working_directory = body.get("working_directory") if isinstance(body, dict) else None
+        # Task item 9: "mặc định reopen trên node cũ; cho phép đổi node
+        # nếu user chọn Move/Reopen elsewhere" -- omitted/None (the
+        # default) reopens on the same node the session was killed on
+        # (controller.terminal_reopen_session's own default); an explicit
+        # node_id moves it there instead.
+        node = body.get("node") if isinstance(body, dict) else None
         if not isinstance(name, str) or not name:
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         if agent_type is not None and not isinstance(agent_type, str):
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         if working_directory is not None and not isinstance(working_directory, str):
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        if node is not None and not isinstance(node, str):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         requested_by = identity.email if identity else "dashboard"
-        _log.info("dashboard reopen_session name=%s identity=%s", name, identity.email if identity else None)
+        _log.info("dashboard reopen_session name=%s node=%s identity=%s", name, node, identity.email if identity else None)
+        # Routed through controller (task item 10) -- same fix as every
+        # other lifecycle route above; controller.terminal_reopen_session
+        # itself resolves via each node's own killed-sessions list, never
+        # live-session lookup (see its own docstring for the real, related
+        # bug that would otherwise cause -- a session past the 20s
+        # location-cache window would report SESSION_NOT_FOUND).
         result = await anyio.to_thread.run_sync(
-            lambda: terminal.terminal_reopen_session(name, agent_type=agent_type, cwd=working_directory,
-                                                      requested_by=requested_by)
+            lambda: _routed(lambda: controller.terminal_reopen_session(
+                name, agent_type=agent_type, cwd=working_directory, node=node, requested_by=requested_by))
         )
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})

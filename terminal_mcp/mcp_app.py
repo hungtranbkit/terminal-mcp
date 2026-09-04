@@ -322,7 +322,7 @@ def build_mcp(service: TerminalService | None = None,
 
     @server.tool()
     def terminal_reopen_session(name: str, agent_type: str | None = None,
-                                working_directory: str | None = None) -> dict:
+                                working_directory: str | None = None, node: str | None = None) -> dict:
         """Recreates a NEW tmux session/process under `name` using saved
         Kill metadata (terminal_kill_session) -- explicitly NOT a
         resurrection of the killed process's own memory/state, a fresh
@@ -333,12 +333,19 @@ def build_mcp(service: TerminalService | None = None,
         agent_type needs a working directory that was never captured.
         agent_type/working_directory, if you DO supply them, override the
         saved values field-by-field -- the intended way to reopen a
-        session whose saved metadata turned out incomplete. Always reopens
-        on the SAME node the session last lived on (never moves it --
-        see terminal_move_session for that, if/when enabled)."""
+        session whose saved metadata turned out incomplete.
+
+        node (optional, default None): reopens on the SAME node the
+        session last lived on by default -- the node it's actually on is
+        found via that node's own killed-sessions record, not guessed.
+        Pass an explicit node_id (from terminal_list_nodes) to move it
+        there instead; the saved agent_type/working_directory are still
+        used as defaults unless you override them here too. The response's
+        node_id/node_name (and moved_from, when moved) say where it
+        actually landed."""
         _refresh_local_heartbeat()
         return controller.terminal_reopen_session(name, agent_type=agent_type, cwd=working_directory,
-                                                   requested_by="mcp")
+                                                   node=node, requested_by="mcp")
 
     @server.tool()
     def terminal_list_killed_sessions() -> dict:

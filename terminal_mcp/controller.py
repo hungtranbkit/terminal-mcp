@@ -222,11 +222,103 @@ class ControllerService:
             bare, confirm_name.split("/", 1)[-1] if "/" in confirm_name else confirm_name, requested_by=requested_by,
         ))
 
+    def _find_killed_session_node(self, name: str) -> tuple[str | None, dict[str, Any] | None]:
+        """Which ONLINE node's own killed-sessions list actually contains
+        `name`, plus that entry's own row (agent_type/working_directory/
+        metadata_complete) -- (None, None) if none do. A killed session's
+        metadata lives wherever it was killed (killed_sessions.py is
+        per-process/per-node, exactly like each node's own bindings/audit
+        stores already are), so this is genuinely the only correct way to
+        find it -- never a live-session lookup (resolve_session/_route),
+        which is wrong here by construction: a killed session is, by
+        definition, not in ANY node's live tmux listing, so that
+        resolution would always report SESSION_NOT_FOUND for exactly the
+        case this exists to handle. Real bug caught while wiring the
+        dashboard's own reopen route through this class for the first
+        time (task's own multi-node create-session UX work) -- the
+        previous _route-based implementation would have silently broken
+        reopen for any session whose 20s session-location cache entry had
+        already expired, on a single-node deployment too, not only multi-
+        node."""
+        for node in self.registry.list():
+            if node.status != NODE_ONLINE:
+                continue
+            client = self._clients.get(node.id)
+            if client is None:
+                continue
+            try:
+                listing = client.list_killed_sessions()
+            except NodeClientError:
+                continue
+            for row in listing.get("killed_sessions", []):
+                if row.get("name") == name:
+                    return node.id, row
+        return None, None
+
     def terminal_reopen_session(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
-                                grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]:
-        return self._route(name, "reopen", lambda client, bare: client.reopen_session(
-            bare, agent_type=agent_type, cwd=cwd, grant_mode=grant_mode, requested_by=requested_by,
-        ))
+                                grant_mode: str = "none", requested_by: str | None = None,
+                                node: str | None = None) -> dict[str, Any]:
+        """Reopens on the SAME node it was killed on by default (node=
+        None, task item 9's own "mặc định reopen trên node cũ") --
+        resolved via _find_killed_session_node, never live-session
+        resolution (see that method's own docstring for why). An explicit
+        `node` moves it elsewhere instead (task item 9's "cho phép đổi
+        node nếu user chọn Move/Reopen elsewhere") -- the killed
+        session's own remembered agent_type/cwd are used as defaults
+        exactly like the same-node path, `agent_type`/`cwd` given here
+        still override them field-by-field; this is functionally a fresh
+        terminal_create_session on the new node, so it gets that method's
+        own full safety guarantees (NEVER falls back to the old node on
+        failure, an incompatible target agent_type/platform fails clearly
+        before anything is touched -- unlike terminal_move_session, there
+        is no "source" here to protect since the session is already
+        killed, but the same "target-first, fail loud" posture applies)."""
+        killed_node_id, killed_row = self._find_killed_session_node(name)
+        if killed_node_id is None:
+            return {"error": "SESSION_NOT_FOUND", "session": name,
+                    "detail": "not found in any online node's own killed-sessions list"}
+        effective_agent_type = agent_type or (killed_row or {}).get("agent_type")
+        effective_cwd = cwd if cwd is not None else (killed_row or {}).get("working_directory")
+
+        if node is None or node == killed_node_id:
+            client = self._clients.get(killed_node_id)
+            if client is None:
+                return {"error": "NODE_UNREACHABLE", "node_id": killed_node_id}
+            try:
+                result = client.reopen_session(name, agent_type=agent_type, cwd=cwd, grant_mode=grant_mode,
+                                               requested_by=requested_by)
+            except NodeClientError as exc:
+                return {"error": "NODE_UNREACHABLE", "node_id": killed_node_id, "detail": str(exc)}
+            if isinstance(result, dict):
+                result.setdefault("node_id", killed_node_id)
+                node_row = self.registry.get(killed_node_id)
+                result.setdefault("node_name", node_row.display_name if node_row else killed_node_id)
+                if "error" not in result:
+                    self._session_location_cache[name] = SessionLocation(node_id=killed_node_id, cached_at=time.monotonic())
+            return result
+
+        if not effective_agent_type:
+            return {"error": "REOPEN_METADATA_INCOMPLETE", "session": name, "missing": "agent_type",
+                    "detail": "killed session's saved metadata has no agent_type -- supply one explicitly to reopen elsewhere"}
+        # Real bug caught by this feature's own test suite: terminal_
+        # create_session's own SESSION_ALREADY_EXISTS check calls
+        # resolve_session(name) -- which, on a cache HIT, trusts the
+        # cached location WITHOUT re-verifying the session is still
+        # there (by design, for the common case -- see resolve_session's
+        # own docstring). A session just killed on `killed_node_id`
+        # within the last session_cache_ttl_seconds still has exactly
+        # that stale, no-longer-true cache entry, so create_session would
+        # incorrectly report SESSION_ALREADY_EXISTS on the node it's
+        # KILLED on instead of creating on the new one. Never true here:
+        # this whole branch only runs once _find_killed_session_node has
+        # already confirmed the session is gone from that node's own
+        # killed-sessions bookkeeping's perspective.
+        self.invalidate_session_location(name)
+        result = self.terminal_create_session(name, effective_agent_type, effective_cwd, node=node,
+                                              grant_mode=grant_mode, requested_by=requested_by)
+        if isinstance(result, dict) and "error" not in result:
+            result["moved_from"] = killed_node_id
+        return result
 
     # -- move (task item 7): explicit prepare/create-on-target/verify/stop-
     # source workflow. NEVER live migration -- no process memory, no
@@ -367,6 +459,22 @@ class ControllerService:
                 # named directly.
                 return {"error": "PLATFORM_MISMATCH", "node_id": node_id,
                         "detail": f"node {node_id!r} is platform={explicit_node.platform!r}, required {platform!r}"}
+            if explicit_node.status != NODE_ONLINE:
+                # Real gap found wiring the dashboard's own multi-node
+                # create-session UX through here for the first time: this
+                # branch had no online check at all, unlike auto placement
+                # (choose_node's own _eligible gate) and terminal_move_
+                # session's target-node check just below -- an operator
+                # explicitly picking a node the UI itself would have shown
+                # as offline got no clear, fast failure here, only
+                # whatever NodeClientError (or, worse, silent apparent
+                # success against a stale/nonexistent client) the actual
+                # network call happened to produce. Fails BEFORE the
+                # network call now, same "target-first, fail loud" posture
+                # as move -- task item 5's own explicit "không silently
+                # fallback... Fail rõ ràng" requirement.
+                return {"error": "NODE_UNREACHABLE", "node_id": node_id,
+                        "detail": f"node status={explicit_node.status!r}, not online"}
 
         client = self._clients.get(node_id)
         if client is None:

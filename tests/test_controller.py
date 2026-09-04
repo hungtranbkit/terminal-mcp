@@ -52,9 +52,11 @@ class FakeNodeClient:
     """Minimal NodeClient stand-in for a 'remote' node -- no HTTP, no
     subprocess, just enough surface for routing/ambiguity/offline tests."""
 
-    def __init__(self, sessions: dict[str, dict[str, Any]] | None = None, *, broken: bool = False) -> None:
+    def __init__(self, sessions: dict[str, dict[str, Any]] | None = None, *, broken: bool = False,
+                killed: list[dict[str, Any]] | None = None) -> None:
         self._sessions = sessions or {}
         self.broken = broken
+        self._killed = killed or []
         self.calls: list[tuple[str, str]] = []
 
     def list_sessions(self) -> dict[str, Any]:
@@ -81,7 +83,25 @@ class FakeNodeClient:
         return {}
 
     def list_killed_sessions(self) -> dict[str, Any]:
-        return {"killed_sessions": []}
+        if self.broken:
+            raise NodeClientError("simulated transport failure")
+        return {"killed_sessions": list(self._killed)}
+
+    def create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
+                       initial_prompt=None, grant_mode="none", binding=None, requested_by=None) -> dict[str, Any]:
+        self.calls.append(("create_session", name))
+        if self.broken:
+            raise NodeClientError("simulated transport failure")
+        self._sessions[name] = {"agent_type": agent_type, "cwd": cwd}
+        return {"session": name, "state": "READY", "agent_type": agent_type, "cwd": cwd}
+
+    def reopen_session(self, name: str, *, agent_type=None, cwd=None, grant_mode="none", requested_by=None) -> dict[str, Any]:
+        self.calls.append(("reopen_session", name))
+        if self.broken:
+            raise NodeClientError("simulated transport failure")
+        self._killed = [row for row in self._killed if row.get("name") != name]
+        self._sessions[name] = {"agent_type": agent_type, "cwd": cwd}
+        return {"session": name, "state": "READY", "agent_type": agent_type, "cwd": cwd}
 
 
 # -- Phase A/B backward compatibility: local-only behaves like plain TerminalService --
@@ -378,3 +398,110 @@ def test_invalidate_session_location_forces_reprobe(tmp_path):
     finally:
         import subprocess
         subprocess.run(["tmux", "kill-session", "-t", "ctrl-inval"], check=False, capture_output=True)
+
+
+# ---------------------------------------------------------------------------
+# terminal_reopen_session -- routes via each node's own killed-sessions
+# list, NEVER live-session resolution (a killed session, by definition,
+# is never in any node's live tmux listing -- see this method's own
+# docstring in controller.py for the exact regression this fixes: the
+# dashboard's create-session-UX multi-node work, task item 9).
+# ---------------------------------------------------------------------------
+
+
+def _register_fake_remote(controller: ControllerService, node_id: str, client: FakeNodeClient) -> None:
+    controller.registry.register(node_id, display_name=node_id, hostname=f"{node_id}-host", endpoint=f"http://{node_id}")
+    controller._clients[node_id] = client
+    controller.registry.heartbeat(
+        node_id,
+        metrics=NodeMetrics(cpu_percent=5.0, load1=0.1, load5=0.1, load15=0.1, cpu_count=4,
+                            ram_total_bytes=8_000_000_000, ram_used_bytes=1_000_000_000, ram_percent=12.5,
+                            swap_total_bytes=0, swap_used_bytes=0, swap_percent=0.0,
+                            disk_total_bytes=100_000_000_000, disk_used_bytes=1_000_000_000,
+                            disk_free_bytes=99_000_000_000, disk_percent=1.0),
+        tmux_session_count=0, agent_counts={}, agent_types=("shell", "claude"), agent_version=None, labels=(),
+    )
+
+
+def test_reopen_finds_the_right_remote_node_via_its_own_killed_sessions_list(tmp_path):
+    # The general _route/resolve_session path would report SESSION_NOT_
+    # FOUND here (the session is, correctly, in no node's LIVE listing --
+    # it's killed) -- this must use the killed-sessions list instead.
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    remote = FakeNodeClient(killed=[{"name": "ctrl-remote-reopen", "agent_type": "shell",
+                                     "working_directory": "/tmp", "metadata_complete": True}])
+    _register_fake_remote(controller, "remote-a", remote)
+
+    result = controller.terminal_reopen_session("ctrl-remote-reopen")
+    assert result.get("error") is None, result
+    assert result["node_id"] == "remote-a"
+    assert ("reopen_session", "ctrl-remote-reopen") in remote.calls
+
+
+def test_reopen_stale_location_cache_never_breaks_it(tmp_path):
+    # Real regression this fix closes: an EXPIRED (or simply never-
+    # populated) session-location cache entry must not matter at all --
+    # reopen never consults that cache for resolution in the first place.
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    remote = FakeNodeClient(killed=[{"name": "ctrl-cache-gone", "agent_type": "shell",
+                                     "working_directory": "/tmp", "metadata_complete": True}])
+    _register_fake_remote(controller, "remote-b", remote)
+    # Simulate a stale/never-set cache pointing nowhere useful for this name.
+    controller.invalidate_session_location("ctrl-cache-gone")
+
+    result = controller.terminal_reopen_session("ctrl-cache-gone")
+    assert result["node_id"] == "remote-b"
+
+
+def test_reopen_not_found_anywhere_reports_cleanly(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    result = controller.terminal_reopen_session("ctrl-nowhere")
+    assert result["error"] == "SESSION_NOT_FOUND"
+
+
+def test_reopen_explicit_node_moves_it_elsewhere_using_saved_metadata(tmp_path):
+    # task item 9: "cho phép đổi node nếu user chọn Move/Reopen elsewhere"
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    origin = FakeNodeClient(killed=[{"name": "ctrl-move-reopen", "agent_type": "shell",
+                                     "working_directory": "/tmp", "metadata_complete": True}])
+    target = FakeNodeClient()
+    _register_fake_remote(controller, "origin-node", origin)
+    _register_fake_remote(controller, "target-node", target)
+
+    result = controller.terminal_reopen_session("ctrl-move-reopen", node="target-node")
+    assert result.get("error") is None, result
+    assert result["node_id"] == "target-node"
+    assert result["moved_from"] == "origin-node"
+    assert ("create_session", "ctrl-move-reopen") in target.calls
+    assert ("reopen_session", "ctrl-move-reopen") not in origin.calls  # never touched the origin's own reopen path
+
+
+def test_reopen_explicit_node_same_as_origin_uses_reopen_not_create(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    origin = FakeNodeClient(killed=[{"name": "ctrl-same-node", "agent_type": "shell",
+                                     "working_directory": "/tmp", "metadata_complete": True}])
+    _register_fake_remote(controller, "origin-node", origin)
+
+    result = controller.terminal_reopen_session("ctrl-same-node", node="origin-node")
+    assert result["node_id"] == "origin-node"
+    assert ("reopen_session", "ctrl-same-node") in origin.calls
+
+
+def test_reopen_explicit_override_agent_type_and_cwd_used_over_saved_metadata(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    origin = FakeNodeClient(killed=[{"name": "ctrl-override", "agent_type": "shell",
+                                     "working_directory": "/tmp/old", "metadata_complete": True}])
+    target = FakeNodeClient()
+    _register_fake_remote(controller, "origin-node2", origin)
+    _register_fake_remote(controller, "target-node2", target)
+
+    result = controller.terminal_reopen_session("ctrl-override", node="target-node2",
+                                                 agent_type="claude", cwd="/tmp/new")
+    assert result["agent_type"] == "claude"
+    assert result["cwd"] == "/tmp/new"

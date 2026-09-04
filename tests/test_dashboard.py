@@ -845,8 +845,13 @@ def test_dashboard_health_indicator_no_new_backend_route():
     # the Kill confirm POST and the Reopen POST, neither of which goes
     # through fetchJSON since neither needs its Cloudflare-Access-redirect
     # detection -- a POST mutation route redirected to a login page would
-    # already read back as a non-JSON body either way).
-    assert DASHBOARD_HTML.count("fetch(") == 11  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen
+    # already read back as a non-JSON body either way), plus two more from
+    # the multi-node "Reopen elsewhere" flow (task item 9): a fresh
+    # /dashboard/api/nodes fetch to list current nodes for the prompt, and
+    # its own separate /dashboard/api/session/reopen POST (distinct call
+    # site from the plain Reopen button's own, same-node call just above
+    # it -- two different bodies, `node` present only on this one).
+    assert DASHBOARD_HTML.count("fetch(") == 13  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere)
 
 
 def test_dashboard_auth_required_distinguished_from_offline():
@@ -1664,3 +1669,55 @@ def test_dashboard_state_order_includes_completion_candidate_and_verified_done()
     assert "'DONE'" not in order_line
     assert "'COMPLETION_CANDIDATE'" in order_line
     assert "'VERIFIED_DONE'" in order_line
+
+
+# ---------------------------------------------------------------------------
+# Create Session node selector UI (task item 1-8, 12) -- SESSIONS_ADMIN_HTML's
+# own #csModal. Route/routing correctness is covered end-to-end by
+# tests/test_dashboard_multinode_sessions.py (a real TestClient + fake
+# remote nodes); these are source-presence assertions for the client-side
+# UX pieces (node dropdown, capability filtering, submit-time
+# revalidation) that file can't exercise without a JS runtime.
+# ---------------------------------------------------------------------------
+
+
+def test_sessions_admin_create_form_has_a_node_selector_defaulting_to_auto():
+    assert '<select id="csNode"><option value="auto">Auto (Recommended)</option></select>' in SESSIONS_ADMIN_HTML
+
+
+def test_sessions_admin_node_capability_filter_mirrors_scheduler_eligibility():
+    # Same rule as scheduler.py's own _eligible: agent_type "shell" needs
+    # nothing special; anything else must be in that node's own reported
+    # agent_types -- never a second, independently-drifting notion of
+    # "supported".
+    assert "function nodeCapable(node, agentType) {" in SESSIONS_ADMIN_HTML
+    assert "return agentType === 'shell' || (node.agent_types || []).includes(agentType);" in SESSIONS_ADMIN_HTML
+    assert "opt.disabled = true;" in SESSIONS_ADMIN_HTML
+
+
+def test_sessions_admin_create_sends_node_field_and_refetches_on_agent_change():
+    assert "body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode})" in SESSIONS_ADMIN_HTML
+    assert "renderNodeOptions(); // re-filter the SAME cached node list -- no re-fetch needed just for this" in SESSIONS_ADMIN_HTML
+    assert "loadNodesForCreateModal(); // fresh every open" in SESSIONS_ADMIN_HTML
+
+
+def test_sessions_admin_create_revalidates_explicit_node_at_submit_time():
+    # Task item 7: node may have gone offline/overloaded while the form
+    # was open -- re-checked right before the actual POST, never trusting
+    # a stale in-memory read.
+    assert "await loadNodesForCreateModal();" in SESSIONS_ADMIN_HTML
+    assert "không còn khả dụng (offline hoặc thiếu capability)" in SESSIONS_ADMIN_HTML
+    assert "đang overloaded" in SESSIONS_ADMIN_HTML
+
+
+def test_sessions_admin_node_label_badge_shown_for_remote_sessions_only():
+    assert "if (row.node_id && row.node_id !== 'local') {" in SESSIONS_ADMIN_HTML
+    assert "nodeBadge.className = 'node-badge';" in SESSIONS_ADMIN_HTML
+
+
+def test_dashboard_reopen_elsewhere_button_present_and_wired():
+    # Task item 9: default Reopen stays same-node; a SEPARATE explicit
+    # action exists for moving it.
+    assert "↩▾ Reopen elsewhere" in DASHBOARD_HTML
+    assert "async function reopenKilledSessionElsewhere(entry) {" in DASHBOARD_HTML
+    assert "const body = {name: entry.name, node: targetNode};" in DASHBOARD_HTML
