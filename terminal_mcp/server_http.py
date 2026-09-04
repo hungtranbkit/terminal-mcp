@@ -18,6 +18,7 @@ from .health import register_health
 from .logging_setup import RequestIdMiddleware, SecurityHeadersMiddleware, configure_logging
 from .maintenance import MaintenanceLoop
 from .mcp_app import build_mcp
+from . import network_bind, network_middleware
 from .node_client import LocalNodeClient
 from .node_registry import NodeRegistry
 from .supervisor import SupervisorLoop, SupervisorService, SupervisorStore
@@ -136,14 +137,38 @@ async def _serve(server) -> None:
     id correlation, security response headers) need one. log_config=None
     is deliberate: uvicorn's own default logging setup would otherwise
     call logging.config.dictConfig() and silently replace the root
-    handler configure_logging() (called before this) just installed."""
+    handler configure_logging() (called before this) just installed.
+
+    Loopback bind is ALWAYS present, unchanged -- HTTP_HOST/HTTP_PORT
+    above stay the loopback default this whole comment (and the class's
+    own "remote access must go through an authenticated HTTPS tunnel")
+    describes. TERMINAL_MCP_LAN_BIND additionally, explicitly opts into
+    a SECOND socket on this host's own LAN address, purely so a worker
+    node's own node-agent can reach node_heartbeat directly -- see
+    network_bind.py's own module docstring for the full two-layer
+    (bind-address + application-level CIDR guard) safety rationale, and
+    docs/multi-node.md's own "Controller LAN bind" section for the
+    operator-facing how-to. Every existing Cloudflare-Access-gated route
+    is unaffected either way -- that check is independent of which
+    socket a request arrived on."""
     starlette_app = server.streamable_http_app(
         streamable_http_path=HTTP_PATH, json_response=True, host=HTTP_HOST,
     )
+    lan_bind_ip = network_bind.resolve_lan_bind(os.environ.get("TERMINAL_MCP_LAN_BIND"))
+    allowed_cidrs = network_bind.resolve_allowed_cidrs(os.environ.get("TERMINAL_MCP_ALLOWED_NODE_CIDRS"), lan_bind_ip)
+    if lan_bind_ip:
+        _log.warning(
+            "network_bind: LAN bind enabled on %s:%d, allowed source CIDRs=%s -- run "
+            "'terminal-mcp-doctor connection' for OS-firewall guidance if you haven't applied one yet "
+            "(this process enforces the same allowlist itself either way, see network_middleware.py)",
+            lan_bind_ip, HTTP_PORT, [str(c) for c in allowed_cidrs],
+        )
+    starlette_app.add_middleware(network_middleware.LanCidrGuardMiddleware, lan_bind_ip=lan_bind_ip, allowed_cidrs=allowed_cidrs)
     starlette_app.add_middleware(SecurityHeadersMiddleware)
     starlette_app.add_middleware(RequestIdMiddleware)
-    config = uvicorn.Config(starlette_app, host=HTTP_HOST, port=HTTP_PORT, log_level="info", log_config=None)
-    await uvicorn.Server(config).serve()
+    sockets = network_bind.build_listen_sockets(HTTP_PORT, lan_bind_ip)
+    config = uvicorn.Config(starlette_app, log_level="info", log_config=None)
+    await uvicorn.Server(config).serve(sockets=sockets)
 
 
 def main() -> None:

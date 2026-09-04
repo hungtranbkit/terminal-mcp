@@ -115,3 +115,38 @@ def test_human_output_shows_os_and_backend(tmp_path, monkeypatch, capsys):
     doctor.main(["nodes", "--config", config_path])
     out = capsys.readouterr().out
     assert "[linux/tmux]" in out
+
+
+# ---------------------------------------------------------------------------
+# `terminal-mcp-doctor connection`'s controller-endpoints reporting
+# (network_bind.py's describe_endpoints, task item 7).
+# ---------------------------------------------------------------------------
+
+
+def test_connection_reports_loopback_only_when_lan_bind_unset(monkeypatch, capsys):
+    monkeypatch.delenv("TERMINAL_MCP_LAN_BIND", raising=False)
+    monkeypatch.delenv("TERMINAL_MCP_ALLOWED_NODE_CIDRS", raising=False)
+    doctor.main(["connection", "--json"])
+    result = json.loads(capsys.readouterr().out)
+    assert result["endpoints"]["loopback"] == "http://127.0.0.1:8766"
+    assert result["endpoints"]["lan"] is None
+
+
+def test_connection_reports_lan_endpoint_and_cidrs_when_configured(monkeypatch, capsys):
+    monkeypatch.setenv("TERMINAL_MCP_LAN_BIND", "192.168.1.132")
+    monkeypatch.setenv("TERMINAL_MCP_ALLOWED_NODE_CIDRS", "192.168.1.0/24")
+    doctor.main(["connection", "--json"])
+    result = json.loads(capsys.readouterr().out)
+    assert result["endpoints"]["lan"] == "http://192.168.1.132:8766"
+    assert result["endpoints"]["allowed_cidrs"] == ["192.168.1.0/24"]
+    assert result["endpoints"]["firewall_verified"] is False
+
+
+def test_connection_human_output_shows_endpoints_section(monkeypatch, capsys):
+    monkeypatch.setenv("TERMINAL_MCP_LAN_BIND", "192.168.1.132")
+    monkeypatch.setenv("TERMINAL_MCP_ALLOWED_NODE_CIDRS", "192.168.1.0/24")
+    doctor.main(["connection"])
+    out = capsys.readouterr().out
+    assert "controller endpoints:" in out
+    assert "192.168.1.132:8766" in out
+    assert "loopback:" in out

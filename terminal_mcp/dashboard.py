@@ -16,7 +16,7 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
-from . import lan_discovery, remote_connect, tunnel_diagnostics
+from . import lan_discovery, network_bind, remote_connect, tunnel_diagnostics
 from .cf_access import verify_access_assertion
 from .agent_availability import available_agent_types
 from .connection_store import ConnectionStore, generate_node_token
@@ -2928,6 +2928,7 @@ NODES_ADMIN_HTML = """<!doctype html>
       <button class="icon-btn" id="addNodeBtn" type="button">+ Thêm node</button>
       <button class="icon-btn" id="refreshBtn" type="button">⟳ Refresh</button>
       <a class="back" href="/dashboard">← Terminal</a>
+      <span class="badge unknown" id="endpointsBadge" title="Controller endpoints" hidden></span>
       <span class="live" id="liveBadge">● LIVE</span>
     </div>
   </header>
@@ -3241,6 +3242,21 @@ NODES_ADMIN_HTML = """<!doctype html>
       });
     }
 
+    function renderEndpointsBadge(endpoints) {
+      const el = document.getElementById('endpointsBadge');
+      if (!endpoints) { el.hidden = true; return; }
+      el.hidden = false;
+      if (endpoints.lan) {
+        el.className = 'badge healthy';
+        el.textContent = `LAN: ${endpoints.lan}`;
+        el.title = `Loopback: ${endpoints.loopback}\nLAN: ${endpoints.lan} (allowed: ${(endpoints.allowed_cidrs || []).join(', ')})\n${endpoints.firewall_reminder || ''}\nTunnel: ${endpoints.tunnel || ''}`;
+      } else {
+        el.className = 'badge unknown';
+        el.textContent = 'LAN: off';
+        el.title = `Loopback: ${endpoints.loopback}\nLAN bind not configured (TERMINAL_MCP_LAN_BIND unset)${endpoints.lan_error ? ' -- ' + endpoints.lan_error : ''}\nTunnel: ${endpoints.tunnel || ''}`;
+      }
+    }
+
     async function loadAll() {
       const liveBadgeEl = document.getElementById('liveBadge');
       try {
@@ -3248,6 +3264,7 @@ NODES_ADMIN_HTML = """<!doctype html>
         if (!result.ok) throw new Error(result.data.error || 'failed');
         nodesCache = result.data.nodes || [];
         renderCards();
+        renderEndpointsBadge(result.data.controller_endpoints);
         liveBadgeEl.textContent = '● LIVE'; liveBadgeEl.className = 'live';
       } catch (error) {
         if (error instanceof AuthRequiredError) { liveBadgeEl.textContent = '● SIGN-IN REQUIRED'; liveBadgeEl.className = 'live auth-required'; }
@@ -4724,7 +4741,19 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         def _compute() -> dict:
             _refresh_local_heartbeat()
             nodes = controller.list_nodes()
-            return {"nodes": [_node_to_dict(n) for n in nodes]}
+            # Task item 7: "Doctor/dashboard phải hiển thị rõ controller
+            # endpoints" -- same resolver terminal-mcp-doctor connection
+            # uses, so the Nodes page and the CLI never show two
+            # independently-drifting answers.
+            endpoints = network_bind.describe_endpoints(
+                # 8766 -- server_http.py's own HTTP_PORT constant, not
+                # imported directly to avoid a circular import
+                # (server_http.py itself imports register_dashboard from
+                # this module).
+                port=8766, lan_bind_env=os.environ.get("TERMINAL_MCP_LAN_BIND"),
+                cidrs_env=os.environ.get("TERMINAL_MCP_ALLOWED_NODE_CIDRS"),
+            )
+            return {"nodes": [_node_to_dict(n) for n in nodes], "controller_endpoints": endpoints}
 
         result = await anyio.to_thread.run_sync(_compute)
         return JSONResponse(result, headers={"Cache-Control": "no-store"})

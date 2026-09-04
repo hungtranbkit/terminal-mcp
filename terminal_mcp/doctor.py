@@ -27,6 +27,16 @@ from .tunnel_diagnostics import DEFAULT_STALE_THRESHOLD_SECONDS, WatchdogState, 
 def cmd_connection(args: argparse.Namespace) -> int:
     state = WatchdogState.load(default_state_path())
     result = diagnose(stale_threshold=args.stale_threshold, state=state)
+    # Controller endpoints (task item 7: "Doctor/dashboard phải hiển thị
+    # rõ controller endpoints: loopback, LAN, tunnel") -- reads the exact
+    # same env vars server_http.py's own startup resolves, so this always
+    # reflects the RUNNING process's real binding, never a guess.
+    from . import network_bind
+    from .server_http import HTTP_PORT
+    result["endpoints"] = network_bind.describe_endpoints(
+        port=HTTP_PORT, lan_bind_env=os.environ.get("TERMINAL_MCP_LAN_BIND"),
+        cidrs_env=os.environ.get("TERMINAL_MCP_ALLOWED_NODE_CIDRS"),
+    )
     if args.json:
         print(json.dumps(result, sort_keys=True))
     else:
@@ -58,6 +68,17 @@ def _print_human(result: dict) -> None:
     else:
         print("  last_recovery_action: none")
     print(f"  recommended_action:   {result['recommended_action']}")
+    endpoints = result.get("endpoints") or {}
+    print("  controller endpoints:")
+    print(f"    loopback: {endpoints.get('loopback')}")
+    if endpoints.get("lan"):
+        print(f"    lan:      {endpoints['lan']}  (allowed_cidrs={endpoints.get('allowed_cidrs')})")
+        print(f"    ⚠ {endpoints.get('firewall_reminder')}")
+    elif endpoints.get("lan_error"):
+        print(f"    lan:      DISABLED -- {endpoints['lan_error']}")
+    else:
+        print("    lan:      not configured (loopback-only -- set TERMINAL_MCP_LAN_BIND to enable)")
+    print(f"    tunnel:   {endpoints.get('tunnel')}")
 
 
 def cmd_nodes(args: argparse.Namespace) -> int:

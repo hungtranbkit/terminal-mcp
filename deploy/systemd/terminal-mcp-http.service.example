@@ -6,6 +6,20 @@ After=default.target
 Type=simple
 WorkingDirectory=/home/dell/workspace/terminal-mcp
 Environment=TERMINAL_MCP_CONFIG=/home/dell/workspace/terminal-mcp/config.yaml
+# Multi-node LAN worker heartbeats need this controller reachable on the
+# LAN (loopback-only, the default above with both lines commented out,
+# means a remote node's own heartbeat push can never reach node_
+# heartbeat) -- uncomment and set your own real private IP/subnet to
+# enable it. Never 0.0.0.0; network_bind.py validates this is a private/
+# link-local address and application-level LanCidrGuardMiddleware
+# restricts the LAN socket to ALLOWED_NODE_CIDRS regardless of whatever
+# OS firewall rule you do or don't have in front of it (see
+# `terminal-mcp-doctor connection`'s own printed firewall_script
+# guidance). Existing Cloudflare-Access-gated routes are unaffected
+# either way -- that check doesn't depend on which socket a request
+# arrived on.
+# Environment=TERMINAL_MCP_LAN_BIND=192.168.1.10
+# Environment=TERMINAL_MCP_ALLOWED_NODE_CIDRS=192.168.1.0/24
 # Per-node shared secrets for config.yaml's nodes.remote[].token_env
 # entries -- mode 600, never inline here. The leading "-" means "load if
 # present, skip silently otherwise" -- without it, systemd refuses to
