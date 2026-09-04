@@ -44,6 +44,7 @@ class TmuxClient:
             "#{session_id}",  # tmux's own "$N" id -- P0-2 identity pinning
             "#{pane_id}",     # tmux's own "%N" id -- P0-2 identity pinning
             "#{pane_in_mode}",  # copy-mode/other tmux client mode -- P0 audit finding #14
+            "#{pane_current_path}",  # kill-with-reopen-metadata's opportunistic cwd capture
         )
     )
 
@@ -173,11 +174,11 @@ class TmuxClient:
 
 
 def parse_session_line(line: str) -> SessionInfo:
-    parts = line.split("|", 10)
-    if len(parts) != 11:
+    parts = line.split("|", 11)
+    if len(parts) != 12:
         raise TmuxError("unexpected tmux session format")
     (name, attached, windows, created, activity, pane_pid, command, pane_dead,
-     session_id, pane_id, pane_in_mode) = parts
+     session_id, pane_id, pane_in_mode, pane_current_path) = parts
     try:
         return SessionInfo(
             name=name,
@@ -191,6 +192,7 @@ def parse_session_line(line: str) -> SessionInfo:
             session_id=session_id,
             pane_id=pane_id,
             pane_in_mode=bool(int(pane_in_mode)),
+            pane_current_path=pane_current_path,
         )
     except ValueError as exc:
         raise TmuxError("invalid numeric field from tmux") from exc

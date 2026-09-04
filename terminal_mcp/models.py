@@ -27,6 +27,15 @@ class SessionInfo:
     # pane_current_command reports (the foreground process is unaffected
     # and unaware). See _input_guard (core.py) / P0 audit finding #14.
     pane_in_mode: bool = False
+    # tmux's own "#{pane_current_path}" -- the pane's current working
+    # directory, resolved fresh from tmux each call (never inferred/
+    # guessed). Used by the Kill-session-with-reopen-metadata flow
+    # (core.py's terminal_kill_session) to opportunistically capture a
+    # real, observed cwd at kill time -- still re-validated against
+    # config.session_lifecycle.allowed_cwd_roots before ever being
+    # trusted for a Reopen, exactly like any other working_directory
+    # input (see lifecycle.py's resolve_cwd).
+    pane_current_path: str = ""
 
 
 @dataclass(frozen=True)

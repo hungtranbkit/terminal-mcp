@@ -225,6 +225,56 @@ def build_mcp(service: TerminalService | None = None,
             supervisor.unwatch(session=name, delete=False)
         return result
 
+    @server.tool()
+    def terminal_kill_session(name: str, confirm_name: str) -> dict:
+        """Destructive: terminates exactly one tmux session AND its
+        process tree (never tmux kill-server, never touches any other
+        session) to free the RAM/process it was using. `confirm_name`
+        must exactly equal `name` -- a required, server-enforced second
+        confirmation, since this is meant to be called deliberately, not
+        by an agent guessing a session might be safe to kill. The
+        configured protected session(s) -- always including "terminal-mcp"
+        itself -- can never be killed this way, full stop.
+
+        On success, captures the pane's real, currently-observed command
+        and working directory (before killing it) and saves them as
+        reopen metadata (see terminal_reopen_session) -- the response's
+        reopen_metadata.metadata_complete tells you whether a later
+        reopen will be able to proceed without you having to supply
+        agent_type/working_directory explicitly. Idempotent: a session
+        already gone returns a success-shaped result (reopen_metadata:
+        null -- nothing was actually killed by this call, so nothing new
+        was captured), not an error."""
+        result = terminal.terminal_kill_session(name, confirm_name, requested_by="mcp")
+        if "error" not in result:
+            supervisor.unwatch(session=name, delete=False)
+        return result
+
+    @server.tool()
+    def terminal_reopen_session(name: str, agent_type: str | None = None,
+                                working_directory: str | None = None) -> dict:
+        """Recreates a NEW tmux session/process under `name` using saved
+        Kill metadata (terminal_kill_session) -- explicitly NOT a
+        resurrection of the killed process's own memory/state, a fresh
+        process with the same name/working directory/launcher. Fails
+        closed with REOPEN_METADATA_INCOMPLETE (naming what's missing)
+        rather than guessing if no saved metadata exists and you don't
+        supply agent_type/working_directory yourself, or the saved
+        agent_type needs a working directory that was never captured.
+        agent_type/working_directory, if you DO supply them, override the
+        saved values field-by-field -- the intended way to reopen a
+        session whose saved metadata turned out incomplete."""
+        return terminal.terminal_reopen_session(name, agent_type=agent_type, cwd=working_directory,
+                                                 requested_by="mcp")
+
+    @server.tool()
+    def terminal_list_killed_sessions() -> dict:
+        """Sessions terminal_kill_session has saved reopen metadata for,
+        most recent first -- each entry's metadata_complete says whether
+        terminal_reopen_session can recreate it without you supplying
+        agent_type/working_directory yourself."""
+        return terminal.terminal_list_killed_sessions()
+
     # -- Supervisor Loop v1: detection + a durable event queue only. Never
     # sends input, never executes a shell command; the underlying watch/poll
     # path is the same whitelist-guarded terminal_status(_bound) above. ----

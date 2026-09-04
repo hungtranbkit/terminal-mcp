@@ -50,6 +50,9 @@ INPUT_ERROR_STATUS = {
     "TMUX_ERROR": 502,
     # Web terminal (webterm.py) error -> status mapping, same table/convention.
     "WEB_TERMINAL_DISABLED": 403,
+    # Kill/Reopen (core.py's terminal_kill_session/terminal_reopen_session).
+    "CONFIRMATION_MISMATCH": 400,
+    "REOPEN_METADATA_INCOMPLETE": 422,
 }
 
 
@@ -131,52 +134,49 @@ DASHBOARD_HTML = """<!doctype html>
     #sidebarBackdrop { display:none }
     #sessions { padding:8px; overflow:auto; max-height:100% }
     /* .session is a <div role="button"> now, not a <button> -- it has to
-       host a real, independently-clickable <button> child (.perm-btn, the
-       row's own "Quyền truy cập" entry point) and a <input type=checkbox>
-       (bulk-select), neither of which is legal inside a <button>. Keyboard
-       activation (Enter/Space) is wired explicitly in JS to compensate for
-       giving up the native <button> semantics. */
+       host real, independently-clickable <button> action children (Mở
+       terminal / Access / Kill), which aren't legal inside a <button>.
+       Keyboard activation (Enter/Space) is wired explicitly in JS to
+       compensate for giving up the native <button> semantics. No
+       checkbox, no per-row lock/eye icon -- click the row (or its name)
+       to select it; grant/revoke lives in the Access action + its modal,
+       shown only when there's actually something to grant (see
+       .session .row-actions below). */
     .session { display:flex; align-items:flex-start; gap:8px; width:100%; text-align:left; color:inherit; background:transparent; border:1px solid transparent; border-radius:8px; padding:11px; cursor:pointer }
     .session:hover, .session.active { background:#19243b; border-color:#344360 }
     .session.needs-attention { border-color:var(--amber); background:rgba(255,200,87,.08) }
-    .session .sess-check { flex:0 0 auto; margin-top:3px }
     .session .sess-main { flex:1; min-width:0 }
-    /* One lock/eye/unlock icon per grantable (non-whitelisted) row only --
-       a statically-whitelisted session never renders this at all, nothing
-       to grant/revoke for it, ever. */
-    .session .perm-btn { flex:0 0 auto; align-self:center; background:transparent; border:1px solid var(--line); border-radius:6px; color:var(--muted); padding:3px 7px; font-size:12px; cursor:pointer; line-height:1 }
-    .session .perm-btn:hover { color:var(--text); border-color:var(--muted) }
+    /* Contextual actions (Mở terminal / Access / Kill) -- a plain text
+       row, never icon-only, never rendered for every row regardless of
+       relevance (Access only when grantable, Kill only when session_
+       lifecycle is enabled). Stops event propagation to the row's own
+       onclick so clicking an action never also (re)selects the row. */
+    .session .row-actions { flex:0 0 auto; display:flex; flex-direction:column; gap:4px; align-items:flex-end }
+    .session .row-actions button, .session .row-actions a {
+      background:transparent; border:1px solid var(--line); border-radius:6px; color:var(--muted);
+      padding:3px 8px; font-size:11px; cursor:pointer; text-decoration:none; white-space:nowrap; font:inherit;
+    }
+    .session .row-actions button:hover, .session .row-actions a:hover { color:var(--text); border-color:var(--muted) }
+    .session .row-actions button.danger { color:#ff9f9f; border-color:#5a2f38 }
+    .session .row-actions button.danger:hover { color:#fff; background:#3a2430; border-color:#ff9f9f }
     .name { font-weight:700 } .meta { font-size:12px; color:var(--muted); margin-top:4px }
     .attach-dot { display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--line); margin-right:5px; vertical-align:middle }
     .attach-dot.on { background:var(--green) }
-    /* Compact bulk-select bar above the session list -- only ever shown
-       while 1+ grantable rows are checked (see #bulkBar[hidden] below);
-       zero footprint otherwise, per the "gọn, không làm dashboard chật"
-       requirement. */
-    #bulkStatus { padding:4px 12px 0; font-size:11px; color:var(--muted) }
-    #bulkStatus[hidden] { display:none }
-    .bulk-bar { display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:8px 12px; border-bottom:1px solid var(--line); font-size:11px; color:var(--muted) }
-    .bulk-bar[hidden] { display:none }
-    .bulk-bar button { background:#2b3f66; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 8px; cursor:pointer; font:inherit; font-size:11px }
-    .bulk-bar button.danger { background:#3a2430 }
-    .bulk-bar button.link { background:transparent; border:none; color:var(--muted); text-decoration:underline; padding:4px 2px }
-    .bulk-bar button:disabled { opacity:.5; cursor:not-allowed }
     /* Compact attention badge: reused identically in the session list and the
        viewer header (#summary) so a WAITING_INPUT session is obvious in both
        places — driven entirely by classify_status()'s existing state string,
        nothing new is inferred from pane content here. */
     .attn-badge { display:inline-block; background:var(--amber); color:#231a00; font-size:11px; font-weight:700; padding:1px 6px; border-radius:4px; vertical-align:middle }
-    /* Layout bugfix (real-device report): .detail's 6 direct children in
-       DOM order are #sessionTabs, #summary, #grantBar, .term, #inputNote,
-       #inputBar -- grid-template-rows must list exactly 6 tracks, in that
-       order, with .term (the actual output viewport) as the one flexible
-       track. It previously listed only 4 (a leftover from before
-       #sessionTabs/#grantBar existed), which silently handed .term's
-       intended growing row to #summary instead and let its content
-       overflow into the rows below -- the reported overlap. */
-    .detail { display:grid; grid-template-rows:auto auto auto minmax(0,1fr) auto auto; min-width:0; min-height:0 }
+    /* Layout bugfix (real-device report), still applicable with the
+       top session-tabs bar removed: .detail's 5 direct children in DOM
+       order are #summary, #grantBar, .term, #inputNote, #inputBar --
+       grid-template-rows must list exactly 5 tracks, in that order, with
+       .term (the actual output viewport) as the one flexible track, or
+       its intended growing row silently goes to #summary instead and lets
+       its content overflow into the rows below. */
+    .detail { display:grid; grid-template-rows:auto auto minmax(0,1fr) auto auto; min-width:0; min-height:0 }
     #grantBar[hidden] { display:none } /* the plain #grantBar{display:flex} rule below would otherwise outrank the UA's own [hidden] default */
-    #summary { grid-row:2; padding:14px 16px; border-bottom:1px solid var(--line) }
+    #summary { grid-row:1; padding:14px 16px; border-bottom:1px solid var(--line) }
     .state-WAITING_INPUT { color:var(--amber) } .state-RUNNING { color:var(--green) }
     /* P0 Part C states: VERIFYING (independent verification in progress --
        amber, same "needs a look" weight as WAITING_INPUT); FAILED/BLOCKED
@@ -186,7 +186,7 @@ DASHBOARD_HTML = """<!doctype html>
     .state-VERIFYING { color:var(--amber) } .state-FAILED,.state-BLOCKED { color:#ff6b6b }
     /* Terminal-style pane: a small chrome bar (title + follow/jump controls)
        above a dark, monospace, ANSI-rendering scrollback view. */
-    .term { grid-row:4; display:flex; flex-direction:column; min-height:0 }
+    .term { grid-row:3; display:flex; flex-direction:column; min-height:0 }
     .term-bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 10px; padding:7px 12px; background:#0e1526; border-bottom:1px solid var(--line) }
     .term-dots { display:flex; gap:6px; flex:0 0 auto }
     .term-dots i { width:10px; height:10px; border-radius:50%; display:inline-block }
@@ -215,12 +215,12 @@ DASHBOARD_HTML = """<!doctype html>
        win over a class selector. */
     .search-current { background:#ffd645 !important; color:#111 !important; border-radius:2px }
     #output { flex:1; min-height:0; margin:0; padding:14px 18px; overflow:auto; white-space:pre-wrap; word-break:break-word; line-height:1.45; font-family:var(--mono); background:var(--term-bg); color:#dce5f5 }
-    #inputBar { grid-row:6; display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line) }
+    #inputBar { grid-row:5; display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line) }
     #inputBar input[type=text] { flex:1; background:#0e1526; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:9px 11px; font:inherit }
     #inputBar button { background:#2b3f66; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:9px 14px; cursor:pointer; font:inherit }
     #inputBar button:disabled { opacity:.5; cursor:not-allowed }
     #inputBar label { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:12px; white-space:nowrap }
-    #inputNote { grid-row:5; padding:6px 16px 0; font-size:12px; color:var(--muted) }
+    #inputNote { grid-row:4; padding:6px 16px 0; font-size:12px; color:var(--muted) }
     #inputNote.error { color:#ff6b6b }
     /* Compact single-line entry point only now -- "Quyền: <label>" plus one
        "🔐 Quyền truy cập" button that opens #permModal, which does all the
@@ -228,7 +228,7 @@ DASHBOARD_HTML = """<!doctype html>
        multi-button inline bar) so re-enabling it can never reintroduce the
        real mobile overlap bug that #permModal's own separate, off-grid
        overlay design structurally avoids. */
-    #grantBar { grid-row:3; display:flex; align-items:center; gap:8px; padding:8px 16px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); flex-wrap:wrap }
+    #grantBar { grid-row:2; display:flex; align-items:center; gap:8px; padding:8px 16px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); flex-wrap:wrap }
     #grantBar button { background:#2b3f66; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:6px 12px; cursor:pointer; font:inherit; font-size:12px }
     /* Quyền truy cập modal -- the single reusable UI for granting/revoking
        a non-whitelisted session's read/input grant, opened from a session
@@ -256,55 +256,52 @@ DASHBOARD_HTML = """<!doctype html>
     .pm-presets button:disabled { opacity:.5; cursor:not-allowed }
     .pm-block { color:#ff9f9f; font-size:11px }
     .pm-error { color:#ff6b6b; font-size:12px }
-    /* Browser-like session tabs -- always visible above output, one click
-       switches session (no sidebar-open step). A single, horizontally-
-       scrollable row (never wraps -- wrapping would push output down by a
-       variable amount every time the tab count changes); thin/overlay
-       scrollbar and touch-drag (`-webkit-overflow-scrolling`) so mobile
-       gets swipe for free from the platform, no custom JS needed. */
-    #sessionTabs {
-      grid-row:1;
-      display:flex; align-items:stretch; gap:2px; padding:4px 6px 0;
-      overflow-x:auto; overflow-y:hidden; scrollbar-width:thin; -webkit-overflow-scrolling:touch;
-      border-bottom:1px solid var(--line); background:var(--panel);
+    /* ---- Kill confirmation modal ------------------------------------
+       Same fixed-overlay + backdrop + body-class pattern as #permModal
+       (living OUTSIDE .detail's own grid, so it can never disturb that
+       grid's fragile track count) -- deliberately a SEPARATE modal, not
+       a repurposed #permModal, so a destructive action can never be
+       mistaken for the harmless grant/revoke one. The Kill button stays
+       disabled until the typed confirmation exactly matches the session
+       name -- the second, server-enforced check (core.py's confirm_name)
+       is the real floor; this is the human-facing half of it. */
+    #killBackdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:30 }
+    #killModal {
+      display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:31;
+      width:min(380px, calc(100vw - 32px)); max-height:80vh; overflow:auto;
+      background:var(--panel); border:1px solid #5a2f38; border-radius:12px; box-shadow:0 20px 50px rgba(0,0,0,.6);
     }
-    #sessionTabs:empty, #sessionTabs[hidden] { display:none }
-    .session-tab {
-      display:flex; align-items:center; gap:6px; flex:0 0 auto; max-width:220px;
-      padding:7px 8px 7px 12px; border-radius:8px 8px 0 0; border:1px solid var(--line); border-bottom:none;
-      background:#0f1730; color:var(--muted); cursor:pointer; font-size:12px; white-space:nowrap; user-select:none;
+    body.kill-modal-visible #killBackdrop, body.kill-modal-visible #killModal { display:block }
+    #killModal .km-head { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px }
+    #killModal .km-head strong { color:#ff9f9f; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    #killModal .km-body { padding:14px 16px; display:flex; flex-direction:column; gap:10px; font-size:13px }
+    #killModal .km-warn { color:var(--amber); font-size:12px; background:rgba(255,200,87,.1); border:1px solid var(--amber); border-radius:8px; padding:8px 10px }
+    #killModal input[type=text] { background:#0e1526; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:9px 11px; font:inherit }
+    #killModal .km-actions { display:flex; justify-content:flex-end; gap:8px }
+    #killModal .km-actions button { border-radius:8px; padding:9px 14px; cursor:pointer; font:inherit; font-size:13px; border:1px solid var(--line); background:#19243b; color:var(--text) }
+    #killModal .km-actions button.danger { background:#3a2430; border-color:#ff9f9f; color:#ff9f9f }
+    #killModal .km-actions button.danger:disabled { opacity:.4; cursor:not-allowed }
+    #killModal .km-error { color:#ff6b6b; font-size:12px }
+    /* ---- killed-sessions reopen list ---------------------------------
+       Compact, collapsed by default, zero footprint until there's
+       actually a killed session to reopen -- one small toggle line below
+       the live session list, never a second navigation surface for LIVE
+       sessions (only ever lists sessions that no longer exist). */
+    #killedSection { border-top:1px solid var(--line) }
+    #killedSection[hidden] { display:none }
+    #killedToggle {
+      width:100%; text-align:left; background:transparent; border:none; color:var(--muted); cursor:pointer;
+      padding:9px 12px; font:inherit; font-size:12px; display:flex; justify-content:space-between; align-items:center;
     }
-    .session-tab:hover { color:var(--text) }
-    .session-tab.active { background:var(--term-bg); color:var(--text); border-color:var(--line) }
-    .session-tab.needs-attention { border-color:var(--amber) }
-    .session-tab.needs-attention:not(.active) { background:rgba(255,200,87,.1) }
-    .session-tab .tab-name { overflow:hidden; text-overflow:ellipsis; max-width:150px }
-    /* Only rendered for a grantable (non-whitelisted) session's tab -- see
-       updateTabElement -- so a normal whitelisted tab shows nothing extra. */
-    .session-tab .tab-perm { flex:0 0 auto; font-size:11px; cursor:pointer; padding:0 1px }
-    .session-tab .tab-perm[hidden] { display:none }
-    .session-tab .tab-close {
-      flex:0 0 auto; width:16px; height:16px; line-height:16px; text-align:center; border-radius:4px;
-      color:var(--muted); font-size:12px; padding:0;
-    }
-    .session-tab .tab-close:hover { background:#3a2430; color:#ff9f9f }
-    .session-tab-add {
-      flex:0 0 auto; padding:7px 10px; border-radius:8px 8px 0 0; border:1px dashed var(--line);
-      background:transparent; color:var(--muted); cursor:pointer; font-size:14px; align-self:center;
-    }
-    .session-tab-add:hover { color:var(--text); border-color:var(--muted) }
-    #detachedMenu {
-      position:absolute; z-index:20; margin-top:4px; min-width:220px; max-width:320px; max-height:50vh; overflow:auto;
-      background:var(--panel); border:1px solid var(--line); border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.4);
-      padding:6px;
-    }
-    #detachedMenu button {
-      display:block; width:100%; text-align:left; background:transparent; border:none; color:var(--text);
-      padding:8px 10px; border-radius:6px; cursor:pointer; font:inherit; font-size:12px;
-    }
-    #detachedMenu button:hover { background:#19243b }
-    #detachedMenu .muted-item { color:var(--muted); padding:8px 10px; font-size:12px }
-    .lock-badge { background:#3a2430; color:#ff9f9f; border-radius:4px; padding:1px 6px; font-size:10px; margin-left:6px; vertical-align:middle }
+    #killedToggle:hover { color:var(--text) }
+    #killedList { padding:0 8px 8px }
+    #killedList[hidden] { display:none }
+    .killed-row { padding:8px 8px; border-radius:8px; font-size:12px }
+    .killed-row + .killed-row { border-top:1px solid var(--line) }
+    .killed-row .kr-name { font-weight:700 }
+    .killed-row .kr-meta { color:var(--muted); margin-top:2px }
+    .killed-row .kr-incomplete { color:var(--amber) }
+    .killed-row button { margin-top:6px; background:#2b3f66; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 10px; cursor:pointer; font:inherit; font-size:11px }
     /* Matched on EITHER dimension, not just width: a phone rotated to
        landscape can easily exceed 760px of width (e.g. 852px on an iPhone
        15 Pro) while its height drops well under 760px, and a naive
@@ -322,9 +319,6 @@ DASHBOARD_HTML = """<!doctype html>
          desktop-sized versions. */
       header { padding:8px 12px; gap:8px }
       h1 { font-size:15px }
-      #sessionTabs { padding:3px 4px 0; gap:1px }
-      .session-tab { padding:6px 6px 6px 10px; font-size:11.5px; max-width:150px }
-      .session-tab .tab-name { max-width:100px }
       header .muted { font-size:10px; line-height:1.25 }
       header .live { font-size:11px }
       .header-right { gap:6px }
@@ -443,9 +437,15 @@ DASHBOARD_HTML = """<!doctype html>
     </div>
   </header>
   <main>
-    <section class="panel" id="sessionsPanel"><div class="panel-title">SESSIONS <span id="count"></span></div><div id="bulkStatus" hidden></div><div id="bulkBar" class="bulk-bar" hidden></div><div id="sessions"></div></section>
+    <section class="panel" id="sessionsPanel">
+      <div class="panel-title">SESSIONS <span id="count"></span></div>
+      <div id="sessions"></div>
+      <div id="killedSection" hidden>
+        <button id="killedToggle" type="button"><span id="killedToggleLabel"></span><span>▾</span></button>
+        <div id="killedList" hidden></div>
+      </div>
+    </section>
     <section class="panel detail">
-      <div id="sessionTabs" class="session-tabs" role="tablist" aria-label="Sessions" hidden></div>
       <div id="summary" class="muted">Chọn một session để xem output.</div>
       <div id="grantBar" hidden></div>
       <div class="term">
@@ -504,6 +504,23 @@ DASHBOARD_HTML = """<!doctype html>
       <div class="pm-error" id="permModalError"></div>
     </div>
   </div>
+  <div id="killBackdrop"></div>
+  <div id="killModal" role="dialog" aria-modal="true" aria-labelledby="killModalTitle">
+    <div class="km-head">
+      <strong id="killModalTitle">Kill session</strong>
+      <button id="killModalCloseBtn" class="term-btn" type="button">✕</button>
+    </div>
+    <div class="km-body">
+      <div id="killModalWarn" class="km-warn" hidden></div>
+      <div>Gõ chính xác tên session để xác nhận:</div>
+      <input type="text" id="killConfirmInput" autocomplete="off" spellcheck="false">
+      <div class="km-error" id="killModalError"></div>
+      <div class="km-actions">
+        <button id="killCancelBtn" type="button">Huỷ</button>
+        <button id="killConfirmBtn" class="danger" type="button" disabled>🗑 Kill session</button>
+      </div>
+    </div>
+  </div>
   <script>
     let selected = null;
     let inputAllowed = false;
@@ -511,16 +528,25 @@ DASHBOARD_HTML = """<!doctype html>
     let lastRenderedSession = null;
     let sidebarForcedOpen = false;
     let fullscreenTerminal = false;
-    let lastKnownRows = []; // the most recent /dashboard/api/sessions rows, for immediate tab re-render (see selectSession)
+    let lastKnownRows = []; // the most recent /dashboard/api/sessions rows, reused by openPermModal/openKillModal without a re-fetch
     let loadDetailSequence = 0; // generation counter -- see loadDetail's own guard for why a session-name check alone isn't enough
-    let detachedMenuOpen = false;
     const sessionsEl = document.querySelector('#sessions');
-    const sessionTabsEl = document.querySelector('#sessionTabs');
     const outputEl = document.querySelector('#output');
     const summaryEl = document.querySelector('#summary');
     const grantBarEl = document.querySelector('#grantBar');
-    const bulkBarEl = document.querySelector('#bulkBar');
-    const bulkStatusEl = document.querySelector('#bulkStatus');
+    const killedSectionEl = document.querySelector('#killedSection');
+    const killedToggleEl = document.querySelector('#killedToggle');
+    const killedToggleLabelEl = document.querySelector('#killedToggleLabel');
+    const killedListEl = document.querySelector('#killedList');
+    const killBackdropEl = document.querySelector('#killBackdrop');
+    const killModalEl = document.querySelector('#killModal');
+    const killModalTitleEl = document.querySelector('#killModalTitle');
+    const killModalWarnEl = document.querySelector('#killModalWarn');
+    const killConfirmInputEl = document.querySelector('#killConfirmInput');
+    const killModalErrorEl = document.querySelector('#killModalError');
+    const killModalCloseBtnEl = document.querySelector('#killModalCloseBtn');
+    const killCancelBtnEl = document.querySelector('#killCancelBtn');
+    const killConfirmBtnEl = document.querySelector('#killConfirmBtn');
     const permBackdropEl = document.querySelector('#permBackdrop');
     const permModalEl = document.querySelector('#permModal');
     const permModalTitleEl = document.querySelector('#permModalTitle');
@@ -1144,18 +1170,16 @@ DASHBOARD_HTML = """<!doctype html>
     // "Xem output" (read) and "Gửi prompt" (input) -- the underlying
     // allowed/whitelist/read_granted/input_granted vocabulary never
     // surfaces; a statically-whitelisted session (row.allowed) never shows
-    // any grant control anywhere (row, tab, card, bulk-select) because it
-    // has nothing to grant/revoke, ever -- that decision is made in one
-    // place (grantable() below) and reused everywhere a control might
-    // render, so it can never drift between the row/tab/card/bulk paths.
+    // any grant control anywhere because it has nothing to grant/revoke,
+    // ever -- that decision is made in one place (grantable() below) and
+    // reused everywhere a control might render, so it can never drift.
     //
-    // Entry points, all opening the SAME #permModal:
-    //   - a lock/eye/unlock icon on each grantable session's row (loadSessions)
-    //   - the same icon on each grantable session's tab (makeTab/updateTabElement)
-    //   - a compact "🔐 Quyền truy cập" line in the open session's own card,
-    //     replacing the old always-multi-button inline bar (#grantBar below)
-    //   - the bulk-select bar's own preset buttons, which apply directly
-    //     without opening the modal at all (see renderBulkBar)
+    // Entry points, both opening the SAME #permModal (no per-row lock/eye
+    // icon anymore -- see item 2 of the dashboard cleanup this backs):
+    //   - a plain "Access" text button in each grantable row's action
+    //     column (renderRows/makeSessionActions)
+    //   - a compact "🔐 Quyền truy cập" line in the open session's own card
+    //     (#grantBar below)
     //
     // Human-facing labels for the same reason codes grant_session_input/
     // _input_grant_block_reason already return -- purely a display
@@ -1189,16 +1213,6 @@ DASHBOARD_HTML = """<!doctype html>
       if (row.effective_read) return 'Chỉ xem';
       return 'Không truy cập';
     }
-    function permIcon(row) {
-      const state = grantState(row);
-      return state === 'full' ? '🔓' : state === 'read' ? '👁' : '🔒';
-    }
-
-    // Bulk-select set (row checkboxes; see loadSessions) -- session names
-    // currently checked for the bulk action bar below. Only ever contains
-    // grantable() names (a whitelisted row never renders a checkbox).
-    const bulkSelected = new Set();
-
     // One raw grant-read/grant-input mutation, no refresh of its own --
     // applyPreset below does exactly ONE combined loadSessions()+loadDetail()
     // refresh after every session in a preset (whether that's 1 or many)
@@ -1211,10 +1225,11 @@ DASHBOARD_HTML = """<!doctype html>
       return response.json().catch(() => ({}));
     }
     // Applies preset ('full' | 'read' | 'none') to every session in
-    // `names`, then refreshes from the backend -- the ONE place any grant
-    // mutation actually happens, used by the modal's own preset buttons
-    // and the bulk-select bar alike, so their outcome (and its real,
-    // server-confirmed effective_read/effective_input) can never diverge.
+    // `names` (#permModal always calls this with exactly one -- the array
+    // shape is kept only because applyPreset itself is otherwise generic),
+    // then refreshes from the backend -- the ONE place any grant mutation
+    // actually happens, so its outcome (and its real, server-confirmed
+    // effective_read/effective_input) can never diverge from what's shown.
     // 'read' explicitly revokes input too if it was on (a real downgrade,
     // not just "grant read and leave input untouched"); 'none' revokes
     // read, which grants.py's own set_read already cascades into revoking
@@ -1244,11 +1259,15 @@ DASHBOARD_HTML = """<!doctype html>
       return failures;
     }
 
-    // ---- #permModal: the one reusable grant/revoke UI ----------------------
-    let permModalNames = null; // the session name(s) the open modal targets
+    // ---- #permModal: the one reusable grant/revoke UI (Access action) ------
+    // Single-session only -- the old multi-select bulk-grant path lived in
+    // the sidebar's row checkboxes, removed along with them (item 1 of the
+    // dashboard cleanup this backs); bulk grant management, if needed,
+    // still lives on the separate /dashboard/sessions admin screen.
+    let permModalName = null; // the session name the open modal targets
     function closePermModal() {
       document.body.classList.remove('perm-modal-visible');
-      permModalNames = null;
+      permModalName = null;
     }
     permModalCloseBtnEl.onclick = closePermModal;
     permBackdropEl.onclick = closePermModal;
@@ -1256,24 +1275,18 @@ DASHBOARD_HTML = """<!doctype html>
       if (event.key === 'Escape' && document.body.classList.contains('perm-modal-visible')) closePermModal();
     });
 
-    function renderPermModalBody(names) {
-      const rows = names.map(n => lastKnownRows.find(r => r.name === n)).filter(Boolean);
-      const bulk = names.length > 1;
-      permModalTitleEl.textContent = bulk ? `${names.length} session đã chọn` : names[0];
+    function renderPermModalBody(name) {
+      const row = lastKnownRows.find(r => r.name === name);
+      permModalTitleEl.textContent = name;
       permModalBlockEl.textContent = '';
       permModalErrorEl.textContent = '';
-      if (!bulk) {
-        const row = rows[0];
-        if (!row) { permModalStateEl.textContent = 'Session không còn tồn tại.'; permModalPresetsEl.replaceChildren(); return; }
-        const state = grantState(row);
-        const granted = grantStateLabel(state);
-        const effective = effectiveLabel(row);
-        permModalStateEl.textContent = granted === effective ? `Hiện tại: ${granted}` : `Đã cấp: ${granted} · Hiệu lực thực tế: ${effective}`;
-        if (row.input_block_reason && state !== 'full') {
-          permModalBlockEl.textContent = `Gửi prompt bị chặn: ${inputBlockLabel(row.input_block_reason)}`;
-        }
-      } else {
-        permModalStateEl.textContent = `Áp dụng một hành động cho cả ${names.length} session.`;
+      if (!row) { permModalStateEl.textContent = 'Session không còn tồn tại.'; permModalPresetsEl.replaceChildren(); return; }
+      const state = grantState(row);
+      const granted = grantStateLabel(state);
+      const effective = effectiveLabel(row);
+      permModalStateEl.textContent = granted === effective ? `Hiện tại: ${granted}` : `Đã cấp: ${granted} · Hiệu lực thực tế: ${effective}`;
+      if (row.input_block_reason && state !== 'full') {
+        permModalBlockEl.textContent = `Gửi prompt bị chặn: ${inputBlockLabel(row.input_block_reason)}`;
       }
 
       permModalPresetsEl.replaceChildren();
@@ -1285,58 +1298,27 @@ DASHBOARD_HTML = """<!doctype html>
       for (const preset of presets) {
         const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = preset.label;
         const classes = [];
-        if (!bulk && grantState(rows[0]) === preset.key) classes.push('current');
+        if (state === preset.key) classes.push('current');
         if (preset.key === 'none') classes.push('danger');
         if (classes.length) btn.className = classes.join(' ');
         btn.onclick = async () => {
           permModalPresetsEl.querySelectorAll('button').forEach(b => b.disabled = true);
-          const failures = await applyPreset(names, preset.key);
-          permModalErrorEl.textContent = failures.length ? `Một số session thất bại: ${failures.join('; ')}` : '';
-          if (bulk) { bulkSelected.clear(); renderBulkBar(); closePermModal(); }
-          else renderPermModalBody(names); // stay open, show the refreshed real state
+          const failures = await applyPreset([name], preset.key);
+          permModalErrorEl.textContent = failures.length ? clean(failures.join('; ')) : '';
+          renderPermModalBody(name); // stay open, show the refreshed real state
         };
         permModalPresetsEl.appendChild(btn);
       }
     }
 
-    async function openPermModal(names) {
-      if (typeof names === 'string') names = [names];
-      permModalNames = names;
+    async function openPermModal(name) {
+      permModalName = name;
       document.body.classList.add('perm-modal-visible');
-      permModalTitleEl.textContent = names.length > 1 ? `${names.length} session đã chọn` : names[0];
+      permModalTitleEl.textContent = name;
       permModalStateEl.textContent = 'Đang tải…';
       permModalPresetsEl.replaceChildren(); permModalBlockEl.textContent = ''; permModalErrorEl.textContent = '';
       await loadSessions(); // fresh grant/effective state before showing presets, every time
-      if (permModalNames === names) renderPermModalBody(names); // still open (not closed while awaiting)
-    }
-
-    // ---- bulk-select bar ---------------------------------------------------
-    // Applies a preset directly to every checked session, WITHOUT opening
-    // #permModal -- "chọn nhiều session -> một hành động", no extra step.
-    function renderBulkBar() {
-      bulkBarEl.hidden = bulkSelected.size === 0;
-      bulkBarEl.replaceChildren();
-      if (bulkSelected.size === 0) return;
-      const label = document.createElement('span'); label.textContent = `${bulkSelected.size} đã chọn:`;
-      const fullBtn = document.createElement('button'); fullBtn.type = 'button'; fullBtn.textContent = '🔓 Xem + gửi';
-      const readBtn = document.createElement('button'); readBtn.type = 'button'; readBtn.textContent = '👁 Chỉ xem';
-      const revokeBtn = document.createElement('button'); revokeBtn.type = 'button'; revokeBtn.className = 'danger'; revokeBtn.textContent = '🔒 Thu hồi';
-      const clearBtn = document.createElement('button'); clearBtn.type = 'button'; clearBtn.className = 'link'; clearBtn.textContent = 'Bỏ chọn';
-      const allBtns = [fullBtn, readBtn, revokeBtn, clearBtn];
-      const run = (preset) => async () => {
-        const names = [...bulkSelected];
-        allBtns.forEach(b => b.disabled = true);
-        bulkStatusEl.hidden = false; bulkStatusEl.textContent = `Đang áp dụng cho ${names.length} session…`;
-        const failures = await applyPreset(names, preset);
-        bulkSelected.clear(); renderBulkBar();
-        bulkStatusEl.hidden = failures.length === 0;
-        if (failures.length) bulkStatusEl.textContent = `Một số session thất bại: ${failures.join('; ')}`;
-      };
-      fullBtn.onclick = run('full');
-      readBtn.onclick = run('read');
-      revokeBtn.onclick = run('none');
-      clearBtn.onclick = () => { bulkSelected.clear(); renderBulkBar(); loadSessions(); };
-      bulkBarEl.append(label, fullBtn, readBtn, revokeBtn, clearBtn);
+      if (permModalName === name) renderPermModalBody(name); // still open (not closed while awaiting)
     }
 
     // Compact single-line entry point in the currently-open session's own
@@ -1396,7 +1378,7 @@ DASHBOARD_HTML = """<!doctype html>
       setAutoFollow(true); refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
       rememberSession(name);
       closeSearch(); // a search from a different session's content wouldn't make sense to keep open
-      renderSessionTabs(lastKnownRows); // reflect the new active tab immediately, not just on the next 5s poll
+      renderRows(lastKnownRows); // reflect the new active/selected row immediately, not just on the next 5s poll
       // Fire immediately; loadDetail's own generation-sequence guard (see
       // below) discards this if the user switches again before it
       // resolves. A rejected fetch here is swallowed deliberately -- the
@@ -1475,276 +1457,79 @@ DASHBOARD_HTML = """<!doctype html>
       return response.json();
     }
 
-    // Detach = reversible remove/hide the session's TAB from this browser's
-    // view only -- never kill-session, never clear its history/input,
-    // never revoke any grant, never disconnect another client attached to
-    // it. Scoped to THIS browser via localStorage (same storage class the
-    // remembered-session/fullscreen preferences above already use); a
-    // detached session is still fully visible/selectable from the
-    // sidebar's own full session list (which never hides anything, and
-    // never auto-detaches by name/pattern -- selecting it there
-    // reattaches it, same as the "+" menu below), so it is never actually
-    // lost, only out of the tab row until brought back.
-    const DETACHED_KEY = 'terminal-mcp:detached-sessions';
-    function loadDetached() {
-      try { return new Set(JSON.parse(localStorage.getItem(DETACHED_KEY) || '[]')); }
-      catch (error) { return new Set(); }
-    }
-    function saveDetached(set) {
-      try { localStorage.setItem(DETACHED_KEY, JSON.stringify([...set])); }
-      catch (error) { /* private mode / storage disabled: not essential, ignore */ }
-    }
-    let detachedSessions = loadDetached(); // never pre-populated -- nothing is auto-detached by name or pattern, ever
+    // ---- sidebar: the ONE session navigation list ---------------------
+    // Click the row (or its name) to select/open it -- no checkbox, no
+    // per-row lock/eye icon (item 1/2 of the dashboard cleanup this
+    // backs). Contextual actions live in a small text-button column:
+    // Open Terminal (real xterm.js attach, webterm.py -- never shown for
+    // a session this viewer can't read), Access (grant/revoke, only when
+    // there's actually something to grant -- a whitelisted session has
+    // nothing to show here), Kill (destructive, only when session_
+    // lifecycle is enabled -- disabled-with-a-reason, not hidden, for a
+    // protected session, same as the admin screen's own convention).
+    const WEBTERM_PAGE = '/dashboard/terminal';
+    let sessionLifecycleEnabled = false;
+    let protectedSessions = new Set();
+    let webTerminalEnabled = false;
 
-    function detachSession(name) {
-      // Save the outgoing draft explicitly, BEFORE `selected` changes --
-      // detaching must preserve it (reattaching later restores it) exactly
-      // like an ordinary tab switch does, never discard it.
-      if (selected === name) { drafts.set(name, inputTextEl.value); }
-      detachedSessions.add(name);
-      saveDetached(detachedSessions);
-      if (selected === name) {
-        // Move to a safe adjacent (still-attached) tab rather than leave
-        // `selected` pointing at a name that no longer has a tab.
-        const remaining = lastKnownRows.filter(row => !detachedSessions.has(row.name));
-        if (remaining.length) {
-          selectSession(remaining[0].name);
-        } else {
-          selected = null; inputAllowed = false;
-          refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
-          summaryEl.textContent = 'Tất cả session đã được gỡ khỏi tab. Bấm "+" hoặc chọn từ danh sách bên trái để mở lại.';
-          outputEl.replaceChildren(); grantBarEl.hidden = true;
+    function makeSessionActions(row) {
+      const actions = document.createElement('div'); actions.className = 'row-actions';
+      const stop = handler => (event) => { event.stopPropagation(); handler(); };
+
+      if (row.effective_read) {
+        const termBtn = document.createElement('a');
+        termBtn.textContent = '🖥 Mở terminal';
+        termBtn.href = `${WEBTERM_PAGE}?session=${encodeURIComponent(row.name)}`;
+        termBtn.title = row.effective_input
+          ? 'Mở web terminal thật (xterm.js), gắn trực tiếp vào tmux session này -- gõ được'
+          : 'Mở web terminal thật (xterm.js) ở chế độ CHỈ XEM -- chưa có quyền input';
+        if (!webTerminalEnabled) {
+          termBtn.removeAttribute('href');
+          termBtn.style.opacity = '.4'; termBtn.style.cursor = 'not-allowed';
+          termBtn.title = 'Tính năng web terminal đang tắt (dashboard.web_terminal_enabled trong config.yaml)';
         }
+        termBtn.onclick = event => event.stopPropagation();
+        actions.appendChild(termBtn);
       }
-      renderSessionTabs(lastKnownRows);
-    }
-    function reattachSession(name) {
-      detachedSessions.delete(name);
-      saveDetached(detachedSessions);
-      closeDetachedMenu();
-      selectSession(name);
-    }
-    function closeDetachedMenu() {
-      detachedMenuOpen = false;
-      document.querySelector('#detachedMenu')?.remove();
-    }
-    function toggleDetachedMenu(anchorEl, rows) {
-      if (detachedMenuOpen) { closeDetachedMenu(); return; }
-      detachedMenuOpen = true;
-      const menu = document.createElement('div');
-      menu.id = 'detachedMenu';
-      const detachedRows = rows.filter(row => detachedSessions.has(row.name));
-      if (!detachedRows.length) {
-        const empty = document.createElement('div'); empty.className = 'muted-item';
-        empty.textContent = 'Không có session nào đã gỡ.'; menu.appendChild(empty);
-      } else {
-        for (const row of detachedRows) {
-          const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = `↩ ${row.name}`;
-          btn.onclick = () => reattachSession(row.name);
-          menu.appendChild(btn);
-        }
+
+      if (grantable(row)) {
+        const accessBtn = document.createElement('button'); accessBtn.type = 'button'; accessBtn.textContent = 'Access';
+        accessBtn.title = 'Xem/cấp quyền truy cập cho session này';
+        accessBtn.onclick = stop(() => openPermModal(row.name));
+        actions.appendChild(accessBtn);
       }
-      document.body.appendChild(menu);
-      const rect = anchorEl.getBoundingClientRect();
-      menu.style.left = `${Math.round(rect.left + window.scrollX)}px`;
-      menu.style.top = `${Math.round(rect.bottom + window.scrollY)}px`;
-      // One-shot outside-click close -- deferred to the next tick so the
-      // very click that opened the menu doesn't also immediately close it.
-      setTimeout(() => {
-        document.addEventListener('click', function handler(event) {
-          if (!menu.contains(event.target)) { closeDetachedMenu(); document.removeEventListener('click', handler); }
-        });
-      }, 0);
+
+      if (sessionLifecycleEnabled) {
+        const isProtected = protectedSessions.has(row.name);
+        const killBtn = document.createElement('button'); killBtn.type = 'button'; killBtn.className = 'danger';
+        killBtn.textContent = 'Kill';
+        killBtn.disabled = isProtected;
+        killBtn.title = isProtected
+          ? 'Session này được bảo vệ, không thể kill qua dashboard'
+          : 'Dừng & giải phóng process/RAM của session này (có thể mở lại sau)';
+        killBtn.onclick = stop(() => openKillModal(row.name, row.kill_reopen_ready !== false));
+        actions.appendChild(killBtn);
+      }
+
+      return actions;
     }
 
-    // Browser-like tabs: one click switches session (no sidebar-open step).
-    // Keyboard: each tab is a real <button> (native Tab-order + Enter/
-    // Space activation); Delete/Backspace while a tab is focused detaches
-    // it too, since the small "×" glyph alone is a poor keyboard target.
-    // Stable tab order, independent of the API's own attention/activity
-    // sort (rows arrive re-sorted on every poll -- looping them directly
-    // would reorder the tab row itself every 5s, which real browser tabs
-    // never do). A name already known keeps its position; a genuinely new
-    // one is appended once, in alphabetical position among other newcomers
-    // of the same poll (deterministic, never "wherever the API happened to
-    // rank it this cycle"). Detaching/reattaching never reorders either --
-    // it only changes which known names are currently visible.
-    let tabOrder = [];
-    // name -> {tab, nameEl, closeBtn} -- cached across renders so an
-    // unchanged tab set patches in place (active/attention class only)
-    // instead of destroying and recreating every DOM node, which would
-    // otherwise reset horizontal scroll position and steal keyboard focus
-    // away from whatever tab the user has focused, on every single poll.
-    let tabElements = new Map();
-    let lastRenderedTabOrder = null; // the exact visible (attached) ordered-name-list last painted, for the skip-rebuild check
-
-    function updateTabElement(tab, refs, row) {
-      const isActive = selected === row.name;
-      const needsAttention = row.state === 'WAITING_INPUT';
-      tab.className = 'session-tab' + (isActive ? ' active' : '') + (needsAttention ? ' needs-attention' : '');
-      tab.setAttribute('aria-selected', isActive ? 'true' : 'false');
-      refs.attnEl.hidden = !needsAttention;
-      // Perm icon only for a grantable (non-whitelisted) session -- a
-      // whitelisted tab shows nothing extra, ever.
-      refs.permEl.hidden = !grantable(row);
-      if (!refs.permEl.hidden) refs.permEl.textContent = permIcon(row);
-    }
-
-    function makeTab(row) {
-      const tab = document.createElement('button');
-      tab.type = 'button';
-      tab.setAttribute('role', 'tab');
-      const nameEl = document.createElement('span'); nameEl.className = 'tab-name'; nameEl.textContent = row.name;
-      tab.appendChild(nameEl);
-      const attnEl = document.createElement('span'); attnEl.textContent = '⚠'; attnEl.hidden = true;
-      tab.appendChild(attnEl);
-      const permEl = document.createElement('span'); permEl.className = 'tab-perm'; permEl.title = 'Quyền truy cập'; permEl.hidden = true;
-      permEl.onclick = (event) => { event.stopPropagation(); openPermModal(row.name); };
-      tab.appendChild(permEl);
-      const closeBtn = document.createElement('span'); closeBtn.className = 'tab-close'; closeBtn.textContent = '×';
-      closeBtn.title = `Gỡ tab "${row.name}" (không xoá session, không thu hồi quyền)`;
-      closeBtn.onclick = (event) => { event.stopPropagation(); detachSession(row.name); };
-      tab.appendChild(closeBtn);
-      tab.onclick = () => { if (selected !== row.name) selectSession(row.name); };
-      tab.onkeydown = (event) => {
-        if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); detachSession(row.name); }
-      };
-      const refs = {tab, attnEl, permEl};
-      tabElements.set(row.name, refs);
-      return tab;
-    }
-
-    function renderSessionTabs(rows) {
+    function renderRows(rows) {
       lastKnownRows = rows;
-      const rowsByName = new Map(rows.map(row => [row.name, row]));
-
-      // Grow tabOrder with any genuinely new names, alphabetically among
-      // this poll's newcomers; drop names that no longer exist at all
-      // (a session actually gone from discovery -- if it reappears later
-      // it re-enters as "new" again, which is fine).
-      const known = new Set(tabOrder);
-      const newcomers = rows.map(row => row.name).filter(name => !known.has(name)).sort();
-      tabOrder = tabOrder.filter(name => rowsByName.has(name)).concat(newcomers);
-      const tabOrderSet = new Set(tabOrder);
-      for (const name of [...tabElements.keys()]) { if (!tabOrderSet.has(name)) tabElements.delete(name); }
-
-      const visibleOrder = tabOrder.filter(name => rowsByName.has(name) && !detachedSessions.has(name));
-      sessionTabsEl.hidden = rows.length === 0;
-
-      const orderUnchanged = lastRenderedTabOrder !== null
-        && visibleOrder.length === lastRenderedTabOrder.length
-        && visibleOrder.every((name, i) => name === lastRenderedTabOrder[i]);
-
-      if (orderUnchanged) {
-        // Same tabs, same order -- patch active/attention state on the
-        // EXISTING nodes only. Scroll position and focus are untouched
-        // because no node is destroyed or replaced.
-        for (const name of visibleOrder) {
-          const refs = tabElements.get(name);
-          if (refs) { updateTabElement(refs.tab, refs, rowsByName.get(name)); }
-        }
-        lastRenderedTabOrder = visibleOrder;
-        return;
-      }
-
-      // Tab set/order actually changed (a session appeared, disappeared,
-      // was detached, or was reattached) -- full rebuild is unavoidable
-      // and acceptable only in that case.
-      sessionTabsEl.replaceChildren();
-      for (const name of visibleOrder) {
-        const row = rowsByName.get(name);
-        let refs = tabElements.get(name);
-        const tab = refs ? refs.tab : makeTab(row);
-        refs = tabElements.get(name);
-        updateTabElement(tab, refs, row);
-        sessionTabsEl.appendChild(tab);
-      }
-      const addBtn = document.createElement('button');
-      addBtn.type = 'button'; addBtn.className = 'session-tab-add'; addBtn.title = 'Mở lại session đã gỡ';
-      addBtn.textContent = '+';
-      addBtn.onclick = (event) => { event.stopPropagation(); toggleDetachedMenu(addBtn, rows); };
-      sessionTabsEl.appendChild(addBtn);
-      lastRenderedTabOrder = visibleOrder;
-    }
-
-    async function loadSessions() {
-      const data = await fetchJSON('/dashboard/api/sessions', {cache:'no-store'});
-      const rows = data.sessions || [];
-      // A 200 response can still legitimately carry data.error (e.g.
-      // READ_DISABLED globally, alongside a correctly-empty `sessions: []`)
-      // -- this is real, correct information ("reading is off"), not
-      // "there simply are no sessions", and must never render identically
-      // to a genuinely healthy empty state.
-      document.querySelector('#count').textContent = data.error ? `(${clean(data.error)})` : `(${rows.length})`;
-
-      // On first load only (never on the recurring 5s poll, which must not
-      // fight a user's manual choice to switch sessions or clear the
-      // selection): auto-open the remembered session if it still exists
-      // and isn't detached, else the first attached, readable session (a
-      // restricted row is real and listed now -- see
-      // dashboard_list_sessions -- but auto-opening one would only greet
-      // a first-time viewer with a locked placeholder instead of real
-      // output; a detached one is real too, but the whole point of
-      // detaching is staying out of the way until explicitly reattached).
-      const readableRows = rows.filter(row => row.effective_read && !detachedSessions.has(row.name));
-      if (!autoSelectAttempted) {
-        autoSelectAttempted = true;
-        if (!selected && readableRows.length) {
-          const remembered = recalledSession();
-          const target = (remembered && readableRows.some(row => row.name === remembered)) ? remembered : readableRows[0].name;
-          selectSession(target);
-        }
-      }
-
-      renderSessionTabs(rows);
-      // Drop any bulk-selected name that's gone or no longer grantable
-      // (session vanished, or became statically whitelisted) -- never
-      // leaves a stale, unactionable checkbox state behind.
-      const rowsByName = new Map(rows.map(row => [row.name, row]));
-      let bulkChanged = false;
-      for (const name of [...bulkSelected]) {
-        const row = rowsByName.get(name);
-        if (!row || !grantable(row)) { bulkSelected.delete(name); bulkChanged = true; }
-      }
-      if (bulkChanged) renderBulkBar();
       sessionsEl.replaceChildren();
       for (const row of rows) {
         // Rows already arrive sorted attention-first, then most-recent-
         // activity, then name (see the /dashboard/api/sessions route) — no
         // client-side reordering here, just rendering in the given order.
         const needsAttention = row.state === 'WAITING_INPUT';
-        const canGrant = grantable(row);
-        // A <div role="button">, not a real <button> -- it hosts a real
-        // <button> (perm-btn) and an <input type=checkbox>, neither legal
-        // inside a <button>. onkeydown below restores Enter/Space
-        // activation that a native <button> would have given for free.
         const div = document.createElement('div');
         div.className = 'session' + (selected === row.name ? ' active' : '') + (needsAttention ? ' needs-attention' : '');
         div.setAttribute('role', 'button'); div.tabIndex = 0;
-
-        if (canGrant) {
-          const check = document.createElement('input'); check.type = 'checkbox'; check.className = 'sess-check';
-          check.checked = bulkSelected.has(row.name);
-          check.setAttribute('aria-label', `Chọn ${row.name} để thao tác hàng loạt`);
-          check.onclick = (event) => event.stopPropagation(); // never trigger the row's own select-session activation
-          check.onchange = () => {
-            if (check.checked) bulkSelected.add(row.name); else bulkSelected.delete(row.name);
-            renderBulkBar();
-          };
-          div.append(check);
-        }
 
         const main = document.createElement('div'); main.className = 'sess-main';
         const name = document.createElement('div'); name.className = 'name'; name.textContent = row.name;
         if (needsAttention) {
           const badge = document.createElement('span'); badge.className = 'attn-badge'; badge.textContent = '⚠ NEEDS INPUT';
-          name.append(' ', badge);
-        } else if (!row.effective_read) {
-          // Newly-discovered, not-yet-granted session -- still listed
-          // (name/attached/windows/activity are tmux metadata, never pane
-          // content), just visibly marked as not readable yet. Admin can
-          // grant it directly via the perm-btn on this same row.
-          const badge = document.createElement('span'); badge.className = 'lock-badge'; badge.textContent = '🔒 Chưa cấp quyền';
           name.append(' ', badge);
         }
         const meta = document.createElement('div'); meta.className = 'meta';
@@ -1753,30 +1538,19 @@ DASHBOARD_HTML = """<!doctype html>
         // a dead pane's session from its own listing, this is never a
         // "the process died" signal) vs. whether any terminal CLIENT
         // (a real terminal, or this dashboard's own Open Terminal) is
-        // currently attached to watch it. A detached session is not a
-        // dead one -- see the Open Terminal button below for reattaching.
+        // currently attached to watch it. "No terminal attached" is not a
+        // dead session -- see the Open Terminal action for reattaching.
         const dot = document.createElement('span'); dot.className = 'attach-dot on';
         meta.append(dot, document.createTextNode(
           `● Running · ${row.windows} window · ${row.attached ? 'Terminal attached' : 'No terminal attached'}`));
-        main.append(name, meta);
-        div.append(main);
-
-        if (canGrant) {
-          const permBtn = document.createElement('button'); permBtn.type = 'button'; permBtn.className = 'perm-btn';
-          permBtn.textContent = permIcon(row); permBtn.title = 'Quyền truy cập';
-          permBtn.onclick = (event) => { event.stopPropagation(); openPermModal(row.name); };
-          div.append(permBtn);
+        if (!row.effective_read) {
+          const note = document.createElement('span'); note.className = 'muted'; note.textContent = ' · chưa cấp quyền xem';
+          meta.appendChild(note);
         }
+        main.append(name, meta);
+        div.append(main, makeSessionActions(row));
 
-        const activate = () => {
-          // The full sidebar list never hides anything -- picking a
-          // detached session here is exactly "obvious reattach via the
-          // detached sessions list": bring its tab back, then select it.
-          if (detachedSessions.has(row.name)) {
-            detachedSessions.delete(row.name); saveDetached(detachedSessions); renderSessionTabs(lastKnownRows);
-          }
-          selectSession(row.name); loadSessions(); // selectSession itself already fires loadDetail() immediately
-        };
+        const activate = () => selectSession(row.name);
         div.onclick = activate;
         div.onkeydown = (event) => {
           if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activate(); }
@@ -1789,6 +1563,167 @@ DASHBOARD_HTML = """<!doctype html>
         summaryEl.textContent = 'Session không còn tồn tại.'; outputEl.replaceChildren(); grantBarEl.hidden = true;
       }
     }
+
+    async function loadSessions() {
+      const data = await fetchJSON('/dashboard/api/sessions', {cache:'no-store'});
+      const rows = data.sessions || [];
+      sessionLifecycleEnabled = data.session_lifecycle_enabled === true;
+      protectedSessions = new Set(data.protected_sessions || []);
+      webTerminalEnabled = data.web_terminal_enabled === true;
+      // A 200 response can still legitimately carry data.error (e.g.
+      // READ_DISABLED globally, alongside a correctly-empty `sessions: []`)
+      // -- this is real, correct information ("reading is off"), not
+      // "there simply are no sessions", and must never render identically
+      // to a genuinely healthy empty state.
+      document.querySelector('#count').textContent = data.error ? `(${clean(data.error)})` : `(${rows.length})`;
+
+      // On first load only (never on the recurring 5s poll, which must not
+      // fight a user's manual choice to switch sessions or clear the
+      // selection): auto-open the remembered session if it still exists,
+      // else the first readable session (a restricted row is real and
+      // listed now -- see dashboard_list_sessions -- but auto-opening one
+      // would only greet a first-time viewer with a locked placeholder
+      // instead of real output).
+      const readableRows = rows.filter(row => row.effective_read);
+      if (!autoSelectAttempted) {
+        autoSelectAttempted = true;
+        if (!selected && readableRows.length) {
+          const remembered = recalledSession();
+          const target = (remembered && readableRows.some(row => row.name === remembered)) ? remembered : readableRows[0].name;
+          selectSession(target);
+        }
+      }
+
+      renderRows(rows);
+      if (sessionLifecycleEnabled) loadKilledSessions(); else killedSectionEl.hidden = true;
+    }
+
+    // ---- Kill confirmation modal (destructive; item 7/8 of the design
+    // this backs) -- a SEPARATE modal from #permModal on purpose, so a
+    // destructive action can never be mistaken for the harmless grant/
+    // revoke one. The Kill button stays disabled until the typed
+    // confirmation exactly matches the session name; core.py's own
+    // confirm_name check is the real, server-enforced floor -- this is
+    // only the human-facing half of it.
+    let killModalName = null;
+    function closeKillModal() {
+      document.body.classList.remove('kill-modal-visible');
+      killModalName = null; killConfirmInputEl.value = ''; killModalErrorEl.textContent = '';
+    }
+    function openKillModal(name, likelyReopenable) {
+      killModalName = name;
+      killModalTitleEl.textContent = `Kill "${name}"`;
+      killConfirmInputEl.value = ''; killModalErrorEl.textContent = '';
+      killConfirmBtnEl.disabled = true;
+      killModalWarnEl.hidden = likelyReopenable !== false;
+      if (!killModalWarnEl.hidden) {
+        killModalWarnEl.textContent = '⚠ Session này chưa từng được tạo qua lifecycle service (hoặc chưa nhận diện được agent/thư mục làm việc) -- sau khi kill có thể KHÔNG reopen tự động được, có thể phải chọn agent/thư mục thủ công.';
+      }
+      document.body.classList.add('kill-modal-visible');
+      killConfirmInputEl.focus();
+    }
+    killModalCloseBtnEl.onclick = closeKillModal;
+    killCancelBtnEl.onclick = closeKillModal;
+    killBackdropEl.onclick = closeKillModal;
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && document.body.classList.contains('kill-modal-visible')) closeKillModal();
+    });
+    killConfirmInputEl.oninput = () => {
+      killConfirmBtnEl.disabled = killModalName === null || killConfirmInputEl.value !== killModalName;
+    };
+    killConfirmBtnEl.onclick = async () => {
+      const name = killModalName;
+      if (!name || killConfirmInputEl.value !== name) return; // client-side floor; core.py's own confirm_name check is the real one
+      killConfirmBtnEl.disabled = true;
+      const response = await fetch('/dashboard/api/session/kill', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name, confirm_name: killConfirmInputEl.value}),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (result && result.error) {
+        killModalErrorEl.textContent = clean(result.error);
+        killConfirmBtnEl.disabled = killConfirmInputEl.value !== killModalName;
+        return;
+      }
+      closeKillModal();
+      if (selected === name) {
+        selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
+        summaryEl.textContent = 'Chọn một session để xem output.'; outputEl.replaceChildren(); grantBarEl.hidden = true;
+      }
+      await loadSessions();
+    };
+
+    // ---- killed-sessions reopen list (item 9-11) -----------------------
+    // Compact, collapsed by default, zero footprint until there's actually
+    // a killed session to reopen -- never a second navigation surface for
+    // LIVE sessions (only ever lists sessions that no longer exist).
+    let killedExpanded = false;
+    let lastKilledEntries = [];
+    function renderKilledSessions(entries) {
+      lastKilledEntries = entries;
+      killedSectionEl.hidden = entries.length === 0;
+      killedToggleLabelEl.textContent = `🗑 Đã kill (${entries.length})`;
+      killedListEl.hidden = !killedExpanded;
+      killedListEl.replaceChildren();
+      for (const entry of entries) {
+        const row = document.createElement('div'); row.className = 'killed-row';
+        const name = document.createElement('div'); name.className = 'kr-name'; name.textContent = entry.name;
+        const meta = document.createElement('div'); meta.className = 'kr-meta';
+        meta.textContent = entry.metadata_complete
+          ? `${clean(entry.agent_type)}${entry.working_directory ? ' · ' + clean(entry.working_directory) : ''}`
+          : '';
+        row.append(name, meta);
+        if (!entry.metadata_complete) {
+          const warn = document.createElement('div'); warn.className = 'kr-incomplete';
+          warn.textContent = '⚠ Thiếu metadata -- reopen sẽ cần chọn agent/thư mục thủ công.';
+          row.append(warn);
+        }
+        const reopenBtn = document.createElement('button'); reopenBtn.type = 'button'; reopenBtn.textContent = '↩ Reopen';
+        reopenBtn.onclick = () => reopenKilledSession(entry);
+        row.append(reopenBtn);
+        killedListEl.appendChild(row);
+      }
+    }
+    async function loadKilledSessions() {
+      try {
+        const data = await fetchJSON('/dashboard/api/killed-sessions', {cache:'no-store'});
+        renderKilledSessions(data.killed_sessions || []);
+      } catch (error) { /* transient poll failure -- next 5s cycle retries, same as loadSessions itself */ }
+    }
+    killedToggleEl.onclick = () => {
+      killedExpanded = !killedExpanded;
+      killedListEl.hidden = !killedExpanded;
+    };
+    async function reopenKilledSession(entry) {
+      let agentType = null, workingDirectory = null;
+      if (!entry.metadata_complete) {
+        // Fail closed, never guess (item 10/12): ask explicitly rather
+        // than inventing an agent_type/cwd. A plain, minimal prompt()
+        // pair is deliberate here -- this is the rare/incomplete-metadata
+        // path, not worth a dedicated modal for.
+        agentType = window.prompt(
+          `Không đủ metadata để tự reopen "${entry.name}".\nNhập agent_type (shell / claude / codex):`, 'shell');
+        if (!agentType) return;
+        if (agentType !== 'shell') {
+          workingDirectory = window.prompt('Nhập working_directory an toàn (trong allowed_cwd_roots):', '');
+          if (!workingDirectory) return;
+        }
+      }
+      const body = {name: entry.name};
+      if (agentType) body.agent_type = agentType;
+      if (workingDirectory) body.working_directory = workingDirectory;
+      const response = await fetch('/dashboard/api/session/reopen', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (result && result.error) {
+        window.alert(`Reopen thất bại: ${clean(result.error)}${result.missing ? ' (thiếu: ' + result.missing.join(', ') + ')' : ''}`);
+        return;
+      }
+      await loadSessions();
+      selectSession(entry.name);
+    }
+
     async function loadDetail() {
       if (!selected) return;
       const requestedSession = selected;
@@ -2047,7 +1982,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     <table>
       <thead>
         <tr>
-          <th></th><th>Session</th><th>Quyền</th><th>Trạng thái</th><th>Windows</th><th>Hoạt động gần nhất</th><th>Detach</th><th>Hành động</th>
+          <th></th><th>Session</th><th>Quyền</th><th>Trạng thái</th><th>Windows</th><th>Hoạt động gần nhất</th><th>Hành động</th>
         </tr>
       </thead>
       <tbody id="tbody"></tbody>
@@ -2147,17 +2082,6 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       return response.json();
     }
 
-    const DETACHED_KEY = 'terminal-mcp:detached-sessions';
-    function loadDetached() {
-      try { return new Set(JSON.parse(localStorage.getItem(DETACHED_KEY) || '[]')); }
-      catch (error) { return new Set(); }
-    }
-    function saveDetached(set) {
-      try { localStorage.setItem(DETACHED_KEY, JSON.stringify([...set])); }
-      catch (error) { /* private mode / storage disabled: not essential, ignore */ }
-    }
-    let detachedSessions = loadDetached();
-
     function grantable(row) { return !row.allowed; }
     function grantState(row) {
       if (row.grant && row.grant.input_enabled) return 'full';
@@ -2243,9 +2167,9 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       }
     };
 
-    // Real tmux detach-client -- distinct from the "Gỡ tab" column above,
-    // which only hides a session from THIS BROWSER's view (localStorage,
-    // never touches tmux). This calls the actual server-side detach.
+    // Real tmux detach-client (⏏ Tách below) -- never a browser-local
+    // hide/show toggle (that feature, tied to the main dashboard's now-
+    // removed tab bar, no longer exists on either screen).
     async function detachSessionReal(name, btn) {
       btn.disabled = true;
       try {
@@ -2263,22 +2187,34 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     }
 
     // Dừng & xóa hẳn session -- terminate the process, never recoverable.
-    async function deleteSessionReal(name, btn) {
-      const confirmed = confirm(
-        `Xóa (dừng & xóa) session "${name}"?\n\nToàn bộ tiến trình đang chạy trong session này sẽ bị dừng. `
-        + `Không thể hoàn tác.`
+    // Kill (docs: item 7/8 of the Kill/Reopen design) supersedes plain
+    // delete here -- same real tmux kill-session + binding/grant cleanup,
+    // PLUS reopen-metadata capture terminal_delete_session never did. One
+    // destructive mechanism system-wide (core.py's terminal_kill_session),
+    // reused by both this admin table and the main dashboard's sidebar --
+    // never a second, parallel "delete" path. Typed confirmation (not
+    // just confirm()) matches the main dashboard's #killModal; this
+    // screen uses a plain prompt() instead of a dedicated modal, since it
+    // already has no modal chrome of its own beyond #permModal/#createModal.
+    async function killSessionReal(name, btn) {
+      const typed = window.prompt(
+        `Kill (dừng & giải phóng RAM) session "${name}"?\n\nGõ chính xác tên session để xác nhận -- `
+        + `không thể hoàn tác. Nếu đủ metadata, có thể Reopen lại sau từ danh sách "Đã kill" trên dashboard chính.`,
+        '',
       );
-      if (!confirmed) return;
+      if (typed === null) return; // cancelled
+      if (typed !== name) { alert('Tên không khớp -- đã huỷ kill.'); return; }
       btn.disabled = true;
       try {
-        const response = await fetch('/dashboard/api/session/delete', {
-          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name}),
+        const response = await fetch('/dashboard/api/session/kill', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name, confirm_name: typed}),
         });
         const result = await response.json().catch(() => ({}));
-        if (result && result.error) { alert(`Không xóa được "${name}": ${clean(result.error)}`); }
+        if (result && result.error) { alert(`Không kill được "${name}": ${clean(result.error)}`); }
         await load();
       } catch (error) {
-        alert(`Lỗi mạng khi xóa "${name}": ${clean(error && error.message)}`);
+        alert(`Lỗi mạng khi kill "${name}": ${clean(error && error.message)}`);
       } finally {
         btn.disabled = false;
       }
@@ -2473,20 +2409,6 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         const tdActivity = document.createElement('td'); tdActivity.textContent = timeAgo(row.activity);
         tr.appendChild(tdActivity);
 
-        const tdDetach = document.createElement('td');
-        const isDetached = detachedSessions.has(row.name);
-        const detachBtn = document.createElement('button');
-        detachBtn.type = 'button'; detachBtn.textContent = isDetached ? 'Gỡ tab' : 'Bấm để gỡ tab';
-        if (isDetached) detachBtn.className = 'on';
-        detachBtn.title = 'Chỉ ẩn/hiện tab trên trình duyệt này -- không đụng session tmux hay quyền thật';
-        detachBtn.onclick = () => {
-          if (detachedSessions.has(row.name)) detachedSessions.delete(row.name); else detachedSessions.add(row.name);
-          saveDetached(detachedSessions);
-          renderRows(lastKnownRows);
-        };
-        tdDetach.appendChild(detachBtn);
-        tr.appendChild(tdDetach);
-
         const tdActions = document.createElement('td');
         const actions = document.createElement('div'); actions.className = 'row-actions';
         if (grantable(row)) {
@@ -2539,13 +2461,13 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         actions.appendChild(tachBtn);
 
         const isProtected = protectedSessions.has(row.name);
-        const xoaBtn = document.createElement('button'); xoaBtn.type = 'button'; xoaBtn.className = 'danger';
-        xoaBtn.textContent = '🗑 Xóa session';
-        xoaBtn.title = isProtected ? 'Session này được bảo vệ, không thể xóa qua dashboard'
-          : 'Dừng & xóa hẳn session này (không thể hoàn tác)';
-        xoaBtn.disabled = !sessionLifecycleEnabled || isProtected;
-        xoaBtn.onclick = () => deleteSessionReal(row.name, xoaBtn);
-        actions.appendChild(xoaBtn);
+        const killBtn = document.createElement('button'); killBtn.type = 'button'; killBtn.className = 'danger';
+        killBtn.textContent = '🗑 Kill';
+        killBtn.title = isProtected ? 'Session này được bảo vệ, không thể kill qua dashboard'
+          : 'Dừng & giải phóng RAM của session này (có thể Reopen lại sau nếu đủ metadata)';
+        killBtn.disabled = !sessionLifecycleEnabled || isProtected;
+        killBtn.onclick = () => killSessionReal(row.name, killBtn);
+        actions.appendChild(killBtn);
 
         tdActions.appendChild(actions);
         tr.appendChild(tdActions);
@@ -3308,6 +3230,73 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         result = await anyio.to_thread.run_sync(terminal.terminal_delete_session, name)
         if "error" not in result:
             await anyio.to_thread.run_sync(lambda: supervisor.unwatch(session=name, delete=False))
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/kill", methods=["POST"], include_in_schema=False)
+    async def session_kill(request: Request) -> JSONResponse:
+        # `confirm_name` must exactly match `name` -- enforced again inside
+        # terminal_kill_session itself (never trust a client-side confirm()
+        # dialog alone for a destructive action); this route's own floor is
+        # the same auth+CSRF _mutation_guard as every mutation here.
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        confirm_name = body.get("confirm_name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name or not isinstance(confirm_name, str):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        requested_by = identity.email if identity else "dashboard"
+        _log.info("dashboard kill_session name=%s identity=%s", name, identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(
+            lambda: terminal.terminal_kill_session(name, confirm_name, requested_by=requested_by)
+        )
+        if "error" not in result:
+            await anyio.to_thread.run_sync(lambda: supervisor.unwatch(session=name, delete=False))
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/reopen", methods=["POST"], include_in_schema=False)
+    async def session_reopen(request: Request) -> JSONResponse:
+        # agent_type/working_directory are OPTIONAL overrides -- omitted,
+        # this uses saved Kill metadata; supplied, they replace the saved
+        # value for that field (never merged/guessed) -- see
+        # terminal_reopen_session's own docstring (core.py).
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        agent_type = body.get("agent_type") if isinstance(body, dict) else None
+        working_directory = body.get("working_directory") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        if agent_type is not None and not isinstance(agent_type, str):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        if working_directory is not None and not isinstance(working_directory, str):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        requested_by = identity.email if identity else "dashboard"
+        _log.info("dashboard reopen_session name=%s identity=%s", name, identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(
+            lambda: terminal.terminal_reopen_session(name, agent_type=agent_type, cwd=working_directory,
+                                                      requested_by=requested_by)
+        )
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/killed-sessions", methods=["GET"], include_in_schema=False)
+    async def killed_sessions_list(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        result = await anyio.to_thread.run_sync(terminal.terminal_list_killed_sessions)
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 

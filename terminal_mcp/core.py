@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from .adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
@@ -12,8 +13,9 @@ from .audit import AuditStore
 from .bindings import Binding, BindingStore, valid_binding_name
 from .config import AppConfig
 from .grants import SessionGrant, SessionGrantStore
+from .killed_sessions import KilledSessionStore
 from .lease import DEFAULT_LEASE_TTL_SECONDS, PaneLeaseStore
-from .lifecycle import SessionLifecycleService
+from .lifecycle import SessionLifecycleService, resolve_cwd
 from .metrics import record_delivery_outcome
 from .models import SessionIdentity
 from .permissions import (SENSITIVE_SESSION_WORDS, input_session_allowed,
@@ -49,6 +51,16 @@ class PaneLockRegistry:
 
 
 SENSITIVE_COMMANDS = {"ssh", "mysql", "psql", "sudo", "passwd"}
+
+# Kill/Reopen reopen-metadata classification (terminal_kill_session): a
+# pane_current_command that matches one of THESE at kill time is
+# recognized as "just a plain shell" (agent_type="shell", no launcher
+# token needed to reopen it safely) -- never an arbitrary command, never
+# used as a launcher itself, only as a classification label. Anything
+# else that doesn't match a configured session_lifecycle.launch_commands
+# value either is simply unrecognized (agent_type=None, incomplete
+# metadata) -- never guessed at.
+SHELL_COMMAND_NAMES = {"bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh", "csh"}
 
 # Post-send submission verification (terminal_send_text/terminal_send_bound,
 # press_enter=True only). tmux.send_text already adds a fixed settle delay
@@ -96,12 +108,16 @@ class TerminalService:
                  bindings: BindingStore | None = None,
                  audit: AuditStore | None = None,
                  grants: SessionGrantStore | None = None,
-                 leases: PaneLeaseStore | None = None) -> None:
+                 leases: PaneLeaseStore | None = None,
+                 killed_sessions: KilledSessionStore | None = None) -> None:
         self.config = config
         self.tmux = tmux or TmuxClient()
         self.bindings = bindings or BindingStore()
         self.audit = audit or AuditStore()
         self.grants = grants or SessionGrantStore()
+        # Kill/Reopen reopen-metadata store -- see killed_sessions.py and
+        # terminal_kill_session/terminal_reopen_session below.
+        self.killed_sessions = killed_sessions or KilledSessionStore()
         # P0 Part B: durable, cross-process pane lease -- defaults to the
         # shared on-disk store (same file for every TerminalService in
         # every process on this host, HTTP/STDIO/dashboard/Supervisor
@@ -1448,6 +1464,16 @@ class TerminalService:
             if not allowed and not effective_input:
                 row["input_block_reason"] = self._input_grant_block_reason(
                     item.name, pane_current_command=item.pane_current_command)
+            # Kill/Reopen UX (item 11 of the design this backs): a real,
+            # currently-observed preview of whether a Kill of THIS session
+            # would capture complete-enough metadata for an automatic
+            # Reopen -- reuses the exact same classification
+            # terminal_kill_session itself applies at kill time, so the
+            # dashboard can warn BEFORE the (irreversible) kill rather than
+            # only after. Only computed while session_lifecycle is even
+            # enabled -- the one thing that ever makes this relevant.
+            if self.config.session_lifecycle.enabled:
+                row["kill_reopen_ready"] = self._reopen_would_be_complete(item)
             sessions.append(row)
         # Read-only convenience for the "Xóa session" UI (never the actual
         # enforcement -- terminal_delete_session's own protected_sessions
@@ -1457,6 +1483,20 @@ class TerminalService:
                "session_lifecycle_enabled": self.config.session_lifecycle.enabled,
                "protected_sessions": list(self.config.session_lifecycle.protected_sessions),
                "web_terminal_enabled": self.config.dashboard.web_terminal_enabled}
+
+    def _reopen_would_be_complete(self, info: Any) -> bool:
+        """Preview-only version of _capture_reopen_metadata's own
+        completeness decision -- never mutates anything, never persisted;
+        purely for the dashboard's pre-Kill warning (item 11)."""
+        agent_type = self._classify_agent_type(info.pane_current_command)
+        if agent_type is None:
+            return False
+        if agent_type == "shell":
+            return True
+        if not info.pane_current_path:
+            return False
+        _resolved, error = resolve_cwd(info.pane_current_path, self.config)
+        return error is None
 
     def terminal_web_terminal_access(self, session: str) -> dict[str, Any]:
         """Authorization + existence resolution for the web terminal
@@ -1841,3 +1881,156 @@ class TerminalService:
         grant = self.grants.get(session)
         if grant is not None and (grant.read_enabled or grant.input_enabled):
             self.grants.set_read(session, False, granted_by="system:session_deleted")
+
+    # -- Kill (destructive, with reopen metadata) / Reopen ---------------
+
+    def _classify_agent_type(self, pane_current_command: str) -> str | None:
+        command = (pane_current_command or "").casefold()
+        for agent_type, launcher in self.config.session_lifecycle.launch_commands:
+            if command == Path(launcher).name.casefold():
+                return agent_type
+        if command in SHELL_COMMAND_NAMES:
+            return "shell"
+        return None
+
+    def _capture_reopen_metadata(self, info: Any) -> dict[str, Any]:
+        """Real, observed pane state at the moment BEFORE a kill -- never
+        a guess. `working_directory` is only kept if it re-validates
+        against config.session_lifecycle.allowed_cwd_roots (the exact
+        same resolve_cwd lifecycle.create() itself uses for a caller-
+        supplied cwd) -- an observed path outside the allowed roots
+        (a session opened directly on the host outside this project's own
+        controls) is simply dropped, not silently trusted."""
+        agent_type = self._classify_agent_type(info.pane_current_command)
+        working_directory = None
+        if info.pane_current_path:
+            resolved, error = resolve_cwd(info.pane_current_path, self.config)
+            if error is None:
+                working_directory = str(resolved)
+        return {"agent_type": agent_type, "working_directory": working_directory,
+               "observed_command": info.pane_current_command}
+
+    def terminal_kill_session(self, name: str, confirm_name: str, *,
+                              requested_by: str | None = None) -> dict[str, Any]:
+        """Terminate exactly one tmux session (kill-session, never kill-
+        server) -- same protected_sessions refusal and idempotent-already-
+        gone shape as terminal_delete_session, which this calls for the
+        actual tmux mechanics and binding/grant cleanup. Two things this
+        adds on top of a plain delete:
+
+          1. `confirm_name` must exactly equal `name` -- a SECOND,
+             server-side-enforced confirmation for a destructive action,
+             never trusting a client-side confirm() dialog alone.
+          2. On an actual kill (never on an already-gone no-op), captures
+             the pane's real, currently-observed command/cwd immediately
+             BEFORE killing it, classifies that into a safe agent_type +
+             validated working_directory, and persists it
+             (killed_sessions.py) so a later terminal_reopen_session can
+             recreate a NEW session under the same name without ever
+             guessing. `metadata_complete` in the response tells the
+             caller (the dashboard) whether that will actually be
+             possible, so it can warn BEFORE the kill if not."""
+        action = "kill_session"
+        if (error := require_session_lifecycle(self.config)) is not None:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason=error)
+            return {"error": error, "session": name}
+        if not valid_session_name(name):
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_SESSION_NAME")
+            return {"error": "INVALID_SESSION_NAME", "session": name}
+        if confirm_name != name:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="CONFIRMATION_MISMATCH")
+            return {"error": "CONFIRMATION_MISMATCH", "session": name}
+        # Protected check is also lifecycle.delete()'s own first move (see
+        # its docstring) -- repeated here only so this can short-circuit
+        # BEFORE ever querying tmux for metadata to capture, not because
+        # the refusal itself would otherwise be missed.
+        if name in self.config.session_lifecycle.protected_sessions:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="SESSION_PROTECTED")
+            return {"error": "SESSION_PROTECTED", "session": name}
+        try:
+            info = self.tmux.get_session(name)
+        except TmuxError as exc:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="TMUX_ERROR")
+            return {"error": "TMUX_ERROR", "reason": str(exc), "session": name}
+        metadata = self._capture_reopen_metadata(info) if info is not None else None
+        result = self.lifecycle.delete(name, protected_sessions=self.config.session_lifecycle.protected_sessions)
+        ok = "error" not in result
+        if ok:
+            self._cleanup_after_session_gone(name)
+            if result.get("action") == "deleted" and metadata is not None:
+                record = self.killed_sessions.record(
+                    name, agent_type=metadata["agent_type"], working_directory=metadata["working_directory"],
+                    observed_command=metadata["observed_command"], killed_by=requested_by,
+                )
+                result["reopen_metadata"] = {
+                    "agent_type": record.agent_type, "working_directory": record.working_directory,
+                    "metadata_complete": record.metadata_complete,
+                }
+            else:
+                result["reopen_metadata"] = None
+        self.audit.record(action=action, session=name, result="KILLED" if ok else "BLOCKED",
+                          reason=result.get("error") or result.get("action"))
+        return result
+
+    def terminal_reopen_session(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
+                                grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]:
+        """Recreates a NEW tmux session/process under `name` from saved
+        Kill metadata (killed_sessions.py) via the exact same
+        terminal_create_session this project's Create action already
+        uses -- explicitly NOT a resurrection of the killed process's own
+        RAM/state; a fresh process, same name/cwd/launcher.
+
+        `agent_type`/`cwd`, when explicitly supplied, OVERRIDE the saved
+        metadata field-by-field (never merged/guessed) -- the intended way
+        to proceed when saved metadata is incomplete, letting a caller
+        pick a safe agent/cwd explicitly rather than this method ever
+        inventing one. Refuses with REOPEN_METADATA_INCOMPLETE, naming
+        exactly what's still missing, if the effective agent_type is
+        unknown, or (for a non-"shell" agent_type) the effective cwd is."""
+        action = "reopen_session"
+        if (error := require_session_lifecycle(self.config)) is not None:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason=error)
+            return {"error": error, "session": name}
+        if not valid_session_name(name):
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_SESSION_NAME")
+            return {"error": "INVALID_SESSION_NAME", "session": name}
+        record = self.killed_sessions.get(name)
+        effective_agent_type = agent_type or (record.agent_type if record else None)
+        effective_cwd = cwd or (record.working_directory if record else None)
+        if effective_agent_type is None:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="AGENT_TYPE_UNKNOWN")
+            return {"error": "REOPEN_METADATA_INCOMPLETE", "session": name, "missing": ["agent_type"]}
+        if effective_agent_type != "shell" and not effective_cwd:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="CWD_UNKNOWN")
+            return {"error": "REOPEN_METADATA_INCOMPLETE", "session": name, "missing": ["working_directory"]}
+        used_saved_metadata_only = record is not None and agent_type is None and cwd is None
+        result = self.terminal_create_session(name, effective_agent_type, effective_cwd,
+                                              grant_mode=grant_mode, requested_by=requested_by)
+        result["reopened_from_metadata"] = used_saved_metadata_only
+        if "error" not in result:
+            self.killed_sessions.clear(name)
+        self.audit.record(action=action, session=name, result="REOPENED" if "error" not in result else "BLOCKED",
+                          reason=result.get("error"))
+        return result
+
+    def terminal_list_killed_sessions(self) -> dict[str, Any]:
+        """Sessions Kill has recorded reopen metadata for, most recent
+        first -- self-healing: a record whose name now belongs to a real,
+        live session again (created some other way since the kill) is
+        cleared here rather than ever listed as still reopenable."""
+        if (error := require_session_lifecycle(self.config)) is not None:
+            return {"error": error, "killed_sessions": []}
+        entries = []
+        for item in self.killed_sessions.list():
+            try:
+                exists = self.tmux.get_session(item.name) is not None
+            except TmuxError:
+                exists = False
+            if exists:
+                self.killed_sessions.clear(item.name)
+                continue
+            entries.append({
+                "name": item.name, "agent_type": item.agent_type, "working_directory": item.working_directory,
+                "metadata_complete": item.metadata_complete, "killed_at": item.killed_at, "killed_by": item.killed_by,
+            })
+        return {"killed_sessions": entries}

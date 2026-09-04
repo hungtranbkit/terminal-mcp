@@ -83,12 +83,20 @@ def test_sessions_admin_reuses_the_permission_modal_and_bulk_bar():
     assert "🔒 Thu hồi" in SESSIONS_ADMIN_HTML
 
 
-def test_sessions_admin_detach_toggle_shares_the_same_localstorage_key():
-    # Detach state must stay in sync with the main dashboard's own tab
-    # strip within the same browser -- both pages read/write the exact
-    # same key.
-    assert "const DETACHED_KEY = 'terminal-mcp:detached-sessions';" in SESSIONS_ADMIN_HTML
-    assert "const DETACHED_KEY = 'terminal-mcp:detached-sessions';" in DASHBOARD_HTML
+def test_browser_local_tab_hide_feature_removed_from_both_pages():
+    # The main dashboard's top session-tabs bar (a second, duplicate
+    # session navigation surface alongside the sidebar) was removed
+    # outright (UI cleanup item 3) -- along with it, the browser-local
+    # "hide a session's tab" mechanism (DETACHED_KEY/detachedSessions),
+    # which controlled visibility in that now-gone tab bar specifically.
+    # The admin screen's own "Gỡ tab" toggle, which only ever managed that
+    # same now-nonexistent state, is gone too -- never left as a control
+    # for a feature that no longer exists anywhere.
+    assert "DETACHED_KEY" not in DASHBOARD_HTML
+    assert "detachedSessions" not in DASHBOARD_HTML
+    assert "#sessionTabs" not in DASHBOARD_HTML
+    assert "DETACHED_KEY" not in SESSIONS_ADMIN_HTML
+    assert "Gỡ tab" not in SESSIONS_ADMIN_HTML
 
 
 def test_dashboard_has_a_nav_link_to_the_sessions_admin_screen():
@@ -310,7 +318,7 @@ def test_dashboard_auto_selects_remembered_or_first_session_once():
     # auto-opened straight into a locked placeholder.
     assert "let autoSelectAttempted = false;" in DASHBOARD_HTML
     assert "if (!autoSelectAttempted) {" in DASHBOARD_HTML
-    assert "const readableRows = rows.filter(row => row.effective_read && !detachedSessions.has(row.name));" in DASHBOARD_HTML
+    assert "const readableRows = rows.filter(row => row.effective_read);" in DASHBOARD_HTML
     assert "if (!selected && readableRows.length) {" in DASHBOARD_HTML
     assert (
         "const target = (remembered && readableRows.some(row => row.name === remembered)) "
@@ -758,13 +766,15 @@ def test_dashboard_copy_uses_plain_text_never_ansi_markup():
 
 
 def test_dashboard_search_and_copy_do_not_persist_content():
-    # Only four lightweight UI preferences are ever written to localStorage
-    # anywhere in this file: the last-viewed session *name*, the font-size
-    # number, the fullscreen on/off flag, and the set of session *names*
-    # detached from the tab bar — never search terms, copied text, or any
-    # rendered output/session content.
+    # Only three lightweight UI preferences are ever written to
+    # localStorage anywhere in this file: the last-viewed session *name*,
+    # the font-size number, and the fullscreen on/off flag — never search
+    # terms, copied text, or any rendered output/session content. (The
+    # browser-local tab-hide set this used to also include was removed
+    # along with the top session-tabs bar it controlled -- see
+    # test_browser_local_tab_hide_feature_removed_from_both_pages.)
     keys = set(re.findall(r"localStorage\.(?:setItem|getItem)\(([A-Za-z_]+)", DASHBOARD_HTML))
-    assert keys == {"LAST_SESSION_KEY", "FONT_SIZE_KEY", "FULLSCREEN_KEY", "DETACHED_KEY"}
+    assert keys == {"LAST_SESSION_KEY", "FONT_SIZE_KEY", "FULLSCREEN_KEY"}
 
 
 def test_dashboard_new_controls_disabled_without_a_selected_session():
@@ -819,11 +829,16 @@ def test_dashboard_health_indicator_no_new_backend_route():
     # separate Supervisor Loop v1/v2 features' summary/ack/pause calls, the
     # dashboard-grant feature's single shared postGrant() helper, whose one
     # fetch() call serves both grant-read and grant-input via a `path`
-    # parameter rather than a separate literal call site for each, and the
-    # shared fetchJSON() wrapper loadSessions/loadDetail now both go
-    # through -- one more literal "fetch(" substring for that wrapper's own
-    # internal call, not a new call SITE or endpoint).
-    assert DASHBOARD_HTML.count("fetch(") == 9  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch()
+    # parameter rather than a separate literal call site for each, the
+    # shared fetchJSON() wrapper loadSessions/loadDetail/loadKilledSessions
+    # all go through -- one more literal "fetch(" substring for that
+    # wrapper's own internal call, not a new call SITE or endpoint -- and
+    # two genuinely new literal call sites from the Kill/Reopen feature:
+    # the Kill confirm POST and the Reopen POST, neither of which goes
+    # through fetchJSON since neither needs its Cloudflare-Access-redirect
+    # detection -- a POST mutation route redirected to a login page would
+    # already read back as a non-JSON body either way).
+    assert DASHBOARD_HTML.count("fetch(") == 11  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen
 
 
 def test_dashboard_auth_required_distinguished_from_offline():
@@ -863,9 +878,11 @@ def test_dashboard_grant_controls_have_an_obvious_entry_point():
     # UX fix: a new, not-yet-granted session must have an obvious, direct
     # path to being granted from the dashboard -- the SHOW_GRANT_CONTROLS
     # kill switch from the earlier mobile-overlap hotfix is gone entirely;
-    # granting is reachable from the session row (lock icon), its tab, its
-    # own open card (#grantBar), and the bulk-select bar, all opening the
-    # same #permModal.
+    # granting is reachable from the session row's own "Access" text
+    # action and its own open card (#grantBar), both opening the same
+    # #permModal (no per-row lock icon, no checkbox/bulk-select bar --
+    # removed by the dashboard UI cleanup, see the no-checkbox/no-lock-
+    # icon regression tests below).
     assert "SHOW_GRANT_CONTROLS" not in DASHBOARD_HTML
     assert "function openPermModal(" in DASHBOARD_HTML
     assert "function renderPermModalBody(" in DASHBOARD_HTML
@@ -875,16 +892,37 @@ def test_dashboard_grant_controls_have_an_obvious_entry_point():
     assert "🔓 Xem + gửi" in DASHBOARD_HTML
     assert "👁 Chỉ xem" in DASHBOARD_HTML
     assert "🔒 Thu hồi" in DASHBOARD_HTML
-    # A never-granted session is still listed, with a badge, not hidden.
-    assert "🔒 Chưa cấp quyền" in DASHBOARD_HTML
-    # Per-row lock icon + checkbox, gated on `grantable()` (never for a
-    # statically-whitelisted row, which has nothing to grant/revoke).
+    # A never-granted session is still listed (never hidden), just marked
+    # inline in its meta line -- not a separate lock-icon badge anymore.
+    assert "chưa cấp quyền xem" in DASHBOARD_HTML
     assert "function grantable(row) { return !row.allowed; }" in DASHBOARD_HTML
-    assert "className = 'perm-btn'" in DASHBOARD_HTML
-    assert "className = 'sess-check'" in DASHBOARD_HTML
-    # Bulk-select bar applies a preset directly to every checked session.
-    assert "function renderBulkBar()" in DASHBOARD_HTML
-    assert "const bulkSelected = new Set();" in DASHBOARD_HTML
+    assert "accessBtn.textContent = 'Access';" in DASHBOARD_HTML
+
+
+def test_dashboard_sidebar_has_no_checkbox_or_lock_icon_or_duplicate_list():
+    # UI cleanup, mandatory regression coverage:
+    #   1) no checkbox anywhere in the sidebar (selection is click-the-row)
+    #   2) no per-row lock/eye/unlock icon badge (Access is a plain text
+    #      action shown only when there's something to grant, never an
+    #      icon rendered for every row)
+    #   3) no second, duplicate session list/tabs bar on the same page as
+    #      the sidebar
+    # (The input composer's own "Enter" toggle -- #inputEnter -- is a
+    # legitimate, unrelated checkbox and stays; this only checks that no
+    # checkbox exists inside the session list itself.)
+    assert "sess-check" not in DASHBOARD_HTML
+    assert "type = 'checkbox'" not in DASHBOARD_HTML  # no dynamically-created (row-selection) checkbox
+    assert "lock-badge" not in DASHBOARD_HTML
+    assert "perm-btn" not in DASHBOARD_HTML
+    assert "permIcon(" not in DASHBOARD_HTML
+    assert "#sessionTabs" not in DASHBOARD_HTML
+    assert "className = 'session-tab" not in DASHBOARD_HTML  # no dynamically-created tab element
+    assert "renderSessionTabs" not in DASHBOARD_HTML
+    assert "const bulkSelected" not in DASHBOARD_HTML
+    assert "function renderBulkBar" not in DASHBOARD_HTML
+    # Exactly one function renders the session navigation list.
+    assert DASHBOARD_HTML.count("function renderRows(rows) {") == 1
+    assert "id=\"sessions\"" in DASHBOARD_HTML
     # Backend this UI drives is unchanged -- grant_session_read/
     # grant_session_input are still called exactly as before, from the
     # same POST routes. These live in dashboard.py's Python source (the
@@ -902,23 +940,21 @@ def test_dashboard_grantbar_hidden_attribute_actually_hides_it():
     # visible layout when shown) would otherwise outrank the browser's
     # default `[hidden] { display:none }` UA rule by specificity, leaving
     # an "empty but still visually present" bar even while .hidden is set
-    # -- exactly the kind of subtle bug this hotfix exists to close. Same
-    # class of fix applied to #sessionTabs for the (rarer) all-detached
-    # case too.
+    # -- exactly the kind of subtle bug this hotfix exists to close.
     assert "#grantBar[hidden] { display:none }" in DASHBOARD_HTML
-    assert "#sessionTabs[hidden] { display:none }" in DASHBOARD_HTML
 
 
 def test_dashboard_detail_grid_rows_match_children_one_to_one():
-    # DOM/CSS layout contract, the direct cause of the real overlap this
-    # hotfix fixes: .detail's grid-template-rows previously listed 4
-    # tracks for what had grown to 6 direct children (#sessionTabs,
-    # #summary, #grantBar, .term, #inputNote, #inputBar) -- auto-placement
-    # silently handed the one flexible (minmax(0,1fr)) track to #summary
-    # instead of .term (the actual output viewport), which then let
-    # #summary's content overflow into the rows below it. Two invariants
-    # are asserted here so this can't silently regress again: the
-    # explicit row-track COUNT must equal 6, and every one of the 6
+    # DOM/CSS layout contract, the direct cause of a real overlap an
+    # earlier hotfix fixed: .detail's grid-template-rows must always list
+    # exactly as many tracks as .detail has direct children (now 5:
+    # #summary, #grantBar, .term, #inputNote, #inputBar -- the top
+    # session-tabs bar that used to be a 6th child was removed outright,
+    # see the UI-cleanup regression tests above), or auto-placement
+    # silently hands the one flexible (minmax(0,1fr)) track to the wrong
+    # element and lets its content overflow into the rows below it. Two
+    # invariants are asserted here so this can't silently regress again:
+    # the explicit row-track COUNT must equal 5, and every one of the 5
     # children must carry its own explicit `grid-row:N` (not rely on
     # sequential auto-placement, which reassigns everyone once any one of
     # them toggles display:none -- e.g. the now-permanently-hidden
@@ -926,10 +962,10 @@ def test_dashboard_detail_grid_rows_match_children_one_to_one():
     detail_rule = re.search(r"\.detail \{ display:grid; grid-template-rows:([^;]+);", DASHBOARD_HTML)
     assert detail_rule is not None
     tracks = detail_rule.group(1).split()
-    assert len(tracks) == 6
-    assert tracks == ["auto", "auto", "auto", "minmax(0,1fr)", "auto", "auto"]  # .term (position 4) is the ONE growing track
+    assert len(tracks) == 5
+    assert tracks == ["auto", "auto", "minmax(0,1fr)", "auto", "auto"]  # .term (position 3) is the ONE growing track
     expected_grid_rows = {
-        "#sessionTabs": 1, "#summary": 2, "#grantBar": 3, ".term": 4, "#inputNote": 5, "#inputBar": 6,
+        "#summary": 1, "#grantBar": 2, ".term": 3, "#inputNote": 4, "#inputBar": 5,
     }
     for selector, row in expected_grid_rows.items():
         assert f"grid-row:{row};" in DASHBOARD_HTML or f"grid-row:{row} " in DASHBOARD_HTML, \
@@ -1006,6 +1042,9 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/session/create": {"POST"},
         "/dashboard/api/session/detach": {"POST"},
         "/dashboard/api/session/delete": {"POST"},
+        "/dashboard/api/session/kill": {"POST"},
+        "/dashboard/api/session/reopen": {"POST"},
+        "/dashboard/api/killed-sessions": {"GET", "HEAD"},
         "/dashboard/assets/{filename}": {"GET", "HEAD"},
         "/dashboard/terminal": {"GET", "HEAD"},
         "/dashboard/api/supervisor": {"GET", "HEAD"},
