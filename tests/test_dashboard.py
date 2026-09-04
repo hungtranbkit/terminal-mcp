@@ -1045,6 +1045,7 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/session/kill": {"POST"},
         "/dashboard/api/session/reopen": {"POST"},
         "/dashboard/api/killed-sessions": {"GET", "HEAD"},
+        "/dashboard/api/connection-health": {"GET", "HEAD"},
         "/dashboard/assets/{filename}": {"GET", "HEAD"},
         "/dashboard/terminal": {"GET", "HEAD"},
         "/dashboard/api/supervisor": {"GET", "HEAD"},

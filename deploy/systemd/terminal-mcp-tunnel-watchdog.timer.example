@@ -1,0 +1,19 @@
+[Unit]
+Description=Run the Terminal MCP tunnel connection watchdog every 45s
+
+[Timer]
+# 45s sits inside the task's own requested 30-60s window. OnUnitActiveSec
+# (not OnCalendar) so runs never overlap/pile up if one cycle ever takes
+# longer than the interval -- the next one is scheduled 45s after the
+# PREVIOUS one finished, not on a fixed wall-clock grid.
+OnBootSec=45
+OnUnitActiveSec=45
+AccuracySec=5
+# A missed tick (host was suspended/off through it) fires once on the
+# next boot/resume instead of being silently skipped -- keeps the
+# watchdog's own state file from going stale for longer than necessary
+# after a sleep/wake cycle (task item 6).
+Persistent=true
+
+[Install]
+WantedBy=timers.target

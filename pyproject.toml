@@ -29,6 +29,8 @@ test = ["pytest>=9,<10"]
 terminal-mcp = "terminal_mcp.server:main"
 terminal-mcp-http = "terminal_mcp.server_http:main"
 terminal-mcp-webauth = "terminal_mcp.webauth_cli:main"
+terminal-mcp-doctor = "terminal_mcp.doctor:main"
+terminal-mcp-tunnel-watchdog = "terminal_mcp.tunnel_watchdog:main"
 
 [tool.setuptools.packages.find]
 include = ["terminal_mcp*"]
@@ -41,7 +43,8 @@ version = {attr = "terminal_mcp.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra -m \"not live_cli\""
+addopts = "-ra -m \"not live_cli and not real_network\""
 markers = [
   "live_cli: exercises a real, locally-installed Codex/Claude Code CLI binary in a disposable tmux session (real API calls, real cost/latency, not run by default -- see tests/test_adapters_real_cli.py). Run explicitly with `pytest -m live_cli`.",
+  "real_network: performs a real DNS/TCP/TLS probe against a real external host (api.openai.com) -- not run by default so the suite stays deterministic on a host/CI runner without real internet access. Run explicitly with `pytest -m real_network`.",
 ]

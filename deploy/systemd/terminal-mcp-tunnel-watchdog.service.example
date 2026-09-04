@@ -1,0 +1,18 @@
+[Unit]
+Description=Terminal MCP tunnel connection watchdog (one check-and-act cycle)
+After=terminal-mcp-http.service terminal-mcp-tunnel.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/dell/workspace/terminal-mcp/.venv/bin/terminal-mcp-tunnel-watchdog
+
+# Never touches tmux (terminal_mcp/tunnel_watchdog.py holds no tmux
+# reference at all) -- the only side effects this can ever have are
+# `systemctl --user restart/start/reset-failed` on terminal-mcp-http.
+# service or terminal-mcp-tunnel.service specifically, each independently
+# cooldown-limited (see tunnel_diagnostics.py) so a sustained platform-
+# side or network outage can never turn into an unbounded restart loop.
+# Triggered by terminal-mcp-tunnel-watchdog.timer -- this unit is never
+# WantedBy= anything itself and is not meant to be started directly
+# outside a manual one-off check (`systemctl --user start
+# terminal-mcp-tunnel-watchdog.service` runs exactly one cycle and exits).

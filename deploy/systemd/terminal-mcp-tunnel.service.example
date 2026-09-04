@@ -1,0 +1,63 @@
+[Unit]
+Description=OpenAI Secure MCP Tunnel for Terminal MCP
+After=network-online.target terminal-mcp-http.service
+Wants=network-online.target
+
+# --- Connection-reliability hardening ---------------------------------
+# Real root cause found in this host's own 4-day log history (journalctl
+# --user -u terminal-mcp-tunnel): 1232 WARN/ERROR poll failures, the
+# overwhelming majority `dial tcp: lookup api.openai.com on 127.0.0.53:53:
+# server misbehaving` (systemd-resolved's stub resolver having a bad
+# patch) plus a handful of IPv6 `network is unreachable`. tunnel-client's
+# OWN internal backoff/retry recovers from nearly all of these within a
+# cycle or two ("poller recovered; polling operational" follows every one
+# in the log) -- which is exactly why NRestarts read 0 across those same
+# 4 days: the process never exits, so Restart= never engages. A long
+# enough run of these CAN push the tunnel's time-since-last-successful-
+# poll past whatever staleness threshold OpenAI's platform uses ("Tunnel-
+# client has not been seen for 300 seconds") while the process stays
+# `active (running)` throughout -- systemd's own process-level Restart=
+# structurally cannot see that. See terminal_mcp/tunnel_watchdog.py for
+# the piece that DOES see it (checks the tunnel's own last-successful-
+# poll timestamp, not just process liveness) and restarts this unit when
+# it happens. The settings below are this unit's own complementary half:
+# make an actual crash/exit recover fast and never get stuck permanently
+# failed, which is a real (if less common) failure mode independent of
+# the hung-but-alive one the watchdog covers.
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/terminal-mcp/tunnel.env
+ExecStart=%h/.local/bin/tunnel-client run --profile terminal-mcp
+# Always, not just on-failure: this daemon is meant to run continuously:
+# an unexpected clean exit (rare, but not provably impossible) should
+# recover exactly like a crash would. `systemctl --user stop` is still
+# always respected regardless of this setting -- systemd never auto-
+# restarts a unit that was explicitly stopped.
+Restart=always
+# Exponential-ish backoff (systemd >= 254, confirmed available here --
+# `systemctl --version` reports 259): starts at RestartSec, grows over
+# RestartSteps steps up to RestartMaxDelaySec. Fast first retry (a
+# transient blip recovers almost immediately) without hammering
+# restarts every 5s forever during a genuinely sustained outage.
+RestartSec=5
+RestartSteps=6
+RestartMaxDelaySec=60
+# Old defaults (StartLimitIntervalSec=10s, StartLimitBurst=5) meant a
+# burst of 5 restarts inside 10s parked this unit in a PERMANENT
+# `failed` SubState -- systemd stops trying entirely until a human runs
+# `systemctl --user reset-failed`, which is exactly the "user phải
+# restart thủ công" this whole hardening pass exists to eliminate. This
+# window is now generous enough that even a bad multi-minute network
+# patch triggering the backoff sequence above repeatedly won't exhaust
+# it, while still catching a truly pathological crash-loop (10 restarts
+# in 5 minutes is not something transient network/DNS flakiness alone
+# produces at this unit's own RestartSteps pace). The watchdog
+# (terminal-mcp-tunnel-watchdog.service/.timer) is still a second,
+# independent safety net: it explicitly checks for SubState=failed and
+# runs reset-failed + start itself if this window is somehow exhausted
+# anyway, so recovery from that state never depends on a human noticing.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Install]
+WantedBy=default.target

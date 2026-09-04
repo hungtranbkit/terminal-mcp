@@ -10,6 +10,7 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket
 
+from . import tunnel_diagnostics
 from .cf_access import verify_access_assertion
 from .core import TerminalService
 from .permissions import input_session_allowed, session_allowed, valid_session_name
@@ -88,6 +89,14 @@ DASHBOARD_HTML = """<!doctype html>
        attention, otherwise a quiet muted count. */
     .supervisor-badge { background:transparent; border:1px solid var(--line); color:var(--muted); border-radius:999px; padding:4px 10px; font:12px var(--mono); cursor:pointer; white-space:nowrap }
     .supervisor-badge.attention { border-color:var(--amber); color:var(--amber) }
+    /* Connection health banner (task: "self-healing, có chẩn đoán rõ") --
+       one quiet, always-present label (never a popup/toast), colored only
+       when something isn't simply "Connected". #connHealthBadge[hidden]
+       is used while the very first poll hasn't resolved yet, never after. */
+    #connHealthBadge { cursor:default }
+    #connHealthBadge[hidden] { display:none }
+    #connHealthBadge.conn-recovering { border-color:var(--amber); color:var(--amber) }
+    #connHealthBadge.conn-tunnel-stale, #connHealthBadge.conn-mcp-down { border-color:#ff6b6b; color:#ff6b6b }
     #supervisorPanel { display:none; position:fixed; right:16px; top:64px; z-index:25; width:min(360px, calc(100vw - 32px)); max-height:70vh; overflow:auto; background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 20px 50px rgba(0,0,0,.6) }
     body.supervisor-visible #supervisorPanel { display:block }
     body.supervisor-visible #supervisorBackdrop { display:block; position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:20 }
@@ -433,6 +442,7 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="header-right">
       <a href="/dashboard/sessions" class="supervisor-badge" id="sessionsAdminLink" style="text-decoration:none">⚙ Quản lý</a>
       <button id="supervisorBadge" class="supervisor-badge" type="button" hidden></button>
+      <span class="supervisor-badge" id="connHealthBadge" title="Kết nối OpenAI Secure MCP Tunnel" hidden></span>
       <span class="live" id="liveBadge">● LIVE</span>
     </div>
   </header>
@@ -556,6 +566,7 @@ DASHBOARD_HTML = """<!doctype html>
     const permModalErrorEl = document.querySelector('#permModalError');
     const permModalCloseBtnEl = document.querySelector('#permModalCloseBtn');
     const liveBadgeEl = document.querySelector('#liveBadge');
+    const connHealthBadgeEl = document.querySelector('#connHealthBadge');
     const supervisorBadgeEl = document.querySelector('#supervisorBadge');
     const supervisorPanelEl = document.querySelector('#supervisorPanel');
     const supervisorBackdropEl = document.querySelector('#supervisorBackdrop');
@@ -1837,6 +1848,34 @@ DASHBOARD_HTML = """<!doctype html>
       }
     }
     refresh(); setInterval(refresh, 5000);
+
+    // ---- connection health banner (OpenAI Secure MCP Tunnel) ---------------
+    // One quiet, always-present label -- never a popup, never re-fetched on
+    // the same fast 5s cadence as session polling (task item 5: "không spam
+    // UI"); the underlying check itself already skips the slower external
+    // DNS/TLS probe (see dashboard.py's own route comment), so this stays
+    // cheap even at this interval. A fetch failure here never touches
+    // liveBadgeEl/setConnectionState -- this banner's own health has
+    // nothing to do with whether THIS dashboard page can reach the server.
+    const CONN_BADGE_CLASSES = {
+      'Connected': '', 'Recovering': 'conn-recovering',
+      'Local OK but tunnel stale': 'conn-tunnel-stale', 'Local MCP down': 'conn-mcp-down',
+    };
+    async function loadConnectionHealth() {
+      try {
+        const data = await fetchJSON('/dashboard/api/connection-health', {cache: 'no-store'});
+        const label = clean(data.banner) || 'Connected';
+        connHealthBadgeEl.hidden = false;
+        connHealthBadgeEl.textContent = label;
+        connHealthBadgeEl.className = 'supervisor-badge ' + (CONN_BADGE_CLASSES[label] || '');
+      } catch (error) {
+        // Sign-in-required/offline is already surfaced by the main LIVE
+        // badge -- this banner just goes quiet rather than showing a
+        // second, redundant error state.
+        connHealthBadgeEl.hidden = true;
+      }
+    }
+    loadConnectionHealth(); setInterval(loadConnectionHealth, 30000);
   </script>
 </body>
 </html>"""
@@ -3395,6 +3434,31 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     server._custom_starlette_routes.append(
         WebSocketRoute("/dashboard/ws/terminal", endpoint=dashboard_terminal_ws, name="dashboard_terminal_ws")
     )
+
+    @server.custom_route("/dashboard/api/connection-health", methods=["GET"], include_in_schema=False)
+    async def connection_health(request: Request) -> JSONResponse:
+        # One coarse label (task item 5: "chỉ cần một trạng thái tổng...
+        # không spam UI") for the dashboard's own small header banner --
+        # the full breakdown lives in `terminal-mcp-doctor connection`,
+        # never duplicated here. skip_network_check=True: this route is
+        # polled by every open dashboard tab, so it deliberately never
+        # does the (slower, external) DNS/TLS probe to api.openai.com on
+        # every request -- mcp_local/tunnel_process/tunnel_ready alone
+        # (all local-only checks) are enough to pick one of the 4 banner
+        # labels; the watchdog's own periodic diagnose() call (every 45s,
+        # not once per open browser tab) is what actually exercises the
+        # network check.
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+
+        def _compute() -> dict:
+            state = tunnel_diagnostics.WatchdogState.load(tunnel_diagnostics.default_state_path())
+            diag = tunnel_diagnostics.diagnose(state=state, skip_network_check=True)
+            return {"banner": tunnel_diagnostics.banner_status(diag, state), "diagnosis": diag}
+
+        result = await anyio.to_thread.run_sync(_compute)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/supervisor", methods=["GET"], include_in_schema=False)
     async def supervisor_summary(request: Request) -> JSONResponse:
