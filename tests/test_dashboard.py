@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import inspect
+import json
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -1014,6 +1018,56 @@ def test_dashboard_ansi_colours_are_the_single_css_token_source():
     assert "const ANSI_BRIGHT = [8, 9, 10, 11, 12, 13, 14, 15].map(ansiVar);" in DASHBOARD_HTML
     # No hardcoded ANSI hex palette left behind alongside it.
     assert "#3b3b3b" not in DASHBOARD_HTML and "#e05561" not in DASHBOARD_HTML
+
+
+def test_dashboard_ansi_renderer_strips_osc_sequences():
+    # Real bug, caught live verifying this redesign against a real Claude
+    # Code CLI session: tmux `capture-pane -e` can carry an OSC sequence
+    # (that session's own output included an OSC 8 hyperlink) alongside the
+    # SGR colour codes this renderer already understood. CSI_RE only ever
+    # matches `ESC [...`, so an OSC sequence (`ESC ]...BEL` or `ESC ]...ESC
+    # \`) had no closing bracket/letter for it to consume, and leaked into
+    # the rendered pane as literal garbage text instead of being silently
+    # dropped like every other non-SGR sequence already is.
+    assert "const OSC_RE = " in DASHBOARD_HTML
+    assert "text = text.replace(OSC_RE, '');" in DASHBOARD_HTML
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available -- semantic regex check skipped, source-level assertions above still ran")
+    # Extract just the self-contained SGR/OSC parsing logic (CSI_RE, OSC_RE,
+    # ansiRuns) -- everything else in this <script> is DOM-dependent
+    # (document.querySelector at module scope) and would need a full
+    # browser/jsdom to even load, which this repo's test suite doesn't
+    # depend on anywhere else. ANSI_BASE/ANSI_BRIGHT (normally read from
+    # CSS custom properties, see the test above) are stubbed with plain
+    # arrays here -- this test is only about OSC-stripping behaviour, not
+    # colour-token sourcing.
+    start = DASHBOARD_HTML.index("const CSI_RE = ")
+    end = DASHBOARD_HTML.index("function renderAnsi(container, text) {")
+    renderer_js = DASHBOARD_HTML[start:end]
+    assert "function ansiRuns(text) {" in renderer_js  # sanity: the slice actually captured it
+    probe = (
+        "const ANSI_BASE = ['b0','b1','b2','b3','b4','b5','b6','b7'];\n"
+        "const ANSI_BRIGHT = ['c0','c1','c2','c3','c4','c5','c6','c7'];\n"
+        + renderer_js
+        + "\nconst r1 = ansiRuns('from=cli\\x1b]8;;https://example.com\\x1b\\\\next').map(x => x.t).join('');"
+        + "\nconst r2 = ansiRuns('before\\x1b]0;window title\\x07after').map(x => x.t).join('');"
+        + "\nconst r3 = ansiRuns('normal \\x1b[31mred\\x1b[0m text');"
+        + "\nconsole.log(JSON.stringify({r1, r2, fg: r3[1].fg, text: r3.map(x => x.t).join('')}));"
+    )
+    fd, probe_path = tempfile.mkstemp(suffix=".js")
+    try:
+        with open(fd, "w") as handle:
+            handle.write(probe)
+        result = subprocess.run([node, probe_path], capture_output=True, text=True, timeout=10)
+    finally:
+        Path(probe_path).unlink(missing_ok=True)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["r1"] == "from=clinext"  # OSC 8 hyperlink (ST terminator) stripped, surrounding text kept
+    assert payload["r2"] == "beforeafter"  # OSC window-title (BEL terminator) stripped, surrounding text kept
+    assert payload["text"] == "normal red text"  # SGR handling untouched by the new OSC stripping
+    assert payload["fg"] == "b1"  # the SGR colour itself is still applied (code 31 -> ANSI_BASE[1])
 
 
 def test_dashboard_grantbar_hidden_attribute_actually_hides_it():

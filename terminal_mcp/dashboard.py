@@ -945,7 +945,18 @@ DASHBOARD_HTML = """<!doctype html>
       return null;
     }
     const CSI_RE = /\\x1b\\[([0-9;]*)([A-Za-z])/g;
+    // OSC sequences (ESC ] ... BEL-or-ESC\\) -- e.g. an OSC 8 hyperlink, or a
+    // window-title set -- a real CLI can legitimately emit these (caught
+    // live verifying this redesign against a real Claude Code session,
+    // whose own output includes one), and tmux `capture-pane -e` passes
+    // them through untouched. CSI_RE above only ever matches `ESC [`, so an
+    // OSC sequence has no closing bracket/letter for it to consume --
+    // without this, it would leak into the rendered pane as literal
+    // garbage text instead of being silently dropped like every other
+    // non-SGR control sequence already is.
+    const OSC_RE = /\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)/g;
     function ansiRuns(text) {
+      text = text.replace(OSC_RE, '');
       const runs = [];
       let fg = null, bg = null, bold = false, dim = false, italic = false, underline = false, inverse = false;
       let last = 0, match;
@@ -1804,6 +1815,19 @@ DASHBOARD_HTML = """<!doctype html>
           : 'Chọn một session để xem output.';
       }
 
+      // Paint the authoritative fresh rows BEFORE any auto-select below --
+      // real bug, caught live in this redesign's own browser verification:
+      // selectSession() repaints via renderRows(lastKnownRows) internally,
+      // and on the very first cold load lastKnownRows was still its []
+      // startup default (this is the FIRST time renderRows(rows) has ever
+      // run) -- selectSession's own repaint then saw an empty list, its
+      // "session no longer exists" branch fired, and immediately un-
+      // selected the session it had just auto-opened. Populating
+      // lastKnownRows here first means selectSession's internal repaint
+      // below always sees the real, current rows, cold-start included.
+      renderRows(rows);
+      if (sessionLifecycleEnabled) loadKilledSessions(); else killedToggleEl.hidden = true;
+
       // On first load only (never on the recurring 5s poll, which must not
       // fight a user's manual choice to switch sessions or clear the
       // selection): auto-open the remembered session if it still exists,
@@ -1820,9 +1844,6 @@ DASHBOARD_HTML = """<!doctype html>
           selectSession(target);
         }
       }
-
-      renderRows(rows);
-      if (sessionLifecycleEnabled) loadKilledSessions(); else killedToggleEl.hidden = true;
     }
 
     // ---- Kill confirmation modal (destructive; item 7/8 of the design
