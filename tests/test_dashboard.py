@@ -187,30 +187,31 @@ def test_dashboard_mobile_uses_smaller_terminal_font_desktop_unchanged():
     assert "#output { font-size:11.5px; line-height:1.3;" in mobile_css
 
 
-def test_dashboard_mobile_sidebar_collapses_and_reopens_as_drawer():
-    # Mobile: once a session is open, the sidebar hides by default (freeing
-    # essentially the full viewport for the terminal pane) and reopens as a
-    # dismissible overlay drawer via the ☰ Sessions control, without
-    # resizing/displacing the terminal. Desktop/tablet keeps the sidebar
-    # permanently visible — none of this is gated only inside the media
-    # query text itself, so also check the toggle defaults to hidden and the
-    # drawer rules are scoped under body.has-selection (mobile-only state).
-    assert 'id="sessionsToggle"' in DASHBOARD_HTML
-    assert 'id="sessionsPanel"' in DASHBOARD_HTML
-    assert 'id="sidebarBackdrop"' in DASHBOARD_HTML
-    assert ".sessions-toggle { display:none }" in DASHBOARD_HTML  # hidden by default (desktop and pre-selection mobile)
-    assert "body.has-selection #sessionsPanel { display:none }" in DASHBOARD_HTML
-    assert "body.has-selection.sidebar-visible #sessionsPanel" in DASHBOARD_HTML
-    assert "body.has-selection.sidebar-visible #sidebarBackdrop" in DASHBOARD_HTML
+def test_dashboard_mobile_has_no_sidebar_drawer():
+    # Windows-Terminal-style redesign (task item 5): mobile/tablet gets a
+    # compact tab bar and a full-screen terminal -- no sidebar overlay/
+    # drawer taking space any more. The old dismissible-drawer mechanism
+    # (☰ toggle, backdrop, sidebar-visible class) is gone entirely, not
+    # just hidden -- the tab bar is already the full, always-visible,
+    # mobile-appropriate nav surface, so there is nothing left to toggle.
+    assert 'id="sessionsToggle"' not in DASHBOARD_HTML
+    assert 'id="sessionsPanel"' not in DASHBOARD_HTML
+    assert 'id="sidebarBackdrop"' not in DASHBOARD_HTML
+    assert "sidebar-visible" not in DASHBOARD_HTML
+    assert 'id="tabbar"' in DASHBOARD_HTML
+    assert 'class="tabbar"' in DASHBOARD_HTML
 
 
-def test_dashboard_sidebar_toggle_and_backdrop_wired_to_state():
-    # The toggle opens/closes the drawer; picking a session always closes it
-    # again (hide-by-default-once-opened); the backdrop closes without
-    # changing the current selection.
-    assert "sessionsToggleEl.onclick = () => { sidebarForcedOpen = !sidebarForcedOpen; updateSidebarVisibility(); };" in DASHBOARD_HTML
-    assert "sidebarBackdropEl.onclick = () => { sidebarForcedOpen = false; updateSidebarVisibility(); };" in DASHBOARD_HTML
-    assert "sidebarForcedOpen = false; // opening a session always closes the mobile drawer again" in DASHBOARD_HTML
+def test_dashboard_selecting_a_session_resets_layout_state():
+    # Every place that used to have to explicitly "close the mobile drawer
+    # again" (selecting a session, a session disappearing, exiting
+    # fullscreen, killing the open session) now funnels through the one,
+    # generic updateLayoutState() -- no separate sidebarForcedOpen flag or
+    # drawer-specific function survives.
+    assert "sidebarForcedOpen" not in DASHBOARD_HTML
+    assert "updateSidebarVisibility" not in DASHBOARD_HTML
+    assert "function updateLayoutState() {" in DASHBOARD_HTML
+    assert "document.body.classList.toggle('has-selection', Boolean(selected));" in DASHBOARD_HTML
 
 
 def test_dashboard_mobile_sidebar_respects_safe_areas():
@@ -277,8 +278,11 @@ def test_dashboard_fullscreen_hides_chrome_and_fills_terminal_on_mobile():
     # instead of showing "essentially only the terminal pane", exactly the
     # bug a real agent-browser screenshot caught before this test existed.
     assert "body.fullscreen-terminal #grantBar," in DASHBOARD_HTML
-    assert "body.fullscreen-terminal #inputBar," in DASHBOARD_HTML
-    assert "body.fullscreen-terminal .sessions-toggle," in DASHBOARD_HTML
+    assert "body.fullscreen-terminal #inputBar { display:none }" in DASHBOARD_HTML
+    # The tab bar replaced the old sidebar as the ONE nav surface (task
+    # item 2/3/5) -- it must be in this hidden list exactly like the
+    # sidebar toggle it replaced, or fullscreen mode would leak it.
+    assert "body.fullscreen-terminal .tabbar," in DASHBOARD_HTML
     assert "body.fullscreen-terminal .detail { grid-template-rows:minmax(0,1fr) }" in DASHBOARD_HTML
 
 
@@ -878,11 +882,12 @@ def test_dashboard_grant_controls_have_an_obvious_entry_point():
     # UX fix: a new, not-yet-granted session must have an obvious, direct
     # path to being granted from the dashboard -- the SHOW_GRANT_CONTROLS
     # kill switch from the earlier mobile-overlap hotfix is gone entirely;
-    # granting is reachable from the session row's own "Access" text
-    # action and its own open card (#grantBar), both opening the same
-    # #permModal (no per-row lock icon, no checkbox/bulk-select bar --
-    # removed by the dashboard UI cleanup, see the no-checkbox/no-lock-
-    # icon regression tests below).
+    # granting is reachable from the term-bar's own "🔐 Quyền truy cập" menu
+    # item (scoped to the selected session -- task item 3's consolidation
+    # of what used to be a per-row "Access" button) and the open session's
+    # own card (#grantBar), both opening the same #permModal (no per-row
+    # lock icon, no checkbox/bulk-select bar -- removed by the dashboard UI
+    # cleanup, see the no-checkbox/no-lock-icon regression tests below).
     assert "SHOW_GRANT_CONTROLS" not in DASHBOARD_HTML
     assert "function openPermModal(" in DASHBOARD_HTML
     assert "function renderPermModalBody(" in DASHBOARD_HTML
@@ -893,36 +898,48 @@ def test_dashboard_grant_controls_have_an_obvious_entry_point():
     assert "👁 Chỉ xem" in DASHBOARD_HTML
     assert "🔒 Thu hồi" in DASHBOARD_HTML
     # A never-granted session is still listed (never hidden), just marked
-    # inline in its meta line -- not a separate lock-icon badge anymore.
+    # inline in its tab's own tooltip -- not a separate lock-icon badge.
     assert "chưa cấp quyền xem" in DASHBOARD_HTML
     assert "function grantable(row) { return !row.allowed; }" in DASHBOARD_HTML
-    assert "accessBtn.textContent = 'Access';" in DASHBOARD_HTML
+    assert 'id="termAccessBtn"' in DASHBOARD_HTML
+    assert "🔐 Quyền truy cập" in DASHBOARD_HTML
+    assert "termAccessBtnEl.disabled = !canGrant;" in DASHBOARD_HTML
+    assert "termAccessBtnEl.onclick = () => { if (row) { closeAllMenus(); openPermModal(row.name); } };" in DASHBOARD_HTML
 
 
 def test_dashboard_sidebar_has_no_checkbox_or_lock_icon_or_duplicate_list():
-    # UI cleanup, mandatory regression coverage:
-    #   1) no checkbox anywhere in the sidebar (selection is click-the-row)
-    #   2) no per-row lock/eye/unlock icon badge (Access is a plain text
-    #      action shown only when there's something to grant, never an
-    #      icon rendered for every row)
-    #   3) no second, duplicate session list/tabs bar on the same page as
-    #      the sidebar
+    # UI cleanup, mandatory regression coverage (now backing the Windows-
+    # Terminal-style tab bar, task item 2/3 -- the tab bar is a full
+    # replacement of the old sidebar, the exact same duplication concern
+    # this test has always guarded, just against a new implementation):
+    #   1) no checkbox anywhere in the tab bar (selection is click-the-tab)
+    #   2) no per-row lock/eye/unlock icon badge (Access lives in the
+    #      term-bar menu, scoped to the selected session, never a per-row
+    #      icon rendered for every tab)
+    #   3) no second, duplicate session list/tabs bar anywhere on the page
+    #      (no leftover sidebar, no second nav surface alongside the tabs)
     # (The input composer's own "Enter" toggle -- #inputEnter -- is a
     # legitimate, unrelated checkbox and stays; this only checks that no
-    # checkbox exists inside the session list itself.)
+    # checkbox exists inside the session nav itself.)
     assert "sess-check" not in DASHBOARD_HTML
     assert "type = 'checkbox'" not in DASHBOARD_HTML  # no dynamically-created (row-selection) checkbox
     assert "lock-badge" not in DASHBOARD_HTML
     assert "perm-btn" not in DASHBOARD_HTML
     assert "permIcon(" not in DASHBOARD_HTML
-    assert "#sessionTabs" not in DASHBOARD_HTML
-    assert "className = 'session-tab" not in DASHBOARD_HTML  # no dynamically-created tab element
-    assert "renderSessionTabs" not in DASHBOARD_HTML
+    assert "#sessionTabs" not in DASHBOARD_HTML  # not this exact old id -- the real tab bar below is `#tabbar`
+    assert "className = 'session-tab" not in DASHBOARD_HTML  # no dynamically-created tab element under that old name
+    assert "renderSessionTabs" not in DASHBOARD_HTML  # the real renderer is named renderRows, checked below
     assert "const bulkSelected" not in DASHBOARD_HTML
     assert "function renderBulkBar" not in DASHBOARD_HTML
-    # Exactly one function renders the session navigation list.
+    # No leftover sidebar element/CSS survives alongside the new tab bar.
+    assert 'id="sessionsPanel"' not in DASHBOARD_HTML
+    assert "row-actions" not in DASHBOARD_HTML
+    assert "sess-main" not in DASHBOARD_HTML
+    # Exactly one function renders the session navigation list, into
+    # exactly one nav element.
     assert DASHBOARD_HTML.count("function renderRows(rows) {") == 1
-    assert "id=\"sessions\"" in DASHBOARD_HTML
+    assert DASHBOARD_HTML.count('id="tabbar"') == 1
+    assert 'id="tabbar"' in DASHBOARD_HTML
     # Backend this UI drives is unchanged -- grant_session_read/
     # grant_session_input are still called exactly as before, from the
     # same POST routes. These live in dashboard.py's Python source (the
@@ -933,6 +950,70 @@ def test_dashboard_sidebar_has_no_checkbox_or_lock_icon_or_duplicate_list():
     assert "terminal.grant_session_input(name, enabled" in module_source
     assert '"/dashboard/api/session/grant-read", methods=["POST"]' in module_source
     assert '"/dashboard/api/session/grant-input", methods=["POST"]' in module_source
+
+
+def test_dashboard_tab_click_selects_and_close_opens_the_real_kill_modal():
+    # Windows-Terminal-style tab bar (task item 2): a tab click/Enter/Space
+    # activates the SAME selectSession() used everywhere else, and its
+    # hover-reveal close button opens the exact same typed-confirmation
+    # kill modal as before -- never a separate, weaker "close tab" that
+    # silently kills or detaches without confirmation.
+    assert "const activate = () => selectSession(row.name);" in DASHBOARD_HTML
+    assert "tab.onclick = activate;" in DASHBOARD_HTML
+    assert "if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activate(); }" in DASHBOARD_HTML
+    assert "closeBtn.className = 'tab-close';" in DASHBOARD_HTML
+    assert "openKillModal(row.name, row.kill_reopen_ready !== false);" in DASHBOARD_HTML
+    # Gated exactly like the old per-row Kill button: disabled (not
+    # hidden), with a reason, for a protected session or when session
+    # lifecycle management is off entirely.
+    assert "closeBtn.disabled = !sessionLifecycleEnabled || isProtected;" in DASHBOARD_HTML
+
+
+def test_dashboard_tab_state_dot_reflects_only_real_backend_states():
+    # Task item 2: "a light indicator for running/idle/error/offline IF the
+    # backend already has that state -- never a fake one". tabDotClass only
+    # ever branches on row.state values classify_status() actually emits.
+    assert "function tabDotClass(row) {" in DASHBOARD_HTML
+    dot_fn = DASHBOARD_HTML.split("function tabDotClass(row) {", 1)[1].split("\n    }", 1)[0]
+    for real_state in ("FAILED", "ERROR", "BLOCKED", "IDLE", "RESTRICTED", "UNKNOWN"):
+        assert real_state in dot_fn
+    # No invented state name anywhere near this function.
+    assert "'CONNECTING'" not in dot_fn and "'PENDING'" not in dot_fn
+
+
+def test_dashboard_clicking_output_focuses_input_but_not_mid_selection():
+    # Task item 4: "clicking the terminal must focus the correct input".
+    # Guarded so an in-progress click-drag text selection is never
+    # disrupted, and so focus is never forced onto a disabled input.
+    assert "outputEl.addEventListener('click', () => {" in DASHBOARD_HTML
+    assert "if (selection && !selection.isCollapsed) return;" in DASHBOARD_HTML
+    assert "if (!inputTextEl.disabled) inputTextEl.focus();" in DASHBOARD_HTML
+
+
+def test_dashboard_terminal_cursor_only_renders_on_the_success_path():
+    # Task item 1/6: a clear blinking cursor glyph, appended fresh after
+    # every real render -- but never for the READ_RESTRICTED placeholder
+    # or a generic error state (loadDetail's own early returns above it).
+    assert "cursor.className = 'term-cursor';" in DASHBOARD_HTML
+    detail_fn = DASHBOARD_HTML.split("async function loadDetail() {", 1)[1].split("\n    }\n", 1)[0]
+    assert "renderAnsi(outputEl, clean(data.tail.output));" in detail_fn
+    assert "cursor.className = 'term-cursor';" in detail_fn
+    # It comes strictly after the READ_RESTRICTED/error early returns, not
+    # before -- those branches must never show a cursor over locked/absent
+    # output.
+    assert detail_fn.index("READ_RESTRICTED") < detail_fn.index("cursor.className")
+
+
+def test_dashboard_ansi_colours_are_the_single_css_token_source():
+    # Task item 6: "clear theme tokens for the terminal surface, not
+    # hardcoded scattered values" -- the SGR renderer's own 16-colour
+    # lookup tables read the same --ansi-0..15 custom properties the :root
+    # palette defines, rather than a second hardcoded hex-colour copy.
+    assert "ROOT_STYLE.getPropertyValue(`--ansi-${n}`)" in DASHBOARD_HTML
+    assert "const ANSI_BASE = [0, 1, 2, 3, 4, 5, 6, 7].map(ansiVar);" in DASHBOARD_HTML
+    assert "const ANSI_BRIGHT = [8, 9, 10, 11, 12, 13, 14, 15].map(ansiVar);" in DASHBOARD_HTML
+    # No hardcoded ANSI hex palette left behind alongside it.
+    assert "#3b3b3b" not in DASHBOARD_HTML and "#e05561" not in DASHBOARD_HTML
 
 
 def test_dashboard_grantbar_hidden_attribute_actually_hides_it():
@@ -1091,10 +1172,15 @@ def test_dashboard_mobile_media_query_matches_landscape_phones_too():
     # stops applying mid-rotation even though the JS fullscreen state
     # (and selected session, auto-follow, font size) never changed.
     assert "@media (max-width:760px), (max-height:760px)" in DASHBOARD_HTML
-    # Only the one, combined mobile query should exist -- a second,
-    # narrower @media block would be exactly the kind of orientation trap
-    # this fixes if introduced by accident.
-    assert DASHBOARD_HTML.count("@media") == 1
+    # Only the one, combined VIEWPORT-breakpoint query should exist -- a
+    # second, width-only one would be exactly the kind of orientation trap
+    # this fixes if introduced by accident. The one other @media in the
+    # file (prefers-reduced-motion, for the blinking terminal cursor) is an
+    # accessibility-preference query, not a viewport breakpoint -- it can
+    # never create that trap, so it is fine for it to coexist.
+    assert DASHBOARD_HTML.count("@media (prefers-reduced-motion:reduce)") == 1
+    assert DASHBOARD_HTML.count("@media (max-width") == 1
+    assert DASHBOARD_HTML.count("@media") == 2
 
 
 def test_dashboard_fullscreen_rules_live_inside_the_orientation_safe_query():
@@ -1110,7 +1196,10 @@ def test_dashboard_fullscreen_rules_live_inside_the_orientation_safe_query():
 def test_dashboard_selected_session_runs_near_edge_to_edge_on_mobile():
     media_start = DASHBOARD_HTML.index("@media (max-width:760px), (max-height:760px)")
     mobile_css = DASHBOARD_HTML[media_start:]
-    assert "body.has-selection main { gap:6px;" in mobile_css
+    # Windows-Terminal-style redesign (task item 1/5): the terminal is the
+    # focal point, so the outer gutter collapses fully (gap:0) once a
+    # session is open, not just shrunk to a thin 6px edge as before.
+    assert "body.has-selection main { gap:0;" in mobile_css
     # Still safe-area aware -- never flush under a notch/home-indicator.
     assert "env(safe-area-inset-left)" in mobile_css.split("body.has-selection main", 1)[1][:200]
     # The actual output area's own font-size/padding is untouched by this

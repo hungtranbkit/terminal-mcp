@@ -81,7 +81,40 @@ DASHBOARD_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
   <title>Terminal MCP Sessions</title>
   <style>
-    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --term-bg:#0a0e1a; --mono: ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace; }
+    :root {
+      color-scheme: dark;
+      /* App chrome (header, tab bar, menus, modals) -- deliberately a
+         touch darker/flatter than before so the terminal surface below
+         reads as the visual focus, not just another panel among many
+         (task item 1: "terminal area là trọng tâm"). */
+      --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd;
+      --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#3b78ff;
+      --mono: ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace;
+      /* Terminal surface tokens (task: "tạo theme token rõ ràng cho
+         terminal surface, không hardcode rải rác") -- Windows Terminal's
+         own default ("Campbell") dark colour scheme, applied identically
+         to BOTH this page's poll-based output pane (ansiRuns/renderAnsi
+         below read --ansi-0..15 by SGR code) AND the real xterm.js
+         terminal (webterm.py's own Terminal({theme:...}) reads these
+         exact same values) -- one palette, never hardcoded a second time,
+         so a colour means the same thing on every terminal surface in
+         this app. */
+      --term-bg:#0c0c0c; --term-fg:#cccccc; --term-cursor:#ffffff; --term-selection:rgba(255,255,255,.28);
+      --ansi-0:#0c0c0c; --ansi-1:#c50f1f; --ansi-2:#13a10e; --ansi-3:#c19c00;
+      --ansi-4:#0037da; --ansi-5:#881798; --ansi-6:#3a96dd; --ansi-7:#cccccc;
+      --ansi-8:#767676; --ansi-9:#e74856; --ansi-10:#16c60c; --ansi-11:#f9f1a5;
+      --ansi-12:#3b78ff; --ansi-13:#b4009e; --ansi-14:#61d6d6; --ansi-15:#f2f2f2;
+    }
+    /* Thin, dark scrollbars everywhere a pane scrolls internally (task
+       item 1: "Scrollbar gọn, giống desktop terminal") -- Firefox via the
+       standard property, WebKit/Blink (Chrome/Edge/Safari) via the
+       vendor-prefixed pseudo-elements; both degrade harmlessly to the
+       platform default on any engine that supports neither. */
+    * { scrollbar-width:thin; scrollbar-color:#3a4560 transparent; }
+    ::-webkit-scrollbar { width:10px; height:10px; }
+    ::-webkit-scrollbar-track { background:transparent; }
+    ::-webkit-scrollbar-thumb { background:#3a4560; border-radius:6px; border:2px solid transparent; background-clip:padding-box; }
+    ::-webkit-scrollbar-thumb:hover { background:#4a5878; background-clip:padding-box; }
     * { box-sizing:border-box }
     /* True app-shell: the page itself never scrolls (100dvh — the *dynamic*
        viewport height — tracks a mobile browser showing/hiding its own
@@ -145,55 +178,60 @@ DASHBOARD_HTML = """<!doctype html>
        the shell's remaining space and can still shrink below its content's
        natural size — the same "let a bounded box actually constrain its
        children instead of growing to fit them" pattern used throughout this
-       chain (main -> .panel -> .detail -> .term -> #output). */
-    main { display:grid; grid-template-columns:minmax(240px,340px) 1fr; grid-template-rows:minmax(0,1fr); gap:18px; padding:18px; flex:1; min-height:0 }
-    .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; min-height:0 }
-    .panel-title { padding:13px 16px; border-bottom:1px solid var(--line); color:var(--muted) }
-    /* Mobile-only "☰ Sessions" reopen control (styled like the other term-bar
-       buttons via .term-btn) and its drawer backdrop; both stay display:none
-       outside the narrow-viewport media query below, so desktop/tablet keeps
-       the sidebar permanently visible exactly as before. Living inside
-       .term-bar (a flex row) rather than as a direct child of .detail means
-       it never participates in .detail's own grid row template, regardless
-       of which breakpoint/visibility state is active. */
-    .sessions-toggle { display:none }
-    #sidebarBackdrop { display:none }
-    #sessions { padding:8px; overflow:auto; max-height:100% }
-    /* .session is a <div role="button"> now, not a <button> -- it has to
-       host real, independently-clickable <button> action children (Mở
-       terminal / Access / Kill), which aren't legal inside a <button>.
-       Keyboard activation (Enter/Space) is wired explicitly in JS to
-       compensate for giving up the native <button> semantics. No
-       checkbox, no per-row lock/eye icon -- click the row (or its name)
-       to select it; grant/revoke lives in the Access action + its modal,
-       shown only when there's actually something to grant (see
-       .session .row-actions below). */
-    .session { display:flex; align-items:flex-start; gap:8px; width:100%; text-align:left; color:inherit; background:transparent; border:1px solid transparent; border-radius:8px; padding:11px; cursor:pointer }
-    .session:hover, .session.active { background:#19243b; border-color:#344360 }
-    .session.needs-attention { border-color:var(--amber); background:rgba(255,200,87,.08) }
-    .session .sess-main { flex:1; min-width:0 }
-    /* Contextual actions (Mở terminal / Access / Kill) -- a plain text
-       row, never icon-only, never rendered for every row regardless of
-       relevance (Access only when grantable, Kill only when session_
-       lifecycle is enabled). Stops event propagation to the row's own
-       onclick so clicking an action never also (re)selects the row. */
-    .session .row-actions { flex:0 0 auto; display:flex; flex-direction:column; gap:4px; align-items:flex-end }
-    .session .row-actions button, .session .row-actions a {
-      background:transparent; border:1px solid var(--line); border-radius:6px; color:var(--muted);
-      padding:3px 8px; font-size:11px; cursor:pointer; text-decoration:none; white-space:nowrap; font:inherit;
+       chain (main -> .panel.detail -> .term -> #output). Single column,
+       two rows now (tab bar above, the session panel below) -- task items
+       2/3: the tab bar is the ONE session-navigation surface on this page,
+       replacing the old left sidebar (see .tabbar below) rather than
+       sitting alongside it, so there is still only ever one list. */
+    main { display:grid; grid-template-columns:1fr; grid-template-rows:auto minmax(0,1fr); gap:0; padding:0; flex:1; min-height:0 }
+    .panel { background:var(--panel); border:1px solid var(--line); overflow:hidden; min-height:0 }
+    .panel.detail { border-left:none; border-right:none; border-bottom:none }
+
+    /* ---- Tab bar: Windows-Terminal-style horizontal session switcher ----
+       (task item 2) -- the ONE navigation list on this page. A tab is a
+       compact chip (status dot + name + node label); the destructive
+       "kill" affordance only appears on hover/focus (task: "Nút close/kill
+       chỉ hiện khi hover") and reuses the EXISTING typed-confirmation
+       #killModal below -- there is no bare "close tab" action, because
+       closing a tab has no meaning independent of the underlying tmux
+       session: the server-driven list would simply show it again on the
+       very next poll if it still exists (see makeTabCloseButton's own
+       comment). Horizontal overflow scrolls (native touch/wheel/trackpad,
+       no separate "more" menu needed at typical session counts) with a
+       thin scrollbar (see the global ::-webkit-scrollbar rules above) and
+       a fading edge so a scrollable tab strip is visually obvious. */
+    .tabbar { display:flex; align-items:stretch; overflow-x:auto; overflow-y:hidden; background:var(--panel); border-bottom:1px solid var(--line); scrollbar-width:thin }
+    .tabbar-empty { padding:12px 16px; color:var(--muted); font-size:13px }
+    .tab {
+      position:relative; display:flex; align-items:center; gap:7px; flex:0 0 auto; max-width:220px; min-width:0;
+      padding:9px 10px 9px 12px; cursor:pointer; color:var(--muted); border-right:1px solid var(--line);
+      border-bottom:2px solid transparent; white-space:nowrap;
     }
-    .session .row-actions button:hover, .session .row-actions a:hover { color:var(--text); border-color:var(--muted) }
-    .session .row-actions button.danger { color:#ff9f9f; border-color:#5a2f38 }
-    .session .row-actions button.danger:hover { color:#fff; background:#3a2430; border-color:#ff9f9f }
-    .name { font-weight:700 } .meta { font-size:12px; color:var(--muted); margin-top:4px }
-    .node-label { font-weight:400; font-size:11px; color:var(--muted); margin-left:8px }
-    .attach-dot { display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--line); margin-right:5px; vertical-align:middle }
-    .attach-dot.on { background:var(--green) }
-    /* Compact attention badge: reused identically in the session list and the
-       viewer header (#summary) so a WAITING_INPUT session is obvious in both
-       places — driven entirely by classify_status()'s existing state string,
-       nothing new is inferred from pane content here. */
+    .tab:hover { background:#171f33; color:var(--text) }
+    .tab.active { background:var(--bg); color:var(--text); border-bottom-color:var(--accent) }
+    .tab.needs-attention:not(.active) { border-bottom-color:var(--amber) }
+    .tab-dot { flex:0 0 auto; display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--line) }
+    .tab-dot.on { background:var(--green) }
+    .tab-dot.err { background:var(--red) } /* real supervisor state (FAILED/ERROR/BLOCKED) -- never a fake/invented one */
+    .tab-dot.idle { background:var(--muted) }
+    .tab-name { overflow:hidden; text-overflow:ellipsis; font-size:13px; font-weight:600 }
+    .tab-node { flex:0 0 auto; font-size:10px; color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:0 6px; line-height:1.6 }
+    /* Compact attention badge -- reused identically in the tab bar and the
+       viewer header (#summary) so a WAITING_INPUT session is obvious in
+       both places, driven entirely by classify_status()'s existing state
+       string, nothing new inferred from pane content here. */
     .attn-badge { display:inline-block; background:var(--amber); color:#231a00; font-size:11px; font-weight:700; padding:1px 6px; border-radius:4px; vertical-align:middle }
+    .tab .attn-badge { flex:0 0 auto; margin-left:2px }
+    /* Hover/focus-only close (kill) button -- kept a fixed 18px hit target
+       even hidden (visibility, not display:none) so the tab's own layout
+       never shifts width when the button appears/disappears. */
+    .tab-close {
+      flex:0 0 auto; visibility:hidden; width:18px; height:18px; display:flex; align-items:center; justify-content:center;
+      border-radius:4px; background:transparent; border:none; color:var(--muted); cursor:pointer; font:12px var(--mono); padding:0;
+    }
+    .tab:hover .tab-close, .tab:focus-within .tab-close { visibility:visible }
+    .tab-close:hover { background:#3a2430; color:#ff9f9f }
+    .tab-close:disabled { visibility:hidden !important; cursor:not-allowed }
     /* Layout bugfix (real-device report), still applicable with the
        top session-tabs bar removed: .detail's 5 direct children in DOM
        order are #summary, #grantBar, .term, #inputNote, #inputBar --
@@ -211,24 +249,51 @@ DASHBOARD_HTML = """<!doctype html>
        configured -- red, distinct from ERROR's transient-pane-pattern
        meaning: these mean automation stopped and needs an operator). */
     .state-VERIFYING { color:var(--amber) } .state-FAILED,.state-BLOCKED { color:#ff6b6b }
-    /* Terminal-style pane: a small chrome bar (title + follow/jump controls)
-       above a dark, monospace, ANSI-rendering scrollback view. */
+    /* Terminal-style pane: a slim chrome bar (title + a handful of core
+       controls) above a dark, monospace, ANSI-rendering scrollback view.
+       No macOS-style traffic-light dots (task item 1/3: "tránh chrome
+       thừa" -- Windows Terminal itself has none either); a session's
+       state already shows via the tab bar's own dot + this bar's title,
+       so a second, purely decorative status indicator here would be
+       redundant chrome, not information. */
     .term { grid-row:3; display:flex; flex-direction:column; min-height:0 }
     .term-bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 10px; padding:7px 12px; background:#0e1526; border-bottom:1px solid var(--line) }
-    .term-dots { display:flex; gap:6px; flex:0 0 auto }
-    .term-dots i { width:10px; height:10px; border-radius:50%; display:inline-block }
-    .term-dots i.r { background:#ff5f57 } .term-dots i.y { background:#febc2e } .term-dots i.g { background:#28c840 }
     .term-title { color:var(--muted); font-size:12px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
     /* flex:1 1 auto + min-width:0 (not flex:0 0 auto): a flex item's
        preferred size is its max-content (unwrapped) width by default, and
        flex-shrink:0 refuses to go below that — so .term-controls never
-       actually shrank enough to let its own flex-wrap kick in, and its 7
-       buttons silently overflowed the 390px shell instead of wrapping. */
-    .term-controls { display:flex; flex-wrap:wrap; gap:8px; flex:1 1 auto; min-width:0 }
+       actually shrank enough to let its own flex-wrap kick in, and its
+       buttons silently overflowed a narrow shell otherwise. Only the
+       core, frequently-used controls live directly in this row now
+       (task item 3: "action ít dùng đưa vào menu ...") -- Font size/
+       Search/Copy/Access/Kill move into the "⋯" menu (see .menu below). */
+    .term-controls { display:flex; flex-wrap:wrap; align-items:center; gap:8px; flex:1 1 auto; min-width:0; justify-content:flex-end }
     .term-btn { background:#19243b; border:1px solid var(--line); color:var(--text); border-radius:6px; padding:5px 10px; font:12px var(--mono); cursor:pointer; white-space:nowrap }
     .term-btn:hover:not(:disabled) { background:#233252 }
     .term-btn:disabled { opacity:.5; cursor:not-allowed }
     .term-btn.paused { border-color:var(--amber); color:var(--amber) }
+    /* ---- Reusable "⋯" overflow menu (task item 3) -- one small component,
+       used for the header's own menu and each term-bar's menu alike, never
+       a bespoke dropdown per screen. Click-to-open (not hover, so it works
+       identically on touch); closes on an outside click or Escape (wired
+       once, generically, in JS below via .menu-open/data-menu). */
+    .menu { position:relative; flex:0 0 auto }
+    .menu-panel {
+      display:none; position:absolute; right:0; top:calc(100% + 6px); z-index:26; min-width:190px;
+      background:var(--panel); border:1px solid var(--line); border-radius:10px; box-shadow:0 16px 40px rgba(0,0,0,.55);
+      padding:6px; flex-direction:column; gap:2px;
+    }
+    .menu.open .menu-panel { display:flex }
+    .menu-panel button, .menu-panel a {
+      display:flex; align-items:center; gap:8px; width:100%; text-align:left; background:transparent; border:none;
+      color:var(--text); border-radius:6px; padding:8px 10px; font:13px var(--mono); cursor:pointer; text-decoration:none; white-space:nowrap;
+    }
+    .menu-panel button:hover, .menu-panel a:hover { background:#19243b }
+    .menu-panel button:disabled { opacity:.4; cursor:not-allowed }
+    .menu-panel a.disabled { opacity:.4; cursor:not-allowed; pointer-events:none } /* an <a> has no disabled attribute -- termOpenRealBtn's own gating */
+    .menu-panel button.danger { color:#ff9f9f }
+    .menu-panel button.danger:hover { background:#3a2430 }
+    .menu-panel hr { border:none; border-top:1px solid var(--line); margin:4px 2px }
     /* Client-side search over the currently rendered output only — no new
        backend route, no history beyond what's already on screen. Hidden
        (via the `hidden` attribute, not display:none in JS) until toggled,
@@ -241,10 +306,37 @@ DASHBOARD_HTML = """<!doctype html>
        color/background (see renderAnsi below), which would otherwise always
        win over a class selector. */
     .search-current { background:#ffd645 !important; color:#111 !important; border-radius:2px }
-    #output { flex:1; min-height:0; margin:0; padding:14px 18px; overflow:auto; white-space:pre-wrap; word-break:break-word; line-height:1.45; font-family:var(--mono); background:var(--term-bg); color:#dce5f5 }
-    #inputBar { grid-row:5; display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line) }
-    #inputBar input[type=text] { flex:1; background:#0e1526; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:9px 11px; font:inherit }
-    #inputBar button { background:#2b3f66; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:9px 14px; cursor:pointer; font:inherit }
+    #output {
+      flex:1; min-height:0; margin:0; padding:10px 18px; overflow:auto; overflow-anchor:none; cursor:text;
+      white-space:pre-wrap; word-break:break-word; line-height:1.45; font-family:var(--mono);
+      background:var(--term-bg); color:var(--term-fg);
+    }
+    #output::selection, #output ::selection { background:var(--term-selection); color:inherit }
+    /* A real terminal's own blinking block cursor (task item 1: "Cursor
+       rõ ràng") -- appended as the LAST child of #output only while a
+       readable session is selected (see renderAnsi's own caller), never
+       during the loading/locked/error placeholder states. Pure CSS
+       blink, no JS timer; respects the OS "reduce motion" preference the
+       same as the rest of this page (no other animation exists here to
+       gate, so this is the one rule that needs it). */
+    .term-cursor { display:inline-block; width:0.6em; height:1.1em; background:var(--term-cursor); vertical-align:text-bottom; animation:term-cursor-blink 1.05s steps(1) infinite }
+    @media (prefers-reduced-motion:reduce) { .term-cursor { animation:none } }
+    @keyframes term-cursor-blink { 0%,49% { opacity:1 } 50%,100% { opacity:0 } }
+    /* ---- Input row: an inline terminal prompt, not a separate boxed web
+       form (task item 1/4) -- blends into the same dark terminal surface
+       (--term-bg) right below the output, with a prompt glyph standing in
+       for a real shell's own "PS>"/"$" prompt. Functionally UNCHANGED:
+       still a single-line composer + explicit "press Enter" checkbox +
+       Send button (core.py's own terminal_send_text press_enter
+       semantics, and the idempotency-key/delivery-state handling in the
+       JS below, are untouched -- only the visual chrome around them). */
+    #inputBar { grid-row:5; display:flex; align-items:center; gap:8px; padding:10px 16px; background:var(--term-bg); border-top:1px solid var(--line) }
+    #inputPrompt { flex:0 0 auto; color:var(--ansi-10); font-weight:700; user-select:none }
+    #inputBar input[type=text] { flex:1; min-width:0; background:transparent; border:none; color:var(--term-fg); padding:8px 2px; font:inherit }
+    #inputBar input[type=text]:focus { outline:none }
+    #inputBar input[type=text]:disabled { opacity:.5 }
+    #inputBar button { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:7px 13px; cursor:pointer; font:inherit }
+    #inputBar button:hover:not(:disabled) { background:#233252 }
     #inputBar button:disabled { opacity:.5; cursor:not-allowed }
     #inputBar label { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:12px; white-space:nowrap }
     #inputNote { grid-row:4; padding:6px 16px 0; font-size:12px; color:var(--muted) }
@@ -309,20 +401,22 @@ DASHBOARD_HTML = """<!doctype html>
     #killModal .km-actions button.danger { background:#3a2430; border-color:#ff9f9f; color:#ff9f9f }
     #killModal .km-actions button.danger:disabled { opacity:.4; cursor:not-allowed }
     #killModal .km-error { color:#ff6b6b; font-size:12px }
-    /* ---- killed-sessions reopen list ---------------------------------
-       Compact, collapsed by default, zero footprint until there's
-       actually a killed session to reopen -- one small toggle line below
-       the live session list, never a second navigation surface for LIVE
+    /* ---- Tab bar row + killed-sessions reopen menu --------------------
+       .tabbar itself scrolls horizontally (see its own rule above);
+       .tabbar-side-btn is a FIXED trailing sibling (never scrolls away)
+       reusing the same .menu/.menu-panel dropdown component as the
+       header/term-bar menus -- compact, zero footprint until there's
+       actually a killed session to reopen (task's own original design
+       intent, unchanged), never a second navigation surface for LIVE
        sessions (only ever lists sessions that no longer exist). */
-    #killedSection { border-top:1px solid var(--line) }
-    #killedSection[hidden] { display:none }
-    #killedToggle {
-      width:100%; text-align:left; background:transparent; border:none; color:var(--muted); cursor:pointer;
-      padding:9px 12px; font:inherit; font-size:12px; display:flex; justify-content:space-between; align-items:center;
+    .tabbar-row { display:flex; align-items:stretch; background:var(--panel); border-bottom:1px solid var(--line) }
+    .tabbar-row .tabbar { flex:1; min-width:0; border-bottom:none }
+    .tabbar-side-btn {
+      flex:0 0 auto; background:transparent; border:none; border-left:1px solid var(--line); color:var(--muted); cursor:pointer;
+      padding:0 14px; font:12px var(--mono); white-space:nowrap;
     }
-    #killedToggle:hover { color:var(--text) }
-    #killedList { padding:0 8px 8px }
-    #killedList[hidden] { display:none }
+    .tabbar-side-btn:hover { color:var(--text); background:#171f33 }
+    .killed-panel { min-width:260px; max-width:min(360px, calc(100vw - 24px)); max-height:60vh; overflow:auto }
     .killed-row { padding:8px 8px; border-radius:8px; font-size:12px }
     .killed-row + .killed-row { border-top:1px solid var(--line) }
     .killed-row .kr-name { font-weight:700 }
@@ -355,12 +449,14 @@ DASHBOARD_HTML = """<!doctype html>
         padding:8px 12px; font-size:12px; line-height:1.3;
         display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden;
       }
-      /* Narrow/mobile: stack the panels (sessions on top, kept compact and
-         independently scrollable; detail fills the rest) instead of sitting
-         side by side — same bounded-height pattern as desktop, reused so the
-         terminal pane still scrolls internally rather than the whole page. */
-      main { grid-template-columns:1fr; grid-template-rows:auto minmax(0,1fr); position:relative }
-      #sessions { max-height:32vh }
+      /* main is already a single column (tab bar row + detail row) on
+         desktop too now (task item 2/5 -- see the base `main` rule above),
+         so nothing to override here: the tab bar itself already IS the
+         compact, always-visible mobile navigation (task item 5: "tab bar
+         compact, terminal full-screen, không sidebar chiếm chỗ") with no
+         separate drawer/backdrop mechanism needed at all. */
+      .tab { max-width:140px; padding:8px 8px 8px 10px }
+      .tab-name { font-size:12.5px }
       .detail { min-height:0 }
       /* Smaller, tighter terminal text fits substantially more real output on
          a phone screen without hurting readability; desktop sizing (14px/1.45
@@ -387,57 +483,40 @@ DASHBOARD_HTML = """<!doctype html>
       #inputBar button { padding:7px 10px; font-size:13px }
       #inputBar label { font-size:11px }
       #inputNote { padding:4px 10px 0; font-size:11px }
-      /* Once a session is open, the sidebar hides by default so the terminal
-         pane gets essentially the full screen (main's "auto" sidebar row
-         collapses to 0 with nothing placed in it); the ☰ Sessions button
-         reopens it as a floating drawer over a backdrop, on top of the still
-         full-size terminal, rather than resizing/displacing it. Before any
-         session is picked, the sidebar stays inline exactly as it always
-         has, so first-time access to the list is never hidden. Positioned
-         `absolute` against `main` (not `fixed` with a guessed pixel offset
-         from the viewport top) so it always sits right below the header,
-         however tall the header actually is. */
-      body.has-selection .sessions-toggle { display:inline-flex }
-      body.has-selection #sessionsPanel { display:none }
-      body.has-selection.sidebar-visible #sessionsPanel {
-        display:block; position:absolute; left:0; right:0; top:0; z-index:20;
-        max-height:70vh; overflow:auto; box-shadow:0 20px 50px rgba(0,0,0,.6);
-      }
-      body.has-selection.sidebar-visible #sidebarBackdrop {
-        display:block; position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:15;
-      }
-      /* Respect notch/home-indicator safe areas for the shell that now spans
-         essentially the full viewport. */
+      /* No mobile drawer needed any more (task item 5): the tab bar is
+         already the full mobile-appropriate session navigation, always
+         visible, taking one slim row -- there is no tall sidebar left to
+         hide/reopen as an overlay. Respect notch/home-indicator safe
+         areas for the shell, which now spans essentially the full
+         viewport either way. */
       main { padding-left:max(18px, env(safe-area-inset-left)); padding-right:max(18px, env(safe-area-inset-right)); padding-bottom:max(18px, env(safe-area-inset-bottom)) }
       header { padding-top:max(8px, env(safe-area-inset-top)) }
-      /* Once a session is open, the terminal panel IS the screen (the
-         sidebar is a floating drawer, not a sibling taking up column
-         space — see has-selection above) — so the generous desktop-style
-         18px outer gutter around it is wasted width on a phone. Shrink it
-         to a thin edge (still safe-area aware, never under it) without
-         touching #output's own padding/font-size, so the actual output
-         area is unchanged — only the empty margin around the panel
-         shrinks. Deliberately not applied before a session is selected,
-         so the sessions list keeps its normal comfortable padding. */
-      body.has-selection main { gap:6px; padding:max(6px, env(safe-area-inset-top)) max(6px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left)) }
-      body.has-selection .panel.detail { border-radius:8px }
+      /* Once a session is open, the terminal panel IS effectively the
+         screen -- the generous desktop-style 18px outer gutter around it
+         is wasted width on a phone. Shrink it to a thin edge (still
+         safe-area aware, never under it) without touching #output's own
+         padding/font-size, so the actual output area is unchanged — only
+         the empty margin around the panel shrinks. Deliberately not
+         applied before a session is selected, so the tab bar/empty state
+         keeps its normal comfortable padding. */
+      body.has-selection main { gap:0; padding:max(0px, env(safe-area-inset-top)) max(0px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom)) max(0px, env(safe-area-inset-left)) }
+      body.has-selection .panel.detail { border-radius:0; border-left:none; border-right:none }
 
       /* ---- fullscreen terminal mode ---------------------------------- */
-      /* Hides every non-terminal chrome element (header, status card,
-         sidebar/drawer controls, input composer) so essentially only the
-         terminal pane remains, its own small term-bar (title + follow/
-         jump/exit-fullscreen controls) acting as the "small floating
-         control" this needs. #output still scrolls internally the same
-         way; the config.default_tail_lines bound, ANSI rendering, and
-         auto-follow/pause/jump are all untouched by anything in this
-         block — it is pure presentation. */
+      /* Hides every non-terminal chrome element (header, status card, tab
+         bar, input composer) so essentially only the terminal pane
+         remains, its own small term-bar (title + follow/jump/exit-
+         fullscreen controls) acting as the "small floating control" this
+         needs. #output still scrolls internally the same way; the
+         config.default_tail_lines bound, ANSI rendering, and auto-follow/
+         pause/jump are all untouched by anything in this block — it is
+         pure presentation. */
       body.fullscreen-terminal header,
+      body.fullscreen-terminal .tabbar,
       body.fullscreen-terminal #summary,
       body.fullscreen-terminal #grantBar,
       body.fullscreen-terminal #inputNote,
-      body.fullscreen-terminal #inputBar,
-      body.fullscreen-terminal .sessions-toggle,
-      body.fullscreen-terminal #sidebarBackdrop { display:none }
+      body.fullscreen-terminal #inputBar { display:none }
       body.fullscreen-terminal main { padding:0; gap:0 }
       body.fullscreen-terminal .detail { grid-template-rows:minmax(0,1fr) }
       body.fullscreen-terminal .panel.detail { border-radius:0; border:none }
@@ -458,38 +537,60 @@ DASHBOARD_HTML = """<!doctype html>
   <header>
     <div><h1>Terminal MCP</h1><div class="muted">Whitelisted tmux session monitor</div></div>
     <div class="header-right">
-      <a href="/dashboard/sessions" class="supervisor-badge" id="sessionsAdminLink" style="text-decoration:none">⚙ Quản lý</a>
-      <a href="/dashboard/nodes" class="supervisor-badge" id="nodesAdminLink" style="text-decoration:none">🖥 Nodes</a>
       <button id="supervisorBadge" class="supervisor-badge" type="button" hidden></button>
       <span class="supervisor-badge" id="connHealthBadge" title="Kết nối OpenAI Secure MCP Tunnel" hidden></span>
       <span class="live" id="liveBadge">● LIVE</span>
+      <!-- Task item 3: rarely-used navigation (admin screens) lives in one
+           "⋯" menu instead of a row of separate buttons -- LIVE/conn-health/
+           Supervisor stay directly visible above since they're STATUS, not
+           navigation. -->
+      <div class="menu" id="headerMenu">
+        <button class="term-btn" id="headerMenuBtn" type="button" aria-haspopup="true" aria-expanded="false" title="Menu">⋯</button>
+        <div class="menu-panel" id="headerMenuPanel" role="menu">
+          <a href="/dashboard/sessions" id="sessionsAdminLink" role="menuitem">⚙ Quản lý session</a>
+          <a href="/dashboard/nodes" id="nodesAdminLink" role="menuitem">🖥 Nodes</a>
+        </div>
+      </div>
     </div>
   </header>
   <main>
-    <section class="panel" id="sessionsPanel">
-      <div class="panel-title">SESSIONS <span id="count"></span></div>
-      <div id="sessions"></div>
-      <div id="killedSection" hidden>
-        <button id="killedToggle" type="button"><span id="killedToggleLabel"></span><span>▾</span></button>
-        <div id="killedList" hidden></div>
+    <!-- Task item 2/3: the ONE session-navigation surface on this page --
+         Windows-Terminal-style horizontal tabs, replacing the old left
+         sidebar entirely (never both at once, see the .tabbar CSS comment
+         above for why that specific duplication was removed once already
+         in this project's own history). One click switches; a hover-only
+         "✕" opens the SAME typed-confirmation kill flow as before (see
+         makeTabCloseButton) -- there is no separate, weaker "close tab". -->
+    <div class="tabbar-row">
+      <nav class="tabbar" id="tabbar" role="tablist" aria-label="Sessions"></nav>
+      <div class="menu" id="killedMenu">
+        <button class="tabbar-side-btn" id="killedToggle" type="button" hidden aria-haspopup="true" aria-expanded="false"><span id="killedToggleLabel"></span></button>
+        <div class="menu-panel killed-panel" id="killedList" role="menu"></div>
       </div>
-    </section>
+    </div>
     <section class="panel detail">
       <div id="summary" class="muted">Chọn một session để xem output.</div>
       <div id="grantBar" hidden></div>
       <div class="term">
         <div class="term-bar">
-          <button id="sessionsToggle" class="sessions-toggle term-btn" type="button">☰ Sessions</button>
-          <span class="term-dots"><i class="r"></i><i class="y"></i><i class="g"></i></span>
           <span class="term-title" id="termTitle"></span>
           <span class="term-controls">
             <button id="followToggle" class="term-btn" type="button" disabled>Auto-follow: ON</button>
-            <button id="jumpBtn" class="term-btn" type="button" disabled>Jump to latest</button>
-            <button id="fullscreenBtn" class="term-btn" type="button" disabled>⛶ Fullscreen</button>
-            <button id="fontDecBtn" class="term-btn" type="button" title="Decrease terminal font size">A−</button>
-            <button id="fontIncBtn" class="term-btn" type="button" title="Increase terminal font size">A+</button>
-            <button id="searchToggleBtn" class="term-btn" type="button" disabled title="Search output">🔍</button>
-            <button id="copyBtn" class="term-btn" type="button" disabled title="Copy output">⧉</button>
+            <button id="fullscreenBtn" class="term-btn" type="button" disabled title="Fullscreen (Esc để thoát)">⛶</button>
+            <div class="menu" id="termMenu">
+              <button class="term-btn" id="termMenuBtn" type="button" disabled aria-haspopup="true" aria-expanded="false" title="Thêm tuỳ chọn">⋯</button>
+              <div class="menu-panel" id="termMenuPanel" role="menu">
+                <button id="jumpBtn" type="button" disabled>↓ Jump to latest</button>
+                <button id="searchToggleBtn" type="button" disabled>🔍 Tìm trong output</button>
+                <button id="copyBtn" type="button" disabled>⧉ Copy output</button>
+                <button id="fontDecBtn" type="button" disabled>A− Chữ nhỏ hơn</button>
+                <button id="fontIncBtn" type="button" disabled>A+ Chữ lớn hơn</button>
+                <hr>
+                <a id="termOpenRealBtn" href="#" role="menuitem">🖥 Mở terminal thật (xterm.js)</a>
+                <button id="termAccessBtn" type="button" disabled>🔐 Quyền truy cập</button>
+                <button id="termKillBtn" type="button" class="danger" disabled>🗑 Kill session</button>
+              </div>
+            </div>
           </span>
         </div>
         <div class="term-search" id="termSearch" hidden>
@@ -503,13 +604,13 @@ DASHBOARD_HTML = """<!doctype html>
       </div>
       <div id="inputNote"></div>
       <div id="inputBar">
+        <span id="inputPrompt">❯</span>
         <input type="text" id="inputText" placeholder="Nhập text để gửi vào session..." disabled>
         <label><input type="checkbox" id="inputEnter" checked> Enter</label>
         <button id="inputSend" disabled>Gửi</button>
       </div>
     </section>
   </main>
-  <div id="sidebarBackdrop"></div>
   <div id="supervisorBackdrop"></div>
   <div id="supervisorPanel">
     <div class="sp-head">
@@ -555,15 +656,13 @@ DASHBOARD_HTML = """<!doctype html>
     let inputAllowed = false;
     let autoFollow = true;
     let lastRenderedSession = null;
-    let sidebarForcedOpen = false;
     let fullscreenTerminal = false;
     let lastKnownRows = []; // the most recent /dashboard/api/sessions rows, reused by openPermModal/openKillModal without a re-fetch
     let loadDetailSequence = 0; // generation counter -- see loadDetail's own guard for why a session-name check alone isn't enough
-    const sessionsEl = document.querySelector('#sessions');
+    const tabbarEl = document.querySelector('#tabbar');
     const outputEl = document.querySelector('#output');
     const summaryEl = document.querySelector('#summary');
     const grantBarEl = document.querySelector('#grantBar');
-    const killedSectionEl = document.querySelector('#killedSection');
     const killedToggleEl = document.querySelector('#killedToggle');
     const killedToggleLabelEl = document.querySelector('#killedToggleLabel');
     const killedListEl = document.querySelector('#killedList');
@@ -607,27 +706,59 @@ DASHBOARD_HTML = """<!doctype html>
     const searchPrevBtnEl = document.querySelector('#searchPrevBtn');
     const searchNextBtnEl = document.querySelector('#searchNextBtn');
     const searchCloseBtnEl = document.querySelector('#searchCloseBtn');
-    const sessionsToggleEl = document.querySelector('#sessionsToggle');
-    const sidebarBackdropEl = document.querySelector('#sidebarBackdrop');
     const inputNoteEl = document.querySelector('#inputNote');
     const inputTextEl = document.querySelector('#inputText');
     const inputEnterEl = document.querySelector('#inputEnter');
     const inputSendEl = document.querySelector('#inputSend');
+    const termMenuBtnEl = document.querySelector('#termMenuBtn');
+    const termOpenRealBtnEl = document.querySelector('#termOpenRealBtn');
+    const termAccessBtnEl = document.querySelector('#termAccessBtn');
+    const termKillBtnEl = document.querySelector('#termKillBtn');
     const clean = value => String(value ?? '');
 
-    // ---- mobile sidebar drawer ---------------------------------------------
-    // Desktop/tablet: pure CSS keeps #sessionsPanel always visible and
-    // .sessions-toggle always display:none, so none of this has any visible
-    // effect there. Mobile only: hides the session list once a session is
-    // open (main's own sidebar row collapses to 0 with nothing placed in
-    // it, so the terminal pane gets the freed height), reopenable as a
-    // floating drawer over a backdrop without displacing/resizing the pane.
-    function updateSidebarVisibility() {
+    // ---- mobile layout: shrink the outer gutter once a session is open ----
+    // (task item 5) -- the tab bar itself needs no drawer/backdrop any more
+    // (it's already a single, always-visible slim row, on every viewport
+    // size); this only toggles the CSS class the mobile media query above
+    // uses to reclaim the desktop-style outer padding once a session fills
+    // the screen.
+    function updateLayoutState() {
       document.body.classList.toggle('has-selection', Boolean(selected));
-      document.body.classList.toggle('sidebar-visible', sidebarForcedOpen);
     }
-    sessionsToggleEl.onclick = () => { sidebarForcedOpen = !sidebarForcedOpen; updateSidebarVisibility(); };
-    sidebarBackdropEl.onclick = () => { sidebarForcedOpen = false; updateSidebarVisibility(); };
+
+    // ---- Reusable "⋯" overflow menu (task item 3) --------------------------
+    // Click-to-open/click-outside-or-Escape-to-close, shared by the header
+    // menu, each term-bar menu, and the killed-sessions menu -- one small
+    // generic component instead of a bespoke dropdown per screen. At most
+    // one menu open at a time (opening one closes any other).
+    function closeAllMenus() {
+      for (const menu of document.querySelectorAll('.menu.open')) {
+        menu.classList.remove('open');
+        const btn = menu.querySelector('[aria-haspopup]');
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+      }
+    }
+    function wireMenu(menuEl, btnEl) {
+      btnEl.onclick = (event) => {
+        event.stopPropagation();
+        const willOpen = !menuEl.classList.contains('open');
+        closeAllMenus();
+        if (willOpen && !btnEl.disabled) {
+          menuEl.classList.add('open');
+          btnEl.setAttribute('aria-expanded', 'true');
+        }
+      };
+      // A click inside the panel itself (e.g. a menu item's own confirm()
+      // dialog trigger) must not bubble to the document-level listener
+      // below and immediately close the menu before the item's own onclick
+      // handler runs.
+      menuEl.querySelector('.menu-panel').addEventListener('click', event => event.stopPropagation());
+    }
+    document.addEventListener('click', closeAllMenus);
+    document.addEventListener('keydown', event => { if (event.key === 'Escape') closeAllMenus(); });
+    wireMenu(document.querySelector('#headerMenu'), document.querySelector('#headerMenuBtn'));
+    wireMenu(document.querySelector('#termMenu'), document.querySelector('#termMenuBtn'));
+    wireMenu(document.querySelector('#killedMenu'), killedToggleEl);
 
     // ---- Supervisor Loop v1 summary (compact badge + overlay panel) -------
     // Read-only from this page's point of view: the badge/panel only ever
@@ -791,8 +922,16 @@ DASHBOARD_HTML = """<!doctype html>
     // one ever appears) is simply dropped rather than mis-rendered. Spans are
     // built with createElement/textContent only, with no raw-HTML assignment
     // anywhere, so captured pane content can never be interpreted as markup.
-    const ANSI_BASE = ['#3b3b3b','#e05561','#8cc265','#d2c057','#5c96d1','#a179dc','#4bc2c5','#c6c6c6'];
-    const ANSI_BRIGHT = ['#6b6b6b','#f76f7a','#a8e08a','#f0d97a','#7bb4e8','#c39bf0','#71dde0','#eeeeee'];
+    // Single source of truth (task item 6): the 16 base ANSI colours are the
+    // same --ansi-0..15 custom properties the :root palette defines (the
+    // Windows Terminal "Campbell" scheme by default), read once here rather
+    // than hardcoded a second time -- changing the theme tokens re-colours
+    // both the raw terminal surface AND every ANSI-coloured span this
+    // renderer builds, with nothing to keep in sync by hand.
+    const ROOT_STYLE = getComputedStyle(document.documentElement);
+    function ansiVar(n) { return (ROOT_STYLE.getPropertyValue(`--ansi-${n}`) || '').trim() || '#c6c6c6'; }
+    const ANSI_BASE = [0, 1, 2, 3, 4, 5, 6, 7].map(ansiVar);
+    const ANSI_BRIGHT = [8, 9, 10, 11, 12, 13, 14, 15].map(ansiVar);
     function ansi256(code) {
       const n = Number(code);
       if (!Number.isFinite(n) || n < 0) return null;
@@ -1011,7 +1150,9 @@ DASHBOARD_HTML = """<!doctype html>
       fullscreenBtnEl.disabled = !selected;
       searchToggleBtnEl.disabled = !selected;
       copyBtnEl.disabled = !selected;
+      termMenuBtnEl.disabled = !selected;
       termTitleEl.textContent = selected || '';
+      refreshTermActionMenu();
     }
     followToggleEl.onclick = () => {
       setAutoFollow(!autoFollow);
@@ -1043,7 +1184,7 @@ DASHBOARD_HTML = """<!doctype html>
         try { localStorage.setItem(FULLSCREEN_KEY, value ? '1' : '0'); } catch (error) { /* ignore */ }
       }
       if (value) {
-        sidebarForcedOpen = false; updateSidebarVisibility(); // exiting must restore the normal layout, so never leave the drawer state stale
+        updateLayoutState(); // exiting must restore the normal layout
         if (document.documentElement.requestFullscreen) {
           document.documentElement.requestFullscreen().catch(() => {});
         }
@@ -1085,6 +1226,18 @@ DASHBOARD_HTML = """<!doctype html>
       // resumes it, matching common log/chat viewers.
       if (nearBottom(outputEl)) { if (!autoFollow) setAutoFollow(true); }
       else if (autoFollow) { setAutoFollow(false); }
+    });
+    // Task item 4: "clicking the terminal must focus the correct input" --
+    // like a real terminal, clicking anywhere in the output jumps focus to
+    // the input line below it. Skipped while the click just finished a
+    // click-drag text selection (selection.isCollapsed is false only in
+    // that case for a plain click) so copying text is never disrupted, and
+    // skipped entirely while input isn't actually allowed for this session
+    // (matches inputTextEl's own disabled gating in refreshInputControls).
+    outputEl.addEventListener('click', () => {
+      const selection = window.getSelection();
+      if (selection && !selection.isCollapsed) return;
+      if (!inputTextEl.disabled) inputTextEl.focus();
     });
 
     function setInputNote(text, isError) {
@@ -1206,8 +1359,8 @@ DASHBOARD_HTML = """<!doctype html>
     //
     // Entry points, both opening the SAME #permModal (no per-row lock/eye
     // icon anymore -- see item 2 of the dashboard cleanup this backs):
-    //   - a plain "Access" text button in each grantable row's action
-    //     column (renderRows/makeSessionActions)
+    //   - the term-bar's "🔐 Quyền truy cập" menu item, scoped to whichever
+    //     session is currently selected (refreshTermActionMenu)
     //   - a compact "🔐 Quyền truy cập" line in the open session's own card
     //     (#grantBar below)
     //
@@ -1392,7 +1545,7 @@ DASHBOARD_HTML = """<!doctype html>
       // auto-follow/scroll/search state the user hasn't actually left.
       if (selected === name) return;
       if (selected) { drafts.set(selected, inputTextEl.value); }
-      selected = name; inputAllowed = false; sidebarForcedOpen = false; // opening a session always closes the mobile drawer again
+      selected = name; inputAllowed = false;
       inputTextEl.value = drafts.get(name) || '';
       // The previous session's output must never remain visible under the
       // new session's name while its own detail fetch is still in flight
@@ -1405,7 +1558,7 @@ DASHBOARD_HTML = """<!doctype html>
       // new session's name either -- hidden until this target's own
       // detail arrives and renderGrantBar repaints it for real.
       grantBarEl.hidden = true; grantBarEl.replaceChildren();
-      setAutoFollow(true); refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
+      setAutoFollow(true); refreshInputControls(); refreshTermControls(); updateLayoutState();
       rememberSession(name);
       closeSearch(); // a search from a different session's content wouldn't make sense to keep open
       renderRows(lastKnownRows); // reflect the new active/selected row immediately, not just on the next 5s poll
@@ -1487,122 +1640,144 @@ DASHBOARD_HTML = """<!doctype html>
       return response.json();
     }
 
-    // ---- sidebar: the ONE session navigation list ---------------------
-    // Click the row (or its name) to select/open it -- no checkbox, no
-    // per-row lock/eye icon (item 1/2 of the dashboard cleanup this
-    // backs). Contextual actions live in a small text-button column:
-    // Open Terminal (real xterm.js attach, webterm.py -- never shown for
-    // a session this viewer can't read), Access (grant/revoke, only when
-    // there's actually something to grant -- a whitelisted session has
-    // nothing to show here), Kill (destructive, only when session_
-    // lifecycle is enabled -- disabled-with-a-reason, not hidden, for a
-    // protected session, same as the admin screen's own convention).
+    // ---- tab bar: the ONE session navigation surface (task item 2/3) --
+    // Windows-Terminal-style horizontal tabs, replacing the old left
+    // sidebar entirely -- never both at once (see the .tabbar CSS comment
+    // above for why that exact duplication was already removed once
+    // before in this project's history). Click a tab (or Enter/Space on
+    // it) to select/open it -- no checkbox, no per-row lock/eye icon.
+    // Contextual actions that used to live in a per-row button column
+    // (Open Terminal / Access / Kill) now live in the term-bar's "⋯" menu
+    // instead, operating on whichever session is currently selected -- see
+    // refreshTermActionMenu below -- EXCEPT closing/killing a tab, which
+    // stays directly on the tab itself (hover-reveal "✕") since that is
+    // the one action a user expects to reach without first selecting the
+    // tab. It opens the exact same typed-confirmation kill modal as
+    // before -- there is no separate, weaker "close tab" semantic.
     const WEBTERM_PAGE = '/dashboard/terminal';
     let sessionLifecycleEnabled = false;
     let protectedSessions = new Set();
     let webTerminalEnabled = false;
 
-    function makeSessionActions(row) {
-      const actions = document.createElement('div'); actions.className = 'row-actions';
-      const stop = handler => (event) => { event.stopPropagation(); handler(); };
-
-      if (row.effective_read) {
-        const termBtn = document.createElement('a');
-        termBtn.textContent = '🖥 Mở terminal';
-        termBtn.href = `${WEBTERM_PAGE}?session=${encodeURIComponent(row.name)}`;
-        termBtn.title = row.effective_input
-          ? 'Mở web terminal thật (xterm.js), gắn trực tiếp vào tmux session này -- gõ được'
-          : 'Mở web terminal thật (xterm.js) ở chế độ CHỈ XEM -- chưa có quyền input';
-        if (!webTerminalEnabled) {
-          termBtn.removeAttribute('href');
-          termBtn.style.opacity = '.4'; termBtn.style.cursor = 'not-allowed';
-          termBtn.title = 'Tính năng web terminal đang tắt (dashboard.web_terminal_enabled trong config.yaml)';
-        }
-        termBtn.onclick = event => event.stopPropagation();
-        actions.appendChild(termBtn);
-      }
-
-      if (grantable(row)) {
-        const accessBtn = document.createElement('button'); accessBtn.type = 'button'; accessBtn.textContent = 'Access';
-        accessBtn.title = 'Xem/cấp quyền truy cập cho session này';
-        accessBtn.onclick = stop(() => openPermModal(row.name));
-        actions.appendChild(accessBtn);
-      }
-
-      if (sessionLifecycleEnabled) {
-        const isProtected = protectedSessions.has(row.name);
-        const killBtn = document.createElement('button'); killBtn.type = 'button'; killBtn.className = 'danger';
-        killBtn.textContent = 'Kill';
-        killBtn.disabled = isProtected;
-        killBtn.title = isProtected
-          ? 'Session này được bảo vệ, không thể kill qua dashboard'
-          : 'Dừng & giải phóng process/RAM của session này (có thể mở lại sau)';
-        killBtn.onclick = stop(() => openKillModal(row.name, row.kill_reopen_ready !== false));
-        actions.appendChild(killBtn);
-      }
-
-      return actions;
+    function tabDotClass(row) {
+      // Reflects only states the backend already reports (classify_status's
+      // real SUPERVISOR_STATES via row.state) -- never an invented one.
+      if (row.state === 'FAILED' || row.state === 'ERROR' || row.state === 'BLOCKED') return 'tab-dot err';
+      if (row.state === 'IDLE') return 'tab-dot idle';
+      if (row.state === 'RESTRICTED' || row.state === 'UNKNOWN') return 'tab-dot';
+      return 'tab-dot on'; // RUNNING / WAITING_INPUT / COMPLETION_CANDIDATE / VERIFYING / VERIFIED_DONE -- process alive & reachable
     }
 
     function renderRows(rows) {
       lastKnownRows = rows;
-      sessionsEl.replaceChildren();
+      tabbarEl.replaceChildren();
+      if (!rows.length) {
+        const empty = document.createElement('div'); empty.className = 'tabbar-empty'; empty.textContent = 'Không có session nào.';
+        tabbarEl.append(empty);
+      }
       for (const row of rows) {
         // Rows already arrive sorted attention-first, then most-recent-
         // activity, then name (see the /dashboard/api/sessions route) — no
         // client-side reordering here, just rendering in the given order.
         const needsAttention = row.state === 'WAITING_INPUT';
-        const div = document.createElement('div');
-        div.className = 'session' + (selected === row.name ? ' active' : '') + (needsAttention ? ' needs-attention' : '');
-        div.setAttribute('role', 'button'); div.tabIndex = 0;
+        const tab = document.createElement('div');
+        tab.className = 'tab' + (selected === row.name ? ' active' : '') + (needsAttention ? ' needs-attention' : '');
+        tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', selected === row.name ? 'true' : 'false');
+        tab.tabIndex = 0;
+        // The old per-row "N window · attached/no terminal attached" line
+        // has no room in a compact tab -- kept as a hover tooltip instead
+        // of dropped outright.
+        tab.title = `${row.name} · ${row.windows} window · ${row.attached ? 'Terminal attached' : 'No terminal attached'}`
+          + (row.effective_read ? '' : ' · chưa cấp quyền xem');
 
-        const main = document.createElement('div'); main.className = 'sess-main';
-        const name = document.createElement('div'); name.className = 'name'; name.textContent = row.name;
+        const dot = document.createElement('span'); dot.className = tabDotClass(row);
+        const name = document.createElement('span'); name.className = 'tab-name'; name.textContent = row.name;
+        tab.append(dot, name);
         // Node label (multi-node session management, task item 16): flat,
         // minimal -- just the node's display name next to the session
-        // name (e.g. "mesflow  Dell"), never a second grouped/nested list.
-        // Only rendered once a row actually carries node_name (today's
-        // single-local-node deployment always does, via /dashboard/api/
-        // sessions -- see that route's own comment); absent entirely
-        // costs nothing and changes no layout.
+        // name, never a second grouped/nested list. Only rendered once a
+        // row actually carries node_name (today's single-local-node
+        // deployment always does, via /dashboard/api/sessions -- see that
+        // route's own comment); absent entirely costs nothing.
         if (row.node_name) {
-          const nodeLabel = document.createElement('span'); nodeLabel.className = 'node-label'; nodeLabel.textContent = row.node_name;
-          name.appendChild(nodeLabel);
+          const nodeLabel = document.createElement('span'); nodeLabel.className = 'tab-node'; nodeLabel.textContent = row.node_name;
+          tab.append(nodeLabel);
         }
         if (needsAttention) {
-          const badge = document.createElement('span'); badge.className = 'attn-badge'; badge.textContent = '⚠ NEEDS INPUT';
-          name.append(' ', badge);
+          const badge = document.createElement('span'); badge.className = 'attn-badge'; badge.textContent = '⚠';
+          tab.append(badge);
         }
-        const meta = document.createElement('div'); meta.className = 'meta';
-        // Two independent axes, never conflated: the process/session
-        // itself (a session in this list always IS running -- tmux drops
-        // a dead pane's session from its own listing, this is never a
-        // "the process died" signal) vs. whether any terminal CLIENT
-        // (a real terminal, or this dashboard's own Open Terminal) is
-        // currently attached to watch it. "No terminal attached" is not a
-        // dead session -- see the Open Terminal action for reattaching.
-        const dot = document.createElement('span'); dot.className = 'attach-dot on';
-        meta.append(dot, document.createTextNode(
-          `● Running · ${row.windows} window · ${row.attached ? 'Terminal attached' : 'No terminal attached'}`));
-        if (!row.effective_read) {
-          const note = document.createElement('span'); note.className = 'muted'; note.textContent = ' · chưa cấp quyền xem';
-          meta.appendChild(note);
-        }
-        main.append(name, meta);
-        div.append(main, makeSessionActions(row));
+
+        // Hover/focus-reveal close button -- same gating as the old Kill
+        // button (disabled-with-a-reason for a protected session, not
+        // hidden, matching the admin screen's own convention), and the
+        // SAME typed-confirmation kill modal, never a silent close.
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button'; closeBtn.className = 'tab-close'; closeBtn.textContent = '✕';
+        const isProtected = protectedSessions.has(row.name);
+        closeBtn.disabled = !sessionLifecycleEnabled || isProtected;
+        closeBtn.title = !sessionLifecycleEnabled ? ''
+          : isProtected ? 'Session này được bảo vệ, không thể kill qua dashboard'
+          : `Kill "${row.name}"`;
+        closeBtn.onclick = (event) => {
+          event.stopPropagation();
+          if (closeBtn.disabled) return;
+          openKillModal(row.name, row.kill_reopen_ready !== false);
+        };
+        tab.append(closeBtn);
 
         const activate = () => selectSession(row.name);
-        div.onclick = activate;
-        div.onkeydown = (event) => {
+        tab.onclick = activate;
+        tab.onkeydown = (event) => {
           if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activate(); }
         };
-        sessionsEl.append(div);
+        tabbarEl.append(tab);
       }
+      refreshTermActionMenu();
       if (selected && !rows.some(row => row.name === selected)) {
-        selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
+        selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateLayoutState();
         if (fullscreenTerminal) setFullscreen(false, { persist: false }); // forced exit — the remembered preference is unrelated and must survive
         summaryEl.textContent = 'Session không còn tồn tại.'; outputEl.replaceChildren(); grantBarEl.hidden = true;
       }
+    }
+
+    // ---- term-bar "⋯" menu: Open Terminal / Access / Kill, now scoped to
+    // whichever session is currently selected (task item 3 -- these used
+    // to be a per-row button column, duplicating the tab's own identity;
+    // now there is exactly one place they act on: the open tab). ----------
+    function refreshTermActionMenu() {
+      const row = selected ? lastKnownRows.find(r => r.name === selected) : null;
+
+      if (row && row.effective_read) {
+        termOpenRealBtnEl.href = `${WEBTERM_PAGE}?session=${encodeURIComponent(row.name)}`;
+        termOpenRealBtnEl.classList.remove('disabled'); termOpenRealBtnEl.removeAttribute('aria-disabled');
+        termOpenRealBtnEl.title = row.effective_input
+          ? 'Mở web terminal thật (xterm.js), gắn trực tiếp vào tmux session này -- gõ được'
+          : 'Mở web terminal thật (xterm.js) ở chế độ CHỈ XEM -- chưa có quyền input';
+        if (!webTerminalEnabled) {
+          termOpenRealBtnEl.removeAttribute('href');
+          termOpenRealBtnEl.classList.add('disabled'); termOpenRealBtnEl.setAttribute('aria-disabled', 'true');
+          termOpenRealBtnEl.title = 'Tính năng web terminal đang tắt (dashboard.web_terminal_enabled trong config.yaml)';
+        }
+      } else {
+        termOpenRealBtnEl.removeAttribute('href');
+        termOpenRealBtnEl.classList.add('disabled'); termOpenRealBtnEl.setAttribute('aria-disabled', 'true');
+        termOpenRealBtnEl.title = row ? 'Chưa có quyền xem session này' : '';
+      }
+
+      const canGrant = Boolean(row) && grantable(row);
+      termAccessBtnEl.disabled = !canGrant;
+      termAccessBtnEl.title = canGrant ? 'Xem/cấp quyền truy cập cho session này' : '';
+      termAccessBtnEl.onclick = () => { if (row) { closeAllMenus(); openPermModal(row.name); } };
+
+      const isProtected = row ? protectedSessions.has(row.name) : false;
+      termKillBtnEl.disabled = !row || !sessionLifecycleEnabled || isProtected;
+      termKillBtnEl.title = !row || !sessionLifecycleEnabled ? ''
+        : isProtected ? 'Session này được bảo vệ, không thể kill qua dashboard'
+        : 'Dừng & giải phóng process/RAM của session này (có thể mở lại sau)';
+      termKillBtnEl.onclick = () => {
+        if (row && !termKillBtnEl.disabled) { closeAllMenus(); openKillModal(row.name, row.kill_reopen_ready !== false); }
+      };
     }
 
     async function loadSessions() {
@@ -1614,9 +1789,20 @@ DASHBOARD_HTML = """<!doctype html>
       // A 200 response can still legitimately carry data.error (e.g.
       // READ_DISABLED globally, alongside a correctly-empty `sessions: []`)
       // -- this is real, correct information ("reading is off"), not
-      // "there simply are no sessions", and must never render identically
-      // to a genuinely healthy empty state.
-      document.querySelector('#count').textContent = data.error ? `(${clean(data.error)})` : `(${rows.length})`;
+      // "there simply are no sessions", and must never silently disappear
+      // just because the old dedicated #count element is gone now that the
+      // tab bar replaced the sidebar. Surfaced via #summary's own default/
+      // empty-state text, the one place already guaranteed visible whenever
+      // nothing is selected.
+      // Only ever touches the plain, still-showing placeholder -- never a
+      // more specific sticky message (e.g. renderRows's own "Session
+      // không còn tồn tại." for a session that just disappeared), which
+      // must stay exactly as it was until the user acts.
+      if (!selected && summaryEl.textContent.startsWith('Chọn một session')) {
+        summaryEl.textContent = data.error
+          ? `Chọn một session để xem output. (${clean(data.error)})`
+          : 'Chọn một session để xem output.';
+      }
 
       // On first load only (never on the recurring 5s poll, which must not
       // fight a user's manual choice to switch sessions or clear the
@@ -1636,7 +1822,7 @@ DASHBOARD_HTML = """<!doctype html>
       }
 
       renderRows(rows);
-      if (sessionLifecycleEnabled) loadKilledSessions(); else killedSectionEl.hidden = true;
+      if (sessionLifecycleEnabled) loadKilledSessions(); else killedToggleEl.hidden = true;
     }
 
     // ---- Kill confirmation modal (destructive; item 7/8 of the design
@@ -1688,7 +1874,7 @@ DASHBOARD_HTML = """<!doctype html>
       }
       closeKillModal();
       if (selected === name) {
-        selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateSidebarVisibility();
+        selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateLayoutState();
         summaryEl.textContent = 'Chọn một session để xem output.'; outputEl.replaceChildren(); grantBarEl.hidden = true;
       }
       await loadSessions();
@@ -1697,14 +1883,15 @@ DASHBOARD_HTML = """<!doctype html>
     // ---- killed-sessions reopen list (item 9-11) -----------------------
     // Compact, collapsed by default, zero footprint until there's actually
     // a killed session to reopen -- never a second navigation surface for
-    // LIVE sessions (only ever lists sessions that no longer exist).
-    let killedExpanded = false;
+    // LIVE sessions (only ever lists sessions that no longer exist). Its
+    // open/closed state is now just the generic .menu component (wired via
+    // wireMenu(#killedMenu, killedToggleEl) above) -- this only populates
+    // rows and shows/hides the toggle button itself.
     let lastKilledEntries = [];
     function renderKilledSessions(entries) {
       lastKilledEntries = entries;
-      killedSectionEl.hidden = entries.length === 0;
+      killedToggleEl.hidden = entries.length === 0;
       killedToggleLabelEl.textContent = `🗑 Đã kill (${entries.length})`;
-      killedListEl.hidden = !killedExpanded;
       killedListEl.replaceChildren();
       for (const entry of entries) {
         const row = document.createElement('div'); row.className = 'killed-row';
@@ -1731,10 +1918,6 @@ DASHBOARD_HTML = """<!doctype html>
         renderKilledSessions(data.killed_sessions || []);
       } catch (error) { /* transient poll failure -- next 5s cycle retries, same as loadSessions itself */ }
     }
-    killedToggleEl.onclick = () => {
-      killedExpanded = !killedExpanded;
-      killedListEl.hidden = !killedExpanded;
-    };
     async function reopenKilledSession(entry) {
       let agentType = null, workingDirectory = null;
       if (!entry.metadata_complete) {
@@ -1815,6 +1998,13 @@ DASHBOARD_HTML = """<!doctype html>
       const switchedSession = selected !== lastRenderedSession;
       if (switchedSession) setAutoFollow(true); // opening a session always starts followed
       renderAnsi(outputEl, clean(data.tail.output));
+      // Blinking cursor glyph at the very end of the rendered output --
+      // purely cosmetic (task item 1/6, "clear cursor"); only ever appended
+      // on this success path, never for the READ_RESTRICTED placeholder or
+      // an error state above, and rebuilt fresh on every render since
+      // renderAnsi() itself already replaces #output's children wholesale.
+      const cursor = document.createElement('span'); cursor.className = 'term-cursor';
+      outputEl.appendChild(cursor);
       // Lines render oldest-first/newest-last (tmux's natural order); only
       // snap to the bottom while auto-follow is on, so a user who has
       // intentionally scrolled up to read history is never pulled back down.
@@ -2908,7 +3098,17 @@ WEBTERM_HTML = """<!doctype html>
   <title>Terminal</title>
   <link rel="stylesheet" href="/dashboard/assets/xterm.css">
   <style>
-    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --err:#ff6b6b; --accent:#5b8cff; --mono: ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace; }
+    :root {
+      color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --err:#ff6b6b; --accent:#5b8cff; --mono: ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace;
+      /* Same Windows Terminal "Campbell" palette as the dashboard's own
+         terminal-surface tokens (task item 6, single preset shared across
+         both real screens that render terminal output) -- this page is the
+         REAL xterm.js terminal, so these are also what the Terminal()
+         theme object below reads at startup, not just CSS decoration. */
+      --term-bg:#0c0c0c; --term-fg:#cccccc; --term-cursor:#ffffff; --term-selection:rgba(255,255,255,.28);
+      --ansi-0:#0c0c0c; --ansi-1:#c50f1f; --ansi-2:#13a10e; --ansi-3:#c19c00; --ansi-4:#0037da; --ansi-5:#881798; --ansi-6:#3a96dd; --ansi-7:#cccccc;
+      --ansi-8:#767676; --ansi-9:#e74856; --ansi-10:#16c60c; --ansi-11:#f9f1a5; --ansi-12:#3b78ff; --ansi-13:#b4009e; --ansi-14:#61d6d6; --ansi-15:#f2f2f2;
+    }
     * { box-sizing:border-box }
     html, body { height:100vh; height:100dvh; overflow:hidden }
     body { margin:0; font:13px/1.4 var(--mono); background:var(--bg); color:var(--text); display:flex; flex-direction:column }
@@ -2924,7 +3124,7 @@ WEBTERM_HTML = """<!doctype html>
     .hdr-btn { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:5px 9px; cursor:pointer; font:inherit; font-size:12px; flex:0 0 auto }
     .hdr-btn:hover { background:#233252 }
     .hdr-btn:disabled { opacity:.4; cursor:not-allowed }
-    #termWrap { flex:1; min-height:0; position:relative; background:#000; padding:4px 6px }
+    #termWrap { flex:1; min-height:0; position:relative; background:var(--term-bg); padding:4px 6px }
     #termHost { width:100%; height:100% }
     .xterm { padding:2px }
     #banner { flex:0 0 auto; display:none; padding:7px 12px; font-size:12px; text-align:center }
@@ -2973,9 +3173,28 @@ WEBTERM_HTML = """<!doctype html>
     }
     let fontSize = loadFontSize();
 
+    // Single source of truth (task item 6): the same --term-*/--ansi-*
+    // custom properties the :root palette above defines (Windows Terminal
+    // "Campbell" by default) drive xterm.js's own theme too, read once at
+    // startup rather than a second hardcoded copy.
+    const rootStyle = getComputedStyle(document.documentElement);
+    function themeVar(name, fallback) { return (rootStyle.getPropertyValue(name) || '').trim() || fallback; }
+    const xtermTheme = {
+      background: themeVar('--term-bg', '#0c0c0c'), foreground: themeVar('--term-fg', '#cccccc'),
+      cursor: themeVar('--term-cursor', '#ffffff'), cursorAccent: themeVar('--term-bg', '#0c0c0c'),
+      selectionBackground: themeVar('--term-selection', 'rgba(255,255,255,.28)'),
+      black: themeVar('--ansi-0', '#0c0c0c'), red: themeVar('--ansi-1', '#c50f1f'),
+      green: themeVar('--ansi-2', '#13a10e'), yellow: themeVar('--ansi-3', '#c19c00'),
+      blue: themeVar('--ansi-4', '#0037da'), magenta: themeVar('--ansi-5', '#881798'),
+      cyan: themeVar('--ansi-6', '#3a96dd'), white: themeVar('--ansi-7', '#cccccc'),
+      brightBlack: themeVar('--ansi-8', '#767676'), brightRed: themeVar('--ansi-9', '#e74856'),
+      brightGreen: themeVar('--ansi-10', '#16c60c'), brightYellow: themeVar('--ansi-11', '#f9f1a5'),
+      brightBlue: themeVar('--ansi-12', '#3b78ff'), brightMagenta: themeVar('--ansi-13', '#b4009e'),
+      brightCyan: themeVar('--ansi-14', '#61d6d6'), brightWhite: themeVar('--ansi-15', '#f2f2f2'),
+    };
     const term = new Terminal({
       cursorBlink: true, fontSize, fontFamily: "ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace",
-      scrollback: 5000, theme: { background: '#000000' }, allowProposedApi: true,
+      scrollback: 5000, theme: xtermTheme, allowProposedApi: true,
     });
     const fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
