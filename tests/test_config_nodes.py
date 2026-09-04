@@ -117,13 +117,21 @@ def test_multiple_remote_nodes(tmp_path):
     assert {n.node_id for n in config.nodes.remote_nodes} == {"m910", "laptop2"}
 
 
-def test_real_production_config_yaml_has_no_nodes_section_yet(tmp_path):
+def test_real_production_config_yaml_declares_the_real_windows_node(tmp_path):
     # Documents the current, deliberate state of the real deployment
-    # config: multi-node is available but nothing is opted into yet --
-    # exactly the "no big-bang rewrite" requirement. If this ever starts
-    # failing because config.yaml gained a `nodes:` section, that's an
-    # intentional, tracked change, not a silent regression.
+    # config: dell-5530 (a real Windows machine, bootstrapped live over
+    # SSH -- see docs/multi-node.md's own "LAN discovery + remote
+    # connect" section) is the one node declared here, exactly the shape
+    # server_http.py's own startup loop expects (a real config.yaml
+    # entry, never a silent auto-registration). Loads cleanly through
+    # the real loader, not just a bare YAML parse, so a schema mistake
+    # here would fail this test the same way it would fail the real
+    # service's own startup.
     import pathlib
-    real_config = pathlib.Path(__file__).parents[1] / "config.yaml"
-    raw = yaml.safe_load(real_config.read_text())
-    assert "nodes" not in raw
+    from terminal_mcp.config import load_config
+    real_config_path = pathlib.Path(__file__).parents[1] / "config.yaml"
+    config = load_config(str(real_config_path))
+    assert [n.node_id for n in config.nodes.remote_nodes] == ["dell-5530"]
+    node = config.nodes.remote_nodes[0]
+    assert node.endpoint == "http://192.168.1.250:8790"
+    assert node.token_env == "TERMINAL_MCP_NODE_TOKEN_DELL_5530"

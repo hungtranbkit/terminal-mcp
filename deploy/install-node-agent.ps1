@@ -119,6 +119,20 @@ if (-not (Test-Path $configPath)) {
 }
 
 # -- 6. Wrapper script (carries the token as an env var) + Scheduled Task -------
+# State dir pinned to an EXPLICIT, absolute path under the repo checkout,
+# never left to each store's own Path.home()-based default -- real bug
+# found live bootstrapping this project's first actual Windows node:
+# under a Scheduled Task (no interactively-loaded user profile), Path.
+# home()/USERPROFILE resolution is NOT guaranteed to match what an
+# interactive session sees, and sqlite3.connect() on the resulting wrong
+# path fails outright ("unable to open database file") -- the agent
+# process exits (LastTaskResult 0, a clean Python exit, easy to mistake
+# for "it just isn't starting") the very first time it tries to open ANY
+# store. Pinning every store's own env-var override here removes that
+# ambiguity entirely, regardless of how Task Scheduler happens to resolve
+# the profile in any given run.
+$stateDir = Join-Path $RepoDir "state"
+New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
 $envVarName = "TERMINAL_MCP_NODE_TOKEN_" + ($NodeId.ToUpper() -replace '-', '_')
 $wrapperPath = Join-Path $RepoDir "run-node-agent.ps1"
 $wrapperContent = @"
@@ -127,6 +141,11 @@ $wrapperContent = @"
 # run-*.ps1; verify that if you fork/customize this).
 `$env:TERMINAL_MCP_NODE_TOKEN = "$Token"
 `$env:TERMINAL_MCP_CONFIG = "$configPath"
+`$env:TERMINAL_MCP_BINDINGS_DB = "$stateDir\bindings.db"
+`$env:TERMINAL_MCP_AUDIT_DB = "$stateDir\audit.db"
+`$env:TERMINAL_MCP_GRANTS_DB = "$stateDir\grants.db"
+`$env:TERMINAL_MCP_LEASE_DB = "$stateDir\leases.db"
+`$env:TERMINAL_MCP_KILLED_SESSIONS_DB = "$stateDir\killed-sessions.db"
 & "$venvPython" -m terminal_mcp.windows_agent --node-id $NodeId --controller-url $ControllerUrl --host $BindHost --port $Port --shell $ShellBinary --heartbeat-interval-seconds $HeartbeatIntervalSeconds
 "@
 Set-Content -Path $wrapperPath -Value $wrapperContent -Encoding UTF8

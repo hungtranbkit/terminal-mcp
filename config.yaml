@@ -105,3 +105,14 @@ session_lifecycle:
     codex: codex
   create_ready_timeout_seconds: 6
   default_grant_mode: none
+
+# Multi-node: real Windows worker node (dell-5530, tranv@192.168.1.250),
+# bootstrapped live over SSH -- see docs/multi-node.md's own "LAN
+# discovery + remote connect" and "Windows node support" sections.
+nodes:
+  remote:
+    - node_id: dell-5530
+      display_name: "dell-5530 (Windows)"
+      hostname: "192.168.1.250"
+      endpoint: "http://192.168.1.250:8790"
+      token_env: TERMINAL_MCP_NODE_TOKEN_DELL_5530

@@ -39,15 +39,12 @@ Security posture:
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import logging
 import os
-import pty
 import select
 import struct
 import subprocess
-import termios
 from typing import Any
 
 import anyio
@@ -74,6 +71,16 @@ class WebTerminalProcess:
     """One PTY-backed `tmux attach-session -t <name>` client process."""
 
     def __init__(self, tmux_binary: str, session: str, *, readonly: bool, takeover: bool) -> None:
+        # Lazy, POSIX-only imports (pty/fcntl/termios don't exist on
+        # Windows at all -- a module-level `import fcntl` here used to
+        # make node_agent.py itself unimportable on a real Windows node,
+        # since it imports this module unconditionally for pump_websocket,
+        # which IS shared cross-platform; only this tmux-attach class
+        # (never instantiated on Windows -- see node_agent.py's own
+        # tmux_binary-vs-WindowsTerminalViewer dispatch) actually needs
+        # them. Caught live bootstrapping this project's first real
+        # Windows node.
+        import pty
         self.session = session
         self.readonly = readonly
         master_fd, slave_fd = pty.openpty()
@@ -98,6 +105,8 @@ class WebTerminalProcess:
         self._closed = False
 
     def resize(self, cols: object, rows: object) -> None:
+        import fcntl
+        import termios
         if not isinstance(cols, int) or not isinstance(rows, int) or isinstance(cols, bool) or isinstance(rows, bool):
             return
         cols = max(1, min(MAX_RESIZE_COLS, cols))
