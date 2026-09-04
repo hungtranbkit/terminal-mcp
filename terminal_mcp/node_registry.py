@@ -34,6 +34,8 @@ from .node_models import (
     CAPACITY_HEALTHY,
     CAPACITY_OVERLOADED,
     CAPACITY_UNKNOWN,
+    PLATFORM_LINUX,
+    SESSION_BACKEND_TMUX,
     Node,
     NodeHeartbeatThresholds,
     OverloadThresholds,
@@ -198,6 +200,25 @@ class NodeRegistry:
                 )
                 """
             )
+            # Multi-node Windows support columns, added after this table's
+            # own baseline -- same "check PRAGMA table_info first, ALTER
+            # TABLE ADD COLUMN only if actually missing" idiom as
+            # bindings.py/audit.py/supervisor.py already use project-wide,
+            # so this is safe whether the table was just freshly created
+            # above (already has these) or is this project's own real,
+            # already-populated production nodes.db from before this
+            # feature existed (existing rows get the column defaults,
+            # e.g. platform='linux' -- correct for every node registered
+            # before Windows support existed).
+            existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()}
+            for column, declaration in (
+                ("platform", "TEXT NOT NULL DEFAULT 'linux'"),
+                ("session_backend", "TEXT NOT NULL DEFAULT 'tmux'"),
+                ("shell_capabilities", "TEXT NOT NULL DEFAULT '[]'"),
+                ("wsl_available", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in existing_columns:
+                    connection.execute(f"ALTER TABLE nodes ADD COLUMN {column} {declaration}")
             apply_migrations(connection, NODE_MIGRATIONS)
         try:
             self.path.chmod(0o600)
@@ -257,7 +278,9 @@ class NodeRegistry:
     def heartbeat(self, node_id: str, *, metrics: NodeMetrics, tmux_session_count: int,
                  agent_counts: dict[str, int], agent_types: tuple[str, ...],
                  agent_version: str | None, labels: tuple[str, ...], latency_ms: float | None = None,
-                 now: datetime | None = None) -> Node | None:
+                 now: datetime | None = None, platform: str = PLATFORM_LINUX,
+                 session_backend: str = SESSION_BACKEND_TMUX, shell_capabilities: tuple[str, ...] = (),
+                 wsl_available: bool = False) -> Node | None:
         """Writes a fresh sample, applies EWMA smoothing on top of
         whatever was previously stored, updates the sustained-high-CPU/
         load duration trackers, recomputes capacity_status/
@@ -309,6 +332,7 @@ class NodeRegistry:
                     disk_total_bytes = ?, disk_used_bytes = ?, disk_free_bytes = ?, disk_percent = ?,
                     tmux_session_count = ?, agent_counts = ?, agent_types = ?, agent_version = ?, labels = ?,
                     high_cpu_since = ?, high_load_since = ?, capacity_status = ?, overload_reasons = ?,
+                    platform = ?, session_backend = ?, shell_capabilities = ?, wsl_available = ?,
                     updated_at = ?
                 WHERE id = ?""",
                 (now_iso, latency_ms,
@@ -319,6 +343,7 @@ class NodeRegistry:
                  metrics.disk_total_bytes, metrics.disk_used_bytes, metrics.disk_free_bytes, metrics.disk_percent,
                  tmux_session_count, json.dumps(agent_counts), json.dumps(list(agent_types)), agent_version,
                  json.dumps(list(labels)), high_cpu_since, high_load_since, capacity_status, json.dumps(reasons),
+                 platform, session_backend, json.dumps(list(shell_capabilities)), int(wsl_available),
                  now_iso, node_id),
             )
         return self.get(node_id, now=now)
@@ -351,6 +376,10 @@ class NodeRegistry:
             capacity_status=data.get("capacity_status") or CAPACITY_UNKNOWN,
             overload_reasons=tuple(json.loads(data.get("overload_reasons") or "[]")),
             registered_at=data.get("registered_at"), updated_at=data.get("updated_at"),
+            platform=data.get("platform") or PLATFORM_LINUX,
+            session_backend=data.get("session_backend") or SESSION_BACKEND_TMUX,
+            shell_capabilities=tuple(json.loads(data.get("shell_capabilities") or "[]")),
+            wsl_available=bool(data.get("wsl_available") or 0),
         )
 
     def _derive_status(self, last_heartbeat_at: str | None, now: datetime) -> str:

@@ -93,15 +93,22 @@ class ControllerService:
     def receive_remote_heartbeat(self, node_id: str, *, metrics: host_metrics.NodeMetrics,
                                  tmux_session_count: int, agent_counts: dict[str, int],
                                  agent_types: tuple[str, ...], agent_version: str | None,
-                                 labels: tuple[str, ...]) -> Node | None:
+                                 labels: tuple[str, ...], platform: str = "linux",
+                                 session_backend: str = "tmux", shell_capabilities: tuple[str, ...] = (),
+                                 wsl_available: bool = False) -> Node | None:
         """Called by the heartbeat-receiving HTTP route (dashboard.py) once
         the pushing node agent's bearer token has already been verified
         against this node_id -- this method itself does no auth, it
         trusts its caller entirely, exactly like every other internal
-        TerminalService-shaped method in this project."""
+        TerminalService-shaped method in this project. platform/
+        session_backend/shell_capabilities/wsl_available (multi-node
+        Windows support) are whatever the pushing node agent itself
+        reported -- this method never infers or overrides them."""
         return self.registry.heartbeat(node_id, metrics=metrics, tmux_session_count=tmux_session_count,
                                        agent_counts=agent_counts, agent_types=agent_types,
-                                       agent_version=agent_version, labels=labels)
+                                       agent_version=agent_version, labels=labels, platform=platform,
+                                       session_backend=session_backend, shell_capabilities=shell_capabilities,
+                                       wsl_available=wsl_available)
 
     # -- session location resolution ---------------------------------------
 
@@ -271,6 +278,21 @@ class ControllerService:
         if target_node.draining:
             return {"error": "NODE_DRAINING", "node_id": target_node_id,
                     "detail": "target node is draining -- not accepting new sessions"}
+        if agent_type not in ("shell", *target_node.agent_types):
+            # Cross-platform (or same-platform) capability mismatch --
+            # task's own explicit "nếu không tương thích phải fail rõ
+            # ràng trước khi dừng source": failed here, BEFORE the
+            # source is ever touched, exactly like every other
+            # incompatibility this method rejects. A cheap local check
+            # (target_node.agent_types is already known from the last
+            # heartbeat, no network round-trip needed) -- cwd
+            # compatibility has no such local shortcut and is instead
+            # caught by create_session's own real resolve_cwd check on
+            # the target below, with the exact same "target first, never
+            # touch source on failure" guarantee.
+            return {"error": "AGENT_TYPE_NOT_AVAILABLE_ON_TARGET", "node_id": target_node_id,
+                    "detail": f"agent_type={agent_type!r} not available on {target_node_id!r} "
+                              f"(has {target_node.agent_types!r}) -- move refused, source untouched"}
         target_client = self._clients.get(target_node_id)
         if target_client is None:
             return {"error": "NODE_UNREACHABLE", "node_id": target_node_id, "detail": "no client configured for this node"}
@@ -319,22 +341,32 @@ class ControllerService:
     # -- create (needs a node CHOICE, not a resolution) ---------------------
 
     def terminal_create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
-                                node: str = "auto", initial_prompt: str | None = None, grant_mode: str = "none",
-                                binding: str | None = None, requested_by: str | None = None) -> dict[str, Any]:
+                                node: str = "auto", platform: str | None = None, initial_prompt: str | None = None,
+                                grant_mode: str = "none", binding: str | None = None,
+                                requested_by: str | None = None) -> dict[str, Any]:
         existing = self.resolve_session(name)
         if "error" not in existing:
             return {"error": "SESSION_ALREADY_EXISTS", "session": name, "node_id": existing["node_id"]}
 
         if node == "auto":
-            placement = choose_node(self.registry.list(), required_agent_type=agent_type)
+            placement = choose_node(self.registry.list(), required_agent_type=agent_type, required_platform=platform)
             if placement.node_id is None:
                 return {"error": "NO_ELIGIBLE_NODE", "session": name, "reason": placement.reason,
                         "excluded": list(placement.excluded)}
             node_id = placement.node_id
         else:
             node_id = node
-            if self.registry.get(node_id) is None:
+            explicit_node = self.registry.get(node_id)
+            if explicit_node is None:
                 return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+            if platform is not None and explicit_node.platform != platform:
+                # An explicit node_id that doesn't match an explicitly
+                # required platform is a caller error, never silently
+                # honored -- fail clearly rather than place a Windows-
+                # only workload on a Linux node just because its id was
+                # named directly.
+                return {"error": "PLATFORM_MISMATCH", "node_id": node_id,
+                        "detail": f"node {node_id!r} is platform={explicit_node.platform!r}, required {platform!r}"}
 
         client = self._clients.get(node_id)
         if client is None:
@@ -439,8 +471,8 @@ class ControllerService:
             return {"error": "NODE_NOT_FOUND", "node_id": node_id}
         return {"node_id": node_id, "draining": draining}
 
-    def choose_node_for(self, *, agent_type: str = "shell") -> PlacementResult:
-        return choose_node(self.registry.list(), required_agent_type=agent_type)
+    def choose_node_for(self, *, agent_type: str = "shell", platform: str | None = None) -> PlacementResult:
+        return choose_node(self.registry.list(), required_agent_type=agent_type, required_platform=platform)
 
 
 def build_default_controller(terminal: "TerminalService") -> ControllerService:

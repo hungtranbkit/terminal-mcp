@@ -156,12 +156,21 @@ class WebTerminalProcess:
             os.close(self.master_fd)
 
 
-async def pump_websocket(websocket: WebSocket, proc: WebTerminalProcess) -> None:
+async def pump_websocket(websocket: WebSocket, proc: Any) -> None:
     """Bidirectional bridge between an already-`accept()`ed WebSocket and
-    an already-spawned WebTerminalProcess. Returns once either side has
-    closed; the caller is responsible for `proc.close()` afterward (this
-    function never assumes it owns the process's lifetime beyond the pump
-    itself, so a caller can inspect/log state after this returns).
+    an already-spawned WebTerminalProcess -- or any OTHER object with the
+    same shape (`read(timeout) -> bytes|None`, `write(bytes)`,
+    `resize(cols, rows)`, `alive() -> bool`, `close()`) -- this function
+    itself never constructs or type-checks `proc`, only calls those five
+    methods, so a non-tmux backend's own equivalent (windows_webterm.py's
+    `WindowsTerminalViewer`, used by node_agent.py's remote-node WS
+    route) reuses this exact pump unmodified. `proc` is typed `Any`
+    rather than `WebTerminalProcess` specifically for this reason -- the
+    real contract is this docstring's method list, not the class name.
+    Returns once either side has closed; the caller is responsible for
+    `proc.close()` afterward (this function never assumes it owns the
+    process's lifetime beyond the pump itself, so a caller can inspect/
+    log state after this returns).
 
     Wire protocol, deliberately minimal:
       server -> client: BINARY frames are raw pty output bytes (exactly

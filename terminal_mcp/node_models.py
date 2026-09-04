@@ -73,17 +73,44 @@ class NodeHeartbeatThresholds:
     offline_after_seconds: float = 180.0
 
 
+# Node platform -- reported by the node agent itself (never guessed
+# centrally, same posture as agent_types below), one of these two.
+PLATFORM_LINUX = "linux"
+PLATFORM_WINDOWS = "windows"
+
+# session_backend -- which SessionBackend (session_backend.py) a node's
+# own TerminalService was actually constructed with. Distinct from
+# `platform` (a Linux node could theoretically run a non-tmux backend in
+# the future; today it's a strict 1:1) -- kept as its own field so the
+# dashboard/doctor output says WHAT is managing sessions, not just WHICH
+# OS, without assuming they're always the same thing.
+SESSION_BACKEND_TMUX = "tmux"
+SESSION_BACKEND_WINDOWS_PTY = "windows_pty"
+
+
 @dataclass(frozen=True)
 class NodeCapabilities:
     """What a node CAN do -- reported by the node agent itself at
     heartbeat time (never assumed/guessed centrally). agent_types: which
     launch_commands this node's own config.session_lifecycle recognizes
-    (e.g. ("shell","claude","codex")) -- the scheduler (item 6's "agent
-    capability phù hợp") only ever places a session needing agent_type=X
-    on a node that actually lists X here."""
+    AND whose launcher binary was actually found on this node (via
+    shutil.which -- see agent_availability.py) -- the scheduler (item 6's
+    "agent capability phù hợp") only ever places a session needing
+    agent_type=X on a node that actually lists X here, whether that
+    means "claude not configured" or "configured but the binary isn't
+    actually installed on this node" (task's own explicit Windows
+    requirement, applied identically on Linux too -- this was a real,
+    pre-existing gap on Linux as well, fixed once for both platforms).
+    platform/session_backend/shell_capabilities/wsl_available: the rest
+    of the multi-node Windows support capability report (task's own
+    explicit field list)."""
     agent_types: tuple[str, ...] = ("shell",)
     agent_version: str | None = None  # this project's own __version__ on that node
     labels: tuple[str, ...] = ()
+    platform: str = PLATFORM_LINUX
+    session_backend: str = SESSION_BACKEND_TMUX
+    shell_capabilities: tuple[str, ...] = ()
+    wsl_available: bool = False
 
 
 @dataclass(frozen=True)
@@ -128,6 +155,12 @@ class Node:
     overload_reasons: tuple[str, ...] = ()
     registered_at: str | None = None
     updated_at: str | None = None
+    # Multi-node Windows support -- reported by the node agent itself,
+    # never guessed centrally (same posture as agent_types above).
+    platform: str = PLATFORM_LINUX
+    session_backend: str = SESSION_BACKEND_TMUX
+    shell_capabilities: tuple[str, ...] = ()
+    wsl_available: bool = False
 
 
 def node_to_dict(node: Node) -> dict[str, Any]:
@@ -152,4 +185,7 @@ def node_to_dict(node: Node) -> dict[str, Any]:
         "labels": list(node.labels), "max_sessions": node.max_sessions,
         "capacity_status": node.capacity_status, "overload_reasons": list(node.overload_reasons),
         "registered_at": node.registered_at, "updated_at": node.updated_at,
+        "platform": node.platform, "session_backend": node.session_backend,
+        "shell_capabilities": list(node.shell_capabilities), "wsl_available": node.wsl_available,
+        "claude_available": "claude" in node.agent_types, "codex_available": "codex" in node.agent_types,
     }

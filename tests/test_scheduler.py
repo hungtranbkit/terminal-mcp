@@ -3,13 +3,21 @@
 registry, no tmux needed."""
 from __future__ import annotations
 
-from terminal_mcp.node_models import CAPACITY_HEALTHY, CAPACITY_OVERLOADED, NODE_OFFLINE, NODE_ONLINE, Node
+from terminal_mcp.node_models import (
+    CAPACITY_HEALTHY,
+    CAPACITY_OVERLOADED,
+    NODE_OFFLINE,
+    NODE_ONLINE,
+    PLATFORM_LINUX,
+    Node,
+)
 from terminal_mcp.scheduler import choose_node
 
 
 def _node(id, *, status=NODE_ONLINE, draining=False, capacity=CAPACITY_HEALTHY,
           ram_percent=30.0, cpu_percent=10.0, sessions=0, agent_types=("shell",),
-          max_sessions=None, disk_free_bytes=100 * 1024 ** 3, labels=(), overload_reasons=()) -> Node:
+          max_sessions=None, disk_free_bytes=100 * 1024 ** 3, labels=(), overload_reasons=(),
+          platform=PLATFORM_LINUX) -> Node:
     return Node(
         id=id, display_name=id, hostname=f"{id}-host", endpoint="local", status=status,
         draining=draining, last_heartbeat_at="2026-01-01T00:00:00+00:00", latency_ms=1.0,
@@ -20,6 +28,7 @@ def _node(id, *, status=NODE_ONLINE, draining=False, capacity=CAPACITY_HEALTHY,
         disk_free_bytes=disk_free_bytes, disk_percent=10.0, tmux_session_count=sessions,
         agent_counts={}, agent_types=agent_types, agent_version="0.13.0", labels=labels,
         max_sessions=max_sessions, capacity_status=capacity, overload_reasons=overload_reasons,
+        platform=platform,
     )
 
 
@@ -147,3 +156,47 @@ def test_excluded_nodes_still_reported_alongside_a_successful_pick():
     assert result.node_id == "dell"
     assert result.candidates_considered == 2
     assert any(nid == "overloaded-node" for nid, _ in result.excluded)
+
+
+# -- platform requirement (multi-node Windows support) ----------------------
+
+def test_no_platform_requirement_ignores_platform_entirely():
+    linux_node = _node("dell", platform="linux")
+    windows_node = _node("m910", platform="windows", ram_percent=5.0)  # more headroom
+    result = choose_node([linux_node, windows_node])
+    assert result.node_id == "m910"  # picked purely on headroom, platform irrelevant
+
+
+def test_required_platform_excludes_the_other_platform():
+    linux_node = _node("dell", platform="linux")
+    windows_node = _node("m910", platform="windows", ram_percent=5.0)  # more headroom, but wrong platform
+    result = choose_node([linux_node, windows_node], required_platform="linux")
+    assert result.node_id == "dell"
+    assert any(nid == "m910" and "platform" in why for nid, why in result.excluded)
+
+
+def test_required_platform_windows_selects_windows_node():
+    linux_node = _node("dell", platform="linux", ram_percent=5.0)  # more headroom, but wrong platform
+    windows_node = _node("m910", platform="windows")
+    result = choose_node([linux_node, windows_node], required_platform="windows")
+    assert result.node_id == "m910"
+
+
+def test_required_platform_no_matching_node_is_no_eligible_node():
+    linux_node = _node("dell", platform="linux")
+    result = choose_node([linux_node], required_platform="windows")
+    assert result.node_id is None
+    assert "platform" in result.excluded[0][1]
+
+
+def test_windows_node_with_no_agent_binaries_only_eligible_for_shell():
+    # Real cross-platform scenario: a Windows node whose config found no
+    # claude/codex CLI at all (agent_availability.py) reports
+    # agent_types=("shell",) only -- exactly like a Linux node in the
+    # same situation, no platform-specific carve-out needed in the
+    # scheduler itself for this case (agent_type filtering already
+    # handles it identically on every platform).
+    windows_node = _node("m910", platform="windows", agent_types=("shell",))
+    result = choose_node([windows_node], required_agent_type="claude")
+    assert result.node_id is None
+    assert "agent_type" in result.excluded[0][1]

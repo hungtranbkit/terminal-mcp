@@ -20,7 +20,8 @@ class PlacementResult:
     excluded: tuple[tuple[str, str], ...] = ()  # (node_id, why-excluded), for diagnostics/doctor
 
 
-def _eligible(node: Node, *, required_agent_type: str, min_disk_free_bytes: int) -> tuple[bool, str | None]:
+def _eligible(node: Node, *, required_agent_type: str, min_disk_free_bytes: int,
+              required_platform: str | None = None) -> tuple[bool, str | None]:
     """One node's eligibility gate -- ALL must pass before it's even
     scored. Returns (eligible, exclusion_reason)."""
     if node.status != NODE_ONLINE:
@@ -29,6 +30,13 @@ def _eligible(node: Node, *, required_agent_type: str, min_disk_free_bytes: int)
         return False, "draining"
     if node.capacity_status == CAPACITY_OVERLOADED:
         return False, f"overloaded ({', '.join(node.overload_reasons) or 'no reason recorded'})"
+    if required_platform is not None and node.platform != required_platform:
+        # Multi-node Windows support -- a caller that explicitly needs a
+        # specific platform (e.g. a session that only makes sense on
+        # Windows, or a Linux-only workflow) is never silently placed on
+        # the wrong one. Omitted (the default): any platform is eligible,
+        # exactly today's single-platform behavior, unchanged.
+        return False, f"platform={node.platform!r} != required {required_platform!r}"
     if required_agent_type not in ("shell", *node.agent_types):
         # "shell" needs no launcher at all -- every node that can run tmux
         # at all can host a plain shell session; claude/codex require the
@@ -57,15 +65,22 @@ def _score(node: Node) -> tuple[float, float, float, str]:
 
 def choose_node(nodes: list[Node], *, required_agent_type: str = "shell",
                 min_disk_free_bytes: int = 1024 * 1024 * 1024,  # 1 GiB -- a real floor, not zero
-                labels_required: tuple[str, ...] = ()) -> PlacementResult:
-    """The Auto scheduler (task item 6). `nodes` should already be the
-    CURRENT NodeRegistry.list() snapshot -- this function trusts it
-    entirely and does no additional freshness check itself (status is
-    already derived by NodeRegistry.list() at the moment it was called)."""
+                labels_required: tuple[str, ...] = (),
+                required_platform: str | None = None) -> PlacementResult:
+    """The Auto scheduler (task item 6, extended by multi-node Windows
+    support's own "Scheduler Auto phải xét platform requirement"). `nodes`
+    should already be the CURRENT NodeRegistry.list() snapshot -- this
+    function trusts it entirely and does no additional freshness check
+    itself (status is already derived by NodeRegistry.list() at the
+    moment it was called). `required_platform` ("linux"/"windows"), when
+    given, excludes every node of the other platform before scoring;
+    omitted (the default), platform plays no role at all -- identical to
+    this function's behavior before Windows nodes existed."""
     excluded: list[tuple[str, str]] = []
     eligible: list[Node] = []
     for node in nodes:
-        ok, reason = _eligible(node, required_agent_type=required_agent_type, min_disk_free_bytes=min_disk_free_bytes)
+        ok, reason = _eligible(node, required_agent_type=required_agent_type, min_disk_free_bytes=min_disk_free_bytes,
+                               required_platform=required_platform)
         if not ok:
             excluded.append((node.id, reason or "ineligible"))
             continue

@@ -22,6 +22,7 @@ from .permissions import (SENSITIVE_SESSION_WORDS, input_session_allowed,
                           require_input, require_read, require_session_lifecycle, session_allowed,
                           session_input_denied_by_pattern, valid_session_name)
 from .redaction import redact_ansi_safe, redact_text
+from .session_backend import SessionBackend
 from .status import classify_status
 from .tmux import SEND_TEXT_ENTER_SETTLE_SECONDS, TmuxClient, TmuxError, iso_timestamp
 
@@ -60,7 +61,15 @@ SENSITIVE_COMMANDS = {"ssh", "mysql", "psql", "sudo", "passwd"}
 # else that doesn't match a configured session_lifecycle.launch_commands
 # value either is simply unrecognized (agent_type=None, incomplete
 # metadata) -- never guessed at.
-SHELL_COMMAND_NAMES = {"bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh", "csh"}
+SHELL_COMMAND_NAMES = {
+    "bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh", "csh",
+    # Windows shells (multi-node Windows support) -- a WindowsSessionBackend
+    # session's own pane_current_command reports whichever of these was
+    # actually launched (see windows_backend.py's WindowsSessionBackend.
+    # shell), with or without the ".exe" suffix depending on how it was
+    # configured/reported.
+    "powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd", "cmd.exe",
+}
 
 # Post-send submission verification (terminal_send_text/terminal_send_bound,
 # press_enter=True only). tmux.send_text already adds a fixed settle delay
@@ -104,12 +113,20 @@ PANE_LEASE_POLL_INTERVAL_SECONDS = 0.1
 
 
 class TerminalService:
-    def __init__(self, config: AppConfig, tmux: TmuxClient | None = None,
+    def __init__(self, config: AppConfig, tmux: SessionBackend | None = None,
                  bindings: BindingStore | None = None,
                  audit: AuditStore | None = None,
                  grants: SessionGrantStore | None = None,
                  leases: PaneLeaseStore | None = None,
                  killed_sessions: KilledSessionStore | None = None) -> None:
+        # `tmux` accepts ANY SessionBackend (session_backend.py) -- a
+        # TmuxClient (the default, Linux) or a WindowsSessionBackend
+        # (windows_backend.py, injected explicitly by windows_agent.py).
+        # Every permission/audit/redaction/kill-reopen-metadata/reliable-
+        # submission behavior below is written entirely in terms of that
+        # narrow, already-generic surface and runs completely unchanged
+        # regardless of which backend this is -- see session_backend.py's
+        # own module docstring for why.
         self.config = config
         self.tmux = tmux or TmuxClient()
         self.bindings = bindings or BindingStore()

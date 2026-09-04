@@ -260,3 +260,66 @@ def test_nodes_admin_page_read_guard_matches_main_dashboard(tmp_path):
     response = no_origin_client.get("/dashboard/nodes")
     main_response = no_origin_client.get("/dashboard")
     assert response.status_code == main_response.status_code
+
+
+# -- /dashboard/api/node/generate-onboarding (Windows onboarding flow) ------
+
+def test_generate_onboarding_returns_token_config_and_command(tmp_path):
+    client, _controller = _client(tmp_path)
+    response = client.post("/dashboard/api/node/generate-onboarding", json={
+        "node_id": "m910", "hostname": "m910.local", "endpoint": "http://192.168.1.50:8790", "platform": "windows",
+    })
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["token"]) == 64  # secrets.token_hex(32)
+    assert body["env_var"] == "TERMINAL_MCP_NODE_TOKEN_M910"
+    assert "node_id: m910" in body["config_yaml_block"]
+    assert "TERMINAL_MCP_NODE_TOKEN_M910" in body["config_yaml_block"]
+    assert "install-node-agent.ps1" in body["install_command"]
+    assert body["token"] in body["install_command"]
+
+
+def test_generate_onboarding_linux_uses_shell_installer(tmp_path):
+    client, _controller = _client(tmp_path)
+    response = client.post("/dashboard/api/node/generate-onboarding", json={
+        "node_id": "laptop2", "hostname": "laptop2", "endpoint": "http://192.168.1.51:8790", "platform": "linux",
+    })
+    assert response.status_code == 200
+    assert "install-node-agent.sh" in response.json()["install_command"]
+
+
+def test_generate_onboarding_rejects_missing_fields(tmp_path):
+    client, _controller = _client(tmp_path)
+    response = client.post("/dashboard/api/node/generate-onboarding", json={"node_id": "m910"})
+    assert response.status_code == 400
+
+
+def test_generate_onboarding_rejects_invalid_node_id(tmp_path):
+    client, _controller = _client(tmp_path)
+    response = client.post("/dashboard/api/node/generate-onboarding", json={
+        "node_id": "m910; rm -rf /", "hostname": "h", "endpoint": "http://h:8790",
+    })
+    assert response.status_code == 400
+
+
+def test_generate_onboarding_never_registers_a_node(tmp_path):
+    # Purely a text-generation convenience -- the operator still does the
+    # real config.yaml + safe-restart steps (docs/multi-node.md).
+    client, controller = _client(tmp_path)
+    client.post("/dashboard/api/node/generate-onboarding", json={
+        "node_id": "m910", "hostname": "m910.local", "endpoint": "http://192.168.1.50:8790",
+    })
+    assert controller.node_status("m910") is None
+
+
+def test_generate_onboarding_requires_origin_csrf_defense(tmp_path):
+    service = TerminalService(_config())
+    registry = NodeRegistry(tmp_path / "nodes.db")
+    controller = ControllerService(registry, local_client=LocalNodeClient(service), local_workspace_root=str(tmp_path))
+    server = build_mcp(service)
+    register_dashboard(server, service, controller=controller)
+    no_origin_client = TestClient(server.streamable_http_app())
+    response = no_origin_client.post("/dashboard/api/node/generate-onboarding", json={
+        "node_id": "m910", "hostname": "h", "endpoint": "http://h:8790",
+    })
+    assert response.status_code in (400, 401, 403)

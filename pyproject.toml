@@ -24,6 +24,12 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=9,<10"]
+# Only needed to actually RUN terminal-windows-node-agent on a real
+# Windows node (windows_backend.py's real ConPTY process spawn) -- never
+# imported at module level anywhere in this package (see windows_backend.
+# py's own "lazy import" discipline), so this project installs and its
+# test suite runs completely normally on Linux/macOS without it.
+windows = ["pywinpty>=2,<3; sys_platform == 'win32'"]
 
 [project.scripts]
 terminal-mcp = "terminal_mcp.server:main"
@@ -32,6 +38,7 @@ terminal-mcp-webauth = "terminal_mcp.webauth_cli:main"
 terminal-mcp-doctor = "terminal_mcp.doctor:main"
 terminal-mcp-tunnel-watchdog = "terminal_mcp.tunnel_watchdog:main"
 terminal-node-agent = "terminal_mcp.node_agent:main"
+terminal-windows-node-agent = "terminal_mcp.windows_agent:main"
 
 [tool.setuptools.packages.find]
 include = ["terminal_mcp*"]

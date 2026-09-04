@@ -70,6 +70,7 @@ def cmd_nodes(args: argparse.Namespace) -> int:
     does) rather than talking to the running service -- so it works even
     when the service is down, and its remote test-connection probes are
     always fresh, never a cached value from the running service."""
+    from .agent_availability import available_agent_types
     from .config import load_config
     from .controller import ControllerService
     from .core import TerminalService
@@ -103,9 +104,9 @@ def cmd_nodes(args: argparse.Namespace) -> int:
         command = (item.pane_current_command or "").casefold()
         if command:
             agent_counts[command] = agent_counts.get(command, 0) + 1
-    agent_types = ["shell"] + [agent_type for agent_type, _cmd in config.session_lifecycle.launch_commands]
+    agent_types = available_agent_types(config.session_lifecycle.launch_commands)
     controller.refresh_local_heartbeat(tmux_session_count=len(items), agent_counts=agent_counts,
-                                       agent_types=tuple(agent_types), agent_version=None)
+                                       agent_types=agent_types, agent_version=None)
 
     rows = []
     for node in controller.list_nodes():

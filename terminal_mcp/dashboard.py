@@ -1,22 +1,27 @@
 from __future__ import annotations
 
+import contextlib
 import hmac
 import logging
 import os
-from urllib.parse import urlparse
+import re
+import secrets
+from urllib.parse import quote, urlparse
 
 import anyio
 from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import WebSocketRoute
-from starlette.websockets import WebSocket
+from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from . import tunnel_diagnostics
 from .cf_access import verify_access_assertion
+from .agent_availability import available_agent_types
 from .controller import ControllerService, build_default_controller
+from .node_client import RemoteNodeClient
 from .core import TerminalService
-from .node_models import node_to_dict
+from .node_models import NODE_ONLINE, node_to_dict
 from .permissions import input_session_allowed, session_allowed, valid_session_name
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
@@ -2664,12 +2669,31 @@ NODES_ADMIN_HTML = """<!doctype html>
   <header>
     <div><h1>Quản lý node</h1><div class="muted">Trạng thái, tài nguyên và session theo từng node</div></div>
     <div style="display:flex;align-items:center;gap:10px">
+      <button class="icon-btn" id="addNodeBtn" type="button">+ Thêm node</button>
       <button class="icon-btn" id="refreshBtn" type="button">⟳ Refresh</button>
       <a class="back" href="/dashboard">← Terminal</a>
       <span class="live" id="liveBadge">● LIVE</span>
     </div>
   </header>
   <main>
+    <div id="onboardPanel" hidden style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+        <strong>Thêm node mới</strong>
+        <button class="icon-btn" id="onboardCloseBtn" type="button">✕</button>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px">
+        <label style="font-size:12px;color:var(--muted)">Node ID<br><input id="obNodeId" type="text" placeholder="m910" style="margin-top:4px;padding:7px 9px;border-radius:6px;border:1px solid var(--line);background:#0f1730;color:var(--text);font:inherit"></label>
+        <label style="font-size:12px;color:var(--muted)">Hostname<br><input id="obHostname" type="text" placeholder="m910.local" style="margin-top:4px;padding:7px 9px;border-radius:6px;border:1px solid var(--line);background:#0f1730;color:var(--text);font:inherit"></label>
+        <label style="font-size:12px;color:var(--muted)">Endpoint<br><input id="obEndpoint" type="text" placeholder="http://192.168.1.50:8790" style="margin-top:4px;padding:7px 9px;border-radius:6px;border:1px solid var(--line);background:#0f1730;color:var(--text);font:inherit;min-width:220px"></label>
+        <label style="font-size:12px;color:var(--muted)">Platform<br>
+          <select id="obPlatform" style="margin-top:4px;padding:7px 9px;border-radius:6px;border:1px solid var(--line);background:#0f1730;color:var(--text);font:inherit">
+            <option value="windows">Windows</option><option value="linux">Linux</option>
+          </select>
+        </label>
+        <button class="icon-btn" id="obGenerateBtn" type="button" style="align-self:flex-end">Generate</button>
+      </div>
+      <div id="obResult" style="margin-top:12px"></div>
+    </div>
     <div id="cards"><div class="empty">Đang tải...</div></div>
     <div id="detail" hidden></div>
   </main>
@@ -2706,14 +2730,24 @@ NODES_ADMIN_HTML = """<!doctype html>
       return { ok: response.ok, status: response.status, data };
     }
 
+    function osIcon(node) { return node.platform === 'windows' ? '🪟' : '🐧'; }
+    function capabilityLine(node) {
+      const parts = [node.session_backend || '—'];
+      if (node.claude_available) parts.push('claude ✓');
+      if (node.codex_available) parts.push('codex ✓');
+      if (node.wsl_available) parts.push('WSL');
+      return parts.join(' · ');
+    }
+
     function nodeCardHtml(node) {
       const capBadge = node.capacity_status || 'unknown';
       const draining = node.draining ? '<span class="badge draining">draining</span>' : '';
       return `
         <div class="node-card${node.id === selectedNodeId ? ' selected' : ''}" data-node-id="${node.id}">
           <div class="nc-head">
-            <div><span class="status-dot ${node.status}"></span><span class="nc-name">${node.display_name}</span>
-              <div class="nc-host">${node.id} · ${node.hostname}</div></div>
+            <div><span class="status-dot ${node.status}"></span><span title="${node.platform || 'linux'}">${osIcon(node)}</span> <span class="nc-name">${node.display_name}</span>
+              <div class="nc-host">${node.id} · ${node.hostname}</div>
+              <div class="nc-host">${capabilityLine(node)}</div></div>
             <div style="display:flex;gap:6px;align-items:center"><span class="badge ${capBadge}">${capBadge}</span>${draining}</div>
           </div>
           <div class="nc-metrics">
@@ -2762,8 +2796,9 @@ NODES_ADMIN_HTML = """<!doctype html>
       const isLocal = node.endpoint === 'local';
       detail.innerHTML = `
         <div class="d-head">
-          <div><h2>${node.display_name} <span class="muted" style="font-weight:400">(${node.id})</span></h2>
-            <div class="muted">${node.hostname} · ${node.endpoint} · agent_version=${node.agent_version || '—'}</div></div>
+          <div><h2>${osIcon(node)} ${node.display_name} <span class="muted" style="font-weight:400">(${node.id})</span></h2>
+            <div class="muted">${node.hostname} · ${node.endpoint} · ${node.platform || 'linux'}/${node.session_backend || 'tmux'} · agent_version=${node.agent_version || '—'}</div>
+            <div class="muted">${capabilityLine(node)}${(node.shell_capabilities && node.shell_capabilities.length) ? ' · shells: ' + node.shell_capabilities.join(', ') : ''}</div></div>
           <div class="d-actions">
             <button id="refreshDetailBtn" type="button">⟳ Refresh</button>
             <button id="testConnBtn" type="button"${isLocal ? ' disabled title="Node local luôn kết nối"' : ''}>Test connection</button>
@@ -2815,6 +2850,34 @@ NODES_ADMIN_HTML = """<!doctype html>
     }
 
     document.getElementById('refreshBtn').addEventListener('click', () => { loadAll(); if (selectedNodeId) loadDetail(selectedNodeId); });
+
+    document.getElementById('addNodeBtn').addEventListener('click', () => {
+      document.getElementById('onboardPanel').hidden = false;
+      document.getElementById('obResult').innerHTML = '';
+    });
+    document.getElementById('onboardCloseBtn').addEventListener('click', () => { document.getElementById('onboardPanel').hidden = true; });
+    document.getElementById('obGenerateBtn').addEventListener('click', async () => {
+      const nodeId = document.getElementById('obNodeId').value.trim();
+      const hostname = document.getElementById('obHostname').value.trim();
+      const endpoint = document.getElementById('obEndpoint').value.trim();
+      const platform = document.getElementById('obPlatform').value;
+      const resultEl = document.getElementById('obResult');
+      if (!nodeId || !hostname || !endpoint) { resultEl.innerHTML = '<div class="d-sessions-error">Điền đủ Node ID, Hostname, Endpoint.</div>'; return; }
+      resultEl.innerHTML = '<div class="d-empty">Đang tạo...</div>';
+      const r = await api('/dashboard/api/node/generate-onboarding', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ node_id: nodeId, hostname, endpoint, platform }),
+      });
+      if (!r.ok) { resultEl.innerHTML = `<div class="d-sessions-error">${r.data.detail || r.data.error || 'Lỗi'}</div>`; return; }
+      const pre = (label, text) => `<div style="margin-top:8px"><div class="muted" style="font-size:11px">${label}</div><pre style="white-space:pre-wrap;word-break:break-all;background:#0f1730;border:1px solid var(--line);border-radius:6px;padding:8px;font-size:11px;user-select:all">${text}</pre></div>`;
+      resultEl.innerHTML = `
+        <div class="d-msg ok">Token được tạo MỘT LẦN duy nhất -- lưu lại ngay, không hiển thị lại.</div>
+        ${pre('1) Chạy trên node mới:', r.data.install_command)}
+        ${pre('2) Thêm vào config.yaml của controller:', r.data.config_yaml_block)}
+        ${pre('3) Export biến môi trường nơi terminal-mcp-http.service đọc env (rồi safe-restart):', r.data.env_var + '=' + r.data.token)}
+        <div class="muted" style="font-size:11px;margin-top:6px">4) Xác minh: terminal-mcp-doctor nodes -- ${nodeId} phải chuyển status=online trong vài giây sau khi node-agent kết nối.</div>`;
+    });
+
     loadAll(); setInterval(loadAll, 8000);
   </script>
 </body>
@@ -3680,6 +3743,106 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
+    def _resolve_remote_web_terminal_access(session: str) -> dict | None:
+        """Only reached after terminal.terminal_web_terminal_access(session)
+        already returned SESSION_NOT_FOUND -- meaning every check UP TO
+        the physical-existence one (web_terminal_enabled, require_read,
+        valid_session_name, and READ authorization via
+        _read_authorized_with_grant) already passed; that function
+        returns ACCESS_DENIED before ever reaching SESSION_NOT_FOUND if
+        read isn't authorized. This only has to resolve WHERE the
+        session actually lives and whether INPUT is authorized -- read
+        access is already a settled question by the time this runs.
+
+        input authorization for a remote session uses revalidate_
+        identity=False (same as the discovery endpoints' own coarse
+        signal) -- a real, documented Phase A/B limitation: per-call
+        identity re-pinning (P0-2) needs this node's own tmux, which a
+        remote session doesn't have. A statically-whitelisted session
+        (input_session_allowed) is completely unaffected (that check
+        short-circuits before identity revalidation ever matters);
+        only a GRANT-based (non-whitelisted) remote session's input
+        authorization is coarser than the local case."""
+        resolution = controller.resolve_session(session)
+        if "error" in resolution:
+            return None
+        node_id = resolution["node_id"]
+        if node_id == controller.local_node_id:
+            return None  # already confirmed not-found locally -- fail safe, never loop back to itself
+        node = controller.node_status(node_id)
+        if node is None or node.status != NODE_ONLINE:
+            return None
+        client = controller.client_for(node_id)
+        if not isinstance(client, RemoteNodeClient):
+            return None
+        grant = terminal.grants.get(session)
+        input_enabled = bool(
+            terminal.config.permissions.terminal_input
+            and terminal._input_authorized_with_grant(session, grant, revalidate_identity=False)[0]
+        )
+        return {"node_id": node_id, "client": client, "input": input_enabled}
+
+    async def _proxy_remote_terminal_ws(websocket: WebSocket, remote_access: dict) -> None:
+        """Relays an already-`accept()`-pending browser WebSocket to a
+        REMOTE node's own /v1/ws/terminal (node_agent.py) -- this
+        process never touches tmux/WindowsSessionBackend directly for a
+        remote session, it's a pure byte/frame relay, same trust
+        boundary as every other routed operation in this project
+        (controller.py never re-implements what a node agent already
+        does, only routes to it)."""
+        import websockets as _websockets_client
+
+        client: RemoteNodeClient = remote_access["client"]
+        session = websocket.query_params.get("session", "")
+        input_enabled = remote_access["input"]
+        remote_base = client.base_url.replace("https://", "wss://").replace("http://", "ws://")
+        remote_url = f"{remote_base}/v1/ws/terminal?session={quote(session)}&readonly={0 if input_enabled else 1}"
+
+        await websocket.accept()
+        try:
+            async with _websockets_client.connect(
+                remote_url, extra_headers={"Authorization": f"Bearer {client._token}"}, open_timeout=10,
+            ) as remote_ws:
+                async def _from_remote() -> None:
+                    async for message in remote_ws:
+                        if websocket.client_state != WebSocketState.CONNECTED:
+                            break
+                        if isinstance(message, (bytes, bytearray)):
+                            await websocket.send_bytes(bytes(message))
+                        else:
+                            await websocket.send_text(message)
+
+                async def _from_browser() -> None:
+                    while True:
+                        message = await websocket.receive()
+                        if message["type"] == "websocket.disconnect":
+                            return
+                        data = message.get("bytes")
+                        if data is not None:
+                            await remote_ws.send(data)
+                            continue
+                        text = message.get("text")
+                        if text is not None:
+                            await remote_ws.send(text)
+
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(_from_remote)
+                    try:
+                        await _from_browser()
+                    except WebSocketDisconnect:
+                        pass
+                    finally:
+                        tg.cancel_scope.cancel()
+        except Exception as exc:  # noqa: BLE001 -- a remote-connect failure must close cleanly, never hang the browser socket
+            _log.warning("remote web terminal proxy to node_id=%s failed: %s: %s",
+                        remote_access.get("node_id"), type(exc).__name__, exc)
+            with contextlib.suppress(Exception):
+                if websocket.client_state == WebSocketState.CONNECTED:
+                    await websocket.send_json({"type": "closed", "reason": "remote_node_unreachable"})
+        with contextlib.suppress(Exception):
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.close()
+
     async def dashboard_terminal_ws(websocket: WebSocket) -> None:
         # _read_guard/_origin_allowed are plain functions of .headers/
         # .cookies -- a Starlette WebSocket exposes both with the exact
@@ -3703,8 +3866,24 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             await websocket.close(code=4400)
             return
         access = await anyio.to_thread.run_sync(terminal.terminal_web_terminal_access, session)
+        if access.get("error") == "SESSION_NOT_FOUND":
+            # Not on the LOCAL node specifically -- task's own "Open
+            # Terminal trên Windows/remote node phải mở được web
+            # terminal", generalized to any remote node (Linux or
+            # Windows). Every check terminal_web_terminal_access itself
+            # would have applied UP TO the physical-existence check
+            # (web_terminal_enabled, require_read, valid_session_name,
+            # already checked above) still applies -- only the "does it
+            # exist" step is redirected to controller.resolve_session
+            # instead of this node's own tmux.
+            remote_access = await anyio.to_thread.run_sync(lambda: _resolve_remote_web_terminal_access(session))
+            if remote_access is not None:
+                await _proxy_remote_terminal_ws(websocket, remote_access)
+                return
+            await websocket.close(code=4404)
+            return
         if "error" in access:
-            code = 4404 if access["error"] == "SESSION_NOT_FOUND" else 4403
+            code = 4403
             await websocket.close(code=code)
             return
         input_enabled = bool(access["input"])
@@ -3791,10 +3970,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             command = (item.pane_current_command or "").casefold()
             if command:
                 agent_counts[command] = agent_counts.get(command, 0) + 1
-        agent_types = ["shell"] + [agent_type for agent_type, _cmd in terminal.config.session_lifecycle.launch_commands]
+        agent_types = available_agent_types(terminal.config.session_lifecycle.launch_commands)
         controller.refresh_local_heartbeat(
             tmux_session_count=len(items), agent_counts=agent_counts,
-            agent_types=tuple(agent_types), agent_version=None,
+            agent_types=agent_types, agent_version=None,
         )
 
     @server.custom_route("/dashboard/api/nodes", methods=["GET"], include_in_schema=False)
@@ -3869,6 +4048,66 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         status_code = 200 if "error" not in result else 404
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
+    @server.custom_route("/dashboard/api/node/generate-onboarding", methods=["POST"], include_in_schema=False)
+    async def node_generate_onboarding(request: Request) -> JSONResponse:
+        # Onboard flow (task's own "Add/onboard Windows node flow ngắn
+        # gọn"): generates a fresh, random token SERVER-SIDE and returns
+        # the exact config.yaml block + env var + one-line install
+        # command to run on the new node -- never writes anything to the
+        # registry or to config.yaml itself (registering a REMOTE node
+        # still requires the same manual "add to config.yaml, export the
+        # env var, safe-restart" steps every other remote node already
+        # needs -- see docs/multi-node.md's own Bringing up the M910
+        # section, this is the same flow, just Windows-flavored and with
+        # the token generated for the operator instead of by hand). The
+        # generated token is returned exactly once, in this one response
+        # -- never persisted, never logged.
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        node_id = body.get("node_id") if isinstance(body, dict) else None
+        display_name = body.get("display_name") if isinstance(body, dict) else None
+        hostname = body.get("hostname") if isinstance(body, dict) else None
+        endpoint = body.get("endpoint") if isinstance(body, dict) else None
+        platform_kind = (body.get("platform") if isinstance(body, dict) else None) or "windows"
+        if not all(isinstance(v, str) and v.strip() for v in (node_id, hostname, endpoint)):
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "node_id, hostname, endpoint are required"},
+                                status_code=400)
+        if not re.match(r"^[A-Za-z0-9_-]+$", node_id):
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "node_id must be alphanumeric/-/_ only"},
+                                status_code=400)
+        display_name = display_name or node_id
+        token = secrets.token_hex(32)
+        env_var = f"TERMINAL_MCP_NODE_TOKEN_{node_id.upper().replace('-', '_')}"
+        config_yaml_block = (
+            "nodes:\n  remote:\n"
+            f"    - node_id: {node_id}\n"
+            f"      display_name: \"{display_name}\"\n"
+            f"      hostname: \"{hostname}\"\n"
+            f"      endpoint: \"{endpoint}\"\n"
+            f"      token_env: {env_var}\n"
+        )
+        if platform_kind == "windows":
+            install_command = (
+                f".\\deploy\\install-node-agent.ps1 -ControllerUrl <http(s)://controller-host:8766> "
+                f"-NodeId {node_id} -Token {token}"
+            )
+        else:
+            install_command = (
+                f"./deploy/install-node-agent.sh --controller <http://controller-host:8766> --node-id {node_id}"
+                " (then paste the token below into the printed node-agent.env)"
+            )
+        _log.info("dashboard node_generate_onboarding node_id=%s platform=%s identity=%s",
+                 node_id, platform_kind, identity.email if identity else None)
+        return JSONResponse({
+            "node_id": node_id, "token": token, "env_var": env_var,
+            "config_yaml_block": config_yaml_block, "install_command": install_command,
+        }, headers={"Cache-Control": "no-store"})
+
     @server.custom_route("/dashboard/api/nodes/{node_id}/heartbeat", methods=["POST"], include_in_schema=False)
     async def node_heartbeat(request: Request) -> JSONResponse:
         # Machine-to-machine (a remote node's own terminal-node-agent
@@ -3898,6 +4137,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 agent_counts=dict(body.get("agent_counts") or {}),
                 agent_types=tuple(body.get("agent_types") or ()),
                 agent_version=body.get("agent_version"), labels=tuple(body.get("labels") or ()),
+                platform=body.get("platform") or "linux", session_backend=body.get("session_backend") or "tmux",
+                shell_capabilities=tuple(body.get("shell_capabilities") or ()),
+                wsl_available=bool(body.get("wsl_available", False)),
             )
             if node is None:
                 return {"error": "NODE_NOT_FOUND", "node_id": node_id}

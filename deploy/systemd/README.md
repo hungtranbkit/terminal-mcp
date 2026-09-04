@@ -305,3 +305,12 @@ Same hardening posture as `terminal-mcp-http.service.example` above
 `SystemCallFilter=@system-service`) -- adjust/drop any directive your
 worker node's own kernel/systemd doesn't support, exactly as documented
 above for the AppArmor-restricted case on this host.
+
+**A Windows worker node has no systemd** -- use `deploy/install-node-
+agent.ps1` instead (run ON the Windows node, from an elevated PowerShell
+prompt), which registers a Windows Scheduled Task in place of a systemd
+unit for auto-start-at-logon/auto-restart. See `docs/multi-node.md`'s own
+"Windows node support" section for the full picture, and its own explicit
+note that this script has been reviewed but not executed anywhere (no
+Windows/PowerShell available in this project's own development
+environment).

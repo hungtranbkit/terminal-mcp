@@ -27,6 +27,7 @@ never blocks any session operation on the heartbeat loop's own success).
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import logging
 import os
@@ -40,12 +41,15 @@ import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket
 
 from . import __version__, host_metrics
+from .agent_availability import available_agent_types
 from .config import load_config
 from .core import TerminalService
 from .node_client import LocalNodeClient
+from .webterm import WebTerminalProcess, pump_websocket
 
 _log = logging.getLogger(__name__)
 
@@ -70,7 +74,6 @@ def _auth_ok(request: Request, expected_token: str) -> bool:
     # check would leak the shared secret one byte at a time to a network
     # attacker; every other auth comparison in this project (webauth.py)
     # already uses the same discipline for the same reason.
-    import hmac
     return hmac.compare_digest(presented, expected_token)
 
 
@@ -218,6 +221,60 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         result = await anyio.to_thread.run_sync(client.list_killed_sessions)
         return JSONResponse(result)
 
+    async def terminal_ws(websocket: WebSocket) -> None:
+        # Open Terminal for a REMOTE node (task's own "Open Terminal trên
+        # Windows phải mở được web terminal vào persistent session"),
+        # generalized for any remote node (Linux or Windows) -- the
+        # dashboard's own /dashboard/ws/terminal route (dashboard.py)
+        # proxies here for a non-local session, see that route's own
+        # comment. Auth: bearer token, same shared secret as every other
+        # route here -- a browser can't set a WS handshake header, but
+        # the only caller of THIS route is the controller's own dashboard
+        # proxy (a Python client, which can), never a browser directly.
+        # A query-param fallback exists for robustness (some WS client
+        # libraries make custom headers awkward), same trust boundary
+        # either way (this whole surface is bearer-token-only, no
+        # separate whitelist/permission re-check -- see this file's own
+        # module docstring for that established trust model).
+        header = websocket.headers.get("authorization", "")
+        presented = header[len("Bearer "):] if header.startswith("Bearer ") else websocket.query_params.get("token", "")
+        if not hmac.compare_digest(presented, token):
+            await websocket.close(code=4401)
+            return
+        session = websocket.query_params.get("session", "")
+        readonly = websocket.query_params.get("readonly") == "1"
+        if not session:
+            await websocket.close(code=4400)
+            return
+        exists = await anyio.to_thread.run_sync(lambda: terminal.tmux.get_session(session) is not None)
+        if not exists:
+            await websocket.close(code=4404)
+            return
+        await websocket.accept()
+        # Backend-aware: a tmux-backed node reuses webterm.py's own
+        # WebTerminalProcess (`tmux attach-session`) unchanged, exactly
+        # like dashboard.py's LOCAL route already does; a Windows node
+        # (no `.binary` attribute -- WindowsSessionBackend has no tmux
+        # binary at all) gets a WindowsTerminalViewer instead. Both
+        # implement the identical read/write/resize/alive/close shape,
+        # so pump_websocket (webterm.py) itself is used unmodified either
+        # way -- never a second, backend-specific pump implementation.
+        tmux_binary = getattr(terminal.tmux, "binary", None)
+        if tmux_binary is not None:
+            proc = await anyio.to_thread.run_sync(
+                lambda: WebTerminalProcess(tmux_binary, session, readonly=readonly, takeover=False)
+            )
+        else:
+            from .windows_webterm import WindowsTerminalViewer
+            proc = await anyio.to_thread.run_sync(
+                lambda: WindowsTerminalViewer(terminal.tmux, session, readonly=readonly)
+            )
+        try:
+            await websocket.send_json({"type": "ready", "session": session, "readonly": readonly})
+            await pump_websocket(websocket, proc)
+        finally:
+            await anyio.to_thread.run_sync(proc.close)
+
     routes = [
         Route("/v1/health", health, methods=["GET"]),
         Route("/v1/metrics", metrics, methods=["GET"]),
@@ -234,17 +291,25 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         Route("/v1/sessions/{name}/kill", kill_session, methods=["POST"]),
         Route("/v1/sessions/{name}/reopen", reopen_session, methods=["POST"]),
         Route("/v1/killed-sessions", killed_sessions, methods=["GET"]),
+        WebSocketRoute("/v1/ws/terminal", terminal_ws, name="node_agent_terminal_ws"),
     ]
     return Starlette(routes=routes)
 
 
 async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller_url: str, token: str,
-                          workspace_root: str, interval_seconds: float) -> None:
+                          workspace_root: str, interval_seconds: float, platform: str = "linux",
+                          session_backend: str = "tmux", shell_capabilities: tuple[str, ...] = (),
+                          wsl_available: bool = False) -> None:
     """Runs forever (until the process exits) -- a single failed push is
     logged and retried next cycle, never raised past this loop, so a
     controller outage can never crash the node agent (task item 2's own
     "controller mất kết nối, node vẫn sống" guarantee applies to THIS
-    process's own survival too, not only to tmux underneath it)."""
+    process's own survival too, not only to tmux underneath it).
+    `platform`/`session_backend`/`shell_capabilities`/`wsl_available`
+    (multi-node Windows support): shared with windows_agent.py's own
+    main(), which calls this SAME function with those set to the real,
+    Windows-appropriate values -- not a separate, duplicated heartbeat
+    loop implementation per platform."""
     url = f"{controller_url.rstrip('/')}/dashboard/api/nodes/{node_id}/heartbeat"
     while True:
         try:
@@ -256,11 +321,13 @@ async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller
                 command = (row.get("pane_current_command") or "").casefold()
                 if command:
                     agent_counts[command] = agent_counts.get(command, 0) + 1
-            agent_types = ["shell"] + [agent_type for agent_type, _command in terminal.config.session_lifecycle.launch_commands]
+            agent_types = available_agent_types(terminal.config.session_lifecycle.launch_commands)
             body = json.dumps({
                 "metrics": metrics.__dict__, "tmux_session_count": len(session_rows),
-                "agent_counts": agent_counts, "agent_types": agent_types,
+                "agent_counts": agent_counts, "agent_types": list(agent_types),
                 "agent_version": __version__, "labels": [],
+                "platform": platform, "session_backend": session_backend,
+                "shell_capabilities": list(shell_capabilities), "wsl_available": wsl_available,
             }).encode()
             request = urllib.request.Request(url, data=body, method="POST")
             request.add_header("Authorization", f"Bearer {token}")

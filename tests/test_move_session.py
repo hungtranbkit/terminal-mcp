@@ -133,7 +133,12 @@ def test_failed_create_on_target_never_touches_real_source(controller_with_fake_
     controller.terminal_create_session("move-src", "shell", str(tmp_path), node="local")
     assert _tmux_has_session("move-src")
 
-    result = controller.terminal_move_session("move-src", "node-b", agent_type="codex")
+    # agent_type="claude" -- node-b's own reported agent_types includes
+    # "claude" (see the fixture's heartbeat call), so this passes the
+    # controller's own local AGENT_TYPE_NOT_AVAILABLE_ON_TARGET pre-check
+    # and reaches the target's real create_session call, whose error this
+    # test is actually about.
+    result = controller.terminal_move_session("move-src", "node-b", agent_type="claude")
     assert result["error"] == "LAUNCHER_NOT_CONFIGURED"
     assert result["phase"] == "create_on_target"
 
@@ -141,6 +146,27 @@ def test_failed_create_on_target_never_touches_real_source(controller_with_fake_
     assert _tmux_has_session("move-src")
     resolution = controller.resolve_session("move-src")
     assert resolution["node_id"] == "local"
+    assert service.terminal_status("move-src")["exists"] is True
+
+
+def test_agent_type_unavailable_on_target_rejected_before_touching_target_or_source(controller_with_fake_target, tmp_path):
+    # A local, cheap pre-check (target_node.agent_types is already known
+    # from its last heartbeat) -- never even calls the target's own
+    # create_session for an agent_type it has already reported it can't
+    # run. Real cross-platform relevance: a Windows node reporting
+    # agent_types=("shell",) (no claude/codex CLI found -- agent_
+    # availability.py) refuses a move requesting agent_type="codex" here,
+    # before ever touching the target OR the source.
+    controller, service = controller_with_fake_target
+    fake_target = FakeTargetClient()  # would happily "succeed" if reached -- must never be reached
+    controller._clients["node-b"] = fake_target
+
+    controller.terminal_create_session("move-src", "shell", str(tmp_path), node="local")
+    result = controller.terminal_move_session("move-src", "node-b", agent_type="codex")
+    assert result["error"] == "AGENT_TYPE_NOT_AVAILABLE_ON_TARGET"
+    assert fake_target.create_calls == []  # never even attempted
+
+    assert _tmux_has_session("move-src")
     assert service.terminal_status("move-src")["exists"] is True
 
 

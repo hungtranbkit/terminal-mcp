@@ -23,7 +23,8 @@ from typing import Any
 
 from .config import AppConfig
 from .permissions import SENSITIVE_SESSION_WORDS, valid_new_session_name
-from .tmux import TmuxClient, TmuxError
+from .session_backend import SessionBackend
+from .tmux import TmuxError
 
 AGENT_TYPES = ("shell", "claude", "codex")
 CREATE_POLL_INTERVAL_SECONDS = 0.2
@@ -62,7 +63,7 @@ def resolve_cwd(requested: str | None, config: AppConfig) -> tuple[Path | None, 
 
 
 class SessionLifecycleService:
-    def __init__(self, config: AppConfig, tmux: TmuxClient) -> None:
+    def __init__(self, config: AppConfig, tmux: SessionBackend) -> None:
         self.config = config
         self.tmux = tmux
 

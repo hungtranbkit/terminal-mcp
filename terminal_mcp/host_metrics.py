@@ -1,22 +1,50 @@
-"""Local host resource metrics -- pure stdlib (Linux `/proc`), no psutil
-dependency (this project's own existing discipline: no new dependency for
-something the stdlib + `/proc` already gives us). Used by both the local
-node (in-process, via LocalNodeClient) and terminal-node-agent (a remote
-node's own process) to answer the exact same `NodeMetrics` shape, so a
-remote node's numbers are computed by the identical code a local one
-uses -- never two divergent implementations of "what does CPU% mean here".
+"""Local host resource metrics -- pure stdlib, no psutil dependency (this
+project's own existing discipline: no new dependency for something the
+stdlib already gives us, on either platform). Used by every node type --
+local (in-process, via LocalNodeClient), a Linux terminal-node-agent, and
+a Windows terminal-node-agent (windows_agent.py) -- to answer the exact
+same `NodeMetrics` shape, so a remote node's numbers are computed by the
+identical per-platform code any node of that platform uses -- never two
+divergent implementations of "what does CPU% mean here" for the same OS.
 
-Every reader here is defensive: a missing/unreadable `/proc` file (a
-non-Linux host, an unusual container/sandbox) returns `None` for the
-fields it would have populated rather than raising -- a metrics
-collection failure must never take down the node agent's own health
-endpoint, and a caller (node_registry.py's overload heuristic) already
+`collect()` dispatches on `sys.platform`: Linux reads `/proc/loadavg`,
+`/proc/meminfo`, `/proc/stat` (unchanged from before multi-node Windows
+support); Windows uses `ctypes` + a handful of well-known kernel32 calls
+(`GlobalMemoryStatusEx`, `GetSystemTimes`) -- still pure stdlib, no
+psutil, matching the exact same "no new dependency" discipline. Windows
+has no native "load average" concept at all (a Unix-specific metric) --
+`load1`/`load5`/`load15` are always `None` there; the overload heuristic
+(node_registry.py's classify_capacity) already treats a `None` metric as
+simply not contributing to that one check, never as zero or as
+"unknown" overall, so this degrades gracefully rather than breaking
+anything. Windows "swap" is approximated from page-file commit
+accounting (`ullTotalPageFile`/`ullAvailPageFile`), which is NOT the
+same exact semantic as Linux's own separate swap partition/file
+accounting -- directionally useful (a node running low on page-file
+headroom), documented here as an approximation, not a precise match.
+
+Every reader here is defensive: a missing/unreadable source (a
+non-Linux host hitting the Linux path, an unusual container/sandbox, a
+failed Windows API call) returns `None` for the fields it would have
+populated rather than raising -- a metrics collection failure must never
+take down the node agent's own health endpoint, and every caller already
 treats `None` as "unknown", never as zero.
+
+**Not live-verified on real Windows** -- `ctypes.windll` does not exist
+on this Linux development host at all (referencing it here would fail to
+even import), so `_collect_windows`'s own correctness (the ctypes
+struct layout matches the real Win32 API, the GetSystemTimes delta math
+is right) could only be exercised by unit-testing the DISPATCH logic
+(does `collect()` call the Windows path when `sys.platform` says
+Windows) with the Windows-specific function itself monkeypatched out --
+see tests/test_host_metrics_windows.py. Report this honestly as
+unverified, not silently assumed correct.
 """
 from __future__ import annotations
 
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 
 
@@ -137,7 +165,7 @@ def disk_usage(path: str) -> tuple[int | None, int | None, int | None]:
         return None, None, None
 
 
-def collect(*, workspace_path: str) -> NodeMetrics:
+def _collect_linux(*, workspace_path: str) -> NodeMetrics:
     load1, load5, load15 = read_loadavg()
     mem = read_meminfo()
     ram_total = mem.get("MemTotal")
@@ -160,6 +188,147 @@ def collect(*, workspace_path: str) -> NodeMetrics:
         cpu_count=os.cpu_count(),
         ram_total_bytes=ram_total, ram_used_bytes=ram_used, ram_percent=ram_percent,
         swap_total_bytes=swap_total, swap_used_bytes=swap_used, swap_percent=swap_percent,
+        disk_total_bytes=disk_total, disk_used_bytes=disk_used, disk_free_bytes=disk_free,
+        disk_percent=disk_percent,
+    )
+
+
+class _WindowsCpuPercentSampler:
+    """GetSystemTimes-based analogue of _CpuPercentSampler above -- same
+    two-sample-delta technique, Windows' own kernel32 API instead of
+    /proc/stat. Windows' GetSystemTimes semantics: lpKernelTime INCLUDES
+    idle time (unlike Linux's /proc/stat, where idle is one of several
+    peer fields) -- so total = kernel + user (no separate idle addend)."""
+
+    def __init__(self) -> None:
+        self._previous: tuple[int, int] | None = None  # (idle, total) in 100ns ticks
+
+    def sample(self) -> float | None:
+        current = _read_windows_system_times()
+        if current is None:
+            return None
+        idle, total = current
+        if self._previous is None:
+            self._previous = (idle, total)
+            return None
+        prev_idle, prev_total = self._previous
+        self._previous = (idle, total)
+        delta_total = total - prev_total
+        delta_idle = idle - prev_idle
+        if delta_total <= 0:
+            return None
+        return max(0.0, min(100.0, 100.0 * (1 - delta_idle / delta_total)))
+
+
+_WINDOWS_CPU_SAMPLER = _WindowsCpuPercentSampler()
+
+
+def _read_windows_system_times() -> tuple[int, int] | None:
+    """Returns (idle_ticks, total_ticks) via kernel32!GetSystemTimes, or
+    None on any failure. `ctypes.windll` only exists on a real Windows
+    interpreter -- this function is never called except from
+    _collect_windows, itself only called when sys.platform == "win32"
+    (see collect() below), so this never even attempts the import
+    elsewhere. See this module's own docstring: not live-verified."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _FILETIME(ctypes.Structure):
+            _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+        idle_ft, kernel_ft, user_ft = _FILETIME(), _FILETIME(), _FILETIME()
+        ok = ctypes.windll.kernel32.GetSystemTimes(
+            ctypes.byref(idle_ft), ctypes.byref(kernel_ft), ctypes.byref(user_ft),
+        )
+        if not ok:
+            return None
+
+        def _to_int(ft: "_FILETIME") -> int:
+            return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+        idle = _to_int(idle_ft)
+        # kernel time already includes idle time on Windows -- total is
+        # kernel + user, NOT kernel + user + idle (that would double-count).
+        total = _to_int(kernel_ft) + _to_int(user_ft)
+        return idle, total
+    except Exception:  # noqa: BLE001 -- any ctypes/API failure -> unknown, never a crash
+        return None
+
+
+def _read_windows_memory() -> tuple[int | None, int | None, float | None, int | None, int | None, float | None]:
+    """Returns (ram_total, ram_used, ram_percent, swap_total, swap_used,
+    swap_percent) via kernel32!GlobalMemoryStatusEx, or all-None on any
+    failure. Swap is approximated from page-file commit accounting -- see
+    this module's own docstring for why that's not an exact match to
+    Linux's own swap semantic. Not live-verified -- see module docstring."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                ("sullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+
+        stat = _MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+        ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+        if not ok:
+            return None, None, None, None, None, None
+
+        ram_total = int(stat.ullTotalPhys)
+        ram_avail = int(stat.ullAvailPhys)
+        ram_used = ram_total - ram_avail
+        ram_percent = (100.0 * ram_used / ram_total) if ram_total else None
+
+        pagefile_total = int(stat.ullTotalPageFile)
+        pagefile_avail = int(stat.ullAvailPageFile)
+        pagefile_used = pagefile_total - pagefile_avail
+        # Windows' page file commit accounting covers physical RAM too --
+        # treat "swap" as whatever commit is beyond physical RAM, a
+        # reasonable (not exact) analogue.
+        swap_total = max(0, pagefile_total - ram_total)
+        swap_used = max(0, pagefile_used - ram_used)
+        swap_percent = (100.0 * swap_used / swap_total) if swap_total else 0.0
+        return ram_total, ram_used, ram_percent, swap_total, swap_used, swap_percent
+    except Exception:  # noqa: BLE001
+        return None, None, None, None, None, None
+
+
+def _collect_windows(*, workspace_path: str) -> NodeMetrics:
+    ram_total, ram_used, ram_percent, swap_total, swap_used, swap_percent = _read_windows_memory()
+    disk_total, disk_used, disk_free = disk_usage(workspace_path)  # shutil.disk_usage -- already cross-platform
+    disk_percent = (100.0 * disk_used / disk_total) if (disk_used is not None and disk_total) else None
+    return NodeMetrics(
+        cpu_percent=_WINDOWS_CPU_SAMPLER.sample(),
+        load1=None, load5=None, load15=None,  # no load-average concept on Windows
+        cpu_count=os.cpu_count(),
+        ram_total_bytes=ram_total, ram_used_bytes=ram_used, ram_percent=ram_percent,
+        swap_total_bytes=swap_total, swap_used_bytes=swap_used, swap_percent=swap_percent,
+        disk_total_bytes=disk_total, disk_used_bytes=disk_used, disk_free_bytes=disk_free,
+        disk_percent=disk_percent,
+    )
+
+
+def collect(*, workspace_path: str) -> NodeMetrics:
+    if sys.platform == "win32":
+        return _collect_windows(workspace_path=workspace_path)
+    if sys.platform.startswith("linux"):
+        return _collect_linux(workspace_path=workspace_path)
+    # Any other platform (e.g. macOS) -- graceful all-unknown rather than
+    # a wrong/misleading number; disk usage is genuinely cross-platform
+    # via shutil, so that one field is still populated.
+    disk_total, disk_used, disk_free = disk_usage(workspace_path)
+    disk_percent = (100.0 * disk_used / disk_total) if (disk_used is not None and disk_total) else None
+    return NodeMetrics(
+        cpu_percent=None, load1=None, load5=None, load15=None, cpu_count=os.cpu_count(),
+        ram_total_bytes=None, ram_used_bytes=None, ram_percent=None,
+        swap_total_bytes=None, swap_used_bytes=None, swap_percent=None,
         disk_total_bytes=disk_total, disk_used_bytes=disk_used, disk_free_bytes=disk_free,
         disk_percent=disk_percent,
     )

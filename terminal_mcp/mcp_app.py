@@ -3,6 +3,7 @@ from __future__ import annotations
 from mcp.server.mcpserver import MCPServer
 
 from . import __version__
+from .agent_availability import available_agent_types
 from .config import load_config
 from .controller import ControllerService, build_default_controller
 from .core import TerminalService
@@ -67,10 +68,10 @@ def build_mcp(service: TerminalService | None = None,
             command = (item.pane_current_command or "").casefold()
             if command:
                 agent_counts[command] = agent_counts.get(command, 0) + 1
-        agent_types = ["shell"] + [agent_type for agent_type, _cmd in terminal.config.session_lifecycle.launch_commands]
+        agent_types = available_agent_types(terminal.config.session_lifecycle.launch_commands)
         controller.refresh_local_heartbeat(
             tmux_session_count=len(items), agent_counts=agent_counts,
-            agent_types=tuple(agent_types), agent_version=None,
+            agent_types=agent_types, agent_version=None,
         )
 
     @server.tool()

@@ -1,0 +1,326 @@
+"""WindowsSessionBackend (windows_backend.py) -- exercised against a REAL
+running child process on this Linux dev box via `_FakePty`, a POSIX-pty-
+backed test double satisfying the exact same `PtyProcessLike` shape
+pywinpty's own `winpty.PtyProcess` has. Every test here runs real session-
+management logic (registry, output buffering, identity, attach/detach
+broadcast, kill) against a real process -- only the actual `pywinpty`/
+ConPTY integration itself (`_default_process_factory`) is never invoked
+here (it lazily imports `winpty`, which does not exist on Linux), and is
+therefore NOT live-verified against real Windows -- see windows_backend.
+py's own module docstring and the final report.
+"""
+from __future__ import annotations
+
+import fcntl
+import os
+import pty
+import select
+import signal
+import subprocess
+import sys
+import time
+
+import pytest
+
+from terminal_mcp.tmux import TmuxError
+from terminal_mcp.windows_backend import (
+    WindowsPathError,
+    WindowsSessionBackend,
+    validate_windows_cwd,
+    validate_windows_session_name,
+)
+
+# A tiny, fully deterministic stand-in for an interactive shell -- reads a
+# line, echoes it back prefixed, exactly enough to prove text really goes
+# in and real output really comes back out through a real pty, without
+# depending on any real shell's own prompt format.
+_FAKE_SHELL_SCRIPT = (
+    "import sys\n"
+    "sys.stdout.write('PS> ')\n"
+    "sys.stdout.flush()\n"
+    "while True:\n"
+    "    line = sys.stdin.readline()\n"
+    "    if not line:\n"
+    "        break\n"
+    "    sys.stdout.write('you said: ' + line)\n"
+    "    sys.stdout.write('PS> ')\n"
+    "    sys.stdout.flush()\n"
+)
+
+
+class _FakePty:
+    """POSIX-pty-backed real child process, satisfying windows_backend.
+    PtyProcessLike's shape (pid/isalive/read/write/setwinsize/terminate)
+    -- see this module's own docstring for why this is a faithful stand-
+    in for pywinpty's real PtyProcess for testing this backend's own
+    logic, not a mock of that logic itself."""
+
+    def __init__(self, argv: list[str], cwd: str) -> None:
+        master_fd, slave_fd = pty.openpty()
+        self._master_fd = master_fd
+        self._proc = subprocess.Popen(argv, cwd=cwd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                                      start_new_session=True, close_fds=True)
+        os.close(slave_fd)
+        flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    @property
+    def pid(self) -> int:
+        return self._proc.pid
+
+    def isalive(self) -> bool:
+        return self._proc.poll() is None
+
+    def read(self, size: int = 4096) -> str:
+        ready, _, _ = select.select([self._master_fd], [], [], 1.0)
+        if not ready:
+            return ""
+        try:
+            data = os.read(self._master_fd, size)
+        except OSError:
+            return ""
+        return data.decode("utf-8", errors="replace")
+
+    def write(self, data: str) -> int:
+        return os.write(self._master_fd, data.encode("utf-8"))
+
+    def setwinsize(self, rows: int, cols: int) -> None:
+        pass
+
+    def terminate(self, force: bool = False) -> None:
+        try:
+            os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL if force else signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            self._proc.wait(timeout=2)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            os.close(self._master_fd)
+        except OSError:
+            pass
+
+
+def _fake_factory(argv: list[str], cwd: str) -> _FakePty:
+    return _FakePty(argv, cwd)
+
+
+@pytest.fixture
+def backend(tmp_path):
+    b = WindowsSessionBackend(shell=sys.executable, process_factory=_fake_factory, history_lines=500)
+    yield b
+    # Cleanup: kill anything a test left running.
+    for name in list(b._sessions.keys()):
+        try:
+            b.kill_session(name)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _wait_until(predicate, *, timeout: float = 3.0, interval: float = 0.05) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+def _new_fake_shell_session(backend: WindowsSessionBackend, tmp_path, name: str = "win-test") -> None:
+    # command=[sys.executable, "-c", script] doesn't fit new_session's
+    # single-string `command` param (matches tmux.py's own new_session
+    # contract: one program name, no argv, exactly like a real launch_
+    # commands entry) -- so this uses the `shell` (no `command` given)
+    # path, with `shell` overridden to our fake interpreter + inline
+    # script via the backend fixture's own `shell=sys.executable`
+    # plus... Python needs `-c script` as args, which a single `shell`
+    # string can't carry either. Simplest real fix: write the fake shell
+    # out as its own executable script file and use ITS path as `shell`.
+    script_path = tmp_path / "fake_shell.py"
+    script_path.write_text(_FAKE_SHELL_SCRIPT)
+    backend.shell = f"{sys.executable}"
+    # Monkeypatch the process factory closure to always run this script,
+    # and to spawn against the REAL (POSIX) tmp_path regardless of the
+    # Windows-shaped cwd string new_session() was given -- new_session's
+    # own validate_windows_cwd only checks the STRING'S SHAPE (a real
+    # Windows path is never actually reachable to spawn against on this
+    # Linux test host), so the fake cwd below exists purely to satisfy
+    # that shape check; the REAL directory the fake process actually
+    # runs in is tmp_path, supplied here instead.
+    original_factory = backend._process_factory
+    def factory(argv, cwd):
+        return original_factory([sys.executable, "-u", str(script_path)], str(tmp_path))
+    backend._process_factory = factory
+    backend.new_session(name, "C:\\fake\\windows\\path")
+
+
+# -- validate_windows_cwd / validate_windows_session_name (pure, no process) --
+
+def test_validate_windows_cwd_accepts_drive_rooted_path():
+    assert str(validate_windows_cwd("C:\\Users\\me\\workspace"))
+
+
+def test_validate_windows_cwd_rejects_relative_path():
+    with pytest.raises(WindowsPathError, match="drive-rooted"):
+        validate_windows_cwd("workspace\\project")
+
+
+def test_validate_windows_cwd_rejects_unc_path():
+    with pytest.raises(WindowsPathError, match="UNC"):
+        validate_windows_cwd("\\\\fileserver\\share\\project")
+
+
+def test_validate_windows_cwd_rejects_empty():
+    with pytest.raises(WindowsPathError, match="empty"):
+        validate_windows_cwd("")
+
+
+def test_validate_windows_cwd_rejects_nul_byte():
+    with pytest.raises(WindowsPathError, match="NUL"):
+        validate_windows_cwd("C:\\Users\\me\x00\\evil")
+
+
+def test_validate_windows_cwd_traversal_is_syntactically_accepted_here():
+    # Deliberately NOT rejected by this shape-only check -- real
+    # containment (../.. escaping allowed_cwd_roots) is resolve_cwd's
+    # job (lifecycle.py, unchanged, reused as-is on a real Windows
+    # interpreter). Documented here so this isn't mistaken for a gap.
+    resolved = validate_windows_cwd("C:\\allowed\\..\\..\\Windows\\System32")
+    assert "System32" in str(resolved)
+
+
+def test_validate_windows_session_name_rejects_empty():
+    with pytest.raises(WindowsPathError):
+        validate_windows_session_name("")
+
+
+def test_windows_path_error_is_a_tmux_error_for_core_py_compatibility():
+    # See session_backend.py's own SessionBackendError comment -- every
+    # `except TmuxError` clause in core.py must catch this too.
+    assert issubclass(WindowsPathError, TmuxError)
+
+
+# -- Real process lifecycle (via _FakePty) -----------------------------------
+
+def test_new_session_creates_a_real_running_process(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    info = backend.get_session("win-test")
+    assert info is not None
+    assert info.pane_dead is False
+    assert info.pane_pid > 0
+    assert info.windows == 1
+    assert info.pane_in_mode is False
+
+
+def test_capture_lines_shows_real_output_from_the_process(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    assert _wait_until(lambda: any("PS>" in line for line in backend.capture_lines("win-test", 20)))
+
+
+def test_send_text_and_capture_round_trip(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    _wait_until(lambda: any("PS>" in line for line in backend.capture_lines("win-test", 20)))
+    backend.send_text("win-test", "hello-windows", press_enter=True)
+    assert _wait_until(lambda: any("you said: hello-windows" in line for line in backend.capture_lines("win-test", 20)))
+
+
+def test_capture_lines_includes_in_progress_partial_line(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    assert _wait_until(lambda: any("PS>" in line for line in backend.capture_lines("win-test", 20)))
+    # Write text WITHOUT pressing enter -- no newline has landed yet, so
+    # this must show up as the buffered partial line, not be invisible
+    # until Enter (see capture_lines' own docstring for why this matters
+    # to the reliable-submission verification poll in core.py).
+    backend.send_text("win-test", "still-typing", press_enter=False)
+    assert _wait_until(lambda: any("still-typing" in line for line in backend.capture_lines("win-test", 20)))
+
+
+def test_send_keys_unmapped_key_raises(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    with pytest.raises(TmuxError, match="no key mapping"):
+        backend.send_keys("win-test", ["F13-does-not-exist"])
+
+
+def test_send_keys_enter_submits(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    _wait_until(lambda: any("PS>" in line for line in backend.capture_lines("win-test", 20)))
+    backend.send_text("win-test", "via-keys", press_enter=False)
+    backend.send_keys("win-test", ["Enter"])
+    assert _wait_until(lambda: any("you said: via-keys" in line for line in backend.capture_lines("win-test", 20)))
+
+
+def test_kill_session_terminates_real_process_and_frees_registry(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    info = backend.get_session("win-test")
+    pid = info.pane_pid
+    backend.kill_session("win-test")
+    assert backend.get_session("win-test") is None
+    # Real evidence: the OS process is actually gone, not just forgotten
+    # by this backend's own registry -- _FakePty.terminate() already
+    # waitpid()s the child itself, so this should already be reaped.
+    assert _wait_until(lambda: not _pid_alive(pid), timeout=3.0)
+
+
+def test_kill_nonexistent_session_raises(backend):
+    with pytest.raises(TmuxError, match="does not exist"):
+        backend.kill_session("ghost")
+
+
+def test_new_session_duplicate_name_raises(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    with pytest.raises(TmuxError, match="already exists"):
+        _new_fake_shell_session(backend, tmp_path)
+
+
+def test_new_session_does_not_re_validate_cwd_shape(backend, tmp_path):
+    # See new_session's own comment: cwd here is already resolve_cwd's
+    # OUTPUT (a real, resolved path on whatever OS this runs on), never
+    # a raw client string -- re-demanding "C:\...\" shape here would
+    # wrongly reject that real, valid output on a non-Windows-shaped
+    # (but real and correctly resolved) test host. validate_windows_cwd
+    # itself is still tested standalone above for exactly this shape
+    # check, for a caller (e.g. windows_agent.py) that wants to
+    # pre-validate a RAW string before it ever reaches resolve_cwd.
+    backend.new_session("win-real-cwd", str(tmp_path))
+    assert backend.get_session("win-real-cwd") is not None
+
+
+def test_detach_session_calls_viewer_callbacks_without_killing_process(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    called = []
+    backend.register_viewer("win-test", lambda: called.append(True))
+    backend.detach_session("win-test")
+    assert called == [True]
+    # Process itself must be completely unaffected -- exactly the task's
+    # own "disconnect browser không kill process" requirement, exercised
+    # here via the detach path specifically.
+    info = backend.get_session("win-test")
+    assert info is not None
+    assert info.pane_dead is False
+
+
+def test_attached_reflects_registered_viewer_count(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    assert backend.get_session("win-test").attached is False
+    stop = lambda: None
+    backend.register_viewer("win-test", stop)
+    assert backend.get_session("win-test").attached is True
+    backend.unregister_viewer("win-test", stop)
+    assert backend.get_session("win-test").attached is False
+
+
+def test_exit_copy_mode_is_a_safe_noop(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    backend.exit_copy_mode("win-test")  # must not raise
+    assert backend.get_session("win-test").pane_dead is False
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True

@@ -1058,6 +1058,7 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/node": {"GET", "HEAD"},
         "/dashboard/api/node/drain": {"POST"},
         "/dashboard/api/node/test-connection": {"POST"},
+        "/dashboard/api/node/generate-onboarding": {"POST"},
         "/dashboard/api/nodes/{node_id}/heartbeat": {"POST"},
         "/dashboard/nodes": {"GET", "HEAD"},
     }

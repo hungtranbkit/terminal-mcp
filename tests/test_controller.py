@@ -176,6 +176,21 @@ def test_create_explicit_unknown_node_is_node_not_found(tmp_path):
     assert result["error"] == "NODE_NOT_FOUND"
 
 
+def test_create_auto_with_platform_requirement_no_match_is_no_eligible_node(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)  # local node is "linux"
+    result = controller.terminal_create_session("ctrl-win", "shell", str(tmp_path), node="auto", platform="windows")
+    assert result["error"] == "NO_ELIGIBLE_NODE"
+
+
+def test_create_explicit_node_platform_mismatch_rejected(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)  # local node is "linux"
+    result = controller.terminal_create_session("ctrl-win2", "shell", str(tmp_path), node="local", platform="windows")
+    assert result["error"] == "PLATFORM_MISMATCH"
+    assert result["node_id"] == "local"
+
+
 def test_create_duplicate_name_across_controller_is_rejected(tmp_path):
     controller, _service = _controller(tmp_path)
     _heartbeat_local(controller)

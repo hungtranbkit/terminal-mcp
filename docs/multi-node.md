@@ -126,7 +126,247 @@ node_id)` — node_id is the LAST tiebreak, purely for reproducibility on a
 genuine tie, never a meaningful ranking signal. The exact same input node
 list always produces the exact same placement decision — no randomness, so
 a placement is always explainable (`PlacementResult.reason`) and
-reproducible in a test.
+reproducible in a test. `required_platform` ("linux"/"windows"), when
+given, filters to that platform before scoring -- `terminal_create_session`
+exposes this as an optional `platform` parameter, on top of the existing
+`agent_type` filter (unaffected, unchanged).
+
+## Windows node support
+
+**Status: backend + tests + installer implemented. Not live-verified
+against a real Windows machine** -- no Windows host was reachable from
+this session either. Everything short of "a real ConPTY spawn on real
+Windows" has been exercised for real on this Linux dev host: a real
+child process driving every session operation through the exact same
+`TerminalService` business logic Linux uses, a real WebSocket relay to a
+real second process, real capability-detection logic. See each
+subsection below for exactly what is/isn't verified.
+
+### The abstraction: `SessionBackend`
+
+`session_backend.py` defines `SessionBackend` as a `Protocol` matching
+`TmuxClient`'s own existing method surface EXACTLY (`list_sessions`,
+`get_session`, `capture_lines`, `send_text`, `send_keys`, `new_session`,
+`detach_session`, `kill_session`, `exit_copy_mode`). `TmuxClient` is not
+modified at all to "implement" it -- Python Protocols are structural, so
+it already satisfies the Protocol by having those exact methods
+(confirmed: `isinstance(TmuxClient(), SessionBackend) is True`).
+
+`TerminalService.__init__`'s `tmux` parameter is now typed
+`SessionBackend | None` instead of `TmuxClient | None` -- a pure type-
+annotation change, zero runtime behavior change for any existing caller
+(`self.tmux = tmux or TmuxClient()` is untouched). This is the whole
+reason Windows support needed **no changes to core.py's actual business
+logic**: every permission check, audit record, redaction, kill/reopen-
+metadata capture, and the reliable-submission verification state machine
+(adapters.py) already operate purely in terms of session names, plain-
+text capture lines, PIDs, and opaque identity strings -- never anything
+tmux-specific. A `WindowsSessionBackend`-backed `TerminalService` runs
+the identical code path. Proven directly, not just asserted: `tests/
+test_windows_terminal_service_integration.py` constructs a real
+`TerminalService(config, tmux=WindowsSessionBackend(...))` and drives
+create/status/tail/send (through the FULL identity-pinning + delivery-
+state verification stack)/kill/reopen through it, plus confirms
+permission denial (`INPUT_DISABLED`) is enforced identically to the
+tmux-backed case.
+
+### `WindowsSessionBackend` (windows_backend.py)
+
+A ConPTY-attached persistent PowerShell/cmd process **per session**,
+managed entirely by this one backend instance (no separate server
+process the way tmux has one -- see "Known limitations" below for
+exactly what that means). A background reader thread per session drains
+output into a bounded ring buffer continuously, independent of whether
+any WebSocket viewer is attached -- this is what makes "disconnect
+browser không kill process" real: closing a viewer only unregisters it
+from that buffer/live-feed, never touches the underlying process,
+exactly like tmux `detach-client`. `kill_session` genuinely terminates
+the process tree, freeing its RAM, exactly like tmux `kill-session`.
+
+`capture_lines` returns the buffered history PLUS the still-in-progress
+trailing line (no newline yet -- e.g. a prompt waiting for input) --
+without this, the reliable-submission verification poll (which diffs a
+pre-Enter vs post-Enter capture) could see two identical snapshots
+across a send that only ever touched the buffered partial line. A real
+bug in the reader loop's own EOF detection (conflating "nothing to read
+within this poll's timeout" with "the process actually exited",
+permanently stopping the reader after the first idle gap) was caught and
+fixed by this backend's own test suite -- see `windows_backend.py`'s
+`_reader_loop` for the fix and the exact failure mode it prevents.
+
+The real `pywinpty` import (`_default_process_factory`) is LAZY -- only
+reached when actually spawning a session -- so this whole module imports
+cleanly on Linux. Every test instead injects `_FakePty`
+(tests/test_windows_backend.py), a REAL POSIX-pty-backed child process
+satisfying the exact same `PtyProcessLike` shape pywinpty's own
+`PtyProcess` has -- so the backend's own logic (registry, buffering,
+identity, attach/detach, kill, path validation) is exercised against a
+real running process, not a mock of this module's own behavior. Only the
+actual `pywinpty`/ConPTY call itself is untested here.
+
+Windows path validation: `validate_windows_cwd`/`validate_windows_session_
+name` are a defense-in-depth SHAPE check (drive-rooted, no UNC, no NUL)
+tested with `PureWindowsPath`-equivalent string logic, decoupled from any
+real filesystem (there is no `C:\` to check against on this host). The
+REAL containment/existence check is `resolve_cwd` (lifecycle.py) --
+completely unmodified, reused as-is: it's built entirely on `pathlib`,
+which becomes a real `WindowsPath` automatically when this code actually
+runs on Windows, so symlink-escape/allowed-roots protection already
+applies correctly there with zero Windows-specific code. `new_session`
+deliberately does NOT re-run the shape check on `resolve_cwd`'s own
+output (a real caught bug during development: doing so would incorrectly
+reject `resolve_cwd`'s valid output on this Linux test host, and on real
+Windows it would just be redundant).
+
+Command injection: every process spawn is a plain argv LIST handed
+directly to the process factory (`pywinpty`/`subprocess`), never a
+formatted shell string, never `shell=True` -- the exact same discipline
+`TmuxClient._run` already uses for every tmux invocation, extended to
+this backend rather than a new convention.
+
+### Metrics (host_metrics.py)
+
+`collect()` now dispatches on `sys.platform`: unchanged `/proc`-based
+Linux path, or a new Windows path using `ctypes` + kernel32
+(`GlobalMemoryStatusEx` for RAM/page-file, `GetSystemTimes` for a two-
+sample CPU% delta) -- still pure stdlib, no psutil, matching this
+project's existing "no new dependency" discipline on both platforms.
+Windows has no native load-average concept; `load1`/`load5`/`load15` are
+always `None` there (the overload heuristic already treats a `None`
+metric as simply not contributing to that check, never as zero). Windows
+"swap" is approximated from page-file commit accounting -- not an exact
+match to Linux's own separate-partition swap semantic, documented as an
+approximation. **Not live-verified**: `ctypes.windll` doesn't exist on
+this Linux host at all, so only the DISPATCH logic and the CPU%-delta
+MATH are tested (via monkeypatching); the real Win32 API calls
+themselves are untested here (`tests/test_host_metrics.py`).
+
+### Capability reporting
+
+Every node's heartbeat now carries `platform` ("linux"/"windows"),
+`session_backend` ("tmux"/"windows_pty"), `shell_capabilities` (e.g.
+`("powershell", "cmd")`), and `wsl_available` (bool) -- new `nodes` table
+columns (`node_registry.py`, added via the same "PRAGMA table_info, ALTER
+TABLE ADD COLUMN only if missing" idiom `bindings.py`/`audit.py` already
+use, verified live against the real, already-populated production
+`nodes.db` on this host). `claude_available`/`codex_available` are
+derived at the display layer from `agent_types` rather than stored
+separately (same information, no duplicate source of truth).
+
+`agent_availability.py` is a new, small module: `available_agent_types()`
+checks `shutil.which()` for each configured launcher, returned only if it
+actually resolves. This fixes a REAL, pre-existing gap on Linux too (not
+just a new Windows requirement): before this, `agent_types` was built
+from `config.session_lifecycle.launch_commands` alone -- a node whose
+operator configured `claude: claude` but never installed the CLI was
+still reported (and scheduled) as claude-capable, only failing later at
+actual launch. Applied identically on every heartbeat path (local,
+`node_agent.py`, `windows_agent.py`, `doctor.py`).
+
+### Open Terminal for a remote node
+
+`node_agent.py` gained a `/v1/ws/terminal` WebSocket route (bearer-token
+authenticated, same shared secret as its other routes) -- backend-aware:
+a tmux-backed node reuses `webterm.py`'s existing `WebTerminalProcess`
+(`tmux attach-session`) completely unmodified; a Windows node uses a new
+`WindowsTerminalViewer` (`windows_webterm.py`) implementing the identical
+`read/write/resize/alive/close` shape, so `webterm.py`'s own
+`pump_websocket` (the actual bidirectional bridge and wire protocol) is
+reused UNCHANGED for both -- never a second, backend-specific pump.
+
+`dashboard.py`'s existing (local-only, before this) `/dashboard/ws/
+terminal` route now falls back to resolving the session via the
+controller when it isn't local, and (if found on a remote, online node)
+proxies the browser's WebSocket to that node's own `/v1/ws/terminal`
+via a real outbound `websockets.connect()` -- this generalizes to ANY
+remote node (Linux or Windows), not only Windows; Open Terminal for a
+remote Linux node had the exact same gap before this. Read authorization
+for the session must already be settled by the LOCAL (controller-side)
+whitelist/grant check before the remote fallback is even attempted (the
+existing `terminal_web_terminal_access` call already does this, and only
+falls through to the remote lookup on `SESSION_NOT_FOUND` specifically,
+never on `ACCESS_DENIED`); input authorization for a remote session uses
+`revalidate_identity=False` (same coarse signal the discovery endpoints
+already use for this exact reason) since P0-2 identity re-pinning needs
+this node's own tmux -- a statically-whitelisted remote session is
+unaffected (that check short-circuits before identity ever matters);
+only a grant-based (non-whitelisted) remote session's input check is
+coarser than the local case.
+
+**This is the one piece verified against a REAL second process, not just
+an in-process fake** (`tests/test_remote_webterm_proxy.py`): a real
+`terminal-node-agent` subprocess on a real port, a real outbound
+`websockets.connect()` from the dashboard's own relay code, real
+bidirectional byte frames -- exactly the piece where a subtly-wrong
+assumption about the `websockets` library's own API could have gone
+uncaught by a pure unit test.
+
+### `terminal-windows-node-agent` (windows_agent.py)
+
+Reuses `node_agent.py`'s `build_node_agent`/`_heartbeat_loop` completely
+unmodified -- the only Windows-specific code is which `SessionBackend`
+`TerminalService` is constructed with, and the capability values this
+process reports. `detect_shell_capabilities()`/`detect_wsl_available()`
+use `shutil.which()` (same mechanism as agent_availability.py), which
+works correctly on any OS -- confirmed on THIS Linux host: both correctly
+report nothing found (no `powershell.exe`/`pwsh.exe`/`cmd.exe`/`wsl.exe`
+here), real evidence rather than an assumption. A real subprocess smoke
+test (`tests/test_windows_agent.py`) confirms the full HTTP/heartbeat
+surface starts and survives an unreachable controller AND a real (and,
+on this host, expected) `pywinpty` import failure on session-create
+without crashing the process -- everything short of an actual Windows
+session spawn.
+
+`deploy/install-node-agent.ps1` mirrors the Linux install script's own
+steps (repo checkout, venv, `pip install -e .[windows]`, token
+generation, config.yaml bootstrap, printed controller-side instructions)
+plus a Windows Scheduled Task registration (`Register-ScheduledTask`,
+`AtLogOn` trigger, auto-restart settings) for auto-start-after-reboot/
+auto-reconnect. **Not executed anywhere** -- no PowerShell interpreter is
+available in this environment at all, so this script could only be
+manually, carefully reviewed for syntax correctness (and one real bug --
+an ambiguous string-concatenation expression passed to `Write-Warning`
+-- was caught and fixed during that review), never actually run. Treat
+it as a strong first draft that needs a real dry run on Windows before
+being trusted unattended.
+
+### Dashboard UI
+
+The Nodes admin page (`/dashboard/nodes`) now shows an OS badge (🐧/🪟)
+and a capability line (session_backend, claude/codex/WSL availability)
+per node card and in the detail view, plus a "+ Thêm node" onboarding
+flow: a short form (node id/hostname/endpoint/platform) that calls a new
+`/dashboard/api/node/generate-onboarding` route, which generates a fresh
+token server-side and returns the exact install command + config.yaml
+block + env var to copy -- shown once, never persisted, never logged.
+This never registers a node itself (confirmed by its own test) -- the
+operator still does the same manual config.yaml + env var + safe-restart
+steps as any other remote node onboarding.
+
+### Windows known limitations
+
+- **Not live-verified against a real Windows machine** -- see each
+  subsection above for exactly what could and couldn't be exercised
+  without one.
+- **No separate persistent server the way tmux has one.** A session's
+  process is a child of this ONE node-agent process; if that process
+  itself is killed/crashes (not a browser disconnect -- the AGENT
+  process), its sessions' survival depends on OS-level process-group
+  semantics this project does not attempt to control and could not
+  verify. Treat a Windows node-agent restart as disruptive to that
+  node's own sessions until verified otherwise on real hardware.
+- **`pane_current_command`/`pane_current_path` are approximations**, not
+  a native OS query the way tmux's own `#{pane_current_command}` is --
+  they report the launched command/cwd, not necessarily the CURRENT
+  foreground child process or directory if the shell has since `cd`'d or
+  launched something else.
+- **`wsl_tmux` is reported as informational only** (`wsl_available`) --
+  no actual WSL-backed SessionBackend was built (task's own "không được
+  bắt buộc WSL" -- native Windows always has its own working backend
+  regardless); building one would need its own live verification this
+  environment cannot provide either.
+- **The PowerShell installer is unexecuted** -- manually reviewed only,
+  see its own subsection above.
 
 ## Kill / Reopen / Move semantics
 
@@ -170,6 +410,18 @@ reproducible in a test.
   deliberately deferred — this keeps today's blast radius at zero (no new
   way for ChatGPT or a stray click to move a real session) until it can be
   exercised against a real second node, not just a `FakeNodeClient`.
+
+  **Cross-platform (Linux↔Windows) compatibility** is checked BEFORE the
+  target is even attempted: `agent_type` must already be in the target
+  node's own reported `agent_types` (a cheap, local check — no network
+  round-trip, and no different, in principle, from the same check for a
+  same-platform move) — a Windows target reporting `agent_types=
+  ("shell",)` (no claude/codex CLI found there) cleanly refuses a move
+  requesting `agent_type="codex"`, source completely untouched, before
+  ever contacting the target. `cwd` compatibility has no such local
+  shortcut and is caught the normal way, by the target's own real
+  `resolve_cwd` check inside `create_session` — same "target first, source
+  never touched on failure" guarantee either way.
 
 ## Security
 
@@ -318,7 +570,7 @@ dashboard-cleanup task's own constraint.
 
 ## Bringing up the M910 (exact steps)
 
-On the M910 itself:
+**If the M910 runs Linux**, on the M910 itself:
 
 ```bash
 git clone <this-repo-url> ~/terminal-mcp   # or copy an existing checkout over
@@ -326,8 +578,22 @@ cd ~/terminal-mcp
 ./deploy/install-node-agent.sh --controller http://<dell-lan-ip>:8766 --node-id m910
 ```
 
-The script prints the exact `config.yaml` block and environment variable
-to add on the controller (this Dell) when it finishes. Then, on the Dell:
+**If the M910 runs Windows**, from an elevated PowerShell prompt on the
+M910 itself:
+
+```powershell
+git clone <this-repo-url> C:\terminal-mcp   # or copy an existing checkout over
+cd C:\terminal-mcp
+.\deploy\install-node-agent.ps1 -ControllerUrl http://<dell-lan-ip>:8766 -NodeId m910
+```
+
+(Not executed anywhere in this session — no Windows/PowerShell available
+— see this doc's own Windows node support section for exactly what was
+and wasn't verified about this specific script.)
+
+Either script prints the exact `config.yaml` block and environment
+variable to add on the controller (this Dell) when it finishes. Then, on
+the Dell:
 
 1. Add the printed `nodes.remote` block to this repo's `config.yaml`.
 2. Export the printed `TERMINAL_MCP_NODE_TOKEN_M910=...` wherever
