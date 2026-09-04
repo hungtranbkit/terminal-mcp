@@ -210,18 +210,28 @@ DASHBOARD_HTML = """<!doctype html>
 
     /* ---- Tab bar: Windows-Terminal-style horizontal session switcher ----
        (task item 2) -- the ONE navigation list on this page. A tab is a
-       compact chip (status dot + name + node label); the destructive
-       "kill" affordance only appears on hover/focus (task: "Nút close/kill
-       chỉ hiện khi hover") and reuses the EXISTING typed-confirmation
+       compact chip (status dot + name only -- task item 3: no node/host/
+       status label here, that lives in the session detail header once
+       opened, see loadDetail's summary render); the destructive "kill"
+       affordance only appears on hover/focus (task: "Nút close/kill chỉ
+       hiện khi hover") and reuses the EXISTING typed-confirmation
        #killModal below -- there is no bare "close tab" action, because
        closing a tab has no meaning independent of the underlying tmux
        session: the server-driven list would simply show it again on the
-       very next poll if it still exists (see makeTabCloseButton's own
-       comment). Horizontal overflow scrolls (native touch/wheel/trackpad,
-       no separate "more" menu needed at typical session counts) with a
-       thin scrollbar (see the global ::-webkit-scrollbar rules above) and
-       a fading edge so a scrollable tab strip is visually obvious. */
-    .tabbar { display:flex; align-items:stretch; overflow-x:auto; overflow-y:hidden; background:var(--panel); border-bottom:1px solid var(--line); scrollbar-width:thin }
+       very next poll if it still exists. Horizontal overflow scrolls with
+       a thin scrollbar (see the global ::-webkit-scrollbar rules above);
+       touch-action/-webkit-overflow-scrolling/overscroll-behavior-x below
+       are the task's own explicit "kéo ngang được trên iPhone/Android,
+       touch-friendly momentum scrolling, không để page body ăn gesture
+       ngang" -- html/body above never scroll at all (100dvh + overflow:
+       hidden), so overscroll-behavior-x:contain here is what stops an
+       iOS rubber-band swipe on this strip from propagating anywhere else,
+       not a page-scroll conflict (there isn't one). */
+    .tabbar {
+      display:flex; align-items:stretch; overflow-x:auto; overflow-y:hidden; background:var(--panel);
+      border-bottom:1px solid var(--line); scrollbar-width:thin;
+      -webkit-overflow-scrolling:touch; touch-action:pan-x; overscroll-behavior-x:contain;
+    }
     .tabbar-empty { padding:12px 16px; color:var(--muted); font-size:13px }
     .tab {
       position:relative; display:flex; align-items:center; gap:7px; flex:0 0 auto; max-width:220px; min-width:0;
@@ -236,7 +246,6 @@ DASHBOARD_HTML = """<!doctype html>
     .tab-dot.err { background:var(--red) } /* real supervisor state (FAILED/ERROR/BLOCKED) -- never a fake/invented one */
     .tab-dot.idle { background:var(--muted) }
     .tab-name { overflow:hidden; text-overflow:ellipsis; font-size:13px; font-weight:600 }
-    .tab-node { flex:0 0 auto; font-size:10px; color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:0 6px; line-height:1.6 }
     /* Compact attention badge -- reused identically in the tab bar and the
        viewer header (#summary) so a WAITING_INPUT session is obvious in
        both places, driven entirely by classify_status()'s existing state
@@ -430,11 +439,25 @@ DASHBOARD_HTML = """<!doctype html>
        actually a killed session to reopen (task's own original design
        intent, unchanged), never a second navigation surface for LIVE
        sessions (only ever lists sessions that no longer exist). */
-    .tabbar-row { display:flex; align-items:stretch; background:var(--panel); border-bottom:1px solid var(--line) }
+    /* min-width:0 is load-bearing, not decorative (task item 2's real
+       root cause, confirmed live): .tabbar-row is a grid item of `main`
+       (grid-template-rows:auto minmax(0,1fr)) -- a grid/flex item's
+       default min-width is `auto`, i.e. "never shrink below your own
+       content's natural width", not 0. Without this override,
+       .tabbar-row grew to fit ALL of #tabbar + the side buttons
+       unwrapped (measured 1599px on a 390px-wide phone viewport) instead
+       of being clamped to main's actual column width -- so #tabbar's own
+       `flex:1; min-width:0` (already correct) never had anything to
+       shrink AGAINST, and overflow-x:auto on it never actually engaged;
+       the tab strip just silently ran off the right edge of the screen
+       with no way to reach it, on every viewport narrower than the full
+       tab strip's content width (mobile, not just very narrow desktop). */
+    .tabbar-row { display:flex; align-items:stretch; background:var(--panel); border-bottom:1px solid var(--line); min-width:0 }
     .tabbar-row .tabbar { flex:1; min-width:0; border-bottom:none }
     .tabbar-side-btn {
       flex:0 0 auto; background:transparent; border:none; border-left:1px solid var(--line); color:var(--muted); cursor:pointer;
       padding:0 14px; font:12px var(--mono); white-space:nowrap;
+      display:flex; align-items:center; text-decoration:none; /* also used on the "+ New session" <a> */
     }
     .tabbar-side-btn:hover { color:var(--text); background:#171f33 }
     .killed-panel { min-width:260px; max-width:min(360px, calc(100vw - 24px)); max-height:60vh; overflow:auto }
@@ -584,6 +607,18 @@ DASHBOARD_HTML = """<!doctype html>
          makeTabCloseButton) -- there is no separate, weaker "close tab". -->
     <div class="tabbar-row">
       <nav class="tabbar" id="tabbar" role="tablist" aria-label="Sessions"></nav>
+      <!-- Task item 1: the tab bar itself had no session-creation entry
+           point at all -- the Create Session form (with its full node
+           selector, agent-type filter, submit-time revalidation) already
+           exists and works on /dashboard/sessions (verified live, real
+           browser, real production node data), it just wasn't reachable
+           from here without already knowing about that separate admin
+           page. Rather than duplicate that whole form's logic into a
+           second copy here (new feature surface, and the task's own
+           "không redesign lớn"), this is a direct, one-click Windows-
+           Terminal-style "+" straight to it -- same admin page the "⚙
+           Quản lý session" menu item already links to. -->
+      <a class="tabbar-side-btn" id="newSessionLinkBtn" href="/dashboard/sessions" title="Tạo session mới (node/host, agent type, ...)">+ New session</a>
       <div class="menu" id="killedMenu">
         <button class="tabbar-side-btn" id="killedToggle" type="button" hidden aria-haspopup="true" aria-expanded="false"><span id="killedToggleLabel"></span></button>
         <div class="menu-panel killed-panel" id="killedList" role="menu"></div>
@@ -680,6 +715,19 @@ DASHBOARD_HTML = """<!doctype html>
     let fullscreenTerminal = false;
     let lastKnownRows = []; // the most recent /dashboard/api/sessions rows, reused by openPermModal/openKillModal without a re-fetch
     let loadDetailSequence = 0; // generation counter -- see loadDetail's own guard for why a session-name check alone isn't enough
+    // session name -> its persistent tab <div>, reused across every
+    // renderRows() call instead of rebuilt (task item 4's own root cause:
+    // the 5s poll used to call tabbarEl.replaceChildren() + recreate every
+    // tab from scratch on EVERY refresh, whether or not anything actually
+    // changed -- a tap/click that landed between "browser dispatches the
+    // event" and "renderRows tears the target node out of the DOM" was
+    // silently lost, needing a second click to land on the now-stable
+    // replacement node. Touch is far more exposed than a mouse click
+    // (longer touchstart-to-click latency), but a plain desktop click can
+    // race it too. Reusing the same node forever (only its classes/text/
+    // handlers-closure-over-row get updated in place) means a click can
+    // never be "stolen" by a rebuild again.
+    const tabEls = new Map();
     const tabbarEl = document.querySelector('#tabbar');
     const outputEl = document.querySelector('#output');
     const summaryEl = document.querySelector('#summary');
@@ -1594,6 +1642,14 @@ DASHBOARD_HTML = """<!doctype html>
       rememberSession(name);
       closeSearch(); // a search from a different session's content wouldn't make sense to keep open
       renderRows(lastKnownRows); // reflect the new active/selected row immediately, not just on the next 5s poll
+      // Task item 2: the newly-active tab must always be scrolled into
+      // view -- opening a session via the killed-sessions list, a URL/
+      // hash, or a tab currently scrolled off past the edge of a narrow
+      // (mobile) tab strip must never leave the user unable to see which
+      // tab is actually selected. 'nearest' -- never yanks an
+      // already-visible tab to a different edge on every poll.
+      const activeRefs = tabEls.get(name);
+      if (activeRefs) activeRefs.tab.scrollIntoView({ block: 'nearest', inline: 'nearest' });
       // Fire immediately; loadDetail's own generation-sequence guard (see
       // below) discards this if the user switches again before it
       // resolves. A rejected fetch here is swallowed deliberately -- the
@@ -1700,70 +1756,100 @@ DASHBOARD_HTML = """<!doctype html>
       return 'tab-dot on'; // RUNNING / WAITING_INPUT / COMPLETION_CANDIDATE / VERIFYING / VERIFIED_DONE -- process alive & reachable
     }
 
+    function buildTabEl(name) {
+      // Called exactly once per session name for as long as it keeps
+      // appearing in the list -- see the tabEls comment above for why
+      // this node identity must never be torn down and recreated on a
+      // routine poll. Static structure only; every value that can change
+      // between polls (classes, text, title, handlers-over-the-latest-
+      // row) is set by updateTabEl, called every time, including right
+      // after this.
+      const tab = document.createElement('div');
+      tab.className = 'tab';
+      tab.setAttribute('role', 'tab');
+      tab.tabIndex = 0;
+      const dot = document.createElement('span');
+      const label = document.createElement('span'); label.className = 'tab-name';
+      const badge = document.createElement('span'); badge.className = 'attn-badge'; badge.textContent = '⚠'; badge.hidden = true;
+      const closeBtn = document.createElement('button');
+      closeBtn.type = 'button'; closeBtn.className = 'tab-close'; closeBtn.textContent = '✕';
+      tab.append(dot, label, badge, closeBtn);
+      tabbarEl.append(tab);
+      return { tab, dot, label, badge, closeBtn };
+    }
+
+    function updateTabEl(refs, row) {
+      const { tab, dot, label, badge, closeBtn } = refs;
+      const needsAttention = row.state === 'WAITING_INPUT';
+      const isActive = selected === row.name;
+      tab.className = 'tab' + (isActive ? ' active' : '') + (needsAttention ? ' needs-attention' : '');
+      tab.setAttribute('aria-selected', isActive ? 'true' : 'false');
+      // The old per-row "N window · attached/no terminal attached" line
+      // has no room in a compact tab -- kept as a hover tooltip instead
+      // of dropped outright. Node/host info deliberately does NOT appear
+      // here (task item 3: "Tab chỉ hiện tên session") -- it moved to
+      // the session detail header once opened (see loadDetail's summary
+      // render), not duplicated in both places.
+      tab.title = `${row.name} · ${row.windows} window · ${row.attached ? 'Terminal attached' : 'No terminal attached'}`
+        + (row.effective_read ? '' : ' · chưa cấp quyền xem');
+      dot.className = tabDotClass(row);
+      label.textContent = row.name;
+      badge.hidden = !needsAttention;
+
+      const isProtected = protectedSessions.has(row.name);
+      closeBtn.disabled = !sessionLifecycleEnabled || isProtected;
+      closeBtn.title = !sessionLifecycleEnabled ? ''
+        : isProtected ? 'Session này được bảo vệ, không thể kill qua dashboard'
+        : `Kill "${row.name}"`;
+      // Re-bound every update (cheap) rather than captured once at build
+      // time, so these always act on the CURRENT row (kill_reopen_ready
+      // etc. can legitimately change between polls) without needing a
+      // separate mutable-row indirection layer.
+      closeBtn.onclick = (event) => {
+        event.stopPropagation();
+        if (closeBtn.disabled) return;
+        openKillModal(row.name, row.kill_reopen_ready !== false);
+      };
+      const activate = () => selectSession(row.name);
+      tab.onclick = activate;
+      tab.onkeydown = (event) => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activate(); }
+      };
+    }
+
     function renderRows(rows) {
       lastKnownRows = rows;
-      tabbarEl.replaceChildren();
+      const emptyEl = tabbarEl.querySelector('.tabbar-empty');
       if (!rows.length) {
-        const empty = document.createElement('div'); empty.className = 'tabbar-empty'; empty.textContent = 'Không có session nào.';
-        tabbarEl.append(empty);
+        if (!emptyEl) {
+          const empty = document.createElement('div'); empty.className = 'tabbar-empty'; empty.textContent = 'Không có session nào.';
+          tabbarEl.append(empty);
+        }
+        for (const [name, refs] of tabEls) { refs.tab.remove(); tabEls.delete(name); }
+        refreshTermActionMenu();
+        if (selected) { selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateLayoutState();
+          if (fullscreenTerminal) setFullscreen(false, { persist: false });
+          summaryEl.textContent = 'Session không còn tồn tại.'; outputEl.replaceChildren(); grantBarEl.hidden = true; }
+        return;
       }
+      if (emptyEl) emptyEl.remove();
+      // Drop tabs for sessions no longer in the list.
+      const currentNames = new Set(rows.map(row => row.name));
+      for (const [name, refs] of tabEls) {
+        if (!currentNames.has(name)) { refs.tab.remove(); tabEls.delete(name); }
+      }
+      // Rows already arrive sorted attention-first, then most-recent-
+      // activity, then name (see the /dashboard/api/sessions route) — no
+      // client-side reordering here, just placing each tab (reused if it
+      // already exists, built once if not) at its correct position.
+      // appendChild on a node already in the DOM MOVES it rather than
+      // duplicating it, so this reorders in place without ever recreating
+      // an existing tab's element.
       for (const row of rows) {
-        // Rows already arrive sorted attention-first, then most-recent-
-        // activity, then name (see the /dashboard/api/sessions route) — no
-        // client-side reordering here, just rendering in the given order.
-        const needsAttention = row.state === 'WAITING_INPUT';
-        const tab = document.createElement('div');
-        tab.className = 'tab' + (selected === row.name ? ' active' : '') + (needsAttention ? ' needs-attention' : '');
-        tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', selected === row.name ? 'true' : 'false');
-        tab.tabIndex = 0;
-        // The old per-row "N window · attached/no terminal attached" line
-        // has no room in a compact tab -- kept as a hover tooltip instead
-        // of dropped outright.
-        tab.title = `${row.name} · ${row.windows} window · ${row.attached ? 'Terminal attached' : 'No terminal attached'}`
-          + (row.effective_read ? '' : ' · chưa cấp quyền xem');
-
-        const dot = document.createElement('span'); dot.className = tabDotClass(row);
-        const name = document.createElement('span'); name.className = 'tab-name'; name.textContent = row.name;
-        tab.append(dot, name);
-        // Node label (multi-node session management, task item 16): flat,
-        // minimal -- just the node's display name next to the session
-        // name, never a second grouped/nested list. Only rendered once a
-        // row actually carries node_name (today's single-local-node
-        // deployment always does, via /dashboard/api/sessions -- see that
-        // route's own comment); absent entirely costs nothing.
-        if (row.node_name) {
-          const nodeLabel = document.createElement('span'); nodeLabel.className = 'tab-node'; nodeLabel.textContent = row.node_name;
-          tab.append(nodeLabel);
-        }
-        if (needsAttention) {
-          const badge = document.createElement('span'); badge.className = 'attn-badge'; badge.textContent = '⚠';
-          tab.append(badge);
-        }
-
-        // Hover/focus-reveal close button -- same gating as the old Kill
-        // button (disabled-with-a-reason for a protected session, not
-        // hidden, matching the admin screen's own convention), and the
-        // SAME typed-confirmation kill modal, never a silent close.
-        const closeBtn = document.createElement('button');
-        closeBtn.type = 'button'; closeBtn.className = 'tab-close'; closeBtn.textContent = '✕';
-        const isProtected = protectedSessions.has(row.name);
-        closeBtn.disabled = !sessionLifecycleEnabled || isProtected;
-        closeBtn.title = !sessionLifecycleEnabled ? ''
-          : isProtected ? 'Session này được bảo vệ, không thể kill qua dashboard'
-          : `Kill "${row.name}"`;
-        closeBtn.onclick = (event) => {
-          event.stopPropagation();
-          if (closeBtn.disabled) return;
-          openKillModal(row.name, row.kill_reopen_ready !== false);
-        };
-        tab.append(closeBtn);
-
-        const activate = () => selectSession(row.name);
-        tab.onclick = activate;
-        tab.onkeydown = (event) => {
-          if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activate(); }
-        };
-        tabbarEl.append(tab);
+        let refs = tabEls.get(row.name);
+        if (!refs) { refs = buildTabEl(row.name); tabEls.set(row.name, refs); }
+        else { tabbarEl.append(refs.tab); }
+        updateTabEl(refs, row);
       }
       refreshTermActionMenu();
       if (selected && !rows.some(row => row.name === selected)) {
@@ -2086,6 +2172,18 @@ DASHBOARD_HTML = """<!doctype html>
         summaryEl.append(badge, document.createTextNode(' '));
       }
       summaryEl.append(strong, state, reason);
+      // Node/host (task item 3: moved out of the tab label into here,
+      // the session's own detail header, shown only once opened). Sourced
+      // from the already-fetched session list (every row is tagged with
+      // node_id/node_name -- local and remote alike, see the
+      // /dashboard/api/sessions route) rather than re-fetching -- this
+      // detail endpoint itself doesn't carry it.
+      const rowForNode = lastKnownRows.find(row => row.name === selected);
+      if (rowForNode && rowForNode.node_name && rowForNode.node_id !== 'local') {
+        const nodeLabel = document.createElement('span'); nodeLabel.className = 'muted';
+        nodeLabel.textContent = ` · node: ${rowForNode.node_name}`;
+        summaryEl.append(nodeLabel);
+      }
       const switchedSession = selected !== lastRenderedSession;
       if (switchedSession) setAutoFollow(true); // opening a session always starts followed
       renderAnsi(outputEl, clean(data.tail.output));
