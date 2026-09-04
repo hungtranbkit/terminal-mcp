@@ -117,21 +117,22 @@ def test_multiple_remote_nodes(tmp_path):
     assert {n.node_id for n in config.nodes.remote_nodes} == {"m910", "laptop2"}
 
 
-def test_real_production_config_yaml_declares_the_real_windows_node(tmp_path):
+def test_real_production_config_yaml_declares_the_real_worker_nodes(tmp_path):
     # Documents the current, deliberate state of the real deployment
-    # config: dell-5530 (a real Windows machine, bootstrapped live over
-    # SSH -- see docs/multi-node.md's own "LAN discovery + remote
-    # connect" section) is the one node declared here, exactly the shape
-    # server_http.py's own startup loop expects (a real config.yaml
-    # entry, never a silent auto-registration). Loads cleanly through
-    # the real loader, not just a bare YAML parse, so a schema mistake
-    # here would fail this test the same way it would fail the real
-    # service's own startup.
+    # config: dell-5530 (Windows) and m910 (Linux, mesflow@192.168.1.109
+    # / "thinkcentre" SSH alias), both bootstrapped live over SSH -- see
+    # docs/multi-node.md's own "LAN discovery + remote connect" and
+    # "Bringing up the M910" sections. Loads cleanly through the real
+    # loader, not just a bare YAML parse, so a schema mistake here would
+    # fail this test the same way it would fail the real service's own
+    # startup.
     import pathlib
     from terminal_mcp.config import load_config
     real_config_path = pathlib.Path(__file__).parents[1] / "config.yaml"
     config = load_config(str(real_config_path))
-    assert [n.node_id for n in config.nodes.remote_nodes] == ["dell-5530"]
-    node = config.nodes.remote_nodes[0]
-    assert node.endpoint == "http://192.168.1.250:8790"
-    assert node.token_env == "TERMINAL_MCP_NODE_TOKEN_DELL_5530"
+    by_id = {n.node_id: n for n in config.nodes.remote_nodes}
+    assert set(by_id) == {"dell-5530", "m910"}
+    assert by_id["dell-5530"].endpoint == "http://192.168.1.250:8790"
+    assert by_id["dell-5530"].token_env == "TERMINAL_MCP_NODE_TOKEN_DELL_5530"
+    assert by_id["m910"].endpoint == "http://192.168.1.109:8790"
+    assert by_id["m910"].token_env == "TERMINAL_MCP_NODE_TOKEN_M910"

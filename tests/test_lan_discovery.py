@@ -231,6 +231,14 @@ async def test_scan_classifies_agent_reachable_ssh_winrm_and_arp_only_correctly(
     assert by_ip["203.0.113.245"].mac == "aa:bb:cc:dd:ee:ff"
     assert "203.0.113.246" not in by_ip  # a FAILED ARP entry alone is not evidence of anything online
 
+    # Task's own explicit "ưu tiên máy có SSH" -- the SSH-reachable host
+    # (.243) must sort ahead of the WinRM-only (.244) and unknown (.245)
+    # hosts, even though its IP is numerically in between, since it's the
+    # only one directly actionable through the Connect Node SSH flow.
+    ips_in_order = [d.ip for d in result.devices]
+    assert ips_in_order.index("203.0.113.243") < ips_in_order.index("203.0.113.244")
+    assert ips_in_order.index("203.0.113.244") < ips_in_order.index("203.0.113.245")
+
 
 @pytest.mark.anyio
 async def test_scan_marks_already_connected_by_matching_known_endpoint(monkeypatch):

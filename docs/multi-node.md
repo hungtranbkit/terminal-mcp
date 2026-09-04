@@ -1,13 +1,13 @@
 # Multi-node session management
 
-**Status: backend + tests + dashboard UI implemented and live-smoke-tested
-on this host (Dell, node id `local`). Not yet live-verified against a real
-second machine** — no M910 (or any other second host) was reachable from
-this session. Everything short of "a real second box actually joined the
-fleet" has been built and exercised for real: a real `terminal-node-agent`
-subprocess on a real port, real HTTP round-trips, real tmux sessions moved
-between two node identities in the same test suite. See **Known
-limitations** and **Bringing up the M910** below for exactly what remains.
+**Status: live in production with three real nodes.** `local` (Dell),
+`dell-5530` (Windows, `tranv@192.168.1.250`) and `m910` (Linux,
+`mesflow@192.168.1.109` / `thinkcentre` SSH alias) are all real, currently
+registered, `status=online` nodes -- session create/status/tail/send/
+detach/kill has been exercised end to end against both real remote nodes
+through the real production controller, not just the test suite. See
+**Windows node support** and **Bringing up the M910** below for exactly
+what was verified on each and what (if anything) still isn't.
 
 ## What this is
 
@@ -733,12 +733,6 @@ dashboard-cleanup task's own constraint.
 
 ## Known limitations
 
-- **Not live-verified against a real second machine.** Every piece has
-  been exercised for real (a real `terminal-node-agent` subprocess on a
-  real port, real HTTP, real tmux) except "a genuinely separate host on
-  the network." See **Bringing up the M910** below for the exact remaining
-  steps — they're operational (run the install script on that machine),
-  not further development.
 - **`terminal_move_session` (moving a LIVE, still-running session to a
   different node) has no MCP/dashboard trigger yet** — backend + tests
   only (see above for why). "↩▾ Reopen elsewhere" (Create Session UX,
@@ -844,44 +838,158 @@ real HTTP routes, plus kill/detach routing to the right node and
 Windows-node platform tagging), `tests/test_dashboard.py` (node
 selector/capability-filter/revalidation UI source-presence checks).
 
-## Bringing up the M910 (exact steps)
+## Bringing up the M910 (real, live-verified — Linux)
 
-**If the M910 runs Linux**, on the M910 itself:
+The M910 (`mesflow-ThinkCentre-M910q`, Ubuntu 26.04, `mesflow@192.168.1.109`
+/ `thinkcentre` SSH alias, 16 cores / 15GB RAM) is a real, running node,
+not a hypothetical target -- brought up and live-verified end to end in
+this session. Steps actually taken, for reproducing on another Linux
+node:
 
 ```bash
-git clone <this-repo-url> ~/terminal-mcp   # or copy an existing checkout over
-cd ~/terminal-mcp
-./deploy/install-node-agent.sh --controller http://<dell-lan-ip>:8766 --node-id m910
+# on the node itself
+sudo apt-get install -y tmux   # this project never installs packages itself
+cd ~/terminal-mcp              # tracked files synced via `git archive HEAD | ssh <node> tar -x -C ~/terminal-mcp`
+./.venv/bin/pip install -e .
+./deploy/install-node-agent.sh --controller http://<dell-lan-ip>:8766 --node-id m910 \
+  --host <this-node's-own-real-LAN-IP>   # see the --host warning below -- REQUIRED for a usable node
 ```
 
-**If the M910 runs Windows**, from an elevated PowerShell prompt on the
-M910 itself:
+**`--host` is not optional in practice.** Without it the agent binds to
+`127.0.0.1`: heartbeats still reach the controller fine (this node
+calls OUT), but the controller can never reach IN to create/attach/send
+input to a session -- the node shows `status=online` yet every session
+operation on it fails with a connection error. The installer's own
+final output now warns about this explicitly and prints the node's
+detected LAN address to use (fixed live during this node's own
+bring-up -- see "Real bugs found and fixed" below).
 
-```powershell
-git clone <this-repo-url> C:\terminal-mcp   # or copy an existing checkout over
-cd C:\terminal-mcp
-.\deploy\install-node-agent.ps1 -ControllerUrl http://<dell-lan-ip>:8766 -NodeId m910
-```
+On the controller (Dell), matching the script's own printed instructions:
 
-(Not executed anywhere in this session — no Windows/PowerShell available
-— see this doc's own Windows node support section for exactly what was
-and wasn't verified about this specific script.)
+1. Added the printed `nodes.remote` block to `config.yaml` (node_id
+   `m910`, endpoint `http://192.168.1.109:8790`).
+2. Exported `TERMINAL_MCP_NODE_TOKEN_M910=...` into
+   `~/.config/terminal-mcp/node-agent-tokens.env` (the same
+   `EnvironmentFile` `dell-5530`'s token already uses).
+3. Safe-restarted `terminal-mcp-http.service` -- all 10 existing tmux
+   sessions' `session_created` timestamps confirmed unchanged before/after.
+4. `terminal-mcp-doctor nodes` -- `m910` reports `status=online,
+   capacity=healthy`, real `test_connection: ok=True`, and full metrics
+   (cpu/ram/swap/disk/load1/5/15) once `--host` was bound correctly.
+5. Created a real session on `m910` through the production controller
+   end to end: `create` (with an initial prompt) → `send_text` a second
+   command → `tail` read back real shell output → `detach` → `status`
+   while detached → `send_text` again ("reattach") → `tail` showed the
+   new output appended → `kill_session` cleanup. Full round trip, no
+   simulated/mocked step.
+6. `systemctl --user stop/start terminal-node-agent.service` live-tested:
+   status correctly degrades (~30s after heartbeats stop) and recovers
+   to `online` on the very next heartbeat after restart -- no manual
+   re-registration needed either direction.
 
-Either script prints the exact `config.yaml` block and environment
-variable to add on the controller (this Dell) when it finishes. Then, on
-the Dell:
+`m910`'s own `agent_types` currently reports only `("shell",)` -- no
+`claude`/`codex` CLI is installed there. Installing those is a capability
+expansion, deliberately left out of this stability-hardening pass.
 
-1. Add the printed `nodes.remote` block to this repo's `config.yaml`.
-2. Export the printed `TERMINAL_MCP_NODE_TOKEN_M910=...` wherever
-   `terminal-mcp-http.service`'s own environment comes from (its systemd
-   unit's `EnvironmentFile`, never inline in the unit).
-3. Safe-restart `terminal-mcp-http.service` — verify every existing tmux
-   session's `session_created` timestamp is unchanged before/after, same
-   as any other restart of this service.
-4. `terminal-mcp-doctor nodes` — `m910` should show `status=online` within
-   one heartbeat interval (~20s default).
-5. From the dashboard's `/dashboard/nodes` page (or `terminal_create_session`
-   with `node="m910"` or `node="auto"`), create a disposable session on it
-   and confirm tail/status/send round-trip correctly — this is the one
-   check this session could not perform itself, with no second machine
-   reachable.
+**Persistence across reboot:** `terminal-node-agent.service` is a
+`systemctl --user` unit with `Restart=always`; `loginctl show-user
+mesflow` already reports `Linger=yes` (enabled independently of this
+session), so the unit starts at boot and survives logout without any
+interactive session, the Linux equivalent of the Windows node's
+`AtStartup`+`S4U` fix (see `configure-windows-node-stability.ps1`'s own
+doc section above). Not verified via an actual reboot in this session
+(same no-unnecessary-reboot posture as the Windows work) -- `enabled`
+state and linger were confirmed by inspection instead.
+
+### Real bugs found and fixed bringing M910 up
+
+- **`list_sessions()` raised `TmuxError` on a host where tmux has NEVER
+  had a server**, instead of treating it as "zero sessions" like the
+  already-handled "server existed and exited" wording -- 100%
+  reproducible, not a race: a genuinely fresh node's very first
+  session-create call always failed. Root-caused precisely (tmux uses
+  two different stderr wordings for what is really the same "no server
+  for this user right now" state) and fixed in `tmux.py`; see
+  `tests/test_tmux_fresh_host_no_server_yet.py`.
+- **`install-node-agent.sh`'s auto-detected LAN IP suggestion picked a
+  link-local `169.254.x.x` address** (an unconnected wired port's APIPA
+  address) over the real routable Wi-Fi LAN address, because
+  `hostname -I | awk '{print $1}'` just takes whatever address sorts
+  first. Fixed to prefer an RFC1918 address; the script now also
+  explicitly warns when `--host` is left at its loopback default,
+  explaining exactly why that makes the node heartbeat-alive but
+  otherwise unusable (see above).
+- **A re-run of `install-node-agent.sh` that only changes `--host` (or
+  anything else in the unit) silently kept the OLD process running**:
+  `systemctl --user enable --now` only starts a unit if it wasn't
+  already active, so an already-running agent never picked up its
+  rewritten `ExecStart`. Fixed to `enable` + explicit `restart`.
+- **`m910`'s own deployed `config.yaml` had literally copied the Linux
+  controller's `session_lifecycle.allowed_cwd_roots`** (harmless there,
+  since it's a real path on the SAME machine as the controller, unlike
+  the Windows node's copy of the same mistake) but pointed at
+  `/home/dell/...` instead of `/home/mesflow/...` -- same class of bug
+  as the Windows node's, fixed the same way (corrected on that node's
+  own `config.yaml`, not the shared repo).
+- **LAN discovery's device list had no priority ordering at all** --
+  sorted purely by IP, so an SSH-reachable host could land anywhere in
+  the table relative to a WinRM-only or unclassifiable one. Fixed to
+  sort SSH-reachable hosts first (IP as the tiebreaker within each
+  tier), matching this task's own explicit ask; live-scanned the real
+  LAN afterward and confirmed `m910` (`192.168.1.109`) is correctly
+  detected with real MAC, both `22`/`8790` open, `os_guess=linux`,
+  `status=already_connected`.
+
+### If M910 needs to be reachable from outside the LAN
+
+Not done in this pass -- M910 is only ever reached over the LAN today
+(SSH directly to `192.168.1.109`, no tunnel), and nothing in this task
+asked for that to change. The architecture to do it safely already
+exists and needs no new code, only a deliberate, human-approved
+Cloudflare-side setup:
+
+1. Create a Cloudflare Tunnel + Access application pointed at M910's
+   own `sshd` (mirroring the existing `ssh-test.mesflow.net`/
+   `nail-ssh.mesflow.net` pattern already in this machine's own
+   `~/.ssh/config`) -- this step needs Cloudflare account access this
+   session doesn't have, and is exactly the kind of outward-facing,
+   hard-to-reverse change that gets proposed, not made unilaterally.
+2. Once that exists, the dashboard's own "Connect Node" → SSH via
+   Cloudflare Tunnel flow (`remote_connect.py`'s
+   `CLOUDFLARE_PROXY_COMMAND` template, host-key pinning, "Trust & pin"
+   required) already works against ANY hostname with such a tunnel --
+   no M910-specific code would be needed.
+3. **Left deliberately untouched**: M910's own `ufw` (currently
+   inactive -- no host firewall enforcement at all, LAN-only exposure
+   in practice since nothing forwards its ports from the router) and
+   sshd config. A Cloudflare Tunnel doesn't need port 22 opened to the
+   internet at all, so setting one up changes nothing here either way;
+   enabling `ufw` is a separate, real hardening step this task didn't
+   ask for and this report flags rather than applies, for the same
+   reason the Windows node's own SSH firewall rules were left alone --
+   getting it wrong risks locking out the only access path in use.
+
+### Known, pre-existing, out-of-scope observations (not changed)
+
+- **LAN discovery's `os_guess` heuristic mis-classifies a Windows host
+  that has OpenSSH Server installed as `linux`** (it infers OS purely
+  from which of SSH/WinRM ports are open, and `dell-5530` -- a real
+  Windows node with OpenSSH but no WinRM -- shows `os_guess: "linux"`
+  in a live scan). Harmless in practice for an already-connected node
+  (its `os_guess` isn't used for anything once `already_connected`),
+  but would mis-fill the SSH-connect form's OS radio button for a
+  *new*, not-yet-connected Windows-with-OpenSSH host. Left as-is:
+  fixing it properly needs a real platform signal (e.g. from the
+  node-agent's own `/v1/health`), which is a small feature addition,
+  not a stability fix, and out of this task's stated scope.
+- **Linux nodes never report `shell_capabilities`** (always `()`,
+  unlike Windows nodes which detect and report `powershell`/`cmd`).
+  Not a bug: this project's Linux `SessionBackend` doesn't expose a
+  choice of shell the way the Windows one does (tmux always launches
+  the user's own default `$SHELL`), so there is currently nothing
+  meaningful to detect or report there.
+- **The pre-existing, unrelated `test_create_initial_prompt_goes_
+  through_reliable_submission_once` flake** (documented before this
+  task started) is still present, still local-only (never seen on a
+  remote node), still not fixed here -- outside this task's stated
+  multi-node-stability scope.

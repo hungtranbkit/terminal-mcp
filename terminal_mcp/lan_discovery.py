@@ -401,7 +401,19 @@ class DiscoveryService:
             else:
                 device.status = STATUS_UNKNOWN
 
-        devices.sort(key=lambda d: tuple(int(p) for p in d.ip.split(".")))
+        # Sort SSH-reachable hosts first (task's own explicit "ưu tiên máy
+        # có SSH" -- prioritize machines with SSH, since those are the
+        # ones actionable through the Connect Node SSH flow right now;
+        # WinRM-only hosts next, then everything else), IP address as the
+        # tiebreaker within each tier so the ordering still reads as
+        # sensible/stable rather than shuffled.
+        def _sort_key(d: DiscoveredDevice) -> tuple[int, tuple[int, ...]]:
+            has_ssh = SSH_PORT in d.open_ports
+            has_winrm = WINRM_HTTP_PORT in d.open_ports or WINRM_HTTPS_PORT in d.open_ports
+            tier = 0 if has_ssh else (1 if has_winrm else 2)
+            return (tier, tuple(int(p) for p in d.ip.split(".")))
+
+        devices.sort(key=_sort_key)
         result.devices = devices
 
 

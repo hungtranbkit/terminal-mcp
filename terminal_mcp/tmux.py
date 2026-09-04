@@ -70,7 +70,24 @@ class TmuxClient:
     def list_sessions(self) -> list[SessionInfo]:
         result = self._run(["list-sessions", "-F", self.SESSION_FORMAT], check=False)
         if result.returncode != 0:
-            if "no server running" in result.stderr or "failed to connect" in result.stderr:
+            # "no server running" is tmux's wording once a server has
+            # existed and exited (e.g. its last session was killed);
+            # "error connecting to ... No such file or directory" is its
+            # OTHER wording for the exact same "no server for this user
+            # right now" state when NO server has EVER run here yet --
+            # e.g. a genuinely fresh node the moment after `tmux` is
+            # installed, before anything has ever created a session.
+            # Found live onboarding M910: this second wording wasn't
+            # matched, so the very first session-create attempt on a
+            # brand new node always raised TMUX_ERROR here (get_session's
+            # own duplicate-name check, called before new_session ever
+            # runs) instead of the plain "no sessions yet" empty list
+            # every later call correctly got once *any* tmux server had
+            # existed on the host (even briefly) -- a real, permanent,
+            # 100%-reproducible first-session bootstrap failure for any
+            # freshly provisioned Linux node, not a flaky race.
+            if ("no server running" in result.stderr or "failed to connect" in result.stderr
+                    or "error connecting to" in result.stderr):
                 return []
             raise TmuxError(result.stderr.strip() or "unable to list sessions")
         sessions: list[SessionInfo] = []

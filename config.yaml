@@ -116,3 +116,11 @@ nodes:
       hostname: "192.168.1.250"
       endpoint: "http://192.168.1.250:8790"
       token_env: TERMINAL_MCP_NODE_TOKEN_DELL_5530
+    # Linux worker node (M910, mesflow@192.168.1.109 / thinkcentre SSH
+    # alias) -- installed via deploy/install-node-agent.sh, running as
+    # a systemd --user service under the mesflow account.
+    - node_id: m910
+      display_name: "m910 (Linux)"
+      hostname: "192.168.1.109"
+      endpoint: "http://192.168.1.109:8790"
+      token_env: TERMINAL_MCP_NODE_TOKEN_M910

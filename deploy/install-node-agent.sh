@@ -113,6 +113,38 @@ if [[ ! -f "$REPO_DIR/config.yaml" ]]; then
   cp "$REPO_DIR/config.example.yaml" "$REPO_DIR/config.yaml"
 fi
 
+# `hostname -I` lists every address on every interface in no particular
+# order -- on a machine with more than one NIC this can put a
+# link-local 169.254.x.x autoconf address first, ahead of the real
+# routable LAN address on another interface (seen live on the M910: a
+# disconnected wired port's APIPA address sorted before the real Wi-Fi
+# LAN address). Prefer a private RFC1918 address; fall back to the
+# first address only if none is found.
+DETECTED_IP=""
+for ip in $(hostname -I 2>/dev/null); do
+  case "$ip" in
+    10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|192.168.*) DETECTED_IP="$ip"; break ;;
+  esac
+done
+if [[ -z "$DETECTED_IP" ]]; then
+  DETECTED_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+fi
+
+if [[ "$AGENT_HOST" == "127.0.0.1" ]]; then
+  echo
+  echo "!! --host was not given, so this agent is bound to 127.0.0.1 (loopback) --"
+  echo "!! that is the SAFE DEFAULT (never exposed without an explicit choice), but"
+  echo "!! it also means the controller can push heartbeats FROM this node (this node"
+  echo "!! calls out to the controller) but can NEVER reach back IN to create/attach/"
+  echo "!! send input to a session here -- the node will show status=online (from the"
+  echo "!! heartbeat) yet every session operation on it will fail with a connection"
+  echo "!! error. For a node that must actually run sessions, re-run with:"
+  echo "!!   --host $DETECTED_IP"
+  echo "!! (this node's own detected LAN address -- verify it's correct for your"
+  echo "!! network before using it, e.g. with 'ip -o -4 addr show')."
+  echo
+fi
+
 # -- 5. systemd unit -----------------------------------------------------------
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT_PATH="$UNIT_DIR/terminal-node-agent.service"
@@ -151,8 +183,14 @@ if [[ "$USE_SYSTEMD" -eq 1 ]]; then
   echo "$UNIT_CONTENT" > "$UNIT_PATH"
   echo "-> Wrote $UNIT_PATH"
   systemctl --user daemon-reload
-  systemctl --user enable --now terminal-node-agent.service
-  echo "-> Started terminal-node-agent.service (systemctl --user status terminal-node-agent to check)"
+  systemctl --user enable terminal-node-agent.service
+  # `enable --now` only STARTS the unit if it wasn't already running -- a
+  # re-run of this script (e.g. to change --host) that rewrites an
+  # already-active unit's ExecStart would then silently keep the OLD
+  # process running with the OLD command line forever. `restart` always
+  # picks up the new unit file, whether the service was running or not.
+  systemctl --user restart terminal-node-agent.service
+  echo "-> Started/restarted terminal-node-agent.service (systemctl --user status terminal-node-agent to check)"
   loginctl enable-linger "$USER" 2>/dev/null || echo "   (could not enable-linger automatically -- run 'loginctl enable-linger $USER' as root/sudo so this survives logout)"
 else
   echo "-> --no-systemd given: unit content that WOULD have been written to $UNIT_PATH:"
@@ -171,7 +209,7 @@ echo "       remote:"
 echo "         - node_id: $NODE_ID"
 echo "           display_name: \"$NODE_ID\""
 echo "           hostname: \"$(hostname)\""
-echo "           endpoint: \"http://$(hostname -I 2>/dev/null | awk '{print $1}'):$AGENT_PORT\"  # verify this LAN address is reachable from the controller"
+echo "           endpoint: \"http://$DETECTED_IP:$AGENT_PORT\"  # verify this is really the LAN address reachable from the controller -- this host has more than one candidate; double-check with 'ip -o -4 addr show' if unsure"
 echo "           token_env: TERMINAL_MCP_NODE_TOKEN_$(echo "$NODE_ID" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
 echo
 echo "2) Export the SAME token this node generated as that environment variable"
