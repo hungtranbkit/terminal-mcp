@@ -466,7 +466,8 @@ DASHBOARD_HTML = """<!doctype html>
     .killed-row .kr-name { font-weight:700 }
     .killed-row .kr-meta { color:var(--muted); margin-top:2px }
     .killed-row .kr-incomplete { color:var(--amber) }
-    .killed-row button { margin-top:6px; background:#2b3f66; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 10px; cursor:pointer; font:inherit; font-size:11px }
+    .killed-row button { margin-top:6px; margin-right:6px; background:#2b3f66; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 10px; cursor:pointer; font:inherit; font-size:11px }
+    #registrySearchInput { width:100%; box-sizing:border-box; margin-bottom:6px; background:#0e1526; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:6px 9px; font:inherit; font-size:12px }
     /* Matched on EITHER dimension, not just width: a phone rotated to
        landscape can easily exceed 760px of width (e.g. 852px on an iPhone
        15 Pro) while its height drops well under 760px, and a naive
@@ -620,6 +621,19 @@ DASHBOARD_HTML = """<!doctype html>
         <button class="header-icon-btn" id="killedToggle" type="button" hidden aria-haspopup="true" aria-expanded="false"><span id="killedToggleLabel"></span></button>
         <div class="menu-panel killed-panel" id="killedList" role="menu"></div>
       </div>
+      <!-- Persistent Session Registry -- Recoverable/History (task's own
+           item 4): same collapsed-until-relevant .menu component as
+           killedMenu just above, never a second, always-visible session
+           list (the one on the tab bar stays the only ACTIVE-session
+           surface; this only ever lists MISSING/KILLED/OFFLINE records,
+           i.e. sessions that no longer exist). -->
+      <div class="menu" id="registryMenu">
+        <button class="header-icon-btn" id="registryToggle" type="button" hidden aria-haspopup="true" aria-expanded="false"><span id="registryToggleLabel"></span></button>
+        <div class="menu-panel killed-panel" id="registryPanel" role="menu">
+          <input type="text" id="registrySearchInput" placeholder="Tìm theo tên / thư mục / repo..." autocomplete="off">
+          <div id="registryListEl"></div>
+        </div>
+      </div>
       <!-- Task item 3: rarely-used navigation (admin screens) lives in one
            "⋯" menu instead of a row of separate buttons -- LIVE/conn-health/
            Supervisor stay directly visible above since they're STATUS, not
@@ -759,6 +773,10 @@ DASHBOARD_HTML = """<!doctype html>
     const killedToggleEl = document.querySelector('#killedToggle');
     const killedToggleLabelEl = document.querySelector('#killedToggleLabel');
     const killedListEl = document.querySelector('#killedList');
+    const registryToggleEl = document.querySelector('#registryToggle');
+    const registryToggleLabelEl = document.querySelector('#registryToggleLabel');
+    const registryListEl = document.querySelector('#registryListEl');
+    const registrySearchInputEl = document.querySelector('#registrySearchInput');
     const killBackdropEl = document.querySelector('#killBackdrop');
     const killModalEl = document.querySelector('#killModal');
     const killModalTitleEl = document.querySelector('#killModalTitle');
@@ -853,6 +871,7 @@ DASHBOARD_HTML = """<!doctype html>
     wireMenu(document.querySelector('#headerMenu'), document.querySelector('#headerMenuBtn'));
     wireMenu(document.querySelector('#termMenu'), document.querySelector('#termMenuBtn'));
     wireMenu(document.querySelector('#killedMenu'), killedToggleEl);
+    wireMenu(document.querySelector('#registryMenu'), registryToggleEl);
 
     // ---- Supervisor Loop v1 summary (compact badge + overlay panel) -------
     // Read-only from this page's point of view: the badge/panel only ever
@@ -2009,6 +2028,7 @@ DASHBOARD_HTML = """<!doctype html>
       // below always sees the real, current rows, cold-start included.
       renderRows(rows);
       if (sessionLifecycleEnabled) loadKilledSessions(); else killedToggleEl.hidden = true;
+      if (sessionLifecycleEnabled) loadRegistry(); else registryToggleEl.hidden = true;
 
       // On first load only (never on the recurring 5s poll, which must not
       // fight a user's manual choice to switch sessions or clear the
@@ -2198,6 +2218,136 @@ DASHBOARD_HTML = """<!doctype html>
       }
       await loadSessions();
       selectSession(entry.name);
+    }
+
+    function timeAgo(iso) {
+      if (!iso) return '—';
+      const ms = Date.now() - new Date(iso).getTime();
+      if (!Number.isFinite(ms) || ms < 0) return iso;
+      const s = Math.floor(ms / 1000);
+      if (s < 60) return `${s}s trước`;
+      const m = Math.floor(s / 60);
+      if (m < 60) return `${m}p trước`;
+      const h = Math.floor(m / 60);
+      if (h < 24) return `${h}g trước`;
+      return `${Math.floor(h / 24)}ngày trước`;
+    }
+
+    // ---- Persistent Session Registry: Recoverable/History --------------
+    // Same collapsed-until-relevant .menu component as killedMenu -- see
+    // that section's own comment. This lists ONLY non-ACTIVE records
+    // (MISSING/KILLED/OFFLINE) -- an ACTIVE session already has its own
+    // tab; this is never a second, duplicate list of what's already
+    // running (task item 4's own explicit "Không duplicate list trên
+    // top"). A session recreated here (Reopen) is explicitly labeled as
+    // such -- a fresh process from saved metadata, never a claim of
+    // resurrecting the original's RAM/state (task item 5).
+    let lastRegistryRecords = [];
+    const STATUS_LABELS_VI = {MISSING: 'Mất (tmux/process biến mất)', KILLED: 'Đã kill', OFFLINE: 'Node offline'};
+    function renderRegistry(records) {
+      lastRegistryRecords = records;
+      registryToggleEl.hidden = records.length === 0;
+      registryToggleLabelEl.textContent = `🗂 Khôi phục (${records.length})`;
+      renderRegistryFiltered(registrySearchInputEl.value);
+    }
+    function renderRegistryFiltered(query) {
+      const needle = (query || '').trim().toLowerCase();
+      const filtered = !needle ? lastRegistryRecords : lastRegistryRecords.filter(r =>
+        [r.session_name, r.cwd, r.repo_root, r.git_remote, r.node_id].some(
+          v => v && String(v).toLowerCase().includes(needle)));
+      registryListEl.replaceChildren();
+      if (filtered.length === 0) {
+        const empty = document.createElement('div'); empty.className = 'muted';
+        empty.style.cssText = 'padding:6px 2px';
+        empty.textContent = needle ? 'Không tìm thấy.' : 'Không có session nào cần khôi phục.';
+        registryListEl.appendChild(empty);
+        return;
+      }
+      for (const record of filtered) {
+        const row = document.createElement('div'); row.className = 'killed-row';
+        const name = document.createElement('div'); name.className = 'kr-name';
+        name.textContent = `${record.session_name}${record.node_id !== 'local' ? ' · ' + record.node_id : ''}`;
+        const meta = document.createElement('div'); meta.className = 'kr-meta';
+        const metaParts = [STATUS_LABELS_VI[record.status] || record.status];
+        if (record.repo_root) metaParts.push(record.repo_root);
+        else if (record.cwd) metaParts.push(record.cwd);
+        if (record.git_branch) metaParts.push(`(${record.git_branch})`);
+        metaParts.push(`last seen ${timeAgo(record.last_seen_at)}`);
+        meta.textContent = metaParts.join(' · ');
+        row.append(name, meta);
+        if (!record.recoverable) {
+          const warn = document.createElement('div'); warn.className = 'kr-incomplete';
+          warn.textContent = record.status === 'DELETED' ? '🗑 Đã xoá vĩnh viễn (chỉ còn lịch sử).'
+            : '⚠ Thiếu metadata (agent_type/cwd) -- reopen sẽ cần nhập thủ công.';
+          row.append(warn);
+        }
+        if (record.status !== 'DELETED') {
+          const reopenBtn = document.createElement('button'); reopenBtn.type = 'button'; reopenBtn.textContent = '↩ Reopen';
+          reopenBtn.onclick = () => reopenFromRegistry(record);
+          row.append(reopenBtn);
+          const purgeBtn = document.createElement('button'); purgeBtn.type = 'button'; purgeBtn.textContent = '🗑 Xoá vĩnh viễn';
+          purgeBtn.onclick = () => purgeFromRegistry(record);
+          row.append(purgeBtn);
+        }
+        registryListEl.appendChild(row);
+      }
+    }
+    registrySearchInputEl.addEventListener('input', () => renderRegistryFiltered(registrySearchInputEl.value));
+    async function loadRegistry() {
+      try {
+        const data = await fetchJSON('/dashboard/api/registry', {cache: 'no-store'});
+        const nonActive = (data.records || []).filter(r => r.status !== 'ACTIVE');
+        renderRegistry(nonActive);
+      } catch (error) { /* transient poll failure -- next 5s cycle retries, same as loadKilledSessions */ }
+    }
+    async function reopenFromRegistry(record) {
+      // Never guesses -- fails closed and asks explicitly, same
+      // established convention as reopenKilledSession above.
+      let agentType = record.agent_type || null, cwd = record.cwd || null;
+      if (!record.recoverable) {
+        agentType = window.prompt(
+          `Không đủ metadata để tự reopen "${record.session_name}".\nNhập agent_type (shell / claude / codex):`, 'shell');
+        if (!agentType) return;
+        if (agentType !== 'shell') {
+          cwd = window.prompt('Nhập cwd an toàn (trong allowed_cwd_roots):', record.cwd || '');
+          if (!cwd) return;
+        }
+      }
+      const body = {session_name: record.session_name};
+      if (agentType) body.agent_type = agentType;
+      if (cwd) body.cwd = cwd;
+      const response = await fetch('/dashboard/api/registry/reopen', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (result && result.error) {
+        window.alert(`Reopen thất bại: ${clean(result.error)}${result.missing ? ' (thiếu: ' + result.missing.join(', ') + ')' : ''}`);
+        return;
+      }
+      window.alert(`Đã tạo session MỚI "${record.session_name}" từ metadata đã lưu -- đây KHÔNG phải khôi phục process/RAM cũ, chỉ là tiến trình mới cùng tên/cwd/agent.`);
+      await loadSessions();
+      selectSession(record.session_name);
+    }
+    async function purgeFromRegistry(record) {
+      // Task item 6: a SEPARATE, strongly-confirmed action from Kill --
+      // same typed-confirmation discipline as #killModal's own
+      // confirm-by-typing-the-exact-name, via a plain prompt() (this is a
+      // rare action, not worth a dedicated modal for).
+      const typed = window.prompt(
+        `Xoá VĨNH VIỄN lịch sử của "${record.session_name}"?\nHành động này không thể hoàn tác (khác với Kill -- Kill vẫn giữ lại lịch sử).\nGõ chính xác tên session để xác nhận:`, '');
+      if (typed !== record.session_name) {
+        if (typed !== null) window.alert('Tên gõ không khớp -- đã huỷ.');
+        return;
+      }
+      const response = await fetch('/dashboard/api/registry/purge', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session_name: record.session_name}),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (result && result.error) {
+        window.alert(`Xoá thất bại: ${clean(result.error)}`);
+        return;
+      }
+      await loadRegistry();
     }
 
     async function loadDetail() {
@@ -4989,6 +5139,76 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         result = await anyio.to_thread.run_sync(terminal.terminal_list_killed_sessions)
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    # -- Persistent Session Registry (recovery -- session_registry.py) ------
+    # Local-node-only in this phase, same as the MCP tools (see mcp_app.py's
+    # own comment on this) -- calls `terminal` directly, never `controller`.
+
+    @server.custom_route("/dashboard/api/registry", methods=["GET"], include_in_schema=False)
+    async def registry_list(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        recoverable_only = request.query_params.get("recoverable_only") == "1"
+        result = await anyio.to_thread.run_sync(
+            lambda: terminal.terminal_registry_list(recoverable_only=recoverable_only))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/registry/search", methods=["GET"], include_in_schema=False)
+    async def registry_search(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        query = request.query_params.get("q", "")
+        result = await anyio.to_thread.run_sync(lambda: terminal.terminal_registry_search(query))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/registry/reopen", methods=["POST"], include_in_schema=False)
+    async def registry_reopen(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        session_name = body.get("session_name") if isinstance(body, dict) else None
+        agent_type = body.get("agent_type") if isinstance(body, dict) else None
+        cwd = body.get("cwd") if isinstance(body, dict) else None
+        if not isinstance(session_name, str) or not session_name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        requested_by = identity.email if identity else "dashboard"
+        _log.info("dashboard registry_reopen session=%s identity=%s", session_name, requested_by)
+        result = await anyio.to_thread.run_sync(
+            lambda: terminal.terminal_registry_reopen(
+                session_name, agent_type=agent_type, cwd=cwd, requested_by=requested_by)
+        )
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/registry/purge", methods=["POST"], include_in_schema=False)
+    async def registry_purge(request: Request) -> JSONResponse:
+        # Deliberately its OWN route, never folded into Kill/Delete --
+        # task item 6's own "action riêng có confirm mạnh". The UI's own
+        # confirm() dialog is the first gate; this route's floor is the
+        # same auth+CSRF _mutation_guard as every mutation here, plus
+        # terminal_registry_purge's own SESSION_STILL_ACTIVE refusal.
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        session_name = body.get("session_name") if isinstance(body, dict) else None
+        if not isinstance(session_name, str) or not session_name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        purged_by = identity.email if identity else "dashboard"
+        _log.info("dashboard registry_purge session=%s identity=%s", session_name, purged_by)
+        result = await anyio.to_thread.run_sync(
+            lambda: terminal.terminal_registry_purge(session_name, purged_by=purged_by))
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 

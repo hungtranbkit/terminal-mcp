@@ -23,6 +23,7 @@ from .permissions import (SENSITIVE_SESSION_WORDS, input_session_allowed,
                           session_input_denied_by_pattern, valid_session_name)
 from .redaction import redact_ansi_safe, redact_text
 from .session_backend import SessionBackend
+from .session_registry import SessionRegistryStore
 from .status import classify_status
 from .tmux import SEND_TEXT_ENTER_SETTLE_SECONDS, TmuxClient, TmuxError, iso_timestamp
 
@@ -118,7 +119,8 @@ class TerminalService:
                  audit: AuditStore | None = None,
                  grants: SessionGrantStore | None = None,
                  leases: PaneLeaseStore | None = None,
-                 killed_sessions: KilledSessionStore | None = None) -> None:
+                 killed_sessions: KilledSessionStore | None = None,
+                 session_registry: SessionRegistryStore | None = None) -> None:
         # `tmux` accepts ANY SessionBackend (session_backend.py) -- a
         # TmuxClient (the default, Linux) or a WindowsSessionBackend
         # (windows_backend.py, injected explicitly by windows_agent.py).
@@ -135,6 +137,16 @@ class TerminalService:
         # Kill/Reopen reopen-metadata store -- see killed_sessions.py and
         # terminal_kill_session/terminal_reopen_session below.
         self.killed_sessions = killed_sessions or KilledSessionStore()
+        # Persistent Session Registry -- durable record of every session
+        # ever discovered/created, independent of the tmux/Windows-backend
+        # process's own lifetime (session_registry.py's own module
+        # docstring has the full rationale/design). This process's own
+        # node has no name from its own point of view -- REGISTRY_LOCAL_
+        # NODE_ID is a private, per-process convention (mirrors
+        # controller.py's LOCAL_NODE_ID); a controller merging this with
+        # other nodes' registries rewrites it to that node's real id,
+        # exactly like it already does for plain session rows.
+        self.session_registry = session_registry or SessionRegistryStore()
         # P0 Part B: durable, cross-process pane lease -- defaults to the
         # shared on-disk store (same file for every TerminalService in
         # every process on this host, HTTP/STDIO/dashboard/Supervisor
@@ -148,6 +160,62 @@ class TerminalService:
         # this already-large class: one small, independently-testable
         # object, shared by both the dashboard routes and the MCP tools.
         self.lifecycle = SessionLifecycleService(config, self.tmux)
+
+    # Private, per-process convention for this TerminalService's OWN node
+    # in the Persistent Session Registry -- see session_registry.py's own
+    # module docstring and this class's __init__ comment on
+    # self.session_registry for why this is never this node's real,
+    # controller-assigned id.
+    REGISTRY_LOCAL_NODE_ID = "local"
+
+    def _reconcile_session_registry(self, items: list[Any], grants_by_session: dict[str, SessionGrant]) -> None:
+        """Called from terminal_list_sessions/dashboard_list_sessions --
+        the ONE place this runs, reusing the exact tmux.list_sessions()
+        result those methods already fetched (zero extra tmux calls).
+        Upserts an ACTIVE record for every currently-live session, then
+        marks any record that WAS active but isn't in `items` this time
+        as MISSING -- the reconcile loop the whole registry depends on to
+        ever notice a session vanished (a tmux-server restart, an out-of-
+        band kill) rather than just silently going stale forever.
+
+        Never raises: a real, currently-broken git binary or an
+        unreadable cwd must never break session listing itself, which is
+        the one path that has to stay usable no matter what (an operator
+        reading `tmux ls`-equivalent data should never be blocked by a
+        registry bug)."""
+        try:
+            seen: set[str] = set()
+            bindings_by_session: dict[str, list[str]] = {}
+            for binding in self.bindings.list():
+                bindings_by_session.setdefault(binding.session, []).append(binding.name)
+            launch_commands_by_type = dict(self.config.session_lifecycle.launch_commands)
+            for item in items:
+                seen.add(item.name)
+                grant = grants_by_session.get(item.name)
+                cwd = None
+                if item.pane_current_path:
+                    resolved, error = resolve_cwd(item.pane_current_path, self.config)
+                    if error is None:
+                        cwd = str(resolved)
+                agent_type = self._classify_agent_type(item.pane_current_command)
+                launcher = launch_commands_by_type.get(agent_type) if agent_type else None
+                binding_names = tuple(bindings_by_session.get(item.name, ()))
+                self.session_registry.upsert_seen(
+                    self.REGISTRY_LOCAL_NODE_ID, item.name, backend_type=self._registry_backend_type(),
+                    cwd=cwd, agent_type=agent_type, launch_command=launcher, launcher_type=agent_type,
+                    read_granted=bool(grant and grant.read_enabled), input_granted=bool(grant and grant.input_enabled),
+                    binding_names=binding_names,
+                )
+            self.session_registry.mark_missing(self.REGISTRY_LOCAL_NODE_ID, seen)
+        except Exception:  # noqa: BLE001 -- see docstring: never let a registry bug break listing itself
+            pass
+
+    def _registry_backend_type(self) -> str:
+        # tmux.py's TmuxClient has a `.binary` attribute; windows_backend.py's
+        # WindowsSessionBackend does not (see webterm.py's own identical
+        # dispatch pattern) -- reused here rather than a new isinstance
+        # check against a class this module would otherwise never import.
+        return "tmux" if hasattr(self.tmux, "binary") else "windows_pty"
 
     def resolve_identity(self, session: str) -> SessionIdentity | None:
         try:
@@ -443,6 +511,7 @@ class TerminalService:
                 "input_allowed": input_allowed, "input_granted": input_granted,
                 "effective_read": read_allowed, "effective_input": input_allowed,
             })
+        self._reconcile_session_registry(items, grants_by_session)
         return {"sessions": sessions}
 
     def terminal_tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]:
@@ -1516,6 +1585,7 @@ class TerminalService:
         # enforcement -- terminal_delete_session's own protected_sessions
         # check is what actually refuses a delete, regardless of what a
         # client does or doesn't disable in its own UI based on this list).
+        self._reconcile_session_registry(items, grants_by_session)
         return {"sessions": sessions,
                "session_lifecycle_enabled": self.config.session_lifecycle.enabled,
                "protected_sessions": list(self.config.session_lifecycle.protected_sessions),
@@ -1600,6 +1670,8 @@ class TerminalService:
             if not exists:
                 return {"error": "SESSION_NOT_FOUND", "session": session}
         grant = self.grants.set_read(session, enabled, granted_by=granted_by)
+        self.session_registry.touch_grant(self.REGISTRY_LOCAL_NODE_ID, session,
+                                          read_granted=grant.read_enabled, input_granted=grant.input_enabled)
         return {"session": session, "read_enabled": grant.read_enabled, "input_enabled": grant.input_enabled}
 
     def _input_grant_block_reason(self, session: str, *, pane_current_command: str | None = None) -> str | None:
@@ -1661,6 +1733,8 @@ class TerminalService:
             return {"error": "READ_GRANT_REQUIRED", "session": session}
         if not enabled:
             grant = self.grants.set_input(session, False, granted_by=granted_by)
+            self.session_registry.touch_grant(self.REGISTRY_LOCAL_NODE_ID, session,
+                                              read_granted=grant.read_enabled, input_granted=grant.input_enabled)
             return {"session": session, "read_enabled": grant.read_enabled, "input_enabled": grant.input_enabled}
         if (reason := self._input_grant_block_reason(session)) is not None:
             return {"error": reason, "session": session}
@@ -1675,6 +1749,8 @@ class TerminalService:
                                       pinned_created_epoch=info.created_epoch)
         if grant is None:  # read was revoked concurrently between the check above and here
             return {"error": "READ_GRANT_REQUIRED", "session": session}
+        self.session_registry.touch_grant(self.REGISTRY_LOCAL_NODE_ID, session,
+                                          read_granted=grant.read_enabled, input_granted=grant.input_enabled)
         return {"session": session, "read_enabled": grant.read_enabled, "input_enabled": grant.input_enabled}
 
     def _require_read_grant(self, session: str) -> dict[str, Any] | None:
@@ -1898,6 +1974,7 @@ class TerminalService:
         ok = "error" not in result
         if ok:
             self._cleanup_after_session_gone(name)
+            self.session_registry.mark_killed(self.REGISTRY_LOCAL_NODE_ID, name, killed_by="dashboard:delete")
         self.audit.record(action=action, session=name, result="DELETED" if ok else "BLOCKED",
                           reason=result.get("error") or result.get("action"))
         return result
@@ -2005,6 +2082,20 @@ class TerminalService:
                 }
             else:
                 result["reopen_metadata"] = None
+            # Registry: KILLED, never removed -- see session_registry.py's
+            # own docstring on why Kill/Delete only ever change `status`.
+            # cwd/agent_type reuse the SAME pane-state capture just above
+            # (metadata) rather than re-deriving it -- also means a
+            # session killed before any reconcile pass ever ran for it
+            # (no registry row yet) still gets a real, complete record,
+            # not an empty one (see mark_killed's own upsert docstring).
+            self.session_registry.mark_killed(
+                self.REGISTRY_LOCAL_NODE_ID, name, killed_by=requested_by,
+                reopen_metadata=result.get("reopen_metadata"),
+                cwd=metadata["working_directory"] if metadata else None,
+                agent_type=metadata["agent_type"] if metadata else None,
+                backend_type=self._registry_backend_type(),
+            )
         self.audit.record(action=action, session=name, result="KILLED" if ok else "BLOCKED",
                           reason=result.get("error") or result.get("action"))
         return result
@@ -2049,6 +2140,126 @@ class TerminalService:
         self.audit.record(action=action, session=name, result="REOPENED" if "error" not in result else "BLOCKED",
                           reason=result.get("error"))
         return result
+
+    # -- Persistent Session Registry (recovery, independent of killed_
+    # sessions.py -- see session_registry.py's own module docstring) -----
+
+    @staticmethod
+    def _registry_record_dict(record: Any) -> dict[str, Any]:
+        return {
+            "node_id": record.node_id, "session_name": record.session_name, "key": record.key(),
+            "display_name": record.display_name, "node_name": record.node_name,
+            "backend_type": record.backend_type, "cwd": record.cwd, "repo_root": record.repo_root,
+            "git_remote": record.git_remote, "git_branch": record.git_branch, "last_commit": record.last_commit,
+            "agent_type": record.agent_type, "launch_command": record.launch_command,
+            "launcher_type": record.launcher_type, "created_at": record.created_at,
+            "last_seen_at": record.last_seen_at, "last_activity_at": record.last_activity_at,
+            "last_known_state": record.last_known_state, "status": record.status,
+            "killed_at": record.killed_at, "deleted_at": record.deleted_at, "offline_at": record.offline_at,
+            "metadata_complete": record.metadata_complete, "recoverable": record.recoverable,
+            "read_granted": record.read_granted, "input_granted": record.input_granted,
+            "grant_updated_at": record.grant_updated_at, "binding_names": list(record.binding_names),
+            "notes": record.notes, "tags": list(record.tags),
+        }
+
+    def terminal_registry_list(self, *, recoverable_only: bool = False) -> dict[str, Any]:
+        """Every session this process has ever discovered/created, active
+        or not -- task item 4's "Active và Recoverable/History" dashboard
+        section is this list, split client-side (or via recoverable_only)
+        on `status`/`recoverable`, never a second, separately-maintained
+        list. A fresh reconcile pass runs first (same as listing sessions
+        itself would) so this is never staler than the live session list
+        happens to be."""
+        self.terminal_list_sessions()  # side effect: reconciles the registry (see _reconcile_session_registry)
+        from .session_registry import RECOVERABLE_STATUSES
+        statuses = RECOVERABLE_STATUSES if recoverable_only else None
+        records = self.session_registry.list(node_id=self.REGISTRY_LOCAL_NODE_ID, statuses=statuses)
+        if recoverable_only:
+            records = [r for r in records if r.recoverable]
+        return {"records": [self._registry_record_dict(r) for r in records]}
+
+    def terminal_registry_get(self, session_name: str) -> dict[str, Any]:
+        record = self.session_registry.get(self.REGISTRY_LOCAL_NODE_ID, session_name)
+        if record is None:
+            return {"error": "REGISTRY_RECORD_NOT_FOUND", "session": session_name}
+        return self._registry_record_dict(record)
+
+    def terminal_registry_search(self, query: str) -> dict[str, Any]:
+        """Task item 9's own explicit scenario: find a project by name/
+        path/repo even when the session that was working on it is gone
+        or renamed (the "quan_ly_ban_hang" case this feature was built
+        for)."""
+        if not query or not query.strip():
+            return {"records": []}
+        records = self.session_registry.search(query.strip())
+        return {"records": [self._registry_record_dict(r) for r in records]}
+
+    def terminal_registry_reopen(self, session_name: str, *, agent_type: str | None = None,
+                                 cwd: str | None = None, grant_mode: str = "none",
+                                 requested_by: str | None = None) -> dict[str, Any]:
+        """Recreate a session FROM REGISTRY METADATA -- explicitly a fresh
+        process, never a resurrection of whatever RAM/state the original
+        had (task item 5's own explicit requirement: "Không giả khôi phục
+        RAM/process cũ; ghi rõ đây là recreate from metadata"). Reuses
+        terminal_create_session exactly like terminal_reopen_session
+        (killed_sessions.py-backed) already does -- the only difference
+        is WHERE the agent_type/cwd come from: this registry (which has
+        an entry for any session ever reconciled here, not only ones
+        explicitly Kill'd through the dashboard -- e.g. mesflow/
+        promptflow/quan_ly_ban_hang after this host's tmux server itself
+        restarted, none of which killed_sessions.db has any record of at
+        all since nothing ever called terminal_kill_session for them).
+
+        No adapter-level --resume/--continue/session-id support (task's
+        own "nếu agent hỗ trợ resume... thì dùng khi an toàn") -- not
+        implemented in this pass: this project's launch_commands config
+        maps agent_type to a plain launcher token only, with no verified,
+        adapter-specific resume-flag wiring to build on safely yet.
+        Documented limitation, not a silent gap."""
+        action = "registry_reopen"
+        if (error := require_session_lifecycle(self.config)) is not None:
+            self.audit.record(action=action, session=session_name, result="BLOCKED", reason=error)
+            return {"error": error, "session": session_name}
+        if not valid_session_name(session_name):
+            return {"error": "INVALID_SESSION_NAME", "session": session_name}
+        record = self.session_registry.get(self.REGISTRY_LOCAL_NODE_ID, session_name)
+        if record is None:
+            return {"error": "REGISTRY_RECORD_NOT_FOUND", "session": session_name}
+        effective_agent_type = agent_type or record.agent_type
+        effective_cwd = cwd or record.cwd
+        if effective_agent_type is None:
+            return {"error": "REOPEN_METADATA_INCOMPLETE", "session": session_name, "missing": ["agent_type"]}
+        if effective_agent_type != "shell" and not effective_cwd:
+            return {"error": "REOPEN_METADATA_INCOMPLETE", "session": session_name, "missing": ["cwd"]}
+        result = self.terminal_create_session(session_name, effective_agent_type, effective_cwd,
+                                              grant_mode=grant_mode, requested_by=requested_by)
+        result["recreated_from_registry"] = True
+        if "error" not in result:
+            # Reflects ACTIVE immediately rather than waiting for the next
+            # ordinary poll's own reconcile pass to notice.
+            self.session_registry.upsert_seen(
+                self.REGISTRY_LOCAL_NODE_ID, session_name, backend_type=self._registry_backend_type(),
+                cwd=effective_cwd, agent_type=effective_agent_type,
+            )
+        self.audit.record(action=action, session=session_name,
+                          result="REOPENED" if "error" not in result else "BLOCKED", reason=result.get("error"))
+        return result
+
+    def terminal_registry_purge(self, session_name: str, *, purged_by: str | None = None) -> dict[str, Any]:
+        """The ONE hard-delete path for a registry row (task item 6) --
+        separate from Kill/Delete of the runtime session, which never
+        touches the registry row's existence, only its `status`. Refuses
+        an ACTIVE record outright (purging a currently-live session's own
+        history makes no sense and almost certainly indicates the caller
+        meant Kill, not this)."""
+        record = self.session_registry.get(self.REGISTRY_LOCAL_NODE_ID, session_name)
+        if record is None:
+            return {"error": "REGISTRY_RECORD_NOT_FOUND", "session": session_name}
+        if record.status == "ACTIVE":
+            return {"error": "SESSION_STILL_ACTIVE", "session": session_name}
+        self.session_registry.purge(self.REGISTRY_LOCAL_NODE_ID, session_name, purged_by=purged_by)
+        self.audit.record(action="registry_purge", session=session_name, result="PURGED", reason=purged_by)
+        return {"session": session_name, "purged": True}
 
     def terminal_list_killed_sessions(self) -> dict[str, Any]:
         """Sessions Kill has recorded reopen metadata for, most recent

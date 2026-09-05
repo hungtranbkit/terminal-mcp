@@ -356,6 +356,62 @@ def build_mcp(service: TerminalService | None = None,
         _refresh_local_heartbeat()
         return controller.terminal_list_killed_sessions()
 
+    # -- Persistent Session Registry (recovery -- session_registry.py) ------
+    # Local-node-only in this phase (same documented Phase A/B limitation
+    # as bindings/Supervisor -- see build_mcp's own module docstring) --
+    # NOT routed through `controller`, calls `service` directly. Answers
+    # "where did my session/project go" even after the underlying tmux/
+    # process is long gone: "session quản lý bán hàng đâu" resolves via
+    # terminal_registry_search("ban hang") or ("quan_ly_ban_hang"), which
+    # matches session name, cwd, repo_root, or git remote.
+
+    @server.tool()
+    def terminal_registry_list(recoverable_only: bool = False) -> dict:
+        """Every session this process has ever discovered/created --
+        ACTIVE (currently running) and MISSING/KILLED/OFFLINE (gone, but
+        the record -- project path, repo, agent type -- is kept). Pass
+        recoverable_only=True to see only the ones with enough saved
+        metadata (`recoverable`) for terminal_registry_reopen to actually
+        recreate."""
+        return terminal.terminal_registry_list(recoverable_only=recoverable_only)
+
+    @server.tool()
+    def terminal_registry_get(session_name: str) -> dict:
+        """One registry record by exact session name -- REGISTRY_RECORD_
+        NOT_FOUND if this process has never seen a session by that name."""
+        return terminal.terminal_registry_get(session_name)
+
+    @server.tool()
+    def terminal_registry_search(query: str) -> dict:
+        """Find a session/project by session name, working directory,
+        repo root, or git remote URL -- for when the session name itself
+        was lost/renamed/recreated but the underlying project wasn't.
+        E.g. terminal_registry_search("ban hang") or
+        terminal_registry_search("offline-pos") both find a session that
+        was working in /home/.../offline-pos, even if that session is
+        long gone and was never named anything containing that text."""
+        return terminal.terminal_registry_search(query)
+
+    @server.tool()
+    def terminal_registry_reopen(session_name: str, agent_type: str | None = None,
+                                 cwd: str | None = None) -> dict:
+        """Recreate a session from its saved registry metadata (project
+        cwd + agent_type) -- a genuinely NEW process under the same name,
+        never a resurrection of the original's RAM/state (this project
+        has no mechanism for that, and never claims otherwise). Explicit
+        agent_type/cwd override the saved values field-by-field.
+        REOPEN_METADATA_INCOMPLETE (naming what's missing) if neither the
+        saved record nor your override supplies enough to launch safely."""
+        return terminal.terminal_registry_reopen(session_name, agent_type=agent_type, cwd=cwd, requested_by="mcp")
+
+    @server.tool()
+    def terminal_registry_purge(session_name: str) -> dict:
+        """Permanently remove a registry record (a tombstone is kept,
+        see session_registry.py) -- a separate, explicit action from Kill/
+        Delete, which never touch the registry. Refuses an ACTIVE record
+        (SESSION_STILL_ACTIVE) -- you almost certainly meant Kill instead."""
+        return terminal.terminal_registry_purge(session_name, purged_by="mcp")
+
     # -- Nodes (multi-node session management, task item 9) -----------------
     # Read-only from the MCP surface on purpose: draining/test-connection
     # are operator actions, dashboard-only (same "control vs discovery"

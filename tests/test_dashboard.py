@@ -850,8 +850,12 @@ def test_dashboard_health_indicator_no_new_backend_route():
     # /dashboard/api/nodes fetch to list current nodes for the prompt, and
     # its own separate /dashboard/api/session/reopen POST (distinct call
     # site from the plain Reopen button's own, same-node call just above
-    # it -- two different bodies, `node` present only on this one).
-    assert DASHBOARD_HTML.count("fetch(") == 13  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere)
+    # it -- two different bodies, `node` present only on this one). Two
+    # more from the Persistent Session Registry (Recoverable/History):
+    # registry/reopen and registry/purge -- registry LISTING itself
+    # (loadRegistry) goes through the shared fetchJSON() wrapper, already
+    # counted once, so it adds no new literal call site of its own.
+    assert DASHBOARD_HTML.count("fetch(") == 15  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere), registry/reopen, registry/purge
 
 
 def test_dashboard_auth_required_distinguished_from_offline():
@@ -1216,6 +1220,12 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/nodes/connect/windows/bootstrap": {"POST"},
         "/dashboard/api/nodes/connect/agent-token": {"POST"},
         "/dashboard/nodes": {"GET", "HEAD"},
+        # Persistent Session Registry (recovery -- session_registry.py) --
+        # another later, separate feature, same as the nodes routes above.
+        "/dashboard/api/registry": {"GET", "HEAD"},
+        "/dashboard/api/registry/search": {"GET", "HEAD"},
+        "/dashboard/api/registry/reopen": {"POST"},
+        "/dashboard/api/registry/purge": {"POST"},
     }
     # The web terminal's WebSocket route is registered too, just outside
     # this HTTP-methods-only dict (WebSocketRoute has no .methods).
