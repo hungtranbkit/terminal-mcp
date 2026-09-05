@@ -108,6 +108,58 @@ def test_strip_ansi_removes_sgr_sequences():
     assert strip_ansi(colored) == "ERROR: build failed OK"
 
 
+# ---------------------------------------------------------------------------
+# P0 hotfix (Windows terminal rendering): the original ANSI_CSI_RE only
+# matched digits/`;` as CSI parameter bytes -- a DEC-private-mode sequence
+# (parameter bytes include `?`) never matched at all and leaked through
+# terminal_tail/terminal_status's "sanitized" output as raw, unreadable
+# escape-code noise. Exactly the sequences a real full-screen TUI (Claude
+# Code's own Ink renderer) emits constantly -- caught live via
+# terminal_status(window) on dell-5530.
+# ---------------------------------------------------------------------------
+
+def test_strip_ansi_removes_dec_private_mode_cursor_visibility():
+    assert strip_ansi("\x1b[?25lhidden\x1b[?25hvisible") == "hiddenvisible"
+
+
+def test_strip_ansi_removes_alternate_screen_toggle():
+    assert strip_ansi("\x1b[?1049hINSIDE ALT SCREEN\x1b[?1049l") == "INSIDE ALT SCREEN"
+
+
+def test_strip_ansi_removes_bracketed_paste_mode():
+    assert strip_ansi("\x1b[?2004hpasted text\x1b[?2004l") == "pasted text"
+
+
+def test_strip_ansi_removes_osc_title_bel_terminated():
+    assert strip_ansi("\x1b]0;My Window Title\x07after") == "after"
+
+
+def test_strip_ansi_removes_osc_string_terminator_style():
+    assert strip_ansi("\x1b]8;;http://example.com\x1b\\link text\x1b]8;;\x1b\\") == "link text"
+
+
+def test_strip_ansi_removes_charset_designation():
+    assert strip_ansi("\x1b(Bhello\x1b)0world") == "helloworld"
+
+
+def test_strip_ansi_removes_simple_two_byte_escapes():
+    # DEC keypad application/numeric mode, save/restore cursor (Fp escapes).
+    assert strip_ansi("a\x1b=b\x1b>c\x1b7d\x1b8e") == "abcde"
+
+
+def test_strip_ansi_preserves_wide_unicode_and_vietnamese_text():
+    text = "Xin chào các bạn \x1b[?25lệ\x1b[?25h việt"
+    assert strip_ansi(text) == "Xin chào các bạn ệ việt"
+
+
+def test_strip_ansi_handles_a_real_captured_conpty_prefix():
+    # Verbatim shape observed live from a real Windows ConPTY session
+    # (dell-5530) -- the exact kind of content that used to leak through
+    # terminal_status's own last_output field as raw escape noise.
+    raw = "\x1b[?9001h\x1b[?1004h\x1b[?25lWindows PowerShell\x1b]0;title\x07\x1b[?25h"
+    assert strip_ansi(raw) == "Windows PowerShell"
+
+
 def test_redact_ansi_safe_catches_secret_glued_to_color_code():
     # Typical CLI styling: the escape code sits directly against the value,
     # with no whitespace in between.

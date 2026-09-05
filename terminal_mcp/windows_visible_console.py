@@ -123,6 +123,37 @@ def _build_commandline(argv: list[str]) -> str:
     return subprocess.list2cmdline(argv)
 
 
+def _read_line_locked(conn: socket.socket, *, max_bytes: int = 256) -> str | None:
+    """One newline-terminated line, byte-by-byte (never a bulk recv that
+    could swallow the START of the next protocol field/the actual pumped
+    stream) -- shared by the token line and the size line in the same
+    handshake. None on a closed connection before a newline ever arrives."""
+    line = b""
+    while not line.endswith(b"\n") and len(line) < max_bytes:
+        chunk = conn.recv(1)
+        if not chunk:
+            return None
+        line += chunk
+    return line.decode("utf-8", errors="replace").strip()
+
+
+def _parse_size(size_line: str) -> tuple[int | None, int | None]:
+    """"cols,rows" -> (cols, rows), or (None, None) for anything that
+    isn't exactly that shape -- a malformed/missing size line just means
+    the initial sync is skipped (session stays at whatever size it
+    already had), never a crash or a guessed fallback size."""
+    parts = size_line.split(",")
+    if len(parts) != 2:
+        return None, None
+    try:
+        cols, rows = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None, None
+    if cols <= 0 or rows <= 0:
+        return None, None
+    return cols, rows
+
+
 class DesktopBridgeServer:
     """A loopback-only TCP server bridging ONE viewer connection at a
     time to windows_backend.py's existing register_viewer/write_raw
@@ -161,19 +192,22 @@ class DesktopBridgeServer:
         # Handshake: the relay's first line must be this server's own
         # token, read byte-by-byte with a bounded timeout -- a stray/
         # unauthorized local connection is dropped before it ever touches
-        # the session's own viewer registration.
+        # the session's own viewer registration. Second line (P0 hotfix:
+        # garbled Windows terminal rendering): the relay's own REAL
+        # console dimensions ("cols,rows") -- see this module's own
+        # relay-script docstring for why this is the actual fix for the
+        # root cause (a ConPTY spawned at pywinpty's own default size,
+        # completely disconnected from whatever size the real console
+        # the human is looking at happens to be, guarantees a full-screen
+        # TUI's own cursor-position math is wrong for the canvas it's
+        # actually rendered on).
         conn.settimeout(TOKEN_READ_TIMEOUT_SECONDS)
         try:
-            line = b""
-            while not line.endswith(b"\n") and len(line) < 256:
-                chunk = conn.recv(1)
-                if not chunk:
-                    conn.close()
-                    return
-                line += chunk
-            if line.strip().decode("utf-8", errors="replace") != self.token:
+            token_line = _read_line_locked(conn)
+            if token_line is None or token_line.strip() != self.token:
                 conn.close()
                 return
+            size_line = _read_line_locked(conn) or ""
         except OSError:
             conn.close()
             return
@@ -181,6 +215,12 @@ class DesktopBridgeServer:
 
         from .windows_webterm import WindowsTerminalViewer
         viewer = WindowsTerminalViewer(self.backend, self.session_name, readonly=False)
+        cols, rows = _parse_size(size_line)
+        if cols and rows:
+            try:
+                self.backend.resize_from_desktop_viewer(self.session_name, rows, cols)
+            except Exception:  # noqa: BLE001 -- an initial size sync failure must not block the viewer from attaching at all
+                pass
 
         def _pump_session_to_socket() -> None:
             while True:
@@ -274,16 +314,33 @@ try:
 except ImportError:
     msvcrt = None
 
+_cols = _rows = None
 try:
     import win32console
     _h = win32console.GetStdHandle(win32console.STD_OUTPUT_HANDLE)
     _h.SetConsoleMode(_h.GetConsoleMode() | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    # The VISIBLE window rect, not the full scrollback buffer's own Size
+    # -- a full-screen TUI needs to know how many rows/cols are actually
+    # ON SCREEN right now, exactly what a real terminal emulator reports
+    # via TIOCGWINSZ/GetConsoleScreenBufferInfo's own Window field.
+    _info = _h.GetConsoleScreenBufferInfo()
+    _win = _info["Window"]
+    _cols = _win.Right - _win.Left + 1
+    _rows = _win.Bottom - _win.Top + 1
 except Exception:
     pass
 
 host, port, token = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 sock = socket.create_connection((host, port), timeout=5)
 sock.sendall((token + "\\n").encode("utf-8"))
+# Real console size (P0 hotfix: garbled Windows terminal rendering) --
+# the ConPTY this viewer is about to display was spawned at some
+# unrelated default size; this line lets the server sync it to match
+# what's ACTUALLY visible here, once, before any output/input flows.
+# Empty values (both query steps above failed) are still sent -- the
+# server's own _parse_size treats that as "skip the sync", never a
+# guessed fallback.
+sock.sendall(f"{_cols or ''},{_rows or ''}\\n".encode("utf-8"))
 # create_connection's own `timeout` applies to every socket op after
 # connect() too, not just the connect itself -- left at 5s, any quiet gap
 # longer than that between server writes (the ordinary case: a shell

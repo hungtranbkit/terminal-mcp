@@ -62,12 +62,51 @@ def redact_text(text: str) -> str:
     return result
 
 
-ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# Full ECMA-48 CSI shape (real bug found live -- see windows_visible_
+# console.py's report/task's own "P0 hotfix windows terminal rendering"):
+# the pattern above only ever matched digits/`;` as parameter bytes, so a
+# DEC-private-mode sequence (parameter bytes include `?`, e.g. `ESC[?25h`
+# show-cursor, `ESC[?1049h` alternate-screen, `ESC[?2004h` bracketed-
+# paste -- exactly the sequences a real, modern full-screen TUI like
+# Claude Code's own Ink renderer emits constantly) never matched at all
+# and leaked through terminal_tail/terminal_status's "sanitized" output
+# as literal, unreadable escape-code noise. `[0-?]` covers the FULL
+# parameter-byte range (0x30-0x3F: digits, `;:<=>?`), `[ -/]*` the
+# intermediate-byte range (0x20-0x2F), `[@-~]` the final byte
+# (0x40-0x7E) -- the complete CSI grammar, not just the common subset.
+ANSI_CSI_FULL_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+# OSC (Operating System Command) -- window title updates, hyperlinks
+# (OSC 8), shell-integration markers (OSC 133/3008, seen live from this
+# host's own bash prompt) -- terminated by BEL or ST (`ESC\`), never
+# matched by CSI_RE at all (no `[` after ESC). Same shape dashboard.py's
+# own frontend OSC_RE already strips client-side; this is the
+# server-side/tool-output equivalent.
+ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+# Simple two-byte Fp/Fe escapes with no CSI/OSC structure at all -- ESC
+# followed by exactly ONE byte in the 0x30-0x3F/0x40-0x5F range (DEC
+# keypad application/numeric mode `ESC=`/`ESC>`, index/next-line/save-
+# restore-cursor `ESC7`/`ESC8`, ...); a real full-screen TUI emits these
+# too. `[` and `]` are deliberately excluded from this range -- those
+# start CSI/OSC, already fully matched and removed above; stripped last
+# so this never runs against text a fuller sequence above should have
+# consumed instead.
+ANSI_SIMPLE_ESC_RE = re.compile(r"\x1b[0-9:;<=>?@-Z\\^_]")
+# Character-set designation (`ESC ( B`, `ESC ) 0`, ...) -- three bytes,
+# never caught by any of the above.
+ANSI_CHARSET_RE = re.compile(r"\x1b[()][A-Za-z0-9]")
 
 
 def strip_ansi(text: str) -> str:
-    """Remove ANSI CSI escape sequences (colour/style codes and similar)."""
-    return ANSI_CSI_RE.sub("", text)
+    """Remove ANSI/VT control sequences -- CSI (including DEC private-mode
+    parameters), OSC, charset designation, and simple two-byte escapes --
+    so tail/status/history output is readable plain text, never a wall of
+    raw escape codes from a full-screen TUI's own cursor/title/screen-mode
+    control traffic."""
+    text = ANSI_OSC_RE.sub("", text)
+    text = ANSI_CSI_FULL_RE.sub("", text)
+    text = ANSI_CHARSET_RE.sub("", text)
+    text = ANSI_SIMPLE_ESC_RE.sub("", text)
+    return text
 
 
 def redact_ansi_safe(text: str) -> str:

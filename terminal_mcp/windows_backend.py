@@ -263,6 +263,12 @@ class _WindowsSession:
     # evicted" rather than silently re-reading old content or missing a
     # gap.
     total_lines_seen: int = 0
+    # (rows, cols) most recently actually applied via resize()/
+    # resize_from_desktop_viewer() -- an idempotency guard, never a time-
+    # based debounce (see resize()'s own docstring: a genuinely new size
+    # must never be silently dropped, only a REPEAT of the size already
+    # in effect).
+    last_resize_dims: tuple[int, int] | None = None
 
 
 class WindowsSessionBackend:
@@ -604,7 +610,48 @@ class WindowsSessionBackend:
         entry.activity_epoch = int(time.time())
 
     def resize(self, name: str, rows: int, cols: int) -> None:
+        """The WEB terminal's own resize path (windows_webterm.py's
+        WindowsTerminalViewer.resize, driven by the browser's xterm.js
+        fitting to its own window size) -- real bug found live (P0
+        hotfix: garbled/overlapping Windows terminal rendering): with
+        NO resize-ownership concept at all, a browser tab's own resize
+        could silently change the SAME ConPTY's dimensions a physical
+        desktop viewer was ALSO currently rendering, out from under it --
+        a full-screen TUI (Claude Code's own Ink renderer) computes every
+        redraw against ITS OWN believed column/row count, so a mismatch
+        between that and the console it's actually being displayed in
+        produces exactly this kind of corrupted overlapping text. While a
+        desktop viewer is attached and alive, the physical console is the
+        size authority -- a web resize request while one is attached is a
+        deliberate, silent no-op (never an error to the browser; its own
+        xterm.js still renders at ITS size regardless, just letterboxed/
+        cropped relative to what the real PTY is actually producing) --
+        see resize_from_desktop_viewer below for the one path that DOES
+        get to set the authoritative size."""
         entry = self._require(name)
+        with entry.lock:
+            viewer = entry.desktop_viewer
+        if viewer is not None and viewer.isalive():
+            return
+        self._apply_resize(entry, rows, cols)
+
+    def resize_from_desktop_viewer(self, name: str, rows: int, cols: int) -> None:
+        """Called exactly once, right when a desktop viewer's relay
+        process attaches (DesktopBridgeServer._handle_connection,
+        windows_visible_console.py) -- syncs the ConPTY's own dimensions
+        to the REAL physical console's actual size, the fix for the
+        dimension-mismatch root cause above. Bypasses resize()'s own
+        guard entirely (that guard exists specifically to protect an
+        ALREADY-attached desktop viewer from a web resize -- it must
+        never also block the desktop viewer's own initial sync)."""
+        entry = self._require(name)
+        self._apply_resize(entry, rows, cols)
+
+    def _apply_resize(self, entry: "_WindowsSession", rows: int, cols: int) -> None:
+        with entry.lock:
+            if entry.last_resize_dims == (rows, cols):
+                return  # idempotent no-op -- never a redundant syscall for a size that hasn't actually changed
+            entry.last_resize_dims = (rows, cols)
         try:
             entry.proc.setwinsize(rows, cols)
         except Exception:  # noqa: BLE001 -- a resize failure is never fatal to the session

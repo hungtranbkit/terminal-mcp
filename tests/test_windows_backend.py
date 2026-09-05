@@ -515,6 +515,81 @@ def test_get_desktop_metadata_of_unknown_session_is_empty_dict(backend):
     assert backend.get_desktop_metadata("no-such-session-ever") == {}
 
 
+# ---------------------------------------------------------------------------
+# Resize ownership (P0 hotfix: garbled/overlapping Windows terminal
+# rendering) -- real bug found live: a web terminal viewer's own resize
+# (driven by the browser's own window size) could silently change the SAME
+# ConPTY's dimensions a physical desktop viewer was ALSO currently
+# rendering, producing exactly the corrupted/overlapping text a full-
+# screen TUI (Claude Code's own Ink renderer) shows when its believed
+# column/row count doesn't match the canvas it's actually drawn on.
+# ---------------------------------------------------------------------------
+
+def test_resize_applies_normally_with_no_desktop_viewer_attached(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    backend.resize("win-test", 30, 100)
+    assert backend._sessions["win-test"].last_resize_dims == (30, 100)
+
+
+def test_resize_is_ignored_while_a_desktop_viewer_is_attached(backend, tmp_path, monkeypatch):
+    from terminal_mcp import windows_visible_console
+
+    fake_viewer = _FakeDesktopViewer()
+    monkeypatch.setattr(windows_visible_console, "is_available", lambda: (True, None))
+    monkeypatch.setattr(windows_visible_console, "spawn_desktop_viewer", lambda backend, name, cwd: fake_viewer)
+    monkeypatch.setattr(windows_visible_console, "desktop_session_id", lambda: 1)
+    backend.new_session("win-resize-owned", str(tmp_path), show_on_desktop=True)
+
+    # A web viewer's own resize (e.g. browser window resize) must be a
+    # silent no-op -- the physical desktop console is the size authority
+    # while its viewer is attached and alive.
+    backend.resize("win-resize-owned", 40, 120)
+    assert backend._sessions["win-resize-owned"].last_resize_dims is None
+
+
+def test_resize_applies_again_once_the_desktop_viewer_is_gone(backend, tmp_path, monkeypatch):
+    from terminal_mcp import windows_visible_console
+
+    fake_viewer = _FakeDesktopViewer()
+    monkeypatch.setattr(windows_visible_console, "is_available", lambda: (True, None))
+    monkeypatch.setattr(windows_visible_console, "spawn_desktop_viewer", lambda backend, name, cwd: fake_viewer)
+    monkeypatch.setattr(windows_visible_console, "desktop_session_id", lambda: 1)
+    backend.new_session("win-resize-freed", str(tmp_path), show_on_desktop=True)
+
+    fake_viewer._alive = False  # the viewer window was closed
+    backend.resize("win-resize-freed", 40, 120)
+    assert backend._sessions["win-resize-freed"].last_resize_dims == (40, 120)
+
+
+def test_resize_from_desktop_viewer_bypasses_the_ownership_guard(backend, tmp_path, monkeypatch):
+    """The desktop viewer's OWN attach-time size sync must apply even
+    though a desktop viewer is (of course) attached at that exact moment
+    -- resize()'s own guard must never also block this path, or the
+    dimension sync this whole fix exists for could never actually run."""
+    from terminal_mcp import windows_visible_console
+
+    fake_viewer = _FakeDesktopViewer()
+    monkeypatch.setattr(windows_visible_console, "is_available", lambda: (True, None))
+    monkeypatch.setattr(windows_visible_console, "spawn_desktop_viewer", lambda backend, name, cwd: fake_viewer)
+    monkeypatch.setattr(windows_visible_console, "desktop_session_id", lambda: 1)
+    backend.new_session("win-resize-sync", str(tmp_path), show_on_desktop=True)
+
+    backend.resize_from_desktop_viewer("win-resize-sync", 50, 160)
+    assert backend._sessions["win-resize-sync"].last_resize_dims == (50, 160)
+
+
+def test_resize_is_idempotent_for_an_unchanged_size(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    entry = backend._sessions["win-test"]
+    backend.resize("win-test", 24, 80)
+    assert entry.last_resize_dims == (24, 80)
+    # A second call with the SAME size must still be a safe no-op (never
+    # raises, never a redundant syscall) -- verified by simply calling it
+    # again and confirming the recorded dims are unchanged.
+    backend.resize("win-test", 24, 80)
+    assert entry.last_resize_dims == (24, 80)
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
