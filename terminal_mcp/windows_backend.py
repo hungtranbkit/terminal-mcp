@@ -227,13 +227,19 @@ class _WindowsSession:
     # Desktop-visibility metadata (task: "user nhìn tại máy Windows cũng
     # thấy đúng terminal session đang chạy") -- see windows_visible_
     # console.py's own module docstring for the full rationale/mechanism.
-    # `visible` is only ever True when a VisibleConsoleProcess was
-    # actually, successfully spawned -- never assumed from a caller's
-    # own request alone (task item 4's own explicit "Không được giả là
-    # visible").
+    # `visible` is only ever True when a DesktopViewerHandle was
+    # actually, successfully spawned AND is still alive -- never assumed
+    # from a caller's own request alone (task item 4's own explicit
+    # "Không được giả là visible").
     visible: bool = False
     desktop_session_id: int | None = None
     visible_reason: str | None = None
+    # The viewer VIEWING this session's real process (windows_visible_
+    # console.DesktopViewerHandle) -- never the process itself. None
+    # until show_on_desktop is requested (at creation or retroactively);
+    # closing its window sets its own isalive() to False without this
+    # entry, or entry.proc, ever being touched.
+    desktop_viewer: object | None = None
     buffer: deque[str] = field(default_factory=lambda: deque(maxlen=DEFAULT_HISTORY_LINES))
     _partial_line: str = ""
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -354,21 +360,24 @@ class WindowsSessionBackend:
 
     def new_session(self, name: str, cwd: str, command: str | None = None, *,
                     show_on_desktop: bool = False) -> tuple[bool, str | None]:
-        """`show_on_desktop=True` requests a REAL, visible OS console
-        window for this session (task's own explicit ask) instead of the
-        normal headless ConPTY -- via windows_visible_console.py, plugged
-        in as an alternative PtyProcessLike-satisfying process, so every
-        OTHER piece of session management below (reader thread, history
-        buffer, viewer queues, kill, resize) is completely unmodified for
-        a visible session too; this is the ONE place the two paths
-        diverge. Returns (visible, reason) -- `visible` is only True if a
-        visible console was ACTUALLY spawned; a request that can't be
-        honored (no interactive desktop attached to this node-agent's own
-        session, pywin32 missing, ...) falls back to the normal headless
-        ConPTY rather than failing the whole session create, but reports
-        exactly why, for the caller (core.py's terminal_create_session,
-        surfaced to the dashboard) to show honestly -- never silently
-        claims visible when it isn't.
+        """The session's own process is ALWAYS the normal headless ConPTY
+        child (`_spawn_headless`) -- exactly the same as every other
+        session, visible-requested or not. `show_on_desktop=True` does
+        NOT change what gets spawned as the session; it additionally
+        attaches a real, visible desktop VIEWER onto it afterward (see
+        `_attach_desktop_viewer`/windows_visible_console.py's own module
+        docstring for the full rationale: this is the fix for a real,
+        verified-live bug the previous design had, where the session's
+        own shell owned the visible console directly and got force-
+        killed by Windows the instant that window closed).
+
+        Returns (visible, reason) -- `visible` is only True if a viewer
+        window was ACTUALLY spawned; a request that can't be honored (no
+        interactive desktop attached to this node-agent's own session,
+        pywin32 missing, ...) never fails session creation itself, but
+        reports exactly why, for the caller (core.py's terminal_create_
+        session, surfaced to the dashboard) to show honestly -- never
+        silently claims visible when it isn't.
 
         `cwd` is NOT re-validated with validate_windows_cwd here on
         purpose: by the time TerminalService/SessionLifecycleService
@@ -394,37 +403,18 @@ class WindowsSessionBackend:
             if name in self._sessions:
                 raise TmuxError(f"session {name!r} already exists")
         argv = [command] if command else [self.shell]
-        visible = False
-        visible_reason: str | None = None
-        desktop_sid: int | None = None
-        proc: PtyProcessLike
-        if show_on_desktop:
-            from . import windows_visible_console
-            ok, reason = windows_visible_console.is_available()
-            if ok:
-                try:
-                    proc = windows_visible_console.spawn(argv, cwd)
-                    visible = True
-                    desktop_sid = windows_visible_console.desktop_session_id()
-                except windows_visible_console.VisibleConsoleSpawnError as exc:
-                    visible_reason = f"visible console spawn failed, fell back to headless: {exc}"
-                    proc = self._spawn_headless(argv, cwd)
-            else:
-                visible_reason = reason
-                proc = self._spawn_headless(argv, cwd)
-        else:
-            proc = self._spawn_headless(argv, cwd)
+        proc = self._spawn_headless(argv, cwd)
         now = int(time.time())
         entry = _WindowsSession(name=name, proc=proc, cwd=cwd, command=command,
                                 created_epoch=now, activity_epoch=now,
-                                visible=visible, desktop_session_id=desktop_sid,
-                                visible_reason=visible_reason,
                                 buffer=deque(maxlen=self.history_lines))
         with self._registry_lock:
             self._sessions[name] = entry
         entry.reader_thread = threading.Thread(target=self._reader_loop, args=(entry,), daemon=True)
         entry.reader_thread.start()
-        return visible, visible_reason
+        if not show_on_desktop:
+            return False, None
+        return self._attach_desktop_viewer(entry)
 
     def _spawn_headless(self, argv: list[str], cwd: str) -> PtyProcessLike:
         try:
@@ -432,28 +422,74 @@ class WindowsSessionBackend:
         except Exception as exc:  # noqa: BLE001 -- any spawn failure is a real backend error
             raise TmuxError(f"failed to spawn session in {cwd!r}: {exc}") from exc
 
+    def _attach_desktop_viewer(self, entry: "_WindowsSession") -> tuple[bool, str | None]:
+        """Spawns a real, visible desktop viewer for an ALREADY-running
+        session's entry -- used both right after creation (show_on_
+        desktop=True) and retroactively (`show_on_desktop()` below). The
+        session's own entry.proc is never touched or re-spawned here."""
+        from . import windows_visible_console
+        ok, reason = windows_visible_console.is_available()
+        if not ok:
+            entry.visible = False
+            entry.visible_reason = reason
+            return False, reason
+        try:
+            viewer = windows_visible_console.spawn_desktop_viewer(self, entry.name, entry.cwd)
+        except windows_visible_console.VisibleConsoleSpawnError as exc:
+            reason = f"viewer spawn failed: {exc}"
+            entry.visible = False
+            entry.visible_reason = reason
+            return False, reason
+        with entry.lock:
+            entry.desktop_viewer = viewer
+        entry.visible = True
+        entry.visible_reason = None
+        entry.desktop_session_id = windows_visible_console.desktop_session_id()
+        return True, None
+
+    def show_on_desktop(self, name: str) -> tuple[bool, str | None]:
+        """Retroactive "Show on desktop" action (task item 5: a session
+        created headless, or whose viewer window was since closed, can
+        be shown again) -- attaches a NEW viewer to the SAME already-
+        running entry.proc; never spawns a second shell. A no-op success
+        if a viewer is already alive and attached."""
+        entry = self._require(name)
+        with entry.lock:
+            existing = entry.desktop_viewer
+        if existing is not None and existing.isalive():
+            return True, None
+        return self._attach_desktop_viewer(entry)
+
     def desktop_capability(self) -> dict:
         """Coarse, session-independent capability probe (task item 4's
-        "No interactive desktop" reporting, and the future "Show on
-        desktop" action's own pre-check) -- reused by both the create-
-        session path above and a dashboard status query, never a second,
-        possibly-divergent copy of this decision."""
+        "No interactive desktop" reporting, and show_on_desktop()'s own
+        pre-check) -- reused by both the create-session path above and a
+        dashboard status query, never a second, possibly-divergent copy
+        of this decision."""
         from . import windows_visible_console
         ok, reason = windows_visible_console.is_available()
         return {"available": ok, "reason": reason, "desktop_session_id": windows_visible_console.desktop_session_id()}
 
     def get_desktop_metadata(self, name: str) -> dict:
         """Per-session visibility metadata (task item 3: `visible_window`/
-        `desktop_session_id`/pid) -- read-only, never mutates anything.
-        SESSION_NOT_FOUND-shaped (empty dict) for an unknown name rather
-        than raising, since dashboard listing calls this opportunistically
-        for every row and must never let one missing/racing session break
-        the whole listing."""
+        `desktop_session_id`/pid) -- read-only, never mutates anything
+        except entry.visible itself, kept honest against the viewer's
+        OWN currently-alive state (never stuck on the create-time answer:
+        a viewer window the user closed flips this back to False on the
+        very next read, exactly reflecting "hidden now, Show on desktop
+        again if you want it back"). SESSION_NOT_FOUND-shaped (empty
+        dict) for an unknown name rather than raising, since dashboard
+        listing calls this opportunistically for every row and must
+        never let one missing/racing session break the whole listing."""
         with self._registry_lock:
             entry = self._sessions.get(name)
         if entry is None:
             return {}
-        return {"visible_window": entry.visible, "desktop_session_id": entry.desktop_session_id,
+        with entry.lock:
+            viewer = entry.desktop_viewer
+        visible_now = bool(viewer is not None and viewer.isalive())
+        entry.visible = visible_now
+        return {"visible_window": visible_now, "desktop_session_id": entry.desktop_session_id,
                 "pid": entry.proc.pid, "visible_reason": entry.visible_reason}
 
     def detach_session(self, name: str) -> None:
@@ -476,6 +512,18 @@ class WindowsSessionBackend:
         if entry is None:
             raise TmuxError(f"session {name!r} does not exist")
         entry.stop_reading.set()
+        with entry.lock:
+            viewer = entry.desktop_viewer
+        if viewer is not None:
+            # The session itself is going away -- the viewer window (if
+            # any is still open) has nothing left to view, so this is the
+            # one place a viewer window IS force-closed. Never the other
+            # way around (closing the viewer window on its own never
+            # reaches here, never touches entry.proc below).
+            try:
+                viewer.stop()
+            except Exception:  # noqa: BLE001 -- best-effort cleanup only
+                pass
         _kill_process_tree(entry.proc)
 
     def exit_copy_mode(self, session: str) -> None:

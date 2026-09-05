@@ -243,6 +243,26 @@ class TerminalService:
         except Exception:  # noqa: BLE001
             return {}
 
+    def terminal_show_on_desktop(self, session: str) -> dict[str, Any]:
+        """Retroactive "Show on desktop" action (task item 5: a session
+        created headless, or whose viewer window was since closed, can be
+        shown again) -- attaches a NEW viewer to the SAME already-running
+        process, never a second shell. Goes through the exact same
+        session-existence/permission guard every other session-name-
+        taking method here uses; NOT_SUPPORTED on a backend with no such
+        concept at all (tmux) rather than a confusing generic error."""
+        if error := self._guard(session):
+            return error
+        action = getattr(self.tmux, "show_on_desktop", None)
+        if action is None:
+            return {"error": "NOT_SUPPORTED", "session": session,
+                    "reason": "this session's backend has no desktop-viewer concept"}
+        try:
+            visible, reason = action(session)
+        except TmuxError as exc:
+            return {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
+        return {"session": session, "visible_window": visible, "visible_reason": reason}
+
     def resolve_identity(self, session: str) -> SessionIdentity | None:
         try:
             info = self.tmux.get_session(session)

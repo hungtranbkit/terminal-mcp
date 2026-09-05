@@ -321,12 +321,34 @@ def test_exit_copy_mode_is_a_safe_noop(backend, tmp_path):
 # thấy đúng terminal session") -- windows_visible_console.py's own actual
 # Win32 API calls are unverifiable on this Linux dev box (pywin32 doesn't
 # exist here), so these tests monkeypatch its two entry points (is_
-# available/spawn) and verify ONLY windows_backend.py's own dispatch/
-# metadata logic -- exactly the same "test the real wiring, fake only the
-# one platform-specific primitive" discipline this whole file already
-# uses for pywinpty itself (_FakePty stands in for winpty.PtyProcess the
-# same way here).
+# available/spawn_desktop_viewer) and verify ONLY windows_backend.py's own
+# dispatch/metadata logic -- exactly the same "test the real wiring, fake
+# only the one platform-specific primitive" discipline this whole file
+# already uses for pywinpty itself (_FakePty stands in for winpty.
+# PtyProcess the same way here).
+#
+# The real architecture (see windows_visible_console.py's own module
+# docstring for the full "why"): the session's own process is ALWAYS the
+# normal headless ConPTY child -- a viewer is a separate, disposable thing
+# attached to it, never the process itself. `_FakeDesktopViewer` below
+# stands in for windows_visible_console.DesktopViewerHandle: an
+# `isalive()` a test can flip (simulating the user closing the real
+# window) and a `stop()` call log (so kill_session's own cleanup can be
+# asserted without a real process to check).
 # ---------------------------------------------------------------------------
+
+class _FakeDesktopViewer:
+    def __init__(self) -> None:
+        self._alive = True
+        self.stop_calls = 0
+
+    def isalive(self) -> bool:
+        return self._alive
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self._alive = False
+
 
 def test_show_on_desktop_false_is_the_unchanged_default(backend, tmp_path):
     visible, reason = backend.new_session("win-headless-default", str(tmp_path))
@@ -341,8 +363,10 @@ def test_show_on_desktop_false_is_the_unchanged_default(backend, tmp_path):
 def test_show_on_desktop_true_spawns_visible_when_available(backend, tmp_path, monkeypatch):
     from terminal_mcp import windows_visible_console
 
+    fake_viewer = _FakeDesktopViewer()
     monkeypatch.setattr(windows_visible_console, "is_available", lambda: (True, None))
-    monkeypatch.setattr(windows_visible_console, "spawn", lambda argv, cwd: _FakePty(argv, cwd))
+    monkeypatch.setattr(windows_visible_console, "spawn_desktop_viewer",
+                        lambda backend, name, cwd: fake_viewer)
     monkeypatch.setattr(windows_visible_console, "desktop_session_id", lambda: 1)
 
     visible, reason = backend.new_session("win-visible-ok", str(tmp_path), show_on_desktop=True)
@@ -353,9 +377,95 @@ def test_show_on_desktop_true_spawns_visible_when_available(backend, tmp_path, m
     assert meta["desktop_session_id"] == 1
     # The session itself is otherwise a completely normal, working
     # session -- same reader thread/buffer/kill semantics, proven by
-    # actually reading real output through it.
+    # actually reading real output through it. Its own process is a
+    # REAL headless _FakePty throughout -- the fake viewer above never
+    # becomes the session's process the way the old design's `spawn()`
+    # once did.
     info = backend.get_session("win-visible-ok")
     assert info is not None and info.pane_dead is False
+
+
+def test_closing_the_viewer_window_never_kills_the_session(backend, tmp_path, monkeypatch):
+    """The real bug this redesign fixes: with the OLD CREATE_NEW_CONSOLE-
+    as-the-shell design, closing the window force-killed the session
+    (verified live against dell-5530). Here: the viewer's own isalive()
+    flips to False (simulating its window having been closed) and the
+    session's real process must be completely unaffected -- still alive,
+    still readable/writable."""
+    from terminal_mcp import windows_visible_console
+
+    fake_viewer = _FakeDesktopViewer()
+    monkeypatch.setattr(windows_visible_console, "is_available", lambda: (True, None))
+    monkeypatch.setattr(windows_visible_console, "spawn_desktop_viewer",
+                        lambda backend, name, cwd: fake_viewer)
+    monkeypatch.setattr(windows_visible_console, "desktop_session_id", lambda: 1)
+    backend.new_session("win-close-safe", str(tmp_path), show_on_desktop=True)
+    assert backend.get_desktop_metadata("win-close-safe")["visible_window"] is True
+
+    fake_viewer._alive = False  # simulate the user closing the real window
+    meta = backend.get_desktop_metadata("win-close-safe")
+    assert meta["visible_window"] is False  # honestly reflects "hidden now"
+    # The session itself: still a real, live, working process -- never
+    # touched by the viewer window closing.
+    info = backend.get_session("win-close-safe")
+    assert info is not None and info.pane_dead is False
+    assert fake_viewer.stop_calls == 0  # closing the WINDOW is not this backend calling stop()
+
+
+def test_show_on_desktop_retroactive_action_attaches_a_new_viewer(backend, tmp_path, monkeypatch):
+    """Task item 5: a session created headless (or whose viewer window
+    was since closed) can be shown again -- attaching a NEW viewer to the
+    SAME already-running process, never a second shell."""
+    from terminal_mcp import windows_visible_console
+
+    backend.new_session("win-show-later", str(tmp_path))  # headless, no show_on_desktop
+    assert backend.get_desktop_metadata("win-show-later")["visible_window"] is False
+    same_pid = backend.get_session("win-show-later").pane_pid
+
+    fake_viewer = _FakeDesktopViewer()
+    monkeypatch.setattr(windows_visible_console, "is_available", lambda: (True, None))
+    monkeypatch.setattr(windows_visible_console, "spawn_desktop_viewer",
+                        lambda backend, name, cwd: fake_viewer)
+    monkeypatch.setattr(windows_visible_console, "desktop_session_id", lambda: 1)
+
+    visible, reason = backend.show_on_desktop("win-show-later")
+    assert visible is True
+    assert reason is None
+    assert backend.get_desktop_metadata("win-show-later")["visible_window"] is True
+    # Exact same process throughout -- never a second shell spawned.
+    assert backend.get_session("win-show-later").pane_pid == same_pid
+
+
+def test_show_on_desktop_retroactive_action_is_a_noop_if_already_visible(backend, tmp_path, monkeypatch):
+    from terminal_mcp import windows_visible_console
+
+    fake_viewer = _FakeDesktopViewer()
+    spawn_calls = []
+    monkeypatch.setattr(windows_visible_console, "is_available", lambda: (True, None))
+    monkeypatch.setattr(windows_visible_console, "spawn_desktop_viewer",
+                        lambda backend, name, cwd: (spawn_calls.append(1), fake_viewer)[1])
+    monkeypatch.setattr(windows_visible_console, "desktop_session_id", lambda: 1)
+    backend.new_session("win-already-visible", str(tmp_path), show_on_desktop=True)
+    assert len(spawn_calls) == 1
+
+    visible, reason = backend.show_on_desktop("win-already-visible")
+    assert visible is True
+    assert len(spawn_calls) == 1  # no second viewer spawned -- the existing one is still alive
+
+
+def test_kill_session_stops_a_still_open_viewer(backend, tmp_path, monkeypatch):
+    from terminal_mcp import windows_visible_console
+
+    fake_viewer = _FakeDesktopViewer()
+    monkeypatch.setattr(windows_visible_console, "is_available", lambda: (True, None))
+    monkeypatch.setattr(windows_visible_console, "spawn_desktop_viewer",
+                        lambda backend, name, cwd: fake_viewer)
+    monkeypatch.setattr(windows_visible_console, "desktop_session_id", lambda: 1)
+    backend.new_session("win-kill-with-viewer", str(tmp_path), show_on_desktop=True)
+
+    backend.kill_session("win-kill-with-viewer")
+    assert fake_viewer.stop_calls == 1
+    assert backend.get_session("win-kill-with-viewer") is None
 
 
 def test_show_on_desktop_true_falls_back_to_headless_when_unavailable(backend, tmp_path, monkeypatch):
@@ -380,11 +490,11 @@ def test_show_on_desktop_true_falls_back_to_headless_when_unavailable(backend, t
 def test_show_on_desktop_true_falls_back_when_spawn_itself_fails(backend, tmp_path, monkeypatch):
     from terminal_mcp import windows_visible_console
 
-    def _boom(argv, cwd):
+    def _boom(backend, name, cwd):
         raise windows_visible_console.VisibleConsoleSpawnError("CreateProcess failed: access denied")
 
     monkeypatch.setattr(windows_visible_console, "is_available", lambda: (True, None))
-    monkeypatch.setattr(windows_visible_console, "spawn", _boom)
+    monkeypatch.setattr(windows_visible_console, "spawn_desktop_viewer", _boom)
 
     visible, reason = backend.new_session("win-visible-spawn-fail", str(tmp_path), show_on_desktop=True)
     assert visible is False

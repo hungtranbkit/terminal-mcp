@@ -155,21 +155,39 @@ def test_permission_denial_still_enforced_on_windows_backend(tmp_path):
 # logic.
 # ---------------------------------------------------------------------------
 
+class _FakeDesktopViewer:
+    """Stands in for windows_visible_console.DesktopViewerHandle -- the
+    session's own process (a REAL _FakePty, via the windows_service
+    fixture's normal headless path) is never this object; this is only
+    ever the separate, disposable VIEWER (see windows_visible_console.py's
+    own module docstring)."""
+
+    def __init__(self) -> None:
+        self._alive = True
+        self.stop_calls = 0
+
+    def isalive(self) -> bool:
+        return self._alive
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self._alive = False
+
+
 def test_create_session_show_on_desktop_surfaces_in_listings(windows_service, tmp_path, monkeypatch):
-    from tests.test_windows_backend import _FakePty
     from terminal_mcp import windows_visible_console
 
-    script_path = tmp_path / "fake_shell_visible.py"
-    script_path.write_text(_FAKE_SHELL_SCRIPT)
+    spawned_viewers = []
 
-    def _fake_visible_spawn(argv, cwd):
-        # Same argv substitution the windows_service fixture's own
-        # (headless-path) factory already does -- "powershell.exe" isn't
-        # a real binary on this Linux dev host, only the fake script is.
-        return _FakePty([sys.executable, "-u", str(script_path)], cwd)
+    def _spawn_fake_viewer(backend, name, cwd):
+        # A REAL spawn always produces a genuinely new, alive viewer --
+        # never reuses a previously-closed one -- so the fake must too.
+        viewer = _FakeDesktopViewer()
+        spawned_viewers.append(viewer)
+        return viewer
 
     monkeypatch.setattr(windows_visible_console, "is_available", lambda: (True, None))
-    monkeypatch.setattr(windows_visible_console, "spawn", _fake_visible_spawn)
+    monkeypatch.setattr(windows_visible_console, "spawn_desktop_viewer", _spawn_fake_viewer)
     monkeypatch.setattr(windows_visible_console, "desktop_session_id", lambda: 1)
 
     service, _backend = windows_service
@@ -183,6 +201,23 @@ def test_create_session_show_on_desktop_surfaces_in_listings(windows_service, tm
 
     dash_row = {r["name"]: r for r in service.dashboard_list_sessions()["sessions"]}["win-svc-visible"]
     assert dash_row["visible_window"] is True
+
+    # The real bug this redesign fixes: closing the viewer window must
+    # never kill the session -- its own process (a real, live _FakePty)
+    # must go on being readable/sendable exactly as before.
+    spawned_viewers[0]._alive = False
+    assert service.terminal_status("win-svc-visible")["exists"] is True
+    send = service.terminal_send_text("win-svc-visible", "still-alive-after-viewer-closed", press_enter=True)
+    assert "error" not in send
+    row_after = {r["name"]: r for r in service.terminal_list_sessions()["sessions"]}["win-svc-visible"]
+    assert row_after["visible_window"] is False  # honestly reflects the closed window
+
+    # And the retroactive "Show on desktop" action attaches a NEW viewer
+    # to that SAME still-running process -- never a second shell.
+    result2 = service.terminal_show_on_desktop("win-svc-visible")
+    assert result2["visible_window"] is True
+    row_again = {r["name"]: r for r in service.terminal_list_sessions()["sessions"]}["win-svc-visible"]
+    assert row_again["visible_window"] is True
 
 
 def test_create_session_show_on_desktop_false_by_default_no_extra_fields_forced(windows_service, tmp_path):
@@ -217,3 +252,15 @@ def test_desktop_metadata_is_empty_on_the_plain_tmux_backend(tmp_path):
     service = TerminalService(config, tmux=TmuxClient())
     assert service._desktop_metadata_for("anything") == {}
     assert service.terminal_desktop_capability() == {}
+
+
+def test_show_on_desktop_not_supported_on_the_plain_tmux_backend(tmp_path):
+    from terminal_mcp.tmux import TmuxClient
+    config = AppConfig(
+        permissions=PermissionsConfig(True, True), allowed_session_patterns=("test-*",),
+        max_capture_lines=200, default_tail_lines=50,
+        input_policy=InputPolicyConfig(allowed_session_patterns=("test-*",)),
+    )
+    service = TerminalService(config, tmux=TmuxClient())
+    result = service.terminal_show_on_desktop("nonexistent-anyway")
+    assert result["error"] in ("NOT_SUPPORTED", "SESSION_NOT_FOUND", "ACCESS_DENIED")
