@@ -224,6 +224,16 @@ class _WindowsSession:
     command: str | None
     created_epoch: int
     activity_epoch: int
+    # Desktop-visibility metadata (task: "user nhìn tại máy Windows cũng
+    # thấy đúng terminal session đang chạy") -- see windows_visible_
+    # console.py's own module docstring for the full rationale/mechanism.
+    # `visible` is only ever True when a VisibleConsoleProcess was
+    # actually, successfully spawned -- never assumed from a caller's
+    # own request alone (task item 4's own explicit "Không được giả là
+    # visible").
+    visible: bool = False
+    desktop_session_id: int | None = None
+    visible_reason: str | None = None
     buffer: deque[str] = field(default_factory=lambda: deque(maxlen=DEFAULT_HISTORY_LINES))
     _partial_line: str = ""
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -342,43 +352,109 @@ class WindowsSessionBackend:
                 raise TmuxError(f"failed to write key {key!r} to session {session!r}: {exc}") from exc
         entry.activity_epoch = int(time.time())
 
-    def new_session(self, name: str, cwd: str, command: str | None = None) -> None:
-        # `cwd` is NOT re-validated with validate_windows_cwd here on
-        # purpose: by the time TerminalService/SessionLifecycleService
-        # calls this (lifecycle.py's create()), `cwd` is already
-        # resolve_cwd's own OUTPUT -- a real, existing, already-
-        # containment-checked path on THIS machine, produced by pathlib
-        # running natively on whatever OS this process is actually on.
-        # Re-demanding a literal "C:\...\" shape here would be not just
-        # redundant but actively WRONG: it would reject resolve_cwd's own
-        # valid output whenever this backend is exercised against a non-
-        # Windows-shaped (but real, resolved, and correctly contained)
-        # path -- exactly what this project's own test suite does on
-        # this Linux dev host (see tests/test_windows_terminal_service_
-        # integration.py). validate_windows_cwd stays available as a
-        # standalone, independently-tested utility for a caller that
-        # wants to pre-validate a RAW, not-yet-resolved client-supplied
-        # string before it ever reaches resolve_cwd (e.g. windows_agent.
-        # py could use it for an early, friendlier rejection) -- it is
-        # simply not appropriate to call from inside new_session, whose
-        # `cwd` argument is never that raw value.
+    def new_session(self, name: str, cwd: str, command: str | None = None, *,
+                    show_on_desktop: bool = False) -> tuple[bool, str | None]:
+        """`show_on_desktop=True` requests a REAL, visible OS console
+        window for this session (task's own explicit ask) instead of the
+        normal headless ConPTY -- via windows_visible_console.py, plugged
+        in as an alternative PtyProcessLike-satisfying process, so every
+        OTHER piece of session management below (reader thread, history
+        buffer, viewer queues, kill, resize) is completely unmodified for
+        a visible session too; this is the ONE place the two paths
+        diverge. Returns (visible, reason) -- `visible` is only True if a
+        visible console was ACTUALLY spawned; a request that can't be
+        honored (no interactive desktop attached to this node-agent's own
+        session, pywin32 missing, ...) falls back to the normal headless
+        ConPTY rather than failing the whole session create, but reports
+        exactly why, for the caller (core.py's terminal_create_session,
+        surfaced to the dashboard) to show honestly -- never silently
+        claims visible when it isn't.
+
+        `cwd` is NOT re-validated with validate_windows_cwd here on
+        purpose: by the time TerminalService/SessionLifecycleService
+        calls this (lifecycle.py's create()), `cwd` is already
+        resolve_cwd's own OUTPUT -- a real, existing, already-
+        containment-checked path on THIS machine, produced by pathlib
+        running natively on whatever OS this process is actually on.
+        Re-demanding a literal "C:\\...\\" shape here would be not just
+        redundant but actively WRONG: it would reject resolve_cwd's own
+        valid output whenever this backend is exercised against a non-
+        Windows-shaped (but real, resolved, and correctly contained) path
+        -- exactly what this project's own test suite does on this Linux
+        dev host (see tests/test_windows_terminal_service_integration.
+        py). validate_windows_cwd stays available as a standalone,
+        independently-tested utility for a caller that wants to pre-
+        validate a RAW, not-yet-resolved client-supplied string before it
+        ever reaches resolve_cwd (e.g. windows_agent.py could use it for
+        an early, friendlier rejection) -- it is simply not appropriate
+        to call from inside new_session, whose `cwd` argument is never
+        that raw value."""
         validate_windows_session_name(name)
         with self._registry_lock:
             if name in self._sessions:
                 raise TmuxError(f"session {name!r} already exists")
         argv = [command] if command else [self.shell]
-        try:
-            proc = self._process_factory(argv, cwd)
-        except Exception as exc:  # noqa: BLE001 -- any spawn failure is a real backend error
-            raise TmuxError(f"failed to spawn session {name!r}: {exc}") from exc
+        visible = False
+        visible_reason: str | None = None
+        desktop_sid: int | None = None
+        proc: PtyProcessLike
+        if show_on_desktop:
+            from . import windows_visible_console
+            ok, reason = windows_visible_console.is_available()
+            if ok:
+                try:
+                    proc = windows_visible_console.spawn(argv, cwd)
+                    visible = True
+                    desktop_sid = windows_visible_console.desktop_session_id()
+                except windows_visible_console.VisibleConsoleSpawnError as exc:
+                    visible_reason = f"visible console spawn failed, fell back to headless: {exc}"
+                    proc = self._spawn_headless(argv, cwd)
+            else:
+                visible_reason = reason
+                proc = self._spawn_headless(argv, cwd)
+        else:
+            proc = self._spawn_headless(argv, cwd)
         now = int(time.time())
         entry = _WindowsSession(name=name, proc=proc, cwd=cwd, command=command,
                                 created_epoch=now, activity_epoch=now,
+                                visible=visible, desktop_session_id=desktop_sid,
+                                visible_reason=visible_reason,
                                 buffer=deque(maxlen=self.history_lines))
         with self._registry_lock:
             self._sessions[name] = entry
         entry.reader_thread = threading.Thread(target=self._reader_loop, args=(entry,), daemon=True)
         entry.reader_thread.start()
+        return visible, visible_reason
+
+    def _spawn_headless(self, argv: list[str], cwd: str) -> PtyProcessLike:
+        try:
+            return self._process_factory(argv, cwd)
+        except Exception as exc:  # noqa: BLE001 -- any spawn failure is a real backend error
+            raise TmuxError(f"failed to spawn session in {cwd!r}: {exc}") from exc
+
+    def desktop_capability(self) -> dict:
+        """Coarse, session-independent capability probe (task item 4's
+        "No interactive desktop" reporting, and the future "Show on
+        desktop" action's own pre-check) -- reused by both the create-
+        session path above and a dashboard status query, never a second,
+        possibly-divergent copy of this decision."""
+        from . import windows_visible_console
+        ok, reason = windows_visible_console.is_available()
+        return {"available": ok, "reason": reason, "desktop_session_id": windows_visible_console.desktop_session_id()}
+
+    def get_desktop_metadata(self, name: str) -> dict:
+        """Per-session visibility metadata (task item 3: `visible_window`/
+        `desktop_session_id`/pid) -- read-only, never mutates anything.
+        SESSION_NOT_FOUND-shaped (empty dict) for an unknown name rather
+        than raising, since dashboard listing calls this opportunistically
+        for every row and must never let one missing/racing session break
+        the whole listing."""
+        with self._registry_lock:
+            entry = self._sessions.get(name)
+        if entry is None:
+            return {}
+        return {"visible_window": entry.visible, "desktop_session_id": entry.desktop_session_id,
+                "pid": entry.proc.pid, "visible_reason": entry.visible_reason}
 
     def detach_session(self, name: str) -> None:
         entry = self._require(name)

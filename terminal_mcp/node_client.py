@@ -53,7 +53,8 @@ class NodeClient(Protocol):
     def input_context(self, session: str | None = None, binding: str | None = None) -> dict[str, Any]: ...
     def create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
                        initial_prompt: str | None = None, grant_mode: str = "none",
-                       binding: str | None = None, requested_by: str | None = None) -> dict[str, Any]: ...
+                       binding: str | None = None, requested_by: str | None = None,
+                       show_on_desktop: bool = False) -> dict[str, Any]: ...
     def detach_session(self, name: str) -> dict[str, Any]: ...
     def delete_session(self, name: str) -> dict[str, Any]: ...
     def kill_session(self, name: str, confirm_name: str, *, requested_by: str | None = None) -> dict[str, Any]: ...
@@ -102,10 +103,11 @@ class LocalNodeClient:
 
     def create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
                        initial_prompt: str | None = None, grant_mode: str = "none",
-                       binding: str | None = None, requested_by: str | None = None) -> dict[str, Any]:
+                       binding: str | None = None, requested_by: str | None = None,
+                       show_on_desktop: bool = False) -> dict[str, Any]:
         return self._terminal.terminal_create_session(name, agent_type, cwd, initial_prompt=initial_prompt,
                                                        grant_mode=grant_mode, binding=binding,
-                                                       requested_by=requested_by)
+                                                       requested_by=requested_by, show_on_desktop=show_on_desktop)
 
     def detach_session(self, name: str) -> dict[str, Any]:
         return self._terminal.terminal_detach_session(name)
@@ -227,10 +229,12 @@ class RemoteNodeClient:
 
     def create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
                        initial_prompt: str | None = None, grant_mode: str = "none",
-                       binding: str | None = None, requested_by: str | None = None) -> dict[str, Any]:
+                       binding: str | None = None, requested_by: str | None = None,
+                       show_on_desktop: bool = False) -> dict[str, Any]:
         return self._request("POST", "/v1/sessions", body={
             "name": name, "agent_type": agent_type, "cwd": cwd, "initial_prompt": initial_prompt,
             "grant_mode": grant_mode, "binding": binding, "requested_by": requested_by,
+            "show_on_desktop": show_on_desktop,
         })
 
     def detach_session(self, name: str) -> dict[str, Any]:

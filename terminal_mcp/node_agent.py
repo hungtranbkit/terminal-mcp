@@ -175,6 +175,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
             body.get("name", ""), body.get("agent_type", "shell"), body.get("cwd"),
             initial_prompt=body.get("initial_prompt"), grant_mode=body.get("grant_mode", "none"),
             binding=body.get("binding"), requested_by=body.get("requested_by"),
+            show_on_desktop=bool(body.get("show_on_desktop", False)),
         ))
         return JSONResponse(result)
 

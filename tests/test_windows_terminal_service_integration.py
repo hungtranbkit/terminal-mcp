@@ -142,3 +142,78 @@ def test_permission_denial_still_enforced_on_windows_backend(tmp_path):
     finally:
         for name in list(backend._sessions.keys()):
             backend.kill_session(name)
+
+
+# ---------------------------------------------------------------------------
+# Desktop-visible-window metadata, end-to-end through TerminalService
+# (task: "user nhìn tại máy Windows cũng thấy đúng terminal session") --
+# windows_visible_console.py's own real Win32 calls are monkeypatched
+# (unverifiable on this Linux dev host, see test_windows_backend.py's own
+# equivalent tests); everything from terminal_create_session's own
+# show_on_desktop kwarg down through dashboard_list_sessions/terminal_
+# list_sessions' row metadata is real, unmocked TerminalService/core.py
+# logic.
+# ---------------------------------------------------------------------------
+
+def test_create_session_show_on_desktop_surfaces_in_listings(windows_service, tmp_path, monkeypatch):
+    from tests.test_windows_backend import _FakePty
+    from terminal_mcp import windows_visible_console
+
+    script_path = tmp_path / "fake_shell_visible.py"
+    script_path.write_text(_FAKE_SHELL_SCRIPT)
+
+    def _fake_visible_spawn(argv, cwd):
+        # Same argv substitution the windows_service fixture's own
+        # (headless-path) factory already does -- "powershell.exe" isn't
+        # a real binary on this Linux dev host, only the fake script is.
+        return _FakePty([sys.executable, "-u", str(script_path)], cwd)
+
+    monkeypatch.setattr(windows_visible_console, "is_available", lambda: (True, None))
+    monkeypatch.setattr(windows_visible_console, "spawn", _fake_visible_spawn)
+    monkeypatch.setattr(windows_visible_console, "desktop_session_id", lambda: 1)
+
+    service, _backend = windows_service
+    result = service.terminal_create_session("win-svc-visible", "shell", str(tmp_path), show_on_desktop=True)
+    assert result["state"] == "READY"
+    assert result["visible_window"] is True
+
+    mcp_row = {r["name"]: r for r in service.terminal_list_sessions()["sessions"]}["win-svc-visible"]
+    assert mcp_row["visible_window"] is True
+    assert mcp_row["desktop_session_id"] == 1
+
+    dash_row = {r["name"]: r for r in service.dashboard_list_sessions()["sessions"]}["win-svc-visible"]
+    assert dash_row["visible_window"] is True
+
+
+def test_create_session_show_on_desktop_false_by_default_no_extra_fields_forced(windows_service, tmp_path):
+    service, _backend = windows_service
+    result = service.terminal_create_session("win-svc-headless", "shell", str(tmp_path))
+    assert "visible_window" not in result  # only surfaced when actually requested
+    mcp_row = {r["name"]: r for r in service.terminal_list_sessions()["sessions"]}["win-svc-headless"]
+    assert mcp_row["visible_window"] is False
+
+
+def test_desktop_capability_reaches_terminal_service(windows_service, monkeypatch):
+    from terminal_mcp import windows_visible_console
+
+    monkeypatch.setattr(windows_visible_console, "is_available", lambda: (False, "no interactive desktop"))
+    monkeypatch.setattr(windows_visible_console, "desktop_session_id", lambda: None)
+    service, _backend = windows_service
+    assert service.terminal_desktop_capability() == {
+        "available": False, "reason": "no interactive desktop", "desktop_session_id": None,
+    }
+
+
+def test_desktop_metadata_is_empty_on_the_plain_tmux_backend(tmp_path):
+    # core.py's duck-typed dispatch (_desktop_metadata_for/terminal_
+    # desktop_capability) must be a harmless {} on a backend with no such
+    # concept at all -- never raise, never invent a fake answer.
+    from terminal_mcp.tmux import TmuxClient
+    config = AppConfig(
+        permissions=PermissionsConfig(True, True), allowed_session_patterns=("test-*",),
+        max_capture_lines=200, default_tail_lines=50,
+        input_policy=InputPolicyConfig(allowed_session_patterns=("test-*",)),
+    )
+    service = TerminalService(config, tmux=TmuxClient())
+    assert service._desktop_metadata_for("anything") == {}
+    assert service.terminal_desktop_capability() == {}

@@ -217,6 +217,32 @@ class TerminalService:
         # check against a class this module would otherwise never import.
         return "tmux" if hasattr(self.tmux, "binary") else "windows_pty"
 
+    def _desktop_metadata_for(self, session: str) -> dict[str, Any]:
+        """Task item 7 (dashboard: "Desktop visible/Headless"): {} on any
+        backend that has no such concept at all (tmux -- duck-typed via
+        the same `get_desktop_metadata` presence check every other cross-
+        backend dispatch in this file already uses, never an isinstance
+        against a class this module doesn't import), never raises."""
+        getter = getattr(self.tmux, "get_desktop_metadata", None)
+        if getter is None:
+            return {}
+        try:
+            return getter(session) or {}
+        except Exception:  # noqa: BLE001 -- desktop metadata is informational only, never fatal to a listing
+            return {}
+
+    def terminal_desktop_capability(self) -> dict[str, Any]:
+        """Session-independent probe (task item 4/6): can a NEW session
+        on THIS node even be created with show_on_desktop=True right now
+        -- {} on a backend with no such concept (tmux)."""
+        getter = getattr(self.tmux, "desktop_capability", None)
+        if getter is None:
+            return {}
+        try:
+            return getter() or {}
+        except Exception:  # noqa: BLE001
+            return {}
+
     def resolve_identity(self, session: str) -> SessionIdentity | None:
         try:
             info = self.tmux.get_session(session)
@@ -503,14 +529,16 @@ class TerminalService:
                 and self._input_authorized_with_grant(
                     item.name, grant, current_identity=SessionIdentity.from_session_info(item))[0]
             )
-            sessions.append({
+            row = {
                 "name": item.name, "allowed": session_allowed(item.name, self.config), "attached": item.attached,
                 "windows": item.windows, "created": iso_timestamp(item.created_epoch),
                 "activity": iso_timestamp(item.activity_epoch),
                 "read_allowed": read_allowed, "read_granted": read_granted,
                 "input_allowed": input_allowed, "input_granted": input_granted,
                 "effective_read": read_allowed, "effective_input": input_allowed,
-            })
+            }
+            row.update(self._desktop_metadata_for(item.name))
+            sessions.append(row)
         self._reconcile_session_registry(items, grants_by_session)
         return {"sessions": sessions}
 
@@ -1559,6 +1587,7 @@ class TerminalService:
                 "effective_read": self._read_authorized_with_grant(item.name, grant),
                 "effective_input": effective_input,
             }
+            row.update(self._desktop_metadata_for(item.name))
             # UX gap fix: an operator needs to know WHY the input-grant
             # control is (or would be) blocked, not just that it is --
             # only computed when it's actually relevant (statically input-
@@ -1873,7 +1902,8 @@ class TerminalService:
 
     def terminal_create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
                                 initial_prompt: str | None = None, grant_mode: str = "none",
-                                binding: str | None = None, requested_by: str | None = None) -> dict[str, Any]:
+                                binding: str | None = None, requested_by: str | None = None,
+                                show_on_desktop: bool = False) -> dict[str, Any]:
         """Create a new detached tmux session running a plain shell, or
         Claude/Codex via a server-side-only launcher (config.session_
         lifecycle.launch_commands -- agent_type never becomes a command
@@ -1902,7 +1932,7 @@ class TerminalService:
         if grant_mode not in ("none", "read", "read_send"):
             self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_GRANT_MODE")
             return {"error": "INVALID_GRANT_MODE", "session": name}
-        result = self.lifecycle.create(name, agent_type, cwd)
+        result = self.lifecycle.create(name, agent_type, cwd, show_on_desktop=show_on_desktop)
         ok = "error" not in result
         self.audit.record(action=action, session=name, result="CREATED" if ok else "BLOCKED",
                           reason=result.get("error") or f"agent_type={agent_type}")

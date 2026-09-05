@@ -2718,6 +2718,10 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         </select>
         <div class="cs-hint">Tạo session không tự cấp quyền -- chọn ở đây nếu muốn xem/dùng ngay, hoặc để mặc định rồi cấp sau trong danh sách.</div>
       </div>
+      <div>
+        <label><input type="checkbox" id="csShowOnDesktop" checked> Hiện cửa sổ thật trên desktop Windows</label>
+        <div class="cs-hint">Chỉ áp dụng cho node Windows có desktop tương tác đang đăng nhập -- không có tác dụng trên node Linux/tmux. Nếu không có desktop tương tác, session vẫn tạo bình thường ở chế độ headless (không giả là visible).</div>
+      </div>
       <div class="cs-error" id="csError"></div>
       <button type="submit" class="cs-submit" id="csSubmitBtn">Tạo session</button>
     </form>
@@ -2742,6 +2746,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     const csNameEl = document.querySelector('#csName');
     const csCwdEl = document.querySelector('#csCwd');
     const csGrantEl = document.querySelector('#csGrant');
+    const csShowOnDesktopEl = document.querySelector('#csShowOnDesktop');
     const csAgentChoicesEl = document.querySelector('#csAgentChoices');
     const csNodeEl = document.querySelector('#csNode');
     const csNodeHintEl = document.querySelector('#csNodeHint');
@@ -2966,7 +2971,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       try {
         const response = await fetch('/dashboard/api/session/create', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, grant_mode: csGrantEl.value}),
+          body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, grant_mode: csGrantEl.value, show_on_desktop: csShowOnDesktopEl.checked}),
         });
         const result = await response.json().catch(() => ({}));
         if (result && result.error) {
@@ -3250,8 +3255,19 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         // "detached" as if it were.
         const tdAttach = document.createElement('td');
         const dot = document.createElement('span'); dot.className = 'attach-dot on';
-        tdAttach.append(dot, document.createTextNode(
-          `Running · ${row.attached ? 'Terminal attached' : 'No terminal attached'}`));
+        let statusText = `Running · ${row.attached ? 'Terminal attached' : 'No terminal attached'}`;
+        // Desktop visibility (task item 7) -- only ever shown for a
+        // Windows/non-tmux-backend row, which is the only kind that has
+        // this concept at all; a real, currently-visible native window
+        // is a DIFFERENT thing from "a web terminal client attached"
+        // above, so this is always its own, separate clause, never
+        // conflated with it.
+        if ((row.session_backend || 'tmux') !== 'tmux') {
+          if (row.visible_window) statusText += ' · 🖥 Visible on desktop';
+          else if (row.visible_reason) statusText += ' · ⬛ Headless (No interactive desktop)';
+          else statusText += ' · ⬛ Headless';
+        }
+        tdAttach.append(dot, document.createTextNode(statusText));
         tr.appendChild(tdAttach);
 
         const tdWindows = document.createElement('td'); tdWindows.textContent = row.windows;
@@ -5025,12 +5041,20 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         grant_mode = body.get("grant_mode", "none") if isinstance(body, dict) else "none"
         if grant_mode not in ("none", "read", "read_send"):
             return JSONResponse({"error": "INVALID_GRANT_MODE", "session": name}, status_code=400)
+        # Windows visible-desktop-window request (task: "user nhìn tại
+        # máy Windows cũng thấy đúng terminal session") -- a plain no-op
+        # on a Linux/tmux node, and never assumed to have actually
+        # succeeded even on a Windows one: the response's own
+        # visible_window field (surfaced from lifecycle.py's create())
+        # says whether it really did.
+        show_on_desktop = bool(body.get("show_on_desktop", False)) if isinstance(body, dict) else False
         granted_by = identity.email if identity else None
-        _log.info("dashboard create_session name=%s agent_type=%s node=%s grant_mode=%s identity=%s",
-                 name, agent_type, node, grant_mode, granted_by)
+        _log.info("dashboard create_session name=%s agent_type=%s node=%s grant_mode=%s show_on_desktop=%s identity=%s",
+                 name, agent_type, node, grant_mode, show_on_desktop, granted_by)
         result = await anyio.to_thread.run_sync(
             lambda: _routed(lambda: controller.terminal_create_session(
-                name, agent_type, cwd, node=node, grant_mode=grant_mode, requested_by=granted_by))
+                name, agent_type, cwd, node=node, grant_mode=grant_mode, requested_by=granted_by,
+                show_on_desktop=show_on_desktop))
         )
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})

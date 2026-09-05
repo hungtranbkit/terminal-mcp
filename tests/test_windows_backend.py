@@ -316,6 +316,95 @@ def test_exit_copy_mode_is_a_safe_noop(backend, tmp_path):
     assert backend.get_session("win-test").pane_dead is False
 
 
+# ---------------------------------------------------------------------------
+# Desktop-visible-window wiring (task: "user nhìn tại máy Windows cũng
+# thấy đúng terminal session") -- windows_visible_console.py's own actual
+# Win32 API calls are unverifiable on this Linux dev box (pywin32 doesn't
+# exist here), so these tests monkeypatch its two entry points (is_
+# available/spawn) and verify ONLY windows_backend.py's own dispatch/
+# metadata logic -- exactly the same "test the real wiring, fake only the
+# one platform-specific primitive" discipline this whole file already
+# uses for pywinpty itself (_FakePty stands in for winpty.PtyProcess the
+# same way here).
+# ---------------------------------------------------------------------------
+
+def test_show_on_desktop_false_is_the_unchanged_default(backend, tmp_path):
+    visible, reason = backend.new_session("win-headless-default", str(tmp_path))
+    assert visible is False
+    assert reason is None
+    assert backend.get_desktop_metadata("win-headless-default") == {
+        "visible_window": False, "desktop_session_id": None, "pid": backend.get_session("win-headless-default").pane_pid,
+        "visible_reason": None,
+    }
+
+
+def test_show_on_desktop_true_spawns_visible_when_available(backend, tmp_path, monkeypatch):
+    from terminal_mcp import windows_visible_console
+
+    monkeypatch.setattr(windows_visible_console, "is_available", lambda: (True, None))
+    monkeypatch.setattr(windows_visible_console, "spawn", lambda argv, cwd: _FakePty(argv, cwd))
+    monkeypatch.setattr(windows_visible_console, "desktop_session_id", lambda: 1)
+
+    visible, reason = backend.new_session("win-visible-ok", str(tmp_path), show_on_desktop=True)
+    assert visible is True
+    assert reason is None
+    meta = backend.get_desktop_metadata("win-visible-ok")
+    assert meta["visible_window"] is True
+    assert meta["desktop_session_id"] == 1
+    # The session itself is otherwise a completely normal, working
+    # session -- same reader thread/buffer/kill semantics, proven by
+    # actually reading real output through it.
+    info = backend.get_session("win-visible-ok")
+    assert info is not None and info.pane_dead is False
+
+
+def test_show_on_desktop_true_falls_back_to_headless_when_unavailable(backend, tmp_path, monkeypatch):
+    from terminal_mcp import windows_visible_console
+
+    monkeypatch.setattr(windows_visible_console, "is_available",
+                        lambda: (False, "this node-agent process is running in session 0, but the "
+                                        "active interactive desktop is session 1"))
+
+    visible, reason = backend.new_session("win-visible-fallback", str(tmp_path), show_on_desktop=True)
+    assert visible is False
+    assert reason is not None and "session 0" in reason
+    meta = backend.get_desktop_metadata("win-visible-fallback")
+    assert meta["visible_window"] is False
+    assert meta["visible_reason"] == reason
+    # Never silently drops the session create itself -- still a real,
+    # working (just headless) session.
+    info = backend.get_session("win-visible-fallback")
+    assert info is not None and info.pane_dead is False
+
+
+def test_show_on_desktop_true_falls_back_when_spawn_itself_fails(backend, tmp_path, monkeypatch):
+    from terminal_mcp import windows_visible_console
+
+    def _boom(argv, cwd):
+        raise windows_visible_console.VisibleConsoleSpawnError("CreateProcess failed: access denied")
+
+    monkeypatch.setattr(windows_visible_console, "is_available", lambda: (True, None))
+    monkeypatch.setattr(windows_visible_console, "spawn", _boom)
+
+    visible, reason = backend.new_session("win-visible-spawn-fail", str(tmp_path), show_on_desktop=True)
+    assert visible is False
+    assert reason is not None and "access denied" in reason
+    assert backend.get_session("win-visible-spawn-fail") is not None  # headless fallback still created
+
+
+def test_desktop_capability_passthrough(backend, monkeypatch):
+    from terminal_mcp import windows_visible_console
+
+    monkeypatch.setattr(windows_visible_console, "is_available", lambda: (False, "no interactive desktop"))
+    monkeypatch.setattr(windows_visible_console, "desktop_session_id", lambda: None)
+    result = backend.desktop_capability()
+    assert result == {"available": False, "reason": "no interactive desktop", "desktop_session_id": None}
+
+
+def test_get_desktop_metadata_of_unknown_session_is_empty_dict(backend):
+    assert backend.get_desktop_metadata("no-such-session-ever") == {}
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)

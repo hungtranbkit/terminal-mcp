@@ -224,7 +224,8 @@ def build_mcp(service: TerminalService | None = None,
     @server.tool()
     def terminal_create_session(name: str, agent_type: str = "shell", working_directory: str | None = None,
                                 initial_prompt: str | None = None, grant_mode: str = "none",
-                                binding: str | None = None, node: str = "auto") -> dict:
+                                binding: str | None = None, node: str = "auto",
+                                show_on_desktop: bool = False) -> dict:
         """Create a new, detached tmux session -- agent_type is "shell"
         (plain default shell), "claude", or "codex" (launched via a fixed,
         server-side-only command from config, never anything this caller
@@ -256,11 +257,24 @@ def build_mcp(service: TerminalService | None = None,
         send_text path every other prompt in this project uses -- if your
         effective permission doesn't cover this session yet, that send
         comes back ACCESS_DENIED, exactly like any other ungranted
-        session. binding, if given, additionally calls terminal_bind."""
+        session. binding, if given, additionally calls terminal_bind.
+
+        show_on_desktop (Windows nodes only, default False): requests a
+        REAL, visible OS console window on that node's own interactive
+        desktop for this session, instead of the normal headless
+        background process -- the SAME process either way (dashboard/
+        MCP reads and writes go to that exact window, never a second,
+        mirrored one). Only actually happens if that node's own node-
+        agent is running in the currently active interactive desktop
+        session (never assumed) -- the response's own visible_window
+        field says whether it really did; a request that can't be
+        honored falls back to a normal headless session rather than
+        failing the create outright. Always False (no-op) on Linux/tmux
+        nodes, which have no such concept."""
         _refresh_local_heartbeat()
         return controller.terminal_create_session(
             name, agent_type, working_directory, node=node, initial_prompt=initial_prompt,
-            grant_mode=grant_mode, binding=binding, requested_by="mcp",
+            grant_mode=grant_mode, binding=binding, requested_by="mcp", show_on_desktop=show_on_desktop,
         )
 
     @server.tool()

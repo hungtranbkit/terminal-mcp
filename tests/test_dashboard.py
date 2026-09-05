@@ -97,6 +97,23 @@ def test_sessions_admin_row_badge_shows_effective_state_not_just_stored_grant():
     assert "perm-badge.stale" in SESSIONS_ADMIN_HTML
 
 
+def test_sessions_admin_shows_windows_desktop_visibility_never_for_tmux():
+    # Task item 7: "Running/Idle, Desktop visible/Headless, Web terminal
+    # connected/disconnected" -- the desktop-visibility clause must only
+    # ever render for a non-tmux (Windows) backend row, and must say so
+    # honestly (never "Visible" unless the backend actually reports
+    # visible_window=true).
+    assert "if ((row.session_backend || 'tmux') !== 'tmux') {" in SESSIONS_ADMIN_HTML
+    assert "🖥 Visible on desktop" in SESSIONS_ADMIN_HTML
+    assert "⬛ Headless (No interactive desktop)" in SESSIONS_ADMIN_HTML
+    assert "row.visible_window" in SESSIONS_ADMIN_HTML
+
+
+def test_create_session_modal_has_show_on_desktop_option():
+    assert 'id="csShowOnDesktop"' in SESSIONS_ADMIN_HTML
+    assert "show_on_desktop: csShowOnDesktopEl.checked" in SESSIONS_ADMIN_HTML
+
+
 def test_sessions_admin_reuses_the_permission_modal_and_bulk_bar():
     assert "function openPermModal(" in SESSIONS_ADMIN_HTML
     assert "function applyPreset(" in SESSIONS_ADMIN_HTML
@@ -1729,7 +1746,8 @@ def test_sessions_admin_node_capability_filter_mirrors_scheduler_eligibility():
 
 
 def test_sessions_admin_create_sends_node_field_and_refetches_on_agent_change():
-    assert "body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, grant_mode: csGrantEl.value})" in SESSIONS_ADMIN_HTML
+    assert ("body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, "
+           "grant_mode: csGrantEl.value, show_on_desktop: csShowOnDesktopEl.checked})") in SESSIONS_ADMIN_HTML
     assert "renderNodeOptions(); // re-filter the SAME cached node list -- no re-fetch needed just for this" in SESSIONS_ADMIN_HTML
     assert "loadNodesForCreateModal(); // fresh every open" in SESSIONS_ADMIN_HTML
 

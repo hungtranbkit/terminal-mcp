@@ -97,7 +97,8 @@ class FakeNodeClient:
         return {}
 
     def create_session(self, name, agent_type="shell", cwd=None, *, initial_prompt=None,
-                       grant_mode="none", binding=None, requested_by=None) -> dict[str, Any]:
+                       grant_mode="none", binding=None, requested_by=None,
+                       show_on_desktop=False) -> dict[str, Any]:
         self.calls.append(("create_session", name))
         if self.broken:
             raise NodeClientError("simulated transport failure")

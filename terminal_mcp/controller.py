@@ -457,7 +457,7 @@ class ControllerService:
     def terminal_create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
                                 node: str = "auto", platform: str | None = None, initial_prompt: str | None = None,
                                 grant_mode: str = "none", binding: str | None = None,
-                                requested_by: str | None = None) -> dict[str, Any]:
+                                requested_by: str | None = None, show_on_desktop: bool = False) -> dict[str, Any]:
         existing = self.resolve_session(name)
         if "error" not in existing:
             return {"error": "SESSION_ALREADY_EXISTS", "session": name, "node_id": existing["node_id"]}
@@ -503,7 +503,8 @@ class ControllerService:
             return {"error": "NODE_UNREACHABLE", "node_id": node_id}
         try:
             result = client.create_session(name, agent_type, cwd, initial_prompt=initial_prompt,
-                                           grant_mode=grant_mode, binding=binding, requested_by=requested_by)
+                                           grant_mode=grant_mode, binding=binding, requested_by=requested_by,
+                                           show_on_desktop=show_on_desktop)
         except NodeClientError as exc:
             return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
         if isinstance(result, dict) and "error" not in result:

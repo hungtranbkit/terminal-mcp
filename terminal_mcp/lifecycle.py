@@ -81,7 +81,8 @@ class SessionLifecycleService:
             return {"error": "INVALID_AGENT_TYPE", "agent_type": agent_type}
         return None
 
-    def create(self, name: str, agent_type: str, cwd: str | None) -> dict[str, Any]:
+    def create(self, name: str, agent_type: str, cwd: str | None, *,
+              show_on_desktop: bool = False) -> dict[str, Any]:
         """Create one new detached session, then poll (bounded by
         config.session_lifecycle.create_ready_timeout_seconds) for
         evidence the launched process actually started. Returns a receipt
@@ -112,9 +113,11 @@ class SessionLifecycleService:
         if agent_type != "shell" and not command:
             return {"error": "LAUNCHER_NOT_CONFIGURED", "agent_type": agent_type, "state": "FAILED"}
         try:
-            self.tmux.new_session(name, str(resolved_cwd), command)
+            spawn_result = self.tmux.new_session(name, str(resolved_cwd), command,
+                                                 show_on_desktop=show_on_desktop)
         except TmuxError as exc:
             return {"error": "LAUNCH_FAILED", "session": name, "reason": str(exc), "state": "FAILED"}
+        visible, visible_reason = spawn_result if isinstance(spawn_result, tuple) else (False, None)
 
         expected_command = Path(command).name.casefold() if command else None
         deadline = time.monotonic() + self.config.session_lifecycle.create_ready_timeout_seconds
@@ -145,11 +148,19 @@ class SessionLifecycleService:
                 break
             time.sleep(CREATE_POLL_INTERVAL_SECONDS)
 
-        return {
+        result = {
             "session": name, "agent_type": agent_type, "cwd": str(resolved_cwd), "state": state,
             "session_id": info.session_id, "pane_id": info.pane_id,
             "pane_current_command": info.pane_current_command, "created_epoch": info.created_epoch,
         }
+        # Only surfaced when actually requested -- never a new, always-
+        # present field an existing (tmux-only, or headless-by-default
+        # Windows) caller would need to start ignoring.
+        if show_on_desktop:
+            result["visible_window"] = visible
+            if visible_reason:
+                result["visible_window_reason"] = visible_reason
+        return result
 
     def detach(self, name: str) -> dict[str, Any]:
         """Detach any attached client -- never kills the session/process,

@@ -144,7 +144,8 @@ class TmuxClient:
         for key in keys:
             self._run(["send-keys", "-t", session, key])
 
-    def new_session(self, name: str, cwd: str, command: str | None = None) -> None:
+    def new_session(self, name: str, cwd: str, command: str | None = None, *,
+                    show_on_desktop: bool = False) -> tuple[bool, str | None]:
         """Create ONE new detached session -- `-d` (never attaches this
         process itself to it) and `-c cwd` (the session's starting working
         directory, already resolved/allowlist-checked by the caller --
@@ -152,11 +153,24 @@ class TmuxClient:
         initial program (e.g. "claude"/"codex", from config.session_
         lifecycle.launch_commands -- never client-supplied text); omitted,
         the session starts the pane's normal default shell, exactly like
-        a bare `tmux new -s NAME`."""
+        a bare `tmux new -s NAME`.
+
+        `show_on_desktop` is a Windows-only concept (windows_backend.py's
+        own visible-console feature, task: "user nhìn tại máy Windows
+        cũng thấy đúng terminal session") -- accepted here purely for
+        SessionBackend Protocol shape parity, always a no-op: a real tmux
+        session already has a native, always-available way to be viewed
+        on a real terminal (`tmux attach -t <name>`, or this dashboard's
+        own Open Terminal), so there is nothing extra for this flag to do
+        on Linux."""
         args = ["new-session", "-d", "-s", name, "-c", cwd]
         if command:
             args.append(command)
         self._run(args)
+        reason = ("tmux sessions have no separate 'visible on desktop' concept -- "
+                  "already viewable via `tmux attach -t " + name + "` from any real terminal"
+                  ) if show_on_desktop else None
+        return False, reason
 
     def detach_session(self, name: str) -> None:
         """Detach every client currently attached to `name` -- does not
