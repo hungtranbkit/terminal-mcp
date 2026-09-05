@@ -99,6 +99,19 @@ supervisor:
 #   create_ready_timeout_seconds: 5
 #   default_grant_mode: none   # none | read | read_send
 
+# Session Knowledge Store: captures every session's REAL (redacted) output
+# into a durable, searchable record (session_knowledge.py) for search/
+# timeline/recovery -- terminal_knowledge_search/_timeline/_recover/
+# _checkpoint (MCP tools + dashboard History panel). Disabled by default:
+# capture has a real side effect on the actual tmux pane (`pipe-pane`,
+# for Linux/tmux sessions) for EVERY session this process's own reconcile
+# pass sees, including ones this config had nothing to do with creating --
+# only ever captures a session whose cwd resolves inside session_
+# lifecycle.allowed_cwd_roots above (a second, independent safety layer),
+# but that alone is not a substitute for deliberately opting in here.
+# session_knowledge:
+#   enabled: false
+
 # Periodic SQLite maintenance: retention pruning (audit.db's input_audit/
 # idempotent_sends, supervisor.db's supervisor_actions -- supervisor_events
 # already has its own event_retention above, pruned every v1 poll cycle)

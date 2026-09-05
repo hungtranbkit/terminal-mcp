@@ -106,6 +106,18 @@ session_lifecycle:
   create_ready_timeout_seconds: 6
   default_grant_mode: none
 
+# Session Knowledge Store: captures every session's REAL output (redacted)
+# into a searchable, durable record (session_knowledge.py) -- disabled by
+# default (see SessionKnowledgeConfig's own docstring for why: capture has
+# a real side effect on the actual tmux pane). Explicitly opted in here so
+# real, currently-attended sessions above (terminal-mcp, codex-main,
+# projectflow-main, promptflow, mesflow, nail, server-hub) get searchable
+# history/recovery going forward -- capture is a pure output tap via tmux's
+# own pipe-pane, never touches keystroke input or the session's own
+# process, so an attached human is unaffected.
+session_knowledge:
+  enabled: true
+
 # Multi-node: real Windows worker node (dell-5530, tranv@192.168.1.250),
 # bootstrapped live over SSH -- see docs/multi-node.md's own "LAN
 # discovery + remote connect" and "Windows node support" sections.
