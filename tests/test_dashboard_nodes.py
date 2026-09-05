@@ -31,7 +31,14 @@ def _config() -> AppConfig:
 
 
 def _client(tmp_path) -> tuple[TestClient, ControllerService]:
-    service = TerminalService(_config())
+    # grants (and audit/bindings/leases/killed_sessions) default to this
+    # host's REAL ~/.local/state/terminal-mcp/*.db when not given
+    # explicitly -- isolated here so this file's grant-read/grant-input
+    # tests can never leak a test session name into real production
+    # state (found live: a prior run had left "test-grant-local-..."
+    # rows sitting in the real grants.db -- since cleaned up).
+    from terminal_mcp.grants import SessionGrantStore
+    service = TerminalService(_config(), grants=SessionGrantStore(tmp_path / "grants.db"))
     registry = NodeRegistry(tmp_path / "nodes.db")
     controller = ControllerService(registry, local_client=LocalNodeClient(service), local_workspace_root=str(tmp_path))
     server = build_mcp(service)

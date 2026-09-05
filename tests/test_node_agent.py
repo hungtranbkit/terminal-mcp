@@ -41,7 +41,14 @@ def _config(tmp_path) -> AppConfig:
 
 @pytest.fixture
 def agent_client(tmp_path):
-    terminal = TerminalService(_config(tmp_path))
+    # grants (and audit/bindings/leases/killed_sessions) default to this
+    # host's REAL ~/.local/state/terminal-mcp/*.db when not given
+    # explicitly -- isolated here so test_grant_read_and_grant_input_
+    # round_trip (and any future grant-mutating test in this file) can
+    # never leak a test session name ("agent-grant") into real
+    # production state (found live -- since cleaned up).
+    from terminal_mcp.grants import SessionGrantStore
+    terminal = TerminalService(_config(tmp_path), grants=SessionGrantStore(tmp_path / "grants.db"))
     app = build_node_agent(node_id="test-node", terminal=terminal, token=TOKEN, workspace_root=str(tmp_path))
     created: list[str] = []
     client = TestClient(app)

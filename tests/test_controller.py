@@ -36,7 +36,17 @@ def _config(tmp_path, *, read=True, input=True) -> AppConfig:
 
 
 def _controller(tmp_path, *, read=True, input=True) -> tuple[ControllerService, TerminalService]:
-    service = TerminalService(_config(tmp_path, read=read, input=input))
+    # grants/audit/bindings/leases/killed_sessions all default to this
+    # host's REAL ~/.local/state/terminal-mcp/*.db when not given
+    # explicitly (TerminalService.__init__) -- isolated here so this
+    # test suite's own grant-read/grant-input/create/kill/reopen calls
+    # (test_remote_session_grant_reaches_the_remote_node_not_local and
+    # friends) can never leak a test session name into real production
+    # state. Found live: a prior run of this exact suite had left
+    # "ctrl-grant-local"/"ctrl-amb-grant" sitting in the real grants.db.
+    from terminal_mcp.grants import SessionGrantStore
+    service = TerminalService(_config(tmp_path, read=read, input=input),
+                              grants=SessionGrantStore(tmp_path / "grants.db"))
     registry = NodeRegistry(tmp_path / "nodes.db")
     controller = ControllerService(registry, local_client=LocalNodeClient(service),
                                    local_workspace_root=str(tmp_path))

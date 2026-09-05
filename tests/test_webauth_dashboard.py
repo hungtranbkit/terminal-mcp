@@ -43,7 +43,15 @@ def _config() -> AppConfig:
 
 
 def _build(tmp_path, *, must_change_password=False, with_cf_dashboard=True, controller=None):
-    service = TerminalService(_config(), audit=AuditStore(tmp_path / "audit.db"))
+    # grants (like audit here) defaults to this host's REAL
+    # ~/.local/state/terminal-mcp/grants.db when not given explicitly --
+    # isolated so this file's grant-read/grant-input tests can never
+    # leak a test session name into real production state (found live:
+    # a prior run had left "test-webauth-grant-fallback" sitting in the
+    # real grants.db -- since cleaned up).
+    from terminal_mcp.grants import SessionGrantStore
+    service = TerminalService(_config(), audit=AuditStore(tmp_path / "audit.db"),
+                              grants=SessionGrantStore(tmp_path / "grants.db"))
     webauth = WebAuthStore(tmp_path / "webauth.db")
     webauth.create_or_replace_user("admin", ADMIN_PASSWORD, must_change_password=must_change_password)
     server = build_mcp(service)
@@ -235,11 +243,13 @@ def test_mutation_with_cross_site_origin_is_blocked_even_with_valid_session(tmp_
 
 def test_grant_read_with_node_id_routes_through_controller_when_given(tmp_path):
     from terminal_mcp.controller import ControllerService
+    from terminal_mcp.grants import SessionGrantStore
     from terminal_mcp.host_metrics import NodeMetrics
     from terminal_mcp.node_client import LocalNodeClient
     from terminal_mcp.node_registry import NodeRegistry
 
-    service = TerminalService(_config(), audit=AuditStore(tmp_path / "audit.db"))
+    service = TerminalService(_config(), audit=AuditStore(tmp_path / "audit.db"),
+                              grants=SessionGrantStore(tmp_path / "grants.db"))
     registry = NodeRegistry(tmp_path / "nodes.db")
     controller = ControllerService(registry, local_client=LocalNodeClient(service), local_workspace_root=str(tmp_path))
     controller.registry.register("worker", display_name="Worker", hostname="worker-host", endpoint="http://worker")
