@@ -284,6 +284,16 @@ except Exception:
 host, port, token = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 sock = socket.create_connection((host, port), timeout=5)
 sock.sendall((token + "\\n").encode("utf-8"))
+# create_connection's own `timeout` applies to every socket op after
+# connect() too, not just the connect itself -- left at 5s, any quiet gap
+# longer than that between server writes (the ordinary case: a shell
+# just sitting idle at its prompt) raises socket.timeout on the next
+# recv(), which looks exactly like the server having closed the
+# connection. Real bug, caught live: the viewer would silently stop
+# updating a few seconds after opening, well before anyone closed
+# anything. Back to blocking (no timeout) once connected, matching the
+# server side's own conn.settimeout(None) after its handshake.
+sock.settimeout(None)
 
 
 def pump_output():
