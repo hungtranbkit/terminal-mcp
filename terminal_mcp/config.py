@@ -142,6 +142,27 @@ class DashboardConfig:
 
 
 @dataclass(frozen=True)
+class SessionKnowledgeConfig:
+    """Session Knowledge Store (session_knowledge.py) -- captures every
+    session's REAL output for search/timeline/recovery. Disabled by
+    default, same posture as session_lifecycle/terminal_input above, and
+    for an even more concrete reason than "not yet reviewed": capture has
+    a REAL, externally-visible side effect on the actual tmux pane
+    (starting `pipe-pane`) for every session core.py's own reconcile pass
+    ever sees, including ones this config had nothing to do with creating
+    -- a real, live incident during this feature's own development (every
+    OTHER real session sharing this host's tmux server briefly had pipe-
+    pane silently turned on by an unrelated test run). An existing
+    deployment's config.yaml keeps today's exact behavior (no capture at
+    all) until an operator explicitly opts in here -- and even then,
+    _capture_session_knowledge (core.py) only ever touches a session
+    whose cwd resolves inside session_lifecycle.allowed_cwd_roots, never
+    an arbitrary other session on the same host, as a second, independent
+    safety boundary."""
+    enabled: bool = False
+
+
+@dataclass(frozen=True)
 class SessionLifecycleConfig:
     """New tmux session create/detach/delete (dashboard + the parallel
     terminal_create_session/_detach_session/_delete_session MCP tools --
@@ -351,6 +372,7 @@ class AppConfig:
     dashboard: DashboardConfig = DashboardConfig()
     maintenance: MaintenanceConfig = MaintenanceConfig()
     session_lifecycle: SessionLifecycleConfig = SessionLifecycleConfig()
+    session_knowledge: SessionKnowledgeConfig = SessionKnowledgeConfig()
     ask_chatgpt: AskChatGptConfig = AskChatGptConfig()
     nodes: NodesConfig = NodesConfig()
     # Loop-protection metadata schema (see docs/prompt-submission.md, P11):
@@ -578,9 +600,16 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         dashboard=_load_dashboard_config(raw.get("dashboard", {})),
         maintenance=_load_maintenance_config(raw.get("maintenance", {})),
         session_lifecycle=_load_session_lifecycle_config(raw.get("session_lifecycle", {})),
+        session_knowledge=_load_session_knowledge_config(raw.get("session_knowledge", {})),
         ask_chatgpt=_load_ask_chatgpt_config(raw.get("ask_chatgpt", {})),
         nodes=nodes_config,
     )
+
+
+def _load_session_knowledge_config(raw: object) -> SessionKnowledgeConfig:
+    if not isinstance(raw, dict):
+        return SessionKnowledgeConfig()
+    return SessionKnowledgeConfig(enabled=bool(raw.get("enabled", False)))
 
 
 def _load_maintenance_config(maintenance_raw: object) -> MaintenanceConfig:

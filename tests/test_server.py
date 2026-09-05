@@ -54,6 +54,10 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_registry_search",
         "terminal_registry_reopen",
         "terminal_registry_purge",
+        "terminal_knowledge_search",
+        "terminal_knowledge_timeline",
+        "terminal_knowledge_recover",
+        "terminal_knowledge_checkpoint",
     }
 
 

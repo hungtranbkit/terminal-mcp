@@ -12,7 +12,7 @@ from urllib.parse import quote, urlparse
 import anyio
 from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
@@ -436,6 +436,31 @@ DASHBOARD_HTML = """<!doctype html>
     #killModal .km-actions button.danger { background:#3a2430; border-color:#ff9f9f; color:#ff9f9f }
     #killModal .km-actions button.danger:disabled { opacity:.4; cursor:not-allowed }
     #killModal .km-error { color:#ff6b6b; font-size:12px }
+    /* ---- History/Search modal (Session Knowledge Store) ---------------
+       Same fixed-overlay + backdrop + body-class pattern as #permModal/
+       #killModal above -- a separate modal, not a redesign of either;
+       reuses their .pm-*-style spacing/typography rather than inventing
+       new visual language. */
+    #knowledgeBackdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:30 }
+    #knowledgeModal {
+      display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:31;
+      width:min(560px, calc(100vw - 32px)); max-height:80vh; overflow:auto;
+      background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 20px 50px rgba(0,0,0,.6);
+    }
+    body.knowledge-modal-visible #knowledgeBackdrop, body.knowledge-modal-visible #knowledgeModal { display:block }
+    #knowledgeModal .pm-head { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px }
+    #knowledgeModal .pm-head strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    #knowledgeModal .pm-body { padding:14px 16px; display:flex; flex-direction:column; gap:10px; font-size:13px }
+    #knowledgeSearchRow { display:flex; gap:8px }
+    #knowledgeSearchRow input { flex:1; background:#0e1526; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:9px 11px; font:inherit }
+    #knowledgeSearchRow button { border-radius:8px; padding:9px 14px; cursor:pointer; font:inherit; font-size:13px; border:1px solid var(--line); background:#19243b; color:var(--text) }
+    #knowledgeCheckpoint { font-size:12px; color:var(--muted); background:rgba(122,162,255,.08); border:1px solid var(--line); border-radius:8px; padding:8px 10px; white-space:pre-wrap }
+    #knowledgeChunks { display:flex; flex-direction:column; gap:6px; max-height:40vh; overflow:auto; font-family:ui-monospace,monospace; font-size:12px }
+    #knowledgeChunks .kc-chunk { border:1px solid var(--line); border-radius:8px; padding:6px 8px; white-space:pre-wrap; word-break:break-word }
+    #knowledgeChunks .kc-meta { color:var(--muted); font-size:11px; margin-bottom:2px }
+    #knowledgeChunks .kc-chunk.backfilled { border-color:var(--amber) }
+    #knowledgeEmpty { color:var(--muted); font-size:12px }
+    #knowledgeExportBtn { align-self:flex-start }
     /* ---- Tab bar row -----------------------------------------------------
        .tabbar itself scrolls horizontally (see its own rule above). The
        row holds ONLY the tab strip now -- New session/Đã kill used to be
@@ -682,6 +707,7 @@ DASHBOARD_HTML = """<!doctype html>
                 <a id="termOpenRealBtn" href="#" role="menuitem">🖥 Mở terminal thật (xterm.js)</a>
                 <button id="termCopyAttachBtn" type="button" disabled hidden>⧉ Copy attach command</button>
                 <button id="termAccessBtn" type="button" disabled>🔐 Quyền truy cập</button>
+                <button id="termHistoryBtn" type="button" disabled>📜 Lịch sử / Tìm kiếm</button>
                 <button id="termKillBtn" type="button" class="danger" disabled>🗑 Kill session</button>
               </div>
             </div>
@@ -745,6 +771,23 @@ DASHBOARD_HTML = """<!doctype html>
       </div>
     </div>
   </div>
+  <div id="knowledgeBackdrop"></div>
+  <div id="knowledgeModal" role="dialog" aria-modal="true" aria-labelledby="knowledgeModalTitle">
+    <div class="pm-head">
+      <strong id="knowledgeModalTitle">Lịch sử</strong>
+      <button id="knowledgeModalCloseBtn" class="term-btn" type="button">✕</button>
+    </div>
+    <div class="pm-body">
+      <div id="knowledgeSearchRow">
+        <input type="text" id="knowledgeSearchInput" placeholder="Tìm trong lịch sử session này..." autocomplete="off">
+        <button id="knowledgeSearchBtn" type="button">🔍 Tìm</button>
+      </div>
+      <div id="knowledgeCheckpoint" hidden></div>
+      <div id="knowledgeEmpty" hidden>Chưa có dữ liệu lịch sử cho session này.</div>
+      <div id="knowledgeChunks"></div>
+      <a id="knowledgeExportBtn" class="term-btn" href="#" target="_blank" rel="noopener">⬇ Xuất lịch sử (.txt)</a>
+    </div>
+  </div>
   <script>
     let selected = null;
     let inputAllowed = false;
@@ -786,6 +829,15 @@ DASHBOARD_HTML = """<!doctype html>
     const killModalCloseBtnEl = document.querySelector('#killModalCloseBtn');
     const killCancelBtnEl = document.querySelector('#killCancelBtn');
     const killConfirmBtnEl = document.querySelector('#killConfirmBtn');
+    const knowledgeBackdropEl = document.querySelector('#knowledgeBackdrop');
+    const knowledgeModalTitleEl = document.querySelector('#knowledgeModalTitle');
+    const knowledgeModalCloseBtnEl = document.querySelector('#knowledgeModalCloseBtn');
+    const knowledgeSearchInputEl = document.querySelector('#knowledgeSearchInput');
+    const knowledgeSearchBtnEl = document.querySelector('#knowledgeSearchBtn');
+    const knowledgeCheckpointEl = document.querySelector('#knowledgeCheckpoint');
+    const knowledgeEmptyEl = document.querySelector('#knowledgeEmpty');
+    const knowledgeChunksEl = document.querySelector('#knowledgeChunks');
+    const knowledgeExportBtnEl = document.querySelector('#knowledgeExportBtn');
     const permBackdropEl = document.querySelector('#permBackdrop');
     const permModalEl = document.querySelector('#permModal');
     const permModalTitleEl = document.querySelector('#permModalTitle');
@@ -825,6 +877,7 @@ DASHBOARD_HTML = """<!doctype html>
     const termOpenRealBtnEl = document.querySelector('#termOpenRealBtn');
     const termCopyAttachBtnEl = document.querySelector('#termCopyAttachBtn');
     const termAccessBtnEl = document.querySelector('#termAccessBtn');
+    const termHistoryBtnEl = document.querySelector('#termHistoryBtn');
     const termKillBtnEl = document.querySelector('#termKillBtn');
     const clean = value => String(value ?? '');
 
@@ -1982,6 +2035,15 @@ DASHBOARD_HTML = """<!doctype html>
       termAccessBtnEl.title = canGrant ? 'Xem/cấp quyền truy cập cho session này' : '';
       termAccessBtnEl.onclick = () => { if (row) { closeAllMenus(); openPermModal(row.name); } };
 
+      // History/Search (Session Knowledge Store) -- available whenever
+      // the session is currently readable, exactly like the pane output
+      // itself; never requires input/kill rights (a read-only viewer can
+      // browse a session's own past output the same way they can watch
+      // it live).
+      termHistoryBtnEl.disabled = !row || !(row.effective_read || row.allowed);
+      termHistoryBtnEl.title = termHistoryBtnEl.disabled ? '' : 'Xem lịch sử/tìm kiếm output đã ghi lại của session này';
+      termHistoryBtnEl.onclick = () => { if (row && !termHistoryBtnEl.disabled) { closeAllMenus(); openKnowledgeModal(row.name); } };
+
       const isProtected = row ? protectedSessions.has(row.name) : false;
       termKillBtnEl.disabled = !row || !sessionLifecycleEnabled || isProtected;
       termKillBtnEl.title = !row || !sessionLifecycleEnabled ? ''
@@ -2102,6 +2164,77 @@ DASHBOARD_HTML = """<!doctype html>
       }
       await loadSessions();
     };
+
+    // ---- History/Search modal (Session Knowledge Store) -----------------
+    // Same fixed-overlay + backdrop + body-class pattern as the Kill/Perm
+    // modals just above -- read-only (search/timeline/export), never a
+    // second way to view/send LIVE output (the tab's own pane above still
+    // owns that); this is explicitly for what was said BEFORE now,
+    // including for a session that's Missing/Killed.
+    let knowledgeModalName = null;
+    function closeKnowledgeModal() {
+      document.body.classList.remove('knowledge-modal-visible');
+      knowledgeModalName = null; knowledgeSearchInputEl.value = '';
+    }
+    function renderKnowledgeChunks(chunks) {
+      knowledgeChunksEl.replaceChildren();
+      knowledgeEmptyEl.hidden = chunks.length > 0;
+      for (const chunk of chunks) {
+        const div = document.createElement('div');
+        div.className = 'kc-chunk' + (chunk.source === 'backfilled' ? ' backfilled' : '');
+        const meta = document.createElement('div'); meta.className = 'kc-meta';
+        meta.textContent = `${clean(chunk.captured_at)}${chunk.source === 'backfilled' ? ' · backfilled' : ''}`;
+        const body = document.createElement('div'); body.textContent = clean(chunk.text);
+        div.append(meta, body);
+        knowledgeChunksEl.appendChild(div);
+      }
+    }
+    async function loadKnowledgeTimeline(name) {
+      const data = await fetchJSON(`/dashboard/api/session/knowledge/timeline?name=${encodeURIComponent(name)}`, {cache: 'no-store'});
+      if (knowledgeModalName !== name) return; // closed/switched while this was in flight
+      if (data.error) {
+        knowledgeCheckpointEl.hidden = true;
+        renderKnowledgeChunks([]);
+        knowledgeEmptyEl.hidden = false;
+        knowledgeEmptyEl.textContent = `${clean(data.error)}`;
+        return;
+      }
+      renderKnowledgeChunks(data.chunks || []);
+    }
+    async function loadKnowledgeCheckpoint(name) {
+      const data = await fetchJSON(`/dashboard/api/session/knowledge/recover?name=${encodeURIComponent(name)}`, {cache: 'no-store'});
+      if (knowledgeModalName !== name) return;
+      if (data.error || !data.checkpoint) { knowledgeCheckpointEl.hidden = true; return; }
+      knowledgeCheckpointEl.hidden = false;
+      knowledgeCheckpointEl.textContent = `📌 Checkpoint gần nhất (${clean(data.checkpoint.kind)}, ${clean(data.checkpoint.created_at)}):\n${clean(data.checkpoint.summary)}`;
+    }
+    async function runKnowledgeSearch(name, query) {
+      if (!query) { await loadKnowledgeTimeline(name); return; }
+      const data = await fetchJSON(`/dashboard/api/knowledge/search?query=${encodeURIComponent(query)}&session_name=${encodeURIComponent(name)}`, {cache: 'no-store'});
+      if (knowledgeModalName !== name) return;
+      renderKnowledgeChunks((data.results || []).map(r => ({captured_at: r.captured_at, text: r.text, source: r.source || 'live'})));
+    }
+    function openKnowledgeModal(name) {
+      knowledgeModalName = name;
+      knowledgeModalTitleEl.textContent = `Lịch sử: ${name}`;
+      knowledgeSearchInputEl.value = '';
+      knowledgeExportBtnEl.href = `/dashboard/api/session/knowledge/export?name=${encodeURIComponent(name)}`;
+      knowledgeEmptyEl.textContent = 'Chưa có dữ liệu lịch sử cho session này.';
+      document.body.classList.add('knowledge-modal-visible');
+      loadKnowledgeCheckpoint(name).catch(() => {});
+      loadKnowledgeTimeline(name).catch(() => {});
+    }
+    knowledgeModalCloseBtnEl.onclick = closeKnowledgeModal;
+    knowledgeBackdropEl.onclick = closeKnowledgeModal;
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && document.body.classList.contains('knowledge-modal-visible')) closeKnowledgeModal();
+    });
+    knowledgeSearchBtnEl.onclick = () => {
+      if (knowledgeModalName) runKnowledgeSearch(knowledgeModalName, knowledgeSearchInputEl.value.trim()).catch(() => {});
+    };
+    knowledgeSearchInputEl.addEventListener('keydown', event => {
+      if (event.key === 'Enter') knowledgeSearchBtnEl.onclick();
+    });
 
     // ---- killed-sessions reopen list (item 9-11) -----------------------
     // Compact, collapsed by default, zero footprint until there's actually
@@ -5072,6 +5205,99 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         )
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    # -- Session Knowledge Store (session_knowledge.py): minimal History/
+    # Search UI -- timeline/recover are node-aware via controller._route
+    # (the same resolve_session mechanism kill/reopen/grant already use,
+    # so a session on a remote node works exactly like a local one, no
+    # separate fallback needed the way session_detail's own bare-name gap
+    # required). Read-only, so no _routed()/heartbeat-refresh wrapper --
+    # a session that only exists on a node whose heartbeat hasn't been
+    # refreshed this request just isn't found yet, same as any other GET.
+
+    @server.custom_route("/dashboard/api/session/knowledge/timeline", methods=["GET"], include_in_schema=False)
+    async def session_knowledge_timeline(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        name = request.query_params.get("name", "")
+        if not name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        limit_raw = request.query_params.get("limit")
+        _refresh_local_heartbeat()
+        result = await anyio.to_thread.run_sync(lambda: controller.terminal_knowledge_timeline(
+            name, since=request.query_params.get("since"), until=request.query_params.get("until"),
+            limit=int(limit_raw) if limit_raw else 200,
+        ))
+        status_code = 200
+        if "error" in result:
+            status_code = 403 if result["error"] in ("ACCESS_DENIED", "READ_RESTRICTED") else \
+                (409 if result["error"] == "AMBIGUOUS_SESSION" else 404)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/knowledge/recover", methods=["GET"], include_in_schema=False)
+    async def session_knowledge_recover(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        name = request.query_params.get("name", "")
+        if not name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        _refresh_local_heartbeat()
+        result = await anyio.to_thread.run_sync(lambda: controller.terminal_knowledge_recover(name))
+        status_code = 200
+        if "error" in result:
+            status_code = 403 if result["error"] in ("ACCESS_DENIED", "READ_RESTRICTED") else \
+                (409 if result["error"] == "AMBIGUOUS_SESSION" else 404)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/knowledge/search", methods=["GET"], include_in_schema=False)
+    async def knowledge_search_fleet(request: Request) -> JSONResponse:
+        # Fleet-wide (task item 10) -- unlike timeline/recover above, a
+        # search query has no single session to resolve a node from, so
+        # this always asks every currently-online node (including local)
+        # and merges; permission filtering for the LOCAL node's own
+        # results happens inside terminal_knowledge_search itself (see
+        # core.py) -- a remote node is trusted to apply the exact same
+        # gate to ITS OWN results the same way tail/status already trust
+        # it for content.
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        query = request.query_params.get("query", "")
+        if not query.strip():
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        limit_raw = request.query_params.get("limit")
+        _refresh_local_heartbeat()
+        result = await anyio.to_thread.run_sync(lambda: controller.terminal_knowledge_search_fleet(
+            query, session_name=request.query_params.get("session_name"),
+            project=request.query_params.get("project"), since=request.query_params.get("since"),
+            until=request.query_params.get("until"), limit=int(limit_raw) if limit_raw else 20,
+        ))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/knowledge/export", methods=["GET"], include_in_schema=False)
+    async def session_knowledge_export(request: Request) -> PlainTextResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        name = request.query_params.get("name", "")
+        if not name:
+            return PlainTextResponse("INVALID_REQUEST", status_code=400)
+        _refresh_local_heartbeat()
+        result = await anyio.to_thread.run_sync(lambda: controller.terminal_knowledge_timeline(name, limit=100000))
+        if "error" in result:
+            return PlainTextResponse(result["error"], status_code=404)
+        body = "\n".join(
+            f"--- [{chunk.get('captured_at', '')}] seq={chunk.get('seq', '')} source={chunk.get('source', '')} ---\n"
+            f"{chunk.get('text', '')}"
+            for chunk in result.get("chunks", [])
+        )
+        safe_name = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in name)
+        return PlainTextResponse(body, headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}-history.txt"',
+            "Cache-Control": "no-store",
+        })
 
     # -- Session lifecycle: create/detach/delete/kill/reopen -- routed
     # through `controller`, the SAME multi-node-aware entry point

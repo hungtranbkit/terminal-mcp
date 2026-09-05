@@ -426,6 +426,59 @@ def build_mcp(service: TerminalService | None = None,
         (SESSION_STILL_ACTIVE) -- you almost certainly meant Kill instead."""
         return terminal.terminal_registry_purge(session_name, purged_by="mcp")
 
+    # -- Session Knowledge Store (search/timeline/recovery over REAL
+    # captured output -- session_knowledge.py) -- local-node-only in this
+    # phase, same documented Phase A/B limitation as the registry tools
+    # just above; not routed through `controller`. Distinct from the
+    # registry above: that answers "where is my session", this answers
+    # "what did it actually say" -- e.g. terminal_knowledge_search("báo
+    # cáo cuối", project="quan_ly_ban_hang") finds the session's own
+    # recent report-generation output, or terminal_knowledge_recover
+    # ("openclaw-") builds an honest recovery brief (checkpoint + recent
+    # real output + repo metadata) for a session that's already gone.
+
+    @server.tool()
+    def terminal_knowledge_search(query: str, session_name: str | None = None,
+                                  project: str | None = None, since: str | None = None,
+                                  until: str | None = None, limit: int = 20) -> dict:
+        """Full-text search over every session's captured (redacted) real
+        output on THIS node. `project` narrows by the owning session's own
+        cwd/repo_root (e.g. project="quan_ly_ban_hang" finds output from
+        a session that worked in that directory, even if the query text
+        itself never repeats the project name). Only ever returns content
+        from a session you currently have effective read access to."""
+        return terminal.terminal_knowledge_search(query, session_name=session_name, project=project,
+                                                  since=since, until=until, limit=limit)
+
+    @server.tool()
+    def terminal_knowledge_timeline(session_name: str, since: str | None = None,
+                                    until: str | None = None, limit: int = 200) -> dict:
+        """Ordered (oldest-first) captured output chunks for one session
+        -- "session openclaw- đã làm gì" — works for a session that's
+        Missing/Killed just as well as a currently-running one; its past
+        output was already captured while it was alive."""
+        return terminal.terminal_knowledge_timeline(session_name, since=since, until=until, limit=limit)
+
+    @server.tool()
+    def terminal_knowledge_recover(session_name: str) -> dict:
+        """"Restore context" for a session that's lost/killed/its node is
+        offline -- an HONEST recovery brief (last checkpoint + recent real
+        output + project/repo metadata + a ready-to-paste recovery_brief_
+        text), never a claim that the old process or its RAM is being
+        resurrected (recovered_process is always false). Use this before
+        starting a fresh agent in the same project so it has real prior
+        context instead of none."""
+        return terminal.terminal_knowledge_recover(session_name)
+
+    @server.tool()
+    def terminal_knowledge_checkpoint(session_name: str, summary: str) -> dict:
+        """Manually mark a point in a session's timeline worth remembering
+        (independent of the automatic checkpoints retention/compaction
+        already creates) -- e.g. right before a risky change, or once a
+        milestone is reached. Requires input authorization (a write),
+        even though it never touches the session's own process."""
+        return terminal.terminal_knowledge_checkpoint(session_name, summary)
+
     # -- Nodes (multi-node session management, task item 9) -----------------
     # Read-only from the MCP surface on purpose: draining/test-connection
     # are operator actions, dashboard-only (same "control vs discovery"

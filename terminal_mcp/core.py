@@ -21,8 +21,9 @@ from .models import SessionIdentity
 from .permissions import (SENSITIVE_SESSION_WORDS, input_session_allowed,
                           require_input, require_read, require_session_lifecycle, session_allowed,
                           session_input_denied_by_pattern, valid_session_name)
-from .redaction import redact_ansi_safe, redact_text
+from .redaction import redact_ansi_safe, redact_text, strip_ansi
 from .session_backend import SessionBackend
+from .session_knowledge import SessionKnowledgeStore, make_instance_id
 from .session_registry import SessionRegistryStore
 from .status import classify_status
 from .tmux import SEND_TEXT_ENTER_SETTLE_SECONDS, TmuxClient, TmuxError, iso_timestamp
@@ -120,7 +121,8 @@ class TerminalService:
                  grants: SessionGrantStore | None = None,
                  leases: PaneLeaseStore | None = None,
                  killed_sessions: KilledSessionStore | None = None,
-                 session_registry: SessionRegistryStore | None = None) -> None:
+                 session_registry: SessionRegistryStore | None = None,
+                 session_knowledge: SessionKnowledgeStore | None = None) -> None:
         # `tmux` accepts ANY SessionBackend (session_backend.py) -- a
         # TmuxClient (the default, Linux) or a WindowsSessionBackend
         # (windows_backend.py, injected explicitly by windows_agent.py).
@@ -147,6 +149,13 @@ class TerminalService:
         # other nodes' registries rewrites it to that node's real id,
         # exactly like it already does for plain session rows.
         self.session_registry = session_registry or SessionRegistryStore()
+        # Session Knowledge Store -- durable, searchable record of every
+        # session's REAL (redacted) output, distinct from the registry
+        # above (which tracks identity/lifecycle, not content). See
+        # session_knowledge.py's own module docstring for the full
+        # design; capture itself is wired into the exact same reconcile
+        # pass as the registry (_capture_session_knowledge below).
+        self.session_knowledge = session_knowledge or SessionKnowledgeStore()
         # P0 Part B: durable, cross-process pane lease -- defaults to the
         # shared on-disk store (same file for every TerminalService in
         # every process on this host, HTTP/STDIO/dashboard/Supervisor
@@ -216,6 +225,257 @@ class TerminalService:
         # dispatch pattern) -- reused here rather than a new isinstance
         # check against a class this module would otherwise never import.
         return "tmux" if hasattr(self.tmux, "binary") else "windows_pty"
+
+    # -- Session Knowledge Store: capture --------------------------------
+
+    def _knowledge_raw_dir(self) -> Path:
+        return self.session_knowledge.path.parent / "raw"
+
+    def _knowledge_log_path(self, session_name: str, instance_id: str) -> Path:
+        safe_instance = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in instance_id)
+        return self._knowledge_raw_dir() / f"{session_name}__{safe_instance}.log"
+
+    def _capture_session_knowledge(self, items: list[Any]) -> None:
+        """Called from the SAME reconcile pass as _reconcile_session_
+        registry (terminal_list_sessions/dashboard_list_sessions) -- zero
+        extra tmux/backend calls beyond what those already fetched for
+        `items`. One session's capture failing (a broken git binary, an
+        unreadable pipe-pane log file, a permission error on the raw dir)
+        must never break listing itself or stop any OTHER session's
+        capture -- each iteration is independently guarded.
+
+        SAFETY BOUNDARY #1, load-bearing (a real, RECURRING incident
+        caught live during this feature's own development, not
+        hypothetical -- see config.py's own SessionKnowledgeConfig
+        docstring): disabled entirely unless config.session_knowledge.
+        enabled is explicitly True. capture has a REAL, externally-
+        visible side effect on the actual tmux pane (`pipe-pane`) for
+        EVERY session terminal_list_sessions/dashboard_list_sessions ever
+        sees -- including every OTHER real, currently-attended session
+        sharing this same host's tmux server, which this process/config
+        had nothing to do with creating. A single opt-in flag is the only
+        boundary that holds regardless of how any given config's own
+        session_lifecycle.allowed_cwd_roots happens to be set (SAFETY
+        BOUNDARY #2 below is real defense-in-depth, but was NOT
+        sufficient by itself: it only protects against configs whose
+        allowed roots are narrow, and plenty of legitimate configs
+        -- most test fixtures included -- fall back to the caller's own
+        home directory, which routinely also contains other real,
+        unrelated sessions' own cwd.
+
+        SAFETY BOUNDARY #2: a session is only ever captured if its OWN
+        cwd resolves inside THIS config's session_lifecycle.allowed_cwd_
+        roots (the same resolve_cwd() gate kill/reopen-metadata capture
+        already uses) -- a session whose cwd can't be positively
+        confirmed as "inside what this process manages" is never piped,
+        never touched, only ever still visible in the plain listing
+        exactly as before this feature existed."""
+        if not self.config.session_knowledge.enabled:
+            return
+        is_tmux = hasattr(self.tmux, "binary")
+        for item in items:
+            try:
+                if not item.pane_current_path:
+                    continue
+                resolved, error = resolve_cwd(item.pane_current_path, self.config)
+                if error is not None:
+                    continue
+                cwd = str(resolved)
+                identity = SessionIdentity.from_session_info(item)
+                instance_id = make_instance_id(
+                    session_id=identity.session_id or "-", pane_id=identity.pane_id or "-",
+                    created_epoch=identity.created_epoch)
+                agent_type = self._classify_agent_type(item.pane_current_command)
+                self.session_knowledge.ensure_meta(
+                    self.REGISTRY_LOCAL_NODE_ID, item.name, instance_id, cwd=cwd,
+                    agent_type=agent_type, backend_type=self._registry_backend_type(),
+                    lifecycle_state="ACTIVE")
+                if is_tmux:
+                    self._capture_tmux_knowledge(item.name, instance_id)
+                else:
+                    self._capture_windows_knowledge(item.name, instance_id)
+            except Exception:  # noqa: BLE001 -- capture must never break listing (same posture as the registry reconcile above)
+                continue
+
+    def _start_knowledge_capture_for_new_session(self, name: str) -> None:
+        """Called once, right after terminal_create_session's own
+        lifecycle.create() succeeds -- see that call site's own comment
+        for why this can't wait for the next reconcile pass. A plain,
+        direct equivalent of one _capture_session_knowledge iteration for
+        exactly this one, brand-new session (there is nothing to
+        duplicate: this session has never been captured before). The
+        same allowed_cwd_roots gate as _capture_session_knowledge applies
+        here too -- lifecycle.create() itself already only ever creates a
+        session inside an allowed root, so this should always resolve;
+        kept as defense-in-depth, never assumed.
+
+        Real, documented tmux race handled here with a short bounded
+        retry (never a blind sleep): immediately after `new-session`,
+        tmux can briefly still report #{pane_current_path} as the PARENT
+        tmux binary's own cwd (e.g. this server process's own cwd), not
+        yet the `-c <cwd>` this session was actually created with -- a
+        one-shot read at exactly this moment caught that stale value live
+        (resolve_cwd correctly refusing it as outside allowed_cwd_roots,
+        since the SERVER's own cwd is usually not itself an allowed
+        session root) and silently skipped capture entirely. Retried a
+        few times, briefly, rather than immediately giving up -- a
+        session that still hasn't settled after this either genuinely
+        has an unusual cwd or will simply pick up capture on the next
+        ordinary reconcile pass instead."""
+        if not self.config.session_knowledge.enabled:
+            return
+        info = None
+        cwd: str | None = None
+        for _attempt in range(5):
+            info = self.tmux.get_session(name)
+            if info is not None and info.pane_current_path:
+                resolved, error = resolve_cwd(info.pane_current_path, self.config)
+                if error is None:
+                    cwd = str(resolved)
+                    break
+            time.sleep(0.1)
+        if info is None or cwd is None:
+            return
+        identity = SessionIdentity.from_session_info(info)
+        instance_id = make_instance_id(session_id=identity.session_id or "-", pane_id=identity.pane_id or "-",
+                                       created_epoch=identity.created_epoch)
+        self.session_knowledge.ensure_meta(
+            self.REGISTRY_LOCAL_NODE_ID, name, instance_id, cwd=cwd,
+            agent_type=self._classify_agent_type(info.pane_current_command),
+            backend_type=self._registry_backend_type(), lifecycle_state="ACTIVE")
+        if hasattr(self.tmux, "binary"):
+            self._capture_tmux_knowledge(name, instance_id)
+        else:
+            self._capture_windows_knowledge(name, instance_id)
+
+    def _capture_tmux_knowledge(self, session_name: str, instance_id: str) -> None:
+        cursor_raw = self.session_knowledge.get_cursor(self.REGISTRY_LOCAL_NODE_ID, session_name, instance_id)
+        if cursor_raw is None:
+            # First capture ever for this instance (requirement #9,
+            # backfill): pipe-pane only ever sees FUTURE bytes -- for a
+            # session that already existed before this feature started
+            # watching it (or before this code was deployed at all), the
+            # best available prior context is whatever's CURRENTLY on
+            # screen right now. One best-effort snapshot, explicitly
+            # marked provenance=backfilled (never conflated with live
+            # capture), before live pipe-pane capture takes over from
+            # here on.
+            try:
+                backfill_lines = self.tmux.capture_lines(session_name, self.config.max_capture_lines)
+                if backfill_lines:
+                    self.session_knowledge.append_output(
+                        self.REGISTRY_LOCAL_NODE_ID, session_name, instance_id,
+                        "\n".join(backfill_lines), source="backfilled")
+            except Exception:  # noqa: BLE001 -- backfill is best-effort, never blocks live capture from starting
+                pass
+        log_path = self._knowledge_log_path(session_name, instance_id)
+        log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.tmux.ensure_output_capture(session_name, str(log_path))
+        cursor = int(cursor_raw) if cursor_raw else 0
+        try:
+            size = log_path.stat().st_size
+        except OSError:
+            return  # pipe-pane just started, nothing flushed to disk yet -- try again next reconcile pass
+        if size <= cursor:
+            return  # nothing new (or the file was truncated/replaced -- never read backwards)
+        # Bounded per call (matches session_knowledge's own per-chunk cap
+        # philosophy) -- a session that produced an enormous amount of
+        # output between two reconcile passes gets captured over several
+        # passes rather than one huge blocking read.
+        max_read_bytes = 1_000_000
+        with open(log_path, "rb") as fh:
+            fh.seek(cursor)
+            data = fh.read(max_read_bytes)
+        new_cursor = cursor + len(data)
+        text = strip_ansi(data.decode("utf-8", errors="replace"))
+        self.session_knowledge.append_output(self.REGISTRY_LOCAL_NODE_ID, session_name, instance_id, text)
+        self.session_knowledge.set_cursor(self.REGISTRY_LOCAL_NODE_ID, session_name, instance_id, str(new_cursor))
+
+    def _capture_windows_knowledge(self, session_name: str, instance_id: str) -> None:
+        reader = getattr(self.tmux, "read_new_output", None)
+        if reader is None:
+            return
+        cursor_raw = self.session_knowledge.get_cursor(self.REGISTRY_LOCAL_NODE_ID, session_name, instance_id)
+        cursor = int(cursor_raw) if cursor_raw else None
+        text, new_cursor, gap = reader(session_name, cursor)
+        if gap:
+            self.session_knowledge.add_checkpoint(
+                self.REGISTRY_LOCAL_NODE_ID, session_name, instance_id, kind="compaction",
+                summary="[capture gap] some output was evicted from the live buffer before it "
+                        "could be captured -- capture polling fell behind the session's own output rate")
+        if text:
+            self.session_knowledge.append_output(self.REGISTRY_LOCAL_NODE_ID, session_name, instance_id, text)
+        self.session_knowledge.set_cursor(self.REGISTRY_LOCAL_NODE_ID, session_name, instance_id, str(new_cursor))
+
+    def _knowledge_read_authorized(self, node_id: str, session_name: str) -> bool:
+        """Requirement #11 (History tuân theo read permission hiện tại):
+        a REMOTE node's knowledge is never checked against THIS process's
+        own grants store at all (see controller.py's own routing for
+        cross-node reads) -- only ever reachable for a node this process
+        IS that node for."""
+        if node_id != self.REGISTRY_LOCAL_NODE_ID:
+            return False
+        return self._read_authorized(session_name)
+
+    def terminal_knowledge_search(self, query: str, *, session_name: str | None = None,
+                                  project: str | None = None, since: str | None = None,
+                                  until: str | None = None, limit: int = 20) -> dict[str, Any]:
+        """Full-text search over this node's own captured output --
+        results are filtered down to sessions the CALLER currently has
+        effective read access to (never exposes a restricted session's
+        content just because it matched a search term)."""
+        if (permission_error := require_read(self.config)) is not None:
+            return {"error": permission_error}
+        raw = self.session_knowledge.search(
+            query, node_id=self.REGISTRY_LOCAL_NODE_ID, session_name=session_name,
+            project=project, since=since, until=until, limit=limit * 2)
+        results = [row for row in raw if self._knowledge_read_authorized(row["node_id"], row["session_name"])][:limit]
+        return {"query": query, "results": results, "untrusted_output": True, "untrusted_fields": ["results"]}
+
+    def terminal_knowledge_timeline(self, session_name: str, *, since: str | None = None,
+                                    until: str | None = None, limit: int = 200) -> dict[str, Any]:
+        if error := self._guard(session_name):
+            return error
+        chunks = self.session_knowledge.timeline(
+            self.REGISTRY_LOCAL_NODE_ID, session_name, since=since, until=until, limit=limit)
+        return {
+            "session": session_name,
+            "chunks": [{"seq": c.seq, "captured_at": c.captured_at, "text": c.text, "source": c.source}
+                      for c in chunks],
+            "untrusted_output": True, "untrusted_fields": ["chunks"],
+        }
+
+    def terminal_knowledge_recover(self, session_name: str) -> dict[str, Any]:
+        """"Restore context" (task item 7) -- an honest recovery BRIEF
+        (checkpoint + recent real output + repo metadata), never a claim
+        that the old process/RAM is being resurrected (recovered_process
+        is always False -- see session_knowledge.py's own recovery_brief
+        docstring). Read-permission-gated exactly like every other read
+        here, deliberately even for a session that's already gone/killed
+        (a killed session's own history is exactly what this is for)."""
+        if error := self._guard(session_name):
+            return error
+        brief = self.session_knowledge.recovery_brief(self.REGISTRY_LOCAL_NODE_ID, session_name)
+        if brief is None:
+            return {"error": "NO_KNOWLEDGE_FOUND", "session": session_name,
+                    "reason": "no captured output for this session on this node"}
+        return {"session": session_name, **brief}
+
+    def terminal_knowledge_checkpoint(self, session_name: str, summary: str) -> dict[str, Any]:
+        """A MANUAL checkpoint -- a human/agent explicitly marking "this
+        is worth remembering", independent of the automatic compaction
+        checkpoints session_knowledge.py's own retention already creates.
+        Requires INPUT authorization (not just read) -- a checkpoint is a
+        write, even though it never touches the session's own process."""
+        if error := self._input_guard(session_name):
+            return error
+        meta = self.session_knowledge.get_meta(self.REGISTRY_LOCAL_NODE_ID, session_name)
+        if meta is None:
+            return {"error": "NO_KNOWLEDGE_FOUND", "session": session_name}
+        checkpoint_id = self.session_knowledge.add_checkpoint(
+            self.REGISTRY_LOCAL_NODE_ID, session_name, meta.session_instance_id,
+            kind="manual", summary=summary)
+        return {"session": session_name, "checkpoint_id": checkpoint_id}
 
     def _desktop_metadata_for(self, session: str) -> dict[str, Any]:
         """Task item 7 (dashboard: "Desktop visible/Headless"): {} on any
@@ -560,6 +820,7 @@ class TerminalService:
             row.update(self._desktop_metadata_for(item.name))
             sessions.append(row)
         self._reconcile_session_registry(items, grants_by_session)
+        self._capture_session_knowledge(items)
         return {"sessions": sessions}
 
     def terminal_tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]:
@@ -1635,6 +1896,7 @@ class TerminalService:
         # check is what actually refuses a delete, regardless of what a
         # client does or doesn't disable in its own UI based on this list).
         self._reconcile_session_registry(items, grants_by_session)
+        self._capture_session_knowledge(items)
         return {"sessions": sessions,
                "session_lifecycle_enabled": self.config.session_lifecycle.enabled,
                "protected_sessions": list(self.config.session_lifecycle.protected_sessions),
@@ -1959,6 +2221,21 @@ class TerminalService:
         if not ok:
             return result
 
+        # Session Knowledge Store: start capture IMMEDIATELY, before
+        # anything else below (in particular, before initial_prompt is
+        # ever sent) -- real bug caught live: capture previously only
+        # started lazily on the first terminal_list_sessions/dashboard_
+        # list_sessions reconcile pass, so any output produced between
+        # creation and that first poll (an initial_prompt's own echoed
+        # command chief among them) was silently, permanently lost --
+        # tmux's pipe-pane never captures retroactively, only from the
+        # moment it's actually started. Never blocks/fails the create
+        # itself if this has a problem.
+        try:
+            self._start_knowledge_capture_for_new_session(name)
+        except Exception:  # noqa: BLE001
+            pass
+
         grant_result: dict[str, Any] | None = None
         if grant_mode != "none":
             read_result = self.grant_session_read(name, True, granted_by=requested_by)
@@ -2117,6 +2394,25 @@ class TerminalService:
             self.audit.record(action=action, session=name, result="BLOCKED", reason="TMUX_ERROR")
             return {"error": "TMUX_ERROR", "reason": str(exc), "session": name}
         metadata = self._capture_reopen_metadata(info) if info is not None else None
+        if info is not None:
+            # Final flush + an automatic checkpoint BEFORE the process is
+            # actually gone -- captures whatever output happened since
+            # the last reconcile pass, and leaves an explicit marker in
+            # the timeline that this is where the session ended (task
+            # item 7's own "Restore context" reads this checkpoint first).
+            try:
+                self._capture_session_knowledge([info])
+                identity = SessionIdentity.from_session_info(info)
+                instance_id = make_instance_id(session_id=identity.session_id or "-",
+                                               pane_id=identity.pane_id or "-",
+                                               created_epoch=identity.created_epoch)
+                self.session_knowledge.add_checkpoint(
+                    self.REGISTRY_LOCAL_NODE_ID, name, instance_id, kind="pre_kill",
+                    summary=f"session killed by {requested_by or 'unknown'}")
+                if hasattr(self.tmux, "binary"):
+                    self.tmux.stop_output_capture(name)
+            except Exception:  # noqa: BLE001 -- knowledge capture must never block or fail an actual kill
+                pass
         result = self.lifecycle.delete(name, protected_sessions=self.config.session_lifecycle.protected_sessions)
         ok = "error" not in result
         if ok:

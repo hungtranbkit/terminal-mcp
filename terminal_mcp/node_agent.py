@@ -246,6 +246,47 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         ))
         return JSONResponse(result)
 
+    async def knowledge_search(request: Request) -> JSONResponse:
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        params = request.query_params
+        lines_raw = params.get("limit")
+        result = await anyio.to_thread.run_sync(lambda: client.knowledge_search(
+            params.get("query", ""), session_name=params.get("session_name"), project=params.get("project"),
+            since=params.get("since"), until=params.get("until"),
+            limit=int(lines_raw) if lines_raw else 20,
+        ))
+        return JSONResponse(result)
+
+    async def knowledge_timeline(request: Request) -> JSONResponse:
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        params = request.query_params
+        limit_raw = params.get("limit")
+        result = await anyio.to_thread.run_sync(lambda: client.knowledge_timeline(
+            request.path_params["name"], since=params.get("since"), until=params.get("until"),
+            limit=int(limit_raw) if limit_raw else 200,
+        ))
+        return JSONResponse(result)
+
+    async def knowledge_recover(request: Request) -> JSONResponse:
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        result = await anyio.to_thread.run_sync(lambda: client.knowledge_recover(request.path_params["name"]))
+        return JSONResponse(result)
+
+    async def knowledge_checkpoint(request: Request) -> JSONResponse:
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        result = await anyio.to_thread.run_sync(lambda: client.knowledge_checkpoint(
+            request.path_params["name"], body.get("summary", ""),
+        ))
+        return JSONResponse(result)
+
     async def terminal_ws(websocket: WebSocket) -> None:
         # Open Terminal for a REMOTE node (task's own "Open Terminal trên
         # Windows phải mở được web terminal vào persistent session"),
@@ -318,6 +359,10 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         Route("/v1/sessions/{name}/grant-read", session_grant_read, methods=["POST"]),
         Route("/v1/sessions/{name}/grant-input", session_grant_input, methods=["POST"]),
         Route("/v1/killed-sessions", killed_sessions, methods=["GET"]),
+        Route("/v1/knowledge/search", knowledge_search, methods=["GET"]),
+        Route("/v1/knowledge/timeline/{name}", knowledge_timeline, methods=["GET"]),
+        Route("/v1/knowledge/recover/{name}", knowledge_recover, methods=["GET"]),
+        Route("/v1/knowledge/checkpoint/{name}", knowledge_checkpoint, methods=["POST"]),
         WebSocketRoute("/v1/ws/terminal", terminal_ws, name="node_agent_terminal_ws"),
     ]
     return Starlette(routes=routes)

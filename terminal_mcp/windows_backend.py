@@ -255,6 +255,14 @@ class _WindowsSession:
     viewer_queues: list["queue.Queue[str]"] = field(default_factory=list)
     reader_thread: threading.Thread | None = None
     stop_reading: threading.Event = field(default_factory=threading.Event)
+    # Monotonic count of every COMPLETE line ever appended to `buffer`
+    # (never reset, never decremented) -- Session Knowledge Store's own
+    # capture cursor for this backend (see read_new_output below):
+    # `buffer` itself is bounded (history_lines), so this is what lets a
+    # caller detect "some of what I haven't captured yet has already been
+    # evicted" rather than silently re-reading old content or missing a
+    # gap.
+    total_lines_seen: int = 0
 
 
 class WindowsSessionBackend:
@@ -327,6 +335,30 @@ class WindowsSessionBackend:
                 snapshot.append(entry._partial_line)
             snapshot = snapshot[-lines:]
         return snapshot if ansi else [strip_ansi(line) for line in snapshot]
+
+    def read_new_output(self, session: str, cursor: int | None) -> tuple[str, int, bool]:
+        """Session Knowledge Store's real capture mechanism for this
+        backend (core.py wires this in, never called directly by a
+        client) -- `cursor` is an opaque total-lines-seen count from a
+        PREVIOUS call (None for the very first capture of this session
+        instance). Returns (new_text, new_cursor, gap_occurred): `buffer`
+        is bounded (history_lines) so old lines get evicted over time --
+        `gap_occurred=True` means some of what hasn't been captured yet
+        was ALREADY evicted before this call ever got to it (capture
+        polling fell behind faster than the ring buffer's own retention),
+        an honest signal rather than silently skipping or re-reading the
+        wrong lines. A gap only ever loses what genuinely couldn't be
+        captured in time -- it never duplicates content."""
+        entry = self._require(session)
+        with entry.lock:
+            total = entry.total_lines_seen
+            start_total = total - len(entry.buffer)
+            effective_cursor = start_total if cursor is None else max(cursor, start_total)
+            gap = cursor is not None and cursor < start_total
+            skip = effective_cursor - start_total
+            new_lines = list(entry.buffer)[skip:]
+        text = ("\n".join(strip_ansi(line) for line in new_lines) + "\n") if new_lines else ""
+        return text, total, gap
 
     def send_text(self, session: str, text: str, press_enter: bool) -> None:
         entry = self._require(session)
@@ -651,3 +683,4 @@ def _append_chunk(entry: _WindowsSession, chunk: str) -> None:
     entry._partial_line = lines.pop()
     for line in lines:
         entry.buffer.append(line.rstrip("\r"))
+    entry.total_lines_seen += len(lines)

@@ -1262,6 +1262,13 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/registry/search": {"GET", "HEAD"},
         "/dashboard/api/registry/reopen": {"POST"},
         "/dashboard/api/registry/purge": {"POST"},
+        # Session Knowledge Store (search/timeline/recovery over captured
+        # output -- session_knowledge.py) -- another later, separate
+        # feature, same as the registry routes above.
+        "/dashboard/api/session/knowledge/timeline": {"GET", "HEAD"},
+        "/dashboard/api/session/knowledge/recover": {"GET", "HEAD"},
+        "/dashboard/api/knowledge/search": {"GET", "HEAD"},
+        "/dashboard/api/session/knowledge/export": {"GET", "HEAD"},
     }
     # The web terminal's WebSocket route is registered too, just outside
     # this HTTP-methods-only dict (WebSocketRoute has no .methods).

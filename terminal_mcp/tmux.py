@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -190,6 +191,51 @@ class TmuxClient:
         first, so idempotency for the "already gone" case is handled one
         layer up."""
         self._run(["kill-session", "-t", name])
+
+    def ensure_output_capture(self, session: str, log_path: str) -> None:
+        """Session Knowledge Store's real capture mechanism for tmux
+        (core.py wires this in, never called directly by a client) --
+        continuously appends every byte the pane produces to `log_path`
+        in real time, from tmux's own side, completely independent of the
+        pane's OWN scrollback/history_size. This is the deliberate fix
+        for a real, documented artifact (see docs/multi-node.md and this
+        project's own memory notes): a Claude Code session's Ink TUI
+        keeps tmux's history_size at 0, so polling `capture-pane` alone
+        can silently miss content that scrolled past between two polls --
+        pipe-pane has no such gap, it sees every byte as tmux itself
+        receives it.
+
+        Real bug caught live: `pipe-pane -o` does NOT mean "no-op if a
+        pipe is already active" (despite tmux's own doc wording reading
+        that way at a glance) -- verified empirically, it TOGGLES the
+        pipe on every single invocation once one already exists. Calling
+        this once per reconcile pass with `-o` (the natural, obviously-
+        wrong-in-hindsight first attempt) silently turned capture back
+        OFF on the very next pass, silently losing everything sent after
+        that -- caught by this feature's own multi-poll integration test,
+        not a hypothetical. Fixed by explicitly checking #{pane_pipe}
+        first and only ever issuing `pipe-pane` (no `-o`) when it reports
+        not already active -- an unconditional, idempotent-by-construction
+        check-then-act, never a toggle."""
+        already_piping = self._run(["display-message", "-p", "-t", session, "#{pane_pipe}"],
+                                   check=False).stdout.strip()
+        if already_piping == "1":
+            return
+        # `stdbuf -oL` forces line-buffered output regardless of whether
+        # cat's stdout is a tty -- verified live (a plain `cat >> file`
+        # already flushed promptly in practice here, but stdio's default
+        # full-buffering for a non-tty output is real and would otherwise
+        # be one coreutils-version/libc's behavior away from silently
+        # delaying capture until several KB accumulate).
+        self._run(["pipe-pane", "-t", session, f"stdbuf -oL cat >> {shlex.quote(log_path)}"])
+
+    def stop_output_capture(self, session: str) -> None:
+        """Cancels an active pipe-pane for `session` (a bare `pipe-pane
+        -t <session>` with no command toggles it off if on, or is a
+        harmless no-op if already off) -- never deletes the log file
+        itself; the caller has already read everything it needs from it
+        by the time this is called (session kill/reopen)."""
+        self._run(["pipe-pane", "-t", session], check=False)
 
     def exit_copy_mode(self, session: str) -> None:
         """Cancel tmux's active pane mode without writing a key to the PTY.

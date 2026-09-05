@@ -65,6 +65,12 @@ class NodeClient(Protocol):
     def grant_input(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]: ...
     def health(self) -> dict[str, Any]: ...
     def metrics(self) -> dict[str, Any]: ...
+    def knowledge_search(self, query: str, *, session_name: str | None = None, project: str | None = None,
+                         since: str | None = None, until: str | None = None, limit: int = 20) -> dict[str, Any]: ...
+    def knowledge_timeline(self, session_name: str, *, since: str | None = None, until: str | None = None,
+                           limit: int = 200) -> dict[str, Any]: ...
+    def knowledge_recover(self, session_name: str) -> dict[str, Any]: ...
+    def knowledge_checkpoint(self, session_name: str, summary: str) -> dict[str, Any]: ...
 
 
 class LocalNodeClient:
@@ -140,6 +146,21 @@ class LocalNodeClient:
         collected = host_metrics.collect(workspace_path=str(self._terminal.config.session_lifecycle.allowed_cwd_roots[0])
                                          if self._terminal.config.session_lifecycle.allowed_cwd_roots else "/")
         return collected.__dict__
+
+    def knowledge_search(self, query: str, *, session_name: str | None = None, project: str | None = None,
+                         since: str | None = None, until: str | None = None, limit: int = 20) -> dict[str, Any]:
+        return self._terminal.terminal_knowledge_search(query, session_name=session_name, project=project,
+                                                        since=since, until=until, limit=limit)
+
+    def knowledge_timeline(self, session_name: str, *, since: str | None = None, until: str | None = None,
+                           limit: int = 200) -> dict[str, Any]:
+        return self._terminal.terminal_knowledge_timeline(session_name, since=since, until=until, limit=limit)
+
+    def knowledge_recover(self, session_name: str) -> dict[str, Any]:
+        return self._terminal.terminal_knowledge_recover(session_name)
+
+    def knowledge_checkpoint(self, session_name: str, summary: str) -> dict[str, Any]:
+        return self._terminal.terminal_knowledge_checkpoint(session_name, summary)
 
 
 class RemoteNodeClient:
@@ -269,6 +290,25 @@ class RemoteNodeClient:
 
     def metrics(self) -> dict[str, Any]:
         return self._request("GET", "/v1/metrics")
+
+    def knowledge_search(self, query: str, *, session_name: str | None = None, project: str | None = None,
+                         since: str | None = None, until: str | None = None, limit: int = 20) -> dict[str, Any]:
+        return self._request("GET", "/v1/knowledge/search", params={
+            "query": query, "session_name": session_name, "project": project,
+            "since": since, "until": until, "limit": limit,
+        })
+
+    def knowledge_timeline(self, session_name: str, *, since: str | None = None, until: str | None = None,
+                           limit: int = 200) -> dict[str, Any]:
+        return self._request("GET", f"/v1/knowledge/timeline/{urllib.parse.quote(session_name)}",
+                             params={"since": since, "until": until, "limit": limit})
+
+    def knowledge_recover(self, session_name: str) -> dict[str, Any]:
+        return self._request("GET", f"/v1/knowledge/recover/{urllib.parse.quote(session_name)}")
+
+    def knowledge_checkpoint(self, session_name: str, summary: str) -> dict[str, Any]:
+        return self._request("POST", f"/v1/knowledge/checkpoint/{urllib.parse.quote(session_name)}",
+                             body={"summary": summary})
 
     def ping(self) -> tuple[bool, float | None, str | None]:
         """Real health check + round-trip latency measurement -- used by

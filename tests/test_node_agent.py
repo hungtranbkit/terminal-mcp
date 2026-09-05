@@ -18,7 +18,9 @@ import anyio
 import pytest
 from starlette.testclient import TestClient
 
-from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig, SessionLifecycleConfig
+from terminal_mcp.config import (
+    AppConfig, InputPolicyConfig, PermissionsConfig, SessionKnowledgeConfig, SessionLifecycleConfig,
+)
 from terminal_mcp.core import TerminalService
 from terminal_mcp.node_agent import _heartbeat_loop, build_node_agent
 
@@ -36,6 +38,12 @@ def _config(tmp_path) -> AppConfig:
             enabled=True, allowed_cwd_roots=(str(tmp_path),), protected_sessions=(),
             launch_commands=(("claude", "true"),),
         ),
+        # Explicit opt-in, safe here because allowed_cwd_roots above is
+        # already narrowly scoped to this test's own tmp_path (see
+        # config.py's SessionKnowledgeConfig docstring for why this flag
+        # exists at all -- a real incident during this feature's own
+        # development, not hypothetical).
+        session_knowledge=SessionKnowledgeConfig(enabled=True),
     )
 
 
@@ -167,6 +175,56 @@ def test_grant_routes_require_auth(agent_client):
     assert response.status_code == 401
     response2 = agent_client.post("/v1/sessions/agent-grant/grant-input", json={"enabled": True})
     assert response2.status_code == 401
+
+
+# -- Session Knowledge Store routes (session_knowledge.py) -------------------
+
+def test_knowledge_routes_require_auth(agent_client):
+    assert agent_client.get("/v1/knowledge/search", params={"query": "x"}).status_code == 401
+    assert agent_client.get("/v1/knowledge/timeline/agent-know").status_code == 401
+    assert agent_client.get("/v1/knowledge/recover/agent-know").status_code == 401
+    assert agent_client.post("/v1/knowledge/checkpoint/agent-know", json={"summary": "x"}).status_code == 401
+
+
+def test_knowledge_search_timeline_recover_round_trip(agent_client):
+    create = agent_client.post("/v1/sessions", headers=_auth(),
+                               json={"name": "agent-know", "agent_type": "shell", "cwd": None})
+    assert create.status_code == 200
+    agent_client.created.append("agent-know")
+
+    send = agent_client.post("/v1/sessions/agent-know/send", headers=_auth(),
+                             json={"text": "echo node-agent-knowledge-marker", "press_enter": True})
+    assert send.status_code == 200
+
+    def _captured() -> bool:
+        agent_client.get("/v1/sessions", headers=_auth())  # triggers the reconcile/capture pass
+        timeline = agent_client.get("/v1/knowledge/timeline/agent-know", headers=_auth())
+        return "node-agent-knowledge-marker" in "\n".join(c["text"] for c in timeline.json().get("chunks", []))
+
+    import time
+    deadline = time.monotonic() + 5.0
+    found = False
+    while time.monotonic() < deadline:
+        if _captured():
+            found = True
+            break
+        time.sleep(0.2)
+    assert found
+
+    search = agent_client.get("/v1/knowledge/search", headers=_auth(), params={"query": "node-agent-knowledge-marker"})
+    assert search.status_code == 200
+    assert any("node-agent-knowledge-marker" in r["text"] for r in search.json()["results"])
+
+    checkpoint = agent_client.post("/v1/knowledge/checkpoint/agent-know", headers=_auth(),
+                                   json={"summary": "manual checkpoint via node-agent route"})
+    assert checkpoint.status_code == 200
+    assert "error" not in checkpoint.json()
+
+    recover = agent_client.get("/v1/knowledge/recover/agent-know", headers=_auth())
+    assert recover.status_code == 200
+    body = recover.json()
+    assert body["recovered_process"] is False
+    assert body["checkpoint"]["summary"] == "manual checkpoint via node-agent route"
 
 
 def test_status_of_unknown_session_is_a_normal_200_not_a_transport_error(agent_client):

@@ -222,6 +222,55 @@ class ControllerService:
             bare, confirm_name.split("/", 1)[-1] if "/" in confirm_name else confirm_name, requested_by=requested_by,
         ))
 
+    # -- Session Knowledge Store (session_knowledge.py) -----------------------
+    # timeline/recover/checkpoint are single-session -- routed exactly like
+    # tail/status above (resolve the session's own node, forward there).
+    # search is fleet-wide (task item 10: "output remote được ingest về
+    # controller... mất mạng không mất dữ liệu") -- queries every currently
+    # ONLINE node's own knowledge store and merges; an unreachable/offline
+    # node just contributes zero results (never fails the whole search, and
+    # never loses anything that node captured -- it stays on that node's
+    # own disk, searchable again the moment it's reachable).
+
+    def terminal_knowledge_timeline(self, session: str, *, since: str | None = None, until: str | None = None,
+                                    limit: int = 200) -> dict[str, Any]:
+        return self._route(session, "knowledge_timeline",
+                           lambda client, name: client.knowledge_timeline(name, since=since, until=until, limit=limit))
+
+    def terminal_knowledge_recover(self, session: str) -> dict[str, Any]:
+        return self._route(session, "knowledge_recover", lambda client, name: client.knowledge_recover(name))
+
+    def terminal_knowledge_checkpoint(self, session: str, summary: str) -> dict[str, Any]:
+        return self._route(session, "knowledge_checkpoint",
+                           lambda client, name: client.knowledge_checkpoint(name, summary))
+
+    def terminal_knowledge_search_fleet(self, query: str, *, session_name: str | None = None,
+                                        project: str | None = None, since: str | None = None,
+                                        until: str | None = None, limit: int = 20) -> dict[str, Any]:
+        results: list[dict[str, Any]] = []
+        errors: dict[str, str] = {}
+        for node in self.registry.list():
+            if node.status != NODE_ONLINE:
+                continue
+            client = self._clients.get(node.id)
+            if client is None:
+                continue
+            try:
+                response = client.knowledge_search(query, session_name=session_name, project=project,
+                                                   since=since, until=until, limit=limit)
+            except NodeClientError as exc:
+                errors[node.id] = str(exc)
+                continue
+            if "error" in response:
+                errors[node.id] = str(response["error"])
+                continue
+            for row in response.get("results", []):
+                row.setdefault("node_id", node.id)
+                results.append(row)
+        results.sort(key=lambda r: r.get("captured_at", ""), reverse=True)
+        return {"query": query, "results": results[:limit], "node_errors": errors,
+                "untrusted_output": True, "untrusted_fields": ["results"]}
+
     def terminal_grant_session_read(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
         """Node-aware equivalent of TerminalService.grant_session_read --
         real bug fixed here (found live against a Windows session named

@@ -134,6 +134,31 @@ class FakeNodeClient:
         existing["input_enabled"] = enabled
         return {"session": name, **existing}
 
+    def knowledge_search(self, query: str, *, session_name=None, project=None, since=None, until=None,
+                         limit: int = 20) -> dict[str, Any]:
+        self.calls.append(("knowledge_search", query))
+        if self.broken:
+            raise NodeClientError("simulated transport failure")
+        return {"query": query, "results": list(getattr(self, "knowledge_results", []))}
+
+    def knowledge_timeline(self, session_name: str, *, since=None, until=None, limit: int = 200) -> dict[str, Any]:
+        self.calls.append(("knowledge_timeline", session_name))
+        if self.broken:
+            raise NodeClientError("simulated transport failure")
+        return {"session": session_name, "chunks": []}
+
+    def knowledge_recover(self, session_name: str) -> dict[str, Any]:
+        self.calls.append(("knowledge_recover", session_name))
+        if self.broken:
+            raise NodeClientError("simulated transport failure")
+        return {"session": session_name, "recovered_process": False, "checkpoint": None, "recent_chunks": []}
+
+    def knowledge_checkpoint(self, session_name: str, summary: str) -> dict[str, Any]:
+        self.calls.append(("knowledge_checkpoint", session_name))
+        if self.broken:
+            raise NodeClientError("simulated transport failure")
+        return {"session": session_name, "checkpoint_id": 1}
+
 
 # -- Phase A/B backward compatibility: local-only behaves like plain TerminalService --
 
@@ -646,3 +671,85 @@ def test_reopen_explicit_override_agent_type_and_cwd_used_over_saved_metadata(tm
                                                  agent_type="claude", cwd="/tmp/new")
     assert result["agent_type"] == "claude"
     assert result["cwd"] == "/tmp/new"
+
+
+# -- Session Knowledge Store fleet search (task item 10) --------------------
+
+
+def test_knowledge_timeline_and_recover_route_to_the_session_own_node(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    remote = FakeNodeClient({"ctrl-know-1": {}})
+    _register_fake_remote(controller, "know-node", remote)
+
+    timeline = controller.terminal_knowledge_timeline("ctrl-know-1")
+    assert timeline["node_id"] == "know-node"
+    assert ("knowledge_timeline", "ctrl-know-1") in remote.calls
+
+    recover = controller.terminal_knowledge_recover("ctrl-know-1")
+    assert recover["node_id"] == "know-node"
+    assert ("knowledge_recover", "ctrl-know-1") in remote.calls
+
+
+def test_knowledge_checkpoint_routes_to_the_session_own_node(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    remote = FakeNodeClient({"ctrl-know-2": {}})
+    _register_fake_remote(controller, "know-node2", remote)
+
+    result = controller.terminal_knowledge_checkpoint("ctrl-know-2", "a manual note")
+    assert result["node_id"] == "know-node2"
+    assert ("knowledge_checkpoint", "ctrl-know-2") in remote.calls
+
+
+def test_knowledge_search_fleet_merges_results_from_every_online_node(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    node_a = FakeNodeClient()
+    node_a.knowledge_results = [{"session_name": "a-sess", "text": "hit on node a", "captured_at": "2026-01-01T00:00:01Z"}]
+    node_b = FakeNodeClient()
+    node_b.knowledge_results = [{"session_name": "b-sess", "text": "hit on node b", "captured_at": "2026-01-01T00:00:02Z"}]
+    _register_fake_remote(controller, "search-node-a", node_a)
+    _register_fake_remote(controller, "search-node-b", node_b)
+
+    result = controller.terminal_knowledge_search_fleet("hit")
+    names = {r["session_name"] for r in result["results"]}
+    assert names == {"a-sess", "b-sess"}
+    # Each result is tagged with the node it actually came from.
+    by_session = {r["session_name"]: r["node_id"] for r in result["results"]}
+    assert by_session["a-sess"] == "search-node-a"
+    assert by_session["b-sess"] == "search-node-b"
+
+
+def test_knowledge_search_fleet_tolerates_an_unreachable_node(tmp_path):
+    """Requirement #10: a node being offline/unreachable never fails the
+    WHOLE search or loses what other nodes have -- it just contributes
+    zero results, reported separately in node_errors."""
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    healthy = FakeNodeClient()
+    healthy.knowledge_results = [{"session_name": "healthy-sess", "text": "still findable", "captured_at": "2026-01-01T00:00:01Z"}]
+    broken = FakeNodeClient(broken=True)
+    _register_fake_remote(controller, "healthy-node", healthy)
+    _register_fake_remote(controller, "broken-node", broken)
+
+    result = controller.terminal_knowledge_search_fleet("findable")
+    assert len(result["results"]) == 1
+    assert result["results"][0]["session_name"] == "healthy-sess"
+    assert "broken-node" in result["node_errors"]
+
+
+def test_knowledge_search_fleet_skips_offline_nodes_entirely(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    remote = FakeNodeClient()
+    remote.knowledge_results = [{"session_name": "offline-sess", "text": "should not be searched",
+                                 "captured_at": "2026-01-01T00:00:01Z"}]
+    controller.registry.register("offline-node", display_name="offline-node", hostname="offline-host",
+                                 endpoint="http://offline-node")
+    controller._clients["offline-node"] = remote
+    # Deliberately never heartbeat()'d -- stays OFFLINE/unknown, never queried.
+
+    result = controller.terminal_knowledge_search_fleet("should not be searched")
+    assert result["results"] == []
+    assert ("knowledge_search", "should not be searched") not in remote.calls
