@@ -937,7 +937,7 @@ class TerminalService:
             output = "\n".join(self.tmux.capture_lines(session, 80))
             state, input_required, reason = classify_status(info, output)
             last_output = "\n".join(output.splitlines()[-20:])
-            return {
+            payload = {
                 "session": session,
                 "exists": True,
                 "allowed": True,
@@ -947,6 +947,22 @@ class TerminalService:
                 "last_output": redact_text(last_output),
                 "untrusted_output": True, "untrusted_fields": ["last_output"], "content_source": "session",
             }
+            # P0 HOTFIX (task: "P0 WINDOWS SESSION STATE-LOSS / STALE
+            # STREAM", item 7's own health-metadata requirement): only
+            # ever present for a backend that actually supervises a real
+            # reader thread (currently WindowsSessionBackend -- None on
+            # tmux, no equivalent concept there) -- reader_alive is
+            # already self-healed by get_session() itself by the time it
+            # reaches here (see WindowsSessionBackend._ensure_reader_
+            # alive), so it will read True again almost immediately after
+            # any real stall; reader_restarts is the honest, persistent
+            # record that a stall happened and was repaired, never
+            # silently hidden just because the very next poll already
+            # looks fine.
+            if info.reader_alive is not None:
+                payload["reader_alive"] = info.reader_alive
+                payload["reader_restarts"] = info.reader_restarts
+            return payload
         except TmuxError as exc:
             return {"error": "TMUX_ERROR", "session": session, "reason": str(exc)}
 

@@ -36,6 +36,16 @@ class SessionInfo:
     # trusted for a Reopen, exactly like any other working_directory
     # input (see lifecycle.py's resolve_cwd).
     pane_current_path: str = ""
+    # Reader-thread health (task: "P0 WINDOWS SESSION STATE-LOSS / STALE
+    # STREAM", item 7's own "stream_source, reader_alive... surface
+    # STREAM_STALLED instead of pretending healthy"). Only meaningful
+    # for backends with a real background reader thread to supervise
+    # (currently WindowsSessionBackend) -- None on tmux (no equivalent
+    # concept: tmux is its own separate server process, not a thread
+    # this project's own process could ever observe dying) rather than
+    # a fabricated True/False that would imply a check that never ran.
+    reader_alive: bool | None = None
+    reader_restarts: int = 0
 
 
 @dataclass(frozen=True)

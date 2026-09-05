@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import queue
 import re
+import sys
 import threading
 import time
 from collections import deque
@@ -202,6 +203,99 @@ def _default_process_factory(argv: list[str], cwd: str) -> PtyProcessLike:
     return winpty.PtyProcess.spawn(argv, cwd=cwd)
 
 
+ForegroundCommandResolver = Callable[[int, str], str]
+"""`(root_pid, fallback_name) -> command_name` -- swappable exactly like
+ProcessFactory above, for the same reason: the real implementation
+(_win32_foreground_command) only works on an actual Windows host, so
+tests on this Linux dev environment inject a fake one to verify the
+WIRING (get_session actually calls it, actually uses its result,
+correctly falls back on failure) without needing real Windows or a
+real child-process tree."""
+
+
+def _win32_foreground_command(root_pid: int, fallback_name: str) -> str:
+    """P0 HOTFIX (task: 'P0 WINDOWS SESSION STATE-LOSS / STALE STREAM',
+    item 5's own 'current_command should reflect foreground process/
+    agent when available'): REAL BUG this fixes -- get_session() used to
+    report the session's ORIGINAL spawn command forever (e.g.
+    'powershell.exe'), never updated, because it was a bare Path(...)
+    .name of the value captured once at create_session time. Confirmed
+    live on the real 'window' session on dell-5530: `claude.exe` had
+    been running for hours as a real, live, actively-CPU-burning CHILD
+    of the session's own tracked powershell.exe, yet terminal_status
+    kept reporting current_command='powershell.exe' throughout, feeding
+    classify_status a permanently-wrong signal.
+
+    Unlike tmux's own #{pane_current_command} (a native, O(1) query --
+    the pty's own foreground process GROUP leader is a well-defined
+    POSIX concept), Windows/ConPTY has no equivalent native "foreground
+    process for this console" query. This walks the process tree
+    instead, starting at the session's own root pid, descending through
+    single-child chains (the same heuristic real terminal emulators use
+    to approximate "what's actually running right now"): at each step,
+    if the current process has exactly one still-alive child, descend
+    into it; stop at a leaf (no children) or a branch (more than one
+    live child, where "which one is foreground" is genuinely
+    ambiguous -- reports the last unambiguous process rather than
+    guessing). Best-effort, matches get_session's own existing
+    "Best-effort approximation, not a native OS query" framing -- falls
+    back to `fallback_name` on ANY failure (missing pywin32, a
+    permission error enumerating another user's process, the root pid
+    itself already gone), never raises past this function."""
+    if sys.platform != "win32":
+        return fallback_name
+    try:
+        import ctypes
+        import ctypes.wintypes as wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        class PROCESSENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_char * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot == INVALID_HANDLE_VALUE:
+            return fallback_name
+        try:
+            entry = PROCESSENTRY32()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            children_by_parent: dict[int, list[tuple[int, str]]] = {}
+            if not kernel32.Process32First(snapshot, ctypes.byref(entry)):
+                return fallback_name
+            while True:
+                children_by_parent.setdefault(entry.th32ParentProcessID, []).append(
+                    (entry.th32ProcessID, entry.szExeFile.decode("mbcs", errors="replace")))
+                if not kernel32.Process32Next(snapshot, ctypes.byref(entry)):
+                    break
+        finally:
+            kernel32.CloseHandle(snapshot)
+
+        current_pid = root_pid
+        current_name = fallback_name
+        seen = {root_pid}  # cycle guard -- a snapshot race could in theory misreport a parent link
+        while True:
+            live_children = [
+                (pid, name) for pid, name in children_by_parent.get(current_pid, [])
+                if pid not in seen
+            ]
+            if len(live_children) != 1:
+                break
+            current_pid, exe = live_children[0]
+            current_name = Path(exe).stem
+            seen.add(current_pid)
+        return current_name
+    except Exception:  # noqa: BLE001 -- best-effort only, must never break get_session over this
+        return fallback_name
+
+
 def _kill_process_tree(proc: PtyProcessLike) -> None:
     """Terminate exactly this session's own process (and whatever it
     spawned under it, if the pty implementation's own terminate() covers
@@ -269,6 +363,17 @@ class _WindowsSession:
     # must never be silently dropped, only a REPEAT of the size already
     # in effect).
     last_resize_dims: tuple[int, int] | None = None
+    # P0 HOTFIX (task: "P0 WINDOWS SESSION STATE-LOSS / STALE STREAM"):
+    # reader_thread's own liveness was previously never checked again
+    # after create_session -- a died thread (entry.proc.read() raised
+    # once) meant this session's output stream silently froze forever,
+    # indistinguishable from "genuinely idle" to any caller. Counted/
+    # timestamped (not just a bool) so health metadata can show an
+    # operator "this session's stream recovered from a stall N times",
+    # never silently hiding that a real, if self-healed, problem
+    # happened. See _ensure_reader_alive.
+    reader_restarts: int = 0
+    last_reader_restart_epoch: int | None = None
 
 
 class WindowsSessionBackend:
@@ -280,10 +385,12 @@ class WindowsSessionBackend:
     "persistent" does and does not mean here."""
 
     def __init__(self, *, shell: str = DEFAULT_SHELL, history_lines: int = DEFAULT_HISTORY_LINES,
-                process_factory: ProcessFactory | None = None) -> None:
+                process_factory: ProcessFactory | None = None,
+                foreground_command_resolver: ForegroundCommandResolver | None = None) -> None:
         self.shell = shell
         self.history_lines = history_lines
         self._process_factory = process_factory or _default_process_factory
+        self._foreground_command_resolver = foreground_command_resolver or _win32_foreground_command
         self._sessions: dict[str, _WindowsSession] = {}
         self._registry_lock = threading.Lock()
 
@@ -300,6 +407,22 @@ class WindowsSessionBackend:
         if session is None:
             return None
         alive = _is_alive(session.proc)
+        if alive:
+            self._ensure_reader_alive(session)
+        fallback_command = Path(session.command or self.shell).name
+        try:
+            # P0 HOTFIX (task: "P0 WINDOWS SESSION STATE-LOSS / STALE
+            # STREAM"): re-derived on EVERY call, never cached/computed
+            # once -- see _win32_foreground_command's own docstring for
+            # the real bug this fixes (current_command used to report
+            # this session's ORIGINAL spawn command forever, e.g.
+            # "powershell.exe", even hours into a real claude.exe run as
+            # its child). Best-effort: any failure here must never break
+            # get_session itself, so it's wrapped even though the
+            # resolver already catches its own errors internally.
+            current_command = self._foreground_command_resolver(session.proc.pid, fallback_command)
+        except Exception:  # noqa: BLE001
+            current_command = fallback_command
         return SessionInfo(
             name=session.name,
             attached=session.attached_viewers > 0,
@@ -314,13 +437,23 @@ class WindowsSessionBackend:
             # process name, e.g. "bash", never "/bin/bash"), which is
             # what core.py's _classify_agent_type/SHELL_COMMAND_NAMES and
             # config.session_lifecycle.launch_commands matching both
-            # already assume.
-            pane_current_command=Path(session.command or self.shell).name,
+            # already assume. Now walks to the real foreground child
+            # (e.g. "claude" running inside a powershell wrapper) rather
+            # than reporting the session's own original spawn command
+            # forever -- see _win32_foreground_command.
+            pane_current_command=current_command,
             pane_dead=not alive,
             session_id=f"win:{session.name}:{session.created_epoch}",
             pane_id=f"pid:{session.proc.pid}",
             pane_in_mode=False,  # no copy-mode concept -- input is never blocked by one here
             pane_current_path=session.cwd,
+            # None (not False) when the process itself is already dead --
+            # "is the reader alive" stops being a meaningful question at
+            # that point, distinct from "the reader specifically died
+            # while the process kept running" (reader_alive=False, the
+            # actual failure mode this whole fix targets).
+            reader_alive=(session.reader_thread is not None and session.reader_thread.is_alive()) if alive else None,
+            reader_restarts=session.reader_restarts,
         )
 
     def capture_lines(self, session: str, lines: int, *, ansi: bool = False) -> list[str]:
@@ -665,6 +798,41 @@ class WindowsSessionBackend:
         if entry is None:
             raise TmuxError(f"session {name!r} does not exist")
         return entry
+
+    def _ensure_reader_alive(self, entry: _WindowsSession) -> None:
+        """P0 HOTFIX (task: "P0 WINDOWS SESSION STATE-LOSS / STALE
+        STREAM", items 3/6/7): reader_thread was started exactly once,
+        at create_session time, and never otherwise supervised -- if
+        entry.proc.read() ever raised (a transient ConPTY hiccup, not
+        necessarily the underlying process dying), _reader_loop's own
+        top-level `except: break` quietly ends the thread forever,
+        freezing this session's activity_epoch/buffer/live-viewer feed
+        even though the real process is still alive and producing
+        output nobody is draining anymore -- exactly the silent
+        STREAM_STALLED failure mode this task exists to catch and
+        self-heal. Called from get_session() (so a single status poll
+        both detects AND repairs it, no separate watchdog loop needed),
+        ONLY while the underlying process is confirmed still alive -- a
+        session whose process genuinely exited needs no reader at all;
+        restarting one against a dead proc.read() would just fail
+        identically on its very first iteration.
+
+        Reconnects to the SAME already-open entry.proc handle -- never
+        respawns the process, never touches or clears the accumulated
+        buffer, only ever loses whatever output arrived during the gap
+        between the old thread dying and this restart (unavoidable; the
+        alternative -- never restarting -- loses everything from that
+        point on forever, which is the real bug this fixes)."""
+        if entry.reader_thread is not None and entry.reader_thread.is_alive():
+            return
+        with entry.lock:
+            if entry.reader_thread is not None and entry.reader_thread.is_alive():
+                return  # lost the race with another caller already restarting it
+            entry.reader_restarts += 1
+            entry.last_reader_restart_epoch = int(time.time())
+            entry.stop_reading.clear()
+            entry.reader_thread = threading.Thread(target=self._reader_loop, args=(entry,), daemon=True)
+            entry.reader_thread.start()
 
     def _reader_loop(self, entry: _WindowsSession) -> None:
         while not entry.stop_reading.is_set():

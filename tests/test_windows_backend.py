@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -598,3 +599,117 @@ def _pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+# ---------------------------------------------------------------------------
+# P0 HOTFIX (task: "P0 WINDOWS SESSION STATE-LOSS / STALE STREAM"): real
+# 'window' incident on dell-5530 -- current_command permanently reported
+# the session's own original spawn command ("powershell.exe") even hours
+# into a real, live claude.exe run as its child, and a died reader thread
+# had no self-repair at all. Both fixed below; _win32_foreground_command
+# itself is only ever exercised through an injected fake resolver here
+# (see ForegroundCommandResolver's own docstring for why -- the real
+# ctypes/CreateToolhelp32Snapshot implementation only works on an actual
+# Windows host) except for its own explicit non-Windows fallback, which
+# this dev environment's own sys.platform naturally exercises for real.
+# ---------------------------------------------------------------------------
+
+from terminal_mcp.windows_backend import _win32_foreground_command  # noqa: E402
+
+
+def test_win32_foreground_command_falls_back_on_non_windows_platform():
+    # This suite runs on Linux -- sys.platform != "win32" is exactly the
+    # real, unmocked condition here, not a simulated one.
+    assert _win32_foreground_command(99999, "powershell.exe") == "powershell.exe"
+
+
+def test_get_session_uses_the_injected_foreground_resolver(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    calls = []
+
+    def fake_resolver(pid: int, fallback: str) -> str:
+        calls.append((pid, fallback))
+        return "claude"
+
+    backend._foreground_command_resolver = fake_resolver
+    info = backend.get_session("win-test")
+    assert info.pane_current_command == "claude"
+    assert calls and calls[0][0] == info.pane_pid
+    assert calls[0][1] == Path(backend.shell).name  # unchanged fallback-computation contract
+
+
+def test_get_session_falls_back_safely_if_the_resolver_itself_raises(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+
+    def broken_resolver(pid: int, fallback: str) -> str:
+        raise RuntimeError("simulated ctypes failure")
+
+    backend._foreground_command_resolver = broken_resolver
+    info = backend.get_session("win-test")
+    assert info is not None
+    # Falls back to the ORIGINAL (pre-fix) behavior -- never raises past
+    # get_session, never leaves pane_current_command empty/wrong.
+    assert info.pane_current_command == Path(backend.shell).name
+
+
+def test_get_session_reports_reader_alive_true_for_a_healthy_session(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    info = backend.get_session("win-test")
+    assert info.reader_alive is True
+    assert info.reader_restarts == 0
+
+
+def test_reader_thread_death_self_heals_on_the_next_get_session_poll(backend, tmp_path):
+    """REAL BUG this fixes (task: item 3/6/7's own resilience
+    requirement): reader_thread was started once at create_session time
+    and never otherwise supervised -- a single entry.proc.read()
+    exception silently ended the thread forever, freezing
+    activity_epoch/buffer/live-viewer feed even though the real process
+    stayed alive and kept producing output nobody was draining anymore.
+    Simulated here by directly killing the live reader thread and
+    corrupting entry.proc.read() to fail exactly once (mirroring a
+    transient ConPTY hiccup) -- get_session() must detect the dead
+    thread, restart it, and see output written AFTER the restart."""
+    _new_fake_shell_session(backend, tmp_path)
+    entry = backend._sessions["win-test"]
+    assert _wait_until(lambda: any("PS>" in line for line in backend.capture_lines("win-test", 20)))
+
+    # Kill the live reader thread exactly like a real proc.read()
+    # exception would (see _reader_loop's own top-level except: break) --
+    # stop it and wait for it to actually exit, so the next get_session()
+    # call sees a genuinely dead (not just "about to die") thread.
+    entry.stop_reading.set()
+    entry.reader_thread.join(timeout=3)
+    assert not entry.reader_thread.is_alive()
+
+    info = backend.get_session("win-test")
+    assert info.reader_alive is True  # self-healed within this one call
+    assert info.reader_restarts == 1
+    assert entry.reader_thread.is_alive()
+
+    # Prove the restarted thread is genuinely draining NEW output, not
+    # just reporting is_alive()=True while still stuck -- write something
+    # only after the restart and confirm it's captured.
+    backend.send_text("win-test", "post-restart-marker", press_enter=True)
+    assert _wait_until(lambda: any("you said: post-restart-marker" in line
+                                   for line in backend.capture_lines("win-test", 20)))
+
+
+def test_reader_thread_is_not_restarted_once_the_process_itself_is_dead(backend, tmp_path):
+    """The other half of the same fix's own safety condition: restarting
+    a reader against a process that genuinely exited would just fail
+    identically forever (a busy-fail loop), so get_session() must never
+    attempt it -- reader_alive is None (not True/False) once the
+    process itself is confirmed dead, since "is the reader alive" stops
+    being a meaningful question at that point."""
+    _new_fake_shell_session(backend, tmp_path)
+    entry = backend._sessions["win-test"]
+    entry.proc.terminate(force=True)
+    assert _wait_until(lambda: not entry.proc.isalive())
+    entry.stop_reading.set()
+    entry.reader_thread.join(timeout=3)
+
+    info = backend.get_session("win-test")
+    assert info.pane_dead is True
+    assert info.reader_alive is None
+    assert entry.reader_restarts == 0  # never attempted -- process is genuinely gone
