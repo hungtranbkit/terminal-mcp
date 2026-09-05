@@ -260,3 +260,97 @@ def test_deregister_removes_the_row(tmp_path):
     assert registry.deregister("n1") is True
     assert registry.get("n1") is None
     assert registry.deregister("n1") is False  # idempotent -- already gone
+
+
+# -- watchdog: node online/offline transitions ----------------------------
+
+def test_sync_status_transitions_first_ever_seen_is_never_an_event(tmp_path):
+    """The very first time a node is observed, there is no real "before"
+    to have transitioned away from -- last_known_status starts NULL, and
+    that must never itself count as a transition."""
+    thresholds = NodeHeartbeatThresholds(degraded_after_seconds=60.0, offline_after_seconds=180.0)
+    registry = NodeRegistry(tmp_path / "nodes.db", heartbeat_thresholds=thresholds)
+    registry.register("n1", display_name="N1", hostname="h1", endpoint="local")
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    registry.heartbeat("n1", metrics=_metrics(), tmux_session_count=0, agent_counts={},
+                       agent_types=(), agent_version=None, labels=(), now=now)
+    transitions = registry.sync_status_transitions(now=now)
+    assert transitions == []
+    assert registry.list_status_events() == []
+
+
+def test_sync_status_transitions_detects_online_to_offline(tmp_path):
+    thresholds = NodeHeartbeatThresholds(degraded_after_seconds=60.0, offline_after_seconds=180.0)
+    registry = NodeRegistry(tmp_path / "nodes.db", heartbeat_thresholds=thresholds)
+    registry.register("n1", display_name="N1", hostname="h1", endpoint="local")
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    registry.heartbeat("n1", metrics=_metrics(), tmux_session_count=0, agent_counts={},
+                       agent_types=(), agent_version=None, labels=(), now=now)
+    registry.sync_status_transitions(now=now)  # baseline: records "online" as last_known_status
+
+    later = now + timedelta(seconds=300)  # past offline_after_seconds, no new heartbeat
+    transitions = registry.sync_status_transitions(now=later)
+    assert len(transitions) == 1
+    assert transitions[0]["node_id"] == "n1"
+    assert transitions[0]["from_status"] == NODE_ONLINE
+    assert transitions[0]["to_status"] == NODE_OFFLINE
+
+    events = registry.list_status_events()
+    assert len(events) == 1
+    assert events[0]["from_status"] == NODE_ONLINE
+    assert events[0]["to_status"] == NODE_OFFLINE
+    assert events[0]["acknowledged"] == 0
+
+
+def test_sync_status_transitions_no_change_is_not_a_new_event(tmp_path):
+    thresholds = NodeHeartbeatThresholds(degraded_after_seconds=60.0, offline_after_seconds=180.0)
+    registry = NodeRegistry(tmp_path / "nodes.db", heartbeat_thresholds=thresholds)
+    registry.register("n1", display_name="N1", hostname="h1", endpoint="local")
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    registry.heartbeat("n1", metrics=_metrics(), tmux_session_count=0, agent_counts={},
+                       agent_types=(), agent_version=None, labels=(), now=now)
+    registry.sync_status_transitions(now=now)
+    # Still online a moment later -- no transition.
+    transitions = registry.sync_status_transitions(now=now + timedelta(seconds=10))
+    assert transitions == []
+    assert registry.list_status_events() == []
+
+
+def test_sync_status_transitions_detects_recovery_back_online(tmp_path):
+    thresholds = NodeHeartbeatThresholds(degraded_after_seconds=60.0, offline_after_seconds=180.0)
+    registry = NodeRegistry(tmp_path / "nodes.db", heartbeat_thresholds=thresholds)
+    registry.register("n1", display_name="N1", hostname="h1", endpoint="local")
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    registry.heartbeat("n1", metrics=_metrics(), tmux_session_count=0, agent_counts={},
+                       agent_types=(), agent_version=None, labels=(), now=now)
+    registry.sync_status_transitions(now=now)
+    registry.sync_status_transitions(now=now + timedelta(seconds=300))  # goes offline
+
+    recovered_at = now + timedelta(seconds=310)
+    registry.heartbeat("n1", metrics=_metrics(), tmux_session_count=0, agent_counts={},
+                       agent_types=(), agent_version=None, labels=(), now=recovered_at)
+    transitions = registry.sync_status_transitions(now=recovered_at)
+    assert len(transitions) == 1
+    assert transitions[0]["from_status"] == NODE_OFFLINE
+    assert transitions[0]["to_status"] == NODE_ONLINE
+
+
+def test_acknowledge_status_event(tmp_path):
+    thresholds = NodeHeartbeatThresholds(degraded_after_seconds=60.0, offline_after_seconds=180.0)
+    registry = NodeRegistry(tmp_path / "nodes.db", heartbeat_thresholds=thresholds)
+    registry.register("n1", display_name="N1", hostname="h1", endpoint="local")
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    registry.heartbeat("n1", metrics=_metrics(), tmux_session_count=0, agent_counts={},
+                       agent_types=(), agent_version=None, labels=(), now=now)
+    registry.sync_status_transitions(now=now)
+    registry.sync_status_transitions(now=now + timedelta(seconds=300))
+    event_id = registry.list_status_events()[0]["id"]
+
+    assert registry.acknowledge_status_event(event_id, by="tester") is True
+    assert registry.list_status_events(unacknowledged_only=True) == []
+    assert len(registry.list_status_events()) == 1  # still there, just acknowledged
+
+
+def test_acknowledge_status_event_unknown_id_returns_false(tmp_path):
+    registry = NodeRegistry(tmp_path / "nodes.db")
+    assert registry.acknowledge_status_event(99999) is False

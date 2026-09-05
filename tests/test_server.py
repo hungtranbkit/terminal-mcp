@@ -58,6 +58,10 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_knowledge_timeline",
         "terminal_knowledge_recover",
         "terminal_knowledge_checkpoint",
+        "terminal_watchdog_session_events",
+        "terminal_watchdog_acknowledge_session_event",
+        "terminal_watchdog_node_events",
+        "terminal_watchdog_acknowledge_node_event",
     }
 
 

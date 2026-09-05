@@ -239,6 +239,26 @@ class SessionRegistryStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_session_records_status ON session_records(status)"
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS drop_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id TEXT NOT NULL,
+                    session_name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    detected_at TEXT NOT NULL,
+                    detail TEXT,
+                    acknowledged INTEGER NOT NULL DEFAULT 0,
+                    acknowledged_at TEXT,
+                    acknowledged_by TEXT,
+                    recovered INTEGER NOT NULL DEFAULT 0,
+                    recovered_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_drop_events_ack ON drop_events(acknowledged, detected_at)"
+            )
             apply_migrations(connection, REGISTRY_MIGRATIONS)
         try:
             self.path.chmod(0o600)
@@ -428,6 +448,70 @@ class SessionRegistryStore:
                 "UPDATE session_records SET status = 'OFFLINE', offline_at = ? "
                 "WHERE node_id = ? AND status = 'ACTIVE'",
                 (now, node_id),
+            )
+        return cursor.rowcount
+
+    # -- watchdog: unexpected drop events -----------------------------------
+    # (task: "theo dõi và noti cho user biết session nào bị rớt đột ngột,
+    # và hỗ trợ hồi phục nó") -- deliberately keyed off mark_missing's own
+    # ALREADY-COMPUTED "vanished" list (core.py's caller passes it straight
+    # here) rather than re-deriving anything: a session that was ACTIVE and
+    # is now gone, with NO corresponding terminal_kill_session/_delete_
+    # session call, is exactly "dropped unexpectedly" -- an explicit Kill
+    # never reaches this path at all (see core.py's terminal_kill_session,
+    # which calls mark_killed, never mark_missing, for the session it just
+    # killed).
+
+    def record_drop_event(self, node_id: str, session_name: str, kind: str, *,
+                          detail: str | None = None, now: str | None = None) -> int:
+        now = now or _now_iso()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "INSERT INTO drop_events (node_id, session_name, kind, detected_at, detail) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (node_id, session_name, kind, now, detail),
+            )
+            return int(cursor.lastrowid)
+
+    def list_drop_events(self, *, unacknowledged_only: bool = False, limit: int = 50) -> list[dict[str, Any]]:
+        clause = "WHERE acknowledged = 0" if unacknowledged_only else ""
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM drop_events {clause} ORDER BY detected_at DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def acknowledge_drop_event(self, event_id: int, *, by: str | None = None) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE drop_events SET acknowledged = 1, acknowledged_at = ?, acknowledged_by = ? WHERE id = ?",
+                (_now_iso(), by, event_id),
+            )
+        return cursor.rowcount == 1
+
+    def mark_drop_event_recovered(self, event_id: int) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE drop_events SET recovered = 1, recovered_at = ? WHERE id = ?",
+                (_now_iso(), event_id),
+            )
+        return cursor.rowcount == 1
+
+    def mark_drop_events_recovered_for(self, node_id: str, session_name: str) -> int:
+        """A session that had an unrecovered drop event is seen ACTIVE
+        again (reopened through terminal_registry_reopen, or simply
+        recreated under the same name some other way) -- called from the
+        SAME reconcile pass that upserts it back to ACTIVE (core.py), so
+        this never needs its own polling loop. Marks every still-
+        unrecovered event for that (node, name), not just the most recent
+        one -- a session that dropped, got reopened, dropped again, and
+        is now back a third time should not leave an earlier event
+        looking unresolved forever."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE drop_events SET recovered = 1, recovered_at = ? "
+                "WHERE node_id = ? AND session_name = ? AND recovered = 0",
+                (_now_iso(), node_id, session_name),
             )
         return cursor.rowcount
 

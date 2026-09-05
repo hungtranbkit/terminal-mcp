@@ -230,3 +230,73 @@ def test_upsert_manual_never_overwrites_an_existing_record(store):
     result = store.upsert_manual("local", "s1", status=STATUS_MISSING, cwd="/somewhere/else")
     assert result.status == STATUS_KILLED  # untouched -- upsert_manual only fills GAPS
     assert result.cwd == "/tmp"
+
+
+# -- watchdog: unexpected drop events -----------------------------------
+
+def test_record_and_list_drop_events(store):
+    event_id = store.record_drop_event("local", "s1", "session_missing", detail="cwd=/tmp agent_type=shell")
+    events = store.list_drop_events()
+    assert len(events) == 1
+    assert events[0]["id"] == event_id
+    assert events[0]["session_name"] == "s1"
+    assert events[0]["kind"] == "session_missing"
+    assert events[0]["acknowledged"] == 0
+    assert events[0]["recovered"] == 0
+
+
+def test_list_drop_events_unacknowledged_only_filters(store):
+    a = store.record_drop_event("local", "s1", "session_missing")
+    store.record_drop_event("local", "s2", "session_missing")
+    store.acknowledge_drop_event(a)
+    events = store.list_drop_events(unacknowledged_only=True)
+    assert len(events) == 1
+    assert events[0]["session_name"] == "s2"
+
+
+def test_acknowledge_drop_event(store):
+    event_id = store.record_drop_event("local", "s1", "session_missing")
+    assert store.acknowledge_drop_event(event_id, by="tester") is True
+    events = store.list_drop_events()
+    assert events[0]["acknowledged"] == 1
+    assert events[0]["acknowledged_by"] == "tester"
+
+
+def test_acknowledge_drop_event_unknown_id_returns_false(store):
+    assert store.acknowledge_drop_event(99999) is False
+
+
+def test_mark_drop_event_recovered(store):
+    event_id = store.record_drop_event("local", "s1", "session_missing")
+    assert store.mark_drop_event_recovered(event_id) is True
+    events = store.list_drop_events()
+    assert events[0]["recovered"] == 1
+
+
+def test_mark_drop_events_recovered_for_marks_all_unrecovered_for_that_session(store):
+    # A session that dropped, got reopened, dropped again -- both events
+    # must be marked recovered once it's seen ACTIVE again, not just the
+    # most recent one.
+    first = store.record_drop_event("local", "s1", "session_missing")
+    second = store.record_drop_event("local", "s1", "session_missing")
+    other = store.record_drop_event("local", "s2", "session_missing")
+
+    count = store.mark_drop_events_recovered_for("local", "s1")
+    assert count == 2
+    events_by_id = {e["id"]: e for e in store.list_drop_events()}
+    assert events_by_id[first]["recovered"] == 1
+    assert events_by_id[second]["recovered"] == 1
+    assert events_by_id[other]["recovered"] == 0  # a DIFFERENT session's event untouched
+
+
+def test_mark_drop_events_recovered_for_is_a_noop_with_nothing_to_recover(store):
+    assert store.mark_drop_events_recovered_for("local", "never-dropped") == 0
+
+
+def test_drop_events_are_node_scoped(store):
+    store.record_drop_event("node-a", "s1", "session_missing")
+    store.record_drop_event("node-b", "s1", "session_missing")
+    assert store.mark_drop_events_recovered_for("node-a", "s1") == 1
+    events_by_node = {e["node_id"]: e for e in store.list_drop_events()}
+    assert events_by_node["node-a"]["recovered"] == 1
+    assert events_by_node["node-b"]["recovered"] == 0

@@ -216,9 +216,35 @@ class NodeRegistry:
                 ("session_backend", "TEXT NOT NULL DEFAULT 'tmux'"),
                 ("shell_capabilities", "TEXT NOT NULL DEFAULT '[]'"),
                 ("wsl_available", "INTEGER NOT NULL DEFAULT 0"),
+                # Watchdog (task: "theo dõi và noti khi session/node rớt đột
+                # ngột") -- the ONLY persisted status field on this table;
+                # everything else here stays derived-at-read-time (see this
+                # module's own docstring). Needed so sync_status_
+                # transitions() below has something to compare THIS read's
+                # freshly-derived status against, to detect a transition
+                # (never just re-deriving the same answer twice).
+                ("last_known_status", "TEXT"),
             ):
                 if column not in existing_columns:
                     connection.execute(f"ALTER TABLE nodes ADD COLUMN {column} {declaration}")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS node_status_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id TEXT NOT NULL,
+                    from_status TEXT,
+                    to_status TEXT NOT NULL,
+                    detected_at TEXT NOT NULL,
+                    acknowledged INTEGER NOT NULL DEFAULT 0,
+                    acknowledged_at TEXT,
+                    acknowledged_by TEXT
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_node_status_events_ack "
+                "ON node_status_events(acknowledged, detected_at)"
+            )
             apply_migrations(connection, NODE_MIGRATIONS)
         try:
             self.path.chmod(0o600)
@@ -407,3 +433,60 @@ class NodeRegistry:
         with self._connection() as connection:
             rows = connection.execute("SELECT * FROM nodes ORDER BY id").fetchall()
         return [self._row_to_node(row, now=now) for row in rows]
+
+    # -- watchdog: node online/offline transitions ---------------------------
+
+    def sync_status_transitions(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
+        """Called from the SAME place a fleet-wide status read already
+        happens (controller.list_nodes(), itself driven by the dashboard's
+        own periodic /dashboard/api/nodes poll -- zero extra network cost,
+        same "reconcile as a side effect of listing" discipline every
+        other store in this project already uses) -- NOT a background
+        thread of its own. Compares each node's freshly-DERIVED status
+        (see this module's own docstring: status is never persisted,
+        only derived from last_heartbeat_at age) against `last_known_
+        status` from the PREVIOUS such call; a change is recorded as a
+        node_status_events row and `last_known_status` is updated to
+        match. The very first time a node is ever seen (last_known_status
+        is NULL) is never itself an event -- there is no real "before" to
+        have transitioned away from. Returns the transitions detected
+        this call (empty on an ordinary, unchanged pass)."""
+        now = now or _now()
+        transitions: list[dict[str, Any]] = []
+        with self._connection() as connection:
+            rows = connection.execute("SELECT id, last_known_status FROM nodes").fetchall()
+            for row in rows:
+                node = self.get(row["id"], now=now)
+                if node is None:
+                    continue
+                previous = row["last_known_status"]
+                current = node.status
+                if previous is not None and previous != current:
+                    detected_at = _iso(now)
+                    connection.execute(
+                        "INSERT INTO node_status_events (node_id, from_status, to_status, detected_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (node.id, previous, current, detected_at),
+                    )
+                    transitions.append({"node_id": node.id, "from_status": previous, "to_status": current,
+                                        "detected_at": detected_at})
+                if previous != current:
+                    connection.execute("UPDATE nodes SET last_known_status = ? WHERE id = ?", (current, node.id))
+        return transitions
+
+    def list_status_events(self, *, unacknowledged_only: bool = False, limit: int = 50) -> list[dict[str, Any]]:
+        clause = "WHERE acknowledged = 0" if unacknowledged_only else ""
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM node_status_events {clause} ORDER BY detected_at DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def acknowledge_status_event(self, event_id: int, *, by: str | None = None) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE node_status_events SET acknowledged = 1, acknowledged_at = ?, acknowledged_by = ? "
+                "WHERE id = ?",
+                (_iso(_now()), by, event_id),
+            )
+        return cursor.rowcount == 1

@@ -753,3 +753,59 @@ def test_knowledge_search_fleet_skips_offline_nodes_entirely(tmp_path):
     result = controller.terminal_knowledge_search_fleet("should not be searched")
     assert result["results"] == []
     assert ("knowledge_search", "should not be searched") not in remote.calls
+
+
+# -- watchdog: node online/offline transitions ---------------------------
+
+def _age_last_heartbeat(registry: NodeRegistry, node_id: str, seconds_ago: float) -> None:
+    """Directly backdates a node's own last_heartbeat_at in the real DB
+    file -- the simplest way to make a REAL, current-time
+    sync_status_transitions() call see that node as stale/offline,
+    without needing to mock datetime.now() anywhere."""
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+    then = (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+    conn = sqlite3.connect(registry.path)
+    conn.execute("UPDATE nodes SET last_heartbeat_at = ? WHERE id = ?", (then, node_id))
+    conn.commit()
+    conn.close()
+
+
+def test_list_nodes_detects_and_records_an_offline_transition(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    controller.list_nodes()  # baseline pass -- records "online" as last_known_status
+
+    _age_last_heartbeat(controller.registry, "local", 300)  # past offline_after_seconds (180s default)
+    controller.list_nodes()  # this call's own sync_status_transitions should detect it
+
+    events = controller.terminal_watchdog_node_events()["events"]
+    matching = [e for e in events if e["node_id"] == "local"]
+    assert len(matching) == 1
+    assert matching[0]["to_status"] == "offline"
+
+
+def test_list_nodes_first_ever_heartbeat_is_never_a_watchdog_event(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    controller.list_nodes()  # the very first status read for this node
+    assert controller.terminal_watchdog_node_events()["events"] == []
+
+
+def test_watchdog_node_event_acknowledge(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    controller.list_nodes()
+    _age_last_heartbeat(controller.registry, "local", 300)
+    controller.list_nodes()
+    event_id = controller.terminal_watchdog_node_events()["events"][0]["id"]
+
+    result = controller.terminal_watchdog_acknowledge_node_event(event_id, by="tester")
+    assert result["acknowledged"] is True
+    assert controller.terminal_watchdog_node_events(unacknowledged_only=True)["events"] == []
+
+
+def test_watchdog_node_event_acknowledge_unknown_id(tmp_path):
+    controller, _service = _controller(tmp_path)
+    result = controller.terminal_watchdog_acknowledge_node_event(99999)
+    assert result["error"] == "EVENT_NOT_FOUND"

@@ -165,6 +165,11 @@ DASHBOARD_HTML = """<!doctype html>
        badges it now sits beside. */
     .header-icon-btn { background:transparent; border:1px solid var(--line); border-radius:999px; color:var(--muted); cursor:pointer; padding:4px 10px; font:12px var(--mono); white-space:nowrap }
     .header-icon-btn:hover { color:var(--text); background:#171f33 }
+    /* Watchdog badge -- deliberately a WARNING color (amber), distinct
+       from the neutral registry button next to it, since this one only
+       ever appears when there's something to actually look at. */
+    #watchdogToggle { border-color:var(--amber); color:var(--amber) }
+    #watchdogToggle:hover { background:rgba(255,200,87,.12) }
     /* Connection health banner (task: "self-healing, có chẩn đoán rõ") --
        one quiet, always-present label (never a popup/toast), colored only
        when something isn't simply "Connected". #connHealthBadge[hidden]
@@ -659,6 +664,17 @@ DASHBOARD_HTML = """<!doctype html>
           <div id="registryListEl"></div>
         </div>
       </div>
+      <!-- Watchdog (task: "theo dõi và noti session/node rớt đột ngột") --
+           same collapsed-until-relevant .menu component; only ever shows
+           UNACKNOWLEDGED events (an acknowledged one just drops off the
+           badge count/list, never deleted -- still in the DB for
+           history). -->
+      <div class="menu" id="watchdogMenu">
+        <button class="header-icon-btn" id="watchdogToggle" type="button" hidden aria-haspopup="true" aria-expanded="false"><span id="watchdogToggleLabel"></span></button>
+        <div class="menu-panel killed-panel" id="watchdogPanel" role="menu">
+          <div id="watchdogListEl"></div>
+        </div>
+      </div>
       <!-- Task item 3: rarely-used navigation (admin screens) lives in one
            "⋯" menu instead of a row of separate buttons -- LIVE/conn-health/
            Supervisor stay directly visible above since they're STATUS, not
@@ -820,6 +836,9 @@ DASHBOARD_HTML = """<!doctype html>
     const registryToggleLabelEl = document.querySelector('#registryToggleLabel');
     const registryListEl = document.querySelector('#registryListEl');
     const registrySearchInputEl = document.querySelector('#registrySearchInput');
+    const watchdogToggleEl = document.querySelector('#watchdogToggle');
+    const watchdogToggleLabelEl = document.querySelector('#watchdogToggleLabel');
+    const watchdogListEl = document.querySelector('#watchdogListEl');
     const killBackdropEl = document.querySelector('#killBackdrop');
     const killModalEl = document.querySelector('#killModal');
     const killModalTitleEl = document.querySelector('#killModalTitle');
@@ -925,6 +944,7 @@ DASHBOARD_HTML = """<!doctype html>
     wireMenu(document.querySelector('#termMenu'), document.querySelector('#termMenuBtn'));
     wireMenu(document.querySelector('#killedMenu'), killedToggleEl);
     wireMenu(document.querySelector('#registryMenu'), registryToggleEl);
+    wireMenu(document.querySelector('#watchdogMenu'), watchdogToggleEl);
 
     // ---- Supervisor Loop v1 summary (compact badge + overlay panel) -------
     // Read-only from this page's point of view: the badge/panel only ever
@@ -2091,6 +2111,7 @@ DASHBOARD_HTML = """<!doctype html>
       renderRows(rows);
       if (sessionLifecycleEnabled) loadKilledSessions(); else killedToggleEl.hidden = true;
       if (sessionLifecycleEnabled) loadRegistry(); else registryToggleEl.hidden = true;
+      loadWatchdog();
 
       // On first load only (never on the recurring 5s poll, which must not
       // fight a user's manual choice to switch sessions or clear the
@@ -2481,6 +2502,67 @@ DASHBOARD_HTML = """<!doctype html>
         return;
       }
       await loadRegistry();
+    }
+
+    // ---- Watchdog (task: "theo dõi và noti session/node rớt đột ngột") ----
+    // Same collapsed-badge-until-relevant pattern as the registry menu
+    // just above -- only ever shows UNACKNOWLEDGED events; acknowledging
+    // one just stops it counting/showing here (never deletes it -- still
+    // queryable via terminal_watchdog_*_events for history).
+    function renderWatchdog(events) {
+      watchdogToggleEl.hidden = events.length === 0;
+      watchdogToggleLabelEl.textContent = `⚠ Cảnh báo (${events.length})`;
+      watchdogListEl.replaceChildren();
+      if (events.length === 0) {
+        const empty = document.createElement('div'); empty.className = 'muted';
+        empty.style.cssText = 'padding:6px 2px';
+        empty.textContent = 'Không có cảnh báo nào.';
+        watchdogListEl.appendChild(empty);
+        return;
+      }
+      for (const event of events) {
+        const row = document.createElement('div'); row.className = 'killed-row';
+        const name = document.createElement('div'); name.className = 'kr-name';
+        name.textContent = event.kind === 'node_status'
+          ? `🖥 Node ${event.node_id}` : `${event.session_name} · ${event.node_id}`;
+        const meta = document.createElement('div'); meta.className = 'kr-meta';
+        const label = event.kind === 'node_status' ? 'node status đổi' : 'session rớt đột ngột';
+        meta.textContent = `${label} · ${clean(event.detail)} · ${timeAgo(event.detected_at)}`;
+        row.append(name, meta);
+        if (event.kind === 'session_missing') {
+          const recoverBtn = document.createElement('button'); recoverBtn.type = 'button';
+          recoverBtn.textContent = '🔄 Khôi phục';
+          recoverBtn.onclick = () => {
+            // Reuses the Persistent Session Registry's own, already-built
+            // Reopen flow rather than a second implementation -- opens
+            // that panel pre-filtered to this exact session.
+            watchdogToggleEl.click();
+            registryToggleEl.hidden = false;
+            registryToggleEl.click();
+            registrySearchInputEl.value = event.session_name;
+            renderRegistryFiltered(event.session_name);
+          };
+          row.append(recoverBtn);
+        }
+        const ackBtn = document.createElement('button'); ackBtn.type = 'button'; ackBtn.textContent = 'Đã xem';
+        ackBtn.onclick = () => acknowledgeWatchdogEvent(event.id);
+        row.append(ackBtn);
+        watchdogListEl.appendChild(row);
+      }
+    }
+    async function loadWatchdog() {
+      try {
+        const data = await fetchJSON('/dashboard/api/watchdog/events?unacknowledged_only=1', {cache: 'no-store'});
+        renderWatchdog(data.events || []);
+      } catch (error) { /* transient poll failure -- next 5s cycle retries */ }
+    }
+    async function acknowledgeWatchdogEvent(id) {
+      const response = await fetch('/dashboard/api/watchdog/acknowledge', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id}),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (result && result.error) { window.alert(`Không thể đánh dấu đã xem: ${clean(result.error)}`); return; }
+      await loadWatchdog();
     }
 
     async function loadDetail() {
@@ -5587,6 +5669,75 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         result = await anyio.to_thread.run_sync(
             lambda: terminal.terminal_registry_purge(session_name, purged_by=purged_by))
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    # -- Watchdog (task: "theo dõi và noti session/node nào bị rớt đột
+    # ngột, hỗ trợ hồi phục") -- merges two independent event streams
+    # (session_registry.py's drop_events -- this node's own sessions --
+    # and node_registry.py's node_status_events -- every node's own
+    # online/offline transitions, detected as a side effect of
+    # controller.list_nodes(), itself already called by /dashboard/api/
+    # nodes) into one list the dashboard shows as a single header badge/
+    # panel. Each event gets a composite "kind:id" string so ONE
+    # acknowledge route can address either store without the caller
+    # needing to know which.
+
+    @server.custom_route("/dashboard/api/watchdog/events", methods=["GET"], include_in_schema=False)
+    async def watchdog_events(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        unacknowledged_only = request.query_params.get("unacknowledged_only") == "1"
+        _refresh_local_heartbeat()
+
+        def _collect() -> list[dict]:
+            merged: list[dict] = []
+            for row in terminal.terminal_watchdog_events(unacknowledged_only=unacknowledged_only)["events"]:
+                merged.append({
+                    "id": f"session:{row['id']}", "kind": "session_missing", "node_id": row["node_id"],
+                    "session_name": row["session_name"], "detected_at": row["detected_at"],
+                    "detail": row.get("detail"), "acknowledged": bool(row["acknowledged"]),
+                    "recovered": bool(row["recovered"]),
+                })
+            for row in controller.terminal_watchdog_node_events(unacknowledged_only=unacknowledged_only)["events"]:
+                merged.append({
+                    "id": f"node:{row['id']}", "kind": "node_status", "node_id": row["node_id"],
+                    "session_name": None, "detected_at": row["detected_at"],
+                    "detail": f"{row['from_status']} → {row['to_status']}",
+                    "acknowledged": bool(row["acknowledged"]), "recovered": row["to_status"] == "online",
+                })
+            merged.sort(key=lambda e: e["detected_at"], reverse=True)
+            return merged
+
+        events = await anyio.to_thread.run_sync(_collect)
+        return JSONResponse({"events": events}, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/watchdog/acknowledge", methods=["POST"], include_in_schema=False)
+    async def watchdog_acknowledge(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        composite_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(composite_id, str) or ":" not in composite_id:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        kind, _, raw_id = composite_id.partition(":")
+        try:
+            event_id = int(raw_id)
+        except ValueError:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        by = identity.email if identity else "dashboard"
+        if kind == "session":
+            result = await anyio.to_thread.run_sync(lambda: terminal.terminal_watchdog_acknowledge(event_id, by=by))
+        elif kind == "node":
+            result = await anyio.to_thread.run_sync(
+                lambda: controller.terminal_watchdog_acknowledge_node_event(event_id, by=by))
+        else:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        status_code = 200 if "error" not in result else 404
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
     # -- Web terminal: xterm.js over a WebSocket, attached directly to an

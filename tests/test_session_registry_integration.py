@@ -116,6 +116,73 @@ def test_session_vanishing_out_of_band_is_reconciled_to_missing(tmp_path, tmux_c
     assert record["recoverable"] is True
 
 
+# -- watchdog: unexpected drop events (task: "theo dõi và noti session
+# nào bị rớt đột ngột, hỗ trợ hồi phục") -------------------------------------
+
+def test_out_of_band_vanish_records_a_watchdog_drop_event(tmp_path, tmux_cleanup):
+    service = _service(tmp_path)
+    service.terminal_create_session("reg-watch1", "shell", str(tmp_path))
+    time.sleep(0.3)
+    service.terminal_list_sessions()  # first reconcile -- ACTIVE
+    _tmux("kill-session", "-t", "reg-watch1", check=False)  # NEVER via terminal_kill_session
+    service.terminal_list_sessions()  # reconcile notices it's gone
+
+    events = service.terminal_watchdog_events()["events"]
+    matching = [e for e in events if e["session_name"] == "reg-watch1"]
+    assert len(matching) == 1
+    assert matching[0]["kind"] == "session_missing"
+    assert matching[0]["acknowledged"] == 0
+    assert matching[0]["recovered"] == 0
+
+
+def test_explicit_kill_never_records_a_watchdog_drop_event(tmp_path, tmux_cleanup):
+    service = _service(tmp_path)
+    service.terminal_create_session("reg-watch2", "shell", str(tmp_path))
+    time.sleep(0.3)
+    service.terminal_list_sessions()
+    service.terminal_kill_session("reg-watch2", "reg-watch2", requested_by="tester")
+
+    events = service.terminal_watchdog_events()["events"]
+    assert not any(e["session_name"] == "reg-watch2" for e in events)
+
+
+def test_watchdog_event_marked_recovered_once_session_is_active_again(tmp_path, tmux_cleanup):
+    service = _service(tmp_path)
+    tmux_cleanup.append("reg-watch3")
+    service.terminal_create_session("reg-watch3", "shell", str(tmp_path))
+    time.sleep(0.3)
+    service.terminal_list_sessions()
+    _tmux("kill-session", "-t", "reg-watch3", check=False)
+    service.terminal_list_sessions()
+    events = service.terminal_watchdog_events()["events"]
+    assert any(e["session_name"] == "reg-watch3" and not e["recovered"] for e in events)
+
+    # Recreated under the same name (e.g. via terminal_registry_reopen, or
+    # simply a fresh create) -- the earlier drop event must show recovered.
+    service.terminal_create_session("reg-watch3", "shell", str(tmp_path))
+    time.sleep(0.3)
+    service.terminal_list_sessions()
+    events_after = service.terminal_watchdog_events()["events"]
+    matching = [e for e in events_after if e["session_name"] == "reg-watch3"]
+    assert matching and all(e["recovered"] for e in matching)
+
+
+def test_watchdog_acknowledge_session_event(tmp_path, tmux_cleanup):
+    service = _service(tmp_path)
+    service.terminal_create_session("reg-watch4", "shell", str(tmp_path))
+    time.sleep(0.3)
+    service.terminal_list_sessions()
+    _tmux("kill-session", "-t", "reg-watch4", check=False)
+    service.terminal_list_sessions()
+    event_id = next(e["id"] for e in service.terminal_watchdog_events()["events"]
+                    if e["session_name"] == "reg-watch4")
+
+    result = service.terminal_watchdog_acknowledge(event_id, by="tester")
+    assert result["acknowledged"] is True
+    assert not any(e["session_name"] == "reg-watch4"
+                  for e in service.terminal_watchdog_events(unacknowledged_only=True)["events"])
+
+
 # -- reopen uses exact stored cwd/agent_type ----------------------------------
 
 def test_registry_reopen_recreates_with_exact_saved_cwd_and_agent(tmp_path, tmux_cleanup):
@@ -303,3 +370,49 @@ def test_dashboard_registry_mutation_routes_require_origin_csrf_defense(tmp_path
     assert r1.status_code == 403
     r2 = no_origin_client.post("/dashboard/api/registry/purge", json={"session_name": "x"})
     assert r2.status_code == 403
+
+
+def test_dashboard_watchdog_routes_list_and_acknowledge(tmp_path, tmux_cleanup):
+    service = _service(tmp_path)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})
+
+    service.terminal_create_session("reg-watchdog-http1", "shell", str(tmp_path))
+    time.sleep(0.3)
+    service.terminal_list_sessions()
+    _tmux("kill-session", "-t", "reg-watchdog-http1", check=False)
+    service.terminal_list_sessions()
+
+    listing = client.get("/dashboard/api/watchdog/events", params={"unacknowledged_only": "1"})
+    assert listing.status_code == 200
+    events = listing.json()["events"]
+    matching = next(e for e in events if e.get("session_name") == "reg-watchdog-http1")
+    assert matching["kind"] == "session_missing"
+    assert matching["acknowledged"] is False
+
+    ack = client.post("/dashboard/api/watchdog/acknowledge", json={"id": matching["id"]})
+    assert ack.status_code == 200
+    assert ack.json()["acknowledged"] is True
+
+    listing2 = client.get("/dashboard/api/watchdog/events", params={"unacknowledged_only": "1"})
+    assert not any(e.get("session_name") == "reg-watchdog-http1" for e in listing2.json()["events"])
+
+
+def test_dashboard_watchdog_acknowledge_requires_origin_csrf_defense(tmp_path):
+    service = _service(tmp_path)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    no_origin_client = TestClient(server.streamable_http_app())
+    r = no_origin_client.post("/dashboard/api/watchdog/acknowledge", json={"id": "session:1"})
+    assert r.status_code == 403
+
+
+def test_dashboard_watchdog_acknowledge_rejects_malformed_id(tmp_path):
+    service = _service(tmp_path)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})
+    for bad_id in ("no-colon", "session:notanumber", "unknownkind:5"):
+        r = client.post("/dashboard/api/watchdog/acknowledge", json={"id": bad_id})
+        assert r.status_code == 400, bad_id

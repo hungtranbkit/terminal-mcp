@@ -479,6 +479,47 @@ def build_mcp(service: TerminalService | None = None,
         even though it never touches the session's own process."""
         return terminal.terminal_knowledge_checkpoint(session_name, summary)
 
+    # -- Watchdog (task: "theo dõi và noti session/node nào bị rớt đột
+    # ngột, hỗ trợ hồi phục") -- session-level events are local-node-only
+    # in this phase (same Phase A/B posture as the registry tools above);
+    # node-level events go through `controller` since only it can see
+    # every node's own online/offline status.
+
+    @server.tool()
+    def terminal_watchdog_session_events(unacknowledged_only: bool = False, limit: int = 50) -> dict:
+        """This node's own "session dropped unexpectedly" events -- a
+        session that was ACTIVE and vanished with no explicit Kill ever
+        having touched it (a tmux-server restart, an out-of-band kill,
+        a crashed Windows ConPTY child, ...). Each event names the
+        session/node/when-detected; recovery is terminal_registry_reopen
+        (Persistent Session Registry) -- this tool only detects and
+        tracks, it never recreates anything itself."""
+        return terminal.terminal_watchdog_events(unacknowledged_only=unacknowledged_only, limit=limit)
+
+    @server.tool()
+    def terminal_watchdog_acknowledge_session_event(event_id: int) -> dict:
+        """Mark one session-drop event as seen -- purely bookkeeping
+        (never affects the session itself); it stops showing as
+        unacknowledged in future terminal_watchdog_session_events(
+        unacknowledged_only=True) calls."""
+        return terminal.terminal_watchdog_acknowledge(event_id, by="mcp")
+
+    @server.tool()
+    def terminal_watchdog_node_events(unacknowledged_only: bool = False, limit: int = 50) -> dict:
+        """Every node's own online/degraded/offline TRANSITION events
+        (never the current status itself -- see terminal_list_nodes for
+        that) -- detected the moment a node's derived status changes from
+        what it was the last time this was checked. A node going offline
+        has no automatic recovery this project can perform remotely (it
+        cannot restart another machine's own agent process); this is the
+        clear, durable notification half of that story."""
+        _refresh_local_heartbeat()
+        return controller.terminal_watchdog_node_events(unacknowledged_only=unacknowledged_only, limit=limit)
+
+    @server.tool()
+    def terminal_watchdog_acknowledge_node_event(event_id: int) -> dict:
+        return controller.terminal_watchdog_acknowledge_node_event(event_id, by="mcp")
+
     # -- Nodes (multi-node session management, task item 9) -----------------
     # Read-only from the MCP surface on purpose: draining/test-connection
     # are operator actions, dashboard-only (same "control vs discovery"

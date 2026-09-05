@@ -215,7 +215,27 @@ class TerminalService:
                     read_granted=bool(grant and grant.read_enabled), input_granted=bool(grant and grant.input_enabled),
                     binding_names=binding_names,
                 )
-            self.session_registry.mark_missing(self.REGISTRY_LOCAL_NODE_ID, seen)
+                # Watchdog: this session is seen ACTIVE right now -- if it
+                # had an unrecovered drop event (came back on its own, or
+                # via terminal_registry_reopen), close that event out.
+                # Cheap even in the common (no prior drop) case: a bounded
+                # UPDATE with zero matching rows.
+                self.session_registry.mark_drop_events_recovered_for(self.REGISTRY_LOCAL_NODE_ID, item.name)
+            vanished = self.session_registry.mark_missing(self.REGISTRY_LOCAL_NODE_ID, seen)
+            # Watchdog (task: "theo dõi và noti session rớt đột ngột"): a
+            # session that WAS active and is gone now, with no explicit
+            # Kill ever having touched it (terminal_kill_session records
+            # via mark_killed, never reaches mark_missing for the session
+            # it killed) -- exactly "dropped unexpectedly". Recorded here,
+            # not raised/logged only, so the dashboard/MCP tools can list
+            # and act on it even long after this one reconcile pass.
+            for name in vanished:
+                record = self.session_registry.get(self.REGISTRY_LOCAL_NODE_ID, name)
+                detail = None
+                if record is not None:
+                    detail = f"cwd={record.cwd or 'unknown'} agent_type={record.agent_type or 'unknown'}"
+                self.session_registry.record_drop_event(
+                    self.REGISTRY_LOCAL_NODE_ID, name, "session_missing", detail=detail)
         except Exception:  # noqa: BLE001 -- see docstring: never let a registry bug break listing itself
             pass
 
@@ -2606,6 +2626,23 @@ class TerminalService:
         self.session_registry.purge(self.REGISTRY_LOCAL_NODE_ID, session_name, purged_by=purged_by)
         self.audit.record(action="registry_purge", session=session_name, result="PURGED", reason=purged_by)
         return {"session": session_name, "purged": True}
+
+    def terminal_watchdog_events(self, *, unacknowledged_only: bool = False, limit: int = 50) -> dict[str, Any]:
+        """This node's own "session dropped unexpectedly" events (task:
+        "theo dõi và noti session nào bị rớt đột ngột") -- recorded by
+        _reconcile_session_registry the moment mark_missing sees a
+        session vanish with no prior Kill. Node-level (whole node went
+        offline) events live in NodeRegistry instead -- controller.py's
+        own terminal_watchdog_node_events -- since this store only ever
+        knows about ITS OWN node's sessions."""
+        events = self.session_registry.list_drop_events(unacknowledged_only=unacknowledged_only, limit=limit)
+        return {"events": events}
+
+    def terminal_watchdog_acknowledge(self, event_id: int, *, by: str | None = None) -> dict[str, Any]:
+        ok = self.session_registry.acknowledge_drop_event(event_id, by=by)
+        if not ok:
+            return {"error": "EVENT_NOT_FOUND", "event_id": event_id}
+        return {"event_id": event_id, "acknowledged": True}
 
     def terminal_list_killed_sessions(self) -> dict[str, Any]:
         """Sessions Kill has recorded reopen metadata for, most recent

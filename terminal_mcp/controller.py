@@ -616,6 +616,17 @@ class ControllerService:
     # -- node views (dashboard/doctor) ---------------------------------------
 
     def list_nodes(self) -> list[Node]:
+        # Watchdog (task: "theo dõi và noti khi node rớt đột ngột"): every
+        # fleet-wide status read already happening here (dashboard's own
+        # periodic /dashboard/api/nodes poll) doubles as the reconcile
+        # pass that detects an ONLINE -> DEGRADED/OFFLINE transition --
+        # zero extra network cost, same discipline session_registry's own
+        # reconcile-as-a-listing-side-effect already uses. Never let a
+        # registry bug break node listing itself.
+        try:
+            self.registry.sync_status_transitions()
+        except Exception:  # noqa: BLE001
+            pass
         return self.registry.list()
 
     def node_status(self, node_id: str) -> Node | None:
@@ -632,6 +643,18 @@ class ControllerService:
             return client.list_sessions()
         except NodeClientError as exc:
             return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
+
+    # -- watchdog: node online/offline transitions ---------------------------
+
+    def terminal_watchdog_node_events(self, *, unacknowledged_only: bool = False, limit: int = 50) -> dict[str, Any]:
+        events = self.registry.list_status_events(unacknowledged_only=unacknowledged_only, limit=limit)
+        return {"events": events}
+
+    def terminal_watchdog_acknowledge_node_event(self, event_id: int, *, by: str | None = None) -> dict[str, Any]:
+        ok = self.registry.acknowledge_status_event(event_id, by=by)
+        if not ok:
+            return {"error": "EVENT_NOT_FOUND", "event_id": event_id}
+        return {"event_id": event_id, "acknowledged": True}
 
     def test_connection(self, node_id: str) -> dict[str, Any]:
         node = self.registry.get(node_id)

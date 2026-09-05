@@ -891,7 +891,7 @@ def test_dashboard_health_indicator_no_new_backend_route():
     # registry/reopen and registry/purge -- registry LISTING itself
     # (loadRegistry) goes through the shared fetchJSON() wrapper, already
     # counted once, so it adds no new literal call site of its own.
-    assert DASHBOARD_HTML.count("fetch(") == 15  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere), registry/reopen, registry/purge
+    assert DASHBOARD_HTML.count("fetch(") == 16  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere), registry/reopen, registry/purge, watchdog/acknowledge
 
 
 def test_dashboard_auth_required_distinguished_from_offline():
@@ -1269,6 +1269,11 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/session/knowledge/recover": {"GET", "HEAD"},
         "/dashboard/api/knowledge/search": {"GET", "HEAD"},
         "/dashboard/api/session/knowledge/export": {"GET", "HEAD"},
+        # Watchdog (session/node dropped-unexpectedly detection --
+        # session_registry.py/node_registry.py) -- another later,
+        # separate feature, same as the knowledge routes above.
+        "/dashboard/api/watchdog/events": {"GET", "HEAD"},
+        "/dashboard/api/watchdog/acknowledge": {"POST"},
     }
     # The web terminal's WebSocket route is registered too, just outside
     # this HTTP-methods-only dict (WebSocketRoute has no .methods).
