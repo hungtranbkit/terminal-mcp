@@ -195,7 +195,8 @@ class TerminalService:
         return self._read_authorized_with_grant(session, self.grants.get(session))
 
     def _input_authorized_with_grant(self, session: str, grant: SessionGrant | None, *,
-                                     revalidate_identity: bool = True) -> tuple[bool, str | None]:
+                                     revalidate_identity: bool = True,
+                                     current_identity: SessionIdentity | None = None) -> tuple[bool, str | None]:
         """Returns (authorized, specific_error). The hard deny floor
         (session_input_denied_by_pattern) is checked first and can never
         be overridden by a grant -- exactly the same absolute floor
@@ -208,29 +209,46 @@ class TerminalService:
         must already be granted" invariant, and revoking read alone
         already clears input too, see SessionGrantStore.set_read).
 
-        revalidate_identity=True (every real send/guard path) additionally
-        re-resolves the session's CURRENT tmux identity and compares it
-        against the grant's pinned one, fresh, every single call -- never
-        cached, never trusted from grant time alone. This is what makes a
-        revoked/expired grant fail closed immediately and a same-name-
-        recreated session never inherit an old grant's input authorization
-        (P0-2's identity-pinning invariant, unchanged and un-bypassable
-        via this path). revalidate_identity=False is for the list/
-        discovery endpoints only (terminal_list_sessions/
-        dashboard_list_sessions): a coarse "is this in principle input-
-        capable" signal that avoids a tmux subprocess call per granted
-        session on every poll -- the real send path below always
-        revalidates regardless of what discovery reported, so this
-        shortcut never weakens the actual guarantee, only the display."""
+        Identity revalidation (P0-2's invariant: a revoked/expired grant
+        fails closed immediately, and a same-name-recreated session --
+        e.g. after a tmux-server restart -- never inherits an old grant's
+        input authorization) now ALWAYS runs, one way or the other:
+        `current_identity`, when given, is used directly (zero extra tmux
+        cost -- see below); otherwise this resolves it itself via a fresh
+        tmux round-trip (`revalidate_identity=False` is kept only as an
+        explicit escape hatch for a caller with neither, and should not be
+        used for anything that claims to report real access).
+
+        REAL BUG FIXED HERE (found live: a dashboard-granted session named
+        "mesflow" reported effective_input=true after this host's tmux
+        server was restarted and every session recreated under the same
+        names with new session_id/pane_id/created_epoch -- the grant's
+        OLD pinned identity no longer matched, so every actual send
+        [terminal_send_text, always identity-revalidated] failed with
+        IDENTITY_MISMATCH despite the dashboard/terminal_list_sessions
+        claiming input was available). Root cause: the list/discovery
+        endpoints (terminal_list_sessions/dashboard_list_sessions) used to
+        pass revalidate_identity=False outright, skipping the identity
+        check entirely "to avoid a tmux subprocess call per granted
+        session" -- but every one of those call sites ALREADY has the
+        session's current SessionInfo in hand from the same bulk
+        tmux.list_sessions() call that produced the row being built, and
+        that struct already carries session_id/pane_id/created_epoch, the
+        exact fields this check needs -- so passing it in as
+        `current_identity` makes the listing identity-aware (and
+        therefore truthful: effective_input now means what it says) at
+        literally zero extra cost, never a new tmux round-trip."""
         if session_input_denied_by_pattern(session, self.config):
             return False, None
         if input_session_allowed(session, self.config):
             return True, None
         if not grant or not grant.read_enabled or not grant.input_enabled:
             return False, None
-        if not revalidate_identity:
-            return True, None
-        current = self.resolve_identity(session)
+        current = current_identity
+        if current is None:
+            if not revalidate_identity:
+                return True, None
+            current = self.resolve_identity(session)
         if current is None or not grant.pinned_session_id:
             return False, "IDENTITY_MISMATCH"
         pinned = SessionIdentity(name=session, session_id=grant.pinned_session_id,
@@ -414,7 +432,8 @@ class TerminalService:
             read_allowed = self._read_authorized_with_grant(item.name, grant)
             input_allowed = bool(
                 self.config.permissions.terminal_input
-                and self._input_authorized_with_grant(item.name, grant, revalidate_identity=False)[0]
+                and self._input_authorized_with_grant(
+                    item.name, grant, current_identity=SessionIdentity.from_session_info(item))[0]
             )
             sessions.append({
                 "name": item.name, "allowed": session_allowed(item.name, self.config), "attached": item.attached,
@@ -1460,7 +1479,8 @@ class TerminalService:
             allowed = session_allowed(item.name, self.config)
             effective_input = bool(
                 self.config.permissions.terminal_input
-                and self._input_authorized_with_grant(item.name, grant, revalidate_identity=False)[0]
+                and self._input_authorized_with_grant(
+                    item.name, grant, current_identity=SessionIdentity.from_session_info(item))[0]
             )
             row = {
                 "name": item.name, "allowed": allowed, "attached": item.attached,

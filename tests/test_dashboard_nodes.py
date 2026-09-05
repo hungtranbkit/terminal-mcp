@@ -246,6 +246,51 @@ def test_sessions_sidebar_rows_carry_local_node_label(tmp_path, tmux_session_fac
     row = next(r for r in rows if r["name"] == "test-nodelabel")
     assert row["node_id"] == "local"
     assert row["node_name"] == controller.node_status("local").display_name
+    # "Copy attach command" visibility (task): the local node's own
+    # default session_backend is tmux, so a plain Linux/local deployment
+    # always shows the action -- driven by this field, never guessed.
+    assert row["session_backend"] == "tmux"
+
+
+def test_sessions_sidebar_rows_carry_remote_windows_node_session_backend(tmp_path):
+    # Windows/non-tmux backend rows must never claim "tmux" -- this is
+    # the field the dashboard's "Copy attach command" action gates
+    # visibility on (task: "Không hiện action này cho Windows/non-tmux
+    # backend").
+    from terminal_mcp.host_metrics import NodeMetrics
+    from terminal_mcp.node_models import PLATFORM_WINDOWS, SESSION_BACKEND_WINDOWS_PTY
+
+    client, controller = _client(tmp_path)
+
+    class _FakeWindowsClient:
+        def list_sessions(self):
+            return {"sessions": [{"name": "window", "allowed": False, "attached": False, "windows": 1,
+                                  "created": "2026-01-01T00:00:00Z", "activity": "2026-01-01T00:00:00Z",
+                                  "read_allowed": True, "read_granted": True, "input_allowed": True,
+                                  "input_granted": True, "effective_read": True, "effective_input": True}]}
+
+        def status(self, name):
+            return {"session": name, "state": "READY"}
+
+    controller.registry.register("winbox", display_name="WinBox", hostname="winbox-host", endpoint="http://winbox")
+    controller._clients["winbox"] = _FakeWindowsClient()
+    controller.registry.heartbeat(
+        "winbox", metrics=NodeMetrics(cpu_percent=5.0, load1=0.1, load5=0.1, load15=0.1, cpu_count=4,
+                                     ram_total_bytes=8_000_000_000, ram_used_bytes=1_000_000_000, ram_percent=12.5,
+                                     swap_total_bytes=0, swap_used_bytes=0, swap_percent=0.0,
+                                     disk_total_bytes=100_000_000_000, disk_used_bytes=1_000_000_000,
+                                     disk_free_bytes=99_000_000_000, disk_percent=1.0),
+        tmux_session_count=1, agent_counts={}, agent_types=("shell",), agent_version=None, labels=(),
+        platform=PLATFORM_WINDOWS, session_backend=SESSION_BACKEND_WINDOWS_PTY,
+    )
+
+    response = client.get("/dashboard/api/sessions")
+    assert response.status_code == 200
+    rows = response.json()["sessions"]
+    row = next(r for r in rows if r["name"] == "window")
+    assert row["node_id"] == "winbox"
+    assert row["session_backend"] == SESSION_BACKEND_WINDOWS_PTY
+    assert row["session_backend"] != "tmux"
 
 
 def test_nodes_admin_page_read_guard_matches_main_dashboard(tmp_path):
@@ -323,3 +368,107 @@ def test_generate_onboarding_requires_origin_csrf_defense(tmp_path):
         "node_id": "m910", "hostname": "h", "endpoint": "http://h:8790",
     })
     assert response.status_code in (400, 401, 403)
+
+
+# -- /dashboard/api/session/grant-read, grant-input: multi-node routing ----
+# Real bug found live: clicking "Xem + gửi" for a Windows session named
+# "window" on a remote node did nothing -- the route called the LOCAL
+# TerminalService's own grant store directly, no matter which node the
+# session actually lived on. These are the HTTP-level regression tests for
+# the fix: an explicit `node_id` in the request body must reach that
+# node's own grant store (via controller.terminal_grant_session_read/
+# _input), never the local one.
+
+class _FakeGrantNodeClient:
+    """Minimal NodeClient stand-in recording grant_read/grant_input calls
+    -- enough surface for the dashboard route test below, nothing more."""
+
+    def __init__(self, sessions):
+        self._sessions = sessions
+        self.grants = {}
+        self.calls = []
+
+    def list_sessions(self):
+        return {"sessions": [{"name": n, **row} for n, row in self._sessions.items()]}
+
+    def grant_read(self, name, enabled, *, granted_by=None):
+        self.calls.append(("grant_read", name, enabled))
+        if name not in self._sessions:
+            return {"error": "SESSION_NOT_FOUND", "session": name}
+        self.grants[name] = {"read_enabled": enabled, "input_enabled": False}
+        return {"session": name, **self.grants[name]}
+
+    def grant_input(self, name, enabled, *, granted_by=None):
+        self.calls.append(("grant_input", name, enabled))
+        existing = self.grants.get(name)
+        if not existing or not existing.get("read_enabled"):
+            return {"error": "READ_GRANT_REQUIRED", "session": name}
+        existing["input_enabled"] = enabled
+        return {"session": name, **existing}
+
+
+def _register_fake_worker(controller):
+    from terminal_mcp.host_metrics import NodeMetrics
+    controller.registry.register("worker", display_name="Worker", hostname="worker-host", endpoint="http://worker")
+    fake = _FakeGrantNodeClient({"window": {}})
+    controller._clients["worker"] = fake
+    controller.registry.heartbeat(
+        "worker", metrics=NodeMetrics(cpu_percent=5.0, load1=0.1, load5=0.1, load15=0.1, cpu_count=4,
+                                     ram_total_bytes=8_000_000_000, ram_used_bytes=1_000_000_000, ram_percent=12.5,
+                                     swap_total_bytes=0, swap_used_bytes=0, swap_percent=0.0,
+                                     disk_total_bytes=100_000_000_000, disk_used_bytes=1_000_000_000,
+                                     disk_free_bytes=99_000_000_000, disk_percent=1.0),
+        tmux_session_count=1, agent_counts={}, agent_types=("shell",), agent_version=None, labels=(),
+    )
+    return fake
+
+
+def test_grant_read_with_node_id_reaches_the_remote_node_not_local(tmp_path):
+    client, controller = _client(tmp_path)
+    fake = _register_fake_worker(controller)
+
+    response = client.post("/dashboard/api/session/grant-read",
+                           json={"name": "window", "enabled": True, "node_id": "worker"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body.get("error") is None
+    assert body["node_id"] == "worker"
+    assert fake.grants["window"]["read_enabled"] is True
+    # Never silently applied to the local TerminalService's own grant
+    # store instead of the remote node's.
+    assert controller._clients["local"]._terminal.grants.get("window") is None
+
+    response2 = client.post("/dashboard/api/session/grant-input",
+                            json={"name": "window", "enabled": True, "node_id": "worker"})
+    assert response2.status_code == 200
+    assert response2.json().get("error") is None
+    assert fake.grants["window"]["input_enabled"] is True
+    assert ("grant_read", "window", True) in fake.calls
+    assert ("grant_input", "window", True) in fake.calls
+
+
+def test_grant_read_without_node_id_still_targets_local_unchanged(tmp_path, tmux_session_factory):
+    # Regression: omitting node_id (every existing caller, single-node
+    # deployments) must behave exactly as before -- local session, local
+    # grants store.
+    tmux_session_factory("test-grant-local-unchanged")
+    client, _controller = _client(tmp_path)
+    response = client.post("/dashboard/api/session/grant-read",
+                           json={"name": "test-grant-local-unchanged", "enabled": True})
+    assert response.status_code == 200
+    body = response.json()
+    assert body.get("error") is None
+    assert body["node_id"] == "local"
+
+
+def test_grant_read_node_id_equal_to_local_is_a_plain_local_name(tmp_path, tmux_session_factory):
+    # node_id: "local" explicitly sent must not get qualified into
+    # "local/name" (harmless either way since resolve_session accepts a
+    # qualified local name too, but this confirms the common-case shape
+    # sent by the dashboard's own JS for a local-node row never changes).
+    tmux_session_factory("test-grant-local-explicit")
+    client, _controller = _client(tmp_path)
+    response = client.post("/dashboard/api/session/grant-read",
+                           json={"name": "test-grant-local-explicit", "enabled": True, "node_id": "local"})
+    assert response.status_code == 200
+    assert response.json().get("error") is None

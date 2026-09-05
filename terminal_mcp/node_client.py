@@ -60,6 +60,8 @@ class NodeClient(Protocol):
     def reopen_session(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
                        grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]: ...
     def list_killed_sessions(self) -> dict[str, Any]: ...
+    def grant_read(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]: ...
+    def grant_input(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]: ...
     def health(self) -> dict[str, Any]: ...
     def metrics(self) -> dict[str, Any]: ...
 
@@ -121,6 +123,12 @@ class LocalNodeClient:
 
     def list_killed_sessions(self) -> dict[str, Any]:
         return self._terminal.terminal_list_killed_sessions()
+
+    def grant_read(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
+        return self._terminal.grant_session_read(name, enabled, granted_by=granted_by)
+
+    def grant_input(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
+        return self._terminal.grant_session_input(name, enabled, granted_by=granted_by)
 
     def health(self) -> dict[str, Any]:
         return {"status": "ok"}
@@ -243,6 +251,14 @@ class RemoteNodeClient:
 
     def list_killed_sessions(self) -> dict[str, Any]:
         return self._request("GET", "/v1/killed-sessions")
+
+    def grant_read(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/v1/sessions/{urllib.parse.quote(name)}/grant-read",
+                             body={"enabled": enabled, "granted_by": granted_by})
+
+    def grant_input(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/v1/sessions/{urllib.parse.quote(name)}/grant-input",
+                             body={"enabled": enabled, "granted_by": granted_by})
 
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/v1/health")

@@ -79,7 +79,13 @@ def test_full_grant_workflow(tmp_path, tmux_session_factory):
     # 2. Grant read.
     granted_read = client.post("/dashboard/api/session/grant-read", json={"name": session, "enabled": True})
     assert granted_read.status_code == 200
-    assert granted_read.json() == {"session": session, "read_enabled": True, "input_enabled": False}
+    # Routed through controller.terminal_grant_session_read (multi-node
+    # grant-routing fix) -- additive node_id/node_name now included,
+    # exactly like every other routed lifecycle response (create/kill/
+    # reopen) already carries; never a breaking shape change.
+    body = granted_read.json()
+    assert body["session"] == session and body["read_enabled"] is True and body["input_enabled"] is False
+    assert body["node_id"] == "local"
 
     # 3. View output: now succeeds, input composer not yet warranted.
     detail = client.get(f"/dashboard/api/session?name={session}")
@@ -98,7 +104,8 @@ def test_full_grant_workflow(tmp_path, tmux_session_factory):
     # 4. Grant input.
     granted_input = client.post("/dashboard/api/session/grant-input", json={"name": session, "enabled": True})
     assert granted_input.status_code == 200
-    assert granted_input.json() == {"session": session, "read_enabled": True, "input_enabled": True}
+    body = granted_input.json()
+    assert body["session"] == session and body["read_enabled"] is True and body["input_enabled"] is True
 
     detail2 = client.get(f"/dashboard/api/session?name={session}")
     assert detail2.json()["input_allowed"] is True
@@ -118,7 +125,8 @@ def test_full_grant_workflow(tmp_path, tmux_session_factory):
     # 6. Revoke input: send is refused again, read still works.
     revoked_input = client.post("/dashboard/api/session/grant-input", json={"name": session, "enabled": False})
     assert revoked_input.status_code == 200
-    assert revoked_input.json() == {"session": session, "read_enabled": True, "input_enabled": False}
+    body = revoked_input.json()
+    assert body["session"] == session and body["read_enabled"] is True and body["input_enabled"] is False
     refused = client.post("/dashboard/api/session/input", json={"name": session, "text": "z"})
     assert refused.status_code == 403
     assert refused.json()["error"] == "GRANT_REQUIRED"
@@ -128,7 +136,8 @@ def test_full_grant_workflow(tmp_path, tmux_session_factory):
     # 7. Revoke read: back to fully restricted.
     revoked_read = client.post("/dashboard/api/session/grant-read", json={"name": session, "enabled": False})
     assert revoked_read.status_code == 200
-    assert revoked_read.json() == {"session": session, "read_enabled": False, "input_enabled": False}
+    body = revoked_read.json()
+    assert body["session"] == session and body["read_enabled"] is False and body["input_enabled"] is False
     final = client.get(f"/dashboard/api/session?name={session}")
     assert final.status_code == 403
     assert final.json()["error"] == "READ_RESTRICTED"

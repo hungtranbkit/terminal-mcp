@@ -44,6 +44,7 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket
 
+from .controller import ControllerService
 from .core import TerminalService
 from .dashboard import DASHBOARD_HTML, INPUT_ERROR_STATUS, SESSIONS_ADMIN_HTML, WEBTERM_HTML
 from .permissions import input_session_allowed, session_allowed, valid_session_name
@@ -202,11 +203,23 @@ def _origin_allowed(request: Request, allowed_origins: tuple[str, ...]) -> bool:
 
 def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, webauth: WebAuthStore,
                                supervisor: SupervisorService | None = None,
-                               supervisor_v2: SupervisorV2Service | None = None) -> None:
+                               supervisor_v2: SupervisorV2Service | None = None,
+                               controller: ControllerService | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
         supervisor_v2 = build_supervisor_v2(supervisor)
+    # `controller` (multi-node grant routing fix -- same one dashboard.py's
+    # /dashboard/api/session/grant-read|input already use): optional so an
+    # existing caller that builds this module standalone (a test, or a
+    # future single-node-only embedding) keeps working unchanged -- with
+    # none given, grant-read/grant-input fall back to the exact single-
+    # node behavior this module always had (local TerminalService only).
+    # This module's session lifecycle (create/detach/delete) and web
+    # terminal WS are NOT routed through `controller` -- a deliberate,
+    # documented scope cut (see docs/multi-node.md): this login path is
+    # the secondary, non-Cloudflare-Access dashboard entry point, and
+    # giving it full multi-node parity is a larger, separate change.
 
     def _client_key(request: Request) -> str:
         # CF-Connecting-IP is Cloudflare's own real-visitor-IP header --
@@ -493,6 +506,19 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
             status_code = INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
+    def _qualify_grant_name(name: str, body: dict) -> str:
+        # Same multi-node grant-routing fix as dashboard.py's own
+        # /dashboard/api/session/grant-read|input (see that module's
+        # identical helper for the full rationale/bug this fixes) --
+        # duplicated rather than shared, matching this file's existing
+        # one-route-pair-per-concept posture. A no-op (returns `name`
+        # unchanged) when `controller` was never given to this module.
+        node_id = body.get("node_id") if isinstance(body, dict) else None
+        if (controller is not None and isinstance(node_id, str) and node_id
+                and node_id != controller.local_node_id and "/" not in name):
+            return f"{node_id}/{name}"
+        return name
+
     @server.custom_route("/app/api/session/grant-read", methods=["POST"], include_in_schema=False)
     async def app_session_grant_read(request: Request):
         blocked, user = _mutation_guard(request)
@@ -506,9 +532,14 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
         enabled = body.get("enabled") if isinstance(body, dict) else None
         if not isinstance(name, str) or not name or not isinstance(enabled, bool):
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        qualified = _qualify_grant_name(name, body)
         granted_by = f"webauth:{user.username}"
-        _log.info("webauth grant_read session=%s enabled=%s username=%s", name, enabled, user.username)
-        result = await anyio.to_thread.run_sync(lambda: terminal.grant_session_read(name, enabled, granted_by=granted_by))
+        _log.info("webauth grant_read session=%s enabled=%s username=%s", qualified, enabled, user.username)
+        if controller is not None:
+            result = await anyio.to_thread.run_sync(
+                lambda: controller.terminal_grant_session_read(qualified, enabled, granted_by=granted_by))
+        else:
+            result = await anyio.to_thread.run_sync(lambda: terminal.grant_session_read(name, enabled, granted_by=granted_by))
         terminal.audit.record(
             action="grant_read", session=name, result="GRANTED" if (enabled and "error" not in result)
             else ("REVOKED" if "error" not in result else "BLOCKED"),
@@ -530,9 +561,14 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
         enabled = body.get("enabled") if isinstance(body, dict) else None
         if not isinstance(name, str) or not name or not isinstance(enabled, bool):
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        qualified = _qualify_grant_name(name, body)
         granted_by = f"webauth:{user.username}"
-        _log.info("webauth grant_input session=%s enabled=%s username=%s", name, enabled, user.username)
-        result = await anyio.to_thread.run_sync(lambda: terminal.grant_session_input(name, enabled, granted_by=granted_by))
+        _log.info("webauth grant_input session=%s enabled=%s username=%s", qualified, enabled, user.username)
+        if controller is not None:
+            result = await anyio.to_thread.run_sync(
+                lambda: controller.terminal_grant_session_input(qualified, enabled, granted_by=granted_by))
+        else:
+            result = await anyio.to_thread.run_sync(lambda: terminal.grant_session_input(name, enabled, granted_by=granted_by))
         terminal.audit.record(
             action="grant_input", session=name, result="GRANTED" if (enabled and "error" not in result)
             else ("REVOKED" if "error" not in result else "BLOCKED"),

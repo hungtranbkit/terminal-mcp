@@ -222,6 +222,28 @@ class ControllerService:
             bare, confirm_name.split("/", 1)[-1] if "/" in confirm_name else confirm_name, requested_by=requested_by,
         ))
 
+    def terminal_grant_session_read(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
+        """Node-aware equivalent of TerminalService.grant_session_read --
+        real bug fixed here (found live against a Windows session named
+        'window' on a remote node): the dashboard's grant-read/grant-
+        input routes used to call the LOCAL TerminalService's own grant
+        store directly, no matter which node the session actually lived
+        on -- silently a no-op (SESSION_NOT_FOUND from the wrong node)
+        for any non-local session. Routed through the exact same
+        resolve_session/_route every other multi-node-aware operation
+        here already uses, so a same-named session on two different
+        nodes is refused as AMBIGUOUS_SESSION (task item 3) rather than
+        guessed, exactly like kill/detach/delete already behave."""
+        return self._route(name, "grant_read", lambda client, bare: client.grant_read(
+            bare, enabled, granted_by=granted_by))
+
+    def terminal_grant_session_input(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
+        """Node-aware equivalent of TerminalService.grant_session_input -- see
+        terminal_grant_session_read's own docstring just above for why this
+        exists."""
+        return self._route(name, "grant_input", lambda client, bare: client.grant_input(
+            bare, enabled, granted_by=granted_by))
+
     def _find_killed_session_node(self, name: str) -> tuple[str | None, dict[str, Any] | None]:
         """Which ONLINE node's own killed-sessions list actually contains
         `name`, plus that entry's own row (agent_type/working_directory/

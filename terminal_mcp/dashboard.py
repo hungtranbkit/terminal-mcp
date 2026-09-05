@@ -23,7 +23,7 @@ from .connection_store import ConnectionStore, generate_node_token
 from .controller import ControllerService, build_default_controller
 from .node_client import RemoteNodeClient
 from .core import TerminalService
-from .node_models import NODE_ONLINE, node_to_dict
+from .node_models import NODE_ONLINE, SESSION_BACKEND_TMUX, node_to_dict
 from .permissions import input_session_allowed, session_allowed, valid_session_name
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
@@ -666,6 +666,7 @@ DASHBOARD_HTML = """<!doctype html>
                 <button id="fontIncBtn" type="button" disabled>A+ Chữ lớn hơn</button>
                 <hr>
                 <a id="termOpenRealBtn" href="#" role="menuitem">🖥 Mở terminal thật (xterm.js)</a>
+                <button id="termCopyAttachBtn" type="button" disabled hidden>⧉ Copy attach command</button>
                 <button id="termAccessBtn" type="button" disabled>🔐 Quyền truy cập</button>
                 <button id="termKillBtn" type="button" class="danger" disabled>🗑 Kill session</button>
               </div>
@@ -804,6 +805,7 @@ DASHBOARD_HTML = """<!doctype html>
     const inputSendEl = document.querySelector('#inputSend');
     const termMenuBtnEl = document.querySelector('#termMenuBtn');
     const termOpenRealBtnEl = document.querySelector('#termOpenRealBtn');
+    const termCopyAttachBtnEl = document.querySelector('#termCopyAttachBtn');
     const termAccessBtnEl = document.querySelector('#termAccessBtn');
     const termKillBtnEl = document.querySelector('#termKillBtn');
     const clean = value => String(value ?? '');
@@ -1197,6 +1199,22 @@ DASHBOARD_HTML = """<!doctype html>
         } catch (fallbackError) { return false; }
       }
     }
+
+    // ---- "Copy attach command" (task: tmux-only session action) -----------
+    // POSIX single-quote escaping: wraps in '...', turning any embedded '
+    // into '\'' (close the quote, an escaped literal quote, reopen the
+    // quote) -- the standard, always-correct way to shell-quote an
+    // arbitrary string, never a denylist of "special" characters. A
+    // session name that's already safe unquoted (valid_session_name's own
+    // charset, e.g. "claude-main") is left bare for readability; anything
+    // else (in practice: only reachable if a future session-name pattern
+    // ever allows more than that today) is still quoted correctly either
+    // way, so this never depends on staying in sync with permissions.py.
+    function shellQuote(value) {
+      if (/^[A-Za-z0-9_./-]+$/.test(value)) return value;
+      return "'" + value.replace(/'/g, "'\\\\''") + "'";
+    }
+    function tmuxAttachCommand(session) { return `tmux attach -t ${shellQuote(session)}`; }
     copyBtnEl.onclick = async () => {
       // outputEl only ever contains plain-text span runs (see renderAnsi
       // above) — no ANSI escape bytes and no markup ever end up in
@@ -1503,10 +1521,19 @@ DASHBOARD_HTML = """<!doctype html>
     // applyPreset below does exactly ONE combined loadSessions()+loadDetail()
     // refresh after every session in a preset (whether that's 1 or many)
     // is done, rather than one refresh per individual read/input call.
-    async function postGrantRaw(path, name, enabled) {
+    async function postGrantRaw(path, name, enabled, nodeId) {
+      // node_id (task: multi-node grant routing fix) -- omitted/local is
+      // completely unchanged behavior (single-node deployment, the
+      // overwhelming common case); set only for a session on a REMOTE
+      // node, so the backend qualifies it as "node_id/name" and routes
+      // the grant to THAT node's own grants store instead of silently
+      // applying it to the local one (the real bug this fixes, found
+      // live against a Windows session named "window").
+      const body = { name, enabled };
+      if (nodeId && nodeId !== 'local') body.node_id = nodeId;
       const response = await fetch(path, {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name, enabled}),
+        body: JSON.stringify(body),
       });
       return response.json().catch(() => ({}));
     }
@@ -1523,20 +1550,21 @@ DASHBOARD_HTML = """<!doctype html>
     async function applyPreset(names, preset) {
       const failures = [];
       for (const name of names) {
+        const nodeId = (lastKnownRows.find(x => x.name === name) || {}).node_id;
         if (preset === 'none') {
-          const r = await postGrantRaw('/dashboard/api/session/grant-read', name, false);
+          const r = await postGrantRaw('/dashboard/api/session/grant-read', name, false, nodeId);
           if (r && r.error) failures.push(`${name}: ${clean(r.error)}`);
           continue;
         }
-        const r1 = await postGrantRaw('/dashboard/api/session/grant-read', name, true);
+        const r1 = await postGrantRaw('/dashboard/api/session/grant-read', name, true, nodeId);
         if (r1 && r1.error) { failures.push(`${name}: ${clean(r1.error)}`); continue; }
         if (preset === 'read') {
           const current = lastKnownRows.find(x => x.name === name);
           if (current && current.grant && current.grant.input_enabled) {
-            await postGrantRaw('/dashboard/api/session/grant-input', name, false);
+            await postGrantRaw('/dashboard/api/session/grant-input', name, false, nodeId);
           }
         } else { // 'full'
-          const r2 = await postGrantRaw('/dashboard/api/session/grant-input', name, true);
+          const r2 = await postGrantRaw('/dashboard/api/session/grant-input', name, true, nodeId);
           if (r2 && r2.error) failures.push(`${name}: ${clean(r2.error)}`);
         }
       }
@@ -1590,8 +1618,15 @@ DASHBOARD_HTML = """<!doctype html>
         btn.onclick = async () => {
           permModalPresetsEl.querySelectorAll('button').forEach(b => b.disabled = true);
           const failures = await applyPreset([name], preset.key);
-          permModalErrorEl.textContent = failures.length ? clean(failures.join('; ')) : '';
           renderPermModalBody(name); // stay open, show the refreshed real state
+          // MUST run AFTER renderPermModalBody, never before -- that
+          // function unconditionally clears permModalErrorEl itself (so
+          // a stale error from a previous attempt never lingers), which
+          // used to wipe THIS attempt's own error message before the
+          // operator ever saw it, i.e. a failed grant (e.g. a remote-
+          // node session before the multi-node grant fix) looked exactly
+          // like the button silently doing nothing.
+          permModalErrorEl.textContent = failures.length ? clean(failures.join('; ')) : '';
         };
         permModalPresetsEl.appendChild(btn);
       }
@@ -1904,6 +1939,23 @@ DASHBOARD_HTML = """<!doctype html>
         termOpenRealBtnEl.removeAttribute('href');
         termOpenRealBtnEl.classList.add('disabled'); termOpenRealBtnEl.setAttribute('aria-disabled', 'true');
         termOpenRealBtnEl.title = row ? 'Chưa có quyền xem session này' : '';
+      }
+
+      // "Copy attach command" -- tmux-backed sessions only (local or a
+      // remote Linux node), never shown for a Windows/non-tmux-backend
+      // session, which has no such command. Never runs anything itself --
+      // copies text to the clipboard, nothing more.
+      const isTmuxBacked = Boolean(row) && (row.session_backend || 'tmux') === 'tmux';
+      termCopyAttachBtnEl.hidden = !isTmuxBacked;
+      if (isTmuxBacked) {
+        termCopyAttachBtnEl.disabled = false;
+        termCopyAttachBtnEl.title = `Copy lệnh: ${tmuxAttachCommand(row.name)}`;
+        termCopyAttachBtnEl.onclick = async () => {
+          const ok = await copyText(tmuxAttachCommand(row.name));
+          const original = termCopyAttachBtnEl.textContent;
+          termCopyAttachBtnEl.textContent = ok ? '✓ Copied' : '✕ Copy thất bại';
+          setTimeout(() => { termCopyAttachBtnEl.textContent = original; }, 1500);
+        };
       }
 
       const canGrant = Boolean(row) && grantable(row);
@@ -2574,6 +2626,31 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       return response.json();
     }
 
+    // ---- copy-to-clipboard + "Copy attach command" (same helpers as the
+    // main tab UI's own copy of these -- see DASHBOARD_HTML's identical
+    // functions for the full rationale; duplicated here rather than
+    // shared, matching this file's existing one-page-one-script posture).
+    async function copyText(text) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch (error) {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.focus(); ta.select();
+          const ok = document.execCommand('copy');
+          document.body.removeChild(ta);
+          return ok;
+        } catch (fallbackError) { return false; }
+      }
+    }
+    function shellQuote(value) {
+      if (/^[A-Za-z0-9_./-]+$/.test(value)) return value;
+      return "'" + value.replace(/'/g, "'\\\\''") + "'";
+    }
+    function tmuxAttachCommand(session) { return `tmux attach -t ${shellQuote(session)}`; }
+
     function grantable(row) { return !row.allowed; }
     function grantState(row) {
       if (row.grant && row.grant.input_enabled) return 'full';
@@ -2797,30 +2874,37 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       }
     }
 
-    async function postGrantRaw(path, name, enabled) {
+    async function postGrantRaw(path, name, enabled, nodeId) {
+      // node_id (multi-node grant routing fix, same as the main dashboard
+      // tab UI) -- omitted/local is unchanged; set only for a remote-node
+      // session so the backend qualifies it as "node_id/name" instead of
+      // silently applying the grant to the local node's own store.
+      const body = { name, enabled };
+      if (nodeId && nodeId !== 'local') body.node_id = nodeId;
       const response = await fetch(path, {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name, enabled}),
+        body: JSON.stringify(body),
       });
       return response.json().catch(() => ({}));
     }
     async function applyPreset(names, preset) {
       const failures = [];
       for (const name of names) {
+        const nodeId = (lastKnownRows.find(x => x.name === name) || {}).node_id;
         if (preset === 'none') {
-          const r = await postGrantRaw('/dashboard/api/session/grant-read', name, false);
+          const r = await postGrantRaw('/dashboard/api/session/grant-read', name, false, nodeId);
           if (r && r.error) failures.push(`${name}: ${clean(r.error)}`);
           continue;
         }
-        const r1 = await postGrantRaw('/dashboard/api/session/grant-read', name, true);
+        const r1 = await postGrantRaw('/dashboard/api/session/grant-read', name, true, nodeId);
         if (r1 && r1.error) { failures.push(`${name}: ${clean(r1.error)}`); continue; }
         if (preset === 'read') {
           const current = lastKnownRows.find(x => x.name === name);
           if (current && current.grant && current.grant.input_enabled) {
-            await postGrantRaw('/dashboard/api/session/grant-input', name, false);
+            await postGrantRaw('/dashboard/api/session/grant-input', name, false, nodeId);
           }
         } else {
-          const r2 = await postGrantRaw('/dashboard/api/session/grant-input', name, true);
+          const r2 = await postGrantRaw('/dashboard/api/session/grant-input', name, true, nodeId);
           if (r2 && r2.error) failures.push(`${name}: ${clean(r2.error)}`);
         }
       }
@@ -2865,9 +2949,17 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         btn.onclick = async () => {
           permModalPresetsEl.querySelectorAll('button').forEach(b => b.disabled = true);
           const failures = await applyPreset(names, preset.key);
-          permModalErrorEl.textContent = failures.length ? `Một số session thất bại: ${failures.join('; ')}` : '';
           if (bulk) { bulkSelected.clear(); renderBulkBar(); closePermModal(); }
+          // MUST set the error text AFTER renderPermModalBody (single-
+          // session path), never before -- that function unconditionally
+          // clears permModalErrorEl itself, which used to wipe THIS
+          // attempt's own error message before the operator ever saw it
+          // (a failed grant looked exactly like the button doing
+          // nothing -- e.g. a remote-node session before the multi-node
+          // grant fix). The bulk path closes the modal outright, so
+          // there's nothing to wipe it there.
           else renderPermModalBody(names);
+          permModalErrorEl.textContent = failures.length ? `Một số session thất bại: ${failures.join('; ')}` : '';
         };
         permModalPresetsEl.appendChild(btn);
       }
@@ -3033,6 +3125,24 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
             termBtn.title = 'Tính năng web terminal đang tắt (dashboard.web_terminal_enabled trong config.yaml)';
           }
           actions.appendChild(termBtn);
+        }
+
+        // "Copy attach command" -- tmux-backed sessions only (local or a
+        // remote Linux node); never shown for a Windows/non-tmux-backend
+        // session. Copies `tmux attach -t <name>` to the clipboard, never
+        // runs anything itself.
+        if ((row.session_backend || 'tmux') === 'tmux') {
+          const copyAttachBtn = document.createElement('button'); copyAttachBtn.type = 'button';
+          copyAttachBtn.textContent = '⧉ Attach cmd';
+          copyAttachBtn.title = `Copy lệnh: ${tmuxAttachCommand(row.name)}`;
+          copyAttachBtn.style.cssText = 'background:#19243b;border:1px solid var(--line);border-radius:6px;color:inherit;padding:4px 9px;font-size:12px';
+          copyAttachBtn.onclick = async () => {
+            const ok = await copyText(tmuxAttachCommand(row.name));
+            const original = copyAttachBtn.textContent;
+            copyAttachBtn.textContent = ok ? '✓ Copied' : '✕ Copy thất bại';
+            setTimeout(() => { copyAttachBtn.textContent = original; }, 1500);
+          };
+          actions.appendChild(copyAttachBtn);
         }
 
         // Real tmux detach/delete -- gated on session_lifecycle_enabled
@@ -4366,9 +4476,15 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             # explicitly (never left for the client to assume) --
             local_node = controller.node_status(controller.local_node_id)
             local_node_name = local_node.display_name if local_node else controller.local_node_id
+            # session_backend (task: "Copy attach command" -- only ever
+            # shown for a real tmux-backed session, never guessed): sourced
+            # from the node registry, the same field the Nodes admin page
+            # already reports, never re-derived independently.
+            local_backend = local_node.session_backend if local_node else SESSION_BACKEND_TMUX
             for row in rows:
                 row.setdefault("node_id", controller.local_node_id)
                 row.setdefault("node_name", local_node_name)
+                row.setdefault("session_backend", local_backend)
 
             async def _fill_state(row: dict) -> None:
                 if not row.get("effective_read"):
@@ -4409,6 +4525,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             for row in remote_rows:
                 row.setdefault("kill_reopen_ready", True)
                 row["grant"] = {"read_enabled": row.get("read_granted", False), "input_enabled": row.get("input_granted", False)}
+                remote_node = controller.node_status(row["node_id"])
+                row["session_backend"] = remote_node.session_backend if remote_node else SESSION_BACKEND_TMUX
 
             async def _fill_remote_state(row: dict) -> None:
                 if not row.get("effective_read"):
@@ -4573,6 +4691,24 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             status_code = INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
+    def _qualify_grant_name(name: str, body: dict) -> str:
+        """A grant-read/grant-input request's `name` is qualified with an
+        explicit `node_id` (when present and not the local node) into the
+        SAME "node_id/session" form resolve_session already accepts for
+        every other lifecycle route (kill/detach/reopen) -- real bug
+        fixed here: this route used to call the LOCAL TerminalService's
+        grant store directly regardless of node, so granting a REMOTE
+        session (e.g. a Windows session named 'window' on a worker node)
+        silently did nothing (SESSION_NOT_FOUND from the wrong node,
+        against the wrong node's grants.db). `name` itself is left alone
+        if it's already qualified (contains "/") or no node_id was sent
+        (the local-node, single-node-deployment case -- unchanged
+        behavior for every existing caller)."""
+        node_id = body.get("node_id") if isinstance(body, dict) else None
+        if isinstance(node_id, str) and node_id and node_id != controller.local_node_id and "/" not in name:
+            return f"{node_id}/{name}"
+        return name
+
     @server.custom_route("/dashboard/api/session/grant-read", methods=["POST"], include_in_schema=False)
     async def session_grant_read(request: Request) -> JSONResponse:
         # Grants a session outside the static whitelist read access from
@@ -4581,6 +4717,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # currently exist). Revoking read (enabled=false) also revokes
         # any input grant for the same session -- input without read makes
         # no sense and is never left dangling (SessionGrantStore.set_read).
+        # Routed through `controller` (node-aware -- see _qualify_grant_
+        # name above), not `terminal` directly, so a session on a REMOTE
+        # node is granted on that node's own grants store, never silently
+        # misapplied to the local one.
         blocked, identity = _mutation_guard(request)
         if blocked is not None:
             return blocked
@@ -4592,10 +4732,11 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         enabled = body.get("enabled") if isinstance(body, dict) else None
         if not isinstance(name, str) or not name or not isinstance(enabled, bool):
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        qualified = _qualify_grant_name(name, body)
         granted_by = identity.email if identity else None
-        _log.info("dashboard grant_read session=%s enabled=%s identity=%s", name, enabled, granted_by)
+        _log.info("dashboard grant_read session=%s enabled=%s identity=%s", qualified, enabled, granted_by)
         result = await anyio.to_thread.run_sync(
-            lambda: terminal.grant_session_read(name, enabled, granted_by=granted_by)
+            lambda: _routed(lambda: controller.terminal_grant_session_read(qualified, enabled, granted_by=granted_by))
         )
         terminal.audit.record(
             action="grant_read", session=name, result="GRANTED" if (enabled and "error" not in result)
@@ -4612,7 +4753,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # still respects the global terminal_input gate, input_policy
         # deny patterns, the sensitive-current-command guard, and pins
         # the session's identity at the moment of grant (re-verified at
-        # every send by terminal_send_text_granted).
+        # every send by terminal_send_text_granted). Also node-aware --
+        # see grant-read's own comment just above.
         blocked, identity = _mutation_guard(request)
         if blocked is not None:
             return blocked
@@ -4624,10 +4766,11 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         enabled = body.get("enabled") if isinstance(body, dict) else None
         if not isinstance(name, str) or not name or not isinstance(enabled, bool):
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        qualified = _qualify_grant_name(name, body)
         granted_by = identity.email if identity else None
-        _log.info("dashboard grant_input session=%s enabled=%s identity=%s", name, enabled, granted_by)
+        _log.info("dashboard grant_input session=%s enabled=%s identity=%s", qualified, enabled, granted_by)
         result = await anyio.to_thread.run_sync(
-            lambda: terminal.grant_session_input(name, enabled, granted_by=granted_by)
+            lambda: _routed(lambda: controller.terminal_grant_session_input(qualified, enabled, granted_by=granted_by))
         )
         terminal.audit.record(
             action="grant_input", session=name, result="GRANTED" if (enabled and "error" not in result)

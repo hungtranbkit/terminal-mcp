@@ -42,14 +42,14 @@ def _config() -> AppConfig:
     )
 
 
-def _build(tmp_path, *, must_change_password=False, with_cf_dashboard=True):
+def _build(tmp_path, *, must_change_password=False, with_cf_dashboard=True, controller=None):
     service = TerminalService(_config(), audit=AuditStore(tmp_path / "audit.db"))
     webauth = WebAuthStore(tmp_path / "webauth.db")
     webauth.create_or_replace_user("admin", ADMIN_PASSWORD, must_change_password=must_change_password)
     server = build_mcp(service)
     if with_cf_dashboard:
         register_dashboard(server, service)  # confirms the two paths coexist without clashing
-    register_webauth_dashboard(server, service, webauth)
+    register_webauth_dashboard(server, service, webauth, controller=controller)
     return server, service, webauth
 
 
@@ -227,6 +227,74 @@ def test_mutation_with_cross_site_origin_is_blocked_even_with_valid_session(tmp_
     r = evil_client.post("/app/api/session/grant-read", json={"name": "test-x", "enabled": True})
     assert r.status_code == 403
     assert r.json() == {"error": "ORIGIN_NOT_ALLOWED"}
+
+
+# ---------------------------------------------------------------------------
+# Multi-node grant routing (same fix as dashboard.py's CF-Access path)
+# ---------------------------------------------------------------------------
+
+def test_grant_read_with_node_id_routes_through_controller_when_given(tmp_path):
+    from terminal_mcp.controller import ControllerService
+    from terminal_mcp.host_metrics import NodeMetrics
+    from terminal_mcp.node_client import LocalNodeClient
+    from terminal_mcp.node_registry import NodeRegistry
+
+    service = TerminalService(_config(), audit=AuditStore(tmp_path / "audit.db"))
+    registry = NodeRegistry(tmp_path / "nodes.db")
+    controller = ControllerService(registry, local_client=LocalNodeClient(service), local_workspace_root=str(tmp_path))
+    controller.registry.register("worker", display_name="Worker", hostname="worker-host", endpoint="http://worker")
+
+    class _FakeClient:
+        def __init__(self):
+            self.grants = {}
+        def list_sessions(self):
+            return {"sessions": [{"name": "window"}]}
+        def grant_read(self, name, enabled, *, granted_by=None):
+            self.grants[name] = {"read_enabled": enabled, "input_enabled": False}
+            return {"session": name, **self.grants[name]}
+
+    fake = _FakeClient()
+    controller._clients["worker"] = fake
+    controller.registry.heartbeat(
+        "worker", metrics=NodeMetrics(cpu_percent=5.0, load1=0.1, load5=0.1, load15=0.1, cpu_count=4,
+                                     ram_total_bytes=8_000_000_000, ram_used_bytes=1_000_000_000, ram_percent=12.5,
+                                     swap_total_bytes=0, swap_used_bytes=0, swap_percent=0.0,
+                                     disk_total_bytes=100_000_000_000, disk_used_bytes=1_000_000_000,
+                                     disk_free_bytes=99_000_000_000, disk_percent=1.0),
+        tmux_session_count=1, agent_counts={}, agent_types=("shell",), agent_version=None, labels=(),
+    )
+
+    webauth = WebAuthStore(tmp_path / "webauth.db")
+    webauth.create_or_replace_user("admin", ADMIN_PASSWORD)
+    server = build_mcp(service)
+    register_webauth_dashboard(server, service, webauth, controller=controller)
+    client = _client(server)
+    r = _login(client)
+    assert r.status_code == 303
+
+    response = client.post("/app/api/session/grant-read", json={"name": "window", "enabled": True, "node_id": "worker"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body.get("error") is None
+    assert body["node_id"] == "worker"
+    assert fake.grants["window"]["read_enabled"] is True
+    # Never silently applied to the local TerminalService's own grants store.
+    assert service.grants.get("window") is None
+
+
+def test_grant_read_without_controller_falls_back_to_local_unchanged(tmp_path, tmux_session_factory):
+    # No `controller` passed (register_webauth_dashboard's own default) --
+    # exact pre-existing single-node behavior, unaffected by the fix.
+    tmux_session_factory("test-webauth-grant-fallback")
+    server, service, _webauth = _build(tmp_path)  # controller=None
+    client = _client(server)
+    r = _login(client)
+    assert r.status_code == 303
+    response = client.post("/app/api/session/grant-read",
+                           json={"name": "test-webauth-grant-fallback", "enabled": True})
+    assert response.status_code == 200
+    assert response.json().get("error") is None
+    assert service.grants.get("test-webauth-grant-fallback").read_enabled is True
 
 
 # ---------------------------------------------------------------------------

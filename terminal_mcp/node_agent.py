@@ -221,6 +221,30 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         result = await anyio.to_thread.run_sync(client.list_killed_sessions)
         return JSONResponse(result)
 
+    async def session_grant_read(request: Request) -> JSONResponse:
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        result = await anyio.to_thread.run_sync(lambda: client.grant_read(
+            request.path_params["name"], bool(body.get("enabled", False)), granted_by=body.get("granted_by"),
+        ))
+        return JSONResponse(result)
+
+    async def session_grant_input(request: Request) -> JSONResponse:
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        result = await anyio.to_thread.run_sync(lambda: client.grant_input(
+            request.path_params["name"], bool(body.get("enabled", False)), granted_by=body.get("granted_by"),
+        ))
+        return JSONResponse(result)
+
     async def terminal_ws(websocket: WebSocket) -> None:
         # Open Terminal for a REMOTE node (task's own "Open Terminal trên
         # Windows phải mở được web terminal vào persistent session"),
@@ -290,6 +314,8 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         Route("/v1/sessions/{name}", delete_session, methods=["DELETE"]),
         Route("/v1/sessions/{name}/kill", kill_session, methods=["POST"]),
         Route("/v1/sessions/{name}/reopen", reopen_session, methods=["POST"]),
+        Route("/v1/sessions/{name}/grant-read", session_grant_read, methods=["POST"]),
+        Route("/v1/sessions/{name}/grant-input", session_grant_input, methods=["POST"]),
         Route("/v1/killed-sessions", killed_sessions, methods=["GET"]),
         WebSocketRoute("/v1/ws/terminal", terminal_ws, name="node_agent_terminal_ws"),
     ]

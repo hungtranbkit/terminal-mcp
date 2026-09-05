@@ -253,7 +253,7 @@ def main() -> None:
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store)
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
-    register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2)
+    register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)
     register_health(server, terminal, supervisor)
 
     # Supervisor tools (watch/status/events/run_once, and the v2 policy/

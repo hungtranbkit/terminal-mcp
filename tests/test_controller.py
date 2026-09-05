@@ -58,6 +58,7 @@ class FakeNodeClient:
         self.broken = broken
         self._killed = killed or []
         self.calls: list[tuple[str, str]] = []
+        self.grants: dict[str, dict[str, bool]] = {}
 
     def list_sessions(self) -> dict[str, Any]:
         if self.broken:
@@ -102,6 +103,25 @@ class FakeNodeClient:
         self._killed = [row for row in self._killed if row.get("name") != name]
         self._sessions[name] = {"agent_type": agent_type, "cwd": cwd}
         return {"session": name, "state": "READY", "agent_type": agent_type, "cwd": cwd}
+
+    def grant_read(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
+        self.calls.append(("grant_read", name))
+        if self.broken:
+            raise NodeClientError("simulated transport failure")
+        if name not in self._sessions:
+            return {"error": "SESSION_NOT_FOUND", "session": name}
+        self.grants[name] = {"read_enabled": enabled, "input_enabled": self.grants.get(name, {}).get("input_enabled", False) and enabled}
+        return {"session": name, **self.grants[name]}
+
+    def grant_input(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
+        self.calls.append(("grant_input", name))
+        if self.broken:
+            raise NodeClientError("simulated transport failure")
+        existing = self.grants.get(name)
+        if not existing or not existing.get("read_enabled"):
+            return {"error": "READ_GRANT_REQUIRED", "session": name}
+        existing["input_enabled"] = enabled
+        return {"session": name, **existing}
 
 
 # -- Phase A/B backward compatibility: local-only behaves like plain TerminalService --
@@ -266,6 +286,116 @@ def test_qualified_name_to_unregistered_node_is_node_not_found(tmp_path):
     _heartbeat_local(controller)
     result = controller.terminal_status("ghost-node/whatever")
     assert result["error"] == "NODE_NOT_FOUND"
+
+
+# -- grant-read/grant-input routing (multi-node permission bug fix) -------
+# Real bug found live: a Windows/remote-node session's "Xem + gửi" grant
+# button did nothing, because the dashboard route called the LOCAL
+# TerminalService's own grants store directly regardless of which node the
+# session actually lived on. These are the routing-layer regression tests
+# for the fix (controller.terminal_grant_session_read/_input, mirroring
+# every other _route-based operation above).
+
+def test_local_session_grant_routes_to_local_grants_store_unchanged(tmp_path):
+    controller, service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    controller.terminal_create_session("ctrl-grant-local", "shell", str(tmp_path))
+    try:
+        result = controller.terminal_grant_session_read("ctrl-grant-local", True)
+        assert result.get("error") is None
+        assert result["read_enabled"] is True
+        assert result["node_id"] == "local"
+        # Really landed in the local TerminalService's own grant store,
+        # not just a routing-layer echo.
+        assert service.grants.get("ctrl-grant-local").read_enabled is True
+    finally:
+        import subprocess
+        subprocess.run(["tmux", "kill-session", "-t", "ctrl-grant-local"], check=False, capture_output=True)
+
+
+def test_remote_session_grant_reaches_the_remote_node_not_local(tmp_path):
+    # The exact scenario reported live: a session that exists ONLY on a
+    # remote node (e.g. Windows session "window" on a worker node) -- the
+    # local TerminalService has never heard of it.
+    controller, service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    controller.registry.register("worker", display_name="Worker", hostname="worker-host", endpoint="http://worker")
+    fake = FakeNodeClient({"window": {}})
+    controller._clients["worker"] = fake
+    controller.registry.heartbeat(
+        "worker", metrics=NodeMetrics(cpu_percent=5.0, load1=0.1, load5=0.1, load15=0.1, cpu_count=4,
+                                     ram_total_bytes=8_000_000_000, ram_used_bytes=1_000_000_000, ram_percent=12.5,
+                                     swap_total_bytes=0, swap_used_bytes=0, swap_percent=0.0,
+                                     disk_total_bytes=100_000_000_000, disk_used_bytes=1_000_000_000,
+                                     disk_free_bytes=99_000_000_000, disk_percent=1.0),
+        tmux_session_count=1, agent_counts={}, agent_types=("shell",), agent_version=None, labels=(),
+    )
+
+    result = controller.terminal_grant_session_read("window", True, granted_by="op@example.com")
+    assert result.get("error") is None
+    assert result["node_id"] == "worker"
+    assert fake.grants["window"]["read_enabled"] is True
+    # Never silently applied to the local grants store instead.
+    assert service.grants.get("window") is None
+
+    result2 = controller.terminal_grant_session_input("window", True)
+    assert result2.get("error") is None
+    assert result2["input_enabled"] is True
+    assert fake.grants["window"]["input_enabled"] is True
+    assert ("grant_read", "window") in fake.calls
+    assert ("grant_input", "window") in fake.calls
+
+
+def test_grant_input_without_read_grant_required_error_from_remote_node(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    controller.registry.register("worker", display_name="Worker", hostname="worker-host", endpoint="http://worker")
+    fake = FakeNodeClient({"window": {}})
+    controller._clients["worker"] = fake
+    controller.registry.heartbeat(
+        "worker", metrics=NodeMetrics(cpu_percent=5.0, load1=0.1, load5=0.1, load15=0.1, cpu_count=4,
+                                     ram_total_bytes=8_000_000_000, ram_used_bytes=1_000_000_000, ram_percent=12.5,
+                                     swap_total_bytes=0, swap_used_bytes=0, swap_percent=0.0,
+                                     disk_total_bytes=100_000_000_000, disk_used_bytes=1_000_000_000,
+                                     disk_free_bytes=99_000_000_000, disk_percent=1.0),
+        tmux_session_count=1, agent_counts={}, agent_types=("shell",), agent_version=None, labels=(),
+    )
+    result = controller.terminal_grant_session_input("worker/window", True)
+    assert result["error"] == "READ_GRANT_REQUIRED"
+
+
+def test_duplicate_session_name_grant_is_ambiguous_never_guessed(tmp_path):
+    # Task item 3: "hai node có cùng session name không được grant nhầm
+    # nhau" -- a bare, unqualified name that exists on two nodes must be
+    # refused outright, exactly like every other routed operation, never
+    # silently applied to whichever node happens to be resolved first.
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    controller.terminal_create_session("ctrl-amb-grant", "shell", str(tmp_path))
+    try:
+        controller.registry.register("fake-remote", display_name="Fake", hostname="fake-host", endpoint="http://fake")
+        fake = FakeNodeClient({"ctrl-amb-grant": {}})
+        controller._clients["fake-remote"] = fake
+        controller.registry.heartbeat(
+            "fake-remote", metrics=NodeMetrics(cpu_percent=5.0, load1=0.1, load5=0.1, load15=0.1, cpu_count=4,
+                                              ram_total_bytes=8_000_000_000, ram_used_bytes=1_000_000_000, ram_percent=12.5,
+                                              swap_total_bytes=0, swap_used_bytes=0, swap_percent=0.0,
+                                              disk_total_bytes=100_000_000_000, disk_used_bytes=1_000_000_000,
+                                              disk_free_bytes=99_000_000_000, disk_percent=1.0),
+            tmux_session_count=1, agent_counts={}, agent_types=("shell",), agent_version=None, labels=(),
+        )
+        controller.invalidate_session_location("ctrl-amb-grant")
+        result = controller.terminal_grant_session_read("ctrl-amb-grant", True)
+        assert result["error"] == "AMBIGUOUS_SESSION"
+        assert set(result["nodes"]) == {"local", "fake-remote"}
+
+        # A qualified name disambiguates cleanly, same as every other route.
+        qualified = controller.terminal_grant_session_read("local/ctrl-amb-grant", True)
+        assert qualified.get("error") is None
+        assert qualified["node_id"] == "local"
+    finally:
+        import subprocess
+        subprocess.run(["tmux", "kill-session", "-t", "ctrl-amb-grant"], check=False, capture_output=True)
 
 
 def test_qualified_name_to_node_with_no_client_is_node_unreachable(tmp_path):

@@ -126,6 +126,42 @@ def test_full_session_lifecycle_round_trip(agent_client):
     assert killed_list.status_code == 200
 
 
+def test_grant_read_and_grant_input_round_trip(agent_client):
+    # The node-agent-side half of the multi-node grant routing fix: the
+    # controller's RemoteNodeClient calls THESE routes for a session that
+    # lives on this node -- must apply to this node's own TerminalService.
+    create = agent_client.post("/v1/sessions", headers=_auth(),
+                               json={"name": "agent-grant", "agent_type": "shell", "cwd": None})
+    assert create.status_code == 200
+    agent_client.created.append("agent-grant")
+
+    grant_read = agent_client.post("/v1/sessions/agent-grant/grant-read", headers=_auth(),
+                                   json={"enabled": True, "granted_by": "op@example.com"})
+    assert grant_read.status_code == 200
+    body = grant_read.json()
+    assert body.get("error") is None
+    assert body["read_enabled"] is True
+    assert agent_client.terminal.grants.get("agent-grant").read_enabled is True
+
+    grant_input = agent_client.post("/v1/sessions/agent-grant/grant-input", headers=_auth(),
+                                    json={"enabled": True})
+    assert grant_input.status_code == 200
+    assert grant_input.json()["input_enabled"] is True
+
+    revoke = agent_client.post("/v1/sessions/agent-grant/grant-read", headers=_auth(),
+                               json={"enabled": False})
+    assert revoke.status_code == 200
+    assert revoke.json()["read_enabled"] is False
+    assert revoke.json()["input_enabled"] is False  # revoking read cascades, same as calling TerminalService directly
+
+
+def test_grant_routes_require_auth(agent_client):
+    response = agent_client.post("/v1/sessions/agent-grant/grant-read", json={"enabled": True})
+    assert response.status_code == 401
+    response2 = agent_client.post("/v1/sessions/agent-grant/grant-input", json={"enabled": True})
+    assert response2.status_code == 401
+
+
 def test_status_of_unknown_session_is_a_normal_200_not_a_transport_error(agent_client):
     # node_agent.py never uses a non-200 status for application-level
     # results (see node_client.py's own RemoteNodeClient docstring for why

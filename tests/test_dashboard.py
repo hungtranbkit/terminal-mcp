@@ -949,14 +949,18 @@ def test_dashboard_sidebar_has_no_checkbox_or_lock_icon_or_duplicate_list():
     assert DASHBOARD_HTML.count("function renderRows(rows) {") == 1
     assert DASHBOARD_HTML.count('id="tabbar"') == 1
     assert 'id="tabbar"' in DASHBOARD_HTML
-    # Backend this UI drives is unchanged -- grant_session_read/
-    # grant_session_input are still called exactly as before, from the
-    # same POST routes. These live in dashboard.py's Python source (the
-    # route registration), not in DASHBOARD_HTML, so check the module
-    # source directly.
+    # Backend this UI drives still serves the same two POST routes --
+    # routed through controller.terminal_grant_session_read/_input (the
+    # multi-node grant-routing fix, so a remote/Windows-node session's
+    # grant lands on THAT node's own store instead of always the local
+    # one) rather than calling TerminalService.grant_session_read/_input
+    # directly, a deliberate, correct behavior change, not a regression.
+    # These live in dashboard.py's Python source (the route
+    # registration), not in DASHBOARD_HTML, so check the module source
+    # directly.
     module_source = inspect.getsource(dashboard_module)
-    assert "terminal.grant_session_read(name, enabled" in module_source
-    assert "terminal.grant_session_input(name, enabled" in module_source
+    assert "controller.terminal_grant_session_read(qualified, enabled" in module_source
+    assert "controller.terminal_grant_session_input(qualified, enabled" in module_source
     assert '"/dashboard/api/session/grant-read", methods=["POST"]' in module_source
     assert '"/dashboard/api/session/grant-input", methods=["POST"]' in module_source
 
