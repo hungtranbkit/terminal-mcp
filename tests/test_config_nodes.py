@@ -119,20 +119,24 @@ def test_multiple_remote_nodes(tmp_path):
 
 def test_real_production_config_yaml_declares_the_real_worker_nodes(tmp_path):
     # Documents the current, deliberate state of the real deployment
-    # config: dell-5530 (Windows) and m910 (Linux, mesflow@192.168.1.109
-    # / "thinkcentre" SSH alias), both bootstrapped live over SSH -- see
-    # docs/multi-node.md's own "LAN discovery + remote connect" and
-    # "Bringing up the M910" sections. Loads cleanly through the real
-    # loader, not just a bare YAML parse, so a schema mistake here would
-    # fail this test the same way it would fail the real service's own
-    # startup.
+    # config: dell-5530 (Windows), m910 (Linux, mesflow@192.168.1.109 /
+    # "thinkcentre" SSH alias), and macbook (macOS,
+    # rumraisin@192.168.1.138 / Rums-MacBook-Pro.local), all bootstrapped
+    # live over SSH -- see docs/multi-node.md's own "LAN discovery +
+    # remote connect", "Bringing up the M910", and (macOS) the bring-up
+    # commit's own message for each one's own history. Loads cleanly
+    # through the real loader, not just a bare YAML parse, so a schema
+    # mistake here would fail this test the same way it would fail the
+    # real service's own startup.
     import pathlib
     from terminal_mcp.config import load_config
     real_config_path = pathlib.Path(__file__).parents[1] / "config.yaml"
     config = load_config(str(real_config_path))
     by_id = {n.node_id: n for n in config.nodes.remote_nodes}
-    assert set(by_id) == {"dell-5530", "m910"}
+    assert set(by_id) == {"dell-5530", "m910", "macbook"}
     assert by_id["dell-5530"].endpoint == "http://192.168.1.250:8790"
     assert by_id["dell-5530"].token_env == "TERMINAL_MCP_NODE_TOKEN_DELL_5530"
     assert by_id["m910"].endpoint == "http://192.168.1.109:8790"
     assert by_id["m910"].token_env == "TERMINAL_MCP_NODE_TOKEN_M910"
+    assert by_id["macbook"].endpoint == "http://192.168.1.138:8790"
+    assert by_id["macbook"].token_env == "TERMINAL_MCP_NODE_TOKEN_MACBOOK"
