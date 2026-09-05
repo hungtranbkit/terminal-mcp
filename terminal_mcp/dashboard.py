@@ -21,7 +21,7 @@ from .cf_access import verify_access_assertion
 from .agent_availability import available_agent_types
 from .connection_store import ConnectionStore, generate_node_token
 from .controller import ControllerService, build_default_controller
-from .node_client import RemoteNodeClient
+from .node_client import NodeClientError, RemoteNodeClient
 from .core import TerminalService
 from .node_models import NODE_ONLINE, SESSION_BACKEND_TMUX, node_to_dict
 from .permissions import input_session_allowed, session_allowed, valid_session_name
@@ -5247,58 +5247,76 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
-    def _resolve_remote_web_terminal_access(session: str) -> dict | None:
-        """Only reached after terminal.terminal_web_terminal_access(session)
-        already returned SESSION_NOT_FOUND -- meaning every check UP TO
-        the physical-existence one (web_terminal_enabled, require_read,
-        valid_session_name, and READ authorization via
-        _read_authorized_with_grant) already passed; that function
-        returns ACCESS_DENIED before ever reaching SESSION_NOT_FOUND if
-        read isn't authorized. This only has to resolve WHERE the
-        session actually lives and whether INPUT is authorized -- read
-        access is already a settled question by the time this runs.
+    async def _open_remote_terminal_ws(websocket: WebSocket, node_id: str, session: str,
+                                       takeover_requested: bool) -> None:
+        """Node-aware remote Open Terminal (task item 7: canonical
+        node_id+session_name identity, never a bare-name guess that could
+        silently fall back to the local grants store -- the real bug this
+        replaces: the old code only ever tried resolving a REMOTE session
+        AFTER terminal.terminal_web_terminal_access(session) had already
+        failed against the LOCAL node's own grants -- for a session that
+        exists ONLY on a remote node with no local grant/whitelist match
+        at all, that call returns ACCESS_DENIED, never SESSION_NOT_FOUND,
+        so the remote fallback was never even reached; Open Terminal for
+        a remote-only-granted session, e.g. a Windows session named
+        "window", was completely unreachable this way. `node_id`/
+        `session` here are already the resolved, unambiguous pair from
+        controller.resolve_session -- this never re-derives or re-guesses
+        them.
 
-        input authorization for a remote session uses revalidate_
-        identity=False (same as the discovery endpoints' own coarse
-        signal) -- a real, documented Phase A/B limitation: per-call
-        identity re-pinning (P0-2) needs this node's own tmux, which a
-        remote session doesn't have. A statically-whitelisted session
-        (input_session_allowed) is completely unaffected (that check
-        short-circuits before identity revalidation ever matters);
-        only a GRANT-based (non-whitelisted) remote session's input
-        authorization is coarser than the local case."""
-        resolution = controller.resolve_session(session)
-        if "error" in resolution:
-            return None
-        node_id = resolution["node_id"]
-        if node_id == controller.local_node_id:
-            return None  # already confirmed not-found locally -- fail safe, never loop back to itself
+        read_allowed/input_allowed come from THAT node's own
+        list_sessions() (client.list_sessions()) -- the exact same
+        canonical _read_authorized_with_grant/_input_authorized_with_
+        grant computation that node's own TerminalService already applies
+        for every other surface (dashboard/MCP alike), read fresh off its
+        own grants.db -- never re-derived from this (wrong) node's
+        local grant store."""
         node = controller.node_status(node_id)
         if node is None or node.status != NODE_ONLINE:
-            return None
+            await websocket.close(code=4404)
+            return
         client = controller.client_for(node_id)
         if not isinstance(client, RemoteNodeClient):
-            return None
-        grant = terminal.grants.get(session)
+            await websocket.close(code=4404)
+            return
+        try:
+            listing = await anyio.to_thread.run_sync(client.list_sessions)
+        except NodeClientError:
+            await websocket.close(code=4404)
+            return
+        row = next((r for r in listing.get("sessions", []) if r.get("name") == session), None)
+        if row is None:
+            await websocket.close(code=4404)
+            return
+        if not row.get("effective_read", row.get("read_allowed", False)):
+            await websocket.close(code=4403)
+            return
         input_enabled = bool(
             terminal.config.permissions.terminal_input
-            and terminal._input_authorized_with_grant(session, grant, revalidate_identity=False)[0]
+            and row.get("effective_input", row.get("input_allowed", False))
         )
-        return {"node_id": node_id, "client": client, "input": input_enabled}
+        # Remote takeover (tmux -d-equivalent) is NOT wired on node_agent.py's
+        # own /v1/ws/terminal route yet (a documented Phase A/B gap, same
+        # as identity re-pinning above) -- `takeover_requested` is
+        # deliberately unused/dropped here rather than silently claiming
+        # support that doesn't exist on the remote side.
+        await _proxy_remote_terminal_ws(websocket, session, client, input_enabled)
 
-    async def _proxy_remote_terminal_ws(websocket: WebSocket, remote_access: dict) -> None:
+    async def _proxy_remote_terminal_ws(websocket: WebSocket, session: str,
+                                        client: RemoteNodeClient, input_enabled: bool) -> None:
         """Relays an already-`accept()`-pending browser WebSocket to a
         REMOTE node's own /v1/ws/terminal (node_agent.py) -- this
         process never touches tmux/WindowsSessionBackend directly for a
         remote session, it's a pure byte/frame relay, same trust
         boundary as every other routed operation in this project
         (controller.py never re-implements what a node agent already
-        does, only routes to it)."""
+        does, only routes to it). `session` is the already-resolved BARE
+        name (never re-read from the query string, which may have been
+        an explicit "node_id/session" qualification the remote node
+        itself has no concept of) -- the one thing that node's own
+        /v1/ws/terminal route understands."""
         import websockets as _websockets_client
 
-        client: RemoteNodeClient = remote_access["client"]
-        session = websocket.query_params.get("session", "")
-        input_enabled = remote_access["input"]
         remote_base = client.base_url.replace("https://", "wss://").replace("http://", "ws://")
         remote_url = f"{remote_base}/v1/ws/terminal?session={quote(session)}&readonly={0 if input_enabled else 1}"
 
@@ -5338,8 +5356,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                     finally:
                         tg.cancel_scope.cancel()
         except Exception as exc:  # noqa: BLE001 -- a remote-connect failure must close cleanly, never hang the browser socket
-            _log.warning("remote web terminal proxy to node_id=%s failed: %s: %s",
-                        remote_access.get("node_id"), type(exc).__name__, exc)
+            _log.warning("remote web terminal proxy session=%s failed: %s: %s",
+                        session, type(exc).__name__, exc)
             with contextlib.suppress(Exception):
                 if websocket.client_state == WebSocketState.CONNECTED:
                     await websocket.send_json({"type": "closed", "reason": "remote_node_unreachable"})
@@ -5369,23 +5387,46 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if not valid_session_name(session):
             await websocket.close(code=4400)
             return
-        access = await anyio.to_thread.run_sync(terminal.terminal_web_terminal_access, session)
-        if access.get("error") == "SESSION_NOT_FOUND":
-            # Not on the LOCAL node specifically -- task's own "Open
-            # Terminal trên Windows/remote node phải mở được web
-            # terminal", generalized to any remote node (Linux or
-            # Windows). Every check terminal_web_terminal_access itself
-            # would have applied UP TO the physical-existence check
-            # (web_terminal_enabled, require_read, valid_session_name,
-            # already checked above) still applies -- only the "does it
-            # exist" step is redirected to controller.resolve_session
-            # instead of this node's own tmux.
-            remote_access = await anyio.to_thread.run_sync(lambda: _resolve_remote_web_terminal_access(session))
-            if remote_access is not None:
-                await _proxy_remote_terminal_ws(websocket, remote_access)
-                return
-            await websocket.close(code=4404)
+        # Node-aware FIRST (task item 7: canonical node_id+session_name
+        # identity, never a bare-name guess) -- resolve_session probes
+        # every ONLINE node's own session list for a bare name (never
+        # ambiguous by construction: two nodes sharing a name is refused
+        # outright, not routed by guessing). SAFE_SESSION_RE (valid_
+        # session_name, just above) has no "/" in its charset, so `session`
+        # here is always bare -- this dashboard's own JS never sends a
+        # qualified "node_id/session" over this param either.
+        #
+        # _refresh_local_heartbeat() first -- same reason _routed() (the
+        # lifecycle-mutation wrapper) always does: resolve_session's own
+        # probe loop skips any node whose status isn't ONLINE, and the
+        # LOCAL node only ever becomes ONLINE once something has
+        # heartbeated it at least once. Without this, a WS connection
+        # arriving before any prior GET /api/sessions poll would get a
+        # false SESSION_NOT_FOUND even for a genuinely live LOCAL session
+        # -- confirmed live wiring this (this route never needed
+        # resolve_session before this fix, so it never needed this call
+        # either).
+        def _resolve() -> dict:
+            _refresh_local_heartbeat()
+            return controller.resolve_session(session)
+        resolution = await anyio.to_thread.run_sync(_resolve)
+        if "error" in resolution:
+            await websocket.close(code=4404 if resolution["error"] == "SESSION_NOT_FOUND" else 4409)
             return
+        node_id = resolution["node_id"]
+        if node_id != controller.local_node_id:
+            # Real bug this replaces: the old code only ever attempted a
+            # remote lookup AFTER terminal.terminal_web_terminal_access
+            # (session) had already failed against the LOCAL node's own
+            # grants store -- for a session that exists ONLY on a remote
+            # node with no local grant/whitelist match, that call returns
+            # ACCESS_DENIED, never SESSION_NOT_FOUND, so the remote branch
+            # was never reached at all. Open Terminal for a remote-only-
+            # granted session (e.g. a Windows session named "window") was
+            # completely unreachable this way -- confirmed live.
+            await _open_remote_terminal_ws(websocket, node_id, session, takeover_requested)
+            return
+        access = await anyio.to_thread.run_sync(terminal.terminal_web_terminal_access, session)
         if "error" in access:
             code = 4403
             await websocket.close(code=code)
