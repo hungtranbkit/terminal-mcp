@@ -186,7 +186,8 @@ def cmd_grants(args: argparse.Namespace) -> int:
     from .controller import ControllerService
     from .core import TerminalService
     from .node_client import LocalNodeClient, NodeClientError
-    from .node_registry import NodeRegistry, NODE_ONLINE
+    from .node_models import NODE_ONLINE
+    from .node_registry import NodeRegistry
 
     config = load_config(args.config)
     terminal = TerminalService(config)

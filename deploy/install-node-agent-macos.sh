@@ -198,6 +198,22 @@ PLIST_PATH="$LAUNCH_DIR/$PLIST_LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/terminal-mcp"
 mkdir -p "$LOG_DIR"
 
+# REAL BUG FOUND LIVE (first bring-up, m910-style live smoke test):
+# launchd runs a LaunchAgent with a minimal PATH (just /usr/bin:/bin:
+# /usr/sbin:/sbin, no shell profile ever sourced) -- every actual tmux
+# invocation (tmux.py's own subprocess calls) failed with
+# FileNotFoundError even though tmux worked fine over an interactive/
+# login SSH shell. Both Homebrew prefixes included below so the SAME
+# plist works whether Homebrew installed to /usr/local (Intel) or
+# /opt/homebrew (Apple Silicon), without needing to detect which at
+# install time. Kept as a plain shell comment, not an inline XML
+# comment inside the heredoc below -- bash 3.2 (macOS's own shipped
+# /bin/bash, still GPLv2-era) genuinely fails to parse this exact
+# heredoc-inside-command-substitution construct when the heredoc body
+# itself contains an XML "<!-- ... -->" comment (confirmed live: the
+# identical heredoc structure worked fine without one).
+AGENT_PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 PLIST_CONTENT=$(cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -227,6 +243,8 @@ PLIST_CONTENT=$(cat <<EOF
         <string>$REPO_DIR/config.yaml</string>
         <key>TERMINAL_MCP_NODE_TOKEN</key>
         <string>$TOKEN_VALUE</string>
+        <key>PATH</key>
+        <string>$AGENT_PATH</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
