@@ -824,11 +824,9 @@ class TerminalService:
             read_granted = bool(grant and grant.read_enabled)
             input_granted = bool(grant and grant.input_enabled)
             read_allowed = self._read_authorized_with_grant(item.name, grant)
-            input_allowed = bool(
-                self.config.permissions.terminal_input
-                and self._input_authorized_with_grant(
-                    item.name, grant, current_identity=SessionIdentity.from_session_info(item))[0]
-            )
+            input_ok, input_specific_reason = self._input_authorized_with_grant(
+                item.name, grant, current_identity=SessionIdentity.from_session_info(item))
+            input_allowed = bool(self.config.permissions.terminal_input and input_ok)
             row = {
                 "name": item.name, "allowed": session_allowed(item.name, self.config), "attached": item.attached,
                 "windows": item.windows, "created": iso_timestamp(item.created_epoch),
@@ -836,6 +834,26 @@ class TerminalService:
                 "read_allowed": read_allowed, "read_granted": read_granted,
                 "input_allowed": input_allowed, "input_granted": input_granted,
                 "effective_read": read_allowed, "effective_input": input_allowed,
+                # P0 HOTFIX (task: "P0 HOTFIX REMOTE PERMISSION FLAP"): a
+                # granted-but-currently-blocked input is not always a bug
+                # -- most commonly it's the identity-pinning invariant
+                # (grant_session_input pins the session's session_id/
+                # pane_id/created_epoch at grant time; a same-named
+                # session recreated later, e.g. after a tmux-server
+                # restart, correctly fails this check rather than
+                # silently inheriting the old grant -- see
+                # _input_authorized_with_grant's own "REAL BUG FIXED
+                # HERE" note). Previously this specific reason was
+                # computed here and then silently discarded (`[0]` only)
+                # -- an operator/dashboard/doctor check had no way to
+                # distinguish "policy denies this" from "an active grant
+                # just needs re-granting because the process was
+                # recreated". Only ever non-null when it's actually the
+                # cause (never fabricated when input_allowed is already
+                # true, and never surfaced when the GLOBAL switch itself
+                # is what's off).
+                "input_denied_reason": (input_specific_reason if (self.config.permissions.terminal_input
+                                                                   and not input_allowed) else None),
             }
             row.update(self._desktop_metadata_for(item.name))
             sessions.append(row)
@@ -1822,13 +1840,18 @@ class TerminalService:
             lines = self.tmux.capture_lines(session, 20)
         except TmuxError as exc:
             return {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
-        effective = (self.config.permissions.terminal_input and self._input_authorized(session)[0]
+        input_ok, input_specific_reason = self._input_authorized(session)
+        effective = (self.config.permissions.terminal_input and input_ok
                      and (stored is None or stored.input_enabled)
                      and info.pane_current_command.casefold() not in SENSITIVE_COMMANDS
                      and not info.pane_in_mode)
         return {"binding": binding, "session": session, "current_command": info.pane_current_command,
                 "status": "RUNNING" if not info.pane_dead else "DEAD",
                 "last_output": redact_text("\n".join(lines)), "effective_input": effective,
+                # See terminal_list_sessions's own "P0 HOTFIX" note --
+                # same additive, only-when-relevant reason field.
+                "input_denied_reason": (input_specific_reason if (self.config.permissions.terminal_input
+                                                                   and not effective) else None),
                 "pane_in_mode": info.pane_in_mode}
 
     # -- dashboard-only per-session grants -----------------------------
@@ -1875,11 +1898,9 @@ class TerminalService:
             grant_read = bool(grant and grant.read_enabled)
             grant_input = bool(grant and grant.input_enabled)
             allowed = session_allowed(item.name, self.config)
-            effective_input = bool(
-                self.config.permissions.terminal_input
-                and self._input_authorized_with_grant(
-                    item.name, grant, current_identity=SessionIdentity.from_session_info(item))[0]
-            )
+            input_ok, input_identity_reason = self._input_authorized_with_grant(
+                item.name, grant, current_identity=SessionIdentity.from_session_info(item))
+            effective_input = bool(self.config.permissions.terminal_input and input_ok)
             row = {
                 "name": item.name, "allowed": allowed, "attached": item.attached,
                 "windows": item.windows, "created": iso_timestamp(item.created_epoch),
@@ -1898,8 +1919,21 @@ class TerminalService:
             # same list_sessions() call -- no extra per-session tmux
             # round-trip, same N+1 discipline as the rest of this route.
             if not allowed and not effective_input:
-                row["input_block_reason"] = self._input_grant_block_reason(
-                    item.name, pane_current_command=item.pane_current_command)
+                # P0 HOTFIX: an identity-mismatch reason (an active grant
+                # exists but no longer matches this session's real
+                # identity -- see _input_authorized_with_grant's own
+                # "REAL BUG FIXED HERE" note) takes priority over
+                # _input_grant_block_reason's plain eligibility check --
+                # that check only asks "could a NEW grant be issued right
+                # now", which would wrongly answer "nothing blocking"
+                # for a session that already HAS an active grant that
+                # just needs re-granting (the operator needs to be told
+                # to re-grant, not left thinking there's no problem at
+                # all, which is what a bare `null` here used to imply).
+                row["input_block_reason"] = (
+                    input_identity_reason if (self.config.permissions.terminal_input and input_identity_reason)
+                    else self._input_grant_block_reason(item.name, pane_current_command=item.pane_current_command)
+                )
             # Kill/Reopen UX (item 11 of the design this backs): a real,
             # currently-observed preview of whether a Kill of THIS session
             # would capture complete-enough metadata for an automatic

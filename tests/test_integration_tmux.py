@@ -31,7 +31,8 @@ def test_real_tmux_list_tail_status_and_denial(read_config, tmux_session_factory
     assert set(private_row) == {"name", "allowed", "attached", "windows", "created",
                                 "activity", "read_allowed", "read_granted",
                                 "input_allowed", "input_granted",
-                                "effective_read", "effective_input"}  # no content field, ever
+                                "effective_read", "effective_input",
+                                "input_denied_reason"}  # no content field, ever
     assert "BUILD STEP 5" in service.terminal_tail("test-running", 20)["output"]
     # Discovery never grants access -- still the exact same ACCESS_DENIED
     # a raw, unmodified whitelist check has always produced.

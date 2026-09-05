@@ -8,6 +8,8 @@ only reports.
     terminal-mcp-doctor connection --json     machine-readable (one line)
     terminal-mcp-doctor nodes                 human-readable node fleet diagnostics
     terminal-mcp-doctor nodes --json          machine-readable (one line)
+    terminal-mcp-doctor grants                fleet-wide granted-but-ineffective-input check
+    terminal-mcp-doctor grants --json         machine-readable (one line)
 
 Never prints the tunnel control-plane API key, a node's bearer token, or
 any other secret -- the diagnostics this reads (health endpoints,
@@ -158,6 +160,86 @@ def cmd_nodes(args: argparse.Namespace) -> int:
     return 0 if healthy else 1
 
 
+def cmd_grants(args: argparse.Namespace) -> int:
+    """Fleet-wide grant-health diagnostic (task: "P0 HOTFIX REMOTE
+    PERMISSION FLAP" -- item 8's own "invariant/assertion/doctor check").
+
+    Flags every session, on every reachable node, where an active input
+    grant (input_granted=true) is currently NOT effective
+    (effective_input=false) while the GLOBAL terminal_input permission is
+    on. This is deliberately a DIAGNOSTIC, never an auto-fix and never
+    proof of a bug on its own -- the single most common cause is the
+    identity-pinning invariant working exactly as designed (a session
+    was recreated, e.g. after a tmux-server restart, and its grant's
+    pinned identity no longer matches; see core.py's
+    _input_authorized_with_grant for the full reasoning and the real
+    incident that invariant itself was built to prevent). Each flagged
+    row is labeled with WHY: `input_denied_reason == "IDENTITY_MISMATCH"`
+    means "re-grant to fix" (an operator/dashboard action, not a code
+    change); any other case (reason is None despite the mismatch) is
+    genuinely unexpected and worth investigating -- this command exits
+    1 only for that second, unexplained case, never for a plain
+    identity-mismatch (which is an expected, self-explanatory state, not
+    a failure this CLI should gate on)."""
+    from .agent_availability import available_agent_types  # noqa: F401 -- parity with cmd_nodes's own imports
+    from .config import load_config
+    from .controller import ControllerService
+    from .core import TerminalService
+    from .node_client import LocalNodeClient, NodeClientError
+    from .node_registry import NodeRegistry, NODE_ONLINE
+
+    config = load_config(args.config)
+    terminal = TerminalService(config)
+    registry = NodeRegistry(overload_thresholds=config.nodes.overload_thresholds,
+                            heartbeat_thresholds=config.nodes.heartbeat_thresholds)
+    workspace_root = (config.session_lifecycle.allowed_cwd_roots[0]
+                      if config.session_lifecycle.allowed_cwd_roots else "/")
+    controller = ControllerService(registry, local_client=LocalNodeClient(terminal), local_workspace_root=workspace_root)
+
+    for remote in config.nodes.remote_nodes:
+        token = os.environ.get(remote.token_env)
+        if token:
+            controller.register_remote_node(remote.node_id, display_name=remote.display_name, hostname=remote.hostname,
+                                            endpoint=remote.endpoint, token=token, max_sessions=remote.max_sessions,
+                                            timeout=remote.timeout_seconds)
+    controller.refresh_local_heartbeat(tmux_session_count=0, agent_counts={}, agent_types=(), agent_version=None)
+
+    flagged = []
+    node_errors = {}
+    for node in controller.list_nodes():
+        if node.id != controller.local_node_id and node.status != NODE_ONLINE:
+            continue
+        client = controller._clients.get(node.id)
+        if client is None:
+            continue
+        try:
+            sessions = client.list_sessions().get("sessions", [])
+        except NodeClientError as exc:
+            node_errors[node.id] = str(exc)
+            continue
+        for row in sessions:
+            if row.get("input_granted") and not row.get("effective_input"):
+                flagged.append({"node_id": node.id, "session": row["name"],
+                                "reason": row.get("input_denied_reason"),
+                                "explained": row.get("input_denied_reason") == "IDENTITY_MISMATCH"})
+
+    result = {"flagged": flagged, "node_errors": node_errors}
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print("Terminal MCP grant health")
+        if not flagged:
+            print("  No granted-but-ineffective input sessions found.")
+        for row in flagged:
+            label = "re-grant to fix (session was recreated)" if row["explained"] else "UNEXPLAINED -- investigate"
+            print(f"  [{row['node_id']}] {row['session']}: reason={row['reason']} -- {label}")
+        for node_id, detail in node_errors.items():
+            print(f"  (could not check {node_id}: {detail})")
+
+    unexplained = [row for row in flagged if not row["explained"]]
+    return 0 if not unexplained else 1
+
+
 def _print_nodes_human(result: dict) -> None:
     print("Terminal MCP node fleet")
     for row in result["nodes"]:
@@ -204,6 +286,12 @@ def build_parser() -> argparse.ArgumentParser:
     nodes.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of text")
     nodes.add_argument("--config", default=None, help="Path to config.yaml (default: the usual lookup)")
     nodes.set_defaults(func=cmd_nodes)
+
+    grants = subparsers.add_parser("grants", help="Diagnose granted-but-ineffective input sessions fleet-wide "
+                                                   "(P0 HOTFIX REMOTE PERMISSION FLAP's own invariant check)")
+    grants.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of text")
+    grants.add_argument("--config", default=None, help="Path to config.yaml (default: the usual lookup)")
+    grants.set_defaults(func=cmd_grants)
 
     return parser
 
