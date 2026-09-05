@@ -136,3 +136,15 @@ nodes:
       hostname: "192.168.1.109"
       endpoint: "http://192.168.1.109:8790"
       token_env: TERMINAL_MCP_NODE_TOKEN_M910
+    # macOS worker node (rumraisin's MacBook Pro, rumraisin@192.168.1.138
+    # LAN / rumraisin@100.104.209.93 Tailscale) -- installed via
+    # deploy/install-node-agent-macos.sh, running as a per-user
+    # LaunchAgent (~/Library/LaunchAgents, macOS's own equivalent of
+    # `systemctl --user`). Clamshell mode (lid closed, still running) is
+    # kept alive by AC power + an external display always connected --
+    # both conditions the user confirmed they keep permanently.
+    - node_id: macbook
+      display_name: "macbook (macOS)"
+      hostname: "Rums-MacBook-Pro.local"
+      endpoint: "http://192.168.1.138:8790"
+      token_env: TERMINAL_MCP_NODE_TOKEN_MACBOOK
