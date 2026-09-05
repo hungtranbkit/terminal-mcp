@@ -654,6 +654,76 @@ def test_get_session_falls_back_safely_if_the_resolver_itself_raises(backend, tm
     assert info.pane_current_command == Path(backend.shell).name
 
 
+# ---------------------------------------------------------------------------
+# P0 CONTROL-PLANE HOTFIX (task: "P0 AUDIT/RECOVERY -- window/window2
+# transcript collision"): real incident on dell-5530 -- a manual recovery
+# resumed BOTH `window` and `window2` with the SAME `claude --resume <uuid>`
+# transcript id, confirmed live via a PEB-based command-line read
+# (_win32_process_command_line -- the same technique this fixes wires
+# in as _win32_foreground_command_line). Same injection posture as the
+# foreground_command_resolver tests above: the real ctypes/
+# NtQueryInformationProcess implementation only works on an actual
+# Windows host.
+# ---------------------------------------------------------------------------
+
+from terminal_mcp.windows_backend import (  # noqa: E402
+    RESUME_CONVERSATION_ID_RE, _win32_foreground_command_line, _win32_process_command_line)
+
+
+def test_win32_process_command_line_falls_back_on_non_windows_platform():
+    assert _win32_process_command_line(99999) is None
+
+
+def test_win32_foreground_command_line_falls_back_on_non_windows_platform():
+    assert _win32_foreground_command_line(99999) is None
+
+
+def test_resume_conversation_id_re_matches_claude_resume_argv():
+    cmdline = ('"C:\\Users\\tranv\\...\\claude.exe" --resume cdbb5b70-b933-46c9-a8f1-dbe57572ea5d')
+    match = RESUME_CONVERSATION_ID_RE.search(cmdline)
+    assert match is not None
+    assert match.group(1) == "cdbb5b70-b933-46c9-a8f1-dbe57572ea5d"
+
+
+def test_resume_conversation_id_re_does_not_match_a_fresh_no_resume_launch():
+    cmdline = '"C:\\Users\\tranv\\...\\claude.exe"'
+    assert RESUME_CONVERSATION_ID_RE.search(cmdline) is None
+
+
+def test_get_session_surfaces_resume_conversation_id_from_injected_cmdline_resolver(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+
+    def fake_cmdline_resolver(pid: int) -> str:
+        return f'"...\\claude.exe" --resume cdbb5b70-b933-46c9-a8f1-dbe57572ea5d'
+
+    backend._foreground_cmdline_resolver = fake_cmdline_resolver
+    info = backend.get_session("win-test")
+    assert info.resume_conversation_id == "cdbb5b70-b933-46c9-a8f1-dbe57572ea5d"
+
+
+def test_get_session_resume_conversation_id_is_none_for_a_fresh_conversation(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+
+    def fake_cmdline_resolver(pid: int) -> str:
+        return '"...\\claude.exe"'  # no --resume -- a fresh conversation, not a collision signal
+
+    backend._foreground_cmdline_resolver = fake_cmdline_resolver
+    info = backend.get_session("win-test")
+    assert info.resume_conversation_id is None
+
+
+def test_get_session_resume_conversation_id_falls_back_safely_if_resolver_raises(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+
+    def broken_resolver(pid: int) -> str:
+        raise RuntimeError("simulated ctypes failure")
+
+    backend._foreground_cmdline_resolver = broken_resolver
+    info = backend.get_session("win-test")
+    assert info is not None
+    assert info.resume_conversation_id is None
+
+
 def test_get_session_reports_reader_alive_true_for_a_healthy_session(backend, tmp_path):
     _new_fake_shell_session(backend, tmp_path)
     info = backend.get_session("win-test")

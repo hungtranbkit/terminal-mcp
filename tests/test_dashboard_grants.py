@@ -325,6 +325,7 @@ def test_dashboard_grant_widens_discovery_and_the_plain_mcp_tools_consistently(t
         "input_allowed": False, "input_granted": False,
         "effective_read": False, "effective_input": False,
         "input_denied_reason": None,  # no grant at all yet -- nothing specific to explain
+        "resume_conversation_id": None,  # tmux backend never populates this (Windows-only signal)
     }
     assert service.terminal_tail(session)["error"] == "ACCESS_DENIED"
     assert service.terminal_status(session)["error"] == "ACCESS_DENIED"

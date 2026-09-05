@@ -46,6 +46,25 @@ class SessionInfo:
     # a fabricated True/False that would imply a check that never ran.
     reader_alive: bool | None = None
     reader_restarts: int = 0
+    # P0 CONTROL-PLANE HOTFIX (task: "P0 AUDIT/RECOVERY -- window/window2
+    # transcript collision"): the --resume/conversation identifier the
+    # session's own foreground agent process was launched with, when
+    # detectable (e.g. Claude Code's `claude --resume <uuid>`). None when
+    # the foreground process isn't a recognized agent CLI, when it was
+    # launched WITHOUT --resume (a fresh conversation -- not a conflict
+    # signal), or when the resolver simply can't determine it (best-
+    # effort, same philosophy as pane_current_command). Currently
+    # populated on the Windows backend only (see
+    # windows_backend._win32_foreground_command_line) -- the real
+    # incident this exists to catch (a manual recovery mistake reusing
+    # one Claude Code transcript id across TWO logical sessions,
+    # `window` and `window2` on dell-5530) happened there; tmux.py leaves
+    # this None (known gap, not yet implemented for Linux/macOS). Lets a
+    # fleet-wide doctor check (doctor.py's `conversations` command)
+    # detect two different sessions sharing one underlying agent
+    # conversation -- a real cross-session-input-collision risk, not
+    # just a cosmetic one.
+    resume_conversation_id: str | None = None
 
 
 @dataclass(frozen=True)

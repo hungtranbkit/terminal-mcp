@@ -854,6 +854,16 @@ class TerminalService:
                 # is what's off).
                 "input_denied_reason": (input_specific_reason if (self.config.permissions.terminal_input
                                                                    and not input_allowed) else None),
+                # P0 CONTROL-PLANE HOTFIX (task: "P0 AUDIT/RECOVERY --
+                # window/window2 transcript collision"): passthrough of
+                # SessionInfo.resume_conversation_id -- see its own
+                # docstring (models.py) for what this is and the real
+                # incident it exists to let a fleet-wide doctor check
+                # (doctor.py's `conversations` command) detect. None on
+                # every non-Windows session and on any Windows session
+                # not currently resolvable/not an agent conversation --
+                # never fabricated.
+                "resume_conversation_id": item.resume_conversation_id,
             }
             row.update(self._desktop_metadata_for(item.name))
             sessions.append(row)
@@ -1924,6 +1934,10 @@ class TerminalService:
                 "grant": {"read_enabled": grant_read, "input_enabled": grant_input},
                 "effective_read": self._read_authorized_with_grant(item.name, grant),
                 "effective_input": effective_input,
+                # P0 CONTROL-PLANE HOTFIX: same passthrough/meaning as
+                # terminal_list_sessions' own resume_conversation_id --
+                # see models.py's SessionInfo.resume_conversation_id.
+                "resume_conversation_id": item.resume_conversation_id,
             }
             row.update(self._desktop_metadata_for(item.name))
             # UX gap fix: an operator needs to know WHY the input-grant

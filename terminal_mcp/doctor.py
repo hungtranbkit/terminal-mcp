@@ -241,6 +241,95 @@ def cmd_grants(args: argparse.Namespace) -> int:
     return 0 if not unexplained else 1
 
 
+def cmd_conversations(args: argparse.Namespace) -> int:
+    """Fleet-wide conversation-collision diagnostic (task: "P0 AUDIT/
+    RECOVERY -- window/window2 transcript collision").
+
+    REAL INCIDENT this exists to catch: a manual recovery on dell-5530
+    (after a node-agent restart killed both `window` and `window2`) used
+    `claude --resume <same-uuid>` for BOTH sessions, because window2's
+    own distinct transcript couldn't be located at the time. This gave
+    two DIFFERENT logical terminal-mcp sessions (confirmed independent
+    at the process level -- distinct ConPTY host pids, distinct claude.exe
+    child pids) shared ownership of the exact same underlying Claude Code
+    conversation, which is what caused window2 to start showing window's
+    own content and Claude Code's own "Remote Control" single-owner lock
+    to correctly refuse it. This is NOT a tmux/pane-mapping bug (session
+    isolation itself was never broken); it is a control-plane invariant
+    a manual recovery had no automated guard against.
+
+    Flags every (resume_conversation_id, node) pair claimed by more than
+    one session, fleet-wide, using SessionInfo.resume_conversation_id
+    (see models.py's own docstring -- currently populated by the Windows
+    backend only; see windows_backend._win32_foreground_command_line).
+    A session with resume_conversation_id=None is never flagged (no
+    signal, not evidence of anything -- most commonly a fresh, non-
+    resumed conversation, or a non-Windows/non-agent session). Exits 1
+    if any collision is found -- unlike `grants`, there is no "expected,
+    self-explanatory" case here: two sessions sharing one conversation
+    is ALWAYS worth investigating."""
+    from .config import load_config
+    from .controller import ControllerService
+    from .core import TerminalService
+    from .node_client import LocalNodeClient, NodeClientError
+    from .node_models import NODE_ONLINE
+    from .node_registry import NodeRegistry
+
+    config = load_config(args.config)
+    terminal = TerminalService(config)
+    registry = NodeRegistry(overload_thresholds=config.nodes.overload_thresholds,
+                            heartbeat_thresholds=config.nodes.heartbeat_thresholds)
+    workspace_root = (config.session_lifecycle.allowed_cwd_roots[0]
+                      if config.session_lifecycle.allowed_cwd_roots else "/")
+    controller = ControllerService(registry, local_client=LocalNodeClient(terminal), local_workspace_root=workspace_root)
+
+    for remote in config.nodes.remote_nodes:
+        token = os.environ.get(remote.token_env)
+        if token:
+            controller.register_remote_node(remote.node_id, display_name=remote.display_name, hostname=remote.hostname,
+                                            endpoint=remote.endpoint, token=token, max_sessions=remote.max_sessions,
+                                            timeout=remote.timeout_seconds)
+    controller.refresh_local_heartbeat(tmux_session_count=0, agent_counts={}, agent_types=(), agent_version=None)
+
+    by_conversation: dict[tuple[str, str], list[str]] = {}
+    node_errors = {}
+    for node in controller.list_nodes():
+        if node.id != controller.local_node_id and node.status != NODE_ONLINE:
+            continue
+        client = controller._clients.get(node.id)
+        if client is None:
+            continue
+        try:
+            sessions = client.list_sessions().get("sessions", [])
+        except NodeClientError as exc:
+            node_errors[node.id] = str(exc)
+            continue
+        for row in sessions:
+            conversation_id = row.get("resume_conversation_id")
+            if not conversation_id:
+                continue
+            by_conversation.setdefault((node.id, conversation_id), []).append(row["name"])
+
+    collisions = [{"node_id": node_id, "conversation_id": conversation_id, "sessions": sorted(sessions)}
+                 for (node_id, conversation_id), sessions in by_conversation.items() if len(sessions) > 1]
+
+    result = {"collisions": collisions, "node_errors": node_errors}
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print("Terminal MCP conversation-collision health")
+        if not collisions:
+            print("  No sessions found sharing one underlying agent conversation.")
+        for row in collisions:
+            print(f"  [{row['node_id']}] conversation {row['conversation_id']} shared by "
+                 f"sessions: {', '.join(row['sessions'])} -- INVESTIGATE, do not send tasks to either "
+                 f"until resolved")
+        for node_id, detail in node_errors.items():
+            print(f"  (could not check {node_id}: {detail})")
+
+    return 0 if not collisions else 1
+
+
 def _print_nodes_human(result: dict) -> None:
     print("Terminal MCP node fleet")
     for row in result["nodes"]:
@@ -293,6 +382,13 @@ def build_parser() -> argparse.ArgumentParser:
     grants.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of text")
     grants.add_argument("--config", default=None, help="Path to config.yaml (default: the usual lookup)")
     grants.set_defaults(func=cmd_grants)
+
+    conversations = subparsers.add_parser("conversations", help="Diagnose sessions fleet-wide that share one "
+                                                                 "underlying agent conversation (P0 AUDIT/RECOVERY "
+                                                                 "transcript-collision invariant check)")
+    conversations.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of text")
+    conversations.add_argument("--config", default=None, help="Path to config.yaml (default: the usual lookup)")
+    conversations.set_defaults(func=cmd_conversations)
 
     return parser
 

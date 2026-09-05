@@ -385,6 +385,154 @@ def _win32_foreground_command(root_pid: int, fallback_name: str) -> str:
         return fallback_name
 
 
+RESUME_CONVERSATION_ID_RE = re.compile(r"--resume[= ]([0-9a-fA-F-]{8,})")
+"""Matches Claude Code's own `--resume <uuid>` / `--resume=<uuid>` argv
+form (see the real recovery commands used live on dell-5530, e.g.
+`claude --resume cdbb5b70-b933-46c9-a8f1-dbe57572ea5d`). Deliberately
+permissive on the id's exact shape (8+ hex/dash chars, not a strict
+UUID regex) -- this is a diagnostic signal, not a validator; a too-
+strict pattern would silently stop detecting a real collision if
+Claude Code's own id format ever changes, which is a worse failure
+mode than being slightly loose here."""
+
+
+def _win32_process_command_line(pid: int) -> str | None:
+    """Read a live process's own full command line (argv, as one string)
+    straight out of its PEB (Process Environment Block) via
+    NtQueryInformationProcess + ReadProcessMemory -- there is no
+    Toolhelp32 equivalent for this (PROCESSENTRY32 only ever carries the
+    bare exe name, szExeFile, which is why _win32_foreground_command
+    above can't just reuse that snapshot for this). Needed specifically
+    to recover the `--resume <uuid>` argument Claude Code was launched
+    with, which is the exact detail that let this task's own live
+    incident (window/window2 on dell-5530 both silently resumed onto the
+    SAME transcript after a manual recovery mistake) be confirmed with
+    certainty rather than guessed at. Best-effort like every other
+    resolver in this module: returns None (never raises) on ANY failure
+    -- a different-privilege process, the pid already gone, a 32/64-bit
+    mismatch, missing ntdll export, etc."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        PROCESS_QUERY_INFORMATION = 0x0400
+        PROCESS_VM_READ = 0x0010
+        kernel32 = ctypes.windll.kernel32
+        ntdll = ctypes.windll.ntdll
+        ptr_size = ctypes.sizeof(ctypes.c_void_p)
+
+        handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+        if not handle:
+            return None
+        try:
+            pbi = (ctypes.c_ubyte * (ptr_size * 6))()
+            ret_len = ctypes.c_ulong(0)
+            status = ntdll.NtQueryInformationProcess(handle, 0, pbi, len(pbi), ctypes.byref(ret_len))
+            if status != 0:
+                return None
+            peb_addr = int.from_bytes(bytes(pbi[ptr_size:ptr_size * 2]), "little")
+
+            def read(addr: int, size: int) -> bytes | None:
+                buf = (ctypes.c_ubyte * size)()
+                read_len = ctypes.c_size_t(0)
+                if not kernel32.ReadProcessMemory(handle, ctypes.c_void_p(addr), buf,
+                                                 size, ctypes.byref(read_len)):
+                    return None
+                return bytes(buf)
+
+            # PEB.ProcessParameters offset: 0x20 (x64) / 0x10 (x86)
+            peb = read(peb_addr, 0x30 if ptr_size == 8 else 0x18)
+            if peb is None:
+                return None
+            pp_off = 0x20 if ptr_size == 8 else 0x10
+            pp_addr = int.from_bytes(peb[pp_off:pp_off + ptr_size], "little")
+
+            # RTL_USER_PROCESS_PARAMETERS.CommandLine (UNICODE_STRING)
+            # offset: 0x70 (x64) / 0x40 (x86) -- CurrentDirectory's own
+            # UNICODE_STRING sits earlier (0x38/0x24); CommandLine
+            # follows ImagePathName.
+            cl_off = 0x70 if ptr_size == 8 else 0x40
+            pp = read(pp_addr, cl_off + ptr_size + 8)
+            if pp is None:
+                return None
+            str_len = int.from_bytes(pp[cl_off:cl_off + 2], "little")
+            buf_addr = int.from_bytes(pp[cl_off + ptr_size:cl_off + ptr_size * 2], "little")
+            if str_len <= 0:
+                return None
+            raw = read(buf_addr, str_len)
+            if raw is None:
+                return None
+            return raw.decode("utf-16-le", errors="replace")
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 -- best-effort only, must never break get_session over this
+        return None
+
+
+ForegroundCommandLineResolver = Callable[[int], "str | None"]
+"""`(root_pid) -> full_command_line_of_the_resolved_foreground_process`
+-- swappable exactly like ForegroundCommandResolver above, for the same
+reason (real implementation only works on an actual Windows host)."""
+
+
+def _win32_foreground_command_line(root_pid: int) -> str | None:
+    """Same single-child-descent walk as _win32_foreground_command (see
+    its own docstring for the full heuristic), but returns the resolved
+    foreground process's FULL command line (via
+    _win32_process_command_line) instead of just its exe basename --
+    that's what's needed to extract a `--resume <uuid>` argument.
+    Deliberately a separate walk (not sharing state with
+    _win32_foreground_command) rather than changing that function's
+    already-tested return shape -- keeps this additive and low-risk."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        class PROCESSENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_char * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot == INVALID_HANDLE_VALUE:
+            return None
+        try:
+            entry = PROCESSENTRY32()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            children_by_parent: dict[int, list[int]] = {}
+            if not kernel32.Process32First(snapshot, ctypes.byref(entry)):
+                return None
+            while True:
+                children_by_parent.setdefault(entry.th32ParentProcessID, []).append(entry.th32ProcessID)
+                if not kernel32.Process32Next(snapshot, ctypes.byref(entry)):
+                    break
+        finally:
+            kernel32.CloseHandle(snapshot)
+
+        current_pid = root_pid
+        seen = {root_pid}
+        while True:
+            live_children = [pid for pid in children_by_parent.get(current_pid, []) if pid not in seen]
+            if len(live_children) != 1:
+                break
+            current_pid = live_children[0]
+            seen.add(current_pid)
+        return _win32_process_command_line(current_pid)
+    except Exception:  # noqa: BLE001 -- best-effort only, must never break get_session over this
+        return None
+
+
 def _kill_process_tree(proc: PtyProcessLike) -> None:
     """Terminate exactly this session's own process (and whatever it
     spawned under it, if the pty implementation's own terminate() covers
@@ -511,11 +659,13 @@ class WindowsSessionBackend:
 
     def __init__(self, *, shell: str = DEFAULT_SHELL, history_lines: int = DEFAULT_HISTORY_LINES,
                 process_factory: ProcessFactory | None = None,
-                foreground_command_resolver: ForegroundCommandResolver | None = None) -> None:
+                foreground_command_resolver: ForegroundCommandResolver | None = None,
+                foreground_cmdline_resolver: ForegroundCommandLineResolver | None = None) -> None:
         self.shell = shell
         self.history_lines = history_lines
         self._process_factory = process_factory or _default_process_factory
         self._foreground_command_resolver = foreground_command_resolver or _win32_foreground_command
+        self._foreground_cmdline_resolver = foreground_cmdline_resolver or _win32_foreground_command_line
         self._sessions: dict[str, _WindowsSession] = {}
         self._registry_lock = threading.Lock()
 
@@ -548,6 +698,17 @@ class WindowsSessionBackend:
             current_command = self._foreground_command_resolver(session.proc.pid, fallback_command)
         except Exception:  # noqa: BLE001
             current_command = fallback_command
+        resume_conversation_id = None
+        try:
+            # P0 CONTROL-PLANE HOTFIX: re-derived on every call, same
+            # posture as current_command above -- see
+            # RESUME_CONVERSATION_ID_RE / _win32_foreground_command_line
+            # for what this catches and why.
+            if cmdline := self._foreground_cmdline_resolver(session.proc.pid):
+                if match := RESUME_CONVERSATION_ID_RE.search(cmdline):
+                    resume_conversation_id = match.group(1)
+        except Exception:  # noqa: BLE001
+            resume_conversation_id = None
         return SessionInfo(
             name=session.name,
             attached=session.attached_viewers > 0,
@@ -579,6 +740,7 @@ class WindowsSessionBackend:
             # actual failure mode this whole fix targets).
             reader_alive=(session.reader_thread is not None and session.reader_thread.is_alive()) if alive else None,
             reader_restarts=session.reader_restarts,
+            resume_conversation_id=resume_conversation_id,
         )
 
     def capture_lines(self, session: str, lines: int, *, ansi: bool = False) -> list[str]:
