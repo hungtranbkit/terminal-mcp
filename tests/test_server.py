@@ -62,6 +62,18 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_watchdog_acknowledge_session_event",
         "terminal_watchdog_node_events",
         "terminal_watchdog_acknowledge_node_event",
+        "terminal_queue_set",
+        "terminal_queue_append",
+        "terminal_queue_status",
+        "terminal_queue_list_all",
+        "terminal_queue_pause",
+        "terminal_queue_resume",
+        "terminal_queue_retry",
+        "terminal_queue_skip",
+        "terminal_queue_cancel",
+        "terminal_queue_reorder",
+        "terminal_queue_clear",
+        "terminal_queue_events",
     }
 
 

@@ -8,6 +8,7 @@ from .config import load_config
 from .controller import ControllerService, build_default_controller
 from .core import TerminalService
 from .node_models import node_to_dict as _node_to_dict
+from .queue_service import QueueService
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
 
@@ -15,7 +16,8 @@ from .supervisor2 import SupervisorV2Service, build_supervisor_v2
 def build_mcp(service: TerminalService | None = None,
               supervisor: SupervisorService | None = None,
               supervisor_v2: SupervisorV2Service | None = None,
-              controller: ControllerService | None = None) -> MCPServer:
+              controller: ControllerService | None = None,
+              queue: QueueService | None = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -43,6 +45,7 @@ def build_mcp(service: TerminalService | None = None,
     supervisor = supervisor or SupervisorService(terminal, SupervisorStore())
     supervisor_v2 = supervisor_v2 or build_supervisor_v2(supervisor)
     controller = controller or build_default_controller(terminal)
+    queue = queue or QueueService()
     server = MCPServer(
         name="terminal-mcp",
         description="Whitelist-only tmux observation and controlled input",
@@ -782,5 +785,97 @@ def build_mcp(service: TerminalService | None = None,
         """List v2 action history (claim/decision/approval/send/outcome),
         optionally filtered by target session/binding name or action state."""
         return supervisor_v2.list_actions(target, state, limit)
+
+    # -- Supervisor Queue v2 (task: "Supervisor Queue v2 cho Terminal MCP")
+    # ONE SESSION = ONE PERSISTENT AUTONOMOUS TASK QUEUE -- `session` IS
+    # the lane, no separate queue/lane id to create first. CRUD/status
+    # only in this phase (queue_service.py's own docstring) -- the
+    # autonomous dispatch loop is not yet wired to send anything.
+    # SAFETY: do not call queue_set/queue_append against `window`/
+    # `window2` (or any other real production session) until this
+    # feature's own acceptance demo has passed and the user/ChatGPT has
+    # explicitly confirmed -- see the task's own explicit constraint.
+
+    @server.tool()
+    def terminal_queue_set(session: str, tasks: list[dict], replace_pending: bool = True) -> dict:
+        """Push an array of tasks into `session`'s own queue in one call.
+        replace_pending=True (the default): cancels every currently-QUEUED
+        (not yet dispatched) task first, never touching one already
+        DISPATCHING/RUNNING/VERIFYING/PAUSED/BLOCKED. Each task:
+        {prompt (required, stored verbatim), title, max_attempts,
+        completion_policy, metadata}. Never auto-dispatches anything by
+        itself -- that's queue_engine.py's own poll loop."""
+        return queue.set_tasks(session, tasks, replace_pending=replace_pending)
+
+    @server.tool()
+    def terminal_queue_append(session: str, tasks: list[dict]) -> dict:
+        """Append tasks to the end of `session`'s queue -- pure append,
+        never touches any existing task regardless of its status."""
+        return queue.append_tasks(session, tasks)
+
+    @server.tool()
+    def terminal_queue_status(session: str) -> dict:
+        """Full status for one session's lane: every task (in position
+        order), which one (if any) is currently active, paused state,
+        counts. This is the per-session queue badge/panel's own data
+        source."""
+        return queue.status(session)
+
+    @server.tool()
+    def terminal_queue_list_all() -> dict:
+        """Cross-session summary -- every lane that has ever had a task,
+        each with its own status() shape."""
+        return queue.list_all()
+
+    @server.tool()
+    def terminal_queue_pause(session: str, reason: str | None = None) -> dict:
+        """Pause dispatch for this session's lane. If a task is currently
+        in flight, it moves to PAUSED (its prior status remembered) so
+        resume restores it exactly -- see terminal_queue_resume."""
+        return queue.pause(session, reason=reason)
+
+    @server.tool()
+    def terminal_queue_resume(session: str) -> dict:
+        """Resume a paused lane -- restores any PAUSED task to whatever
+        status it was paused from, and allows dispatch again."""
+        return queue.resume(session)
+
+    @server.tool()
+    def terminal_queue_retry(session: str, task_id: str) -> dict:
+        """BLOCKED -> QUEUED. Only ever explicit -- a failed task's lane
+        never auto-retries or auto-skips on its own (item 11's own
+        failure policy)."""
+        return queue.retry(session, task_id)
+
+    @server.tool()
+    def terminal_queue_skip(session: str, task_id: str) -> dict:
+        """Mark one task SKIPPED (a terminal state) without running it."""
+        return queue.skip(session, task_id)
+
+    @server.tool()
+    def terminal_queue_cancel(session: str, task_id: str) -> dict:
+        """Mark one task CANCELLED (a terminal state)."""
+        return queue.cancel(session, task_id)
+
+    @server.tool()
+    def terminal_queue_reorder(session: str, ordered_task_ids: list[str]) -> dict:
+        """Reorder the still-QUEUED tasks in this lane. Any id that isn't
+        currently QUEUED is silently ignored (reordering an in-flight or
+        already-terminal task has no meaning)."""
+        return queue.reorder(session, ordered_task_ids)
+
+    @server.tool()
+    def terminal_queue_clear(session: str, only_pending: bool = True) -> dict:
+        """Cancel every QUEUED task in this lane (only_pending=True, the
+        safe default); only_pending=False additionally cancels BLOCKED
+        tasks. Never touches an in-flight task either way."""
+        return queue.clear(session, only_pending=only_pending)
+
+    @server.tool()
+    def terminal_queue_events(session: str, limit: int = 50) -> dict:
+        """Recent audit events for this lane (ENQUEUED, DISPATCHED,
+        COMPLETED, BLOCKED, PAUSED, RESUMED, MANUAL_INTERVENTION, ...),
+        newest first."""
+        return queue.events(session, limit)
 
     return server
