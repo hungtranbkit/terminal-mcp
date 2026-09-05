@@ -185,3 +185,57 @@ def test_windows_ws_terminal_wrong_token_rejected(tmp_path):
         assert excinfo.value.code == 4401
     finally:
         backend.kill_session("wsterm-win-auth")
+
+
+def test_windows_ws_terminal_readonly_client_cannot_type(tmp_path):
+    # The Windows-backend counterpart of test_linux_ws_terminal_readonly_
+    # client_cannot_type above -- WindowsTerminalViewer.write() already
+    # had this guard from the start (unlike resize(), see the next test).
+    client, backend, service = _windows_client(tmp_path)
+    backend.new_session("wsterm-win-readonly", str(tmp_path))
+    try:
+        with client.websocket_connect(
+                f"/v1/ws/terminal?session=wsterm-win-readonly&token={TOKEN}&readonly=1") as ws:
+            ready = ws.receive_json()
+            assert ready["readonly"] is True
+            ws.send_bytes(b"should_never_appear\n")
+            time.sleep(0.5)
+        output = "\n".join(backend.capture_lines("wsterm-win-readonly", 20))
+        assert "should_never_appear" not in output
+    finally:
+        backend.kill_session("wsterm-win-readonly")
+
+
+def test_windows_ws_terminal_readonly_client_cannot_resize(tmp_path):
+    """P0 HOTFIX (task: "...observer/read-only dashboard gửi resize
+    xuống Windows PTY. Chỉ active interactive owner mới có quyền
+    resize"). REAL BUG this fixes: WindowsTerminalViewer.resize() had no
+    `self.readonly` check at all -- unlike webterm.py's own
+    WebTerminalProcess.resize() (the tmux/Linux counterpart), which has
+    always had one. A read-only viewer (no input permission) sending a
+    resize control message would previously still resize the real
+    ConPTY out from under whoever else is actually using the session."""
+    client, backend, service = _windows_client(tmp_path)
+    backend.new_session("wsterm-win-resize-ro", str(tmp_path))
+    try:
+        entry = backend._sessions["wsterm-win-resize-ro"]
+        assert entry.last_resize_dims is None  # nothing has resized it yet
+        with client.websocket_connect(
+                f"/v1/ws/terminal?session=wsterm-win-resize-ro&token={TOKEN}&readonly=1") as ws:
+            ready = ws.receive_json()
+            assert ready["readonly"] is True
+            ws.send_text('{"type": "resize", "cols": 200, "rows": 60}')
+            time.sleep(0.3)
+        assert entry.last_resize_dims is None  # still untouched -- the resize was correctly ignored
+
+        # Contrast: a NON-readonly (the active interactive owner) client's
+        # resize DOES apply -- proves the guard is specifically about
+        # readonly, not resize being broken outright.
+        with client.websocket_connect(f"/v1/ws/terminal?session=wsterm-win-resize-ro&token={TOKEN}") as ws:
+            ready = ws.receive_json()
+            assert ready["readonly"] is False
+            ws.send_text('{"type": "resize", "cols": 100, "rows": 40}')
+            time.sleep(0.3)
+        assert entry.last_resize_dims == (40, 100)  # (rows, cols) -- matches resize()'s own param order
+    finally:
+        backend.kill_session("wsterm-win-resize-ro")

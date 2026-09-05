@@ -45,6 +45,20 @@ class WindowsTerminalViewer:
         self._queue = backend.register_viewer(session, _on_detach)
 
     def resize(self, cols: object, rows: object) -> None:
+        # P0 HOTFIX (task: "...observer/read-only dashboard gửi resize
+        # xuống Windows PTY. Chỉ active interactive owner mới có quyền
+        # resize"): REAL BUG -- this guard was missing entirely, unlike
+        # webterm.py's own WebTerminalProcess.resize() (the tmux/Linux
+        # counterpart), which has always checked `self.readonly` first.
+        # Without it, a read-only web-terminal viewer (no input
+        # permission) could still resize the real ConPTY out from under
+        # whoever else is actually using the session -- exactly the
+        # observer-resizes-the-owner's-terminal failure mode this
+        # class's own module docstring already promises never happens
+        # for writes (`self.readonly` is already checked in write()
+        # above), just never extended to resize.
+        if self.readonly or self._closed:
+            return
         if not isinstance(cols, int) or not isinstance(rows, int) or isinstance(cols, bool) or isinstance(rows, bool):
             return
         try:

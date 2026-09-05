@@ -1119,6 +1119,66 @@ def test_dashboard_ansi_renderer_strips_osc_sequences():
     assert payload["fg"] == "b1"  # the SGR colour itself is still applied (code 31 -> ANSI_BASE[1])
 
 
+def test_dashboard_ansi_renderer_consumes_dec_private_mode_and_full_csi_grammar():
+    # P0 HOTFIX (task: "Terminal MCP dashboard/session renderer trên
+    # mobile/Windows" -- real bug, evidence: user screenshot of the real
+    # 'window' session on dell-5530 showing literal 'ESC[?25h'/'ESC[?25l'
+    # text in the read-only preview panel instead of being consumed like
+    # every other control sequence). ROOT CAUSE: CSI_RE's own parameter-
+    # byte class was [0-9;] only -- correct for tmux capture-pane -e's
+    # own pre-resolved SGR-only output, but a Windows session's raw
+    # ConPTY bytes constantly carry DEC-private-mode sequences (cursor
+    # show/hide, alternate screen, bracketed paste -- all use a leading
+    # '?' parameter byte that class never matched at all), plus real
+    # cursor-movement/erase sequences a live TUI redraw emits. Broadened
+    # to the full ECMA-48 CSI grammar (see CSI_RE's own comment).
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available -- semantic regex check skipped")
+    start = DASHBOARD_HTML.index("const CSI_RE = ")
+    end = DASHBOARD_HTML.index("function renderAnsi(container, text) {")
+    renderer_js = DASHBOARD_HTML[start:end]
+    probe = (
+        "const ANSI_BASE = ['b0','b1','b2','b3','b4','b5','b6','b7'];\n"
+        "const ANSI_BRIGHT = ['c0','c1','c2','c3','c4','c5','c6','c7'];\n"
+        + renderer_js
+        # Cursor hide/show (DEC private mode ?25) -- the EXACT sequences
+        # from the real live evidence.
+        + "\nconst r1 = ansiRuns('before\\x1b[?25hmid\\x1b[?25lafter').map(x => x.t).join('');"
+        # Alternate screen buffer toggle (?1049) -- Claude Code's own
+        # full-screen Ink TUI uses this.
+        + "\nconst r2 = ansiRuns('a\\x1b[?1049hb\\x1b[?1049lc').map(x => x.t).join('');"
+        # Bracketed paste mode (?2004).
+        + "\nconst r3 = ansiRuns('x\\x1b[?2004hy\\x1b[?2004lz').map(x => x.t).join('');"
+        # Cursor movement (CUP, e.g. a full-screen redraw repositioning
+        # the cursor to an arbitrary row/col) and erase-line/erase-screen.
+        + "\nconst r4 = ansiRuns('one\\x1b[10;20Htwo\\x1b[2Kthree\\x1b[2Jfour').map(x => x.t).join('');"
+        # SGR colour handling must still work, completely unaffected by
+        # the broadened parameter/final-byte classes.
+        + "\nconst r5 = ansiRuns('plain \\x1b[31mred\\x1b[0m text');"
+        # Vietnamese/wide Unicode text must pass through byte-for-byte.
+        + "\nconst r6 = ansiRuns('Xin ch\\u00e0o, \\u0111\\u00e2y l\\u00e0 ti\\u1ebfng Vi\\u1ec7t \\u2014 "
+        + "\\x1b[?25h\\u2705 xong').map(x => x.t).join('');"
+        + "\nconsole.log(JSON.stringify({r1, r2, r3, r4, r6, fg: r5[1].fg, r5text: r5.map(x => x.t).join('')}));"
+    )
+    fd, probe_path = tempfile.mkstemp(suffix=".js")
+    try:
+        with open(fd, "w") as handle:
+            handle.write(probe)
+        result = subprocess.run([node, probe_path], capture_output=True, text=True, timeout=10)
+    finally:
+        Path(probe_path).unlink(missing_ok=True)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["r1"] == "beforemidafter"  # cursor hide/show consumed, never visible as literal text
+    assert payload["r2"] == "abc"  # alternate-screen toggle consumed
+    assert payload["r3"] == "xyz"  # bracketed-paste toggle consumed
+    assert payload["r4"] == "onetwothreefour"  # cursor move + erase-line + erase-screen all consumed
+    assert payload["r5text"] == "plain red text"
+    assert payload["fg"] == "b1"  # SGR colour still applied (code 31 -> ANSI_BASE[1])
+    assert payload["r6"] == "Xin chào, đây là tiếng Việt — ✅ xong"
+
+
 def test_dashboard_grantbar_hidden_attribute_actually_hides_it():
     # A plain `#grantBar { display:flex; ... }` rule (needed for its own
     # visible layout when shown) would otherwise outrank the browser's

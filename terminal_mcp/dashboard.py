@@ -1130,7 +1130,28 @@ DASHBOARD_HTML = """<!doctype html>
       if (n <= 255) { const gray = 8 + (n - 232) * 10; return `rgb(${gray},${gray},${gray})`; }
       return null;
     }
-    const CSI_RE = /\\x1b\\[([0-9;]*)([A-Za-z])/g;
+    // P0 HOTFIX (task: "Terminal MCP dashboard/session renderer trên
+    // mobile/Windows" -- real bug, evidence: user screenshot of the
+    // 'window' session on dell-5530 showing literal 'ESC[?25h'/'ESC[?25l'
+    // text in the read-only preview panel). ROOT CAUSE: this regex's
+    // parameter-byte class was [0-9;] only -- correct for the plain SGR
+    // codes tmux `capture-pane -e` emits, but DEC-private-mode CSI
+    // sequences (cursor show/hide "ESC[?25h"/"ESC[?25l", alternate-screen
+    // "ESC[?1049h/l", bracketed-paste "ESC[?2004h/l") use a leading '?'
+    // parameter prefix this class never matched -- so the regex simply
+    // failed to match those sequences AT ALL, and they fell straight
+    // through into the rendered text runs as literal garbage instead of
+    // being consumed like every other non-SGR CSI sequence already is.
+    // Windows sessions (raw ConPTY bytes, not tmux's own pre-resolved
+    // SGR-only capture) emit these constantly -- the same class of gap
+    // already fixed server-side in redaction.py's own ANSI_CSI_FULL_RE
+    // earlier, never ported to this client-side copy until now. Broadened
+    // to the full ECMA-48 CSI grammar: parameter bytes 0x30-0x3F ([0-?],
+    // digits/;/</=/>/?), intermediate bytes 0x20-0x2F ([ -/]*, non-
+    // captured -- never used by ansiRuns), final byte 0x40-0x7E ([@-~],
+    // not just A-Za-z -- a handful of legitimate CSI final bytes fall
+    // outside that narrower range).
+    const CSI_RE = /\\x1b\\[([0-?]*)[ -\/]*([@-~])/g;
     // OSC sequences (ESC ] ... BEL-or-ESC\\) -- e.g. an OSC 8 hyperlink, or a
     // window-title set -- a real CLI can legitimately emit these (caught
     // live verifying this redesign against a real Claude Code session,
