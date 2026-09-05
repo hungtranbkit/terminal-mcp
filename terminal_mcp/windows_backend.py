@@ -363,6 +363,11 @@ class _WindowsSession:
     # must never be silently dropped, only a REPEAT of the size already
     # in effect).
     last_resize_dims: tuple[int, int] | None = None
+    # Cursor column within `_partial_line` -- see _append_chunk's own
+    # docstring (P0 HOTFIX: "\r overwrite fix for last_output"). Always
+    # 0 <= _partial_line_col <= len(_partial_line); reset to 0 by '\r'
+    # or by committing the line on '\n', never negative.
+    _partial_line_col: int = 0
     # P0 HOTFIX (task: "P0 WINDOWS SESSION STATE-LOSS / STALE STREAM"):
     # reader_thread's own liveness was previously never checked again
     # after create_session -- a died thread (entry.proc.read() raised
@@ -892,10 +897,56 @@ def _append_chunk(entry: _WindowsSession, chunk: str) -> None:
     keeping `capture_lines` output stable/comparable across polls (the
     same property tmux's own capture-pane already gives every existing
     caller, including the reliable-submission verification poll loop in
-    core.py, which diffs successive captures)."""
-    text = entry._partial_line + chunk
-    lines = text.split("\n")
-    entry._partial_line = lines.pop()
-    for line in lines:
-        entry.buffer.append(line.rstrip("\r"))
-    entry.total_lines_seen += len(lines)
+    core.py, which diffs successive captures).
+
+    P0 HOTFIX ("\r overwrite fix for last_output" -- task: "P0 WINDOWS
+    SESSION STATE-LOSS / STALE STREAM", the garbled/overlapping-text
+    finding deliberately deferred out of that task's own item 10, "do
+    not work on renderer cosmetics"). REAL BUG this fixes: the OLD
+    version only ever split on '\\n' and .rstrip("\\r") a finished
+    line's own TRAILING carriage returns -- a '\\r' in the MIDDLE of a
+    line (used by any in-place redraw: a spinner, a live-updating
+    status/progress line, exactly what Claude Code's own Ink renderer
+    emits constantly) was kept as an ordinary character and every
+    successive redraw got naively CONCATENATED onto the last one
+    instead of overwriting it. Confirmed live against the real dell-
+    5530 'window' session: last_output showed the same spinner verb
+    ("Newspapering…") repeated dozens of times back-to-back, and whole
+    multi-line code-diff blocks appearing twice in a row.
+
+    Interprets exactly the two control characters real terminal '\r'
+    overwrite semantics need -- '\\r' resets the write cursor to the
+    START of the current (still in-progress) line, so subsequent
+    characters overwrite what was already there (extending the line
+    only once the cursor reaches its current end) rather than being
+    appended after it; '\\n' commits the current line to `buffer` and
+    starts a genuinely new one. Deliberately does NOT interpret ANSI
+    cursor-positioning/clear-line/clear-screen/alternate-screen escape
+    sequences (moving the cursor to an arbitrary row, or up/down
+    between lines) -- those still pass through as literal bytes (later
+    stripped for display by strip_ansi, same as before this fix) and a
+    full-screen redraw spanning multiple lines can still show as
+    repeated/interleaved content. That is a real, separate, larger gap
+    (a genuine terminal-state emulator, not a one-line patch) --
+    explicitly out of scope here, same as the task's own instruction
+    that scoped this fix to '\r' specifically."""
+    line = list(entry._partial_line)
+    col = entry._partial_line_col
+    committed = 0
+    for ch in chunk:
+        if ch == "\n":
+            entry.buffer.append("".join(line))
+            committed += 1
+            line = []
+            col = 0
+        elif ch == "\r":
+            col = 0
+        else:
+            if col < len(line):
+                line[col] = ch
+            else:
+                line.append(ch)
+            col += 1
+    entry._partial_line = "".join(line)
+    entry._partial_line_col = col
+    entry.total_lines_seen += committed

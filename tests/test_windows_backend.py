@@ -27,6 +27,8 @@ from terminal_mcp.tmux import TmuxError
 from terminal_mcp.windows_backend import (
     WindowsPathError,
     WindowsSessionBackend,
+    _append_chunk,
+    _WindowsSession,
     validate_windows_cwd,
     validate_windows_session_name,
 )
@@ -713,3 +715,94 @@ def test_reader_thread_is_not_restarted_once_the_process_itself_is_dead(backend,
     assert info.pane_dead is True
     assert info.reader_alive is None
     assert entry.reader_restarts == 0  # never attempted -- process is genuinely gone
+
+
+# ---------------------------------------------------------------------------
+# P0 HOTFIX: "\r overwrite fix for last_output" (task: "P0 WINDOWS SESSION
+# STATE-LOSS / STALE STREAM", the garbled-text finding deliberately
+# deferred out of that task's own item 10 -- deployed as its own explicit
+# follow-up). _append_chunk is tested directly here (no real pty/process
+# needed at all -- it only ever touches the entry's own buffer/cursor
+# state), which is both faster and more precise than going through a full
+# fake-shell round trip for pure text-buffering logic.
+# ---------------------------------------------------------------------------
+
+def _new_entry() -> _WindowsSession:
+    return _WindowsSession(name="t", proc=None, cwd="/", command="powershell.exe",
+                           created_epoch=0, activity_epoch=0)
+
+
+def test_append_chunk_plain_text_is_unchanged_from_before_this_fix():
+    entry = _new_entry()
+    _append_chunk(entry, "hello\nworld\n")
+    assert list(entry.buffer) == ["hello", "world"]
+    assert entry._partial_line == ""
+    assert entry.total_lines_seen == 2
+
+
+def test_append_chunk_carriage_return_overwrites_the_current_line():
+    """REAL BUG this fixes: a spinner redraw ('\\r<frame><text>' repeated,
+    exactly what Claude Code's own Ink renderer emits) used to get
+    concatenated onto the previous frame instead of overwriting it --
+    confirmed live as e.g. "Newspapering…Newspapering…Newspapering…"
+    repeated dozens of times in the real dell-5530 'window' session's
+    own last_output."""
+    entry = _new_entry()
+    _append_chunk(entry, "Newspapering...")
+    _append_chunk(entry, "\rNewspapering.. ")  # one shorter frame, trailing space "erases" the stray dot
+    assert entry._partial_line == "Newspapering.. "
+
+
+def test_append_chunk_carriage_return_then_shorter_text_leaves_the_untouched_tail():
+    entry = _new_entry()
+    _append_chunk(entry, "AAAAAAAAAA")  # 10 chars
+    _append_chunk(entry, "\rBBBBB")     # overwrites only the first 5
+    # Real terminals leave characters past the overwrite untouched too
+    # (a real redraw almost always pads with spaces to cover them, which
+    # this fix does not fabricate on the source's behalf -- it only
+    # implements '\r' itself, never invents erase-to-end-of-line) --
+    # documenting that honestly rather than silently "cleaning" content
+    # the actual byte stream never asked to be cleaned.
+    assert entry._partial_line == "BBBBBAAAAA"
+
+
+def test_append_chunk_multiple_redraws_converge_to_the_final_frame():
+    entry = _new_entry()
+    for frame in ("Br", "Bre", "Brew", "Brewing"):
+        _append_chunk(entry, "\r" + frame)
+    assert entry._partial_line == "Brewing"
+
+
+def test_append_chunk_carriage_return_inside_a_completed_line_is_resolved_before_commit():
+    """The overwrite must apply BEFORE a line is ever committed to
+    `buffer` -- not just to the still-in-progress partial line -- since a
+    real redraw sequence often does eventually end with a genuine '\\n'
+    once the TUI moves on."""
+    entry = _new_entry()
+    _append_chunk(entry, "loading.\rloaded! \n")
+    assert list(entry.buffer) == ["loaded! "]
+    assert entry._partial_line == ""
+
+
+def test_append_chunk_carriage_return_across_two_separate_reads():
+    """The exact real-world shape: an in-progress line spans TWO separate
+    proc.read() chunks (a spinner frame that started in one read and gets
+    overwritten by a redraw arriving in the next) -- the cursor position
+    must survive across _append_chunk calls, not just within one."""
+    entry = _new_entry()
+    _append_chunk(entry, "Cooking")
+    _append_chunk(entry, "\rCooked ")
+    assert entry._partial_line == "Cooked "
+
+
+def test_append_chunk_plain_carriage_return_newline_still_works_like_before():
+    # A bare CRLF line ending (the single most common real-world '\r'
+    # usage) must keep working exactly as before this fix: '\r' alone
+    # never erases content, only repositions the cursor -- real terminal
+    # semantics -- so with nothing typed after it before the line ends,
+    # the line commits unchanged. The OLD code got this same case right
+    # too (rstrip("\r") on a trailing \r); this proves the new
+    # character-by-character implementation didn't regress it.
+    entry = _new_entry()
+    _append_chunk(entry, "hello\r\n")
+    assert list(entry.buffer) == ["hello"]
