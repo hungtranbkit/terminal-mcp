@@ -4739,6 +4739,69 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             rows.sort(key=lambda r: 0 if r.get("state") == "WAITING_INPUT" else 1)
         return JSONResponse(listed, headers={"Cache-Control": "no-store"})
 
+    async def _remote_session_detail(node_id: str, name: str) -> JSONResponse:
+        """The remote-node counterpart of session_detail's own local body
+        (task item 9) -- read_allowed/input_allowed/status/tail all come
+        from THAT node's own TerminalService (via client.list_sessions()
+        and controller.terminal_status/terminal_tail, exactly the same
+        canonical effective_read/effective_input computation every other
+        node-aware surface here already uses), never guessed or re-
+        derived from this (wrong) node's local grants store."""
+        node = controller.node_status(node_id)
+        if node is None or node.status != NODE_ONLINE:
+            return JSONResponse({"error": "NODE_UNREACHABLE", "node_id": node_id},
+                                 status_code=502, headers={"Cache-Control": "no-store"})
+        client = controller.client_for(node_id)
+        if client is None:
+            return JSONResponse({"error": "NODE_UNREACHABLE", "node_id": node_id},
+                                 status_code=502, headers={"Cache-Control": "no-store"})
+        try:
+            listing = await anyio.to_thread.run_sync(client.list_sessions)
+        except NodeClientError:
+            return JSONResponse({"error": "NODE_UNREACHABLE", "node_id": node_id},
+                                 status_code=502, headers={"Cache-Control": "no-store"})
+        row = next((r for r in listing.get("sessions", []) if r.get("name") == name), None)
+        if row is None:
+            return JSONResponse({"error": "SESSION_NOT_FOUND", "session": name},
+                                 status_code=404, headers={"Cache-Control": "no-store"})
+        if not row.get("effective_read", row.get("read_allowed", False)):
+            return JSONResponse({"error": "READ_RESTRICTED", "session": name},
+                                 status_code=403, headers={"Cache-Control": "no-store"})
+        qualified = f"{node_id}/{name}"
+        status_result: dict = {}
+        tail_result: dict = {}
+
+        async def _status() -> None:
+            status_result.update(await anyio.to_thread.run_sync(controller.terminal_status, qualified))
+
+        async def _tail() -> None:
+            tail_result.update(
+                await anyio.to_thread.run_sync(lambda: controller.terminal_tail(qualified, ansi=True))
+            )
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_status)
+            tg.start_soon(_tail)
+
+        if "error" in status_result:
+            return JSONResponse(status_result, status_code=403 if status_result["error"] in
+                                ("ACCESS_DENIED", "READ_RESTRICTED") else 404,
+                                headers={"Cache-Control": "no-store"})
+        if "error" in tail_result:
+            return JSONResponse(tail_result, status_code=403 if tail_result["error"] == "READ_RESTRICTED" else 404,
+                                headers={"Cache-Control": "no-store"})
+        input_allowed = bool(
+            terminal.config.permissions.terminal_input
+            and row.get("effective_input", row.get("input_allowed", False))
+        )
+        body = {
+            "session": name, "status": status_result, "tail": tail_result, "input_allowed": input_allowed,
+            "allowed": bool(row.get("allowed", False)), "node_id": node_id,
+            "grant": {"read_enabled": bool(row.get("read_granted", False)),
+                     "input_enabled": bool(row.get("input_granted", False))},
+        }
+        return JSONResponse(body, headers={"Cache-Control": "no-store"})
+
     @server.custom_route("/dashboard/api/session", methods=["GET"], include_in_schema=False)
     async def session_detail(request: Request) -> JSONResponse:
         blocked, _identity = _read_guard(request)
@@ -4756,6 +4819,23 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if not session_allowed(name, terminal.config) and not (
             (grant := terminal.grants.get(name)) is not None and grant.read_enabled
         ):
+            # Not authorized against the LOCAL whitelist/grants store --
+            # before giving up, check whether this bare name actually
+            # lives on a REMOTE node (task item 9: the real bug this
+            # fixes -- a session like "window" on dell-5530 was correctly
+            # LISTED by /dashboard/api/sessions (that route already merges
+            # in fleet-wide rows) but this route only ever consulted the
+            # local TerminalService, so the main tab view's pane/input
+            # composer silently showed READ_RESTRICTED for a session the
+            # user had already been granted read+input on -- just on the
+            # wrong node). Same node-aware identity controller.
+            # resolve_session already gives every other routed operation
+            # (kill/reopen/grant) -- never a bare-name guess.
+            resolution = await anyio.to_thread.run_sync(controller.resolve_session, name)
+            if "error" not in resolution and resolution["node_id"] != controller.local_node_id:
+                return await _remote_session_detail(resolution["node_id"], resolution["session"])
+            if resolution.get("error") == "AMBIGUOUS_SESSION":
+                return JSONResponse(resolution, status_code=409, headers={"Cache-Control": "no-store"})
             # Proactive, not just reactive: an operator opening a
             # never-granted session sees up front whether input would ALSO
             # be blocked by policy once read is granted, rather than only
@@ -4870,6 +4950,30 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # pinned identity against the session's current tmux identity at
         # send time.
         grant = terminal.grants.get(name)
+        if grant is None and not input_session_allowed(name, terminal.config):
+            # No local grant and not locally input-whitelisted -- before
+            # falling through to terminal_send_text's generic
+            # ACCESS_DENIED, check whether this bare name actually lives
+            # on a REMOTE node (task item 9, same real bug as session_
+            # detail above: a granted Windows session like "window" on
+            # dell-5530 was listed but its own tab's input composer
+            # couldn't actually send, since this route only ever
+            # consulted the local TerminalService). Same node-aware
+            # identity controller.resolve_session gives every other
+            # routed operation -- never a bare-name guess.
+            resolution = await anyio.to_thread.run_sync(controller.resolve_session, name)
+            if "error" not in resolution and resolution["node_id"] != controller.local_node_id:
+                qualified = f"{resolution['node_id']}/{resolution['session']}"
+                result = await anyio.to_thread.run_sync(
+                    lambda: controller.terminal_send_text(
+                        qualified, text, press_enter=press_enter, idempotency_key=idempotency_key)
+                )
+                status_code = 200
+                if "error" in result:
+                    status_code = INPUT_ERROR_STATUS.get(result["error"], 400)
+                return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+            if resolution.get("error") == "AMBIGUOUS_SESSION":
+                return JSONResponse(resolution, status_code=409, headers={"Cache-Control": "no-store"})
         use_granted = grant is not None and not input_session_allowed(name, terminal.config)
         send_fn = terminal.terminal_send_text_granted if use_granted else terminal.terminal_send_text
         result = await anyio.to_thread.run_sync(

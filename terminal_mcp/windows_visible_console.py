@@ -245,7 +245,7 @@ class VisibleConsoleProcess:
             cursor_row = info["CursorPosition"].Y
             lines: list[str] = []
             for row in range(cursor_row + 1):
-                text = console_out.ReadConsoleOutputCharacter(width, (0, row))
+                text = console_out.ReadConsoleOutputCharacter(width, win32console.PyCOORDType(0, row))
                 lines.append(_TRAILING_BLANK_RE.sub("", text))
             return lines
         except pywintypes.error:
@@ -254,6 +254,7 @@ class VisibleConsoleProcess:
             self._detach_locked()
 
     def _write_input_locked(self, data: str) -> None:
+        import win32con
         import win32console
         import win32file
         import pywintypes  # type: ignore[import-not-found]
@@ -267,12 +268,26 @@ class VisibleConsoleProcess:
             console_in = win32console.PyConsoleScreenBufferType(handle)
             records = []
             for ch in data:
+                # Plain typed characters are recognized correctly by a
+                # console's line editor from `Char` alone (verified live
+                # against a real powershell.exe session), but Enter is
+                # NOT -- PSReadLine (modern PowerShell's line editor)
+                # decides "submit the line" from the record's virtual key
+                # code, not from the Unicode char, so a Char='\r' with
+                # VirtualKeyCode=0 is silently misread as a stray keypress
+                # instead of Enter (caught live: it left a garbage
+                # character appended to the unexecuted command line
+                # rather than submitting it). VK_RETURN makes it a real,
+                # recognized Enter regardless of which line editor is
+                # reading it.
+                is_enter = ch in ("\r", "\n")
+                virtual_key_code = win32con.VK_RETURN if is_enter else 0
                 for key_down in (True, False):
                     record = win32console.PyINPUT_RECORDType(win32console.KEY_EVENT)
                     record.KeyDown = key_down
                     record.RepeatCount = 1
                     record.Char = ch
-                    record.VirtualKeyCode = 0
+                    record.VirtualKeyCode = virtual_key_code
                     record.VirtualScanCode = 0
                     record.ControlKeyState = 0
                     records.append(record)

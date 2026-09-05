@@ -87,8 +87,14 @@ class FakeNodeClient:
     def capture(self, session, start_line=None):
         return {"session": session, "lines": []}
 
-    def send_text(self, *a, **k):
-        return {"error": "NOT_IMPLEMENTED_IN_FAKE"}
+    def send_text(self, session, text, press_enter=False, dry_run=False, **kwargs):
+        self.calls.append(("send_text", session))
+        if self.broken:
+            raise NodeClientError("simulated transport failure")
+        if session not in self._sessions:
+            return {"error": "SESSION_NOT_FOUND"}
+        return {"session": session, "sent": True, "enter_sent": press_enter,
+                "characters": len(text), "press_enter": press_enter, "delivery_state": "TEXT_SENT"}
 
     def send_keys(self, *a, **k):
         return {"error": "NOT_IMPLEMENTED_IN_FAKE"}
@@ -437,3 +443,87 @@ def test_create_grant_mode_invalid_value_rejected(tmp_path):
                     json={"name": "mn-badgrant", "agent_type": "shell", "grant_mode": "everything"})
     assert r.status_code == 400
     assert r.json()["error"] == "INVALID_GRANT_MODE"
+
+
+# ---------------------------------------------------------------------------
+# session_detail/session_input reach a REMOTE-only session (task item 9:
+# real bug where the main dashboard tab view could LIST a remote session
+# like Windows' "window" on dell-5530 but never actually tail/send to it,
+# since these two routes only ever consulted the LOCAL TerminalService --
+# never controller.resolve_session -- for a bare name with no local
+# whitelist/grant match at all).
+# ---------------------------------------------------------------------------
+
+
+def test_session_detail_reaches_a_remote_only_session(tmp_path):
+    client, controller, _service = _client(tmp_path)
+    _heartbeat_local(controller)
+    remote = FakeNodeClient()
+    _register_fake_remote(controller, "detail-node", remote)
+    # Deliberately NOT matching the local config's "mn-*" whitelist pattern
+    # -- this session has no local whitelist entry and no local grant at
+    # all, exactly the real "window" scenario.
+    r = client.post("/dashboard/api/session/create",
+                    json={"name": "remote-only-1", "agent_type": "shell", "node": "detail-node"})
+    assert r.status_code == 200, r.text
+
+    r = client.get("/dashboard/api/session?name=remote-only-1")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["node_id"] == "detail-node"
+    assert body["status"]["state"] == "RUNNING"
+    assert body["input_allowed"] is True
+
+
+def test_session_detail_remote_read_restricted_when_not_effective(tmp_path):
+    client, controller, _service = _client(tmp_path)
+    _heartbeat_local(controller)
+    remote = FakeNodeClient()
+    _register_fake_remote(controller, "restricted-node", remote)
+    client.post("/dashboard/api/session/create",
+               json={"name": "remote-only-2", "agent_type": "shell", "node": "restricted-node"})
+    # Simulate that node's own grants store reporting no effective access
+    # (never guessed/derived from the local node's own grants).
+    remote._sessions["remote-only-2"]["effective_read"] = False
+    remote._sessions["remote-only-2"]["effective_input"] = False
+
+    r = client.get("/dashboard/api/session?name=remote-only-2")
+    assert r.status_code == 403
+    assert r.json()["error"] == "READ_RESTRICTED"
+
+
+def test_session_detail_ambiguous_across_two_nodes_reported_clearly(tmp_path):
+    client, controller, _service = _client(tmp_path)
+    _heartbeat_local(controller)
+    remote_a = FakeNodeClient()
+    remote_b = FakeNodeClient()
+    _register_fake_remote(controller, "node-a", remote_a)
+    _register_fake_remote(controller, "node-b", remote_b)
+    r = client.post("/dashboard/api/session/create", json={"name": "dup-name", "agent_type": "shell", "node": "node-a"})
+    assert r.status_code == 200, r.text
+    # create_session already refuses a genuine fleet-wide name collision
+    # (SESSION_ALREADY_EXISTS) -- the real-world case this guards is two
+    # nodes independently discovering an externally-created session with
+    # the same name, so that's reproduced directly here rather than via
+    # the (rightly refused) create route.
+    remote_b._sessions["dup-name"] = {"agent_type": "shell"}
+    controller.invalidate_session_location("dup-name")
+
+    r = client.get("/dashboard/api/session?name=dup-name")
+    assert r.status_code == 409
+    assert r.json()["error"] == "AMBIGUOUS_SESSION"
+
+
+def test_session_input_routes_to_remote_node(tmp_path):
+    client, controller, _service = _client(tmp_path)
+    _heartbeat_local(controller)
+    remote = FakeNodeClient()
+    _register_fake_remote(controller, "input-node", remote)
+    client.post("/dashboard/api/session/create",
+               json={"name": "remote-only-3", "agent_type": "shell", "node": "input-node"})
+
+    r = client.post("/dashboard/api/session/input",
+                    json={"name": "remote-only-3", "text": "echo hi", "press_enter": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["sent"] is True
+    assert ("send_text", "remote-only-3") in remote.calls
