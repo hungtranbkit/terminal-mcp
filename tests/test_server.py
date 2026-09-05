@@ -49,6 +49,11 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_list_nodes",
         "terminal_node_status",
         "terminal_node_sessions",
+        "terminal_registry_list",
+        "terminal_registry_get",
+        "terminal_registry_search",
+        "terminal_registry_reopen",
+        "terminal_registry_purge",
     }
 
 
