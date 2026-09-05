@@ -68,7 +68,10 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
+
+import pyte
+from wcwidth import wcwidth
 
 from .models import SessionInfo
 from .redaction import strip_ansi
@@ -77,6 +80,92 @@ from .tmux import TmuxError
 DEFAULT_HISTORY_LINES = 2000
 DEFAULT_SHELL = "powershell.exe"
 READ_CHUNK_SIZE = 4096
+# Default ConPTY dimensions for a session's own canonical terminal-screen
+# state (pyte.HistoryScreen) before any real resize has ever been applied
+# -- matches the same 80x24 default winpty/ConPTY itself falls back to
+# absent an explicit size (see _default_process_factory's own docstring
+# on the dimension-mismatch bug that default caused before this
+# project's earlier resize-sync fix). Kept in sync with the real ConPTY
+# size on every _apply_resize call, below -- never allowed to drift.
+DEFAULT_SCREEN_COLS = 80
+DEFAULT_SCREEN_ROWS = 24
+
+
+def _render_history_row(row: "pyte.screens.StaticDefaultDict", columns: int) -> str:
+    """Same cell-joining logic pyte.Screen.display's own property uses
+    internally (see its source) -- reused here because that property
+    only ever renders the CURRENT visible screen (self.buffer), never a
+    scrolled-off HISTORY row (self.screen.history.top/bottom), which has
+    the identical per-column Char-dict shape but no built-in renderer of
+    its own. Correctly skips the trailing stub cell of a wide (e.g. many
+    CJK, some emoji) character rather than duplicating it -- the same
+    correctness pyte's own renderer already gives the visible screen."""
+    chars: list[str] = []
+    is_wide_char = False
+    for x in range(columns):
+        if is_wide_char:
+            is_wide_char = False
+            continue
+        char = row[x].data
+        is_wide_char = bool(char) and wcwidth(char[0]) == 2
+        chars.append(char)
+    return "".join(chars)
+
+
+# DEC private modes real terminals use for the "alternate screen buffer"
+# (a full-screen TUI like Claude Code's own Ink renderer switches into
+# this on startup and back out on exit) -- 1049 is the modern/xterm form
+# (save cursor + switch + clear), 47/1047 are older, narrower variants
+# real-world programs still sometimes emit. All three are treated the
+# same way here: swap to/from a separate, blank buffer.
+_ALTERNATE_SCREEN_MODES = (1049, 47, 1047)
+
+
+class _AltScreenHistoryScreen(pyte.HistoryScreen):
+    """pyte's own Screen/HistoryScreen already tracks DEC private modes
+    1049/47/1047 being SET in `self.mode` (see set_mode's own shifted-
+    value storage), but does not itself swap to a separate buffer for
+    them -- real xterm/VT100 alternate-screen semantics needs exactly
+    that: entering it saves the current (primary) screen content and
+    cursor and starts from a blank screen; leaving it restores exactly
+    what was there. Confirmed live testing this fix: without this, a
+    full-screen TUI's own content could show interleaved with whatever
+    was on screen right before it started. A minimal, targeted addition
+    on top of pyte's own otherwise-correct VT100 emulation -- not a
+    second parser, just the one real behavior this library's own base
+    classes don't implement (checked directly against pyte 0.8's own
+    source: Screen.set_mode/reset_mode never reference these modes at
+    all beyond the generic mode-set bookkeeping every mode gets)."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._alt_screen_active = False
+        self._primary_buffer: Any = None
+        self._primary_cursor: Any = None
+
+    def set_mode(self, *modes: int, **kwargs: Any) -> None:
+        super().set_mode(*modes, **kwargs)
+        if kwargs.get("private") and not self._alt_screen_active and any(m in _ALTERNATE_SCREEN_MODES for m in modes):
+            self._alt_screen_active = True
+            self._primary_buffer = self.buffer
+            self._primary_cursor = self.cursor
+            self.buffer = type(self.buffer)(self.buffer.default_factory)
+            self.dirty.update(range(self.lines))
+            self.cursor_position()
+
+    def reset_mode(self, *modes: int, **kwargs: Any) -> None:
+        was_active = self._alt_screen_active
+        super().reset_mode(*modes, **kwargs)
+        if kwargs.get("private") and was_active and any(m in _ALTERNATE_SCREEN_MODES for m in modes):
+            self._alt_screen_active = False
+            if self._primary_buffer is not None:
+                self.buffer = self._primary_buffer
+                self.cursor = self._primary_cursor
+                self.dirty.update(range(self.lines))
+            self._primary_buffer = None
+            self._primary_cursor = None
+
+
 # Same rationale as tmux.py's SEND_TEXT_ENTER_SETTLE_SECONDS -- a small
 # gap between the literal text write and the Enter byte so an
 # interactive program's own async input handling has time to consume the
@@ -336,6 +425,37 @@ class _WindowsSession:
     desktop_viewer: object | None = None
     buffer: deque[str] = field(default_factory=lambda: deque(maxlen=DEFAULT_HISTORY_LINES))
     _partial_line: str = ""
+    # Canonical terminal-screen state (task: "Terminal MCP dashboard/
+    # session renderer trên mobile/Windows" -- item 4's own "bổ sung
+    # canonical terminal-screen state/VT parser"). `buffer`/_partial_line
+    # above stay exactly as they were -- Session Knowledge Store's own
+    # read_new_output() still reads from them, untouched by this fix --
+    # `screen`/`vt_stream` are a SEPARATE, additional real VT100/xterm
+    # emulator fed the exact same raw chunks in _reader_loop, and are
+    # what capture_lines() (the dashboard's own read-only tail/preview
+    # path) reads from instead: a simple \r-overwrite model (this
+    # project's own earlier, smaller fix) cannot correctly resolve a
+    # modern Ink-based TUI's real redraw mechanism -- full cursor
+    # repositioning (CSI CUP), erase-line/screen, alternate-screen --
+    # confirmed live: repeated "Beaming…Beaming…Beaming…" spinner text in
+    # the real dell-5530 'window' session's own read-only preview, which
+    # the \r-only fix alone could not fix. pyte.HistoryScreen bounds its
+    # own scrollback the same way `buffer` above already does (maxlen-
+    # style, via its own `history=` param) -- see get_session/_apply_
+    # resize for how `screen`'s own dimensions stay synced to the real
+    # ConPTY size, and capture_lines for how history+current-visible-
+    # screen are combined into one flat snapshot.
+    screen: "pyte.HistoryScreen" = field(
+        default_factory=lambda: _AltScreenHistoryScreen(DEFAULT_SCREEN_COLS, DEFAULT_SCREEN_ROWS,
+                                                    history=DEFAULT_HISTORY_LINES))
+    # Bound to `screen` in __post_init__ below -- never constructed
+    # independently, so a caller can never pass a vt_stream wrapping a
+    # DIFFERENT screen instance by mistake (a real, easy-to-make error
+    # this dataclass shape makes structurally impossible instead).
+    vt_stream: "pyte.Stream" = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.vt_stream = pyte.Stream(self.screen)
     lock: threading.Lock = field(default_factory=threading.Lock)
     attached_viewers: int = 0
     detach_callbacks: list[Callable[[], None]] = field(default_factory=list)
@@ -462,23 +582,41 @@ class WindowsSessionBackend:
         )
 
     def capture_lines(self, session: str, lines: int, *, ansi: bool = False) -> list[str]:
+        """P0 HOTFIX (task: "Terminal MCP dashboard/session renderer trên
+        mobile/Windows" -- item 4): now reads from the canonical, real-VT-
+        emulated screen state (`entry.screen`, a pyte.HistoryScreen fed
+        every raw chunk in _reader_loop) instead of the old naive line
+        buffer -- see _WindowsSession's own "screen"/"vt_stream" field
+        comments for the full ROOT_CAUSE this replaces (a bare \\r-
+        overwrite model cannot correctly resolve full cursor-
+        repositioning redraws, confirmed live as repeated "Beaming…"
+        spinner text). `ansi` is accepted for call-site parity with the
+        tmux backend but is a deliberate no-op HERE: pyte has already
+        fully resolved every control sequence (SGR included) into a
+        plain, correct text snapshot by this point -- there is no raw
+        ANSI left to preserve or strip either way, matching item 2's own
+        framing of the read-only path as "sanitized/rendered text
+        snapshot; không raw ANSI" (color fidelity in the read-only
+        preview is a real, deliberate simplification given up for
+        correctness -- the LIVE interactive terminal, windows_webterm.py,
+        is unaffected by any of this: it still gets the true raw byte
+        stream straight from the reader loop, for a real xterm.js to
+        render with full colour, exactly as before)."""
         entry = self._require(session)
         lines = max(1, lines)
         with entry.lock:
-            # The still-in-progress trailing line (no newline yet -- e.g.
-            # a shell prompt sitting there waiting for input) is included
-            # too, same as tmux's own capture-pane always shows the pane's
-            # current visible content whether or not the cursor's own
-            # line has been "finished" with a newline. Without this, the
-            # reliable-submission verification poll (core.py, diffing a
-            # pre-Enter vs post-Enter capture) could see two identical
-            # snapshots across a send that only ever touched the still-
-            # buffered partial line, never observing a real change.
-            snapshot = list(entry.buffer)
-            if entry._partial_line:
-                snapshot.append(entry._partial_line)
-            snapshot = snapshot[-lines:]
-        return snapshot if ansi else [strip_ansi(line) for line in snapshot]
+            history_rows = [_render_history_row(row, entry.screen.columns) for row in entry.screen.history.top]
+            current_rows = [row.rstrip() for row in entry.screen.display]
+        snapshot = history_rows + current_rows
+        # pyte.Screen.display always returns exactly `screen.lines` rows
+        # (padded with blanks down to the full screen height, regardless
+        # of how much real content has actually been written) -- trim
+        # only the TRAILING run of not-yet-drawn blank rows, never an
+        # interior blank line that's genuinely part of the real content
+        # (a paragraph break, a blank line in a diff, ...).
+        while snapshot and not snapshot[-1]:
+            snapshot.pop()
+        return snapshot[-lines:]
 
     def read_new_output(self, session: str, cursor: int | None) -> tuple[str, int, bool]:
         """Session Knowledge Store's real capture mechanism for this
@@ -583,7 +721,9 @@ class WindowsSessionBackend:
         now = int(time.time())
         entry = _WindowsSession(name=name, proc=proc, cwd=cwd, command=command,
                                 created_epoch=now, activity_epoch=now,
-                                buffer=deque(maxlen=self.history_lines))
+                                buffer=deque(maxlen=self.history_lines),
+                                screen=_AltScreenHistoryScreen(DEFAULT_SCREEN_COLS, DEFAULT_SCREEN_ROWS,
+                                                         history=self.history_lines))
         with self._registry_lock:
             self._sessions[name] = entry
         entry.reader_thread = threading.Thread(target=self._reader_loop, args=(entry,), daemon=True)
@@ -790,6 +930,15 @@ class WindowsSessionBackend:
             if entry.last_resize_dims == (rows, cols):
                 return  # idempotent no-op -- never a redundant syscall for a size that hasn't actually changed
             entry.last_resize_dims = (rows, cols)
+            # Keeps the canonical screen-state's own dimensions synced to
+            # the real ConPTY size -- exactly the same dimension-mismatch
+            # bug this project's earlier resize-sync fix addressed for the
+            # visible desktop console, applied here too: a full-screen
+            # TUI's own redraws (cursor positioning, erase regions) are
+            # only correctly resolved if this emulator believes the same
+            # column/row count the real console does. pyte.Screen.resize
+            # itself handles reflow/history push safely.
+            entry.screen.resize(rows, cols)
         try:
             entry.proc.setwinsize(rows, cols)
         except Exception:  # noqa: BLE001 -- a resize failure is never fatal to the session
@@ -865,6 +1014,21 @@ class WindowsSessionBackend:
             entry.activity_epoch = int(time.time())
             with entry.lock:
                 _append_chunk(entry, chunk)
+                # Canonical terminal-screen state -- fed the exact same
+                # raw chunk, completely independent of _append_chunk's
+                # own line buffer above (that one still backs Session
+                # Knowledge Store's read_new_output, untouched by this
+                # fix). pyte.Stream.feed itself never raises on malformed
+                # input (unknown/invalid sequences are simply ignored,
+                # same tolerance strip_ansi/redaction.py already has for
+                # this project's other sanitizers) -- still wrapped
+                # defensively since a third-party parser must never be
+                # able to kill this reader thread over a byte sequence it
+                # doesn't understand.
+                try:
+                    entry.vt_stream.feed(chunk)
+                except Exception:  # noqa: BLE001 -- see comment above
+                    pass
                 viewer_queues = list(entry.viewer_queues)
             for viewer_queue in viewer_queues:
                 viewer_queue.put(chunk)

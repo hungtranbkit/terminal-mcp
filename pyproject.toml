@@ -20,6 +20,27 @@ dependencies = [
   # WebSocket implementation of its own and silently 403s any upgrade
   # request without one of websockets/wsproto installed.
   "websockets>=13,<14",
+  # Canonical terminal-screen-state emulation for WindowsSessionBackend's
+  # own read-only capture/tail path (task: "Terminal MCP dashboard/session
+  # renderer trên mobile/Windows" -- item 4's own "bổ sung canonical
+  # terminal-screen state/VT parser... Không chỉ regex-strip ANSI nếu đó
+  # là live terminal"). A simple line-buffer + bare-\r-overwrite model
+  # (this project's own earlier, smaller fix) cannot correctly resolve a
+  # modern Ink-based TUI's real redraw mechanism -- full cursor
+  # repositioning (CSI CUP), not just \r -- confirmed live: repeated
+  # "Beaming…Beaming…Beaming…" spinner text in the real dell-5530 'window'
+  # session's own read-only preview. pyte is a mature, pure-Python VT100/
+  # xterm-compatible terminal emulator (used by many real terminal
+  # projects for exactly this) -- reimplementing full CUP/erase-line/
+  # erase-screen/alternate-screen semantics by hand here would be a
+  # second, likely-buggier copy of what this library already does
+  # correctly. Pure Python, no native/platform-specific code, so it
+  # installs and is testable on Linux/macOS dev hosts too (this backend's
+  # own tests already run against a real POSIX pty stand-in, never a real
+  # Windows host -- see windows_backend.py's own module docstring) --
+  # never imported by the tmux/Linux path at all, which gets real
+  # terminal-state resolution from tmux's own `capture-pane -e` instead.
+  "pyte>=0.8,<1",
 ]
 
 [project.optional-dependencies]

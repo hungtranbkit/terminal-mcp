@@ -38,6 +38,7 @@ pydantic_core==2.46.5
 Pygments==2.21.0
 PyJWT==2.13.0
 pytest==9.1.1
+pyte==0.8.2
 python-dotenv==1.2.3
 python-multipart==0.0.32
 PyYAML==6.0.3
@@ -52,3 +53,4 @@ typer==0.27.2
 typing_extensions==4.16.0
 typing-inspection==0.4.4
 uvicorn==0.52.4
+wcwidth==0.8.3

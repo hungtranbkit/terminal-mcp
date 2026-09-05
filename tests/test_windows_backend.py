@@ -806,3 +806,96 @@ def test_append_chunk_plain_carriage_return_newline_still_works_like_before():
     entry = _new_entry()
     _append_chunk(entry, "hello\r\n")
     assert list(entry.buffer) == ["hello"]
+
+
+# ---------------------------------------------------------------------------
+# P0 HOTFIX: canonical terminal-screen state (task: "Terminal MCP dashboard/
+# session renderer trên mobile/Windows", item 4). capture_lines() now reads
+# from a real pyte.HistoryScreen (entry.screen), fed every raw chunk in
+# _reader_loop -- fed here directly (entry.vt_stream.feed) for fast,
+# deterministic tests, exactly mirroring the required regression checklist
+# (item 8): \r overwrite, DEC private mode (cursor hide/show), cursor
+# movement, erase-line, spinner redraw, alternate screen, Unicode.
+# ---------------------------------------------------------------------------
+
+def test_capture_lines_resolves_carriage_return_overwrite(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path)
+    entry = backend._sessions["win-test"]
+    entry.vt_stream.feed("progress: 10%\rdone!         ")
+    lines = backend.capture_lines("win-test", 10)
+    assert any("done!" in line for line in lines)
+    assert not any("progress" in line for line in lines)
+
+
+def test_capture_lines_never_leaks_dec_private_mode_sequences(backend, tmp_path):
+    # REAL BUG this fixes -- confirmed live on the real dell-5530 'window'
+    # session: literal "ESC[?25h"/"ESC[?25l" text visible in the dashboard's
+    # read-only preview, because the OLD line-buffer model never
+    # interpreted these at all (see _append_chunk's own docstring for the
+    # narrower \r-only fix that came before this one).
+    _new_fake_shell_session(backend, tmp_path)
+    entry = backend._sessions["win-test"]
+    entry.vt_stream.feed("before\x1b[?25hmid\x1b[?25lafter\n")
+    lines = backend.capture_lines("win-test", 10)
+    joined = "\n".join(lines)
+    assert "beforemidafter" in joined
+    assert "?25" not in joined and "\x1b" not in joined
+
+
+def test_capture_lines_resolves_cursor_movement_and_erase_line():
+    # Direct unit test against _WindowsSession -- no real subprocess
+    # needed for pure VT-parsing behaviour.
+    entry = _new_entry()
+    entry.vt_stream.feed("one two three\r\n")
+    entry.vt_stream.feed("\x1b[1;1H")       # move cursor to row 1, col 1 (the "one two three" line)
+    entry.vt_stream.feed("\x1b[2K")         # erase that entire line
+    entry.vt_stream.feed("replaced")
+    display = entry.screen.display
+    assert display[0].rstrip() == "replaced"
+
+
+def test_capture_lines_resolves_repeated_spinner_redraw_via_cursor_reposition():
+    """REAL BUG this fixes -- confirmed live: Claude Code's own Ink
+    renderer redraws its spinner by repositioning the cursor (CUP), not
+    just bare '\\r' -- the earlier, narrower \\r-only fix could not
+    resolve this, and the dashboard showed "Beaming…" repeated dozens of
+    times back-to-back instead of the current frame only."""
+    entry = _new_entry()
+    for frame in ("Beaming.", "Beaming..", "Beaming...", "Beaming.. ", "Beaming.  "):
+        entry.vt_stream.feed(f"\x1b[1;1H{frame}")
+    display = entry.screen.display
+    assert display[0].rstrip() == "Beaming.  ".rstrip()
+    assert display[0].count("Beaming") == 1  # never duplicated/appended
+
+
+def test_capture_lines_handles_alternate_screen_toggle():
+    entry = _new_entry()
+    entry.vt_stream.feed("normal screen content\r\n")
+    entry.vt_stream.feed("\x1b[?1049h")  # enter alternate screen (full-screen TUI)
+    entry.vt_stream.feed("tui content")
+    display_in_alt = list(entry.screen.display)
+    assert any("tui content" in line for line in display_in_alt)
+    assert not any("normal screen" in line for line in display_in_alt)
+    entry.vt_stream.feed("\x1b[?1049l")  # leave alternate screen -- original content restored
+    display_after = entry.screen.display
+    assert any("normal screen content" in line for line in display_after)
+
+
+def test_capture_lines_preserves_vietnamese_and_wide_unicode():
+    entry = _new_entry()
+    entry.vt_stream.feed("Xin chào, đây là tiếng Việt — ✅ xong\r\n")
+    display = entry.screen.display
+    assert any("Xin chào, đây là tiếng Việt — ✅ xong" in line for line in display)
+
+
+def test_capture_lines_trims_trailing_blank_screen_padding_but_keeps_interior_blanks():
+    # pyte.Screen.display always pads to the FULL screen height -- only
+    # the trailing run of never-drawn blank rows should be trimmed
+    # (matching what a real terminal visually shows), never an interior
+    # blank line that's genuinely part of the real content.
+    entry = _new_entry()
+    entry.vt_stream.feed("line one\r\n\r\nline three\r\n")
+    lines = [row.rstrip() for row in entry.screen.display]
+    while lines and not lines[-1]:
+        lines.pop()
+    assert lines == ["line one", "", "line three"]
