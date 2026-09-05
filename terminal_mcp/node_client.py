@@ -71,6 +71,8 @@ class NodeClient(Protocol):
                            limit: int = 200) -> dict[str, Any]: ...
     def knowledge_recover(self, session_name: str) -> dict[str, Any]: ...
     def knowledge_checkpoint(self, session_name: str, summary: str) -> dict[str, Any]: ...
+    def watchdog_session_events(self, *, unacknowledged_only: bool = False, limit: int = 50) -> dict[str, Any]: ...
+    def watchdog_acknowledge_session_event(self, event_id: int, *, by: str | None = None) -> dict[str, Any]: ...
 
 
 class LocalNodeClient:
@@ -161,6 +163,12 @@ class LocalNodeClient:
 
     def knowledge_checkpoint(self, session_name: str, summary: str) -> dict[str, Any]:
         return self._terminal.terminal_knowledge_checkpoint(session_name, summary)
+
+    def watchdog_session_events(self, *, unacknowledged_only: bool = False, limit: int = 50) -> dict[str, Any]:
+        return self._terminal.terminal_watchdog_events(unacknowledged_only=unacknowledged_only, limit=limit)
+
+    def watchdog_acknowledge_session_event(self, event_id: int, *, by: str | None = None) -> dict[str, Any]:
+        return self._terminal.terminal_watchdog_acknowledge(event_id, by=by)
 
 
 class RemoteNodeClient:
@@ -309,6 +317,13 @@ class RemoteNodeClient:
     def knowledge_checkpoint(self, session_name: str, summary: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/knowledge/checkpoint/{urllib.parse.quote(session_name)}",
                              body={"summary": summary})
+
+    def watchdog_session_events(self, *, unacknowledged_only: bool = False, limit: int = 50) -> dict[str, Any]:
+        return self._request("GET", "/v1/watchdog/events",
+                             params={"unacknowledged_only": int(unacknowledged_only), "limit": limit})
+
+    def watchdog_acknowledge_session_event(self, event_id: int, *, by: str | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/v1/watchdog/acknowledge/{event_id}", body={"by": by})
 
     def ping(self) -> tuple[bool, float | None, str | None]:
         """Real health check + round-trip latency measurement -- used by

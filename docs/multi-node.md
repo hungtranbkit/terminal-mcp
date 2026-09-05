@@ -731,6 +731,62 @@ small node label next to the session name (e.g. "mesflow&nbsp;&nbsp;Dell")
 — flat, no grouping, no second competing list, matching the earlier
 dashboard-cleanup task's own constraint.
 
+## Watchdog: session-dropped-unexpectedly detection, fleet-wide
+
+Originally local-node-only (session-level drop detection reused
+`mark_missing()`'s own already-computed "vanished" list inside
+`_reconcile_session_registry`, node-level detection compared a
+persisted `last_known_status` column against each fresh
+`sync_status_transitions()` call — both from that feature's own initial
+build). Extended fleet-wide (task: "Mở rộng fleet-wide cho session
+drop"): the dashboard's watchdog badge/panel now shows a session
+dropping unexpectedly on ANY online node (local, dell-5530, m910), not
+only local.
+
+- **Per-node storage, fleet-wide aggregation** — each node keeps
+  detecting and recording its own drops in its own
+  `session_registry.db` (so a node still detects and remembers its own
+  drops even fully network-partitioned from the controller); nothing
+  moved to a shared/central table. `ControllerService.
+  terminal_watchdog_session_events_fleet()` asks every currently-ONLINE
+  node (same tolerant pattern as `terminal_knowledge_search_fleet`: a
+  node that's unreachable or errors just contributes zero events,
+  reported separately in `node_errors`, never fails the whole call) and
+  merges, sorted by `detected_at`.
+- **`node_client.py`**: `NodeClient.watchdog_session_events`/
+  `watchdog_acknowledge_session_event`, implemented by both
+  `LocalNodeClient` (direct delegation) and `RemoteNodeClient`
+  (`GET /v1/watchdog/events`, `POST /v1/watchdog/acknowledge/{event_id}`
+  on the remote node-agent, added to `node_agent.py`'s own route table).
+- **Composite event ids became 3-part for session events**:
+  `"session:<node_id>:<event_id>"` (was `"session:<event_id>"` when this
+  was local-only) — each node's own event-id sequence is only unique
+  within that node, so the node has to be named in the id too. Node-
+  status events stay 2-part (`"node:<event_id>"`, unchanged) since that
+  table is already single, shared, controller-side. The dashboard's
+  acknowledge route parses the session case with `rest.rpartition(":")`
+  (node_id may itself be anything short of a literal colon) and routes
+  to `ControllerService.terminal_watchdog_acknowledge_session_event(
+  node_id, event_id)`, which looks up that one node's own client and
+  acknowledges there — a session-drop event, unlike a node-status one,
+  only ever exists on the one node that detected it.
+- **Real bug caught while building this**: `terminal_knowledge_search_
+  fleet`'s own pre-existing `row.setdefault("node_id", node.id)` was a
+  silent no-op — `session_knowledge.search()`'s result rows already
+  carry a `"node_id"` key (always the literal `"local"`, that remote
+  node's own private per-process convention), so `setdefault` never
+  overwrote it and every remote node's own knowledge-search results had
+  been mislabeled as coming from `"local"`. Fixed (direct assignment)
+  alongside this feature, and the new fleet-wide session-drop code uses
+  direct assignment from the start for the same reason.
+- **Recovery is unchanged** — reopening a dropped session still goes
+  through the existing Persistent Session Registry "↩ Reopen" flow
+  (`registryToggleEl` pre-filtered to the session name), not a second,
+  node-aware implementation; that panel itself remains local-node-only
+  (a separate, pre-existing, documented limitation below), so recovering
+  a REMOTE node's dropped session still means opening that node's own
+  dashboard view for now.
+
 ## Known limitations
 
 - **`terminal_move_session` (moving a LIVE, still-running session to a

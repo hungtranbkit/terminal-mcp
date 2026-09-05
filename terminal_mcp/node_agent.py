@@ -287,6 +287,29 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         ))
         return JSONResponse(result)
 
+    async def watchdog_events(request: Request) -> JSONResponse:
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        params = request.query_params
+        limit_raw = params.get("limit")
+        result = await anyio.to_thread.run_sync(lambda: client.watchdog_session_events(
+            unacknowledged_only=params.get("unacknowledged_only") == "1",
+            limit=int(limit_raw) if limit_raw else 50,
+        ))
+        return JSONResponse(result)
+
+    async def watchdog_acknowledge(request: Request) -> JSONResponse:
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        event_id = int(request.path_params["event_id"])
+        result = await anyio.to_thread.run_sync(
+            lambda: client.watchdog_acknowledge_session_event(event_id, by=body.get("by")))
+        return JSONResponse(result)
+
     async def terminal_ws(websocket: WebSocket) -> None:
         # Open Terminal for a REMOTE node (task's own "Open Terminal trên
         # Windows phải mở được web terminal vào persistent session"),
@@ -363,6 +386,8 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         Route("/v1/knowledge/timeline/{name}", knowledge_timeline, methods=["GET"]),
         Route("/v1/knowledge/recover/{name}", knowledge_recover, methods=["GET"]),
         Route("/v1/knowledge/checkpoint/{name}", knowledge_checkpoint, methods=["POST"]),
+        Route("/v1/watchdog/events", watchdog_events, methods=["GET"]),
+        Route("/v1/watchdog/acknowledge/{event_id}", watchdog_acknowledge, methods=["POST"]),
         WebSocketRoute("/v1/ws/terminal", terminal_ws, name="node_agent_terminal_ws"),
     ]
     return Starlette(routes=routes)

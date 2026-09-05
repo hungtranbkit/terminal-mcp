@@ -5692,9 +5692,15 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
         def _collect() -> list[dict]:
             merged: list[dict] = []
-            for row in terminal.terminal_watchdog_events(unacknowledged_only=unacknowledged_only)["events"]:
+            # Fleet-wide now (was local-node-only): each node's own
+            # session_registry.db has its own independent event-id
+            # sequence, so the composite id needs the node in it too --
+            # "session:<node_id>:<id>" -- not just "session:<id>".
+            for row in controller.terminal_watchdog_session_events_fleet(
+                    unacknowledged_only=unacknowledged_only)["events"]:
                 merged.append({
-                    "id": f"session:{row['id']}", "kind": "session_missing", "node_id": row["node_id"],
+                    "id": f"session:{row['node_id']}:{row['id']}", "kind": "session_missing",
+                    "node_id": row["node_id"],
                     "session_name": row["session_name"], "detected_at": row["detected_at"],
                     "detail": row.get("detail"), "acknowledged": bool(row["acknowledged"]),
                     "recovered": bool(row["recovered"]),
@@ -5724,15 +5730,26 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         composite_id = body.get("id") if isinstance(body, dict) else None
         if not isinstance(composite_id, str) or ":" not in composite_id:
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
-        kind, _, raw_id = composite_id.partition(":")
-        try:
-            event_id = int(raw_id)
-        except ValueError:
-            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        kind, _, rest = composite_id.partition(":")
         by = identity.email if identity else "dashboard"
         if kind == "session":
-            result = await anyio.to_thread.run_sync(lambda: terminal.terminal_watchdog_acknowledge(event_id, by=by))
+            # "session:<node_id>:<event_id>" -- fleet-wide now, so the
+            # node has to be named too (each node's own event-id
+            # sequence is only unique within that node).
+            node_id, _, raw_id = rest.rpartition(":")
+            if not node_id:
+                return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+            try:
+                event_id = int(raw_id)
+            except ValueError:
+                return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+            result = await anyio.to_thread.run_sync(
+                lambda: controller.terminal_watchdog_acknowledge_session_event(node_id, event_id, by=by))
         elif kind == "node":
+            try:
+                event_id = int(rest)
+            except ValueError:
+                return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
             result = await anyio.to_thread.run_sync(
                 lambda: controller.terminal_watchdog_acknowledge_node_event(event_id, by=by))
         else:

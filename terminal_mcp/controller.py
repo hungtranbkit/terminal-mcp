@@ -265,7 +265,16 @@ class ControllerService:
                 errors[node.id] = str(response["error"])
                 continue
             for row in response.get("results", []):
-                row.setdefault("node_id", node.id)
+                # Real bug fixed here: a plain setdefault() is a no-op --
+                # each row already carries its OWN "node_id" from
+                # session_knowledge.py's own DB column, which is always
+                # the string "local" from THAT remote node's own private
+                # per-process point of view (core.py's REGISTRY_LOCAL_
+                # NODE_ID convention -- see its own docstring), never this
+                # controller's real node_id for it. Every remote node's
+                # results were silently mislabeled "local" until this was
+                # an explicit overwrite instead.
+                row["node_id"] = node.id
                 results.append(row)
         results.sort(key=lambda r: r.get("captured_at", ""), reverse=True)
         return {"query": query, "results": results[:limit], "node_errors": errors,
@@ -655,6 +664,66 @@ class ControllerService:
         if not ok:
             return {"error": "EVENT_NOT_FOUND", "event_id": event_id}
         return {"event_id": event_id, "acknowledged": True}
+
+    # -- watchdog: session-dropped-unexpectedly events, FLEET-WIDE -----------
+    # (extends the earlier local-node-only pass, task's own explicit "mở
+    # rộng fleet-wide cho session drop"). Each node's own session_
+    # registry.db only ever knows about ITS OWN sessions -- there is no
+    # shared/central store to query directly (deliberately: a node keeps
+    # working and detecting its own drops even fully network-partitioned
+    # from the controller) -- so this asks every currently-ONLINE node in
+    # parallel-in-spirit (sequentially here, same as terminal_knowledge_
+    # search_fleet, since NodeClient calls are already fast local-process
+    # calls or short HTTP round-trips) and merges, tolerating one node's
+    # failure without losing another's results or failing the whole call.
+
+    def terminal_watchdog_session_events_fleet(self, *, unacknowledged_only: bool = False,
+                                               limit: int = 50) -> dict[str, Any]:
+        results: list[dict[str, Any]] = []
+        errors: dict[str, str] = {}
+        for node in self.registry.list():
+            if node.status != NODE_ONLINE:
+                continue
+            client = self._clients.get(node.id)
+            if client is None:
+                continue
+            try:
+                response = client.watchdog_session_events(unacknowledged_only=unacknowledged_only, limit=limit)
+            except NodeClientError as exc:
+                errors[node.id] = str(exc)
+                continue
+            if "error" in response:
+                errors[node.id] = str(response["error"])
+                continue
+            for row in response.get("events", []):
+                # Same real bug class as terminal_knowledge_search_fleet
+                # above (see its own comment): each event row already
+                # carries "node_id" from session_registry.py's own DB
+                # column, always "local" from THAT node's own private
+                # point of view -- an explicit overwrite, never
+                # setdefault(), or every remote node's events would be
+                # mislabeled "local".
+                row["node_id"] = node.id
+                results.append(row)
+        results.sort(key=lambda e: e.get("detected_at", ""), reverse=True)
+        return {"events": results[:limit], "node_errors": errors}
+
+    def terminal_watchdog_acknowledge_session_event(self, node_id: str, event_id: int, *,
+                                                    by: str | None = None) -> dict[str, Any]:
+        """Unlike the node-level acknowledge above (one shared table, no
+        node to route to), a session-drop event only exists on the ONE
+        node that detected it -- `node_id` (from the fleet listing's own
+        already-corrected tag above) says which."""
+        client = self._clients.get(node_id)
+        if client is None:
+            return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+        try:
+            result = client.watchdog_acknowledge_session_event(event_id, by=by)
+        except NodeClientError as exc:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
+        if isinstance(result, dict):
+            result.setdefault("node_id", node_id)
+        return result
 
     def test_connection(self, node_id: str) -> dict[str, Any]:
         node = self.registry.get(node_id)

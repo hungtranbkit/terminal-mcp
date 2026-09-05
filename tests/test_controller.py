@@ -36,17 +36,24 @@ def _config(tmp_path, *, read=True, input=True) -> AppConfig:
 
 
 def _controller(tmp_path, *, read=True, input=True) -> tuple[ControllerService, TerminalService]:
-    # grants/audit/bindings/leases/killed_sessions all default to this
-    # host's REAL ~/.local/state/terminal-mcp/*.db when not given
-    # explicitly (TerminalService.__init__) -- isolated here so this
-    # test suite's own grant-read/grant-input/create/kill/reopen calls
-    # (test_remote_session_grant_reaches_the_remote_node_not_local and
-    # friends) can never leak a test session name into real production
-    # state. Found live: a prior run of this exact suite had left
-    # "ctrl-grant-local"/"ctrl-amb-grant" sitting in the real grants.db.
+    # grants/audit/bindings/leases/killed_sessions/session_registry all
+    # default to this host's REAL ~/.local/state/terminal-mcp/*.db when
+    # not given explicitly (TerminalService.__init__) -- isolated here so
+    # this test suite's own grant-read/grant-input/create/kill/reopen
+    # calls (test_remote_session_grant_reaches_the_remote_node_not_local
+    # and friends) can never leak a test session name into real
+    # production state. Found live: a prior run of this exact suite had
+    # left "ctrl-grant-local"/"ctrl-amb-grant" sitting in the real
+    # grants.db. session_registry.db was found the same way while adding
+    # the fleet-wide watchdog session-drop tests: without this, every
+    # prior test's own mark_missing()-detected drop events (real,
+    # accumulated across every past run of this whole file) leaked
+    # straight into terminal_watchdog_session_events_fleet()'s results.
     from terminal_mcp.grants import SessionGrantStore
+    from terminal_mcp.session_registry import SessionRegistryStore
     service = TerminalService(_config(tmp_path, read=read, input=input),
-                              grants=SessionGrantStore(tmp_path / "grants.db"))
+                              grants=SessionGrantStore(tmp_path / "grants.db"),
+                              session_registry=SessionRegistryStore(tmp_path / "session_registry.db"))
     registry = NodeRegistry(tmp_path / "nodes.db")
     controller = ControllerService(registry, local_client=LocalNodeClient(service),
                                    local_workspace_root=str(tmp_path))
@@ -158,6 +165,22 @@ class FakeNodeClient:
         if self.broken:
             raise NodeClientError("simulated transport failure")
         return {"session": session_name, "checkpoint_id": 1}
+
+    def watchdog_session_events(self, *, unacknowledged_only: bool = False, limit: int = 50) -> dict[str, Any]:
+        self.calls.append(("watchdog_session_events", ""))
+        if self.broken:
+            raise NodeClientError("simulated transport failure")
+        return {"events": list(getattr(self, "drop_events", []))}
+
+    def watchdog_acknowledge_session_event(self, event_id: int, *, by: str | None = None) -> dict[str, Any]:
+        self.calls.append(("watchdog_acknowledge_session_event", str(event_id)))
+        if self.broken:
+            raise NodeClientError("simulated transport failure")
+        for row in getattr(self, "drop_events", []):
+            if row["id"] == event_id:
+                row["acknowledged"] = True
+                return {"event_id": event_id, "acknowledged": True}
+        return {"error": "EVENT_NOT_FOUND", "event_id": event_id}
 
 
 # -- Phase A/B backward compatibility: local-only behaves like plain TerminalService --
@@ -705,17 +728,31 @@ def test_knowledge_checkpoint_routes_to_the_session_own_node(tmp_path):
 def test_knowledge_search_fleet_merges_results_from_every_online_node(tmp_path):
     controller, _service = _controller(tmp_path)
     _heartbeat_local(controller)
+    # Real bug regression: session_knowledge.py's own search() ALWAYS
+    # includes a "node_id" field already -- always the string "local"
+    # from that remote node's own private point of view (core.py's
+    # REGISTRY_LOCAL_NODE_ID convention), never this controller's real
+    # node_id for it. A fake result with no node_id key at all (as this
+    # test used to write it) can't catch a setdefault()-instead-of-
+    # overwrite bug, since setdefault happens to "work" when the key is
+    # simply absent -- these fakes deliberately include the same wrong
+    # "local" value real results always carry, so this test actually
+    # exercises the overwrite.
     node_a = FakeNodeClient()
-    node_a.knowledge_results = [{"session_name": "a-sess", "text": "hit on node a", "captured_at": "2026-01-01T00:00:01Z"}]
+    node_a.knowledge_results = [{"session_name": "a-sess", "text": "hit on node a",
+                                "captured_at": "2026-01-01T00:00:01Z", "node_id": "local"}]
     node_b = FakeNodeClient()
-    node_b.knowledge_results = [{"session_name": "b-sess", "text": "hit on node b", "captured_at": "2026-01-01T00:00:02Z"}]
+    node_b.knowledge_results = [{"session_name": "b-sess", "text": "hit on node b",
+                                "captured_at": "2026-01-01T00:00:02Z", "node_id": "local"}]
     _register_fake_remote(controller, "search-node-a", node_a)
     _register_fake_remote(controller, "search-node-b", node_b)
 
     result = controller.terminal_knowledge_search_fleet("hit")
     names = {r["session_name"] for r in result["results"]}
     assert names == {"a-sess", "b-sess"}
-    # Each result is tagged with the node it actually came from.
+    # Each result is tagged with the node it actually came from -- NOT
+    # the "local" value it was faked with, matching what a real remote
+    # node's own session_knowledge.py would have sent.
     by_session = {r["session_name"]: r["node_id"] for r in result["results"]}
     assert by_session["a-sess"] == "search-node-a"
     assert by_session["b-sess"] == "search-node-b"
@@ -809,3 +846,92 @@ def test_watchdog_node_event_acknowledge_unknown_id(tmp_path):
     controller, _service = _controller(tmp_path)
     result = controller.terminal_watchdog_acknowledge_node_event(99999)
     assert result["error"] == "EVENT_NOT_FOUND"
+
+
+# -- watchdog: session-dropped-unexpectedly events, FLEET-WIDE ------------
+# (task: "Mở rộng fleet-wide cho session drop" -- extends the earlier
+# local-node-only pass. Mirrors the knowledge_search_fleet tests above:
+# merges across online nodes, tags each row with the REAL node it came
+# from (not whatever "local" value the node's own private DB row
+# happened to carry), tolerates one unreachable node without losing
+# another's events, and never queries an offline node at all.)
+
+def test_watchdog_session_events_fleet_merges_and_tags_every_online_node(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    node_a = FakeNodeClient()
+    node_a.drop_events = [{"id": 1, "node_id": "local", "session_name": "a-sess", "kind": "session_missing",
+                          "detected_at": "2026-01-01T00:00:01Z", "detail": None, "acknowledged": False,
+                          "recovered": False}]
+    node_b = FakeNodeClient()
+    node_b.drop_events = [{"id": 1, "node_id": "local", "session_name": "b-sess", "kind": "session_missing",
+                          "detected_at": "2026-01-01T00:00:02Z", "detail": None, "acknowledged": False,
+                          "recovered": False}]
+    _register_fake_remote(controller, "drop-node-a", node_a)
+    _register_fake_remote(controller, "drop-node-b", node_b)
+
+    result = controller.terminal_watchdog_session_events_fleet()
+    names = {e["session_name"] for e in result["events"]}
+    assert names == {"a-sess", "b-sess"}
+    # Each event is tagged with the node it actually came from -- NOT the
+    # "local" value it was faked with (same bug class fixed in
+    # terminal_knowledge_search_fleet: this must be a direct assignment,
+    # never setdefault, or every remote node's own drop events would be
+    # mislabeled "local").
+    by_session = {e["session_name"]: e["node_id"] for e in result["events"]}
+    assert by_session["a-sess"] == "drop-node-a"
+    assert by_session["b-sess"] == "drop-node-b"
+
+
+def test_watchdog_session_events_fleet_tolerates_an_unreachable_node(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    healthy = FakeNodeClient()
+    healthy.drop_events = [{"id": 1, "node_id": "local", "session_name": "healthy-sess",
+                           "kind": "session_missing", "detected_at": "2026-01-01T00:00:01Z",
+                           "detail": None, "acknowledged": False, "recovered": False}]
+    broken = FakeNodeClient(broken=True)
+    _register_fake_remote(controller, "healthy-node", healthy)
+    _register_fake_remote(controller, "broken-node", broken)
+
+    result = controller.terminal_watchdog_session_events_fleet()
+    assert len(result["events"]) == 1
+    assert result["events"][0]["session_name"] == "healthy-sess"
+    assert "broken-node" in result["node_errors"]
+
+
+def test_watchdog_session_events_fleet_skips_offline_nodes_entirely(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    remote = FakeNodeClient()
+    remote.drop_events = [{"id": 1, "node_id": "local", "session_name": "offline-sess",
+                          "kind": "session_missing", "detected_at": "2026-01-01T00:00:01Z",
+                          "detail": None, "acknowledged": False, "recovered": False}]
+    controller.registry.register("offline-drop-node", display_name="offline-drop-node",
+                                 hostname="offline-host", endpoint="http://offline-drop-node")
+    controller._clients["offline-drop-node"] = remote
+    # Deliberately never heartbeat()'d -- stays OFFLINE/unknown, never queried.
+
+    result = controller.terminal_watchdog_session_events_fleet()
+    assert result["events"] == []
+    assert ("watchdog_session_events", "") not in remote.calls
+
+
+def test_watchdog_acknowledge_session_event_routes_to_the_right_node(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    remote = FakeNodeClient()
+    remote.drop_events = [{"id": 7, "node_id": "local", "session_name": "route-me",
+                          "kind": "session_missing", "detected_at": "2026-01-01T00:00:01Z",
+                          "detail": None, "acknowledged": False, "recovered": False}]
+    _register_fake_remote(controller, "route-node", remote)
+
+    result = controller.terminal_watchdog_acknowledge_session_event("route-node", 7, by="tester")
+    assert result["acknowledged"] is True
+    assert remote.drop_events[0]["acknowledged"] is True
+
+
+def test_watchdog_acknowledge_session_event_unknown_node(tmp_path):
+    controller, _service = _controller(tmp_path)
+    result = controller.terminal_watchdog_acknowledge_session_event("no-such-node", 1)
+    assert result["error"] == "NODE_NOT_FOUND"
