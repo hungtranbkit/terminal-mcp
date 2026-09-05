@@ -302,6 +302,38 @@ def test_recreated_same_name_session_does_not_inherit_input_grant(tmp_path, tmux
     subprocess.run(["tmux", "kill-session", "-t", session], check=False)
 
 
+def test_dashboard_listing_never_shows_a_stale_grant_as_currently_effective(tmp_path, tmux_session_factory):
+    """P0 hotfix (found live: "openclaw-"/"nail"/"server-hub", same root
+    cause as mesflow/promptflow earlier -- a tmux-server restart recreated
+    the session under the same name with a new identity while the grant
+    stayed pinned to the old one). This is NOT a legacy-whitelist bug --
+    the grant record's own `input_enabled` stays True throughout (the
+    STORED intent never changes); only the derived, identity-revalidated
+    `effective_input` correctly goes False. Both dashboard_list_sessions
+    and terminal_list_sessions must report this divergence honestly (the
+    dashboard's own JS renders "Đã cấp: X · Hiệu lực: Y" specifically
+    because of it -- see test_dashboard.py's own source-level test for
+    that rendering)."""
+    import subprocess
+
+    service, session = _granted_session(tmp_path, tmux_session_factory, "newsession-stale-badge")
+    subprocess.run(["tmux", "kill-session", "-t", session], check=True)
+    time.sleep(0.2)
+    subprocess.run(["tmux", "new-session", "-d", "-s", session, "bash -lc 'sleep 20'"], check=True)
+    time.sleep(0.3)
+    try:
+        dash_row = {r["name"]: r for r in service.dashboard_list_sessions()["sessions"]}[session]
+        assert dash_row["grant"]["input_enabled"] is True   # stored intent: unchanged
+        assert dash_row["effective_input"] is False          # actual runtime: correctly blocked
+        assert dash_row["effective_read"] is True             # read is never identity-pinned
+
+        mcp_row = {r["name"]: r for r in service.terminal_list_sessions()["sessions"]}[session]
+        assert mcp_row["input_granted"] is True
+        assert mcp_row["effective_input"] is False
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", session], check=False)
+
+
 # ---------------------------------------------------------------------------
 # Direct / bound / dashboard / Supervisor authorization parity
 # ---------------------------------------------------------------------------

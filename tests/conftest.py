@@ -14,9 +14,8 @@ def read_config() -> AppConfig:
     return AppConfig(PermissionsConfig(True, False), ("test-*", "agent-*"), 50, 20)
 
 
-@pytest.fixture(autouse=True, scope="session")
-def _isolate_default_state_dir(tmp_path_factory):
-    """Global safety net -- a real, live incident found TWICE in one
+def pytest_configure(config: pytest.Config) -> None:
+    """Global safety net -- a real, live incident found repeatedly in one
     session: grants.py's SessionGrantStore(), then session_registry.py's
     SessionRegistryStore() (reconciled on every terminal_list_sessions/
     dashboard_list_sessions call -- i.e. from a huge fraction of this
@@ -38,24 +37,54 @@ def _isolate_default_state_dir(tmp_path_factory):
     unaffected -- both outrank this in every default_*_path()'s own
     lookup order.
 
-    session-scoped, not per-test: a module/class-scoped fixture
-    constructing a TerminalService (several test files do exactly this,
-    reusing one instance across many tests) is itself set up BEFORE any
-    function-scoped fixture ever runs for that module's first test --
-    pytest instantiates broader-scoped fixtures first regardless of
-    request order -- so a PER-TEST (function-scoped) version of this
-    fixture would already be too late for those, confirmed live (it
-    still leaked ~10 rows in one full-suite run). One shared isolated
-    directory for the whole test session closes that ordering gap
-    entirely, at the cost of sharing state across unrelated test files
-    within a single run -- an acceptable trade here: no test in this
-    suite asserts the real ~/.local/state fallback path itself (verified:
-    none reference XDG_STATE_HOME or any default_*_path function by
-    name), and this project's own tests already assume a shared real tmux
-    server/session-name namespace across files (protected_sessions /
-    disposable-name conventions), the same discipline that keeps this
-    additionally-shared directory collision-free in practice."""
-    os.environ["XDG_STATE_HOME"] = str(tmp_path_factory.mktemp("terminal-mcp-test-state"))
+    A `pytest_configure` hook, deliberately NOT a fixture -- tried a
+    function-scoped autouse fixture first (still leaked ~10 rows: a
+    module/class-scoped fixture building a TerminalService is set up
+    BEFORE any function-scoped fixture runs for that module's first
+    test), then a session-scoped autouse fixture (STILL leaked a
+    handful of rows on a full-suite run -- pytest only guarantees
+    higher-scoped fixtures are set up before LOWER-scoped ones that
+    actually DEPEND on them through the request graph; a module that
+    builds its TerminalService as a bare local inside a test function
+    with no fixture at all is unaffected by fixture setup order
+    entirely, since there is no fixture in that path to order against).
+    `pytest_configure` is a pytest hook, not a fixture -- it runs once,
+    before collection even begins, before ANY test module is imported
+    or ANY test function executes, so there is no ordering question left
+    to get wrong. Uses a plain tempfile dir (not tmp_path_factory, which
+    is itself only available inside a fixture) since this runs outside
+    the fixture system entirely.
+
+    Shares one directory for the whole run (not per-test): no test in
+    this suite asserts the real ~/.local/state fallback path itself
+    (verified: none reference XDG_STATE_HOME or any default_*_path
+    function by name), and this project's own tests already assume a
+    shared real tmux server/session-name namespace across files
+    (protected_sessions / disposable-name conventions), the same
+    discipline that keeps this additionally-shared directory collision-
+    free in practice.
+
+    A DIFFERENT, residual source of the same symptom this cannot fix
+    (confirmed live, worth remembering): this project's own real,
+    separately-running `terminal-mcp-http.service` shares the SAME real
+    tmux server this test suite creates disposable sessions on -- while
+    that service is up (the normal state on this dev host) and something
+    is polling its dashboard/MCP session listing (a real open dashboard
+    tab, a real MCP client), ITS OWN reconcile pass sees whatever test
+    session happens to be alive on the shared tmux server at that
+    instant and writes a real row into the PRODUCTION session_registry.
+    db for it -- a completely separate process, with its own unmodified
+    XDG_STATE_HOME, that this hook has no way to reach or isolate. Not a
+    bug in this isolation mechanism (which correctly covers everything
+    the TEST process itself writes) -- an inherent consequence of this
+    project's own testing philosophy (real tmux, real shared server)
+    combined with a real, live sibling service. Harmless (rows are
+    obviously test-named, and correctly age into MISSING once the test's
+    tmux session ends) -- clean up periodically with the same read-only-
+    diff-then-DELETE approach used to discover this, never treat it as
+    a regression to chase further."""
+    import tempfile
+    os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="terminal-mcp-test-state-")
 
 
 def tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

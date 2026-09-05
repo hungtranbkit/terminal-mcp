@@ -2571,6 +2571,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     .perm-badge.full { color:var(--green); border-color:var(--green) }
     .perm-badge.read { color:#8fb8ff; border-color:#8fb8ff }
     .perm-badge.none { color:#ff9f9f; border-color:#ff9f9f }
+    .perm-badge.stale { color:var(--amber); border-color:var(--amber) } /* stored grant present but not currently effective (e.g. IDENTITY_MISMATCH) */
     .attach-dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--line); margin-right:5px; vertical-align:middle }
     .attach-dot.on { background:var(--green) }
     .row-actions { display:flex; gap:6px; align-items:center; white-space:nowrap }
@@ -2809,6 +2810,16 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     }
     function grantStateLabel(state) {
       return state === 'full' ? 'Xem + gửi' : state === 'read' ? 'Chỉ xem' : 'Chưa cấp quyền';
+    }
+    // Actual, current runtime capability -- may diverge from grantState()
+    // above (the STORED grant record) when e.g. IDENTITY_MISMATCH blocks
+    // input for a grant pinned to a session that's since been recreated
+    // (a tmux-server restart, most commonly). See this file's own perm-
+    // badge rendering for why this distinction matters.
+    function effectiveLabel(row) {
+      if (row.effective_input) return 'Xem + gửi';
+      if (row.effective_read) return 'Chỉ xem';
+      return 'Không truy cập';
     }
     const INPUT_BLOCK_LABELS = {
       INPUT_DISABLED: 'nhập liệu đang tắt toàn cục (permissions.terminal_input trong config.yaml)',
@@ -3213,8 +3224,20 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         if (!grantable(row)) { permBadge.classList.add('whitelist'); permBadge.textContent = 'Whitelist tĩnh'; }
         else {
           const state = grantState(row);
+          const granted = grantStateLabel(state);
+          const effective = effectiveLabel(row);
           permBadge.classList.add(state);
-          permBadge.textContent = grantStateLabel(state);
+          // P0 fix: a STORED grant of "Xem + gửi" whose runtime is
+          // actually blocked (most commonly IDENTITY_MISMATCH -- the
+          // session was recreated, e.g. a tmux-server restart, since the
+          // grant was pinned) must never render as a plain, unqualified
+          // "Xem + gửi" here -- that's exactly what let this list badge
+          // claim send access was active while ChatGPT/terminal_send_text
+          // was actually refused. Same "Đã cấp: X · Hiệu lực: Y" wording
+          // this project's own term-bar grant card (#grantBar) and
+          // #permModal already use when the two diverge.
+          permBadge.textContent = granted === effective ? granted : `Đã cấp: ${granted} · Hiệu lực: ${effective}`;
+          if (granted !== effective) permBadge.classList.add('stale');
         }
         tdPerm.appendChild(permBadge);
         tr.appendChild(tdPerm);

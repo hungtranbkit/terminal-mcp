@@ -78,6 +78,25 @@ def test_sessions_admin_html_shows_every_session_never_hides_ungranted(tmux_sess
     assert "rows.length ? 'Không có session khớp bộ lọc.'" in SESSIONS_ADMIN_HTML
 
 
+def test_sessions_admin_row_badge_shows_effective_state_not_just_stored_grant():
+    # P0 hotfix: the row-level perm badge used to render ONLY the STORED
+    # grant preset (grantStateLabel(grantState(row))) regardless of
+    # whether it was actually in force -- a session whose grant said
+    # input_enabled=true but whose effective_input was false (most
+    # commonly IDENTITY_MISMATCH after the underlying session got
+    # recreated, e.g. a tmux-server restart) rendered as a plain,
+    # unqualified "Xem + gửi", indistinguishable from a session that
+    # could genuinely accept input right now. Real bug found live
+    # against "openclaw-"/"nail"/"server-hub". Must now compare against
+    # effectiveLabel(row) and say so explicitly when they diverge -- the
+    # exact "Đã cấp: X · Hiệu lực: Y" wording this file's own #grantBar/
+    # #permModal already use for the identical divergence.
+    assert "function effectiveLabel(row) {" in SESSIONS_ADMIN_HTML
+    assert "const effective = effectiveLabel(row);" in SESSIONS_ADMIN_HTML
+    assert "permBadge.textContent = granted === effective ? granted : `Đã cấp: ${granted} · Hiệu lực: ${effective}`;" in SESSIONS_ADMIN_HTML
+    assert "perm-badge.stale" in SESSIONS_ADMIN_HTML
+
+
 def test_sessions_admin_reuses_the_permission_modal_and_bulk_bar():
     assert "function openPermModal(" in SESSIONS_ADMIN_HTML
     assert "function applyPreset(" in SESSIONS_ADMIN_HTML
