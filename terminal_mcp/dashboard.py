@@ -110,7 +110,7 @@ DASHBOARD_HTML = """<!doctype html>
          (task item 1: "terminal area là trọng tâm"). */
       --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd;
       --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#3b78ff;
-      --mono: ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace;
+      --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono','Courier New',monospace;
       /* Terminal surface tokens (task: "tạo theme token rõ ràng cho
          terminal surface, không hardcode rải rác") -- Windows Terminal's
          own default ("Campbell") dark colour scheme, applied identically
@@ -2668,7 +2668,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Quản lý session</title>
   <style>
-    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --accent:#5b8cff; --mono: ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace; }
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --accent:#5b8cff; --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono','Courier New',monospace; }
     * { box-sizing:border-box }
     html, body { height:100vh; height:100dvh; overflow:hidden }
     body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text); display:flex; flex-direction:column }
@@ -3558,7 +3558,7 @@ NODES_ADMIN_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Quản lý node</title>
   <style>
-    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#5b8cff; --mono: ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace; }
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#5b8cff; --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono','Courier New',monospace; }
     * { box-sizing:border-box }
     html, body { height:100vh; height:100dvh; overflow:hidden }
     body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text); display:flex; flex-direction:column }
@@ -4336,7 +4336,7 @@ WEBTERM_HTML = """<!doctype html>
   <link rel="stylesheet" href="/dashboard/assets/xterm.css">
   <style>
     :root {
-      color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --err:#ff6b6b; --accent:#5b8cff; --mono: ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace;
+      color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --err:#ff6b6b; --accent:#5b8cff; --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono','Courier New',monospace;
       /* Same Windows Terminal "Campbell" palette as the dashboard's own
          terminal-surface tokens (task item 6, single preset shared across
          both real screens that render terminal output) -- this page is the
@@ -4430,7 +4430,7 @@ WEBTERM_HTML = """<!doctype html>
       brightCyan: themeVar('--ansi-14', '#61d6d6'), brightWhite: themeVar('--ansi-15', '#f2f2f2'),
     };
     const term = new Terminal({
-      cursorBlink: true, fontSize, fontFamily: "ui-monospace,SFMono-Regular,Menlo,'DejaVu Sans Mono','Courier New',monospace",
+      cursorBlink: true, fontSize, fontFamily: "ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono','Courier New',monospace",
       scrollback: 5000, theme: xtermTheme, allowProposedApi: true,
     });
     const fitAddon = new FitAddon.FitAddon();
