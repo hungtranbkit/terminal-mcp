@@ -174,8 +174,27 @@ def _match_recent(patterns: tuple[re.Pattern[str], ...], output: str, window: in
 # heuristic-limitations section).
 # ---------------------------------------------------------------------------
 
+# Real, live-discovered bug (P0 QUEUE + SUPERVISOR LIVE TEST checkpoint,
+# 2026-09-07): the marker's own printed form (~150-160 chars on one
+# LOGICAL line) routinely exceeds a normal terminal's column width (e.g.
+# 80), so a captured pane genuinely WRAPS it across multiple physical
+# rows -- each padded with trailing spaces before its own real '\n' (real
+# tmux/pyte row-rendering behavior, not a hypothetical). The original
+# `[^#\n]*?` middle group excluded '\n', so a wrapped marker was NEVER
+# matched at all -- confirmed live: a disposable Claude session
+# correctly replied "alpha" and printed the exact expected marker
+# (visually confirmed in the pane), yet `parse_completion_marker`
+# returned None and the task sat in VERIFYING forever. Fixed by
+# excluding only '#' (never '\n') -- the marker's own fields (hex ids,
+# integers, a fixed enum value) never contain '#', so this still
+# terminates correctly at the real closing '###' and cannot run away
+# past it; `_MARKER_FIELD_RE`'s own `\w+=\S+` extraction is already
+# whitespace/newline-agnostic. `verify_completion_marker`'s exact task_
+# id/attempt/nonce match (not just "some fields were found") remains the
+# real defense against a false positive from incidental text landing
+# inside a match span.
 COMPLETION_MARKER_RE = re.compile(
-    r"###TERMINAL_MCP_COMPLETION\s+protocol=terminal-mcp-completion/v1\s+([^#\n]*?)###"
+    r"###TERMINAL_MCP_COMPLETION\s+protocol=terminal-mcp-completion/v1\s+([^#]*?)###"
 )
 _MARKER_FIELD_RE = re.compile(r"(\w+)=(\S+)")
 COMPLETION_MARKER_REQUIRED_FIELDS = ("task_id", "status", "summary_sha256")

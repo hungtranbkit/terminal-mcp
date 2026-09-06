@@ -340,8 +340,13 @@ present).
 
 ## 7. Persistent Task Queue v2
 
-**Status: VERIFIED** for everything except the background auto-dispatch
-loop's LIVE enablement, which is **IMPLEMENTED_NOT_LIVE_VERIFIED**.
+**Status: VERIFIED**, including the background auto-dispatch loop's LIVE
+behavior on the LOCAL node (2026-09-07 P0 QUEUE + SUPERVISOR LIVE TEST
+checkpoint — see the Feature Details entry below for the full write-up).
+Auto-dispatch against a REMOTE node (dell-5530) end-to-end remains
+**IMPLEMENTED_NOT_LIVE_VERIFIED** (Backlog item 1, unchanged by this
+pass) — this checkpoint deliberately used local/Linux disposable
+sessions only, per its own explicit scope.
 
 - **Persist-before-dispatch:** every prompt becomes a durable
   `queue_tasks` row (via `terminal_enqueue_task`/`terminal_queue_set/
@@ -367,17 +372,19 @@ loop's LIVE enablement, which is **IMPLEMENTED_NOT_LIVE_VERIFIED**.
   ordering, exactly one active task per lane at a time; other lanes
   progress independently (never serialized across sessions).
 - **Background auto-dispatch + global kill switch/config:**
-  `queue_loop.py`'s `QueueLoop` — a real daemon thread, code-complete
-  and unit/integration-tested (incl. a REAL background thread driving a
-  full lifecycle with zero manual `tick()` calls). Two independent,
-  stacked gates: `config.queue.enabled` (new `QueueConfig`, global,
-  `False` by default in this project's own `config.yaml`) AND the
-  existing per-lane `queue_lanes.auto_dispatch_enabled` (`False` by
-  default). **Neither gate is on for any real session right now,
-  including window/window2** — this is IMPLEMENTED_NOT_LIVE_VERIFIED
-  specifically because it has not yet been run against a real remote
-  node (dell-5530) end to end; that live smoke test is this task
-  batch's own explicit next step (see Backlog).
+  `queue_loop.py`'s `QueueLoop` — a real daemon thread. Two independent,
+  stacked gates: `config.queue.enabled` (global — **now `true`** in
+  production `config.yaml` since the 2026-09-07 checkpoint below) AND
+  the per-lane `queue_lanes.auto_dispatch_enabled` (`False` by default,
+  per-lane opt-in). **The per-lane gate is still off for every real
+  session, including window/window2/wtest** — only 4 disposable
+  `claude-qtest-*` lanes were ever turned on, and all 4 were turned back
+  off and their sessions killed once the live test finished. Confirmed
+  live: the REAL running `terminal-mcp-http.service` process
+  automatically dispatched, ran, and verified every disposable task
+  with ZERO manual `tick()`/`run_once()` calls from the test itself —
+  the loop's own 3s poll cycle did all of it, unattended, exactly as
+  designed.
 - **Task inbox / session task views:** VERIFIED — §3's Task Manager/
   Global Inbox entries.
 
@@ -1391,6 +1398,128 @@ scan/audit view over the SAME facts.)*
   (liveness fix, `AGENT_GENERATION`, fleet-aware `registry_reopen`
   routing — this entry builds directly on top of all three).
 - **Follow-up/backlog:** Backlog items 11–13.
+- **Trace:** see this file's own commit.
+
+### P0 Queue + Supervisor live test (local/Linux)
+
+- **Goal / user value:** prove the Persistent Task Queue v2 auto-dispatch
+  loop and Supervisor v2's suggest_only decision pipeline actually work
+  end-to-end against real, live sessions and the real production
+  service — not just unit tests — before ever considering enabling
+  either for window/window2/wtest.
+- **Status:** VERIFIED (local/Linux disposable sessions only, per this
+  checkpoint's own explicit scope — remote Windows dell-5530 auto-
+  dispatch remains a separate, still-pending backlog item).
+- **What was found and fixed (two real, live-discovered bugs):**
+  1. **`queue.db` migration drift:** this project's own real, existing
+     `queue.db` (7 lanes, including window/window2/wtest) had `PRAGMA
+     user_version=4` yet was genuinely missing `dispatch_idempotency_key`
+     — confirmed via `git log -S` that this column has been part of
+     Migration 2's own body since the very commit that introduced it, so
+     the only honest explanation is this specific file was created
+     against an in-development state of that migration before the
+     column existed, with `user_version` already stamped past 2 by the
+     time it was added. Every read of the affected table crashed with
+     `IndexError`. Fixed with a new `Migration(5, ...)` that checks
+     column existence via a real `PRAGMA table_info` first (never a
+     try/except) — a no-op on any fresh `queue.db` (migration 2 already
+     includes the column from the start), heals the one real drifted
+     case otherwise. Applied to the real production `queue.db`.
+  2. **Completion-marker line-wrapping bug (independent, more
+     consequential):** the structured completion marker (`###TERMINAL_
+     MCP_COMPLETION ...`, ~150-160 chars on one logical line) routinely
+     exceeds a normal terminal's column width, so a captured pane
+     genuinely wraps it across multiple physical rows (each padded with
+     trailing spaces before its own real `\n` — real tmux/pyte row-
+     rendering, not hypothetical). The old regex's middle group excluded
+     `\n`, so a wrapped marker was **never matched at all** — a real
+     disposable Claude session correctly replied and printed the exact
+     expected marker (visually confirmed in the pane), yet the task sat
+     in `VERIFYING` forever. This would very likely affect ANY real
+     production task dispatched into a standard-width pane, not a rare
+     edge case. Fixed in `status.py`'s `COMPLETION_MARKER_RE`: excludes
+     only `#` now (never `\n`) — the marker's own fields never contain
+     `#`, so it still terminates correctly at the real closing `###` and
+     cannot run away past it; confirmed this doesn't create a false-
+     bridging risk (a stray `#` anywhere still breaks that one match
+     attempt, never causes bridging to a later, unrelated marker).
+- **Config change:** `config.yaml` gained `queue: enabled: true` (the
+  global auto-dispatch gate) — the per-lane `auto_dispatch_enabled` flag
+  (the second, independent gate) stays `False` for every existing lane,
+  including window/window2/wtest; only 4 disposable `claude-qtest-*`
+  lanes were ever turned on for this test, all turned back off and their
+  sessions killed once finished.
+- **Scope / flow:** exercises the REAL running `terminal-mcp-http.service`
+  process's own background `QueueLoop` (3s poll) and `SupervisorService.
+  run_once` polling — the test script only ever enqueued tasks / created
+  watches / observed state; it never manually drove a dispatch tick.
+- **Acceptance/tests/evidence — live, real, on the actual production
+  service (all disposable sessions/lanes cleaned up after):**
+  1. **5 sequential tasks, 1 session:** all `QUEUED -> PRECHECK -> READY
+     -> RUNNING -> VERIFYING -> COMPLETED`, one at a time, each with a
+     unique task_id/nonce/summary_sha256 in `verification_evidence`
+     (confirmed no cross-task contamination).
+  2. **6 tasks across 3 sessions (2 each):** all COMPLETED, running in
+     genuine parallel once each session had its own separate cwd (an
+     initial attempt using ONE shared cwd for all 3 correctly triggered
+     the Coordinator's existing cross-lane same-repo conflict check —
+     working as designed, not a bug, but revealed a test-setup mistake).
+  3. **Dependency chain:** task B (`depends_on: [A]`) correctly stayed
+     `QUEUED` while A was `READY`/`RUNNING`, and only started dispatching
+     once A reached `COMPLETED`.
+  4. **Blocked task:** `metadata.artificial_blocker` correctly produced
+     `BLOCKED` with `coordinator_reason: "operator-declared blocker:
+     ..."`, verified alongside the dependency-chain task completing
+     normally in a sibling lane.
+  5. **Node/session unavailable then back:** killed a session with a
+     task already `WAITING_SESSION`; task correctly held (never lost,
+     never marked FAILED); recreating the session under the same name
+     let the SAME task (same id) resume through to `COMPLETED`.
+  6. **Controller restart mid-QUEUED:** enqueued a task, restarted
+     `terminal-mcp-http.service` immediately (before dispatch) — task
+     survived (`PRECHECK` right after restart) and completed exactly
+     once (`attempt_count: 1`, one row with that title) — 0 dropped, 0
+     duplicated.
+  7. **Supervisor v2, `observe_only`:** watch created on a disposable
+     session, correctly tracked `UNKNOWN -> COMPLETION_CANDIDATE ->
+     VERIFIED_DONE` via the real quiet-window promotion, with ZERO
+     actionable events generated (by design — `list_actionable_events`
+     explicitly filters out `observe_only` policies) and zero auto-send.
+  8. **Supervisor v2, `suggest_only`, full real cycle:** a real shell
+     session's own `read -p "Do you want to continue? [y/n] "` produced
+     a genuine `WAITING_INPUT` state → `attention_required` actionable
+     event → `claim_event` (double-claim correctly rejected:
+     `ACTION_ALREADY_ACTIVE_FOR_WATCH`) → `submit_decision` (`"y"`) →
+     `review_action` (approve) → `execute_send` (real send, pane
+     correctly shows the prompt answered and a fresh shell prompt) →
+     re-`execute_send` correctly rejected (`ALREADY_SENT_OR_NOT_APPROVED`)
+     — full idempotency confirmed. `approved_auto_continue` itself
+     (auto-approval without a manual `review_action` step) was NOT
+     separately tested this pass — the claim/decision/send/idempotency
+     mechanics it shares with `suggest_only` are already proven above;
+     see Known limitations.
+  9. Dashboard's real data sources (`queue.session_task_board`,
+     `queue.global_inbox`) confirmed reflecting live state throughout
+     (correct running/queued/blocked_rework counts, correct fleet-wide
+     totals across all 10 real+disposable lanes).
+- **Known limitations:** (1) `approved_auto_continue` not separately
+  live-tested this pass (see above); (2) remote Windows (dell-5530)
+  auto-dispatch end-to-end is still a separate, unstarted backlog item
+  (item 1) — this checkpoint was local/Linux only, per its own explicit
+  scope; (3) Claude Code's own UI footer (e.g. "✻ Worked for Ns · done")
+  always renders after a response, which pushed an artificially-crafted
+  "waiting for input" phrase out of `detect_waiting_input`'s own "last 4
+  non-empty lines" window when attempted inside a Claude session directly
+  — a real shell session was used instead to get a clean, natural
+  `WAITING_INPUT` signal; this is a testing-methodology note, not a
+  product bug (a REAL Claude Code permission/confirmation dialog, unlike
+  a plain instructed reply, does behave like the shell case).
+- **Dependencies:** Persistent Task Queue v2 / Coordinator Agent (§7/§8,
+  unchanged), Supervisor v2 (§6, unchanged) — this entry is a live
+  verification pass over existing, already-documented features plus two
+  real bug fixes it found along the way.
+- **Follow-up/backlog:** remote Windows queue auto-dispatch smoke test
+  (Backlog item 1, unchanged); `approved_auto_continue` live test.
 - **Trace:** see this file's own commit.
 
 ### Living-requirements convention itself

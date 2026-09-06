@@ -68,6 +68,52 @@ def test_parse_completion_marker_picks_the_last_of_several():
     assert fields["task_id"] == "xyz789"
 
 
+def test_parse_completion_marker_survives_real_terminal_line_wrapping():
+    # Real, live-discovered bug (P0 QUEUE + SUPERVISOR LIVE TEST
+    # checkpoint, 2026-09-07): a real disposable Claude session, in a
+    # real ~80-column tmux pane, printed the marker exactly as
+    # instructed -- but the pane's own row-wrapping (padding each
+    # visual row to full width before a real '\n') split it across
+    # several physical lines, and the OLD regex (`[^#\n]*?`, excluding
+    # '\n') never matched at all -- the task sat in VERIFYING forever
+    # even though the agent had genuinely completed it. This is a
+    # faithful reproduction of the actual captured pane text from that
+    # live session (trailing space padding before each wrap included).
+    wrapped = (
+        "  ###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1                \n"
+        "  task_id=5455ccf75f314318886140bc48689d5d attempt=1                            \n"
+        "  nonce=2dd1b21656084b6ca675cbc711c3f295 status=completion_candidate            \n"
+        "  summary_sha256=e8899e7889d721c3###                                            \n"
+    )
+    fields = parse_completion_marker(f"some output\n{wrapped}\nmore output")
+    assert fields is not None
+    assert fields["task_id"] == "5455ccf75f314318886140bc48689d5d"
+    assert fields["nonce"] == "2dd1b21656084b6ca675cbc711c3f295"
+    assert fields["status"] == "completion_candidate"
+    assert fields["summary_sha256"] == "e8899e7889d721c3"
+
+
+def test_parse_completion_marker_wrapped_still_never_bridges_past_a_hash():
+    # The relaxed `[^#]*?` (was `[^#\n]*?`) must still never match PAST
+    # a real '#' -- confirms this isn't an unbounded/greedy regression:
+    # two wrapped markers stay correctly separate, and a stray '#'
+    # inside unrelated prose between them still terminates the match at
+    # the FIRST closing ### it finds, never swallowing everything up to
+    # a later one.
+    stray_hash = "note: see issue #42 for context\n"
+    two_wrapped = (
+        "###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1\n"
+        "task_id=first attempt=1 status=completion_candidate\n"
+        "summary_sha256=aaaa###\n"
+        f"{stray_hash}"
+        "###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1\n"
+        "task_id=second attempt=1 status=completion_candidate\n"
+        "summary_sha256=bbbb###\n"
+    )
+    fields = parse_completion_marker(two_wrapped)
+    assert fields["task_id"] == "second"  # last well-formed match, same as before this fix
+
+
 def test_quoted_or_pasted_marker_text_is_still_just_a_marker_match():
     # This module has no concept of "quoting" -- a marker match is a
     # marker match regardless of surrounding context. That is fine: the
