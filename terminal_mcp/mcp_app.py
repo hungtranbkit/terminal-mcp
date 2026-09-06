@@ -9,6 +9,7 @@ from .controller import ControllerService, build_default_controller
 from .core import TerminalService
 from .coordinator import CoordinatorGate
 from .integration_engine import IntegrationEngine
+from .task_migration import TaskMigrationPlanner
 from .integration_service import IntegrationService
 from .integration_store import publish_handoff_for_completed_task
 from .node_models import node_to_dict as _node_to_dict
@@ -77,6 +78,11 @@ def build_mcp(service: TerminalService | None = None,
     queue_engine = QueueEngine(queue.store, controller, coordinator=CoordinatorGate(),
                               on_completed=_on_task_completed)
     integration.engine = integration.engine or IntegrationEngine(integration.store, queue.store)
+    # Task Migration/Load Balancing: same node-aware controller as
+    # everything else, so eligibility checks (item 6) resolve a
+    # destination session's real cwd/node_id regardless of which node
+    # it's on.
+    queue.planner = queue.planner or TaskMigrationPlanner(queue.store, controller)
     server = MCPServer(
         name="terminal-mcp",
         description="Whitelist-only tmux observation and controlled input",
@@ -988,6 +994,51 @@ def build_mcp(service: TerminalService | None = None,
         runtime measurement that could read nonzero; see queue_store.py's
         own metrics() docstring)."""
         return queue.metrics(session)
+
+    # -- Task Migration / Load Balancing (task: "bổ sung Task Migration /
+    # Load Balancing vào Queue/Coordinator") -- moves a task's OWNERSHIP
+    # (its lane) between sessions in the SAME project, never creating a
+    # new task, never touching a RUNNING task. Auto-rebalance is
+    # ALWAYS dry-run unless a caller explicitly passes dry_run=false
+    # (item 10's own "Dry-run phải cho xem plan trước").
+
+    @server.tool()
+    def terminal_task_set_project(session: str, project: str | None = None) -> dict:
+        """Groups `session` into `project` for rebalancing purposes
+        (item 11) -- rebalancing only ever considers sessions sharing
+        the exact same project value; pass project=None to clear it."""
+        return queue.set_project(session, project)
+
+    @server.tool()
+    def terminal_task_reassign(task_id: str, to_session: str, reason: str, actor: str = "chatgpt") -> dict:
+        """Moves ONE task's ownership to `to_session` -- same task_id,
+        full history preserved (item 1). Only QUEUED/WAITING_SESSION/
+        BLOCKED/FAILED tasks are eligible (item 2: never a RUNNING task,
+        hot); refuses with TASK_ALREADY_CLAIMED if a dispatcher claimed
+        it in the meantime (item 12's own race-safety requirement)."""
+        return queue.reassign(task_id, to_session, reason=reason, actor=actor)
+
+    @server.tool()
+    def terminal_task_assignment_history(task_id: str) -> dict:
+        """The task's own original_owner (never changes) and full,
+        ordered migration_history."""
+        return queue.assignment_history(task_id)
+
+    @server.tool()
+    def terminal_task_rebalance_plan(project: str | None, sessions: list[str]) -> dict:
+        """Preview-only (item 10): computes what terminal_task_rebalance
+        WOULD do, applying nothing. Always safe to call."""
+        return queue.rebalance_plan(project, sessions)
+
+    @server.tool()
+    def terminal_task_rebalance(project: str | None, sessions: list[str], dry_run: bool = True) -> dict:
+        """dry_run=True (the default): identical to terminal_task_
+        rebalance_plan, applies nothing. dry_run=False: actually applies
+        the plan via race-safe terminal_task_reassign calls, one per
+        move -- a task claimed by a dispatcher in the meantime fails
+        clean for that one move only, every other move in the plan
+        still applies."""
+        return queue.rebalance(project, sessions, dry_run=dry_run)
 
     # -- Phase 2: Coordinator Agent gate + dispatch (task: "Supervisor
     # Queue v2 Phase 2 -- Coordinator Agent")

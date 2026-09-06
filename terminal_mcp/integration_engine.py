@@ -33,6 +33,7 @@ after the (possibly no-op) merge completes.
 """
 from __future__ import annotations
 
+import calendar
 import subprocess
 import time
 from dataclasses import dataclass
@@ -361,7 +362,11 @@ class IntegrationEngine:
         if not pending:
             return EngineResult(project, "WAITING_FOR_HANDOFF")
         oldest_integrated_at = min(h.integrated_at for h in pending if h.integrated_at)
-        age_seconds = time.time() - time.mktime(time.strptime(oldest_integrated_at, "%Y-%m-%dT%H:%M:%SZ"))
+        # calendar.timegm, not time.mktime -- these timestamps are always
+        # UTC; time.mktime wrongly assumes local time, a real bug found
+        # and fixed on any host whose local timezone isn't UTC (see
+        # queue_store.py's own identical fix/comment).
+        age_seconds = time.time() - calendar.timegm(time.strptime(oldest_integrated_at, "%Y-%m-%dT%H:%M:%SZ"))
         if len(pending) >= pipeline["batch_size"] or age_seconds >= pipeline["batch_max_wait_seconds"]:
             batch = self.store.create_batch(project, [h.id for h in pending])
             return EngineResult(project, "BATCH_CREATED", batch_id=batch.id, detail=f"{len(pending)} handoffs")

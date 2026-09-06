@@ -90,6 +90,11 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_enqueue_task",
         "terminal_task_status",
         "terminal_queue_metrics",
+        "terminal_task_set_project",
+        "terminal_task_reassign",
+        "terminal_task_assignment_history",
+        "terminal_task_rebalance_plan",
+        "terminal_task_rebalance",
     }
 
 

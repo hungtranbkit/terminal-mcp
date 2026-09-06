@@ -29,18 +29,23 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .permissions import valid_session_name
-from .queue_store import VERIFYING, InvalidTransitionError, QueueStore
+from .queue_store import VERIFYING, InvalidTransitionError, TaskAlreadyClaimedError, QueueStore
 
 
 class QueueService:
     def __init__(self, store: QueueStore | None = None, *,
-                on_completed: Callable[[Any], None] | None = None) -> None:
+                on_completed: Callable[[Any], None] | None = None, planner: Any = None) -> None:
         self.store = store or QueueStore()
         # Same optional 3-role-model hook as QueueEngine's own
         # on_completed -- the explicit-fallback completion path
         # (verify(), below) needs to fire it too, not just the
         # automatic marker-verified path.
         self.on_completed = on_completed
+        # Task Migration/Load Balancing (task: "bổ sung Task Migration /
+        # Load Balancing"): a TaskMigrationPlanner, wired in by mcp_app.py
+        # once a real SessionOps (the controller) exists -- same
+        # deferred-assignment pattern as IntegrationService.engine.
+        self.planner = planner
 
     def _validate_session(self, session: str) -> dict[str, Any] | None:
         if not session or not valid_session_name(session):
@@ -224,3 +229,59 @@ class QueueService:
             return error
         self.store.set_auto_dispatch(session, enabled)
         return self.store.lane_status(session)
+
+    # -- Task Migration / Load Balancing -----------------------------------
+
+    def set_project(self, session: str, project: str | None) -> dict[str, Any]:
+        if error := self._validate_session(session):
+            return error
+        self.store.set_lane_project(session, project)
+        return self.store.lane_status(session)
+
+    def reassign(self, task_id: str, to_session: str, *, reason: str, actor: str) -> dict[str, Any]:
+        """task_reassign(task_id, to_session, reason) -- item 10's own
+        minimum tool. Fails clean (never partially applies) if the task
+        is no longer eligible (already claimed, RUNNING, terminal, ...)."""
+        if error := self._validate_session(to_session):
+            return error
+        task = self.store.get_task(task_id)
+        if task is None:
+            return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+        try:
+            updated = self.store.reassign_task(task_id, to_session, reason=reason, actor=actor)
+        except TaskAlreadyClaimedError as exc:
+            return {"error": "TASK_ALREADY_CLAIMED", "task_id": task_id, "reason": str(exc)}
+        except KeyError:
+            return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+        return {"task": updated.to_dict()}
+
+    def assignment_history(self, task_id: str) -> dict[str, Any]:
+        try:
+            return self.store.assignment_history(task_id)
+        except KeyError:
+            return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+
+    def rebalance_plan(self, project: str | None, sessions: list[str], *,
+                       imbalance_threshold: int | None = None) -> dict[str, Any]:
+        """task_rebalance_plan(project) -- item 10's own dry-run-first
+        requirement: ALWAYS just a preview, never applies anything."""
+        if self.planner is None:
+            return {"error": "PLANNER_NOT_CONFIGURED"}
+        kwargs = {} if imbalance_threshold is None else {"imbalance_threshold": imbalance_threshold}
+        plan = self.planner.plan_rebalance(project, sessions, **kwargs)
+        return {"project": project, "plan": plan, "move_count": len(plan)}
+
+    def rebalance(self, project: str | None, sessions: list[str], *, dry_run: bool = True, actor: str = "auto-balancer",
+                  imbalance_threshold: int | None = None) -> dict[str, Any]:
+        """task_rebalance(project, dry_run=true/false) -- dry_run=True
+        (the default, and the ONLY mode a caller gets without explicitly
+        opting out) returns the exact same plan rebalance_plan would,
+        applying nothing. dry_run=False actually calls apply_plan."""
+        if self.planner is None:
+            return {"error": "PLANNER_NOT_CONFIGURED"}
+        kwargs = {} if imbalance_threshold is None else {"imbalance_threshold": imbalance_threshold}
+        plan = self.planner.plan_rebalance(project, sessions, **kwargs)
+        if dry_run:
+            return {"project": project, "plan": plan, "move_count": len(plan), "applied": False}
+        results = self.planner.apply_plan(plan, actor=actor)
+        return {"project": project, "plan": plan, "results": results, "applied": True}

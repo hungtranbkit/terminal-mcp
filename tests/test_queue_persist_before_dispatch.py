@@ -166,6 +166,18 @@ def test_metrics_reports_zero_missed_and_dropped_by_construction(store):
     assert metrics["queued_depth"] == 2
 
 
+def test_oldest_queued_age_of_a_just_enqueued_task_is_near_zero_not_a_timezone_offset(store):
+    """Regression test for a real bug found in this same task: age
+    computations that mix time.mktime (assumes LOCAL time) with a UTC-
+    stamped ('...Z') timestamp are off by the host's own UTC offset --
+    on this dev host, exactly +25200s (UTC+7). A task enqueued THIS
+    instant must report an age of a few seconds at most, never
+    thousands."""
+    store.set_tasks("lane-a", [{"prompt": "a"}])
+    metrics = store.metrics("lane-a")
+    assert metrics["oldest_queued_age_seconds"] < 5
+
+
 def test_metrics_counts_uncertain_and_waiting_session(store):
     ids = store.set_tasks("lane-a", [{"prompt": "a"}, {"prompt": "b"}])
     store.transition_task(ids[0], "DISPATCHING", event_type="TEST")

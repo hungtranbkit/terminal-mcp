@@ -39,6 +39,7 @@ on which session name a caller chooses to act on.
 """
 from __future__ import annotations
 
+import calendar
 import contextlib
 import json
 import os
@@ -182,6 +183,17 @@ class InvalidTransitionError(ValueError):
     fail loudly in a test, not quietly corrupt a task's history."""
 
 
+class TaskAlreadyClaimedError(ValueError):
+    """Raised by reassign_task (Task Migration/Load Balancing, item 12's
+    own race-safety requirement) when the task is no longer in a
+    migratable status by the time the reassignment's own atomic
+    transaction runs -- e.g. a dispatcher concurrently claimed it
+    (QUEUED -> PRECHECK) in the window between a caller's own eligibility
+    check and this call. The caller (task_migration.py) reports this as
+    TASK_ALREADY_CLAIMED rather than silently reassigning out from under
+    a live claim."""
+
+
 def is_valid_transition(from_status: str, to_status: str) -> bool:
     return to_status in VALID_TRANSITIONS.get(from_status, frozenset())
 
@@ -220,6 +232,9 @@ class QueueTask:
     verification_nonce: str | None = None
     dispatch_idempotency_key: str | None = None
     uncertain_or_waiting_since: str | None = None
+    original_owner: str | None = None
+    migration_history: tuple[dict[str, Any], ...] = ()
+    at_risk: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "QueueTask":
@@ -242,6 +257,9 @@ class QueueTask:
             verification_nonce=row["verification_nonce"],
             dispatch_idempotency_key=row["dispatch_idempotency_key"],
             uncertain_or_waiting_since=row["uncertain_or_waiting_since"],
+            original_owner=row["original_owner"],
+            migration_history=tuple(_parse_json_dict_list(row["migration_history"])),
+            at_risk=bool(row["at_risk"]),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -262,6 +280,9 @@ class QueueTask:
             "verification_nonce": self.verification_nonce,
             "dispatch_idempotency_key": self.dispatch_idempotency_key,
             "uncertain_or_waiting_since": self.uncertain_or_waiting_since,
+            "original_owner": self.original_owner,
+            "migration_history": list(self.migration_history),
+            "at_risk": self.at_risk,
         }
 
 
@@ -283,6 +304,16 @@ def _parse_json_list(raw: str | None) -> list[str]:
     except (TypeError, ValueError):
         return []
     return [str(item) for item in parsed] if isinstance(parsed, list) else []
+
+
+def _parse_json_dict_list(raw: str | None) -> list[dict[str, Any]]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
 
 
 def iso_now() -> str:
@@ -417,12 +448,41 @@ def _add_v3_uncertain_waiting_column(connection: sqlite3.Connection) -> None:
     connection.execute("ALTER TABLE queue_tasks ADD COLUMN uncertain_or_waiting_since TEXT")
 
 
+def _add_v4_migration_columns(connection: sqlite3.Connection) -> None:
+    """Task Migration / Load Balancing (task: "bổ sung Task Migration /
+    Load Balancing vào Queue/Coordinator"). Additive only. original_owner
+    is set ONCE (at creation, to the task's initial session) and never
+    changes again -- migration_history is the full, ordered provenance
+    trail; `session` itself (the task's CURRENT assignment) is the only
+    column reassign_task ever actually moves. at_risk marks a RUNNING
+    task whose own session went offline (item 8) -- informational only,
+    never auto-migrated. queue_lanes gets `project` (an optional
+    grouping key -- rebalancing only ever considers same-project lanes;
+    None only matches None, so unconfigured lanes are never accidentally
+    mixed) and `last_rebalance_at` (the cooldown/hysteresis clock, item
+    5's own "cooldown để task không ping-pong qua lại")."""
+    for column, declaration in (
+        ("original_owner", "TEXT"),
+        ("migration_history", "TEXT"),  # JSON list of {from, to, reason, time, actor}
+        ("at_risk", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        connection.execute(f"ALTER TABLE queue_tasks ADD COLUMN {column} {declaration}")
+    connection.execute("UPDATE queue_tasks SET original_owner = session WHERE original_owner IS NULL")
+    for column, declaration in (
+        ("project", "TEXT"),
+        ("last_rebalance_at", "TEXT"),
+    ):
+        connection.execute(f"ALTER TABLE queue_lanes ADD COLUMN {column} {declaration}")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
                  "coordinator_decision/verification_evidence)", _add_v2_coordinator_columns),
     Migration(3, "P0 persist-before-dispatch: DISPATCH_UNCERTAIN/WAITING_SESSION grace-period column",
              _add_v3_uncertain_waiting_column),
+    Migration(4, "Task Migration/Load Balancing: original_owner/migration_history/at_risk, "
+                 "lane project/last_rebalance_at", _add_v4_migration_columns),
 ]
 
 
@@ -535,6 +595,8 @@ class QueueStore:
             "paused": bool(lane_row["paused"]),
             "paused_reason": lane_row["paused_reason"],
             "auto_dispatch_enabled": bool(lane_row["auto_dispatch_enabled"]),
+            "project": lane_row["project"],
+            "last_rebalance_at": lane_row["last_rebalance_at"],
             "tasks": tasks,
             "current_task": active,
             "queued_count": queued_count,
@@ -597,12 +659,13 @@ class QueueStore:
                 ids.append(task_id)
                 connection.execute(
                     "INSERT INTO queue_tasks (id, session, position, title, prompt, status, created_at, "
-                    "attempt_count, max_attempts, completion_policy, metadata, updated_at, priority, depends_on) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
+                    "attempt_count, max_attempts, completion_policy, metadata, updated_at, priority, depends_on, "
+                    "original_owner) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
                     (task_id, session, next_position + offset, task.get("title") or "", task["prompt"], QUEUED, now,
                      int(task.get("max_attempts") or 3), json.dumps(task.get("completion_policy") or {}),
                      json.dumps(task.get("metadata") or {}), now, int(task.get("priority") or 0),
-                     json.dumps(list(task.get("depends_on") or []))),
+                     json.dumps(list(task.get("depends_on") or [])), session),
                 )
                 self._record_event_locked(connection, session=session, task_id=task_id, event_type="ENQUEUED",
                                           reason=None)
@@ -916,8 +979,15 @@ class QueueStore:
         RUNNING first. Never drops a task -- the worst case is an extra,
         safely-deduped retry attempt, never silence."""
         now_epoch = now or iso_now()
+        # calendar.timegm (NOT time.mktime, which wrongly assumes its
+        # struct_time input is LOCAL time) -- these timestamps are
+        # always UTC (iso_now() stamps via time.gmtime()), so this must
+        # use the UTC-correct inverse or every host whose local
+        # timezone isn't UTC computes a cutoff off by that offset (a
+        # real bug found and fixed in this same task -- see this
+        # module's own CHANGELOG-equivalent commit message).
         cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                              time.gmtime(time.mktime(time.strptime(now_epoch, "%Y-%m-%dT%H:%M:%SZ")) - grace_seconds))
+                              time.gmtime(calendar.timegm(time.strptime(now_epoch, "%Y-%m-%dT%H:%M:%SZ")) - grace_seconds))
         with self._connection() as connection:
             clause = "session = ? AND " if session else ""
             params: tuple[Any, ...] = (session,) if session else ()
@@ -973,10 +1043,13 @@ class QueueStore:
         queued = [row for row in rows if row["status"] == QUEUED]
         uncertain = [row for row in rows if row["status"] == DISPATCH_UNCERTAIN]
         waiting_session = [row for row in rows if row["status"] == WAITING_SESSION]
-        now_epoch = time.mktime(time.strptime(iso_now(), "%Y-%m-%dT%H:%M:%SZ"))
+        now_epoch = calendar.timegm(time.strptime(iso_now(), "%Y-%m-%dT%H:%M:%SZ"))
 
         def _age_seconds(created_at: str) -> float:
-            return now_epoch - time.mktime(time.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ"))
+            # calendar.timegm, not time.mktime -- see reconcile_uncertain_
+            # and_waiting's own comment for why (a real bug found and
+            # fixed in this task, affecting every non-UTC host).
+            return now_epoch - calendar.timegm(time.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ"))
 
         oldest_queued_age = max((_age_seconds(row["created_at"]) for row in queued), default=0.0)
         return {
@@ -1025,6 +1098,137 @@ class QueueStore:
                             "use transition_task directly only for a test/legacy no-evidence path")
         return self.transition_task(task_id, COMPLETED, event_type="VERIFIED",
                                     extra_fields={"verification_evidence": json.dumps(evidence)})
+
+    # -- Task Migration / Load Balancing -----------------------------------
+
+    _MIGRATABLE_STATUSES = (QUEUED, WAITING_SESSION, BLOCKED, FAILED)
+    """Task Migration item 2: "Chỉ migrate task QUEUED/WAITING/READY chưa
+    thực thi." Deliberately narrower than that in one respect (READY is
+    EXCLUDED here, disclosed): READY means the Coordinator Agent has
+    ALREADY approved this exact task for THIS session (session/cwd/
+    node_id identity checks already passed against the source session --
+    see coordinator.py's own review()) -- moving it to a different
+    session at that point would silently invalidate a review that
+    already happened without re-running it. reassign_task instead moves
+    a READY task back through QUEUED (a fresh claim+review will happen
+    at the NEW destination regardless) rather than trying to carry a
+    stale approval across a session change; BLOCKED/FAILED are included
+    (a operator explicitly moving a stuck task to a healthier session is
+    exactly item 8's own use case) even though they're not, technically,
+    "chưa thực thi" -- they never actually ran to completion either."""
+
+    def reassign_task(self, task_id: str, to_session: str, *, reason: str, actor: str) -> QueueTask:
+        """Moves ONE task's OWNERSHIP (its own `session` column -- the
+        lane it belongs to) from its current session to `to_session`.
+        NEVER creates a new task (item 1) -- same task_id, same prompt/
+        metadata/dependencies/attempt_count/priority throughout; only
+        `session` and (append-only) `migration_history` change.
+        original_owner is set once, at creation, and never touched here.
+
+        RACE SAFETY (item 12): atomic `BEGIN IMMEDIATE` transaction,
+        re-checking the task's status INSIDE it -- if a dispatcher
+        concurrently claimed this exact task (QUEUED -> PRECHECK)
+        between whatever caller-side check led here and this call
+        actually running, this raises TaskAlreadyClaimedError instead of
+        silently reassigning out from under a live claim.
+
+        REFUSES any task not currently in _MIGRATABLE_STATUSES --
+        RUNNING/DISPATCHING/VERIFYING/PRECHECK/READY/PAUSED are never
+        hot-migrated (item 2's own "Task RUNNING mặc định không được
+        chuyển nóng"); use mark_at_risk for a RUNNING task whose session
+        went offline instead of trying to move it."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise KeyError(f"no such task: {task_id}")
+            if row["status"] not in self._MIGRATABLE_STATUSES:
+                connection.rollback()
+                raise TaskAlreadyClaimedError(
+                    f"{task_id}: status is {row['status']!r}, no longer eligible for reassignment "
+                    f"(expected one of {self._MIGRATABLE_STATUSES})"
+                )
+            from_session = row["session"]
+            history = _parse_json_dict_list(row["migration_history"])
+            history.append({"from": from_session, "to": to_session, "reason": reason, "actor": actor,
+                           "time": iso_now()})
+            max_position_row = connection.execute(
+                "SELECT COALESCE(MAX(position), -1) AS max_position FROM queue_tasks WHERE session = ?",
+                (to_session,),
+            ).fetchone()
+            new_position = max_position_row["max_position"] + 1
+            self._ensure_lane(connection, to_session)
+            now = iso_now()
+            # Migrating a task OUT of PRECHECK/READY isn't possible here
+            # (excluded from _MIGRATABLE_STATUSES above) -- but a
+            # WAITING_SESSION/BLOCKED/FAILED task moving to a new home
+            # should get a fully fresh start there: back to QUEUED, own
+            # claim/lease state cleared, so the destination's own next
+            # claim_next_task treats it exactly like any other ordinary
+            # QUEUED task (a fresh Coordinator review included).
+            connection.execute(
+                "UPDATE queue_tasks SET session = ?, position = ?, status = ?, migration_history = ?, "
+                "claimed_by = NULL, claim_token = NULL, lease_expires_at = NULL, "
+                "uncertain_or_waiting_since = NULL, updated_at = ? WHERE id = ?",
+                (to_session, new_position, QUEUED, json.dumps(history), now, task_id),
+            )
+            self._record_event_locked(connection, session=from_session, task_id=task_id, event_type="MIGRATED_OUT",
+                                      reason=reason, metadata={"to": to_session, "actor": actor})
+            self._record_event_locked(connection, session=to_session, task_id=task_id, event_type="MIGRATED_IN",
+                                      reason=reason, metadata={"from": from_session, "actor": actor})
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_task(task_id)
+
+    def assignment_history(self, task_id: str) -> dict[str, Any]:
+        """item 10's own `task_assignment_history` tool -- the task's
+        full migration_history plus its own never-changing
+        original_owner and its CURRENT session."""
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(f"no such task: {task_id}")
+        return {"task_id": task_id, "original_owner": task.original_owner, "current_session": task.session,
+               "migration_history": list(task.migration_history)}
+
+    def mark_at_risk(self, task_id: str, *, at_risk: bool = True) -> QueueTask:
+        """Item 8: a RUNNING task whose own session went offline is
+        marked AT_RISK -- purely informational (dashboard-visible),
+        never auto-migrated, never auto-recovered by force-takeover.
+        Does NOT change the task's own status -- at_risk is an
+        orthogonal flag, not a state-machine transition."""
+        with self._connection() as connection:
+            connection.execute("UPDATE queue_tasks SET at_risk = ?, updated_at = ? WHERE id = ?",
+                              (1 if at_risk else 0, iso_now(), task_id))
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"no such task: {task_id}")
+            self._record_event_locked(connection, session=row["session"], task_id=task_id,
+                                      event_type="AT_RISK" if at_risk else "AT_RISK_CLEARED", reason=None)
+        return self.get_task(task_id)
+
+    def set_lane_project(self, session: str, project: str | None) -> None:
+        """Rebalancing (task_migration.py) only ever considers lanes
+        sharing the SAME project value -- None only matches None, so an
+        unconfigured lane is never accidentally grouped with another
+        unconfigured one just because both happen to be blank."""
+        with self._connection() as connection:
+            self._ensure_lane(connection, session)
+            connection.execute("UPDATE queue_lanes SET project = ?, updated_at = ? WHERE session = ?",
+                              (project, iso_now(), session))
+
+    def mark_rebalanced(self, session: str) -> None:
+        """Stamps the cooldown/hysteresis clock (item 5) -- called once
+        per session touched by an APPLIED (not dry-run) rebalance plan."""
+        with self._connection() as connection:
+            self._ensure_lane(connection, session)
+            connection.execute("UPDATE queue_lanes SET last_rebalance_at = ?, updated_at = ? WHERE session = ?",
+                              (iso_now(), iso_now(), session))
 
     def retry_task(self, task_id: str) -> QueueTask:
         """BLOCKED|FAILED -> QUEUED, explicit operator action only (item
