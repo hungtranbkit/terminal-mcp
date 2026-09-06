@@ -46,6 +46,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .core import RECOVERY_STATE_FAILED, RECOVERY_STATE_RESTORING
 from .queue_store import COMPLETED, QueueStore, QueueTask
 
 READY = "READY"
@@ -242,6 +243,14 @@ class SessionSnapshot:
     state: str | None = None            # e.g. "RUNNING" | "WAITING_INPUT" | "IDLE" | "UNKNOWN"
     input_required: bool | None = None
     reader_alive: bool | None = None    # Windows backend only; None (no such concept) on tmux -- never treated as False
+    # Conversation-continuity follow-up (2026-09-07): RESTORING/
+    # RECOVERY_FAILED from session_registry.py's own transient recovery_
+    # state column (via terminal_status -- core.py's _status_payload),
+    # None for the overwhelmingly common case (no recovery history, or
+    # the session's last recovery -- if any -- already resolved to
+    # RESUMED_OK and was cleared back to None on the next ordinary ACTIVE
+    # sighting).
+    recovery_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -397,6 +406,29 @@ class CoordinatorGate:
                 NEEDS_HUMAN, evidence={"reader_alive": False},
                 reason="session's own output stream reader is not alive (stale stream) -- "
                       "refusing to dispatch until it's confirmed healthy",
+            )
+        # 4c. Recovery-in-flight/failed check (conversation-continuity
+        #     follow-up, 2026-09-07, task item 5: "task RUNNING khi
+        #     restart... sau resume Coordinator xác minh agent thực sự
+        #     tiếp tục đúng task trước khi state trở lại RUNNING") -- a
+        #     session terminal_registry_reopen is still mid-resume
+        #     (RESTORING) or whose last resume attempt is known to have
+        #     failed (RECOVERY_FAILED) must never receive a fresh
+        #     dispatch: RESTORING could still land moments before the new
+        #     text (a real double-dispatch/interleaving risk, same class
+        #     as the WAITING_INPUT check above); RECOVERY_FAILED means
+        #     nobody has yet confirmed this session is genuinely the same
+        #     conversation continuing -- dispatching onto it would risk
+        #     silently treating an unverified/failed recovery as if it
+        #     were an ordinary healthy session. Requires an explicit
+        #     human/operator resolution (a fresh registry_reopen retry,
+        #     or accepting a plain new session) before this task's own
+        #     session can be dispatched into again.
+        if session.recovery_state in (RECOVERY_STATE_RESTORING, RECOVERY_STATE_FAILED):
+            return CoordinatorDecision(
+                NEEDS_HUMAN, evidence={"recovery_state": session.recovery_state},
+                reason=f"session's own conversation recovery is {session.recovery_state} -- "
+                      "refusing to dispatch until a human confirms it actually continued the right task",
             )
 
         # 5. Session identity/cwd/branch check -- the exact P0 lesson

@@ -146,7 +146,8 @@ class TmuxClient:
             self._run(["send-keys", "-t", session, key])
 
     def new_session(self, name: str, cwd: str, command: str | None = None, *,
-                    show_on_desktop: bool = False) -> tuple[bool, str | None]:
+                    show_on_desktop: bool = False,
+                    extra_args: tuple[str, ...] = ()) -> tuple[bool, str | None]:
         """Create ONE new detached session -- `-d` (never attaches this
         process itself to it) and `-c cwd` (the session's starting working
         directory, already resolved/allowlist-checked by the caller --
@@ -163,10 +164,19 @@ class TmuxClient:
         session already has a native, always-available way to be viewed
         on a real terminal (`tmux attach -t <name>`, or this dashboard's
         own Open Terminal), so there is nothing extra for this flag to do
-        on Linux."""
+        on Linux.
+
+        `extra_args` (conversation-continuity follow-up, 2026-09-07):
+        additional literal argv tokens appended after `command` -- e.g.
+        `("--session-id", uuid)`/`("--resume", uuid)` for a resume-
+        capable agent_type (core.py decides when/whether to pass these;
+        never client-supplied text). Ignored (and must be empty) when
+        `command` is None -- there is nothing to pass flags to when the
+        session is just a plain shell."""
         args = ["new-session", "-d", "-s", name, "-c", cwd]
         if command:
             args.append(command)
+            args.extend(extra_args)
         self._run(args)
         reason = ("tmux sessions have no separate 'visible on desktop' concept -- "
                   "already viewable via `tmux attach -t " + name + "` from any real terminal"

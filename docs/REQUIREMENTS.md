@@ -1234,6 +1234,165 @@ scan/audit view over the SAME facts.)*
   action.
 - **Trace:** see this file's own commit.
 
+### Conversation-continuity recovery (`--resume` wiring)
+
+- **Goal / user value:** since the 2026-09-06 Phase 0 audit proved a
+  Windows node-agent restart ALWAYS ends a session's real OS process,
+  no exceptions — make the honest recovery path (`registry_reopen`)
+  actually continue the SAME Claude conversation where possible, not
+  just recreate an empty session in the same folder. Never claims OS/
+  RAM survival; always a genuinely new process, honestly disclosed.
+- **Status:** VERIFIED — real mechanism, real live E2E proof (3 restart
+  cycles + 1 rename-then-resume cycle) on a real Windows node. The real
+  dell-5530 node-agent restart itself is still deliberately NOT done
+  (see Backlog item 7's own "Go/no-go" note, unchanged by this entry).
+- **Root mechanics (real, live-verified against Claude Code 2.1.258 on
+  dell-5530 via `claude --help` and live behavior — never assumed):**
+  `-r, --resume [value]` resumes a conversation by session id;
+  `--session-id <uuid>` assigns a specific (valid-UUID) id to a NEW
+  conversation at launch; conversations are stored per-project at
+  `~/.claude/projects/<escaped-cwd>/<uuid>.jsonl` (confirmed via real
+  file listings on dell-5530, correlated by timestamp to window/wtest's
+  own real activity). An unresolvable `--resume <id>` makes Claude Code
+  print `"No conversation found with session ID: <id>"` and EXIT — it
+  never silently falls back to a fresh conversation; this project's own
+  verification only has to detect that real, existing behavior, not
+  invent an equivalent guard itself. A workspace-trust confirmation
+  dialog can still appear even on `--resume` for a cwd Claude Code
+  hasn't independently trust-recorded (confirmed live for a generic
+  path like `~`; NOT observed for an established project directory like
+  `~/terminal-mcp`) — never auto-dismissed by this project (would be a
+  silent security-prompt bypass). Codex was NOT verified (not installed
+  on any node this project has live access to) — see Backlog item 11.
+- **Fix / what's built:**
+  - `config.py`: `SessionLifecycleConfig.resume_capable_agent_types`
+    (verified-only allowlist, default `("claude",)`).
+  - `session_backend.py`/`tmux.py`/`windows_backend.py`: `new_session`
+    gained `extra_args: tuple[str, ...] = ()`, threaded through
+    `lifecycle.py`'s `create()`. Both backends now support arbitrary
+    extra launcher argv tokens, not just the bare command.
+  - `session_registry.py`: new `conversation_id`/`recovery_state`/
+    `recovery_detail`/`recovery_updated_at` columns (Migration 2,
+    `schema.py`'s real migration framework); `SessionRecord.resumable`
+    property (`recoverable AND conversation_id`); `upsert_seen` gained
+    `conversation_id` (COALESCE-preserved, like `launch_command`) and
+    now clears `recovery_state`/`recovery_detail` back to NULL once a
+    session is seen genuinely ACTIVE again; new `set_recovery_state()`
+    method for the transient RESTORING/RESUMED_OK/RECOVERY_FAILED
+    signal, independent of any one caller's own return value.
+  - `core.py`: `terminal_create_session` gained `resume_session_id` —
+    for a resume-capable agent_type, ALWAYS launches with an explicit
+    project-assigned id (`--session-id <uuid4>` for a genuinely new
+    conversation, `--resume <id>` when continuing one), persisted into
+    the registry immediately. `terminal_registry_reopen` now: sets
+    RESTORING before launch; passes the record's own `conversation_id`
+    as `resume_session_id` when `record.resumable`; calls the new
+    `_verify_resume_or_fail()` (bounded `RESUME_VERIFY_TIMEOUT_SECONDS`
+    = 15.0s poll — see its own constant comment for why 15s and not a
+    shorter value found live during this feature's own E2E test) which
+    detects Claude Code's own `RESUME_FAILURE_PATTERN` / an alive pane
+    with real, non-trust-dialog content / a genuine timeout; sets
+    RESUMED_OK or RECOVERY_FAILED accordingly and returns `error:
+    "RECOVERY_FAILED"` with `recovery_detail` on failure — NEVER
+    silently reports success for an unconfirmed resume. `terminal_
+    status`'s own response gained a `recovery_state` field (sourced
+    from the registry) so any caller — Coordinator included — sees it.
+  - `coordinator.py`: `SessionSnapshot.recovery_state`; new gate check —
+    `RESTORING`/`RECOVERY_FAILED` → `NEEDS_HUMAN`, refusing a fresh
+    dispatch onto a session whose own conversation continuity is still
+    unresolved (task item 5's own explicit requirement). `queue_engine.
+    py`'s `_review()` populates it from the routed `terminal_status`.
+  - `node_agent.py`/`node_client.py`: `create_session`'s Protocol/Local/
+    RemoteNodeClient/HTTP-route surface gained `resume_session_id`.
+  - `dashboard.py`: `/dashboard/api/registry/reopen` FIXED to route
+    through `controller` (was local-node-only, mirroring the exact same
+    gap the Phase 0 pass already fixed for the MCP tool of the same
+    name) — the panel's own JS now sends the qualified `node_id/session`
+    form (required for a MISSING session's bare name to resolve via
+    `controller`'s routing) and surfaces `resumable`/`recovery_state` in
+    each row plus a distinct RECOVERY_FAILED alert (never conflated with
+    an ordinary metadata error).
+- **Scope / flow:** applies to session creation/reopen on any backend
+  (tmux + Windows both got `extra_args` support), but the resume-
+  capable allowlist currently only enables it for `agent_type=claude`.
+- **UI route/screen:** existing Dashboard "🗂 Khôi phục" (Recovery)
+  panel, extended in place — no new screen. Session Manager per-record
+  Restore button.
+- **API/tool/command:** `terminal_create_session`/`terminal_registry_
+  reopen` (MCP, gained `resume_session_id`/richer response fields, no
+  breaking signature change), `POST /v1/sessions` and `POST /v1/sessions
+  /{name}/registry-reopen` (node-agent HTTP, gained `resume_session_id`
+  body field), `POST /dashboard/api/registry/reopen` (fixed to be fleet-
+  aware).
+- **Config/permission:** new `session_lifecycle.resume_capable_agent_
+  types` (default `("claude",)`) — no new permission gate; reuses
+  `session_lifecycle.enabled`/existing lifecycle permission checks
+  entirely.
+- **Data/schema/migration:** `session_registry.db` Migration 2 (real,
+  tracked via `PRAGMA user_version` — see `schema.py`) — 4 new nullable
+  columns, applied automatically on next open, no data loss, no manual
+  step.
+- **Acceptance/tests/evidence:** `tests/test_session_registry.py` (29
+  existing, all still pass — no new dedicated migration test added this
+  pass, covered indirectly via every other new test exercising the
+  store through its real, migrated schema); `tests/test_coordinator.py`
+  (4 new: RESTORING/RECOVERY_FAILED → NEEDS_HUMAN, None/RESUMED_OK →
+  READY); full default suite green (only the same 1 pre-existing,
+  unrelated flake). **Live E2E evidence (real dell-5530, isolated
+  disposable instance on port 8791, cleaned up after — window/window2/
+  wtest independently confirmed unaffected via read-only checks after
+  every cycle):**
+  1. Created `claude-e2e-resume` in `~/terminal-mcp` (an established,
+     already-trusted project dir — no trust-dialog interference),
+     confirmed real `--session-id <uuid>` on the actual process command
+     line via `Get-CimInstance Win32_Process`.
+  2. Told it a fact ("my favorite number is 8842"), confirmed real
+     acknowledgment in the pane.
+  3. **Cycle 1:** graceful `/v1/internal/shutdown` → relaunch (new
+     `agent_generation`, confirming a genuinely new process) → `POST
+     .../registry-reopen` → `resume_verified: true` → asked "what
+     number?" → real answer **"8842"**.
+  4. **Cycle 2:** repeated — `resume_verified: true` → real answer
+     **"8842"** again.
+  5. **Cycle 3:** first attempt hit the false negative documented above
+     (`resume_verified: false`, real timeout) despite the resume having
+     actually succeeded (confirmed by re-checking the live pane content
+     directly) — this is exactly what found and justified the 6s→15s
+     timeout fix. Retested after the fix: `resume_verified: true` → real
+     answer **"8842"** a third time.
+  6. **Rename interop:** renamed the session mid-flight (`rename` →
+     registry row correctly carries `conversation_id` under the NEW
+     name, confirmed via a live listing before any restart), then
+     graceful-shutdown → relaunch → `registry-reopen` under the RENAMED
+     name → `resume_verified: true`, same conversation.
+  7. **Explicit resume-failure signal, live-reproduced:** a bogus all-
+     zero UUID produced Claude Code's own `"No conversation found..."`
+     text and the process exiting — confirmed this project's own
+     verification correctly reports `RECOVERY_FAILED` for a genuinely
+     unresolvable resume, never a false positive.
+  8. Watchdog drop events (`session_missing`) correctly recorded on each
+     restart and correctly marked `recovered` once `registry_reopen`
+     brought the session back (a small, related fix: `registry_reopen`
+     now calls `mark_drop_events_recovered_for` itself, rather than
+     waiting for the next unrelated ordinary reconcile pass).
+- **Known limitations:** (1) recovery is best-effort verification, not a
+  byte-for-byte transcript diff — a resume that renders SOME real
+  content within 15s with no failure signal is treated as confirmed;
+  (2) a genuine send-reliability edge case was found (not fixed) during
+  this feature's own E2E test — see Backlog item 12; (3) Codex not
+  supported (Backlog item 11); (4) the dashboard's Recovery panel itself
+  is still local-node-only (Backlog item 13) even though the underlying
+  action is now fleet-aware; (5) `RESTORING` is a real but genuinely
+  transient state (the whole `registry_reopen` call is synchronous, a
+  few seconds at most) — a concurrent poller has a real but narrow
+  window to observe it; this is disclosed, not hidden, and does not
+  affect correctness (Coordinator still gates on it if seen).
+- **Dependencies:** the Phase 0 restart-safety pass immediately above
+  (liveness fix, `AGENT_GENERATION`, fleet-aware `registry_reopen`
+  routing — this entry builds directly on top of all three).
+- **Follow-up/backlog:** Backlog items 11–13.
+- **Trace:** see this file's own commit.
+
 ### Living-requirements convention itself
 
 - **Goal / user value:** any agent reads ONE file and knows what the
@@ -1418,6 +1577,65 @@ scan/audit view over the SAME facts.)*
      kind of newly-material risk information this project's own standing
      rules require surfacing before acting on an earlier, now-outdated
      authorization, not proceeding on it silently.
+   - **2026-09-07 update — `--resume` conversation-continuity mitigation
+     now built and live-proven (disposable only)** — see the
+     "Conversation-continuity recovery (--resume wiring)" Feature
+     Details entry above. This materially changes the cost of a real
+     restart (conversation history is no longer necessarily lost, only
+     the OS process — still true and unconditional), but window/window2/
+     wtest were ALL CREATED before this feature existed, so **none of
+     them currently has a `conversation_id` recorded** — a real restart
+     TODAY would still only recover them via the honest, metadata-only
+     path (new empty conversation, same folder), not `--resume`. A real
+     restart's own recovery quality can be upgraded first by simply
+     having each session reconciled at least once (already true — they
+     are listed regularly) is NOT enough; `conversation_id` is only ever
+     set at CREATE time by this project's own code, and window/window2/
+     wtest were created by an EARLIER version that never set it. Two
+     honest options, not yet chosen:
+     (a) accept metadata-only recovery for these three specific sessions
+     if/when a real restart happens (conversation history genuinely
+     lost, exactly as originally found), or
+     (b) before restarting, read each session's OWN currently-loaded
+     conversation id from its live `~/.claude/projects/<cwd>/*.jsonl`
+     directory (the most-recently-modified file, by timestamp
+     correlation — a disclosed HEURISTIC backfill, not a certainty,
+     since this project never assigned that id itself) and manually
+     `UPDATE`/backfill it into `session_registry.db`'s `conversation_id`
+     column for exactly these three rows before the restart, so `--
+     resume` becomes available for them too. Not done automatically by
+     any code in this pass (a manual, one-time, disclosed-as-heuristic
+     step, only worth doing immediately before an actual planned
+     restart, not speculatively now).
+   - **Recovery plan for window/window2/wtest, IF/WHEN a real restart is
+     authorized (docs only — no restart performed by this entry):**
+     1. Snapshot before: PID/created/activity for all three (matches the
+        pattern already used and reported in this file's own restart-
+        attempt history above) + (optional, per option (b) above) each
+        session's own current `.jsonl` conversation id, backfilled into
+        the registry first if conversation continuity is wanted.
+     2. Graceful stop via `POST /v1/internal/shutdown` (bearer-token
+        auth'd, the SAME real node token dell-5530 already uses) — never
+        `schtasks /end` (proven non-deterministic and unsafe) and never
+        a raw `taskkill` unless the graceful path itself fails to make
+        the process exit within a reasonable wait.
+     3. Poll for the port to actually free, then trigger the Scheduled
+        Task's own start (`schtasks /run /tn TerminalMcpNodeAgent-
+        dell-5530`) — confirms `/v1/health`'s `agent_generation` differs
+        from before (proves a genuinely new process, not a stuck one).
+     4. For each of window/window2/wtest: call `terminal_registry_reopen`
+        with the qualified `dell-5530/<name>` form. Expect `recreated_
+        from_registry: true`; if a `conversation_id` was backfilled,
+        also expect `resume_verified: true` and a real answer to a
+        verification question about recent, real prior context — never
+        just trust the flag, ask something checkable, exactly as this
+        feature's own E2E test did.
+     5. Report exactly what happened for each of the three, honestly —
+        conversation continued vs. genuinely lost, any RECOVERY_FAILED,
+        and the real PIDs before/after — never a summary that implies
+        more success than what was actually observed.
+     6. Still requires the user's own explicit go-ahead before step 2 —
+        this plan existing does not itself constitute that authorization.
 8. **Dashboard Task Manager/Supervisor-Coordinator panel deployment
    gap (found and fixed):** the production `terminal-mcp-http.service`
    process had been running continuously since before commits `20f6ff0`/
@@ -1443,25 +1661,44 @@ scan/audit view over the SAME facts.)*
    items 1 and 7 above — the scheduled-task restart bug itself is now
    FIXED (see the "Windows node-agent restart safety (Phase 0)" Feature
    Details entry) — none of Phase 1+ starts until Phase 0 is green.
-10. **`--resume` wiring for `registry_reopen`** (real conversation
-    continuity, not just metadata) — PLANNED, not started. Claude Code's
-    own `resume_conversation_id` is already captured live per-session
-    (`models.py`/`windows_backend.py`'s `RESUME_CONVERSATION_ID_RE`
-    scrape) but never persisted into `session_registry.db` or read back
-    by `terminal_registry_reopen`. Since the 2026-09-06 Phase 0 audit
-    confirmed a Windows node-agent restart ALWAYS ends a session's real
-    OS process (no exceptions found), this is now the single most
-    valuable remaining mitigation: persist `resume_conversation_id` on
-    every reconcile pass (`SessionRegistryStore.upsert_seen` needs a new
-    column + param), and have `terminal_registry_reopen` pass `--resume
-    <id>` on the new process's launch command when the saved agent_type
-    supports it (needs a real, verified way to know which launch_
-    commands entries accept a resume flag — not assumed). Would turn
-    "new process, same folder, conversation gone" into "new process,
-    same folder, same conversation continued" — still honestly a NEW
-    process (never claims OS/RAM survival), but a materially better
-    recovery outcome. Blocks nothing else; safe to build independently
-    whenever prioritized.
+10. **`--resume` wiring for `registry_reopen`** — DONE, 2026-09-07. See
+    the "Conversation-continuity recovery (--resume wiring)" Feature
+    Details entry below for the full writeup, live E2E evidence (3
+    restart cycles + a rename-then-resume cycle, all against a real
+    disposable Windows session on dell-5530), files/tests/commit.
+11. **Codex `--resume` support** — PLANNED, not started. `config.session
+    _lifecycle.resume_capable_agent_types` defaults to `("claude",)`
+    only — Codex CLI was never installed/verified on any node this
+    project has live access to (confirmed absent on dell-5530,
+    2026-09-07: `where codex` found nothing), so it was deliberately
+    left out rather than guessed at. Adding it is a one-line config
+    change PLUS first verifying Codex's own `--help`/resume-flag
+    behavior live — never assumed from Claude Code's own flag names.
+12. **Real send-reliability edge case found (not the same as the
+    2026-09-06 P0 fix), disclosed, not fixed in this pass** — during
+    this feature's own live E2E test (2026-09-07), a `press_enter=true`
+    send that returned `SUBMIT_CONFIRMED` (`evidence: ["OUTPUT_CHANGED"]`)
+    against a FRESH Claude session in a project with auto-memory startup
+    (reading `MEMORY.md` before the composer is interactive) twice left
+    the typed text sitting unsent in the composer — a genuine false
+    positive, the opposite direction from the 2026-09-06 fix (which
+    closed a false NEGATIVE). A plain follow-up `Enter` keypress always
+    resolved it. Root cause not yet isolated (plausibly: the composer
+    accepts keystrokes into its input buffer before Claude Code's own
+    startup tool-use sequence has attached its submit handler, so the
+    Enter races a state the 2026-09-06 fix's polling window doesn't
+    cover). Scoped out of this pass (a different investigation, real
+    effort to isolate properly) — tracked here so it's never mistaken
+    for a "fixed" issue or silently re-discovered from scratch.
+13. **Dashboard's own Persistent Registry panel stays local-node-only**
+    — the underlying `terminal_registry_reopen` action is now fleet-
+    aware (this entry, item 10), but `registry_list`/`registry_search`
+    (and their dashboard/MCP surfaces) were deliberately NOT changed in
+    this pass, matching the same documented Phase A/B scope cut as
+    `terminal_knowledge_*`. A remote node's MISSING/resumable sessions
+    are recoverable via the fleet-aware API (`node_id/session` qualified
+    form) but do not yet APPEAR in this specific dashboard panel/MCP
+    listing tools unless queried directly.
 
 ---
 

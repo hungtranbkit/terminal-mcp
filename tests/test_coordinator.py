@@ -356,6 +356,46 @@ def test_session_running_state_is_fine(store):
 
 
 # ---------------------------------------------------------------------------
+# Conversation-continuity follow-up (2026-09-07): a session mid-recovery
+# (RESTORING) or whose last recovery attempt failed (RECOVERY_FAILED) must
+# never receive a fresh dispatch on top -- task item 5's own explicit
+# "Coordinator xác minh agent thực sự tiếp tục đúng task trước khi state
+# trở lại RUNNING".
+# ---------------------------------------------------------------------------
+
+def test_session_restoring_needs_human(store):
+    task = _make_task(store)
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory())
+    decision = gate.review(task, store=store, session=_ok_session(recovery_state="RESTORING"))
+    assert decision.status == NEEDS_HUMAN
+    assert "RESTORING" in decision.reason
+
+
+def test_session_recovery_failed_needs_human(store):
+    task = _make_task(store)
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory())
+    decision = gate.review(task, store=store, session=_ok_session(recovery_state="RECOVERY_FAILED"))
+    assert decision.status == NEEDS_HUMAN
+    assert "RECOVERY_FAILED" in decision.reason
+
+
+def test_session_recovery_state_none_is_fine(store):
+    task = _make_task(store)
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory())
+    decision = gate.review(task, store=store, session=_ok_session(recovery_state=None))
+    assert decision.status == READY
+
+
+def test_session_recovery_state_resumed_ok_is_fine(store):
+    # A resolved-successful recovery is not a blocker -- only the two
+    # unresolved/failed states are.
+    task = _make_task(store)
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory())
+    decision = gate.review(task, store=store, session=_ok_session(recovery_state="RESUMED_OK"))
+    assert decision.status == READY
+
+
+# ---------------------------------------------------------------------------
 # Production-readiness pass: git diverged/ahead/behind (real repos, real
 # remote-tracking branches -- never a fake RepoEvidence for this one, since
 # the actual `git rev-list --left-right --count`/`@{upstream}` parsing is

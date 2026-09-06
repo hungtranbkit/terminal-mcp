@@ -227,6 +227,7 @@ class QueueEngine:
             # ever present for a Windows-backed session, None on tmux).
             state=status_response.get("state"), input_required=status_response.get("input_required"),
             reader_alive=status_response.get("reader_alive"),
+            recovery_state=status_response.get("recovery_state"),
         )
         other_active = tuple(
             OtherLaneSnapshot(session=lane["session"],

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import threading
 import time
 import uuid
@@ -86,6 +87,35 @@ SHELL_COMMAND_NAMES = {
 SEND_VERIFY_LINES = 20
 SEND_VERIFY_TIMEOUT_SECONDS = 0.6
 SEND_VERIFY_POLL_INTERVAL_SECONDS = 0.05
+
+# Conversation-continuity follow-up (2026-09-07, Phase 0 node-agent
+# restart-safety) -- terminal_registry_reopen's own resume verification.
+# Both patterns are real, live-verified strings from Claude Code 2.1.258
+# on a real Windows node, not guessed: RESUME_FAILURE_PATTERN is Claude
+# Code's OWN explicit refusal-to-resume message (it prints this and exits
+# rather than silently starting fresh -- confirmed live with a bogus
+# UUID); TRUST_DIALOG_PATTERN is its workspace-trust confirmation prompt,
+# which can reappear even on --resume for a cwd it hasn't independently
+# trust-recorded (confirmed live) -- NEVER auto-dismissed by
+# _verify_resume_or_fail, see that method's own docstring for why.
+RESUME_FAILURE_PATTERN = re.compile(r"No conversation found with session ID", re.IGNORECASE)
+TRUST_DIALOG_PATTERN = re.compile(r"trust this folder|Accessing workspace", re.IGNORECASE)
+# 15s, not a shorter value: live-reproduced false negative during this
+# feature's own disposable E2E test (2026-09-07) -- a real resume that
+# HAD succeeded (full prior conversation correctly loaded, confirmed by
+# a follow-up question moments later) was still reported RECOVERY_FAILED
+# because a slower cold start (this project's own auto-memory-file-read
+# startup step adds real, variable latency) hadn't rendered anything
+# within the previous, tighter 6s window yet. Never shortened again
+# without new live evidence -- a false RECOVERY_FAILED is a strictly
+# worse outcome than waiting a few extra seconds (task's own explicit
+# "không silently start fresh" -- the corollary is also "không silently
+# report failure" for a resume that actually worked).
+RESUME_VERIFY_TIMEOUT_SECONDS = 15.0
+RESUME_VERIFY_POLL_INTERVAL_SECONDS = 0.3
+RECOVERY_STATE_RESTORING = "RESTORING"
+RECOVERY_STATE_RESUMED_OK = "RESUMED_OK"
+RECOVERY_STATE_FAILED = "RECOVERY_FAILED"
 # Live-tested against the real Codex CLI (not just a synthetic fixture):
 # the base 0.6s window is fine for a simple shell but too short for an
 # LLM-backed agent CLI to visibly start responding -- a real send that
@@ -988,6 +1018,20 @@ class TerminalService:
             if info.reader_alive is not None:
                 payload["reader_alive"] = info.reader_alive
                 payload["reader_restarts"] = info.reader_restarts
+            # Conversation-continuity follow-up (2026-09-07): surfaces a
+            # RESTORING registry_reopen still in flight (or a just-
+            # finished RECOVERY_FAILED one) to any caller of terminal_
+            # status -- in particular CoordinatorGate.review, so a task
+            # is never dispatched against a session mid-recovery or one
+            # whose last recovery attempt is known to have failed. None
+            # (the overwhelmingly common case -- an ordinary session with
+            # no recovery history) when the registry has no row, or the
+            # row's recovery_state is itself None (cleared back to None
+            # on the next ordinary ACTIVE sighting -- see session_
+            # registry.py's own upsert_seen docstring).
+            record = self.session_registry.get(self.REGISTRY_LOCAL_NODE_ID, session)
+            if record is not None and record.recovery_state:
+                payload["recovery_state"] = record.recovery_state
             return payload
         except TmuxError as exc:
             return {"error": "TMUX_ERROR", "session": session, "reason": str(exc)}
@@ -2357,7 +2401,8 @@ class TerminalService:
     def terminal_create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
                                 initial_prompt: str | None = None, grant_mode: str = "none",
                                 binding: str | None = None, requested_by: str | None = None,
-                                show_on_desktop: bool = False) -> dict[str, Any]:
+                                show_on_desktop: bool = False,
+                                resume_session_id: str | None = None) -> dict[str, Any]:
         """Create a new detached tmux session running a plain shell, or
         Claude/Codex via a server-side-only launcher (config.session_
         lifecycle.launch_commands -- agent_type never becomes a command
@@ -2378,7 +2423,22 @@ class TerminalService:
         ungranted session -- creating a session never silently bypasses
         that. binding, when given, calls terminal_bind (fails closed on a
         name collision exactly like terminal_bind always has, never
-        remaps an existing binding out from under it)."""
+        remaps an existing binding out from under it).
+
+        Conversation-continuity follow-up (2026-09-07): for an agent_type
+        in config.session_lifecycle.resume_capable_agent_types (verified-
+        only allowlist -- see its own docstring), this ALWAYS launches
+        with an explicit, project-assigned conversation id --
+        `--session-id <uuid>` for a genuinely new conversation (`uuid4()`,
+        generated here, never left to the launcher's own default), or
+        `--resume <resume_session_id>` when the caller (terminal_
+        registry_reopen) is continuing a specific prior one. Either way
+        the id is persisted into the Persistent Session Registry
+        immediately (session_registry.py's own `conversation_id` column)
+        so a LATER registry_reopen -- even after this process's own
+        node-agent restarts -- can find it. A non-resume-capable
+        agent_type (including "shell") is completely unaffected: no extra
+        args, no conversation_id recorded, exactly today's behavior."""
         action = "create_session"
         if (error := require_session_lifecycle(self.config)) is not None:
             self.audit.record(action=action, session=name, result="BLOCKED", reason=error)
@@ -2386,12 +2446,33 @@ class TerminalService:
         if grant_mode not in ("none", "read", "read_send"):
             self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_GRANT_MODE")
             return {"error": "INVALID_GRANT_MODE", "session": name}
-        result = self.lifecycle.create(name, agent_type, cwd, show_on_desktop=show_on_desktop)
+        conversation_id: str | None = None
+        extra_args: tuple[str, ...] = ()
+        if agent_type in self.config.session_lifecycle.resume_capable_agent_types:
+            if resume_session_id:
+                conversation_id = resume_session_id
+                extra_args = ("--resume", resume_session_id)
+            else:
+                conversation_id = str(uuid.uuid4())
+                extra_args = ("--session-id", conversation_id)
+        result = self.lifecycle.create(name, agent_type, cwd, show_on_desktop=show_on_desktop,
+                                       extra_args=extra_args)
         ok = "error" not in result
         self.audit.record(action=action, session=name, result="CREATED" if ok else "BLOCKED",
                           reason=result.get("error") or f"agent_type={agent_type}")
         if not ok:
             return result
+        if conversation_id:
+            result["conversation_id"] = conversation_id
+            result["resumed_from"] = resume_session_id
+            # Registry row may not exist yet at all (this is often the
+            # very FIRST time this session name is ever seen) -- upsert_
+            # seen is an INSERT-or-update, same call shape terminal_
+            # registry_reopen already uses right after its own create.
+            self.session_registry.upsert_seen(
+                self.REGISTRY_LOCAL_NODE_ID, name, backend_type=self._registry_backend_type(),
+                cwd=result.get("cwd"), agent_type=agent_type, conversation_id=conversation_id,
+            )
 
         # Session Knowledge Store: start capture IMMEDIATELY, before
         # anything else below (in particular, before initial_prompt is
@@ -2777,6 +2858,17 @@ class TerminalService:
             "read_granted": record.read_granted, "input_granted": record.input_granted,
             "grant_updated_at": record.grant_updated_at, "binding_names": list(record.binding_names),
             "notes": record.notes, "tags": list(record.tags),
+            # Conversation-continuity follow-up (2026-09-07): `resumable`
+            # (recoverable AND a real conversation_id is on record) is
+            # the honest, stronger signal a caller/UI should use to
+            # decide whether Restore can offer genuine conversation
+            # continuity vs. only an honest metadata-only recreate --
+            # never inferred client-side from conversation_id alone
+            # (this property already encodes the full, correct logic,
+            # see session_registry.py's own docstring).
+            "conversation_id": record.conversation_id, "resumable": record.resumable,
+            "recovery_state": record.recovery_state, "recovery_detail": record.recovery_detail,
+            "recovery_updated_at": record.recovery_updated_at,
         }
 
     def terminal_registry_list(self, *, recoverable_only: bool = False) -> dict[str, Any]:
@@ -2827,12 +2919,33 @@ class TerminalService:
         restarted, none of which killed_sessions.db has any record of at
         all since nothing ever called terminal_kill_session for them).
 
-        No adapter-level --resume/--continue/session-id support (task's
-        own "nếu agent hỗ trợ resume... thì dùng khi an toàn") -- not
-        implemented in this pass: this project's launch_commands config
-        maps agent_type to a plain launcher token only, with no verified,
-        adapter-specific resume-flag wiring to build on safely yet.
-        Documented limitation, not a silent gap."""
+        Conversation-continuity follow-up (2026-09-07): when `record.
+        agent_type` is in config.session_lifecycle.resume_capable_
+        agent_types AND the record carries a `conversation_id` (i.e.
+        `record.resumable`), this ALSO passes `--resume <id>` (real,
+        live-verified Claude Code flag -- see config.py's own docstring)
+        so the NEW process continues the SAME conversation, then
+        VERIFIES it actually did before ever reporting success --
+        `_verify_resume_or_fail` reads the real pane content for Claude
+        Code's own explicit failure text ("No conversation found with
+        session ID: ...", confirmed live) or the process exiting, and
+        ONLY returns success once the pane shows real content with
+        neither signal. A verification failure returns `error:
+        "RECOVERY_FAILED"` with a `recovery_detail` explaining exactly
+        why -- this method NEVER silently falls back to a plain fresh
+        session and calls that success; a caller that explicitly wants
+        a fresh session instead can still get one via terminal_create_
+        session directly. `recovery_state` (RESTORING while in flight,
+        RESUMED_OK/RECOVERY_FAILED once resolved) is persisted onto the
+        registry row itself (session_registry.py's own `set_recovery_
+        state`) for any other caller/dashboard poll to see, not only the
+        one that made this specific call.
+
+        A record with no conversation_id (a plain shell, an agent_type
+        never declared resume_capable, or a claude/codex session created
+        before this feature existed) reopens exactly as before -- an
+        honest, metadata-only recreate, never a claim of conversation
+        continuity it can't back up."""
         action = "registry_reopen"
         if (error := require_session_lifecycle(self.config)) is not None:
             self.audit.record(action=action, session=session_name, result="BLOCKED", reason=error)
@@ -2848,19 +2961,103 @@ class TerminalService:
             return {"error": "REOPEN_METADATA_INCOMPLETE", "session": session_name, "missing": ["agent_type"]}
         if effective_agent_type != "shell" and not effective_cwd:
             return {"error": "REOPEN_METADATA_INCOMPLETE", "session": session_name, "missing": ["cwd"]}
+        resume_target = (record.conversation_id
+                        if (effective_agent_type in self.config.session_lifecycle.resume_capable_agent_types
+                            and record.conversation_id) else None)
+        if resume_target:
+            self.session_registry.set_recovery_state(
+                self.REGISTRY_LOCAL_NODE_ID, session_name, RECOVERY_STATE_RESTORING,
+                detail=f"resuming conversation {resume_target}")
         result = self.terminal_create_session(session_name, effective_agent_type, effective_cwd,
-                                              grant_mode=grant_mode, requested_by=requested_by)
+                                              grant_mode=grant_mode, requested_by=requested_by,
+                                              resume_session_id=resume_target)
         result["recreated_from_registry"] = True
-        if "error" not in result:
-            # Reflects ACTIVE immediately rather than waiting for the next
-            # ordinary poll's own reconcile pass to notice.
-            self.session_registry.upsert_seen(
-                self.REGISTRY_LOCAL_NODE_ID, session_name, backend_type=self._registry_backend_type(),
-                cwd=effective_cwd, agent_type=effective_agent_type,
-            )
-        self.audit.record(action=action, session=session_name,
-                          result="REOPENED" if "error" not in result else "BLOCKED", reason=result.get("error"))
+        if "error" in result:
+            if resume_target:
+                self.session_registry.set_recovery_state(
+                    self.REGISTRY_LOCAL_NODE_ID, session_name, RECOVERY_STATE_FAILED,
+                    detail=f"create failed: {result.get('error')}")
+            self.audit.record(action=action, session=session_name, result="BLOCKED", reason=result.get("error"))
+            return result
+        # Reflects ACTIVE immediately rather than waiting for the next
+        # ordinary poll's own reconcile pass to notice.
+        self.session_registry.upsert_seen(
+            self.REGISTRY_LOCAL_NODE_ID, session_name, backend_type=self._registry_backend_type(),
+            cwd=effective_cwd, agent_type=effective_agent_type, conversation_id=resume_target,
+        )
+        # Same watchdog close-out _reconcile_session_registry's own
+        # ordinary ACTIVE path already does -- without this, a drop event
+        # this exact reopen just resolved would otherwise sit
+        # unrecovered until whatever LATER call happens to run a normal
+        # reconcile pass (list_sessions), which may be much later.
+        self.session_registry.mark_drop_events_recovered_for(self.REGISTRY_LOCAL_NODE_ID, session_name)
+        if resume_target:
+            verified, detail = self._verify_resume_or_fail(session_name, resume_target)
+            result["resume_verified"] = verified
+            result["resume_detail"] = detail
+            if verified:
+                self.session_registry.set_recovery_state(
+                    self.REGISTRY_LOCAL_NODE_ID, session_name, RECOVERY_STATE_RESUMED_OK, detail=detail)
+            else:
+                self.session_registry.set_recovery_state(
+                    self.REGISTRY_LOCAL_NODE_ID, session_name, RECOVERY_STATE_FAILED, detail=detail)
+                result["error"] = "RECOVERY_FAILED"
+                result["recovery_detail"] = detail
+                self.audit.record(action=action, session=session_name, result="RECOVERY_FAILED", reason=detail)
+                return result
+        self.audit.record(action=action, session=session_name, result="REOPENED",
+                          reason=f"resumed={resume_target!r}" if resume_target else "metadata_only")
         return result
+
+    def _verify_resume_or_fail(self, session_name: str, conversation_id: str) -> tuple[bool, str]:
+        """Real, bounded (RESUME_VERIFY_TIMEOUT_SECONDS) verification that
+        a `--resume <conversation_id>` launch actually continued that
+        conversation -- never trusts "the process started" alone. Real
+        signals, live-verified against Claude Code 2.1.258 on a real
+        Windows node (2026-09-07):
+          - Claude Code prints the literal text "No conversation found
+            with session ID: <id>" and EXITS when the id doesn't resolve
+            -- this is Claude Code's OWN refusal to silently start fresh,
+            not a fallback this project has to build; it just has to be
+            detected and reported honestly.
+          - A workspace-trust confirmation dialog ("Quick safety check...
+            trust this folder?") can reappear even on resume for a cwd
+            Claude Code hasn't independently trust-recorded -- this is
+            NEVER auto-dismissed here (auto-approving a security prompt
+            on the operator's behalf would be exactly the kind of silent
+            bypass this project's own permission model exists to
+            prevent); it is reported as an unresolved, alive-but-
+            unconfirmed outcome instead, same as a genuine timeout.
+          - Otherwise: the pane rendering real, non-empty content with
+            neither signal present is treated as resumed -- best-effort
+            (never a byte-for-byte transcript comparison), same
+            disclosed-heuristic posture as classify_status elsewhere in
+            this project."""
+        deadline = time.monotonic() + RESUME_VERIFY_TIMEOUT_SECONDS
+        last_output = ""
+        while time.monotonic() < deadline:
+            try:
+                info = self.tmux.get_session(session_name)
+            except TmuxError:
+                info = None
+            if info is None:
+                return False, "session vanished during resume verification"
+            try:
+                last_output = "\n".join(self.tmux.capture_lines(session_name, 30))
+            except TmuxError:
+                last_output = ""
+            if RESUME_FAILURE_PATTERN.search(last_output):
+                return False, f"Claude Code reported no conversation found for id {conversation_id}"
+            if info.pane_dead:
+                return False, f"process exited during resume verification -- last output: {last_output[-500:]!r}"
+            if last_output.strip() and not TRUST_DIALOG_PATTERN.search(last_output):
+                return True, "resume launched and rendered real content with no failure signal observed"
+            time.sleep(RESUME_VERIFY_POLL_INTERVAL_SECONDS)
+        if TRUST_DIALOG_PATTERN.search(last_output):
+            return False, ("resume is alive but awaiting a workspace-trust confirmation this project never "
+                           "auto-dismisses -- resolve manually (attach/Open Terminal), then retry if needed")
+        return False, (f"resume verification timed out after {RESUME_VERIFY_TIMEOUT_SECONDS}s with no clear "
+                       f"signal -- last output: {last_output[-500:]!r}")
 
     def terminal_registry_purge(self, session_name: str, *, purged_by: str | None = None) -> dict[str, Any]:
         """The ONE hard-delete path for a registry row (task item 6) --

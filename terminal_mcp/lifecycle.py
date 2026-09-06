@@ -82,7 +82,7 @@ class SessionLifecycleService:
         return None
 
     def create(self, name: str, agent_type: str, cwd: str | None, *,
-              show_on_desktop: bool = False) -> dict[str, Any]:
+              show_on_desktop: bool = False, extra_args: tuple[str, ...] = ()) -> dict[str, Any]:
         """Create one new detached session, then poll (bounded by
         config.session_lifecycle.create_ready_timeout_seconds) for
         evidence the launched process actually started. Returns a receipt
@@ -98,7 +98,13 @@ class SessionLifecycleService:
         the whole session vanished) -- in the pane_dead case the disposable
         session this call itself just made is cleaned up (kill-session)
         before returning; a request that fails before create ever runs
-        touches no session at all, disposable or otherwise."""
+        touches no session at all, disposable or otherwise.
+
+        `extra_args` (conversation-continuity follow-up, 2026-09-07):
+        passed straight through to the backend's own `new_session` --
+        see its docstring. core.py's terminal_create_session is the
+        only caller that ever populates this (`--session-id`/`--resume`
+        for a resume-capable agent_type), never derived here."""
         if (error := self.validate_create(name, agent_type)) is not None:
             return {**error, "state": "FAILED"}
         try:
@@ -114,7 +120,7 @@ class SessionLifecycleService:
             return {"error": "LAUNCHER_NOT_CONFIGURED", "agent_type": agent_type, "state": "FAILED"}
         try:
             spawn_result = self.tmux.new_session(name, str(resolved_cwd), command,
-                                                 show_on_desktop=show_on_desktop)
+                                                 show_on_desktop=show_on_desktop, extra_args=extra_args)
         except TmuxError as exc:
             return {"error": "LAUNCH_FAILED", "session": name, "reason": str(exc), "state": "FAILED"}
         visible, visible_reason = spawn_result if isinstance(spawn_result, tuple) else (False, None)

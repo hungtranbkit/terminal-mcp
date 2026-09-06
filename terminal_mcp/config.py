@@ -200,11 +200,28 @@ class SessionLifecycleConfig:
     the new session's initial command (never client-supplied -- see
     README's "Create an agent tmux session" for the same two binaries
     invoked here, "claude"/"codex"). "shell" always ignores this and
-    starts the session's plain default shell, no entry needed."""
+    starts the session's plain default shell, no entry needed.
+
+    resume_capable_agent_types: which agent_type values support this
+    project's own conversation-continuity mechanism (Phase 0 node-agent
+    restart-safety follow-up, 2026-09-07: `--session-id <uuid>` at
+    creation, `--resume <uuid>` on registry-reopen) -- a real, verified-
+    only allowlist, never a guess. Live-verified via `claude --help` on
+    a real Windows node (dell-5530, Claude Code 2.1.258): both flags
+    exist and behave as documented. "codex" is deliberately NOT in the
+    default -- its CLI was never installed/verified on any node this
+    project has live access to; adding it here without first verifying
+    its own `--help`/behavior would be exactly the kind of unverified
+    assumption this project's own standing rules forbid. Any agent_type
+    NOT in this set still creates/reopens normally -- it just never gets
+    `--session-id`/`--resume` appended, and `registry_reopen` for it
+    always does an honest metadata-only recreate (never claims
+    conversation continuity it can't verify)."""
     enabled: bool = False
     allowed_cwd_roots: tuple[str, ...] = ()
     protected_sessions: tuple[str, ...] = ("terminal-mcp",)
     launch_commands: tuple[tuple[str, str], ...] = (("claude", "claude"), ("codex", "codex"))
+    resume_capable_agent_types: tuple[str, ...] = ("claude",)
     create_ready_timeout_seconds: float = 5.0
     default_grant_mode: str = "none"
 
@@ -694,10 +711,14 @@ def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
     grant_mode = raw.get("default_grant_mode", SessionLifecycleConfig.default_grant_mode)
     if grant_mode not in ("none", "read", "read_send"):
         raise ValueError("session_lifecycle.default_grant_mode must be one of: none, read, read_send")
+    resume_capable_raw = raw.get("resume_capable_agent_types",
+                                 list(SessionLifecycleConfig.resume_capable_agent_types))
+    if not isinstance(resume_capable_raw, list) or not all(isinstance(a, str) and a for a in resume_capable_raw):
+        raise ValueError("session_lifecycle.resume_capable_agent_types must be a list of strings")
     return SessionLifecycleConfig(
         enabled=enabled, allowed_cwd_roots=tuple(roots), protected_sessions=protected_set,
         launch_commands=tuple(sorted(launch_raw.items())), create_ready_timeout_seconds=timeout,
-        default_grant_mode=grant_mode,
+        default_grant_mode=grant_mode, resume_capable_agent_types=tuple(resume_capable_raw),
     )
 
 

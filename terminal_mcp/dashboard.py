@@ -3087,6 +3087,24 @@ DASHBOARD_HTML = """<!doctype html>
           warn.textContent = record.status === 'DELETED' ? '🗑 Đã xoá vĩnh viễn (chỉ còn lịch sử).'
             : '⚠ Thiếu metadata (agent_type/cwd) -- reopen sẽ cần nhập thủ công.';
           row.append(warn);
+        } else if (record.resumable) {
+          // Conversation-continuity follow-up (2026-09-07): a real,
+          // stronger signal than plain "recoverable" -- Restore can
+          // pass --resume and genuinely continue this conversation,
+          // not just recreate an empty session in the same folder.
+          const ok = document.createElement('div'); ok.className = 'kr-meta';
+          ok.style.color = 'var(--ok, #2a7)';
+          ok.textContent = '↺ Có thể khôi phục ĐÚNG hội thoại (conversation-id đã lưu).';
+          row.append(ok);
+        }
+        if (record.recovery_state === 'RECOVERY_FAILED') {
+          const fail = document.createElement('div'); fail.className = 'kr-incomplete';
+          fail.textContent = `✗ Lần khôi phục gần nhất THẤT BẠI (${timeAgo(record.recovery_updated_at)}): ${record.recovery_detail || ''}`;
+          row.append(fail);
+        } else if (record.recovery_state === 'RESTORING') {
+          const restoring = document.createElement('div'); restoring.className = 'kr-meta';
+          restoring.textContent = '⏳ Đang khôi phục...';
+          row.append(restoring);
         }
         if (record.status !== 'DELETED') {
           const reopenBtn = document.createElement('button'); reopenBtn.type = 'button'; reopenBtn.textContent = '↩ Reopen';
@@ -3120,7 +3138,15 @@ DASHBOARD_HTML = """<!doctype html>
           if (!cwd) return;
         }
       }
-      const body = {session_name: record.session_name};
+      // Qualified node_id/session form -- REQUIRED now that this route
+      // is fleet-aware (2026-09-07): a MISSING session's bare name
+      // can't resolve via the ordinary live-listing lookup (see
+      // controller.py's own terminal_registry_reopen docstring). This
+      // panel's own records are still local-node-only for now (registry_
+      // list/search), so record.node_id is always "local" today, but
+      // sending it qualified here is what makes this keep working
+      // unchanged if/when that panel itself becomes fleet-wide later.
+      const body = {session_name: `${record.node_id}/${record.session_name}`};
       if (agentType) body.agent_type = agentType;
       if (cwd) body.cwd = cwd;
       const response = await fetch('/dashboard/api/registry/reopen', {
@@ -3128,10 +3154,24 @@ DASHBOARD_HTML = """<!doctype html>
       });
       const result = await response.json().catch(() => ({}));
       if (result && result.error) {
-        window.alert(`Reopen thất bại: ${clean(result.error)}${result.missing ? ' (thiếu: ' + result.missing.join(', ') + ')' : ''}`);
+        // RECOVERY_FAILED (conversation-continuity follow-up, 2026-09-07):
+        // a resume was attempted and Claude Code itself, or this
+        // project's own verification, could not confirm it actually
+        // continued the right conversation -- shown distinctly from an
+        // ordinary metadata error (missing agent_type/cwd), never
+        // silently treated as an unremarkable failure.
+        if (result.error === 'RECOVERY_FAILED') {
+          window.alert(`Khôi phục hội thoại THẤT BẠI cho "${record.session_name}":\n${clean(result.recovery_detail || '')}\n\nMột process MỚI đã được tạo nhưng KHÔNG xác nhận được là cùng hội thoại cũ -- kiểm tra thủ công (Open Terminal) trước khi dùng.`);
+        } else {
+          window.alert(`Reopen thất bại: ${clean(result.error)}${result.missing ? ' (thiếu: ' + result.missing.join(', ') + ')' : ''}`);
+        }
+        await loadSessions();
         return;
       }
-      window.alert(`Đã tạo session MỚI "${record.session_name}" từ metadata đã lưu -- đây KHÔNG phải khôi phục process/RAM cũ, chỉ là tiến trình mới cùng tên/cwd/agent.`);
+      const resumeNote = result.resumed_from
+        ? `\n\n✅ Hội thoại cũ đã được khôi phục và xác nhận (--resume ${result.conversation_id}).`
+        : '';
+      window.alert(`Đã tạo session MỚI "${record.session_name}" từ metadata đã lưu -- đây KHÔNG phải khôi phục process/RAM cũ, chỉ là tiến trình mới cùng tên/cwd/agent.${resumeNote}`);
       await loadSessions();
       selectSession(record.session_name);
     }
@@ -6579,6 +6619,15 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
     @server.custom_route("/dashboard/api/registry/reopen", methods=["POST"], include_in_schema=False)
     async def registry_reopen(request: Request) -> JSONResponse:
+        # Fleet-aware (conversation-continuity follow-up, 2026-09-07) --
+        # same fix as mcp_app.py's terminal_registry_reopen tool: this
+        # used to call `terminal.terminal_registry_reopen` directly
+        # (local-node-only), leaving a REMOTE node's own MISSING/
+        # resumable sessions with no working Restore action from the
+        # dashboard at all. `session_name` should be the qualified
+        # `node_id/session` form for a session that isn't currently
+        # live (see controller.py's own terminal_registry_reopen
+        # docstring for why a bare name won't resolve).
         blocked, identity = _mutation_guard(request)
         if blocked is not None:
             return blocked
@@ -6594,7 +6643,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         requested_by = identity.email if identity else "dashboard"
         _log.info("dashboard registry_reopen session=%s identity=%s", session_name, requested_by)
         result = await anyio.to_thread.run_sync(
-            lambda: terminal.terminal_registry_reopen(
+            lambda: controller.terminal_registry_reopen(
                 session_name, agent_type=agent_type, cwd=cwd, requested_by=requested_by)
         )
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)

@@ -843,7 +843,8 @@ class WindowsSessionBackend:
         entry.activity_epoch = int(time.time())
 
     def new_session(self, name: str, cwd: str, command: str | None = None, *,
-                    show_on_desktop: bool = False) -> tuple[bool, str | None]:
+                    show_on_desktop: bool = False,
+                    extra_args: tuple[str, ...] = ()) -> tuple[bool, str | None]:
         """The session's own process is ALWAYS the normal headless ConPTY
         child (`_spawn_headless`) -- exactly the same as every other
         session, visible-requested or not. `show_on_desktop=True` does
@@ -886,7 +887,12 @@ class WindowsSessionBackend:
         with self._registry_lock:
             if name in self._sessions:
                 raise TmuxError(f"session {name!r} already exists")
-        argv = [command] if command else [self.shell]
+        # `extra_args` (conversation-continuity follow-up, 2026-09-07):
+        # e.g. ("--session-id", uuid)/("--resume", uuid) for a resume-
+        # capable agent_type -- core.py decides when/whether to pass
+        # these, never client-supplied text. Ignored when there's no
+        # `command` (a plain shell session has nothing to pass flags to).
+        argv = [command, *extra_args] if command else [self.shell]
         proc = self._spawn_headless(argv, cwd)
         now = int(time.time())
         entry = _WindowsSession(name=name, proc=proc, cwd=cwd, command=command,

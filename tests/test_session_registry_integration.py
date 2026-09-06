@@ -348,7 +348,13 @@ def test_dashboard_registry_routes_list_reopen_purge(tmp_path, tmux_cleanup):
     assert search.status_code == 200
     assert {r["session_name"] for r in search.json()["records"]} == {"reg-http1"}
 
-    reopened = client.post("/dashboard/api/registry/reopen", json={"session_name": "reg-http1"})
+    # Qualified node_id/session form -- REQUIRED since /dashboard/api/
+    # registry/reopen became fleet-aware (routed through `controller`,
+    # conversation-continuity follow-up 2026-09-07): a KILLED (not
+    # currently live) session's bare name cannot resolve through the
+    # ordinary live-listing lookup, only the qualified form skips that
+    # check (see controller.py's own terminal_registry_reopen docstring).
+    reopened = client.post("/dashboard/api/registry/reopen", json={"session_name": "local/reg-http1"})
     assert reopened.status_code == 200
     assert reopened.json().get("error") is None
 

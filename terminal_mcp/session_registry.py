@@ -62,8 +62,28 @@ from typing import Any
 
 from .schema import Migration, apply_migrations
 
+def _add_conversation_continuity_columns(connection: sqlite3.Connection) -> None:
+    connection.execute("ALTER TABLE session_records ADD COLUMN conversation_id TEXT")
+    connection.execute("ALTER TABLE session_records ADD COLUMN recovery_state TEXT")
+    connection.execute("ALTER TABLE session_records ADD COLUMN recovery_detail TEXT")
+    connection.execute("ALTER TABLE session_records ADD COLUMN recovery_updated_at TEXT")
+
+
 REGISTRY_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: session_records", lambda connection: None),
+    # Conversation-continuity follow-up (2026-09-07): `conversation_id`
+    # is the Claude-native session UUID this project itself assigns at
+    # creation time (`--session-id <uuid>`, verified live against a real
+    # Windows node -- see config.py's SessionLifecycleConfig.
+    # resume_capable_agent_types docstring) so a later registry_reopen
+    # can pass `--resume <uuid>` and continue the SAME conversation,
+    # never a guess/scrape. `recovery_state` (RESTORING/RESUMED_OK/
+    # RECOVERY_FAILED, transient -- see terminal_registry_reopen)
+    # + `recovery_detail`/`recovery_updated_at` are this feature's own
+    # explicit, no-fake-resurrection signal: a resume attempt that
+    # can't be verified must say so, never silently look like an
+    # ordinary fresh session.
+    Migration(2, "add conversation_id + recovery_state columns", _add_conversation_continuity_columns),
 ]
 
 STATUS_ACTIVE = "ACTIVE"
@@ -160,10 +180,29 @@ class SessionRecord:
     binding_names: tuple[str, ...] = field(default_factory=tuple)
     notes: str | None = None
     tags: tuple[str, ...] = field(default_factory=tuple)
+    conversation_id: str | None = None
+    recovery_state: str | None = None
+    recovery_detail: str | None = None
+    recovery_updated_at: str | None = None
 
     @property
     def recoverable(self) -> bool:
         return self.status in RECOVERABLE_STATUSES and self.metadata_complete
+
+    @property
+    def resumable(self) -> bool:
+        """Stronger than `recoverable` (conversation-continuity follow-
+        up, 2026-09-07): True only when this record ALSO carries a real
+        `conversation_id` this project itself assigned at creation --
+        i.e. `registry_reopen` can pass `--resume <id>` and genuinely
+        continue the same conversation, not just recreate an empty
+        session in the same folder. A recoverable-but-not-resumable
+        record (a plain shell, or a claude/codex session created before
+        this feature existed, or one for an agent_type never declared
+        resume_capable) still reopens fine -- just without conversation
+        continuity, exactly as honestly disclosed by this property being
+        False rather than silently attempted."""
+        return self.recoverable and bool(self.conversation_id)
 
     def key(self) -> str:
         # The one qualified-name string every caller/UI/search result
@@ -192,6 +231,8 @@ def _from_row(row: sqlite3.Row | None) -> SessionRecord | None:
         grant_updated_at=row["grant_updated_at"],
         binding_names=tuple(json.loads(row["binding_names"] or "[]")),
         notes=row["notes"], tags=tuple(json.loads(row["tags"] or "[]")),
+        conversation_id=row["conversation_id"], recovery_state=row["recovery_state"],
+        recovery_detail=row["recovery_detail"], recovery_updated_at=row["recovery_updated_at"],
     )
 
 
@@ -384,7 +425,7 @@ class SessionRegistryStore:
                     launcher_type: str | None = None, last_known_state: str | None = None,
                     read_granted: bool = False, input_granted: bool = False,
                     binding_names: tuple[str, ...] = (), backfill_project: bool = True,
-                    now: str | None = None) -> SessionRecord:
+                    conversation_id: str | None = None, now: str | None = None) -> SessionRecord:
         """Called on every reconcile pass for a session CURRENTLY observed
         alive -- status always becomes ACTIVE (a session that reappears
         after being MISSING/KILLED/OFFLINE is exactly as "back" as one
@@ -392,7 +433,19 @@ class SessionRegistryStore:
         just left stale). Existing project-info fields (cwd/repo_root/...)
         are preserved rather than overwritten with None when a caller
         doesn't have fresher info to offer this call -- only a genuinely
-        new, non-empty value ever replaces what's already recorded."""
+        new, non-empty value ever replaces what's already recorded.
+
+        `conversation_id` (conversation-continuity follow-up, 2026-09-07):
+        set ONCE, explicitly, by terminal_create_session right after a
+        resume-capable session is spawned (never guessed/scraped) --
+        preserved via COALESCE on every later ordinary reconcile pass
+        exactly like launch_command already is, so a ordinary poll that
+        doesn't know it never clears it. `recovery_state`/`recovery_
+        detail` are cleared back to NULL here -- once a session is seen
+        genuinely ACTIVE again, whatever RESTORING/RECOVERY_FAILED
+        marker a prior registry_reopen attempt left is no longer
+        meaningful (mirrors killed_at/offline_at's own "clear on
+        ACTIVE" treatment just below)."""
         now = now or _now_iso()
         existing = self.get(node_id, session_name)
         # Only actually shell out to git the FIRST time this session's cwd
@@ -420,9 +473,9 @@ class SessionRegistryStore:
                     git_branch, last_commit, agent_type, launch_command, launcher_type,
                     created_at, last_seen_at, last_activity_at, last_known_state, status,
                     killed_at, deleted_at, offline_at, metadata_complete,
-                    read_granted, input_granted, grant_updated_at, binding_names)
+                    read_granted, input_granted, grant_updated_at, binding_names, conversation_id)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE',
-                           NULL, NULL, NULL, ?, ?, ?, ?, ?)
+                           NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(node_id, session_name) DO UPDATE SET
                        node_name = excluded.node_name, backend_type = excluded.backend_type,
                        cwd = excluded.cwd, repo_root = excluded.repo_root,
@@ -435,14 +488,36 @@ class SessionRegistryStore:
                        killed_at = NULL, deleted_at = NULL, offline_at = NULL,
                        metadata_complete = excluded.metadata_complete,
                        read_granted = excluded.read_granted, input_granted = excluded.input_granted,
-                       grant_updated_at = excluded.grant_updated_at, binding_names = excluded.binding_names
+                       grant_updated_at = excluded.grant_updated_at, binding_names = excluded.binding_names,
+                       conversation_id = COALESCE(excluded.conversation_id, session_records.conversation_id),
+                       recovery_state = NULL, recovery_detail = NULL
                 """,
                 (node_id, session_name, node_name, backend_type, cwd, repo_root, git_remote,
                  git_branch, last_commit, agent_type, launch_command, launcher_type,
                  created_at, now, now, last_known_state,
-                 int(metadata_complete), int(read_granted), int(input_granted), now, binding_json),
+                 int(metadata_complete), int(read_granted), int(input_granted), now, binding_json,
+                 conversation_id),
             )
         return self.get(node_id, session_name)
+
+    def set_recovery_state(self, node_id: str, session_name: str, recovery_state: str, *,
+                           detail: str | None = None, now: str | None = None) -> None:
+        """Conversation-continuity follow-up (2026-09-07): the transient
+        RESTORING/RESUMED_OK/RECOVERY_FAILED signal `terminal_registry_
+        reopen` sets across its own attempt, for the dashboard/Task
+        Manager/Coordinator to see WHILE it's in flight or after it
+        finishes, without needing to poll the reopen call's own return
+        value (which only the ONE caller who made the call ever sees). A
+        no-op if the row doesn't exist yet (a resume attempt always
+        targets a row `terminal_registry_reopen` already confirmed exists
+        via `.get()` first)."""
+        now = now or _now_iso()
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE session_records SET recovery_state = ?, recovery_detail = ?, recovery_updated_at = ? "
+                "WHERE node_id = ? AND session_name = ?",
+                (recovery_state, detail, now, node_id, session_name),
+            )
 
     def mark_missing(self, node_id: str, session_names_seen: set[str], *, now: str | None = None) -> list[str]:
         """The other half of reconcile: any record for `node_id` that was

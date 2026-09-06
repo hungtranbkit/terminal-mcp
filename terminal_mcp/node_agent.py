@@ -233,6 +233,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
             initial_prompt=body.get("initial_prompt"), grant_mode=body.get("grant_mode", "none"),
             binding=body.get("binding"), requested_by=body.get("requested_by"),
             show_on_desktop=bool(body.get("show_on_desktop", False)),
+            resume_session_id=body.get("resume_session_id"),
         ))
         return JSONResponse(result)
 
