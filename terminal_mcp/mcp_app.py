@@ -948,6 +948,25 @@ def build_mcp(service: TerminalService | None = None,
         return queue.list_all()
 
     @server.tool()
+    def terminal_session_tasks(session: str) -> dict:
+        """Dashboard Task Manager UI's own data source (also directly
+        usable by ChatGPT as the "session_tasks/list" tool): the SAME
+        real, persistent queue state terminal_queue_status returns,
+        grouped into Running/Queued/Waiting-Dependency/Blocked-Rework/
+        Recent-Done-Failed buckets, plus the Coordinator's gate decision
+        (READY/BLOCKED/NEEDS_REWORK/NEEDS_HUMAN + reason) for whichever
+        task is next in line. Every field is a real, stored column --
+        nothing here is guessed from terminal output."""
+        return queue.session_task_board(session)
+
+    @server.tool()
+    def terminal_fleet_task_summary() -> dict:
+        """One small aggregate across every session's queue lane --
+        {running, queued, blocked} -- the dashboard's own global
+        overview line ("Running 1 · Waiting 3 · Blocked 1")."""
+        return queue.fleet_task_summary()
+
+    @server.tool()
     def terminal_queue_pause(session: str, reason: str | None = None) -> dict:
         """Pause dispatch for this session's lane. If a task is currently
         in flight, it moves to PAUSED (its prior status remembered) so

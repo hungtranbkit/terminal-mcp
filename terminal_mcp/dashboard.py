@@ -488,6 +488,42 @@ DASHBOARD_HTML = """<!doctype html>
     #knowledgeChunks .kc-chunk.backfilled { border-color:var(--amber) }
     #knowledgeEmpty { color:var(--muted); font-size:12px }
     #knowledgeExportBtn { align-self:flex-start }
+    /* ---- Task Manager modal (Dashboard Task Manager UI, queue_service.py)
+       Same fixed-overlay+backdrop+pm-* pieces as #knowledgeModal just
+       above, wider (needs to show up to 5 grouped sections) and its own
+       group/row styling. Every field rendered here comes straight off
+       the real, persistent queue state (session_task_board) -- never
+       guessed from terminal output. */
+    #taskBackdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:30 }
+    #taskModal {
+      display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:31;
+      width:min(680px, calc(100vw - 32px)); max-height:85vh; overflow:auto;
+      background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 20px 50px rgba(0,0,0,.6);
+    }
+    body.task-modal-visible #taskBackdrop, body.task-modal-visible #taskModal { display:block }
+    #taskModal .pm-head { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px }
+    #taskModal .pm-head strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    #taskModal .pm-body { padding:14px 16px; display:flex; flex-direction:column; gap:12px; font-size:13px }
+    #taskGate { font-size:12px; border-radius:8px; padding:8px 10px; border:1px solid var(--line); background:rgba(122,162,255,.08) }
+    #taskGate.gate-blocked { border-color:#ff9f9f; background:rgba(255,159,159,.08); color:#ff9f9f }
+    #taskGate.gate-ready { border-color:var(--green); color:var(--green) }
+    .tm-enqueue-row { display:flex; gap:8px }
+    .tm-enqueue-row input { flex:1; background:#0e1526; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:9px 11px; font:inherit; font-size:13px }
+    .tm-enqueue-row button, .tm-lane-actions button { border-radius:8px; padding:7px 12px; cursor:pointer; font:inherit; font-size:12px; border:1px solid var(--line); background:#19243b; color:var(--text) }
+    .tm-lane-actions { display:flex; gap:8px }
+    .tm-group { display:flex; flex-direction:column; gap:6px }
+    .tm-group-title { font-size:12px; color:var(--muted); display:flex; align-items:center; gap:6px }
+    .tm-count { font-size:11px; padding:1px 7px; border-radius:999px; border:1px solid var(--line); color:var(--muted) }
+    .tm-count.nonzero { color:var(--text); border-color:var(--accent, #7aa2ff) }
+    .tm-task { border:1px solid var(--line); border-radius:8px; padding:7px 9px; display:flex; flex-direction:column; gap:3px }
+    .tm-task-top { display:flex; justify-content:space-between; gap:8px; align-items:baseline }
+    .tm-task-title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px }
+    .tm-task-meta { font-size:11px; color:var(--muted); display:flex; flex-wrap:wrap; gap:6px 10px }
+    .tm-task-meta a { color:var(--muted); text-decoration:underline; cursor:pointer }
+    .tm-task-reason { font-size:11px; color:#ff9f9f }
+    .tm-task-actions { display:flex; gap:6px }
+    .tm-task-actions button { border-radius:6px; padding:3px 8px; cursor:pointer; font:inherit; font-size:11px; border:1px solid var(--line); background:#19243b; color:var(--text) }
+    #taskEmpty { color:var(--muted); font-size:12px }
     /* ---- Tab bar row -----------------------------------------------------
        .tabbar itself scrolls horizontally (see its own rule above). The
        row holds ONLY the tab strip now -- New session/Đã kill used to be
@@ -656,6 +692,7 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="header-right">
       <button id="supervisorBadge" class="supervisor-badge" type="button" hidden></button>
       <span class="supervisor-badge" id="connHealthBadge" title="Kết nối OpenAI Secure MCP Tunnel" hidden></span>
+      <span class="supervisor-badge" id="taskSummaryBadge" title="Tổng số task đang chạy/chờ/blocked trên toàn bộ session" hidden></span>
       <span class="live" id="liveBadge">● LIVE</span>
       <!-- Task (mobile tab strip fix) item 3: "+ New session" / "Đã kill"
            must never compete with session tabs for horizontal room on a
@@ -732,6 +769,7 @@ DASHBOARD_HTML = """<!doctype html>
           <span class="term-title" id="termTitle"></span>
           <span class="term-controls">
             <button id="followToggle" class="term-btn" type="button" disabled>Auto-follow: ON</button>
+            <button id="taskManagerBtn" class="term-btn" type="button" disabled title="Xem Running/Queued/Blocked/... của session này">📋 Tasks</button>
             <button id="fullscreenBtn" class="term-btn" type="button" disabled title="Fullscreen (Esc để thoát)">⛶</button>
             <div class="menu" id="termMenu">
               <button class="term-btn" id="termMenuBtn" type="button" disabled aria-haspopup="true" aria-expanded="false" title="Thêm tuỳ chọn">⋯</button>
@@ -843,6 +881,46 @@ DASHBOARD_HTML = """<!doctype html>
       <a id="knowledgeExportBtn" class="term-btn" href="#" target="_blank" rel="noopener">⬇ Xuất lịch sử (.txt)</a>
     </div>
   </div>
+  <div id="taskBackdrop"></div>
+  <div id="taskModal" role="dialog" aria-modal="true" aria-labelledby="taskModalTitle">
+    <div class="pm-head">
+      <strong id="taskModalTitle">Tasks</strong>
+      <button id="taskModalCloseBtn" class="term-btn" type="button">✕</button>
+    </div>
+    <div class="pm-body">
+      <div class="tm-lane-actions">
+        <button id="taskPauseBtn" type="button">⏸ Pause queue</button>
+        <button id="taskResumeBtn" type="button" hidden>▶ Resume queue</button>
+      </div>
+      <div class="tm-enqueue-row">
+        <input type="text" id="taskEnqueueInput" placeholder="Thêm task mới (prompt)..." autocomplete="off">
+        <button id="taskEnqueueBtn" type="button">+ Thêm</button>
+      </div>
+      <div id="taskModalError" class="km-error"></div>
+      <div id="taskGate" hidden></div>
+      <div id="taskEmpty" hidden>Chưa có task nào cho session này.</div>
+      <div class="tm-group">
+        <div class="tm-group-title">▶ Đang chạy <span class="tm-count" id="taskCountRunning">0</span></div>
+        <div id="taskListRunning"></div>
+      </div>
+      <div class="tm-group">
+        <div class="tm-group-title">⏳ Đang chờ <span class="tm-count" id="taskCountQueued">0</span></div>
+        <div id="taskListQueued"></div>
+      </div>
+      <div class="tm-group">
+        <div class="tm-group-title">🔗 Chờ dependency <span class="tm-count" id="taskCountWaitingDep">0</span></div>
+        <div id="taskListWaitingDep"></div>
+      </div>
+      <div class="tm-group">
+        <div class="tm-group-title">⚠ Blocked / Rework <span class="tm-count" id="taskCountBlocked">0</span></div>
+        <div id="taskListBlocked"></div>
+      </div>
+      <div class="tm-group">
+        <div class="tm-group-title">✓ Gần đây (Done/Failed) <span class="tm-count" id="taskCountRecent">0</span></div>
+        <div id="taskListRecent"></div>
+      </div>
+    </div>
+  </div>
   <script>
     let selected = null;
     let inputAllowed = false;
@@ -903,6 +981,16 @@ DASHBOARD_HTML = """<!doctype html>
     const knowledgeEmptyEl = document.querySelector('#knowledgeEmpty');
     const knowledgeChunksEl = document.querySelector('#knowledgeChunks');
     const knowledgeExportBtnEl = document.querySelector('#knowledgeExportBtn');
+    const taskBackdropEl = document.querySelector('#taskBackdrop');
+    const taskModalTitleEl = document.querySelector('#taskModalTitle');
+    const taskModalCloseBtnEl = document.querySelector('#taskModalCloseBtn');
+    const taskModalErrorEl = document.querySelector('#taskModalError');
+    const taskPauseBtnEl = document.querySelector('#taskPauseBtn');
+    const taskResumeBtnEl = document.querySelector('#taskResumeBtn');
+    const taskEnqueueInputEl = document.querySelector('#taskEnqueueInput');
+    const taskEnqueueBtnEl = document.querySelector('#taskEnqueueBtn');
+    const taskGateEl = document.querySelector('#taskGate');
+    const taskEmptyEl = document.querySelector('#taskEmpty');
     const permBackdropEl = document.querySelector('#permBackdrop');
     const permModalEl = document.querySelector('#permModal');
     const permModalTitleEl = document.querySelector('#permModalTitle');
@@ -913,6 +1001,7 @@ DASHBOARD_HTML = """<!doctype html>
     const permModalCloseBtnEl = document.querySelector('#permModalCloseBtn');
     const liveBadgeEl = document.querySelector('#liveBadge');
     const connHealthBadgeEl = document.querySelector('#connHealthBadge');
+    const taskSummaryBadgeEl = document.querySelector('#taskSummaryBadge');
     const supervisorBadgeEl = document.querySelector('#supervisorBadge');
     const supervisorPanelEl = document.querySelector('#supervisorPanel');
     const supervisorBackdropEl = document.querySelector('#supervisorBackdrop');
@@ -923,6 +1012,7 @@ DASHBOARD_HTML = """<!doctype html>
     const termTitleEl = document.querySelector('#termTitle');
     const followToggleEl = document.querySelector('#followToggle');
     const jumpBtnEl = document.querySelector('#jumpBtn');
+    const taskManagerBtnEl = document.querySelector('#taskManagerBtn');
     const fullscreenBtnEl = document.querySelector('#fullscreenBtn');
     const fontDecBtnEl = document.querySelector('#fontDecBtn');
     const fontIncBtnEl = document.querySelector('#fontIncBtn');
@@ -1428,6 +1518,7 @@ DASHBOARD_HTML = """<!doctype html>
     function refreshTermControls() {
       followToggleEl.disabled = !selected;
       jumpBtnEl.disabled = !selected;
+      taskManagerBtnEl.disabled = !selected;
       fullscreenBtnEl.disabled = !selected;
       searchToggleBtnEl.disabled = !selected;
       copyBtnEl.disabled = !selected;
@@ -1435,6 +1526,7 @@ DASHBOARD_HTML = """<!doctype html>
       termTitleEl.textContent = selected || '';
       refreshTermActionMenu();
     }
+    taskManagerBtnEl.onclick = () => { if (selected) openTaskModal(selected); };
     followToggleEl.onclick = () => {
       setAutoFollow(!autoFollow);
       if (autoFollow) outputEl.scrollTop = outputEl.scrollHeight;
@@ -2413,6 +2505,173 @@ DASHBOARD_HTML = """<!doctype html>
       if (event.key === 'Enter') knowledgeSearchBtnEl.onclick();
     });
 
+    // ---- Task Manager (Dashboard Task Manager UI, queue_service.py) -----
+    // Every field rendered below comes straight from session_task_board's
+    // own real, persistent Queue/Coordinator state -- task_id/status/
+    // priority/coordinator_decision/original_owner/migration_history/
+    // last_error are all real stored columns, never guessed from a
+    // session's own terminal text. Realtime: polls the SAME lightweight
+    // GET this modal itself fetched to open, every 3s while open, no
+    // page reload.
+    let taskModalName = null;
+    let taskPollTimer = null;
+    const GATE_CLASS = {READY: 'gate-ready', BLOCKED: 'gate-blocked', NEEDS_REWORK: 'gate-blocked', NEEDS_HUMAN: 'gate-blocked'};
+    function closeTaskModal() {
+      document.body.classList.remove('task-modal-visible');
+      taskModalName = null; taskModalErrorEl.textContent = '';
+      if (taskPollTimer) { clearInterval(taskPollTimer); taskPollTimer = null; }
+    }
+    function taskAge(iso) {
+      if (!iso) return '';
+      const ms = Date.now() - new Date(iso + (iso.endsWith('Z') ? '' : 'Z')).getTime();
+      if (!Number.isFinite(ms) || ms < 0) return '';
+      const mins = Math.floor(ms / 60000);
+      if (mins < 1) return 'vừa xong';
+      if (mins < 60) return `${mins}p trước`;
+      const hours = Math.floor(mins / 60);
+      if (hours < 24) return `${hours}g trước`;
+      return `${Math.floor(hours / 24)}ng trước`;
+    }
+    function renderTaskRow(task, group) {
+      const row = document.createElement('div'); row.className = 'tm-task';
+      const top = document.createElement('div'); top.className = 'tm-task-top';
+      const title = document.createElement('div'); title.className = 'tm-task-title';
+      title.textContent = task.title || task.prompt || task.id;
+      title.title = task.prompt || '';
+      const status = document.createElement('span'); status.className = 'tm-count'; status.textContent = task.status;
+      top.append(title, status);
+      const meta = document.createElement('div'); meta.className = 'tm-task-meta';
+      const bits = [`#${clean(task.id).slice(0, 8)}`, `priority ${task.priority ?? 0}`, taskAge(task.created_at)];
+      if (task.original_owner && task.original_owner !== taskModalName) {
+        const ownerLink = document.createElement('a');
+        ownerLink.textContent = `owner: ${task.original_owner}`;
+        ownerLink.onclick = () => { closeTaskModal(); selectSession(task.original_owner); };
+        meta.append(...bits.filter(Boolean).map(t => { const s = document.createElement('span'); s.textContent = t; return s; }), ownerLink);
+      } else {
+        for (const bit of bits.filter(Boolean)) { const s = document.createElement('span'); s.textContent = bit; meta.append(s); }
+      }
+      if (task.migration_history && task.migration_history.length) {
+        const mig = document.createElement('span'); mig.textContent = `migrated ${task.migration_history.length}x`; meta.append(mig);
+      }
+      if ((task.attempt_count || 0) > 0) {
+        const att = document.createElement('span'); att.textContent = `attempts ${task.attempt_count}`; meta.append(att);
+      }
+      row.append(top, meta);
+      if (task.depends_on && task.depends_on.length) {
+        const dep = document.createElement('div'); dep.className = 'tm-task-meta';
+        dep.textContent = `chờ: ${task.depends_on.map(d => '#' + d.slice(0, 8)).join(', ')}`;
+        row.append(dep);
+      }
+      const reasonText = task.last_error || task.coordinator_reason;
+      if (reasonText && (group === 'blocked_rework' || group === 'waiting_dependency')) {
+        const reason = document.createElement('div'); reason.className = 'tm-task-reason'; reason.textContent = reasonText;
+        row.append(reason);
+      }
+      const actions = document.createElement('div'); actions.className = 'tm-task-actions';
+      if (group === 'queued') {
+        const cancelBtn = document.createElement('button'); cancelBtn.type = 'button'; cancelBtn.textContent = '✕ Cancel';
+        cancelBtn.onclick = () => taskAction('/dashboard/api/task/cancel', task.id);
+        actions.append(cancelBtn);
+      }
+      if (group === 'blocked_rework' && (task.status === 'BLOCKED' || task.status === 'FAILED')) {
+        const retryBtn = document.createElement('button'); retryBtn.type = 'button'; retryBtn.textContent = '↻ Retry';
+        retryBtn.onclick = () => taskAction('/dashboard/api/task/retry', task.id);
+        actions.append(retryBtn);
+      }
+      if (actions.childElementCount) row.append(actions);
+      return row;
+    }
+    function renderTaskGroup(listEl, countEl, tasks, group) {
+      listEl.replaceChildren();
+      countEl.textContent = String(tasks.length);
+      countEl.classList.toggle('nonzero', tasks.length > 0);
+      for (const task of tasks) listEl.append(renderTaskRow(task, group));
+    }
+    function renderTaskBoard(data) {
+      if (data.error) { taskModalErrorEl.textContent = clean(data.error); return; }
+      taskModalErrorEl.textContent = '';
+      taskPauseBtnEl.hidden = data.paused === true;
+      taskResumeBtnEl.hidden = data.paused !== true;
+      renderTaskGroup(document.querySelector('#taskListRunning'), document.querySelector('#taskCountRunning'), data.running, 'running');
+      renderTaskGroup(document.querySelector('#taskListQueued'), document.querySelector('#taskCountQueued'), data.queued, 'queued');
+      renderTaskGroup(document.querySelector('#taskListWaitingDep'), document.querySelector('#taskCountWaitingDep'), data.waiting_dependency, 'waiting_dependency');
+      renderTaskGroup(document.querySelector('#taskListBlocked'), document.querySelector('#taskCountBlocked'), data.blocked_rework, 'blocked_rework');
+      renderTaskGroup(document.querySelector('#taskListRecent'), document.querySelector('#taskCountRecent'), data.recent, 'recent');
+      taskEmptyEl.hidden = data.summary.total > 0;
+      if (data.next_gate) {
+        taskGateEl.hidden = false;
+        const cls = GATE_CLASS[data.next_gate.decision && data.next_gate.decision.status] || '';
+        taskGateEl.className = cls;
+        taskGateEl.textContent = `Coordinator gate cho task tiếp theo (${clean(data.next_gate.title || data.next_gate.task_id)}): `
+          + (data.next_gate.decision ? clean(data.next_gate.decision.status) : 'chưa review')
+          + (data.next_gate.reason ? ' -- ' + clean(data.next_gate.reason) : '');
+      } else {
+        taskGateEl.hidden = true;
+      }
+    }
+    async function loadTaskBoard(name) {
+      const data = await fetchJSON(`/dashboard/api/session/tasks?name=${encodeURIComponent(name)}`, {cache: 'no-store'});
+      if (taskModalName !== name) return;
+      renderTaskBoard(data);
+    }
+    function openTaskModal(name) {
+      taskModalName = name;
+      taskModalTitleEl.textContent = `Tasks: ${name}`;
+      taskEnqueueInputEl.value = ''; taskModalErrorEl.textContent = '';
+      document.body.classList.add('task-modal-visible');
+      loadTaskBoard(name).catch(() => {});
+      if (taskPollTimer) clearInterval(taskPollTimer);
+      taskPollTimer = setInterval(() => { if (taskModalName) loadTaskBoard(taskModalName).catch(() => {}); }, 3000);
+    }
+    taskModalCloseBtnEl.onclick = closeTaskModal;
+    taskBackdropEl.onclick = closeTaskModal;
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && document.body.classList.contains('task-modal-visible')) closeTaskModal();
+    });
+    async function taskAction(path, taskId) {
+      if (!taskModalName) return;
+      const response = await fetch(path, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: taskModalName, task_id: taskId}),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (result && result.error) { taskModalErrorEl.textContent = clean(result.error); return; }
+      await loadTaskBoard(taskModalName);
+    }
+    taskPauseBtnEl.onclick = async () => {
+      if (!taskModalName) return;
+      const response = await fetch('/dashboard/api/session/queue/pause', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: taskModalName}),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (result && result.error) { taskModalErrorEl.textContent = clean(result.error); return; }
+      await loadTaskBoard(taskModalName);
+    };
+    taskResumeBtnEl.onclick = async () => {
+      if (!taskModalName) return;
+      const response = await fetch('/dashboard/api/session/queue/resume', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: taskModalName}),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (result && result.error) { taskModalErrorEl.textContent = clean(result.error); return; }
+      await loadTaskBoard(taskModalName);
+    };
+    taskEnqueueBtnEl.onclick = async () => {
+      const prompt = taskEnqueueInputEl.value.trim();
+      if (!taskModalName || !prompt) return;
+      const response = await fetch('/dashboard/api/session/queue/enqueue', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: taskModalName, prompt}),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (result && result.error) { taskModalErrorEl.textContent = clean(result.error); return; }
+      taskEnqueueInputEl.value = '';
+      await loadTaskBoard(taskModalName);
+    };
+    taskEnqueueInputEl.addEventListener('keydown', event => {
+      if (event.key === 'Enter') { event.preventDefault(); taskEnqueueBtnEl.onclick(); }
+    });
+
     // ---- killed-sessions reopen list (item 9-11) -----------------------
     // Compact, collapsed by default, zero footprint until there's actually
     // a killed session to reopen -- never a second navigation surface for
@@ -2881,6 +3140,24 @@ DASHBOARD_HTML = """<!doctype html>
       }
     }
     loadConnectionHealth(); setInterval(loadConnectionHealth, 30000);
+
+    // Dashboard's own small global overview line (task: "Running 1 ·
+    // Waiting 3 · Blocked 1") -- one aggregate across every queue lane,
+    // hidden entirely when all-zero (never used queue features at all)
+    // so it adds no clutter for a deployment that doesn't use this.
+    async function loadFleetTaskSummary() {
+      try {
+        const data = await fetchJSON('/dashboard/api/fleet-task-summary', {cache: 'no-store'});
+        if (!data || (data.running === 0 && data.queued === 0 && data.blocked === 0)) {
+          taskSummaryBadgeEl.hidden = true; return;
+        }
+        taskSummaryBadgeEl.hidden = false;
+        taskSummaryBadgeEl.textContent = `Running ${data.running} · Waiting ${data.queued} · Blocked ${data.blocked}`;
+      } catch (error) {
+        taskSummaryBadgeEl.hidden = true;
+      }
+    }
+    loadFleetTaskSummary(); setInterval(loadFleetTaskSummary, 10000);
   </script>
 </body>
 </html>"""
@@ -5506,6 +5783,163 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if "error" in result:
             status_code = 403 if result["error"] in ("ACCESS_DENIED", "READ_RESTRICTED") else \
                 (409 if result["error"] == "AMBIGUOUS_SESSION" else 404)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    # -- Dashboard Task Manager UI (queue_service.py) ------------------------
+    # Reuses the SAME persistent Queue/Coordinator store the MCP
+    # terminal_queue_*/terminal_task_*/terminal_session_tasks tool
+    # surface already uses -- never a second, dashboard-only task store
+    # (task's own explicit "không tạo một task store song song"). Read
+    # routes gate on the SAME _read_authorized per-session check the
+    # Knowledge Store routes just above use (a task's own prompt/title
+    # text can be sensitive, same reasoning as session output); action
+    # routes go through the ordinary _mutation_guard (auth+CSRF) every
+    # other mutation here uses -- no separate permission model.
+
+    @server.custom_route("/dashboard/api/session/tasks", methods=["GET"], include_in_schema=False)
+    async def session_tasks(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        name = request.query_params.get("name", "")
+        if not name or not terminal._read_authorized(name):
+            return JSONResponse({"error": "READ_RESTRICTED", "session": name}, status_code=403)
+        result = await anyio.to_thread.run_sync(lambda: queue.session_task_board(name))
+        status_code = 200 if "error" not in result else 400
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/fleet-task-summary", methods=["GET"], include_in_schema=False)
+    async def fleet_task_summary(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        result = await anyio.to_thread.run_sync(queue.fleet_task_summary)
+        return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/queue/pause", methods=["POST"], include_in_schema=False)
+    async def session_queue_pause(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name or not terminal._read_authorized(name):
+            return JSONResponse({"error": "READ_RESTRICTED", "session": name}, status_code=403)
+        reason = body.get("reason") if isinstance(body, dict) else None
+        _log.info("dashboard queue_pause session=%s identity=%s", name, identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(lambda: queue.pause(name, reason=reason or "dashboard"))
+        return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/queue/resume", methods=["POST"], include_in_schema=False)
+    async def session_queue_resume(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name or not terminal._read_authorized(name):
+            return JSONResponse({"error": "READ_RESTRICTED", "session": name}, status_code=403)
+        _log.info("dashboard queue_resume session=%s identity=%s", name, identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(lambda: queue.resume(name))
+        return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/queue/enqueue", methods=["POST"], include_in_schema=False)
+    async def session_queue_enqueue(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        prompt = body.get("prompt") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name or not terminal._read_authorized(name):
+            return JSONResponse({"error": "READ_RESTRICTED", "session": name}, status_code=403)
+        if not isinstance(prompt, str) or not prompt:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        title = body.get("title") if isinstance(body.get("title"), str) else None
+        priority = body.get("priority") if isinstance(body.get("priority"), int) else 0
+        _log.info("dashboard queue_enqueue session=%s identity=%s", name, identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(
+            lambda: queue.enqueue(name, prompt, title=title, priority=priority)
+        )
+        status_code = 200 if "error" not in result else 400
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/queue/reorder", methods=["POST"], include_in_schema=False)
+    async def session_queue_reorder(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        ordered_task_ids = body.get("ordered_task_ids") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name or not terminal._read_authorized(name):
+            return JSONResponse({"error": "READ_RESTRICTED", "session": name}, status_code=403)
+        if not isinstance(ordered_task_ids, list) or not all(isinstance(t, str) for t in ordered_task_ids):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        _log.info("dashboard queue_reorder session=%s identity=%s", name, identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(lambda: queue.reorder(name, ordered_task_ids))
+        status_code = 200 if "error" not in result else 400
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/task/retry", methods=["POST"], include_in_schema=False)
+    async def task_retry(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        task_id = body.get("task_id") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name or not terminal._read_authorized(name):
+            return JSONResponse({"error": "READ_RESTRICTED", "session": name}, status_code=403)
+        if not isinstance(task_id, str) or not task_id:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        _log.info("dashboard task_retry session=%s task_id=%s identity=%s", name, task_id,
+                 identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(lambda: queue.retry(name, task_id))
+        status_code = 200 if "error" not in result else 400
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/task/cancel", methods=["POST"], include_in_schema=False)
+    async def task_cancel(request: Request) -> JSONResponse:
+        # Dashboard UI only ever offers this for a still-QUEUED task (see
+        # the JS below) -- the underlying store itself would also allow
+        # cancelling a RUNNING one (a real, audited transition, useful
+        # from the API/ChatGPT side), but this route doesn't add any
+        # extra restriction of its own beyond that real state machine;
+        # the UI is what keeps the dashboard's own one-click action safe
+        # ("never cancel a RUNNING task in an audit-losing way").
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        task_id = body.get("task_id") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name or not terminal._read_authorized(name):
+            return JSONResponse({"error": "READ_RESTRICTED", "session": name}, status_code=403)
+        if not isinstance(task_id, str) or not task_id:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        _log.info("dashboard task_cancel session=%s task_id=%s identity=%s", name, task_id,
+                 identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(lambda: queue.cancel(name, task_id))
+        status_code = 200 if "error" not in result else 400
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/knowledge/search", methods=["GET"], include_in_schema=False)

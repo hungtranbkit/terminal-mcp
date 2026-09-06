@@ -136,6 +136,104 @@ class QueueService:
     def list_all(self) -> dict[str, Any]:
         return {"lanes": self.store.list_all_lanes()}
 
+    _TERMINAL_RECENT_STATUSES = ("COMPLETED", "FAILED", "CANCELLED", "SKIPPED")
+    _ATTENTION_STATUSES = ("BLOCKED", "FAILED", "DISPATCH_UNCERTAIN", "WAITING_SESSION", "PAUSED")
+    _RUNNING_STATUSES = ("PRECHECK", "READY", "DISPATCHING", "RUNNING", "VERIFYING")
+
+    def session_task_board(self, session: str, *, recent_limit: int = 10) -> dict[str, Any]:
+        """Dashboard Task Manager UI's own single read (task: "khi chọn
+        session/card/tab phải thấy Running/Queued/Waiting Dependency/
+        Blocked-Rework/Recent Done-Failed") -- every field here comes
+        straight from lane_status()'s own QueueTask.to_dict() rows
+        (which themselves come straight off the persistent state
+        machine -- status/priority/coordinator_decision/
+        coordinator_reason/attempt_count/original_owner/
+        migration_history/verification_evidence/last_error are all
+        real, stored columns), never guessed or re-derived from a
+        session's own terminal text. This method only GROUPS those same
+        rows into the buckets the UI wants; it never creates a second,
+        parallel task store (task's own explicit "không tạo một task
+        store song song")."""
+        if error := self._validate_session(session):
+            return error
+        lane = self.store.lane_status(session)
+        tasks = lane["tasks"]
+        by_id = {t["id"]: t for t in tasks}
+
+        def _dependency_satisfied(task: dict[str, Any]) -> bool:
+            return all(by_id.get(dep_id, {}).get("status") == "COMPLETED" for dep_id in task.get("depends_on") or ())
+
+        running: list[dict[str, Any]] = []
+        queued: list[dict[str, Any]] = []
+        waiting_dependency: list[dict[str, Any]] = []
+        blocked_rework: list[dict[str, Any]] = []
+        recent: list[dict[str, Any]] = []
+        for task in tasks:
+            status = task["status"]
+            if status in self._RUNNING_STATUSES:
+                running.append(task)
+            elif status == "QUEUED":
+                (queued if _dependency_satisfied(task) else waiting_dependency).append(task)
+            elif status in self._ATTENTION_STATUSES:
+                blocked_rework.append(task)
+            elif status in self._TERMINAL_RECENT_STATUSES:
+                recent.append(task)
+        recent.sort(key=lambda t: t.get("completed_at") or t.get("updated_at") or "", reverse=True)
+        recent = recent[:recent_limit]
+
+        # Coordinator gate for the head-of-line task (task's own "Gate
+        # được hiển thị ngay trên task tiếp theo") -- the first QUEUED/
+        # PRECHECK task in position order that hasn't run yet; a
+        # session with something already RUNNING has no "next" gate to
+        # show (it's correctly busy, not waiting on a gate decision).
+        next_gate = None
+        if not running:
+            head = next((t for t in tasks if t["status"] in ("QUEUED", "PRECHECK")), None)
+            if head is not None:
+                next_gate = {
+                    "task_id": head["id"], "title": head["title"],
+                    "decision": head.get("coordinator_decision") or None,
+                    "reason": head.get("coordinator_reason"),
+                    "checked_at": head.get("coordinator_checked_at"),
+                }
+
+        return {
+            "session": session,
+            "paused": lane["paused"],
+            "paused_reason": lane["paused_reason"],
+            "project": lane["project"],
+            "summary": {
+                "running": len(running), "queued": len(queued), "waiting_dependency": len(waiting_dependency),
+                "blocked_rework": len(blocked_rework), "total": lane["total_count"],
+            },
+            "next_gate": next_gate,
+            "running": running,
+            "queued": queued,
+            "waiting_dependency": waiting_dependency,
+            "blocked_rework": blocked_rework,
+            "recent": recent,
+        }
+
+    def fleet_task_summary(self) -> dict[str, Any]:
+        """The dashboard's own small global overview line (task: "Running
+        1 · Waiting 3 · Blocked 1") -- one aggregate across every lane
+        that has ever had a task, deliberately not per-row (avoids a
+        lane_status() query per visible session tab on every poll);
+        entirely absent/zero lanes (never used queue features at all)
+        collapses to all-zero counts, which the UI hides rather than
+        showing a clutter line of zeros."""
+        running = queued = blocked = 0
+        for lane in self.store.list_all_lanes():
+            for task in lane["tasks"]:
+                status = task["status"]
+                if status in self._RUNNING_STATUSES:
+                    running += 1
+                elif status == "QUEUED":
+                    queued += 1
+                elif status in self._ATTENTION_STATUSES:
+                    blocked += 1
+        return {"running": running, "queued": queued, "blocked": blocked}
+
     def pause(self, session: str, *, reason: str | None = None) -> dict[str, Any]:
         if error := self._validate_session(session):
             return error

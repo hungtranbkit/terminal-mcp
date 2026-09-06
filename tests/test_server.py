@@ -96,6 +96,8 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_task_assignment_history",
         "terminal_task_rebalance_plan",
         "terminal_task_rebalance",
+        "terminal_session_tasks",
+        "terminal_fleet_task_summary",
     }
 
 

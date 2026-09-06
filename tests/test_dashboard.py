@@ -891,7 +891,7 @@ def test_dashboard_health_indicator_no_new_backend_route():
     # registry/reopen and registry/purge -- registry LISTING itself
     # (loadRegistry) goes through the shared fetchJSON() wrapper, already
     # counted once, so it adds no new literal call site of its own.
-    assert DASHBOARD_HTML.count("fetch(") == 17  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere), registry/reopen, registry/purge, watchdog/acknowledge, session/rename (Rename Session feature)
+    assert DASHBOARD_HTML.count("fetch(") == 21  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere), registry/reopen, registry/purge, watchdog/acknowledge, session/rename (Rename Session feature), task/cancel-or-retry (taskAction, Task Manager UI), session/queue/pause, session/queue/resume, session/queue/enqueue (Task Manager UI)
 
 
 def test_dashboard_auth_required_distinguished_from_offline():
@@ -1335,6 +1335,16 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # separate feature, same as the knowledge routes above.
         "/dashboard/api/watchdog/events": {"GET", "HEAD"},
         "/dashboard/api/watchdog/acknowledge": {"POST"},
+        # Dashboard Task Manager UI (queue_service.py) -- another later,
+        # separate feature, same as the watchdog routes above.
+        "/dashboard/api/session/tasks": {"GET", "HEAD"},
+        "/dashboard/api/fleet-task-summary": {"GET", "HEAD"},
+        "/dashboard/api/session/queue/pause": {"POST"},
+        "/dashboard/api/session/queue/resume": {"POST"},
+        "/dashboard/api/session/queue/enqueue": {"POST"},
+        "/dashboard/api/session/queue/reorder": {"POST"},
+        "/dashboard/api/task/retry": {"POST"},
+        "/dashboard/api/task/cancel": {"POST"},
     }
     # The web terminal's WebSocket route is registered too, just outside
     # this HTTP-methods-only dict (WebSocketRoute has no .methods).
