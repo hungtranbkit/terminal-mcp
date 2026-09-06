@@ -72,6 +72,16 @@ def _engine(stores):
     return IntegrationEngine(stores["integration"], stores["queue"])
 
 
+def _publish_handoff(store, **kwargs):
+    # docs_exempt="chore" by default -- every test in this file is
+    # exercising merge/conflict/rework/regression/promote MECHANICS, not
+    # the living-requirements doc gate (that gate has its own dedicated
+    # tests in test_integration_reviewer.py); a disposable a.txt/shared.txt
+    # commit has nothing real to document either way.
+    kwargs.setdefault("artifacts", {"docs_exempt": "chore"})
+    return store.publish_handoff(**kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Clean merge -> targeted test -> INTEGRATED.
 # ---------------------------------------------------------------------------
@@ -79,7 +89,7 @@ def _engine(stores):
 def test_clean_merge_and_passing_targeted_test_reaches_integrated(stores, repo):
     _configure(stores["integration"], repo)
     sha, base_sha = _commit_on_branch(repo, "feature/a", "a.txt", "hello from A\n")
-    handoff = stores["integration"].publish_handoff(
+    handoff = _publish_handoff(stores["integration"], 
         project="proj-a", task_id="t1", origin_session="lane-a", branch="feature/a",
         commit_sha=sha, base_sha=base_sha, changed_paths=["a.txt"],
     )
@@ -111,11 +121,11 @@ def test_real_merge_conflict_routes_rework_to_owning_session(stores, repo):
     sha_a, base_a = _commit_on_branch(repo, "feature/a", "shared.txt", "version A\n")
     sha_b, base_b = _commit_on_branch(repo, "feature/b", "shared.txt", "version B (conflicting)\n")
 
-    handoff_a = stores["integration"].publish_handoff(
+    handoff_a = _publish_handoff(stores["integration"], 
         project="proj-a", task_id="t1", origin_session="lane-a", branch="feature/a",
         commit_sha=sha_a, base_sha=base_a, changed_paths=["shared.txt"],
     )
-    handoff_b = stores["integration"].publish_handoff(
+    handoff_b = _publish_handoff(stores["integration"], 
         project="proj-a", task_id="t2", origin_session="lane-b", branch="feature/b",
         commit_sha=sha_b, base_sha=base_b, changed_paths=["shared.txt"],
     )
@@ -159,10 +169,10 @@ def test_conflict_routes_to_a_different_session_via_ownership_override(stores, r
     _configure(stores["integration"], repo, session_ownership={"shared.txt": "lane-c"})
     sha_a, base_a = _commit_on_branch(repo, "feature/a", "shared.txt", "version A\n")
     sha_b, base_b = _commit_on_branch(repo, "feature/b", "shared.txt", "version B\n")
-    stores["integration"].publish_handoff(project="proj-a", task_id="t1", origin_session="lane-a",
+    _publish_handoff(stores["integration"], project="proj-a", task_id="t1", origin_session="lane-a",
                                           branch="feature/a", commit_sha=sha_a, base_sha=base_a,
                                           changed_paths=["shared.txt"])
-    handoff_b = stores["integration"].publish_handoff(project="proj-a", task_id="t2", origin_session="lane-a",
+    handoff_b = _publish_handoff(stores["integration"], project="proj-a", task_id="t2", origin_session="lane-a",
                                                       branch="feature/b", commit_sha=sha_b, base_sha=base_b,
                                                       changed_paths=["shared.txt"])
     engine = _engine(stores)
@@ -182,7 +192,7 @@ def test_conflict_routes_to_a_different_session_via_ownership_override(stores, r
 def test_failing_targeted_test_command_routes_rework(stores, repo):
     _configure(stores["integration"], repo, targeted_test_command=["grep", "-q", "SHOULD_NOT_EXIST", "{paths}"])
     sha, base_sha = _commit_on_branch(repo, "feature/bad", "bad.txt", "perfectly normal content\n")
-    handoff = stores["integration"].publish_handoff(
+    handoff = _publish_handoff(stores["integration"], 
         project="proj-a", task_id="t1", origin_session="lane-a", branch="feature/bad",
         commit_sha=sha, base_sha=base_sha, changed_paths=["bad.txt"],
     )
@@ -207,7 +217,7 @@ def test_failing_targeted_test_command_routes_rework(stores, repo):
 def test_restart_mid_merge_never_creates_a_duplicate_merge_commit(stores, repo, tmp_path):
     _configure(stores["integration"], repo)
     sha, base_sha = _commit_on_branch(repo, "feature/a", "a.txt", "content\n")
-    handoff = stores["integration"].publish_handoff(
+    handoff = _publish_handoff(stores["integration"], 
         project="proj-a", task_id="t1", origin_session="lane-a", branch="feature/a",
         commit_sha=sha, base_sha=base_sha, changed_paths=["a.txt"],
     )
@@ -251,7 +261,7 @@ def test_restart_mid_merge_never_creates_a_duplicate_merge_commit(stores, repo, 
 def test_batch_regression_pass_and_promote_to_main(stores, repo):
     _configure(stores["integration"], repo, batch_size=1)
     sha, base_sha = _commit_on_branch(repo, "feature/a", "a.txt", "content\n")
-    stores["integration"].publish_handoff(project="proj-a", task_id="t1", origin_session="lane-a",
+    _publish_handoff(stores["integration"], project="proj-a", task_id="t1", origin_session="lane-a",
                                           branch="feature/a", commit_sha=sha, base_sha=base_sha,
                                           changed_paths=["a.txt"])
     engine = _engine(stores)
@@ -279,7 +289,7 @@ def test_batch_regression_pass_and_promote_to_main(stores, repo):
 def test_batch_regression_failure_pauses_the_whole_pipeline(stores, repo):
     _configure(stores["integration"], repo, batch_size=1, full_regression_command=["false"])
     sha, base_sha = _commit_on_branch(repo, "feature/a", "a.txt", "content\n")
-    stores["integration"].publish_handoff(project="proj-a", task_id="t1", origin_session="lane-a",
+    _publish_handoff(stores["integration"], project="proj-a", task_id="t1", origin_session="lane-a",
                                           branch="feature/a", commit_sha=sha, base_sha=base_sha,
                                           changed_paths=["a.txt"])
     engine = _engine(stores)
@@ -296,7 +306,7 @@ def test_batch_regression_failure_pauses_the_whole_pipeline(stores, repo):
 def test_auto_promote_disabled_by_default_never_touches_main(stores, repo):
     _configure(stores["integration"], repo, batch_size=1)  # auto_promote_enabled defaults False
     sha, base_sha = _commit_on_branch(repo, "feature/a", "a.txt", "content\n")
-    stores["integration"].publish_handoff(project="proj-a", task_id="t1", origin_session="lane-a",
+    _publish_handoff(stores["integration"], project="proj-a", task_id="t1", origin_session="lane-a",
                                           branch="feature/a", commit_sha=sha, base_sha=base_sha,
                                           changed_paths=["a.txt"])
     engine = _engine(stores)

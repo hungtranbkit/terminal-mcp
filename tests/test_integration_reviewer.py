@@ -10,7 +10,7 @@ import subprocess
 
 import pytest
 
-from terminal_mcp.integration_reviewer import BLOCKED, READY, IntegrationReviewGate
+from terminal_mcp.integration_reviewer import BLOCKED, READY, REWORK_REQUIRED, IntegrationReviewGate
 from terminal_mcp.integration_store import Handoff
 
 
@@ -39,9 +39,14 @@ def _commit(repo, filename, content, message="feature commit"):
 
 
 def _handoff(**overrides):
+    # artifacts defaults to docs_exempt="chore" -- every pre-existing
+    # test here is exercising review mechanics OTHER than the living-
+    # requirements doc gate (commit resolution, dirty tree, migration
+    # flags, evidence shape); the doc-gate's OWN tests (below) override
+    # this explicitly to prove the real behavior.
     base = {"id": "h1", "project": "proj-a", "task_id": "t1", "origin_session": "lane-a", "branch": "feature/x",
-           "commit_sha": "x", "base_sha": "y", "changed_paths": (), "test_summary": {}, "artifacts": {},
-           "status": "CLAIMED", "created_at": "now", "updated_at": "now"}
+           "commit_sha": "x", "base_sha": "y", "changed_paths": (), "test_summary": {},
+           "artifacts": {"docs_exempt": "chore"}, "status": "CLAIMED", "created_at": "now", "updated_at": "now"}
     base.update(overrides)
     return Handoff(**base)
 
@@ -117,3 +122,68 @@ def test_evidence_includes_resolved_commit(repo):
     gate = IntegrationReviewGate()
     decision = gate.review(handoff, _pipeline(repo))
     assert decision.evidence["resolved_commit"] == sha
+
+
+# ---------------------------------------------------------------------------
+# Living-requirements convention: a behavior-changing diff must also touch
+# docs/REQUIREMENTS.md, or be explicitly docs_exempt, or be REWORK_REQUIRED.
+# ---------------------------------------------------------------------------
+
+def test_behavior_change_without_requirements_doc_update_needs_rework(repo):
+    sha, base_sha = _commit(repo, "app.py", "def handler():\n    return 42\n")
+    handoff = _handoff(commit_sha=sha, base_sha=base_sha, changed_paths=("app.py",), artifacts={})
+    gate = IntegrationReviewGate()
+    decision = gate.review(handoff, _pipeline(repo))
+    assert decision.status == REWORK_REQUIRED
+    assert "REQUIREMENTS.md" in decision.reason
+    assert "missing_requirements_doc_update" in decision.risk_flags
+
+
+def test_behavior_change_with_requirements_doc_update_is_ready(repo):
+    base_sha = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    (repo / "app.py").write_text("def handler():\n    return 42\n")
+    (repo / "docs").mkdir()
+    (repo / "docs" / "REQUIREMENTS.md").write_text("### handler\n- Status: Verified\n")
+    _git(["add", "."], repo)
+    _git(["commit", "-q", "-m", "add handler + docs"], repo)
+    sha = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    handoff = _handoff(commit_sha=sha, base_sha=base_sha, changed_paths=("app.py", "docs/REQUIREMENTS.md"),
+                       artifacts={})
+    gate = IntegrationReviewGate()
+    decision = gate.review(handoff, _pipeline(repo))
+    assert decision.status == READY
+
+
+def test_behavior_change_with_docs_exempt_metadata_is_ready(repo):
+    sha, base_sha = _commit(repo, "app.py", "def handler():\n    return 42\n")
+    handoff = _handoff(commit_sha=sha, base_sha=base_sha, changed_paths=("app.py",),
+                       artifacts={"docs_exempt": "refactor"})
+    gate = IntegrationReviewGate()
+    decision = gate.review(handoff, _pipeline(repo))
+    assert decision.status == READY
+
+
+def test_test_only_change_is_exempt_without_needing_docs_exempt(repo):
+    (repo / "tests").mkdir()
+    sha, base_sha = _commit(repo, "tests/test_app.py", "def test_handler():\n    assert True\n")
+    handoff = _handoff(commit_sha=sha, base_sha=base_sha, changed_paths=("tests/test_app.py",), artifacts={})
+    gate = IntegrationReviewGate()
+    decision = gate.review(handoff, _pipeline(repo))
+    assert decision.status == READY
+
+
+def test_doc_only_change_is_exempt_without_needing_docs_exempt(repo):
+    (repo / "docs").mkdir()
+    sha, base_sha = _commit(repo, "docs/notes.md", "some notes\n")
+    handoff = _handoff(commit_sha=sha, base_sha=base_sha, changed_paths=("docs/notes.md",), artifacts={})
+    gate = IntegrationReviewGate()
+    decision = gate.review(handoff, _pipeline(repo))
+    assert decision.status == READY
+
+
+def test_doc_gate_runs_at_basic_depth_too_not_only_deep(repo):
+    sha, base_sha = _commit(repo, "app.py", "def handler():\n    return 42\n")
+    handoff = _handoff(commit_sha=sha, base_sha=base_sha, changed_paths=("app.py",), artifacts={})
+    gate = IntegrationReviewGate()
+    decision = gate.review(handoff, _pipeline(repo, review_depth="basic"))
+    assert decision.status == REWORK_REQUIRED

@@ -822,9 +822,19 @@ def publish_handoff_for_completed_task(task: Any, store: IntegrationStore) -> Ha
     required = ("project", "branch", "commit_sha", "base_sha")
     if not all(spec.get(field) for field in required):
         return None
+    # Living-requirements convention: task.metadata['docs_exempt']
+    # ("refactor" | "chore") carries forward onto the Handoff's own
+    # `artifacts` (a pre-existing, free-form JSON field -- no schema
+    # change needed) so integration_reviewer.py's own requirements-doc
+    # gate can read it without this store needing a dedicated column for
+    # what is, functionally, just one more piece of task provenance.
+    artifacts = dict(spec.get("artifacts") or {})
+    docs_exempt = (task.metadata or {}).get("docs_exempt")
+    if docs_exempt and "docs_exempt" not in artifacts:
+        artifacts["docs_exempt"] = docs_exempt
     return store.publish_handoff(
         project=spec["project"], task_id=task.id, origin_session=task.session, branch=spec["branch"],
         commit_sha=spec["commit_sha"], base_sha=spec["base_sha"], changed_paths=spec.get("changed_paths") or [],
         test_summary=spec.get("test_summary") or task.verification_evidence or {},
-        artifacts=spec.get("artifacts") or {},
+        artifacts=artifacts,
     )

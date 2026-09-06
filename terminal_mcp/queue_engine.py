@@ -99,17 +99,36 @@ def idempotency_key_for(task_id: str, attempt: int) -> str:
     return f"queue:{task_id}:{attempt}"
 
 
+REQUIREMENTS_REMINDER = (
+    "Before coding: read docs/REQUIREMENTS.md (and its own Backlog section) so you know what "
+    "the system already has. If this task changes behavior/contract (not a pure refactor/chore), "
+    "update the relevant entry in docs/REQUIREMENTS.md in place before this task is done -- the "
+    "Integration review gate checks for this and returns REWORK_REQUIRED if it's missing."
+)
+"""Living-requirements convention (task: 'sau khi hoàn tất + verify một
+feature... phải cập nhật living requirements/spec'): a short, clearly-
+delimited reminder appended to every dispatched task, same posture as
+the completion-marker instruction right below it -- never rewrites or
+reinterprets the task's own prompt, which stays verbatim and first.
+Enforcement itself lives in integration_reviewer.py (the one place a
+real diff already exists to check against), not here -- this is only
+the worker-facing half of the mechanism."""
+
+
 def build_dispatch_text(task: QueueTask, *, nonce: str) -> str:
     """The 'wrapper rất ngắn' item 7 explicitly allows and limits: the
     task's own prompt is included VERBATIM, first, unmodified -- nothing
     here rewrites or reinterprets the business request. Only a short,
-    clearly-delimited completion-marker instruction is appended, reusing
-    status.py's own COMPLETION_MARKER_RE protocol (task_id+attempt+nonce
-    -bound) so a real, verifiable completion signal is possible instead
-    of relying on a bare 'final report' heuristic (item 11)."""
+    clearly-delimited completion-marker instruction (and, per the
+    living-requirements convention, a one-line docs reminder) is
+    appended, reusing status.py's own COMPLETION_MARKER_RE protocol
+    (task_id+attempt+nonce-bound) so a real, verifiable completion
+    signal is possible instead of relying on a bare 'final report'
+    heuristic (item 11)."""
     return (
         f"{task.prompt}\n\n"
         f"---\n"
+        f"{REQUIREMENTS_REMINDER}\n\n"
         f"When (and only when) the above task is FULLY complete, print exactly one line in this "
         f"exact format (once), then stop:\n"
         f"###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1 task_id={task.id} "

@@ -34,6 +34,30 @@ a human/dashboard can see it, exactly the same posture as coordinator.py's
 own scope-reasoner: a real judgment call about whether a given schema
 change is safe is not something this mechanical check claims to make."""
 
+REQUIREMENTS_DOC_PATH = "docs/REQUIREMENTS.md"
+"""Living-requirements convention (task: "sau khi hoàn tất + verify một
+feature... phải cập nhật living requirements/spec"; "Integration/merge-
+test khi review phải kiểm tra docs đã được update cùng code, thiếu docs
+thì trả NEEDS_REWORK"): the ONE canonical requirements file every
+project this Integration Agent manages is expected to keep current --
+see that file's own header for the full convention this check enforces."""
+
+_NON_BEHAVIOR_PATH_MARKERS = ("tests/", "/tests/", "test_", "docs/")
+"""A changed path matching one of these is never, on its own, evidence
+that this diff needs a requirements-doc update -- test-only and doc-only
+changes are exempt by construction (there is no "behavior" to document
+beyond what the diff already says). A diff whose changed paths are
+ENTIRELY covered by these markers skips the requirements-doc check
+outright; the exact same disclosed-heuristic posture as coordinator.py's
+own _default_scope_reasoner -- simple and conservative, not a claim of
+real code understanding."""
+
+
+def _looks_like_a_pure_test_or_doc_change(changed_paths: list[str]) -> bool:
+    if not changed_paths:
+        return True  # nothing changed at all -- trivially nothing to document
+    return all(any(marker in path for marker in _NON_BEHAVIOR_PATH_MARKERS) for path in changed_paths)
+
 
 class ReviewEvidenceError(RuntimeError):
     """Raised when the diff/ancestry evidence this review needs could
@@ -120,6 +144,29 @@ class IntegrationReviewGate:
 
         risk_flags: list[str] = []
         evidence: dict[str, Any] = {"resolved_commit": resolved_commit}
+
+        # 4b. Living-requirements convention (task: "Integration/merge-
+        #     test khi review phải kiểm tra docs đã được update cùng
+        #     code, thiếu docs thì trả NEEDS_REWORK"). Computed at BOTH
+        #     review depths -- docs discipline is not something a
+        #     project should be able to skip just by choosing "basic"
+        #     review_depth. Exempt: a handoff whose diff touches nothing
+        #     but tests/docs (nothing behavior-changing to document), or
+        #     one whose originating task declared
+        #     artifacts['docs_exempt'] ("refactor"/"chore" -- see
+        #     publish_handoff_for_completed_task).
+        name_only = _git(["diff", "--name-only", f"{handoff.base_sha}..{handoff.commit_sha}"], repo_path)
+        changed_paths = [line for line in name_only.stdout.splitlines() if line.strip()]
+        docs_exempt = (handoff.artifacts or {}).get("docs_exempt")
+        if not docs_exempt and not _looks_like_a_pure_test_or_doc_change(changed_paths) \
+                and REQUIREMENTS_DOC_PATH not in changed_paths:
+            return IntegrationReviewDecision(
+                REWORK_REQUIRED,
+                reason=f"this diff changes behavior but does not update {REQUIREMENTS_DOC_PATH} -- "
+                      f"the living-requirements convention requires updating it before this can be marked done",
+                evidence={"changed_paths": changed_paths[:200]},
+                risk_flags=("missing_requirements_doc_update",),
+            )
 
         if depth == "deep":
             name_status = _git(["diff", "--name-status", f"{handoff.base_sha}..{handoff.commit_sha}"], repo_path)

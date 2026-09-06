@@ -119,6 +119,10 @@ def test_full_happy_path_one_tick_at_a_time(store, ops):
     # The completion-marker wrapper is appended, never replacing the
     # verbatim prompt (item 7).
     assert "TERMINAL_MCP_COMPLETION" in ops.sent[0]["text"]
+    # Living-requirements convention: the reminder is appended too, also
+    # never touching the verbatim prompt (which appears FIRST, unmodified).
+    assert "docs/REQUIREMENTS.md" in ops.sent[0]["text"]
+    assert ops.sent[0]["text"].startswith("please do the real work carefully")
 
     # Still running.
     ops.set_status("lane-a", {"state": "RUNNING", "node_id": "local", "cwd": "/repo/a"})
