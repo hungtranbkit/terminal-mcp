@@ -11,6 +11,15 @@ detail; this file is the index and the one place that must stay
 current. Do not create a second requirements/feature-matrix file
 anywhere in this repo.
 
+**If you are ChatGPT, another LLM, or any agent about to USE this
+system (not modify its code) — read `docs/CHATGPT_USAGE.md` first.**
+That file is the operational companion to this one: exact tool names,
+call order, return-value semantics, and anti-patterns. This file stays
+the technical source of truth; that one stays truthful to it and must
+be updated in the same commit whenever a behavior-changing feature
+here changes (same living-requirements convention as this file's own,
+below).
+
 **Status legend** (used everywhere below — never promote a wish-list
 item to a stronger status than the evidence supports):
 
@@ -763,6 +772,348 @@ list (`main` branch):
 
 Dates are real commit timestamps (`git log --format=%ci`), not restated
 here to avoid drift — `git log <sha> -1` is the authoritative source.
+
+---
+
+## 20. Unified Task System (PLANNED — architecture, not built)
+
+**Status: PLANNED.** Nothing in this section is callable. It exists so
+a future implementer (human or agent) builds ONE coherent system
+instead of re-discovering these decisions piecemeal or accidentally
+building a second, parallel task store. This section supersedes an
+earlier, narrower "Global Backlog Orchestrator" idea that was discussed
+but never written up as its own design — everything that idea would
+have covered is folded in here instead, under one name.
+
+### 20.0 Core principle (binding on every future phase below)
+
+**ONE canonical task row, ONE queue engine (`queue_store.py`/
+`queue_engine.py`, both already real and VERIFIED), many VIEWS.** A
+task that has no session assigned yet is shown in the Global/Unassigned
+view; the moment it's assigned, it appears in that session's own queue
+— **the same row**, never copied, never duplicated into a second store.
+The Kanban board, the per-session Task Manager, the Global Task Inbox,
+and any future PM/Planner/Merge-Agent surface are all different
+read-shapes over this one table. Any implementation that creates a
+second task/backlog table is wrong by construction, regardless of how
+well it works in isolation.
+
+### 20.1 Data model — real gap found, real reuse found
+
+`queue_tasks.session` is currently `TEXT NOT NULL` (`queue_store.py`'s
+own schema) — a task **cannot** exist without a session today. This is
+the one real, necessary schema change for "Global/Unassigned" to exist
+at all: `session` must become nullable (a new, additive migration —
+`schema.py`'s real `Migration`/`apply_migrations` framework already
+used for exactly this kind of change, see Migration 5's own real
+precedent in this same file). No other existing column needs to change
+shape for this.
+
+New columns needed on `queue_tasks` (one migration, additive, never
+touches historical rows' meaning):
+- `parent_task_id TEXT` — set by the Planner (§20.3) when a task is
+  split; `depends_on` (already exists) is reused unchanged for the
+  resulting child-to-child DAG, never a second dependency mechanism.
+- `required_role TEXT`, `required_os TEXT`, `required_capabilities TEXT`
+  (JSON list), `preferred_capabilities TEXT` (JSON list),
+  `pinned_session TEXT` / `pinned_node TEXT` (an explicit human/PM hard
+  constraint — see §20.2), `excluded_sessions TEXT`/`excluded_nodes
+  TEXT` (JSON lists), `risk_level TEXT` (`LOW`/`MEDIUM`/`HIGH`/
+  `CRITICAL`, §20.6), `created_by TEXT` (`"human"`/`"orchestrator"`/a
+  specific identity), `acceptance_criteria TEXT`.
+- `routing_reason TEXT` (JSON — the PM's own explainability record: what
+  was scored, why this worker won — §20.2's own explicit requirement),
+  `pm_decision_id TEXT`.
+
+**State mapping (task's own explicit ask — reuse, never a parallel
+vocabulary):**
+
+| User-facing name | Real `queue_tasks.status` |
+|---|---|
+| UNASSIGNED / BACKLOG | any status, WHERE `session IS NULL` |
+| QUEUED | `QUEUED`, `PRECHECK`, `READY`, `DISPATCHING`, `DISPATCH_UNCERTAIN` |
+| RUNNING | `RUNNING` |
+| BLOCKED | `BLOCKED`, `WAITING_SESSION`, `PAUSED` |
+| VERIFYING | `VERIFYING` |
+| REWORK | `QUEUED` with a non-empty `rework_task_id`/`rework_reason` (via the Handoff link, §20.4) — never a new status value; a rework is just a normal task re-entering the SAME state machine, tagged with why |
+| DONE | `COMPLETED` (and, for a coding task, only once its Handoff also reaches `INTEGRATED` — see §20.1's own parent-completion rule below) |
+| CANCELLED | `CANCELLED`, `SKIPPED` |
+
+**Parent completion rule** (task's own explicit requirement): a parent
+task with children is `COMPLETED` only when every REQUIRED child
+`depends_on` it AND (for a coding parent) its own Handoff has reached
+`INTEGRATED` — never when a worker merely stops reporting activity.
+This reuses `_dependency_satisfied_locked`'s own existing gate logic
+(already real, already used for ordinary `depends_on` — see §7), not a
+new completion-detection mechanism.
+
+### 20.2 PM / Orchestrator Agent — skill-based routing
+
+A new role, not a new queue. Reads READY/UNASSIGNED tasks + a new
+**Capability Profile** per node/session (a new store — reuse `node_
+registry.py`'s own SQLite/dataclass pattern, don't invent a new one):
+`os`, `runtime_tools` (JSON list — e.g. `dotnet`, `wpf`, `docker`,
+`playwright`), `project_affinity`, `role` (`developer`/`qa`/
+`integration`/`infra`/`docs`), `skills` (JSON list, versioned/
+confidence-scored per the task's own explicit ask), `current_load`/
+`queue_depth`, `online`/`recovering`/`busy`/`idle`, `permissions`
+(effective read/input, reused from the existing grants model, never
+re-derived independently).
+
+**Routing algorithm, two phases, never one score blending everything:**
+1. **Hard constraints (eligibility gate, deterministic, no ML/LLM):**
+   OS match, required_capabilities ⊆ session's own capabilities,
+   project affinity if the task declares one, permission (session must
+   already have effective input), online (not OFFLINE/RECOVERING),
+   not already at its 1-active-task limit, not in the excluded list, a
+   `pinned_session`/`pinned_node` (if set) must itself pass every other
+   check or the task goes `BLOCKED`/`NEEDS_HUMAN` with reason
+   `"pinned session/node is not eligible: <why>"` — **never silently
+   reroute away from an explicit human pin.**
+2. **Soft scoring (only among sessions that passed phase 1):** project
+   affinity strength, skill-match count, idle/load, queue depth,
+   fairness (starvation prevention — a session that hasn't been picked
+   in N cycles gets a small boost), locality (same node as a related
+   task if relevant). The WINNING session's own score + the reasons
+   that contributed become `routing_reason` (task's own explicit
+   "Assigned to window2 because Windows + idle + project match"
+   example) — stored on the task row, shown on its Kanban card/detail.
+3. **No eligible session:** task stays `UNASSIGNED`/`BLOCKED` with
+   `coordinator_reason = "NO_ELIGIBLE_WORKER"` — **never dropped**,
+   retried automatically once a capability profile changes or a node
+   reconnects (the existing node-reconnect/heartbeat machinery already
+   real in `node_registry.py` is the trigger, not a new poll).
+
+**Modes** (same posture as Supervisor's own `observe_only`/`suggest_
+only`/`approved_auto_continue` — reuse the vocabulary, not a fourth
+one): `OFF` (PM never assigns anything), `SUGGEST` (proposes a worker +
+`routing_reason`, a human approves before it actually dispatches —
+**the recommended production default**), `AUTO` (assigns automatically
+— **only after a live disposable E2E pass**, same standing rule this
+whole project already applies to Queue auto-dispatch and Supervisor
+policies). Per-project/session opt-in, never a single global switch
+that silently starts claiming every existing UNASSIGNED task the
+moment AUTO is flipped on anywhere.
+
+### 20.3 Planner (task breaking)
+
+Decides, for a newly-created UNASSIGNED task, whether to split it —
+based on declared/estimated complexity, module count, dependency
+shape, and how many eligible workers could run parts in parallel.
+Small tasks are never split just because splitting is possible. When it
+does split: each child gets its own `parent_task_id`, its own
+`acceptance_criteria`, and a real `depends_on` DAG (reusing §7's
+existing dependency mechanism) — genuinely-parallel children get no
+mutual dependency; children whose Planner-estimated `changed_paths`/
+module footprint plausibly overlaps get a serializing `depends_on`
+instead of running concurrently (task's own explicit conflict-
+prevention ask — advisory only, git itself remains the real source of
+truth for an actual conflict, this is purely a *scheduling* hint to
+avoid a predictable, wasteful conflict). Same three modes as the PM
+(`OFF`/`SUGGEST`/`AUTO`), same SUGGEST-first production rollout rule.
+A task with genuinely insufficient acceptance criteria to plan against
+becomes `NEEDS_CLARIFICATION`/`NEEDS_HUMAN` — the Planner never guesses
+scope into existence.
+
+### 20.4 Git isolation policy + Integration/Merge Agent (mostly REUSE)
+
+**Real, significant reuse found:** `integration_store.py`'s existing
+`Handoff` dataclass (§9, already VERIFIED, already live-tested) already
+carries `branch`, `commit_sha` (== "head_sha"), `base_sha`,
+`changed_paths`, `test_summary`, `conflict_detected`, `conflict_paths`,
+`rework_task_id`, `rework_reason`, `merge_commit_sha`, `origin_session`
+(== "owner_session") — this is already almost exactly the git-isolation
+metadata this task asks for. The ONLY genuinely new fields needed:
+`worktree_path` and a `parent_task_id`/`task_id` link consistent with
+§20.1's own column (Handoff already has `task_id`) — a small, additive
+migration on the EXISTING `handoffs` table, not a new one.
+
+**Policy (new, on top of existing infrastructure):**
+- A coding task defaults to requiring its own isolated worktree +
+  branch (`task/T<id>-<short-title>`), created from the canonical
+  base/integration SHA — never a task's own worker directly on `main`/a
+  shared working tree, unless the task is explicitly exempted
+  (docs/chore) by policy.
+- Coordinator's existing pre-dispatch gate (§8, already real —
+  `git_repo_evidence`/the diverged-branch check) is the natural place
+  to ALSO verify worktree/branch isolation before letting a task
+  proceed: if the target session is currently on shared `main` or
+  another task's own worktree, `BLOCKED`/needs repair, never "continue
+  anyway".
+- A worker never merges into integration/main itself — it produces the
+  SAME structured Handoff this project already has, unchanged in kind.
+- The Integration/Merge Agent (§9, already real) is the ONLY role
+  allowed to merge, per policy — extend its own routing so a Handoff is
+  specifically assigned to a session/node whose Capability Profile
+  (§20.2) declares the `integration` role + `git-integration`/`test-
+  integration` skills, never to an ordinary coding worker.
+- Conflict handling: the Integration Agent may only auto-resolve
+  mechanical conflicts (whitespace, trivial non-overlapping-intent
+  merges) — a semantic conflict is `REWORK_REQUIRED` back to the
+  owning task(s), never business-logic decisions made by the merge
+  step itself. Rebase policy: a still-QUEUED task may refresh its own
+  base before starting; a RUNNING task is never force-rebased mid-
+  flight; a project may require a rebase-and-rerun-tests step
+  immediately before a Handoff is accepted.
+
+### 20.5 Kanban UI (Global Tasks)
+
+A new dashboard screen/route, reading the SAME queue store as
+everything else (§20.0's own binding rule) — never a second read path.
+Default columns: **Backlog | Queued | Running | Blocked/Review | Done**
+(lifecycle-based, not one column per session — a fleet with many
+sessions would make a per-session-column board unreadable). Each
+RUNNING/QUEUED card shows its session/node/role as a real, visible
+label (never buried in a tooltip) — task's own explicit "card phải cho
+biết rõ đang ở session nào, node nào, role gì". Filters: project,
+session/owner, node, priority, status, risk, type
+(feature/bug/incident/release, once §20.6 exists), stale/blocked. Group-
+by-session view shows each session as its own lane with Current +
+Next, matching the "session như developer" mental model. A parent task
+card shows real child progress (`x/y done`, reusing §20.1's own parent-
+completion rule, never a separately-computed percentage). Click opens
+task detail (history/audit/state transitions/dependency tree/git
+branch+worktree info/Handoff status once relevant). The existing
+per-session Task button + pending badge (§3, VERIFIED 2026-09-07) stays
+exactly as-is and, when clicked, opens this same Kanban filtered to
+that one session — never a second, competing task view. Drag/drop
+deferred behind explicit action-based moves first (task's own
+"nếu dễ gây race, dùng actions trước") — Backlog→session-queue and
+reorder-within-queue as ordinary button/API actions before any drag/
+drop is attempted.
+
+### 20.6 Startup Software Operating Model (Phases A–E, PLANNED, docs-
+only — no code yet, per explicit instruction)
+
+All phases below build on §20.0–20.5 above, never a separate system.
+Each phase gets its own real live-verification pass before being marked
+VERIFIED — none of this is built yet.
+
+**Phase A — Delivery discipline:**
+- **Definition of Ready**: Coordinator's existing pre-dispatch gate
+  (§8) extended to require goal/scope/`acceptance_criteria`/project/
+  priority/dependencies/`required_capabilities`/`required_os`/
+  `risk_level` before a task may leave UNASSIGNED — missing any of
+  these is `NEEDS_CLARIFICATION`, never guessed.
+- **Definition of Done**: a coding task is not `COMPLETED` on a
+  worker's own say-so — real evidence required (test output, the
+  structured completion marker already real in §7, a Handoff for
+  anything that touched code, `docs/REQUIREMENTS.md`/`AGENT_GUIDE`
+  update for a behavior change per the existing living-requirements
+  gate). A release task (Phase C) additionally needs real deploy/health
+  evidence.
+- **WIP limits**: the existing one-active-task-per-session enforcement
+  (§7, already real) extended to a configurable NEXT/QUEUED cap per
+  role/session — PM never floods a worker's own queue past it.
+- **Ownership/affinity**: PM prefers continuity (the same session/
+  project pairing) over reassigning for its own sake — reassignment
+  needs a real reason (offline/blocked/overload/explicit routing
+  policy), recorded via `routing_reason`.
+- **Risk classification**: `risk_level` (§20.1) drives stronger gates
+  for `HIGH`/`CRITICAL` (auth, migrations, permissions, infra, deploy,
+  security) than a small UI task — exact gate strength is a per-project
+  policy, not hardcoded here.
+- **Conflict prediction**: the Planner's own overlap-based serialization
+  (§20.3) is this requirement, not a separate mechanism.
+
+**Phase B — Quality/integration:**
+- The Integration Agent (§20.4) already independently builds/lints/
+  tests a Handoff rather than trusting the worker's own report — this
+  requirement is already substantially real (§9), extend rather than
+  rebuild.
+- Rework loop bounds: `max_attempts`/`coordinator_attempts` (already
+  real, §7/§8) already trip to `NEEDS_HUMAN` past a threshold — reuse,
+  don't reinvent, for the rework-specific loop too.
+- Incident lane: `type: "incident"` + `risk_level` combination with its
+  own fast-track dispatch policy (still audited, never bypassing the
+  Coordinator gate entirely) — a new, small policy on top of the
+  existing priority field, not a parallel queue.
+
+**Phase C — Release/environments:**
+- New lifecycle states layered ON TOP of `COMPLETED`/`INTEGRATED` for a
+  release-type task: `MERGED -> RELEASE_CANDIDATE -> DEPLOYING ->
+  DEPLOYED -> VERIFIED_PROD / ROLLED_BACK` — a genuinely new, small
+  state machine (its own `Migration`), not an overload of the existing
+  task states.
+- Environment model (dev/test/staging/prod) + permission boundaries —
+  an ordinary coding worker has no production deploy/secret access by
+  default; a dedicated Release/Deploy Agent role (own Capability
+  Profile entry, §20.2) is the only one routed a release task, gated by
+  an explicit human approval for prod given `risk_level`.
+- A known-good artifact/commit + rollback plan is a required field on
+  any production release task, not optional.
+
+**Phase D — Operations/knowledge:**
+- End-to-end audit trail: this project already has real audit stores
+  (`audit.py`, `queue_events`, `Handoff` history) — Phase D is mostly
+  "wire the NEW transition types (split, PM routing decision, worktree/
+  branch, deploy/rollback) into the SAME existing audit mechanisms",
+  not a new audit system.
+- Knowledge capture: `session_knowledge.py` (§13, already real) already
+  captures real session output/checkpoints searchable by project — a
+  post-task/incident ADR/gotcha note is a `terminal_knowledge_
+  checkpoint` call, not a new store. Never persist secrets into it.
+- Daily/weekly PM summary + backlog hygiene (stale/duplicate/obsolete
+  detection, human controls destructive close) — a new, small
+  aggregation over the existing task/handoff/node data, not a new
+  source of truth.
+- Resource/cost awareness reuses `host_metrics.py`'s existing real CPU/
+  RAM collection (already used for node heartbeats, §12) plus queue
+  depth already computed for §3's own badge.
+
+**Phase E — Security/control plane:**
+- Least privilege per task/role/environment, secret redaction (this
+  project's own existing `redaction.py` reused, not reinvented),
+  production credentials never granted to an ordinary coding worker's
+  session by default.
+- Human override controls, all explicit UI actions, several already
+  real (`terminal_queue_pause`/`resume`, PM/Planner OFF/SUGGEST/AUTO
+  from §20.2/20.3): Pause Auto, Run Next, Reassign, Block, Approve
+  Merge, Approve Deploy, and a new **Emergency Stop** (immediately sets
+  every relevant mode to OFF/paused fleet-wide — a genuinely new,
+  simple, high-priority action).
+- Agent failure policy: repeated identical failure / no real progress
+  trips to `NEEDS_HUMAN`/reassignment rather than an unbounded retry
+  loop — same posture as the existing `coordinator_attempts` cap (§8),
+  extended to cover this specific "stuck in a loop" shape explicitly.
+
+### 20.7 New API/tools (PLANNED names, for future implementation —
+none of these exist yet)
+
+`task_create` (canonical creation, `assigned_session_id` nullable — a
+null value means "create UNASSIGNED, persist immediately, return
+`task_id`", never a direct send to any terminal), `task_plan`/
+`task_split`/`approve_plan`, `task_children`, `task_assign`/`task_
+reassign` (already real as `terminal_task_reassign`, extend rather than
+duplicate), `task_run_next` (Insert Next — queues ahead of other QUEUED
+work without interrupting a RUNNING task), `worktree_status`,
+`integration_handoff`/`integration_status` (mostly already real via
+`terminal_integration_*`, §9 — extend, don't duplicate), `pm_status`/
+`pm_explain` (the routing rationale for one task), `worker_
+capabilities` (list/query the Capability Profile store). Every one of
+these should be exposed as a real MCP tool once built, and this file's
+own §15 inventory updated in the same commit that adds it — never
+documented as available before it exists.
+
+### 20.8 Acceptance (for whenever this is actually built — nothing
+below has happened yet)
+
+20+ backlog tasks; 3+ worker sessions with distinct Capability
+Profiles; a task large enough to trigger a real Planner split (3-5
+children); 2 children genuinely running in parallel on different
+worktrees; 1 overlapping-change pair correctly serialized instead of
+parallelized; 2 branches handed off to a real Integration Agent session
+(mechanical conflict auto-resolved, semantic conflict correctly
+REWORK_REQUIRED back to the right owner); a parent task that only
+reaches DONE after its Handoff reaches INTEGRATED; PM in SUGGEST then
+AUTO mode correctly routing a Windows/WPF task to a Windows session and
+never to Linux; a pinned-but-ineligible session correctly BLOCKED with
+a clear reason, never silently rerouted; a controller restart and a
+node offline/reconnect cycle with 0 duplicate task rows, 0 lost tasks,
+0 cross-task worktree contamination, 0 coding directly on shared main.
+Every phase above gets its OWN such pass before its own status moves
+off PLANNED — this file must never claim VERIFIED for something that
+hasn't had one.
 
 ---
 

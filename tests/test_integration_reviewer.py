@@ -187,3 +187,90 @@ def test_doc_gate_runs_at_basic_depth_too_not_only_deep(repo):
     gate = IntegrationReviewGate()
     decision = gate.review(handoff, _pipeline(repo, review_depth="basic"))
     assert decision.status == REWORK_REQUIRED
+
+
+# ---------------------------------------------------------------------------
+# Agent-guide currency (comprehensive-docs checkpoint, 2026-09-07) --
+# informational risk_flag only, never blocks (unlike the REQUIREMENTS.md
+# gate above) -- see AGENT_FACING_PATH_MARKERS' own docstring for why.
+# ---------------------------------------------------------------------------
+
+def test_mcp_app_change_without_agent_guide_update_flags_but_stays_ready(repo):
+    (repo / "terminal_mcp").mkdir()
+    (repo / "docs").mkdir()
+    (repo / "docs" / "REQUIREMENTS.md").write_text("### new tool\n- Status: Verified\n")
+    base_sha = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    (repo / "terminal_mcp" / "mcp_app.py").write_text("def new_tool(): return 1\n")
+    _git(["add", "."], repo)
+    _git(["commit", "-q", "-m", "add a new mcp tool + REQUIREMENTS"], repo)
+    sha = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    handoff = _handoff(commit_sha=sha, base_sha=base_sha,
+                       changed_paths=("terminal_mcp/mcp_app.py", "docs/REQUIREMENTS.md"), artifacts={})
+    gate = IntegrationReviewGate()
+    decision = gate.review(handoff, _pipeline(repo))
+    # Informational only -- REQUIREMENTS.md was updated so the hard gate
+    # passes; this is a SEPARATE, non-blocking signal.
+    assert decision.status == READY
+    assert "missing_agent_guide_update" in decision.risk_flags
+
+
+def test_mcp_app_change_with_agent_guide_update_has_no_flag(repo):
+    (repo / "terminal_mcp").mkdir()
+    (repo / "docs").mkdir()
+    (repo / "docs" / "REQUIREMENTS.md").write_text("### new tool\n- Status: Verified\n")
+    (repo / "docs" / "CHATGPT_USAGE.md").write_text("## new tool\nHow to call it.\n")
+    base_sha = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    (repo / "terminal_mcp" / "mcp_app.py").write_text("def new_tool(): return 1\n")
+    _git(["add", "."], repo)
+    _git(["commit", "-q", "-m", "add a new mcp tool + both docs"], repo)
+    sha = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    handoff = _handoff(commit_sha=sha, base_sha=base_sha,
+                       changed_paths=("terminal_mcp/mcp_app.py", "docs/REQUIREMENTS.md",
+                                     "docs/CHATGPT_USAGE.md"), artifacts={})
+    gate = IntegrationReviewGate()
+    decision = gate.review(handoff, _pipeline(repo))
+    assert decision.status == READY
+    assert "missing_agent_guide_update" not in decision.risk_flags
+
+
+def test_dashboard_py_change_also_triggers_agent_guide_flag(repo):
+    (repo / "terminal_mcp").mkdir()
+    (repo / "docs").mkdir()
+    (repo / "docs" / "REQUIREMENTS.md").write_text("### new route\n- Status: Verified\n")
+    base_sha = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    (repo / "terminal_mcp" / "dashboard.py").write_text("# new route\n")
+    _git(["add", "."], repo)
+    _git(["commit", "-q", "-m", "add a new dashboard route + REQUIREMENTS"], repo)
+    sha = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    handoff = _handoff(commit_sha=sha, base_sha=base_sha,
+                       changed_paths=("terminal_mcp/dashboard.py", "docs/REQUIREMENTS.md"), artifacts={})
+    gate = IntegrationReviewGate()
+    decision = gate.review(handoff, _pipeline(repo))
+    assert "missing_agent_guide_update" in decision.risk_flags
+
+
+def test_non_agent_facing_change_never_flags_missing_agent_guide(repo):
+    (repo / "docs").mkdir()
+    (repo / "docs" / "REQUIREMENTS.md").write_text("### internal fix\n- Status: Verified\n")
+    base_sha = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    (repo / "status.py").write_text("# internal-only fix, no MCP/dashboard surface change\n")
+    _git(["add", "."], repo)
+    _git(["commit", "-q", "-m", "internal fix + REQUIREMENTS"], repo)
+    sha = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+    handoff = _handoff(commit_sha=sha, base_sha=base_sha,
+                       changed_paths=("status.py", "docs/REQUIREMENTS.md"), artifacts={})
+    gate = IntegrationReviewGate()
+    decision = gate.review(handoff, _pipeline(repo))
+    assert decision.status == READY
+    assert "missing_agent_guide_update" not in decision.risk_flags
+
+
+def test_agent_guide_flag_is_skipped_when_docs_exempt(repo):
+    (repo / "terminal_mcp").mkdir()
+    sha, base_sha = _commit(repo, "terminal_mcp/mcp_app.py", "def x(): return 1\n")
+    handoff = _handoff(commit_sha=sha, base_sha=base_sha, changed_paths=("terminal_mcp/mcp_app.py",),
+                       artifacts={"docs_exempt": "chore"})
+    gate = IntegrationReviewGate()
+    decision = gate.review(handoff, _pipeline(repo))
+    assert decision.status == READY
+    assert "missing_agent_guide_update" not in decision.risk_flags

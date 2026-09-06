@@ -1,5 +1,10 @@
 # Terminal MCP
 
+**If you are ChatGPT, another LLM, or any agent connecting to this
+server to USE it (not modify its code): read [`docs/CHATGPT_USAGE.md`](docs/CHATGPT_USAGE.md)
+first.** For the full technical spec (every feature's real status,
+config, schema, tests), see [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md).
+
 ## Purpose
 
 Terminal MCP lets an MCP client discover every tmux session on the host, then observe and, when explicitly enabled, send constrained input to whitelisted (or explicitly per-session-granted -- see "Dashboard session grants" below) tmux sessions. It supports local STDIO and a loopback-only Streamable HTTP transport intended to sit behind an authenticated HTTPS tunnel.

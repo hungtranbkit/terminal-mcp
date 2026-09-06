@@ -42,6 +42,20 @@ thì trả NEEDS_REWORK"): the ONE canonical requirements file every
 project this Integration Agent manages is expected to keep current --
 see that file's own header for the full convention this check enforces."""
 
+AGENT_GUIDE_DOC_PATH = "docs/CHATGPT_USAGE.md"
+AGENT_FACING_PATH_MARKERS = ("terminal_mcp/mcp_app.py", "terminal_mcp/dashboard.py")
+"""Comprehensive-docs checkpoint (2026-09-07): a diff touching the MCP
+tool surface or the dashboard's own routes is a strong signal that
+ChatGPT/agent-facing BEHAVIOR changed (a new tool, a changed return
+shape, a new route) -- exactly what docs/CHATGPT_USAGE.md exists to
+keep truthful. Deliberately INFORMATIONAL only (a risk_flag, never a
+REWORK_REQUIRED block, same posture as MIGRATION_PATH_MARKERS above):
+unlike docs/REQUIREMENTS.md's own hard gate, not every mcp_app.py/
+dashboard.py touch changes something a ChatGPT caller needs to know
+(an internal bugfix with no surface-shape change, e.g.), so a human/
+reviewer judgment call is still needed -- this only ensures it's never
+silently missed."""
+
 _NON_BEHAVIOR_PATH_MARKERS = ("tests/", "/tests/", "test_", "docs/")
 """A changed path matching one of these is never, on its own, evidence
 that this diff needs a requirements-doc update -- test-only and doc-only
@@ -167,6 +181,14 @@ class IntegrationReviewGate:
                 evidence={"changed_paths": changed_paths[:200]},
                 risk_flags=("missing_requirements_doc_update",),
             )
+
+        # 4c. Agent-guide currency (informational -- see AGENT_FACING_
+        #     PATH_MARKERS' own docstring for why this is a risk_flag,
+        #     never a block, unlike the REQUIREMENTS.md check above).
+        touches_agent_facing_surface = any(
+            marker in path for path in changed_paths for marker in AGENT_FACING_PATH_MARKERS)
+        if not docs_exempt and touches_agent_facing_surface and AGENT_GUIDE_DOC_PATH not in changed_paths:
+            risk_flags.append("missing_agent_guide_update")
 
         if depth == "deep":
             name_status = _git(["diff", "--name-status", f"{handoff.base_sha}..{handoff.commit_sha}"], repo_path)
