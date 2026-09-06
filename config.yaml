@@ -61,6 +61,23 @@ supervisor:
   # supervisor.db carries no watches/policies as of this change).
   v2_enabled: true
 
+# Persistent Task Queue v2 -- P0 QUEUE + SUPERVISOR LIVE TEST checkpoint
+# (2026-09-07): enables the background AUTO-DISPATCH loop (queue_loop.py)
+# globally -- the FIRST of two required gates (queue_engine.py's own
+# module docstring). The SECOND gate is per-lane (queue_lanes.auto_
+# dispatch_enabled, off by default for every lane, toggled only via
+# terminal_queue_set_auto_dispatch) -- enabling this alone does nothing
+# to any existing lane, including window/window2/wtest, until that
+# per-lane flag is ALSO explicitly turned on for it, which this
+# checkpoint deliberately does NOT do for those three (disposable
+# sessions only, per this task's own explicit constraint). Restarting
+# terminal-mcp-http.service after this change is required for it to take
+# effect (this project has no hot-reload) -- verified safe: the
+# control-plane process restarting never touches any tmux/node-agent
+# session, confirmed repeatedly earlier this same day.
+queue:
+  enabled: true
+
 # P1 hardening item #2: this deployment's dashboard hostname
 # (terminal-dashboard.mesflow.net) sits behind a real Cloudflare Access
 # application (confirmed live: an unauthenticated request 302s to

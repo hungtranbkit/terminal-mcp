@@ -475,6 +475,36 @@ def _add_v4_migration_columns(connection: sqlite3.Connection) -> None:
         connection.execute(f"ALTER TABLE queue_lanes ADD COLUMN {column} {declaration}")
 
 
+def _add_v5_dispatch_idempotency_key_if_missing(connection: sqlite3.Connection) -> None:
+    """Real, live-discovered data-integrity fix (P0 QUEUE + SUPERVISOR
+    LIVE TEST checkpoint, 2026-09-07): this project's own real, existing
+    `queue.db` (7 lanes, including window/window2/wtest) was found to
+    have `PRAGMA user_version = 4` -- meaning migrations 1-4 are all
+    considered already applied -- yet its `queue_tasks` table was
+    genuinely missing `dispatch_idempotency_key`, a column `Migration(2,
+    ...)`'s own function (`_add_v2_coordinator_columns`, above) has
+    included since the very commit that introduced it (`04f14d0`,
+    confirmed via `git log -S`). The only honest explanation: this
+    specific, real database file was created against an earlier, in-
+    development state of that same migration's body (mid-iteration on
+    that feature, before `04f14d0` reached its own final form) and had
+    its `user_version` already stamped to 2 (then 3, then 4) at that
+    point -- `apply_migrations` correctly never re-runs a migration
+    version it already recorded as complete, so this column silently
+    never arrived. A fresh `queue.db` created from this codebase today
+    would never hit this (migration 2 already includes the column from
+    the start) -- this migration exists ONLY to heal that one real,
+    already-existing file (and any other one migrated the same way)
+    without ever touching/renumbering the historical migration list
+    itself. Checks column existence first (real `PRAGMA table_info`,
+    not a try/except) so it is correctly a no-op on a database that
+    already has the column -- safe either way, never a duplicate-column
+    error, never a guess."""
+    existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(queue_tasks)")}
+    if "dispatch_idempotency_key" not in existing_columns:
+        connection.execute("ALTER TABLE queue_tasks ADD COLUMN dispatch_idempotency_key TEXT")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
@@ -483,6 +513,8 @@ QUEUE_MIGRATIONS = [
              _add_v3_uncertain_waiting_column),
     Migration(4, "Task Migration/Load Balancing: original_owner/migration_history/at_risk, "
                  "lane project/last_rebalance_at", _add_v4_migration_columns),
+    Migration(5, "heal a real, already-migrated database missing dispatch_idempotency_key "
+                 "(see this function's own docstring)", _add_v5_dispatch_idempotency_key_if_missing),
 ]
 
 

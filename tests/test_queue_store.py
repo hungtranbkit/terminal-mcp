@@ -128,6 +128,38 @@ def test_migration_is_idempotent_across_repeated_opens(tmp_path):
         QueueStore(db_path)  # must not raise (duplicate CREATE TABLE, etc.)
 
 
+def test_migration_5_heals_a_real_already_migrated_db_missing_the_column(tmp_path):
+    # Real, live-discovered bug (P0 QUEUE + SUPERVISOR LIVE TEST
+    # checkpoint, 2026-09-07): this project's own actual queue.db (7
+    # lanes, including window/window2/wtest) had PRAGMA user_version=4
+    # (migrations 1-4 all considered complete) yet was genuinely missing
+    # dispatch_idempotency_key -- created against an in-development state
+    # of migration 2's own body before that column was added to it, with
+    # user_version already stamped past 2 by the time it was. Simulates
+    # exactly that drifted shape here (a real db file, not a mock) and
+    # confirms opening a NEW QueueStore against it heals it, and that a
+    # normal set_tasks call (which reads dispatch_idempotency_key on
+    # every row) no longer raises.
+    import sqlite3
+
+    db_path = tmp_path / "drifted.db"
+    QueueStore(db_path)  # brand new, fully migrated -- gives us a real schema to drift from
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("ALTER TABLE queue_tasks DROP COLUMN dispatch_idempotency_key")
+        connection.execute("PRAGMA user_version = 4")  # still claims fully migrated
+    cols_before = {row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(queue_tasks)")}
+    assert "dispatch_idempotency_key" not in cols_before
+
+    healed = QueueStore(db_path)
+    cols_after = {row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(queue_tasks)")}
+    assert "dispatch_idempotency_key" in cols_after
+    # The real symptom this bug caused live: reading back a task row
+    # (queue_position -> get_task -> QueueTask.from_row) must not raise.
+    task_id = _make_one_task(healed, title="post-heal")
+    task = healed.get_task(task_id)
+    assert task is not None and task.dispatch_idempotency_key is None
+
+
 # ---------------------------------------------------------------------------
 # set_tasks / append_tasks semantics.
 # ---------------------------------------------------------------------------
