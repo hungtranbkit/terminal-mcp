@@ -74,6 +74,9 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_queue_reorder",
         "terminal_queue_clear",
         "terminal_queue_events",
+        "terminal_queue_run_once",
+        "terminal_queue_verify",
+        "terminal_queue_set_auto_dispatch",
     }
 
 

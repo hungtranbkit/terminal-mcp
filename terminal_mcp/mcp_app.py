@@ -7,7 +7,9 @@ from .agent_availability import available_agent_types
 from .config import load_config
 from .controller import ControllerService, build_default_controller
 from .core import TerminalService
+from .coordinator import CoordinatorGate
 from .node_models import node_to_dict as _node_to_dict
+from .queue_engine import QueueEngine
 from .queue_service import QueueService
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
@@ -46,6 +48,16 @@ def build_mcp(service: TerminalService | None = None,
     supervisor_v2 = supervisor_v2 or build_supervisor_v2(supervisor)
     controller = controller or build_default_controller(terminal)
     queue = queue or QueueService()
+    # Phase 2 (task: "Supervisor Queue v2 Phase 2 -- Coordinator Agent"):
+    # one shared QueueEngine over the SAME queue store + the SAME
+    # (already node-aware) controller every other routed tool in this
+    # file uses -- terminal_queue_run_once below is the ONLY way any
+    # dispatch/coordinator-review step actually happens in this phase;
+    # nothing here starts an automatic background loop (see queue_
+    # engine.py's own module docstring / QueueService.set_auto_dispatch
+    # for the explicit per-session opt-in a FUTURE automatic loop would
+    # still have to check).
+    queue_engine = QueueEngine(queue.store, controller, coordinator=CoordinatorGate())
     server = MCPServer(
         name="terminal-mcp",
         description="Whitelist-only tmux observation and controlled input",
@@ -877,5 +889,44 @@ def build_mcp(service: TerminalService | None = None,
         COMPLETED, BLOCKED, PAUSED, RESUMED, MANUAL_INTERVENTION, ...),
         newest first."""
         return queue.events(session, limit)
+
+    # -- Phase 2: Coordinator Agent gate + dispatch (task: "Supervisor
+    # Queue v2 Phase 2 -- Coordinator Agent")
+
+    @server.tool()
+    def terminal_queue_run_once(session: str) -> dict:
+        """Runs exactly ONE reconciliation step for `session`'s lane:
+        reconcile any stale claim, then at most one of (claim the next
+        QUEUED task, run the Coordinator Agent's gate review on a
+        PRECHECK task, dispatch a READY task, or check a RUNNING/
+        VERIFYING task for a verified completion marker). Safe to call
+        repeatedly/idempotently -- this is how a queue actually
+        progresses in this phase (no automatic background loop is
+        wired yet); call it again to advance further. Never bypasses
+        the Coordinator gate and never auto-dispatches into a paused
+        lane."""
+        return queue_engine.tick(session).to_dict()
+
+    @server.tool()
+    def terminal_queue_verify(session: str, task_id: str, evidence: dict) -> dict:
+        """Explicit fallback completion verification (item 11) for a
+        task stuck in VERIFYING with no completion marker ever
+        appearing -- a human or ChatGPT supplies real evidence directly
+        (e.g. {"manually_confirmed": true, "notes": "..."}) to move it
+        to COMPLETED. Requires non-empty evidence; refuses any task not
+        currently VERIFYING. Never automatic, never a bare heuristic."""
+        return queue.verify(session, task_id, evidence)
+
+    @server.tool()
+    def terminal_queue_set_auto_dispatch(session: str, enabled: bool) -> dict:
+        """Explicit, per-session opt-in/out for an AUTOMATIC background
+        dispatch loop (OFF by default for every lane -- task's own
+        explicit constraint: never on by default for an existing
+        production session). No automatic loop is wired to run in this
+        phase regardless of this flag; it exists now so a future one
+        has something real to check before it may ever touch a lane
+        unattended. terminal_queue_run_once above is never gated by
+        this."""
+        return queue.set_auto_dispatch(session, enabled)
 
     return server

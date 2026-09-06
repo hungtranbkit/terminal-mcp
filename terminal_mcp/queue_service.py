@@ -29,7 +29,7 @@ from __future__ import annotations
 from typing import Any
 
 from .permissions import valid_session_name
-from .queue_store import InvalidTransitionError, QueueStore
+from .queue_store import VERIFYING, InvalidTransitionError, QueueStore
 
 
 class QueueService:
@@ -128,3 +128,42 @@ class QueueService:
         if error := self._validate_session(session):
             return error
         return {"session": session, "events": self.store.list_events(session, limit)}
+
+    def verify(self, session: str, task_id: str, evidence: dict[str, Any]) -> dict[str, Any]:
+        """Phase 2 (item 11's own explicit fallback): a human or ChatGPT
+        supplies verification evidence directly for a task stuck in
+        VERIFYING with no completion marker ever appearing (e.g. an
+        agent that finished but didn't echo the marker correctly, or a
+        task whose own completion_policy never asked for one) --
+        moves it to COMPLETED, evidence attached, exactly like a real
+        marker-verified completion would. This is NEVER automatic and
+        NEVER a bare heuristic: it requires an explicit caller and
+        non-empty evidence (queue_store.mark_completed_with_evidence's
+        own requirement)."""
+        if error := self._validate_session(session):
+            return error
+        task = self.store.get_task(task_id)
+        if task is None or task.session != session:
+            return {"error": "TASK_NOT_FOUND", "session": session, "task_id": task_id}
+        if task.status != VERIFYING:
+            return {"error": "INVALID_TRANSITION", "session": session, "task_id": task_id,
+                    "reason": f"task is {task.status}, not VERIFYING -- nothing to verify"}
+        if not evidence:
+            return {"error": "EVIDENCE_REQUIRED", "session": session, "task_id": task_id}
+        updated = self.store.mark_completed_with_evidence(task_id, evidence=evidence)
+        return {"session": session, "task": updated.to_dict()}
+
+    def set_auto_dispatch(self, session: str, enabled: bool) -> dict[str, Any]:
+        """Phase 2's explicit per-session opt-in for an AUTOMATIC
+        background dispatch loop (task's own constraint: "Không bật
+        auto-dispatch cho session production hiện hữu mặc định...
+        opt-in per session"). Manually calling terminal_queue_run_once
+        is never gated by this -- it only controls whether an
+        unattended poll loop may touch this lane on its own (see
+        queue_engine.py's own module docstring; no such automatic loop
+        is wired to run in this phase regardless of this flag -- see the
+        Phase 2 report's own limitations section)."""
+        if error := self._validate_session(session):
+            return error
+        self.store.set_auto_dispatch(session, enabled)
+        return self.store.lane_status(session)

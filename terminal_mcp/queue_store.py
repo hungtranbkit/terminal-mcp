@@ -52,42 +52,85 @@ from typing import Any
 from .schema import Migration, apply_migrations
 
 # -- Task status state machine ------------------------------------------
+#
+# Phase 2 (task: "Supervisor Queue v2 Phase 2 -- Coordinator Agent") adds
+# PRECHECK, READY, and FAILED on top of Phase 1's set, and requires a
+# Coordinator Agent gate review between QUEUED and actual dispatch:
+#
+#   QUEUED -> PRECHECK -> READY -> DISPATCHING -> RUNNING -> VERIFYING
+#     -> COMPLETED | BLOCKED | FAILED | CANCELLED
+#
+# Naming note (disclosed, deliberate): the task spec calls the post-
+# review, about-to-send state "DISPATCHED" and the success state
+# "VERIFIED_DONE". This module keeps Phase 1's existing DISPATCHING/
+# COMPLETED names for those exact same concepts instead of introducing
+# synonyms -- Phase 1 shipped with real tests and real callers already
+# depending on those two names, and "Migration DB idempotent, backward
+# compatible" is an explicit Phase 2 requirement. DISPATCHING here means
+# exactly what the spec's DISPATCHED means (coordinator-approved, actual
+# send attempt in flight); COMPLETED here means exactly what the spec's
+# VERIFIED_DONE means (verified, not just claimed-done).
 
 QUEUED = "QUEUED"
-DISPATCHING = "DISPATCHING"
+PRECHECK = "PRECHECK"      # Phase 2: claimed by the engine, awaiting Coordinator Agent review
+READY = "READY"            # Phase 2: coordinator said READY, about to attempt dispatch
+DISPATCHING = "DISPATCHING"  # == spec's "DISPATCHED": send attempt in flight
 RUNNING = "RUNNING"
 VERIFYING = "VERIFYING"
-COMPLETED = "COMPLETED"
-BLOCKED = "BLOCKED"
+COMPLETED = "COMPLETED"    # == spec's "VERIFIED_DONE"
+BLOCKED = "BLOCKED"        # coordinator/gate refusal, or an unrecoverable-without-human send failure
+FAILED = "FAILED"          # Phase 2: engine/worker-detected execution failure (distinct from a gate refusal)
 PAUSED = "PAUSED"
 SKIPPED = "SKIPPED"
 CANCELLED = "CANCELLED"
 
-ALL_STATUSES = (QUEUED, DISPATCHING, RUNNING, VERIFYING, COMPLETED, BLOCKED, PAUSED, SKIPPED, CANCELLED)
+ALL_STATUSES = (QUEUED, PRECHECK, READY, DISPATCHING, RUNNING, VERIFYING, COMPLETED, BLOCKED, FAILED,
+                PAUSED, SKIPPED, CANCELLED)
 TERMINAL_STATUSES = (COMPLETED, SKIPPED, CANCELLED)
 """Once here, a task never transitions again -- not even via a manual
-tool call. A BLOCKED task is deliberately NOT terminal (terminal_queue_
-retry/skip/cancel all still apply to it -- see VALID_TRANSITIONS)."""
+tool call. BLOCKED/FAILED are deliberately NOT terminal (terminal_queue_
+retry/skip/cancel all still apply to them -- see VALID_TRANSITIONS)."""
 
 # Every ALLOWED (from_status -> {to_status, ...}) edge. Anything not
 # listed here is refused by transition_task -- see its own docstring for
 # why this is enforced centrally rather than trusted to each caller.
+# Phase 1's edges are kept EXACTLY as they were (backward compatible --
+# QUEUED -> DISPATCHING directly, e.g., remains valid for any caller
+# that bypasses the Phase 2 coordinator gate on purpose, such as a test
+# or a future non-gated queue mode); Phase 2 only ADDS new states/edges
+# on top, never removes or narrows an existing one.
 VALID_TRANSITIONS: dict[str, frozenset[str]] = {
-    QUEUED: frozenset({DISPATCHING, SKIPPED, CANCELLED, PAUSED}),
+    QUEUED: frozenset({
+        PRECHECK,     # Phase 2: engine claimed this task, coordinator review starting
+        DISPATCHING,  # Phase 1 compat: direct dispatch, bypassing the coordinator gate
+        SKIPPED, CANCELLED, PAUSED,
+    }),
+    PRECHECK: frozenset({
+        READY,        # coordinator: READY
+        QUEUED,       # coordinator: NEEDS_REWORK -- back of a remediation task, retry later
+        BLOCKED,      # coordinator: BLOCKED
+        PAUSED,       # coordinator: NEEDS_HUMAN -- pauses the whole lane
+        CANCELLED,
+    }),
+    READY: frozenset({DISPATCHING, CANCELLED, PAUSED}),
     DISPATCHING: frozenset({
         RUNNING,  # submit confirmed (delivery_state == SUBMIT_CONFIRMED)
         QUEUED,   # DELIVERY_UNKNOWN reconciled as "definitely not sent" -- safe to retry
-        BLOCKED,  # a hard send failure (ACCESS_DENIED, SESSION_NOT_FOUND, ...)
+        BLOCKED,  # a hard send failure needing human attention
+        FAILED,   # a hard send failure the engine can auto-classify as retryable
         CANCELLED, PAUSED,
     }),
-    RUNNING: frozenset({VERIFYING, BLOCKED, CANCELLED, PAUSED}),
+    RUNNING: frozenset({VERIFYING, BLOCKED, FAILED, CANCELLED, PAUSED}),
     VERIFYING: frozenset({
         COMPLETED,
         RUNNING,   # false alarm -- the agent wasn't actually done, re-arm
-        BLOCKED, CANCELLED, PAUSED,
+        BLOCKED, FAILED, CANCELLED, PAUSED,
     }),
     BLOCKED: frozenset({QUEUED, SKIPPED, CANCELLED}),  # only ever via an explicit operator tool call
-    PAUSED: frozenset({QUEUED, DISPATCHING, RUNNING, VERIFYING, CANCELLED}),  # resume (to paused_from_status) or cancel
+    FAILED: frozenset({QUEUED, SKIPPED, CANCELLED}),   # only ever via an explicit operator tool call
+    PAUSED: frozenset({
+        QUEUED, PRECHECK, READY, DISPATCHING, RUNNING, VERIFYING, CANCELLED,
+    }),  # resume (to paused_from_status) or cancel
     COMPLETED: frozenset(),
     SKIPPED: frozenset(),
     CANCELLED: frozenset(),
@@ -125,6 +168,20 @@ class QueueTask:
     metadata: dict[str, Any]
     updated_at: str
     paused_from_status: str | None = None
+    # -- Phase 2 additions (migration v2) --------------------------------
+    priority: int = 0
+    depends_on: tuple[str, ...] = ()
+    node_id: str | None = None
+    claimed_by: str | None = None
+    claim_token: str | None = None
+    lease_expires_at: str | None = None
+    coordinator_decision: dict[str, Any] = field(default_factory=dict)
+    coordinator_reason: str | None = None
+    coordinator_checked_at: str | None = None
+    coordinator_attempts: int = 0
+    verification_evidence: dict[str, Any] = field(default_factory=dict)
+    verification_nonce: str | None = None
+    dispatch_idempotency_key: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "QueueTask":
@@ -137,6 +194,15 @@ class QueueTask:
             last_error=row["last_error"], correlation_id=row["correlation_id"],
             metadata=_parse_json_object(row["metadata"]), updated_at=row["updated_at"],
             paused_from_status=row["paused_from_status"],
+            priority=row["priority"], depends_on=tuple(_parse_json_list(row["depends_on"])),
+            node_id=row["node_id"], claimed_by=row["claimed_by"], claim_token=row["claim_token"],
+            lease_expires_at=row["lease_expires_at"],
+            coordinator_decision=_parse_json_object(row["coordinator_decision"]),
+            coordinator_reason=row["coordinator_reason"], coordinator_checked_at=row["coordinator_checked_at"],
+            coordinator_attempts=row["coordinator_attempts"],
+            verification_evidence=_parse_json_object(row["verification_evidence"]),
+            verification_nonce=row["verification_nonce"],
+            dispatch_idempotency_key=row["dispatch_idempotency_key"],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -148,6 +214,14 @@ class QueueTask:
             "completion_policy": self.completion_policy, "last_error": self.last_error,
             "correlation_id": self.correlation_id, "metadata": self.metadata, "updated_at": self.updated_at,
             "paused_from_status": self.paused_from_status,
+            "priority": self.priority, "depends_on": list(self.depends_on), "node_id": self.node_id,
+            "claimed_by": self.claimed_by, "claim_token": self.claim_token,
+            "lease_expires_at": self.lease_expires_at,
+            "coordinator_decision": self.coordinator_decision, "coordinator_reason": self.coordinator_reason,
+            "coordinator_checked_at": self.coordinator_checked_at, "coordinator_attempts": self.coordinator_attempts,
+            "verification_evidence": self.verification_evidence,
+            "verification_nonce": self.verification_nonce,
+            "dispatch_idempotency_key": self.dispatch_idempotency_key,
         }
 
 
@@ -159,6 +233,16 @@ def _parse_json_object(raw: str | None) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _parse_json_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return [str(item) for item in parsed] if isinstance(parsed, list) else []
 
 
 def iso_now() -> str:
@@ -233,8 +317,60 @@ def _create_v1_schema(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX idx_queue_events_session ON queue_events(session, id)")
 
 
+def _add_v2_coordinator_columns(connection: sqlite3.Connection) -> None:
+    """Phase 2 (task: "Supervisor Queue v2 Phase 2 -- Coordinator
+    Agent"): additive only -- every new column is nullable or has a
+    default, so every existing Phase 1 row (and every Phase 1 caller
+    that only ever set the columns it knew about) keeps working
+    unchanged. Applied via schema.py's own tracked Migration/
+    apply_migrations (PRAGMA user_version), so this runs exactly once,
+    idempotent across restarts, same guarantee as v1's own creation."""
+    for column, declaration in (
+        ("priority", "INTEGER NOT NULL DEFAULT 0"),
+        ("depends_on", "TEXT"),          # JSON list of task_ids
+        ("node_id", "TEXT"),             # pinned at PRECHECK/claim time -- see claim_next_task
+        ("claimed_by", "TEXT"),          # engine/worker instance id holding the current lease
+        ("claim_token", "TEXT"),         # durable idempotency/lease token -- see claim_next_task
+        ("lease_expires_at", "TEXT"),    # reconcile_stale_claims' own expiry check
+        ("coordinator_decision", "TEXT"),  # full structured CoordinatorDecision, JSON
+        ("coordinator_reason", "TEXT"),
+        ("coordinator_checked_at", "TEXT"),
+        ("coordinator_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("verification_evidence", "TEXT"),  # JSON -- what actually proved COMPLETED, not just the label
+        ("verification_nonce", "TEXT"),  # minted at dispatch time -- status.py's verify_completion_marker input
+        # Minted ONCE per real send attempt and then STICKY across a
+        # reconcile-and-reclaim cycle (reconcile_stale_claims never
+        # clears it -- only an explicit retry_task/skip_task/cancel_task
+        # after a real BLOCKED/FAILED does, which IS a genuinely new
+        # attempt). This is what makes "restart mid-dispatch, then
+        # re-claim and re-dispatch" actually idempotent at the
+        # terminal_send_text layer: attempt_count keeps bumping (for
+        # audit visibility -- see _transition_locked), but the ACTUAL
+        # idempotency_key used for the send stays the same until a real
+        # outcome (RUNNING, or an explicit operator retry) is reached,
+        # so a crash between "send succeeded" and "RUNNING transition
+        # committed" can never cause a second real keystroke -- core.py's
+        # own idempotent_sends store returns the original result for the
+        # reused key instead.
+        ("dispatch_idempotency_key", "TEXT"),
+    ):
+        connection.execute(f"ALTER TABLE queue_tasks ADD COLUMN {column} {declaration}")
+    connection.execute("CREATE INDEX idx_queue_tasks_priority ON queue_tasks(session, priority, position)")
+    # Explicit, per-session, OFF-by-default opt-in for an AUTOMATIC
+    # background dispatch loop (queue_engine.py's own module docstring;
+    # task's own explicit constraint: "Không bật auto-dispatch cho
+    # session production hiện hữu mặc định. Feature flag/policy opt-in
+    # per session."). Calling queue_engine.tick() directly (a test, a
+    # manual terminal_queue_run_once tool call) is NEVER gated by this --
+    # it only controls whether an unattended poll loop is allowed to
+    # touch this lane on its own.
+    connection.execute("ALTER TABLE queue_lanes ADD COLUMN auto_dispatch_enabled INTEGER NOT NULL DEFAULT 0")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
+    Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
+                 "coordinator_decision/verification_evidence)", _add_v2_coordinator_columns),
 ]
 
 
@@ -280,28 +416,32 @@ class QueueStore:
 
     def pause_lane(self, session: str, *, reason: str | None = None) -> None:
         """Pauses dispatch for this session's lane. If a task is currently
-        DISPATCHING/RUNNING/VERIFYING, it moves to PAUSED too (its prior
-        status saved in paused_from_status so resume_lane can restore
-        it) -- this is the mechanism item 10's "manual intervention ->
-        pause lane, no race" requirement is built on, as well as a plain
-        operator-requested pause of an otherwise-idle lane."""
+        PRECHECK/READY/DISPATCHING/RUNNING/VERIFYING, it moves to PAUSED
+        too (its prior status saved in paused_from_status so resume_lane
+        can restore it) -- this is the mechanism item 10's "manual
+        intervention -> pause lane, no race" requirement is built on, as
+        well as a plain operator-requested pause of an otherwise-idle
+        lane, and record_coordinator_decision's own NEEDS_HUMAN path."""
         with self._connection() as connection:
-            self._ensure_lane(connection, session)
-            now = iso_now()
-            connection.execute(
-                "UPDATE queue_lanes SET paused = 1, paused_reason = ?, updated_at = ? WHERE session = ?",
-                (reason, now, session),
-            )
-            active = connection.execute(
-                "SELECT id, status FROM queue_tasks WHERE session = ? AND status IN (?, ?, ?)",
-                (session, DISPATCHING, RUNNING, VERIFYING),
-            ).fetchall()
-            for row in active:
-                self._transition_locked(connection, row["id"], row["status"], PAUSED,
-                                        event_type="PAUSED", reason=reason,
-                                        extra_fields={"paused_from_status": row["status"]})
-            self._record_event_locked(connection, session=session, task_id=None, event_type="LANE_PAUSED",
-                                      reason=reason)
+            self._pause_lane_locked(connection, session, reason=reason)
+
+    def _pause_lane_locked(self, connection: sqlite3.Connection, session: str, *, reason: str | None) -> None:
+        self._ensure_lane(connection, session)
+        now = iso_now()
+        connection.execute(
+            "UPDATE queue_lanes SET paused = 1, paused_reason = ?, updated_at = ? WHERE session = ?",
+            (reason, now, session),
+        )
+        active = connection.execute(
+            "SELECT id, status FROM queue_tasks WHERE session = ? AND status IN (?, ?, ?, ?, ?)",
+            (session, PRECHECK, READY, DISPATCHING, RUNNING, VERIFYING),
+        ).fetchall()
+        for row in active:
+            self._transition_locked(connection, row["id"], row["status"], PAUSED,
+                                    event_type="PAUSED", reason=reason,
+                                    extra_fields={"paused_from_status": row["status"]})
+        self._record_event_locked(connection, session=session, task_id=None, event_type="LANE_PAUSED",
+                                  reason=reason)
 
     def resume_lane(self, session: str) -> None:
         with self._connection() as connection:
@@ -330,13 +470,19 @@ class QueueStore:
                 "SELECT * FROM queue_tasks WHERE session = ? ORDER BY position ASC", (session,),
             ).fetchall()
         tasks = [QueueTask.from_row(row).to_dict() for row in task_rows]
-        active = next((t for t in tasks if t["status"] in (DISPATCHING, RUNNING, VERIFYING, PAUSED)), None)
+        # Phase 2: PRECHECK/READY/BLOCKED/FAILED all count as "the lane's
+        # current task" too, not just the Phase 1 in-flight set -- same
+        # _ACTIVE_STATUSES the store's own dispatch-gating query uses
+        # (defined further down this class), kept in sync deliberately
+        # rather than duplicating the literal tuple here.
+        active = next((t for t in tasks if t["status"] in self._ACTIVE_STATUSES), None)
         queued_count = sum(1 for t in tasks if t["status"] == QUEUED)
         completed_count = sum(1 for t in tasks if t["status"] == COMPLETED)
         return {
             "session": session,
             "paused": bool(lane_row["paused"]),
             "paused_reason": lane_row["paused_reason"],
+            "auto_dispatch_enabled": bool(lane_row["auto_dispatch_enabled"]),
             "tasks": tasks,
             "current_task": active,
             "queued_count": queued_count,
@@ -348,6 +494,23 @@ class QueueStore:
         with self._connection() as connection:
             sessions = [row["session"] for row in connection.execute("SELECT session FROM queue_lanes").fetchall()]
         return [self.lane_status(session) for session in sessions]
+
+    def set_auto_dispatch(self, session: str, enabled: bool) -> None:
+        """The explicit, per-session opt-in an automatic background
+        dispatch loop is required to check (see queue_engine.py's own
+        module docstring and the task's own explicit constraint) --
+        OFF by default for every lane, including one that already has
+        tasks queued. Calling queue_engine.tick() directly is never
+        gated by this."""
+        with self._connection() as connection:
+            self._ensure_lane(connection, session)
+            connection.execute(
+                "UPDATE queue_lanes SET auto_dispatch_enabled = ?, updated_at = ? WHERE session = ?",
+                (1 if enabled else 0, iso_now(), session),
+            )
+            self._record_event_locked(connection, session=session, task_id=None,
+                                      event_type="AUTO_DISPATCH_ENABLED" if enabled else "AUTO_DISPATCH_DISABLED",
+                                      reason=None)
 
     # -- task CRUD ---------------------------------------------------------
 
@@ -382,11 +545,12 @@ class QueueStore:
                 ids.append(task_id)
                 connection.execute(
                     "INSERT INTO queue_tasks (id, session, position, title, prompt, status, created_at, "
-                    "attempt_count, max_attempts, completion_policy, metadata, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+                    "attempt_count, max_attempts, completion_policy, metadata, updated_at, priority, depends_on) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
                     (task_id, session, next_position + offset, task.get("title") or "", task["prompt"], QUEUED, now,
                      int(task.get("max_attempts") or 3), json.dumps(task.get("completion_policy") or {}),
-                     json.dumps(task.get("metadata") or {}), now),
+                     json.dumps(task.get("metadata") or {}), now, int(task.get("priority") or 0),
+                     json.dumps(list(task.get("depends_on") or []))),
                 )
                 self._record_event_locked(connection, session=session, task_id=task_id, event_type="ENQUEUED",
                                           reason=None)
@@ -413,20 +577,56 @@ class QueueStore:
         session dispatches until an operator explicitly retries/skips/
         cancels it (see retry_task/skip_task/cancel_task)."""
         with self._connection() as connection:
-            lane = connection.execute("SELECT paused FROM queue_lanes WHERE session = ?", (session,)).fetchone()
-            if lane is None or lane["paused"]:
-                return None
-            active = connection.execute(
-                "SELECT id FROM queue_tasks WHERE session = ? AND status IN (?, ?, ?, ?, ?)",
-                (session, DISPATCHING, RUNNING, VERIFYING, PAUSED, BLOCKED),
-            ).fetchone()
-            if active is not None:
-                return None  # one task at a time, per session -- BLOCKED stops the lane too
-            row = connection.execute(
-                "SELECT * FROM queue_tasks WHERE session = ? AND status = ? ORDER BY position ASC LIMIT 1",
-                (session, QUEUED),
-            ).fetchone()
-        return QueueTask.from_row(row) if row else None
+            task = self._next_dispatchable_locked(connection, session)
+        return task
+
+    _ACTIVE_STATUSES = (PRECHECK, READY, DISPATCHING, RUNNING, VERIFYING, PAUSED, BLOCKED, FAILED)
+    """Phase 2: any status in this set means the lane already has a task
+    occupying it -- nothing else may be claimed/dispatched until it
+    reaches a terminal state or an operator explicitly retries/skips/
+    cancels it (BLOCKED/FAILED) or resumes it (PAUSED). Includes
+    PRECHECK/READY (mid coordinator-gate review) on top of Phase 1's own
+    set."""
+
+    def _next_dispatchable_locked(self, connection: sqlite3.Connection, session: str) -> QueueTask | None:
+        lane = connection.execute("SELECT paused FROM queue_lanes WHERE session = ?", (session,)).fetchone()
+        if lane is None or lane["paused"]:
+            return None
+        placeholders = ", ".join("?" for _ in self._ACTIVE_STATUSES)
+        active = connection.execute(
+            f"SELECT id FROM queue_tasks WHERE session = ? AND status IN ({placeholders})",
+            (session, *self._ACTIVE_STATUSES),
+        ).fetchone()
+        if active is not None:
+            return None  # one task at a time, per session
+        candidates = connection.execute(
+            "SELECT * FROM queue_tasks WHERE session = ? AND status = ? ORDER BY priority DESC, position ASC",
+            (session, QUEUED),
+        ).fetchall()
+        for row in candidates:
+            task = QueueTask.from_row(row)
+            if self._dependencies_satisfied_locked(connection, task):
+                return task
+        return None  # every QUEUED task (if any) is still waiting on an unmet dependency
+
+    def _dependencies_satisfied_locked(self, connection: sqlite3.Connection, task: QueueTask) -> bool:
+        """Phase 2 dependency gating (item 3's own "task kế có đủ
+        prerequisite... phụ thuộc task chưa xong không"): a purely
+        mechanical, deterministic claim-time filter -- NOT something the
+        Coordinator Agent has to reason about. A declared dependency
+        (task.depends_on, a list of task_ids -- may reference a task in
+        a DIFFERENT session/lane) must be COMPLETED for this task to
+        even become a dispatch candidate; a missing dependency id is
+        treated as unmet (fail-closed, never silently ignored). Same-
+        lane dependencies are normally redundant with strict FIFO
+        ordering (the prior task must already be COMPLETED for THIS one
+        to ever be reached), but a same-lane id is checked identically
+        for correctness if ever declared explicitly."""
+        for dep_id in task.depends_on:
+            dep_row = connection.execute("SELECT status FROM queue_tasks WHERE id = ?", (dep_id,)).fetchone()
+            if dep_row is None or dep_row["status"] != COMPLETED:
+                return False
+        return True
 
     def transition_task(self, task_id: str, to_status: str, *, event_type: str, reason: str | None = None,
                         extra_fields: dict[str, Any] | None = None) -> QueueTask:
@@ -460,7 +660,7 @@ class QueueStore:
         if to_status == DISPATCHING:
             fields["attempt_count"] = connection.execute(
                 "SELECT attempt_count FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()["attempt_count"] + 1
-        if reason is not None and to_status in (BLOCKED,):
+        if reason is not None and to_status in (BLOCKED, FAILED):
             fields["last_error"] = reason
         if extra_fields:
             fields.update(extra_fields)
@@ -471,15 +671,214 @@ class QueueStore:
                                   reason=reason, from_status=from_status, to_status=to_status)
         return QueueTask.from_row(row)
 
+    # -- Phase 2: atomic claim + Coordinator Agent gate + reconciliation ---
+
+    def claim_next_task(self, session: str, *, claimed_by: str, lease_seconds: float = 300.0) -> QueueTask | None:
+        """The ONLY entry point queue_engine.py uses to pick up a new
+        task -- QUEUED -> PRECHECK, atomically. Fixes a real Phase 1
+        design gap found during this Phase 2's own safety audit (item:
+        "Nếu phát hiện Phase 1 còn flaw ảnh hưởng safety thì sửa trước
+        Phase 2"): Phase 1's next_dispatchable_task was READ-ONLY by
+        design (no engine existed yet to race against), so a caller
+        reading it and then separately calling transition_task had a
+        genuine TOCTOU window -- two concurrent engine workers (or two
+        ticks of the same one, re-entered) could both read the same
+        QUEUED task before either had transitioned it, and both attempt
+        to dispatch it. This method closes that window: `BEGIN
+        IMMEDIATE` acquires SQLite's write lock BEFORE the read, so a
+        second concurrent caller blocks (then sees the now-PRECHECK
+        state and correctly gets None) rather than racing. `claimed_by`
+        and a fresh claim_token/lease_expires_at are stamped in the SAME
+        transaction as the QUEUED -> PRECHECK transition -- this is the
+        durable claim/lease item 8 asks for, and what
+        reconcile_stale_claims uses to detect an engine that crashed
+        mid-claim."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            task = self._next_dispatchable_locked(connection, session)
+            if task is None:
+                connection.rollback()
+                return None
+            claim_token = new_task_id()
+            lease_expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                             time.gmtime(time.time() + lease_seconds))
+            updated = self._transition_locked(
+                connection, task.id, task.status, PRECHECK, event_type="CLAIMED", reason=None,
+                extra_fields={"claimed_by": claimed_by, "claim_token": claim_token,
+                             "lease_expires_at": lease_expires_at},
+            )
+            connection.commit()
+            return updated
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def record_coordinator_decision(self, task_id: str, *, status: str, reason: str,
+                                    blockers: list[str] | None = None, required_actions: list[str] | None = None,
+                                    evidence: dict[str, Any] | None = None) -> QueueTask:
+        """Applies one Coordinator Agent review outcome (task item 4):
+        status is one of READY | BLOCKED | NEEDS_REWORK | NEEDS_HUMAN
+        (the Coordinator's own vocabulary -- distinct from, and mapped
+        onto, this store's task-status vocabulary right here, in ONE
+        place, so the mapping is never duplicated/drifted between
+        callers):
+          READY        -> PRECHECK -> READY (task dispatchable next tick)
+          BLOCKED      -> PRECHECK -> BLOCKED (stops this lane; explicit
+                          retry/skip/cancel only)
+          NEEDS_REWORK -> PRECHECK -> QUEUED (goes back to the back of
+                          the "ready to reconsider" line -- the caller is
+                          expected to have enqueued/prioritized a
+                          remediation task ahead of it first; see item 5)
+          NEEDS_HUMAN  -> PRECHECK -> PAUSED, and pauses the WHOLE lane
+                          (item 6: "dừng queue session đó") -- a plain
+                          resume_lane is what un-pauses it once a human
+                          has acted.
+        The full decision (status/reason/blockers/required_actions/
+        evidence) is stored verbatim on the task (coordinator_decision,
+        JSON) for audit/dashboard -- evidence is expected to already be
+        redacted by the caller (CoordinatorGate) per this project's
+        existing redaction policy before it ever reaches here; this
+        method does not itself redact anything."""
+        decision = {"status": status, "reason": reason, "blockers": blockers or [],
+                    "required_actions": required_actions or [], "evidence": evidence or {}}
+        target_status = {"READY": READY, "BLOCKED": BLOCKED, "NEEDS_REWORK": QUEUED,
+                         "NEEDS_HUMAN": PAUSED}.get(status)
+        if target_status is None:
+            raise ValueError(f"unknown coordinator decision status: {status!r}")
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"no such task: {task_id}")
+            now = iso_now()
+            extra = {
+                "coordinator_decision": json.dumps(decision), "coordinator_reason": reason,
+                "coordinator_checked_at": now, "coordinator_attempts": row["coordinator_attempts"] + 1,
+            }
+            if target_status in (QUEUED, BLOCKED):
+                # NEEDS_REWORK (-> QUEUED) / BLOCKED: the claim this
+                # PRECHECK review was holding is no longer active -- clear
+                # it so reconcile_stale_claims never mistakes this for an
+                # abandoned-but-still-claimed task. (target_status ==
+                # READY is the one case that deliberately KEEPS the claim:
+                # the same claimed_by/claim_token/lease continues straight
+                # into dispatch.)
+                extra.update({"claimed_by": None, "claim_token": None, "lease_expires_at": None})
+            if target_status == PAUSED:
+                # NEEDS_HUMAN: resume_lane should hand this back to QUEUED
+                # for a FRESH claim + coordinator review (paused_from_status
+                # = QUEUED), never straight back into PRECHECK holding a
+                # now-stale claim_token/lease -- also clear the stale claim
+                # itself so a reconcile pass never mistakes this for an
+                # abandoned-but-still-claimed task.
+                extra.update({"paused_from_status": QUEUED, "claimed_by": None, "claim_token": None,
+                             "lease_expires_at": None})
+            updated = self._transition_locked(connection, task_id, row["status"], target_status,
+                                              event_type="COORDINATOR_DECISION", reason=reason, extra_fields=extra)
+            self._record_event_locked(connection, session=row["session"], task_id=task_id,
+                                      event_type=f"COORDINATOR_{status}", reason=reason, metadata=decision)
+            if status == "NEEDS_HUMAN":
+                # Item 6: NEEDS_HUMAN stops this session's queue but never
+                # another session's -- pause_lane only ever touches the
+                # ONE session named here. The task itself is already
+                # PAUSED (above, in the SAME transaction) so
+                # _pause_lane_locked's own active-task sweep will not
+                # find/re-touch it -- it only sets the lane's own paused
+                # flag at this point.
+                self._pause_lane_locked(connection, row["session"], reason=f"coordinator: {reason}")
+        return updated
+
+    def reconcile_stale_claims(self, session: str | None = None, *, now: str | None = None) -> list[str]:
+        """Restart-safe reconciliation (item 8): a task stuck in
+        PRECHECK or DISPATCHING past its own lease_expires_at means the
+        engine instance that claimed it died (process crash, node-agent
+        restart, ...) before finishing that step -- NOT that the step
+        itself is still safely in progress (a healthy engine keeps
+        renewing/finishing well within the lease). PRECHECK is always
+        safe to reconcile straight back to QUEUED (nothing was ever sent
+        to any session in that state). DISPATCHING is reconciled to
+        QUEUED too -- this deliberately does NOT re-check delivery
+        evidence here; that is queue_engine.py's own job on its next
+        claim of the task (it re-derives an idempotency_key from
+        (task_id, attempt_count) before ever calling terminal_send_text
+        again, so even if the original send DID go through, the durable
+        idempotency store -- core.py's terminal_send_text idempotency_
+        key -- returns the original result instead of sending twice;
+        see queue_engine.py's own module docstring). Returns the ids
+        actually reconciled."""
+        now = now or iso_now()
+        with self._connection() as connection:
+            clause = "session = ? AND " if session else ""
+            params: tuple[Any, ...] = (session,) if session else ()
+            rows = connection.execute(
+                f"SELECT id, status FROM queue_tasks WHERE {clause}status IN (?, ?) "
+                f"AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
+                (*params, PRECHECK, DISPATCHING, now),
+            ).fetchall()
+            reconciled = []
+            for row in rows:
+                self._transition_locked(connection, row["id"], row["status"], QUEUED,
+                                        event_type="RECOVERED_AFTER_RESTART",
+                                        reason="stale lease reconciled after restart",
+                                        extra_fields={"claimed_by": None, "claim_token": None,
+                                                     "lease_expires_at": None})
+                reconciled.append(row["id"])
+        return reconciled
+
+    def ensure_verification_nonce(self, task_id: str) -> str:
+        """Idempotent: returns the task's existing verification_nonce if
+        it already has one (e.g. a retry re-dispatching the same
+        attempt), otherwise mints a fresh one and stores it. Called by
+        queue_engine.py right before dispatch, so the completion-marker
+        wrapper it adds to the prompt (item 7's own "wrapper rất ngắn")
+        can embed a real, per-task nonce -- reusing status.py's own
+        nonce+task_id+attempt-bound completion marker protocol (item
+        11) instead of a second one."""
+        with self._connection() as connection:
+            row = connection.execute("SELECT verification_nonce FROM queue_tasks WHERE id = ?",
+                                     (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"no such task: {task_id}")
+            if row["verification_nonce"]:
+                return row["verification_nonce"]
+            nonce = new_task_id()
+            connection.execute("UPDATE queue_tasks SET verification_nonce = ?, updated_at = ? WHERE id = ?",
+                              (nonce, iso_now(), task_id))
+        return nonce
+
+    def mark_completed_with_evidence(self, task_id: str, *, evidence: dict[str, Any]) -> QueueTask:
+        """VERIFYING -> COMPLETED, but ONLY through here -- unlike a bare
+        transition_task(..., COMPLETED), this REQUIRES evidence (item 11:
+        "Không phụ thuộc heuristic 'final report' đơn thuần... fallback
+        cần explicit coordinator verification") and stores it
+        (verification_evidence) so the Coordinator Agent's own "did the
+        previous task really finish" check (item 3's first bullet) has
+        something concrete to look at instead of just trusting the
+        status label. `evidence` is expected to already be redacted by
+        the caller per existing policy."""
+        if not evidence:
+            raise ValueError("mark_completed_with_evidence requires non-empty evidence -- "
+                            "use transition_task directly only for a test/legacy no-evidence path")
+        return self.transition_task(task_id, COMPLETED, event_type="VERIFIED",
+                                    extra_fields={"verification_evidence": json.dumps(evidence)})
+
     def retry_task(self, task_id: str) -> QueueTask:
-        """BLOCKED -> QUEUED, explicit operator action only (item 11:
-        "task lỗi -> BLOCKED và dừng queue... không tự skip... user có
-        thể retry"). Does NOT reset attempt_count -- max_attempts is a
-        lifetime cap across manual retries too, not just automatic ones."""
+        """BLOCKED|FAILED -> QUEUED, explicit operator action only (item
+        11: "task lỗi -> BLOCKED và dừng queue... không tự skip... user
+        có thể retry"). Does NOT reset attempt_count -- max_attempts is
+        a lifetime cap across manual retries too, not just automatic
+        ones. DOES clear dispatch_idempotency_key -- unlike an automatic
+        stale-lease reconciliation (which keeps it, because the outcome
+        of THAT send attempt is still genuinely unknown), an explicit
+        operator retry after a real BLOCKED/FAILED is a deliberate new
+        attempt, so a fresh idempotency_key is correct here."""
         task = self.get_task(task_id)
         if task is None:
             raise KeyError(f"no such task: {task_id}")
-        return self.transition_task(task_id, QUEUED, event_type="RETRIED")
+        return self.transition_task(task_id, QUEUED, event_type="RETRIED",
+                                    extra_fields={"dispatch_idempotency_key": None})
 
     def skip_task(self, task_id: str) -> QueueTask:
         task = self.get_task(task_id)
@@ -512,12 +911,13 @@ class QueueStore:
 
     def clear_tasks(self, session: str, *, only_pending: bool = True) -> int:
         """only_pending=True (the safe default): cancels every QUEUED
-        task, never an in-flight (DISPATCHING/RUNNING/VERIFYING/PAUSED)
-        or already-terminal one. only_pending=False additionally cancels
-        BLOCKED tasks (an explicit "give up on the whole backlog"
-        action) -- still never touches an in-flight task, which has no
-        safe/instant way to be cancelled out from under a live send."""
-        statuses = [QUEUED] if only_pending else [QUEUED, BLOCKED]
+        task, never an in-flight (PRECHECK/READY/DISPATCHING/RUNNING/
+        VERIFYING/PAUSED) or already-terminal one. only_pending=False
+        additionally cancels BLOCKED/FAILED tasks (an explicit "give up
+        on the whole backlog" action) -- still never touches an
+        in-flight task, which has no safe/instant way to be cancelled
+        out from under a live send."""
+        statuses = [QUEUED] if only_pending else [QUEUED, BLOCKED, FAILED]
         with self._connection() as connection:
             rows = connection.execute(
                 f"SELECT id, status FROM queue_tasks WHERE session = ? AND status IN "

@@ -956,6 +956,22 @@ class TerminalService:
                 "reason": reason,
                 "last_output": redact_text(last_output),
                 "untrusted_output": True, "untrusted_fields": ["last_output"], "content_source": "session",
+                # Supervisor Queue v2 Phase 2 (Coordinator Agent): the
+                # session's own current working directory, when the
+                # backend tracks one (tmux's native #{pane_current_path},
+                # or WindowsSessionBackend's own tracked session.cwd) --
+                # None otherwise. This is the ONLY place in the whole
+                # public API surface (MCP tools/dashboard/NodeClient) that
+                # ever exposed pane_current_path before this: previously
+                # it was read internally (core.py's own kill/reopen-
+                # metadata capture) but never returned to a caller. Added
+                # here, additively, specifically so CoordinatorGate's
+                # session/branch/worktree/cwd check (item 3) has a real,
+                # observed value to compare a task's declared
+                # expected_cwd against, fleet-wide (this flows through
+                # ControllerService.terminal_status's own node-routed
+                # response unchanged, same as every other field here).
+                "cwd": info.pane_current_path or None,
             }
             # P0 HOTFIX (task: "P0 WINDOWS SESSION STATE-LOSS / STALE
             # STREAM", item 7's own health-metadata requirement): only
