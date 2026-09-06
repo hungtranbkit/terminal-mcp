@@ -1025,3 +1025,50 @@ scan/audit view over the SAME facts.)*
 6. Enabling `config.queue.enabled` and `queue_lanes.auto_dispatch_enabled`
    against any real production session, including window/window2 —
    blocked on item 1.
+7. **Direct-send reliability root cause NOT yet conclusively identified**
+   (task: "P0 FIX TRIỆT ĐỂ DIRECT SEND WINDOWS / CLAUDE INPUT" — user
+   report: a ChatGPT-originated prompt into `window` sometimes needs
+   multiple submits before it's accepted). A live, disposable-session
+   diagnostic (`claude-diag-timing-1` on dell-5530, real `terminal_send_text`
+   calls through the real production `ControllerService`/`RemoteNodeClient`)
+   confirmed: (a) the Queue/Coordinator system is provably NOT in this
+   path (`config.queue.enabled=False` in production `config.yaml`;
+   `terminal_send_text` calls `controller.terminal_send_text` directly,
+   the queue is only consulted afterward for an informational warning);
+   (b) `core.py`'s `TARGET_WAITING` pre-Enter guard correctly detected
+   and safely blocked sends into a REAL Claude Code onboarding dialog
+   ("Teach auto mode about your environment?") that appeared mid-
+   diagnostic — working as designed, not a bug, but it consumed the
+   diagnostic's remaining budget before a clean, multi-send run against
+   an already-past-onboarding session (the actual shape of window/
+   window2/wtest) could be completed; (c) the one clean send observed
+   returned `SUBMIT_CONFIRMED` in 171ms, no retry needed. The fixed
+   80ms pre-Enter settle window (`SEND_TEXT_ENTER_SETTLE_SECONDS`,
+   `tmux.py`/`windows_backend.py`) remains a real, disclosed, NOT-yet-
+   proven-or-disproven suspect (non-adaptive, same value used for local
+   tmux and remote ConPTY+Node.js-Ink alike) — the next session should
+   re-run a longer, controlled multi-send diagnostic against an already-
+   onboarded disposable Windows Claude session (skip the first message
+   entirely, or dismiss onboarding first) and, if still inconclusive,
+   add the real write-start/enter-sent/output-changed timestamps this
+   task asked for directly into the `_send_text_and_verify_locked`
+   result before changing the settle/verification logic itself.
+8. **Dashboard Task Manager/Supervisor-Coordinator panel deployment
+   gap (found and fixed):** the production `terminal-mcp-http.service`
+   process had been running continuously since before commits `20f6ff0`/
+   `fa5e661`/`d345524`/`edd316f` were written — a long-lived Python
+   process keeps its already-imported module code in memory regardless
+   of what's on disk, so none of the Task Manager/Global Task Inbox/
+   Supervisor-Coordinator panel UI (real, tested, committed) was ever
+   actually visible in production, purely because the service was never
+   restarted after those commits landed. Fixed by `systemctl --user
+   restart terminal-mcp-http.service` (confirmed safe: tmux sessions —
+   including window/window2/wtest — are independent OS processes,
+   completely unaffected by this control-plane process restarting;
+   verified reachable immediately after). **Process/deploy takeaway:**
+   this project has no CI/CD or auto-restart-on-deploy step yet — every
+   future checkpoint that touches `dashboard.py`/`mcp_app.py`/
+   `server_http.py` needs an explicit `systemctl --user restart
+   terminal-mcp-http.service` (with a post-restart health/session check,
+   as done here) before it's actually live, not just committed. Tracked
+   here as a standing operational reminder, not a one-time fix.
