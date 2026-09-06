@@ -108,6 +108,16 @@ def build_mcp(service: TerminalService | None = None,
             agent_types=agent_types, agent_version=None,
         )
 
+    def _active_queue_task_for(session: str) -> dict | None:
+        """P0 (task: "persist-before-dispatch", item 10): does `session`
+        currently have an active queue task? Used only to decide whether
+        a raw terminal_send_text call gets a queue_conflict_warning --
+        never blocks the send itself (backward compatibility, item 12)."""
+        try:
+            return queue.store.lane_status(session).get("current_task")
+        except Exception:  # noqa: BLE001 -- a metrics/warning lookup must never break a real send
+            return None
+
     @server.tool()
     def terminal_list_sessions() -> dict:
         """List every real tmux session on the host, not only whitelisted
@@ -160,7 +170,20 @@ def build_mcp(service: TerminalService | None = None,
     @server.tool()
     def terminal_send_text(session: str, text: str, press_enter: bool = False,
                            dry_run: bool = False, idempotency_key: str | None = None) -> dict:
-        """Send literal text only when terminal_input is enabled in local
+        """LOW-LEVEL/MANUAL send -- bypasses the durable task queue
+        entirely (task: "persist-before-dispatch", item 10/12). For a
+        normal ChatGPT/UI/API-originated task, use terminal_enqueue_task
+        (or terminal_queue_set/append) instead: those create a durable,
+        restart-safe task record BEFORE anything is ever sent, so a busy
+        session never causes a missed/dropped prompt. This tool remains
+        for genuinely manual/emergency use (kept for backward
+        compatibility) -- if `session` currently has an active queue
+        task (RUNNING/DISPATCHING/etc.), the send still proceeds
+        unblocked, but the response's own `queue_conflict_warning` field
+        is set and the event is recorded to that task's own audit trail,
+        so this bypass is never silent.
+
+        Send literal text only when terminal_input is enabled in local
         config. Reports submit_status (TEXT_SENT/SUBMIT_CONFIRMED/
         SUBMIT_UNCONFIRMED, press_enter=True only) -- sent=True alone is
         NOT proof the target processed Enter; treat SUBMIT_UNCONFIRMED as
@@ -168,7 +191,17 @@ def build_mcp(service: TerminalService | None = None,
         UUID you generate) to make a retried/duplicate call with the same
         key return the original result instead of sending again."""
         _refresh_local_heartbeat()
-        return controller.terminal_send_text(session, text, press_enter, dry_run, idempotency_key=idempotency_key)
+        result = controller.terminal_send_text(session, text, press_enter, dry_run, idempotency_key=idempotency_key)
+        active_task = _active_queue_task_for(session)
+        if active_task is not None and isinstance(result, dict):
+            result["queue_conflict_warning"] = (
+                f"session {session!r} has an active queue task ({active_task['id']}, status="
+                f"{active_task['status']}) -- this raw send bypassed the durable queue; see item 10's own "
+                f"'explicit emergency/manual-send' posture"
+            )
+            queue.store.record_event(session=session, task_id=active_task["id"], event_type="RAW_SEND_DURING_ACTIVE_QUEUE_TASK",
+                                     reason="terminal_send_text called directly while a queue task was active")
+        return result
 
     @server.tool()
     def terminal_send_keys(session: str, keys: list[str], confirm_sensitive: bool = False) -> dict:
@@ -221,7 +254,12 @@ def build_mcp(service: TerminalService | None = None,
     @server.tool()
     def terminal_send_bound(binding: str, text: str, press_enter: bool = False,
                             dry_run: bool = False, idempotency_key: str | None = None) -> dict:
-        """Send literal text only when global and binding input are enabled.
+        """LOW-LEVEL/MANUAL send, same posture as terminal_send_text
+        (task: "persist-before-dispatch", item 10/12) -- bypasses the
+        durable task queue; prefer terminal_enqueue_task/terminal_queue_
+        set/append for a normal ChatGPT/UI/API-originated task.
+
+        Send literal text only when global and binding input are enabled.
         Reports submit_status (TEXT_SENT/SUBMIT_CONFIRMED/SUBMIT_UNCONFIRMED,
         press_enter=True only) -- sent=True alone is NOT proof the target
         processed Enter; treat SUBMIT_UNCONFIRMED as needing follow-up,
@@ -908,6 +946,48 @@ def build_mcp(service: TerminalService | None = None,
         COMPLETED, BLOCKED, PAUSED, RESUMED, MANUAL_INTERVENTION, ...),
         newest first."""
         return queue.events(session, limit)
+
+    # -- P0 persist-before-dispatch (task: "vấn đề thực tế là prompt từ
+    # ChatGPT đang được gửi trực tiếp như message nên rất dễ miss khi
+    # Claude/session đang bận") -- the high-level, RECOMMENDED-default
+    # enqueue path: by the time terminal_enqueue_task returns, the task's
+    # own durable row already exists (queue_store.py's set_tasks/
+    # append_tasks write it in the SAME call that produces a task_id),
+    # so a busy/offline session can never cause a prompt to be silently
+    # missed -- it just sits QUEUED/WAITING_SESSION until eligible.
+
+    @server.tool()
+    def terminal_enqueue_task(session: str, prompt: str, title: str | None = None, priority: int = 0,
+                              metadata: dict | None = None) -> dict:
+        """THE RECOMMENDED default for any normal ChatGPT/UI/API-
+        originated task (item 12) -- creates a durable, restart-safe
+        task record for `session`'s own queue BEFORE anything is ever
+        sent, then returns immediately with a TASK_ACCEPTED
+        acknowledgment: {status: "TASK_ACCEPTED", task_id, session,
+        queue_position}. ACCEPTED means "durably recorded in the
+        queue" -- it does NOT mean delivered to the session yet; call
+        terminal_queue_status/terminal_task_status to track actual
+        progress. Always appends (never cancels anything already
+        queued). The task's own prompt is stored VERBATIM -- nothing
+        here rewrites it."""
+        return queue.enqueue(session, prompt, title=title, priority=priority, metadata=metadata)
+
+    @server.tool()
+    def terminal_task_status(task_id: str) -> dict:
+        """Direct by-id lookup for one task -- lets a caller track a
+        specific task (e.g. one just returned by terminal_enqueue_task)
+        without needing to already know which session's lane it's in."""
+        return queue.task_status(task_id)
+
+    @server.tool()
+    def terminal_queue_metrics(session: str) -> dict:
+        """Item 14's own required metrics: queued_depth,
+        oldest_queued_age_seconds, dispatch_uncertain_count,
+        waiting_session_count, and missed_count/dropped_count (always 0
+        -- a structural guarantee of persist-before-dispatch, not a
+        runtime measurement that could read nonzero; see queue_store.py's
+        own metrics() docstring)."""
+        return queue.metrics(session)
 
     # -- Phase 2: Coordinator Agent gate + dispatch (task: "Supervisor
     # Queue v2 Phase 2 -- Coordinator Agent")

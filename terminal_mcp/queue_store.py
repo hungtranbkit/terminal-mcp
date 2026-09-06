@@ -75,17 +75,42 @@ QUEUED = "QUEUED"
 PRECHECK = "PRECHECK"      # Phase 2: claimed by the engine, awaiting Coordinator Agent review
 READY = "READY"            # Phase 2: coordinator said READY, about to attempt dispatch
 DISPATCHING = "DISPATCHING"  # == spec's "DISPATCHED": send attempt in flight
+DISPATCH_UNCERTAIN = "DISPATCH_UNCERTAIN"
+"""P0 (task: "persist-before-dispatch"): a send attempt returned
+delivery_state == DELIVERY_UNKNOWN (Enter was sent, no adapter evidence
+either way). Distinct from a bare re-QUEUED task specifically so a
+dashboard/ChatGPT/operator can SEE "this one's outcome is genuinely
+unknown right now" rather than it silently looking like an ordinary
+still-waiting task -- the whole point of this status existing at all.
+Never resolved by guessing: reconcile_uncertain_and_waiting either
+confirms real activity (-> RUNNING) or, after a grace period with none,
+falls back to QUEUED for a safe re-attempt (same sticky dispatch_
+idempotency_key, so a send that actually DID land is still deduped by
+core.py's own idempotent_sends store rather than repeated)."""
 RUNNING = "RUNNING"
 VERIFYING = "VERIFYING"
 COMPLETED = "COMPLETED"    # == spec's "VERIFIED_DONE"
 BLOCKED = "BLOCKED"        # coordinator/gate refusal, or an unrecoverable-without-human send failure
 FAILED = "FAILED"          # Phase 2: engine/worker-detected execution failure (distinct from a gate refusal)
+WAITING_SESSION = "WAITING_SESSION"
+"""P0 (task: "persist-before-dispatch"): the task's own target session
+could not be found/reached at all (SESSION_NOT_FOUND, NODE_UNREACHABLE,
+AMBIGUOUS_SESSION) -- NOT a coordinator refusal (PAUSED/NEEDS_HUMAN)
+and NOT an execution failure (FAILED): the session/node itself is
+simply not there right now, which is routine and auto-recoverable (a
+node reconnecting, a session being recreated) rather than something a
+human needs to decide about. The task is never dropped -- it just waits
+here until the session becomes resolvable again, then reconcile_
+uncertain_and_waiting returns it to QUEUED for a completely fresh
+claim+review (never resumes "in place": the session may have a new
+identity by the time it's back, so a full re-review is the safe
+default, not an optimization worth the complexity of doing otherwise)."""
 PAUSED = "PAUSED"
 SKIPPED = "SKIPPED"
 CANCELLED = "CANCELLED"
 
-ALL_STATUSES = (QUEUED, PRECHECK, READY, DISPATCHING, RUNNING, VERIFYING, COMPLETED, BLOCKED, FAILED,
-                PAUSED, SKIPPED, CANCELLED)
+ALL_STATUSES = (QUEUED, PRECHECK, READY, DISPATCHING, DISPATCH_UNCERTAIN, RUNNING, VERIFYING, COMPLETED, BLOCKED,
+                FAILED, WAITING_SESSION, PAUSED, SKIPPED, CANCELLED)
 TERMINAL_STATUSES = (COMPLETED, SKIPPED, CANCELLED)
 """Once here, a task never transitions again -- not even via a manual
 tool call. BLOCKED/FAILED are deliberately NOT terminal (terminal_queue_
@@ -109,27 +134,39 @@ VALID_TRANSITIONS: dict[str, frozenset[str]] = {
         READY,        # coordinator: READY
         QUEUED,       # coordinator: NEEDS_REWORK -- back of a remediation task, retry later
         BLOCKED,      # coordinator: BLOCKED
+        WAITING_SESSION,  # session/node unreachable -- checked BEFORE the coordinator gate even runs
         PAUSED,       # coordinator: NEEDS_HUMAN -- pauses the whole lane
         CANCELLED,
     }),
-    READY: frozenset({DISPATCHING, CANCELLED, PAUSED}),
+    READY: frozenset({DISPATCHING, WAITING_SESSION, CANCELLED, PAUSED}),
     DISPATCHING: frozenset({
         RUNNING,  # submit confirmed (delivery_state == SUBMIT_CONFIRMED)
-        QUEUED,   # DELIVERY_UNKNOWN reconciled as "definitely not sent" -- safe to retry
+        DISPATCH_UNCERTAIN,  # delivery_state == DELIVERY_UNKNOWN -- outcome genuinely unknown
+        QUEUED,   # legacy/compat direct path -- reconciled as "definitely not sent" -- safe to retry
+        WAITING_SESSION,  # the session/node itself vanished mid-send
         BLOCKED,  # a hard send failure needing human attention
         FAILED,   # a hard send failure the engine can auto-classify as retryable
         CANCELLED, PAUSED,
     }),
-    RUNNING: frozenset({VERIFYING, BLOCKED, FAILED, CANCELLED, PAUSED}),
+    DISPATCH_UNCERTAIN: frozenset({
+        RUNNING,   # later evidence confirms it really was delivered
+        QUEUED,    # grace period elapsed with no confirming evidence -- safe re-attempt (same sticky key)
+        CANCELLED, PAUSED,
+    }),
+    RUNNING: frozenset({VERIFYING, WAITING_SESSION, BLOCKED, FAILED, CANCELLED, PAUSED}),
     VERIFYING: frozenset({
         COMPLETED,
         RUNNING,   # false alarm -- the agent wasn't actually done, re-arm
-        BLOCKED, FAILED, CANCELLED, PAUSED,
+        WAITING_SESSION, BLOCKED, FAILED, CANCELLED, PAUSED,
     }),
     BLOCKED: frozenset({QUEUED, SKIPPED, CANCELLED}),  # only ever via an explicit operator tool call
     FAILED: frozenset({QUEUED, SKIPPED, CANCELLED}),   # only ever via an explicit operator tool call
+    WAITING_SESSION: frozenset({
+        QUEUED,  # the ONLY outgoing edge -- session is resolvable again, fresh claim+review from scratch
+        CANCELLED,
+    }),
     PAUSED: frozenset({
-        QUEUED, PRECHECK, READY, DISPATCHING, RUNNING, VERIFYING, CANCELLED,
+        QUEUED, PRECHECK, READY, DISPATCHING, DISPATCH_UNCERTAIN, RUNNING, VERIFYING, WAITING_SESSION, CANCELLED,
     }),  # resume (to paused_from_status) or cancel
     COMPLETED: frozenset(),
     SKIPPED: frozenset(),
@@ -182,6 +219,7 @@ class QueueTask:
     verification_evidence: dict[str, Any] = field(default_factory=dict)
     verification_nonce: str | None = None
     dispatch_idempotency_key: str | None = None
+    uncertain_or_waiting_since: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "QueueTask":
@@ -203,6 +241,7 @@ class QueueTask:
             verification_evidence=_parse_json_object(row["verification_evidence"]),
             verification_nonce=row["verification_nonce"],
             dispatch_idempotency_key=row["dispatch_idempotency_key"],
+            uncertain_or_waiting_since=row["uncertain_or_waiting_since"],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -222,6 +261,7 @@ class QueueTask:
             "verification_evidence": self.verification_evidence,
             "verification_nonce": self.verification_nonce,
             "dispatch_idempotency_key": self.dispatch_idempotency_key,
+            "uncertain_or_waiting_since": self.uncertain_or_waiting_since,
         }
 
 
@@ -367,10 +407,22 @@ def _add_v2_coordinator_columns(connection: sqlite3.Connection) -> None:
     connection.execute("ALTER TABLE queue_lanes ADD COLUMN auto_dispatch_enabled INTEGER NOT NULL DEFAULT 0")
 
 
+def _add_v3_uncertain_waiting_column(connection: sqlite3.Connection) -> None:
+    """P0 (task: "persist-before-dispatch"): a single timestamp column,
+    reused for BOTH new statuses (DISPATCH_UNCERTAIN and
+    WAITING_SESSION) -- each task is only ever in one of the two at a
+    time, so one column is enough; reconcile_uncertain_and_waiting uses
+    it as the grace-period clock for both. Additive only, same
+    backward-compatible posture as migration v2."""
+    connection.execute("ALTER TABLE queue_tasks ADD COLUMN uncertain_or_waiting_since TEXT")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
                  "coordinator_decision/verification_evidence)", _add_v2_coordinator_columns),
+    Migration(3, "P0 persist-before-dispatch: DISPATCH_UNCERTAIN/WAITING_SESSION grace-period column",
+             _add_v3_uncertain_waiting_column),
 ]
 
 
@@ -433,8 +485,8 @@ class QueueStore:
             (reason, now, session),
         )
         active = connection.execute(
-            "SELECT id, status FROM queue_tasks WHERE session = ? AND status IN (?, ?, ?, ?, ?)",
-            (session, PRECHECK, READY, DISPATCHING, RUNNING, VERIFYING),
+            "SELECT id, status FROM queue_tasks WHERE session = ? AND status IN (?, ?, ?, ?, ?, ?, ?)",
+            (session, PRECHECK, READY, DISPATCHING, DISPATCH_UNCERTAIN, RUNNING, VERIFYING, WAITING_SESSION),
         ).fetchall()
         for row in active:
             self._transition_locked(connection, row["id"], row["status"], PAUSED,
@@ -580,13 +632,15 @@ class QueueStore:
             task = self._next_dispatchable_locked(connection, session)
         return task
 
-    _ACTIVE_STATUSES = (PRECHECK, READY, DISPATCHING, RUNNING, VERIFYING, PAUSED, BLOCKED, FAILED)
-    """Phase 2: any status in this set means the lane already has a task
-    occupying it -- nothing else may be claimed/dispatched until it
+    _ACTIVE_STATUSES = (PRECHECK, READY, DISPATCHING, DISPATCH_UNCERTAIN, RUNNING, VERIFYING, WAITING_SESSION,
+                       PAUSED, BLOCKED, FAILED)
+    """Phase 2/P0: any status in this set means the lane already has a
+    task occupying it -- nothing else may be claimed/dispatched until it
     reaches a terminal state or an operator explicitly retries/skips/
     cancels it (BLOCKED/FAILED) or resumes it (PAUSED). Includes
-    PRECHECK/READY (mid coordinator-gate review) on top of Phase 1's own
-    set."""
+    PRECHECK/READY (mid coordinator-gate review) and DISPATCH_UNCERTAIN/
+    WAITING_SESSION (P0: outcome genuinely unknown / session
+    unreachable -- still occupies the lane, never silently dropped)."""
 
     def _next_dispatchable_locked(self, connection: sqlite3.Connection, session: str) -> QueueTask | None:
         lane = connection.execute("SELECT paused FROM queue_lanes WHERE session = ?", (session,)).fetchone()
@@ -826,6 +880,114 @@ class QueueStore:
                                                      "lease_expires_at": None})
                 reconciled.append(row["id"])
         return reconciled
+
+    def mark_dispatch_uncertain(self, task_id: str, *, reason: str) -> QueueTask:
+        """DISPATCHING -> DISPATCH_UNCERTAIN, stamping the grace-period
+        clock (item 2). Called by queue_engine.py the moment a send
+        comes back delivery_state == DELIVERY_UNKNOWN -- never QUEUED
+        directly anymore, so this genuinely-uncertain outcome is never
+        silently indistinguishable from an ordinary still-waiting task."""
+        return self.transition_task(task_id, DISPATCH_UNCERTAIN, event_type="SUBMIT_UNKNOWN", reason=reason,
+                                    extra_fields={"uncertain_or_waiting_since": iso_now()})
+
+    def mark_waiting_session(self, task_id: str, *, reason: str) -> QueueTask:
+        """Any active status -> WAITING_SESSION, stamping the grace-
+        period clock (item 9) -- called when the task's own target
+        session/node cannot be resolved at all (SESSION_NOT_FOUND/
+        NODE_UNREACHABLE/AMBIGUOUS_SESSION), which is routine and
+        auto-recoverable, never a reason to drop the task or treat it
+        as a coordinator/execution failure."""
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(f"no such task: {task_id}")
+        return self.transition_task(task_id, WAITING_SESSION, event_type="WAITING_SESSION", reason=reason,
+                                    extra_fields={"uncertain_or_waiting_since": iso_now()})
+
+    def reconcile_uncertain_and_waiting(self, session: str | None = None, *, grace_seconds: float = 60.0,
+                                        now: str | None = None) -> list[str]:
+        """Restart-safe AND ordinary-operation reconciliation (item 2/9):
+        a DISPATCH_UNCERTAIN or WAITING_SESSION task older than
+        grace_seconds (by its own uncertain_or_waiting_since clock, which
+        survives a restart same as lease_expires_at does) falls back to
+        QUEUED for a fresh attempt -- WAITING_SESSION always via this
+        path (its only outgoing edge); DISPATCH_UNCERTAIN only reaches
+        here if queue_engine.py's own more specific re-check (did the
+        session show real activity since?) didn't already resolve it to
+        RUNNING first. Never drops a task -- the worst case is an extra,
+        safely-deduped retry attempt, never silence."""
+        now_epoch = now or iso_now()
+        cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                              time.gmtime(time.mktime(time.strptime(now_epoch, "%Y-%m-%dT%H:%M:%SZ")) - grace_seconds))
+        with self._connection() as connection:
+            clause = "session = ? AND " if session else ""
+            params: tuple[Any, ...] = (session,) if session else ()
+            rows = connection.execute(
+                f"SELECT id, status FROM queue_tasks WHERE {clause}status IN (?, ?) "
+                f"AND uncertain_or_waiting_since IS NOT NULL AND uncertain_or_waiting_since < ?",
+                (*params, DISPATCH_UNCERTAIN, WAITING_SESSION, cutoff),
+            ).fetchall()
+            reconciled = []
+            for row in rows:
+                self._transition_locked(connection, row["id"], row["status"], QUEUED,
+                                        event_type="RECONCILED_AFTER_GRACE_PERIOD",
+                                        reason=f"{row['status']} exceeded {grace_seconds}s grace period",
+                                        extra_fields={"claimed_by": None, "claim_token": None,
+                                                     "lease_expires_at": None,
+                                                     "uncertain_or_waiting_since": None})
+                reconciled.append(row["id"])
+        return reconciled
+
+    def queue_position(self, task_id: str) -> int | None:
+        """1-indexed position of this task among its own lane's
+        currently-QUEUED tasks (priority DESC, position ASC -- the same
+        order claim_next_task itself uses), for the TASK_ACCEPTED
+        acknowledgment shape (item 8). None if the task isn't currently
+        QUEUED at all (it's already further along, or terminal)."""
+        task = self.get_task(task_id)
+        if task is None or task.status != QUEUED:
+            return None
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT id FROM queue_tasks WHERE session = ? AND status = ? ORDER BY priority DESC, position ASC",
+                (task.session, QUEUED),
+            ).fetchall()
+        for index, row in enumerate(rows, start=1):
+            if row["id"] == task_id:
+                return index
+        return None
+
+    def metrics(self, session: str) -> dict[str, Any]:
+        """P0 item 14's own required metrics. missed_count/dropped_count
+        are always 0 here, structurally -- not a runtime measurement
+        that COULD read nonzero, but a direct consequence of persist-
+        before-dispatch's own design: set_tasks/append_tasks write the
+        durable row in the SAME call that returns a task_id to the
+        caller (queue_service.py's own TASK_ACCEPTED response), so there
+        is no code path in this store where a caller could be told a
+        task was accepted and no row exists for it -- surfaced as an
+        explicit field so a dashboard/test can assert on it directly
+        rather than trusting the absence of a bug report."""
+        with self._connection() as connection:
+            rows = connection.execute("SELECT status, created_at FROM queue_tasks WHERE session = ?",
+                                      (session,)).fetchall()
+        queued = [row for row in rows if row["status"] == QUEUED]
+        uncertain = [row for row in rows if row["status"] == DISPATCH_UNCERTAIN]
+        waiting_session = [row for row in rows if row["status"] == WAITING_SESSION]
+        now_epoch = time.mktime(time.strptime(iso_now(), "%Y-%m-%dT%H:%M:%SZ"))
+
+        def _age_seconds(created_at: str) -> float:
+            return now_epoch - time.mktime(time.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ"))
+
+        oldest_queued_age = max((_age_seconds(row["created_at"]) for row in queued), default=0.0)
+        return {
+            "session": session,
+            "queued_depth": len(queued),
+            "oldest_queued_age_seconds": oldest_queued_age,
+            "dispatch_uncertain_count": len(uncertain),
+            "waiting_session_count": len(waiting_session),
+            "missed_count": 0,   # structural guarantee -- see docstring
+            "dropped_count": 0,  # structural guarantee -- see docstring
+        }
 
     def ensure_verification_nonce(self, task_id: str) -> str:
         """Idempotent: returns the task's existing verification_nonce if

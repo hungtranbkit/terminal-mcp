@@ -61,13 +61,18 @@ class QueueService:
         "MCP chỉ được thêm một wrapper rất ngắn... không tự viết lại yêu
         cầu nghiệp vụ") -- nothing here rewrites, trims, or wraps it;
         any completion-marker wrapper is queue_engine.py's job, applied
-        only at dispatch time, never persisted over the original prompt."""
+        only at dispatch time, never persisted over the original prompt.
+        P0 (task: "persist-before-dispatch", item 1/8): by the time this
+        method RETURNS, every task's own durable row already exists --
+        the `tasks` list in the response is the TASK_ACCEPTED
+        acknowledgment itself, each with its own queue_position."""
         if error := self._validate_session(session):
             return error
         if error := self._validate_tasks(tasks):
             return error
         ids = self.store.set_tasks(session, tasks, replace_pending=replace_pending)
-        return {"session": session, "task_ids": ids, "replace_pending": replace_pending}
+        return {"session": session, "task_ids": ids, "replace_pending": replace_pending,
+               "tasks": [self._accepted(session, task_id) for task_id in ids]}
 
     def append_tasks(self, session: str, tasks: list[dict[str, Any]]) -> dict[str, Any]:
         if error := self._validate_session(session):
@@ -75,7 +80,48 @@ class QueueService:
         if error := self._validate_tasks(tasks):
             return error
         ids = self.store.append_tasks(session, tasks)
-        return {"session": session, "task_ids": ids}
+        return {"session": session, "task_ids": ids,
+               "tasks": [self._accepted(session, task_id) for task_id in ids]}
+
+    def enqueue(self, session: str, prompt: str, *, title: str | None = None, priority: int = 0,
+               metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        """terminal_enqueue_task's own service method (P0 item 1/12: the
+        new high-level, single-task, append-only convenience path --
+        the RECOMMENDED default for a normal ChatGPT/UI/API-originated
+        prompt, per the task's own explicit "MCP nên expose high-level
+        enqueue tool làm mặc định"). Always appends (never replace_
+        pending -- an "enqueue" call has no business cancelling
+        anything already queued). Returns the exact TASK_ACCEPTED shape
+        (item 8): status/task_id/queue_position, so the caller
+        immediately knows this was ACCEPTED into the durable queue --
+        distinct from, and not implying, that it has been DELIVERED to
+        the session yet."""
+        if error := self._validate_session(session):
+            return error
+        if not prompt:
+            return {"error": "TASK_PROMPT_REQUIRED"}
+        task = {"prompt": prompt, "title": title or "", "priority": priority, "metadata": metadata or {}}
+        (task_id,) = self.store.append_tasks(session, [task])
+        accepted = self._accepted(session, task_id)
+        accepted["status"] = "TASK_ACCEPTED"
+        return accepted
+
+    def _accepted(self, session: str, task_id: str) -> dict[str, Any]:
+        return {"task_id": task_id, "session": session, "queue_position": self.store.queue_position(task_id)}
+
+    def task_status(self, task_id: str) -> dict[str, Any]:
+        """Direct by-id lookup (item 11's own `task_status` tool) -- lets
+        a caller track a specific task without already knowing (or
+        re-deriving) which session/lane it lives in."""
+        task = self.store.get_task(task_id)
+        if task is None:
+            return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+        return {"task": task.to_dict(), "queue_position": self.store.queue_position(task_id)}
+
+    def metrics(self, session: str) -> dict[str, Any]:
+        if error := self._validate_session(session):
+            return error
+        return self.store.metrics(session)
 
     def status(self, session: str) -> dict[str, Any]:
         if error := self._validate_session(session):

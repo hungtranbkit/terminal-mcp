@@ -256,9 +256,24 @@ def test_delivery_unknown_reconciles_to_queued_not_a_resend(store, ops):
     engine.tick("lane-a")
     engine.tick("lane-a")
     result = engine.tick("lane-a")
-    assert result.action == "SUBMIT_UNKNOWN"
-    assert store.get_task(task_id).status == QUEUED
+    assert result.action == "DISPATCH_UNCERTAIN"
+    assert store.get_task(task_id).status == "DISPATCH_UNCERTAIN"
     assert len(unknown_ops.sent) == 1  # exactly one send attempt, no automatic resend within this tick
+
+    # A later tick with the session still not showing real activity --
+    # stays DISPATCH_UNCERTAIN (within its grace period), never resent.
+    still_uncertain = engine.tick("lane-a")
+    assert still_uncertain.action == "NO_OP"
+    assert store.get_task(task_id).status == "DISPATCH_UNCERTAIN"
+    assert len(unknown_ops.sent) == 1
+
+    # After the grace period elapses, it safely falls back to QUEUED.
+    with store._connection() as connection:
+        connection.execute("UPDATE queue_tasks SET uncertain_or_waiting_since = '2000-01-01T00:00:00Z' "
+                          "WHERE id = ?", (task_id,))
+    reconciled = store.reconcile_uncertain_and_waiting("lane-a")
+    assert task_id in reconciled
+    assert store.get_task(task_id).status == QUEUED
 
 
 # ---------------------------------------------------------------------------

@@ -86,7 +86,7 @@ async def test_stdio_real_handshake_and_tools(tmp_path):
     assert initialized.server_info.name == "terminal-mcp"
     assert initialized.server_info.version == __version__
     names = {tool.name for tool in tools.tools}
-    assert len(names) == 80  # +terminal_registry_* (5) +terminal_knowledge_* (4) +terminal_watchdog_* (4, session/node drop detection) +terminal_queue_* (15, Supervisor Queue v2 Phase 1+2) +terminal_integration_* (10, 3-role model Integration Agent)
+    assert len(names) == 83  # +terminal_registry_* (5) +terminal_knowledge_* (4) +terminal_watchdog_* (4, session/node drop detection) +terminal_queue_* (15, Supervisor Queue v2 Phase 1+2) +terminal_integration_* (10, 3-role model Integration Agent) +terminal_enqueue_task/terminal_task_status/terminal_queue_metrics (3, P0 persist-before-dispatch)
     assert {"terminal_tail", "terminal_send_keys", "terminal_exit_copy_mode",
             "terminal_bind", "terminal_tail_bound"} <= names
 
@@ -139,7 +139,7 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
     # global INPUT_DISABLED gate; INPUT_DISABLED itself stays covered in test_permissions.py.
     assert text_disabled["error"] == "ACCESS_DENIED"
     assert keys_disabled["error"] == "ACCESS_DENIED"
-    assert len(tools.tools) == 80  # +terminal_registry_* (5) +terminal_knowledge_* (4) +terminal_watchdog_* (4, session/node drop detection) +terminal_queue_* (15, Supervisor Queue v2 Phase 1+2) +terminal_integration_* (10, 3-role model Integration Agent)
+    assert len(tools.tools) == 83  # +terminal_registry_* (5) +terminal_knowledge_* (4) +terminal_watchdog_* (4, session/node drop detection) +terminal_queue_* (15, Supervisor Queue v2 Phase 1+2) +terminal_integration_* (10, 3-role model Integration Agent) +terminal_enqueue_task/terminal_task_status/terminal_queue_metrics (3, P0 persist-before-dispatch)
 
 
 @pytest.mark.anyio

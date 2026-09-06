@@ -54,12 +54,23 @@ from typing import Any, Callable, Protocol
 
 from .coordinator import CoordinatorGate, OtherLaneSnapshot, SessionSnapshot
 from .queue_store import (
-    BLOCKED, COMPLETED, DISPATCHING, FAILED, PRECHECK, QUEUED, READY, RUNNING, VERIFYING, QueueStore, QueueTask,
+    BLOCKED, COMPLETED, DISPATCH_UNCERTAIN, DISPATCHING, FAILED, PRECHECK, QUEUED, READY, RUNNING, VERIFYING,
+    WAITING_SESSION, QueueStore, QueueTask,
 )
 from .status import parse_completion_marker, verify_completion_marker
 
 DEFAULT_CLAIMED_BY = "queue-engine"
 DEFAULT_LEASE_SECONDS = 300.0
+DEFAULT_UNCERTAIN_GRACE_SECONDS = 60.0
+
+SESSION_UNREACHABLE_ERRORS = frozenset({"SESSION_NOT_FOUND", "NODE_UNREACHABLE", "AMBIGUOUS_SESSION"})
+"""P0 (task: "persist-before-dispatch", item 9): these specific
+terminal_status/controller error codes mean the SESSION/NODE itself
+isn't reachable right now -- routine and auto-recoverable, never a
+coordinator refusal or an execution failure. Any OTHER error string is
+left to whichever existing path already handles it (NEEDS_HUMAN in
+_review, FAILED in _check_completion) -- this set is deliberately
+narrow, not a catch-all."""
 
 
 class SessionOps(Protocol):
@@ -148,6 +159,7 @@ class QueueEngine:
         state transition per call, so a test (or an operator watching
         terminal_queue_events) can observe each step individually."""
         self.store.reconcile_stale_claims(session)
+        self.store.reconcile_uncertain_and_waiting(session)
         lane = self.store.lane_status(session)
         if lane["paused"]:
             return TickResult(session, "PAUSED", detail=lane.get("paused_reason") or "")
@@ -168,6 +180,10 @@ class QueueEngine:
             return self._dispatch(session, task_id)
         if status in (RUNNING, VERIFYING):
             return self._check_completion(session, task_id, status)
+        if status == DISPATCH_UNCERTAIN:
+            return self._recheck_uncertain(session, task_id)
+        if status == WAITING_SESSION:
+            return self._recheck_waiting_session(session, task_id)
         return TickResult(session, "NO_OP", task_id=task_id, detail=f"status={status}")
 
     # -- coordinator review ------------------------------------------------
@@ -175,10 +191,17 @@ class QueueEngine:
     def _review(self, session: str, task_id: str) -> TickResult:
         task = self.store.get_task(task_id)
         status_response = self.ops.terminal_status(session)
+        error = status_response.get("error")
+        if error in SESSION_UNREACHABLE_ERRORS:
+            # P0 item 9: the session/node itself isn't there -- WAITING_
+            # SESSION, never NEEDS_HUMAN/PAUSED and never dropped. Skip
+            # the coordinator gate entirely (nothing to review yet).
+            self.store.mark_waiting_session(task_id, reason=error)
+            return TickResult(session, "WAITING_SESSION", task_id=task_id, detail=error)
         session_snapshot = SessionSnapshot(
             node_id=status_response.get("node_id"), cwd=status_response.get("cwd"),
             current_command=status_response.get("current_command"),
-            error=status_response.get("error"),
+            error=error,
         )
         other_active = tuple(
             OtherLaneSnapshot(session=lane["session"],
@@ -238,27 +261,70 @@ class QueueEngine:
                                        reason=f"send failed: {response['error']}")
             return TickResult(session, "BLOCKED", task_id=task_id, detail=str(response["error"]))
         if delivery_state == "DELIVERY_UNKNOWN":
-            # Item 9: never resend blindly -- reconcile back to QUEUED,
+            # P0 item 2: never resend blindly, and never silently look
+            # like an ordinary QUEUED task either -- DISPATCH_UNCERTAIN,
             # KEEPING the same dispatch_idempotency_key (the outcome is
             # genuinely unknown -- if the send actually went through,
             # core.py's own idempotent_sends store will return that
             # original result the next time this exact key is reused,
-            # rather than sending twice).
-            self.store.transition_task(task_id, QUEUED, event_type="SUBMIT_UNKNOWN",
-                                       reason="delivery_state=DELIVERY_UNKNOWN -- reconcile before resend")
-            return TickResult(session, "SUBMIT_UNKNOWN", task_id=task_id)
+            # rather than sending twice). _recheck_uncertain resolves
+            # this on a later tick: real evidence of activity -> RUNNING,
+            # else a grace period -> QUEUED for a fresh attempt.
+            self.store.mark_dispatch_uncertain(task_id, reason="delivery_state=DELIVERY_UNKNOWN")
+            return TickResult(session, "DISPATCH_UNCERTAIN", task_id=task_id)
         self.store.transition_task(task_id, RUNNING, event_type="STARTED")
         return TickResult(session, "DISPATCHED", task_id=task_id, detail=idempotency_key)
+
+    # -- P0 persist-before-dispatch: uncertain/waiting reconciliation -------
+
+    def _recheck_uncertain(self, session: str, task_id: str) -> TickResult:
+        """A DISPATCH_UNCERTAIN task, revisited on a later tick (item 2):
+        if the session now shows real activity (RUNNING, or simply no
+        longer showing an error), the send almost certainly landed --
+        promote straight to RUNNING rather than waiting out the full
+        grace period pointlessly. Otherwise leave it for reconcile_
+        uncertain_and_waiting's own grace-period timeout to eventually
+        return it to QUEUED (already run once at the top of this same
+        tick, before this method is ever reached -- so by construction
+        this branch only sees a task still genuinely within its grace
+        window)."""
+        status_response = self.ops.terminal_status(session)
+        if not status_response.get("error") and status_response.get("state") == "RUNNING":
+            self.store.transition_task(task_id, RUNNING, event_type="STARTED",
+                                       reason="confirmed real activity after DISPATCH_UNCERTAIN")
+            return TickResult(session, "RUNNING", task_id=task_id, detail="confirmed after uncertain dispatch")
+        return TickResult(session, "NO_OP", task_id=task_id, detail="still DISPATCH_UNCERTAIN, within grace period")
+
+    def _recheck_waiting_session(self, session: str, task_id: str) -> TickResult:
+        """A WAITING_SESSION task, revisited on a later tick (item 9): if
+        the session is resolvable again RIGHT NOW, don't wait out the
+        rest of the grace period -- return it to QUEUED immediately for
+        a fresh claim+review (WAITING_SESSION's only outgoing edge;
+        never resumes "in place")."""
+        status_response = self.ops.terminal_status(session)
+        if not status_response.get("error"):
+            self.store.transition_task(task_id, QUEUED, event_type="SESSION_RECOVERED",
+                                       reason="session resolvable again",
+                                       extra_fields={"uncertain_or_waiting_since": None})
+            return TickResult(session, "QUEUED", task_id=task_id, detail="session recovered")
+        return TickResult(session, "NO_OP", task_id=task_id, detail="still WAITING_SESSION, within grace period")
 
     # -- completion detection -----------------------------------------------
 
     def _check_completion(self, session: str, task_id: str, current_status: str) -> TickResult:
         task = self.store.get_task(task_id)
         status_response = self.ops.terminal_status(session)
-        if status_response.get("error"):
+        error = status_response.get("error")
+        if error in SESSION_UNREACHABLE_ERRORS:
+            # P0 item 9: the session/node vanished mid-flight -- WAITING_
+            # SESSION (auto-recoverable), never FAILED (a real execution
+            # failure) and never silently dropped.
+            self.store.mark_waiting_session(task_id, reason=error)
+            return TickResult(session, "WAITING_SESSION", task_id=task_id, detail=error)
+        if error:
             self.store.transition_task(task_id, FAILED, event_type="FAILED",
-                                       reason=f"could not read session status: {status_response['error']}")
-            return TickResult(session, "FAILED", task_id=task_id, detail=str(status_response["error"]))
+                                       reason=f"could not read session status: {error}")
+            return TickResult(session, "FAILED", task_id=task_id, detail=str(error))
 
         state = status_response.get("state")
         if current_status == RUNNING:

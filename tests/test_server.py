@@ -87,6 +87,9 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_integration_force_regression",
         "terminal_integration_promote",
         "terminal_integration_events",
+        "terminal_enqueue_task",
+        "terminal_task_status",
+        "terminal_queue_metrics",
     }
 
 
