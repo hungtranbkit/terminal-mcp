@@ -1138,11 +1138,47 @@ scan/audit view over the SAME facts.)*
    `terminal-mcp-http.service` restart was only done after the user's
    own explicit "restart an toàn"). Until that deployment happens,
    window/window2/wtest and every other dell-5530 session still run the
-   OLD, buggy verification logic. Next step: pull/copy the fix to
-   `C:\Users\tranv\terminal-mcp`, restart the node-agent process there
-   (never the tmux-equivalent sessions themselves), and re-run the exact
-   same live disposable-session repro to confirm 0 false negatives on
-   the ACTUAL deployment those sessions use.
+   OLD, buggy verification logic.
+   **2026-09-06 update — fix files deployed, restart attempted, restart
+   did NOT actually happen:** the full `terminal_mcp/` package (68
+   files) was deployed to `C:\Users\tranv\terminal-mcp` via a safe
+   staged-copy-then-atomic-swap (old code kept at
+   `terminal_mcp_backup_20260906` for rollback), confirmed byte-
+   identical, confirmed no impact on the already-running process (files
+   on disk don't affect an already-imported Python process). A restart
+   was then attempted via
+   `schtasks /end /tn TerminalMcpNodeAgent-dell-5530` followed by
+   `schtasks /run /tn ...` — **this did NOT restart the real process.**
+   `schtasks /end` only ends Task Scheduler's own tracking of the
+   `powershell.exe` wrapper; the actual `python.exe -m
+   terminal_mcp.windows_agent` process it launched (PID 3352, running
+   since 2026-09-05 23:06 — i.e. still the pre-fix code in memory) kept
+   running and kept holding port 8790. The new instance Task Scheduler
+   launched failed to bind that port (`WinError 10048`) and crashed
+   immediately (exit code 1). Net effect: **window/window2/wtest were
+   completely unaffected** (same PIDs — 18304/1760/1464 — same
+   `created` timestamps, same live tail content, both before and after
+   the attempt) — but only because nothing actually restarted, so this
+   attempt is NOT evidence that a real restart is safe. A real restart
+   now requires a hard `taskkill /F` on the old PID, which is the exact
+   disruptive action `windows_backend.py`'s own docstring warns about
+   (real risk of killing the ConPTY child sessions with no known
+   reattach mechanism). Surfaced to the user via AskUserQuestion before
+   attempting that; **user chose to wait for a safer window** rather
+   than force it now. Fix remains undeployed-in-practice (on disk, not
+   loaded) until a real restart happens.
+   **Also newly discovered:** the scheduled task's restart mechanism
+   itself has a latent bug worth fixing before the next attempt —
+   `schtasks /end` does not reliably terminate the process tree it
+   launches (likely because `run-node-agent.ps1` execs python without a
+   job-object/process-group link Task Scheduler's End Task can walk).
+   Next step: either fix `run-node-agent.ps1`/the scheduled task
+   definition so End Task actually kills the process tree (making a
+   graceful restart possible without a manual `taskkill`), or accept a
+   manual `taskkill /F` + explicit user go-ahead as the only path, and
+   re-run the exact same live disposable-session repro afterward to
+   confirm 0 false negatives on the ACTUAL deployment those sessions
+   use.
 8. **Dashboard Task Manager/Supervisor-Coordinator panel deployment
    gap (found and fixed):** the production `terminal-mcp-http.service`
    process had been running continuously since before commits `20f6ff0`/
@@ -1162,3 +1198,155 @@ scan/audit view over the SAME facts.)*
    terminal-mcp-http.service` (with a post-restart health/session check,
    as done here) before it's actually live, not just committed. Tracked
    here as a standing operational reminder, not a one-time fix.
+9. **Internet/VPS migration roadmap** — PLANNED, phased, not started.
+   See "Internet / VPS migration roadmap" section below for the full
+   phase breakdown. Phase 0 (stability gates) is itself mostly backlog
+   items 1 and 7 above, plus a fix for the scheduled-task restart bug
+   just found — none of Phase 1+ starts until Phase 0 is green.
+
+---
+
+## Internet / VPS migration roadmap (PLANNED — docs only, no code yet)
+
+Goal: today, the Controller/Dashboard/Queue/Coordinator/Registry all run
+on the `local` (Dell) machine, and every node (including Dell's own
+tmux backend) is only reachable because the Dell box is on and on the
+same LAN/tunnel. The target end state moves the control plane to a
+small VPS reachable over the internet, with every real node (Dell,
+dell-5530, m910, macbook, and future ones) connecting **outbound only**
+to it — so no node needs an open inbound port, and Dell going offline
+no longer takes down the other nodes' ability to be controlled.
+
+**Rationale (for future agents / not to be re-litigated per phase):**
+the VPS is a *light control plane* — it holds queue state, session
+registry, task history, and routes commands; it does not run builds,
+tests, or Claude/Codex itself. All actual work (tmux, ConPTY, file
+edits, git, test runs) stays on the edge nodes, matching the existing
+`ControllerService` → `NodeClient` (local vs remote) split already in
+the codebase (see section 12, Node/fleet support) — this migration
+generalizes that existing local/remote split, it does not redesign it.
+Keeping queue/registry state centrally (not per-node) is what lets one
+node's outage stay isolated to that node's own sessions instead of
+stalling the whole fleet.
+
+```
+                    ┌─────────────────────────────┐
+                    │   VPS (control plane)        │
+                    │  Controller · Dashboard ·     │
+                    │  Queue · Coordinator ·        │
+                    │  Supervisor · Registry ·      │
+                    │  audit/history (SQLite→PG)    │
+                    └───────────────▲───────────────┘
+                     outbound HTTPS/WSS, node token
+              ┌──────────────┬──────┴───────┬──────────────┐
+              │              │              │              │
+        ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐
+        │   Dell     │  │ dell-5530 │  │   m910    │  │  macbook  │
+        │ Node Agent │  │ Node Agent│  │Node Agent │  │Node Agent │
+        │ tmux/Claude│  │ ConPTY/   │  │ tmux/     │  │ tmux/     │
+        │  /Codex    │  │ Claude    │  │Claude/Codex│  │Claude/Codex│
+        └────────────┘  └───────────┘  └───────────┘  └───────────┘
+        no inbound port   no inbound port  no inbound port  no inbound port
+```
+
+### Phase 0 — Stability gates (blocks everything below; code work stays
+in the *current* repo/deployment, not the future VPS)
+
+- Reliable direct-send on Windows actually deployed and live-reverified
+  on dell-5530 (Backlog item 7 — fix shipped locally, remote deploy
+  attempted 2026-09-06, real restart still pending a safe window; the
+  scheduled-task restart-doesn't-kill-the-process bug found during that
+  attempt should be fixed here too, since Phase 2's node-agent will need
+  a trustworthy restart/reconnect story anyway).
+- Task Queue / Task Manager / Supervisor dashboard verified at runtime
+  end-to-end (Backlog item 1 — the live remote-node auto-dispatch smoke
+  test on dell-5530 via the real `RemoteNodeClient`, not local/mock) —
+  0 dropped / 0 duplicate dispatch under restart and reconnect.
+- Session registry survives controller restart and node reconnect
+  without duplicating or losing sessions.
+- Node-agent restart has a known-safe story: either it provably does
+  not lose sessions, or — if it can't be made safe (real risk on
+  Windows ConPTY, per `windows_backend.py`'s own docstring, confirmed
+  unresolved as of 2026-09-06) — a written, explicit recovery contract
+  (what "restart" is allowed to cost, who approves it, how loss is
+  reported) exists before Phase 2 makes node-agent reconnects a routine,
+  automatic event over the internet instead of a rare, manually-
+  approved LAN action.
+
+### Phase 1 — Controller decoupling
+
+Separate the Controller/Dashboard/Queue/Coordinator/Registry roles from
+the Dell machine so Dell becomes just another Node Agent (tmux/Claude/
+Codex/workspaces), not special-cased. Controller becomes stateless-ish
+process state + a persistent DB (see Phase 3 for SQLite→Postgres),
+addressed by stable `node_id`/`session_id` (already largely the case —
+verify no code path assumes "the controller runs where Dell's tmux
+does"). Node connectivity becomes outbound-only in this phase's design
+(even before the VPS exists), so Phase 2 is a transport swap, not a
+re-architecture.
+
+### Phase 2 — Internet node transport
+
+Each Node Agent (Windows/Dell/M910/macOS) connects **outbound**
+HTTPS/WSS to the central controller instead of the controller dialing
+in. Per-node machine token (already exists per node via `token_env`
+config — extend, don't replace). Heartbeat/reconnect/backoff so a
+node's laptop sleeping, changing Wi-Fi, or losing its IP doesn't
+require manual re-registration. No inbound port required on any node.
+Any task enqueued while a node is offline is preserved and auto-
+dispatched on reconnect (builds on the existing Persistent Task Queue
+v2 durability, not a new queue).
+
+### Phase 3 — VPS deployment
+
+Ubuntu VPS, ~2 vCPU / 2 GB RAM / 30–40 GB SSD as the baseline sizing
+target (to be confirmed against Phase 6's resource benchmark, not
+assumed). Deploys Controller + Dashboard + Queue + Coordinator +
+Supervisor + Registry + audit/history. HTTPS/WSS via a real domain
+(e.g. `terminal.mesflow.net`) fronted by Cloudflare, same posture as
+today's `dashboard.cloudflare_access_team_domain` gating. Storage:
+SQLite acceptable to start (matches today's deployment), but the
+schema/access layer must have a clear migration path to PostgreSQL —
+Postgres becomes the production default once queue/history/fleet size
+grows past what SQLite comfortably handles (no fixed threshold set yet;
+Phase 6's benchmark should inform this, not a guess made now).
+
+### Phase 4 — Remote fleet operations
+
+From ChatGPT/dashboard: create/reopen/kill a session on any online
+node; node selection by capability/OS/load (extends the existing
+`nodes.overload_thresholds`/node-registry logic, not a new scheduler).
+Tasks persist when their target node is offline and auto-dispatch on
+reconnect (Phase 2's job, exercised here at the product level).
+Dashboard shows node/session/task state fleet-wide. Explicitly: none of
+this depends on Dell being online — Dell is just one more node once
+Phase 1 lands.
+
+### Phase 5 — HA / operations / security
+
+Per-node token rotation; auth/RBAC beyond today's single-team
+Cloudflare Access gate; audit trail (extends the existing audit DB
+already in the codebase); TLS everywhere; DB backups; watchdog +
+health metrics (extends the existing watchdog/health endpoints, see
+section 13); terminal-history retention policy; rate limits; secret
+redaction in logs/history; disaster-recovery procedure; controller
+upgrade path that doesn't drop connected node state (ties back to
+Phase 1's stateless-ish controller design).
+
+### Phase 6 — Acceptance
+
+Real test matrix before calling the migration done: Dell and a Windows
+node on two different real internet networks (not just LAN); mobile/
+browser/ChatGPT control through the VPS; node disconnect/reconnect;
+controller reboot; node reboot; node IP change; baseline load (50+
+sessions across a few dozen nodes); queue survives an extended node
+offline period with no duplicate dispatch and no lost tasks; no cross-
+session output bleed. Benchmark actual controller CPU/RAM/WebSocket-
+connection-count/history-growth on the VPS sizing target to confirm the
+"light control plane" assumption this whole roadmap rests on, rather
+than asserting it.
+
+**Ground rule for this roadmap:** no code changes for Phases 1–6 start
+until Phase 0 is fully green (all its bullets independently verified,
+not just "probably fine"). This section is docs-only as of
+2026-09-06.
