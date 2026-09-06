@@ -786,6 +786,7 @@ DASHBOARD_HTML = """<!doctype html>
         <div class="menu-panel" id="headerMenuPanel" role="menu">
           <a href="/dashboard/sessions" id="sessionsAdminLink" role="menuitem">⚙ Quản lý session</a>
           <a href="/dashboard/nodes" id="nodesAdminLink" role="menuitem">🖥 Nodes</a>
+          <a href="/dashboard/tasks" id="globalTasksLink" role="menuitem">🗂 Global Tasks</a>
           <button type="button" id="openSupervisorPanelBtn" role="menuitem">🧭 Supervisor / Coordinator</button>
           <button type="button" id="openTaskInboxBtn" role="menuitem">📥 Task Inbox</button>
         </div>
@@ -5132,6 +5133,269 @@ NODES_ADMIN_HTML = """<!doctype html>
 </html>"""
 
 
+# Unified Task System checkpoint (2026-09-07, docs/REQUIREMENTS.md §20):
+# Global Tasks -- ONE canonical task model + ONE queue engine, this is
+# simply a NEW VIEW over the exact same queue_store.py rows every other
+# screen already reads (queue.board(), the fleet-wide 5-lifecycle-column
+# grouping -- see queue_service.py's own docstring for exactly why those
+# 5 buckets and not the per-session Task Manager's Running/Queued/
+# Waiting-Dependency/Blocked-Rework/Recent split). A fourth standalone
+# admin screen, same "own page, not folded into DASHBOARD_HTML's tab UI"
+# precedent SESSIONS_ADMIN_HTML/NODES_ADMIN_HTML already set. Backlog
+# (UNASSIGNED_LANE) cards get an inline "assign to session" action --
+# drag/drop is explicitly deferred behind this action-based move first
+# (task's own "drag/drop deferred behind action-based moves"). `?session=`
+# in the URL (read client-side, same convention as webterm.py's own
+# ?session=) pre-fills the session filter so the per-session Task button
+# elsewhere can deep-link here filtered to one session without this page
+# needing any server-side templating of its own.
+GLOBAL_TASKS_HTML = """<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Global Tasks</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#5b8cff; --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono','Courier New',monospace; }
+    * { box-sizing:border-box }
+    html, body { height:100vh; height:100dvh; overflow:hidden }
+    body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text); display:flex; flex-direction:column }
+    header { flex:0 0 auto; display:flex; justify-content:space-between; gap:16px; align-items:center; padding:14px 24px; border-bottom:1px solid var(--line); flex-wrap:wrap }
+    h1 { margin:0; font-size:18px } .muted { color:var(--muted) }
+    .live { color:var(--green); font-size:12px } .live.offline { color:var(--red) }
+    a.back { color:var(--muted); text-decoration:none; font-size:12px; border:1px solid var(--line); border-radius:999px; padding:4px 10px }
+    a.back:hover { color:var(--text); border-color:var(--muted) }
+    button.icon-btn { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:5px 11px; cursor:pointer; font:inherit; font-size:12px }
+    button.icon-btn:hover { background:#233252 }
+    input[type=text], select { padding:6px 9px; border-radius:6px; border:1px solid var(--line); background:#0f1730; color:var(--text); font:inherit; font-size:12px }
+    .toolbar { flex:0 0 auto; display:flex; gap:10px; align-items:center; padding:10px 24px; border-bottom:1px solid var(--line); flex-wrap:wrap }
+    main { flex:1; min-height:0; overflow:auto; padding:14px 24px 24px }
+    #board { display:grid; grid-template-columns:repeat(5, minmax(220px,1fr)); gap:12px; height:100%; align-items:start }
+    .col { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:10px; display:flex; flex-direction:column; min-height:120px; max-height:100%; }
+    .col-head { display:flex; justify-content:space-between; align-items:center; font-size:12px; color:var(--muted); padding:2px 4px 8px; border-bottom:1px solid var(--line); margin-bottom:8px }
+    .col-head b { color:var(--text) }
+    .col-list { overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:8px }
+    .col-empty { color:var(--muted); font-size:11px; text-align:center; padding:16px 4px }
+    .task-card { background:#0f1730; border:1px solid var(--line); border-radius:8px; padding:8px 10px; font-size:12px }
+    .task-card .tc-title { font-weight:600; margin-bottom:4px; word-break:break-word }
+    .task-card .tc-meta { display:flex; flex-wrap:wrap; gap:6px; color:var(--muted); font-size:11px }
+    .chip { display:inline-block; border-radius:999px; padding:1px 8px; border:1px solid var(--line); font-size:10px }
+    .chip.session { color:var(--accent); border-color:var(--accent); cursor:pointer }
+    .chip.status-FAILED, .chip.status-CANCELLED { color:var(--red); border-color:var(--red) }
+    .chip.status-COMPLETED { color:var(--green); border-color:var(--green) }
+    .tc-assign { display:flex; gap:6px; margin-top:6px }
+    .tc-assign input { flex:1; min-width:0; padding:4px 6px; font-size:11px }
+    .tc-assign button { padding:4px 8px; font-size:11px }
+    .tc-error { color:var(--red); font-size:11px; margin-top:4px }
+    #newTaskPanel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin:0 24px 14px }
+    #newTaskPanel[hidden] { display:none }
+    #newTaskPanel .row { display:flex; gap:10px; flex-wrap:wrap; margin-top:8px }
+    #newTaskPanel label { font-size:11px; color:var(--muted); display:flex; flex-direction:column; gap:3px }
+    #ntError { color:var(--red); font-size:12px; margin-top:8px; min-height:14px }
+    @media (max-width:900px) {
+      #board { grid-template-columns:1fr; }
+      .col { max-height:none }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>🗂 Global Tasks</h1><div class="muted">Một task model, một queue engine -- mọi task ở đây, kể cả chưa gán session</div></div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <button class="icon-btn" id="newTaskBtn" type="button">+ New Task</button>
+      <button class="icon-btn" id="refreshBtn" type="button">⟳ Refresh</button>
+      <a class="back" href="/dashboard">← Terminal</a>
+      <span class="live" id="liveBadge">● LIVE</span>
+    </div>
+  </header>
+  <div class="toolbar">
+    <label class="muted" style="font-size:11px">Lọc theo session:
+      <input type="text" id="sessionFilter" placeholder="tất cả" style="margin-left:6px">
+    </label>
+    <span class="muted" id="totalCount" style="font-size:11px"></span>
+  </div>
+  <div id="newTaskPanel" hidden>
+    <strong>Task mới</strong>
+    <div class="row">
+      <label>Title<br><input type="text" id="ntTitle" placeholder="ngắn gọn"></label>
+      <label>Session (để trống = Backlog/Unassigned)<br><input type="text" id="ntSession" placeholder="vd: lane-a"></label>
+      <label>Project<br><input type="text" id="ntProject" placeholder="tuỳ chọn"></label>
+    </div>
+    <div class="row">
+      <label style="flex:1;min-width:260px">Prompt<br><input type="text" id="ntPrompt" placeholder="nội dung task" style="width:100%"></label>
+    </div>
+    <div class="row">
+      <button class="icon-btn" id="ntSubmitBtn" type="button">Tạo task</button>
+      <button class="icon-btn" id="ntCancelBtn" type="button">Huỷ</button>
+    </div>
+    <div id="ntError"></div>
+  </div>
+  <main>
+    <div id="board">
+      <div class="col" data-col="backlog"><div class="col-head"><b>Backlog</b><span id="cnt-backlog">0</span></div><div class="col-list" id="list-backlog"></div></div>
+      <div class="col" data-col="queued"><div class="col-head"><b>Queued</b><span id="cnt-queued">0</span></div><div class="col-list" id="list-queued"></div></div>
+      <div class="col" data-col="running"><div class="col-head"><b>Running</b><span id="cnt-running">0</span></div><div class="col-list" id="list-running"></div></div>
+      <div class="col" data-col="blocked_review"><div class="col-head"><b>Blocked/Review</b><span id="cnt-blocked_review">0</span></div><div class="col-list" id="list-blocked_review"></div></div>
+      <div class="col" data-col="done"><div class="col-head"><b>Done</b><span id="cnt-done">0</span></div><div class="col-list" id="list-done"></div></div>
+    </div>
+  </main>
+  <script>
+    function clean(value) { return value == null ? '' : String(value); }
+    class AuthRequiredError extends Error {}
+    async function fetchJSON(url, options) {
+      const response = await fetch(url, options);
+      let landedOnAccessLogin = false;
+      if (response.redirected) {
+        try {
+          const host = new URL(response.url).hostname;
+          landedOnAccessLogin = host === 'cloudflareaccess.com' || host.endsWith('.cloudflareaccess.com');
+        } catch (error) { /* opaque/malformed response.url -- fall through */ }
+      }
+      const accessChallengeHeader = (response.headers.get('www-authenticate') || '').includes('Cloudflare-Access');
+      if (landedOnAccessLogin || accessChallengeHeader || response.status === 401) {
+        throw new AuthRequiredError(`sign-in required for ${url} (status ${response.status})`);
+      }
+      if (response.status >= 500) throw new Error(`server error from ${url}: status ${response.status}`);
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        throw new Error(`unexpected response from ${url}: status ${response.status}, content-type ${contentType || '(none)'}`);
+      }
+      return response.json();
+    }
+
+    const liveBadgeEl = document.querySelector('#liveBadge');
+    const sessionFilterEl = document.querySelector('#sessionFilter');
+    const totalCountEl = document.querySelector('#totalCount');
+    const COLUMNS = ['backlog', 'queued', 'running', 'blocked_review', 'done'];
+    const params = new URLSearchParams(location.search);
+    if (params.get('session')) sessionFilterEl.value = params.get('session');
+
+    function taskAge(iso) {
+      if (!iso) return '';
+      const ms = Date.now() - new Date(iso + (iso.endsWith('Z') ? '' : 'Z')).getTime();
+      if (!Number.isFinite(ms) || ms < 0) return '';
+      const mins = Math.floor(ms / 60000);
+      if (mins < 1) return 'vừa xong';
+      if (mins < 60) return `${mins}p trước`;
+      const hours = Math.floor(mins / 60);
+      if (hours < 24) return `${hours}g trước`;
+      return `${Math.floor(hours / 24)}ng trước`;
+    }
+
+    async function assignTask(taskId, session, errEl) {
+      if (!session) return;
+      errEl.textContent = '';
+      try {
+        const result = await fetchJSON('/dashboard/api/tasks/assign', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({task_id: taskId, session}),
+        });
+        if (result && result.error) { errEl.textContent = clean(result.error); return; }
+        await load();
+      } catch (error) { errEl.textContent = clean(error.message || error); }
+    }
+
+    function renderCard(task) {
+      const card = document.createElement('div'); card.className = 'task-card';
+      const title = document.createElement('div'); title.className = 'tc-title';
+      title.textContent = task.title || task.prompt || task.id; title.title = task.prompt || '';
+      const meta = document.createElement('div'); meta.className = 'tc-meta';
+      if (task.session) {
+        const s = document.createElement('span'); s.className = 'chip session'; s.textContent = task.session;
+        s.onclick = () => { sessionFilterEl.value = task.session; renderBoard(lastData); };
+        meta.append(s);
+      } else {
+        const s = document.createElement('span'); s.className = 'chip'; s.textContent = 'unassigned';
+        meta.append(s);
+      }
+      const status = document.createElement('span'); status.className = `chip status-${task.status}`; status.textContent = task.status;
+      meta.append(status);
+      const idChip = document.createElement('span'); idChip.className = 'chip'; idChip.textContent = `#${clean(task.id).slice(0,8)}`;
+      meta.append(idChip);
+      const age = taskAge(task.created_at);
+      if (age) { const a = document.createElement('span'); a.className = 'chip'; a.textContent = age; meta.append(a); }
+      const project = task.metadata && task.metadata.project;
+      if (project) { const p = document.createElement('span'); p.className = 'chip'; p.textContent = clean(project); meta.append(p); }
+      card.append(title, meta);
+      if (!task.session) {
+        const assignRow = document.createElement('div'); assignRow.className = 'tc-assign';
+        const input = document.createElement('input'); input.type = 'text'; input.placeholder = 'gán vào session...';
+        const btn = document.createElement('button'); btn.className = 'icon-btn'; btn.type = 'button'; btn.textContent = 'Assign';
+        const err = document.createElement('div'); err.className = 'tc-error';
+        btn.onclick = () => assignTask(task.id, input.value.trim(), err);
+        input.addEventListener('keydown', event => { if (event.key === 'Enter') btn.onclick(); });
+        assignRow.append(input, btn);
+        card.append(assignRow, err);
+      }
+      return card;
+    }
+
+    let lastData = null;
+    function renderBoard(data) {
+      if (!data) return;
+      lastData = data;
+      const filter = sessionFilterEl.value.trim().toLowerCase();
+      let total = 0;
+      for (const col of COLUMNS) {
+        const listEl = document.querySelector(`#list-${col}`);
+        listEl.replaceChildren();
+        const tasks = (data[col] || []).filter(t => !filter || (t.session || '').toLowerCase().includes(filter));
+        document.querySelector(`#cnt-${col}`).textContent = String(tasks.length);
+        total += tasks.length;
+        if (!tasks.length) {
+          const empty = document.createElement('div'); empty.className = 'col-empty'; empty.textContent = '(trống)';
+          listEl.append(empty);
+        } else {
+          for (const task of tasks) listEl.append(renderCard(task));
+        }
+      }
+      totalCountEl.textContent = filter ? `${total} task (lọc: ${filter})` : `${total} task`;
+    }
+
+    async function load() {
+      try {
+        const data = await fetchJSON('/dashboard/api/tasks/board', {cache: 'no-store'});
+        liveBadgeEl.textContent = '● LIVE'; liveBadgeEl.classList.remove('offline');
+        renderBoard(data);
+      } catch (error) {
+        liveBadgeEl.textContent = error instanceof AuthRequiredError ? '● SIGN-IN REQUIRED' : '● OFFLINE';
+        liveBadgeEl.classList.add('offline');
+      }
+    }
+
+    document.querySelector('#refreshBtn').onclick = load;
+    sessionFilterEl.addEventListener('input', () => renderBoard(lastData));
+
+    const newTaskPanelEl = document.querySelector('#newTaskPanel');
+    document.querySelector('#newTaskBtn').onclick = () => { newTaskPanelEl.hidden = false; document.querySelector('#ntTitle').focus(); };
+    document.querySelector('#ntCancelBtn').onclick = () => { newTaskPanelEl.hidden = true; };
+    document.querySelector('#ntSubmitBtn').onclick = async () => {
+      const title = document.querySelector('#ntTitle').value.trim();
+      const prompt = document.querySelector('#ntPrompt').value.trim();
+      const session = document.querySelector('#ntSession').value.trim() || null;
+      const project = document.querySelector('#ntProject').value.trim() || null;
+      const errEl = document.querySelector('#ntError');
+      if (!prompt) { errEl.textContent = 'Prompt là bắt buộc.'; return; }
+      errEl.textContent = '';
+      try {
+        const result = await fetchJSON('/dashboard/api/tasks/create', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({title, prompt, session, project}),
+        });
+        if (result && result.error) { errEl.textContent = clean(result.error); return; }
+        document.querySelector('#ntTitle').value = ''; document.querySelector('#ntPrompt').value = '';
+        document.querySelector('#ntSession').value = ''; document.querySelector('#ntProject').value = '';
+        newTaskPanelEl.hidden = true;
+        await load();
+      } catch (error) { errEl.textContent = clean(error.message || error); }
+    };
+
+    load(); setInterval(load, 4000);
+  </script>
+</body>
+</html>"""
+
+
 # Web terminal (xterm.js over a WebSocket -- webterm.py). A standalone
 # page, deliberately NOT folded into DASHBOARD_HTML's own tab UI: this is
 # the one screen in the whole dashboard that genuinely needs a dedicated,
@@ -5603,6 +5867,20 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return blocked
         return HTMLResponse(
             NODES_ADMIN_HTML,
+            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
+        )
+
+    @server.custom_route("/dashboard/tasks", methods=["GET"], include_in_schema=False)
+    async def dashboard_global_tasks(request: Request) -> HTMLResponse | JSONResponse:
+        # Same read guard as /dashboard/sessions and /dashboard/nodes -- a
+        # VIEW over the existing /dashboard/api/tasks/board data and the
+        # existing queue mutation routes, not a new privilege surface. See
+        # GLOBAL_TASKS_HTML's own module-level comment.
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(
+            GLOBAL_TASKS_HTML,
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
@@ -6179,6 +6457,72 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return blocked
         result = await anyio.to_thread.run_sync(integration.fleet_overview)
         return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/tasks/board", methods=["GET"], include_in_schema=False)
+    async def tasks_board(request: Request) -> JSONResponse:
+        # Same fleet-wide gate posture as /dashboard/api/queue/global-inbox
+        # just above (this is the Global Tasks Kanban's own real data
+        # source, queue.board() -- never a second task store).
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        result = await anyio.to_thread.run_sync(queue.board)
+        return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/tasks/create", methods=["POST"], include_in_schema=False)
+    async def tasks_create(request: Request) -> JSONResponse:
+        # Unified Task System's canonical creation path (queue.create_
+        # task, same one terminal_task_create's MCP tool calls) --
+        # `session` omitted/None creates a real UNASSIGNED/Backlog task;
+        # given, gated by the SAME per-session _read_authorized check
+        # session_queue_enqueue above already uses (a task destined for a
+        # specific session can carry sensitive prompt text same as any
+        # other enqueue).
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        prompt = body.get("prompt") if isinstance(body, dict) else None
+        if not isinstance(prompt, str) or not prompt:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        title = body.get("title") if isinstance(body.get("title"), str) else None
+        session = body.get("session") if isinstance(body.get("session"), str) and body.get("session") else None
+        project = body.get("project") if isinstance(body.get("project"), str) and body.get("project") else None
+        if session is not None and not terminal._read_authorized(session):
+            return JSONResponse({"error": "READ_RESTRICTED", "session": session}, status_code=403)
+        _log.info("dashboard task_create session=%s identity=%s", session, identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(
+            lambda: queue.create_task(title or "", prompt, session=session, project=project)
+        )
+        status_code = 200 if "error" not in result else 400
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/tasks/assign", methods=["POST"], include_in_schema=False)
+    async def tasks_assign(request: Request) -> JSONResponse:
+        # Moves an existing task (Backlog, or another session's own lane)
+        # into `session`'s queue -- gated the same way session_queue_
+        # enqueue is (the TARGET session's own _read_authorized check).
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        task_id = body.get("task_id") if isinstance(body, dict) else None
+        session = body.get("session") if isinstance(body, dict) else None
+        if not isinstance(task_id, str) or not task_id:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        if not isinstance(session, str) or not session or not terminal._read_authorized(session):
+            return JSONResponse({"error": "READ_RESTRICTED", "session": session}, status_code=403)
+        _log.info("dashboard task_assign task_id=%s session=%s identity=%s", task_id, session,
+                 identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(lambda: queue.assign_task(task_id, session))
+        status_code = 200 if "error" not in result else 400
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/session/queue/pause", methods=["POST"], include_in_schema=False)
     async def session_queue_pause(request: Request) -> JSONResponse:

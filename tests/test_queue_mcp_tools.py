@@ -201,6 +201,38 @@ async def test_recent_events_merges_across_sessions_newest_first(server):
 
 
 @pytest.mark.anyio
+async def test_task_create_without_session_lands_in_backlog(server):
+    created = await _call(server, "terminal_task_create", title="Investigate", prompt="look into it")
+    assert created["status"] == "TASK_ACCEPTED"
+    assert created["assigned"] is False
+    board = await _call(server, "terminal_task_board")
+    assert board["counts"]["backlog"] == 1
+    assert board["backlog"][0]["id"] == created["task_id"]
+    assert board["backlog"][0]["session"] is None
+
+
+@pytest.mark.anyio
+async def test_task_create_with_assigned_session_id_goes_straight_to_that_lane(server):
+    created = await _call(server, "terminal_task_create", title="Ship it", prompt="do it",
+                          assigned_session_id="lane-a")
+    assert created["assigned"] is True
+    status = await _call(server, "terminal_queue_status", session="lane-a")
+    assert status["total_count"] == 1
+
+
+@pytest.mark.anyio
+async def test_task_assign_moves_a_backlog_task_into_a_session_lane(server):
+    created = await _call(server, "terminal_task_create", title="t", prompt="p")
+    task_id = created["task_id"]
+    result = await _call(server, "terminal_task_assign", task_id=task_id, session="lane-a")
+    assert "error" not in result
+    assert result["task"]["id"] == task_id
+    board = await _call(server, "terminal_task_board")
+    assert board["counts"]["backlog"] == 0
+    assert board["counts"]["queued"] == 1
+
+
+@pytest.mark.anyio
 async def test_integration_fleet_overview_lists_only_configured_projects(server):
     empty = await _call(server, "terminal_integration_fleet_overview")
     assert empty["projects"] == []

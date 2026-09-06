@@ -800,6 +800,14 @@ well it works in isolation.
 
 ### 20.1 Data model — real gap found, real reuse found
 
+**Status of this subsection: PARTIALLY VERIFIED (2026-09-07) — see
+20.1a.** The paragraph below is the ORIGINAL plan as first designed;
+20.1a documents what was actually built and why it deliberately chose a
+different, lower-risk mechanism for "Global/Unassigned" than the one
+described here. Kept side by side (never silently rewritten) so a
+future implementer sees both the original reasoning and why it changed
+on contact with the real, already-battle-tested dispatch engine.
+
 `queue_tasks.session` is currently `TEXT NOT NULL` (`queue_store.py`'s
 own schema) — a task **cannot** exist without a session today. This is
 the one real, necessary schema change for "Global/Unassigned" to exist
@@ -808,6 +816,90 @@ at all: `session` must become nullable (a new, additive migration —
 used for exactly this kind of change, see Migration 5's own real
 precedent in this same file). No other existing column needs to change
 shape for this.
+
+#### 20.1a Implementation note (2026-09-07, VERIFIED live) — sentinel lane, not a nullable column
+
+The Kanban backend slice of §20 (board/create/assign — NOT the rest of
+§20: PM routing, Planner, git isolation, Merge Agent, Phase A-E are all
+still PLANNED, unbuilt) is now real, tested, and live-verified. It
+deliberately did **not** make `queue_tasks.session` nullable. Instead:
+
+- `queue_store.UNASSIGNED_LANE = "__unassigned__"` — a reserved,
+  ordinary lane name. An "unassigned" task is a completely normal row
+  in this lane; `session` stays `TEXT NOT NULL` everywhere, unchanged.
+- Why: a nullable `session` would have rippled through `queue_engine.
+  py`'s dispatch loop, the Coordinator gate, and every existing test/
+  caller that assumes a real session string for `session IS NOT NULL`
+  reasoning. The sentinel-lane approach needs zero changes to any of
+  that: `auto_dispatch_enabled` defaults `False` for every lane
+  including this one, so `UNASSIGNED_LANE` is completely inert to the
+  background dispatch loop — exactly the property an unassigned task
+  needs (nothing should ever try to send it anywhere).
+- `queue_store.MOVABLE_STATUSES = (QUEUED, BLOCKED, PAUSED,
+  WAITING_SESSION)` + `QueueStore.move_task_to_session(task_id,
+  new_session)`: reassigns the **same row** (id/history/metadata
+  unchanged, never a duplicate) between lanes — including out of
+  `UNASSIGNED_LANE` into a real session, or between two real sessions.
+  Refuses (`TASK_NOT_MOVABLE`) a task currently in PRECHECK/READY/
+  DISPATCHING/DISPATCH_UNCERTAIN/RUNNING/VERIFYING or any terminal
+  status, to avoid racing the engine's own background tick.
+- `QueueService.create_task(title, prompt, *, session=None, priority=0,
+  project=None, metadata=None)` — the ONE canonical creation path:
+  `session=None` creates a durable, immediately-persisted row in
+  `UNASSIGNED_LANE`; `session` given creates it already assigned (same
+  guarantee `enqueue()` always had). `project` is folded into
+  `metadata["project"]` — no schema change needed for that one field.
+- `QueueService.assign_task(task_id, session)` — validates the session
+  name, then calls `move_task_to_session`.
+- `QueueService.board()` — the Global Tasks Kanban's real data source:
+  one bulk `list_all_lanes()` read, grouped into the 5 lifecycle columns
+  the UI shows (`backlog`, `queued`, `running`, `blocked_review`,
+  `done` — see the table in the base §20.1 above for which raw statuses
+  land in each). `UNASSIGNED_LANE` never leaks to a caller — a task's
+  `session` field reads `None` when it's actually in that lane.
+- MCP tools: `terminal_task_create` (nullable `assigned_session_id`),
+  `terminal_task_assign`, `terminal_task_board` (`mcp_app.py`).
+- Dashboard: `/dashboard/tasks` — a new, standalone Kanban page (same
+  "own page, not folded into `DASHBOARD_HTML`'s tab UI" precedent
+  `SESSIONS_ADMIN_HTML`/`NODES_ADMIN_HTML` already set), 5 columns,
+  session-substring filter (`?session=` deep-link), inline "Assign to
+  session" action on Backlog cards (drag/drop deferred, per the task's
+  own "action-based moves first"), a "+ New Task" panel. Backed by
+  `GET /dashboard/api/tasks/board`, `POST /dashboard/api/tasks/create`,
+  `POST /dashboard/api/tasks/assign` — same `_read_guard`/
+  `_mutation_guard`/per-session `_read_authorized` gating every other
+  queue route already uses, no new permission model. Linked from the
+  main dashboard's `⋯` menu (`🗂 Global Tasks`, next to `⚙ Quản lý
+  session`/`🖥 Nodes`). The existing per-session Task button/badge
+  (`#taskManagerBtn`) still opens its own existing modal unchanged —
+  this new page is an additional fleet-wide view, not a replacement,
+  reachable directly or via `?session=` for a filtered look at one
+  session's own cards.
+- Tests: `tests/test_queue_store.py` (7, `move_task_to_session`),
+  `tests/test_queue_service_fleet_views.py` (12, `create_task`/
+  `assign_task`/`board`), `tests/test_queue_mcp_tools.py` (3, the new
+  MCP tools through the real `server.call_tool` path), `tests/
+  test_task_manager_ui.py` (7, the 3 new dashboard routes + the page
+  route, through a real `TestClient` with real tmux workers + real
+  grants — same rig every other dashboard queue-route test already
+  uses). Full suite green apart from one pre-existing, unrelated
+  timing-sensitive failure (see Backlog item 14).
+- Live evidence: a disposable server (scratch config/state/queue.db, a
+  separate port, never the production instance) seeded with 9 tasks
+  spanning all 5 columns, checked with a real Playwright browser —
+  initial render matched seeded counts exactly; clicking "Assign" on a
+  Backlog card moved it into Queued in real time (counts updated on the
+  next poll, no page reload); the session filter correctly narrowed to
+  one session's own 3 tasks; the "+ New Task" panel created a real row
+  that appeared in Backlog; mobile viewport (390×844) confirmed the
+  page's own internal scroll region (not the outer document) reaches
+  every column's content.
+- Still PLANNED, not built in this slice: drag/drop, the PM/Orchestrator
+  routing that would auto-populate Backlog assignment, dependency-tree
+  visualization, and the `parent_task_id`/routing/risk columns listed
+  in the ORIGINAL plan just above (20.1's base paragraph) — none of
+  those were needed for a working Kanban board, so none were added
+  speculatively ahead of the phase that actually needs them.
 
 New columns needed on `queue_tasks` (one migration, additive, never
 touches historical rows' meaning):
@@ -2199,6 +2291,39 @@ scan/audit view over the SAME facts.)*
     are recoverable via the fleet-aware API (`node_id/session` qualified
     form) but do not yet APPEAR in this specific dashboard panel/MCP
     listing tools unless queried directly.
+14. **`terminal_create_session`'s `initial_prompt` send can visibly echo
+    twice for a brand-new plain-shell session** (found live, 2026-09-07,
+    while running the full suite ahead of the Kanban checkpoint —
+    `tests/test_session_lifecycle.py::
+    test_create_initial_prompt_goes_through_reliable_submission_once`,
+    now consistently reproducing on this machine, not flaky). Evidence:
+    the captured pane shows the typed command once with no prompt
+    prefix at all (`echo hello-lifecycle`), then again as a normal
+    prompt-prefixed line once the shell's own prompt actually renders
+    (`...$ echo hello-lifecycle`) followed by its real output — the
+    likely mechanism is bash's own readline redrawing buffered input
+    once it finishes initializing, if `_send_text_and_verify_locked`'s
+    text-send/Enter land before the very first prompt has been drawn at
+    all, not a second real `send_keys`/Enter call from this project's
+    own code (only one Enter is ever sent per the method's own logic —
+    confirmed by reading it, not just observing the symptom). Likely the
+    same general class of issue as item 12 above (a timing race right
+    around a freshly-created session's own readiness), but a distinct
+    repro on plain `shell` rather than Claude, and not yet root-caused
+    to the same fix. Scoped out of the Kanban checkpoint this entry sits
+    next to (different investigation) — tracked here, not silently
+    fixed or silently ignored, so a future pass knows exactly what to
+    reproduce and where to start looking (`core.py`'s own `terminal_
+    create_session`/`_send_text_and_verify_locked`).
+15. **Unified Task System §20's Global Tasks Kanban slice is now VERIFIED
+    and live** (2026-09-07) — see §20.1a's own full implementation note
+    (data model choice, new store/service methods, MCP tools, dashboard
+    route, tests, live Playwright evidence) and §4a of `docs/
+    CHATGPT_USAGE.md`. The REST of §20 (PM/Orchestrator skill routing,
+    Task Planner, git worktree isolation, the Integration/Merge Agent,
+    the Phase A-E Startup Operating Model) remains PLANNED, unbuilt —
+    this entry marks progress on exactly one slice of a much larger,
+    still-open design, not completion of §20 as a whole.
 
 ---
 

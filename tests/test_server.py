@@ -103,6 +103,10 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_queue_global_inbox",
         "terminal_queue_recent_events",
         "terminal_integration_fleet_overview",
+        # Unified Task System: Global Tasks Kanban (queue.board()).
+        "terminal_task_create",
+        "terminal_task_assign",
+        "terminal_task_board",
     }
 
 

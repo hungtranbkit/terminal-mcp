@@ -169,3 +169,103 @@ def test_count_pending_over_99_is_a_real_count_not_capped_server_side(queue):
     tasks = [{"prompt": f"t{i}"} for i in range(150)]
     queue.store.append_tasks("lane-a", tasks)
     assert queue.pending_counts()["lane-a"] == 150
+
+
+# ---------------------------------------------------------------------------
+# Unified Task System checkpoint: create_task / assign_task / board (Kanban).
+# ---------------------------------------------------------------------------
+
+def test_create_task_without_session_lands_unassigned(queue):
+    result = queue.create_task("Investigate flaky test", "look into it", session=None)
+    assert result["status"] == "TASK_ACCEPTED"
+    assert result["assigned"] is False
+    task = queue.store.get_task(result["task_id"])
+    assert task.session == "__unassigned__"
+
+
+def test_create_task_with_session_is_assigned_directly(queue):
+    result = queue.create_task("Ship the thing", "do it", session="lane-a")
+    assert result["assigned"] is True
+    assert result["session"] == "lane-a"
+    task = queue.store.get_task(result["task_id"])
+    assert task.session == "lane-a"
+
+
+def test_create_task_rejects_invalid_session_name(queue):
+    result = queue.create_task("x", "y", session="../not valid")
+    assert "error" in result
+
+
+def test_create_task_requires_a_prompt(queue):
+    assert queue.create_task("title only", "", session=None) == {"error": "TASK_PROMPT_REQUIRED"}
+
+
+def test_create_task_folds_project_into_metadata_without_schema_change(queue):
+    result = queue.create_task("t", "p", session=None, project="OfflinePOS")
+    task = queue.store.get_task(result["task_id"])
+    assert task.metadata.get("project") == "OfflinePOS"
+
+
+def test_assign_task_moves_same_task_id_no_duplicate(queue):
+    created = queue.create_task("t", "p", session=None)
+    task_id = created["task_id"]
+    result = queue.assign_task(task_id, "lane-a")
+    assert "error" not in result
+    assert result["task"]["id"] == task_id
+    assert result["task"]["session"] == "lane-a"
+    lanes = {lane["session"]: lane["total_count"] for lane in queue.store.list_all_lanes()}
+    assert lanes.get("__unassigned__", 0) == 0
+    assert lanes["lane-a"] == 1
+
+
+def test_assign_task_rejects_invalid_session_name(queue):
+    created = queue.create_task("t", "p", session=None)
+    result = queue.assign_task(created["task_id"], "../not valid")
+    assert "error" in result
+
+
+def test_assign_task_refuses_a_running_task(queue):
+    (task_id,) = queue.store.append_tasks("lane-a", [{"prompt": "p"}])
+    queue.store.transition_task(task_id, "DISPATCHING", event_type="TEST")
+    queue.store.transition_task(task_id, "RUNNING", event_type="TEST")
+    result = queue.assign_task(task_id, "lane-b")
+    assert result == {"error": "TASK_NOT_MOVABLE", "task_id": task_id, "status": "RUNNING"}
+
+
+def test_board_empty_when_nothing_ever_created(queue):
+    board = queue.board()
+    assert board["counts"] == {"backlog": 0, "queued": 0, "running": 0, "blocked_review": 0, "done": 0}
+
+
+def test_board_groups_tasks_into_the_five_real_lifecycle_columns(queue):
+    unassigned = queue.create_task("u", "p", session=None)["task_id"]
+    queued = queue.create_task("q", "p", session="lane-a")["task_id"]
+    running = queue.create_task("r", "p", session="lane-a")["task_id"]
+    queue.store.transition_task(running, "DISPATCHING", event_type="TEST")
+    queue.store.transition_task(running, "RUNNING", event_type="TEST")
+    blocked = queue.create_task("b", "p", session="lane-b")["task_id"]
+    queue.store.transition_task(blocked, "PRECHECK", event_type="TEST")
+    queue.store.transition_task(blocked, "BLOCKED", event_type="TEST", reason="x")
+    done = queue.create_task("d", "p", session="lane-b")["task_id"]
+    queue.store.transition_task(done, "DISPATCHING", event_type="TEST")
+    queue.store.transition_task(done, "RUNNING", event_type="TEST")
+    queue.store.transition_task(done, "VERIFYING", event_type="TEST")
+    queue.store.mark_completed_with_evidence(done, evidence={"marker_found": True})
+
+    board = queue.board()
+    assert board["counts"] == {"backlog": 1, "queued": 1, "running": 1, "blocked_review": 1, "done": 1}
+    assert board["backlog"][0]["id"] == unassigned
+    assert board["backlog"][0]["session"] is None  # sentinel never leaks to the caller
+    assert board["queued"][0]["id"] == queued
+    assert board["running"][0]["id"] == running
+    assert board["blocked_review"][0]["id"] == blocked
+    assert board["done"][0]["id"] == done
+
+
+def test_board_after_assign_moves_task_from_backlog_to_queued(queue):
+    created = queue.create_task("u", "p", session=None)
+    assert queue.board()["counts"]["backlog"] == 1
+    queue.assign_task(created["task_id"], "lane-a")
+    counts = queue.board()["counts"]
+    assert counts["backlog"] == 0
+    assert counts["queued"] == 1

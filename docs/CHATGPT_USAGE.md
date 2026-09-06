@@ -175,6 +175,38 @@ orchestration (retries, verification, multi-step) by hand-rolling your
 own `terminal_send_text` loop — you lose persistence, one-active-task
 enforcement, and real completion verification for no benefit.
 
+### 4a. Global Tasks (Unified Task System — task creation with no session yet)
+
+**Status: VERIFIED** (this slice only — Kanban board/create/assign;
+see REQUIREMENTS.md §20.1a for full evidence. The rest of §20 — PM/
+Orchestrator skill-based routing, Task Planner, git-isolation, the
+Integration/Merge Agent, the Phase A-E Startup Operating Model — is
+still PLANNED, not built; don't assume any of that exists.)
+
+Same one canonical task table/queue engine as §4 above — this is just
+the entry point for a task that doesn't have a session picked yet:
+
+- `terminal_task_create(title, prompt, assigned_session_id=None, ...)`
+  — `assigned_session_id` omitted/None creates a real, durable
+  UNASSIGNED task (shows up in the "Backlog" column); given, it's
+  identical to `terminal_enqueue_task`. Use this instead of
+  `terminal_enqueue_task` whenever you don't yet know (or don't need to
+  pick) which session should run something.
+- `terminal_task_assign(task_id, session)` — moves an existing task
+  (Backlog, or another session's own lane) into `session`'s queue — the
+  *same* `task_id`/history, never a duplicate. Refused
+  (`TASK_NOT_MOVABLE`) if the task is already mid-dispatch/RUNNING/
+  VERIFYING or in a terminal state.
+- `terminal_task_board()` — every task, grouped into the 5 columns the
+  dashboard's `/dashboard/tasks` Kanban page shows: `backlog`,
+  `queued`, `running`, `blocked_review`, `done`, plus `counts`. A
+  task's `session` field is `null` while it's in Backlog.
+
+**Anti-pattern:** don't invent your own "unassigned task" convention
+(a magic session name, a separate list you keep yourself) — always
+create it with `assigned_session_id` omitted and read it back through
+`terminal_task_board`/`terminal_task_status`.
+
 ## 5. Supervisor flow (canonical for watching an unattended session and
 reacting to it needing help)
 
@@ -335,12 +367,15 @@ see REQUIREMENTS.md Backlog item 7).
 
 ## 11. What's coming (do not treat as available yet)
 
-A Unified Task System (Global Tasks Kanban, PM/Orchestrator skill-based
-routing, a Planner that splits large tasks, git worktree isolation, and
-a dedicated Integration/Merge Agent role) is being designed as an
-extension of the Queue/Coordinator/Supervisor stack described above —
-**PLANNED**, not built, as of this file's own last update. See
-`docs/REQUIREMENTS.md`'s own "Unified Task System" section for the
-current architecture-in-progress. Nothing in this section is callable
-yet; if asked to use it, say so plainly rather than guessing at a tool
-name.
+The Unified Task System is an extension of the Queue/Coordinator/
+Supervisor stack described above. Its **Global Tasks Kanban slice is
+now VERIFIED and callable** — see §4a above (`terminal_task_create`/
+`terminal_task_assign`/`terminal_task_board`, and the dashboard's
+`/dashboard/tasks` page). Everything else in that design — PM/
+Orchestrator skill-based routing, a Planner that splits large tasks,
+git worktree isolation, and a dedicated Integration/Merge Agent role —
+is still **PLANNED**, not built, as of this file's own last update. See
+`docs/REQUIREMENTS.md`'s own "Unified Task System" section (§20) for
+the current architecture-in-progress. Nothing beyond §4a's tools is
+callable yet; if asked to use any of the rest, say so plainly rather
+than guessing at a tool name.

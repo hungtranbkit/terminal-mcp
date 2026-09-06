@@ -341,3 +341,78 @@ def test_concurrent_enqueue_and_pause_never_lose_an_update(rig):
     assert errors == []
     board_response = client.get("/dashboard/api/session/tasks", params={"name": name})
     assert board_response.json()["summary"]["total"] == 40  # 4 threads * 10 each, none lost, none duplicated
+
+
+# -- Unified Task System checkpoint: Global Tasks Kanban dashboard routes --
+
+def test_dashboard_tasks_board_route_reflects_real_queue_state(rig):
+    client, queue = rig["client"], rig["queue"]
+    queue.create_task("Backlog item", "investigate", session=None)
+    board = client.get("/dashboard/api/tasks/board")
+    assert board.status_code == 200
+    assert board.json()["counts"]["backlog"] == 1
+
+
+def test_dashboard_tasks_create_route_without_session_lands_in_backlog(rig):
+    client = rig["client"]
+    created = client.post("/dashboard/api/tasks/create", json={"title": "t", "prompt": "p"})
+    assert created.status_code == 200, created.json()
+    assert created.json()["assigned"] is False
+    board = client.get("/dashboard/api/tasks/board").json()
+    assert board["counts"]["backlog"] == 1
+    assert board["backlog"][0]["session"] is None
+
+
+def test_dashboard_tasks_create_route_with_session_requires_read_authorization(rig):
+    client = rig["client"]
+    name = _unique("other-noauth")  # never granted read -- must be refused, not silently created
+    denied = client.post("/dashboard/api/tasks/create", json={"title": "t", "prompt": "p", "session": name})
+    assert denied.status_code == 403
+    assert denied.json()["error"] == "READ_RESTRICTED"
+
+
+def test_dashboard_tasks_create_route_with_authorized_session_is_assigned_directly(rig):
+    client, service, make_worker = rig["client"], rig["service"], rig["make_worker"]
+    name = _unique("tm")
+    make_worker(name)
+    service.grants.set_read(name, True, granted_by="test")
+    created = client.post("/dashboard/api/tasks/create", json={"title": "t", "prompt": "p", "session": name})
+    assert created.status_code == 200, created.json()
+    assert created.json()["assigned"] is True
+    board = client.get("/dashboard/api/tasks/board").json()
+    assert any(t["session"] == name for t in board["queued"])
+
+
+def test_dashboard_tasks_assign_route_moves_same_task_no_duplicate(rig):
+    client, service, make_worker = rig["client"], rig["service"], rig["make_worker"]
+    name = _unique("tm")
+    make_worker(name)
+    service.grants.set_read(name, True, granted_by="test")
+
+    created = client.post("/dashboard/api/tasks/create", json={"title": "t", "prompt": "p"})
+    task_id = created.json()["task_id"]
+    assigned = client.post("/dashboard/api/tasks/assign", json={"task_id": task_id, "session": name})
+    assert assigned.status_code == 200, assigned.json()
+    assert assigned.json()["task"]["id"] == task_id
+
+    board = client.get("/dashboard/api/tasks/board").json()
+    assert board["counts"]["backlog"] == 0
+    assert board["counts"]["queued"] == 1
+    assert board["queued"][0]["id"] == task_id
+
+
+def test_dashboard_tasks_assign_route_requires_read_authorization_on_target_session(rig):
+    client = rig["client"]
+    created = client.post("/dashboard/api/tasks/create", json={"title": "t", "prompt": "p"})
+    task_id = created.json()["task_id"]
+    other = _unique("other-noauth")
+    denied = client.post("/dashboard/api/tasks/assign", json={"task_id": task_id, "session": other})
+    assert denied.status_code == 403
+    assert denied.json()["error"] == "READ_RESTRICTED"
+
+
+def test_dashboard_tasks_page_served_when_read_authorized(rig):
+    client = rig["client"]
+    response = client.get("/dashboard/tasks")
+    assert response.status_code == 200
+    assert "Global Tasks" in response.text

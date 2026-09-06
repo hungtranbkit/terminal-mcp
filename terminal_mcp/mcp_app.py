@@ -1115,6 +1115,51 @@ def build_mcp(service: TerminalService | None = None,
         return queue.task_status(task_id)
 
     @server.tool()
+    def terminal_task_create(title: str, prompt: str, assigned_session_id: str | None = None,
+                             priority: int = 0, project: str | None = None,
+                             metadata: dict | None = None) -> dict:
+        """Unified Task System's canonical task-creation entry point
+        (docs/REQUIREMENTS.md §20) -- the ONE way to create a Global
+        Task, whether or not a session is known yet. assigned_session_id
+        omitted/None: creates a real, durable UNASSIGNED task (shows in
+        the Global Tasks Kanban's "Backlog" column, in
+        terminal_task_board's own `backlog` list) -- NOT a draft, not a
+        second-class record, just one with no lane yet; assign it later
+        with terminal_task_assign. assigned_session_id given: identical
+        to terminal_enqueue_task (same durable-before-dispatch guarantee,
+        same TASK_ACCEPTED shape), just reached through this one
+        canonical name instead of two separate tools for "assigned" vs
+        "unassigned". project, if given, is recorded on the task
+        (visible in terminal_task_board's per-card metadata) for the
+        Kanban's own project affinity/grouping."""
+        return queue.create_task(title, prompt, session=assigned_session_id, priority=priority,
+                                 project=project, metadata=metadata)
+
+    @server.tool()
+    def terminal_task_assign(task_id: str, session: str) -> dict:
+        """Moves an existing task (Global/Backlog, or another session's
+        own lane) into `session`'s queue -- the SAME task_id, history
+        and metadata preserved, never a duplicate record. Refused
+        (TASK_NOT_MOVABLE) if the task is currently mid-review/mid-
+        dispatch/RUNNING/VERIFYING or already in a terminal state --
+        reassign only reaches a task that is genuinely still waiting.
+        This is how a human/PM/dashboard moves a Backlog card onto a
+        specific session's board in the Global Tasks Kanban."""
+        return queue.assign_task(task_id, session)
+
+    @server.tool()
+    def terminal_task_board() -> dict:
+        """The Global Tasks Kanban's own real data source: every task
+        that has ever been created, across every session AND the
+        Backlog/Unassigned lane, grouped into the 5 lifecycle columns
+        the dashboard's Global Tasks page shows -- backlog, queued,
+        running, blocked_review, done -- plus a `counts` summary. Same
+        underlying persistent rows terminal_queue_list_all/terminal_
+        queue_global_inbox already read, just grouped by lifecycle stage
+        instead of by session."""
+        return queue.board()
+
+    @server.tool()
     def terminal_queue_metrics(session: str) -> dict:
         """Item 14's own required metrics: queued_depth,
         oldest_queued_age_seconds, dispatch_uncertain_count,

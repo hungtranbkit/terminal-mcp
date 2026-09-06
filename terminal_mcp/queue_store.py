@@ -112,6 +112,36 @@ CANCELLED = "CANCELLED"
 
 ALL_STATUSES = (QUEUED, PRECHECK, READY, DISPATCHING, DISPATCH_UNCERTAIN, RUNNING, VERIFYING, COMPLETED, BLOCKED,
                 FAILED, WAITING_SESSION, PAUSED, SKIPPED, CANCELLED)
+
+UNASSIGNED_LANE = "__unassigned__"
+"""Unified Task System checkpoint (2026-09-07, docs/REQUIREMENTS.md §20):
+a reserved, real lane name for a Global Task with no session assigned
+yet ("Backlog" in the Kanban UI) -- deliberately NOT a schema change
+(queue_tasks.session stays NOT NULL, unchanged from every existing
+caller's own assumption) specifically to avoid rippling a nullable-
+session change through queue_engine.py's dispatch loop, the Coordinator
+gate, and every existing test that assumes a real session string.
+`auto_dispatch_enabled` defaults to False for every lane including this
+one (§7), so this lane is never ticked by the background loop -- it is
+completely inert with respect to dispatch, which is exactly what an
+unassigned task needs (nothing to send it to yet). §20.1's own doc
+entry describes the nullable-column alternative that was considered and
+why this reserved-lane approach was chosen instead for the real,
+shipped implementation -- kept in sync with this comment, never
+contradicting it."""
+
+MOVABLE_STATUSES = (QUEUED, BLOCKED, PAUSED, WAITING_SESSION)
+"""Unified Task System checkpoint: which statuses `move_task_to_session`
+will move at all -- deliberately narrower than "not yet terminal".
+PRECHECK/READY/DISPATCHING/DISPATCH_UNCERTAIN are excluded even though
+they're not RUNNING either: the engine's own background tick could be
+mid-review/mid-dispatch for exactly this task at the same moment a
+human/PM tries to move it, a real race this project's own standing
+discipline (never risk a double-dispatch/lost-task race for a cosmetic
+convenience) says to avoid rather than "probably fine". A task in one
+of those states must reach QUEUED/BLOCKED/WAITING_SESSION/PAUSED (or a
+terminal state, which is simply not movable at all -- already done)
+before it can be reassigned."""
 TERMINAL_STATUSES = (COMPLETED, SKIPPED, CANCELLED)
 """Once here, a task never transitions again -- not even via a manual
 tool call. BLOCKED/FAILED are deliberately NOT terminal (terminal_queue_
@@ -705,6 +735,47 @@ class QueueStore:
 
     def append_tasks(self, session: str, tasks: list[dict[str, Any]]) -> list[str]:
         return self.set_tasks(session, tasks, replace_pending=False)
+
+    def move_task_to_session(self, task_id: str, new_session: str) -> dict[str, Any]:
+        """Unified Task System checkpoint (2026-09-07): reassigns an
+        EXISTING task row to a different lane (Global/Unassigned ->
+        a real session, or session A -> session B) -- the SAME row,
+        `id`/`created_at`/`metadata`/history all preserved unchanged
+        (task's own explicit "không duplicate record khi assign/move").
+        Only ever moves a task in `MOVABLE_STATUSES` (see its own
+        docstring for why PRECHECK/READY/DISPATCHING/DISPATCH_UNCERTAIN/
+        RUNNING/VERIFYING and every terminal status are refused) --
+        returns `{"error": "TASK_NOT_MOVABLE", "status": <current>}`
+        rather than silently no-op'ing or forcing it through. Appended
+        at the END of the target lane's own position order (never
+        inserts ahead of what's already queued there) -- ensures the
+        target lane's own `_ensure_lane` row exists first, same as
+        `set_tasks` already does for a brand-new lane."""
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+            task = QueueTask.from_row(row)
+            if task.status not in MOVABLE_STATUSES:
+                return {"error": "TASK_NOT_MOVABLE", "task_id": task_id, "status": task.status}
+            old_session = task.session
+            if old_session == new_session:
+                return QueueTask.from_row(row).to_dict()  # no-op, not an error -- already there
+            self._ensure_lane(connection, new_session)
+            max_position_row = connection.execute(
+                "SELECT COALESCE(MAX(position), -1) AS max_position FROM queue_tasks WHERE session = ?",
+                (new_session,),
+            ).fetchone()
+            new_position = max_position_row["max_position"] + 1
+            now = iso_now()
+            connection.execute(
+                "UPDATE queue_tasks SET session = ?, position = ?, updated_at = ? WHERE id = ?",
+                (new_session, new_position, now, task_id),
+            )
+            self._record_event_locked(connection, session=new_session, task_id=task_id, event_type="TASK_ASSIGNED",
+                                      reason=f"moved from {old_session!r} to {new_session!r}")
+            updated_row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+        return QueueTask.from_row(updated_row).to_dict()
 
     def get_task(self, task_id: str) -> QueueTask | None:
         with self._connection() as connection:

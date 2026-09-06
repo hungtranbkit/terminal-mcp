@@ -86,7 +86,7 @@ async def test_stdio_real_handshake_and_tools(tmp_path):
     assert initialized.server_info.name == "terminal-mcp"
     assert initialized.server_info.version == __version__
     names = {tool.name for tool in tools.tools}
-    assert len(names) == 96  # ...previous total (93) +terminal_queue_global_inbox/terminal_queue_recent_events/terminal_integration_fleet_overview (3, Dashboard Supervisor/Coordinator panel + Global Task Inbox)
+    assert len(names) == 99  # ...previous total (96) +terminal_task_create/terminal_task_assign/terminal_task_board (3, Unified Task System Global Tasks Kanban)
     assert {"terminal_tail", "terminal_send_keys", "terminal_exit_copy_mode",
             "terminal_bind", "terminal_tail_bound"} <= names
 
@@ -139,7 +139,7 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
     # global INPUT_DISABLED gate; INPUT_DISABLED itself stays covered in test_permissions.py.
     assert text_disabled["error"] == "ACCESS_DENIED"
     assert keys_disabled["error"] == "ACCESS_DENIED"
-    assert len(tools.tools) == 96  # ...previous total (93) +terminal_queue_global_inbox/terminal_queue_recent_events/terminal_integration_fleet_overview (3, Dashboard Supervisor/Coordinator panel + Global Task Inbox)
+    assert len(tools.tools) == 99  # ...previous total (96) +terminal_task_create/terminal_task_assign/terminal_task_board (3, Unified Task System Global Tasks Kanban)
 
 
 @pytest.mark.anyio

@@ -13,8 +13,8 @@ from __future__ import annotations
 import pytest
 
 from terminal_mcp.queue_store import (
-    ALL_STATUSES, BLOCKED, CANCELLED, COMPLETED, DISPATCHING, PAUSED, QUEUED, RUNNING, SKIPPED, VERIFYING,
-    InvalidTransitionError, QueueStore, is_valid_transition,
+    ALL_STATUSES, BLOCKED, CANCELLED, COMPLETED, DISPATCHING, PAUSED, QUEUED, RUNNING, SKIPPED, UNASSIGNED_LANE,
+    VERIFYING, InvalidTransitionError, QueueStore, is_valid_transition,
 )
 
 
@@ -351,3 +351,63 @@ def test_list_all_lanes_reports_every_session_independently(store):
     lanes = {lane["session"]: lane for lane in store.list_all_lanes()}
     assert lanes["lane-a"]["total_count"] == 1
     assert lanes["lane-b"]["total_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Unified Task System checkpoint: move_task_to_session (Kanban backend).
+# ---------------------------------------------------------------------------
+
+def test_move_task_to_session_moves_same_row_no_duplicate(store):
+    task_id = _make_one_task(store, session=UNASSIGNED_LANE)
+    moved = store.move_task_to_session(task_id, "lane-a")
+    assert "error" not in moved
+    assert moved["id"] == task_id
+    assert moved["session"] == "lane-a"
+    lanes = {lane["session"]: lane for lane in store.list_all_lanes()}
+    assert lanes.get(UNASSIGNED_LANE, {"total_count": 0})["total_count"] == 0
+    assert lanes["lane-a"]["total_count"] == 1
+    # No second row anywhere -- get_task still resolves to exactly one task.
+    assert store.get_task(task_id).session == "lane-a"
+
+
+def test_move_task_to_session_appends_at_end_of_target_lane(store):
+    _make_one_task(store, session="lane-b", prompt="already there")
+    task_id = _make_one_task(store, session=UNASSIGNED_LANE, prompt="incoming")
+    moved = store.move_task_to_session(task_id, "lane-b")
+    assert moved["position"] == 1  # after the existing lane-b task (position 0)
+
+
+def test_move_task_to_session_same_session_is_a_noop_not_an_error(store):
+    task_id = _make_one_task(store, session="lane-a")
+    result = store.move_task_to_session(task_id, "lane-a")
+    assert "error" not in result
+    assert result["session"] == "lane-a"
+
+
+def test_move_task_to_session_refuses_running_task(store):
+    task_id = _make_one_task(store, session="lane-a")
+    store.transition_task(task_id, DISPATCHING, event_type="DISPATCH_ATTEMPTED")
+    store.transition_task(task_id, RUNNING, event_type="DISPATCH_CONFIRMED")
+    result = store.move_task_to_session(task_id, "lane-b")
+    assert result == {"error": "TASK_NOT_MOVABLE", "task_id": task_id, "status": RUNNING}
+    # Refused -- task must still be exactly where it was, unchanged.
+    assert store.get_task(task_id).session == "lane-a"
+
+
+def test_move_task_to_session_refuses_terminal_task(store):
+    task_id = _make_one_task(store, session="lane-a")
+    store.transition_task(task_id, CANCELLED, event_type="CANCELLED_BY_USER")
+    result = store.move_task_to_session(task_id, "lane-b")
+    assert result == {"error": "TASK_NOT_MOVABLE", "task_id": task_id, "status": CANCELLED}
+
+
+def test_move_task_to_session_missing_task_reports_not_found(store):
+    result = store.move_task_to_session("no-such-task-id", "lane-a")
+    assert result == {"error": "TASK_NOT_FOUND", "task_id": "no-such-task-id"}
+
+
+def test_move_task_to_session_records_task_assigned_event(store):
+    task_id = _make_one_task(store, session=UNASSIGNED_LANE)
+    store.move_task_to_session(task_id, "lane-a")
+    events = store.list_events("lane-a")
+    assert any(e["event_type"] == "TASK_ASSIGNED" and e["task_id"] == task_id for e in events)

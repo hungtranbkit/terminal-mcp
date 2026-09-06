@@ -1410,6 +1410,13 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/queue/recent-events": {"GET", "HEAD"},
         "/dashboard/api/queue/loop-status": {"GET", "HEAD"},
         "/dashboard/api/integration/fleet-overview": {"GET", "HEAD"},
+        # Unified Task System: Global Tasks Kanban (queue.board()) --
+        # another later, separate feature, same as the Task Manager routes
+        # above.
+        "/dashboard/tasks": {"GET", "HEAD"},
+        "/dashboard/api/tasks/board": {"GET", "HEAD"},
+        "/dashboard/api/tasks/create": {"POST"},
+        "/dashboard/api/tasks/assign": {"POST"},
     }
     # The web terminal's WebSocket route is registered too, just outside
     # this HTTP-methods-only dict (WebSocketRoute has no .methods).

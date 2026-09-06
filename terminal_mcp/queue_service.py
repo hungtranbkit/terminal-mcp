@@ -29,7 +29,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .permissions import valid_session_name
-from .queue_store import VERIFYING, InvalidTransitionError, TaskAlreadyClaimedError, QueueStore
+from .queue_store import UNASSIGNED_LANE, VERIFYING, InvalidTransitionError, TaskAlreadyClaimedError, QueueStore
 
 
 class QueueService:
@@ -127,6 +127,104 @@ class QueueService:
 
     def _accepted(self, session: str, task_id: str) -> dict[str, Any]:
         return {"task_id": task_id, "session": session, "queue_position": self.store.queue_position(task_id)}
+
+    def create_task(self, title: str, prompt: str, *, session: str | None = None, priority: int = 0,
+                    project: str | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Unified Task System checkpoint (2026-09-07, docs/REQUIREMENTS.
+        md §20): the canonical `task_create` entry point (§20.7) --
+        `session=None` creates a real, durable, UNASSIGNED (Global/
+        Backlog) task, persisted immediately, exactly like any other
+        queue task (§7's own persist-before-dispatch guarantee applies
+        identically here -- an unassigned task is not a lesser, second-
+        class kind of task, just one with no lane assignment yet).
+        `session` given creates it directly assigned, same as `enqueue`
+        -- this is the ONE canonical creation path either way, never two
+        separate code paths for "assigned" vs "unassigned" beyond which
+        lane the row lands in. `project` is stored in `metadata` (no
+        schema change needed for this field alone -- reuses the existing
+        free-form JSON column, same posture as `docs_exempt` elsewhere
+        in this project)."""
+        if not prompt:
+            return {"error": "TASK_PROMPT_REQUIRED"}
+        target = session
+        if target is not None:
+            if error := self._validate_session(target):
+                return error
+        else:
+            target = UNASSIGNED_LANE
+        full_metadata = dict(metadata or {})
+        if project:
+            full_metadata["project"] = project
+        task = {"prompt": prompt, "title": title or "", "priority": priority, "metadata": full_metadata}
+        (task_id,) = self.store.append_tasks(target, [task])
+        accepted = self._accepted(target, task_id)
+        accepted["status"] = "TASK_ACCEPTED"
+        accepted["assigned"] = session is not None
+        return accepted
+
+    def assign_task(self, task_id: str, session: str) -> dict[str, Any]:
+        """Unified Task System checkpoint: moves an existing task (from
+        Global/Unassigned, or from another session's own queue) into
+        `session`'s lane -- the SAME row/task_id/history, never a
+        duplicate (task's own explicit "không duplicate record khi
+        assign/move"). Refuses (TASK_NOT_MOVABLE) a task currently mid-
+        review/mid-dispatch/running/verifying or already in a terminal
+        state -- see `queue_store.py`'s own `MOVABLE_STATUSES` docstring
+        for exactly why. `session` is validated the same way any other
+        session name is everywhere else in this project."""
+        if error := self._validate_session(session):
+            return error
+        result = self.store.move_task_to_session(task_id, session)
+        if "error" in result:
+            return result
+        return {"task": result}
+
+    def board(self) -> dict[str, Any]:
+        """Unified Task System checkpoint: the Global Tasks Kanban's own
+        real data source -- one bulk read (`list_all_lanes`, already
+        real, already used by `list_all`/`global_inbox`), grouped into
+        the 5 real lifecycle columns the Kanban UI shows (task's own
+        explicit column set): Backlog (UNASSIGNED_LANE, not yet
+        terminal), Queued, Running, Blocked/Review (BLOCKED/WAITING_
+        SESSION/PAUSED/VERIFYING -- "in review" reads naturally for a
+        task under verification too), Done (every terminal status,
+        including FAILED/CANCELLED/SKIPPED -- the real per-card status
+        is always shown, this column is a lifecycle grouping, never a
+        claim that everything in it succeeded). Never a second grouping
+        rule independent of `_group_tasks`'s own established buckets
+        where they already apply -- this is a NEW grouping specifically
+        for the 5-column Kanban shape, not a duplicate of the per-
+        session Task Manager's own Running/Queued/Waiting-Dependency/
+        Blocked-Rework/Recent buckets (a genuinely different view, same
+        underlying rows)."""
+        backlog: list[dict[str, Any]] = []
+        queued: list[dict[str, Any]] = []
+        running: list[dict[str, Any]] = []
+        blocked_review: list[dict[str, Any]] = []
+        done: list[dict[str, Any]] = []
+        for lane in self.store.list_all_lanes():
+            session = lane["session"]
+            for task in lane["tasks"]:
+                status = task["status"]
+                row = dict(task)
+                row["session"] = session if session != UNASSIGNED_LANE else None
+                if status in ("COMPLETED", "FAILED", "CANCELLED", "SKIPPED"):
+                    done.append(row)
+                elif status == "RUNNING":
+                    running.append(row)
+                elif status in ("BLOCKED", "WAITING_SESSION", "PAUSED", "VERIFYING"):
+                    blocked_review.append(row)
+                elif session == UNASSIGNED_LANE:
+                    backlog.append(row)
+                else:
+                    queued.append(row)  # QUEUED/PRECHECK/READY/DISPATCHING/DISPATCH_UNCERTAIN, assigned
+        done.sort(key=lambda t: t.get("completed_at") or t.get("updated_at") or "", reverse=True)
+        return {
+            "backlog": backlog, "queued": queued, "running": running,
+            "blocked_review": blocked_review, "done": done,
+            "counts": {"backlog": len(backlog), "queued": len(queued), "running": len(running),
+                      "blocked_review": len(blocked_review), "done": len(done)},
+        }
 
     def task_status(self, task_id: str) -> dict[str, Any]:
         """Direct by-id lookup (item 11's own `task_status` tool) -- lets
