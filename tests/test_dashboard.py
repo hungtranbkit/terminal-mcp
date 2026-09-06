@@ -144,6 +144,38 @@ def test_dashboard_has_a_nav_link_to_the_sessions_admin_screen():
     assert 'id="sessionsAdminLink"' in DASHBOARD_HTML
 
 
+def test_dashboard_task_button_has_a_pending_count_badge_element():
+    # Task button badge (2026-09-07 checkpoint): a real, hidden-by-
+    # default <span> inside the Task button, never a separate floating
+    # element that could drift out of sync with the button itself.
+    assert 'id="taskManagerBadge"' in DASHBOARD_HTML
+    assert 'class="task-pending-badge"' in DASHBOARD_HTML
+    # [hidden], never inline style.display, matching this project's own
+    # documented convention (see this file's own head-of-module note on
+    # toggling visibility).
+    assert '<span id="taskManagerBadge" class="task-pending-badge" hidden>' in DASHBOARD_HTML
+
+
+def test_dashboard_task_pending_badge_hidden_rule_actually_wins():
+    # Real, live-discovered bug (2026-09-07, found via a Playwright
+    # check, not just code inspection): .task-pending-badge's own
+    # display:inline-block has EQUAL specificity to the browser's
+    # default [hidden] rule and, being an author style, silently beats
+    # it regardless of source order -- badge.hidden=true rendered as
+    # visible ("Tasks 5") for a session with pending_count=0. Fixed the
+    # same way this project's own pre-existing .term-search[hidden] rule
+    # already does; guards against the identical mistake recurring.
+    assert ".task-pending-badge[hidden] { display:none }" in DASHBOARD_HTML
+
+
+def test_dashboard_task_button_badge_reflects_selected_session_pending_count():
+    assert "taskManagerBadgeEl.hidden = pendingCount === 0;" in DASHBOARD_HTML
+    assert "pendingCount > 99 ? '99+'" in DASHBOARD_HTML
+    # Never re-derived from task rows/DOM client-side -- the real
+    # backend field, straight off the /dashboard/api/sessions row.
+    assert "selectedRow.pending_count" in DASHBOARD_HTML
+
+
 def test_sessions_admin_uses_safe_dom_rendering():
     assert "innerHTML" not in SESSIONS_ADMIN_HTML
     assert "textContent" in SESSIONS_ADMIN_HTML
@@ -652,6 +684,32 @@ def test_sessions_route_includes_state_and_sorts_attention_first(read_config, tm
     assert by_name["test-attn-waiting"]["state"] == "WAITING_INPUT"
     names = [row["name"] for row in rows]
     assert names.index("test-attn-waiting") < names.index("test-attn-idle")
+
+
+def test_sessions_route_includes_real_pending_count_from_queue(read_config, tmux_session_factory):
+    # Task button badge (2026-09-07 checkpoint): pending_count on each
+    # /dashboard/api/sessions row must be the REAL backend count
+    # (QueueService.count_pending), sourced from ONE bulk queue read
+    # (pending_counts()), never a per-row guess -- and a session with no
+    # queue lane at all must get 0, not a missing key.
+    from terminal_mcp.queue_service import QueueService
+    from terminal_mcp.queue_store import QueueStore
+
+    tmux_session_factory("test-badge-has-tasks", "bash -lc 'sleep 20'")
+    tmux_session_factory("test-badge-no-tasks", "bash -lc 'sleep 20'")
+    time.sleep(0.4)
+
+    service = TerminalService(read_config)
+    queue = QueueService(QueueStore(Path(tempfile.mkdtemp()) / "queue.db"))
+    queue.set_tasks("test-badge-has-tasks", [{"prompt": "1"}, {"prompt": "2"}, {"prompt": "3"}])
+    server = build_mcp(service)
+    register_dashboard(server, service, queue=queue)
+    client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})
+
+    rows = client.get("/dashboard/api/sessions").json()["sessions"]
+    by_name = {row["name"]: row for row in rows}
+    assert by_name["test-badge-has-tasks"]["pending_count"] == 3
+    assert by_name["test-badge-no-tasks"]["pending_count"] == 0
 
 
 def test_sessions_route_preserves_unknown_state_not_misclassified(read_config, tmux_session_factory):

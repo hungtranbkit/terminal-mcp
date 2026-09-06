@@ -248,6 +248,26 @@ sessions bringing up dell-5530/m910/macbook — see `docs/multi-node.md`).
   header-menu "📥 Task Inbox" (fleet-wide) — both real, grouped
   (Running/Queued/Waiting-Dependency/Blocked-Rework/Recent), reading
   live off `queue_store.py`, never a second task store.
+- **Task button pending-count badge (2026-09-07):** the term-bar "📋
+  Tasks" button shows a small numeric badge (hidden when 0, `"99+"`
+  above 99) for the CURRENTLY selected session's own pending task count.
+  `QueueService.PENDING_STATUSES`/`count_pending()` is the ONE canonical
+  definition (`QUEUED`/`PRECHECK`/`READY`/`DISPATCHING`/
+  `DISPATCH_UNCERTAIN`/`BLOCKED`/`WAITING_SESSION`/`PAUSED` — excludes
+  actively-executing `RUNNING`/`VERIFYING` and terminal `COMPLETED`/
+  `FAILED`/`CANCELLED`/`SKIPPED`) — the frontend never re-derives this
+  from task rows/DOM; `/dashboard/api/sessions` enriches every row with
+  a real `pending_count` field via ONE bulk `queue.pending_counts()`
+  call (never a per-session query). Reflects `config.queue.enabled`
+  being off exactly as intended: the count reads persisted state
+  directly, independent of whether the auto-dispatch loop is running.
+  A real, live-discovered CSS bug (author `.task-pending-badge{display:
+  inline-block}` silently beat the browser's own default `[hidden]`
+  behavior, same specificity, no `!important` — confirmed via a live
+  Playwright check showing the badge rendered even with `hidden=true`)
+  was found and fixed with an explicit `.task-pending-badge[hidden]
+  {display:none}` override, the same established pattern this file's
+  own `.term-search[hidden]` rule already uses.
 - **Supervisor/Coordinator panel:** header-menu "🧭 Supervisor /
   Coordinator" — extends the pre-existing v1/v2 watch panel with
   auto-dispatch loop status, queue depth per session, fleet-wide

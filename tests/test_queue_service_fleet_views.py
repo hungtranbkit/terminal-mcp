@@ -78,3 +78,94 @@ def test_recent_events_respects_limit(queue):
         queue.store.append_tasks(f"lane-{i}", [{"prompt": f"task {i}"}])
     result = queue.recent_events(limit=3)
     assert len(result["events"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# Dashboard Task button pending-count badge (2026-09-07 checkpoint) --
+# QueueService.count_pending/pending_counts is the ONE canonical
+# definition (PENDING_STATUSES) the badge/status()/session_task_board all
+# share -- these tests exercise the real state machine (transition_task),
+# never a hand-built fake status string, so a future status-vocabulary
+# change that misses updating PENDING_STATUSES would break a REAL
+# transition path here, not just a hardcoded list.
+# ---------------------------------------------------------------------------
+
+def test_pending_counts_empty_when_nothing_ever_queued(queue):
+    assert queue.pending_counts() == {}
+
+
+def test_pending_counts_counts_queued_tasks(queue):
+    queue.store.append_tasks("lane-a", [{"prompt": "1"}, {"prompt": "2"}, {"prompt": "3"}])
+    assert queue.pending_counts() == {"lane-a": 3}
+
+
+def test_pending_counts_excludes_running_and_verifying(queue):
+    (running_id, verifying_id, queued_id) = queue.store.append_tasks(
+        "lane-a", [{"prompt": "r"}, {"prompt": "v"}, {"prompt": "q"}])
+    for tid in (running_id, verifying_id):
+        queue.store.transition_task(tid, "PRECHECK", event_type="TEST")
+        queue.store.transition_task(tid, "READY", event_type="TEST")
+        queue.store.transition_task(tid, "DISPATCHING", event_type="TEST")
+        queue.store.transition_task(tid, "RUNNING", event_type="TEST")
+    queue.store.transition_task(verifying_id, "VERIFYING", event_type="TEST")
+    # running_id: RUNNING (not pending); verifying_id: VERIFYING (not
+    # pending); queued_id: still QUEUED (pending) -- only 1 counts.
+    assert queue.pending_counts() == {"lane-a": 1}
+
+
+def test_pending_counts_excludes_terminal_statuses(queue):
+    (completed_id, failed_id, cancelled_id, skipped_id) = queue.store.append_tasks(
+        "lane-a", [{"prompt": "c"}, {"prompt": "f"}, {"prompt": "x"}, {"prompt": "s"}])
+    for tid in (completed_id, failed_id):
+        queue.store.transition_task(tid, "PRECHECK", event_type="TEST")
+        queue.store.transition_task(tid, "READY", event_type="TEST")
+        queue.store.transition_task(tid, "DISPATCHING", event_type="TEST")
+        queue.store.transition_task(tid, "RUNNING", event_type="TEST")
+    queue.store.transition_task(completed_id, "VERIFYING", event_type="TEST")
+    queue.store.transition_task(completed_id, "COMPLETED", event_type="TEST")
+    queue.store.transition_task(failed_id, "FAILED", event_type="TEST", reason="boom")
+    queue.store.transition_task(skipped_id, "SKIPPED", event_type="TEST")  # from QUEUED, never dispatched
+    queue.store.transition_task(cancelled_id, "CANCELLED", event_type="TEST")
+    assert queue.pending_counts() == {"lane-a": 0}
+
+
+def test_pending_counts_includes_blocked_and_waiting_session_and_precheck_ready(queue):
+    (blocked_id,) = queue.store.append_tasks("lane-a", [{"prompt": "b"}])
+    queue.store.transition_task(blocked_id, "PRECHECK", event_type="TEST")
+    queue.store.transition_task(blocked_id, "BLOCKED", event_type="TEST", reason="gate refusal")
+
+    (waiting_id,) = queue.store.append_tasks("lane-b", [{"prompt": "w"}])
+    queue.store.transition_task(waiting_id, "PRECHECK", event_type="TEST")
+    queue.store.transition_task(waiting_id, "WAITING_SESSION", event_type="TEST")
+
+    (precheck_id,) = queue.store.append_tasks("lane-c", [{"prompt": "p"}])
+    queue.store.transition_task(precheck_id, "PRECHECK", event_type="TEST")
+
+    (ready_id,) = queue.store.append_tasks("lane-d", [{"prompt": "r"}])
+    queue.store.transition_task(ready_id, "PRECHECK", event_type="TEST")
+    queue.store.transition_task(ready_id, "READY", event_type="TEST")
+
+    counts = queue.pending_counts()
+    assert counts == {"lane-a": 1, "lane-b": 1, "lane-c": 1, "lane-d": 1}
+
+
+def test_pending_counts_across_multiple_lanes_independent(queue):
+    queue.store.append_tasks("lane-a", [{"prompt": "1"}, {"prompt": "2"}])
+    queue.store.append_tasks("lane-b", [{"prompt": "1"}])
+    assert queue.pending_counts() == {"lane-a": 2, "lane-b": 1}
+
+
+def test_status_response_includes_pending_count(queue):
+    queue.store.append_tasks("lane-a", [{"prompt": "1"}, {"prompt": "2"}])
+    status = queue.status("lane-a")
+    assert status["pending_count"] == 2
+
+
+def test_count_pending_over_99_is_a_real_count_not_capped_server_side(queue):
+    # The "99+" DISPLAY cap is a frontend-only concern (never truncate the
+    # real backend count) -- confirms the helper itself returns the true
+    # number so the frontend's own >99 formatting has real data to work
+    # with, not a pre-clamped value.
+    tasks = [{"prompt": f"t{i}"} for i in range(150)]
+    queue.store.append_tasks("lane-a", tasks)
+    assert queue.pending_counts()["lane-a"] == 150

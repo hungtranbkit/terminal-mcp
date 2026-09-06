@@ -330,6 +330,20 @@ DASHBOARD_HTML = """<!doctype html>
     .term-btn:hover:not(:disabled) { background:#233252 }
     .term-btn:disabled { opacity:.5; cursor:not-allowed }
     .term-btn.paused { border-color:var(--amber); color:var(--amber) }
+    /* Task button pending-count badge (2026-09-07 checkpoint) -- compact,
+       inline, never affects the button's own layout/height. Hidden via
+       [hidden] (never style.display) when pending_count is 0 -- the
+       explicit [hidden] override below is REQUIRED (same fix as
+       .term-search[hidden] above): .task-pending-badge's own
+       display:inline-block has equal specificity to the browser's
+       default [hidden] rule and, being an AUTHOR style, silently beats
+       it regardless of source order -- confirmed live via a real
+       Playwright check (getComputedStyle showed display:inline-block
+       while badge.hidden was true) before this override was added. */
+    .task-pending-badge { display:inline-block; margin-left:6px; padding:0 6px; min-width:16px; height:16px;
+      line-height:16px; text-align:center; border-radius:999px; background:var(--accent); color:#fff;
+      font-size:10px; font-weight:700; vertical-align:middle }
+    .task-pending-badge[hidden] { display:none }
     /* ---- Reusable "⋯" overflow menu (task item 3) -- one small component,
        used for the header's own menu and each term-bar's menu alike, never
        a bespoke dropdown per screen. Click-to-open (not hover, so it works
@@ -800,7 +814,7 @@ DASHBOARD_HTML = """<!doctype html>
           <span class="term-title" id="termTitle"></span>
           <span class="term-controls">
             <button id="followToggle" class="term-btn" type="button" disabled>Auto-follow: ON</button>
-            <button id="taskManagerBtn" class="term-btn" type="button" disabled title="Xem Running/Queued/Blocked/... của session này">📋 Tasks</button>
+            <button id="taskManagerBtn" class="term-btn" type="button" disabled title="Xem Running/Queued/Blocked/... của session này">📋 Tasks<span id="taskManagerBadge" class="task-pending-badge" hidden></span></button>
             <button id="fullscreenBtn" class="term-btn" type="button" disabled title="Fullscreen (Esc để thoát)">⛶</button>
             <div class="menu" id="termMenu">
               <button class="term-btn" id="termMenuBtn" type="button" disabled aria-haspopup="true" aria-expanded="false" title="Thêm tuỳ chọn">⋯</button>
@@ -1096,6 +1110,7 @@ DASHBOARD_HTML = """<!doctype html>
     const followToggleEl = document.querySelector('#followToggle');
     const jumpBtnEl = document.querySelector('#jumpBtn');
     const taskManagerBtnEl = document.querySelector('#taskManagerBtn');
+    const taskManagerBadgeEl = document.querySelector('#taskManagerBadge');
     const fullscreenBtnEl = document.querySelector('#fullscreenBtn');
     const fontDecBtnEl = document.querySelector('#fontDecBtn');
     const fontIncBtnEl = document.querySelector('#fontIncBtn');
@@ -2244,6 +2259,17 @@ DASHBOARD_HTML = """<!doctype html>
         else { tabbarEl.append(refs.tab); }
         updateTabEl(refs, row);
       }
+      // Task button pending-count badge (2026-09-07 checkpoint) --
+      // reflects the CURRENTLY selected session's own row, refreshed on
+      // every poll cycle (same cadence as everything else here) and
+      // immediately on selection change (selectSession already calls
+      // renderRows(lastKnownRows) itself). pending_count is a real
+      // backend field (QueueService.count_pending), never re-derived
+      // from task rows/DOM here.
+      const selectedRow = selected ? rows.find(row => row.name === selected) : null;
+      const pendingCount = selectedRow ? (selectedRow.pending_count || 0) : 0;
+      taskManagerBadgeEl.hidden = pendingCount === 0;
+      if (pendingCount > 0) taskManagerBadgeEl.textContent = pendingCount > 99 ? '99+' : String(pendingCount);
       refreshTermActionMenu();
       if (selected && !rows.some(row => row.name === selected)) {
         selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateLayoutState();
@@ -5676,6 +5702,17 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 for row in remote_rows:
                     tg.start_soon(_fill_remote_state, row)
             rows.extend(remote_rows)
+
+            # Task button badge (2026-09-07 checkpoint): ONE bulk queue
+            # read for every row, never a per-session query -- pending_
+            # count is the canonical backend definition (QueueService.
+            # PENDING_STATUSES/count_pending), the frontend never re-
+            # derives it from task rows/DOM itself. A session with no
+            # queue lane at all (never queued anything) gets 0, not a
+            # missing key, so the frontend never needs its own fallback.
+            pending_counts = await anyio.to_thread.run_sync(queue.pending_counts)
+            for row in rows:
+                row["pending_count"] = pending_counts.get(row["name"], 0)
 
             # Stable multi-key sort applied least-significant-key first: name
             # (deterministic fallback for ties) -> activity descending (most

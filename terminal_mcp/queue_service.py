@@ -145,14 +145,47 @@ class QueueService:
     def status(self, session: str) -> dict[str, Any]:
         if error := self._validate_session(session):
             return error
-        return self.store.lane_status(session)
+        lane = self.store.lane_status(session)
+        lane["pending_count"] = self.count_pending(lane["tasks"])
+        return lane
 
     def list_all(self) -> dict[str, Any]:
         return {"lanes": self.store.list_all_lanes()}
 
+    def pending_counts(self) -> dict[str, int]:
+        """Dashboard Task button badge's own bulk data source (the
+        `/dashboard/api/sessions` route enriches every row with this in
+        ONE call, never one queue read per session row) -- `{session:
+        pending_count}` for every lane that has ever had a task. A
+        session with no lane at all (never queued anything) simply has
+        no key here; callers use `.get(name, 0)`, never a bare index."""
+        return {lane["session"]: self.count_pending(lane["tasks"]) for lane in self.store.list_all_lanes()}
+
     _TERMINAL_RECENT_STATUSES = ("COMPLETED", "FAILED", "CANCELLED", "SKIPPED")
     _ATTENTION_STATUSES = ("BLOCKED", "FAILED", "DISPATCH_UNCERTAIN", "WAITING_SESSION", "PAUSED")
     _RUNNING_STATUSES = ("PRECHECK", "READY", "DISPATCHING", "RUNNING", "VERIFYING")
+
+    # Dashboard Task button badge (2026-09-07 checkpoint): the ONE
+    # canonical definition of "pending" -- every status that is not
+    # actively executing (RUNNING/VERIFYING -- the task is genuinely in
+    # progress right now, not waiting on anything) and not terminal
+    # (_TERMINAL_RECENT_STATUSES -- already resolved, one way or
+    # another). Deliberately INCLUDES PRECHECK/READY/DISPATCHING (still
+    # waiting for the dispatch pipeline to actually start executing the
+    # task, from a user's-eye-view still "not started yet") and BLOCKED/
+    # WAITING_SESSION/PAUSED/DISPATCH_UNCERTAIN (needs attention or is
+    # waiting on something external -- still "pending", not done). A
+    # frontend must NEVER re-derive this list itself (task's own
+    # explicit "dùng một helper/backend field thống nhất để tránh
+    # frontend/backend lệch nhau") -- `count_pending`/the `pending_count`
+    # field this produces (session_task_board, status, and the dashboard
+    # sessions list route all reuse it) is the only source of truth.
+    PENDING_STATUSES = ("QUEUED", "PRECHECK", "READY", "DISPATCHING", "DISPATCH_UNCERTAIN",
+                        "BLOCKED", "WAITING_SESSION", "PAUSED")
+
+    @classmethod
+    def count_pending(cls, tasks: list[dict[str, Any]]) -> int:
+        return sum(1 for task in tasks if task.get("status") in cls.PENDING_STATUSES)
 
     @classmethod
     def _group_tasks(cls, tasks: list[dict[str, Any]], recent_limit: int) -> tuple[
