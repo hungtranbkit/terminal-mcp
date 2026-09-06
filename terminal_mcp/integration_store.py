@@ -429,11 +429,8 @@ class IntegrationStore:
             )
         return self.get_pipeline(project)
 
-    def get_pipeline(self, project: str) -> dict[str, Any] | None:
-        with self._connection() as connection:
-            row = connection.execute("SELECT * FROM integration_pipelines WHERE project = ?", (project,)).fetchone()
-        if row is None:
-            return None
+    @staticmethod
+    def _pipeline_from_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "project": row["project"], "paused": bool(row["paused"]), "paused_reason": row["paused_reason"],
             "repo_path": row["repo_path"], "integration_branch": row["integration_branch"],
@@ -446,6 +443,22 @@ class IntegrationStore:
             "review_depth": row["review_depth"],
             "created_at": row["created_at"], "updated_at": row["updated_at"],
         }
+
+    def get_pipeline(self, project: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM integration_pipelines WHERE project = ?", (project,)).fetchone()
+        if row is None:
+            return None
+        return self._pipeline_from_row(row)
+
+    def list_pipelines(self) -> list[dict[str, Any]]:
+        """Every configured project (task: Dashboard Supervisor/Coordinator
+        panel's own fleet-wide Integration lane view) -- a project with no
+        terminal_integration_configure call ever made for it simply never
+        appears here, same as a queue lane that's never had a task."""
+        with self._connection() as connection:
+            rows = connection.execute("SELECT * FROM integration_pipelines ORDER BY project").fetchall()
+        return [self._pipeline_from_row(row) for row in rows]
 
     def rename_session(self, old_session: str, new_session: str) -> dict[str, Any]:
         """Rename Session feature: a coding session's own handoffs

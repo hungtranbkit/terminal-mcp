@@ -981,6 +981,37 @@ def build_mcp(service: TerminalService | None = None,
         return queue.fleet_task_summary()
 
     @server.tool()
+    def terminal_queue_global_inbox() -> dict:
+        """Dashboard Global Task Inbox's own data source: every task from
+        every session's queue lane, grouped the SAME way terminal_
+        session_tasks groups one lane (Running/Queued/Waiting-Dependency/
+        Blocked-Rework/Recent), each task still tagged with its own
+        `session` field. Still the same persistent queue rows -- no
+        second task store."""
+        return queue.global_inbox()
+
+    @server.tool()
+    def terminal_queue_recent_events(limit: int = 30) -> dict:
+        """Recent queue events across EVERY session's lane, merged and
+        sorted newest-first -- claim/dispatch/coordinator-decision/
+        completion/cancel/etc, exactly what queue_store.py already
+        records for its own per-session terminal_queue_events, just
+        fleet-wide in one call (the Supervisor/Coordinator panel's own
+        recent event timeline)."""
+        return queue.recent_events(limit=limit)
+
+    @server.tool()
+    def terminal_integration_fleet_overview() -> dict:
+        """Every configured project's own Integration lane state in one
+        call: current handoff + its UI-facing lane label (Waiting/
+        Reviewing/Merging/Test/Integrated/Rework/Blocked), handoff counts
+        by status, and the current regression batch (if any) + its own
+        lane label (Regression pending/running, Merge ready, Regression
+        failed). A project with no terminal_integration_configure call
+        ever made for it simply never appears."""
+        return integration.fleet_overview()
+
+    @server.tool()
     def terminal_queue_pause(session: str, reason: str | None = None) -> dict:
         """Pause dispatch for this session's lane. If a task is currently
         in flight, it moves to PAUSED (its prior status remembered) so

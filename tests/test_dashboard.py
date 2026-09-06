@@ -1345,6 +1345,13 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/session/queue/reorder": {"POST"},
         "/dashboard/api/task/retry": {"POST"},
         "/dashboard/api/task/cancel": {"POST"},
+        # Dashboard Supervisor/Coordinator panel + Global Task Inbox --
+        # another later, separate feature, same as the Task Manager routes
+        # above.
+        "/dashboard/api/queue/global-inbox": {"GET", "HEAD"},
+        "/dashboard/api/queue/recent-events": {"GET", "HEAD"},
+        "/dashboard/api/queue/loop-status": {"GET", "HEAD"},
+        "/dashboard/api/integration/fleet-overview": {"GET", "HEAD"},
     }
     # The web terminal's WebSocket route is registered too, just outside
     # this HTTP-methods-only dict (WebSocketRoute has no .methods).

@@ -170,3 +170,44 @@ async def test_queue_loop_run_once_ticks_only_auto_dispatch_enabled_lanes(server
     loop_status = await _call(server, "terminal_queue_loop_status")
     assert loop_status["last_cycle_at"] is not None
     assert loop_status["running"] is False
+
+
+# ---------------------------------------------------------------------------
+# Global Task Inbox + fleet-wide recent events (Dashboard Supervisor/
+# Coordinator panel).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_global_inbox_spans_every_session_with_the_session_tagged_per_task(server):
+    await _call(server, "terminal_queue_set", session="lane-a", tasks=[{"prompt": "task in lane-a"}])
+    await _call(server, "terminal_queue_set", session="lane-b", tasks=[{"prompt": "task in lane-b"}])
+
+    inbox = await _call(server, "terminal_queue_global_inbox")
+    assert inbox["summary"]["total"] == 2
+    assert inbox["summary"]["sessions"] == 2
+    sessions_in_queued = {t["session"] for t in inbox["queued"]}
+    assert sessions_in_queued == {"lane-a", "lane-b"}
+
+
+@pytest.mark.anyio
+async def test_recent_events_merges_across_sessions_newest_first(server):
+    await _call(server, "terminal_queue_set", session="lane-a", tasks=[{"prompt": "a"}])
+    await _call(server, "terminal_queue_set", session="lane-b", tasks=[{"prompt": "b"}])
+    events = await _call(server, "terminal_queue_recent_events", limit=10)
+    sessions_seen = {e["session"] for e in events["events"]}
+    assert {"lane-a", "lane-b"} <= sessions_seen
+    timestamps = [e["timestamp"] for e in events["events"]]
+    assert timestamps == sorted(timestamps, reverse=True)
+
+
+@pytest.mark.anyio
+async def test_integration_fleet_overview_lists_only_configured_projects(server):
+    empty = await _call(server, "terminal_integration_fleet_overview")
+    assert empty["projects"] == []
+
+    await _call(server, "terminal_integration_configure", project="proj-x", repo_path="/tmp/does-not-matter")
+    overview = await _call(server, "terminal_integration_fleet_overview")
+    assert len(overview["projects"]) == 1
+    assert overview["projects"][0]["project"] == "proj-x"
+    assert overview["projects"][0]["current_handoff"] is None
+    assert overview["projects"][0]["current_lane"] is None

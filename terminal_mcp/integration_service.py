@@ -54,6 +54,44 @@ class IntegrationService:
         return {"project": project, "handoffs": [h.to_dict() for h in self.store.list_handoffs(
             project, status=status, limit=limit)]}
 
+    # UI-facing lane label for one Handoff/RegressionBatch status -- the
+    # Dashboard Supervisor/Coordinator panel's own "Waiting/Reviewing/
+    # Merging/Test/Regression/Rework" vocabulary (task: "integration lane
+    # trạng thái Waiting/Reviewing/Merging/Test/Regression/Rework"),
+    # mapped from this store's own real status constants in exactly ONE
+    # place so it's never re-derived/duplicated at the dashboard layer.
+    _HANDOFF_LANE_LABEL = {
+        "READY_FOR_INTEGRATION": "Waiting", "CLAIMED": "Reviewing", "MERGING": "Merging",
+        "TARGETED_TEST": "Test", "INTEGRATED": "Integrated", "REWORK_REQUIRED": "Rework", "BLOCKED": "Blocked",
+    }
+    _BATCH_LANE_LABEL = {
+        "REGRESSION_PENDING": "Regression (pending)", "REGRESSION_RUNNING": "Regression (running)",
+        "MERGE_READY": "Merge ready", "REGRESSION_FAILED": "Regression failed",
+    }
+
+    def fleet_overview(self) -> dict[str, Any]:
+        """Every configured project's own Integration lane state, in one
+        call (task: Dashboard Supervisor/Coordinator panel's "integration
+        handoffs" section) -- reuses status()'s own per-project
+        aggregation for each, adding only the UI-facing lane_label. A
+        project with no pipeline configured at all simply never appears
+        (same posture as an unconfigured queue lane)."""
+        projects = []
+        for pipeline in self.store.list_pipelines():
+            project = pipeline["project"]
+            detail = self.status(project)
+            current_handoff = detail["current_handoff"]
+            open_batch = self.store.get_open_batch(project)
+            projects.append({
+                "project": project, "paused": pipeline["paused"], "repo_path": pipeline["repo_path"],
+                "current_handoff": current_handoff,
+                "current_lane": self._HANDOFF_LANE_LABEL.get(current_handoff["status"]) if current_handoff else None,
+                "handoff_counts": detail["handoff_counts"],
+                "open_batch": open_batch.to_dict() if open_batch else None,
+                "open_batch_lane": self._BATCH_LANE_LABEL.get(open_batch.status) if open_batch else None,
+            })
+        return {"projects": projects}
+
     def pause(self, project: str, *, reason: str | None = None) -> dict[str, Any]:
         self.store.pause_pipeline(project, reason=reason)
         return self.status(project)

@@ -154,6 +154,38 @@ class QueueService:
     _ATTENTION_STATUSES = ("BLOCKED", "FAILED", "DISPATCH_UNCERTAIN", "WAITING_SESSION", "PAUSED")
     _RUNNING_STATUSES = ("PRECHECK", "READY", "DISPATCHING", "RUNNING", "VERIFYING")
 
+    @classmethod
+    def _group_tasks(cls, tasks: list[dict[str, Any]], recent_limit: int) -> tuple[
+            list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]],
+            list[dict[str, Any]], list[dict[str, Any]]]:
+        """The one grouping rule session_task_board (per-session) and
+        global_inbox (fleet-wide) both share -- refactored out so the two
+        views can never silently drift apart on what counts as "queued"
+        vs "waiting on a dependency" vs "needs attention"."""
+        by_id = {t["id"]: t for t in tasks}
+
+        def _dependency_satisfied(task: dict[str, Any]) -> bool:
+            return all(by_id.get(dep_id, {}).get("status") == "COMPLETED" for dep_id in task.get("depends_on") or ())
+
+        running: list[dict[str, Any]] = []
+        queued: list[dict[str, Any]] = []
+        waiting_dependency: list[dict[str, Any]] = []
+        blocked_rework: list[dict[str, Any]] = []
+        recent: list[dict[str, Any]] = []
+        for task in tasks:
+            status = task["status"]
+            if status in cls._RUNNING_STATUSES:
+                running.append(task)
+            elif status == "QUEUED":
+                (queued if _dependency_satisfied(task) else waiting_dependency).append(task)
+            elif status in cls._ATTENTION_STATUSES:
+                blocked_rework.append(task)
+            elif status in cls._TERMINAL_RECENT_STATUSES:
+                recent.append(task)
+        recent.sort(key=lambda t: t.get("completed_at") or t.get("updated_at") or "", reverse=True)
+        recent = recent[:recent_limit]
+        return running, queued, waiting_dependency, blocked_rework, recent
+
     def session_task_board(self, session: str, *, recent_limit: int = 10) -> dict[str, Any]:
         """Dashboard Task Manager UI's own single read (task: "khi chọn
         session/card/tab phải thấy Running/Queued/Waiting Dependency/
@@ -172,28 +204,7 @@ class QueueService:
             return error
         lane = self.store.lane_status(session)
         tasks = lane["tasks"]
-        by_id = {t["id"]: t for t in tasks}
-
-        def _dependency_satisfied(task: dict[str, Any]) -> bool:
-            return all(by_id.get(dep_id, {}).get("status") == "COMPLETED" for dep_id in task.get("depends_on") or ())
-
-        running: list[dict[str, Any]] = []
-        queued: list[dict[str, Any]] = []
-        waiting_dependency: list[dict[str, Any]] = []
-        blocked_rework: list[dict[str, Any]] = []
-        recent: list[dict[str, Any]] = []
-        for task in tasks:
-            status = task["status"]
-            if status in self._RUNNING_STATUSES:
-                running.append(task)
-            elif status == "QUEUED":
-                (queued if _dependency_satisfied(task) else waiting_dependency).append(task)
-            elif status in self._ATTENTION_STATUSES:
-                blocked_rework.append(task)
-            elif status in self._TERMINAL_RECENT_STATUSES:
-                recent.append(task)
-        recent.sort(key=lambda t: t.get("completed_at") or t.get("updated_at") or "", reverse=True)
-        recent = recent[:recent_limit]
+        running, queued, waiting_dependency, blocked_rework, recent = self._group_tasks(tasks, recent_limit)
 
         # Coordinator gate for the head-of-line task (task's own "Gate
         # được hiển thị ngay trên task tiếp theo") -- the first QUEUED/
@@ -247,6 +258,41 @@ class QueueService:
                 elif status in self._ATTENTION_STATUSES:
                     blocked += 1
         return {"running": running, "queued": queued, "blocked": blocked}
+
+    def global_inbox(self, *, recent_limit: int = 20) -> dict[str, Any]:
+        """Dashboard Global Task Inbox (task: "Global Task Inbox") -- the
+        SAME grouping session_task_board gives one session, applied
+        fleet-wide: every task from every lane that has ever had one,
+        each still tagged with its own `session` (unlike session_task_
+        board, where that's implicit). Still the SAME persistent queue
+        rows, still no second task store."""
+        all_tasks: list[dict[str, Any]] = []
+        lanes_by_session: dict[str, dict[str, Any]] = {}
+        for lane in self.store.list_all_lanes():
+            lanes_by_session[lane["session"]] = lane
+            all_tasks.extend(lane["tasks"])
+        running, queued, waiting_dependency, blocked_rework, recent = self._group_tasks(all_tasks, recent_limit)
+        return {
+            "summary": {"running": len(running), "queued": len(queued),
+                       "waiting_dependency": len(waiting_dependency), "blocked_rework": len(blocked_rework),
+                       "total": len(all_tasks), "sessions": len(lanes_by_session),
+                       "paused_sessions": sum(1 for lane in lanes_by_session.values() if lane["paused"])},
+            "running": running, "queued": queued, "waiting_dependency": waiting_dependency,
+            "blocked_rework": blocked_rework, "recent": recent,
+        }
+
+    def recent_events(self, *, limit: int = 30) -> dict[str, Any]:
+        """Fleet-wide recent queue events (task: Supervisor/Coordinator
+        panel's own "recent event timeline") -- merges each lane's own
+        list_events (already real, persistent, append-only rows) and
+        sorts by timestamp, newest first. Bounded by however many lanes
+        exist (never unbounded), same posture as queue_engine.py's own
+        cross-lane conflict enrichment."""
+        merged: list[dict[str, Any]] = []
+        for lane in self.store.list_all_lanes():
+            merged.extend(self.store.list_events(lane["session"], limit=limit))
+        merged.sort(key=lambda e: e.get("timestamp") or "", reverse=True)
+        return {"events": merged[:limit]}
 
     def pause(self, session: str, *, reason: str | None = None) -> dict[str, Any]:
         if error := self._validate_session(session):

@@ -100,6 +100,9 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_fleet_task_summary",
         "terminal_queue_loop_status",
         "terminal_queue_loop_run_once",
+        "terminal_queue_global_inbox",
+        "terminal_queue_recent_events",
+        "terminal_integration_fleet_overview",
     }
 
 

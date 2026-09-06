@@ -307,3 +307,54 @@ def test_configure_pipeline_is_idempotent_and_updates_in_place(store):
     _configure(store, batch_size=5)
     pipeline = store.get_pipeline("proj-a")
     assert pipeline["batch_size"] == 5
+
+
+def test_list_pipelines_empty_when_nothing_configured(store):
+    assert store.list_pipelines() == []
+
+
+def test_list_pipelines_returns_every_configured_project(store):
+    _configure(store, project="proj-a")
+    _configure(store, project="proj-b")
+    projects = {p["project"] for p in store.list_pipelines()}
+    assert projects == {"proj-a", "proj-b"}
+
+
+# ---------------------------------------------------------------------------
+# IntegrationService.fleet_overview -- Dashboard Supervisor/Coordinator
+# panel's own "integration lane trạng thái Waiting/Reviewing/Merging/Test/
+# Regression/Rework" data source.
+# ---------------------------------------------------------------------------
+
+def test_fleet_overview_empty_when_nothing_configured(store):
+    from terminal_mcp.integration_service import IntegrationService
+    service = IntegrationService(store)
+    assert service.fleet_overview() == {"projects": []}
+
+
+def test_fleet_overview_maps_handoff_status_to_the_ui_lane_label(store):
+    from terminal_mcp.integration_service import IntegrationService
+    service = IntegrationService(store)
+    _configure(store, project="proj-a")
+    handoff = store.publish_handoff(project="proj-a", task_id="t1", origin_session="lane-a", branch="feature/x",
+                                    commit_sha="a" * 40, base_sha="b" * 40)
+    overview = service.fleet_overview()
+    assert len(overview["projects"]) == 1
+    row = overview["projects"][0]
+    assert row["project"] == "proj-a"
+    assert row["current_handoff"] is None  # READY_FOR_INTEGRATION isn't "current" (nothing has CLAIMED it yet)
+    assert row["handoff_counts"]["READY_FOR_INTEGRATION"] == 1
+
+    store.claim_next_handoff("proj-a", claimed_by="integration-engine")
+    overview_after_claim = service.fleet_overview()
+    row_after_claim = overview_after_claim["projects"][0]
+    assert row_after_claim["current_handoff"]["id"] == handoff.id
+    assert row_after_claim["current_lane"] == "Reviewing"  # CLAIMED -> "Reviewing"
+
+    store.transition_handoff(handoff.id, "MERGING", event_type="TEST")
+    row_merging = service.fleet_overview()["projects"][0]
+    assert row_merging["current_lane"] == "Merging"
+
+    store.transition_handoff(handoff.id, "TARGETED_TEST", event_type="TEST")
+    row_test = service.fleet_overview()["projects"][0]
+    assert row_test["current_lane"] == "Test"

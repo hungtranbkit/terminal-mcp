@@ -195,6 +195,20 @@ DASHBOARD_HTML = """<!doctype html>
     #supervisorPanel .sp-event .sp-target { font-weight:700 }
     #supervisorPanel .sp-event button { margin-top:4px; background:#19243b; border:1px solid var(--line); color:var(--text); border-radius:6px; padding:3px 8px; font:11px var(--mono); cursor:pointer }
     #supervisorPanel .sp-empty { padding:10px 14px; color:var(--muted); font-size:12px }
+    /* Dashboard Supervisor/Coordinator panel: Queue/Coordinator +
+       Integration sections appended below the existing v1/v2 content --
+       widened slightly (still the same fixed-overlay panel) since there
+       is genuinely more to show now. Reuses .sp-count/.sp-event's own
+       look; .sp-section-title is the only new visual element, a plain
+       section divider label. */
+    #supervisorPanel { width:min(420px, calc(100vw - 32px)) }
+    #supervisorPanel .sp-section-title { padding:10px 14px 4px; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; border-top:1px solid var(--line) }
+    #supervisorPanel .sp-row { padding:6px 14px; font-size:12px; display:flex; justify-content:space-between; gap:8px }
+    #supervisorPanel .sp-row .sp-row-label { color:var(--muted) }
+    #supervisorPanel .sp-lane-item { padding:6px 14px; font-size:12px; border-top:1px solid var(--line) }
+    #supervisorPanel .sp-lane-item .sp-lane-badge { font-size:10px; padding:1px 7px; border-radius:999px; border:1px solid var(--line); color:var(--muted); margin-left:6px }
+    #supervisorPanel .sp-lane-item .sp-lane-badge.attn { color:var(--amber); border-color:var(--amber) }
+    #supervisorPanel .sp-lane-item a { color:var(--text); text-decoration:underline; cursor:pointer }
     /* Supervisor v2 (policy-gated decision/send pipeline): compact, only
        ever shows watches with a non-default policy — a plain v1-only watch
        adds nothing here, so this never bloats the panel by default. */
@@ -524,6 +538,21 @@ DASHBOARD_HTML = """<!doctype html>
     .tm-task-actions { display:flex; gap:6px }
     .tm-task-actions button { border-radius:6px; padding:3px 8px; cursor:pointer; font:inherit; font-size:11px; border:1px solid var(--line); background:#19243b; color:var(--text) }
     #taskEmpty { color:var(--muted); font-size:12px }
+    /* Global Task Inbox -- same #taskModal component pieces, fleet-wide
+       instead of one session; each row additionally shows/links its own
+       session (task_manager's per-row .tm-task-meta already supports an
+       optional leading session badge -- see renderTaskRow's own
+       showSession param). */
+    #taskInboxBackdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:30 }
+    #taskInboxPanel {
+      display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:31;
+      width:min(760px, calc(100vw - 32px)); max-height:85vh; overflow:auto;
+      background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 20px 50px rgba(0,0,0,.6);
+    }
+    body.task-inbox-visible #taskInboxBackdrop, body.task-inbox-visible #taskInboxPanel { display:block }
+    #taskInboxPanel .pm-head { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px }
+    #taskInboxPanel .pm-body { padding:14px 16px; display:flex; flex-direction:column; gap:12px; font-size:13px }
+    .tm-task-session { font-size:10px; padding:1px 7px; border-radius:999px; border:1px solid var(--line); color:var(--muted); cursor:pointer }
     /* ---- Tab bar row -----------------------------------------------------
        .tabbar itself scrolls horizontally (see its own rule above). The
        row holds ONLY the tab strip now -- New session/Đã kill used to be
@@ -743,6 +772,8 @@ DASHBOARD_HTML = """<!doctype html>
         <div class="menu-panel" id="headerMenuPanel" role="menu">
           <a href="/dashboard/sessions" id="sessionsAdminLink" role="menuitem">⚙ Quản lý session</a>
           <a href="/dashboard/nodes" id="nodesAdminLink" role="menuitem">🖥 Nodes</a>
+          <button type="button" id="openSupervisorPanelBtn" role="menuitem">🧭 Supervisor / Coordinator</button>
+          <button type="button" id="openTaskInboxBtn" role="menuitem">📥 Task Inbox</button>
         </div>
       </div>
     </div>
@@ -811,12 +842,53 @@ DASHBOARD_HTML = """<!doctype html>
   <div id="supervisorBackdrop"></div>
   <div id="supervisorPanel">
     <div class="sp-head">
-      <strong>Supervisor</strong>
+      <strong>Supervisor / Coordinator</strong>
       <button id="supervisorCloseBtn" class="term-btn" type="button">✕</button>
     </div>
     <div class="sp-counts" id="supervisorCounts"></div>
     <div class="sp-events" id="supervisorEvents"></div>
     <div class="sp-v2" id="supervisorV2"></div>
+    <div class="sp-section-title">Auto-dispatch loop</div>
+    <div class="sp-row" id="qcLoopStatusRow"><span class="sp-row-label">status</span><span id="qcLoopStatusValue">—</span></div>
+    <div class="sp-section-title">Queue depth theo session</div>
+    <div id="qcQueueDepths"></div>
+    <div class="sp-section-title">Blocked / Rework (toàn bộ session)</div>
+    <div id="qcBlockedRework"></div>
+    <div class="sp-section-title">Integration lanes</div>
+    <div id="qcIntegrationLanes"></div>
+    <div class="sp-section-title">Recent events</div>
+    <div id="qcRecentEvents"></div>
+  </div>
+  <div id="taskInboxBackdrop"></div>
+  <div id="taskInboxPanel" role="dialog" aria-modal="true" aria-labelledby="taskInboxTitle">
+    <div class="pm-head">
+      <strong id="taskInboxTitle">Task Inbox</strong>
+      <button id="taskInboxCloseBtn" class="term-btn" type="button">✕</button>
+    </div>
+    <div class="pm-body">
+      <div id="taskInboxError" class="km-error"></div>
+      <div id="taskInboxEmpty" hidden>Chưa có task nào trên toàn hệ thống.</div>
+      <div class="tm-group">
+        <div class="tm-group-title">▶ Đang chạy <span class="tm-count" id="inboxCountRunning">0</span></div>
+        <div id="inboxListRunning"></div>
+      </div>
+      <div class="tm-group">
+        <div class="tm-group-title">⏳ Đang chờ <span class="tm-count" id="inboxCountQueued">0</span></div>
+        <div id="inboxListQueued"></div>
+      </div>
+      <div class="tm-group">
+        <div class="tm-group-title">🔗 Chờ dependency <span class="tm-count" id="inboxCountWaitingDep">0</span></div>
+        <div id="inboxListWaitingDep"></div>
+      </div>
+      <div class="tm-group">
+        <div class="tm-group-title">⚠ Blocked / Rework <span class="tm-count" id="inboxCountBlocked">0</span></div>
+        <div id="inboxListBlocked"></div>
+      </div>
+      <div class="tm-group">
+        <div class="tm-group-title">✓ Gần đây (Done/Failed) <span class="tm-count" id="inboxCountRecent">0</span></div>
+        <div id="inboxListRecent"></div>
+      </div>
+    </div>
   </div>
   <div id="permBackdrop"></div>
   <div id="permModal" role="dialog" aria-modal="true" aria-labelledby="permModalTitle">
@@ -991,6 +1063,17 @@ DASHBOARD_HTML = """<!doctype html>
     const taskEnqueueBtnEl = document.querySelector('#taskEnqueueBtn');
     const taskGateEl = document.querySelector('#taskGate');
     const taskEmptyEl = document.querySelector('#taskEmpty');
+    const taskInboxBackdropEl = document.querySelector('#taskInboxBackdrop');
+    const taskInboxCloseBtnEl = document.querySelector('#taskInboxCloseBtn');
+    const taskInboxErrorEl = document.querySelector('#taskInboxError');
+    const taskInboxEmptyEl = document.querySelector('#taskInboxEmpty');
+    const openSupervisorPanelBtnEl = document.querySelector('#openSupervisorPanelBtn');
+    const openTaskInboxBtnEl = document.querySelector('#openTaskInboxBtn');
+    const qcLoopStatusValueEl = document.querySelector('#qcLoopStatusValue');
+    const qcQueueDepthsEl = document.querySelector('#qcQueueDepths');
+    const qcBlockedReworkEl = document.querySelector('#qcBlockedRework');
+    const qcIntegrationLanesEl = document.querySelector('#qcIntegrationLanes');
+    const qcRecentEventsEl = document.querySelector('#qcRecentEvents');
     const permBackdropEl = document.querySelector('#permBackdrop');
     const permModalEl = document.querySelector('#permModal');
     const permModalTitleEl = document.querySelector('#permModalTitle');
@@ -2532,20 +2615,33 @@ DASHBOARD_HTML = """<!doctype html>
       if (hours < 24) return `${hours}g trước`;
       return `${Math.floor(hours / 24)}ng trước`;
     }
-    function renderTaskRow(task, group) {
+    function renderTaskRow(task, group, { showSession = false, closeModalFn = closeTaskModal } = {}) {
+      // The per-session Task Manager modal calls this with showSession
+      // false (the session is already obvious -- it's the modal's own
+      // title); the Global Task Inbox (fleet-wide, showSession=true)
+      // needs each row to say/link to ITS OWN session, and the actions
+      // below need that session explicitly rather than assuming
+      // taskModalName (which is null/wrong in the inbox context).
+      const ownerSession = showSession ? task.session : taskModalName;
       const row = document.createElement('div'); row.className = 'tm-task';
       const top = document.createElement('div'); top.className = 'tm-task-top';
       const title = document.createElement('div'); title.className = 'tm-task-title';
       title.textContent = task.title || task.prompt || task.id;
       title.title = task.prompt || '';
+      if (showSession && task.session) {
+        const sessionBadge = document.createElement('span'); sessionBadge.className = 'tm-task-session';
+        sessionBadge.textContent = task.session;
+        sessionBadge.onclick = () => { closeModalFn(); selectSession(task.session); };
+        top.append(sessionBadge);
+      }
       const status = document.createElement('span'); status.className = 'tm-count'; status.textContent = task.status;
       top.append(title, status);
       const meta = document.createElement('div'); meta.className = 'tm-task-meta';
       const bits = [`#${clean(task.id).slice(0, 8)}`, `priority ${task.priority ?? 0}`, taskAge(task.created_at)];
-      if (task.original_owner && task.original_owner !== taskModalName) {
+      if (task.original_owner && task.original_owner !== ownerSession) {
         const ownerLink = document.createElement('a');
         ownerLink.textContent = `owner: ${task.original_owner}`;
-        ownerLink.onclick = () => { closeTaskModal(); selectSession(task.original_owner); };
+        ownerLink.onclick = () => { closeModalFn(); selectSession(task.original_owner); };
         meta.append(...bits.filter(Boolean).map(t => { const s = document.createElement('span'); s.textContent = t; return s; }), ownerLink);
       } else {
         for (const bit of bits.filter(Boolean)) { const s = document.createElement('span'); s.textContent = bit; meta.append(s); }
@@ -2568,24 +2664,23 @@ DASHBOARD_HTML = """<!doctype html>
         row.append(reason);
       }
       const actions = document.createElement('div'); actions.className = 'tm-task-actions';
-      if (group === 'queued') {
+      if (group === 'queued' && ownerSession) {
         const cancelBtn = document.createElement('button'); cancelBtn.type = 'button'; cancelBtn.textContent = '✕ Cancel';
-        cancelBtn.onclick = () => taskAction('/dashboard/api/task/cancel', task.id);
+        cancelBtn.onclick = () => taskAction('/dashboard/api/task/cancel', task.id, ownerSession);
         actions.append(cancelBtn);
       }
-      if (group === 'blocked_rework' && (task.status === 'BLOCKED' || task.status === 'FAILED')) {
+      if (group === 'blocked_rework' && (task.status === 'BLOCKED' || task.status === 'FAILED') && ownerSession) {
         const retryBtn = document.createElement('button'); retryBtn.type = 'button'; retryBtn.textContent = '↻ Retry';
-        retryBtn.onclick = () => taskAction('/dashboard/api/task/retry', task.id);
+        retryBtn.onclick = () => taskAction('/dashboard/api/task/retry', task.id, ownerSession);
         actions.append(retryBtn);
       }
       if (actions.childElementCount) row.append(actions);
       return row;
     }
-    function renderTaskGroup(listEl, countEl, tasks, group) {
+    function renderTaskGroup(listEl, countEl, tasks, group, options) {
       listEl.replaceChildren();
-      countEl.textContent = String(tasks.length);
-      countEl.classList.toggle('nonzero', tasks.length > 0);
-      for (const task of tasks) listEl.append(renderTaskRow(task, group));
+      if (countEl) { countEl.textContent = String(tasks.length); countEl.classList.toggle('nonzero', tasks.length > 0); }
+      for (const task of tasks) listEl.append(renderTaskRow(task, group, options));
     }
     function renderTaskBoard(data) {
       if (data.error) { taskModalErrorEl.textContent = clean(data.error); return; }
@@ -2628,15 +2723,23 @@ DASHBOARD_HTML = """<!doctype html>
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape' && document.body.classList.contains('task-modal-visible')) closeTaskModal();
     });
-    async function taskAction(path, taskId) {
-      if (!taskModalName) return;
+    async function taskAction(path, taskId, session) {
+      // `session` is explicit (not always taskModalName -- the Global
+      // Task Inbox calls this for a task in whichever lane it belongs
+      // to, with no single modal session of its own).
+      const targetSession = session || taskModalName;
+      if (!targetSession) return;
       const response = await fetch(path, {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name: taskModalName, task_id: taskId}),
+        body: JSON.stringify({name: targetSession, task_id: taskId}),
       });
       const result = await response.json().catch(() => ({}));
-      if (result && result.error) { taskModalErrorEl.textContent = clean(result.error); return; }
-      await loadTaskBoard(taskModalName);
+      if (result && result.error) {
+        (taskModalName === targetSession ? taskModalErrorEl : taskInboxErrorEl).textContent = clean(result.error);
+        return;
+      }
+      if (taskModalName === targetSession) await loadTaskBoard(taskModalName);
+      if (document.body.classList.contains('task-inbox-visible')) await loadTaskInbox();
     }
     taskPauseBtnEl.onclick = async () => {
       if (!taskModalName) return;
@@ -2671,6 +2774,141 @@ DASHBOARD_HTML = """<!doctype html>
     taskEnqueueInputEl.addEventListener('keydown', event => {
       if (event.key === 'Enter') { event.preventDefault(); taskEnqueueBtnEl.onclick(); }
     });
+
+    // ---- Global Task Inbox (fleet-wide -- every session's queue lane) ---
+    // Same tm-group/tm-task rendering as the per-session Task Manager
+    // modal (renderTaskRow/renderTaskGroup, showSession=true here so
+    // each row says/links to its own session), fed by
+    // terminal_queue_global_inbox's own grouping -- never a second task
+    // store, never re-derived data.
+    function closeTaskInbox() {
+      document.body.classList.remove('task-inbox-visible');
+      taskInboxErrorEl.textContent = '';
+    }
+    function openTaskInbox() {
+      taskInboxErrorEl.textContent = '';
+      document.body.classList.add('task-inbox-visible');
+      loadTaskInbox().catch(() => {});
+    }
+    async function loadTaskInbox() {
+      const data = await fetchJSON('/dashboard/api/queue/global-inbox', {cache: 'no-store'});
+      if (!document.body.classList.contains('task-inbox-visible')) return;
+      if (data.error) { taskInboxErrorEl.textContent = clean(data.error); return; }
+      taskInboxErrorEl.textContent = '';
+      const opts = {showSession: true, closeModalFn: closeTaskInbox};
+      renderTaskGroup(document.querySelector('#inboxListRunning'), document.querySelector('#inboxCountRunning'), data.running, 'running', opts);
+      renderTaskGroup(document.querySelector('#inboxListQueued'), document.querySelector('#inboxCountQueued'), data.queued, 'queued', opts);
+      renderTaskGroup(document.querySelector('#inboxListWaitingDep'), document.querySelector('#inboxCountWaitingDep'), data.waiting_dependency, 'waiting_dependency', opts);
+      renderTaskGroup(document.querySelector('#inboxListBlocked'), document.querySelector('#inboxCountBlocked'), data.blocked_rework, 'blocked_rework', opts);
+      renderTaskGroup(document.querySelector('#inboxListRecent'), document.querySelector('#inboxCountRecent'), data.recent, 'recent', opts);
+      taskInboxEmptyEl.hidden = data.summary.total > 0;
+    }
+    taskInboxCloseBtnEl.onclick = closeTaskInbox;
+    taskInboxBackdropEl.onclick = closeTaskInbox;
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && document.body.classList.contains('task-inbox-visible')) closeTaskInbox();
+    });
+    openTaskInboxBtnEl.onclick = () => { closeAllMenus(); openTaskInbox(); };
+
+    // ---- Supervisor/Coordinator panel's own Queue/Coordinator +
+    // Integration sections (task: Dashboard Supervisor/Coordinator panel)
+    // -- extends the EXISTING #supervisorPanel (v1/v2 content above is
+    // completely untouched) with real, live data straight off queue_
+    // store.py/integration_store.py: the auto-dispatch loop's own state,
+    // queue depth per session, every blocked/rework task fleet-wide, one
+    // row per configured Integration project (with its own Waiting/
+    // Reviewing/Merging/Test/Regression/Rework lane label), and a merged
+    // recent-event timeline. openSupervisorPanelBtn is this section's own
+    // entry point -- independent of supervisorBadgeEl (which stays
+    // hidden whenever there are zero v1 watches, exactly as before) so
+    // this remains reachable for a deployment that only ever uses the
+    // Queue/Coordinator system and never v1 watches at all.
+    openSupervisorPanelBtnEl.onclick = () => { closeAllMenus(); toggleSupervisorPanel(true); loadQueueCoordinatorPanel().catch(() => {}); };
+
+    function renderLaneRow(container, label, valueText, { attention = false, onClick = null } = {}) {
+      const row = document.createElement('div'); row.className = 'sp-lane-item';
+      const labelSpan = document.createElement(onClick ? 'a' : 'span');
+      labelSpan.textContent = label;
+      if (onClick) labelSpan.onclick = onClick;
+      const badge = document.createElement('span'); badge.className = 'sp-lane-badge' + (attention ? ' attn' : '');
+      badge.textContent = valueText;
+      row.append(labelSpan, badge);
+      container.append(row);
+    }
+
+    async function loadQueueCoordinatorPanel() {
+      if (!document.body.classList.contains('supervisor-visible')) return; // no point fetching while the panel is closed
+      try {
+        const [loopStatus, inbox, integrationOverview, recentEvents] = await Promise.all([
+          fetchJSON('/dashboard/api/queue/loop-status', {cache: 'no-store'}),
+          fetchJSON('/dashboard/api/queue/global-inbox', {cache: 'no-store'}),
+          fetchJSON('/dashboard/api/integration/fleet-overview', {cache: 'no-store'}),
+          fetchJSON('/dashboard/api/queue/recent-events?limit=15', {cache: 'no-store'}),
+        ]);
+
+        qcLoopStatusValueEl.textContent = loopStatus.running
+          ? `running (poll ${loopStatus.poll_interval_seconds}s, last cycle ${clean(loopStatus.last_cycle_at)})`
+          : 'not running (config.queue.enabled is off, or no lane has auto-dispatch on)';
+        if (loopStatus.last_error) {
+          qcLoopStatusValueEl.textContent += ` -- last error: ${clean(loopStatus.last_error.error)}`;
+        }
+
+        // Queue depth per session -- derived from the SAME inbox payload
+        // (never a separate query per session), one row per lane that
+        // has any non-terminal task right now.
+        qcQueueDepthsEl.replaceChildren();
+        const depthBySession = new Map();
+        for (const bucket of [inbox.running, inbox.queued, inbox.waiting_dependency, inbox.blocked_rework]) {
+          for (const task of bucket) depthBySession.set(task.session, (depthBySession.get(task.session) || 0) + 1);
+        }
+        if (depthBySession.size === 0) {
+          const empty = document.createElement('div'); empty.className = 'sp-empty'; empty.textContent = 'Không có task nào đang active.';
+          qcQueueDepthsEl.append(empty);
+        }
+        for (const [session, depth] of depthBySession) {
+          renderLaneRow(qcQueueDepthsEl, session, String(depth), {onClick: () => { toggleSupervisorPanel(false); selectSession(session); }});
+        }
+
+        // Blocked/Rework fleet-wide.
+        qcBlockedReworkEl.replaceChildren();
+        if (inbox.blocked_rework.length === 0) {
+          const empty = document.createElement('div'); empty.className = 'sp-empty'; empty.textContent = 'Không có task blocked/rework.';
+          qcBlockedReworkEl.append(empty);
+        }
+        for (const task of inbox.blocked_rework) {
+          renderLaneRow(qcBlockedReworkEl, `${task.session}: ${clean(task.title || task.prompt || task.id).slice(0, 40)}`,
+                       task.status, {attention: true, onClick: () => { toggleSupervisorPanel(false); selectSession(task.session); }});
+        }
+
+        // Integration lanes, one row per configured project.
+        qcIntegrationLanesEl.replaceChildren();
+        if (integrationOverview.projects.length === 0) {
+          const empty = document.createElement('div'); empty.className = 'sp-empty'; empty.textContent = 'Chưa có project Integration nào được cấu hình.';
+          qcIntegrationLanesEl.append(empty);
+        }
+        for (const project of integrationOverview.projects) {
+          const lane = project.current_lane || project.open_batch_lane || (project.paused ? 'Paused' : 'Idle');
+          const attn = lane === 'Rework' || lane === 'Blocked' || lane === 'Regression failed';
+          renderLaneRow(qcIntegrationLanesEl, project.project, lane, {attention: attn});
+        }
+
+        // Recent events, merged across every lane.
+        qcRecentEventsEl.replaceChildren();
+        if (recentEvents.events.length === 0) {
+          const empty = document.createElement('div'); empty.className = 'sp-empty'; empty.textContent = 'Chưa có event nào.';
+          qcRecentEventsEl.append(empty);
+        }
+        for (const event of recentEvents.events.slice(0, 15)) {
+          const row = document.createElement('div'); row.className = 'sp-event';
+          const target = document.createElement('div'); target.className = 'sp-target';
+          target.textContent = `${clean(event.session)} · ${clean(event.event_type)}`;
+          const reason = document.createElement('div'); reason.className = 'muted';
+          reason.textContent = `${clean(event.timestamp)}${event.reason ? ' -- ' + clean(event.reason) : ''}`;
+          row.append(target, reason);
+          qcRecentEventsEl.append(row);
+        }
+      } catch (error) { /* best-effort -- next poll reconciles */ }
+    }
 
     // ---- killed-sessions reopen list (item 9-11) -----------------------
     // Compact, collapsed by default, zero footprint until there's actually
@@ -3103,6 +3341,8 @@ DASHBOARD_HTML = """<!doctype html>
         await loadSessions(); await loadDetail(); setConnectionState(true);
         await loadSupervisor(); // independent of session connectivity above; never affects the LIVE/RECONNECTING badge
         await loadSupervisorV2();
+        await loadQueueCoordinatorPanel(); // no-op fetch unless the panel is actually open
+        if (document.body.classList.contains('task-inbox-visible')) await loadTaskInbox();
         if (!fullscreenRestoreAttempted) {
           fullscreenRestoreAttempted = true;
           if (selected && recalledFullscreen()) setFullscreen(true, { persist: false });
@@ -5814,6 +6054,53 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         result = await anyio.to_thread.run_sync(queue.fleet_task_summary)
+        return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
+    # -- Dashboard Supervisor/Coordinator panel + Global Task Inbox ---------
+    # Fleet-wide (every session/project, not one) -- same gate posture as
+    # the EXISTING /dashboard/api/sessions listing (_read_guard only, no
+    # per-session _read_authorized check): this dashboard's own threat
+    # model already treats "can reach the dashboard API at all" as the
+    # access boundary for fleet-level listing/summary data, reserving
+    # per-session _read_authorized for actually reading ONE session's
+    # live output/history. Never a second task store -- these all read
+    # straight off queue_store.py/integration_store.py via
+    # queue.global_inbox/recent_events and integration.fleet_overview.
+
+    @server.custom_route("/dashboard/api/queue/global-inbox", methods=["GET"], include_in_schema=False)
+    async def queue_global_inbox(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        result = await anyio.to_thread.run_sync(queue.global_inbox)
+        return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/queue/recent-events", methods=["GET"], include_in_schema=False)
+    async def queue_recent_events(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        limit_raw = request.query_params.get("limit")
+        result = await anyio.to_thread.run_sync(lambda: queue.recent_events(limit=int(limit_raw) if limit_raw else 30))
+        return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/queue/loop-status", methods=["GET"], include_in_schema=False)
+    async def queue_loop_status_route(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        if queue.loop is None:
+            result = {"running": False, "poll_interval_seconds": None, "last_cycle_at": None, "last_error": None}
+        else:
+            result = await anyio.to_thread.run_sync(queue.loop.status)
+        return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/integration/fleet-overview", methods=["GET"], include_in_schema=False)
+    async def integration_fleet_overview_route(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        result = await anyio.to_thread.run_sync(integration.fleet_overview)
         return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/session/queue/pause", methods=["POST"], include_in_schema=False)
