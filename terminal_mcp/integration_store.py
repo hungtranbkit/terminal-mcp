@@ -447,6 +447,38 @@ class IntegrationStore:
             "created_at": row["created_at"], "updated_at": row["updated_at"],
         }
 
+    def rename_session(self, old_session: str, new_session: str) -> dict[str, Any]:
+        """Rename Session feature: a coding session's own handoffs
+        (origin_session -- who this Handoff came FROM, read by
+        integration_engine.py's resolve_rework_owner to route a failed
+        review/test back to the right worker) must keep pointing at the
+        SAME worker after a rename, not silently stop matching. Also
+        rewrites any `session_ownership` VALUE (never a key -- keys are
+        path prefixes, not session names) equal to old_session, across
+        every project's pipeline config, for the same reason. Purely a
+        string rewrite -- no handoff/batch/pipeline row's own identity,
+        status, or history changes."""
+        now = iso_now()
+        with self._connection() as connection:
+            handoffs_updated = connection.execute(
+                "UPDATE integration_handoffs SET origin_session = ?, updated_at = ? WHERE origin_session = ?",
+                (new_session, now, old_session),
+            ).rowcount
+            pipelines_updated = 0
+            for row in connection.execute("SELECT project, session_ownership FROM integration_pipelines").fetchall():
+                ownership = _parse_json_object(row["session_ownership"])
+                if not ownership or old_session not in ownership.values():
+                    continue
+                rewritten = {path: (new_session if owner == old_session else owner)
+                            for path, owner in ownership.items()}
+                connection.execute(
+                    "UPDATE integration_pipelines SET session_ownership = ?, updated_at = ? WHERE project = ?",
+                    (json.dumps(rewritten), now, row["project"]),
+                )
+                pipelines_updated += 1
+        return {"old_session": old_session, "new_session": new_session,
+               "handoffs_updated": handoffs_updated, "pipelines_updated": pipelines_updated}
+
     def pause_pipeline(self, project: str, *, reason: str | None = None) -> None:
         with self._connection() as connection:
             connection.execute("UPDATE integration_pipelines SET paused = 1, paused_reason = ?, updated_at = ? "

@@ -58,6 +58,7 @@ class NodeClient(Protocol):
     def detach_session(self, name: str) -> dict[str, Any]: ...
     def delete_session(self, name: str) -> dict[str, Any]: ...
     def kill_session(self, name: str, confirm_name: str, *, requested_by: str | None = None) -> dict[str, Any]: ...
+    def rename_session(self, name: str, new_name: str, *, requested_by: str | None = None) -> dict[str, Any]: ...
     def reopen_session(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
                        grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]: ...
     def list_killed_sessions(self) -> dict[str, Any]: ...
@@ -125,6 +126,9 @@ class LocalNodeClient:
 
     def kill_session(self, name: str, confirm_name: str, *, requested_by: str | None = None) -> dict[str, Any]:
         return self._terminal.terminal_kill_session(name, confirm_name, requested_by=requested_by)
+
+    def rename_session(self, name: str, new_name: str, *, requested_by: str | None = None) -> dict[str, Any]:
+        return self._terminal.terminal_rename_session(name, new_name, requested_by=requested_by)
 
     def reopen_session(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
                        grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]:
@@ -275,6 +279,10 @@ class RemoteNodeClient:
     def kill_session(self, name: str, confirm_name: str, *, requested_by: str | None = None) -> dict[str, Any]:
         return self._request("POST", f"/v1/sessions/{urllib.parse.quote(name)}/kill",
                              body={"confirm_name": confirm_name, "requested_by": requested_by})
+
+    def rename_session(self, name: str, new_name: str, *, requested_by: str | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/v1/sessions/{urllib.parse.quote(name)}/rename",
+                             body={"new_name": new_name, "requested_by": requested_by})
 
     def reopen_session(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
                        grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]:

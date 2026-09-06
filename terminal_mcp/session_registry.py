@@ -348,6 +348,36 @@ class SessionRegistryStore:
 
     # -- writes ------------------------------------------------------------
 
+    def rename(self, node_id: str, old_name: str, new_name: str, *, now: str | None = None) -> SessionRecord | None:
+        """Rename Session feature: moves this session's own row (and its
+        drop_events history) to the new (node_id, new_name) primary key
+        IN PLACE -- created_at, repo_root/git_remote/git_branch,
+        binding_names, grant flags, everything already recorded stays
+        attached to the SAME row, exactly as if it had always been
+        recorded under the new name. Without this, the next ordinary
+        reconcile pass (upsert_seen, which has no idea a rename just
+        happened) would instead INSERT a brand new row for `new_name`
+        with created_at reset to "now" and leave the old row behind as a
+        stale, orphaned entry until mark_missing eventually ages it out
+        -- exactly the "mất history" this feature must never do. Returns
+        None if there was no existing row for `old_name` (nothing to
+        carry forward -- a session with no registry history yet is not
+        an error, just a no-op here)."""
+        now = now or _now_iso()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE session_records SET session_name = ?, last_seen_at = ? "
+                "WHERE node_id = ? AND session_name = ?",
+                (new_name, now, node_id, old_name),
+            )
+            if cursor.rowcount == 0:
+                return None
+            connection.execute(
+                "UPDATE drop_events SET session_name = ? WHERE node_id = ? AND session_name = ?",
+                (new_name, node_id, old_name),
+            )
+        return self.get(node_id, new_name)
+
     def upsert_seen(self, node_id: str, session_name: str, *, node_name: str | None = None,
                     backend_type: str | None = None, cwd: str | None = None,
                     agent_type: str | None = None, launch_command: str | None = None,

@@ -413,6 +413,51 @@ def build_mcp(service: TerminalService | None = None,
         return result
 
     @server.tool()
+    def terminal_rename_session(name: str, new_name: str) -> dict:
+        """Renames a session -- the real process/pane, its PID, tmux's own
+        internal identity, EVERY existing binding/grant/queue task/
+        integration handoff/supervisor watch/history entry that already
+        references it, all keep working, now under the new name. Nothing
+        is killed, nothing is lost, nothing is duplicated.
+
+        `new_name` must still pass every ordinary session-name rule
+        (same charset as creating a brand new session, must stay inside
+        allowed_session_patterns, can't collide with any session that
+        already exists anywhere in the fleet, can't be/become a
+        protected name). Fails closed with SESSION_NOT_FOUND /
+        NAME_COLLISION / INVALID_NEW_SESSION_NAME / TARGET_NAME_NOT_ALLOWED
+        / TARGET_NAME_PROTECTED / SAME_NAME -- never guesses.
+
+        The queue/integration/supervisor propagation below is
+        deliberately best-effort ON TOP of an already-successful
+        rename (same posture terminal_rename_session (core.py) itself
+        takes for bindings/grants/session_registry) -- a problem in any
+        one of those is surfaced as a warning, never turned into a
+        false report that the rename itself failed, since by this point
+        it hasn't: the session is already live under its new name."""
+        _refresh_local_heartbeat()
+        result = controller.terminal_rename_session(name, new_name, requested_by="mcp")
+        if "error" in result:
+            return result
+        warnings = list(result.get("warnings") or [])
+        try:
+            queue_result = queue.store.rename_session(name, new_name)
+            result["queue_tasks_updated"] = queue_result["tasks_updated"]
+        except Exception as exc:  # noqa: BLE001 -- best-effort, see docstring
+            warnings.append(f"queue: {exc}")
+        try:
+            integration_result = integration.store.rename_session(name, new_name)
+            result["integration_handoffs_updated"] = integration_result["handoffs_updated"]
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"integration: {exc}")
+        try:
+            result["watches_renamed"] = supervisor.rename_session(name, new_name)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"supervisor: {exc}")
+        result["warnings"] = warnings
+        return result
+
+    @server.tool()
     def terminal_reopen_session(name: str, agent_type: str | None = None,
                                 working_directory: str | None = None, node: str | None = None) -> dict:
         """Recreates a NEW tmux session/process under `name` using saved

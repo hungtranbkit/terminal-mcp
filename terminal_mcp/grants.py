@@ -144,6 +144,22 @@ class SessionGrantStore:
                 )
         return self.get(session)  # type: ignore[return-value]
 
+    def rename_session(self, old: str, new: str) -> bool:
+        """Rename Session feature: re-keys an existing grant's PRIMARY KEY
+        in place -- read/input flags and the tmux identity pin
+        (pinned_session_id/pinned_pane_id, tmux's own `$N`/`%N`, which
+        rename-session never changes) all carry over untouched, exactly
+        as if the grant had always been recorded under the new name.
+        Returns False (a no-op) when there is no grant for `old` at all,
+        which is the common case -- most sessions have no dashboard
+        grant -- never an error."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE session_grants SET session = ?, updated_at = ? WHERE session = ?", (new, now, old),
+            )
+            return cursor.rowcount > 0
+
     def set_input(self, session: str, enabled: bool, *, granted_by: str | None,
                   pinned_session_id: str | None = None, pinned_pane_id: str | None = None,
                   pinned_created_epoch: int | None = None) -> SessionGrant | None:

@@ -366,3 +366,67 @@ def test_dashboard_kill_then_reopen_round_trip(tmp_path, cleanup_tmux):
 
     listed_after = client.get("/dashboard/api/killed-sessions")
     assert not any(e["name"] == name for e in listed_after.json()["killed_sessions"])
+
+
+# -- Rename Session (dashboard route) -----------------------------------------
+
+def test_dashboard_rename_route_rejects_cross_origin_request(tmp_path):
+    from starlette.testclient import TestClient
+    from terminal_mcp.dashboard import register_dashboard
+    from terminal_mcp.mcp_app import build_mcp
+    config = _config(tmp_path)
+    service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(), headers={"Origin": "https://evil.example.com"})
+    response = client.post("/dashboard/api/session/rename", json={"name": "lifecycle-x", "new_name": "lifecycle-y"})
+    assert response.status_code == 403
+    assert response.json()["error"] == "ORIGIN_NOT_ALLOWED"
+
+
+def test_dashboard_rename_route_refuses_protected_session(tmp_path):
+    name = "lifecycle-protected-dashboard-rename"
+    config = _config(tmp_path, protected=(name,))
+    client, service = _dashboard_client(config)
+    import subprocess, time
+    subprocess.run(["tmux", "new-session", "-d", "-s", name, "bash"], check=True)
+    time.sleep(0.2)
+    try:
+        response = client.post("/dashboard/api/session/rename", json={"name": name, "new_name": "lifecycle-newname"})
+        assert response.status_code == 403
+        assert response.json()["error"] == "SESSION_PROTECTED"
+        assert service.tmux.get_session(name) is not None
+        assert service.tmux.get_session("lifecycle-newname") is None
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+
+
+def test_dashboard_rename_route_rejects_missing_new_name(tmp_path, cleanup_tmux):
+    config = _config(tmp_path)
+    client, service = _dashboard_client(config)
+    name = "lifecycle-dashboard-rename-invalid"
+    cleanup_tmux(name)
+    _create_and_settle(service, name, "shell", tmp_path)
+    response = client.post("/dashboard/api/session/rename", json={"name": name})
+    assert response.status_code == 400
+    assert response.json()["error"] == "INVALID_REQUEST"
+    assert service.tmux.get_session(name) is not None
+
+
+def test_dashboard_rename_route_round_trip(tmp_path, cleanup_tmux):
+    config = _config(tmp_path)
+    client, service = _dashboard_client(config)
+    name = "lifecycle-dashboard-rename-src"
+    new_name = "lifecycle-dashboard-rename-dst"
+    cleanup_tmux(name)
+    cleanup_tmux(new_name)
+    _create_and_settle(service, name, "shell", tmp_path)
+
+    response = client.post("/dashboard/api/session/rename", json={"name": name, "new_name": new_name})
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["old_name"] == name
+    assert body["new_name"] == new_name
+
+    assert service.tmux.get_session(name) is None
+    assert service.tmux.get_session(new_name) is not None

@@ -27,6 +27,7 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_detach_session",
         "terminal_delete_session",
         "terminal_kill_session",
+        "terminal_rename_session",
         "terminal_reopen_session",
         "terminal_list_killed_sessions",
         "supervisor_watch",

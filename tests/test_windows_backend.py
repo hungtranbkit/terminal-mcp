@@ -276,6 +276,42 @@ def test_new_session_duplicate_name_raises(backend, tmp_path):
         _new_fake_shell_session(backend, tmp_path)
 
 
+def test_rename_session_rekeys_the_real_registry_entry(backend, tmp_path):
+    """Rename Session feature: this backend has no OS-level session name
+    at all (rename_session's own docstring) -- the real, running process
+    (same PID) must be reachable under the new name immediately, and no
+    longer under the old one, with nothing restarted/killed."""
+    _new_fake_shell_session(backend, tmp_path)
+    pid_before = backend.get_session("win-test").pane_pid
+
+    backend.rename_session("win-test", "win-renamed")
+
+    assert backend.get_session("win-test") is None
+    renamed = backend.get_session("win-renamed")
+    assert renamed is not None
+    assert renamed.name == "win-renamed"
+    assert renamed.pane_pid == pid_before  # same real process, never restarted
+    assert _pid_alive(pid_before)
+    backend.kill_session("win-renamed")
+
+
+def test_rename_nonexistent_session_raises(backend):
+    with pytest.raises(TmuxError, match="does not exist"):
+        backend.rename_session("ghost", "whatever")
+
+
+def test_rename_onto_an_existing_name_raises_and_changes_nothing(backend, tmp_path):
+    _new_fake_shell_session(backend, tmp_path, name="win-a")
+    _new_fake_shell_session(backend, tmp_path, name="win-b")
+    with pytest.raises(TmuxError, match="duplicate session"):
+        backend.rename_session("win-a", "win-b")
+    # Both sessions untouched by the failed attempt.
+    assert backend.get_session("win-a") is not None
+    assert backend.get_session("win-b") is not None
+    backend.kill_session("win-a")
+    backend.kill_session("win-b")
+
+
 def test_new_session_does_not_re_validate_cwd_shape(backend, tmp_path):
     # See new_session's own comment: cwd here is already resolve_cwd's
     # OUTPUT (a real, resolved path on whatever OS this runs on), never

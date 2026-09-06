@@ -20,7 +20,7 @@ from .metrics import record_delivery_outcome
 from .models import SessionIdentity
 from .permissions import (SENSITIVE_SESSION_WORDS, input_session_allowed,
                           require_input, require_read, require_session_lifecycle, session_allowed,
-                          session_input_denied_by_pattern, valid_session_name)
+                          session_input_denied_by_pattern, valid_new_session_name, valid_session_name)
 from .redaction import redact_ansi_safe, redact_text, strip_ansi
 from .session_backend import SessionBackend
 from .session_knowledge import SessionKnowledgeStore, make_instance_id
@@ -2545,6 +2545,105 @@ class TerminalService:
         self.audit.record(action=action, session=name, result="KILLED" if ok else "BLOCKED",
                           reason=result.get("error") or result.get("action"))
         return result
+
+    def terminal_rename_session(self, name: str, new_name: str, *,
+                                requested_by: str | None = None) -> dict[str, Any]:
+        """Rename Session feature (task: "bổ sung tính năng Rename Session
+        trực tiếp trên Dashboard"): the session's REAL identity -- its
+        process/PID, tmux's own internal $N/%N ids, all history --
+        is never lost; only the human-readable NAME every store keys on
+        changes, in place, everywhere. On Linux this is a real `tmux
+        rename-session` (the pane/process is completely untouched); on
+        the Windows backend it's an in-process dict re-key (see
+        WindowsSessionBackend.rename_session) -- either way this method
+        itself never knows or cares which backend it's talking to,
+        exactly like every other call on self.tmux.
+
+        Propagates to every LOCAL, per-node store that keys on session
+        name (bindings, dashboard grants, the session registry) so a
+        rename never silently orphans a binding/grant or resets this
+        session's registry history -- see each store's own
+        rename/rename_session_references docstring for exactly what
+        "never lost" means there. Fleet-wide, CENTRAL stores that also
+        key on session name (queue_store.py, integration_store.py) are
+        NOT reachable from here (TerminalService has no reference to
+        them -- they're composed one layer up, at the controller/MCP
+        wiring level) -- mcp_app.py's terminal_rename_session tool calls
+        this first, then renames those too, in the same tool call."""
+        action = "rename_session"
+        if (error := require_session_lifecycle(self.config)) is not None:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason=error)
+            return {"error": error, "session": name}
+        if not valid_session_name(name):
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_SESSION_NAME")
+            return {"error": "INVALID_SESSION_NAME", "session": name}
+        if not valid_new_session_name(new_name):
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_NEW_SESSION_NAME")
+            return {"error": "INVALID_NEW_SESSION_NAME", "session": name, "new_name": new_name}
+        if new_name == name:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="SAME_NAME")
+            return {"error": "SAME_NAME", "session": name}
+        if name in self.config.session_lifecycle.protected_sessions:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="SESSION_PROTECTED")
+            return {"error": "SESSION_PROTECTED", "session": name}
+        if new_name in self.config.session_lifecycle.protected_sessions:
+            # A rename must never let a session ASSUME a protected name
+            # either -- symmetric with the check above.
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="TARGET_NAME_PROTECTED")
+            return {"error": "TARGET_NAME_PROTECTED", "session": name, "new_name": new_name}
+        if not session_allowed(new_name, self.config):
+            # The new name must stay inside the SAME static whitelist
+            # every session name is already held to -- a rename must
+            # never be a back door out of allowed_session_patterns (e.g.
+            # into a SENSITIVE_SESSION_WORDS name without an exact
+            # whitelist entry).
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="TARGET_NAME_NOT_ALLOWED")
+            return {"error": "TARGET_NAME_NOT_ALLOWED", "session": name, "new_name": new_name}
+        try:
+            info = self.tmux.get_session(name)
+        except TmuxError as exc:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="TMUX_ERROR")
+            return {"error": "TMUX_ERROR", "reason": str(exc), "session": name}
+        if info is None:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="SESSION_NOT_FOUND")
+            return {"error": "SESSION_NOT_FOUND", "session": name}
+        try:
+            existing_new = self.tmux.get_session(new_name)
+        except TmuxError:
+            existing_new = None
+        if existing_new is not None:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="NAME_COLLISION")
+            return {"error": "NAME_COLLISION", "session": name, "new_name": new_name}
+        try:
+            self.tmux.rename_session(name, new_name)
+        except TmuxError as exc:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="TMUX_ERROR")
+            return {"error": "TMUX_ERROR", "reason": str(exc), "session": name, "new_name": new_name}
+        # From here on the REAL rename already happened -- every
+        # propagation step below is best-effort bookkeeping on top of an
+        # already-successful rename, never something that could leave
+        # the caller thinking the rename itself failed. A failure in any
+        # one of these is recorded as a warning, not returned as
+        # {"error": ...} (see warnings below).
+        warnings: list[str] = []
+        try:
+            bindings_updated = self.bindings.rename_session_references(name, new_name)
+        except Exception as exc:  # noqa: BLE001
+            bindings_updated = 0
+            warnings.append(f"bindings: {exc}")
+        try:
+            grant_renamed = self.grants.rename_session(name, new_name)
+        except Exception as exc:  # noqa: BLE001
+            grant_renamed = False
+            warnings.append(f"grants: {exc}")
+        try:
+            self.session_registry.rename(self.REGISTRY_LOCAL_NODE_ID, name, new_name)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"session_registry: {exc}")
+        self.audit.record(action=action, session=name, result="RENAMED",
+                          reason=f"-> {new_name}" + (f" (requested_by={requested_by})" if requested_by else ""))
+        return {"old_name": name, "new_name": new_name, "bindings_updated": bindings_updated,
+               "grant_renamed": grant_renamed, "warnings": warnings}
 
     def terminal_reopen_session(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
                                 grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]:

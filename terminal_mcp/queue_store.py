@@ -1230,6 +1230,51 @@ class QueueStore:
             connection.execute("UPDATE queue_lanes SET last_rebalance_at = ?, updated_at = ? WHERE session = ?",
                               (iso_now(), iso_now(), session))
 
+    def rename_session(self, old_session: str, new_session: str) -> dict[str, Any]:
+        """Rename Session feature: this queue's `session` is the SAME
+        stable identity every task/lane/event row already keys on --
+        renaming updates that one string, in place, everywhere it
+        appears, so every existing task_id/priority/dependency/
+        migration_history/queue_position reference keeps working
+        completely unchanged; nothing here is a new task or a new
+        migration (deliberately does NOT append to migration_history or
+        touch original_owner -- a rename is not a hand-off between
+        sessions, it is the SAME session/coding-worker under a new
+        display name, unlike reassign_task above).
+
+        Fails clean (ValueError) if `new_session` already names a lane
+        with any row of its own -- the caller (mcp_app.py's
+        terminal_rename_session tool) is expected to have already
+        checked this isn't a real collision via the fleet/backend layer,
+        but this store never trusts that alone."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_new_lane = connection.execute(
+                "SELECT 1 FROM queue_lanes WHERE session = ?", (new_session,),
+            ).fetchone()
+            if existing_new_lane is not None:
+                connection.rollback()
+                raise ValueError(f"a queue lane already exists for {new_session!r}")
+            now = iso_now()
+            connection.execute(
+                "UPDATE queue_lanes SET session = ?, updated_at = ? WHERE session = ?",
+                (new_session, now, old_session),
+            )
+            tasks_updated = connection.execute(
+                "UPDATE queue_tasks SET session = ?, updated_at = ? WHERE session = ?",
+                (new_session, now, old_session),
+            ).rowcount
+            connection.execute(
+                "UPDATE queue_tasks SET original_owner = ? WHERE original_owner = ?",
+                (new_session, old_session),
+            )
+            connection.execute(
+                "UPDATE queue_events SET session = ? WHERE session = ?", (new_session, old_session),
+            )
+            self._record_event_locked(connection, session=new_session, task_id=None, event_type="SESSION_RENAMED",
+                                      reason=f"renamed from {old_session!r}", metadata={"from": old_session})
+        return {"old_session": old_session, "new_session": new_session, "tasks_updated": tasks_updated}
+
     def retry_task(self, task_id: str) -> QueueTask:
         """BLOCKED|FAILED -> QUEUED, explicit operator action only (item
         11: "task lỗi -> BLOCKED và dừng queue... không tự skip... user

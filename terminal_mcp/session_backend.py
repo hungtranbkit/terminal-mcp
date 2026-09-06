@@ -75,6 +75,8 @@ class SessionBackend(Protocol):
 
     def exit_copy_mode(self, session: str) -> None: ...
 
+    def rename_session(self, old: str, new: str) -> None: ...
+
 
 # SessionBackendError = tmux.TmuxError (aliased above), deliberately NOT a
 # new exception class. TerminalService (core.py) catches `TmuxError` by

@@ -180,6 +180,22 @@ class BindingStore:
             )
         return cursor.rowcount == 1
 
+    def rename_session_references(self, old_session: str, new_session: str) -> int:
+        """Rename Session feature: every binding's `name` (the binding's
+        OWN alias, e.g. "explain-stock") is untouched -- only its
+        `session` column (which tmux session it points AT) is updated,
+        for every binding currently pointing at `old_session`. The
+        identity pin (pinned_session_id/pinned_pane_id -- tmux's own
+        `$N`/`%N`, unaffected by rename-session) carries over unchanged,
+        so a binding survives a session rename exactly as if it had
+        always pointed at the new name. Returns the number of bindings
+        updated (0 is normal -- most sessions have no binding at all)."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE bindings SET session = ? WHERE session = ?", (new_session, old_session),
+            )
+            return cursor.rowcount
+
     def delete(self, name: str) -> bool:
         with self._connection() as connection:
             cursor = connection.execute("DELETE FROM bindings WHERE name = ?", (name,))

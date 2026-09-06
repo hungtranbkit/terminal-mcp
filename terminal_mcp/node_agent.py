@@ -203,6 +203,18 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         ))
         return JSONResponse(result)
 
+    async def rename_session(request: Request) -> JSONResponse:
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        result = await anyio.to_thread.run_sync(lambda: client.rename_session(
+            request.path_params["name"], body.get("new_name", ""), requested_by=body.get("requested_by"),
+        ))
+        return JSONResponse(result)
+
     async def reopen_session(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
             return blocked
@@ -378,6 +390,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         Route("/v1/sessions/{name}/detach", detach_session, methods=["POST"]),
         Route("/v1/sessions/{name}", delete_session, methods=["DELETE"]),
         Route("/v1/sessions/{name}/kill", kill_session, methods=["POST"]),
+        Route("/v1/sessions/{name}/rename", rename_session, methods=["POST"]),
         Route("/v1/sessions/{name}/reopen", reopen_session, methods=["POST"]),
         Route("/v1/sessions/{name}/grant-read", session_grant_read, methods=["POST"]),
         Route("/v1/sessions/{name}/grant-input", session_grant_input, methods=["POST"]),

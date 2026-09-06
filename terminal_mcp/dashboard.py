@@ -23,8 +23,12 @@ from .connection_store import ConnectionStore, generate_node_token
 from .controller import ControllerService, build_default_controller
 from .node_client import NodeClientError, RemoteNodeClient
 from .core import TerminalService
+from .integration_service import IntegrationService
+from .integration_store import IntegrationStore
 from .node_models import NODE_ONLINE, SESSION_BACKEND_TMUX, node_to_dict
 from .permissions import input_session_allowed, session_allowed, valid_session_name
+from .queue_service import QueueService
+from .queue_store import QueueStore
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
 from .webterm import WebTerminalProcess, pump_websocket
@@ -431,16 +435,34 @@ DASHBOARD_HTML = """<!doctype html>
       background:var(--panel); border:1px solid #5a2f38; border-radius:12px; box-shadow:0 20px 50px rgba(0,0,0,.6);
     }
     body.kill-modal-visible #killBackdrop, body.kill-modal-visible #killModal { display:block }
-    #killModal .km-head { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px }
+    #killModal .km-head, #renameModal .km-head { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px }
     #killModal .km-head strong { color:#ff9f9f; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
-    #killModal .km-body { padding:14px 16px; display:flex; flex-direction:column; gap:10px; font-size:13px }
+    #killModal .km-body, #renameModal .km-body { padding:14px 16px; display:flex; flex-direction:column; gap:10px; font-size:13px }
     #killModal .km-warn { color:var(--amber); font-size:12px; background:rgba(255,200,87,.1); border:1px solid var(--amber); border-radius:8px; padding:8px 10px }
-    #killModal input[type=text] { background:#0e1526; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:9px 11px; font:inherit }
-    #killModal .km-actions { display:flex; justify-content:flex-end; gap:8px }
-    #killModal .km-actions button { border-radius:8px; padding:9px 14px; cursor:pointer; font:inherit; font-size:13px; border:1px solid var(--line); background:#19243b; color:var(--text) }
+    #killModal input[type=text], #renameModal input[type=text] { background:#0e1526; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:9px 11px; font:inherit }
+    #killModal .km-actions, #renameModal .km-actions { display:flex; justify-content:flex-end; gap:8px }
+    #killModal .km-actions button, #renameModal .km-actions button { border-radius:8px; padding:9px 14px; cursor:pointer; font:inherit; font-size:13px; border:1px solid var(--line); background:#19243b; color:var(--text) }
     #killModal .km-actions button.danger { background:#3a2430; border-color:#ff9f9f; color:#ff9f9f }
-    #killModal .km-actions button.danger:disabled { opacity:.4; cursor:not-allowed }
-    #killModal .km-error { color:#ff6b6b; font-size:12px }
+    #killModal .km-actions button:disabled, #renameModal .km-actions button:disabled { opacity:.4; cursor:not-allowed }
+    #killModal .km-error, #renameModal .km-error { color:#ff6b6b; font-size:12px }
+    /* Rename Session's own modal -- same fixed-overlay+backdrop+km-*
+       component pieces as #killModal (widened selectors above), but
+       neutral (not red/danger) styling throughout: renaming is not a
+       destructive action, so it must never visually read as one. Its
+       primary action button stays disabled until the typed new name
+       passes the SAME lightweight client-side shape check core.py's own
+       valid_new_session_name enforces server-side (never trusted alone
+       -- INVALID_NEW_SESSION_NAME/NAME_COLLISION/etc. from the real
+       response is what actually gates it). */
+    #renameBackdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:30 }
+    #renameModal {
+      display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:31;
+      width:min(380px, calc(100vw - 32px)); max-height:80vh; overflow:auto;
+      background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 20px 50px rgba(0,0,0,.6);
+    }
+    body.rename-modal-visible #renameBackdrop, body.rename-modal-visible #renameModal { display:block }
+    #renameModal .km-head strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    #renameModal .km-hint { color:var(--muted); font-size:12px }
     /* ---- History/Search modal (Session Knowledge Store) ---------------
        Same fixed-overlay + backdrop + body-class pattern as #permModal/
        #killModal above -- a separate modal, not a redesign of either;
@@ -724,6 +746,7 @@ DASHBOARD_HTML = """<!doctype html>
                 <button id="termCopyAttachBtn" type="button" disabled hidden>⧉ Copy attach command</button>
                 <button id="termAccessBtn" type="button" disabled>🔐 Quyền truy cập</button>
                 <button id="termHistoryBtn" type="button" disabled>📜 Lịch sử / Tìm kiếm</button>
+                <button id="termRenameBtn" type="button" disabled>✏ Đổi tên session</button>
                 <button id="termKillBtn" type="button" class="danger" disabled>🗑 Kill session</button>
               </div>
             </div>
@@ -784,6 +807,22 @@ DASHBOARD_HTML = """<!doctype html>
       <div class="km-actions">
         <button id="killCancelBtn" type="button">Huỷ</button>
         <button id="killConfirmBtn" class="danger" type="button" disabled>🗑 Kill session</button>
+      </div>
+    </div>
+  </div>
+  <div id="renameBackdrop"></div>
+  <div id="renameModal" role="dialog" aria-modal="true" aria-labelledby="renameModalTitle">
+    <div class="km-head">
+      <strong id="renameModalTitle">Đổi tên session</strong>
+      <button id="renameModalCloseBtn" class="term-btn" type="button">✕</button>
+    </div>
+    <div class="km-body">
+      <div class="km-hint">Tên mới (chữ/số/_/.-/, không dấu, không trùng session khác):</div>
+      <input type="text" id="renameNewNameInput" autocomplete="off" spellcheck="false">
+      <div class="km-error" id="renameModalError"></div>
+      <div class="km-actions">
+        <button id="renameCancelBtn" type="button">Huỷ</button>
+        <button id="renameConfirmBtn" type="button" disabled>✏ Đổi tên</button>
       </div>
     </div>
   </div>
@@ -848,6 +887,13 @@ DASHBOARD_HTML = """<!doctype html>
     const killModalCloseBtnEl = document.querySelector('#killModalCloseBtn');
     const killCancelBtnEl = document.querySelector('#killCancelBtn');
     const killConfirmBtnEl = document.querySelector('#killConfirmBtn');
+    const renameBackdropEl = document.querySelector('#renameBackdrop');
+    const renameModalTitleEl = document.querySelector('#renameModalTitle');
+    const renameNewNameInputEl = document.querySelector('#renameNewNameInput');
+    const renameModalErrorEl = document.querySelector('#renameModalError');
+    const renameModalCloseBtnEl = document.querySelector('#renameModalCloseBtn');
+    const renameCancelBtnEl = document.querySelector('#renameCancelBtn');
+    const renameConfirmBtnEl = document.querySelector('#renameConfirmBtn');
     const knowledgeBackdropEl = document.querySelector('#knowledgeBackdrop');
     const knowledgeModalTitleEl = document.querySelector('#knowledgeModalTitle');
     const knowledgeModalCloseBtnEl = document.querySelector('#knowledgeModalCloseBtn');
@@ -897,6 +943,7 @@ DASHBOARD_HTML = """<!doctype html>
     const termCopyAttachBtnEl = document.querySelector('#termCopyAttachBtn');
     const termAccessBtnEl = document.querySelector('#termAccessBtn');
     const termHistoryBtnEl = document.querySelector('#termHistoryBtn');
+    const termRenameBtnEl = document.querySelector('#termRenameBtn');
     const termKillBtnEl = document.querySelector('#termKillBtn');
     const clean = value => String(value ?? '');
 
@@ -2086,6 +2133,19 @@ DASHBOARD_HTML = """<!doctype html>
       termHistoryBtnEl.onclick = () => { if (row && !termHistoryBtnEl.disabled) { closeAllMenus(); openKnowledgeModal(row.name); } };
 
       const isProtected = row ? protectedSessions.has(row.name) : false;
+      // Rename Session feature: gated the SAME way Kill is (core.py's
+      // terminal_rename_session requires session_lifecycle.enabled too,
+      // and a protected session can never be renamed either) -- never a
+      // separate, looser client-side rule than what the server actually
+      // enforces.
+      termRenameBtnEl.disabled = !row || !sessionLifecycleEnabled || isProtected;
+      termRenameBtnEl.title = !row || !sessionLifecycleEnabled ? ''
+        : isProtected ? 'Session này được bảo vệ, không thể đổi tên qua dashboard'
+        : 'Đổi tên session này (mọi binding/quyền/queue/lịch sử vẫn giữ nguyên)';
+      termRenameBtnEl.onclick = () => {
+        if (row && !termRenameBtnEl.disabled) { closeAllMenus(); openRenameModal(row.name); }
+      };
+
       termKillBtnEl.disabled = !row || !sessionLifecycleEnabled || isProtected;
       termKillBtnEl.title = !row || !sessionLifecycleEnabled ? ''
         : isProtected ? 'Session này được bảo vệ, không thể kill qua dashboard'
@@ -2204,6 +2264,81 @@ DASHBOARD_HTML = """<!doctype html>
         selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateLayoutState();
         summaryEl.textContent = 'Chọn một session để xem output.'; outputEl.replaceChildren(); grantBarEl.hidden = true;
       }
+      await loadSessions();
+    };
+
+    // ---- Rename Session modal ---------------------------------------------
+    // Same fixed-overlay + backdrop + km-* component pieces as the Kill
+    // modal just above, neutral (non-danger) styling -- see this file's
+    // own CSS comment on #renameModal. Enter/Esc are both first-class:
+    // Enter submits (when the button isn't disabled), Esc cancels,
+    // matching the task's own "Enter/Save vs Esc/Cancel" requirement.
+    // SAFE_SESSION_NAME_RE mirrors permissions.py's own SAFE_SESSION_RE
+    // exactly -- a client-side floor only; core.py's real
+    // valid_new_session_name/session_allowed/NAME_COLLISION checks are
+    // what actually decide this, never trusted from here alone.
+    const SAFE_SESSION_NAME_RE = /^[A-Za-z0-9_.-]{1,128}$/;
+    let renameModalName = null;
+    function closeRenameModal() {
+      document.body.classList.remove('rename-modal-visible');
+      renameModalName = null; renameNewNameInputEl.value = ''; renameModalErrorEl.textContent = '';
+    }
+    function openRenameModal(name) {
+      renameModalName = name;
+      renameModalTitleEl.textContent = `Đổi tên "${name}"`;
+      renameNewNameInputEl.value = name; renameModalErrorEl.textContent = '';
+      renameConfirmBtnEl.disabled = true;
+      document.body.classList.add('rename-modal-visible');
+      renameNewNameInputEl.focus();
+      renameNewNameInputEl.select();
+    }
+    renameModalCloseBtnEl.onclick = closeRenameModal;
+    renameCancelBtnEl.onclick = closeRenameModal;
+    renameBackdropEl.onclick = closeRenameModal;
+    document.addEventListener('keydown', event => {
+      if (!document.body.classList.contains('rename-modal-visible')) return;
+      if (event.key === 'Escape') closeRenameModal();
+    });
+    function renameNewNameIsValid() {
+      const value = renameNewNameInputEl.value;
+      return renameModalName !== null && value !== '' && value !== renameModalName
+        && SAFE_SESSION_NAME_RE.test(value) && !value.startsWith('-') && !value.startsWith('.');
+    }
+    renameNewNameInputEl.oninput = () => {
+      renameModalErrorEl.textContent = '';
+      renameConfirmBtnEl.disabled = !renameNewNameIsValid();
+    };
+    renameNewNameInputEl.addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !renameConfirmBtnEl.disabled) { event.preventDefault(); renameConfirmBtnEl.click(); }
+    });
+    renameConfirmBtnEl.onclick = async () => {
+      const name = renameModalName;
+      const newName = renameNewNameInputEl.value;
+      if (!name || !renameNewNameIsValid()) return; // client-side floor only; core.py's own checks are the real one
+      renameConfirmBtnEl.disabled = true;
+      const response = await fetch('/dashboard/api/session/rename', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name, new_name: newName}),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (result && result.error) {
+        renameModalErrorEl.textContent = clean(result.error);
+        renameConfirmBtnEl.disabled = !renameNewNameIsValid();
+        return;
+      }
+      closeRenameModal();
+      // The open tab/pane must keep showing the SAME session's output
+      // uninterrupted (task's own "open session keeps correct terminal/
+      // output") -- update `selected` directly rather than going through
+      // selectSession(), which resets drafts/scroll/output as if this
+      // were a brand new tab click; the next poll/loadDetail() call
+      // already reads `selected` live, so this alone is enough to keep
+      // following the renamed session correctly.
+      if (selected === name) {
+        selected = newName;
+        if (summaryEl.textContent === name) { summaryEl.textContent = newName; }
+      }
+      drafts.set(newName, drafts.get(name) ?? ''); drafts.delete(name);
       await loadSessions();
     };
 
@@ -4707,7 +4842,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        supervisor: SupervisorService | None = None,
                        supervisor_v2: SupervisorV2Service | None = None,
                        controller: ControllerService | None = None,
-                       connection_store: ConnectionStore | None = None) -> None:
+                       connection_store: ConnectionStore | None = None,
+                       queue: QueueService | None = None,
+                       integration: IntegrationService | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -4735,6 +4872,23 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # persistent ConnectionStore instead of relying on this fallback.
         import tempfile
         connection_store = ConnectionStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-connections-")) / "connections.db")
+    if queue is None:
+        # SAME private-temp-file discipline as connection_store's own
+        # default just above: every EXISTING caller of register_dashboard
+        # (tests especially) that doesn't explicitly pass `queue` must
+        # never silently touch the real, persistent default queue.db --
+        # server_http.py's real main() always constructs one explicit
+        # QueueService and passes the SAME instance to both build_mcp and
+        # register_dashboard (see its own comment) specifically so the
+        # Dashboard Task Manager's rename/task routes and the MCP
+        # terminal_queue_*/terminal_task_* tool surface share one real,
+        # persistent store -- never two independently-drifting ones.
+        import tempfile
+        queue = QueueService(QueueStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-queue-")) / "queue.db"))
+    if integration is None:
+        import tempfile
+        integration = IntegrationService(IntegrationStore(
+            Path(tempfile.mkdtemp(prefix="terminal-mcp-integration-")) / "integration.db"))
     discovery_config = terminal.config.nodes.discovery
     discovery = lan_discovery.DiscoveryService(
         agent_port=discovery_config.agent_port, concurrency=discovery_config.concurrency,
@@ -5565,6 +5719,63 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         )
         if "error" not in result:
             await anyio.to_thread.run_sync(lambda: supervisor.unwatch(session=name, delete=False))
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/rename", methods=["POST"], include_in_schema=False)
+    async def session_rename(request: Request) -> JSONResponse:
+        """Rename Session feature. Same auth+CSRF floor as every other
+        mutation route here; the REAL validation (charset/collision/
+        protected/allowed-pattern) all happens server-side inside
+        controller.terminal_rename_session -> core.py's own
+        terminal_rename_session, never trusted from the client alone.
+
+        Mirrors terminal_rename_session (the MCP tool, mcp_app.py)
+        exactly: the routed rename handles the target node's own real
+        backend rename + local bindings/grants/session_registry
+        propagation; this route additionally propagates to the fleet-
+        wide queue/integration/supervisor-watch stores, same best-effort-
+        on-top-of-an-already-successful-rename posture (a problem in any
+        one of those never gets reported as if the rename itself
+        failed)."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        new_name = body.get("new_name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name or not isinstance(new_name, str) or not new_name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        requested_by = identity.email if identity else "dashboard"
+        _log.info("dashboard rename_session name=%s new_name=%s identity=%s",
+                 name, new_name, identity.email if identity else None)
+
+        def _do_rename() -> dict:
+            result = _routed(lambda: controller.terminal_rename_session(name, new_name, requested_by=requested_by))
+            if "error" in result:
+                return result
+            warnings = list(result.get("warnings") or [])
+            try:
+                queue_result = queue.store.rename_session(name, new_name)
+                result["queue_tasks_updated"] = queue_result["tasks_updated"]
+            except Exception as exc:  # noqa: BLE001 -- best-effort, see docstring
+                warnings.append(f"queue: {exc}")
+            try:
+                integration_result = integration.store.rename_session(name, new_name)
+                result["integration_handoffs_updated"] = integration_result["handoffs_updated"]
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"integration: {exc}")
+            try:
+                result["watches_renamed"] = supervisor.rename_session(name, new_name)
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"supervisor: {exc}")
+            result["warnings"] = warnings
+            return result
+
+        result = await anyio.to_thread.run_sync(_do_rename)
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 

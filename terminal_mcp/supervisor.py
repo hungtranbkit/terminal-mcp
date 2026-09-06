@@ -296,6 +296,38 @@ class SupervisorStore:
 
     # -- watches ----------------------------------------------------------
 
+    def rename_target(self, old_target: str, new_target: str) -> int:
+        """Rename Session feature: re-keys any "session"-kind watch
+        pointed at `old_target` onto `new_target` -- watch_key is
+        DERIVED from (kind, target), so this isn't a plain column
+        update: every other column (state/iteration_count/
+        same_failure_count/pins/completion nonce/...) is carried over
+        onto a row under the NEW key, and the old row is removed,
+        exactly the same "never lose history, just re-key" contract
+        bindings.py/session_registry.py already give this feature.
+        "binding"-kind watches are untouched here -- a binding watch's
+        target is a BINDING name, not a session name; the session it
+        actually points at is handled separately by
+        BindingStore.rename_session_references. Returns the number of
+        watches re-keyed (0 is the common case: most sessions have no
+        active watch)."""
+        old_key = watch_key("session", old_target)
+        new_key = watch_key("session", new_target)
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM watches WHERE watch_key = ?", (old_key,)).fetchone()
+            if row is None:
+                return 0
+            data = dict(row)
+            data["watch_key"] = new_key
+            data["target"] = new_target
+            columns = list(data.keys())
+            connection.execute(
+                f"INSERT OR REPLACE INTO watches ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
+                tuple(data[c] for c in columns),
+            )
+            connection.execute("DELETE FROM watches WHERE watch_key = ?", (old_key,))
+        return 1
+
     def get_watch(self, key: str) -> dict[str, Any] | None:
         with self._connection() as connection:
             row = connection.execute("SELECT * FROM watches WHERE watch_key = ?", (key,)).fetchone()
@@ -706,6 +738,14 @@ class SupervisorService:
 
     def list_watches(self) -> dict[str, Any]:
         return {"watches": [self._watch_view(row) for row in self.store.list_watches()]}
+
+    def rename_session(self, old_session: str, new_session: str) -> int:
+        """Thin passthrough to SupervisorStore.rename_target -- the
+        wiring-layer coordination point mcp_app.py's own
+        terminal_rename_session tool calls, same posture as
+        unwatch(delete=False) already being called from there on
+        kill/delete."""
+        return self.store.rename_target(old_session, new_session)
 
     def get_completion_token(self, binding: str | None = None, session: str | None = None) -> dict[str, Any]:
         """P0-7 phase 2 nonce delivery: the current, unconsumed completion

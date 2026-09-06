@@ -891,7 +891,7 @@ def test_dashboard_health_indicator_no_new_backend_route():
     # registry/reopen and registry/purge -- registry LISTING itself
     # (loadRegistry) goes through the shared fetchJSON() wrapper, already
     # counted once, so it adds no new literal call site of its own.
-    assert DASHBOARD_HTML.count("fetch(") == 16  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere), registry/reopen, registry/purge, watchdog/acknowledge
+    assert DASHBOARD_HTML.count("fetch(") == 17  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere), registry/reopen, registry/purge, watchdog/acknowledge, session/rename (Rename Session feature)
 
 
 def test_dashboard_auth_required_distinguished_from_offline():
@@ -1287,6 +1287,7 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/session/detach": {"POST"},
         "/dashboard/api/session/delete": {"POST"},
         "/dashboard/api/session/kill": {"POST"},
+        "/dashboard/api/session/rename": {"POST"},
         "/dashboard/api/session/reopen": {"POST"},
         "/dashboard/api/killed-sessions": {"GET", "HEAD"},
         "/dashboard/api/connection-health": {"GET", "HEAD"},

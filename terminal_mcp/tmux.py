@@ -192,6 +192,17 @@ class TmuxClient:
         layer up."""
         self._run(["kill-session", "-t", name])
 
+    def rename_session(self, old: str, new: str) -> None:
+        """Real `tmux rename-session -t old new` -- the pane/process
+        (PID, cwd, scrollback, everything the session actually IS)
+        is completely untouched; only tmux's own name for the session
+        changes, exactly like `mv` renaming a file without touching its
+        contents. tmux itself refuses (`can't rename ... to ...: duplicate
+        session`) if `new` already names another live session, so no
+        separate existence check is duplicated here -- the real error
+        just surfaces as a TmuxError, same as every other tmux failure."""
+        self._run(["rename-session", "-t", old, new])
+
     def ensure_output_capture(self, session: str, log_path: str) -> None:
         """Session Knowledge Store's real capture mechanism for tmux
         (core.py wires this in, never called directly by a client) --

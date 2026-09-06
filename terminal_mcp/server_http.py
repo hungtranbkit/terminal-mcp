@@ -15,9 +15,11 @@ from .controller import ControllerService
 from .core import TerminalService
 from .dashboard import node_token_env_var, register_dashboard
 from .health import register_health
+from .integration_service import IntegrationService
 from .logging_setup import RequestIdMiddleware, SecurityHeadersMiddleware, configure_logging
 from .maintenance import MaintenanceLoop
 from .mcp_app import build_mcp
+from .queue_service import QueueService
 from . import network_bind, network_middleware
 from .node_client import LocalNodeClient
 from .node_registry import NodeRegistry
@@ -249,8 +251,20 @@ def main() -> None:
         _log.info("nodes: re-registered previously-connected node %r (%s, transport=%s)",
                  saved.node_id, saved.endpoint, saved.transport_type)
 
-    server = build_mcp(terminal, supervisor, supervisor_v2, controller)
-    register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store)
+    # Constructed ONCE here (real, persistent default db paths -- see
+    # QueueStore/IntegrationStore's own __init__) and handed to BOTH
+    # build_mcp and register_dashboard below, so the Dashboard Task
+    # Manager's own rename/task routes and every terminal_queue_*/
+    # terminal_integration_*/terminal_task_* MCP tool operate on the
+    # exact SAME queue/integration state -- never two independent stores
+    # that could silently drift apart (Rename Session task's own "không
+    # tạo một task store song song" principle, reused here for the
+    # dashboard<->MCP split specifically).
+    queue = QueueService()
+    integration = IntegrationService()
+    server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration)
+    register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
+                       queue=queue, integration=integration)
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)

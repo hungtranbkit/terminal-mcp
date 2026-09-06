@@ -50,6 +50,18 @@ class ControllerService:
         self.local_workspace_root = local_workspace_root
         self._clients: dict[str, NodeClient] = {}
         self._session_location_cache: dict[str, SessionLocation] = {}
+        # Rename Session feature: old_bare_name -> current_bare_name, so a
+        # stale caller (an old dashboard tab, a bookmarked binding call)
+        # still resolves instead of a flat SESSION_NOT_FOUND right after a
+        # rename -- see resolve_session's own use of this below. Kept
+        # in-memory only, same lifetime posture as _session_location_cache
+        # itself (also never persisted): a controller restart loses the
+        # redirect, not any real data -- every store that actually OWNS
+        # session-keyed data (queue/integration/bindings/grants/session_
+        # registry) already got the rename written to disk by
+        # rename_session below, so nothing is lost, a caller just has to
+        # use the current name again after a restart instead of the old one.
+        self._rename_aliases: dict[str, str] = {}
         # Cache TTL: short enough that a session created/killed/moved
         # elsewhere is noticed quickly, long enough that a chatty MCP
         # client (many tool calls in a row for the same session) doesn't
@@ -150,6 +162,20 @@ class ControllerService:
                 found_on.append(node.id)
 
         if not found_on:
+            # Rename Session feature: a bare name that was renamed away
+            # (no qualified "node/name" was given, so this genuinely
+            # wasn't found anywhere just now) may still be a stale
+            # caller using the OLD name -- redirect transparently rather
+            # than a flat SESSION_NOT_FOUND, exactly once (aliases are
+            # collapsed to their final target at rename time, so this
+            # never chains more than one hop).
+            redirect = self._rename_aliases.get(session)
+            if redirect is not None and redirect != session:
+                resolved = self.resolve_session(redirect, now=now)
+                if "error" not in resolved:
+                    resolved = dict(resolved)
+                    resolved["redirected_from"] = session
+                    return resolved
             return {"error": "SESSION_NOT_FOUND", "session": session}
         if len(found_on) > 1:
             return {"error": "AMBIGUOUS_SESSION", "session": session, "nodes": found_on,
@@ -180,6 +206,8 @@ class ControllerService:
         if isinstance(result, dict):
             result.setdefault("node_id", node_id)
             result.setdefault("node_name", node.display_name if node else node_id)
+            if "redirected_from" in resolution:
+                result.setdefault("redirected_from", resolution["redirected_from"])
         return result
 
     def terminal_tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]:
@@ -221,6 +249,62 @@ class ControllerService:
         return self._route(name, "kill", lambda client, bare: client.kill_session(
             bare, confirm_name.split("/", 1)[-1] if "/" in confirm_name else confirm_name, requested_by=requested_by,
         ))
+
+    def terminal_rename_session(self, name: str, new_name: str, *,
+                                requested_by: str | None = None) -> dict[str, Any]:
+        """Rename Session feature, fleet-aware: `name` resolves to a real,
+        currently-existing session exactly like every other routed call;
+        `new_name` is additionally required to resolve to NOTHING
+        anywhere in the fleet right now (task item 3's own "same-node
+        collision" requirement, widened to same-FLEET -- two different
+        nodes ending up with the same bare session name is exactly the
+        AMBIGUOUS_SESSION situation resolve_session already refuses to
+        silently guess through, so a rename must never create one).
+        Node-level mechanics + local-store propagation (bindings/grants/
+        session_registry) all happen inside the target node's own
+        terminal_rename_session (core.py) via the routed call below --
+        this method's own job is purely fleet-level: collision-check,
+        route to the right node, then keep the location cache and the
+        old-name redirect (see resolve_session) in sync with what just
+        happened."""
+        resolution = self.resolve_session(name)
+        if "error" in resolution:
+            return resolution
+        # A same-name "rename" trivially "collides" with itself (name
+        # resolves to the exact session new_name would also resolve to)
+        # -- let it fall through to the routed call instead, so core.py's
+        # own real SAME_NAME check answers it, rather than this method
+        # reporting a confusing NAME_COLLISION against itself.
+        if new_name != name:
+            collision = self.resolve_session(new_name)
+            if "error" not in collision:
+                return {"error": "NAME_COLLISION", "session": name, "new_name": new_name,
+                        "detail": f"a session named {new_name!r} already exists on node {collision['node_id']!r}"}
+        node_id, bare_old = resolution["node_id"], resolution["session"]
+        client = self._clients.get(node_id)
+        if client is None:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": "no client configured for this node"}
+        bare_new = new_name.split("/", 1)[-1] if "/" in new_name else new_name
+        node = self.registry.get(node_id)
+        try:
+            result = client.rename_session(bare_old, bare_new, requested_by=requested_by)
+        except NodeClientError as exc:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
+        if isinstance(result, dict) and "error" not in result:
+            self._session_location_cache.pop(bare_old, None)
+            self._session_location_cache[bare_new] = SessionLocation(node_id=node_id, cached_at=time.monotonic())
+            # Collapse any EXISTING alias chain pointing at bare_old onto
+            # bare_new too (A renamed to B, B now renamed to C -> a
+            # caller still using "A" should redirect straight to "C",
+            # never to the now-stale "B").
+            for old_alias, target in list(self._rename_aliases.items()):
+                if target == bare_old:
+                    self._rename_aliases[old_alias] = bare_new
+            self._rename_aliases[bare_old] = bare_new
+        if isinstance(result, dict):
+            result.setdefault("node_id", node_id)
+            result.setdefault("node_name", node.display_name if node else node_id)
+        return result
 
     # -- Session Knowledge Store (session_knowledge.py) -----------------------
     # timeline/recover/checkpoint are single-session -- routed exactly like

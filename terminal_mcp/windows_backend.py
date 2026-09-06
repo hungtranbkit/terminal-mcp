@@ -1011,6 +1011,28 @@ class WindowsSessionBackend:
         # purely to satisfy the SessionBackend Protocol's shape.
         self._require(session)
 
+    def rename_session(self, old: str, new: str) -> None:
+        """This backend has no OS-level session name at all (identity is
+        the real process's PID, tracked in self._sessions purely as an
+        in-process dict) -- "rename" is just re-keying that dict under
+        the registry lock and updating the entry's own .name field so
+        get_session's returned SessionInfo.name matches immediately.
+        Nothing about the actual ConPTY process/reader thread/buffered
+        output is touched, exactly like TmuxClient.rename_session leaves
+        the real pane/process untouched. Raises TmuxError (this module's
+        established convention -- see _require/kill_session -- never a
+        new exception type) for a missing `old` or a `new` that already
+        names another live session, mirroring tmux's own real
+        `rename-session` refusal for a duplicate target name."""
+        with self._registry_lock:
+            if old not in self._sessions:
+                raise TmuxError(f"session {old!r} does not exist")
+            if new in self._sessions:
+                raise TmuxError(f"can't rename {old!r} to {new!r}: duplicate session")
+            entry = self._sessions.pop(old)
+            entry.name = new
+            self._sessions[new] = entry
+
     # -- Attach/detach bookkeeping for windows_webterm.py's WS bridge -----
 
     def register_viewer(self, name: str, on_detach: Callable[[], None]) -> "queue.Queue[str]":
