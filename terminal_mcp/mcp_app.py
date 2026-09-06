@@ -8,6 +8,9 @@ from .config import load_config
 from .controller import ControllerService, build_default_controller
 from .core import TerminalService
 from .coordinator import CoordinatorGate
+from .integration_engine import IntegrationEngine
+from .integration_service import IntegrationService
+from .integration_store import publish_handoff_for_completed_task
 from .node_models import node_to_dict as _node_to_dict
 from .queue_engine import QueueEngine
 from .queue_service import QueueService
@@ -19,7 +22,8 @@ def build_mcp(service: TerminalService | None = None,
               supervisor: SupervisorService | None = None,
               supervisor_v2: SupervisorV2Service | None = None,
               controller: ControllerService | None = None,
-              queue: QueueService | None = None) -> MCPServer:
+              queue: QueueService | None = None,
+              integration: IntegrationService | None = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -47,7 +51,18 @@ def build_mcp(service: TerminalService | None = None,
     supervisor = supervisor or SupervisorService(terminal, SupervisorStore())
     supervisor_v2 = supervisor_v2 or build_supervisor_v2(supervisor)
     controller = controller or build_default_controller(terminal)
-    queue = queue or QueueService()
+    # 3-role model (task: "Coding A/B + Integration Agent"): constructed
+    # BEFORE queue/queue_engine below so its store exists for their own
+    # on_completed hook to reference -- integration.engine itself is
+    # filled in a few lines down, once queue.store exists too (each
+    # needs the other's store, not the other's engine, so this ordering
+    # has no real circularity).
+    integration = integration or IntegrationService()
+
+    def _on_task_completed(task) -> None:
+        publish_handoff_for_completed_task(task, integration.store)
+
+    queue = queue or QueueService(on_completed=_on_task_completed)
     # Phase 2 (task: "Supervisor Queue v2 Phase 2 -- Coordinator Agent"):
     # one shared QueueEngine over the SAME queue store + the SAME
     # (already node-aware) controller every other routed tool in this
@@ -56,8 +71,12 @@ def build_mcp(service: TerminalService | None = None,
     # nothing here starts an automatic background loop (see queue_
     # engine.py's own module docstring / QueueService.set_auto_dispatch
     # for the explicit per-session opt-in a FUTURE automatic loop would
-    # still have to check).
-    queue_engine = QueueEngine(queue.store, controller, coordinator=CoordinatorGate())
+    # still have to check). on_completed publishes a Handoff for any
+    # task whose own metadata opts in (integration_store.py's own
+    # publish_handoff_for_completed_task) -- a no-op for every other task.
+    queue_engine = QueueEngine(queue.store, controller, coordinator=CoordinatorGate(),
+                              on_completed=_on_task_completed)
+    integration.engine = integration.engine or IntegrationEngine(integration.store, queue.store)
     server = MCPServer(
         name="terminal-mcp",
         description="Whitelist-only tmux observation and controlled input",
@@ -928,5 +947,95 @@ def build_mcp(service: TerminalService | None = None,
         unattended. terminal_queue_run_once above is never gated by
         this."""
         return queue.set_auto_dispatch(session, enabled)
+
+    # -- Integration Agent (task: "3-role model: Coding A/B + Integration
+    # Agent"). Per-PROJECT (not per-session) merge/test pipeline --
+    # session IS the lane for terminal_queue_*; PROJECT is the lane
+    # here. SAFETY: configure() must be called explicitly per project
+    # before anything runs against it; nothing here ever touches a repo
+    # not explicitly configured, and no automatic background loop is
+    # wired (see integration_engine.py's own WAITING_FOR_HANDOFF
+    # docstring) -- terminal_integration_run_once is the only way any
+    # merge/test/promotion step actually happens in this phase.
+
+    @server.tool()
+    def terminal_integration_configure(project: str, repo_path: str, integration_branch: str = "integration",
+                                       main_branch: str = "main", targeted_test_command: list[str] | None = None,
+                                       full_regression_command: list[str] | None = None, batch_size: int = 3,
+                                       batch_max_wait_seconds: float = 1800, auto_promote_enabled: bool = False,
+                                       session_ownership: dict | None = None,
+                                       review_depth: str = "basic") -> dict:
+        """Creates or updates `project`'s Integration Agent pipeline
+        config. auto_promote_enabled defaults False -- promotion to
+        main always needs an explicit terminal_integration_promote call
+        unless a project has been deliberately opted in. session_ownership
+        is an optional {path_prefix: session_name} map, the rework-
+        routing fallback (item 9) used only when a handoff's own
+        origin_session no longer looks like the right owner."""
+        return integration.configure(
+            project, repo_path=repo_path, integration_branch=integration_branch, main_branch=main_branch,
+            targeted_test_command=targeted_test_command, full_regression_command=full_regression_command,
+            batch_size=batch_size, batch_max_wait_seconds=batch_max_wait_seconds,
+            auto_promote_enabled=auto_promote_enabled, session_ownership=session_ownership,
+            review_depth=review_depth,
+        )
+
+    @server.tool()
+    def terminal_integration_status(project: str) -> dict:
+        """Pipeline config, the current in-flight handoff (if any),
+        counts by status, and recent regression batches -- the
+        dashboard's own data source for the Integration lane."""
+        return integration.status(project)
+
+    @server.tool()
+    def terminal_integration_list_handoffs(project: str, status: str | None = None, limit: int = 100) -> dict:
+        return integration.list_handoffs(project, status=status, limit=limit)
+
+    @server.tool()
+    def terminal_integration_run_once(project: str) -> dict:
+        """Runs exactly ONE reconciliation step for `project`'s
+        Integration Agent pipeline: reconcile any stale claim, then at
+        most one of (claim the next READY_FOR_INTEGRATION handoff, run
+        the pre-merge review gate, merge, run the targeted test, or
+        progress a regression batch). Returns action="WAITING_FOR_HANDOFF"
+        when there is genuinely nothing to do -- call this again once a
+        new handoff is expected (see integration_engine.py's own
+        event-driven/WAITING_FOR_HANDOFF docstring for why no automatic
+        loop is wired to call this by itself yet)."""
+        return integration.run_once(project)
+
+    @server.tool()
+    def terminal_integration_pause(project: str, reason: str | None = None) -> dict:
+        return integration.pause(project, reason=reason)
+
+    @server.tool()
+    def terminal_integration_resume(project: str) -> dict:
+        return integration.resume(project)
+
+    @server.tool()
+    def terminal_integration_retry_handoff(project: str, handoff_id: str) -> dict:
+        """REWORK_REQUIRED|BLOCKED -> READY_FOR_INTEGRATION, explicit
+        only -- e.g. after confirming a transient failure or that a
+        flagged risk is actually fine."""
+        return integration.retry_handoff(project, handoff_id)
+
+    @server.tool()
+    def terminal_integration_force_regression(project: str) -> dict:
+        """Explicit 'Force Regression' action (item 8): creates a
+        regression batch from whatever is currently INTEGRATED-but-
+        unbatched right now, even if the configured batch_size/
+        batch_max_wait_seconds threshold hasn't naturally been reached."""
+        return integration.force_regression(project)
+
+    @server.tool()
+    def terminal_integration_promote(project: str, batch_id: str) -> dict:
+        """Explicit promotion of a MERGE_READY batch to main -- the
+        only way a commit ever reaches main when auto_promote_enabled
+        is False (the default)."""
+        return integration.promote(project, batch_id)
+
+    @server.tool()
+    def terminal_integration_events(project: str, limit: int = 50) -> dict:
+        return integration.events(project, limit)
 
     return server

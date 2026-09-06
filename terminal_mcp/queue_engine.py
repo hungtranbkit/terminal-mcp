@@ -120,12 +120,25 @@ class TickResult:
 
 class QueueEngine:
     def __init__(self, store: QueueStore, ops: SessionOps, *, coordinator: CoordinatorGate | None = None,
-                claimed_by: str = DEFAULT_CLAIMED_BY, lease_seconds: float = DEFAULT_LEASE_SECONDS) -> None:
+                claimed_by: str = DEFAULT_CLAIMED_BY, lease_seconds: float = DEFAULT_LEASE_SECONDS,
+                on_completed: Callable[[QueueTask], None] | None = None) -> None:
         self.store = store
         self.ops = ops
         self.coordinator = coordinator or CoordinatorGate()
         self.claimed_by = claimed_by
         self.lease_seconds = lease_seconds
+        # 3-role model follow-up ("publish immutable handoff... rồi lập
+        # tức nhận feature task kế tiếp"): an OPTIONAL callback invoked
+        # with the freshly-COMPLETED task, right after mark_completed_
+        # with_evidence succeeds -- deliberately NOT a direct import of
+        # integration_store.py here (queue_engine.py stays fully
+        # decoupled from the Integration Agent's own store/schema; see
+        # integration_store.py's own module docstring on why they're
+        # separate). mcp_app.py wires this to a small publish-handoff
+        # glue function for any task whose own metadata declares
+        # integration_required. Never blocks/fails the task's own
+        # COMPLETED transition if the callback itself raises.
+        self.on_completed = on_completed
 
     def tick(self, session: str) -> TickResult:
         """One full reconciliation step for `session`'s lane. Always
@@ -272,7 +285,8 @@ class QueueEngine:
             nonce_consumed=False,
         )
         if verified:
-            self.store.mark_completed_with_evidence(task_id, evidence={"completion_marker": marker})
+            completed = self.store.mark_completed_with_evidence(task_id, evidence={"completion_marker": marker})
+            self._notify_completed(completed)
             return TickResult(session, "COMPLETED", task_id=task_id)
         if state == "RUNNING":
             # A false alarm -- the agent picked back up (e.g. a slow
@@ -281,3 +295,11 @@ class QueueEngine:
             return TickResult(session, "RUNNING", task_id=task_id, detail="false alarm, re-armed")
         return TickResult(session, "AWAITING_VERIFICATION", task_id=task_id,
                           detail="no verified completion marker yet")
+
+    def _notify_completed(self, task: QueueTask) -> None:
+        if self.on_completed is None:
+            return
+        try:
+            self.on_completed(task)
+        except Exception:  # noqa: BLE001 -- a handoff-publishing glitch must never un-complete a real task
+            pass

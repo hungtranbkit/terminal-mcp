@@ -77,6 +77,16 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_queue_run_once",
         "terminal_queue_verify",
         "terminal_queue_set_auto_dispatch",
+        "terminal_integration_configure",
+        "terminal_integration_status",
+        "terminal_integration_list_handoffs",
+        "terminal_integration_run_once",
+        "terminal_integration_pause",
+        "terminal_integration_resume",
+        "terminal_integration_retry_handoff",
+        "terminal_integration_force_regression",
+        "terminal_integration_promote",
+        "terminal_integration_events",
     }
 
 

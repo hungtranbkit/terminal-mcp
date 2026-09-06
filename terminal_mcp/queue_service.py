@@ -26,15 +26,21 @@ CALLING set_tasks/append_tasks against those names during this
 feature's own development, not by a technical guard in this file."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from .permissions import valid_session_name
 from .queue_store import VERIFYING, InvalidTransitionError, QueueStore
 
 
 class QueueService:
-    def __init__(self, store: QueueStore | None = None) -> None:
+    def __init__(self, store: QueueStore | None = None, *,
+                on_completed: Callable[[Any], None] | None = None) -> None:
         self.store = store or QueueStore()
+        # Same optional 3-role-model hook as QueueEngine's own
+        # on_completed -- the explicit-fallback completion path
+        # (verify(), below) needs to fire it too, not just the
+        # automatic marker-verified path.
+        self.on_completed = on_completed
 
     def _validate_session(self, session: str) -> dict[str, Any] | None:
         if not session or not valid_session_name(session):
@@ -151,6 +157,11 @@ class QueueService:
         if not evidence:
             return {"error": "EVIDENCE_REQUIRED", "session": session, "task_id": task_id}
         updated = self.store.mark_completed_with_evidence(task_id, evidence=evidence)
+        if self.on_completed is not None:
+            try:
+                self.on_completed(updated)
+            except Exception:  # noqa: BLE001 -- a handoff-publishing glitch must never un-complete a real task
+                pass
         return {"session": session, "task": updated.to_dict()}
 
     def set_auto_dispatch(self, session: str, enabled: bool) -> dict[str, Any]:
