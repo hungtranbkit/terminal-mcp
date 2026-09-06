@@ -46,6 +46,20 @@ class QueueService:
         # once a real SessionOps (the controller) exists -- same
         # deferred-assignment pattern as IntegrationService.engine.
         self.planner = planner
+        # AUTO-DISPATCH background loop (task: "hệ thống tự gửi task kế...
+        # không cần ChatGPT đứng chờ"): the SAME QueueEngine instance
+        # build_mcp constructs (over this SAME store/controller/
+        # coordinator), wired in here so server_http.py's QueueLoop drives
+        # the identical engine every terminal_queue_run_once tool call
+        # already uses -- never a second, independently-constructed
+        # engine that could see stale/duplicate state.
+        self.engine: Any = None
+        # Same deferred-assignment pattern, for the QueueLoop instance
+        # itself (queue_loop.py) -- built once by mcp_app.py's build_mcp
+        # around the SAME self.engine, so server_http.py's config.queue.
+        # enabled gate starts/stops the real, wired-up loop rather than a
+        # second, disconnected one.
+        self.loop: Any = None
 
     def _validate_session(self, session: str) -> dict[str, Any] | None:
         if not session or not valid_session_name(session):

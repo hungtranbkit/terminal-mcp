@@ -202,6 +202,12 @@ class QueueEngine:
             node_id=status_response.get("node_id"), cwd=status_response.get("cwd"),
             current_command=status_response.get("current_command"),
             error=error,
+            # Production-readiness pass: real fields straight off the
+            # routed terminal_status response (core.py's _status_payload
+            # -- state/input_required always present; reader_alive only
+            # ever present for a Windows-backed session, None on tmux).
+            state=status_response.get("state"), input_required=status_response.get("input_required"),
+            reader_alive=status_response.get("reader_alive"),
         )
         other_active = tuple(
             OtherLaneSnapshot(session=lane["session"],

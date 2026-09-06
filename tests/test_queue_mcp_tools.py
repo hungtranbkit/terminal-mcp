@@ -135,3 +135,38 @@ async def test_queue_retry_on_a_non_blocked_task_is_refused_not_silently_applied
     task_id = result["task_ids"][0]
     retried = await _call(server, "terminal_queue_retry", session="lane-a", task_id=task_id)
     assert retried["error"] == "INVALID_TRANSITION"  # still QUEUED, retry is only valid from BLOCKED
+
+
+# ---------------------------------------------------------------------------
+# AUTO-DISPATCH background loop introspection/manual-trigger tools
+# (queue_loop.py).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_queue_loop_status_reports_not_running_when_never_started(server):
+    status = await _call(server, "terminal_queue_loop_status")
+    assert status["running"] is False
+    assert status["last_cycle_at"] is None
+
+
+@pytest.mark.anyio
+async def test_queue_loop_run_once_ticks_only_auto_dispatch_enabled_lanes(server):
+    await _call(server, "terminal_queue_set", session="lane-a", tasks=[{"prompt": "a real task"}])
+    await _call(server, "terminal_queue_set", session="lane-b", tasks=[{"prompt": "a real task"}])
+    await _call(server, "terminal_queue_set_auto_dispatch", session="lane-a", enabled=True)
+    # lane-b left OFF (the default) -- must be completely untouched.
+
+    result = await _call(server, "terminal_queue_loop_run_once")
+    sessions_touched = {r["session"] for r in result["results"]}
+    assert sessions_touched == {"lane-a"}
+
+    status_a = await _call(server, "terminal_queue_status", session="lane-a")
+    status_b = await _call(server, "terminal_queue_status", session="lane-b")
+    assert status_a["tasks"][0]["status"] != "QUEUED"  # lane-a's task was claimed (PRECHECK at least)
+    assert status_b["tasks"][0]["status"] == "QUEUED"  # lane-b completely untouched
+
+    # And terminal_queue_loop_status now shows a real last_cycle_at,
+    # even though the background thread itself was never started.
+    loop_status = await _call(server, "terminal_queue_loop_status")
+    assert loop_status["last_cycle_at"] is not None
+    assert loop_status["running"] is False

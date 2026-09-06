@@ -117,33 +117,111 @@ class RepoEvidence:
     head: str
     clean: bool
     status_lines: tuple[str, ...]
+    # Production-readiness pass (task: "git dirty/conflict/diverged/
+    # unpushed state có ảnh hưởng không") -- has_upstream=False (a fresh
+    # local-only branch, or one with no configured remote-tracking
+    # branch at all) is a legitimate, common state, NOT an error/evidence
+    # failure; ahead/behind are simply 0 in that case (nothing to compare
+    # against), never guessed.
+    has_upstream: bool = False
+    ahead: int = 0
+    behind: int = 0
+
+    @property
+    def diverged(self) -> bool:
+        """True only when BOTH ahead and behind are nonzero -- the real
+        "needs a merge/rebase decision, not safe to auto-continue" state.
+        Being merely ahead (unpushed local commits) or merely behind (a
+        fast-forward away) is routine mid-task state, not a divergence."""
+        return self.has_upstream and self.ahead > 0 and self.behind > 0
 
 
 def git_repo_evidence(cwd: str, *, timeout: float = 10.0) -> RepoEvidence:
     """The default RepoEvidenceCollector: real `git status --porcelain`/
-    `rev-parse` subprocess calls against `cwd`. Raises RepoEvidenceError
-    on ANY failure -- a non-repo directory, git not installed, a
-    permission error, a timeout -- rather than returning a "looks clean"
-    default, which is exactly the fail-open behavior item 7 forbids."""
-    def run(*args: str) -> str:
+    `rev-parse`/`rev-list` subprocess calls against `cwd`. Raises
+    RepoEvidenceError on ANY failure a real repo could not legitimately
+    produce -- git not installed, a permission error, a timeout, `cwd`
+    not a git repo at all -- rather than returning a "looks clean"
+    default, which is exactly the fail-open behavior item 7 forbids. A
+    branch with no upstream configured is NOT such a failure (see
+    RepoEvidence.has_upstream)."""
+    def run(*args: str, allow_failure: bool = False) -> tuple[int, str]:
         try:
             result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
                                     timeout=timeout, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RepoEvidenceError(f"git {' '.join(args)} failed to run in {cwd!r}: {exc}") from exc
-        if result.returncode != 0:
+        if result.returncode != 0 and not allow_failure:
             raise RepoEvidenceError(f"git {' '.join(args)} exited {result.returncode} in {cwd!r}: "
                                     f"{result.stderr.strip()[:300]}")
-        return result.stdout
+        return result.returncode, result.stdout
 
-    branch = run("rev-parse", "--abbrev-ref", "HEAD").strip()
-    head = run("rev-parse", "HEAD").strip()
-    status_output = run("status", "--porcelain")
+    _, branch = run("rev-parse", "--abbrev-ref", "HEAD")
+    branch = branch.strip()
+    _, head = run("rev-parse", "HEAD")
+    head = head.strip()
+    _, status_output = run("status", "--porcelain")
     status_lines = tuple(line for line in status_output.splitlines() if line.strip())
-    return RepoEvidence(branch=branch, head=head, clean=not status_lines, status_lines=status_lines)
+    # `@{upstream}` resolution fails (a real, expected, non-zero exit --
+    # not a repo-read failure) whenever the current branch has no
+    # remote-tracking branch configured -- allow_failure=True here is
+    # what distinguishes that ordinary case from a genuine git/repo
+    # problem, which the two calls above (never allow_failure) still
+    # catch and fail-closed on.
+    upstream_code, upstream_name = run("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}",
+                                       allow_failure=True)
+    has_upstream = upstream_code == 0 and bool(upstream_name.strip())
+    ahead = behind = 0
+    if has_upstream:
+        _, counts = run("rev-list", "--left-right", "--count", "HEAD...@{upstream}")
+        parts = counts.split()
+        if len(parts) == 2 and all(p.isdigit() for p in parts):
+            ahead, behind = int(parts[0]), int(parts[1])
+    return RepoEvidence(branch=branch, head=head, clean=not status_lines, status_lines=status_lines,
+                        has_upstream=has_upstream, ahead=ahead, behind=behind)
 
 
 RepoEvidenceCollector = Callable[[str], RepoEvidence]
+
+
+@dataclass(frozen=True)
+class SmokeTestResult:
+    passed: bool
+    output_tail: str
+    returncode: int | None = None
+
+
+SmokeTestRunner = Callable[[tuple[str, ...], str, float], SmokeTestResult]
+"""(command, cwd, timeout_seconds) -> SmokeTestResult. Pluggable exactly
+like RepoEvidenceCollector/ScopeReasoner -- the default (run_smoke_test_
+command below) is a real subprocess call; tests inject a fake to avoid
+spawning slow/real processes."""
+
+DEFAULT_SMOKE_TEST_TIMEOUT_SECONDS = 120.0
+SMOKE_TEST_OUTPUT_TAIL_CHARS = 2000
+
+
+def run_smoke_test_command(command: tuple[str, ...], cwd: str, timeout_seconds: float) -> SmokeTestResult:
+    """The default SmokeTestRunner (task item 2: "test/build/smoke còn
+    fail không") -- OPT-IN per task (task.metadata['require_smoke_test_
+    command']), never run for an ordinary task that didn't declare one
+    (this module has no way to guess what "the test suite" is for an
+    arbitrary repo). A real subprocess call, bounded by timeout_seconds
+    -- a timeout is itself treated as a FAILED smoke test (fail-closed:
+    "did it definitely pass" is the only way to get READY), never
+    silently ignored or treated as a pass."""
+    try:
+        result = subprocess.run(list(command), cwd=cwd, capture_output=True, text=True,
+                                timeout=timeout_seconds, check=False)
+    except subprocess.TimeoutExpired as exc:
+        partial = (exc.stdout or "") + (exc.stderr or "")
+        return SmokeTestResult(passed=False, output_tail=(partial or "(no output)")[-SMOKE_TEST_OUTPUT_TAIL_CHARS:],
+                               returncode=None)
+    except OSError as exc:
+        return SmokeTestResult(passed=False, output_tail=f"failed to run {command!r}: {exc}", returncode=None)
+    combined = (result.stdout or "") + (result.stderr or "")
+    return SmokeTestResult(passed=result.returncode == 0, output_tail=combined[-SMOKE_TEST_OUTPUT_TAIL_CHARS:],
+                           returncode=result.returncode)
 
 
 @dataclass(frozen=True)
@@ -157,6 +235,13 @@ class SessionSnapshot:
     cwd: str | None
     current_command: str | None
     error: str | None = None  # set when the engine itself could not read status -- fail-closed trigger
+    # Production-readiness pass (task: "session có đang WAITING_INPUT/
+    # BLOCKED/stream stale/node offline không") -- straight from
+    # terminal_status's own classify_status()-derived fields (core.py),
+    # never re-derived or guessed here.
+    state: str | None = None            # e.g. "RUNNING" | "WAITING_INPUT" | "IDLE" | "UNKNOWN"
+    input_required: bool | None = None
+    reader_alive: bool | None = None    # Windows backend only; None (no such concept) on tmux -- never treated as False
 
 
 @dataclass(frozen=True)
@@ -200,10 +285,12 @@ class CoordinatorGate:
     def __init__(self, *, sensitive_patterns: tuple[re.Pattern, ...] = SENSITIVE_PROMPT_PATTERNS,
                 evidence_collector: RepoEvidenceCollector = git_repo_evidence,
                 scope_reasoner: ScopeReasoner = _default_scope_reasoner,
+                smoke_test_runner: SmokeTestRunner = run_smoke_test_command,
                 max_review_attempts: int = DEFAULT_MAX_REVIEW_ATTEMPTS) -> None:
         self.sensitive_patterns = sensitive_patterns
         self.evidence_collector = evidence_collector
         self.scope_reasoner = scope_reasoner
+        self.smoke_test_runner = smoke_test_runner
         self.max_review_attempts = max_review_attempts
 
     def review(self, task: QueueTask, *, store: QueueStore, session: SessionSnapshot,
@@ -288,6 +375,30 @@ class CoordinatorGate:
                 reason=f"could not read the target session's status ({session.error}) -- fail-closed, refusing to dispatch",
             )
 
+        # 4b. Session state check (task item: "session có đang WAITING_
+        #     INPUT/BLOCKED/stream stale/node offline không") -- a
+        #     session already waiting on a human/other prompt, or whose
+        #     output stream is known-dead, must never receive a NEW
+        #     dispatch on top -- that would interleave the new task's
+        #     text with whatever is already pending and confuse both.
+        #     "node offline" is covered by session.error above (a
+        #     SESSION_UNREACHABLE-class error never even reaches here --
+        #     queue_engine.py routes it to WAITING_SESSION before the
+        #     coordinator gate ever runs), so this is specifically the
+        #     "session IS reachable but not actually available" case.
+        if session.input_required or session.state == "WAITING_INPUT":
+            return CoordinatorDecision(
+                NEEDS_HUMAN, evidence={"session_state": session.state, "input_required": session.input_required},
+                reason="session is already waiting on input (a prompt/confirmation pending) -- "
+                      "refusing to dispatch a new task on top of it",
+            )
+        if session.reader_alive is False:
+            return CoordinatorDecision(
+                NEEDS_HUMAN, evidence={"reader_alive": False},
+                reason="session's own output stream reader is not alive (stale stream) -- "
+                      "refusing to dispatch until it's confirmed healthy",
+            )
+
         # 5. Session identity/cwd/branch check -- the exact P0 lesson
         #    from the real window/window2 transcript-collision incident
         #    this same feature's earlier phase fixed live.
@@ -317,6 +428,7 @@ class CoordinatorGate:
 
         # 7. Repo evidence (git status/branch/HEAD) -- fail-closed on
         #    ANY collection failure (item 7).
+        repo: RepoEvidence | None = None
         if session.cwd:
             try:
                 repo = self.evidence_collector(session.cwd)
@@ -332,10 +444,51 @@ class CoordinatorGate:
                     reason=f"uncommitted changes present in {session.cwd!r} ({len(repo.status_lines)} line(s))",
                     required_actions=["commit or stash the uncommitted changes before this task proceeds"],
                 )
+            # 7b. Diverged from upstream (task item: "...conflict/diverged/
+            #     unpushed state có ảnh hưởng không") -- both ahead AND
+            #     behind means a merge/rebase decision is needed; a human
+            #     call, not something to auto-resolve. Merely ahead
+            #     (unpushed commits) or merely behind (a clean fast-
+            #     forward) is routine mid-task state and never blocks on
+            #     its own -- ahead/behind are still always recorded as
+            #     evidence either way, visible on the dashboard.
+            if repo.diverged and not task.metadata.get("allow_diverged_branch"):
+                return CoordinatorDecision(
+                    NEEDS_HUMAN,
+                    evidence={"branch": repo.branch, "head": repo.head, "ahead": repo.ahead, "behind": repo.behind},
+                    reason=f"branch {repo.branch!r} has diverged from its upstream "
+                          f"({repo.ahead} ahead, {repo.behind} behind) -- needs a human merge/rebase decision",
+                    required_actions=["a human resolves the divergence (merge or rebase) before this task proceeds"],
+                )
+
+        # 8. Smoke test (task item 2: "test/build/smoke còn fail không")
+        #    -- OPT-IN per task via metadata['require_smoke_test_command']
+        #    (a list of argv strings); a task that doesn't declare one is
+        #    completely unaffected (this module has no way to guess what
+        #    "the test suite" is for an arbitrary repo/task). A failure
+        #    here is NEEDS_REWORK, not BLOCKED -- the expected remediation
+        #    is a corrective task routed back to the SAME worker (task's
+        #    own explicit "ưu tiên đưa corrective task quay lại chính
+        #    worker"), not a hard stop requiring a human every time.
+        smoke_command = task.metadata.get("require_smoke_test_command")
+        if smoke_command and session.cwd:
+            timeout_seconds = float(task.metadata.get("smoke_test_timeout_seconds", DEFAULT_SMOKE_TEST_TIMEOUT_SECONDS))
+            result = self.smoke_test_runner(tuple(smoke_command), session.cwd, timeout_seconds)
+            if not result.passed:
+                return CoordinatorDecision(
+                    NEEDS_REWORK,
+                    evidence={"smoke_test_command": list(smoke_command), "returncode": result.returncode,
+                             "output_tail": result.output_tail},
+                    reason=f"smoke test command {list(smoke_command)!r} failed (returncode={result.returncode})",
+                    required_actions=["fix the failing test/build/smoke check before this task proceeds"],
+                )
 
         # All checks passed.
-        return CoordinatorDecision(READY, reason="all coordinator checks passed",
-                                   evidence={"node_id": session.node_id, "cwd": session.cwd})
+        ready_evidence: dict[str, Any] = {"node_id": session.node_id, "cwd": session.cwd}
+        if repo is not None:
+            ready_evidence.update({"branch": repo.branch, "head": repo.head, "has_upstream": repo.has_upstream,
+                                   "ahead": repo.ahead, "behind": repo.behind})
+        return CoordinatorDecision(READY, reason="all coordinator checks passed", evidence=ready_evidence)
 
     def _previous_task_in_lane(self, store: QueueStore, task: QueueTask) -> QueueTask | None:
         """The most recent (highest position < task.position) task in

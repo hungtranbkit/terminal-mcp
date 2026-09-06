@@ -92,6 +92,22 @@ class SupervisorConfig:
 
 
 @dataclass(frozen=True)
+class QueueConfig:
+    """Supervisor Queue v2's own AUTO-DISPATCH background loop
+    (queue_loop.py) -- a SEPARATE, independent global kill switch from
+    supervisor.enabled above (this drives QueueEngine.tick() in a loop,
+    not SupervisorService.run_once()). Disabled by default everywhere,
+    same posture as every other autonomous-background-thread config in
+    this project: an operator must explicitly opt in. Even once enabled
+    here, NO session is actually touched until its own lane also sets
+    queue_lanes.auto_dispatch_enabled (a separate, PER-SESSION opt-in
+    this config has no effect on) -- see queue_loop.py's own module
+    docstring for the full two-gate safety reasoning."""
+    enabled: bool = False
+    poll_interval_seconds: float = 3.0
+
+
+@dataclass(frozen=True)
 class DashboardConfig:
     # A boundary specific to the web dashboard's own mutation routes
     # (session input, supervisor event ack, supervisor2 pause) --
@@ -375,6 +391,7 @@ class AppConfig:
     session_knowledge: SessionKnowledgeConfig = SessionKnowledgeConfig()
     ask_chatgpt: AskChatGptConfig = AskChatGptConfig()
     nodes: NodesConfig = NodesConfig()
+    queue: QueueConfig = QueueConfig()
     # Loop-protection metadata schema (see docs/prompt-submission.md, P11):
     # terminal_send_text/_granted accept optional origin/trace_id/parent_
     # turn_id/depth kwargs (all unused by every current caller -- MCP tools,
@@ -603,7 +620,17 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         session_knowledge=_load_session_knowledge_config(raw.get("session_knowledge", {})),
         ask_chatgpt=_load_ask_chatgpt_config(raw.get("ask_chatgpt", {})),
         nodes=nodes_config,
+        queue=_load_queue_config(raw.get("queue", {})),
     )
+
+
+def _load_queue_config(queue_raw: object) -> QueueConfig:
+    if not isinstance(queue_raw, dict):
+        queue_raw = {}
+    poll_interval = float(queue_raw.get("poll_interval_seconds", QueueConfig.poll_interval_seconds))
+    if poll_interval < 0.5:
+        raise ValueError("queue.poll_interval_seconds must be at least 0.5")
+    return QueueConfig(enabled=bool(queue_raw.get("enabled", False)), poll_interval_seconds=poll_interval)
 
 
 def _load_session_knowledge_config(raw: object) -> SessionKnowledgeConfig:

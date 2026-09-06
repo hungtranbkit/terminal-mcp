@@ -312,3 +312,203 @@ def test_artificial_blocker_true_without_a_string_reason_still_blocks(store):
     gate = CoordinatorGate(evidence_collector=_fake_collector_factory())
     decision = gate.review(task, store=store, session=_ok_session())
     assert decision.status == BLOCKED
+
+
+# ---------------------------------------------------------------------------
+# Production-readiness pass: session state (WAITING_INPUT/stale stream).
+# ---------------------------------------------------------------------------
+
+def test_session_waiting_input_needs_human(store):
+    task = _make_task(store)
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory())
+    decision = gate.review(task, store=store, session=_ok_session(state="WAITING_INPUT", input_required=True))
+    assert decision.status == NEEDS_HUMAN
+    assert "waiting on input" in decision.reason
+
+
+def test_session_input_required_true_needs_human_even_if_state_looks_ok(store):
+    task = _make_task(store)
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory())
+    decision = gate.review(task, store=store, session=_ok_session(state="UNKNOWN", input_required=True))
+    assert decision.status == NEEDS_HUMAN
+
+
+def test_session_reader_not_alive_needs_human(store):
+    task = _make_task(store)
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory())
+    decision = gate.review(task, store=store, session=_ok_session(reader_alive=False))
+    assert decision.status == NEEDS_HUMAN
+    assert "stale stream" in decision.reason
+
+
+def test_session_reader_alive_none_is_fine_tmux_has_no_such_concept(store):
+    task = _make_task(store)
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory())
+    decision = gate.review(task, store=store, session=_ok_session(reader_alive=None))
+    assert decision.status == READY
+
+
+def test_session_running_state_is_fine(store):
+    task = _make_task(store)
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory())
+    decision = gate.review(task, store=store, session=_ok_session(state="RUNNING", input_required=False))
+    assert decision.status == READY
+
+
+# ---------------------------------------------------------------------------
+# Production-readiness pass: git diverged/ahead/behind (real repos, real
+# remote-tracking branches -- never a fake RepoEvidence for this one, since
+# the actual `git rev-list --left-right --count`/`@{upstream}` parsing is
+# exactly what needs proving).
+# ---------------------------------------------------------------------------
+
+def _init_bare_remote_and_clone(tmp_path):
+    """A real bare 'origin' + a real clone tracking it -- the minimal setup
+    that gives the clone a real @{upstream} to diverge from/behind/ahead of."""
+    bare = tmp_path / "origin.git"
+    bare.mkdir()
+    subprocess.run(["git", "init", "-q", "--bare"], cwd=bare, check=True)
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(bare), str(clone)], check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=clone, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=clone, check=True)
+    (clone / "README.md").write_text("hello\n")
+    subprocess.run(["git", "add", "."], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=clone, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "HEAD"], cwd=clone, check=True)
+    return bare, clone
+
+
+def test_real_git_repo_with_no_upstream_at_all_is_ready(store, tmp_path):
+    """A fresh local-only branch (init, no remote at all) is a real, common
+    state -- has_upstream=False must never be treated as an evidence
+    failure or as "diverged"."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_real_git_repo(repo)
+    task = _make_task(store)
+    gate = CoordinatorGate()
+    decision = gate.review(task, store=store, session=_ok_session(cwd=str(repo)))
+    assert decision.status == READY
+    assert decision.evidence["has_upstream"] is False
+    assert decision.evidence["ahead"] == 0 and decision.evidence["behind"] == 0
+
+
+def test_real_git_repo_ahead_only_is_still_ready(store, tmp_path):
+    """Unpushed local commits alone (ahead > 0, behind == 0) is routine
+    mid-task state -- must never block on its own."""
+    _bare, clone = _init_bare_remote_and_clone(tmp_path)
+    (clone / "new_file.txt").write_text("a new unpushed commit\n")
+    subprocess.run(["git", "add", "."], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "unpushed work"], cwd=clone, check=True)
+    task = _make_task(store)
+    gate = CoordinatorGate()
+    decision = gate.review(task, store=store, session=_ok_session(cwd=str(clone)))
+    assert decision.status == READY
+    assert decision.evidence["ahead"] == 1 and decision.evidence["behind"] == 0
+
+
+def test_real_git_repo_diverged_needs_human(store, tmp_path):
+    """A REAL divergence: one commit pushed to origin from a second clone,
+    one different, unpushed local commit in the first clone -- ahead AND
+    behind both nonzero, exactly the case that needs a human merge/rebase
+    call."""
+    bare, clone = _init_bare_remote_and_clone(tmp_path)
+    # A second clone pushes a diverging commit to the same remote.
+    other_clone = tmp_path / "other-clone"
+    subprocess.run(["git", "clone", "-q", str(bare), str(other_clone)], check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=other_clone, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=other_clone, check=True)
+    (other_clone / "from_other_clone.txt").write_text("a remote-side commit\n")
+    subprocess.run(["git", "add", "."], cwd=other_clone, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "remote-side work"], cwd=other_clone, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "HEAD"], cwd=other_clone, check=True)
+    # The first clone makes its OWN, different, unpushed local commit.
+    (clone / "from_first_clone.txt").write_text("a local-side commit\n")
+    subprocess.run(["git", "add", "."], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "local-side work"], cwd=clone, check=True)
+    subprocess.run(["git", "fetch", "-q"], cwd=clone, check=True)  # sees the remote-side commit, doesn't merge it
+
+    task = _make_task(store)
+    gate = CoordinatorGate()
+    decision = gate.review(task, store=store, session=_ok_session(cwd=str(clone)))
+    assert decision.status == NEEDS_HUMAN
+    assert decision.evidence["ahead"] == 1 and decision.evidence["behind"] == 1
+    assert "diverged" in decision.reason
+
+
+def test_real_git_repo_diverged_allowed_when_task_metadata_opts_in(store, tmp_path):
+    bare, clone = _init_bare_remote_and_clone(tmp_path)
+    other_clone = tmp_path / "other-clone"
+    subprocess.run(["git", "clone", "-q", str(bare), str(other_clone)], check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=other_clone, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=other_clone, check=True)
+    (other_clone / "from_other_clone.txt").write_text("a remote-side commit\n")
+    subprocess.run(["git", "add", "."], cwd=other_clone, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "remote-side work"], cwd=other_clone, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "HEAD"], cwd=other_clone, check=True)
+    (clone / "from_first_clone.txt").write_text("a local-side commit\n")
+    subprocess.run(["git", "add", "."], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "local-side work"], cwd=clone, check=True)
+    subprocess.run(["git", "fetch", "-q"], cwd=clone, check=True)
+
+    task = _make_task(store, metadata={"allow_diverged_branch": True})
+    gate = CoordinatorGate()
+    decision = gate.review(task, store=store, session=_ok_session(cwd=str(clone)))
+    assert decision.status == READY
+
+
+# ---------------------------------------------------------------------------
+# Production-readiness pass: opt-in smoke test (task item 2).
+# ---------------------------------------------------------------------------
+
+def test_smoke_test_not_declared_is_unaffected(store, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_real_git_repo(repo)
+    task = _make_task(store)  # no require_smoke_test_command in metadata
+    calls = []
+    def runner(command, cwd, timeout_seconds):
+        calls.append(command)
+        raise AssertionError("must never be called when not declared")
+    gate = CoordinatorGate(smoke_test_runner=runner)
+    decision = gate.review(task, store=store, session=_ok_session(cwd=str(repo)))
+    assert decision.status == READY
+    assert calls == []
+
+
+def test_smoke_test_passing_is_ready(store, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_real_git_repo(repo)
+    task = _make_task(store, metadata={"require_smoke_test_command": ["true"]})
+    gate = CoordinatorGate()  # the REAL run_smoke_test_command subprocess runner
+    decision = gate.review(task, store=store, session=_ok_session(cwd=str(repo)))
+    assert decision.status == READY
+
+
+def test_smoke_test_failing_needs_rework_with_real_evidence(store, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_real_git_repo(repo)
+    task = _make_task(store, metadata={
+        "require_smoke_test_command": ["python3", "-c", "print('assertion failed: widget count'); exit(1)"],
+    })
+    gate = CoordinatorGate()  # the REAL run_smoke_test_command subprocess runner
+    decision = gate.review(task, store=store, session=_ok_session(cwd=str(repo)))
+    assert decision.status == NEEDS_REWORK
+    assert decision.evidence["returncode"] == 1
+    assert "widget count" in decision.evidence["output_tail"]
+
+
+def test_smoke_test_timeout_is_treated_as_a_failure(store, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_real_git_repo(repo)
+    task = _make_task(store, metadata={
+        "require_smoke_test_command": ["python3", "-c", "import time; time.sleep(5)"],
+        "smoke_test_timeout_seconds": 0.2,
+    })
+    gate = CoordinatorGate()
+    decision = gate.review(task, store=store, session=_ok_session(cwd=str(repo)))
+    assert decision.status == NEEDS_REWORK

@@ -14,6 +14,7 @@ from .integration_service import IntegrationService
 from .integration_store import publish_handoff_for_completed_task
 from .node_models import node_to_dict as _node_to_dict
 from .queue_engine import QueueEngine
+from .queue_loop import QueueLoop
 from .queue_service import QueueService
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
@@ -77,6 +78,7 @@ def build_mcp(service: TerminalService | None = None,
     # publish_handoff_for_completed_task) -- a no-op for every other task.
     queue_engine = QueueEngine(queue.store, controller, coordinator=CoordinatorGate(),
                               on_completed=_on_task_completed)
+    queue.engine = queue.engine or queue_engine
     integration.engine = integration.engine or IntegrationEngine(integration.store, queue.store)
     # Task Migration/Load Balancing: same node-aware controller as
     # everything else, so eligibility checks (item 6) resolve a
@@ -113,6 +115,18 @@ def build_mcp(service: TerminalService | None = None,
             tmux_session_count=len(items), agent_counts=agent_counts,
             agent_types=agent_types, agent_version=None,
         )
+
+    # AUTO-DISPATCH background loop (queue_loop.py) -- constructed here
+    # (not started -- see server_http.py's own config.queue.enabled gate
+    # for that) so it drives the SAME queue_engine every terminal_queue_
+    # run_once tool call already uses, and reuses this SAME
+    # _refresh_local_heartbeat closure rather than a second, duplicated
+    # copy. Exposed as queue.loop so server_http.py can start/stop it and
+    # a status tool below can report on it.
+    queue.loop = queue.loop or QueueLoop(
+        queue_engine, poll_interval_seconds=terminal.config.queue.poll_interval_seconds,
+        heartbeat_refresher=_refresh_local_heartbeat,
+    )
 
     def _active_queue_task_for(session: str) -> dict | None:
         """P0 (task: "persist-before-dispatch", item 10): does `session`
@@ -1114,11 +1128,14 @@ def build_mcp(service: TerminalService | None = None,
         QUEUED task, run the Coordinator Agent's gate review on a
         PRECHECK task, dispatch a READY task, or check a RUNNING/
         VERIFYING task for a verified completion marker). Safe to call
-        repeatedly/idempotently -- this is how a queue actually
-        progresses in this phase (no automatic background loop is
-        wired yet); call it again to advance further. Never bypasses
-        the Coordinator gate and never auto-dispatches into a paused
-        lane."""
+        repeatedly/idempotently. A lane with queue_lanes.
+        auto_dispatch_enabled=True AND the global config.queue.enabled
+        loop running (queue_loop.py) already advances on its own, on a
+        short interval -- this tool remains available for a lane that
+        hasn't opted into that (e.g. every lane by default), or to force
+        one extra step immediately rather than waiting for the next
+        automatic cycle. Never bypasses the Coordinator gate and never
+        auto-dispatches into a paused lane."""
         return queue_engine.tick(session).to_dict()
 
     @server.tool()
@@ -1133,15 +1150,43 @@ def build_mcp(service: TerminalService | None = None,
 
     @server.tool()
     def terminal_queue_set_auto_dispatch(session: str, enabled: bool) -> dict:
-        """Explicit, per-session opt-in/out for an AUTOMATIC background
-        dispatch loop (OFF by default for every lane -- task's own
-        explicit constraint: never on by default for an existing
-        production session). No automatic loop is wired to run in this
-        phase regardless of this flag; it exists now so a future one
-        has something real to check before it may ever touch a lane
-        unattended. terminal_queue_run_once above is never gated by
-        this."""
+        """Explicit, per-session opt-in/out for the AUTOMATIC background
+        dispatch loop (queue_loop.py; OFF by default for every lane --
+        task's own explicit constraint: never on by default for an
+        existing production session). This is the PER-LANE half of a
+        two-gate safety mechanism -- the loop itself must ALSO be
+        globally enabled (config.queue.enabled, an operator-only
+        config.yaml setting, never toggleable from here) before this
+        flag has any effect; a lane with this on but the global loop off
+        is still completely inert. terminal_queue_run_once above is
+        never gated by either gate -- it can always be called manually,
+        regardless."""
         return queue.set_auto_dispatch(session, enabled)
+
+    @server.tool()
+    def terminal_queue_loop_status() -> dict:
+        """Whether the AUTOMATIC background dispatch loop (queue_loop.py)
+        is actually running right now, its poll interval, when its last
+        cycle completed, and its last error (if any) -- distinct from
+        any single lane's own auto_dispatch_enabled flag. A lane can have
+        auto_dispatch_enabled=True while this reports running=False
+        (config.queue.enabled is off system-wide) -- exactly the "why
+        isn't my task moving on its own" question this answers."""
+        if queue.loop is None:
+            return {"running": False, "poll_interval_seconds": None, "last_cycle_at": None, "last_error": None}
+        return queue.loop.status()
+
+    @server.tool()
+    def terminal_queue_loop_run_once() -> dict:
+        """Manually forces exactly one full cycle of the automatic
+        dispatch loop -- one tick() per lane that has auto_dispatch_
+        enabled=True, regardless of whether the background loop itself
+        is currently running. Useful for tests/smoke or to force
+        immediate progress without waiting for the next automatic
+        interval."""
+        if queue.loop is None:
+            return {"error": "QUEUE_LOOP_NOT_CONFIGURED"}
+        return {"results": queue.loop.run_one_cycle()}
 
     # -- Integration Agent (task: "3-role model: Coding A/B + Integration
     # Agent"). Per-PROJECT (not per-session) merge/test pipeline --

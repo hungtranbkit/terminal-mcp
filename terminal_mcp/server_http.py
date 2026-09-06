@@ -288,6 +288,24 @@ def main() -> None:
         loop.start()
         atexit.register(loop.stop)
 
+    # Supervisor Queue v2's own AUTO-DISPATCH background loop (queue_
+    # loop.py) -- an INDEPENDENT global kill switch from config.supervisor
+    # above (see QueueConfig's own docstring for why these are two
+    # separate opt-ins, never combined). Even when this is on, no lane is
+    # actually touched unless it ALSO has its own queue_lanes.
+    # auto_dispatch_enabled set -- see queue_loop.py's own module
+    # docstring for the full two-gate reasoning; this is the mechanism
+    # that keeps `window`/`window2` (or any other real session) safe from
+    # ever being auto-dispatched until their own operator opts that ONE
+    # lane in specifically. The QueueLoop INSTANCE itself is constructed
+    # inside build_mcp (queue.loop) -- reusing that SAME build_mcp-owned
+    # _refresh_local_heartbeat closure every other routed tool call
+    # already uses, rather than a second, duplicated copy here -- this is
+    # only responsible for starting/stopping it based on config.
+    if config.queue.enabled:
+        queue.loop.start()
+        atexit.register(queue.loop.stop)
+
     # P1 hardening item #9: unconditional, unlike the supervisor loop
     # above -- audit.db accumulates from any terminal_send_text/_keys call
     # regardless of whether Supervisor Loop v1 is enabled, so its

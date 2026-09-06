@@ -98,6 +98,8 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_task_rebalance",
         "terminal_session_tasks",
         "terminal_fleet_task_summary",
+        "terminal_queue_loop_status",
+        "terminal_queue_loop_run_once",
     }
 
 
