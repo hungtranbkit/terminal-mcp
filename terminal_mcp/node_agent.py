@@ -31,7 +31,9 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import sys
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -52,6 +54,22 @@ from .node_client import LocalNodeClient
 from .webterm import WebTerminalProcess, pump_websocket
 
 _log = logging.getLogger(__name__)
+
+# Process generation id (Phase 0 node-agent restart-safety audit,
+# 2026-09-06, task item 2: "process generation" as part of the explicit,
+# no-fake-resurrection recovery contract) -- a fresh random id computed
+# ONCE per process, at import time, never persisted/reused across a
+# restart. Exposed in /v1/health and every heartbeat push so the
+# controller/dashboard/session_registry can tell "this is a NEW agent
+# process instance" apart from the one that was running a moment ago,
+# even though node_id/host/port are all unchanged -- e.g. to show
+# "sessions reported by generation X are gone; this is generation Y"
+# rather than silently conflating two different process lifetimes under
+# the same node_id. Deliberately NOT a monotonic counter (would need its
+# own persisted state to survive correctly across every possible restart
+# path, including a fresh state dir) -- a random id is simpler and just
+# as sufficient for "is this the same process instance or not".
+AGENT_GENERATION = secrets.token_hex(8)
 
 
 def _read_token(token: str | None, token_file: str | None) -> str:
@@ -87,7 +105,46 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         return None
 
     async def health(request: Request) -> JSONResponse:
-        return JSONResponse({"status": "ok", "node_id": node_id, "version": __version__})
+        return JSONResponse({"status": "ok", "node_id": node_id, "version": __version__,
+                             "agent_generation": AGENT_GENERATION})
+
+    async def internal_shutdown(request: Request) -> JSONResponse:
+        """Deterministic, graceful self-shutdown (Phase 0 node-agent
+        restart-safety audit, 2026-09-06) -- REPLACES relying on
+        `schtasks /end`/an external TerminateProcess to stop this
+        process for a restart. Real, live-reproduced bug this exists to
+        fix: `schtasks /end` on this project's own real Scheduled Task
+        deployment shape was confirmed (both against the real dell-5530
+        node-agent AND a fully isolated disposable one, same result
+        twice) to be non-deterministic and unsafe -- it left the actual
+        node-agent process (the one holding the port) running untouched
+        while SEPARATELY, silently killing that process's own ConPTY
+        session children, with no error and no visible sign anything had
+        happened. Never once did it actually achieve the restart it was
+        asked for either. This endpoint sidesteps that whole ambiguity:
+        the process asks uvicorn to stop serving via its own supported
+        `should_exit` mechanism and then returns from `main()` through
+        the ordinary, unwound Python interpreter shutdown path -- no
+        TerminateProcess, no reliance on Task Scheduler's own process-
+        tree bookkeeping at all. A caller (deploy tooling, an operator)
+        still separately triggers the Scheduled Task's own start trigger
+        (or waits for its at-logon/at-startup trigger) to bring a NEW
+        instance up once this one has actually exited -- this endpoint
+        only ever stops, never restarts, by design (a single action
+        doing both would remove the caller's own ability to verify the
+        stop actually completed, e.g. by polling for the port to free,
+        before starting a new one).
+
+        Whether a session's ConPTY child processes actually survive THIS
+        graceful exit path (as opposed to the schtasks-driven kill this
+        replaces) is exactly the open question the disposable-session
+        restart tests (this task's own item 3) exist to answer with real
+        evidence -- never asserted here."""
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        request.app.state.shutdown_event.set()
+        return JSONResponse({"shutdown_requested": True, "node_id": node_id,
+                             "agent_generation": AGENT_GENERATION})
 
     async def metrics(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
@@ -223,6 +280,26 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         except ValueError:
             body = {}
         result = await anyio.to_thread.run_sync(lambda: client.reopen_session(
+            request.path_params["name"], agent_type=body.get("agent_type"), cwd=body.get("cwd"),
+            grant_mode=body.get("grant_mode", "none"), requested_by=body.get("requested_by"),
+        ))
+        return JSONResponse(result)
+
+    async def registry_reopen_session(request: Request) -> JSONResponse:
+        # Phase 0 node-agent restart-safety audit (2026-09-06): the
+        # Persistent Session Registry's own honest, MISSING/OFFLINE-aware
+        # reopen -- see LocalNodeClient.registry_reopen's own docstring
+        # for why this is a SEPARATE route from reopen_session above, not
+        # a replacement for it. This is the recovery path a node-agent
+        # restart actually needs (never Killed, so reopen_session's own
+        # killed_sessions.py-backed metadata has nothing for it).
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        result = await anyio.to_thread.run_sync(lambda: client.registry_reopen(
             request.path_params["name"], agent_type=body.get("agent_type"), cwd=body.get("cwd"),
             grant_mode=body.get("grant_mode", "none"), requested_by=body.get("requested_by"),
         ))
@@ -392,6 +469,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         Route("/v1/sessions/{name}/kill", kill_session, methods=["POST"]),
         Route("/v1/sessions/{name}/rename", rename_session, methods=["POST"]),
         Route("/v1/sessions/{name}/reopen", reopen_session, methods=["POST"]),
+        Route("/v1/sessions/{name}/registry-reopen", registry_reopen_session, methods=["POST"]),
         Route("/v1/sessions/{name}/grant-read", session_grant_read, methods=["POST"]),
         Route("/v1/sessions/{name}/grant-input", session_grant_input, methods=["POST"]),
         Route("/v1/killed-sessions", killed_sessions, methods=["GET"]),
@@ -401,9 +479,29 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         Route("/v1/knowledge/checkpoint/{name}", knowledge_checkpoint, methods=["POST"]),
         Route("/v1/watchdog/events", watchdog_events, methods=["GET"]),
         Route("/v1/watchdog/acknowledge/{event_id}", watchdog_acknowledge, methods=["POST"]),
+        Route("/v1/internal/shutdown", internal_shutdown, methods=["POST"]),
         WebSocketRoute("/v1/ws/terminal", terminal_ws, name="node_agent_terminal_ws"),
     ]
-    return Starlette(routes=routes)
+    app = Starlette(routes=routes)
+    # threading.Event, not anyio.Event -- safe to touch from a plain sync
+    # context too (no event-loop affinity), and the only thing ever done
+    # with it is a fast, non-blocking .set()/.is_set() from Starlette's
+    # async request handler above and the polling watcher below.
+    app.state.shutdown_event = threading.Event()
+    return app
+
+
+async def watch_for_shutdown(app: Starlette, server: "uvicorn.Server", *,
+                             poll_interval_seconds: float = 0.2) -> None:
+    """Shared by node_agent.py's and windows_agent.py's own `main()` --
+    run as a sibling task alongside `server.serve()`; translates a
+    graceful-shutdown request (internal_shutdown route above) into
+    uvicorn's own supported `should_exit` flag, which `server.serve()`
+    itself already polls to unwind cleanly. See internal_shutdown's own
+    docstring for the real bug this whole mechanism replaces."""
+    while not app.state.shutdown_event.is_set():
+        await anyio.sleep(poll_interval_seconds)
+    server.should_exit = True
 
 
 async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller_url: str, token: str,
@@ -435,7 +533,7 @@ async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller
             body = json.dumps({
                 "metrics": metrics.__dict__, "tmux_session_count": len(session_rows),
                 "agent_counts": agent_counts, "agent_types": list(agent_types),
-                "agent_version": __version__, "labels": [],
+                "agent_version": __version__, "agent_generation": AGENT_GENERATION, "labels": [],
                 "platform": platform, "session_backend": session_backend,
                 "shell_capabilities": list(shell_capabilities), "wsl_available": wsl_available,
             }).encode()
@@ -487,7 +585,19 @@ def main(argv: list[str] | None = None) -> int:
             tg.start_soon(_heartbeat_task)
             server_config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
             server = uvicorn.Server(server_config)
+
+            async def _shutdown_watch() -> None:
+                await watch_for_shutdown(app, server)
+
+            tg.start_soon(_shutdown_watch)
             await server.serve()
+            # server.serve() returning (external signal OR the graceful
+            # /v1/internal/shutdown path above) must actually end this
+            # process -- without this, the task group's own __aexit__
+            # would wait forever on _heartbeat_task (an intentional,
+            # never-returns-on-its-own `while True` loop), silently
+            # hanging the process past what looks like a clean shutdown.
+            tg.cancel_scope.cancel()
 
     anyio.run(run)
     return 0

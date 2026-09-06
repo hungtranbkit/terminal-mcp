@@ -122,6 +122,17 @@ class FakeNodeClient:
         self._sessions[name] = {"agent_type": agent_type, "cwd": cwd}
         return {"session": name, "state": "READY", "agent_type": agent_type, "cwd": cwd}
 
+    def registry_reopen(self, name: str, *, agent_type=None, cwd=None, grant_mode="none",
+                        requested_by=None) -> dict[str, Any]:
+        self.calls.append(("registry_reopen", name))
+        if self.broken:
+            raise NodeClientError("simulated transport failure")
+        if agent_type is None:
+            return {"error": "REOPEN_METADATA_INCOMPLETE", "session": name, "missing": ["agent_type"]}
+        self._sessions[name] = {"agent_type": agent_type, "cwd": cwd}
+        return {"session": name, "state": "READY", "agent_type": agent_type, "cwd": cwd,
+               "recreated_from_registry": True}
+
     def grant_read(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
         self.calls.append(("grant_read", name))
         if self.broken:
@@ -935,3 +946,83 @@ def test_watchdog_acknowledge_session_event_unknown_node(tmp_path):
     controller, _service = _controller(tmp_path)
     result = controller.terminal_watchdog_acknowledge_session_event("no-such-node", 1)
     assert result["error"] == "NODE_NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# terminal_registry_reopen -- FLEET-AWARE (Phase 0 node-agent restart-
+# safety audit, 2026-09-06). Previously this tool bypassed `controller`
+# entirely (mcp_app.py called `terminal.terminal_registry_reopen` on the
+# LOCAL TerminalService only), leaving a remote node's own MISSING
+# sessions with no working recovery path at all -- confirmed live against
+# a real disposable dell-5530 session before this fix. Unlike
+# terminal_reopen_session above (routes via each node's own killed-
+# sessions list), the target session here is MISSING/OFFLINE, never
+# Killed, so a bare name must use the qualified node_id/session form
+# (resolve_session's bare-name path only searches currently-LIVE
+# sessions -- see controller.py's own terminal_registry_reopen docstring).
+# ---------------------------------------------------------------------------
+
+def test_registry_reopen_routes_to_the_right_remote_node_via_qualified_name(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    remote = FakeNodeClient()
+    _register_fake_remote(controller, "remote-reg", remote)
+
+    result = controller.terminal_registry_reopen("remote-reg/ctrl-reg-reopen", agent_type="shell",
+                                                  cwd="/tmp/somewhere")
+    assert result.get("error") is None, result
+    assert result["node_id"] == "remote-reg"
+    assert result["recreated_from_registry"] is True
+    assert ("registry_reopen", "ctrl-reg-reopen") in remote.calls
+
+
+def test_registry_reopen_bare_name_for_a_missing_session_is_not_found(tmp_path):
+    # The whole point of the qualified-name requirement: a MISSING
+    # session (by definition not in any node's current live listing)
+    # cannot be found via the ordinary bare-name resolution path.
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    remote = FakeNodeClient()
+    _register_fake_remote(controller, "remote-reg2", remote)
+
+    result = controller.terminal_registry_reopen("ctrl-reg-bare-missing", agent_type="shell")
+    assert result["error"] == "SESSION_NOT_FOUND"
+    assert ("registry_reopen", "ctrl-reg-bare-missing") not in remote.calls
+
+
+def test_registry_reopen_propagates_incomplete_metadata_error(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    remote = FakeNodeClient()
+    _register_fake_remote(controller, "remote-reg3", remote)
+
+    result = controller.terminal_registry_reopen("remote-reg3/ctrl-reg-incomplete")
+    assert result["error"] == "REOPEN_METADATA_INCOMPLETE"
+    assert result["missing"] == ["agent_type"]
+
+
+def test_registry_reopen_unreachable_node_reports_cleanly(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    result = controller.terminal_registry_reopen("no-such-node/ctrl-reg-unreachable", agent_type="shell")
+    assert result["error"] == "NODE_NOT_FOUND"
+
+
+def test_registry_reopen_local_node_uses_the_real_session_registry(tmp_path):
+    # Local node: no fake client, exercises the REAL LocalNodeClient ->
+    # TerminalService.terminal_registry_reopen path end-to-end -- a
+    # session must first be reconciled (seen via terminal_list_sessions)
+    # before the registry has anything to reopen from.
+    controller, service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    controller.terminal_create_session("ctrl-reg-local", "shell", str(tmp_path))
+    try:
+        controller.terminal_list_sessions()  # reconcile pass: upserts ACTIVE
+        controller.terminal_kill_session("ctrl-reg-local", "ctrl-reg-local")
+        controller.terminal_list_sessions()  # reconcile pass: marks MISSING... except Kill marks it KILLED directly
+        result = controller.terminal_registry_reopen("local/ctrl-reg-local")
+        assert result.get("error") is None, result
+        assert result["recreated_from_registry"] is True
+    finally:
+        import subprocess
+        subprocess.run(["tmux", "kill-session", "-t", "ctrl-reg-local"], check=False, capture_output=True)

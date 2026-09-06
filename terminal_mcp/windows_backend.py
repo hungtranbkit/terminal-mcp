@@ -60,6 +60,7 @@ real Windows -- see this module's own report entry in the final summary.
 """
 from __future__ import annotations
 
+import os
 import queue
 import re
 import sys
@@ -660,12 +661,19 @@ class WindowsSessionBackend:
     def __init__(self, *, shell: str = DEFAULT_SHELL, history_lines: int = DEFAULT_HISTORY_LINES,
                 process_factory: ProcessFactory | None = None,
                 foreground_command_resolver: ForegroundCommandResolver | None = None,
-                foreground_cmdline_resolver: ForegroundCommandLineResolver | None = None) -> None:
+                foreground_cmdline_resolver: ForegroundCommandLineResolver | None = None,
+                pid_alive_resolver: PidAliveResolver | None = None) -> None:
         self.shell = shell
         self.history_lines = history_lines
         self._process_factory = process_factory or _default_process_factory
         self._foreground_command_resolver = foreground_command_resolver or _win32_foreground_command
         self._foreground_cmdline_resolver = foreground_cmdline_resolver or _win32_foreground_command_line
+        # OS-authoritative liveness check -- injectable for tests, same
+        # posture as the two resolvers above; see _win32_pid_alive's own
+        # docstring for the real, live-reproduced bug this fixes
+        # (pywinpty's own isalive() staying True indefinitely for a
+        # ConPTY child confirmed gone at the OS level).
+        self._pid_alive_resolver = pid_alive_resolver or _win32_pid_alive
         self._sessions: dict[str, _WindowsSession] = {}
         self._registry_lock = threading.Lock()
 
@@ -681,7 +689,7 @@ class WindowsSessionBackend:
             session = self._sessions.get(name)
         if session is None:
             return None
-        alive = _is_alive(session.proc)
+        alive = _is_alive(session.proc, pid_alive_resolver=self._pid_alive_resolver)
         if alive:
             self._ensure_reader_alive(session)
         fallback_command = Path(session.command or self.shell).name
@@ -1192,7 +1200,7 @@ class WindowsSessionBackend:
                 # a session's live output stream would go permanently
                 # silent after its first idle gap, well before the
                 # process itself ever exited.
-                if not _is_alive(entry.proc):
+                if not _is_alive(entry.proc, pid_alive_resolver=self._pid_alive_resolver):
                     break
                 continue
             entry.activity_epoch = int(time.time())
@@ -1231,7 +1239,90 @@ class WindowsSessionBackend:
             return list(entry.buffer)
 
 
-def _is_alive(proc: PtyProcessLike) -> bool:
+_STILL_ACTIVE = 259
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def _win32_pid_alive(pid: int) -> bool:
+    """OS-authoritative "is this PID still a real, running process"
+    check -- real, live-reproduced bug this exists to fix (Phase 0
+    node-agent restart-safety audit, 2026-09-06): a disposable Windows
+    session's ConPTY-spawned child (and its sibling conhost.exe) was
+    confirmed via `Get-CimInstance Win32_Process`/`tasklist` to be
+    completely gone from the OS (killed as a side effect of a
+    `schtasks /end` node-agent restart attempt), yet pywinpty's own
+    `PtyProcess.isalive()` kept returning True indefinitely afterward --
+    `entry.proc.read()` in `_reader_loop` was returning repeated empty
+    chunks (never raising, never signaling EOF) rather than reflecting
+    the child's real death, so the existing "empty read + isalive() to
+    disambiguate idle-vs-dead" logic (see `_reader_loop`'s own comment)
+    silently treated a fully dead session as merely idling forever --
+    `pane_dead` stayed False, `reader_alive` stayed True, `tail`/`status`
+    kept serving stale cached content with no error, indefinitely. Root
+    cause is inside pywinpty/ConPTY's own liveness bookkeeping on
+    Windows (not this project's own code) and could not be fixed there;
+    this is a real, independent OS-level check used to overrule it.
+
+    Real Win32 API (`OpenProcess` + `GetExitCodeProcess`), not a
+    third-party dependency -- `PROCESS_QUERY_LIMITED_INFORMATION` is the
+    minimal access right that still allows reading the exit code,
+    matching the same "least privilege" posture the rest of this
+    module's existing ctypes process-walking code
+    (`_win32_foreground_command`) already uses. `GetExitCodeProcess`
+    returns `STILL_ACTIVE` (259) while the process has not exited --
+    genuinely ambiguous only in the vanishingly rare case a real process
+    happens to exit with status code 259 itself, a known, accepted
+    limitation of this exact Win32 idiom, not unique to this use of it.
+
+    POSIX fallback (`os.kill(pid, 0)`) is for this project's own
+    Linux/macOS test/dev environment, where this module must still
+    import and this function must still be meaningfully callable/
+    injectable -- never reached on a real Windows node-agent."""
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True  # exists but not signalable by us (e.g. permission) -- still alive
+        return True
+    import ctypes  # noqa: PLC0415 -- Windows-only, mirrors this module's other lazy ctypes imports
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False  # no such process (or we genuinely can't even query it) -- treat as gone
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == _STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+PidAliveResolver = Callable[[int], bool]
+
+
+def _is_alive(proc: PtyProcessLike, *, pid_alive_resolver: PidAliveResolver | None = None) -> bool:
+    """`pid_alive_resolver` (OS-authoritative, see `_win32_pid_alive`'s
+    own docstring for the real bug this closes) is checked FIRST and can
+    only ever turn a live-looking process into a dead one -- never the
+    reverse -- so a resolver that itself fails/is unavailable safely
+    falls back to the original `proc.isalive()` behavior exactly as
+    before this fix, never a regression for a caller/test that doesn't
+    inject one."""
+    resolver = pid_alive_resolver or _win32_pid_alive
+    try:
+        pid = proc.pid
+    except Exception:  # noqa: BLE001
+        pid = None
+    if pid is not None:
+        try:
+            if not resolver(pid):
+                return False
+        except Exception:  # noqa: BLE001 -- resolver itself broke; fall through to proc.isalive()
+            pass
     try:
         return bool(proc.isalive())
     except Exception:  # noqa: BLE001 -- treat an unqueryable process as dead, never crash a caller over it

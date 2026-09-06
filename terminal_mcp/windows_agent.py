@@ -38,7 +38,7 @@ import uvicorn
 
 from .config import load_config
 from .core import TerminalService
-from .node_agent import _heartbeat_loop, _read_token, build_node_agent
+from .node_agent import _heartbeat_loop, _read_token, build_node_agent, watch_for_shutdown
 from .node_models import PLATFORM_WINDOWS, SESSION_BACKEND_WINDOWS_PTY
 from .windows_backend import WindowsSessionBackend
 
@@ -127,7 +127,15 @@ def main(argv: list[str] | None = None) -> int:
             tg.start_soon(_heartbeat_task)
             server_config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
             server = uvicorn.Server(server_config)
+
+            async def _shutdown_watch() -> None:
+                await watch_for_shutdown(app, server)
+
+            tg.start_soon(_shutdown_watch)
             await server.serve()
+            # See node_agent.py's own main()/run() for why this cancel is
+            # required -- identical reasoning, shared heartbeat-loop shape.
+            tg.cancel_scope.cancel()
 
     anyio.run(run)
     return 0

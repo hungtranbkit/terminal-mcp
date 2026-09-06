@@ -552,8 +552,19 @@ def build_mcp(service: TerminalService | None = None,
         has no mechanism for that, and never claims otherwise). Explicit
         agent_type/cwd override the saved values field-by-field.
         REOPEN_METADATA_INCOMPLETE (naming what's missing) if neither the
-        saved record nor your override supplies enough to launch safely."""
-        return terminal.terminal_registry_reopen(session_name, agent_type=agent_type, cwd=cwd, requested_by="mcp")
+        saved record nor your override supplies enough to launch safely.
+
+        FLEET-AWARE (Phase 0 node-agent restart-safety audit, 2026-09-06)
+        -- unlike the other registry/knowledge tools in this section,
+        this one IS routed through `controller`, since it's the actual
+        recovery action a node-agent restart needs. For a session on a
+        remote node, pass the qualified `node_id/session_name` form (a
+        bare name only resolves against CURRENTLY-live sessions, which a
+        just-restarted node's own MISSING sessions by definition are
+        not)."""
+        _refresh_local_heartbeat()
+        return controller.terminal_registry_reopen(session_name, agent_type=agent_type, cwd=cwd,
+                                                    requested_by="mcp")
 
     @server.tool()
     def terminal_registry_purge(session_name: str) -> dict:
@@ -624,22 +635,31 @@ def build_mcp(service: TerminalService | None = None,
 
     @server.tool()
     def terminal_watchdog_session_events(unacknowledged_only: bool = False, limit: int = 50) -> dict:
-        """This node's own "session dropped unexpectedly" events -- a
-        session that was ACTIVE and vanished with no explicit Kill ever
-        having touched it (a tmux-server restart, an out-of-band kill,
-        a crashed Windows ConPTY child, ...). Each event names the
-        session/node/when-detected; recovery is terminal_registry_reopen
-        (Persistent Session Registry) -- this tool only detects and
-        tracks, it never recreates anything itself."""
-        return terminal.terminal_watchdog_events(unacknowledged_only=unacknowledged_only, limit=limit)
+        """FLEET-WIDE "session dropped unexpectedly" events -- a session
+        that was ACTIVE and vanished with no explicit Kill ever having
+        touched it (a tmux-server restart, an out-of-band kill, a
+        crashed Windows ConPTY child, a node-agent restart, ...). Each
+        event names the session/node/when-detected; recovery is
+        terminal_registry_reopen (Persistent Session Registry) -- this
+        tool only detects and tracks, it never recreates anything itself.
+        Phase 0 node-agent restart-safety audit (2026-09-06): previously
+        local-node-only (this node's events only); now asks every
+        currently-online node and merges (`node_errors` names any node
+        that couldn't be reached, without losing the others' results)."""
+        _refresh_local_heartbeat()
+        return controller.terminal_watchdog_session_events_fleet(unacknowledged_only=unacknowledged_only, limit=limit)
 
     @server.tool()
-    def terminal_watchdog_acknowledge_session_event(event_id: int) -> dict:
+    def terminal_watchdog_acknowledge_session_event(event_id: int, node_id: str = "local") -> dict:
         """Mark one session-drop event as seen -- purely bookkeeping
         (never affects the session itself); it stops showing as
         unacknowledged in future terminal_watchdog_session_events(
-        unacknowledged_only=True) calls."""
-        return terminal.terminal_watchdog_acknowledge(event_id, by="mcp")
+        unacknowledged_only=True) calls. `node_id` (from that same
+        event's own "node_id" field) says which node's own registry the
+        event lives in -- each node only ever knows about its own drop
+        events. Defaults to "local" (this controller's own node) for
+        backward compatibility with a caller that never passed it."""
+        return controller.terminal_watchdog_acknowledge_session_event(node_id, event_id, by="mcp")
 
     @server.tool()
     def terminal_watchdog_node_events(unacknowledged_only: bool = False, limit: int = 50) -> dict:

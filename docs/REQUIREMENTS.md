@@ -187,7 +187,11 @@ sessions bringing up dell-5530/m910/macbook — see `docs/multi-node.md`).
   purge` — `session_registry.py`, tracks ACTIVE/MISSING/KILLED/OFFLINE
   history per (node_id, session_name), survives a session being renamed/
   recreated/lost, searchable by cwd/repo/branch even once the name
-  itself is gone.
+  itself is gone. `terminal_registry_reopen` is fleet-aware (routed
+  through `controller`, use the qualified `node_id/session` form for a
+  remote node's MISSING session — see the "Windows node-agent restart
+  safety (Phase 0)" Feature Details entry); `list/get/search/purge`
+  remain the documented local-node-only Phase A/B posture.
 - **Local Linux tmux backend:** `tmux.py`'s `TmuxClient` — the default,
   most-exercised backend.
 - **Remote Linux node:** `RemoteNodeClient` (HTTP + bearer token) talking
@@ -1069,6 +1073,167 @@ scan/audit view over the SAME facts.)*
   similar transitional-frame gap is ever found there.
 - **Trace:** see this file's own commit.
 
+### Windows node-agent restart safety (Phase 0)
+
+- **Goal / user value:** understand — with real, empirical evidence, not
+  guesses — whether a Windows node-agent restart is safe for its own
+  sessions, make the restart mechanism itself deterministic and correct,
+  and build the most honest recovery path the current architecture
+  allows, all BEFORE ever restarting the real dell-5530 node-agent that
+  serves window/window2/wtest.
+- **Status:** VERIFIED (the audit, the fixes, and the disposable
+  end-to-end proof) — the real dell-5530 restart itself is deliberately
+  NOT yet done (see Backlog item 7's own "Go/no-go" note).
+- **Root causes (all three empirically confirmed, live, against real
+  Windows processes — never theorized only):**
+  1. `schtasks /end` does not reliably terminate the process tree a
+     Scheduled Task launches (`powershell.exe` wrapper → `python.exe`
+     node-agent → ConPTY-spawned session children) — non-deterministic:
+     reproduced leaving the port-holding agent process alive while
+     separately killing its own session children, on both the real
+     dell-5530 node-agent and a fully isolated disposable instance.
+  2. `WindowsSessionBackend`'s liveness check trusted `pywinpty`'s own
+     `PtyProcess.isalive()`, which was confirmed to keep returning
+     `True` indefinitely for a ConPTY child already gone at the OS level
+     (`Get-CimInstance Win32_Process`/`tasklist` showed nothing) — the
+     background reader thread's own "empty read: idle or dead?"
+     disambiguation (`_reader_loop`) relies on exactly this check, so it
+     busy-looped forever, and `status`/`tail` served stale content with
+     no error indefinitely.
+  3. The registry-based, MISSING-aware reopen (`terminal_registry_
+     reopen`) was local-node-only — `mcp_app.py` called it directly on
+     the controller's own local `TerminalService`, never routed through
+     `controller`, so it was structurally unreachable for any remote
+     node. The only reopen path a remote node's HTTP surface exposed
+     (`/v1/sessions/{name}/reopen`) is the older, `killed_sessions.py`-
+     backed one, which needs an explicit prior Kill a restart-caused
+     drop never gets.
+- **Fix:**
+  - `node_agent.py`: new `AGENT_GENERATION` (a random id computed once
+    per process, in `/v1/health` and every heartbeat payload — "is this
+    a new process instance", task's own "process generation"
+    requirement); new `POST /v1/internal/shutdown` route (bearer-auth'd)
+    that sets a `threading.Event` on `app.state`; new shared
+    `watch_for_shutdown(app, server)` coroutine (used by both
+    `node_agent.py`'s and `windows_agent.py`'s own `main()`) that
+    translates that event into uvicorn's own `server.should_exit = True`
+    — a deterministic, graceful self-stop that never depends on Task
+    Scheduler's own process-tree semantics. Both `main()` functions also
+    gained `tg.cancel_scope.cancel()` right after `server.serve()`
+    returns, fixing a related latent bug: without it, the task group's
+    own `__aexit__` would wait forever on the never-returning heartbeat
+    loop task, silently hanging the process past what looked like a
+    clean shutdown (true for the pre-existing external-signal shutdown
+    path too, not only the new one).
+  - `windows_backend.py`: new `_win32_pid_alive(pid)` (real
+    `OpenProcess`+`GetExitCodeProcess`, POSIX `os.kill(pid, 0)` fallback
+    for this project's own Linux dev/test environment) as an injectable
+    `pid_alive_resolver`; `_is_alive()` now checks it FIRST — a resolver
+    saying "gone" always overrules a stale `isalive()==True`; a resolver
+    saying "alive" (or itself failing) still falls through to
+    `isalive()` as before, so no existing caller regresses. Wired into
+    both `get_session()` and `_reader_loop()`'s own liveness check.
+  - `node_client.py`/`node_agent.py`/`controller.py`/`mcp_app.py`: new
+    `registry_reopen` method on the `NodeClient` Protocol +
+    `LocalNodeClient` + `RemoteNodeClient`; new node-agent route `POST
+    /v1/sessions/{name}/registry-reopen`; new fleet-aware `Controller
+    Service.terminal_registry_reopen` (uses the existing `_route` /
+    `resolve_session` machinery — the qualified `node_id/session` form
+    is required for a MISSING session, since bare-name resolution only
+    searches currently-live sessions); the `terminal_registry_reopen`
+    MCP tool now calls `controller.terminal_registry_reopen` instead of
+    the local-only `terminal.terminal_registry_reopen`. Also rewired
+    (already-existing, previously-unwired) fleet aggregators:
+    `terminal_watchdog_session_events` MCP tool now calls `controller.
+    terminal_watchdog_session_events_fleet` (asks every online node,
+    merges, tolerates one node's failure); `terminal_watchdog_
+    acknowledge_session_event` gained a `node_id: str = "local"` param
+    (backward-compatible default) and calls `controller.
+    terminal_watchdog_acknowledge_session_event(node_id, event_id)`.
+- **Scope / flow:** `registry_reopen`/watchdog fleet-wiring applies to
+  every node (local and remote); the liveness fix and shutdown endpoint
+  apply to `WindowsSessionBackend` specifically (the Linux/tmux backend
+  has no equivalent staleness bug — tmux's own server independently
+  tracks pane liveness). The OTHER registry/knowledge tools
+  (`terminal_registry_list/get/search/purge`, `terminal_knowledge_*`)
+  remain the documented, deliberate Phase A/B local-node-only posture —
+  NOT changed by this pass (out of scope: this pass fixed only the tools
+  load-bearing for the restart-recovery story itself).
+- **UI route/screen:** none yet — Dashboard surfacing of `agent_
+  generation`/registry-reopen as an operator action is PLANNED, not
+  built (the MCP tools and HTTP routes are real and tested; no button
+  exists for them yet).
+- **API/tool/command:** `POST /v1/internal/shutdown`, `POST /v1/sessions
+  /{name}/registry-reopen` (node-agent HTTP); `terminal_registry_reopen`
+  (now fleet-aware), `terminal_watchdog_session_events` (now fleet-
+  aware), `terminal_watchdog_acknowledge_session_event` (now takes
+  `node_id`) (MCP tools — no new tool count change, 3 existing tools
+  became fleet-aware).
+- **Config/permission:** none new — `/v1/internal/shutdown` and
+  `/registry-reopen` use the exact same bearer-token auth every other
+  node-agent route already requires.
+- **Data/schema/migration:** none — reuses the existing `session_
+  registry.db` schema as-is (`agent_generation` is reported live, not
+  persisted anywhere yet).
+- **Acceptance/tests/evidence:** `tests/test_windows_backend.py` (7 new
+  tests: OS-authoritative liveness override, POSIX fallback, integration
+  through `get_session`/`_reader_loop`); `tests/test_node_agent.py` (5
+  new tests: generation id, shutdown auth + event-setting, `watch_for_
+  shutdown` flipping `should_exit`, registry-reopen round trip against a
+  REAL unexpectedly-dropped tmux session, registry-reopen auth); `tests/
+  test_controller.py` (5 new tests: fleet routing via qualified name,
+  bare-name-for-MISSING correctly `SESSION_NOT_FOUND`, incomplete-
+  metadata propagation, unreachable node, real local end-to-end). Full
+  default suite re-run clean after every change (1 pre-existing,
+  unrelated flake — `test_create_initial_prompt_goes_through_reliable_
+  submission_once`, confirmed via `git stash` to fail identically on
+  unmodified `HEAD`, not a regression from this pass).
+  **Live disposable evidence (real dell-5530, isolated instance on port
+  8791 — a temporary, narrowly-scoped LAN-only firewall rule was added
+  for the test and removed afterward, along with the Scheduled Task and
+  state directory used):** empirically confirmed (1) `schtasks /end`'s
+  non-deterministic partial-kill behavior, reproduced identically on
+  both the real node-agent and this isolated instance; (2) a disposable
+  session's ConPTY child does NOT survive the agent process's own exit,
+  confirmed via both `taskkill /F` and the new graceful `/v1/internal/
+  shutdown` — settling the previously-unverified architectural question
+  definitively; (3) the liveness fix correctly flips a zombie session to
+  `pane_dead: true` (previously stuck `true` forever as alive); (4) the
+  full recovery cycle end-to-end: create → list (registers into the
+  registry) → graceful shutdown → relaunch (new `agent_generation`) →
+  list (reconcile marks MISSING, records a `session_missing` drop event)
+  → `registry-reopen` (new PID, `recreated_from_registry: true`, correct
+  cwd/agent_type carried forward) — repeated across multiple full
+  cycles, 0 orphan processes left running after cleanup, 0 duplicate
+  dispatch, 0 cross-session attach. `window`/`window2`/`wtest` read-only-
+  verified completely unaffected (identical PIDs/tail content) after
+  every cycle.
+- **Known limitations:** (1) recovery is metadata-only — conversation
+  history is genuinely lost on a real restart, not resumed (see Backlog
+  item 10 for the `--resume`-wiring follow-up that would fix this
+  honestly, without ever claiming OS-level survival); (2) `agent_
+  generation` is reported (health + heartbeat) but not yet persisted/
+  surfaced anywhere in the dashboard or session_registry; (3) the OTHER
+  registry/knowledge MCP tools remain local-node-only (documented,
+  unchanged scope cut, not this pass's job); (4) the real dell-5530
+  node-agent has NOT been restarted with any of these fixes live yet —
+  they exist on disk there (deployed for the disposable test) and are
+  fully tested/proven on an isolated instance on the SAME machine, but
+  not yet exercised against window/window2/wtest themselves.
+- **Dependencies:** `session_registry.py` (SessionRegistryStore,
+  pre-existing, unmodified — this pass exercises it far more thoroughly
+  than before, finds no bugs in it); `controller.py`'s existing `_route`/
+  `resolve_session` machinery (reused, not replaced).
+- **Follow-up/backlog:** the real dell-5530 restart itself (Backlog item
+  7); `--resume` wiring for genuine conversation continuity (Backlog
+  item 10); fixing `run-node-agent.ps1`'s own Scheduled Task definition
+  so a future install doesn't need this session's manual graceful-
+  shutdown-then-`/run` two-step (PLANNED, not built — the two-step is
+  proven correct, just not yet packaged into the installer script);
+  dashboard surfacing of `agent_generation` + a registry-reopen operator
+  action.
+- **Trace:** see this file's own commit.
+
 ### Living-requirements convention itself
 
 - **Goal / user value:** any agent reads ONE file and knows what the
@@ -1167,18 +1332,92 @@ scan/audit view over the SAME facts.)*
    attempting that; **user chose to wait for a safer window** rather
    than force it now. Fix remains undeployed-in-practice (on disk, not
    loaded) until a real restart happens.
-   **Also newly discovered:** the scheduled task's restart mechanism
-   itself has a latent bug worth fixing before the next attempt —
-   `schtasks /end` does not reliably terminate the process tree it
-   launches (likely because `run-node-agent.ps1` execs python without a
-   job-object/process-group link Task Scheduler's End Task can walk).
-   Next step: either fix `run-node-agent.ps1`/the scheduled task
-   definition so End Task actually kills the process tree (making a
-   graceful restart possible without a manual `taskkill`), or accept a
-   manual `taskkill /F` + explicit user go-ahead as the only path, and
-   re-run the exact same live disposable-session repro afterward to
-   confirm 0 false negatives on the ACTUAL deployment those sessions
-   use.
+   **2026-09-06 Phase 0 update — full restart-safety audit complete,
+   DEFINITIVE finding: session survival across a node-agent restart is
+   NOT achievable with the current architecture, by any method.** See
+   the "Windows node-agent restart safety (Phase 0)" Feature Details
+   entry below for the complete writeup (root cause, fix, disposable
+   evidence). Summary:
+   - **`schtasks /end` root cause, empirically confirmed (not just
+     theorized):** reproduced twice — once against the real dell-5530
+     node-agent, once against a fully isolated disposable instance on
+     the same machine. It is non-deterministic and unsafe: in one run it
+     left the actual agent process (the port-holder) completely
+     untouched while separately, silently killing that process's own
+     ConPTY session children; in another it did the same. It never once
+     achieved the restart it was asked for. **Fixed** by a new,
+     deterministic graceful self-shutdown path (`POST
+     /v1/internal/shutdown`, bearer-token-auth'd) that asks uvicorn to
+     stop via its own `should_exit` mechanism — no reliance on Task
+     Scheduler's own process-tree bookkeeping at all.
+   - **The open architectural question is now closed, empirically:** a
+     disposable session's ConPTY child process (and its sibling
+     `conhost.exe`) does **not** survive the node-agent process's own
+     exit — confirmed identical outcome via a hard `taskkill /F` AND via
+     the new fully graceful `/v1/internal/shutdown` path. This is no
+     longer an unverified risk (as `windows_backend.py`'s own module
+     docstring previously, honestly, flagged it) — it is a confirmed
+     fact for this deployment. **Any future node-agent restart on
+     dell-5530 WILL end window/window2/wtest's real OS processes,
+     unconditionally, regardless of how the restart is performed.**
+   - **A second, independent, real bug found and fixed in the same
+     investigation:** `WindowsSessionBackend`'s liveness check
+     (`proc.isalive()`, from `pywinpty`) was confirmed to keep reporting
+     a genuinely-dead ConPTY child as alive indefinitely — `pane_dead`
+     stayed `False`, `reader_alive` stayed `True`, `tail`/`status` kept
+     serving stale cached content forever, with no error, and the
+     background reader thread busy-looped forever never noticing. Fixed
+     with a new, OS-authoritative liveness check
+     (`_win32_pid_alive`/`OpenProcess`+`GetExitCodeProcess`) that
+     overrules a stale `isalive()` — this is what makes MISSING
+     detection (below) actually fire correctly at all.
+   - **A third, real gap found and fixed:** the Persistent Session
+     Registry's own honest, MISSING-aware reopen
+     (`terminal_registry_reopen`) was **local-node-only** — unreachable
+     for any remote node (dell-5530, m910) at all. The only reopen path
+     a remote node's HTTP surface exposed was the OLDER, `killed_
+     sessions.py`-backed one, which needs an explicit prior Kill that a
+     restart-caused drop never gets — meaning, before this fix, a
+     restarted remote node's MISSING sessions had **no working recovery
+     path whatsoever**, not even the honest "new process, same cwd/
+     agent_type" recreate. Fixed: new `/v1/sessions/{name}/registry-
+     reopen` node-agent route + fleet-aware `controller.
+     terminal_registry_reopen`/`terminal_watchdog_session_events_fleet`/
+     `terminal_watchdog_acknowledge_session_event`, all now routed
+     through `controller` like every other multi-node operation, using
+     the qualified `node_id/session` form (required, since a MISSING
+     session by definition isn't in any node's live listing that bare-
+     name resolution searches).
+   - **Disposable proof (real dell-5530, isolated instance on port 8791,
+     never touching window/window2/wtest):** created real sessions,
+     confirmed graceful-shutdown → process exit (port frees) → relaunch
+     → `session_missing` drop event correctly recorded → `registry-
+     reopen` correctly recreates (new PID, `recreated_from_registry:
+     true`, same cwd/agent_type) → repeated across multiple full
+     restart cycles. 0 orphan processes left running after cleanup
+     (verified via `Get-CimInstance Win32_Process`/`tasklist`), 0
+     duplicate dispatch, 0 cross-session attach. `window`/`window2`/
+     `wtest` independently confirmed completely unaffected throughout
+     (same PIDs, same tail content) via a read-only check after every
+     cycle.
+   - **Known, real, still-open limitation:** recovery is metadata-only
+     (cwd/agent_type honestly carried forward) — **conversation history
+     is genuinely lost**, not resumed. Claude Code's own `resume_
+     conversation_id` is already captured live per-session (`models.py`/
+     `windows_backend.py`) but not yet persisted into the registry or
+     wired into `registry_reopen`'s own relaunch command — doing so
+     (passing `--resume <id>` on the new process) is the single most
+     valuable remaining mitigation and is NOT yet built (scoped out of
+     this pass for time; see Backlog item 10).
+   - **Go/no-go on the real dell-5530 restart:** deliberately NOT done
+     this session. The fact pattern changed materially mid-investigation
+     (from "restart might be safe, unverified" to "restart WILL end
+     these processes, confirmed") — window2 had a real, unsent typed
+     prompt pending and window/wtest were both actively mid-task ("esc
+     to interrupt") the last time they were checked. This is exactly the
+     kind of newly-material risk information this project's own standing
+     rules require surfacing before acting on an earlier, now-outdated
+     authorization, not proceeding on it silently.
 8. **Dashboard Task Manager/Supervisor-Coordinator panel deployment
    gap (found and fixed):** the production `terminal-mcp-http.service`
    process had been running continuously since before commits `20f6ff0`/
@@ -1201,8 +1440,28 @@ scan/audit view over the SAME facts.)*
 9. **Internet/VPS migration roadmap** — PLANNED, phased, not started.
    See "Internet / VPS migration roadmap" section below for the full
    phase breakdown. Phase 0 (stability gates) is itself mostly backlog
-   items 1 and 7 above, plus a fix for the scheduled-task restart bug
-   just found — none of Phase 1+ starts until Phase 0 is green.
+   items 1 and 7 above — the scheduled-task restart bug itself is now
+   FIXED (see the "Windows node-agent restart safety (Phase 0)" Feature
+   Details entry) — none of Phase 1+ starts until Phase 0 is green.
+10. **`--resume` wiring for `registry_reopen`** (real conversation
+    continuity, not just metadata) — PLANNED, not started. Claude Code's
+    own `resume_conversation_id` is already captured live per-session
+    (`models.py`/`windows_backend.py`'s `RESUME_CONVERSATION_ID_RE`
+    scrape) but never persisted into `session_registry.db` or read back
+    by `terminal_registry_reopen`. Since the 2026-09-06 Phase 0 audit
+    confirmed a Windows node-agent restart ALWAYS ends a session's real
+    OS process (no exceptions found), this is now the single most
+    valuable remaining mitigation: persist `resume_conversation_id` on
+    every reconcile pass (`SessionRegistryStore.upsert_seen` needs a new
+    column + param), and have `terminal_registry_reopen` pass `--resume
+    <id>` on the new process's launch command when the saved agent_type
+    supports it (needs a real, verified way to know which launch_
+    commands entries accept a resume flag — not assumed). Would turn
+    "new process, same folder, conversation gone" into "new process,
+    same folder, same conversation continued" — still honestly a NEW
+    process (never claims OS/RAM survival), but a materially better
+    recovery outcome. Blocks nothing else; safe to build independently
+    whenever prioritized.
 
 ---
 

@@ -250,6 +250,24 @@ class ControllerService:
             bare, confirm_name.split("/", 1)[-1] if "/" in confirm_name else confirm_name, requested_by=requested_by,
         ))
 
+    def terminal_registry_reopen(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
+                                 grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]:
+        """Fleet-aware Persistent Session Registry reopen (Phase 0 node-
+        agent restart-safety audit, 2026-09-06) -- previously local-node-
+        only (mcp_app.py called `terminal.terminal_registry_reopen`
+        directly, never routed through here), meaning a session on a
+        REMOTE node (e.g. dell-5530) had NO working recovery path at all
+        after a node-agent restart: reopen_session above needs an
+        explicit prior Kill (killed_sessions.py), which a restart never
+        performs. `name` MUST be the qualified `node_id/session` form for
+        a session that is no longer live -- resolve_session's own bare-
+        name lookup only searches CURRENTLY-listed sessions, which a
+        MISSING/OFFLINE session by definition is not; the qualified form
+        skips that liveness check entirely (see resolve_session's own
+        docstring), exactly what recovering a gone session needs."""
+        return self._route(name, "registry_reopen", lambda client, bare: client.registry_reopen(
+            bare, agent_type=agent_type, cwd=cwd, grant_mode=grant_mode, requested_by=requested_by))
+
     def terminal_rename_session(self, name: str, new_name: str, *,
                                 requested_by: str | None = None) -> dict[str, Any]:
         """Rename Session feature, fleet-aware: `name` resolves to a real,

@@ -22,7 +22,7 @@ from terminal_mcp.config import (
     AppConfig, InputPolicyConfig, PermissionsConfig, SessionKnowledgeConfig, SessionLifecycleConfig,
 )
 from terminal_mcp.core import TerminalService
-from terminal_mcp.node_agent import _heartbeat_loop, build_node_agent
+from terminal_mcp.node_agent import AGENT_GENERATION, _heartbeat_loop, build_node_agent, watch_for_shutdown
 
 TOKEN = "test-node-token-abc123"
 
@@ -77,6 +77,54 @@ def test_health_needs_no_auth(agent_client):
     response = agent_client.get("/v1/health")
     assert response.status_code == 200
     assert response.json()["node_id"] == "test-node"
+
+
+def test_health_reports_this_process_own_generation_id(agent_client):
+    # Phase 0 node-agent restart-safety audit (2026-09-06): a fresh id
+    # per process, so a caller (deploy tooling, dashboard) can tell "this
+    # is a new process instance" apart from the one running a moment
+    # ago, even under the same node_id/host/port.
+    body = agent_client.get("/v1/health").json()
+    assert body["agent_generation"] == AGENT_GENERATION
+    assert len(body["agent_generation"]) == 16  # secrets.token_hex(8)
+
+
+# -- graceful self-shutdown (Phase 0 node-agent restart-safety audit) ------
+
+def test_internal_shutdown_requires_auth(agent_client):
+    response = agent_client.post("/v1/internal/shutdown")
+    assert response.status_code == 401
+    assert agent_client.app.state.shutdown_event.is_set() is False
+
+
+def test_internal_shutdown_sets_the_shutdown_event(agent_client):
+    assert agent_client.app.state.shutdown_event.is_set() is False
+    response = agent_client.post("/v1/internal/shutdown", headers=_auth())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["shutdown_requested"] is True
+    assert body["agent_generation"] == AGENT_GENERATION
+    assert agent_client.app.state.shutdown_event.is_set() is True
+
+
+@pytest.mark.anyio
+async def test_watch_for_shutdown_flips_server_should_exit_once_event_is_set(agent_client):
+    class _FakeServer:
+        should_exit = False
+
+    server = _FakeServer()
+
+    async def _watch() -> None:
+        await watch_for_shutdown(agent_client.app, server, poll_interval_seconds=0.02)
+
+    with anyio.move_on_after(2.0) as scope:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_watch)
+            await anyio.sleep(0.05)
+            assert server.should_exit is False  # not set yet -- watcher is genuinely polling, not a no-op
+            agent_client.app.state.shutdown_event.set()
+    assert not scope.cancelled_caught
+    assert server.should_exit is True
 
 
 def test_every_other_route_rejects_missing_token(agent_client):
@@ -139,6 +187,48 @@ def test_full_session_lifecycle_round_trip(agent_client):
 
     killed_list = agent_client.get("/v1/killed-sessions", headers=_auth())
     assert killed_list.status_code == 200
+
+
+def test_registry_reopen_round_trip_after_an_unexpected_drop(agent_client):
+    # Phase 0 node-agent restart-safety audit (2026-09-06): the honest,
+    # MISSING-aware recovery path a node-agent restart actually needs --
+    # distinct from /reopen above (killed_sessions-based, needs an
+    # explicit prior Kill, which an unexpected drop never gets).
+    create = agent_client.post("/v1/sessions", headers=_auth(),
+                               json={"name": "agent-reg", "agent_type": "shell", "cwd": None})
+    assert create.status_code == 200
+    agent_client.created.append("agent-reg")
+    # Reconcile pass: registers this session into session_registry as ACTIVE.
+    listing = agent_client.get("/v1/sessions", headers=_auth())
+    assert any(row["name"] == "agent-reg" for row in listing.json()["sessions"])
+
+    # Simulate an UNEXPECTED drop (a node-agent restart, never an
+    # explicit Kill) -- kill the real tmux session directly, bypassing
+    # terminal_kill_session, so killed_sessions.py never learns about it.
+    subprocess.run(["tmux", "kill-session", "-t", "agent-reg"], check=False, capture_output=True)
+
+    # Another reconcile pass: notices it vanished, marks MISSING.
+    listing2 = agent_client.get("/v1/sessions", headers=_auth())
+    assert not any(row["name"] == "agent-reg" for row in listing2.json()["sessions"])
+
+    # The OLDER, killed_sessions-based reopen has nothing to work with --
+    # this session was never explicitly Killed.
+    old_reopen = agent_client.post("/v1/sessions/agent-reg/reopen", headers=_auth(), json={})
+    assert "error" in old_reopen.json()
+
+    # The registry-based reopen DOES have what it needs -- a real, honest
+    # recreate (recreated_from_registry=True, never a claim the old
+    # process/RAM survived).
+    reg_reopen = agent_client.post("/v1/sessions/agent-reg/registry-reopen", headers=_auth(), json={})
+    assert reg_reopen.status_code == 200
+    body = reg_reopen.json()
+    assert body.get("error") is None, body
+    assert body["recreated_from_registry"] is True
+
+
+def test_registry_reopen_requires_auth(agent_client):
+    response = agent_client.post("/v1/sessions/agent-reg-noauth/registry-reopen", json={})
+    assert response.status_code == 401
 
 
 def test_grant_read_and_grant_input_round_trip(agent_client):

@@ -28,6 +28,8 @@ from terminal_mcp.windows_backend import (
     WindowsPathError,
     WindowsSessionBackend,
     _append_chunk,
+    _is_alive,
+    _win32_pid_alive,
     _WindowsSession,
     validate_windows_cwd,
     validate_windows_session_name,
@@ -1005,3 +1007,138 @@ def test_capture_lines_trims_trailing_blank_screen_padding_but_keeps_interior_bl
     while lines and not lines[-1]:
         lines.pop()
     assert lines == ["line one", "", "line three"]
+
+
+# -- OS-authoritative liveness check (Phase 0 node-agent restart-safety --
+# real, live-reproduced bug: pywinpty's own PtyProcess.isalive() kept
+# reporting True indefinitely for a ConPTY child confirmed gone at the OS
+# level via Get-CimInstance/tasklist on a real disposable dell-5530
+# session, after a schtasks-driven node-agent restart attempt killed it.
+# See _win32_pid_alive's own docstring for the full writeup.) ------------
+
+class _LiarPty:
+    """A PtyProcessLike whose isalive() always claims True -- models the
+    exact confirmed-live pywinpty bug: the process is genuinely gone at
+    the OS level, but this object's own liveness bookkeeping never
+    reflects that. read() always returns an empty string (also matching
+    the live finding: read() on the dead ConPTY kept returning empty
+    chunks, never raising, never signaling EOF)."""
+
+    def __init__(self, pid: int = 999999) -> None:
+        self.pid = pid
+
+    def isalive(self) -> bool:
+        return True
+
+    def read(self, size: int = 4096) -> str:
+        return ""
+
+    def write(self, data: str) -> int:
+        return len(data)
+
+    def setwinsize(self, rows: int, cols: int) -> None:
+        pass
+
+    def terminate(self, force: bool = False) -> None:
+        pass
+
+
+def test_is_alive_with_no_resolver_still_defers_to_isalive_for_a_real_pid():
+    # No explicit resolver injected -- falls back to the module's own
+    # real default (_win32_pid_alive), same as every existing caller
+    # written before this fix. For a pid that genuinely exists (this
+    # test process's own), the default resolver agrees "alive", so the
+    # final answer still comes from isalive() as before -- no regression
+    # for any caller that never injects a resolver.
+    assert _is_alive(_LiarPty(pid=os.getpid())) is True
+
+
+def test_is_alive_with_no_resolver_still_catches_a_genuinely_dead_pid_by_default():
+    # The fix is always-on by default (not opt-in): even with NO
+    # explicit resolver injected, a pid that is genuinely gone at the OS
+    # level is still caught via the module's own default _win32_pid_alive
+    # resolver -- this is the real production behavior windows_agent.py
+    # gets for free, not just an injectable test-only capability. Uses a
+    # real, freshly-reaped pid (never a hardcoded guess) for a
+    # deterministic "definitely gone" pid.
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=5)
+    assert _is_alive(_LiarPty(pid=proc.pid)) is False
+
+
+def test_is_alive_pid_resolver_overrules_a_stale_isalive_true():
+    liar = _LiarPty(pid=424242)
+    resolver_calls = []
+
+    def resolver(pid: int) -> bool:
+        resolver_calls.append(pid)
+        return False  # OS-authoritative: this pid is genuinely gone
+
+    assert _is_alive(liar, pid_alive_resolver=resolver) is False
+    assert resolver_calls == [424242]
+
+
+def test_is_alive_pid_resolver_true_still_defers_to_isalive():
+    # The resolver can only ever turn "alive" into "dead", never the
+    # reverse -- a resolver confirming the pid exists still falls
+    # through to proc.isalive() for the final answer (e.g. a recycled
+    # pid belonging to an unrelated process would otherwise be
+    # misreported as this session's own process still running).
+    assert _is_alive(_LiarPty(), pid_alive_resolver=lambda pid: True) is True
+
+
+def test_is_alive_resolver_exception_falls_back_to_isalive():
+    def broken_resolver(pid: int) -> bool:
+        raise RuntimeError("boom")
+
+    assert _is_alive(_LiarPty(), pid_alive_resolver=broken_resolver) is True
+
+
+def test_win32_pid_alive_posix_fallback_true_for_this_own_process():
+    assert _win32_pid_alive(os.getpid()) is True
+
+
+def test_win32_pid_alive_posix_fallback_false_for_a_reaped_pid():
+    # Spawn and fully wait() on a real child so its pid is confirmed
+    # gone (not a zombie) before checking -- the real, deterministic
+    # POSIX-side analogue of the Windows OpenProcess/GetExitCodeProcess
+    # path this dev/test environment never reaches.
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=5)
+    assert _win32_pid_alive(proc.pid) is False
+
+
+def test_get_session_reports_dead_when_pid_resolver_says_gone(backend, tmp_path, monkeypatch):
+    # Full integration: even though the real, still-alive-per-isalive()
+    # fake process is untouched, injecting a pid_alive_resolver that
+    # says "gone" must flip pane_dead True / reader_alive None on the
+    # NEXT get_session() call -- exactly the fields the dashboard/
+    # Coordinator gate/session_registry reconcile pass all read to
+    # decide MISSING vs ACTIVE (see session_registry.py's own docstring).
+    _new_fake_shell_session(backend, tmp_path, name="win-liveness-test")
+    before = backend.get_session("win-liveness-test")
+    assert before is not None and before.pane_dead is False and before.reader_alive is True
+
+    monkeypatch.setattr(backend, "_pid_alive_resolver", lambda pid: False)
+    after = backend.get_session("win-liveness-test")
+    assert after is not None
+    assert after.pane_dead is True
+    assert after.reader_alive is None  # "is the reader alive" stops being meaningful once dead
+
+
+def test_reader_loop_stops_spinning_once_pid_resolver_says_gone(backend, tmp_path, monkeypatch):
+    # Before this fix, a dead-but-isalive()-lying process's reader
+    # thread would busy-loop forever on empty reads (the exact live
+    # symptom: reader_alive stayed True, tail served stale content
+    # forever, with no error). The resolver must make the reader thread
+    # actually exit.
+    _new_fake_shell_session(backend, tmp_path, name="win-liveness-reader")
+    entry = backend._require("win-liveness-reader")
+    assert entry.reader_thread is not None and entry.reader_thread.is_alive()
+
+    monkeypatch.setattr(backend, "_pid_alive_resolver", lambda pid: False)
+    # Force the underlying fake process to stop producing output (still
+    # "isalive()==True" per _FakePty until reaped) so the reader loop's
+    # next read() is genuinely empty and hits the liveness check.
+    entry.proc.terminate(force=True)
+    assert _wait_until(lambda: not entry.reader_thread.is_alive(), timeout=3.0)

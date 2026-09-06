@@ -61,6 +61,8 @@ class NodeClient(Protocol):
     def rename_session(self, name: str, new_name: str, *, requested_by: str | None = None) -> dict[str, Any]: ...
     def reopen_session(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
                        grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]: ...
+    def registry_reopen(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
+                        grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]: ...
     def list_killed_sessions(self) -> dict[str, Any]: ...
     def grant_read(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]: ...
     def grant_input(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]: ...
@@ -134,6 +136,18 @@ class LocalNodeClient:
                        grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]:
         return self._terminal.terminal_reopen_session(name, agent_type=agent_type, cwd=cwd,
                                                        grant_mode=grant_mode, requested_by=requested_by)
+
+    def registry_reopen(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
+                        grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]:
+        # Phase 0 node-agent restart-safety audit (2026-09-06): the
+        # Persistent Session Registry's own honest, MISSING/OFFLINE-
+        # aware reopen (session_registry.py) -- distinct from
+        # reopen_session above, which only ever knows about sessions an
+        # explicit terminal_kill_session call recorded (killed_sessions.
+        # py). This is the ONLY reopen path that works for a session that
+        # vanished via a node-agent restart (never explicitly Killed).
+        return self._terminal.terminal_registry_reopen(name, agent_type=agent_type, cwd=cwd,
+                                                        grant_mode=grant_mode, requested_by=requested_by)
 
     def list_killed_sessions(self) -> dict[str, Any]:
         return self._terminal.terminal_list_killed_sessions()
@@ -287,6 +301,12 @@ class RemoteNodeClient:
     def reopen_session(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
                        grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]:
         return self._request("POST", f"/v1/sessions/{urllib.parse.quote(name)}/reopen", body={
+            "agent_type": agent_type, "cwd": cwd, "grant_mode": grant_mode, "requested_by": requested_by,
+        })
+
+    def registry_reopen(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
+                        grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/v1/sessions/{urllib.parse.quote(name)}/registry-reopen", body={
             "agent_type": agent_type, "cwd": cwd, "grant_mode": grant_mode, "requested_by": requested_by,
         })
 
