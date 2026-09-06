@@ -1415,15 +1415,87 @@ class TerminalService:
                 result["submit_reason"] = "still unconfirmed after Escape+Enter recovery"
             return result
 
-        confirmed = after is not None and adapter.submit_ack_evidence(typed_snapshot, after, text)
+        # P0 "direct send" bugfix (real, live-reproduced root cause: a
+        # ChatGPT-originated prompt into a Windows Claude session
+        # intermittently needed several manual re-sends before it
+        # visibly "took"): _poll_for_submission above stops at the FIRST
+        # pane change it sees and hands that single snapshot to
+        # submit_ack_evidence -- but a Claude Code Ink redraw is not
+        # atomic: live capture instrumented against a real dell-5530
+        # session (disposable claude-diag-* sessions, never window/
+        # window2) showed the footer switching to its "esc to interrupt"
+        # busy indicator BEFORE the just-typed prompt's own echo line has
+        # rendered into the scrollback above it, on some sends. Landing a
+        # single capture in exactly that transitional frame makes
+        # submit_ack_evidence's own (deliberately stricter, item 3's own
+        # "tránh false positive") busy-window echo requirement fail --
+        # not because the send didn't work (the real Claude response
+        # always DID land moments later in every repro), but because the
+        # ONE frame checked happened to be too early. Reproduced 9/9
+        # times in one real run once a session had a couple of prior
+        # turns of scrollback (tests/test_send_verification.py's own new
+        # regression tests simulate this exact transitional-frame
+        # sequence without a real CLI).
+        #
+        # Fix: never commit to "unconfirmed" off a single frame -- keep
+        # polling (bounded by the SAME already-elapsed verify_timeout
+        # budget, never a longer worst-case latency than before) for
+        # submit_ack_evidence to actually pass, the same "wait for the
+        # real condition, not a fixed sleep" principle this project
+        # already uses for _poll_for_submission itself. A send that
+        # genuinely never gets accepted (a real stuck composer, a truly
+        # dead session) still correctly times out into DELIVERY_UNKNOWN
+        # -- this only removes the false negative for a send that WAS
+        # about to be, and genuinely is, accepted.
+        confirmed, after = self._poll_for_ack_evidence(session, typed_snapshot, after, adapter, text,
+                                                        deadline=time.monotonic() + verify_timeout)
         if confirmed:
             result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
             result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
             return result
         result["delivery_state"] = DELIVERY_UNKNOWN
         result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
-        result["submit_reason"] = reason
+        # Direct-send bugfix: `reason` (from _poll_for_submission, above)
+        # only ever says "the pane changed" or "the pane never changed" --
+        # by the time we get here, the pane DID change (reason=="confirmed"
+        # is the common case) but adapter.submit_ack_evidence never
+        # actually passed within the whole verify_timeout budget, which
+        # "confirmed" alone would misleadingly contradict. A caller-
+        # facing reason string must describe THAT, not silently repeat a
+        # word that means something different at this point in the flow.
+        result["submit_reason"] = (
+            "the pane changed but no adapter-specific submission evidence was found within the "
+            "verification window" if reason == "confirmed" else reason
+        )
         return result
+
+    def _poll_for_ack_evidence(self, session: str, typed_snapshot: list[str], first_after: list[str] | None,
+                               adapter: Any, text: str, *, deadline: float) -> tuple[bool, list[str] | None]:
+        """Keeps checking `adapter.submit_ack_evidence(typed_snapshot,
+        <latest capture>, text)` against fresh captures until it passes
+        or `deadline` (an ABSOLUTE time.monotonic() value -- the caller's
+        own already-computed verify_timeout budget, shared with
+        _poll_for_submission above it, never a separate/additional
+        window) is reached. `first_after` (already captured by
+        _poll_for_submission) is checked first, for free, before any
+        extra capture_lines call -- the common case (evidence already
+        present on the very first detected change) costs nothing extra
+        over the old single-shot check. Returns (confirmed, last_capture)
+        -- last_capture is always the most recent one seen, for the
+        caller's own DELIVERY_UNKNOWN evidence even on a genuine
+        timeout."""
+        after = first_after
+        if after is not None and adapter.submit_ack_evidence(typed_snapshot, after, text):
+            return True, after
+        while time.monotonic() < deadline:
+            time.sleep(SEND_VERIFY_POLL_INTERVAL_SECONDS)
+            try:
+                after = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
+            except TmuxError:
+                return False, after
+            if adapter.submit_ack_evidence(typed_snapshot, after, text):
+                return True, after
+        return False, after
 
     def _poll_for_submission(self, session: str, typed_snapshot: list[str], *,
                              timeout: float = SEND_VERIFY_TIMEOUT_SECONDS) -> tuple[bool, list[str] | None, str]:

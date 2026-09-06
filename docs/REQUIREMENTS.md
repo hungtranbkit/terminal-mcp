@@ -104,6 +104,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Windows renderer: real VT100/pyte screen-state emulation | VERIFIED |
 | Live disposable E2E: burst enqueue + rename + migrate + restart | VERIFIED |
 | Live remote-node (dell-5530) auto-dispatch smoke test | NOT YET RUN (this task's own required next step) |
+| Direct-send verification: continued-polling ack evidence (P0 fix) | VERIFIED locally; NOT YET DEPLOYED to dell-5530 |
 
 ---
 
@@ -976,6 +977,98 @@ scan/audit view over the SAME facts.)*
 - **Follow-up/backlog:** none outstanding for this entry specifically.
 - **Trace:** `d345524`.
 
+### Direct-send verification: continued-polling ack evidence (P0 fix)
+
+- **Goal / user value:** a ChatGPT/dashboard-originated prompt into a
+  Windows Claude session must not need multiple manual re-sends — the
+  original P0 report ("phải bấm/gửi vài lần mới vào").
+- **Status:** VERIFIED locally (real fixture-reproduced regression +
+  full default suite green); **NOT yet deployed** to the remote
+  dell-5530 node-agent that window/window2/wtest actually run on — see
+  Backlog item 7.
+- **Root cause (live-reproduced, real evidence):** a real disposable
+  `claude-diag-onb-1` Windows Claude session on dell-5530, already past
+  onboarding, was sent 12 sequential real prompts through the actual
+  production `ControllerService` → `RemoteNodeClient` path. The FIRST
+  send after a quiet session confirmed correctly; **every subsequent
+  send failed with `DELIVERY_UNKNOWN`** (11/12 in the cleanest run, 9/9
+  in an earlier one) even though Claude's own responses landed correctly
+  every time (confirmed via `terminal_tail`). Root cause, isolated via
+  fine-grained real-time polling instrumentation against the live
+  session: `_poll_for_submission` (`core.py`) returns as soon as it sees
+  the FIRST pane change after Enter and hands that ONE snapshot to
+  `ClaudeAdapter.submit_ack_evidence`. A real Claude Code Ink redraw is
+  NOT atomic — the footer can switch to its "esc to interrupt" busy
+  indicator before the just-typed prompt's own echo has rendered into
+  scrollback. A single-shot check landing exactly in that transitional
+  frame sees "busy, no echo yet" and reports `DELIVERY_UNKNOWN` — a pure
+  false negative; the send was already correctly accepted moments
+  later. This exactly explains the report: the caller sees
+  `SUBMIT_UNCONFIRMED`, assumes it may not have gone through, and
+  resends — risking a real duplicate on top of the original that HAD
+  landed.
+- **Fix:** `TerminalService._poll_for_ack_evidence` (new method,
+  `core.py`) — instead of checking `submit_ack_evidence` once against
+  `_poll_for_submission`'s first snapshot, it keeps polling (bounded by
+  the exact SAME `verify_timeout` budget already in place — 0.6s or
+  3.0s for Claude/Codex — never a longer worst case than before) until
+  the adapter's own ack evidence actually passes or the deadline is
+  reached. A send that genuinely never gets accepted still correctly
+  times out to `DELIVERY_UNKNOWN` — this only removes the false negative
+  for a send that was already on its way to being accepted. Also fixed:
+  a self-contradictory `submit_reason: "confirmed"` string that used to
+  accompany a `DELIVERY_UNKNOWN` result (leftover from
+  `_poll_for_submission`'s own "the pane changed" reason, misleading
+  once ack evidence still failed) — now says plainly that the pane
+  changed but no ack evidence was found in time.
+- **Scope / flow:** applies to every `press_enter=True` send through
+  `terminal_send_text`/`terminal_send_bound` — local tmux and remote
+  Windows/ConPTY sessions alike (the polling loop itself is backend-
+  agnostic; only the Claude/Codex adapters' own busy-window echo
+  requirement is what made this reachable in practice for a fast-
+  responding Claude session).
+- **UI route/screen:** none (backend-only fix); surfaces as fewer
+  `SUBMIT_UNCONFIRMED` results in the dashboard's own send-input flow.
+- **API/tool/command:** `terminal_send_text`, `terminal_send_bound` (no
+  signature change — same result shape, same `delivery_state`/
+  `submit_status` vocabulary).
+- **Config/permission:** none — no new config, no behavior gated behind
+  a flag (this is a correctness fix to existing, always-on verification).
+- **Data/schema/migration:** none.
+- **Acceptance/tests/evidence:** `tests/fixtures/claude_composer.py`
+  (new — a real raw-tty program modeling the exact two-phase-redraw race
+  found live) + 4 new tests in `tests/test_send_reliability.py`,
+  including `test_claude_race_repeated_sends_all_confirm_no_false_negatives`
+  (the direct regression proof: 5 sends in a row, all previously-
+  reproducible-as-false-negative, all now correctly `SUBMIT_CONFIRMED`).
+  Full default suite re-run clean after the fix: 1649 passed, 1
+  pre-existing unrelated flake, 14 deselected. Live evidence: real
+  before/after timing captured against dell-5530 (documented above) —
+  the FIX ITSELF has only been verified via the local fixture tests so
+  far, since it isn't deployed to dell-5530's own node-agent yet (see
+  Backlog item 7) — the local fixture reproduces the exact captured
+  live race faithfully, but a final live re-run against dell-5530 after
+  deployment is the closing piece of evidence still needed.
+- **Known limitations:** the fix does not change `SEND_TEXT_ENTER_SETTLE_SECONDS`
+  (still a fixed 80ms pre-Enter settle, not adaptive) — this investigation
+  found and fixed a DIFFERENT, confirmed bug in the post-Enter
+  verification instead; the settle window remains a disclosed, un-
+  exercised suspect for some other failure mode, not ruled out, just not
+  what this specific reproducible bug turned out to be. The full 13-item
+  send-reliability redesign from the original P0 ask (BUSY/QUEUED
+  semantics, a redesigned result-state contract, automatic
+  DELIVERY_UNKNOWN reconciliation, latency percentile metrics fields,
+  the full 12-scenario test matrix) was NOT built — this fix is scoped
+  to the one confirmed, live-reproduced root cause.
+- **Dependencies:** `adapters.py`'s existing `ClaudeAdapter`/
+  `CodexAdapter` evidence model (reused, not replaced).
+- **Follow-up/backlog:** deploy to dell-5530's node-agent + live re-
+  verify (Backlog item 7, the single most important remaining step);
+  consider the same continued-polling treatment for
+  `stuck_composer_evidence`'s own recovery-path evidence check if a
+  similar transitional-frame gap is ever found there.
+- **Trace:** see this file's own commit.
+
 ### Living-requirements convention itself
 
 - **Goal / user value:** any agent reads ONE file and knows what the
@@ -1025,34 +1118,31 @@ scan/audit view over the SAME facts.)*
 6. Enabling `config.queue.enabled` and `queue_lanes.auto_dispatch_enabled`
    against any real production session, including window/window2 —
    blocked on item 1.
-7. **Direct-send reliability root cause NOT yet conclusively identified**
-   (task: "P0 FIX TRIỆT ĐỂ DIRECT SEND WINDOWS / CLAUDE INPUT" — user
-   report: a ChatGPT-originated prompt into `window` sometimes needs
-   multiple submits before it's accepted). A live, disposable-session
-   diagnostic (`claude-diag-timing-1` on dell-5530, real `terminal_send_text`
-   calls through the real production `ControllerService`/`RemoteNodeClient`)
-   confirmed: (a) the Queue/Coordinator system is provably NOT in this
-   path (`config.queue.enabled=False` in production `config.yaml`;
-   `terminal_send_text` calls `controller.terminal_send_text` directly,
-   the queue is only consulted afterward for an informational warning);
-   (b) `core.py`'s `TARGET_WAITING` pre-Enter guard correctly detected
-   and safely blocked sends into a REAL Claude Code onboarding dialog
-   ("Teach auto mode about your environment?") that appeared mid-
-   diagnostic — working as designed, not a bug, but it consumed the
-   diagnostic's remaining budget before a clean, multi-send run against
-   an already-past-onboarding session (the actual shape of window/
-   window2/wtest) could be completed; (c) the one clean send observed
-   returned `SUBMIT_CONFIRMED` in 171ms, no retry needed. The fixed
-   80ms pre-Enter settle window (`SEND_TEXT_ENTER_SETTLE_SECONDS`,
-   `tmux.py`/`windows_backend.py`) remains a real, disclosed, NOT-yet-
-   proven-or-disproven suspect (non-adaptive, same value used for local
-   tmux and remote ConPTY+Node.js-Ink alike) — the next session should
-   re-run a longer, controlled multi-send diagnostic against an already-
-   onboarded disposable Windows Claude session (skip the first message
-   entirely, or dismiss onboarding first) and, if still inconclusive,
-   add the real write-start/enter-sent/output-changed timestamps this
-   task asked for directly into the `_send_text_and_verify_locked`
-   result before changing the settle/verification logic itself.
+7. **Direct-send reliability: ROOT CAUSE CONFIRMED, LOCAL FIX SHIPPED,
+   REMOTE DEPLOYMENT STILL PENDING** (task: "P0 FIX TRIỆT ĐỂ DIRECT SEND
+   WINDOWS / CLAUDE INPUT" — user report: a ChatGPT-originated prompt
+   into `window` sometimes needs multiple submits before it's accepted).
+   See the "Direct-send verification: continued-polling ack evidence"
+   entry below for the full writeup. **Critical outstanding step:** the
+   fix lives in this repo's own `terminal_mcp/core.py`, but a session on
+   dell-5530 (window/window2/wtest, and any other Windows session) is
+   served by a SEPARATE deployment of this codebase running directly on
+   that machine (`C:\Users\tranv\terminal-mcp`, its own node-agent
+   process) — confirmed via SSH (`tranv@192.168.1.250`, key-based,
+   already working) that this remote checkout is older than the local
+   fix. **The fix has NOT been deployed there and the remote node-agent
+   has NOT been restarted** — deliberately not done autonomously this
+   session (a live Windows machine with many real, active sessions;
+   restarting its node-agent is a real, outward-facing action that
+   deserves an explicit go-ahead, the same as the earlier
+   `terminal-mcp-http.service` restart was only done after the user's
+   own explicit "restart an toàn"). Until that deployment happens,
+   window/window2/wtest and every other dell-5530 session still run the
+   OLD, buggy verification logic. Next step: pull/copy the fix to
+   `C:\Users\tranv\terminal-mcp`, restart the node-agent process there
+   (never the tmux-equivalent sessions themselves), and re-run the exact
+   same live disposable-session repro to confirm 0 false negatives on
+   the ACTUAL deployment those sessions use.
 8. **Dashboard Task Manager/Supervisor-Coordinator panel deployment
    gap (found and fixed):** the production `terminal-mcp-http.service`
    process had been running continuously since before commits `20f6ff0`/

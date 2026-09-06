@@ -578,3 +578,84 @@ def test_codex_normal_composer_send_still_works_after_approval_prompt_fix(tmux_s
     assert result["sent"] is True
     assert result["submit_status"] == "SUBMIT_CONFIRMED"
     assert "error" not in result
+
+
+# ---------------------------------------------------------------------------
+# P0 "direct send" bugfix (task: "P0 FIX TRIỆT ĐỂ DIRECT SEND WINDOWS /
+# CLAUDE INPUT" -- real user report: a ChatGPT-originated prompt into
+# `window` intermittently needed several manual re-sends). Root cause,
+# live-reproduced against a real disposable dell-5530 Claude session (see
+# docs/REQUIREMENTS.md's own writeup): _poll_for_submission stopped
+# polling at the FIRST detected pane change and handed that single,
+# possibly-transitional frame to submit_ack_evidence -- a real Claude Code
+# Ink redraw is not atomic, so that one frame can show the busy footer
+# ("esc to interrupt") BEFORE the sent text's own echo has rendered into
+# scrollback, making the stricter busy-window echo check fail even though
+# the send genuinely was (and moments later visibly is) accepted. Fixed by
+# _poll_for_ack_evidence: keep polling for real ack evidence across the
+# SAME already-existing verify_timeout budget, never a single-shot check.
+# ---------------------------------------------------------------------------
+
+CLAUDE_FIXTURE_PATH = FIXTURES_DIR / "claude_composer.py"
+
+
+def _claude_session(tmux_session_factory, name: str, mode: str) -> str:
+    command = f"bash -lc 'CLAUDE_FIXTURE_MODE={mode} exec -a claude python3 -u {CLAUDE_FIXTURE_PATH}'"
+    tmux_session_factory(name, command)
+    return name
+
+
+def test_claude_normal_submit_confirms_without_extra_polling(tmux_session_factory, tmp_path):
+    session = _claude_session(tmux_session_factory, "test-claude-normal", "normal_submit")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "hello", press_enter=True)
+    assert result["submit_status"] == "SUBMIT_CONFIRMED"
+    pane = service.terminal_tail(session, 10)["output"]
+    assert "SUBMITTED[1]: hello" in pane
+
+
+def test_claude_busy_footer_before_echo_race_now_confirms(tmux_session_factory, tmp_path):
+    """THE regression proof: before this fix, a single-shot check landing
+    on the busy-footer-no-echo-yet frame would report DELIVERY_UNKNOWN
+    for a send that was genuinely accepted 150ms later -- exactly the
+    live-reproduced root cause. The fix's continued polling (bounded by
+    the same verify_timeout, well over 150ms for a claude-class adapter)
+    must now correctly wait for the echo and report SUBMIT_CONFIRMED."""
+    session = _claude_session(tmux_session_factory, "test-claude-race", "busy_footer_before_echo")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "diag prompt", press_enter=True)
+    assert result["submit_status"] == "SUBMIT_CONFIRMED", result
+    assert result["delivery_state"] == "SUBMIT_CONFIRMED"
+    pane = service.terminal_tail(session, 10)["output"]
+    assert "SUBMITTED[1]: diag prompt" in pane
+
+
+def test_claude_never_echoes_still_correctly_reports_unconfirmed(tmux_session_factory, tmp_path):
+    """The fix's extra polling must never turn a REAL failure (no echo
+    ever appears) into a false positive -- still correctly times out to
+    DELIVERY_UNKNOWN, same as before this fix, just not off a single
+    premature frame."""
+    session = _claude_session(tmux_session_factory, "test-claude-never-echo", "never_echoes")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "diag prompt", press_enter=True)
+    assert result["submit_status"] == "SUBMIT_UNCONFIRMED"
+    assert result["delivery_state"] == "DELIVERY_UNKNOWN"
+
+
+def test_claude_race_repeated_sends_all_confirm_no_false_negatives(tmux_session_factory, tmp_path):
+    """The exact live-reproduced pattern: several sends IN A ROW against
+    the same session, each hitting the busy-footer-before-echo race --
+    every one of them must now confirm (the live bug showed 9/9
+    consecutive false negatives before this fix)."""
+    session = _claude_session(tmux_session_factory, "test-claude-race-repeat", "busy_footer_before_echo")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    for i in range(5):
+        result = service.terminal_send_text(session, f"pong-{i}", press_enter=True)
+        assert result["submit_status"] == "SUBMIT_CONFIRMED", (i, result)
+    pane = service.terminal_tail(session, 50)["output"]  # wide enough for all 5 exchanges' own scrollback
+    for i in range(5):
+        assert f"SUBMITTED[1]: pong-{i}" in pane
