@@ -212,3 +212,33 @@ def test_route_task_reason_and_score_breakdown_are_populated_for_explainability(
     assert decision.reason  # non-empty, human-readable
     assert "total" in decision.score_breakdown
     assert decision.evidence["candidates_considered"] == 1
+
+
+# -- WIP limit (§20.6 Phase A) ---------------------------------------------
+
+def test_hard_gate_rejects_candidate_at_its_wip_limit():
+    task = _task()
+    candidate = _candidate("worker-a", max_queued=2, queue_depth=2)
+    failure = hard_gate_failure(task, candidate)
+    assert failure is not None and "WIP limit" in failure
+
+
+def test_hard_gate_accepts_candidate_under_its_wip_limit():
+    task = _task()
+    candidate = _candidate("worker-a", max_queued=2, queue_depth=1)
+    assert hard_gate_failure(task, candidate) is None
+
+
+def test_hard_gate_unbounded_by_default_even_at_high_queue_depth():
+    task = _task()
+    candidate = _candidate("worker-a", max_queued=None, queue_depth=1000)
+    assert hard_gate_failure(task, candidate) is None
+
+
+def test_route_task_prefers_a_worker_under_its_wip_limit_over_one_at_it():
+    task = _task()
+    at_limit = _candidate("worker-a", max_queued=1, queue_depth=1)
+    under_limit = _candidate("worker-b", max_queued=5, queue_depth=1)
+    decision = route_task(task, [at_limit, under_limit])
+    assert decision.status == ROUTED
+    assert decision.chosen.session == "worker-b"

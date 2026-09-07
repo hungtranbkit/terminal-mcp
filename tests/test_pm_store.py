@@ -117,3 +117,21 @@ def test_latest_decisions_for_tasks_bulk_read(store):
 
 def test_latest_decisions_for_tasks_empty_list_returns_empty_dict(store):
     assert store.latest_decisions_for_tasks([]) == {}
+
+
+# -- max_queued (WIP limit, §20.6 Phase A) -------------------------------------
+
+def test_upsert_capability_sets_max_queued(store):
+    profile = store.upsert_capability("local", "worker-a", max_queued=3)
+    assert profile.max_queued == 3
+
+
+def test_upsert_capability_max_queued_defaults_to_unbounded(store):
+    profile = store.upsert_capability("local", "worker-a")
+    assert profile.max_queued is None
+
+
+def test_upsert_capability_preserves_max_queued_when_not_specified(store):
+    store.upsert_capability("local", "worker-a", max_queued=5)
+    updated = store.upsert_capability("local", "worker-a", role="developer")
+    assert updated.max_queued == 5

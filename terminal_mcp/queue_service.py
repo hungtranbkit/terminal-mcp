@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from .dor_gate import check_definition_of_ready
 from .permissions import valid_session_name
 from .queue_store import UNASSIGNED_LANE, VERIFYING, InvalidTransitionError, TaskAlreadyClaimedError, QueueStore
 
@@ -151,15 +152,24 @@ class QueueService:
         dependency mechanism for Planner-created children."""
         if not prompt:
             return {"error": "TASK_PROMPT_REQUIRED"}
+        full_metadata = dict(metadata or {})
+        if project:
+            full_metadata["project"] = project
         target = session
         if target is not None:
             if error := self._validate_session(target):
                 return error
+            # Definition of Ready (§20.6 Phase A): a task created ALREADY
+            # assigned skips UNASSIGNED entirely, but is "leaving
+            # UNASSIGNED" in every way that matters -- same opt-in DoR
+            # check as assign_task, checked against what WOULD be the
+            # task's own row (dor_gate.py only reads title/metadata, so
+            # no real row needs to exist yet for this check).
+            dor = check_definition_of_ready({"title": title or "", "metadata": full_metadata})
+            if dor["status"] != "READY":
+                return {"error": "NEEDS_CLARIFICATION", **dor}
         else:
             target = UNASSIGNED_LANE
-        full_metadata = dict(metadata or {})
-        if project:
-            full_metadata["project"] = project
         task = {"prompt": prompt, "title": title or "", "priority": priority, "metadata": full_metadata}
         if depends_on:
             task["depends_on"] = list(depends_on)
@@ -178,7 +188,20 @@ class QueueService:
         review/mid-dispatch/running/verifying or already in a terminal
         state -- see `queue_store.py`'s own `MOVABLE_STATUSES` docstring
         for exactly why. `session` is validated the same way any other
-        session name is everywhere else in this project."""
+        session name is everywhere else in this project.
+
+        Definition of Ready (§20.6 Phase A, dor_gate.py): refuses
+        (NEEDS_CLARIFICATION) a task leaving UNASSIGNED whose own
+        metadata declares `dor_required: true` but is missing a
+        required field -- OPT-IN per task, never enforced on a task
+        that never asked for this rigor (see dor_gate.py's own
+        docstring for why)."""
+        existing = self.store.get_task(task_id)
+        if existing is None:
+            return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+        dor = check_definition_of_ready(existing.to_dict())
+        if dor["status"] != "READY":
+            return {"error": "NEEDS_CLARIFICATION", "task_id": task_id, **dor}
         if error := self._validate_session(session):
             return error
         result = self.store.move_task_to_session(task_id, session)

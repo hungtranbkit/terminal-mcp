@@ -68,6 +68,7 @@ class WorkerCandidate:
     permissions_ok: bool = True
     queue_depth: int = 0
     picks_since_last_fairness_reset: int = 0  # higher = picked more often recently; lower gets a fairness boost
+    max_queued: int | None = None  # WIP limit (§20.6 Phase A) -- None means unbounded, same as today
 
     def key(self) -> str:
         return f"{self.node_id}/{self.session}"
@@ -123,6 +124,13 @@ def hard_gate_failure(task: dict[str, Any], candidate: WorkerCandidate) -> str |
     excluded = {s.casefold() for s in _as_str_list(metadata.get("excluded_sessions"))}
     if candidate.session.casefold() in excluded:
         return "session is explicitly excluded for this task"
+    # WIP limit (§20.6 Phase A: "PM never floods a worker's own queue
+    # past it") -- a HARD gate, not a soft-scoring nudge, once a cap is
+    # actually configured on the candidate's own Capability Profile
+    # (max_queued=None, the default, means unbounded -- unchanged
+    # behavior for every profile that never set one).
+    if candidate.max_queued is not None and candidate.queue_depth >= candidate.max_queued:
+        return f"WIP limit reached: {candidate.queue_depth} queued >= max_queued {candidate.max_queued}"
     return None
 
 

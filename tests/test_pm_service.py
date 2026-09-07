@@ -196,3 +196,13 @@ def test_node_online_check_via_controller_list_nodes(tmp_path):
     task_id = pm.queue.create_task("t", "p", session=None)["task_id"]
     result = pm.route_task(task_id, mode=MODE_SUGGEST)
     assert result["decision"]["chosen_session"] == "worker-b"
+
+
+def test_wip_limit_hard_gates_a_session_at_capacity(pm):
+    pm.upsert_capability("local", "worker-a", max_queued=1)
+    pm.upsert_capability("local", "worker-b")  # unbounded
+    # Fill worker-a to its own cap.
+    pm.queue.create_task("existing", "p", session="worker-a")
+    task_id = pm.queue.create_task("t", "p", session=None)["task_id"]
+    result = pm.route_task(task_id, mode=MODE_SUGGEST)
+    assert result["decision"]["chosen_session"] == "worker-b"

@@ -125,6 +125,8 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_task_create_isolated",
         "terminal_worktree_status",
         "terminal_worktree_cleanup",
+        # Delivery discipline: Definition of Ready (§20.6 Phase A).
+        "terminal_task_check_dor",
     }
 
 

@@ -1370,6 +1370,86 @@ VERIFIED — none of this is built yet.
 - **Conflict prediction**: the Planner's own overlap-based serialization
   (§20.3) is this requirement, not a separate mechanism.
 
+#### Phase A implementation note (2026-09-07, VERIFIED — DoR, WIP limits, risk-level gate)
+
+**Status: VERIFIED** for the 3 pieces actually built (unit tests + a
+real disposable live E2E). **Not built**: an "ownership/affinity
+prefers continuity" scoring factor distinct from the already-real
+`project_affinity` soft-score (disclosed scope cut — see below); a
+project-level wiring point for `CoordinatorGate`'s new `require_
+approval_for_risk_levels` constructor param (it is real and fully
+tested, but no project currently opts into it by default — a future
+increment would thread a per-project config value into wherever
+`CoordinatorGate()` is actually constructed for a real project's own
+queue_engine).
+
+- **Definition of Ready** (`dor_gate.py`, new) — deliberately **OPT-IN
+  per task** (`metadata.dor_required: true`), never a blanket
+  requirement retrofitted onto every existing task: this project's own
+  Kanban/PM/Planner checkpoints already created (and continue to
+  create, in their own test suites) many small tasks with none of
+  these fields declared — a mandatory gate would be a breaking
+  behavior change with no real safety value for an opportunistic task.
+  When opted in, requires `title`, `acceptance_criteria`, `project`,
+  and a valid `risk_level` (`LOW`/`MEDIUM`/`HIGH`/`CRITICAL`) — missing
+  any is `NEEDS_CLARIFICATION`, never guessed. **Scope cut, disclosed**:
+  `required_os`/`required_capabilities` are read if present but NOT
+  mandated (their absence is itself a meaningful "no specific
+  requirement" declaration); `dependencies` (`depends_on`) is not
+  checked either — it is always a real column, and there is no way to
+  distinguish "declared none, deliberately" from "never considered"
+  from the data alone. Enforced at the two real "leaving UNASSIGNED"
+  points: `QueueService.assign_task` and `QueueService.create_task`
+  (when created already-assigned). `terminal_task_check_dor` is a
+  read-only inspection tool.
+- **WIP limits** (`pm_router.py`/`pm_store.py`) — `CapabilityProfile.
+  max_queued` (None = unbounded, the unchanged default) is now a HARD
+  routing gate (not just PM's existing soft `idle_bonus` score): a
+  candidate whose `queue_depth >= max_queued` is ineligible outright,
+  same as an OS/capability mismatch — "PM never floods a worker's own
+  queue past it" (task's own words). Set via `terminal_pm_set_
+  capability(..., max_queued=N)`.
+- **Risk classification** (`coordinator.py`) — `CoordinatorGate`
+  gained a new, OFF-by-default constructor param `require_approval_
+  for_risk_levels: tuple[str, ...] = ()`. A project that opts specific
+  levels in (e.g. `("HIGH", "CRITICAL")`) requires an explicit
+  `metadata.risk_approved: true` (a real human/PM sign-off, never
+  inferred from the prompt text) before a task declaring one of those
+  levels may reach READY — a task with no `risk_level` declared at all
+  is never gated by this, regardless of project policy.
+- **Ownership/affinity**: substantially covered by the already-real
+  `project_affinity` soft-scoring factor (§20.2a) + every routing
+  decision already being recorded with a real `routing_reason` — a
+  distinct "prefers the SAME session that did prior related work"
+  factor (beyond project affinity) was not built this pass, disclosed
+  as a scope cut rather than silently claimed.
+- **Definition of Done / Conflict prediction**: both already
+  substantially real via existing, previously-VERIFIED mechanisms
+  (§7's `mark_completed_with_evidence` evidence requirement + the
+  completion-marker protocol + the living-requirements doc gate for
+  Done; §20.3's own `depends_on_indices` overlap-based serialization
+  for conflict prediction) — no new code needed for either, per this
+  section's own explicit "extend, don't rebuild" framing.
+- Tests: `tests/test_dor_gate.py` (9), 5 new in `tests/test_queue_
+  service_fleet_views.py` (assign_task/create_task DoR wiring), 4 new
+  in `tests/test_pm_router.py` + 1 new in `tests/test_pm_service.py`
+  (WIP limit), 5 new in `tests/test_coordinator.py` (risk-level gate),
+  5 new in `tests/test_dor_gate_mcp_tools.py` (the real MCP tool
+  surface for all three). Full suite green.
+- **Live evidence** (real disposable tmux sessions, real grants, the
+  real MCP `server.call_tool` path — never `window`/`window2`/
+  `wtest`): a DoR-opted, incomplete task was correctly refused
+  assignment (`NEEDS_CLARIFICATION`, all 3 missing fields listed);
+  re-submitted complete, `terminal_task_check_dor` correctly reported
+  `READY`; assigned to a session capped at `max_queued=1` — a second
+  task then correctly saw that session as the ONLY ineligible
+  candidate (`"WIP limit reached: 1 queued >= max_queued 1"`) and PM
+  correctly routed it to the uncapped alternative instead; a real
+  `CoordinatorGate` configured with `require_approval_for_risk_levels`
+  correctly returned `NEEDS_HUMAN` for the real, real-store HIGH-risk
+  task with no `risk_approved` flag set. Disposable sessions/state
+  cleaned up after.
+
 **Phase B — Quality/integration:**
 - The Integration Agent (§20.4) already independently builds/lints/
   tests a Handoff rather than trusting the worker's own report — this
@@ -2874,6 +2954,21 @@ scan/audit view over the SAME facts.)*
     the user: accept that loss to deploy every accumulated fix, or leave
     `window2` exactly as it is (safe, unchanged, but still stuck) until
     a further diagnosis or a deliberate decision is made.
+21. **Unified Task System §20.6 Phase A (Delivery discipline) — 3 of 5
+    pieces now VERIFIED and live** (2026-09-07): Definition of Ready
+    (opt-in, `dor_gate.py`), WIP limits (`CapabilityProfile.max_queued`,
+    a hard PM routing gate), and a risk-level human-approval gate
+    (`CoordinatorGate`'s new `require_approval_for_risk_levels`) — see
+    Phase A's own implementation note in §20.6 for full evidence
+    (tests + a real disposable live E2E) and §4e of `docs/CHATGPT_
+    USAGE.md`. Definition of Done and Conflict prediction needed no new
+    code (already real via existing mechanisms, per the section's own
+    "extend, don't rebuild" framing). NOT built: a distinct "ownership/
+    affinity prefers continuity" scoring factor beyond the already-real
+    `project_affinity` soft score, and any project-level wiring that
+    actually turns on `require_approval_for_risk_levels` for a real
+    project (the mechanism is real and tested; no policy currently
+    activates it). Phases B-E remain entirely PLANNED, unbuilt.
 
 ---
 

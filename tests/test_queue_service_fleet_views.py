@@ -269,3 +269,47 @@ def test_board_after_assign_moves_task_from_backlog_to_queued(queue):
     counts = queue.board()["counts"]
     assert counts["backlog"] == 0
     assert counts["queued"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Definition of Ready checkpoint (§20.6 Phase A): opt-in gate before a
+# task may leave UNASSIGNED (assign_task) or be created already-assigned
+# (create_task with session=).
+# ---------------------------------------------------------------------------
+
+def test_assign_task_refuses_dor_required_task_missing_fields(queue):
+    created = queue.create_task("t", "p", session=None, metadata={"dor_required": True})
+    result = queue.assign_task(created["task_id"], "lane-a")
+    assert result["error"] == "NEEDS_CLARIFICATION"
+    assert "acceptance_criteria" in result["missing_fields"]
+    # Refused -- task must still be exactly where it was.
+    assert queue.board()["counts"]["backlog"] == 1
+
+
+def test_assign_task_allows_dor_required_task_with_all_fields(queue):
+    created = queue.create_task("t", "p", session=None, metadata={
+        "dor_required": True, "acceptance_criteria": "works", "project": "P", "risk_level": "LOW",
+    })
+    result = queue.assign_task(created["task_id"], "lane-a")
+    assert "error" not in result
+
+
+def test_assign_task_never_checks_dor_when_not_opted_in(queue):
+    created = queue.create_task("t", "p", session=None)  # no dor_required at all
+    result = queue.assign_task(created["task_id"], "lane-a")
+    assert "error" not in result
+
+
+def test_create_task_with_session_enforces_dor_when_opted_in(queue):
+    result = queue.create_task("t", "p", session="lane-a", metadata={"dor_required": True})
+    assert result["error"] == "NEEDS_CLARIFICATION"
+    assert queue.board()["counts"]["queued"] == 0  # never created at all
+
+
+def test_create_task_unassigned_never_checks_dor_at_creation_time(queue):
+    # DoR is about LEAVING unassigned -- creating it AS unassigned is
+    # exactly where DoR belongs unchecked; the gate applies once it's
+    # actually assigned (assign_task, tested above).
+    result = queue.create_task("t", "p", session=None, metadata={"dor_required": True})
+    assert "error" not in result
+    assert queue.board()["counts"]["backlog"] == 1

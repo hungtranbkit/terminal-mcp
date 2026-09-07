@@ -117,7 +117,7 @@ class PMService:
                 role=profile.role, skills=profile.skills,
                 online=self._node_online(profile.node_id),
                 permissions_ok=self._permissions_ok(profile.node_id, profile.session),
-                queue_depth=pending.get(profile.session, 0),
+                queue_depth=pending.get(profile.session, 0), max_queued=profile.max_queued,
             ))
         return candidates
 

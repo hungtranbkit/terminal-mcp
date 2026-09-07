@@ -315,6 +315,53 @@ def test_artificial_blocker_true_without_a_string_reason_still_blocks(store):
 
 
 # ---------------------------------------------------------------------------
+# Risk classification (§20.6 Phase A) -- OFF by default, opt-in per project.
+# ---------------------------------------------------------------------------
+
+def test_risk_level_gate_off_by_default_never_blocks_a_high_risk_task(store):
+    task = _make_task(store, metadata={"risk_level": "HIGH"})
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory())  # require_approval_for_risk_levels=()
+    decision = gate.review(task, store=store, session=_ok_session())
+    assert decision.status == READY
+
+
+def test_risk_level_gate_blocks_unapproved_high_risk_task_when_opted_in(store):
+    task = _make_task(store, metadata={"risk_level": "HIGH"})
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory(),
+                           require_approval_for_risk_levels=("HIGH", "CRITICAL"))
+    decision = gate.review(task, store=store, session=_ok_session())
+    assert decision.status == NEEDS_HUMAN
+    assert "risk_level" in decision.reason
+    assert "HIGH" in decision.reason
+
+
+def test_risk_level_gate_allows_explicitly_approved_high_risk_task(store):
+    task = _make_task(store, metadata={"risk_level": "HIGH", "risk_approved": True})
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory(),
+                           require_approval_for_risk_levels=("HIGH", "CRITICAL"))
+    decision = gate.review(task, store=store, session=_ok_session())
+    assert decision.status == READY
+
+
+def test_risk_level_gate_only_applies_to_opted_in_levels(store):
+    # LOW is not in the opted-in set -- never gated even though the
+    # project DID opt HIGH/CRITICAL into this requirement.
+    task = _make_task(store, metadata={"risk_level": "LOW"})
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory(),
+                           require_approval_for_risk_levels=("HIGH", "CRITICAL"))
+    decision = gate.review(task, store=store, session=_ok_session())
+    assert decision.status == READY
+
+
+def test_risk_level_gate_no_risk_level_declared_never_blocks(store):
+    task = _make_task(store)  # no risk_level metadata at all
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory(),
+                           require_approval_for_risk_levels=("HIGH", "CRITICAL"))
+    decision = gate.review(task, store=store, session=_ok_session())
+    assert decision.status == READY
+
+
+# ---------------------------------------------------------------------------
 # Production-readiness pass: session state (WAITING_INPUT/stale stream).
 # ---------------------------------------------------------------------------
 

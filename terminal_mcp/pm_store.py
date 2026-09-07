@@ -96,6 +96,7 @@ class CapabilityProfile:
     permissions_note: str | None
     created_at: str
     updated_at: str
+    max_queued: int | None = None  # WIP limit (§20.6 Phase A) -- None = unbounded, unchanged default
 
     def key(self) -> str:
         # Same "node_id/session" qualified-name shape controller.py's
@@ -108,7 +109,7 @@ class CapabilityProfile:
             "node_id": self.node_id, "session": self.session, "os": self.os,
             "runtime_tools": list(self.runtime_tools), "project_affinity": self.project_affinity,
             "role": self.role, "skills": [dict(s) for s in self.skills],
-            "permissions_note": self.permissions_note,
+            "permissions_note": self.permissions_note, "max_queued": self.max_queued,
             "created_at": self.created_at, "updated_at": self.updated_at,
         }
 
@@ -141,7 +142,7 @@ def _profile_from_row(row: sqlite3.Row) -> CapabilityProfile:
         node_id=row["node_id"], session=row["session"], os=row["os"],
         runtime_tools=_load_list(row["runtime_tools"]), project_affinity=row["project_affinity"],
         role=row["role"], skills=_load_list(row["skills"]), permissions_note=row["permissions_note"],
-        created_at=row["created_at"], updated_at=row["updated_at"],
+        max_queued=row["max_queued"], created_at=row["created_at"], updated_at=row["updated_at"],
     )
 
 
@@ -171,6 +172,7 @@ class PMStore:
                     role TEXT,
                     skills TEXT NOT NULL DEFAULT '[]',
                     permissions_note TEXT,
+                    max_queued INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (node_id, session)
@@ -222,13 +224,16 @@ class PMStore:
     def upsert_capability(self, node_id: str, session: str, *, os: str | None = None,
                           runtime_tools: list[str] | None = None, project_affinity: str | None = None,
                           role: str | None = None, skills: list[dict[str, Any]] | None = None,
-                          permissions_note: str | None = None) -> CapabilityProfile:
+                          permissions_note: str | None = None, max_queued: int | None = None) -> CapabilityProfile:
         """INSERT-or-update, same shape as session_registry.py's own
         upsert_seen -- a repeat call for the same (node_id, session)
         updates the row in place (COALESCE-style: a field left None
         keeps its previous stored value rather than being blanked,
         so a caller updating just `skills` doesn't need to re-supply
-        `os`/`runtime_tools` every time)."""
+        `os`/`runtime_tools` every time). `max_queued` (§20.6 Phase A
+        WIP limit) follows the same COALESCE convention -- pass 0
+        explicitly to actually set "no queued capacity", None to leave
+        whatever was already stored (or unbounded, on first creation)."""
         now = _now_iso()
         with self._connection() as connection:
             existing = connection.execute(
@@ -244,22 +249,25 @@ class PMStore:
                 "skills": skills if skills is not None else (_load_list(existing["skills"]) if existing else ()),
                 "permissions_note": permissions_note if permissions_note is not None
                     else (existing["permissions_note"] if existing else None),
+                "max_queued": max_queued if max_queued is not None
+                    else (existing["max_queued"] if existing else None),
             }
             connection.execute(
                 """
                 INSERT INTO capability_profiles
                     (node_id, session, os, runtime_tools, project_affinity, role, skills, permissions_note,
-                     created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     max_queued, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(node_id, session) DO UPDATE SET
                     os = excluded.os, runtime_tools = excluded.runtime_tools,
                     project_affinity = excluded.project_affinity, role = excluded.role,
                     skills = excluded.skills, permissions_note = excluded.permissions_note,
-                    updated_at = excluded.updated_at
+                    max_queued = excluded.max_queued, updated_at = excluded.updated_at
                 """,
                 (node_id, session, merged["os"], _dump(list(merged["runtime_tools"])),
                  merged["project_affinity"], merged["role"], _dump(list(merged["skills"])),
-                 merged["permissions_note"], now if existing is None else existing["created_at"], now),
+                 merged["permissions_note"], merged["max_queued"],
+                 now if existing is None else existing["created_at"], now),
             )
             row = connection.execute(
                 "SELECT * FROM capability_profiles WHERE node_id = ? AND session = ?", (node_id, session),

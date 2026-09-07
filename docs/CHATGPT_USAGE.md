@@ -324,6 +324,36 @@ really know what you're doing — `terminal_task_create_isolated` is what
 keeps the worktree, the branch, and the task's own metadata consistent
 with each other in one real, atomic-ish step (rolled back on failure).
 
+### 4e. Delivery discipline (Definition of Ready, WIP limits, risk-level approval)
+
+**Status: VERIFIED** — see REQUIREMENTS.md's own Phase A implementation
+note for full evidence. All three are **opt-in**; a task/project that
+never asks for this rigor is completely unaffected.
+
+- **Definition of Ready**: set `metadata.dor_required: true` on a task
+  to require `acceptance_criteria`, `project`, and a valid `risk_level`
+  (`LOW`/`MEDIUM`/`HIGH`/`CRITICAL`) before it can leave Backlog.
+  `terminal_task_check_dor(task_id)` inspects this read-only;
+  `terminal_task_assign`/`terminal_task_create` (with a session)
+  refuse (`NEEDS_CLARIFICATION` + `missing_fields`) if it's incomplete.
+- **WIP limits**: `terminal_pm_set_capability(..., max_queued=N)` caps
+  how many QUEUED tasks PM will ever route to that session — once at
+  capacity it's simply not eligible (same as an OS mismatch), PM
+  routes elsewhere or reports `NO_ELIGIBLE_WORKER` if nothing else
+  qualifies. Omit/None stays unbounded.
+- **Risk-level approval**: a `CoordinatorGate` can be configured (by
+  whoever wires it up for a project) with `require_approval_for_
+  risk_levels=("HIGH", "CRITICAL")` — a task declaring one of those
+  levels then needs `metadata.risk_approved: true` (a real human/PM
+  sign-off) before the Coordinator will let it dispatch. Not wired
+  into any project's own real queue engine by default yet — this is
+  the mechanism, not an activated policy.
+
+**Anti-pattern:** don't set `dor_required`/a `risk_level` on every
+trivial task "just in case" — it adds real friction (a task genuinely
+cannot be assigned until the fields are filled in) for no benefit on
+small, obvious work.
+
 ## 5. Supervisor flow (canonical for watching an unattended session and
 reacting to it needing help)
 
@@ -491,14 +521,15 @@ the dashboard's `/dashboard/tasks` page), **PM/Orchestrator skill-based
 routing slice** (§4b — `terminal_pm_*` tools, no auto-loop), **Planner
 split-infrastructure slice** (§4c — `terminal_task_split`/`approve_
 plan`/`children`/`complete_parent`, no auto-complexity-based splitter),
-and **git isolation slice** (§4d — `terminal_task_create_isolated`/
+**git isolation slice** (§4d — `terminal_task_create_isolated`/
 `worktree_status`/`worktree_cleanup`, plus `allow_mechanical_conflict_
-resolution` on `terminal_integration_configure`) are all **VERIFIED
-and callable**. Everything else in that design — PM-based routing of
-the Integration/Merge Agent to a specific session, and the Phase A-E
-Startup Operating Model — is still **PLANNED**, not built, as of this
-file's own last update. See `docs/REQUIREMENTS.md`'s own "Unified Task
-System" section (§20) for the current architecture-in-progress.
-Nothing beyond §4a/§4b/§4c/§4d's tools is callable yet; if asked to
-use any of the rest, say so plainly rather
-than guessing at a tool name.
+resolution` on `terminal_integration_configure`), and **delivery-
+discipline slice** (§4e — Definition of Ready, WIP limits, risk-level
+approval, all opt-in) are all **VERIFIED and callable**. Everything
+else in that design — PM-based routing of the Integration/Merge Agent
+to a specific session, and the rest of the Phase A-E Startup Operating
+Model (Phases B through E) — is still **PLANNED**, not built, as of
+this file's own last update. See `docs/REQUIREMENTS.md`'s own "Unified
+Task System" section (§20) for the current architecture-in-progress.
+Nothing beyond §4a-§4e's tools is callable yet; if asked to use any of
+the rest, say so plainly rather than guessing at a tool name.

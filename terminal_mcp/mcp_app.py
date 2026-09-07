@@ -12,6 +12,7 @@ from .integration_engine import IntegrationEngine
 from .task_migration import TaskMigrationPlanner
 from .integration_service import IntegrationService
 from .integration_store import publish_handoff_for_completed_task
+from .dor_gate import check_definition_of_ready
 from .git_isolation_service import GitIsolationService
 from .node_models import node_to_dict as _node_to_dict
 from .planner_service import PlannerService
@@ -1201,17 +1202,20 @@ def build_mcp(service: TerminalService | None = None,
     def terminal_pm_set_capability(node_id: str, session: str, os: str | None = None,
                                    runtime_tools: list[str] | None = None, project_affinity: str | None = None,
                                    role: str | None = None, skills: list[dict] | None = None,
-                                   permissions_note: str | None = None) -> dict:
+                                   permissions_note: str | None = None, max_queued: int | None = None) -> dict:
         """Create/update one session's Capability Profile -- declarative
         only (never inferred from a display name): `os` (e.g. "windows"/
         "linux"), `runtime_tools` (e.g. ["dotnet", "wpf", "docker"]),
         `project_affinity`, `role` (e.g. "developer"/"qa"/"integration"),
-        `skills` ([{"name": "wpf", "confidence": 0.9}, ...]). A repeat
-        call updates in place -- a field left None keeps its previous
-        stored value rather than being blanked."""
+        `skills` ([{"name": "wpf", "confidence": 0.9}, ...]), `max_queued`
+        (§20.6 Phase A WIP limit -- a HARD routing gate once set: PM
+        never routes a task to this session once it already has this
+        many QUEUED tasks; None/omitted stays unbounded, the default).
+        A repeat call updates in place -- a field left None keeps its
+        previous stored value rather than being blanked."""
         return pm.upsert_capability(node_id, session, os=os, runtime_tools=runtime_tools,
                                     project_affinity=project_affinity, role=role, skills=skills,
-                                    permissions_note=permissions_note)
+                                    permissions_note=permissions_note, max_queued=max_queued)
 
     @server.tool()
     def terminal_pm_list_capabilities() -> dict:
@@ -1360,6 +1364,26 @@ def build_mcp(service: TerminalService | None = None,
         reaches a terminal state). Refuses a worktree with real
         uncommitted changes unless `force=True`."""
         return git_isolation.cleanup_worktree_for_task(task_id, force=force)
+
+    # -- Delivery discipline: Definition of Ready (docs/REQUIREMENTS.md
+    # §20.6 Phase A). OPT-IN per task (metadata.dor_required: true) --
+    # see dor_gate.py's own docstring for why this is never a blanket
+    # requirement. Enforced automatically inside terminal_task_create
+    # (session given) and terminal_task_assign; this tool is purely for
+    # explicit, read-only inspection ahead of time.
+
+    @server.tool()
+    def terminal_task_check_dor(task_id: str) -> dict:
+        """Definition-of-Ready check for one task, read-only -- reports
+        READY or NEEDS_CLARIFICATION (+ `missing_fields`) without
+        actually trying to assign anything. A task whose own metadata
+        never set `dor_required: true` always reports READY (DoR is
+        opt-in, never enforced retroactively on a task that didn't ask
+        for it)."""
+        status = queue.task_status(task_id)
+        if "error" in status:
+            return status
+        return check_definition_of_ready(status["task"])
 
     @server.tool()
     def terminal_queue_metrics(session: str) -> dict:

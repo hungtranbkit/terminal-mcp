@@ -295,12 +295,24 @@ class CoordinatorGate:
                 evidence_collector: RepoEvidenceCollector = git_repo_evidence,
                 scope_reasoner: ScopeReasoner = _default_scope_reasoner,
                 smoke_test_runner: SmokeTestRunner = run_smoke_test_command,
-                max_review_attempts: int = DEFAULT_MAX_REVIEW_ATTEMPTS) -> None:
+                max_review_attempts: int = DEFAULT_MAX_REVIEW_ATTEMPTS,
+                require_approval_for_risk_levels: tuple[str, ...] = ()) -> None:
         self.sensitive_patterns = sensitive_patterns
         self.evidence_collector = evidence_collector
         self.scope_reasoner = scope_reasoner
         self.smoke_test_runner = smoke_test_runner
         self.max_review_attempts = max_review_attempts
+        # Risk classification (§20.6 Phase A): OFF by default (empty
+        # tuple -- "exact gate strength is a per-project policy, not
+        # hardcoded here", task's own explicit words) -- a project opts
+        # in by passing e.g. ("HIGH", "CRITICAL") to require an explicit
+        # human/PM sign-off (task.metadata.risk_approved: true) before a
+        # task at one of these declared risk_level values may reach
+        # READY. A task with no risk_level declared at all is never
+        # blocked by this -- only a task that explicitly declares itself
+        # HIGH/CRITICAL (§20.1's own risk_level field) and whose
+        # project has opted this specific level into the requirement.
+        self.require_approval_for_risk_levels = require_approval_for_risk_levels
 
     def review(self, task: QueueTask, *, store: QueueStore, session: SessionSnapshot,
               other_active: tuple[OtherLaneSnapshot, ...] = ()) -> CoordinatorDecision:
@@ -324,6 +336,24 @@ class CoordinatorGate:
             reason = artificial_blocker if isinstance(artificial_blocker, str) else "artificial_blocker=true in task metadata"
             return CoordinatorDecision(BLOCKED, reason=f"operator-declared blocker: {reason}",
                                        evidence={"artificial_blocker": artificial_blocker})
+
+        # -0.5. Risk-level approval gate (§20.6 Phase A) -- OFF by
+        #       default (self.require_approval_for_risk_levels == ()).
+        #       When a project HAS opted a risk_level into this
+        #       requirement and this task declares that exact level,
+        #       an explicit metadata.risk_approved: true (a human/PM
+        #       sign-off, never inferred) is required before READY --
+        #       never a guess at whether a HIGH/CRITICAL task is "safe
+        #       enough" from the prompt text alone.
+        risk_level = task.metadata.get("risk_level")
+        if risk_level in self.require_approval_for_risk_levels and not task.metadata.get("risk_approved"):
+            return CoordinatorDecision(
+                NEEDS_HUMAN, evidence={"risk_level": risk_level},
+                reason=f"risk_level={risk_level!r} requires explicit human/PM approval "
+                      f"(metadata.risk_approved: true) before this project will dispatch it",
+                required_actions=["a human/PM reviews this task and sets metadata.risk_approved=true, "
+                                 "or reduces/reclassifies its risk_level"],
+            )
 
         # 0. Review-attempt budget -- never loop forever (item: Coordinator design).
         if task.coordinator_attempts >= self.max_review_attempts:
