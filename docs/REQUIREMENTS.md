@@ -1104,6 +1104,91 @@ A task with genuinely insufficient acceptance criteria to plan against
 becomes `NEEDS_CLARIFICATION`/`NEEDS_HUMAN` — the Planner never guesses
 scope into existence.
 
+#### 20.3a Implementation note (2026-09-07, VERIFIED — split infrastructure, no auto-splitter)
+
+**Status: VERIFIED** (unit + real disposable-session live E2E, full
+parent-completion lifecycle proven end to end). **Deliberately NOT
+built in this checkpoint: automatic complexity/module-count-based
+splitting.** This project's own standing rule is deterministic-first,
+no ML/LLM call to invent scope that doesn't already exist (same
+posture as `coordinator.py`'s own disclosed `scope_reasoner`), and the
+task's own explicit "không chia vụn vô nghĩa" (never split into
+meaningless fragments) rules out a naive heuristic splitter that could
+easily produce exactly that. What was built instead is the real, safe,
+tested INFRASTRUCTURE for a split whose decomposition (child titles/
+prompts/acceptance criteria/dependency shape) is supplied by the
+CALLER — a human, ChatGPT, or a future smarter Planner mode — never
+invented from a crude estimate.
+
+- `planner_store.py` (new) — `plan_proposals`, an append-oriented log
+  of every split ever proposed (`PROPOSED`/`APPROVED`/`REJECTED`/
+  `NEEDS_CLARIFICATION`), same store pattern as every other feature in
+  this project. `parent_task_id`/`acceptance_criteria` live in each
+  CHILD's own `metadata` (via the existing `QueueService.create_task`)
+  — same deliberate metadata-based implementation choice as §20.1a/
+  §20.2a, for the same reason: zero change to `queue_store.py`'s
+  schema needed.
+- `planner_service.py` (new) — `propose_split` (validates: parent must
+  still be `QUEUED` — `PARENT_NOT_SPLITTABLE` otherwise, which also
+  correctly refuses re-splitting an already-split parent since it's
+  always parked in `BLOCKED` by then; every child needs a real
+  `prompt`+`acceptance_criteria` or the WHOLE proposal becomes
+  `NEEDS_CLARIFICATION`, never partially applied); `SUGGEST` mode
+  persists the proposal without creating anything, `AUTO` creates the
+  children immediately; `approve_split` applies a pending `SUGGEST`
+  proposal for real. `depends_on_indices` on a child spec wires a real
+  `depends_on` to an earlier sibling's own newly-minted task_id — reuses
+  §7/§8's existing, already-verified dependency mechanism (checked at
+  claim time), never a second one. `children_progress`/`complete_
+  parent_if_children_done` implement §20.1's own parent-completion rule
+  (COMPLETED only once every non-cancelled/non-skipped child is too) —
+  an explicit, manual call, no background loop in this checkpoint (same
+  "no auto-loop yet" posture as PM's own §20.2a).
+- **New, narrowly-additive state-machine edge:** `queue_store.py`'s
+  `VALID_TRANSITIONS[BLOCKED]` now also allows `COMPLETED` — a split
+  parent is parked in `BLOCKED` the moment its children are created
+  (it has no more real work of its own to dispatch) and reaches
+  `COMPLETED` only via this one new edge. Guarded entirely at the
+  CALLER (`complete_parent_if_children_done` refuses unless `metadata.
+  is_split_parent` is `True`) — every OTHER existing `BLOCKED` case (a
+  real Coordinator refusal) is completely unaffected; `QUEUED`/
+  `SKIPPED`/`CANCELLED` remain its only other reachable states, proven
+  by a dedicated regression test.
+- MCP tools (`mcp_app.py`): `terminal_task_split`, `terminal_task_
+  approve_plan`, `terminal_task_children`, `terminal_task_complete_
+  parent`.
+- Dashboard: a split parent's Kanban card shows real `child_progress`
+  (`x/y done`, from `planner.children_progress`) — enriched at the
+  `/dashboard/api/tasks/board` route layer, same pattern as PM's own
+  `routing_reason` enrichment (queue_service.py/queue_store.py stay
+  decoupled from planner_store.py too).
+- Tests: `tests/test_planner_store.py` (5), `tests/test_planner_
+  service.py` (18, including the guarded `BLOCKED`->`COMPLETED` edge, a
+  cancelled child not blocking completion, and dependency wiring),
+  `tests/test_planner_mcp_tools.py` (4), 2 new in `tests/test_queue_
+  store.py` (the state-machine edge itself), 1 new in `tests/
+  test_task_manager_ui.py` (dashboard enrichment). Full suite green.
+- **Live evidence** (real disposable tmux sessions, real grants, the
+  real MCP `server.call_tool` path — never `window`/`window2`/
+  `wtest`): a parent task split (SUGGEST, verified nothing was created;
+  then approved) into 2 real children on 2 different real sessions, the
+  second declaring `depends_on_indices: [0]` — confirmed its real
+  `depends_on` correctly referenced the first child's own newly-minted
+  task_id, and the Kanban board correctly showed 1 `blocked_review`
+  (parent) + 2 `queued` (real children, in their real sessions); `pm_
+  explain`-style `terminal_task_complete_parent` correctly refused
+  while children were still open; both children then marked `COMPLETED`
+  (direct transition — the actual dispatch/completion mechanism itself
+  is separately, already VERIFIED, §7's own P0 Queue+Supervisor live
+  test; this step exercises the Planner's own completion rule, not a
+  re-verification of dispatch) and `terminal_task_complete_parent`
+  correctly completed the parent too — final board showed all 3 tasks
+  `done`. Disposable sessions/state cleaned up after.
+- Still **PLANNED**, not built: any complexity/module-count-based
+  AUTO-suggestion of WHAT to split into (the caller must always supply
+  the decomposition); the Kanban's own dependency-tree visualization
+  (only a flat `x/y done` count exists so far).
+
 ### 20.4 Git isolation policy + Integration/Merge Agent (mostly REUSE)
 
 **Real, significant reuse found:** `integration_store.py`'s existing
@@ -2527,6 +2612,17 @@ scan/audit view over the SAME facts.)*
     explicit call). The REST of §20 (Planner/task-breaking, git
     worktree isolation, the Integration/Merge Agent extension, the
     Phase A-E Startup Operating Model) remains PLANNED, unbuilt.
+18. **Unified Task System §20.3's Planner (task-breaking) split
+    infrastructure is now VERIFIED and live** (2026-09-07) — see
+    §20.3a's own full implementation note (deliberately NO automatic
+    complexity-based splitter — the decomposition always comes from the
+    caller; new store/service modules, the new narrowly-guarded
+    BLOCKED->COMPLETED state-machine edge, MCP tools, dashboard child_
+    progress display, tests, live disposable E2E evidence proving the
+    full split->dependency->completion lifecycle) and §4c of `docs/
+    CHATGPT_USAGE.md`. The REST of §20 (git worktree isolation, the
+    Integration/Merge Agent extension, the Phase A-E Startup Operating
+    Model) remains PLANNED, unbuilt.
 
 ---
 

@@ -27,6 +27,8 @@ from .integration_service import IntegrationService
 from .integration_store import IntegrationStore
 from .node_models import NODE_ONLINE, SESSION_BACKEND_TMUX, node_to_dict
 from .permissions import input_session_allowed, session_allowed, valid_session_name
+from .planner_service import PlannerService
+from .planner_store import PlannerStore
 from .pm_service import PMService
 from .pm_store import PMStore
 from .queue_service import QueueService
@@ -5316,6 +5318,14 @@ GLOBAL_TASKS_HTML = """<!doctype html>
       meta.append(idChip);
       const age = taskAge(task.created_at);
       if (age) { const a = document.createElement('span'); a.className = 'chip'; a.textContent = age; meta.append(a); }
+      if (task.child_progress) {
+        // Planner checkpoint (§20.3): real child progress, never a
+        // separately-computed percentage -- straight from the dashboard
+        // route's own planner.children_progress read.
+        const cp = document.createElement('span'); cp.className = 'chip';
+        cp.textContent = `${task.child_progress.done}/${task.child_progress.total} children done`;
+        meta.append(cp);
+      }
       const project = task.metadata && task.metadata.project;
       if (project) { const p = document.createElement('span'); p.className = 'chip'; p.textContent = clean(project); meta.append(p); }
       card.append(title, meta);
@@ -5704,7 +5714,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        connection_store: ConnectionStore | None = None,
                        queue: QueueService | None = None,
                        integration: IntegrationService | None = None,
-                       pm: PMService | None = None) -> None:
+                       pm: PMService | None = None,
+                       planner: PlannerService | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -5766,6 +5777,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
         pm = PMService(PMStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-pm-")) / "pm.db"), queue, controller,
                        permission_checker=_local_permission_checker)
+    if planner is None:
+        import tempfile
+        planner = PlannerService(
+            PlannerStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-planner-")) / "planner.db"), queue)
     discovery_config = terminal.config.nodes.discovery
     discovery = lan_discovery.DiscoveryService(
         agent_port=discovery_config.agent_port, concurrency=discovery_config.concurrency,
@@ -6515,6 +6530,12 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             if decision is not None:
                 row["routing_reason"] = decision.reason
                 row["pm_decision_status"] = decision.status
+            # Planner checkpoint (§20.3): a split parent's own card shows
+            # real "x/y done" child progress -- read fresh every call
+            # (planner.children_progress), never a cached percentage.
+            if (row.get("metadata") or {}).get("is_split_parent"):
+                progress = await anyio.to_thread.run_sync(planner.children_progress, row["id"])
+                row["child_progress"] = {"total": progress["total"], "done": progress["done"]}
         return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/tasks/create", methods=["POST"], include_in_schema=False)

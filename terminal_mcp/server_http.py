@@ -19,6 +19,8 @@ from .integration_service import IntegrationService
 from .logging_setup import RequestIdMiddleware, SecurityHeadersMiddleware, configure_logging
 from .maintenance import MaintenanceLoop
 from .mcp_app import build_mcp
+from .planner_service import PlannerService
+from .planner_store import PlannerStore
 from .pm_service import PMService
 from .pm_store import PMStore
 from .queue_service import QueueService
@@ -276,9 +278,11 @@ def main() -> None:
         return authorized
 
     pm = PMService(PMStore(), queue, controller, permission_checker=_pm_permission_checker)
-    server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm)
+    planner = PlannerService(PlannerStore(), queue)
+    server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
+                       planner=planner)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
-                       queue=queue, integration=integration, pm=pm)
+                       queue=queue, integration=integration, pm=pm, planner=planner)
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)

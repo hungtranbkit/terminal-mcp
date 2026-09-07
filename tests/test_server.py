@@ -116,6 +116,11 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_pm_approve_routing",
         "terminal_pm_route_all_unassigned",
         "terminal_pm_explain",
+        # Planner: task-breaking (§20.3).
+        "terminal_task_split",
+        "terminal_task_approve_plan",
+        "terminal_task_children",
+        "terminal_task_complete_parent",
     }
 
 

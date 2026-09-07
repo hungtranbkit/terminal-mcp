@@ -129,7 +129,8 @@ class QueueService:
         return {"task_id": task_id, "session": session, "queue_position": self.store.queue_position(task_id)}
 
     def create_task(self, title: str, prompt: str, *, session: str | None = None, priority: int = 0,
-                    project: str | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+                    project: str | None = None, metadata: dict[str, Any] | None = None,
+                    depends_on: list[str] | None = None) -> dict[str, Any]:
         """Unified Task System checkpoint (2026-09-07, docs/REQUIREMENTS.
         md §20): the canonical `task_create` entry point (§20.7) --
         `session=None` creates a real, durable, UNASSIGNED (Global/
@@ -143,7 +144,11 @@ class QueueService:
         lane the row lands in. `project` is stored in `metadata` (no
         schema change needed for this field alone -- reuses the existing
         free-form JSON column, same posture as `docs_exempt` elsewhere
-        in this project)."""
+        in this project). `depends_on` (Planner checkpoint, §20.3):
+        existing task_ids this one must wait on -- reuses §7/§8's own
+        real, already-verified dependency mechanism (`_dependencies_
+        satisfied_locked`, checked at claim time), never a second
+        dependency mechanism for Planner-created children."""
         if not prompt:
             return {"error": "TASK_PROMPT_REQUIRED"}
         target = session
@@ -156,6 +161,8 @@ class QueueService:
         if project:
             full_metadata["project"] = project
         task = {"prompt": prompt, "title": title or "", "priority": priority, "metadata": full_metadata}
+        if depends_on:
+            task["depends_on"] = list(depends_on)
         (task_id,) = self.store.append_tasks(target, [task])
         accepted = self._accepted(target, task_id)
         accepted["status"] = "TASK_ACCEPTED"

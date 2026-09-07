@@ -466,3 +466,29 @@ def test_dashboard_tasks_board_route_omits_routing_reason_for_never_routed_task(
     board = client.get("/dashboard/api/tasks/board").json()
     card = next(t for t in board["backlog"] if t["id"] == created["task_id"])
     assert "routing_reason" not in card
+
+
+def test_dashboard_tasks_board_route_shows_child_progress_for_split_parent(tmp_path):
+    from terminal_mcp.planner_service import PlannerService
+    from terminal_mcp.planner_store import PlannerStore
+
+    service = _service(tmp_path)
+    controller = build_default_controller(service)
+    queue = QueueService(QueueStore(tmp_path / "queue.db"))
+    planner = PlannerService(PlannerStore(tmp_path / "planner.db"), queue)
+    server = build_mcp(service, controller=controller, queue=queue, planner=planner)
+    register_dashboard(server, service, controller=controller, queue=queue, planner=planner)
+    client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})
+
+    parent = queue.create_task("Big task", "do it", session=None)
+    children = [{"prompt": "p1", "acceptance_criteria": "a1"}, {"prompt": "p2", "acceptance_criteria": "a2"}]
+    split = planner.propose_split(parent["task_id"], children, mode="AUTO")
+    done_child = split["child_task_ids"][0]
+    queue.store.transition_task(done_child, "DISPATCHING", event_type="TEST")
+    queue.store.transition_task(done_child, "RUNNING", event_type="TEST")
+    queue.store.transition_task(done_child, "VERIFYING", event_type="TEST")
+    queue.store.mark_completed_with_evidence(done_child, evidence={"ok": True})
+
+    board = client.get("/dashboard/api/tasks/board").json()
+    parent_card = next(t for t in board["blocked_review"] if t["id"] == parent["task_id"])
+    assert parent_card["child_progress"] == {"total": 2, "done": 1}

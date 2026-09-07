@@ -13,6 +13,8 @@ from .task_migration import TaskMigrationPlanner
 from .integration_service import IntegrationService
 from .integration_store import publish_handoff_for_completed_task
 from .node_models import node_to_dict as _node_to_dict
+from .planner_service import PlannerService
+from .planner_store import PlannerStore
 from .pm_service import PMService
 from .pm_store import PMStore
 from .queue_engine import QueueEngine
@@ -28,7 +30,8 @@ def build_mcp(service: TerminalService | None = None,
               controller: ControllerService | None = None,
               queue: QueueService | None = None,
               integration: IntegrationService | None = None,
-              pm: PMService | None = None) -> MCPServer:
+              pm: PMService | None = None,
+              planner: PlannerService | None = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -99,6 +102,9 @@ def build_mcp(service: TerminalService | None = None,
         return authorized
 
     pm = pm or PMService(PMStore(), queue, controller, permission_checker=_local_permission_checker)
+    # Planner (task-breaking, §20.3): reads/writes the SAME queue store
+    # as everything above -- never a second queue/task store.
+    planner = planner or PlannerService(PlannerStore(), queue)
     # Task Migration/Load Balancing: same node-aware controller as
     # everything else, so eligibility checks (item 6) resolve a
     # destination session's real cwd/node_id regardless of which node
@@ -1255,6 +1261,57 @@ def build_mcp(service: TerminalService | None = None,
         one task, newest first -- real, append-only audit trail, never
         just the latest verdict."""
         return pm.explain(task_id)
+
+    # -- Planner: task-breaking (docs/REQUIREMENTS.md §20.3). NOT an
+    # automatic complexity-based splitter -- the decomposition content
+    # (child titles/prompts/acceptance_criteria/dependency shape) always
+    # comes from the CALLER; this provides the safe, tested
+    # infrastructure (validation, parent/child linking, a real depends_on
+    # DAG, parent-completion tracking), never an LLM/heuristic guess at
+    # scope that doesn't already exist.
+
+    @server.tool()
+    def terminal_task_split(parent_task_id: str, children: list[dict], mode: str = "SUGGEST") -> dict:
+        """Proposes splitting `parent_task_id` (must still be QUEUED,
+        never already split/dispatched/running/terminal) into
+        `children` -- each `{title, prompt, acceptance_criteria
+        (REQUIRED -- a child missing it makes the WHOLE proposal
+        NEEDS_CLARIFICATION, never guessed), session (optional),
+        priority, project, depends_on_indices (optional list of earlier
+        `children` list indices this one must wait on -- overlap-based
+        serialization), metadata}`. `mode="SUGGEST"` (default) persists
+        the proposal WITHOUT creating anything -- call terminal_task_
+        approve_plan next. `mode="AUTO"` creates the children
+        immediately. Either way each child gets `metadata.
+        parent_task_id`/`metadata.acceptance_criteria`, and the parent
+        is parked in BLOCKED (no more real work of its own) once
+        actually applied."""
+        return planner.propose_split(parent_task_id, children, mode=mode)
+
+    @server.tool()
+    def terminal_task_approve_plan(proposal_id: str) -> dict:
+        """Applies a pending SUGGEST-mode split proposal for real --
+        creates the child tasks and parks the parent in BLOCKED.
+        Refuses (NO_PENDING_PROPOSAL) if the proposal isn't a real,
+        still-pending one."""
+        return planner.approve_split(proposal_id)
+
+    @server.tool()
+    def terminal_task_children(parent_task_id: str) -> dict:
+        """`task_children` (§20.7): every real child task of
+        `parent_task_id` plus `total`/`done`/`terminal_not_done` counts
+        -- the Kanban parent card's own "x/y done" progress, read fresh
+        every call, never a cached/separately-computed percentage."""
+        return planner.children_progress(parent_task_id)
+
+    @server.tool()
+    def terminal_task_complete_parent(parent_task_id: str) -> dict:
+        """Applies §20.1's parent-completion rule: marks a split parent
+        COMPLETED once every real child has itself reached COMPLETED
+        (cancelled/skipped children don't block this). Explicit, manual
+        call -- there is no background loop for this in this phase.
+        Refuses (NOT_A_SPLIT_PARENT) for a task that was never split."""
+        return planner.complete_parent_if_children_done(parent_task_id)
 
     @server.tool()
     def terminal_queue_metrics(session: str) -> dict:

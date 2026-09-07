@@ -78,7 +78,13 @@ def _drive_to_status(store, task_id, status):
     (COMPLETED, RUNNING), (COMPLETED, QUEUED), (COMPLETED, CANCELLED),
     (SKIPPED, QUEUED), (SKIPPED, RUNNING),
     (CANCELLED, QUEUED), (CANCELLED, RUNNING),
-    (BLOCKED, RUNNING), (BLOCKED, COMPLETED), (BLOCKED, VERIFYING), (BLOCKED, DISPATCHING),
+    # (BLOCKED, COMPLETED) deliberately removed from this "must be
+    # rejected" list (Planner checkpoint, §20.3): a split parent reaches
+    # COMPLETED from BLOCKED once every real child does -- see queue_
+    # store.py's own VALID_TRANSITIONS comment on BLOCKED, and
+    # test_transition_blocked_to_completed_allowed_only_for_split_parent
+    # below for the guarded, real coverage of this one specific edge.
+    (BLOCKED, RUNNING), (BLOCKED, VERIFYING), (BLOCKED, DISPATCHING),
     (RUNNING, QUEUED), (RUNNING, COMPLETED), (RUNNING, DISPATCHING),
     (DISPATCHING, VERIFYING), (DISPATCHING, COMPLETED),
     (PAUSED, COMPLETED), (PAUSED, BLOCKED), (PAUSED, SKIPPED),
@@ -411,3 +417,32 @@ def test_move_task_to_session_records_task_assigned_event(store):
     store.move_task_to_session(task_id, "lane-a")
     events = store.list_events("lane-a")
     assert any(e["event_type"] == "TASK_ASSIGNED" and e["task_id"] == task_id for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Planner checkpoint (§20.3): BLOCKED -> COMPLETED is real at the STORE
+# level (the state machine allows it), but the safety comes from the
+# CALLER (planner_service.py's own complete_parent_if_children_done,
+# guarded on metadata.is_split_parent) -- test_planner_service.py covers
+# that guard; this is the store-level mechanics only.
+# ---------------------------------------------------------------------------
+
+def test_transition_blocked_to_completed_is_a_real_valid_transition(store):
+    task_id = _make_one_task(store)
+    store.transition_task(task_id, DISPATCHING, event_type="TEST")
+    store.transition_task(task_id, BLOCKED, event_type="TEST", reason="split into children")
+    completed = store.transition_task(task_id, COMPLETED, event_type="PARENT_COMPLETED_VIA_CHILDREN",
+                                      reason="all children done")
+    assert completed.status == COMPLETED
+    assert completed.completed_at is not None
+
+
+def test_blocked_still_cannot_reach_every_other_non_terminal_status(store):
+    # The new BLOCKED->COMPLETED edge is narrowly additive -- every other
+    # real Coordinator-refusal BLOCKED case is completely unaffected.
+    assert is_valid_transition(BLOCKED, RUNNING) is False
+    assert is_valid_transition(BLOCKED, VERIFYING) is False
+    assert is_valid_transition(BLOCKED, DISPATCHING) is False
+    assert is_valid_transition(BLOCKED, QUEUED) is True  # unchanged, pre-existing
+    assert is_valid_transition(BLOCKED, SKIPPED) is True  # unchanged, pre-existing
+    assert is_valid_transition(BLOCKED, CANCELLED) is True  # unchanged, pre-existing

@@ -190,7 +190,23 @@ VALID_TRANSITIONS: dict[str, frozenset[str]] = {
         RUNNING,   # false alarm -- the agent wasn't actually done, re-arm
         WAITING_SESSION, BLOCKED, FAILED, CANCELLED, PAUSED,
     }),
-    BLOCKED: frozenset({QUEUED, SKIPPED, CANCELLED}),  # only ever via an explicit operator tool call
+    BLOCKED: frozenset({
+        QUEUED, SKIPPED, CANCELLED,
+        # Planner checkpoint (§20.3): a SPLIT PARENT is deliberately
+        # parked in BLOCKED the moment its children are created (it has
+        # no more real work of its own to dispatch -- see planner_
+        # service.py's own _apply_split) and reaches COMPLETED only when
+        # every real child does too (§20.1's own parent-completion
+        # rule), never via the ordinary DISPATCHING->RUNNING->VERIFYING
+        # path. Guarded at the CALLER (PlannerService.complete_parent_
+        # if_children_done refuses unless metadata.is_split_parent is
+        # True) -- this is a targeted, additive transition for exactly
+        # that one real, new need, never a generic "any BLOCKED task can
+        # be marked done" escape hatch; every OTHER existing BLOCKED
+        # case (a real Coordinator refusal) is completely unaffected --
+        # QUEUED/SKIPPED/CANCELLED are its only reachable states.
+        COMPLETED,
+    }),  # only ever via an explicit operator tool call (or the guarded split-parent completion above)
     FAILED: frozenset({QUEUED, SKIPPED, CANCELLED}),   # only ever via an explicit operator tool call
     WAITING_SESSION: frozenset({
         QUEUED,  # the ONLY outgoing edge -- session is resolvable again, fresh claim+review from scratch

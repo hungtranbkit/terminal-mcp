@@ -251,6 +251,44 @@ routing requirements (`required_os`/`required_capabilities`/etc. in its
 could send a Windows/WPF task to a Linux-only session by hand exactly
 the mistake this feature exists to prevent.
 
+### 4c. Planner (splitting a large task into child tasks)
+
+**Status: VERIFIED** (split infrastructure only — see REQUIREMENTS.md
+§20.3a for full evidence. There is NO automatic complexity-based
+splitter: YOU (or whoever is planning the work) must supply the actual
+child breakdown — titles/prompts/acceptance criteria/dependency shape.
+This tool never invents scope on its own.)
+
+- `terminal_task_split(parent_task_id, children, mode="SUGGEST")` — the
+  parent must still be a plain Backlog/Queued task (not yet split,
+  running, or done). Each child in `children` needs a real `prompt` AND
+  `acceptance_criteria` — if any child is missing either, the WHOLE
+  proposal comes back `NEEDS_CLARIFICATION` and nothing is created.
+  `depends_on_indices: [0, 1, ...]` on a child wires a real dependency
+  onto an earlier sibling in the SAME `children` list (use this for two
+  children that would touch overlapping code/files — serialize them
+  instead of letting them run in parallel). `mode="SUGGEST"` (default)
+  only persists the proposal — call `terminal_task_approve_plan` next
+  to actually create the children. `mode="AUTO"` creates them
+  immediately.
+- `terminal_task_approve_plan(proposal_id)` — applies a pending
+  SUGGEST proposal: creates the real child tasks and parks the parent
+  in `BLOCKED` (it has no more work of its own to dispatch once split).
+- `terminal_task_children(parent_task_id)` — real `total`/`done` counts
+  + the actual child task rows. This is where the Kanban's own
+  `x/y children done` card line comes from too.
+- `terminal_task_complete_parent(parent_task_id)` — call this once
+  every child has reached `COMPLETED` (cancelled/skipped children don't
+  block it) — marks the parent `COMPLETED` too. There is no background
+  loop that does this automatically yet; call it explicitly once you
+  believe the children are done, and it will tell you honestly if any
+  are still open.
+
+**Anti-pattern:** don't split a task into meaningless fragments just
+because you can — a task with no real parallelism/module boundary
+should usually stay as one task. Don't guess `depends_on_indices` —
+only use it when two children genuinely touch overlapping work.
+
 ## 5. Supervisor flow (canonical for watching an unattended session and
 reacting to it needing help)
 
@@ -414,13 +452,15 @@ see REQUIREMENTS.md Backlog item 7).
 The Unified Task System is an extension of the Queue/Coordinator/
 Supervisor stack described above. Its **Global Tasks Kanban slice** (§4a
 — `terminal_task_create`/`terminal_task_assign`/`terminal_task_board`,
-the dashboard's `/dashboard/tasks` page) and its **PM/Orchestrator
-skill-based routing slice** (§4b — `terminal_pm_*` tools, no auto-loop)
-are both **VERIFIED and callable**. Everything else in that design — a
-Planner that splits large tasks, git worktree isolation, a dedicated
-Integration/Merge Agent role, and the Phase A-E Startup Operating Model
-— is still **PLANNED**, not built, as of this file's own last update.
-See `docs/REQUIREMENTS.md`'s own "Unified Task System" section (§20)
-for the current architecture-in-progress. Nothing beyond §4a/§4b's tools is
+the dashboard's `/dashboard/tasks` page), **PM/Orchestrator skill-based
+routing slice** (§4b — `terminal_pm_*` tools, no auto-loop), and
+**Planner split-infrastructure slice** (§4c — `terminal_task_split`/
+`approve_plan`/`children`/`complete_parent`, no auto-complexity-based
+splitter) are all **VERIFIED and callable**. Everything else in that
+design — git worktree isolation, a dedicated Integration/Merge Agent
+role, and the Phase A-E Startup Operating Model — is still **PLANNED**,
+not built, as of this file's own last update. See `docs/REQUIREMENTS.
+md`'s own "Unified Task System" section (§20) for the current
+architecture-in-progress. Nothing beyond §4a/§4b/§4c's tools is
 callable yet; if asked to use any of the rest, say so plainly rather
 than guessing at a tool name.
