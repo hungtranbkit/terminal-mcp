@@ -130,6 +130,12 @@ async def test_server_registers_v1_and_binding_tools():
         # Incident lane (§20.6 Phase B).
         "terminal_task_create_incident",
         "terminal_list_active_incidents",
+        # Release lifecycle (§20.6 Phase C).
+        "terminal_release_create",
+        "terminal_release_advance",
+        "terminal_release_rollback",
+        "terminal_release_status",
+        "terminal_release_list",
     }
 
 

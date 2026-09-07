@@ -1519,6 +1519,56 @@ regression pipeline, §9) — reused exactly as this section's own
 - A known-good artifact/commit + rollback plan is a required field on
   any production release task, not optional.
 
+#### Phase C implementation note (2026-09-07, VERIFIED — release lifecycle state machine)
+
+**Status: VERIFIED** (unit tests over both new modules + real MCP-tool-
+surface tests driving the actual persisted state machine through the
+real `server.call_tool` path). **No tmux/session dimension to this
+checkpoint** (a release is not something dispatched to a session) --
+the "live" bar here is the real MCP protocol + real SQLite persistence,
+not a disposable tmux session; disclosed explicitly rather than forcing
+an artificial session into a workflow that has none.
+
+- `release_store.py` (new) — a genuinely new, small state machine
+  (`MERGED -> RELEASE_CANDIDATE -> DEPLOYING -> DEPLOYED ->
+  VERIFIED_PROD`, `ROLLED_BACK` reachable from `DEPLOYING`/`DEPLOYED`/
+  `VERIFIED_PROD` — `VERIFIED_PROD` is deliberately NOT a dead end, a
+  real production issue can be discovered even after verification),
+  its own table + `Migration`, referencing a `task_id` for provenance
+  only — never an overload of `queue_store.py`'s own task states, same
+  "new concept, own table, zero ripple into the existing dispatch
+  engine" discipline as every other checkpoint in this section.
+- `release_service.py` (new) — the two explicit policies: (1) a `prod`
+  release REQUIRES `known_good_artifact_ref` + `rollback_plan` at
+  creation time (refused, `PROD_RELEASE_REQUIRES_ROLLBACK_PLAN`,
+  otherwise); (2) advancing a `prod` release into `DEPLOYING` requires
+  an explicit `approved_by` (a real, non-empty identity string) —
+  refused (`PROD_DEPLOY_REQUIRES_APPROVAL`) otherwise, never auto-
+  approved regardless of `risk_level`.
+- **Environment model / "no production deploy access by default" —
+  disclosed as PARTIAL:** `environment` (dev/test/staging/prod) is a
+  real, validated field; the explicit-approval-string requirement above
+  is real and enforced; every transition is recorded in a real,
+  queryable `release_events` audit trail. What is NOT built: a
+  technical, session-identity-based enforcement of WHO is allowed to
+  supply that approval (a real Release/Deploy Agent role check) — this
+  project's MCP tool layer has no caller-identity system wired to
+  Capability Profiles for that purpose today (an MCP tool call's caller
+  is ChatGPT/a human/an agent, not tied to a specific session row this
+  project could check a `role` field against). `CapabilityProfile.role`
+  already supports a free-string "release"/"deploy" value with zero
+  schema change if/when that enforcement is ever built.
+- MCP tools: `terminal_release_create`, `terminal_release_advance`,
+  `terminal_release_rollback`, `terminal_release_status`, `terminal_
+  release_list`.
+- Tests: `tests/test_release_store.py` (21, including every valid/
+  invalid transition pair and the `VERIFIED_PROD` roll-back-is-still-
+  possible case), `tests/test_release_service.py` (15, both required-
+  field policies), `tests/test_release_mcp_tools.py` (5, a full real
+  dev lifecycle through the real MCP path, the prod-creation gate, the
+  prod-deploy-approval gate, rollback, project filtering). Updated MCP
+  tool-count assertions (117 -> 122). Full suite green.
+
 **Phase D — Operations/knowledge:**
 - End-to-end audit trail: this project already has real audit stores
   (`audit.py`, `queue_events`, `Handoff` history) — Phase D is mostly
@@ -3018,6 +3068,17 @@ scan/audit view over the SAME facts.)*
     independent build-test/rework-bound pieces needed no new code
     (already real, reused as-is). Phases C-E remain entirely PLANNED,
     unbuilt.
+23. **Unified Task System §20.6 Phase C — release lifecycle state
+    machine VERIFIED and live** (2026-09-07): `release_store.py`/
+    `release_service.py` (new), `terminal_release_create`/`advance`/
+    `rollback`/`status`/`list` — see Phase C's own implementation note
+    in §20.6 and §4g of `docs/CHATGPT_USAGE.md`. A `prod` release
+    requires a known-good artifact + rollback plan at creation and an
+    explicit human approval to deploy — both real, enforced, never
+    optional/auto-approved. Disclosed PARTIAL: no technical, session-
+    identity-based enforcement of WHO may supply that approval (no
+    caller-identity system exists in this project's MCP layer to check
+    against). Phases D-E remain entirely PLANNED, unbuilt.
 
 ---
 

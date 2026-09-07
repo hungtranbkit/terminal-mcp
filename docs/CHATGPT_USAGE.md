@@ -376,6 +376,39 @@ ordinary urgent-but-not-actually-an-incident work — reserve it for a
 genuine production issue; overuse defeats its own purpose (everything
 fast-tracked is nothing fast-tracked).
 
+### 4g. Release lifecycle (deploy tracking with a real state machine)
+
+**Status: VERIFIED** — see REQUIREMENTS.md's own Phase C implementation
+note. A release is a SEPARATE concept from a task (it tracks a deploy,
+referencing a `task_id` for provenance) — not something you dispatch to
+a session.
+
+- `terminal_release_create(project, task_id, environment, artifact_ref, known_good_artifact_ref=, rollback_plan=)`
+  — `environment` is one of `dev`/`test`/`staging`/`prod`. For `prod`,
+  `known_good_artifact_ref` and `rollback_plan` are REQUIRED — the call
+  is refused (`PROD_RELEASE_REQUIRES_ROLLBACK_PLAN`) without them.
+- `terminal_release_advance(release_id, to_status, approved_by=, reason=)`
+  — moves it through the real sequence `MERGED -> RELEASE_CANDIDATE ->
+  DEPLOYING -> DEPLOYED -> VERIFIED_PROD`. Advancing a `prod` release
+  into `DEPLOYING` requires `approved_by` (a real identity string) —
+  refused (`PROD_DEPLOY_REQUIRES_APPROVAL`) otherwise, no exceptions.
+  An out-of-sequence jump is refused (`INVALID_RELEASE_TRANSITION`).
+- `terminal_release_rollback(release_id, reason, actor=)` — from
+  `DEPLOYING`/`DEPLOYED`/`VERIFIED_PROD`. `reason` is required.
+  `VERIFIED_PROD` can still roll back — a real issue found after
+  verification is not a dead end.
+- `terminal_release_status(release_id)` / `terminal_release_list(project=)`
+  — real state + full event history / every release, newest first.
+
+**Known limitation, disclosed:** there is no technical enforcement of
+WHO is allowed to supply `approved_by` — it's a real, required,
+audited string, but not checked against a role/identity system. Treat
+the approval field as a real commitment, not a formality to fill in.
+
+**Anti-pattern:** don't advance a `prod` release to `DEPLOYING` with a
+placeholder `approved_by` value just to get past the gate — it is
+recorded permanently in the release's own audit trail.
+
 ## 5. Supervisor flow (canonical for watching an unattended session and
 reacting to it needing help)
 
@@ -547,14 +580,16 @@ plan`/`children`/`complete_parent`, no auto-complexity-based splitter),
 `worktree_status`/`worktree_cleanup`, plus `allow_mechanical_conflict_
 resolution` on `terminal_integration_configure`), and **delivery-
 discipline slice** (§4e — Definition of Ready, WIP limits, risk-level
-approval, all opt-in), and **incident lane slice** (§4f — `terminal_
-task_create_incident`/`terminal_list_active_incidents`) are all
-**VERIFIED and callable**. Everything else in that design — PM-based
-routing of the Integration/Merge Agent to a specific session, and the
-rest of the Phase A-E Startup Operating Model (Phases C through E, and
-the remaining pieces of Phase B) — is still **PLANNED**, not built, as
-of this file's own last update. See `docs/REQUIREMENTS.md`'s own
-"Unified Task System" section (§20) for the current architecture-in-
-progress. Nothing beyond §4a-§4f's tools is callable yet; if asked to
-use any of the rest, say so plainly rather than guessing at a tool
-name.
+approval, all opt-in), **incident lane slice** (§4f — `terminal_
+task_create_incident`/`terminal_list_active_incidents`), and **release
+lifecycle slice** (§4g — `terminal_release_create`/`advance`/
+`rollback`/`status`/`list`) are all **VERIFIED and callable**.
+Everything else in that design — PM-based routing of the Integration/
+Merge Agent to a specific session, technical role-based enforcement of
+release approvals, and the rest of the Phase A-E Startup Operating
+Model (Phases D-E, and the remaining pieces of Phase B/C) — is still
+**PLANNED**, not built, as of this file's own last update. See `docs/
+REQUIREMENTS.md`'s own "Unified Task System" section (§20) for the
+current architecture-in-progress. Nothing beyond §4a-§4g's tools is
+callable yet; if asked to use any of the rest, say so plainly rather
+than guessing at a tool name.

@@ -22,6 +22,8 @@ from .pm_store import PMStore
 from .queue_engine import QueueEngine
 from .queue_loop import QueueLoop
 from .queue_service import QueueService
+from .release_service import ReleaseService
+from .release_store import ReleaseStore
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
 
@@ -33,7 +35,8 @@ def build_mcp(service: TerminalService | None = None,
               queue: QueueService | None = None,
               integration: IntegrationService | None = None,
               pm: PMService | None = None,
-              planner: PlannerService | None = None) -> MCPServer:
+              planner: PlannerService | None = None,
+              release: ReleaseService | None = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -111,6 +114,11 @@ def build_mcp(service: TerminalService | None = None,
     # real state lives entirely in the SAME queue store, on each task's
     # own metadata.
     git_isolation = GitIsolationService(queue)
+    # Release lifecycle (§20.6 Phase C): a genuinely new, small state
+    # machine layered ON TOP of a COMPLETED/INTEGRATED task -- its own
+    # store, referencing a task_id for provenance only, never an
+    # overload of queue_store.py's own task states.
+    release = release or ReleaseService(ReleaseStore())
     # Task Migration/Load Balancing: same node-aware controller as
     # everything else, so eligibility checks (item 6) resolve a
     # destination session's real cwd/node_id regardless of which node
@@ -1410,6 +1418,59 @@ def build_mcp(service: TerminalService | None = None,
         """Every task tagged as an incident that hasn't yet reached a
         terminal status -- real audit/visibility, fleet-wide."""
         return queue.list_active_incidents()
+
+    # -- Release lifecycle (§20.6 Phase C). A genuinely new, small state
+    # machine layered on top of a COMPLETED/INTEGRATED task: MERGED ->
+    # RELEASE_CANDIDATE -> DEPLOYING -> DEPLOYED -> VERIFIED_PROD, with
+    # ROLLED_BACK reachable from DEPLOYING/DEPLOYED/VERIFIED_PROD. A
+    # production release REQUIRES a known-good artifact + rollback plan
+    # at creation, and an explicit human approval to actually deploy --
+    # never auto-approved, never optional.
+
+    @server.tool()
+    def terminal_release_create(project: str, task_id: str, environment: str, artifact_ref: str,
+                                known_good_artifact_ref: str | None = None,
+                                rollback_plan: str | None = None) -> dict:
+        """Creates a release, starting at MERGED. `environment` must be
+        one of dev/test/staging/prod. For `environment="prod"`,
+        `known_good_artifact_ref` + `rollback_plan` are REQUIRED (not
+        optional) -- refused (PROD_RELEASE_REQUIRES_ROLLBACK_PLAN) if
+        either is missing."""
+        return release.create_release(project=project, task_id=task_id, environment=environment,
+                                      artifact_ref=artifact_ref, known_good_artifact_ref=known_good_artifact_ref,
+                                      rollback_plan=rollback_plan)
+
+    @server.tool()
+    def terminal_release_advance(release_id: str, to_status: str, approved_by: str | None = None,
+                                 reason: str | None = None) -> dict:
+        """Advances a release through its real state machine (MERGED ->
+        RELEASE_CANDIDATE -> DEPLOYING -> DEPLOYED -> VERIFIED_PROD).
+        Refuses (INVALID_RELEASE_TRANSITION) any transition not in that
+        real sequence. Advancing a `prod` release into DEPLOYING
+        requires `approved_by` (a real, non-empty identity string) --
+        refused (PROD_DEPLOY_REQUIRES_APPROVAL) otherwise, regardless
+        of risk_level -- never auto-approved."""
+        return release.advance_release(release_id, to_status, approved_by=approved_by, reason=reason)
+
+    @server.tool()
+    def terminal_release_rollback(release_id: str, reason: str, actor: str | None = None) -> dict:
+        """Rolls back a release (from DEPLOYING/DEPLOYED/VERIFIED_PROD)
+        -- `reason` is required, never a silent/unexplained rollback.
+        VERIFIED_PROD is NOT a dead end: a real production issue found
+        after verification can still roll back from here."""
+        return release.rollback_release(release_id, reason=reason, actor=actor)
+
+    @server.tool()
+    def terminal_release_status(release_id: str) -> dict:
+        """One release's current state + its full, real event history
+        (every transition ever applied, newest last)."""
+        return release.status(release_id)
+
+    @server.tool()
+    def terminal_release_list(project: str | None = None) -> dict:
+        """Every release, optionally filtered to one project, newest
+        first."""
+        return release.list_releases(project=project)
 
     @server.tool()
     def terminal_queue_metrics(session: str) -> dict:
