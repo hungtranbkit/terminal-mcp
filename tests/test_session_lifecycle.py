@@ -66,7 +66,7 @@ def test_create_shell_session_succeeds(tmp_path, lifecycle_session_factory):
     name = lifecycle_session_factory("lifecycle-shell-1")
     result = service.terminal_create_session(name, "shell")
     assert "error" not in result
-    assert result["state"] == "READY"  # a shell has nothing to wait for
+    assert result["state"] == "READY"  # waits for the shell's own first prompt to actually draw
     assert result["agent_type"] == "shell"
     assert service.tmux.get_session(name) is not None
     # Creating never auto-grants -- caller gets a session, nothing more.

@@ -88,9 +88,14 @@ class SessionLifecycleService:
         evidence the launched process actually started. Returns a receipt
         with `state` in {"READY", "CREATED", "FAILED"}: READY means the
         pane's current command already matches the expected launcher (or,
-        for agent_type="shell", the session simply exists -- a shell has
-        nothing else to wait for); CREATED means the session exists but
-        the expected command hasn't shown up in the pane yet by the
+        for agent_type="shell", the pane has drawn its own first real
+        output -- at minimum its prompt; see the loop's own comment
+        below for the real, reproducing race this closes: reporting
+        READY the instant the tmux session merely EXISTS, before the
+        shell has actually attached its line editor, used to let
+        terminal_create_session's initial_prompt send race the shell's
+        own startup); CREATED means the session exists but the expected
+        readiness signal hasn't shown up in the pane yet by the
         timeout (still probably starting -- never torn down on a mere
         timeout, since a slow-starting real CLI is not a failure); FAILED
         means either the request was invalid/blocked before anything was
@@ -147,9 +152,43 @@ class SessionLifecycleService:
                     pass
                 return {"error": "LAUNCH_FAILED", "session": name, "state": "FAILED",
                         "reason": "launched process exited"}
-            if expected_command is None or info.pane_current_command.casefold() == expected_command:
-                state = "READY"
-                break
+            if expected_command is not None:
+                if info.pane_current_command.casefold() == expected_command:
+                    state = "READY"
+                    break
+            else:
+                # agent_type == "shell": no specific launcher command to
+                # poll for, but the pane's own shell (rc-file sourcing,
+                # PS1 draw, readline attaching to the tty) can genuinely
+                # still be mid-startup the INSTANT tmux reports the
+                # session created -- this used to fall straight through
+                # to READY on this loop's very first iteration, zero
+                # wait, zero readiness signal at all. Real, reproducing
+                # bug this fixes (Backlog item 14, "initial_prompt can
+                # visibly echo twice for a brand-new plain-shell
+                # session"): terminal_create_session sends initial_prompt
+                # the instant this returns READY -- racing that shell
+                # startup meant the kernel tty's own raw echo of the
+                # just-written text (drawn with no prompt yet) was
+                # followed by the shell's OWN readline redraw of that
+                # same still-buffered line once it finished attaching,
+                # visibly duplicating it. Waiting for a real, cheap
+                # readiness signal instead -- the pane has drawn
+                # SOMETHING (its own prompt, at minimum) -- closes that
+                # race in the overwhelming majority of real cases (a
+                # shell's first prompt draws in low milliseconds), same
+                # bounded deadline as every other agent_type, so a
+                # genuinely silent/empty-PS1 shell (rare, untested edge
+                # case) just falls back to the pre-existing CREATED-
+                # after-timeout behavior -- never a regression, only a
+                # strictly better readiness check.
+                try:
+                    has_output = bool("".join(self.tmux.capture_lines(name, 5)).strip())
+                except TmuxError:
+                    has_output = False
+                if has_output:
+                    state = "READY"
+                    break
             if time.monotonic() >= deadline:
                 break
             time.sleep(CREATE_POLL_INTERVAL_SECONDS)
