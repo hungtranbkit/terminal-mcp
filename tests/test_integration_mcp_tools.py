@@ -86,6 +86,42 @@ async def test_run_once_reports_waiting_for_handoff_on_an_empty_queue(server, tm
 
 
 @pytest.mark.anyio
+async def test_integration_loop_status_reports_not_running_by_default(server, tmp_path):
+    mcp_server, integration, queue = server
+    status = await _call(mcp_server, "terminal_integration_loop_status")
+    assert status["running"] is False  # build_mcp constructs it but server_http.py never started it here
+    assert status["last_cycle_at"] is None
+
+
+@pytest.mark.anyio
+async def test_integration_loop_run_once_through_mcp_drives_one_real_cycle(server, tmp_path):
+    mcp_server, integration, queue = server
+    repo = _init_repo(tmp_path / "repo")
+    await _call(mcp_server, "terminal_integration_configure", project="proj-a", repo_path=str(repo),
+               targeted_test_command=["true"], full_regression_command=["true"])
+    subprocess.run(["git", "checkout", "-q", "-b", "feature/x"], cwd=repo, check=True)
+    (repo / "x.txt").write_text("content\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "feature commit"], cwd=repo, check=True)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True,
+                         check=True).stdout.strip()
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    base_sha = subprocess.run(["git", "rev-parse", "main"], cwd=repo, capture_output=True, text=True,
+                              check=True).stdout.strip()
+    integration.store.publish_handoff(project="proj-a", task_id="t1", origin_session="role-a", branch="feature/x",
+                                      commit_sha=sha, base_sha=base_sha, changed_paths=["x.txt"],
+                                      artifacts={"docs_exempt": "chore"})
+
+    result = await _call(mcp_server, "terminal_integration_loop_run_once")
+    assert result["results"][0]["project"] == "proj-a"
+    assert result["results"][0]["action"] == "CLAIMED"  # exactly ONE tick -- same one-step-per-call posture as tick()
+
+    status = await _call(mcp_server, "terminal_integration_loop_status")
+    assert status["last_cycle_at"] is not None
+    assert status["running"] is False  # run_one_cycle never starts the background thread itself
+
+
+@pytest.mark.anyio
 async def test_a_completed_queue_task_with_integration_required_publishes_a_real_handoff_via_mcp(server, tmp_path):
     mcp_server, integration, queue = server
     repo = _init_repo(tmp_path / "repo")

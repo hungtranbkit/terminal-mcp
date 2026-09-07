@@ -192,15 +192,23 @@ async def test_conflict_and_failing_test_route_rework_to_correct_owner_end_to_en
     sha_b1, base_b1 = _commit_on_branch(repo, "feature/b1", "shared.txt", "CONFLICT: no marker here\n")
     sha_a2, base_a2 = _commit_on_branch(repo, "feature/a2", "a2.txt", "no marker at all -- will fail test\n")
 
+    # docs_exempt="chore": this test exercises merge/conflict/rework/
+    # regression MECHANICS with disposable a1.txt/a2.txt/shared.txt
+    # content -- nothing real to document either way (same precedent as
+    # test_integration_engine.py's own _publish_handoff helper). Without
+    # this, the real, correctly-working "Living-requirements convention"
+    # doc gate (edd316f, added AFTER this file was originally written)
+    # would refuse every one of these as REWORK_REQUIRED.
+    docs_exempt = {"docs_exempt": "chore"}
     integration.store.publish_handoff(project="proj-3role", task_id="task-a1", origin_session="role3-a",
                                       branch="feature/a1", commit_sha=sha_a1, base_sha=base_a1,
-                                      changed_paths=["shared.txt"])
+                                      changed_paths=["shared.txt"], artifacts=docs_exempt)
     integration.store.publish_handoff(project="proj-3role", task_id="task-b1", origin_session="role3-b",
                                       branch="feature/b1", commit_sha=sha_b1, base_sha=base_b1,
-                                      changed_paths=["shared.txt"])
+                                      changed_paths=["shared.txt"], artifacts=docs_exempt)
     integration.store.publish_handoff(project="proj-3role", task_id="task-a2", origin_session="role3-a",
                                       branch="feature/a2", commit_sha=sha_a2, base_sha=base_a2,
-                                      changed_paths=["a2.txt"])
+                                      changed_paths=["a2.txt"], artifacts=docs_exempt)
 
     engine = integration.engine
     # A1: claim -> review -> merge -> targeted test PASS -> INTEGRATED.
@@ -266,7 +274,7 @@ async def test_restart_mid_pipeline_never_double_merges(rig, tmp_path):
     sha, base_sha = _commit_on_branch(repo, "feature/x", "x.txt", "content\n")
     handoff = integration.store.publish_handoff(project="proj-3role", task_id="t1", origin_session="role3-a",
                                                 branch="feature/x", commit_sha=sha, base_sha=base_sha,
-                                                changed_paths=["x.txt"])
+                                                changed_paths=["x.txt"], artifacts={"docs_exempt": "chore"})
     engine = integration.engine
     engine.tick("proj-3role")  # CLAIMED
     merged = engine.tick("proj-3role")  # MERGED -> TARGETED_TEST

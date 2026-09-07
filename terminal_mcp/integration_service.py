@@ -18,6 +18,11 @@ class IntegrationService:
     def __init__(self, store: IntegrationStore | None = None, engine: IntegrationEngine | None = None) -> None:
         self.store = store or IntegrationStore()
         self.engine = engine
+        # Event-driven WAIT/wake background loop (integration_loop.py) --
+        # same "constructed lazily by mcp_app.py once self.engine exists,
+        # exposed as its own attribute so server_http.py can start/stop
+        # it" convention as QueueService.loop.
+        self.loop: Any = None
 
     def configure(self, project: str, *, repo_path: str, integration_branch: str = "integration",
                  main_branch: str = "main", targeted_test_command: list[str] | None = None,

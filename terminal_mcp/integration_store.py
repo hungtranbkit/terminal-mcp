@@ -68,7 +68,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .schema import Migration, apply_migrations
 
@@ -381,7 +381,8 @@ INTEGRATION_MIGRATIONS = [
 
 
 class IntegrationStore:
-    def __init__(self, path: str | Path | None = None) -> None:
+    def __init__(self, path: str | Path | None = None, *,
+                on_handoff_published: Callable[[str], None] | None = None) -> None:
         self.path = Path(path) if path is not None else default_integration_db_path()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with self._connection() as connection:
@@ -391,6 +392,15 @@ class IntegrationStore:
             self.path.chmod(0o600)
         except OSError:
             pass
+        # 3-role pipeline event-driven wake (integration_loop.py):
+        # injected, not imported -- same "callback, not a new pub/sub
+        # system" convention as QueueEngine's own on_completed. Called
+        # at most once per real publish_handoff call, best-effort (a
+        # broken hook must never break publishing a Handoff itself,
+        # which is the durable, restart-safe part -- the hook is purely
+        # a latency optimization on top of that, see integration_loop.
+        # py's own module docstring).
+        self.on_handoff_published = on_handoff_published
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
@@ -554,6 +564,11 @@ class IntegrationStore:
             self._record_event_locked(connection, project=project, handoff_id=handoff_id, batch_id=None,
                                       event_type="HANDOFF_PUBLISHED", reason=None,
                                       metadata={"branch": branch, "commit_sha": commit_sha})
+        if self.on_handoff_published is not None:
+            try:
+                self.on_handoff_published(project)
+            except Exception:  # noqa: BLE001 -- a broken wake hook must never break publishing itself
+                pass
         return self.get_handoff(handoff_id)
 
     def get_handoff(self, handoff_id: str) -> Handoff | None:
