@@ -9,6 +9,8 @@ from .controller import ControllerService, build_default_controller
 from .core import TerminalService
 from .coordinator import CoordinatorGate
 from .integration_engine import IntegrationEngine
+from .ai_usage_service import AiUsageService
+from .integration_loop import IntegrationLoop
 from .task_migration import TaskMigrationPlanner
 from .integration_service import IntegrationService
 from .integration_store import publish_handoff_for_completed_task
@@ -40,7 +42,8 @@ def build_mcp(service: TerminalService | None = None,
               integration: IntegrationService | None = None,
               pm: PMService | None = None,
               planner: PlannerService | None = None,
-              release: ReleaseService | None = None) -> MCPServer:
+              release: ReleaseService | None = None,
+              ai_usage: AiUsageService | None = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -65,6 +68,19 @@ def build_mcp(service: TerminalService | None = None,
     limitation as ControllerService.terminal_input_context's own
     binding-only branch; see docs/multi-node.md."""
     terminal = service or TerminalService(load_config())
+
+    def _local_sessions_for_ai_usage() -> list[dict]:
+        # Local-only, best-effort (§ai_usage_service.py's own docstring
+        # for why remote-node sessions are never correlated) -- reads
+        # straight off the backend's own real session listing, never a
+        # second/cached copy.
+        try:
+            items = terminal.tmux.list_sessions()
+        except Exception:  # noqa: BLE001 -- correlation is a non-essential extra
+            return []
+        return [{"name": item.name, "agent_type": item.pane_current_command} for item in items]
+
+    ai_usage = ai_usage or AiUsageService(terminal.config.ai_usage, session_lister=_local_sessions_for_ai_usage)
     supervisor = supervisor or SupervisorService(terminal, SupervisorStore())
     supervisor_v2 = supervisor_v2 or build_supervisor_v2(supervisor)
     controller = controller or build_default_controller(terminal)
@@ -95,6 +111,22 @@ def build_mcp(service: TerminalService | None = None,
                               on_completed=_on_task_completed)
     queue.engine = queue.engine or queue_engine
     integration.engine = integration.engine or IntegrationEngine(integration.store, queue.store)
+    # Event-driven WAIT/wake background loop (integration_loop.py) --
+    # constructed here (not started -- see server_http.py's own config.
+    # integration_loop.enabled gate for that), same "queue.loop"
+    # precedent immediately below. Wired as the store's own on_handoff_
+    # published hook: a fresh publish_handoff call (either the manual
+    # MCP path or _on_task_completed's auto-publish above) wakes this
+    # loop almost immediately instead of waiting out its own fallback
+    # poll interval -- see integration_loop.py's own module docstring
+    # for the full two-layer wake reasoning. Never overwrites an
+    # already-set hook (a caller that constructed its own IntegrationStore
+    # with a different on_handoff_published -- e.g. a test -- keeps it).
+    integration.loop = integration.loop or IntegrationLoop(
+        integration.engine, integration.store,
+        fallback_poll_seconds=terminal.config.integration_loop.fallback_poll_seconds,
+    )
+    integration.store.on_handoff_published = integration.store.on_handoff_published or integration.loop.wake
     # PM/Orchestrator Agent (docs/REQUIREMENTS.md §20.2): reads the SAME
     # queue store as everything else above (§20.0's own binding rule),
     # never a second queue. permission_checker is wired to the exact
@@ -1669,10 +1701,11 @@ def build_mcp(service: TerminalService | None = None,
     # session IS the lane for terminal_queue_*; PROJECT is the lane
     # here. SAFETY: configure() must be called explicitly per project
     # before anything runs against it; nothing here ever touches a repo
-    # not explicitly configured, and no automatic background loop is
-    # wired (see integration_engine.py's own WAITING_FOR_HANDOFF
-    # docstring) -- terminal_integration_run_once is the only way any
-    # merge/test/promotion step actually happens in this phase.
+    # not explicitly configured. terminal_integration_run_once always
+    # works regardless of the loop below; an OPTIONAL, OFF-by-default
+    # event-driven background loop (integration_loop.py, config.
+    # integration_loop.enabled) can also drive this automatically --
+    # see its own module docstring for the real wake mechanism.
 
     @server.tool()
     def terminal_integration_configure(project: str, repo_path: str, integration_branch: str = "integration",
@@ -1727,6 +1760,31 @@ def build_mcp(service: TerminalService | None = None,
         return integration.run_once(project)
 
     @server.tool()
+    def terminal_integration_loop_status() -> dict:
+        """Whether the AUTOMATIC event-driven background loop
+        (integration_loop.py) is actually running right now, its
+        fallback poll interval, when its last cycle completed, and its
+        last error (if any) -- distinct from any single project's own
+        `paused` flag. A project can be unpaused while this reports
+        running=False (config.integration_loop.enabled is off
+        system-wide) -- exactly the "why isn't my handoff being
+        processed automatically" question this answers."""
+        if integration.loop is None:
+            return {"running": False, "fallback_poll_seconds": None, "last_cycle_at": None, "last_error": None}
+        return integration.loop.status()
+
+    @server.tool()
+    def terminal_integration_loop_run_once() -> dict:
+        """Manually forces exactly one full cycle of the automatic
+        Integration Agent loop -- one tick() per configured, non-paused
+        project, regardless of whether the background loop itself is
+        currently running. Useful for tests/smoke or to force immediate
+        progress without waiting for the next automatic wake/poll."""
+        if integration.loop is None:
+            return {"error": "INTEGRATION_LOOP_NOT_CONFIGURED"}
+        return {"results": integration.loop.run_one_cycle()}
+
+    @server.tool()
     def terminal_integration_pause(project: str, reason: str | None = None) -> dict:
         return integration.pause(project, reason=reason)
 
@@ -1759,5 +1817,29 @@ def build_mcp(service: TerminalService | None = None,
     @server.tool()
     def terminal_integration_events(project: str, limit: int = 50) -> dict:
         return integration.events(project, limit)
+
+    # -- AI Usage (read-only integration with the separate 'AI Usage
+    # Monitor' local service, ~/.local/share/ai-usage-monitor, its own
+    # systemd --user service on config.ai_usage.base_url -- see
+    # ai_usage_service.py's own module docstring). Never blocks: bounded
+    # by config.ai_usage.timeout_seconds, degrades to a stale-but-
+    # available cached snapshot (or an honest unavailable) if that
+    # service is down, never raises.
+
+    @server.tool()
+    def terminal_ai_usage_status(force: bool = False) -> dict:
+        """Provider usage/quota (Codex/Claude/Gemini/Antigravity) as last
+        reported by the local AI Usage Monitor service, normalized into
+        one common shape with this project's own warning/critical
+        threshold classification (config.ai_usage.warning_threshold_
+        percent/critical_threshold_percent) and, best-effort, which LOCAL
+        sessions are currently running which provider's CLI. `available:
+        false` (with `error`) means the AI Usage Monitor itself is
+        unreachable and no prior snapshot exists yet; `stale: true` means
+        it's currently unreachable but this is the last real snapshot
+        successfully fetched. `force=true` bypasses this service's own
+        short cache (but never forces the AI Usage Monitor to hit the
+        real provider APIs early -- see its own docstring)."""
+        return ai_usage.get_usage(force=force)
 
     return server

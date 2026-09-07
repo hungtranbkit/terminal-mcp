@@ -1417,6 +1417,12 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/tasks/board": {"GET", "HEAD"},
         "/dashboard/api/tasks/create": {"POST"},
         "/dashboard/api/tasks/assign": {"POST"},
+        # AI Usage (read-only, local AI Usage Monitor) + Move-Task UI --
+        # both later, separate features, same as the Task Manager routes
+        # above.
+        "/dashboard/api/ai-usage": {"GET", "HEAD"},
+        "/dashboard/api/tasks/reassign": {"POST"},
+        "/dashboard/requirements": {"GET", "HEAD"},
     }
     # The web terminal's WebSocket route is registered too, just outside
     # this HTTP-methods-only dict (WebSocketRoute has no .methods).

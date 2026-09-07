@@ -23,6 +23,7 @@ from .connection_store import ConnectionStore, generate_node_token
 from .controller import ControllerService, build_default_controller
 from .node_client import NodeClientError, RemoteNodeClient
 from .core import TerminalService
+from .ai_usage_service import AiUsageService
 from .integration_service import IntegrationService
 from .integration_store import IntegrationStore
 from .node_models import NODE_ONLINE, SESSION_BACKEND_TMUX, node_to_dict
@@ -55,6 +56,18 @@ def node_token_env_var(node_id: str) -> str:
     time -- silently rejecting every heartbeat from that node forever.
     Centralized here so the two can never drift apart again."""
     return f"TERMINAL_MCP_NODE_TOKEN_{node_id.upper().replace('-', '_')}"
+
+
+def _requirements_doc_path() -> Path:
+    """This project's own docs/REQUIREMENTS.md -- same `parents[N]`-from-
+    `__file__` convention as config.py's default_config_path (this
+    module lives one level deeper, in terminal_mcp/, so parents[1] is
+    the repo root either way)."""
+    return Path(__file__).resolve().parents[1] / "docs" / "REQUIREMENTS.md"
+
+
+def _read_requirements_doc() -> str:
+    return _requirements_doc_path().read_text(encoding="utf-8")
 
 
 INPUT_ERROR_STATUS = {
@@ -571,6 +584,38 @@ DASHBOARD_HTML = """<!doctype html>
     #taskInboxPanel .pm-head { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px }
     #taskInboxPanel .pm-body { padding:14px 16px; display:flex; flex-direction:column; gap:12px; font-size:13px }
     .tm-task-session { font-size:10px; padding:1px 7px; border-radius:999px; border:1px solid var(--line); color:var(--muted); cursor:pointer }
+
+    /* AI Usage (read-only, ~/.local/share/ai-usage-monitor local service) --
+       same modal component shape as #taskInboxPanel above. */
+    #aiUsageBackdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:30 }
+    #aiUsagePanel {
+      display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:31;
+      width:min(640px, calc(100vw - 32px)); max-height:85vh; overflow:auto;
+      background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 20px 50px rgba(0,0,0,.6);
+    }
+    body.ai-usage-visible #aiUsageBackdrop, body.ai-usage-visible #aiUsagePanel { display:block }
+    #aiUsagePanel .pm-head { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px }
+    #aiUsagePanel .pm-head .acts, #taskModal .pm-head .acts { display:flex; gap:6px; align-items:center }
+    #taskModal .pm-head a.term-btn { text-decoration:none; display:inline-flex; align-items:center }
+    #aiUsagePanel .pm-body { padding:14px 16px; display:flex; flex-direction:column; gap:12px; font-size:13px }
+    .au-meta { color:var(--muted); font-size:11px; display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap }
+    .au-stale { color:var(--amber) }
+    .au-card { border:1px solid var(--line); border-radius:10px; padding:10px 12px }
+    .au-card-head { display:flex; justify-content:space-between; align-items:center; gap:8px }
+    .au-card-head b { font-size:13px }
+    .au-badge { font-size:10px; padding:1px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted) }
+    .au-badge.warning { color:var(--amber); border-color:var(--amber) }
+    .au-badge.critical { color:var(--red); border-color:var(--red) }
+    .au-badge.offline { color:var(--red); border-color:var(--red) }
+    .au-window { margin-top:8px }
+    .au-window-row { display:flex; justify-content:space-between; font-size:12px }
+    .au-bar { height:7px; background:#1b2638; border-radius:99px; overflow:hidden; margin:3px 0 }
+    .au-bar > div { height:100% }
+    .au-window-meta { color:var(--muted); font-size:11px }
+    .au-unavailable { color:var(--muted); font-size:12px; font-style:italic }
+    .au-sessions { font-size:12px; color:var(--muted) }
+    .au-sessions .au-session-row { padding:3px 0; border-top:1px solid var(--line) }
+    #aiUsageRefreshBtn.loading { opacity:.6; pointer-events:none }
     /* ---- Tab bar row -----------------------------------------------------
        .tabbar itself scrolls horizontally (see its own rule above). The
        row holds ONLY the tab strip now -- New session/Đã kill used to be
@@ -791,8 +836,10 @@ DASHBOARD_HTML = """<!doctype html>
           <a href="/dashboard/sessions" id="sessionsAdminLink" role="menuitem">⚙ Quản lý session</a>
           <a href="/dashboard/nodes" id="nodesAdminLink" role="menuitem">🖥 Nodes</a>
           <a href="/dashboard/tasks" id="globalTasksLink" role="menuitem">🗂 Global Tasks</a>
+          <a href="/dashboard/requirements" id="requirementsLink" role="menuitem" target="_blank" rel="noopener">📄 Requirements</a>
           <button type="button" id="openSupervisorPanelBtn" role="menuitem">🧭 Supervisor / Coordinator</button>
           <button type="button" id="openTaskInboxBtn" role="menuitem">📥 Task Inbox</button>
+          <button type="button" id="openAiUsageBtn" role="menuitem">📊 AI Usage</button>
         </div>
       </div>
     </div>
@@ -909,6 +956,30 @@ DASHBOARD_HTML = """<!doctype html>
       </div>
     </div>
   </div>
+  <div id="aiUsageBackdrop"></div>
+  <div id="aiUsagePanel" role="dialog" aria-modal="true" aria-labelledby="aiUsageTitle">
+    <div class="pm-head">
+      <strong id="aiUsageTitle">AI Usage</strong>
+      <span class="acts">
+        <button id="aiUsageRefreshBtn" class="term-btn" type="button" title="Refresh ngay">↻</button>
+        <button id="aiUsageCloseBtn" class="term-btn" type="button">✕</button>
+      </span>
+    </div>
+    <div class="pm-body">
+      <div id="aiUsageError" class="km-error"></div>
+      <div class="au-meta">
+        <span id="aiUsageMeta">—</span>
+        <label style="display:flex;align-items:center;gap:5px;cursor:pointer">
+          <input type="checkbox" id="aiUsageAutoRefresh" checked> auto-refresh 30s
+        </label>
+      </div>
+      <div id="aiUsageProviders"></div>
+      <div class="tm-group">
+        <div class="tm-group-title">Session hiện tại (local)</div>
+        <div id="aiUsageSessions" class="au-sessions"></div>
+      </div>
+    </div>
+  </div>
   <div id="permBackdrop"></div>
   <div id="permModal" role="dialog" aria-modal="true" aria-labelledby="permModalTitle">
     <div class="pm-head">
@@ -976,7 +1047,10 @@ DASHBOARD_HTML = """<!doctype html>
   <div id="taskModal" role="dialog" aria-modal="true" aria-labelledby="taskModalTitle">
     <div class="pm-head">
       <strong id="taskModalTitle">Tasks</strong>
-      <button id="taskModalCloseBtn" class="term-btn" type="button">✕</button>
+      <span class="acts">
+        <a href="/dashboard/requirements" target="_blank" rel="noopener" class="term-btn" title="Xem docs/REQUIREMENTS.md (feature matrix, backlog)">📄 Docs</a>
+        <button id="taskModalCloseBtn" class="term-btn" type="button">✕</button>
+      </span>
     </div>
     <div class="pm-body">
       <div class="tm-lane-actions">
@@ -1088,6 +1162,15 @@ DASHBOARD_HTML = """<!doctype html>
     const taskInboxEmptyEl = document.querySelector('#taskInboxEmpty');
     const openSupervisorPanelBtnEl = document.querySelector('#openSupervisorPanelBtn');
     const openTaskInboxBtnEl = document.querySelector('#openTaskInboxBtn');
+    const openAiUsageBtnEl = document.querySelector('#openAiUsageBtn');
+    const aiUsageBackdropEl = document.querySelector('#aiUsageBackdrop');
+    const aiUsageCloseBtnEl = document.querySelector('#aiUsageCloseBtn');
+    const aiUsageRefreshBtnEl = document.querySelector('#aiUsageRefreshBtn');
+    const aiUsageErrorEl = document.querySelector('#aiUsageError');
+    const aiUsageMetaEl = document.querySelector('#aiUsageMeta');
+    const aiUsageProvidersEl = document.querySelector('#aiUsageProviders');
+    const aiUsageSessionsEl = document.querySelector('#aiUsageSessions');
+    const aiUsageAutoRefreshEl = document.querySelector('#aiUsageAutoRefresh');
     const qcLoopStatusValueEl = document.querySelector('#qcLoopStatusValue');
     const qcQueueDepthsEl = document.querySelector('#qcQueueDepths');
     const qcBlockedReworkEl = document.querySelector('#qcBlockedRework');
@@ -2629,6 +2712,7 @@ DASHBOARD_HTML = """<!doctype html>
     // page reload.
     let taskModalName = null;
     let taskPollTimer = null;
+    let taskModalQueuedOrder = [];  // current queued-group task ids, in position order -- for ↑/↓ reorder
     const GATE_CLASS = {READY: 'gate-ready', BLOCKED: 'gate-blocked', NEEDS_REWORK: 'gate-blocked', NEEDS_HUMAN: 'gate-blocked'};
     function closeTaskModal() {
       document.body.classList.remove('task-modal-visible');
@@ -2705,8 +2789,60 @@ DASHBOARD_HTML = """<!doctype html>
         retryBtn.onclick = () => taskAction('/dashboard/api/task/retry', task.id, ownerSession);
         actions.append(retryBtn);
       }
+      // Priority/reorder UI (per-session Task Manager only -- reordering
+      // across a mixed-session Global Task Inbox list has no single
+      // well-defined meaning, so this stays scoped to !showSession):
+      // ↑/↓ swap this task's position with its neighbor within the SAME
+      // session's queued group, then POST the whole new order via the
+      // already-real, already-tested /dashboard/api/session/queue/reorder.
+      if (group === 'queued' && !showSession && ownerSession) {
+        const idx = taskModalQueuedOrder.indexOf(task.id);
+        const upBtn = document.createElement('button'); upBtn.type = 'button'; upBtn.textContent = '↑';
+        upBtn.disabled = idx <= 0;
+        upBtn.onclick = () => reorderQueuedTask(ownerSession, idx, idx - 1);
+        const downBtn = document.createElement('button'); downBtn.type = 'button'; downBtn.textContent = '↓';
+        downBtn.disabled = idx < 0 || idx >= taskModalQueuedOrder.length - 1;
+        downBtn.onclick = () => reorderQueuedTask(ownerSession, idx, idx + 1);
+        actions.append(upBtn, downBtn);
+      }
+      // Move-Task UI (Backlog: dedicated Move-Task UI) -- any status the
+      // real backend actually allows reassigning (QUEUED/WAITING_SESSION/
+      // BLOCKED/FAILED -- never RUNNING, enforced server-side either way).
+      if ((group === 'queued' || group === 'blocked_rework') && ownerSession) {
+        const moveBtn = document.createElement('button'); moveBtn.type = 'button'; moveBtn.textContent = '↷ Move';
+        moveBtn.onclick = () => moveTaskToSession(task.id, ownerSession);
+        actions.append(moveBtn);
+      }
       if (actions.childElementCount) row.append(actions);
       return row;
+    }
+    async function postJSON(path, body) {
+      const response = await fetch(path, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+      });
+      return response.json().catch(() => ({}));
+    }
+    async function reorderQueuedTask(session, fromIdx, toIdx) {
+      if (fromIdx < 0 || toIdx < 0 || toIdx >= taskModalQueuedOrder.length) return;
+      const order = taskModalQueuedOrder.slice();
+      const [moved] = order.splice(fromIdx, 1);
+      order.splice(toIdx, 0, moved);
+      try {
+        const result = await postJSON('/dashboard/api/session/queue/reorder', {name: session, ordered_task_ids: order});
+        if (result && result.error) { alert(clean(result.error)); return; }
+        if (taskModalName === session) await loadTaskBoard(session);
+      } catch (e) { alert(e.message || String(e)); }
+    }
+    async function moveTaskToSession(taskId, currentSession) {
+      const target = window.prompt(`Move task #${taskId.slice(0, 8)} từ "${currentSession}" sang session nào?`, '');
+      if (!target || target === currentSession) return;
+      const reason = window.prompt('Lý do di chuyển (tuỳ chọn):', '') || 'moved via dashboard';
+      try {
+        const result = await postJSON('/dashboard/api/tasks/reassign', {task_id: taskId, to_session: target, reason});
+        if (result && result.error) { alert(clean(result.error)); return; }
+        if (taskModalName === currentSession) await loadTaskBoard(currentSession);
+        if (document.body.classList.contains('task-inbox-visible')) await loadTaskInbox();
+      } catch (e) { alert(e.message || String(e)); }
     }
     function renderTaskGroup(listEl, countEl, tasks, group, options) {
       listEl.replaceChildren();
@@ -2718,6 +2854,7 @@ DASHBOARD_HTML = """<!doctype html>
       taskModalErrorEl.textContent = '';
       taskPauseBtnEl.hidden = data.paused === true;
       taskResumeBtnEl.hidden = data.paused !== true;
+      taskModalQueuedOrder = (data.queued || []).map(t => t.id);
       renderTaskGroup(document.querySelector('#taskListRunning'), document.querySelector('#taskCountRunning'), data.running, 'running');
       renderTaskGroup(document.querySelector('#taskListQueued'), document.querySelector('#taskCountQueued'), data.queued, 'queued');
       renderTaskGroup(document.querySelector('#taskListWaitingDep'), document.querySelector('#taskCountWaitingDep'), data.waiting_dependency, 'waiting_dependency');
@@ -2840,6 +2977,130 @@ DASHBOARD_HTML = """<!doctype html>
       if (event.key === 'Escape' && document.body.classList.contains('task-inbox-visible')) closeTaskInbox();
     });
     openTaskInboxBtnEl.onclick = () => { closeAllMenus(); openTaskInbox(); };
+
+    // ---- AI Usage (read-only integration with the separate local
+    // 'AI Usage Monitor' service -- terminal_mcp/ai_usage_service.py's
+    // own module docstring has the full design). Renders whatever
+    // `providers`/`sessions` the real /dashboard/api/ai-usage response
+    // carries -- never invents a number for a provider/window the
+    // source didn't report (a missing/unavailable window is shown as
+    // "unavailable" text, never a fake 0%/100% bar).
+    const AU_PROVIDER_LABEL = {codex: 'Codex', claude: 'Claude Code', gemini: 'Gemini CLI', antigravity: 'Antigravity'};
+    let aiUsageAutoTimer = null;
+    function auBarColor(severity) {
+      if (severity === 'critical') return 'var(--red)';
+      if (severity === 'warning') return 'var(--amber)';
+      return 'var(--green)';
+    }
+    function auFmtTime(iso) {
+      if (!iso) return '—';
+      const d = typeof iso === 'number' ? new Date(iso * 1000) : new Date(iso);
+      return isNaN(d) ? clean(String(iso)) : d.toLocaleString();
+    }
+    // Real DOM construction throughout (never raw string-built markup --
+    // same standing project rule the terminal renderer/task rows
+    // already follow, see test_dashboard_uses_safe_dom_rendering).
+    function auEl(tag, {className, text} = {}) {
+      const el = document.createElement(tag);
+      if (className) el.className = className;
+      if (text != null) el.textContent = text;
+      return el;
+    }
+    function renderAiUsageWindow(w) {
+      const wrap = auEl('div', {className: 'au-window'});
+      const row = auEl('div', {className: 'au-window-row'});
+      row.append(auEl('b', {text: w.label}));
+      if (w.used_percent == null) {
+        row.append(auEl('span', {className: 'au-unavailable', text: 'unavailable'}));
+        wrap.append(row);
+        return wrap;
+      }
+      const used = Number(w.used_percent);
+      const remaining = w.remaining_percent != null ? Number(w.remaining_percent) : (100 - used);
+      row.append(auEl('span', {text: `${remaining.toFixed(0)}% còn lại`}));
+      const bar = auEl('div', {className: 'au-bar'});
+      const fill = document.createElement('div');
+      fill.style.width = `${Math.min(100, Math.max(0, used))}%`;
+      fill.style.background = auBarColor(w.severity);
+      bar.append(fill);
+      const meta = auEl('div', {className: 'au-window-meta', text: `Đã dùng ${used.toFixed(0)}% · reset ${auFmtTime(w.resets_at)}`});
+      wrap.append(row, bar, meta);
+      return wrap;
+    }
+    function renderAiUsageProvider(p) {
+      const card = auEl('div', {className: 'au-card'});
+      const head = auEl('div', {className: 'au-card-head'});
+      head.append(auEl('b', {text: AU_PROVIDER_LABEL[p.provider] || p.provider}));
+      if (!p.ok) {
+        head.append(auEl('span', {className: 'au-badge offline', text: 'Offline'}));
+        card.append(head, auEl('div', {className: 'au-unavailable', text: p.error || p.usage_message || 'Unavailable'}));
+        return card;
+      }
+      const badgeCls = p.critical ? 'au-badge critical' : p.warning ? 'au-badge warning' : 'au-badge';
+      const badgeText = p.critical ? 'Critical' : p.warning ? 'Warning' : 'OK';
+      head.append(auEl('span', {className: badgeCls, text: badgeText}));
+      card.append(head);
+      const acct = [p.account, p.plan].filter(Boolean).join(' · ');
+      if (acct) card.append(auEl('div', {className: 'au-window-meta', text: acct}));
+      if (p.windows.length) {
+        for (const w of p.windows) card.append(renderAiUsageWindow(w));
+      } else {
+        card.append(auEl('div', {className: 'au-unavailable', text: p.usage_message || 'Usage data unavailable'}));
+      }
+      return card;
+    }
+    function closeAiUsage() {
+      document.body.classList.remove('ai-usage-visible');
+      aiUsageErrorEl.textContent = '';
+      if (aiUsageAutoTimer) { clearInterval(aiUsageAutoTimer); aiUsageAutoTimer = null; }
+    }
+    function openAiUsage() {
+      aiUsageErrorEl.textContent = '';
+      document.body.classList.add('ai-usage-visible');
+      loadAiUsage().catch(() => {});
+      if (aiUsageAutoTimer) clearInterval(aiUsageAutoTimer);
+      aiUsageAutoTimer = setInterval(() => {
+        if (aiUsageAutoRefreshEl.checked) loadAiUsage().catch(() => {});
+      }, 30000);
+    }
+    async function loadAiUsage(force) {
+      aiUsageRefreshBtnEl.classList.add('loading');
+      try {
+        const data = await fetchJSON('/dashboard/api/ai-usage' + (force ? '?force=1' : ''), {cache: 'no-store'});
+        if (!document.body.classList.contains('ai-usage-visible')) return;
+        if (!data.available) {
+          aiUsageErrorEl.textContent = 'AI Usage Monitor không khả dụng: ' + clean(data.error || 'unknown');
+          aiUsageMetaEl.textContent = '—';
+          aiUsageProvidersEl.replaceChildren();
+          aiUsageSessionsEl.replaceChildren();
+          return;
+        }
+        aiUsageErrorEl.textContent = '';
+        let metaText = `${data.source} · cập nhật ${auFmtTime(data.fetched_at)}`;
+        if (data.cached) metaText += ` · cache ${data.cache_age_seconds}s`;
+        aiUsageMetaEl.replaceChildren(document.createTextNode(metaText));
+        if (data.stale) {
+          aiUsageMetaEl.append(auEl('span', {className: 'au-stale', text: ` · STALE (${data.last_error || 'lỗi'})`}));
+        }
+        aiUsageProvidersEl.replaceChildren(...(data.providers || []).map(renderAiUsageProvider));
+        const sessions = (data.sessions || []).filter(s => s.provider);
+        aiUsageSessionsEl.replaceChildren(...(sessions.length
+          ? sessions.map(s => auEl('div', {className: 'au-session-row',
+              text: `${s.session} · ${s.agent_type}${s.quota_available ? '' : ' (quota unavailable)'}`}))
+          : [auEl('div', {className: 'au-session-row', text: 'Không có session Claude/Codex local đang chạy.'})]));
+      } catch (e) {
+        if (document.body.classList.contains('ai-usage-visible')) aiUsageErrorEl.textContent = clean(e.message || String(e));
+      } finally {
+        aiUsageRefreshBtnEl.classList.remove('loading');
+      }
+    }
+    aiUsageCloseBtnEl.onclick = closeAiUsage;
+    aiUsageBackdropEl.onclick = closeAiUsage;
+    aiUsageRefreshBtnEl.onclick = () => loadAiUsage(true);
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && document.body.classList.contains('ai-usage-visible')) closeAiUsage();
+    });
+    openAiUsageBtnEl.onclick = () => { closeAllMenus(); openAiUsage(); };
 
     // ---- Supervisor/Coordinator panel's own Queue/Coordinator +
     // Integration sections (task: Dashboard Supervisor/Coordinator panel)
@@ -5715,7 +5976,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        queue: QueueService | None = None,
                        integration: IntegrationService | None = None,
                        pm: PMService | None = None,
-                       planner: PlannerService | None = None) -> None:
+                       planner: PlannerService | None = None,
+                       ai_usage: AiUsageService | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -5760,6 +6022,18 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         import tempfile
         integration = IntegrationService(IntegrationStore(
             Path(tempfile.mkdtemp(prefix="terminal-mcp-integration-")) / "integration.db"))
+    if ai_usage is None:
+        # No persistent store at all (in-memory cache only) -- no
+        # private-temp-file discipline needed, unlike queue/integration
+        # above. server_http.py's real main() passes the SAME instance
+        # build_mcp already constructed so both surfaces share one cache.
+        def _local_sessions_for_ai_usage() -> list[dict]:
+            try:
+                items = terminal.tmux.list_sessions()
+            except Exception:  # noqa: BLE001 -- correlation is a non-essential extra
+                return []
+            return [{"name": item.name, "agent_type": item.pane_current_command} for item in items]
+        ai_usage = AiUsageService(terminal.config.ai_usage, session_lister=_local_sessions_for_ai_usage)
     if pm is None:
         # Same private-temp-file discipline as queue/integration's own
         # defaults just above -- server_http.py's real main() always
@@ -5876,6 +6150,25 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         every other CF Access usage here: with no team_domain/audience
         configured, GET routes are completely unaffected by this."""
         return _cloudflare_access_guard(request)
+
+    @server.custom_route("/dashboard/requirements", methods=["GET"], include_in_schema=False)
+    async def dashboard_requirements(request: Request) -> Response:
+        # Backlog: "Requirements/Feature Matrix link inside the Dashboard
+        # Task Manager" -- a plain, read-only view of the SAME docs/
+        # REQUIREMENTS.md this whole file's own header points every
+        # agent to, read fresh off disk on every request (so a doc
+        # update is visible immediately, no restart needed). Served as
+        # plain text (not rendered markdown -- no new dependency, no
+        # injection surface) -- same _read_guard-only posture as every
+        # other fleet-level read route.
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            text = await anyio.to_thread.run_sync(_read_requirements_doc)
+        except OSError as exc:
+            return JSONResponse({"error": "REQUIREMENTS_DOC_UNREADABLE", "detail": str(exc)}, status_code=500)
+        return PlainTextResponse(text, headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
 
     @server.custom_route("/dashboard", methods=["GET"], include_in_schema=False)
     async def dashboard(request: Request) -> HTMLResponse | JSONResponse:
@@ -6503,6 +6796,21 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         result = await anyio.to_thread.run_sync(integration.fleet_overview)
         return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
 
+    @server.custom_route("/dashboard/api/ai-usage", methods=["GET"], include_in_schema=False)
+    async def ai_usage_status_route(request: Request) -> JSONResponse:
+        # Same _read_guard-only posture as the fleet-level routes just
+        # above -- this is a fleet/account-level status read, not one
+        # session's own content. Bounded by config.ai_usage.timeout_
+        # seconds (default 2.0s), never raises (see ai_usage_service.py)
+        # -- a down AI Usage Monitor degrades this route's own response,
+        # never hangs the request or the dashboard around it.
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        force = request.query_params.get("force") == "1"
+        result = await anyio.to_thread.run_sync(lambda: ai_usage.get_usage(force=force))
+        return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
     @server.custom_route("/dashboard/api/tasks/board", methods=["GET"], include_in_schema=False)
     async def tasks_board(request: Request) -> JSONResponse:
         # Same fleet-wide gate posture as /dashboard/api/queue/global-inbox
@@ -6667,6 +6975,43 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         _log.info("dashboard queue_reorder session=%s identity=%s", name, identity.email if identity else None)
         result = await anyio.to_thread.run_sync(lambda: queue.reorder(name, ordered_task_ids))
+        status_code = 200 if "error" not in result else 400
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/tasks/reassign", methods=["POST"], include_in_schema=False)
+    async def tasks_reassign(request: Request) -> JSONResponse:
+        # Move-Task UI (Backlog: "Task Migration: dedicated Move-Task UI",
+        # PLANNED until this route+the Task Manager's own ↷ Move button)
+        # -- thin wrapper over the already-real, already-tested queue.
+        # reassign (race-safe: TASK_ALREADY_CLAIMED if claimed for
+        # dispatch in the meantime, never a RUNNING task). Requires read
+        # access to BOTH the task's current session and the target --
+        # never lets a caller move a task into/out of a session they
+        # can't otherwise see.
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        task_id = body.get("task_id") if isinstance(body, dict) else None
+        to_session = body.get("to_session") if isinstance(body, dict) else None
+        reason = body.get("reason") if isinstance(body, dict) else None
+        if not isinstance(task_id, str) or not task_id or not isinstance(to_session, str) or not to_session:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        if not terminal._read_authorized(to_session):
+            return JSONResponse({"error": "READ_RESTRICTED", "session": to_session}, status_code=403)
+        existing = await anyio.to_thread.run_sync(lambda: queue.store.get_task(task_id))
+        if existing is None:
+            return JSONResponse({"error": "TASK_NOT_FOUND", "task_id": task_id}, status_code=404)
+        if existing.session and not terminal._read_authorized(existing.session):
+            return JSONResponse({"error": "READ_RESTRICTED", "session": existing.session}, status_code=403)
+        _log.info("dashboard tasks_reassign task_id=%s to_session=%s identity=%s",
+                 task_id, to_session, identity.email if identity else None)
+        actor = (identity.email if identity else None) or "dashboard"
+        result = await anyio.to_thread.run_sync(
+            lambda: queue.reassign(task_id, to_session, reason=(reason or "moved via dashboard"), actor=actor))
         status_code = 200 if "error" not in result else 400
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 

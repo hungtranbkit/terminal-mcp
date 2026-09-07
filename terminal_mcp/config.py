@@ -108,6 +108,52 @@ class QueueConfig:
 
 
 @dataclass(frozen=True)
+class IntegrationLoopConfig:
+    """3-role pipeline's own event-driven WAIT/wake background loop
+    (integration_loop.py) -- a SEPARATE, independent global kill switch
+    from queue.enabled above (this drives IntegrationEngine.tick() in a
+    loop, not QueueEngine.tick()). Disabled by default, same posture as
+    every other autonomous-background-thread config in this project.
+    Unlike queue.enabled, there is no separate PER-PROJECT opt-in column
+    needed here -- a project must already be explicitly configured via
+    terminal_integration_configure (real setup, not a bare flag) before
+    any Handoff can even be published for it, and an already-real
+    per-project `paused` flag (integration_service.py's pause/resume)
+    is the reuse-not-rebuild equivalent of queue_lanes.auto_dispatch_
+    enabled's per-lane gate -- see integration_loop.py's own module
+    docstring for the full two-gate reasoning."""
+    enabled: bool = False
+    fallback_poll_seconds: float = 5.0
+
+
+@dataclass(frozen=True)
+class AiUsageConfig:
+    """Read-only integration with the separate 'AI Usage Monitor' local
+    service (a SEPARATE project -- its own repo, its own systemd user
+    service, ~/.local/share/ai-usage-monitor -- see docs/REQUIREMENTS.md's
+    own "AI Usage" section for the full audit). This project makes ZERO
+    changes to that service and duplicates NONE of its usage-collection
+    logic -- it only reads that service's own already-computed
+    `/api/usage` JSON over a plain local HTTP GET. Defaults ON (unlike
+    every autonomous-background-thread config in this project, which
+    defaults OFF): there is no autonomous ACTION to gate here, only a
+    read, and a down/missing service degrades cleanly (see ai_usage_
+    service.py) rather than breaking anything. `base_url` is deliberately
+    a plain override (not multi-node) -- the AI Usage Monitor reflects
+    THIS machine's own local CLI credential files, not a fleet-wide
+    concept; when this project's own control plane later moves to a VPS
+    (see the Internet/VPS migration roadmap), `base_url` is the one
+    value an operator repoints, e.g. to a tunneled/loopback-forwarded
+    address on the new host -- never made public on the internet."""
+    enabled: bool = True
+    base_url: str = "http://127.0.0.1:8787"
+    timeout_seconds: float = 2.0
+    cache_ttl_seconds: float = 20.0
+    warning_threshold_percent: float = 70.0
+    critical_threshold_percent: float = 90.0
+
+
+@dataclass(frozen=True)
 class DashboardConfig:
     # A boundary specific to the web dashboard's own mutation routes
     # (session input, supervisor event ack, supervisor2 pause) --
@@ -409,6 +455,8 @@ class AppConfig:
     ask_chatgpt: AskChatGptConfig = AskChatGptConfig()
     nodes: NodesConfig = NodesConfig()
     queue: QueueConfig = QueueConfig()
+    integration_loop: IntegrationLoopConfig = IntegrationLoopConfig()
+    ai_usage: AiUsageConfig = AiUsageConfig()
     # Loop-protection metadata schema (see docs/prompt-submission.md, P11):
     # terminal_send_text/_granted accept optional origin/trace_id/parent_
     # turn_id/depth kwargs (all unused by every current caller -- MCP tools,
@@ -638,7 +686,38 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ask_chatgpt=_load_ask_chatgpt_config(raw.get("ask_chatgpt", {})),
         nodes=nodes_config,
         queue=_load_queue_config(raw.get("queue", {})),
+        integration_loop=_load_integration_loop_config(raw.get("integration_loop", {})),
+        ai_usage=_load_ai_usage_config(raw.get("ai_usage", {})),
     )
+
+
+def _load_ai_usage_config(raw: object) -> AiUsageConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    timeout = float(raw.get("timeout_seconds", AiUsageConfig.timeout_seconds))
+    cache_ttl = float(raw.get("cache_ttl_seconds", AiUsageConfig.cache_ttl_seconds))
+    warning = float(raw.get("warning_threshold_percent", AiUsageConfig.warning_threshold_percent))
+    critical = float(raw.get("critical_threshold_percent", AiUsageConfig.critical_threshold_percent))
+    if timeout <= 0:
+        raise ValueError("ai_usage.timeout_seconds must be positive")
+    if cache_ttl < 0:
+        raise ValueError("ai_usage.cache_ttl_seconds must be non-negative")
+    if not (0 <= warning <= 100) or not (0 <= critical <= 100):
+        raise ValueError("ai_usage.warning_threshold_percent/critical_threshold_percent must be 0-100")
+    return AiUsageConfig(
+        enabled=bool(raw.get("enabled", True)), base_url=str(raw.get("base_url", AiUsageConfig.base_url)),
+        timeout_seconds=timeout, cache_ttl_seconds=cache_ttl,
+        warning_threshold_percent=warning, critical_threshold_percent=critical,
+    )
+
+
+def _load_integration_loop_config(raw: object) -> IntegrationLoopConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    fallback_poll = float(raw.get("fallback_poll_seconds", IntegrationLoopConfig.fallback_poll_seconds))
+    if fallback_poll < 0.5:
+        raise ValueError("integration_loop.fallback_poll_seconds must be at least 0.5")
+    return IntegrationLoopConfig(enabled=bool(raw.get("enabled", False)), fallback_poll_seconds=fallback_poll)
 
 
 def _load_queue_config(queue_raw: object) -> QueueConfig:

@@ -165,3 +165,22 @@ nodes:
       hostname: "Rums-MacBook-Pro.local"
       endpoint: "http://192.168.1.138:8790"
       token_env: TERMINAL_MCP_NODE_TOKEN_MACBOOK
+
+# AI Usage: read-only integration with the separate, already-running
+# local 'AI Usage Monitor' service (ai-usage-monitor.service, its own
+# project -- see docs/REQUIREMENTS.md's own "AI Usage" section for the
+# full audit). Every value below already matches this deployment's own
+# real defaults (AiUsageConfig in config.py) -- this whole section is
+# commented out on purpose, documenting what's available rather than
+# overriding a working default. Uncomment and edit only if this
+# deployment's own AI Usage Monitor moves (e.g. this project's control
+# plane relocating to a VPS later -- base_url is the one value to
+# repoint then, via a tunneled/loopback-forwarded address, never a
+# public 8787).
+# ai_usage:
+#   enabled: true
+#   base_url: "http://127.0.0.1:8787"
+#   timeout_seconds: 2.0
+#   cache_ttl_seconds: 20.0
+#   warning_threshold_percent: 70.0
+#   critical_threshold_percent: 90.0

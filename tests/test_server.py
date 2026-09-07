@@ -82,6 +82,8 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_integration_status",
         "terminal_integration_list_handoffs",
         "terminal_integration_run_once",
+        "terminal_integration_loop_status",
+        "terminal_integration_loop_run_once",
         "terminal_integration_pause",
         "terminal_integration_resume",
         "terminal_integration_retry_handoff",
@@ -144,6 +146,8 @@ async def test_server_registers_v1_and_binding_tools():
         # Emergency Stop / Agent failure policy (§20.6 Phase E).
         "terminal_emergency_stop",
         "terminal_emergency_resume",
+        # AI Usage: read-only integration with the local AI Usage Monitor.
+        "terminal_ai_usage_status",
     }
 
 

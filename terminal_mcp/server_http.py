@@ -9,6 +9,7 @@ from pathlib import Path
 import anyio
 import uvicorn
 
+from .ai_usage_service import AiUsageService
 from .config import load_config
 from .connection_store import ConnectionStore
 from .controller import ControllerService
@@ -279,10 +280,23 @@ def main() -> None:
 
     pm = PMService(PMStore(), queue, controller, permission_checker=_pm_permission_checker)
     planner = PlannerService(PlannerStore(), queue)
+    # AI Usage (read-only, ~/.local/share/ai-usage-monitor's own local
+    # service): ONE shared instance, same "constructed once, shared by
+    # both build_mcp and register_dashboard" discipline as queue/
+    # integration/pm above -- both surfaces read/reuse the exact same
+    # short in-memory cache, never two independently-drifting fetches.
+    def _local_sessions_for_ai_usage() -> list[dict]:
+        try:
+            items = terminal.tmux.list_sessions()
+        except Exception:  # noqa: BLE001 -- correlation is a non-essential extra
+            return []
+        return [{"name": item.name, "agent_type": item.pane_current_command} for item in items]
+
+    ai_usage = AiUsageService(config.ai_usage, session_lister=_local_sessions_for_ai_usage)
     server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
-                       planner=planner)
+                       planner=planner, ai_usage=ai_usage)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
-                       queue=queue, integration=integration, pm=pm, planner=planner)
+                       queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage)
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)
@@ -323,6 +337,21 @@ def main() -> None:
     if config.queue.enabled:
         queue.loop.start()
         atexit.register(queue.loop.stop)
+
+    # 3-role pipeline's own event-driven WAIT/wake background loop
+    # (integration_loop.py) -- an INDEPENDENT global kill switch from
+    # config.queue above (see IntegrationLoopConfig's own docstring).
+    # No separate per-project opt-in flag is needed here: a project must
+    # already be explicitly configured via terminal_integration_configure
+    # before any Handoff can even exist for it, and the loop itself
+    # skips any project already `paused` -- see integration_loop.py's
+    # own module docstring for the full two-gate reasoning. The
+    # INSTANCE itself is constructed inside build_mcp (integration.loop),
+    # wired as integration.store's own on_handoff_published wake hook --
+    # this is only responsible for starting/stopping it based on config.
+    if config.integration_loop.enabled:
+        integration.loop.start()
+        atexit.register(integration.loop.stop)
 
     # P1 hardening item #9: unconditional, unlike the supervisor loop
     # above -- audit.db accumulates from any terminal_send_text/_keys call
