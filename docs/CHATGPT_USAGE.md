@@ -354,6 +354,28 @@ trivial task "just in case" — it adds real friction (a task genuinely
 cannot be assigned until the fields are filled in) for no benefit on
 small, obvious work.
 
+### 4f. Incident lane (fast-tracking a real production issue)
+
+**Status: VERIFIED** — see REQUIREMENTS.md's own Phase B implementation
+note for full evidence (a real dispatch-engine test proving the
+ordering, not just a store-level check).
+
+- `terminal_task_create_incident(title, prompt, assigned_session_id=, risk_level=, project=, metadata=)`
+  — creates a real task in the target session's own queue (or Backlog
+  if unassigned), tagged `metadata.type: "incident"`, with a priority
+  high enough to dispatch ahead of ordinary QUEUED work in that same
+  lane. NOT a separate queue — it still goes through the exact same
+  DoR check (if opted in) and Coordinator review as everything else;
+  an incident is never a way to skip real checks, only to jump the
+  line.
+- `terminal_list_active_incidents()` — every incident that hasn't
+  reached a terminal status yet, fleet-wide.
+
+**Anti-pattern:** don't use `terminal_task_create_incident` for
+ordinary urgent-but-not-actually-an-incident work — reserve it for a
+genuine production issue; overuse defeats its own purpose (everything
+fast-tracked is nothing fast-tracked).
+
 ## 5. Supervisor flow (canonical for watching an unattended session and
 reacting to it needing help)
 
@@ -525,11 +547,14 @@ plan`/`children`/`complete_parent`, no auto-complexity-based splitter),
 `worktree_status`/`worktree_cleanup`, plus `allow_mechanical_conflict_
 resolution` on `terminal_integration_configure`), and **delivery-
 discipline slice** (§4e — Definition of Ready, WIP limits, risk-level
-approval, all opt-in) are all **VERIFIED and callable**. Everything
-else in that design — PM-based routing of the Integration/Merge Agent
-to a specific session, and the rest of the Phase A-E Startup Operating
-Model (Phases B through E) — is still **PLANNED**, not built, as of
-this file's own last update. See `docs/REQUIREMENTS.md`'s own "Unified
-Task System" section (§20) for the current architecture-in-progress.
-Nothing beyond §4a-§4e's tools is callable yet; if asked to use any of
-the rest, say so plainly rather than guessing at a tool name.
+approval, all opt-in), and **incident lane slice** (§4f — `terminal_
+task_create_incident`/`terminal_list_active_incidents`) are all
+**VERIFIED and callable**. Everything else in that design — PM-based
+routing of the Integration/Merge Agent to a specific session, and the
+rest of the Phase A-E Startup Operating Model (Phases C through E, and
+the remaining pieces of Phase B) — is still **PLANNED**, not built, as
+of this file's own last update. See `docs/REQUIREMENTS.md`'s own
+"Unified Task System" section (§20) for the current architecture-in-
+progress. Nothing beyond §4a-§4f's tools is callable yet; if asked to
+use any of the rest, say so plainly rather than guessing at a tool
+name.

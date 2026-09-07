@@ -30,7 +30,9 @@ from typing import Any, Callable
 
 from .dor_gate import check_definition_of_ready
 from .permissions import valid_session_name
-from .queue_store import UNASSIGNED_LANE, VERIFYING, InvalidTransitionError, TaskAlreadyClaimedError, QueueStore
+from .queue_store import (
+    TERMINAL_STATUSES, UNASSIGNED_LANE, VERIFYING, InvalidTransitionError, TaskAlreadyClaimedError, QueueStore,
+)
 
 
 class QueueService:
@@ -208,6 +210,52 @@ class QueueService:
         if "error" in result:
             return result
         return {"task": result}
+
+    # -- Incident lane (§20.6 Phase B) -------------------------------------
+    # Deliberately NOT a parallel queue -- "a new, small policy on top of
+    # the existing priority field" (task's own words): an incident task
+    # is a completely ordinary task in the SAME lane, with `metadata.
+    # type="incident"` and a priority high enough to dispatch ahead of
+    # normal work (queue_store.py's own real, already-verified `ORDER BY
+    # priority DESC, position ASC` claim ordering -- zero new dispatch-
+    # engine code needed). Still goes through create_task's own DoR gate
+    # (if opted in) and the Coordinator's ordinary review -- "still
+    # audited, never bypassing the Coordinator gate entirely."
+    INCIDENT_PRIORITY = 1000
+    """A constant comfortably above any normal task's typical priority
+    (this project's own convention uses small ints, 0-10) -- disclosed
+    limitation: a normal task manually given a HIGHER priority than
+    this would still out-rank an incident. Not dynamically computed
+    against the lane's current max on purpose -- keeps this a simple,
+    predictable policy rather than a moving target."""
+
+    def create_incident_task(self, title: str, prompt: str, *, session: str | None = None,
+                             risk_level: str | None = None, project: str | None = None,
+                             metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The ONE way to create a fast-tracked incident task -- same
+        canonical create_task underneath, `metadata.type="incident"` +
+        priority=INCIDENT_PRIORITY. `risk_level` is folded into metadata
+        (reused by §20.6 Phase A's own risk-level approval gate, if a
+        project has opted into it -- an incident is not exempt from
+        that gate just for being an incident)."""
+        full_metadata = dict(metadata or {})
+        full_metadata["type"] = "incident"
+        if risk_level:
+            full_metadata["risk_level"] = risk_level
+        return self.create_task(title, prompt, session=session, priority=self.INCIDENT_PRIORITY,
+                                project=project, metadata=full_metadata)
+
+    def list_active_incidents(self) -> dict[str, Any]:
+        """Every task tagged `metadata.type="incident"` that hasn't yet
+        reached a terminal status -- real audit/visibility list, same
+        full-scan-over-list_all_lanes style `board()` already uses at
+        this project's real, small scale."""
+        incidents = []
+        for lane in self.store.list_all_lanes():
+            for task in lane["tasks"]:
+                if (task.get("metadata") or {}).get("type") == "incident" and task["status"] not in TERMINAL_STATUSES:
+                    incidents.append(task)
+        return {"incidents": incidents, "count": len(incidents)}
 
     def board(self) -> dict[str, Any]:
         """Unified Task System checkpoint: the Global Tasks Kanban's own

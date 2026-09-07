@@ -1385,6 +1385,32 @@ def build_mcp(service: TerminalService | None = None,
             return status
         return check_definition_of_ready(status["task"])
 
+    # -- Incident lane (§20.6 Phase B). NOT a parallel queue -- a real
+    # task in the SAME lane, fast-tracked by priority, still subject to
+    # DoR (if opted in) and the ordinary Coordinator gate.
+
+    @server.tool()
+    def terminal_task_create_incident(title: str, prompt: str, assigned_session_id: str | None = None,
+                                      risk_level: str | None = None, project: str | None = None,
+                                      metadata: dict | None = None) -> dict:
+        """Creates a fast-tracked incident task -- same canonical
+        creation path as terminal_task_create, `metadata.type=
+        "incident"` + a priority high enough to dispatch ahead of
+        ordinary QUEUED work in its own lane (real, already-verified
+        `ORDER BY priority DESC` claim ordering -- no separate incident
+        queue, no bypass of DoR/the Coordinator gate). `risk_level`
+        (LOW/MEDIUM/HIGH/CRITICAL) is recorded on the task like any
+        other -- an incident is not exempt from a project's own risk-
+        level approval gate (§20.6 Phase A) just for being an incident."""
+        return queue.create_incident_task(title, prompt, session=assigned_session_id, risk_level=risk_level,
+                                          project=project, metadata=metadata)
+
+    @server.tool()
+    def terminal_list_active_incidents() -> dict:
+        """Every task tagged as an incident that hasn't yet reached a
+        terminal status -- real audit/visibility, fleet-wide."""
+        return queue.list_active_incidents()
+
     @server.tool()
     def terminal_queue_metrics(session: str) -> dict:
         """Item 14's own required metrics: queued_depth,

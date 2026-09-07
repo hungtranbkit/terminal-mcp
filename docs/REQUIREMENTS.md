@@ -1463,6 +1463,48 @@ queue_engine).
   Coordinator gate entirely) — a new, small policy on top of the
   existing priority field, not a parallel queue.
 
+#### Phase B implementation note (2026-09-07, VERIFIED — incident lane)
+
+**Status: VERIFIED** (unit tests + a real disposable live E2E proving
+the actual dispatch engine, not just the store's own SQL ordering).
+Rework loop bounds and independent build/lint/test needed no new code
+(already real via `max_attempts`/`coordinator_attempts`, §7/§8, and the
+Integration Agent's own real pre-merge review + targeted/full
+regression pipeline, §9) — reused exactly as this section's own
+"reuse, don't reinvent" framing asks.
+
+- `QueueService.create_incident_task`/`INCIDENT_PRIORITY` (new) — NOT a
+  parallel queue: an incident is an ordinary task in the SAME lane,
+  tagged `metadata.type="incident"`, given a priority (a fixed constant,
+  `1000`, comfortably above this project's own typical small-int
+  priorities — disclosed as a simple, predictable policy rather than a
+  dynamically-computed "always above current max", which would be a
+  moving target) that dispatches it ahead of ordinary QUEUED work via
+  `queue_store.py`'s own real, already-verified `ORDER BY priority DESC,
+  position ASC` claim ordering — zero new dispatch-engine code. Still
+  goes through `create_task`'s own DoR gate (if a project opted in) and
+  the ordinary Coordinator review — never a bypass. `risk_level` is
+  folded into the SAME metadata field Phase A's own risk-approval gate
+  reads, so an incident is not exempt from that gate just for being an
+  incident.
+- `QueueService.list_active_incidents` — every non-terminal incident
+  task, fleet-wide, real audit/visibility.
+- MCP tools: `terminal_task_create_incident`, `terminal_list_active_
+  incidents`.
+- Tests: 6 new in `tests/test_queue_service_fleet_views.py` (tagging,
+  real dispatch-ordering proof via `claim_next_task`, DoR interaction,
+  risk_level carry-through, active-incident listing), 3 new in `tests/
+  test_incident_lane_mcp_tools.py`. Updated MCP tool-count assertions
+  (115 -> 117). Full suite green.
+- **Live evidence** (a real disposable git-repo-backed tmux session,
+  real grants, the real MCP `server.call_tool` path — never `window`/
+  `window2`/`wtest`): a normal task queued first, then a real incident
+  task created SECOND — `terminal_queue_run_once` (the real Coordinator
+  + dispatch engine, not a direct store call) correctly claimed the
+  INCIDENT first (`CLAIMED`, `PRECHECK`), proving the fast-track policy
+  works through the actual production dispatch path, not just in
+  isolation. Disposable session/repo/state cleaned up after.
+
 **Phase C — Release/environments:**
 - New lifecycle states layered ON TOP of `COMPLETED`/`INTEGRATED` for a
   release-type task: `MERGED -> RELEASE_CANDIDATE -> DEPLOYING ->
@@ -2969,6 +3011,13 @@ scan/audit view over the SAME facts.)*
     actually turns on `require_approval_for_risk_levels` for a real
     project (the mechanism is real and tested; no policy currently
     activates it). Phases B-E remain entirely PLANNED, unbuilt.
+22. **Unified Task System §20.6 Phase B — incident lane VERIFIED and
+    live** (2026-09-07): `terminal_task_create_incident`/`terminal_
+    list_active_incidents` — see Phase B's own implementation note in
+    §20.6 and §4f of `docs/CHATGPT_USAGE.md`. Real dispatch/
+    independent build-test/rework-bound pieces needed no new code
+    (already real, reused as-is). Phases C-E remain entirely PLANNED,
+    unbuilt.
 
 ---
 

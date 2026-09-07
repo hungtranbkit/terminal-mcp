@@ -313,3 +313,56 @@ def test_create_task_unassigned_never_checks_dor_at_creation_time(queue):
     result = queue.create_task("t", "p", session=None, metadata={"dor_required": True})
     assert "error" not in result
     assert queue.board()["counts"]["backlog"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Incident lane (§20.6 Phase B): a real task in the SAME lane, fast-
+# tracked by priority -- never a parallel queue.
+# ---------------------------------------------------------------------------
+
+def test_create_incident_task_tags_type_and_boosts_priority(queue):
+    result = queue.create_incident_task("Prod down", "investigate the outage", session="lane-a")
+    task = queue.store.get_task(result["task_id"])
+    assert task.metadata["type"] == "incident"
+    assert task.priority == queue.INCIDENT_PRIORITY
+
+
+def test_incident_task_dispatches_ahead_of_normal_queued_work(queue):
+    normal_id = queue.create_task("normal work", "p", session="lane-a")["task_id"]
+    incident_id = queue.create_incident_task("Prod down", "p", session="lane-a")["task_id"]
+    # Real claim ordering (ORDER BY priority DESC, position ASC) --
+    # the incident, created SECOND, still claims FIRST.
+    claimed = queue.store.claim_next_task("lane-a", claimed_by="engine-1")
+    assert claimed.id == incident_id
+    assert claimed.id != normal_id
+
+
+def test_incident_task_still_goes_through_dor_when_opted_in(queue):
+    result = queue.create_incident_task("Prod down", "p", session="lane-a",
+                                        metadata={"dor_required": True})
+    assert result["error"] == "NEEDS_CLARIFICATION"  # incidents are not exempt from DoR
+
+
+def test_incident_task_carries_risk_level(queue):
+    result = queue.create_incident_task("Prod down", "p", session=None, risk_level="CRITICAL")
+    task = queue.store.get_task(result["task_id"])
+    assert task.metadata["risk_level"] == "CRITICAL"
+
+
+def test_list_active_incidents_excludes_terminal_and_non_incidents(queue):
+    queue.create_task("normal", "p", session="lane-a")  # not an incident
+    active = queue.create_incident_task("Active incident", "p", session="lane-b")["task_id"]
+    done = queue.create_incident_task("Resolved incident", "p", session="lane-c")["task_id"]
+    queue.store.transition_task(done, "DISPATCHING", event_type="TEST")
+    queue.store.transition_task(done, "RUNNING", event_type="TEST")
+    queue.store.transition_task(done, "VERIFYING", event_type="TEST")
+    queue.store.mark_completed_with_evidence(done, evidence={"resolved": True})
+
+    result = queue.list_active_incidents()
+    assert result["count"] == 1
+    assert result["incidents"][0]["id"] == active
+
+
+def test_list_active_incidents_empty_when_none(queue):
+    queue.create_task("normal", "p", session="lane-a")
+    assert queue.list_active_incidents() == {"incidents": [], "count": 0}
