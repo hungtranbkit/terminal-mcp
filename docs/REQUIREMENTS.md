@@ -3210,6 +3210,67 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
     the user: accept that loss to deploy every accumulated fix, or leave
     `window2` exactly as it is (safe, unchanged, but still stuck) until
     a further diagnosis or a deliberate decision is made.
+    **2026-09-07 P0 follow-up audit — confirmed root cause for HALF the
+    symptom, other half remains genuinely unresolved:** a fresh, fully
+    read-only live audit (`resolve_session`/`terminal_status`/
+    `terminal_input_context`/`node_sessions`/`terminal_list_sessions`
+    against the real `dell-5530` node, never touching `window2` itself)
+    proved `dell-5530`'s node-agent is running OLD code that predates
+    TODAY's own fixes — two independent, live markers: (1) `terminal_
+    status` still reports `reason: "recent prompt matched '\bpermission
+    \b'"`, the EXACT bare-word pattern removed from `status.py`/
+    `adapters.py` earlier today (commits `fe53f97`/`1c0a2ff`) — proves
+    the deployed build predates both; (2) `terminal_list_sessions`'s row
+    for `window2` has NO `resume_conversation_id` field at all, proving
+    the deployed build predates the "Conversation-continuity recovery"
+    feature (commit `5a93cc4`, itself from earlier this same morning) —
+    matches this file's own pre-existing, explicit "Windows node-agent
+    restart safety (Phase 0)" note that dell-5530's node-agent "has NOT
+    been restarted with any of these fixes live yet." This DOES fully
+    explain why `terminal_send_text(..., press_enter=True)` was wrongly
+    refused with `TARGET_AWAITING_APPROVAL` (the composer's own text
+    contains "Permission", still matching the OLD, undeployed-fix
+    pattern) — a real, root-caused, already-fixed-in-repo bug, just not
+    yet live. It does NOT explain the deeper anomaly: `terminal_send_
+    keys(["Enter"])` never went through that classifier at all (checked
+    via code reading — `_input_guard`'s `identify_target_state` check
+    only runs for `terminal_send_text` with `press_enter=True`, never
+    for `terminal_send_keys`), and every write path in this codebase
+    that could deliver an Enter byte (`send_text`'s Enter, `send_keys`'s
+    Enter, `windows_webterm.py`'s live `write_raw`) converges on the
+    EXACT SAME single `entry.proc.write()` call against the SAME
+    long-lived `pywinpty.PtyProcess` handle for this session (confirmed
+    via direct code reading, `windows_backend.py`) — a call already
+    proven, twice, to write successfully (no exception) yet have zero
+    observable effect on `window2` specifically. No in-repo code change
+    can alter that shared call without either corrupting the composer's
+    own content (a raw text-level `\n` probe was considered and
+    deliberately NOT attempted — Claude Code's composer supports literal
+    newlines, so this risks polluting the exact content being preserved)
+    or requiring a node-agent restart to load new code — which the Phase
+    0 finding confirms kills the ConPTY child. Additionally checked (new
+    this pass): `window2` has a live, ATTACHED visible desktop viewer
+    (`visible_window: true`, `desktop_session_id: 1`, `attached: true`,
+    `pid: 1760`, via `windows_visible_console.py`'s socket-relay
+    architecture) — read-confirmed this is architecturally a separate
+    relay process that never touches `entry.proc` (so it cannot itself
+    explain a failed programmatic write), but is flagged as a real,
+    concrete fact worth the user's own attention (a stuck/frozen-looking
+    relay window is a distinct, human-visible symptom from this
+    investigation's own read path, which bypasses the relay entirely).
+    Also checked (new this pass): the LOCAL `session_registry.db` (the
+    real store the `--resume` recovery mechanism reads from) has NO row
+    at all for `window2` — its `conversation_id` was never captured, so
+    the project's own "safe" resume-after-restart path would NOT recover
+    this specific conversation automatically today; only a manual,
+    out-of-band correlation (timestamp-matching `~/.claude/projects/
+    <escaped-cwd>/*.jsonl` on `dell-5530` itself, per the "Conversation-
+    continuity recovery" Feature Details entry's own "Root mechanics")
+    could locate the right conversation id if a restart is ever accepted.
+    Zero writes/sends were attempted against `window2` this pass —
+    every call was read-only; the composer's content is unchanged.
+    Decision on whether to accept a node-agent restart (and its real,
+    now more precisely characterized cost) remains the user's alone.
 21. **Unified Task System §20.6 Phase A (Delivery discipline) — 3 of 5
     pieces now VERIFIED and live** (2026-09-07): Definition of Ready
     (opt-in, `dor_gate.py`), WIP limits (`CapabilityProfile.max_queued`,
