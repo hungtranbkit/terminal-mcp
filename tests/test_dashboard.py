@@ -949,7 +949,7 @@ def test_dashboard_health_indicator_no_new_backend_route():
     # registry/reopen and registry/purge -- registry LISTING itself
     # (loadRegistry) goes through the shared fetchJSON() wrapper, already
     # counted once, so it adds no new literal call site of its own.
-    assert DASHBOARD_HTML.count("fetch(") == 21  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere), registry/reopen, registry/purge, watchdog/acknowledge, session/rename (Rename Session feature), task/cancel-or-retry (taskAction, Task Manager UI), session/queue/pause, session/queue/resume, session/queue/enqueue (Task Manager UI)
+    assert DASHBOARD_HTML.count("fetch(") == 22  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere), registry/reopen, registry/purge, watchdog/acknowledge, session/rename (Rename Session feature), task/cancel-or-retry (taskAction, Task Manager UI), session/queue/pause, session/queue/resume, session/queue/enqueue (Task Manager UI), postJSON's own internal fetch() (queue/reorder + tasks/reassign, Move-Task/priority-edit UI)
 
 
 def test_dashboard_auth_required_distinguished_from_offline():
