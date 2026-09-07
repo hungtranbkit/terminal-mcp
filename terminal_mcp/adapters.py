@@ -174,7 +174,7 @@ _WAITING_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"do you want to continue", r"press enter", r"\[y/n\]", r"\[Y/n\]",
-        r"continue\?\s*$", r"\bapprove\b", r"\bpermission\b", r"waiting for input",
+        r"continue\?\s*$", r"waiting for input",
         # URGENT bugfix follow-up: found LIVE, in production, against a
         # real attended Claude Code session (mesflow) -- an interactive
         # multi-choice selection widget (Claude Code's own AskUserQuestion-
@@ -188,6 +188,29 @@ _WAITING_PATTERNS = tuple(
         # strings (never plausible inside the model's own conversational
         # text), not the y/n phrasing above.
         r"enter to select", r"tab/arrow keys to navigate", r"esc to cancel",
+        # REMOVED (2026-09-07, real false positive found LIVE against a
+        # real attended session, `window2`): this list used to also
+        # include bare r"\bapprove\b" and r"\bpermission\b" word-boundary
+        # matches. A real composer line reading "Làm Role/Permission step
+        # 2 custom role web đi" -- an entirely ordinary prompt about this
+        # project's OWN subject matter (a permissions/roles feature) --
+        # matched `\bpermission\b` and caused every send to that session
+        # to be wrongly refused as TARGET_AWAITING_APPROVAL, with no real
+        # approval/menu prompt on screen at all. Neither bare word was
+        # ever exercised by a real fixture/regression test in the first
+        # place (tests/fixtures/waiting_prompt.py's own real y/n dialog
+        # matches via `\[y/n\]`; tests/fixtures/menu_prompt.py's own real
+        # multi-choice widget matches via the menu-chrome strings just
+        # above) -- both of Claude Code's actual observed approval shapes
+        # (a y/n dialog, and its AskUserQuestion-style numbered-menu
+        # permission widget) are already fully covered without these two
+        # words. Removed rather than narrowed: this project's own standing
+        # rule is to never invent unverified CLI-output phrasing (see
+        # e.g. config.py's resume_capable_agent_types docstring) -- there
+        # is no real, observed Claude/Codex dialog on record that uses
+        # the bare word "approve" or "permission" outside of the menu-
+        # chrome shape the patterns above already catch, so no speculative
+        # replacement pattern was added in their place.
     )
 )
 

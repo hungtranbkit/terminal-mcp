@@ -334,6 +334,11 @@ sessions bringing up dell-5530/m910/macbook — see `docs/multi-node.md`).
   durable across a process restart (`idempotent_sends` table).
 - **Input audit:** `terminal_list_input_audit`, `terminal_input_context`
   — every send's fingerprint/preview/result queryable.
+- **TARGET_AWAITING_APPROVAL pre-send gate (`adapters.py`'s
+  `_WAITING_PATTERNS`):** a real false positive was found and fixed live
+  (2026-09-07, real attended session `window2`) — see this file's own
+  Feature Details entry "TARGET_AWAITING_APPROVAL false positive on
+  ordinary composer text" below for the full root cause/fix/tests.
 
 ## 6. Supervisor v1/v2
 
@@ -1541,6 +1546,91 @@ scan/audit view over the SAME facts.)*
   consider the same continued-polling treatment for
   `stuck_composer_evidence`'s own recovery-path evidence check if a
   similar transitional-frame gap is ever found there.
+
+### TARGET_AWAITING_APPROVAL false positive on ordinary composer text
+
+- **Goal / user value:** `terminal_send_text` must only refuse a send as
+  `TARGET_AWAITING_APPROVAL` when the target is genuinely showing a
+  real approval/menu/confirmation prompt — never for an ordinary,
+  idle composer whose own typed text happens to contain an
+  everyday word.
+- **Status:** VERIFIED (real disposable-session E2E + unit tests, full
+  suite green).
+- **Root cause (live, real report):** a real, attended session
+  (`window2`) had `current_command=claude`, `effective_input=true`,
+  `pane_in_mode=false`, and a completely ordinary composer showing
+  `> Làm Role/Permission step 2 custom role web đi` (this project's own
+  subject matter — a permissions/roles feature) plus Claude Code's own
+  normal context-usage status line (`new task? /clear to save 891k
+  tokens`) — yet every `terminal_send_text` call was refused with
+  `TARGET_AWAITING_APPROVAL`. `adapters.py`'s `_WAITING_PATTERNS` (the
+  pre-send `identify_target_state` check `_send_text_and_verify_locked`
+  consults before committing to a `press_enter=True` send — §5) used to
+  include bare, un-anchored `\bapprove\b`/`\bpermission\b` word-boundary
+  patterns. The composer's own perfectly ordinary use of the word
+  "Permission" matched, classifying an idle composer as `TARGET_
+  WAITING`. Neither bare word was ever exercised by a real regression
+  fixture: `tests/fixtures/waiting_prompt.py`'s real y/n dialog matches
+  via `\[y/n\]`; `tests/fixtures/menu_prompt.py`'s real AskUserQuestion-
+  style numbered-menu widget (the actual shape Claude Code's own
+  permission-request UI renders as) matches via the menu-chrome strings
+  (`enter to select`/`tab/arrow keys to navigate`/`esc to cancel`) —
+  both of Claude Code's real, observed approval shapes were already
+  fully covered without the two removed words.
+- **Fix:** removed the bare `\bapprove\b`/`\bpermission\b` patterns from
+  `_WAITING_PATTERNS` (`adapters.py`) entirely, rather than narrowing
+  them to a guessed replacement phrase — this project's own standing
+  rule is to never invent unverified CLI-output phrasing (matches
+  `config.py`'s `resume_capable_agent_types` docstring posture, and
+  `coordinator.py`'s own disclosed-heuristic philosophy), and there is
+  no real, observed Claude/Codex dialog on record using the bare word
+  "approve" or "permission" outside the menu-chrome shape already
+  caught by the remaining patterns. `terminal_input_context` was
+  already unaffected either way (it never consulted `identify_target_
+  state`/`_WAITING_PATTERNS` — its `effective_input` is derived
+  independently from permissions/grants/`pane_current_command`/
+  `pane_in_mode`), confirmed still correct after the fix.
+- **Scope / flow:** the pre-send `TARGET_WAITING` check inside
+  `_send_text_and_verify_locked`, `press_enter=True` only — identical
+  scope to the original TARGET_AWAITING_APPROVAL feature (§5's own
+  "URGENT bugfix" note in `core.py`), no other behavior touched.
+- **UI route/screen:** none (backend-only fix); surfaces as a session
+  that mentions ordinary words like "permission"/"approve" in its own
+  conversation no longer being spuriously unsendable.
+- **API/tool/command:** `terminal_send_text`/`terminal_send_bound` (no
+  signature change — same result shape).
+- **Config/permission:** none.
+- **Data/schema/migration:** none.
+- **Acceptance/tests/evidence:** `tests/test_adapters.py` — 2 new unit
+  tests (`test_claude_adapter_normal_composer_mentioning_permission_is_
+  not_waiting` reproducing the exact reported pane shape and asserting
+  `TARGET_UNKNOWN`/sendable; `test_claude_adapter_still_detects_a_real_
+  permission_dialog_via_menu_chrome` proving real detection is
+  unweakened — a genuine permission-request menu, including the literal
+  word "permission" in its own descriptive text, is still correctly
+  classified `TARGET_WAITING` via the surrounding menu chrome).
+  `tests/fixtures/normal_composer_permission_word.py` (new) + 1 new
+  real disposable-session E2E test in `tests/test_send_reliability.py`
+  (`test_claude_send_allowed_for_normal_composer_mentioning_permission`)
+  — a real `exec -a claude` pty target showing the exact reported
+  composer/status-line shape, confirming `terminal_input_context`
+  reports `effective_input: true`/`pane_in_mode: false` (as the real
+  report observed) AND `terminal_send_text` now genuinely delivers the
+  text (`RECEIVED=...` echoed back by the real target process, not
+  swallowed). The two pre-existing real regression fixtures (y/n
+  dialog, multi-choice menu) re-verified still correctly refused. Full
+  suite green.
+- **Known limitations:** `_WORKING_PATTERNS` (`\bworking\b`/
+  `\bthinking\b`) has a similar theoretical false-positive shape (an
+  ordinary composer line that happens to contain those words) — not
+  reported, not touched by this fix, tracked as a disclosed, un-
+  reproduced suspect only (Backlog item 16), scoped out to avoid
+  widening this fix beyond the confirmed, reported root cause.
+- **Dependencies:** `adapters.py`'s existing `ClaudeAdapter`/
+  `CodexAdapter`/menu-chrome pattern set (reused, not replaced).
+- **Follow-up/backlog:** none required — this closes the reported
+  issue; Backlog item 16 tracks the disclosed `_WORKING_PATTERNS`
+  suspect for a future pass if it is ever actually reported/reproduced.
 - **Trace:** see this file's own commit.
 
 ### Windows node-agent restart safety (Phase 0)
@@ -2324,6 +2414,18 @@ scan/audit view over the SAME facts.)*
     the Phase A-E Startup Operating Model) remains PLANNED, unbuilt —
     this entry marks progress on exactly one slice of a much larger,
     still-open design, not completion of §20 as a whole.
+16. **`adapters.py`'s `_WORKING_PATTERNS` (`\bworking\b`/`\bthinking\b`)
+    has the same theoretical false-positive shape** the now-fixed
+    `_WAITING_PATTERNS` bare-word entries had (see this file's own
+    "TARGET_AWAITING_APPROVAL false positive on ordinary composer text"
+    Feature Details entry) — an ordinary composer line that happens to
+    contain the word "working" or "thinking" could, in principle,
+    misclassify `identify_target_state`/`can_submit_now` as `TARGET_
+    RUNNING`. Disclosed, NOT reported, NOT reproduced — deliberately
+    left untouched by that fix to avoid widening it beyond the actual
+    confirmed root cause. Revisit only if a real report/repro surfaces,
+    same standing rule as everywhere else in this file (never fix an
+    unreproduced suspect speculatively).
 
 ---
 

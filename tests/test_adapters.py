@@ -66,6 +66,45 @@ def test_codex_adapter_waiting_state_detected():
     assert adapter.identify_target_state(waiting) == TARGET_WAITING
 
 
+def test_claude_adapter_normal_composer_mentioning_permission_is_not_waiting():
+    # Real false positive, found LIVE against a real attended session
+    # (window2, 2026-09-07): an entirely ordinary composer line about
+    # this project's OWN subject matter (a permissions/roles feature)
+    # used to match a bare r"\bpermission\b" pattern that used to live in
+    # _WAITING_PATTERNS, wrongly classifying a normal, idle composer as
+    # TARGET_WAITING and refusing every send with TARGET_AWAITING_
+    # APPROVAL. This is the exact reported pane shape (composer line +
+    # Claude Code's own context-usage status line) -- neither the word
+    # "Permission" in the user's own typed prompt nor "new task?" in the
+    # status hint is a real approval/menu prompt.
+    adapter = ClaudeAdapter()
+    normal_composer = [
+        "│ > Làm Role/Permission step 2 custom role web đi",
+        "",
+        "  new task? /clear to save 891k tokens",
+    ]
+    assert adapter.identify_target_state(normal_composer) == TARGET_UNKNOWN
+    assert adapter.can_submit_now(normal_composer) is True
+
+
+def test_claude_adapter_still_detects_a_real_permission_dialog_via_menu_chrome():
+    # The removal above must not weaken real detection: Claude Code's own
+    # actual permission-request UI is the SAME AskUserQuestion-style
+    # numbered-menu widget test_claude_send_refused_for_a_multi_choice_
+    # selection_menu (test_send_reliability.py) already reproduces live --
+    # already fully caught by the menu-chrome strings, independent of the
+    # bare "approve"/"permission" words that were removed.
+    adapter = ClaudeAdapter()
+    real_permission_menu = [
+        "Bash command wants permission to run: rm -rf /tmp/scratch",
+        "1. Yes",
+        "2. Yes, don't ask again",
+        "3. No, and tell Claude what to do differently",
+        "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+    ]
+    assert adapter.identify_target_state(real_permission_menu) == TARGET_WAITING
+
+
 def test_claude_adapter_never_claims_stuck_composer_evidence():
     # Never reproduced for Claude Code -- no recovery path is enabled for
     # it regardless of how strongly a redraw-without-growth pattern

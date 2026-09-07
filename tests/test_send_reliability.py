@@ -565,6 +565,37 @@ def test_claude_send_refused_for_a_multi_choice_selection_menu(tmux_session_fact
     assert "CHOSE=" not in after
 
 
+def test_claude_send_allowed_for_normal_composer_mentioning_permission(tmux_session_factory, tmp_path):
+    # Real false positive, found LIVE against a real attended session
+    # (`window2`, 2026-09-07): a normal, idle Claude Code composer whose
+    # own typed prompt happened to contain the word "Permission" (this
+    # project's own subject matter) was wrongly refused as TARGET_
+    # AWAITING_APPROVAL -- no real approval/menu prompt was on screen.
+    # This reproduces the exact reported pane shape (own fixture, not a
+    # send_keys simulation) and confirms a send is now correctly allowed.
+    session = "test-claude-normal-permission-word"
+    fixture_path = FIXTURES_DIR / "normal_composer_permission_word.py"
+    tmux_session_factory(session, f"bash -lc 'exec -a claude python3 -u {fixture_path}'")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+
+    # terminal_input_context must say this session is genuinely sendable
+    # (effective_input=true, pane_in_mode=false) -- exactly what the real
+    # report observed, and unaffected by this fix either way (it never
+    # consulted identify_target_state/_WAITING_PATTERNS at all).
+    context = service.terminal_input_context(session)
+    assert context["effective_input"] is True
+    assert context["pane_in_mode"] is False
+
+    result = service.terminal_send_text(session, "a new unrelated prompt", press_enter=True)
+    assert result.get("error") != "TARGET_AWAITING_APPROVAL"
+    assert result["sent"] is True
+    assert result["enter_sent"] is True
+
+    after = service.terminal_tail(session, 10)["output"]
+    assert "RECEIVED=a new unrelated prompt" in after  # genuinely delivered, not swallowed
+
+
 def test_codex_normal_composer_send_still_works_after_approval_prompt_fix(tmux_session_factory, tmp_path):
     # Regression check: the new pre-send check must never false-positive
     # on an ordinary idle composer -- reuses the existing real-shape
