@@ -2199,6 +2199,32 @@ scan/audit view over the SAME facts.)*
   file's own recent Backlog items — 14, this entry, and the earlier
   TARGET_AWAITING_APPROVAL fix — all still undeployed to that node).
 
+**Re-verification addendum (same day, later P0 pass):** re-ran the exact
+same read-only `terminal_status("window2")` check first — confirmed the
+composer's own text was byte-for-byte unchanged since the entry above,
+and (independent re-confirmation of Root cause #1, since `dell-5530`'s
+node-agent is still undeployed) still reports `state: "WAITING_INPUT"`
+via the exact same `\bpermission\b` match, proving that specific fix is
+correct-but-undeployed rather than wrong. Sent **exactly one** more
+`terminal_send_keys(["Enter"])`, gated the same way (aborted-if-changed
+composer-marker check first), then polled for a real pane change every
+5s for **150s** — more than 11x the prior pass's 13s window, specifically
+to rule out "the poll window was just too short for an 891k-token
+session's own processing indicator to appear" as an explanation. Result:
+**zero change across all 30 polls, 150s** — no spinner tick, no footer
+change, nothing. This rules out the slow-huge-context theory as the
+(sole) explanation and further narrows the anomaly to a genuine input-
+delivery gap specific to `window2`'s own ConPTY child, not a timing
+artifact of the previous, shorter check. No further Enter attempts were
+made after this one (per this task's own "don't spam Enter, stop and
+report" instruction) — `window2` is left exactly as found, composer text
+intact, nothing else touched. `Ctrl+M` was considered but not added to
+`allow_keys`/attempted: it is byte-identical to `"Enter"`'s own mapping
+(`KEY_BYTES["Enter"] = b"\r"`, ASCII 0x0D = Ctrl-M) in `windows_backend.py`
+— sending it would be a literal byte-for-byte repeat of the Enter attempt
+already made, not a new code path, so it carries no new diagnostic value
+and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
+
 ### Windows node-agent restart safety (Phase 0)
 
 - **Goal / user value:** understand — with real, empirical evidence, not
