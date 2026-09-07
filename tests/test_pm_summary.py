@@ -8,7 +8,8 @@ from __future__ import annotations
 import pytest
 
 from terminal_mcp.pm_summary import (
-    close_task_with_confirmation, detect_duplicate_tasks, detect_stale_backlog_tasks, generate_summary,
+    close_task_with_confirmation, detect_duplicate_tasks, detect_stale_backlog_tasks,
+    emergency_resume_all_lanes, emergency_stop_all_lanes, generate_summary,
 )
 from terminal_mcp.queue_service import QueueService
 from terminal_mcp.queue_store import QueueStore
@@ -159,3 +160,66 @@ def test_close_task_with_confirmation_and_reason_succeeds(queue):
 def test_close_task_unknown_id(queue):
     result = close_task_with_confirmation(queue, "no-such-id", reason="x", confirmed=True)
     assert result["error"] == "TASK_NOT_FOUND"
+
+
+# -- emergency_stop_all_lanes / emergency_resume_all_lanes (§20.6 Phase E) ------
+
+def test_emergency_stop_refuses_without_confirmation(queue):
+    queue.create_task("t", "p", session="lane-a")
+    result = emergency_stop_all_lanes(queue, reason="prod incident")
+    assert result["error"] == "CONFIRMATION_REQUIRED"
+    assert queue.store.lane_status("lane-a")["paused"] is False
+
+
+def test_emergency_stop_requires_a_reason(queue):
+    queue.create_task("t", "p", session="lane-a")
+    result = emergency_stop_all_lanes(queue, reason="", confirmed=True)
+    assert result["error"] == "REASON_REQUIRED"
+
+
+def test_emergency_stop_pauses_every_lane(queue):
+    queue.create_task("t1", "p1", session="lane-a")
+    queue.create_task("t2", "p2", session="lane-b")
+    result = emergency_stop_all_lanes(queue, reason="prod incident", confirmed=True)
+    assert "error" not in result
+    assert set(result["paused_lanes"]) == {"lane-a", "lane-b"}
+    assert result["count"] == 2
+    for session in ("lane-a", "lane-b"):
+        status = queue.store.lane_status(session)
+        assert status["paused"] is True
+        assert "prod incident" in status["paused_reason"]
+        assert status["paused_reason"].startswith("EMERGENCY STOP:")
+
+
+def test_emergency_stop_never_touches_an_already_paused_lane(queue):
+    queue.create_task("t", "p", session="lane-a")
+    queue.pause("lane-a", reason="manual maintenance window")
+    result = emergency_stop_all_lanes(queue, reason="prod incident", confirmed=True)
+    assert result["paused_lanes"] == []  # already-paused lane left untouched
+    status = queue.store.lane_status("lane-a")
+    assert status["paused_reason"] == "manual maintenance window"
+
+
+def test_emergency_resume_only_lifts_lanes_the_emergency_stop_itself_paused(queue):
+    queue.create_task("t1", "p1", session="lane-a")
+    queue.create_task("t2", "p2", session="lane-b")
+    queue.pause("lane-b", reason="manual maintenance window")  # pre-existing, unrelated pause
+    emergency_stop_all_lanes(queue, reason="prod incident", confirmed=True)
+    # lane-a: paused by emergency stop. lane-b: was ALREADY paused before
+    # the emergency stop (never touched by it, per the test above), so
+    # its own unrelated pause reason is exactly what's still there.
+    assert queue.store.lane_status("lane-a")["paused"] is True
+    assert queue.store.lane_status("lane-b")["paused_reason"] == "manual maintenance window"
+
+    result = emergency_resume_all_lanes(queue)
+    assert result["resumed_lanes"] == ["lane-a"]
+    assert queue.store.lane_status("lane-a")["paused"] is False
+    # lane-b's own unrelated, pre-existing pause is left exactly as it was.
+    assert queue.store.lane_status("lane-b")["paused"] is True
+    assert queue.store.lane_status("lane-b")["paused_reason"] == "manual maintenance window"
+
+
+def test_emergency_resume_is_a_no_op_when_nothing_was_emergency_stopped(queue):
+    queue.create_task("t", "p", session="lane-a")
+    result = emergency_resume_all_lanes(queue)
+    assert result == {"resumed_lanes": [], "count": 0}

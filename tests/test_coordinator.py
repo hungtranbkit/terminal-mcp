@@ -133,10 +133,77 @@ def test_exceeding_max_review_attempts_forces_needs_human(store):
         store.claim_next_task(task.session, claimed_by="engine-1")
     task = store.get_task(task.id)
     assert task.coordinator_attempts == 3
-    gate = CoordinatorGate(evidence_collector=_fake_collector_factory(), max_review_attempts=3)
+    # repeated_failure_threshold=None: isolates the RAW attempt-count cap
+    # from the (also real, tested separately below) repeated-identical-
+    # reason check -- both would otherwise fire on this same fixture
+    # (3 identical "not ready yet" reasons), since only ONE reason is
+    # ever reported per decision.
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory(), max_review_attempts=3,
+                          repeated_failure_threshold=None)
     decision = gate.review(task, store=store, session=_ok_session())
     assert decision.status == NEEDS_HUMAN
     assert "max coordinator review attempts" in decision.reason
+
+
+# ---------------------------------------------------------------------------
+# Repeated-identical-failure ("stuck in a loop") detection (§20.6 Phase E).
+# ---------------------------------------------------------------------------
+
+def test_repeated_identical_reason_forces_needs_human_before_the_raw_attempt_cap(store):
+    task = _make_task(store)
+    for _ in range(3):
+        store.record_coordinator_decision(task.id, status="NEEDS_REWORK", reason="not ready yet")
+        store.claim_next_task(task.session, claimed_by="engine-1")
+    task = store.get_task(task.id)
+    assert task.coordinator_attempts == 3
+    # Default max_review_attempts=5 -- 3 < 5, so ONLY the repeated-failure
+    # check (default threshold=3) can be what fires here.
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory())
+    decision = gate.review(task, store=store, session=_ok_session())
+    assert decision.status == NEEDS_HUMAN
+    assert "stuck in a loop" in decision.reason
+    assert "not ready yet" in decision.reason
+    assert decision.evidence["repeat_count"] == 3
+
+
+def test_different_reasons_do_not_trigger_the_repeated_failure_gate(store):
+    task = _make_task(store)
+    for reason in ("not ready yet", "still missing X", "now missing Y"):
+        store.record_coordinator_decision(task.id, status="NEEDS_REWORK", reason=reason)
+        store.claim_next_task(task.session, claimed_by="engine-1")
+    task = store.get_task(task.id)
+    assert task.coordinator_attempts == 3
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory())
+    decision = gate.review(task, store=store, session=_ok_session())
+    # Falls through the stuck-loop check (reasons differ) and the raw
+    # attempt cap (3 < default 5) straight to a normal READY.
+    assert decision.status == READY
+
+
+def test_repeated_failure_threshold_is_configurable(store):
+    task = _make_task(store)
+    for _ in range(2):
+        store.record_coordinator_decision(task.id, status="NEEDS_REWORK", reason="not ready yet")
+        store.claim_next_task(task.session, claimed_by="engine-1")
+    task = store.get_task(task.id)
+    assert task.coordinator_attempts == 2
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory(), repeated_failure_threshold=2)
+    decision = gate.review(task, store=store, session=_ok_session())
+    assert decision.status == NEEDS_HUMAN
+    assert decision.evidence["repeat_count"] == 2
+
+
+def test_repeated_failure_gate_disabled_via_none_falls_back_to_raw_attempt_cap_only(store):
+    task = _make_task(store)
+    for _ in range(3):
+        store.record_coordinator_decision(task.id, status="NEEDS_REWORK", reason="not ready yet")
+        store.claim_next_task(task.session, claimed_by="engine-1")
+    task = store.get_task(task.id)
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory(), repeated_failure_threshold=None)
+    decision = gate.review(task, store=store, session=_ok_session())
+    # 3 identical reasons would trip the (disabled) stuck-loop check, but
+    # 3 < default max_review_attempts=5, so this reaches a normal READY.
+    assert decision.status == READY
 
 
 # ---------------------------------------------------------------------------

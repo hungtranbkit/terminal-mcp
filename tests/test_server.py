@@ -141,6 +141,9 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_pm_detect_stale_backlog",
         "terminal_pm_detect_duplicate_tasks",
         "terminal_pm_close_task_with_confirmation",
+        # Emergency Stop / Agent failure policy (§20.6 Phase E).
+        "terminal_emergency_stop",
+        "terminal_emergency_resume",
     }
 
 

@@ -91,6 +91,13 @@ MIN_PROMPT_LENGTH = 8
 """_default_scope_reasoner's own crude, disclosed heuristic threshold --
 see its docstring."""
 
+DEFAULT_REPEATED_FAILURE_THRESHOLD = 3
+"""§20.6 Phase E "Agent failure policy": how many times in a row the
+EXACT SAME coordinator decision reason has to repeat, with zero
+progress, before this is treated as a stuck loop and forced to
+NEEDS_HUMAN -- see CoordinatorGate.__init__'s own comment for why this
+is deliberately lower than DEFAULT_MAX_REVIEW_ATTEMPTS."""
+
 
 @dataclass(frozen=True)
 class CoordinatorDecision:
@@ -283,6 +290,29 @@ def _default_scope_reasoner(prompt: str) -> str | None:
 ScopeReasoner = Callable[[str], "str | None"]
 
 
+def _recent_coordinator_reasons(store: QueueStore, task: QueueTask, *, limit: int) -> list[str]:
+    """§20.6 Phase E: this task's own most recent coordinator-decision
+    reasons, newest first, for the repeated-identical-failure check.
+    Reuses QueueStore.list_events (§7, already real) rather than adding
+    a second history mechanism -- that method is bounded/ordered by
+    SESSION, not task_id, so this filters client-side to this one
+    task's own "COORDINATOR_DECISION" events (the ONE event type
+    guaranteed emitted exactly once per real coordinator decision --
+    the sibling "COORDINATOR_{status}" event that same call also
+    writes would double-count each decision if included here).
+    A generous-but-still-bounded scan window (never "the full
+    history") -- same disclosed-heuristic posture as
+    _default_scope_reasoner above."""
+    scan_window = max(limit * 20, 100)
+    events = store.list_events(task.session, limit=scan_window)
+    reasons = [
+        event["reason"] for event in events
+        if event.get("task_id") == task.id and event.get("event_type") == "COORDINATOR_DECISION"
+        and event.get("reason")
+    ]
+    return reasons[:limit]
+
+
 class CoordinatorGate:
     """The Coordinator Agent itself. `review()` is the one entry point
     queue_engine.py calls for every PRECHECK task, exactly once per
@@ -296,12 +326,24 @@ class CoordinatorGate:
                 scope_reasoner: ScopeReasoner = _default_scope_reasoner,
                 smoke_test_runner: SmokeTestRunner = run_smoke_test_command,
                 max_review_attempts: int = DEFAULT_MAX_REVIEW_ATTEMPTS,
-                require_approval_for_risk_levels: tuple[str, ...] = ()) -> None:
+                require_approval_for_risk_levels: tuple[str, ...] = (),
+                repeated_failure_threshold: int | None = DEFAULT_REPEATED_FAILURE_THRESHOLD) -> None:
         self.sensitive_patterns = sensitive_patterns
         self.evidence_collector = evidence_collector
         self.scope_reasoner = scope_reasoner
         self.smoke_test_runner = smoke_test_runner
         self.max_review_attempts = max_review_attempts
+        # Agent failure policy (§20.6 Phase E): ON by default (unlike
+        # the risk-level gate above) -- this is a real EXTENSION of the
+        # already-always-on max_review_attempts cap just below, not a
+        # new opt-in behavior change. Deliberately set LOWER than
+        # max_review_attempts (3 < 5, the two real defaults) so a
+        # genuine stuck-in-a-loop pattern (the exact same coordinator
+        # decision reason repeating, not just "many attempts") is
+        # caught sooner than the raw attempt budget alone would.
+        # None disables this check entirely (falls back to the raw
+        # attempt-count cap only).
+        self.repeated_failure_threshold = repeated_failure_threshold
         # Risk classification (§20.6 Phase A): OFF by default (empty
         # tuple -- "exact gate strength is a per-project policy, not
         # hardcoded here", task's own explicit words) -- a project opts
@@ -354,6 +396,28 @@ class CoordinatorGate:
                 required_actions=["a human/PM reviews this task and sets metadata.risk_approved=true, "
                                  "or reduces/reclassifies its risk_level"],
             )
+
+        # -0.4. Repeated-identical-failure ("stuck in a loop") detection
+        #       (§20.6 Phase E) -- a real EXTENSION of the raw attempt-
+        #       count cap just below: not "how many times has this been
+        #       tried" but "did the exact same coordinator decision
+        #       reason repeat, with zero actual progress". Reads this
+        #       task's own real event history (queue_events, §7,
+        #       already real) -- a best-effort scan of the lane's most
+        #       recent events (bounded, same "disclosed heuristic, not
+        #       perfect" posture as this module's own scope_reasoner):
+        #       for a small threshold this is more than enough in
+        #       practice, never a claim of scanning the FULL history.
+        if self.repeated_failure_threshold and task.coordinator_attempts >= self.repeated_failure_threshold:
+            recent_reasons = _recent_coordinator_reasons(store, task, limit=self.repeated_failure_threshold)
+            if len(recent_reasons) >= self.repeated_failure_threshold and len(set(recent_reasons)) == 1:
+                return CoordinatorDecision(
+                    NEEDS_HUMAN, evidence={"repeated_reason": recent_reasons[0], "repeat_count": len(recent_reasons)},
+                    reason=f"the exact same coordinator decision reason repeated {len(recent_reasons)} times in "
+                          f"a row ({recent_reasons[0]!r}) -- stuck in a loop, needs a human rather than another "
+                          f"identical automatic retry",
+                    required_actions=["a human reviews this task -- repeating the same automatic retry will not help"],
+                )
 
         # 0. Review-attempt budget -- never loop forever (item: Coordinator design).
         if task.coordinator_attempts >= self.max_review_attempts:

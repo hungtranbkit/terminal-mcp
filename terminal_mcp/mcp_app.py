@@ -19,7 +19,10 @@ from .planner_service import PlannerService
 from .planner_store import PlannerStore
 from .pm_service import PMService
 from .pm_store import PMStore
-from .pm_summary import close_task_with_confirmation, detect_duplicate_tasks, detect_stale_backlog_tasks, generate_summary
+from .pm_summary import (
+    close_task_with_confirmation, detect_duplicate_tasks, detect_stale_backlog_tasks,
+    emergency_resume_all_lanes, emergency_stop_all_lanes, generate_summary,
+)
 from .queue_engine import QueueEngine
 from .queue_loop import QueueLoop
 from .queue_service import QueueService
@@ -1511,6 +1514,30 @@ def build_mcp(service: TerminalService | None = None,
         with confirmed=true without a human having actually reviewed
         the specific task first."""
         return close_task_with_confirmation(queue, task_id, reason=reason, confirmed=confirmed)
+
+    # -- Emergency Stop (§20.6 Phase E: security/control-plane). One big
+    # red button for the whole fleet -- pauses every lane's dispatch via
+    # the existing, real pause mechanism (never a new stop/kill path,
+    # never touches a session's own tmux/ConPTY process). Refuses
+    # without an explicit confirmation, same "human controls destructive
+    # action" posture as terminal_pm_close_task_with_confirmation above.
+
+    @server.tool()
+    def terminal_emergency_stop(reason: str, confirmed: bool = False) -> dict:
+        """Pauses EVERY lane in the fleet at once (queue dispatch only
+        -- never kills/touches a session's own process). Refuses
+        (CONFIRMATION_REQUIRED) unless confirmed=true is explicitly
+        passed. A lane already paused for an unrelated reason is left
+        untouched. Use terminal_emergency_resume to undo."""
+        return emergency_stop_all_lanes(queue, reason=reason, confirmed=confirmed)
+
+    @server.tool()
+    def terminal_emergency_resume() -> dict:
+        """Resumes ONLY lanes that terminal_emergency_stop itself
+        paused -- a lane a human/PM had already deliberately paused for
+        an unrelated reason before the emergency stop is left exactly
+        as they left it."""
+        return emergency_resume_all_lanes(queue)
 
     @server.tool()
     def terminal_queue_metrics(session: str) -> dict:

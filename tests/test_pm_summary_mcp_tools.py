@@ -59,3 +59,20 @@ async def test_detect_stale_backlog_through_real_mcp_path(server):
     # 0-hour threshold -- a task created just now is already "stale" by this loose bound.
     assert result["count"] == 1
     assert result["stale_tasks"][0]["id"] == created["task_id"]
+
+
+@pytest.mark.anyio
+async def test_emergency_stop_and_resume_through_real_mcp_path(server):
+    await _call(server, "terminal_task_create", title="t", prompt="p", assigned_session_id="lane-a")
+    refused = await _call(server, "terminal_emergency_stop", reason="prod incident")
+    assert refused["error"] == "CONFIRMATION_REQUIRED"
+
+    stopped = await _call(server, "terminal_emergency_stop", reason="prod incident", confirmed=True)
+    assert stopped["paused_lanes"] == ["lane-a"]
+    status = await _call(server, "terminal_queue_status", session="lane-a")
+    assert status["paused"] is True
+
+    resumed = await _call(server, "terminal_emergency_resume")
+    assert resumed["resumed_lanes"] == ["lane-a"]
+    status = await _call(server, "terminal_queue_status", session="lane-a")
+    assert status["paused"] is False

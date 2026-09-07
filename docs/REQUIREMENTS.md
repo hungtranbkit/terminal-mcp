@@ -1663,6 +1663,84 @@ is disclosed explicitly rather than silently claimed as "built":
   loop — same posture as the existing `coordinator_attempts` cap (§8),
   extended to cover this specific "stuck in a loop" shape explicitly.
 
+#### Phase E implementation note (2026-09-07, VERIFIED — repeated-failure
+gate + Emergency Stop; least-privilege documented, no new code needed)
+
+- **Agent failure policy** (`coordinator.py`, `CoordinatorGate`): a new
+  `repeated_failure_threshold` param (default
+  `DEFAULT_REPEATED_FAILURE_THRESHOLD = 3`) — deliberately **ON by
+  default**, unlike every other Phase A/E opt-in gate, because it is a
+  real EXTENSION of the already-always-on `max_review_attempts` cap
+  (default 5), not a new behavior class: it catches the *specific*
+  "exact same reason, zero progress" shape strictly sooner than the raw
+  attempt budget alone would. New check (`review()`, placed right after
+  the existing risk-level gate and before the raw attempt-budget check):
+  once `task.coordinator_attempts >= repeated_failure_threshold`, reads
+  this task's own real `COORDINATOR_DECISION` event history (via the
+  existing, real `QueueStore.list_events` — no second history
+  mechanism) through a new `_recent_coordinator_reasons` helper; if the
+  most recent `repeated_failure_threshold` reasons are byte-for-byte
+  identical, returns `NEEDS_HUMAN` with `evidence.repeated_reason`/
+  `repeat_count` rather than letting the loop continue. `None` disables
+  the check entirely (falls back to the raw attempt cap only).
+- **Emergency Stop** (`pm_summary.py`): `emergency_stop_all_lanes(queue,
+  *, reason, confirmed=False)` — pauses **every** lane at once via the
+  existing, real, already-idempotent `QueueService.pause`/`QueueStore.
+  pause_lane` (§10) — never a new stop/kill mechanism, and a QUEUE
+  DISPATCH stop only (never touches a session's own tmux/ConPTY
+  process — this project's own standing "never disrupt a real attended
+  session" discipline). Same "human controls destructive action,
+  refuses without `confirmed=true`" posture as Phase D's
+  `close_task_with_confirmation`. A lane already paused (for any
+  reason) is left untouched. `emergency_resume_all_lanes(queue)` is the
+  undo — it resumes **only** lanes whose `paused_reason` was actually
+  set by `emergency_stop_all_lanes` (prefixed `EMERGENCY STOP:`), so a
+  lane a human had already deliberately paused for an unrelated reason
+  *before* the emergency stop is left exactly as they left it, never
+  guessed at. MCP tools: `terminal_emergency_stop`, `terminal_
+  emergency_resume`.
+- **Least privilege / secret redaction / no prod creds by default**:
+  documented as **already true by construction**, no new code —
+  disclosed honestly rather than built redundantly. This project has no
+  credential-granting mechanism anywhere in its MCP surface at all (no
+  tool exists that ever hands a session a secret/API key/deploy
+  credential); the existing `redaction.py` (`redact_text`/
+  `redact_ansi_safe`, pre-existing, unmodified) already strips
+  credential-shaped substrings from anything this project surfaces
+  (logs, captured panes); and Phase C's own release-approval gate
+  (`release_service.py`) already requires an explicit human `approved_
+  by` before any `prod` deploy can even start — an ordinary coding
+  worker session is never handed anything beyond what it already had
+  (tmux send/read + queue tools), so "not granted prod secrets by
+  default" was never something to newly build.
+- **Tests**: `tests/test_coordinator.py` (+5: default-on repeated-
+  failure detection, differing reasons don't trip it, configurable
+  threshold, disabling via `None`, and the pre-existing max-attempts
+  test isolated from this new always-on check via an explicit `None`
+  override so the two independently-real checks don't both fire on the
+  same fixture), `tests/test_pm_summary.py` (+6: confirmation/reason
+  gates, real multi-lane pause, already-paused-lane-left-untouched,
+  resume-only-what-was-stopped, no-op resume), `tests/test_pm_summary_
+  mcp_tools.py` (+1, the real MCP stop→status→resume→status round
+  trip). **Live disposable E2E** (`tests/test_queue_engine_smoke.py`,
+  `pytest -m queue_smoke`, +2, both against real disposable tmux
+  sessions — never `window`/`window2`/`wtest`):
+  `test_repeated_identical_coordinator_failure_forces_needs_human_for_
+  real` — a real dirty git repo (an uncommitted change that is never
+  fixed) drives 3 real, independent `engine.tick()` PRECHECK reviews to
+  the identical real `git_repo_evidence` "uncommitted changes" reason,
+  and the 4th tick's real `COORDINATOR_NEEDS_HUMAN` correctly fires
+  BEFORE the raw `max_review_attempts=5` budget would have (confirmed
+  via `evidence.repeat_count == 3` and the task's own persisted
+  `coordinator_reason`); `test_emergency_stop_pauses_a_real_in_flight_
+  lane_and_resume_lets_it_finish` — a real disposable worker session's
+  task is driven to `COORDINATOR_READY`, real-paused mid-flight by
+  `emergency_stop_all_lanes`, proven inert under a real `engine.tick()`
+  while stopped, then `emergency_resume_all_lanes` lets the same real
+  task run to a real `COMPLETED` with real verification evidence. Both
+  green. Updated MCP tool-count assertions (126 -> 128). Full suite
+  green (see Backlog item 25).
+
 ### 20.7 New API/tools (PLANNED names, for future implementation —
 none of these exist yet)
 
@@ -3176,8 +3254,29 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
     list_nodes()`/`pending_counts()` respectively) — disclosed
     explicitly rather than silently claimed as newly built. "Human
     controls destructive close" is real and enforced: the only mutating
-    action refuses without an explicit `confirmed=true`. Phase E
-    remains entirely PLANNED, unbuilt.
+    action refuses without an explicit `confirmed=true`.
+25. **Unified Task System §20.6 Phase E — security/control-plane
+    VERIFIED and live** (2026-09-07): repeated-identical-failure ("stuck
+    in a loop") detection in `CoordinatorGate` (ON by default,
+    `repeated_failure_threshold=3`, extends the existing
+    `max_review_attempts` cap rather than replacing it), and fleet-wide
+    Emergency Stop/Resume (`pm_summary.emergency_stop_all_lanes`/
+    `emergency_resume_all_lanes`, `terminal_emergency_stop`/`terminal_
+    emergency_resume`) — see Phase E's own implementation note in §20.6
+    and §4i of `docs/CHATGPT_USAGE.md`. Least privilege/secret redaction
+    documented as already true by construction (no credential-granting
+    mechanism exists anywhere in this project's MCP surface) — disclosed
+    rather than redundantly rebuilt. Both new pieces proven against
+    REAL disposable tmux sessions (never `window`/`window2`/`wtest`)
+    through the real `engine.tick()` dispatch loop, not just unit tests
+    — see `tests/test_queue_engine_smoke.py` (`pytest -m queue_smoke`).
+    This completes the entire §20.6 Phases A-E roadmap to the extent
+    each phase's own disclosed scope allows (see items 21-25 for the
+    honest per-phase scope cuts — most notably: DoR's `required_os`/
+    `required_capabilities`/`dependencies` fields not mandated, and no
+    project has actually opted a real risk-level/`require_approval_for_
+    risk_levels` policy in yet — the mechanism is real, wiring one in
+    for a specific project is a future increment).
 
 ---
 

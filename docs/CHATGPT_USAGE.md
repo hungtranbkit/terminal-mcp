@@ -434,6 +434,35 @@ with `confirmed=true` in a loop over every stale/duplicate finding
 without a human actually looking at each one first — that defeats the
 entire point of the confirmation requirement.
 
+### 4i. Security/control-plane: Emergency Stop + agent failure policy
+
+**Status: VERIFIED** — see REQUIREMENTS.md's own Phase E implementation
+note (§20.6). This is the last slice of the §20.6 roadmap.
+
+- **Repeated-identical-failure detection** — no tool to call; it's a
+  real, always-ON extension of the Coordinator's own review-attempt
+  cap. If the *exact same* coordinator decision reason repeats 3 times
+  in a row for one task (checked via `terminal_task_status`/
+  `terminal_queue_events`'s own `coordinator_reason`/`coordinator_
+  attempts` fields, already real), the task is forced to `NEEDS_HUMAN`
+  — strictly before the raw 5-attempt budget would have caught it.
+  This is deliberately stricter than the risk-level gate (§4e): it
+  needs no per-project opt-in.
+- `terminal_emergency_stop(reason, confirmed=False)` — pauses **every**
+  lane in the fleet at once (queue dispatch only — never kills or
+  touches any session's own process). Refuses `CONFIRMATION_REQUIRED`
+  unless `confirmed=true` is explicitly passed. A lane a human had
+  already paused for an unrelated reason is left untouched.
+- `terminal_emergency_resume()` — undoes it: resumes **only** the lanes
+  `terminal_emergency_stop` itself paused. A lane paused for an
+  unrelated, pre-existing reason stays exactly as it was.
+
+**Anti-pattern:** never call `terminal_emergency_stop` with
+`confirmed=true` reflexively/speculatively — this pauses the ENTIRE
+fleet's dispatch, not just one lane; use `terminal_queue_pause(session)`
+for a single lane instead. Reserve Emergency Stop for a genuine
+fleet-wide incident.
+
 ## 5. Supervisor flow (canonical for watching an unattended session and
 reacting to it needing help)
 
@@ -610,13 +639,18 @@ task_create_incident`/`terminal_list_active_incidents`), and **release
 lifecycle slice** (§4g — `terminal_release_create`/`advance`/
 `rollback`/`status`/`list`), and **PM summary + backlog hygiene slice**
 (§4h — `terminal_pm_summary`/`detect_stale_backlog`/`detect_duplicate_
-tasks`/`close_task_with_confirmation`, no scheduler) are all
-**VERIFIED and callable**. Everything else in that design — PM-based
-routing of the Integration/Merge Agent to a specific session, technical
-role-based enforcement of release approvals, and the rest of the Phase
-A-E Startup Operating Model (Phase E, and the remaining pieces of
-Phase B/C) — is still **PLANNED**, not built, as of this file's own
-last update. See `docs/REQUIREMENTS.md`'s own "Unified Task System"
-section (§20) for the current architecture-in-progress. Nothing beyond
-§4a-§4h's tools is callable yet; if asked to use any of the rest, say
-so plainly rather than guessing at a tool name.
+tasks`/`close_task_with_confirmation`, no scheduler), and **security/
+control-plane slice** (§4i — repeated-identical-failure detection
+always ON in the Coordinator, `terminal_emergency_stop`/`terminal_
+emergency_resume`) are all **VERIFIED and callable** — this completes
+the entire §20.6 Phases A-E Startup Operating Model roadmap, to the
+extent each phase's own honestly-disclosed scope allows (see
+REQUIREMENTS.md's own Backlog items 21-25 for the specific, real scope
+cuts in each phase — nothing here claims more than what was actually
+built and live-tested). Still **PLANNED**, not built: PM-based routing
+of the Integration/Merge Agent to a specific session, and technical
+role-based enforcement of WHO may supply a release's `approved_by` (no
+caller-identity system exists in this project's MCP layer at all yet).
+See `docs/REQUIREMENTS.md`'s own "Unified Task System" section (§20)
+for the current architecture. If asked to use a tool beyond §4a-§4i's
+own lists, say so plainly rather than guessing at a name.

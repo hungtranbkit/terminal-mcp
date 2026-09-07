@@ -268,6 +268,85 @@ def test_artificial_blocker_blocks_only_its_own_queue(rig):
 
 
 # ---------------------------------------------------------------------------
+# §20.6 Phase E: repeated-identical-failure ("stuck in a loop") detection
+# -- real disposable session, real dirty git repo, real engine.tick loop.
+# ---------------------------------------------------------------------------
+
+def test_repeated_identical_coordinator_failure_forces_needs_human_for_real(rig, tmp_path, tmux_session_factory):
+    """A REAL disposable session sitting in a REAL git repo with an
+    uncommitted change: every PRECHECK review's real git_repo_evidence
+    collector reports the exact same "uncommitted changes" NEEDS_REWORK
+    reason, with zero actual progress between attempts (nothing here
+    ever touches the repo). Proves the real CoordinatorGate() default
+    (repeated_failure_threshold=3) forces NEEDS_HUMAN on the 3rd
+    identical repeat -- BEFORE the raw max_review_attempts=5 budget
+    would have caught it -- through the real engine.tick() loop, not a
+    unit test poking CoordinatorGate.review() directly."""
+    repo = _init_real_git_repo(tmp_path / "repo-stuck-loop")
+    (repo / "README.md").write_text("modified, never committed\n")  # stays dirty for every tick
+    tmux_session_factory("queue-smoke-stuck", f"bash -c 'cd {repo} && exec bash'")
+    store = rig["store"]
+    engine = rig["engine"]
+    (task_id,) = store.set_tasks("queue-smoke-stuck", [{"prompt": "please refactor the exporter module cleanly"}])
+
+    actions = []
+    for _ in range(8):  # CLAIMED, review, CLAIMED, review, CLAIMED, review(stuck) -- 6 ticks, some slack
+        result = engine.tick("queue-smoke-stuck")
+        actions.append(result.action)
+        if result.action == "COORDINATOR_NEEDS_HUMAN":
+            break
+
+    assert "COORDINATOR_NEEDS_HUMAN" in actions
+    task = store.get_task(task_id)
+    # 3 identical prior NEEDS_REWORK reviews triggered the stuck-loop
+    # check on the 4th review call (coordinator_attempts increments to 4
+    # only as THIS NEEDS_HUMAN decision itself is recorded) -- caught
+    # well before the raw max_review_attempts=5 budget would have been.
+    assert task.coordinator_attempts == 4
+    assert task.coordinator_decision["evidence"]["repeat_count"] == 3
+    assert "stuck in a loop" in (task.coordinator_reason or "")
+    assert "uncommitted" in (task.coordinator_reason or "")
+
+
+# ---------------------------------------------------------------------------
+# §20.6 Phase E: Emergency Stop -- real disposable session, real pause/
+# resume of real in-flight dispatch through the real engine.tick loop.
+# ---------------------------------------------------------------------------
+
+def test_emergency_stop_pauses_a_real_in_flight_lane_and_resume_lets_it_finish(rig):
+    from terminal_mcp.pm_summary import emergency_resume_all_lanes, emergency_stop_all_lanes
+    from terminal_mcp.queue_service import QueueService
+
+    rig["make_worker"]("queue-smoke-estop")
+    store = rig["store"]
+    engine = rig["engine"]
+    queue = QueueService(store)
+    (task_id,) = store.set_tasks("queue-smoke-estop", [{"prompt": "print marker ESTOP1 please"}])
+
+    # Drive it partway (CLAIMED + review -> READY) before stopping.
+    engine.tick("queue-smoke-estop")  # CLAIMED
+    result = engine.tick("queue-smoke-estop")  # COORDINATOR_READY
+    assert result.action == "COORDINATOR_READY"
+
+    stopped = emergency_stop_all_lanes(queue, reason="live Phase E smoke test", confirmed=True)
+    assert "queue-smoke-estop" in stopped["paused_lanes"]
+    task = store.get_task(task_id)
+    assert task.status == "PAUSED"
+
+    # While stopped, ticking this lane is a real no-op (never dispatches).
+    paused_tick = engine.tick("queue-smoke-estop")
+    assert paused_tick.action == "PAUSED"
+    assert store.get_task(task_id).status == "PAUSED"
+
+    resumed = emergency_resume_all_lanes(queue)
+    assert resumed["resumed_lanes"] == ["queue-smoke-estop"]
+
+    final = _run_task_to_completion(engine, "queue-smoke-estop", controller=rig["controller"])
+    assert store.get_task(task_id).status == COMPLETED
+    assert store.get_task(task_id).verification_evidence  # real evidence, not just the label
+
+
+# ---------------------------------------------------------------------------
 # Item B: restart mid-dispatch -- no duplicate real keystroke.
 # ---------------------------------------------------------------------------
 
