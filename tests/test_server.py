@@ -107,6 +107,15 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_task_create",
         "terminal_task_assign",
         "terminal_task_board",
+        # PM/Orchestrator Agent: skill-based routing (§20.2).
+        "terminal_pm_set_capability",
+        "terminal_pm_list_capabilities",
+        "terminal_pm_delete_capability",
+        "terminal_pm_eligible_workers",
+        "terminal_pm_route_task",
+        "terminal_pm_approve_routing",
+        "terminal_pm_route_all_unassigned",
+        "terminal_pm_explain",
     }
 
 

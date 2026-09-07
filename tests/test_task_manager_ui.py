@@ -416,3 +416,53 @@ def test_dashboard_tasks_page_served_when_read_authorized(rig):
     response = client.get("/dashboard/tasks")
     assert response.status_code == 200
     assert "Global Tasks" in response.text
+
+
+def test_dashboard_tasks_board_route_enriches_cards_with_pm_routing_reason(tmp_path, tmux_session_factory):
+    # PM/Orchestrator checkpoint (§20.2): the Kanban board's own routing_
+    # reason display must reflect a REAL, persisted PM decision -- one
+    # bulk read (pm.store.latest_decisions_for_tasks), never N+1, never
+    # a client-side guess.
+    from terminal_mcp.pm_service import PMService
+    from terminal_mcp.pm_store import PMStore
+
+    service = _service(tmp_path)
+    controller = build_default_controller(service)
+    controller.refresh_local_heartbeat(tmux_session_count=0, agent_counts={}, agent_types=(), agent_version=None)
+    queue = QueueService(QueueStore(tmp_path / "queue.db"))
+    pm = PMService(PMStore(tmp_path / "pm.db"), queue, controller)
+    server = build_mcp(service, controller=controller, queue=queue, pm=pm)
+    register_dashboard(server, service, controller=controller, queue=queue, pm=pm)
+    client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})
+
+    name = _unique("tm")
+    tmux_session_factory(name, "bash -lc 'sleep 300'")
+    service.grants.set_read(name, True, granted_by="test")
+    service.grants.set_input(name, True, granted_by="test")
+
+    pm.upsert_capability("local", name, os="linux")
+    created = pm.queue.create_task("t", "p", session=None)
+    pm.route_task(created["task_id"], mode="SUGGEST")
+
+    board = client.get("/dashboard/api/tasks/board").json()
+    card = next(t for t in board["backlog"] if t["id"] == created["task_id"])
+    assert card["pm_decision_status"] == "SUGGESTED"
+    assert name in card["routing_reason"]
+
+
+def test_dashboard_tasks_board_route_omits_routing_reason_for_never_routed_task(tmp_path):
+    from terminal_mcp.pm_service import PMService
+    from terminal_mcp.pm_store import PMStore
+
+    service = _service(tmp_path)
+    controller = build_default_controller(service)
+    queue = QueueService(QueueStore(tmp_path / "queue.db"))
+    pm = PMService(PMStore(tmp_path / "pm.db"), queue, controller)
+    server = build_mcp(service, controller=controller, queue=queue, pm=pm)
+    register_dashboard(server, service, controller=controller, queue=queue, pm=pm)
+    client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})
+
+    created = pm.queue.create_task("t", "p", session=None)
+    board = client.get("/dashboard/api/tasks/board").json()
+    card = next(t for t in board["backlog"] if t["id"] == created["task_id"])
+    assert "routing_reason" not in card

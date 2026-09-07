@@ -27,6 +27,8 @@ from .integration_service import IntegrationService
 from .integration_store import IntegrationStore
 from .node_models import NODE_ONLINE, SESSION_BACKEND_TMUX, node_to_dict
 from .permissions import input_session_allowed, session_allowed, valid_session_name
+from .pm_service import PMService
+from .pm_store import PMStore
 from .queue_service import QueueService
 from .queue_store import QueueStore
 from .supervisor import SupervisorService, SupervisorStore
@@ -5317,6 +5319,16 @@ GLOBAL_TASKS_HTML = """<!doctype html>
       const project = task.metadata && task.metadata.project;
       if (project) { const p = document.createElement('span'); p.className = 'chip'; p.textContent = clean(project); meta.append(p); }
       card.append(title, meta);
+      if (task.routing_reason) {
+        // PM/Orchestrator checkpoint (§20.2): explainability -- WHY this
+        // task is (or would be) on this card, straight from the real,
+        // persisted PM decision (dashboard.py's tasks_board route),
+        // never a client-side guess.
+        const reason = document.createElement('div'); reason.className = 'tc-error';
+        reason.style.color = 'var(--muted)';
+        reason.textContent = `PM (${clean(task.pm_decision_status)}): ${clean(task.routing_reason)}`;
+        card.append(reason);
+      }
       if (!task.session) {
         const assignRow = document.createElement('div'); assignRow.className = 'tc-assign';
         const input = document.createElement('input'); input.type = 'text'; input.placeholder = 'gán vào session...';
@@ -5691,7 +5703,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        controller: ControllerService | None = None,
                        connection_store: ConnectionStore | None = None,
                        queue: QueueService | None = None,
-                       integration: IntegrationService | None = None) -> None:
+                       integration: IntegrationService | None = None,
+                       pm: PMService | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -5736,6 +5749,23 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         import tempfile
         integration = IntegrationService(IntegrationStore(
             Path(tempfile.mkdtemp(prefix="terminal-mcp-integration-")) / "integration.db"))
+    if pm is None:
+        # Same private-temp-file discipline as queue/integration's own
+        # defaults just above -- server_http.py's real main() always
+        # constructs one explicit PMService (sharing the SAME `queue`
+        # instance) and passes it here so the Kanban board's own
+        # routing_reason display and the MCP terminal_pm_* tool surface
+        # read/write the exact same store.
+        import tempfile
+
+        def _local_permission_checker(node_id: str, session: str) -> bool:
+            if node_id != controller.local_node_id:
+                return True
+            authorized, _reason = terminal._input_authorized(session)
+            return authorized
+
+        pm = PMService(PMStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-pm-")) / "pm.db"), queue, controller,
+                       permission_checker=_local_permission_checker)
     discovery_config = terminal.config.nodes.discovery
     discovery = lan_discovery.DiscoveryService(
         agent_port=discovery_config.agent_port, concurrency=discovery_config.concurrency,
@@ -6467,6 +6497,24 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         result = await anyio.to_thread.run_sync(queue.board)
+        # PM/Orchestrator checkpoint (§20.2): enrich each card with its
+        # own latest routing decision, if any -- ONE bulk read (never
+        # N+1 per card), done here at the dashboard-route layer rather
+        # than inside queue.board() itself (queue_service.py stays
+        # decoupled from pm_store.py -- a lower layer never depends on a
+        # feature built on top of it). `routing_reason`/`pm_decision_
+        # status` are additive fields; a task never routed by the PM
+        # simply has neither, same "no key rather than a fake value"
+        # posture as every other optional field in this project.
+        all_rows = [row for column in ("backlog", "queued", "running", "blocked_review", "done")
+                   for row in result.get(column, [])]
+        latest_decisions = await anyio.to_thread.run_sync(
+            pm.store.latest_decisions_for_tasks, [row["id"] for row in all_rows])
+        for row in all_rows:
+            decision = latest_decisions.get(row["id"])
+            if decision is not None:
+                row["routing_reason"] = decision.reason
+                row["pm_decision_status"] = decision.status
         return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/tasks/create", methods=["POST"], include_in_schema=False)

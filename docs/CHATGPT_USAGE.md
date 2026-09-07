@@ -207,6 +207,50 @@ the entry point for a task that doesn't have a session picked yet:
 create it with `assigned_session_id` omitted and read it back through
 `terminal_task_board`/`terminal_task_status`.
 
+### 4b. PM/Orchestrator Agent (skill-based routing for a Backlog task)
+
+**Status: VERIFIED** (capability schema + deterministic router only —
+see REQUIREMENTS.md §20.2a for full evidence. No auto-loop exists —
+every routing decision below is triggered by an explicit call. Planner/
+git-isolation/Merge-Agent/Phase A-E remain PLANNED.)
+
+Use this when you have a Backlog task (§4a) and want the PM to pick
+which session should run it, instead of assigning one yourself:
+
+- `terminal_pm_set_capability(node_id, session, os=, runtime_tools=,
+  project_affinity=, role=, skills=)` — declare what a session can do.
+  Declarative only — set this up front for each real worker session;
+  never inferred from a display name.
+- `terminal_pm_list_capabilities()` / `terminal_pm_eligible_workers(
+  task_id)` — see the full worker roster, or (for one specific task)
+  exactly which candidates pass the hard-constraint gate right now and
+  why the rest don't. Read-only — routes/assigns nothing.
+- `terminal_pm_route_task(task_id, mode="SUGGEST")` — runs the
+  deterministic router (hard constraints — OS/capabilities/project/
+  permission/online/pin/exclusions — then soft scoring among eligible
+  candidates) and PERSISTS the decision. `mode="SUGGEST"` (default)
+  never assigns by itself — call `terminal_pm_approve_routing(task_id)`
+  next to actually move it. `mode="AUTO"` assigns immediately on a
+  `ROUTED` result — only use AUTO on a project after its own live
+  disposable E2E pass, never as a default.
+- `terminal_pm_route_all_unassigned(mode=)` — the same router, swept
+  once over every Backlog task. Not a background loop — call it again
+  whenever you want another pass.
+- `NO_ELIGIBLE_WORKER` and `BLOCKED` (a `pinned_session`/`pinned_node`
+  that itself fails a hard constraint) both leave the task exactly
+  where it was — never dropped, never silently rerouted away from an
+  explicit human pin.
+- `terminal_pm_explain(task_id)` — the full, real routing-decision
+  history for one task, newest first (an append-only audit trail, so
+  approving a suggestion adds a new entry rather than erasing the old
+  one).
+
+**Anti-pattern:** don't hand-pick a session for a task that declared
+routing requirements (`required_os`/`required_capabilities`/etc. in its
+`metadata`) without checking `terminal_pm_eligible_workers` first — you
+could send a Windows/WPF task to a Linux-only session by hand exactly
+the mistake this feature exists to prevent.
+
 ## 5. Supervisor flow (canonical for watching an unattended session and
 reacting to it needing help)
 
@@ -368,14 +412,15 @@ see REQUIREMENTS.md Backlog item 7).
 ## 11. What's coming (do not treat as available yet)
 
 The Unified Task System is an extension of the Queue/Coordinator/
-Supervisor stack described above. Its **Global Tasks Kanban slice is
-now VERIFIED and callable** — see §4a above (`terminal_task_create`/
-`terminal_task_assign`/`terminal_task_board`, and the dashboard's
-`/dashboard/tasks` page). Everything else in that design — PM/
-Orchestrator skill-based routing, a Planner that splits large tasks,
-git worktree isolation, and a dedicated Integration/Merge Agent role —
-is still **PLANNED**, not built, as of this file's own last update. See
-`docs/REQUIREMENTS.md`'s own "Unified Task System" section (§20) for
-the current architecture-in-progress. Nothing beyond §4a's tools is
+Supervisor stack described above. Its **Global Tasks Kanban slice** (§4a
+— `terminal_task_create`/`terminal_task_assign`/`terminal_task_board`,
+the dashboard's `/dashboard/tasks` page) and its **PM/Orchestrator
+skill-based routing slice** (§4b — `terminal_pm_*` tools, no auto-loop)
+are both **VERIFIED and callable**. Everything else in that design — a
+Planner that splits large tasks, git worktree isolation, a dedicated
+Integration/Merge Agent role, and the Phase A-E Startup Operating Model
+— is still **PLANNED**, not built, as of this file's own last update.
+See `docs/REQUIREMENTS.md`'s own "Unified Task System" section (§20)
+for the current architecture-in-progress. Nothing beyond §4a/§4b's tools is
 callable yet; if asked to use any of the rest, say so plainly rather
 than guessing at a tool name.

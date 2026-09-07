@@ -13,6 +13,8 @@ from .task_migration import TaskMigrationPlanner
 from .integration_service import IntegrationService
 from .integration_store import publish_handoff_for_completed_task
 from .node_models import node_to_dict as _node_to_dict
+from .pm_service import PMService
+from .pm_store import PMStore
 from .queue_engine import QueueEngine
 from .queue_loop import QueueLoop
 from .queue_service import QueueService
@@ -25,7 +27,8 @@ def build_mcp(service: TerminalService | None = None,
               supervisor_v2: SupervisorV2Service | None = None,
               controller: ControllerService | None = None,
               queue: QueueService | None = None,
-              integration: IntegrationService | None = None) -> MCPServer:
+              integration: IntegrationService | None = None,
+              pm: PMService | None = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -80,6 +83,22 @@ def build_mcp(service: TerminalService | None = None,
                               on_completed=_on_task_completed)
     queue.engine = queue.engine or queue_engine
     integration.engine = integration.engine or IntegrationEngine(integration.store, queue.store)
+    # PM/Orchestrator Agent (docs/REQUIREMENTS.md §20.2): reads the SAME
+    # queue store as everything else above (§20.0's own binding rule),
+    # never a second queue. permission_checker is wired to the exact
+    # same `_input_authorized` gate terminal_send_text itself uses for a
+    # LOCAL session -- a session on a remote node (controller routes to
+    # it, not `terminal` directly) always gets the safe default (True;
+    # its own node-agent still enforces the real gate at actual send
+    # time regardless -- see pm_service.py's own docstring for why this
+    # is never a security bypass).
+    def _local_permission_checker(node_id: str, session: str) -> bool:
+        if node_id != controller.local_node_id:
+            return True
+        authorized, _reason = terminal._input_authorized(session)
+        return authorized
+
+    pm = pm or PMService(PMStore(), queue, controller, permission_checker=_local_permission_checker)
     # Task Migration/Load Balancing: same node-aware controller as
     # everything else, so eligibility checks (item 6) resolve a
     # destination session's real cwd/node_id regardless of which node
@@ -1158,6 +1177,84 @@ def build_mcp(service: TerminalService | None = None,
         queue_global_inbox already read, just grouped by lifecycle stage
         instead of by session."""
         return queue.board()
+
+    # -- PM/Orchestrator Agent: skill-based routing (docs/REQUIREMENTS.md
+    # §20.2). Reads the SAME queue/tasks as every tool above -- a new
+    # ROLE, not a new queue. SUGGEST is the recommended default (compute
+    # + persist a decision, never assign by itself); AUTO actually calls
+    # assign_task -- only use AUTO on a project after its own live
+    # disposable E2E pass (see docs/REQUIREMENTS.md's own status note
+    # for this feature), never as a blanket default.
+
+    @server.tool()
+    def terminal_pm_set_capability(node_id: str, session: str, os: str | None = None,
+                                   runtime_tools: list[str] | None = None, project_affinity: str | None = None,
+                                   role: str | None = None, skills: list[dict] | None = None,
+                                   permissions_note: str | None = None) -> dict:
+        """Create/update one session's Capability Profile -- declarative
+        only (never inferred from a display name): `os` (e.g. "windows"/
+        "linux"), `runtime_tools` (e.g. ["dotnet", "wpf", "docker"]),
+        `project_affinity`, `role` (e.g. "developer"/"qa"/"integration"),
+        `skills` ([{"name": "wpf", "confidence": 0.9}, ...]). A repeat
+        call updates in place -- a field left None keeps its previous
+        stored value rather than being blanked."""
+        return pm.upsert_capability(node_id, session, os=os, runtime_tools=runtime_tools,
+                                    project_affinity=project_affinity, role=role, skills=skills,
+                                    permissions_note=permissions_note)
+
+    @server.tool()
+    def terminal_pm_list_capabilities() -> dict:
+        """Every Capability Profile ever declared -- the PM's own worker
+        roster ("xem eligible workers" starts here)."""
+        return pm.list_capabilities()
+
+    @server.tool()
+    def terminal_pm_delete_capability(node_id: str, session: str) -> dict:
+        """Removes one Capability Profile (a worker retired/repurposed).
+        Idempotent -- `deleted: false` for a profile that never existed,
+        never an error."""
+        return pm.delete_capability(node_id, session)
+
+    @server.tool()
+    def terminal_pm_eligible_workers(task_id: str) -> dict:
+        """Explainability (task's own explicit "xem eligible workers"):
+        for one real task, which Capability Profiles pass the hard-
+        constraint gate right now and which don't, with a real reason
+        for each rejection -- read-only, routes/assigns nothing."""
+        return pm.eligible_workers(task_id)
+
+    @server.tool()
+    def terminal_pm_route_task(task_id: str, mode: str = "SUGGEST") -> dict:
+        """Runs the deterministic two-phase router for one task (hard
+        constraints, then soft scoring among eligible candidates) and
+        PERSISTS the decision either way -- `SUGGEST` (default, never
+        assigns; call terminal_pm_approve_routing to act on it) or
+        `AUTO` (a ROUTED result immediately calls terminal_task_assign
+        for real). `NO_ELIGIBLE_WORKER`/`BLOCKED` never drops the task
+        -- it stays exactly where it was, retriable later."""
+        return pm.route_task(task_id, mode=mode)
+
+    @server.tool()
+    def terminal_pm_approve_routing(task_id: str) -> dict:
+        """Human approval for a pending SUGGESTED routing decision --
+        the ONLY way a SUGGEST-mode decision actually results in a real
+        assignment. Refuses (NO_SUGGESTED_DECISION) if the task's latest
+        decision isn't a pending SUGGESTED one."""
+        return pm.approve_routing(task_id)
+
+    @server.tool()
+    def terminal_pm_route_all_unassigned(mode: str = "SUGGEST") -> dict:
+        """One explicit, manual sweep over every Backlog/UNASSIGNED task
+        -- NOT a background loop (there is none in this phase). Never
+        touches an already-assigned task."""
+        return pm.route_all_unassigned(mode=mode)
+
+    @server.tool()
+    def terminal_pm_explain(task_id: str) -> dict:
+        """`pm_explain` (§20.7): the full routing-decision history for
+        one task, newest first -- real, append-only audit trail, never
+        just the latest verdict."""
+        return pm.explain(task_id)
 
     @server.tool()
     def terminal_queue_metrics(session: str) -> dict:

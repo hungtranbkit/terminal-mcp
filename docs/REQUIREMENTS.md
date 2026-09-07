@@ -992,6 +992,98 @@ policies). Per-project/session opt-in, never a single global switch
 that silently starts claiming every existing UNASSIGNED task the
 moment AUTO is flipped on anywhere.
 
+#### 20.2a Implementation note (2026-09-07, VERIFIED — capability schema + deterministic router)
+
+**Status: VERIFIED** (unit tests + real disposable-session live E2E).
+Built: the Capability Profile store, the two-phase deterministic
+router, SUGGEST/AUTO modes, the append-only decision audit trail, and
+the Kanban card's own `routing_reason` display. **NOT yet built**: any
+PM auto-loop (every routing decision here is triggered by an explicit
+call — `terminal_pm_route_task`/`terminal_pm_route_all_unassigned` —
+never a background poll thread; see this section's own MODE note
+above, same "SUGGEST first, prove it live, only then consider more
+automation" rollout discipline as Queue auto-dispatch/Supervisor v2),
+`current_load`/`queue_depth` are NOT persisted on the profile (derived
+live at decision time instead — see below), and the Planner/git-
+isolation/Merge-Agent/Phase A-E sections remain entirely PLANNED.
+
+- `pm_store.py` (new) — `capability_profiles` (`(node_id, session)`
+  composite key, same convention `session_registry.py`'s own
+  `SessionRecord` already established) + `pm_decisions` (an APPEND-ONLY
+  log, one row per routing decision ever made, never overwritten — the
+  real audit trail this section's own explainability requirement asks
+  for, queryable by `task_id`).
+- `pm_router.py` (new) — the pure, deterministic two-phase algorithm
+  (`route_task`), no I/O, unit-tested in isolation. Task-side routing
+  requirements (`required_os`, `required_capabilities`,
+  `required_role`, `project`, `pinned_session`, `pinned_node`,
+  `excluded_sessions`) are read from **`task["metadata"]`**, NOT new
+  `queue_tasks` columns — same deliberate implementation choice as
+  §20.1a's own `UNASSIGNED_LANE` decision, made for the same reason:
+  the router only ever READS a task and, when it decides to assign one,
+  calls the EXISTING `QueueService.assign_task` — zero change to
+  `queue_store.py`'s schema or `queue_engine.py`'s dispatch loop needed.
+  `queue_depth` is a SOFT-scoring factor only in this checkpoint, NOT a
+  hard "1-active-task" gate (that hard limit is already enforced for
+  real by the dispatch engine itself, §7) — a true per-role/session WIP
+  CAP as a hard routing gate is Phase A's own future work (§20.6),
+  intentionally not pulled forward into this checkpoint.
+- `pm_service.py` (new) — the I/O glue: assembles real `WorkerCandidate`
+  rows from `PMStore` + live `QueueService.pending_counts()` (queue
+  depth) + an optional `ControllerService.list_nodes()` (node-online
+  check, best-effort True if no controller wired) + an optional
+  injected `permission_checker(node_id, session) -> bool` closure (the
+  real caller — `mcp_app.py`/`dashboard.py`/`server_http.py` — wires
+  this to the local node's own `TerminalService._input_authorized`;
+  defaults to True for a remote node or when unwired, since routing is
+  a placement decision, not itself a security boundary — the actual
+  send still goes through the real, full authorization gate regardless
+  of what PM decided). `route_task` (SUGGEST computes + persists only;
+  AUTO also calls `assign_task` for real), `approve_routing` (the only
+  way a SUGGEST decision becomes a real assignment), `route_all_
+  unassigned` (one explicit, manual sweep — not a loop), `eligible_
+  workers`/`explain` (read-only explainability).
+- MCP tools (`mcp_app.py`): `terminal_pm_set_capability`, `terminal_pm_
+  list_capabilities`, `terminal_pm_delete_capability`, `terminal_pm_
+  eligible_workers`, `terminal_pm_route_task`, `terminal_pm_approve_
+  routing`, `terminal_pm_route_all_unassigned`, `terminal_pm_explain`.
+- Dashboard: `/dashboard/api/tasks/board` enriches each card with its
+  own latest `routing_reason`/`pm_decision_status` (one bulk
+  `latest_decisions_for_tasks` read, never N+1) — the Global Tasks
+  Kanban page shows it as a small line under the card's own title/meta
+  chips, straight from the real, persisted decision, never a client-
+  side guess. `queue_store.py`/`queue_service.py` themselves stay
+  completely decoupled from `pm_store.py` (a lower layer never depends
+  on a feature built on top of it) — the enrichment happens at the
+  dashboard-route layer only.
+- Tests: `tests/test_pm_router.py` (24, pure algorithm — hard gate per
+  constraint, pin eligible/ineligible/nonexistent, NO_ELIGIBLE_WORKER
+  never drops, deterministic tie-break, the explicit "Windows/WPF never
+  to Linux" acceptance example), `tests/test_pm_store.py` (16,
+  persistence), `tests/test_pm_service.py` (18, real I/O including
+  `permission_checker`/controller-online injection), `tests/
+  test_pm_mcp_tools.py` (8, the real MCP tool surface), 2 new in
+  `tests/test_task_manager_ui.py` (the dashboard route's own
+  enrichment). Full suite green.
+- **Live evidence** (real disposable tmux sessions, real grants, the
+  real MCP `server.call_tool` path — never `window`/`window2`/`wtest`):
+  3 sessions with distinct real Capability Profiles (2 `linux`, 1
+  `windows`, different project affinities/skills); a Windows+WPF-
+  required task correctly routed ONLY to the Windows session (`local/
+  pme2e-windows-a`) — the Linux sessions correctly listed as ineligible
+  with the real OS-mismatch reason via `terminal_pm_eligible_workers`;
+  SUGGEST mode correctly left the task in Backlog until `terminal_pm_
+  approve_routing` was called, which then performed a real assignment;
+  a `pinned_session` pointing at an OS-ineligible session correctly
+  came back `BLOCKED` with an explicit reason, never silently rerouted
+  to the otherwise-perfectly-eligible alternative also present; AUTO
+  mode correctly assigned a project/skill-matched task immediately; a
+  task requiring a nonexistent OS (`macos`) correctly stayed
+  `NO_ELIGIBLE_WORKER`/UNASSIGNED, never dropped; `terminal_pm_explain`
+  correctly showed the full 2-entry decision history (SUGGESTED then
+  APPROVED_AND_ASSIGNED) for the first task. Disposable sessions/state
+  cleaned up after.
+
 ### 20.3 Planner (task breaking)
 
 Decides, for a newly-created UNASSIGNED task, whether to split it —
@@ -2426,6 +2518,15 @@ scan/audit view over the SAME facts.)*
     confirmed root cause. Revisit only if a real report/repro surfaces,
     same standing rule as everywhere else in this file (never fix an
     unreproduced suspect speculatively).
+17. **Unified Task System §20.2's PM/Orchestrator capability schema +
+    deterministic router is now VERIFIED and live** (2026-09-07) — see
+    §20.2a's own full implementation note (data model choice, new
+    store/router/service modules, MCP tools, dashboard routing_reason
+    display, tests, live disposable E2E evidence) and §4b of `docs/
+    CHATGPT_USAGE.md`. No PM auto-loop exists yet (every decision is an
+    explicit call). The REST of §20 (Planner/task-breaking, git
+    worktree isolation, the Integration/Merge Agent extension, the
+    Phase A-E Startup Operating Model) remains PLANNED, unbuilt.
 
 ---
 

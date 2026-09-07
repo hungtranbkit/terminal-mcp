@@ -19,6 +19,8 @@ from .integration_service import IntegrationService
 from .logging_setup import RequestIdMiddleware, SecurityHeadersMiddleware, configure_logging
 from .maintenance import MaintenanceLoop
 from .mcp_app import build_mcp
+from .pm_service import PMService
+from .pm_store import PMStore
 from .queue_service import QueueService
 from . import network_bind, network_middleware
 from .node_client import LocalNodeClient
@@ -262,9 +264,21 @@ def main() -> None:
     # dashboard<->MCP split specifically).
     queue = QueueService()
     integration = IntegrationService()
-    server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration)
+    # Same "constructed ONCE, shared by both build_mcp and register_
+    # dashboard" discipline as queue/integration just above -- the
+    # Kanban board's own routing_reason display and the terminal_pm_*
+    # MCP tool surface must read/write the exact same PM decision log,
+    # never two independently-drifting ones.
+    def _pm_permission_checker(node_id: str, session: str) -> bool:
+        if node_id != controller.local_node_id:
+            return True
+        authorized, _reason = terminal._input_authorized(session)
+        return authorized
+
+    pm = PMService(PMStore(), queue, controller, permission_checker=_pm_permission_checker)
+    server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
-                       queue=queue, integration=integration)
+                       queue=queue, integration=integration, pm=pm)
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)
