@@ -17,9 +17,23 @@ WAIT_PATTERNS = tuple(
         r"\[y/n\]",
         r"\[Y/n\]",
         r"continue\?\s*$",
-        r"\bapprove\b",
-        r"\bpermission\b",
         r"waiting for input",
+        # REMOVED (2026-09-07, real false positive found LIVE against a
+        # real attended session, `window2`): this list used to also
+        # include bare r"\bapprove\b" and r"\bpermission\b" word-boundary
+        # matches -- a real duplicate of the same bug already found and
+        # fixed in adapters.py's own _WAITING_PATTERNS (see that
+        # module's own docstring for the full root-cause writeup; the
+        # exact same reasoning applies here verbatim). An ordinary
+        # composer line about this project's own subject matter (a
+        # permissions/roles feature) wrongly reported classify_status's
+        # `state` as WAITING_INPUT/`input_required` as True for a
+        # completely idle, ordinary session -- confirmed live via
+        # terminal_status against window2 itself. Removed rather than
+        # narrowed, same reasoning as adapters.py: no real, observed
+        # Claude/Codex dialog on record uses the bare word "approve" or
+        # "permission" outside a numbered-menu/y-n shape already caught
+        # by the patterns above.
     )
 )
 ACTIVE_COMMANDS = {"claude", "codex", "python", "python3", "pytest", "node", "npm", "bash", "zsh"}

@@ -1890,6 +1890,143 @@ scan/audit view over the SAME facts.)*
   suspect for a future pass if it is ever actually reported/reproduced.
 - **Trace:** see this file's own commit.
 
+### P0 follow-up: window2 composer still stuck — 2 more real root causes fixed, 1 real anomaly NOT resolved (2026-09-07)
+
+- **Goal / user value:** a real, attended session (`window2`) had typed-
+  but-unsubmitted text sitting in its composer; fix the real cause(s),
+  not a workaround, verify on a disposable session first, then
+  (if safe) submit the live composer without restarting/losing the
+  session.
+- **Status: PARTIAL.** Two more real, confirmed root causes found and
+  fixed (VERIFIED, local — see below for what "deployed" actually means
+  here). The live `window2` composer itself is **STILL STUCK** — a
+  real, reproducible anomaly specific to that one session that did
+  **NOT** reproduce on a disposable session on the exact same real host/
+  currently-deployed code, and was **NOT** resolved. This is disclosed
+  honestly rather than claimed fixed.
+- **Root cause #1 (a real, exact duplicate of the earlier adapters.py
+  bug, found live via `terminal_status`):** `status.py`'s own
+  `WAIT_PATTERNS` (used by `detect_waiting_input`/`classify_status`,
+  a COMPLETELY SEPARATE code path from `adapters.py`'s `_WAITING_
+  PATTERNS` — never touched by the earlier TARGET_AWAITING_APPROVAL
+  fix) also had bare `\bapprove\b`/`\bpermission\b` word-boundary
+  patterns. `terminal_status("dell-5530/window2")` was observed, live,
+  reporting `state: "WAITING_INPUT"`, `input_required: true`, `reason:
+  "recent prompt matched '\\bpermission\\b' at bottom offset 2"` for a
+  completely ordinary, idle composer — the exact same false-positive
+  class, independently present in a second location. **Confirmed NOT
+  the cause of the stuck composer itself** (this field is purely
+  informational — read for `terminal_status`/dashboard/Supervisor/
+  Coordinator display, never consulted by `_send_text_and_verify_
+  locked`'s own send-gating logic) — fixed anyway since it is a real,
+  now-confirmed-live bug in its own right (wrong dashboard/Coordinator-
+  visible status for any session whose own text happens to mention
+  "permission"/"approve").
+  - **Fix:** removed the same two bare-word patterns from `status.py`'s
+    `WAIT_PATTERNS`, identical reasoning/precedent as the earlier
+    `adapters.py` fix (no speculative replacement pattern — the real
+    y/n and "press enter"/"waiting for input" patterns already cover
+    every actually-observed real prompt shape).
+- **Root cause #2 (a real gap in this project's own send_keys
+  reliability, per this task's own explicit requirement):**
+  `terminal_send_keys` previously reported `sent: true` for ANY
+  successful write — including `["Enter"]`, the single most common
+  real use (submitting whatever text is already sitting in the
+  composer) — with ZERO acceptance verification, unlike `terminal_
+  send_text`'s own already-real, already-verified press_enter path.
+  - **Fix:** `core.py`'s `_send_keys_leased`/new `_send_enter_key_
+    verified_locked` — a single `["Enter"]` send now reuses the EXACT
+    SAME adapter-based ack-evidence verification (`_poll_for_
+    submission`/`_poll_for_ack_evidence`) `terminal_send_text`'s own
+    `press_enter=True` path already uses, adding real `delivery_state`/
+    `submit_status`/`submit_reason` fields (`sent` keeps its exact
+    prior meaning — backward compatible). A genuine implementation
+    bug was caught and fixed DURING this same pass (see its own test
+    failure): passing an empty `sent_text` to `submit_ack_evidence`
+    would have silently defeated the exact busy-window echo-matching
+    race guard this whole mechanism exists to enforce (an empty string
+    is treated as trivially satisfied by `_sent_text_echoed`) — fixed
+    by a new `_extract_composer_text` helper that reads the actual
+    expected text straight from the composer's own pre-Enter content
+    (stripping a leading `"> "` marker), never blindly empty. Every
+    OTHER key combination (not exactly `["Enter"]`) is completely
+    unaffected — deliberately narrow, not a general raw-key
+    verification system.
+- **Live disposable-session evidence (real dell-5530 host, currently-
+  deployed/unpatched node-agent code, a fresh `test-winkey-diag-1`
+  Claude session, cleaned up after):** typed text, then a raw, bare
+  `terminal_send_keys(["Enter"])` (the SAME mechanism the report said
+  didn't work) **correctly submitted** — Claude began processing
+  ("Noodling…") within 0.3s and produced a real reply. This proves the
+  underlying Enter-byte mechanism (`windows_backend.py`'s `KEY_BYTES["Enter"]
+  = b"\r"`, delivered via `pywinpty`'s own `PtyProcess.write` — not a
+  simulated keypress, not focus-dependent) is fundamentally sound on
+  this real host, for a normal session.
+- **The unresolved anomaly:** the SAME action (a real, careful,
+  verified `terminal_send_keys(["Enter"])`, sent exactly once, then a
+  SECOND time after 8+ seconds confirmed zero effect from the first)
+  against the REAL `window2` session had **NO observable effect at
+  all** — the composer's own text stayed byte-for-byte identical
+  across two attempts and 13+ cumulative seconds of polling. `reader_
+  alive: true`, `reader_restarts: 0` — the session's own output-capture
+  path is healthy; this looks specifically like an INPUT-delivery gap
+  for this one process, not a dead/hung session. Both send attempts
+  were safety-gated (aborted if the composer's own text had changed
+  from the last known-good read, so neither attempt could have
+  duplicated or corrupted anything) and left `window2`'s real state
+  completely unchanged — no harm done, but also no fix. **Not
+  explained**: why a mechanism proven to work moments earlier, on the
+  same real host and currently-deployed code, against a fresh session,
+  does not work against this one, specific, long-running session
+  (891k tokens, many hours). Candidate directions for a future pass
+  (none tested, all speculative — disclosed as such, never guessed at
+  further without real evidence): a `pywinpty`/ConPTY input-pipe
+  condition specific to a very long-running child process; something
+  about `window2`'s own prior interaction history (e.g. the earlier
+  classifier-blocked attempts, though code-review found no write
+  occurs on that path) leaving the reader/writer pairing in an
+  inconsistent state that only deeper Windows-side instrumentation
+  (not available from this remote diagnostic vantage point) could
+  actually confirm.
+- **Deliberately NOT done:** deploying either fix (or the send_keys
+  verification) to `dell-5530`'s own node-agent — this project's own
+  established Phase 0 finding (no ConPTY session survives ANY node-
+  agent restart method) means doing so would kill `window2`'s actual
+  Claude process, destroying the exact unsubmitted composer text this
+  whole investigation exists to preserve. This is a real, disclosed
+  catch-22 the user needs to decide on, not something to resolve
+  unilaterally.
+- **Scope / flow:** `status.py`'s `WAIT_PATTERNS` (informational status
+  classification only); `core.py`'s `terminal_send_keys(["Enter"])`
+  path (adds verification, never changes what bytes are written).
+- **API/tool/command:** `terminal_status`/`terminal_input_context`
+  (indirectly, via `classify_status`); `terminal_send_keys` (new
+  `delivery_state`/`submit_status`/`submit_reason` fields for the
+  `["Enter"]` case only).
+- **Config/permission:** none.
+- **Data/schema/migration:** none.
+- **Acceptance/tests/evidence:** `tests/test_status.py` — 2 new (the
+  exact reported pane shape no longer WAITING_INPUT; a real y/n dialog
+  still correctly detected). `tests/test_send_reliability.py` — 4 new
+  for the verified-Enter path (real submission confirmed; the same
+  busy-footer-before-echo race survives; a genuine never-submits target
+  still correctly times out to `DELIVERY_UNKNOWN`; every other key
+  combination unaffected) + 5 new for `_extract_composer_text` itself.
+  Full suite green. Live evidence as described above (disposable
+  session: mechanism proven sound; `window2` itself: anomaly confirmed
+  real and reproducible, not resolved).
+- **Known limitations:** the `window2` composer itself remains stuck as
+  of this entry — this is an honest, open, un-explained finding, not a
+  claimed fix.
+- **Dependencies:** `adapters.py`'s existing ack-evidence model (reused
+  for the new `_send_enter_key_verified_locked` path, not replaced).
+- **Follow-up/backlog:** Backlog item 20 tracks the unresolved `window2`
+  input-delivery anomaly and the deployment decision (whether/when to
+  accept a `dell-5530` node-agent restart, losing that session's own
+  unsubmitted composer text, to pick up every fix accumulated in this
+  file's own recent Backlog items — 14, this entry, and the earlier
+  TARGET_AWAITING_APPROVAL fix — all still undeployed to that node).
+
 ### Windows node-agent restart safety (Phase 0)
 
 - **Goal / user value:** understand — with real, empirical evidence, not
@@ -2720,6 +2857,23 @@ scan/audit view over the SAME facts.)*
     redesign — disclosed, deferred) and the rebase-before-start policy.
     The REST of §20 (the Phase A-E Startup Operating Model) remains
     PLANNED, unbuilt.
+20. **`window2`'s composer is STILL stuck** (2026-09-07) — see this
+    file's own "P0 follow-up: window2 composer still stuck" Feature
+    Details entry for the full investigation. Two more real root causes
+    were found and fixed (a `status.py` duplicate of the `adapters.py`
+    bare-word bug; `terminal_send_keys(["Enter"])` gained real
+    acceptance verification) and proven correct on a disposable session
+    on the same real host — but the exact same, carefully-verified,
+    twice-attempted action had genuinely NO effect against `window2`
+    itself, an anomaly NOT explained or resolved. None of this session's
+    accumulated fixes (this entry, item 14, the earlier TARGET_AWAITING_
+    APPROVAL fix) are deployed to `dell-5530`'s own node-agent — doing
+    so would restart it, and this project's own Phase 0 finding means
+    that kills `window2`'s real Claude process, losing its own
+    unsubmitted composer text. This is a real, disclosed decision for
+    the user: accept that loss to deploy every accumulated fix, or leave
+    `window2` exactly as it is (safe, unchanged, but still stuck) until
+    a further diagnosis or a deliberate decision is made.
 
 ---
 

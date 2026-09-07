@@ -29,7 +29,7 @@ from pathlib import Path
 
 from terminal_mcp.audit import AuditStore
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig
-from terminal_mcp.core import TerminalService
+from terminal_mcp.core import TerminalService, _extract_composer_text
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 LAGGY_READER = f"python3 -u {FIXTURES_DIR / 'laggy_line_reader.py'}"
@@ -690,3 +690,96 @@ def test_claude_race_repeated_sends_all_confirm_no_false_negatives(tmux_session_
     pane = service.terminal_tail(session, 50)["output"]  # wide enough for all 5 exchanges' own scrollback
     for i in range(5):
         assert f"SUBMITTED[1]: pong-{i}" in pane
+
+
+# ---------------------------------------------------------------------------
+# P0 fix (2026-09-07, real report against `window2`): terminal_send_keys(
+# ["Enter"]) used to report sent: true with zero acceptance verification --
+# a caller had no way to tell "the byte was written" from "the target
+# actually processed it". Real disposable-session reproduction against the
+# SAME live dell-5530 environment/deployed-code as the reported session
+# confirmed a bare Enter DOES correctly submit an ordinary idle composer --
+# the "didn't submit" observation was very likely an unverified, too-early
+# single check (the exact class of Ink-redraw race this project already
+# fixed once for terminal_send_text's own press_enter path, reused here).
+# ---------------------------------------------------------------------------
+
+def test_send_keys_enter_now_verifies_real_submission_not_just_the_write(tmux_session_factory, tmp_path):
+    session = _claude_session(tmux_session_factory, "test-claude-sendkeys-enter", "normal_submit")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    # Type (do not submit) first -- exactly the reported real shape:
+    # composer already has unsent text, THEN a bare Enter is sent alone.
+    typed = service.terminal_send_text(session, "hello via send_keys", press_enter=False)
+    assert typed["sent"] is True
+    result = service.terminal_send_keys(session, ["Enter"])
+    assert result["sent"] is True  # backward-compatible field, unchanged meaning
+    assert result["delivery_state"] == "SUBMIT_CONFIRMED"
+    assert result["submit_status"] == "SUBMIT_CONFIRMED"
+    pane = service.terminal_tail(session, 10)["output"]
+    assert "SUBMITTED[1]: hello via send_keys" in pane
+
+
+def test_send_keys_enter_survives_the_busy_footer_before_echo_race(tmux_session_factory, tmp_path):
+    # Same real race the terminal_send_text fix already covers -- a raw
+    # Enter must ALSO keep polling rather than report DELIVERY_UNKNOWN off
+    # a single premature frame.
+    session = _claude_session(tmux_session_factory, "test-claude-sendkeys-race", "busy_footer_before_echo")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    service.terminal_send_text(session, "diag via send_keys", press_enter=False)
+    result = service.terminal_send_keys(session, ["Enter"])
+    assert result["delivery_state"] == "SUBMIT_CONFIRMED", result
+    pane = service.terminal_tail(session, 10)["output"]
+    assert "SUBMITTED[1]: diag via send_keys" in pane
+
+
+def test_send_keys_enter_never_echoes_correctly_reports_unconfirmed(tmux_session_factory, tmp_path):
+    # A genuine failure (no ack evidence ever appears) must still
+    # correctly time out to DELIVERY_UNKNOWN -- never upgraded to a false
+    # SUBMIT_CONFIRMED just because verification was added.
+    session = _claude_session(tmux_session_factory, "test-claude-sendkeys-never-echo", "never_echoes")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    service.terminal_send_text(session, "diag via send_keys", press_enter=False)
+    result = service.terminal_send_keys(session, ["Enter"])
+    assert result["delivery_state"] == "DELIVERY_UNKNOWN"
+    assert result["sent"] is True  # the write itself still succeeded
+
+
+def test_send_keys_non_enter_key_combinations_unaffected_no_verification(tmux_session_factory, tmp_path):
+    # Scope discipline: ONLY a single ["Enter"] gets verification --
+    # every other key (or a multi-key send) keeps the exact prior,
+    # unverified shape (no delivery_state/submit_status fields at all).
+    session = _claude_session(tmux_session_factory, "test-claude-sendkeys-other", "normal_submit")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_keys(session, ["Escape"])
+    assert result["sent"] is True
+    assert "delivery_state" not in result
+
+
+def test_extract_composer_text_strips_prompt_marker():
+    snapshot = ["some earlier line", "> hello world"]
+    assert _extract_composer_text(snapshot) == "hello world"
+
+
+def test_extract_composer_text_real_reported_shape():
+    # The exact real pane shape from the live window2 report.
+    snapshot = [
+        "new task? /clear to save 891k tokens",
+        "> Làm Role/Permission step 2 custom role web đi",
+    ]
+    assert _extract_composer_text(snapshot) == "Làm Role/Permission step 2 custom role web đi"
+
+
+def test_extract_composer_text_no_marker_uses_whole_line():
+    assert _extract_composer_text(["just text, no marker"]) == "just text, no marker"
+
+
+def test_extract_composer_text_skips_trailing_blank_lines():
+    assert _extract_composer_text(["> real text", "", "  "]) == "real text"
+
+
+def test_extract_composer_text_empty_snapshot_returns_empty():
+    assert _extract_composer_text([]) == ""

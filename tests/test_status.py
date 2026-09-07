@@ -28,6 +28,34 @@ def test_running_and_idle_classification():
     assert classify_status(info("bash", 1), "$", now=100)[0] == "IDLE"
 
 
+def test_ordinary_composer_mentioning_permission_is_not_waiting_input():
+    # Real false positive, found LIVE against a real attended session
+    # (`window2`, 2026-09-07): status.py's own WAIT_PATTERNS used to
+    # duplicate adapters.py's now-fixed bare r"\bpermission\b" bug --
+    # this exact reported composer/status-line shape used to make
+    # classify_status report WAITING_INPUT/input_required=True for a
+    # completely ordinary, idle session.
+    output = (
+        "hết, JS chỉ render, mọi quyền/luật/audit/transaction nằm ở .NET bridge/service.\n"
+        "✻ Worked for 14m 33s · done 2:31 AM\n"
+        "                    new task? /clear to save 891k tokens\n"
+        "> Làm Role/Permission step 2 custom role web đi\n"
+        "  ⏵⏵ auto mode on (shift+tab to cycle) · install gh for PR status · ← for agents"
+    )
+    waiting, reason = detect_waiting_input(output)
+    assert waiting is False
+    state, input_required, _reason = classify_status(info("claude", 5), output, now=100)
+    assert state != "WAITING_INPUT"
+    assert input_required is False
+
+
+def test_real_yn_dialog_still_detected_as_waiting_input():
+    # Removing the bare "approve"/"permission" words must not weaken
+    # real detection -- the actual y/n dialog shape is unaffected.
+    waiting, _reason = detect_waiting_input("Allow this command to run?\napprove or deny? [y/n]")
+    assert waiting is True
+
+
 # ---------------------------------------------------------------------------
 # P0-7: structured completion marker
 # ---------------------------------------------------------------------------

@@ -144,6 +144,28 @@ PANE_LEASE_WAIT_SECONDS = 5.0
 PANE_LEASE_POLL_INTERVAL_SECONDS = 0.1
 
 
+def _extract_composer_text(snapshot: list[str]) -> str:
+    """Best-effort read of whatever text is currently sitting in a
+    composer's own last non-empty line, for `_send_enter_key_verified_
+    locked`'s own ack-evidence check -- that call never typed the text
+    itself (a bare Enter alone), so this is the only source for what
+    `adapters.py`'s own `submit_ack_evidence`/`_sent_text_echoed` should
+    require an echo of during the busy-window race case. Strips a
+    leading `"> "` composer-prompt marker (the shape every real Claude/
+    Codex composer and this project's own test fixtures use) if present
+    -- never a claim of parsing every possible composer chrome, just the
+    common, well-established one. An empty/unreadable snapshot returns
+    "" (falls back to `_sent_text_echoed`'s own documented trivially-
+    true behavior for nothing to attribute -- never raises)."""
+    for line in reversed(snapshot):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        marker = stripped.find("> ")
+        return stripped[marker + 2:] if marker != -1 else stripped
+    return ""
+
+
 class TerminalService:
     def __init__(self, config: AppConfig, tmux: SessionBackend | None = None,
                  bindings: BindingStore | None = None,
@@ -1655,10 +1677,30 @@ class TerminalService:
         """P0 Part B: raw key sends (terminal_send_keys) share the exact
         same durable cross-process pane lease as terminal_send_text -- "any
         text/key send" (see lease.py) means both, not just the verified
-        text-composition path. No adapter/verification involved here (this
-        is the same unverified raw send terminal_send_keys always was);
-        the lease's only job for this caller is stopping two processes'
-        raw key sequences from interleaving into the same pane."""
+        text-composition path. The lease's own job for this caller is
+        stopping two processes' raw key sequences from interleaving into
+        the same pane -- unchanged from before.
+
+        Real-Enter acceptance verification (P0 fix, 2026-09-07, task:
+        "Do not report sent=true for send_keys Enter unless PTY write
+        succeeded; add acceptance verification path where possible"):
+        a single `["Enter"]` send -- overwhelmingly the common real use
+        (submitting whatever text is already sitting in the composer,
+        exactly the shape a real live report found `sent: true` gave no
+        actual confirmation for) -- now gets the SAME adapter-based ack-
+        evidence verification `terminal_send_text`'s own press_enter path
+        already uses (`_poll_for_submission`/`_poll_for_ack_evidence`,
+        reused as-is, not re-implemented), with an EMPTY sent_text (this
+        call never typed anything itself, so there is no specific text to
+        require an echo of -- `_sent_text_echoed` already treats an empty
+        string as trivially satisfied, so this only ever requires genuine
+        progress evidence, never a text match). Adds `delivery_state`/
+        `submit_status`/`submit_reason` fields; `sent` keeps its EXACT
+        prior meaning (the write itself succeeded) for backward
+        compatibility -- a caller that only ever checked `sent` sees no
+        behavior change. Every OTHER key combination (not exactly
+        `["Enter"]`) keeps the EXACT prior unverified behavior --
+        deliberately narrow, not a general raw-key verification system."""
         identity = self.resolve_identity(session)
         lock_key = f"{identity.session_id}:{identity.pane_id}" if identity is not None else f"name:{session}"
         correlation_id = uuid.uuid4().hex
@@ -1667,12 +1709,67 @@ class TerminalService:
                     "reason": "another process is currently holding the send lease for this pane"}
         try:
             with self._pane_locks.get(lock_key):
-                self.tmux.send_keys(session, keys)
-                return {"session": session, "sent": True, "keys": keys, "correlation_id": correlation_id}
+                if keys != ["Enter"]:
+                    self.tmux.send_keys(session, keys)
+                    return {"session": session, "sent": True, "keys": keys, "correlation_id": correlation_id}
+                return self._send_enter_key_verified_locked(session, keys, correlation_id=correlation_id)
         except TmuxError as exc:
             return {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
         finally:
             self.leases.release(lock_key, correlation_id)
+
+    def _send_enter_key_verified_locked(self, session: str, keys: list[str], *, correlation_id: str) -> dict[str, Any]:
+        try:
+            info_before = self.tmux.get_session(session)
+        except TmuxError:
+            info_before = None
+        command_before = (info_before.pane_current_command if info_before is not None else "") or ""
+        adapter = select_adapter(command_before)
+        try:
+            typed_snapshot = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
+        except TmuxError:
+            typed_snapshot = None
+
+        self.tmux.send_keys(session, keys)
+        result: dict[str, Any] = {"session": session, "sent": True, "keys": keys,
+                                  "correlation_id": correlation_id, "agent_type": adapter.name}
+        if typed_snapshot is None:
+            result["delivery_state"] = DELIVERY_UNKNOWN
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
+            result["submit_reason"] = "could not capture a pre-send baseline to verify against"
+            return result
+
+        # The expected echo text for the busy-window ack check (see
+        # adapters.py's own submit_ack_evidence -- "if was_busy: return
+        # _sent_text_echoed(after, sent_text)") is read straight from the
+        # composer's OWN pre-Enter content, never blindly empty -- an
+        # empty sent_text would make _sent_text_echoed trivially True
+        # (by design, for a caller with genuinely nothing to attribute),
+        # which would silently defeat the exact busy-window race guard
+        # this whole mechanism exists for (found live, in this project's
+        # own test suite, before this line existed: a busy-footer-before-
+        # echo transitional frame was wrongly confirmed with no real
+        # echo ever checked). This call never typed the text itself, so
+        # there is no other source for it.
+        expected_text = _extract_composer_text(typed_snapshot)
+
+        verify_timeout = (RECOVERY_VERIFY_TIMEOUT_SECONDS if adapter.name in WIDE_VERIFY_ADAPTERS
+                          else SEND_VERIFY_TIMEOUT_SECONDS)
+        deadline = time.monotonic() + verify_timeout
+        _, first_after, _reason = self._poll_for_submission(session, typed_snapshot, timeout=verify_timeout)
+        confirmed, after = self._poll_for_ack_evidence(session, typed_snapshot, first_after, adapter, expected_text,
+                                                       deadline=deadline)
+        if confirmed:
+            result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
+            result["submit_reason"] = "confirmed via adapter ack evidence"
+        else:
+            result["delivery_state"] = DELIVERY_UNKNOWN
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
+            result["submit_reason"] = ("pane changed but no adapter ack evidence found in time" if after != typed_snapshot
+                                       else "the pane looked identical to its pre-send state throughout the "
+                                            "verification window")
+        return result
 
     def terminal_exit_copy_mode(self, *, session: str | None = None,
                                 binding: str | None = None) -> dict[str, Any]:
