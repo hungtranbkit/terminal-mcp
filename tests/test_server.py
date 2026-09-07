@@ -121,6 +121,10 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_task_approve_plan",
         "terminal_task_children",
         "terminal_task_complete_parent",
+        # Git isolation policy (§20.4).
+        "terminal_task_create_isolated",
+        "terminal_worktree_status",
+        "terminal_worktree_cleanup",
     }
 
 

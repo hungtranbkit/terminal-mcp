@@ -23,13 +23,14 @@ class IntegrationService:
                  main_branch: str = "main", targeted_test_command: list[str] | None = None,
                  full_regression_command: list[str] | None = None, batch_size: int = 3,
                  batch_max_wait_seconds: float = 1800, auto_promote_enabled: bool = False,
-                 session_ownership: dict[str, str] | None = None, review_depth: str = "basic") -> dict[str, Any]:
+                 session_ownership: dict[str, str] | None = None, review_depth: str = "basic",
+                 allow_mechanical_conflict_resolution: bool = False) -> dict[str, Any]:
         return self.store.configure_pipeline(
             project, repo_path=repo_path, integration_branch=integration_branch, main_branch=main_branch,
             targeted_test_command=targeted_test_command, full_regression_command=full_regression_command,
             batch_size=batch_size, batch_max_wait_seconds=batch_max_wait_seconds,
             auto_promote_enabled=auto_promote_enabled, session_ownership=session_ownership,
-            review_depth=review_depth,
+            review_depth=review_depth, allow_mechanical_conflict_resolution=allow_mechanical_conflict_resolution,
         )
 
     def status(self, project: str) -> dict[str, Any]:

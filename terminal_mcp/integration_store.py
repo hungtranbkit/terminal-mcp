@@ -360,8 +360,23 @@ def _create_v1_schema(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX idx_integration_events_project ON integration_events(project, id)")
 
 
+def _add_v2_mechanical_conflict_resolution_column(connection: sqlite3.Connection) -> None:
+    """Git isolation + Merge Agent checkpoint (§20.4): a project-level,
+    OFF-by-default opt-in for the mechanical-only conflict auto-resolve
+    integration_engine.py's own _merge now attempts before giving up and
+    routing to REWORK_REQUIRED (see that module's own docstring on why
+    this is safe -- git's own -X ignore-all-space merge strategy, never
+    a custom content-guessing resolution of this project's own)."""
+    connection.execute(
+        "ALTER TABLE integration_pipelines ADD COLUMN allow_mechanical_conflict_resolution "
+        "INTEGER NOT NULL DEFAULT 0"
+    )
+
+
 INTEGRATION_MIGRATIONS = [
     Migration(1, "initial Integration Agent schema (pipelines/handoffs/batches/events)", _create_v1_schema),
+    Migration(2, "Git isolation + Merge Agent: allow_mechanical_conflict_resolution opt-in",
+             _add_v2_mechanical_conflict_resolution_column),
 ]
 
 
@@ -398,21 +413,26 @@ class IntegrationStore:
                            full_regression_command: list[str] | None = None, batch_size: int = 3,
                            batch_max_wait_seconds: float = 1800, auto_promote_enabled: bool = False,
                            session_ownership: dict[str, str] | None = None,
-                           review_depth: str = "basic") -> dict[str, Any]:
+                           review_depth: str = "basic",
+                           allow_mechanical_conflict_resolution: bool = False) -> dict[str, Any]:
         """Creates or updates `project`'s pipeline config. session_ownership
         is an OPTIONAL {path_prefix: session_name} map -- the rework-
         routing fallback heuristic (item 9) used only when a handoff's
         own origin_session no longer looks like the right owner (see
         integration_engine.py's own resolve_rework_owner). review_depth
         ("basic" | "deep") governs integration_reviewer.py's own pre-
-        merge review gate depth."""
+        merge review gate depth. allow_mechanical_conflict_resolution
+        (§20.4, OFF by default): opts this project into integration_
+        engine.py's own mechanical-only (whitespace-only) conflict auto-
+        resolve retry -- never a semantic/content-guessing resolution."""
         now = iso_now()
         with self._connection() as connection:
             connection.execute(
                 "INSERT INTO integration_pipelines (project, paused, paused_reason, repo_path, integration_branch, "
                 "main_branch, targeted_test_command, full_regression_command, batch_size, batch_max_wait_seconds, "
-                "auto_promote_enabled, session_ownership, review_depth, created_at, updated_at) "
-                "VALUES (?, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "auto_promote_enabled, session_ownership, review_depth, allow_mechanical_conflict_resolution, "
+                "created_at, updated_at) "
+                "VALUES (?, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(project) DO UPDATE SET repo_path=excluded.repo_path, "
                 "integration_branch=excluded.integration_branch, main_branch=excluded.main_branch, "
                 "targeted_test_command=excluded.targeted_test_command, "
@@ -420,12 +440,14 @@ class IntegrationStore:
                 "batch_max_wait_seconds=excluded.batch_max_wait_seconds, "
                 "auto_promote_enabled=excluded.auto_promote_enabled, "
                 "session_ownership=excluded.session_ownership, review_depth=excluded.review_depth, "
+                "allow_mechanical_conflict_resolution=excluded.allow_mechanical_conflict_resolution, "
                 "updated_at=excluded.updated_at",
                 (project, repo_path, integration_branch, main_branch,
                  json.dumps(targeted_test_command) if targeted_test_command else None,
                  json.dumps(full_regression_command) if full_regression_command else None,
                  batch_size, batch_max_wait_seconds, int(auto_promote_enabled),
-                 json.dumps(session_ownership) if session_ownership else None, review_depth, now, now),
+                 json.dumps(session_ownership) if session_ownership else None, review_depth,
+                 int(allow_mechanical_conflict_resolution), now, now),
             )
         return self.get_pipeline(project)
 
@@ -441,6 +463,7 @@ class IntegrationStore:
             "auto_promote_enabled": bool(row["auto_promote_enabled"]),
             "session_ownership": _parse_json_object(row["session_ownership"]),
             "review_depth": row["review_depth"],
+            "allow_mechanical_conflict_resolution": bool(row["allow_mechanical_conflict_resolution"]),
             "created_at": row["created_at"], "updated_at": row["updated_at"],
         }
 
@@ -832,6 +855,15 @@ def publish_handoff_for_completed_task(task: Any, store: IntegrationStore) -> Ha
     docs_exempt = (task.metadata or {}).get("docs_exempt")
     if docs_exempt and "docs_exempt" not in artifacts:
         artifacts["docs_exempt"] = docs_exempt
+    # Git isolation checkpoint (§20.4): same "carry task metadata into
+    # artifacts, no schema change" precedent as docs_exempt just above
+    # -- a task created via GitIsolationService.create_isolated_task
+    # carries its own real worktree_path/branch/base_sha through onto
+    # the Handoff it eventually produces, for the Integration Agent's
+    # own real audit trail (never a second place this is recorded).
+    git_isolation = (task.metadata or {}).get("git_isolation")
+    if git_isolation and "worktree_path" not in artifacts:
+        artifacts["worktree_path"] = git_isolation.get("worktree_path")
     return store.publish_handoff(
         project=spec["project"], task_id=task.id, origin_session=task.session, branch=spec["branch"],
         commit_sha=spec["commit_sha"], base_sha=spec["base_sha"], changed_paths=spec.get("changed_paths") or [],

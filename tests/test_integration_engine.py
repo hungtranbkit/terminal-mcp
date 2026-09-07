@@ -317,3 +317,120 @@ def test_auto_promote_disabled_by_default_never_touches_main(stores, repo):
     assert result.action == "MERGE_READY"  # reached MERGE_READY but did NOT auto-promote
     _git(["checkout", "-q", "main"], repo)
     assert not (repo / "a.txt").exists()  # main untouched
+
+
+# ---------------------------------------------------------------------------
+# Git isolation + Merge Agent checkpoint (§20.4): mechanical-only
+# (whitespace-only) conflict auto-resolve, opt-in per project, real git
+# behavior throughout -- never a custom content-guessing heuristic.
+# ---------------------------------------------------------------------------
+
+def _commit_base_file(repo, filename, content):
+    _git(["checkout", "-q", "main"], repo)
+    (repo / filename).write_text(content)
+    _git(["add", "."], repo)
+    _git(["commit", "-q", "-m", "base content"], repo)
+    _git(["branch", "-f", "integration", "main"], repo)
+
+
+def test_whitespace_only_conflict_auto_resolved_when_opted_in(stores, repo):
+    # base line has 2-space indentation; branch A changes it to 4-space,
+    # branch B changes the SAME line to tab-indentation -- a REAL git
+    # conflict (both sides touched the same line), but the two versions
+    # differ from each other ONLY in whitespace.
+    _commit_base_file(repo, "shared.txt", "function foo() {\n  return 1;\n}\n")
+    _configure(stores["integration"], repo, allow_mechanical_conflict_resolution=True)
+
+    sha_a, base_a = _commit_on_branch(repo, "feature/a", "shared.txt",
+                                      "function foo() {\n    return 1;\n}\n")
+    sha_b, base_b = _commit_on_branch(repo, "feature/b", "shared.txt",
+                                      "function foo() {\n\treturn 1;\n}\n")
+
+    handoff_a = _publish_handoff(stores["integration"], project="proj-a", task_id="t1", origin_session="lane-a",
+                                 branch="feature/a", commit_sha=sha_a, base_sha=base_a,
+                                 changed_paths=["shared.txt"])
+    handoff_b = _publish_handoff(stores["integration"], project="proj-a", task_id="t2", origin_session="lane-b",
+                                 branch="feature/b", commit_sha=sha_b, base_sha=base_b,
+                                 changed_paths=["shared.txt"])
+    engine = _engine(stores)
+
+    engine.tick("proj-a")  # CLAIMED (a)
+    engine.tick("proj-a")  # MERGED (a)
+    engine.tick("proj-a")  # INTEGRATED (a)
+    assert stores["integration"].get_handoff(handoff_a.id).status == INTEGRATED
+
+    engine.tick("proj-a")  # CLAIMED (b)
+    merge_result = engine.tick("proj-a")  # attempts merge -> real conflict -> mechanical retry succeeds
+    assert merge_result.action == "MERGED"
+
+    handoff_b_final = stores["integration"].get_handoff(handoff_b.id)
+    assert handoff_b_final.status == TARGETED_TEST
+    assert handoff_b_final.conflict_detected is False  # never recorded as an unresolved conflict
+    assert handoff_b_final.artifacts["mechanical_conflict_auto_resolved"] is True
+    assert "shared.txt" in handoff_b_final.artifacts["mechanical_conflict_original_paths"]
+
+    # The integration branch is clean, no leftover conflict markers.
+    _git(["checkout", "-q", "integration"], repo)
+    status = _git(["status", "--porcelain"], repo).stdout
+    assert status.strip() == ""
+    assert "<<<<<<<" not in (repo / "shared.txt").read_text()
+
+
+def test_real_content_conflict_still_routes_rework_even_when_opted_in(stores, repo):
+    # Genuinely different CONTENT (not just whitespace) on the same
+    # line -- the mechanical retry must also conflict, so this still
+    # correctly falls through to REWORK_REQUIRED, never silently picking
+    # a side.
+    _commit_base_file(repo, "shared.txt", "version base\n")
+    _configure(stores["integration"], repo, allow_mechanical_conflict_resolution=True)
+
+    sha_a, base_a = _commit_on_branch(repo, "feature/a", "shared.txt", "version A\n")
+    sha_b, base_b = _commit_on_branch(repo, "feature/b", "shared.txt", "version B (conflicting)\n")
+
+    handoff_a = _publish_handoff(stores["integration"], project="proj-a", task_id="t1", origin_session="lane-a",
+                                 branch="feature/a", commit_sha=sha_a, base_sha=base_a,
+                                 changed_paths=["shared.txt"])
+    handoff_b = _publish_handoff(stores["integration"], project="proj-a", task_id="t2", origin_session="lane-b",
+                                 branch="feature/b", commit_sha=sha_b, base_sha=base_b,
+                                 changed_paths=["shared.txt"])
+    engine = _engine(stores)
+
+    engine.tick("proj-a")  # CLAIMED (a)
+    engine.tick("proj-a")  # MERGED (a)
+    engine.tick("proj-a")  # INTEGRATED (a)
+
+    engine.tick("proj-a")  # CLAIMED (b)
+    merge_result = engine.tick("proj-a")
+    assert merge_result.action == "REWORK_REQUIRED"
+    handoff_b_final = stores["integration"].get_handoff(handoff_b.id)
+    assert handoff_b_final.status == REWORK_REQUIRED
+    assert handoff_b_final.conflict_detected is True
+    assert "mechanical_conflict_auto_resolved" not in handoff_b_final.artifacts
+
+    _git(["checkout", "-q", "integration"], repo)
+    assert _git(["status", "--porcelain"], repo).stdout.strip() == ""
+
+
+def test_mechanical_conflict_resolution_disabled_by_default(stores, repo):
+    # Same whitespace-only scenario as above, but WITHOUT opting in --
+    # must fall through to REWORK_REQUIRED exactly like before this
+    # feature existed (never a silent behavior change for an unconfigured
+    # project).
+    _commit_base_file(repo, "shared.txt", "function foo() {\n  return 1;\n}\n")
+    _configure(stores["integration"], repo)  # allow_mechanical_conflict_resolution defaults False
+
+    sha_a, base_a = _commit_on_branch(repo, "feature/a", "shared.txt",
+                                      "function foo() {\n    return 1;\n}\n")
+    sha_b, base_b = _commit_on_branch(repo, "feature/b", "shared.txt",
+                                      "function foo() {\n\treturn 1;\n}\n")
+    _publish_handoff(stores["integration"], project="proj-a", task_id="t1", origin_session="lane-a",
+                     branch="feature/a", commit_sha=sha_a, base_sha=base_a, changed_paths=["shared.txt"])
+    handoff_b = _publish_handoff(stores["integration"], project="proj-a", task_id="t2", origin_session="lane-b",
+                                 branch="feature/b", commit_sha=sha_b, base_sha=base_b,
+                                 changed_paths=["shared.txt"])
+    engine = _engine(stores)
+    engine.tick("proj-a"); engine.tick("proj-a"); engine.tick("proj-a")  # a: claim/merge/integrate
+    engine.tick("proj-a")  # CLAIMED (b)
+    merge_result = engine.tick("proj-a")
+    assert merge_result.action == "REWORK_REQUIRED"
+    assert stores["integration"].get_handoff(handoff_b.id).status == REWORK_REQUIRED

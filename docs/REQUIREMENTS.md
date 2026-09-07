@@ -1230,6 +1230,86 @@ migration on the EXISTING `handoffs` table, not a new one.
   flight; a project may require a rebase-and-rerun-tests step
   immediately before a Handoff is accepted.
 
+#### 20.4a Implementation note (2026-09-07, VERIFIED — worktree isolation + mechanical-only conflict retry)
+
+**Status: VERIFIED** (unit tests with real git subprocess calls
+throughout — no mocks — + a real disposable-tmux-session live E2E).
+Confirms this section's own "mostly REUSE" framing was accurate: the
+Coordinator's existing `expected_cwd` check (§8, unchanged, zero new
+code — its own error message already said "expected worktree" before
+this checkpoint ever existed) is the ENTIRE isolation enforcement
+mechanism; this checkpoint only needed to create a real worktree and
+point that field at it.
+
+- `git_worktree.py` (new) — real, bounded `git` subprocess calls
+  (`create_worktree`/`remove_worktree`/`worktree_status`/
+  `list_worktrees`), same fail-closed/no-`shell=True` posture as every
+  other git-touching module in this project. `create_worktree` resolves
+  `base_ref` to a real commit SHA first (fail-closed if unresolvable),
+  refuses to reuse an already-existing branch name.
+- `git_isolation_service.py` (new) — `GitIsolationService.
+  create_isolated_task` creates the real worktree+branch FIRST (branch
+  name `task/<short-random-id>-<slug>`, not literally `task/T<task_id>-
+  <slug>` — the worktree must exist before `QueueService.create_task`
+  mints the real task_id, so a short random id is used for the branch
+  string instead; the real correlation always lives in `metadata.
+  git_isolation`, traceability is never lost), then creates the task
+  with `metadata.expected_cwd` pointed at it — reusing the Coordinator's
+  existing check, not extending it. Rolls back (removes) the worktree
+  if task creation itself fails (e.g. an invalid session name), so a
+  failed call never leaks an orphaned worktree. `worktree_status_for_
+  task`/`cleanup_worktree_for_task` (explicit, manual — no auto-cleanup
+  in this checkpoint, a worktree may still be genuinely needed for
+  debugging after its task reaches a terminal state).
+- `integration_store.py`'s `publish_handoff_for_completed_task` now
+  also carries `metadata.git_isolation.worktree_path` into the
+  resulting Handoff's own `artifacts["worktree_path"]` — same "carry
+  task metadata into artifacts, no schema change" precedent as the
+  pre-existing `docs_exempt` field.
+- **Mechanical-only conflict auto-resolve** (`integration_engine.py`'s
+  `_merge`): a new, project-level, OFF-by-default opt-in
+  (`allow_mechanical_conflict_resolution`, additive `integration_
+  pipelines` column) — on a real merge conflict, ONE retry using git's
+  own `-X ignore-all-space` merge strategy (a real, well-defined git
+  feature that only ever affects whitespace-only differences) before
+  falling back to the pre-existing `REWORK_REQUIRED` path. A retry that
+  still conflicts (a genuine content/semantic conflict) falls through
+  completely unchanged — never a custom content-guessing resolution of
+  this codebase's own (task's own explicit "không tự đoán business
+  logic"). A successful mechanical resolution is disclosed on the
+  Handoff itself (`artifacts.mechanical_conflict_auto_resolved: true`
+  + the original conflicted paths) — never silently indistinguishable
+  from an ordinary clean merge.
+- **Not built in this checkpoint** (disclosed): PM-based routing of the
+  Integration Agent to a specific capability-profiled session — the
+  existing architecture's Integration Agent is "a pure backend engine
+  with NO real interactive tmux session of its own" (§9), which doesn't
+  cleanly map onto PM/session routing without a deeper redesign; forcing
+  it now risked an ill-fitting change. The rebase-before-start policy
+  (a still-QUEUED task refreshing its own base) is also not built yet.
+- Tests: `tests/test_git_worktree.py` (11, real git subprocess calls),
+  `tests/test_git_isolation_service.py` (9, including 2 real
+  Coordinator-gate integration tests proving the reuse claim directly),
+  `tests/test_git_isolation_mcp_tools.py` (4), 3 new in `tests/
+  test_integration_engine.py` (real whitespace-only conflict correctly
+  auto-resolved; a real content conflict still correctly routes to
+  REWORK_REQUIRED even when opted in; disabled-by-default unchanged
+  behavior), 2 new in `tests/test_integration_hook.py` (worktree_path
+  threading). Full suite green.
+- **Live evidence** (a real disposable git repo + a real disposable
+  tmux session + the real MCP `server.call_tool` path — never `window`/
+  `window2`/`wtest`): created a real isolated task via `terminal_task_
+  create_isolated` — confirmed a real worktree directory + branch now
+  exist on disk; `terminal_worktree_status` reported it `exists`/clean;
+  the session's own REAL, live cwd (read via `terminal_status`) was
+  still the base repo, not the worktree — the Coordinator's existing
+  gate correctly returned `NEEDS_HUMAN` with the pre-existing "expected
+  worktree" reason text; a real `cd <worktree_path>` was sent through
+  `terminal_send_text` (`SUBMIT_CONFIRMED`), the session's own live cwd
+  was re-observed and now genuinely matched; the SAME Coordinator gate
+  (zero code changed) now correctly returned `READY`. Disposable
+  session/repo/state cleaned up after.
+
 ### 20.5 Kanban UI (Global Tasks)
 
 A new dashboard screen/route, reading the SAME queue store as
@@ -2623,6 +2703,23 @@ scan/audit view over the SAME facts.)*
     CHATGPT_USAGE.md`. The REST of §20 (git worktree isolation, the
     Integration/Merge Agent extension, the Phase A-E Startup Operating
     Model) remains PLANNED, unbuilt.
+19. **Unified Task System §20.4's git isolation policy + mechanical-only
+    conflict auto-resolve are now VERIFIED and live** (2026-09-07) —
+    see §20.4a's own full implementation note (confirms the section's
+    own "mostly REUSE" framing: the Coordinator's pre-existing
+    `expected_cwd` check needed ZERO new code; new git_worktree.py/
+    git_isolation_service.py modules, the new mechanical-conflict retry
+    in integration_engine.py's `_merge` — real git `-X ignore-all-space`
+    behavior, never a custom content-guessing resolution; MCP tools,
+    tests with real git subprocess calls throughout, live disposable
+    E2E evidence with a real tmux session proving the Coordinator gate
+    genuinely refuses a mismatched cwd and accepts a matching one) and
+    §4d of `docs/CHATGPT_USAGE.md`. NOT built: PM-based routing of the
+    Integration Agent to a specific capability-profiled session (doesn't
+    cleanly map onto the existing architecture without a deeper
+    redesign — disclosed, deferred) and the rebase-before-start policy.
+    The REST of §20 (the Phase A-E Startup Operating Model) remains
+    PLANNED, unbuilt.
 
 ---
 

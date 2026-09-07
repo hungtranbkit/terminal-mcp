@@ -34,6 +34,7 @@ after the (possibly no-op) merge completes.
 from __future__ import annotations
 
 import calendar
+import json
 import subprocess
 import time
 from dataclasses import dataclass
@@ -199,6 +200,47 @@ class IntegrationEngine:
             conflict_paths = _conflicted_paths(repo_path)
             _run_git(["merge", "--abort"], repo_path, check=False)
             if conflict_paths:
+                # Git isolation + Merge Agent checkpoint (§20.4): before
+                # giving up, a project that has explicitly opted in
+                # (allow_mechanical_conflict_resolution) gets exactly
+                # ONE retry using git's own `-X ignore-all-space` merge
+                # strategy -- this is a real, well-defined git feature
+                # that only ever affects WHITESPACE-only differences; if
+                # the conflict was genuinely about content (business
+                # logic), this retry will conflict again, identically,
+                # never silently picking a side. Only a retry that
+                # succeeds CLEANLY (returncode 0, no conflicted paths at
+                # all) proves the original conflict was mechanical --
+                # this project's OWN git operations decide that, never a
+                # custom content-guessing heuristic of this codebase's
+                # own (task's own explicit "không tự đoán business
+                # logic").
+                if pipeline.get("allow_mechanical_conflict_resolution"):
+                    retry_result = _run_git(
+                        ["merge", "--no-ff", "-X", "ignore-all-space", "-m",
+                         f"integrate {handoff.branch} ({handoff.commit_sha[:8]}) task={handoff.task_id} "
+                         f"[mechanical conflict auto-resolved]", handoff.commit_sha],
+                        repo_path, check=False,
+                    )
+                    if retry_result.returncode == 0 and not _conflicted_paths(repo_path):
+                        merge_commit_sha = _run_git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+                        artifacts = dict(handoff.artifacts)
+                        artifacts["mechanical_conflict_auto_resolved"] = True
+                        artifacts["mechanical_conflict_original_paths"] = conflict_paths
+                        self.store.transition_handoff(
+                            handoff.id, TARGETED_TEST, event_type="MERGED_MECHANICAL_CONFLICT_RESOLVED",
+                            reason=f"whitespace-only conflict in {conflict_paths} auto-resolved via "
+                                  f"-X ignore-all-space",
+                            extra_fields={"merge_commit_sha": merge_commit_sha,
+                                         "artifacts": json.dumps(artifacts)},
+                        )
+                        return EngineResult(project, "MERGED", handoff_id=handoff.id, detail=merge_commit_sha)
+                    # Retry still conflicts (or failed outright) -- a
+                    # genuine content conflict, never resolved here.
+                    # `merge --abort` may have nothing to abort if the
+                    # retry itself failed before creating a conflict
+                    # state; check=False below tolerates either.
+                    _run_git(["merge", "--abort"], repo_path, check=False)
                 rework_task_id = self._route_rework(
                     project, handoff, pipeline, paths=conflict_paths,
                     reason=f"merge conflict in {', '.join(conflict_paths)}",

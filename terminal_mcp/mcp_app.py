@@ -12,6 +12,7 @@ from .integration_engine import IntegrationEngine
 from .task_migration import TaskMigrationPlanner
 from .integration_service import IntegrationService
 from .integration_store import publish_handoff_for_completed_task
+from .git_isolation_service import GitIsolationService
 from .node_models import node_to_dict as _node_to_dict
 from .planner_service import PlannerService
 from .planner_store import PlannerStore
@@ -105,6 +106,10 @@ def build_mcp(service: TerminalService | None = None,
     # Planner (task-breaking, §20.3): reads/writes the SAME queue store
     # as everything above -- never a second queue/task store.
     planner = planner or PlannerService(PlannerStore(), queue)
+    # Git isolation (§20.4): stateless glue (no store of its own) -- the
+    # real state lives entirely in the SAME queue store, on each task's
+    # own metadata.
+    git_isolation = GitIsolationService(queue)
     # Task Migration/Load Balancing: same node-aware controller as
     # everything else, so eligibility checks (item 6) resolve a
     # destination session's real cwd/node_id regardless of which node
@@ -1313,6 +1318,49 @@ def build_mcp(service: TerminalService | None = None,
         Refuses (NOT_A_SPLIT_PARENT) for a task that was never split."""
         return planner.complete_parent_if_children_done(parent_task_id)
 
+    # -- Git isolation policy (docs/REQUIREMENTS.md §20.4). A coding task
+    # gets its own real worktree+branch; the EXISTING Coordinator pre-
+    # dispatch gate (§8, zero new code) already verifies a session's
+    # live cwd matches this task's own expected_cwd -- these tools only
+    # create/inspect/clean up the real git side of that.
+
+    @server.tool()
+    def terminal_task_create_isolated(title: str, prompt: str, repo_path: str, base_ref: str = "HEAD",
+                                      assigned_session_id: str | None = None, priority: int = 0,
+                                      project: str | None = None, metadata: dict | None = None,
+                                      worktree_root: str | None = None) -> dict:
+        """Creates a REAL git worktree + branch (from `base_ref`, e.g.
+        "main"/"integration"/a specific SHA) for a coding task, then
+        creates the task with `metadata.expected_cwd` pointed at it --
+        the target session must actually be cd'd into that exact
+        worktree before this task can dispatch (the Coordinator's own
+        existing gate enforces this automatically; a session still on
+        shared `main`/another task's worktree is refused NEEDS_HUMAN,
+        never silently allowed through). `assigned_session_id` omitted
+        creates an UNASSIGNED isolated task, same semantics as
+        terminal_task_create."""
+        return git_isolation.create_isolated_task(
+            title, prompt, repo_path=repo_path, base_ref=base_ref, session=assigned_session_id,
+            priority=priority, project=project, metadata=metadata, worktree_root=worktree_root,
+        )
+
+    @server.tool()
+    def terminal_worktree_status(task_id: str) -> dict:
+        """`worktree_status` (§20.7): real, live `git` introspection
+        (exists/branch/head_sha/dirty) of the isolated worktree
+        `task_id` was created with. Refuses (TASK_NOT_ISOLATED) for a
+        task that was never created via terminal_task_create_isolated."""
+        return git_isolation.worktree_status_for_task(task_id)
+
+    @server.tool()
+    def terminal_worktree_cleanup(task_id: str, force: bool = False) -> dict:
+        """Explicit, manual removal of `task_id`'s own isolated
+        worktree (`git worktree remove`) -- never automatic (a worktree
+        may still be genuinely needed for debugging after its task
+        reaches a terminal state). Refuses a worktree with real
+        uncommitted changes unless `force=True`."""
+        return git_isolation.cleanup_worktree_for_task(task_id, force=force)
+
     @server.tool()
     def terminal_queue_metrics(session: str) -> dict:
         """Item 14's own required metrics: queued_depth,
@@ -1454,20 +1502,26 @@ def build_mcp(service: TerminalService | None = None,
                                        full_regression_command: list[str] | None = None, batch_size: int = 3,
                                        batch_max_wait_seconds: float = 1800, auto_promote_enabled: bool = False,
                                        session_ownership: dict | None = None,
-                                       review_depth: str = "basic") -> dict:
+                                       review_depth: str = "basic",
+                                       allow_mechanical_conflict_resolution: bool = False) -> dict:
         """Creates or updates `project`'s Integration Agent pipeline
         config. auto_promote_enabled defaults False -- promotion to
         main always needs an explicit terminal_integration_promote call
         unless a project has been deliberately opted in. session_ownership
         is an optional {path_prefix: session_name} map, the rework-
         routing fallback (item 9) used only when a handoff's own
-        origin_session no longer looks like the right owner."""
+        origin_session no longer looks like the right owner.
+        allow_mechanical_conflict_resolution (§20.4, OFF by default):
+        opts into a real merge conflict getting ONE mechanical-only
+        (whitespace-only, via git's own -X ignore-all-space) auto-
+        resolve retry before falling back to REWORK_REQUIRED -- never a
+        content/business-logic guess."""
         return integration.configure(
             project, repo_path=repo_path, integration_branch=integration_branch, main_branch=main_branch,
             targeted_test_command=targeted_test_command, full_regression_command=full_regression_command,
             batch_size=batch_size, batch_max_wait_seconds=batch_max_wait_seconds,
             auto_promote_enabled=auto_promote_enabled, session_ownership=session_ownership,
-            review_depth=review_depth,
+            review_depth=review_depth, allow_mechanical_conflict_resolution=allow_mechanical_conflict_resolution,
         )
 
     @server.tool()

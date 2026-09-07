@@ -289,6 +289,41 @@ because you can — a task with no real parallelism/module boundary
 should usually stay as one task. Don't guess `depends_on_indices` —
 only use it when two children genuinely touch overlapping work.
 
+### 4d. Git isolation (a coding task gets its own worktree + branch)
+
+**Status: VERIFIED** — see REQUIREMENTS.md §20.4a for full evidence
+(a real worktree/branch created on disk, and the Coordinator's own
+existing cwd check proven, live, to refuse a mismatched session and
+accept a matching one).
+
+- `terminal_task_create_isolated(title, prompt, repo_path, base_ref="HEAD", assigned_session_id=None, ...)`
+  — creates a REAL `git worktree` + branch from `base_ref` (a branch
+  name, or a specific commit SHA), then creates the task with `metadata.
+  expected_cwd` pointed at it. The target session must actually `cd`
+  into that exact worktree path before this task can dispatch — if it's
+  still on the shared repo root (or another task's own worktree), the
+  Coordinator gate refuses it (`NEEDS_HUMAN`, "session cwd does not
+  match this task's expected worktree") rather than letting it proceed.
+  This is the SAME gate every other task already goes through — nothing
+  extra to call to get this protection.
+- `terminal_worktree_status(task_id)` — real, live `git` status
+  (exists/branch/head_sha/dirty) for the task's own worktree.
+- `terminal_worktree_cleanup(task_id, force=False)` — explicit, manual
+  removal once you're done with a task's worktree. Refuses a worktree
+  with real uncommitted changes unless `force=True`. There is no
+  automatic cleanup — a worktree stays until you remove it.
+- `terminal_integration_configure(..., allow_mechanical_conflict_resolution=True)`
+  — OFF by default. When a project opts in, a real merge conflict gets
+  ONE mechanical-only (whitespace-only) auto-resolve attempt before
+  falling back to the existing `REWORK_REQUIRED` path — a genuine
+  content conflict is completely unaffected by this flag.
+
+**Anti-pattern:** don't create a coding task's session/worktree by hand
+outside this flow and then declare `expected_cwd` yourself unless you
+really know what you're doing — `terminal_task_create_isolated` is what
+keeps the worktree, the branch, and the task's own metadata consistent
+with each other in one real, atomic-ish step (rolled back on failure).
+
 ## 5. Supervisor flow (canonical for watching an unattended session and
 reacting to it needing help)
 
@@ -453,14 +488,17 @@ The Unified Task System is an extension of the Queue/Coordinator/
 Supervisor stack described above. Its **Global Tasks Kanban slice** (§4a
 — `terminal_task_create`/`terminal_task_assign`/`terminal_task_board`,
 the dashboard's `/dashboard/tasks` page), **PM/Orchestrator skill-based
-routing slice** (§4b — `terminal_pm_*` tools, no auto-loop), and
-**Planner split-infrastructure slice** (§4c — `terminal_task_split`/
-`approve_plan`/`children`/`complete_parent`, no auto-complexity-based
-splitter) are all **VERIFIED and callable**. Everything else in that
-design — git worktree isolation, a dedicated Integration/Merge Agent
-role, and the Phase A-E Startup Operating Model — is still **PLANNED**,
-not built, as of this file's own last update. See `docs/REQUIREMENTS.
-md`'s own "Unified Task System" section (§20) for the current
-architecture-in-progress. Nothing beyond §4a/§4b/§4c's tools is
-callable yet; if asked to use any of the rest, say so plainly rather
+routing slice** (§4b — `terminal_pm_*` tools, no auto-loop), **Planner
+split-infrastructure slice** (§4c — `terminal_task_split`/`approve_
+plan`/`children`/`complete_parent`, no auto-complexity-based splitter),
+and **git isolation slice** (§4d — `terminal_task_create_isolated`/
+`worktree_status`/`worktree_cleanup`, plus `allow_mechanical_conflict_
+resolution` on `terminal_integration_configure`) are all **VERIFIED
+and callable**. Everything else in that design — PM-based routing of
+the Integration/Merge Agent to a specific session, and the Phase A-E
+Startup Operating Model — is still **PLANNED**, not built, as of this
+file's own last update. See `docs/REQUIREMENTS.md`'s own "Unified Task
+System" section (§20) for the current architecture-in-progress.
+Nothing beyond §4a/§4b/§4c/§4d's tools is callable yet; if asked to
+use any of the rest, say so plainly rather
 than guessing at a tool name.
