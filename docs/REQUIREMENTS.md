@@ -86,7 +86,8 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Dashboard: Global Task Inbox | VERIFIED |
 | Dashboard: Supervisor/Coordinator panel | VERIFIED |
 | Dashboard: Integration lane view (in Supervisor panel) | VERIFIED |
-| Dashboard: Requirements/Feature Matrix link | PLANNED |
+| Dashboard: AI Usage panel (read-only, local AI Usage Monitor) | VERIFIED |
+| Dashboard: Requirements/Feature Matrix link | VERIFIED |
 | Permissions: read/input grants + effective permissions | VERIFIED |
 | Reliable prompt submission (press-enter, DELIVERY_UNKNOWN, idempotency) | VERIFIED |
 | Supervisor v1 (watch/poll/state machine) | VERIFIED |
@@ -97,12 +98,13 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Coordinator Agent gate | VERIFIED |
 | Coordinator: session-state/git-diverged/smoke-test checks | VERIFIED |
 | Coordinator: doc-update gate (this convention) | VERIFIED |
-| Auto-dispatch background loop (code+tests) | IMPLEMENTED_NOT_LIVE_VERIFIED |
-| Auto-dispatch enabled on any real session (incl. window/window2) | NOT ENABLED (`config.queue.enabled=False` everywhere) |
+| Auto-dispatch background loop (code+tests) | VERIFIED_LIVE (`config.queue.enabled=true` in production — the loop process is real and running) |
+| Auto-dispatch enabled on any real session (incl. window/window2) | NOT ENABLED — 0 of 17 real lanes have `auto_dispatch_enabled` set (confirmed live, 2026-09-07); see Backlog for the exact blocker |
 | 3-role pipeline (Coding A/B + Integration Agent) | VERIFIED (disposable only) |
-| Integration Agent: event-driven WAIT/wake posture | PLANNED |
+| Integration Agent: event-driven WAIT/wake posture | VERIFIED (`integration_loop.py`, `config.integration_loop.enabled=false` by default — not yet turned on for a real project) |
 | Task Migration / Load Balancing | VERIFIED |
-| Task Migration: dedicated Move-Task UI | PLANNED |
+| Task Migration: dedicated Move-Task UI | VERIFIED |
+| Task Manager: priority-edit/reorder UI (↑/↓, queued tasks) | VERIFIED |
 | Session-to-session coordination via structured handoff (not direct chat) | VERIFIED |
 | Node/fleet: scheduler (`choose_node`) | VERIFIED |
 | Node/fleet: LAN discovery | VERIFIED |
@@ -114,6 +116,9 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Live disposable E2E: burst enqueue + rename + migrate + restart | VERIFIED |
 | Live remote-node (dell-5530) auto-dispatch smoke test | NOT YET RUN (this task's own required next step) |
 | Direct-send verification: continued-polling ack evidence (P0 fix) | VERIFIED locally; NOT YET DEPLOYED to dell-5530 |
+| `terminal_create_session(initial_prompt)` double-echo (shell sessions) | FIXED, 2026-09-07 (`lifecycle.py`'s own real readiness signal) |
+| AI Usage (read-only, local AI Usage Monitor integration) | VERIFIED_LIVE (real browser smoke, real live data) |
+| Unified Task System §20 (Kanban/PM/Planner/git isolation/Phase A-E) | VERIFIED — see §20 itself for the exact per-slice scope |
 
 ---
 
@@ -286,7 +291,12 @@ sessions bringing up dell-5530/m910/macbook — see `docs/multi-node.md`).
   one row per configured project, its own Waiting/Reviewing/Merging/
   Test/Regression/Rework/Blocked label (mapped from
   `integration_store.py`'s real status constants in exactly one place).
-- **Requirements/Feature Matrix link:** **PLANNED**, not built.
+- **Requirements/Feature Matrix link:** **VERIFIED, 2026-09-07** —
+  `GET /dashboard/requirements` (plain-text, read fresh off disk every
+  request, `_read_guard` only), linked from the header `⋯` menu ("📄
+  Requirements") and from the Task Manager modal's own header ("📄
+  Docs"). Real live browser check confirmed both links present and the
+  route serving real, current `docs/REQUIREMENTS.md` content.
 
 ## 4. Permissions / security
 
@@ -549,6 +559,20 @@ project's own coding sessions).
   unmutated store mid-loop caused the same task to be selected multiple
   times in one plan — found and fixed during development, see git
   history).
+- **Move-Task UI: VERIFIED, 2026-09-07.** `POST /dashboard/api/tasks/
+  reassign` (thin wrapper over the already-real `queue.reassign` —
+  never a second reassignment mechanism; requires read access to BOTH
+  the task's current and target session) + a "↷ Move" button on every
+  eligible task row (queued/blocked-rework groups) in the per-session
+  Task Manager AND the fleet-wide Global Task Inbox, prompting for the
+  target session and an optional reason. Real live browser check: a
+  real click → real `window.prompt` dialogs → real reassign → the task
+  genuinely moved sessions, confirmed via the Task Manager's own list
+  shrinking by one. Priority/reorder UI: ↑/↓ buttons on each QUEUED
+  task row in the per-session Task Manager (scoped there only — a
+  mixed-session Global Task Inbox list has no single well-defined
+  reorder meaning), wired to the already-real, already-tested
+  `/dashboard/api/session/queue/reorder` route.
 
 ## 11. Session-to-session coordination
 
@@ -780,7 +804,12 @@ here to avoid drift — `git log <sha> -1` is the authoritative source.
 
 ---
 
-## 20. Unified Task System (PLANNED — architecture, not built)
+## 20. Unified Task System (VERIFIED — Kanban/PM/Planner/git isolation/
+Phase A-E all live; see each §20.x subsection's own implementation note
+for exactly what's built vs. still PLANNED within it — this header used
+to say "PLANNED — architecture, not built" when this section was first
+drafted; updated 2026-09-07 once the roadmap below was actually
+implemented, checkpoint by checkpoint, over several sessions)
 
 **Status: PLANNED.** Nothing in this section is callable. It exists so
 a future implementer (human or agent) builds ONE coherent system
@@ -1878,14 +1907,92 @@ scan/audit view over the SAME facts.)*
 - **Acceptance/tests/evidence:** `tests/test_integration_store.py`,
   `tests/test_integration_reviewer.py`, `tests/test_integration_engine.py`,
   `tests/test_integration_hook.py`, `tests/test_integration_mcp_tools.py`,
-  `tests/test_three_role_smoke.py`.
+  `tests/test_three_role_smoke.py`, `tests/test_integration_loop.py`.
 - **Known limitations:** no real tmux session of its own (pure backend
-  engine); no automatic background loop (event-driven wake is PLANNED,
-  see Backlog).
+  engine).
 - **Dependencies:** Phase 1/2, persist-before-dispatch.
-- **Follow-up/backlog:** event-driven WAIT/wake posture (PLANNED); no
-  dashboard view until "Dashboard Supervisor/Coordinator panel" below.
-- **Trace:** `957f15a`.
+- **Follow-up/backlog:** no dashboard view until "Dashboard Supervisor/
+  Coordinator panel" below.
+- **Trace:** `957f15a`, event-driven WAIT/wake loop below.
+
+#### Event-driven WAIT/wake background loop (2026-09-07, VERIFIED)
+
+- **Goal:** close the one real gap the entry above disclosed — no
+  automatic background loop existed, so `terminal_integration_run_once`
+  had to be called explicitly for every single pipeline step.
+- **Design (see `integration_loop.py`'s own module docstring for the
+  full reasoning):** `claim_next_handoff`'s own query is already the
+  durable, restart-safe "detection" of new work (no new wake-flag
+  bookkeeping needed) — the real gap was purely the missing driver.
+  `IntegrationLoop` mirrors `queue_loop.py`'s `QueueLoop` shape
+  (daemon thread, `start`/`stop`/`status`/`run_one_cycle`, one project's
+  exception never stops another's cycle) with ONE addition: a real
+  in-process `threading.Event`, set by `IntegrationStore.publish_handoff`
+  itself via a newly-injected `on_handoff_published` hook (same
+  "injected callback, not a new pub/sub system" convention as
+  `QueueEngine.on_completed`) — a fresh handoff wakes the loop almost
+  immediately instead of waiting out a poll interval. A bounded
+  fallback poll (`config.integration_loop.fallback_poll_seconds`,
+  default 5.0s) remains as the cross-process/restart safety net (a
+  handoff published by a different process, or one that already existed
+  before the loop started, is still picked up, bounded). A cycle that
+  made real progress on any project skips its own wait entirely before
+  the next cycle, so a multi-step pipeline (CLAIMED -> MERGED ->
+  INTEGRATED, each its own `tick()`) advances back-to-back rather than
+  paying the fallback interval between every single step — only a
+  cycle where every project reports `WAITING_FOR_HANDOFF`/
+  `ENGINE_ERROR` goes back to waiting.
+- **Idempotent/race-safe:** reuses the EXISTING, already-atomic
+  `BEGIN IMMEDIATE claim_next_handoff` — the loop adds no new claiming
+  logic of its own, so two loop instances (simulating two processes)
+  racing the identical handoff never double-claim/double-merge (real
+  git repo, live-proven).
+- **Restart-safe:** the wake `Event` is purely in-memory/best-effort —
+  losing it on a crash loses nothing real, since every handoff's own
+  `READY_FOR_INTEGRATION`/stale-claimed row is still sitting in the
+  database exactly where the next loop instance's `claim_next_handoff`
+  (after `reconcile_stale_handoff_claims`) will find it, bounded by the
+  fallback poll at worst.
+- **Two-gate safety (same posture as `QueueLoop`):** (1)
+  `config.integration_loop.enabled` (default False) — a global kill
+  switch nothing starts without; (2) reuses the ALREADY-real per-project
+  `configure`/`paused` gate rather than adding a new per-project opt-in
+  column — a project must be explicitly configured before any Handoff
+  can even exist for it, and a paused project's cycle is skipped
+  entirely (never even ticked).
+- **Fix/what's built:** `integration_loop.py` (new, `IntegrationLoop`),
+  `integration_store.py` (`on_handoff_published` hook param + call site
+  in `publish_handoff`), `config.py` (`IntegrationLoopConfig`,
+  `integration_loop.enabled`/`fallback_poll_seconds`), `mcp_app.py`
+  (constructs `integration.loop`, wires the wake hook — same "queue.loop"
+  precedent), `server_http.py` (starts/stops it based on config, mirrors
+  the `queue.enabled` gate), new MCP tools `terminal_integration_loop_
+  status`/`terminal_integration_loop_run_once`.
+- **Deployment status:** code + tests VERIFIED; `config.integration_loop.
+  enabled` is `False` in the real production `config.yaml` (this
+  checkpoint does not turn it on) — no real project has an Integration
+  pipeline configured in production today either, so enabling it would
+  currently be inert. Turning it on for a real project is a future,
+  separate, disclosed decision, not silently bundled into this fix.
+- **Tests:** `tests/test_integration_loop.py` (9, real git repos, real
+  background threads — `wake()` reaction-latency proof against a
+  deliberately long 30s fallback poll, a full clean-handoff-to-
+  INTEGRATED lifecycle with ZERO manual ticks, a real-conflict-to-
+  REWORK_REQUIRED lifecycle with ZERO manual ticks, TWO concurrent real
+  loop instances racing the same handoff — exactly one merge commit,
+  never duplicated, and a fresh loop instance recovering a handoff
+  abandoned by a dead one — restart safety), 2 new in `tests/
+  test_integration_mcp_tools.py` (the MCP tool surface). Also found and
+  fixed, while re-verifying this pass: `tests/test_three_role_smoke.py`
+  had 2 tests that predated the "Living-requirements convention" doc
+  gate (`edd316f`, added ~12h after this file was originally written)
+  and never got the `docs_exempt` artifact real disposable-content
+  handoffs elsewhere in this codebase already carry — a real,
+  pre-existing latent test bug, unrelated to this checkpoint's own code,
+  fixed alongside it (test-only change, same fix already applied
+  everywhere else). Full suite green (1 known pre-existing failure
+  unrelated to this entry — see item 14's own writeup, now itself fixed
+  this same session).
 
 ### Task Migration / Load Balancing
 
@@ -2838,6 +2945,155 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
   Dashboard Task Manager (PLANNED).
 - **Trace:** see this file's own commit.
 
+### AI Usage (read-only integration with the local 'AI Usage Monitor')
+
+- **Goal / user value:** Terminal MCP can show, centrally, the Codex/
+  Claude/Gemini/Antigravity CLI usage/quota this HOST already tracks via
+  a separate, already-installed local service — without duplicating any
+  of that service's own credential-reading/provider-API-calling logic.
+- **Status:** VERIFIED and live (2026-09-07). Real browser (Playwright,
+  headless Chromium) smoke against a disposable local dashboard instance
+  confirmed the panel renders genuinely live data end to end (see
+  Backlog item 26 for the full evidence/sample values).
+- **Audit of the service being integrated (done first, per the task's
+  own explicit "không đoán; dùng curl/source để xác minh"):** a
+  SEPARATE project ("AI Usage Monitor" 0.6.0) — source at `~/workspace/
+  ai-usage-monitor` (a plain directory, no git repo), deployed to `~/
+  .local/share/ai-usage-monitor/app/ai_usage_monitor.py` (single-file,
+  stdlib-only `http.server`, no framework/deps), run by a real, enabled
+  `ai-usage-monitor.service` user-systemd unit (auto-starts at login,
+  `Restart=on-failure`) on `127.0.0.1:8787` — loopback-only, no
+  authentication of its own on the HTTP API (matches this project's own
+  "loopback bind is its own boundary" posture elsewhere). It reads THIS
+  machine's own real local OAuth credential files (`~/.codex/auth.json`,
+  `~/.claude/.credentials.json`) and calls the REAL provider backend
+  usage endpoints directly (`chatgpt.com/backend-api/wham/usage`,
+  `api.anthropic.com/api/oauth/usage`) — Gemini is presence/auth-only
+  (no stable local/public quota endpoint exists for every auth mode, per
+  that project's own `SOURCES.md`); Antigravity reads a local telemetry
+  file a separate hook writes. `GET /api/usage` (the one endpoint this
+  integration reads) is already a clean, well-structured, machine-
+  readable JSON response — no changes needed on that project's side at
+  all (confirmed live: real sample response captured and used to design
+  the normalizer below), so this integration is a pure, read-only
+  consumer with zero duplicate collection logic, exactly per the task's
+  own "tránh duplicate logic thu thập usage" requirement. Own in-process
+  cache: Codex 60s TTL, Claude 180s TTL (never forced early by this
+  integration — see `ai_usage_client.py`'s own docstring).
+- **Architecture chosen:** adapter/read-only provider inside Terminal
+  MCP (`ai_usage_client.py` + `ai_usage_service.py`), reusing this
+  project's own established `urllib.request`-based HTTP client
+  convention (`node_client.py`'s `RemoteNodeClient`) rather than adding
+  a new HTTP dependency. `ai_usage_client.py` is a pure, bounded-timeout
+  (`config.ai_usage.timeout_seconds`, default 2.0s) GET, never raises
+  past its own `AiUsageClientError`. `ai_usage_service.py` normalizes
+  every provider's own (subtly different) response shape into one common
+  `providers: [{provider, ok, account, plan, windows: [{label,
+  used_percent, remaining_percent, resets_at, severity}], usage_
+  available, usage_message, error, updated_at, warning, critical}]`
+  list, adds this project's own configurable warning/critical threshold
+  classification (the AI Usage Monitor itself has no such concept — its
+  own UI just picks a bar color inline), and NEVER invents a number: a
+  window with no real `used_percent` renders `severity: null`/an
+  "unavailable" message, never a fake 0%/100% bar.
+- **Degraded state (task requirement: "tuyệt đối không làm dashboard/
+  session controller treo theo"):** every call is bounded by `config.
+  ai_usage.timeout_seconds` and never raises. A failure after at least
+  one prior success returns the LAST real snapshot marked `stale: true`
+  plus `last_error` (more useful than a bare "unavailable" when recent
+  real data exists); a failure with no prior success at all returns
+  `available: false` with a real `error` string — never a fake number
+  either way. A separate short in-memory cache (`config.ai_usage.
+  cache_ttl_seconds`, default 20s) on top of the AI Usage Monitor's own
+  caching avoids hammering it on every dashboard poll.
+- **Session correlation (item 4):** best-effort, LOCAL sessions only —
+  disclosed explicitly: the AI Usage Monitor reflects THIS machine's own
+  single set of locally logged-in CLI credential files, not a fleet-wide
+  concept, so a session on a remote node (dell-5530/m910/macbook) is
+  never correlated (would be misleading — that node's own `claude`/
+  `codex` CLI, if any, uses ITS OWN separate local credentials, not this
+  host's). A local session's `pane_current_command` (`claude`/`codex`)
+  is matched against the corresponding provider's `ok` state — real,
+  live-verified against actual local tmux sessions (see Backlog item 26).
+- **Secret handling:** no token/API key/cookie is ever read, stored, or
+  surfaced by this integration — it only reads the AI Usage Monitor's
+  own already-computed, already-redacted-of-secrets JSON response. The
+  provider `account` field (an email or masked id) IS passed through
+  unredacted, matching the AI Usage Monitor's own dashboard, which
+  already shows it to the same owner this Terminal MCP dashboard is
+  gated to (the same Cloudflare Access identity) — never sent to a third
+  party, never logged beyond this project's own existing redaction-safe
+  logging.
+- **UI route/screen:** `⋯` menu → "📊 AI Usage" → a slide-out panel
+  (`#aiUsagePanel`, same modal-component shape as the existing Task
+  Inbox panel) — provider cards with progress bars/warning-critical
+  badges, a "Session hiện tại (local)" section, manual ↻ refresh
+  (`force=1`), and an auto-refresh checkbox (30s, off-by-choice per
+  viewer). Never a bare iframe — real data through this project's own
+  route/adapter, per the task's own explicit "Không chỉ nhúng iframe nếu
+  có thể truy cập data/API thật".
+- **API/tool/command:** `terminal_ai_usage_status(force: bool = False)`
+  (MCP), `GET /dashboard/api/ai-usage[?force=1]` (dashboard, `_read_
+  guard` only — fleet/account-level status, not one session's own
+  content, same posture as `/dashboard/api/queue/global-inbox` etc.).
+- **Config/permission:** `AiUsageConfig` (`config.py`) — `enabled`
+  (default `True`; unlike every autonomous-background-thread config in
+  this project, which defaults OFF, there is no autonomous ACTION here
+  to gate, only a bounded read), `base_url` (default `http://
+  127.0.0.1:8787` — the ONE value an operator repoints when this
+  project's own control plane later moves to a VPS, per the task's own
+  explicit requirement; never made public on the internet), `timeout_
+  seconds`, `cache_ttl_seconds`, `warning_threshold_percent`/`critical_
+  threshold_percent` (both configurable, not hardcoded, per the task's
+  own explicit "ngưỡng config, không hard-code nếu dễ config").
+- **Data/schema/migration:** none — no persistent store at all (in-
+  memory cache only), matching the task's own "tránh duplicate logic
+  thu thập usage" (nothing is stored redundantly here; the AI Usage
+  Monitor's own state remains the only copy).
+- **Acceptance/tests/evidence:** `tests/test_ai_usage_client.py` (6,
+  real disposable `http.server` instance — real HTTP round trip, real
+  timeout, real malformed-JSON/non-dict-response/connection-refused
+  handling, never mocks `urllib` itself), `tests/test_ai_usage_service.py`
+  (17, normalization of the real captured sample response shape incl.
+  severity thresholds, antigravity's differently-shaped `quota_windows`,
+  a missing provider key, a `None` `used_percent` never given a fake
+  severity, cache TTL/force-bypass, degraded-state stale-fallback and
+  no-prior-cache paths, disabled-config short-circuit, the client-error
+  boundary proven not to swallow an unrelated real bug, session
+  correlation incl. a broken lister never breaking real usage data),
+  `tests/test_ai_usage_mcp_tools.py` (3, real MCP call path), `tests/
+  test_dashboard_ai_usage.py` (5, real Starlette `TestClient` — the
+  route, degraded state, `force=1`, session correlation, and the
+  dashboard HTML itself containing the new panel markup). **Live browser
+  smoke** (Playwright, headless Chromium, against a disposable local
+  dashboard instance with NO Cloudflare Access configured — see Backlog
+  item 26 for why the real gated production URL isn't directly
+  browser-testable from here — `base_url` pointed at the REAL, already-
+  running `127.0.0.1:8787`): real menu click → real panel open → real
+  rendered provider cards with a real Critical badge (Codex 5h at the
+  real captured 99% used) and real local session rows (`terminal-mcp ·
+  claude`, `codex-main · codex`, etc.) — genuinely live data through the
+  real client → service → route → HTML → browser DOM pipeline, not
+  mocked at any layer. Tool count 131 -> updated in `tests/test_server
+  .py`/`tests/test_transports.py`. Full suite green.
+- **Known limitations:** (1) usage/quota is per-MACHINE (this host's own
+  logged-in CLI credentials), not per-terminal-mcp-SESSION — multiple
+  local sessions running `claude` share ONE quota number, disclosed
+  explicitly rather than implying a false per-session breakdown; (2) no
+  correlation at all for sessions on remote nodes (dell-5530/m910/
+  macbook), disclosed rather than guessed; (3) the real, gated production
+  dashboard URL was not directly browser-tested (would need real
+  Cloudflare Access session credentials this environment doesn't have) —
+  the live browser smoke above used a disposable, ungated local instance
+  running the exact same route/service/UI code instead; (4) the AI Usage
+  Monitor project itself was NOT modified — no commit needed there.
+- **Dependencies:** none new (stdlib `urllib`/`http.server` only, no new
+  `pyproject.toml` dependency).
+- **Follow-up/backlog:** none currently open — the AI Usage Monitor's
+  own `/api/usage` was already sufficient; the "add a minimal endpoint
+  there if unstable" fallback the task allowed for was not needed.
+- **Trace:** see this file's own commit.
+
 ---
 
 ## Backlog (explicitly not done yet — tracked here so it isn't re-discovered)
@@ -2848,12 +3104,42 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
    window/window2. Not started as of this file's own commit.
 2. Event-driven WAIT/wake posture for the Integration Agent's own
    merge-test role.
-3. Move-Task drag/drop UI for Task Migration.
-4. Priority-edit/drag-reorder UI for the Task Manager.
-5. Requirements/Feature Matrix link inside the Dashboard Task Manager.
-6. Enabling `config.queue.enabled` and `queue_lanes.auto_dispatch_enabled`
-   against any real production session, including window/window2 —
-   blocked on item 1.
+3. ~~Move-Task drag/drop UI for Task Migration.~~ **DONE, 2026-09-07**
+   — a button-based "↷ Move" UI (prompt for target session), not literal
+   drag/drop — see §10's own updated implementation note.
+4. ~~Priority-edit/drag-reorder UI for the Task Manager.~~ **DONE,
+   2026-09-07** — ↑/↓ buttons on queued tasks, wired to the existing
+   reorder route — see §10's own updated implementation note.
+5. ~~Requirements/Feature Matrix link inside the Dashboard Task
+   Manager.~~ **DONE, 2026-09-07** — see §3's own updated implementation
+   note.
+6. **Enabling auto-dispatch against a real production session/lane —
+   audited 2026-09-07, decision: KEEP DISABLED, exact blocker below.**
+   `config.queue.enabled` (the GLOBAL gate) is already `true` in the
+   real production `config.yaml` (done in an earlier checkpoint) — the
+   auto-dispatch background loop process IS really running in
+   production right now. What remains genuinely NOT done, audited this
+   pass: `queue_lanes.auto_dispatch_enabled` (the PER-LANE gate) is
+   confirmed `0` for all 17 real lanes in the live production `queue.db`
+   (`wtest`, `window`, `window2`, `win3`, `terminal-mcp`, `mesflow`,
+   `codex-main`, `promptflow`, `projectflow`, `nail`, and 7 others —
+   read live, 2026-09-07). **Deliberately left this way** — not because
+   evidence is thin (it is, in fact, extensive: `test_queue_engine_smoke
+   .py`/`test_three_role_smoke.py`'s own real disposable-tmux, real-
+   restart, real-race tests all prove 0 lost/0 duplicate dispatch under
+   restart+reconnect, repeatedly, across this whole session) — but
+   because flipping this flag for ANY specific real session is itself a
+   real, outward-facing behavior change (that session would start
+   receiving automatically-dispatched tasks with no human pushing them
+   each time), squarely within this project's own standing rule that
+   this class of action needs an explicit, per-instance human go-ahead,
+   not an inference from generic disposable-test success. The
+   mechanism's own safety is real and proven; the remaining gap is a
+   DECISION, not a missing capability — left for the user to make
+   explicitly, for a specific session, when wanted. (The dell-5530-
+   specific live remote-node smoke test from item 1 is a SEPARATE,
+   still-genuinely-blocked concern — see the Internet/VPS Phase 0 gate
+   audit for why.)
 7. **Direct-send reliability: ROOT CAUSE CONFIRMED, LOCAL FIX SHIPPED,
    REMOTE DEPLOYMENT STILL PENDING** (task: "P0 FIX TRIỆT ĐỂ DIRECT SEND
    WINDOWS / CLAUDE INPUT" — user report: a ChatGPT-originated prompt
@@ -3111,30 +3397,63 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
     are recoverable via the fleet-aware API (`node_id/session` qualified
     form) but do not yet APPEAR in this specific dashboard panel/MCP
     listing tools unless queried directly.
-14. **`terminal_create_session`'s `initial_prompt` send can visibly echo
-    twice for a brand-new plain-shell session** (found live, 2026-09-07,
-    while running the full suite ahead of the Kanban checkpoint —
-    `tests/test_session_lifecycle.py::
+14. **`terminal_create_session`'s `initial_prompt` send could visibly
+    echo twice for a brand-new plain-shell session — FIXED, 2026-09-07.**
+    Originally found live while running the full suite ahead of the
+    Kanban checkpoint (`tests/test_session_lifecycle.py::
     test_create_initial_prompt_goes_through_reliable_submission_once`,
-    now consistently reproducing on this machine, not flaky). Evidence:
-    the captured pane shows the typed command once with no prompt
-    prefix at all (`echo hello-lifecycle`), then again as a normal
-    prompt-prefixed line once the shell's own prompt actually renders
-    (`...$ echo hello-lifecycle`) followed by its real output — the
-    likely mechanism is bash's own readline redrawing buffered input
-    once it finishes initializing, if `_send_text_and_verify_locked`'s
-    text-send/Enter land before the very first prompt has been drawn at
-    all, not a second real `send_keys`/Enter call from this project's
-    own code (only one Enter is ever sent per the method's own logic —
-    confirmed by reading it, not just observing the symptom). Likely the
-    same general class of issue as item 12 above (a timing race right
-    around a freshly-created session's own readiness), but a distinct
-    repro on plain `shell` rather than Claude, and not yet root-caused
-    to the same fix. Scoped out of the Kanban checkpoint this entry sits
-    next to (different investigation) — tracked here, not silently
-    fixed or silently ignored, so a future pass knows exactly what to
-    reproduce and where to start looking (`core.py`'s own `terminal_
-    create_session`/`_send_text_and_verify_locked`).
+    reproduced consistently, not flaky). Evidence: the captured pane
+    showed the typed command once with no prompt prefix at all (`echo
+    hello-lifecycle`), then again as a normal prompt-prefixed line once
+    the shell's own prompt actually rendered (`...$ echo hello-
+    lifecycle`) followed by its real output.
+    **Root cause, confirmed via code reading (`lifecycle.py`'s own
+    `SessionLifecycleService.create`):** for `agent_type="shell"`,
+    `expected_command` is always `None`, and the readiness loop's own
+    condition (`if expected_command is None or ...: state = "READY";
+    break`) made it return `READY` on the very FIRST loop iteration —
+    zero polls, zero readiness signal, zero wait at all — the instant
+    tmux merely reported the session existing, regardless of whether
+    the shell had actually finished its own startup (rc-file sourcing,
+    PS1 draw, readline attaching to the tty). `terminal_create_session`
+    sends `initial_prompt` the instant `state == "READY"` comes back, so
+    the text+Enter wrote into the pane while the shell was still mid-
+    startup: the kernel tty's own raw echo of the just-written text
+    (drawn with no prompt yet, since the shell hadn't drawn one) was
+    followed by the shell's OWN readline redraw of that same still-
+    buffered line once it finished attaching — visibly duplicating it.
+    Only ONE real `send_keys`/Enter call is ever issued (confirmed by
+    reading `_send_text_and_verify_locked` — not a second, extra send
+    from this project's own code).
+    **Fix (minimal, at the actual root):** `lifecycle.py`'s readiness
+    loop, for the `agent_type == "shell"` branch only, now waits for a
+    real, cheap readiness signal — the pane has drawn SOMETHING (its own
+    prompt, at minimum), checked via `capture_lines` — instead of
+    short-circuiting to `READY` unconditionally. Same bounded deadline
+    (`create_ready_timeout_seconds`) as every other `agent_type`; a
+    genuinely silent/empty-`PS1` shell (untested edge case) just falls
+    back to the pre-existing `CREATED`-after-timeout behavior, never a
+    regression. Backend-agnostic (`lifecycle.py` is shared by both the
+    tmux and Windows backends via the same `SessionBackend` protocol) —
+    the same fix applies to a Windows shell session once deployed there
+    too, though that deployment is separately gated (see Backlog item
+    20/the window2 investigation).
+    **Tests:** the original regression test now passes consistently (5
+    repeated runs, previously reliably failing); `test_session_lifecycle
+    .py`'s full file (44 tests) and every other file touching session
+    creation (`test_kill_reopen.py`, `test_session_registry_integration
+    .py`, `test_controller.py`, `test_windows_terminal_service_
+    integration.py`, `test_session_knowledge_integration.py`, `test_move
+    _session.py`, `test_server.py`, `test_remote_webterm_proxy.py`,
+    `test_transports.py`, `test_task_manager_ui.py` — every file that
+    creates a session at all) re-verified green, 0 regressions. Full
+    suite green.
+    Item 12 above (the `press_enter=true` false-positive `SUBMIT_
+    CONFIRMED`-but-actually-unsent race on a FRESH Claude session with
+    auto-memory startup) remains a **separate, still-open** issue — same
+    general "freshly-created session readiness race" family, but a
+    distinct code path (Claude's own composer readiness, not a plain
+    shell's prompt draw) and NOT fixed by this entry.
 15. **Unified Task System §20's Global Tasks Kanban slice is now VERIFIED
     and live** (2026-09-07) — see §20.1a's own full implementation note
     (data model choice, new store/service methods, MCP tools, dashboard
@@ -3338,6 +3657,28 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
     project has actually opted a real risk-level/`require_approval_for_
     risk_levels` policy in yet — the mechanism is real, wiring one in
     for a specific project is a future increment).
+26. **AI Usage (read-only integration with the local 'AI Usage Monitor')
+    — VERIFIED and live** (2026-09-07): `ai_usage_client.py`/`ai_usage_
+    service.py` (new), `terminal_ai_usage_status` (MCP), `GET /dashboard
+    /api/ai-usage` + a new "📊 AI Usage" dashboard panel — see this
+    file's own "AI Usage" Feature Details entry above for the full audit
+    (a SEPARATE, unmodified project, `ai-usage-monitor.service`, real
+    provider usage/quota already computed there), architecture, and
+    degraded-state design. Real live browser smoke (Playwright, headless
+    Chromium, against a disposable local instance — NOT the real gated
+    production URL, see that entry's own "Known limitations") confirmed
+    the panel genuinely renders live data end to end: real sample values
+    captured — Codex `5h: 99% used (Critical)`, `Weekly: 12% used`,
+    account `tranvuhungbkit@gmail.com`, plan `plus`; Claude `5h: ~71-79%
+    used (Warning)`, `Weekly: ~67% used`; Gemini `OK, usage data
+    unavailable` (by that project's own design — no stable local/public
+    quota endpoint for every Gemini auth mode); Antigravity `OK, no live
+    telemetry yet` — and real local session correlation (`terminal-mcp ·
+    claude`, `codex-main · codex`, `mesflow · claude`, and 7 others, each
+    correctly tagged). This project makes ZERO changes to the AI Usage
+    Monitor project itself — its own `/api/usage` was already a clean,
+    sufficient, machine-readable JSON response; no separate commit was
+    needed there. Tool count 130 -> 131.
 
 ---
 
@@ -3407,6 +3748,65 @@ in the *current* repo/deployment, not the future VPS)
   reported) exists before Phase 2 makes node-agent reconnects a routine,
   automatic event over the internet instead of a rare, manually-
   approved LAN action.
+
+#### Phase 0 gate audit (2026-09-07, no Windows/dell-5530 restart performed)
+
+Per explicit instruction this pass: audit every gate, close what doesn't
+require restarting the real dell-5530 node-agent/Windows sessions,
+mark the rest BLOCKED and move on.
+
+- **Gate 1 (reliable direct-send deployed+live-reverified on dell-5530):
+  BLOCKED.** Unchanged from Backlog item 7/20 — the fix is real and
+  shipped locally, but verifying it live specifically requires
+  restarting the real dell-5530 node-agent, which this pass is
+  explicitly forbidden from doing. No substitute closes this gate — it
+  is Windows-ConPTY-specific by its own nature.
+- **Gate 2 (live remote-node auto-dispatch smoke test): PARTIALLY
+  BLOCKED.** The gate as written names dell-5530 specifically (Backlog
+  item 1) — still BLOCKED, same reason as Gate 1. A real, equivalent
+  smoke test against a DIFFERENT already-connected real remote node
+  (m910, Linux — no ConPTY/Windows restart risk at all) would genuinely
+  reduce the underlying architectural uncertainty (does auto-dispatch
+  actually work correctly through a real `RemoteNodeClient`, restart-
+  and-reconnect included) without touching anything forbidden — but was
+  deliberately NOT attempted this pass: m910 is a real, shared
+  production node this session has not separately inventoried for any
+  currently-running real work of its own (unlike `window`/`window2`/
+  `wtest`, which have an explicit, maintained protected list), and
+  taking on that new production risk wasn't specifically authorized
+  here. Left as a disclosed, well-scoped, low-risk next step rather than
+  attempted speculatively.
+- **Gate 3 (session registry survives controller restart / node
+  reconnect without duplicating or losing sessions): VERIFIED_LIVE,**
+  based on real, repeated evidence already accumulated THIS session —
+  every checkpoint's own `systemctl --user restart terminal-mcp-http.
+  service` (many times this session alone) was followed by a real
+  post-restart check confirming all 3 remote nodes (dell-5530, m910,
+  macbook) re-registered cleanly with fresh heartbeats and no
+  duplication, plus real ongoing dashboard/session traffic resuming
+  immediately (see e.g. the real `window2` 200 OK dashboard request
+  logged immediately after the Phase E restart). This is the local
+  control-plane process restarting, not a node-agent restart — exactly
+  what this gate is actually asking about (node-AGENT restart safety is
+  Gate 1/4's own separate, Windows-specific concern).
+- **Gate 4 (node-agent restart has a known-safe story — either provably
+  safe, or a written recovery contract): already REAL, no new work
+  needed.** The "Windows node-agent restart safety (Phase 0)" Feature
+  Details entry (2026-09-06) already estabished the honest answer
+  (restart is NOT safe for ConPTY sessions, by design, unconditionally)
+  and the "Conversation-continuity recovery (--resume wiring)" entry
+  plus Backlog item 7's own explicit numbered recovery-plan sequence
+  (snapshot before -> graceful `/v1/internal/shutdown` -> poll for a
+  genuinely new `agent_generation` -> `terminal_registry_reopen` per
+  session -> honest report) together ARE that written contract. Nothing
+  new required by this pass.
+
+**Net result: Phase 0 is still not fully green** (Gates 1 and 2's
+dell-5530-specific half remain BLOCKED, unconditionally, until a real
+Windows node-agent restart is separately authorized) — Gates 3 and 4
+are real and green. No code changed for this audit; it is a documentation
+pass over already-real evidence plus one new disclosed scope decision
+(m910 smoke test deliberately deferred, not silently dropped).
 
 ### Phase 1 — Controller decoupling
 
