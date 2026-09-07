@@ -86,7 +86,7 @@ async def test_stdio_real_handshake_and_tools(tmp_path):
     assert initialized.server_info.name == "terminal-mcp"
     assert initialized.server_info.version == __version__
     names = {tool.name for tool in tools.tools}
-    assert len(names) == 122  # ...previous total (117) +5 terminal_release_create/advance/rollback/status/list (Release lifecycle, sec20.6 Phase C)
+    assert len(names) == 126  # ...previous total (122) +4 terminal_pm_summary/detect_stale_backlog/detect_duplicate_tasks/close_task_with_confirmation (PM summary+hygiene, sec20.6 Phase D)
     assert {"terminal_tail", "terminal_send_keys", "terminal_exit_copy_mode",
             "terminal_bind", "terminal_tail_bound"} <= names
 
@@ -139,7 +139,7 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
     # global INPUT_DISABLED gate; INPUT_DISABLED itself stays covered in test_permissions.py.
     assert text_disabled["error"] == "ACCESS_DENIED"
     assert keys_disabled["error"] == "ACCESS_DENIED"
-    assert len(tools.tools) == 122  # ...previous total (117) +5 terminal_release_create/advance/rollback/status/list (Release lifecycle, sec20.6 Phase C)
+    assert len(tools.tools) == 126  # ...previous total (122) +4 terminal_pm_summary/detect_stale_backlog/detect_duplicate_tasks/close_task_with_confirmation (PM summary+hygiene, sec20.6 Phase D)
 
 
 @pytest.mark.anyio

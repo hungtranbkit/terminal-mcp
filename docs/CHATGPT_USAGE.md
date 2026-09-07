@@ -409,6 +409,31 @@ the approval field as a real commitment, not a formality to fill in.
 placeholder `approved_by` value just to get past the gate — it is
 recorded permanently in the release's own audit trail.
 
+### 4h. PM summary + backlog hygiene
+
+**Status: VERIFIED** — see REQUIREMENTS.md's own Phase D implementation
+note. No scheduler exists yet — call these whenever you want a current
+report, at whatever cadence makes sense for you.
+
+- `terminal_pm_summary()` — real, fleet-wide snapshot: board counts,
+  total pending tasks, active incidents, and (best-effort) real per-
+  node CPU/RAM/capacity from the controller.
+- `terminal_pm_detect_stale_backlog(stale_after_hours=24.0)` — every
+  Backlog/Queued task older than the threshold, flagged for review.
+- `terminal_pm_detect_duplicate_tasks()` — groups of still-open tasks
+  sharing the identical prompt text (exact match, never fuzzy).
+- `terminal_pm_close_task_with_confirmation(task_id, reason, confirmed=False)`
+  — the ONLY action that changes anything from this group. Calling it
+  with `confirmed` omitted/false ALWAYS refuses
+  (`CONFIRMATION_REQUIRED`) — this is by design, not a bug: review the
+  flagged task yourself first, then call again with `confirmed=true`
+  and a real `reason`.
+
+**Anti-pattern:** never call `terminal_pm_close_task_with_confirmation`
+with `confirmed=true` in a loop over every stale/duplicate finding
+without a human actually looking at each one first — that defeats the
+entire point of the confirmation requirement.
+
 ## 5. Supervisor flow (canonical for watching an unattended session and
 reacting to it needing help)
 
@@ -583,13 +608,15 @@ discipline slice** (§4e — Definition of Ready, WIP limits, risk-level
 approval, all opt-in), **incident lane slice** (§4f — `terminal_
 task_create_incident`/`terminal_list_active_incidents`), and **release
 lifecycle slice** (§4g — `terminal_release_create`/`advance`/
-`rollback`/`status`/`list`) are all **VERIFIED and callable**.
-Everything else in that design — PM-based routing of the Integration/
-Merge Agent to a specific session, technical role-based enforcement of
-release approvals, and the rest of the Phase A-E Startup Operating
-Model (Phases D-E, and the remaining pieces of Phase B/C) — is still
-**PLANNED**, not built, as of this file's own last update. See `docs/
-REQUIREMENTS.md`'s own "Unified Task System" section (§20) for the
-current architecture-in-progress. Nothing beyond §4a-§4g's tools is
-callable yet; if asked to use any of the rest, say so plainly rather
-than guessing at a tool name.
+`rollback`/`status`/`list`), and **PM summary + backlog hygiene slice**
+(§4h — `terminal_pm_summary`/`detect_stale_backlog`/`detect_duplicate_
+tasks`/`close_task_with_confirmation`, no scheduler) are all
+**VERIFIED and callable**. Everything else in that design — PM-based
+routing of the Integration/Merge Agent to a specific session, technical
+role-based enforcement of release approvals, and the rest of the Phase
+A-E Startup Operating Model (Phase E, and the remaining pieces of
+Phase B/C) — is still **PLANNED**, not built, as of this file's own
+last update. See `docs/REQUIREMENTS.md`'s own "Unified Task System"
+section (§20) for the current architecture-in-progress. Nothing beyond
+§4a-§4h's tools is callable yet; if asked to use any of the rest, say
+so plainly rather than guessing at a tool name.

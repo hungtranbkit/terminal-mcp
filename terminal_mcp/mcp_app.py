@@ -19,6 +19,7 @@ from .planner_service import PlannerService
 from .planner_store import PlannerStore
 from .pm_service import PMService
 from .pm_store import PMStore
+from .pm_summary import close_task_with_confirmation, detect_duplicate_tasks, detect_stale_backlog_tasks, generate_summary
 from .queue_engine import QueueEngine
 from .queue_loop import QueueLoop
 from .queue_service import QueueService
@@ -1471,6 +1472,45 @@ def build_mcp(service: TerminalService | None = None,
         """Every release, optionally filtered to one project, newest
         first."""
         return release.list_releases(project=project)
+
+    # -- PM summary + backlog hygiene (§20.6 Phase D). A new, small
+    # aggregation over already-real data -- never a new source of
+    # truth. Every hygiene finding is READ-ONLY; the one action that
+    # actually changes anything refuses without an explicit
+    # confirmation -- "human controls destructive close".
+
+    @server.tool()
+    def terminal_pm_summary() -> dict:
+        """Real, fleet-wide snapshot: board counts, total pending
+        tasks, active incidents, and (best-effort) real per-node
+        capacity from the controller -- call this whenever a summary is
+        needed (daily/weekly/on-demand); there is no background
+        scheduler producing this automatically yet."""
+        return generate_summary(queue, controller=controller)
+
+    @server.tool()
+    def terminal_pm_detect_stale_backlog(stale_after_hours: float = 24.0) -> dict:
+        """Backlog hygiene: every Backlog/Queued task older than
+        `stale_after_hours` -- flagged for human review, NEVER auto-
+        closed. Use terminal_pm_close_task_with_confirmation to
+        actually close one, only after a human reviews it."""
+        return detect_stale_backlog_tasks(queue, stale_after_hours=stale_after_hours)
+
+    @server.tool()
+    def terminal_pm_detect_duplicate_tasks() -> dict:
+        """Backlog hygiene: groups of 2+ still-open tasks sharing the
+        IDENTICAL prompt text (byte-for-byte, never a fuzzy/semantic
+        guess) -- flagged, never auto-merged/closed."""
+        return detect_duplicate_tasks(queue)
+
+    @server.tool()
+    def terminal_pm_close_task_with_confirmation(task_id: str, reason: str, confirmed: bool = False) -> dict:
+        """The ONLY hygiene action that changes anything -- refuses
+        (CONFIRMATION_REQUIRED) unless `confirmed=true` is explicitly
+        passed, and always requires a real `reason`. Never call this
+        with confirmed=true without a human having actually reviewed
+        the specific task first."""
+        return close_task_with_confirmation(queue, task_id, reason=reason, confirmed=confirmed)
 
     @server.tool()
     def terminal_queue_metrics(session: str) -> dict:

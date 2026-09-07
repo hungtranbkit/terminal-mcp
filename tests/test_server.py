@@ -136,6 +136,11 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_release_rollback",
         "terminal_release_status",
         "terminal_release_list",
+        # PM summary + backlog hygiene (§20.6 Phase D).
+        "terminal_pm_summary",
+        "terminal_pm_detect_stale_backlog",
+        "terminal_pm_detect_duplicate_tasks",
+        "terminal_pm_close_task_with_confirmation",
     }
 
 

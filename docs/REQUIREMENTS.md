@@ -1587,6 +1587,66 @@ an artificial session into a workflow that has none.
   RAM collection (already used for node heartbeats, §12) plus queue
   depth already computed for §3's own badge.
 
+#### Phase D implementation note (2026-09-07, VERIFIED — PM summary + backlog hygiene)
+
+**Status: VERIFIED** for the one genuinely new piece (unit tests + real
+MCP-tool-surface tests, same "no tmux/session dimension, the real MCP-
+protocol tests are this checkpoint's own live evidence" posture as
+Phase C). The other three Phase D items needed **NO new code** — this
+is disclosed explicitly rather than silently claimed as "built":
+
+- **End-to-end audit trail**: already real and already complete for
+  every checkpoint built in this whole Unified Task System effort —
+  `pm_decisions` (§20.2a), `plan_proposals` (§20.3a), `queue_events`
+  (§7, including the Planner's own `SPLIT_INTO_CHILDREN`/`PARENT_
+  COMPLETED_VIA_CHILDREN` event types and the git-isolation checkpoint's
+  own worktree metadata riding on existing task events), `release_
+  events` (§20.6 Phase C) — each subsystem's own dedicated, real,
+  append-only event log, exactly the "one canonical store per concept"
+  discipline this whole system has followed throughout. Deliberately
+  NOT also duplicated into the project's separate, pre-existing
+  `audit.py` (the send/session-action log) — that would be a second,
+  parallel audit trail for the same events, which this project's own
+  standing discipline explicitly avoids.
+- **Knowledge capture**: already real via `session_knowledge.py` (§13)
+  — a post-incident/release ADR or gotcha note is exactly a
+  `terminal_knowledge_checkpoint` call against the relevant session/
+  project, no new store needed. Not specifically wired to auto-fire
+  after an incident/release closes in this pass (a human/PM decides
+  when a checkpoint is worth recording) — disclosed as unbuilt
+  automation, not a missing capability.
+- **Resource/cost awareness**: already real via `ControllerService.
+  list_nodes()` (§12's own CPU/RAM/capacity_status collection) +
+  `QueueService.pending_counts()` (§3's own badge data source) — both
+  now surfaced together in `terminal_pm_summary`'s own `node_capacity`
+  field below, rather than needing any new metrics collection.
+- **PM summary + backlog hygiene** (`pm_summary.py`, new) — the one
+  genuinely new piece: `generate_summary` (board counts, total pending,
+  active incidents, optional real per-node capacity via an optional
+  `controller` param); `detect_stale_backlog_tasks` (Backlog/Queued
+  tasks older than a configurable threshold, real `created_at` ages,
+  never RUNNING/done tasks); `detect_duplicate_tasks` (still-open tasks
+  sharing byte-for-byte identical prompt text — never a fuzzy/semantic
+  guess). **"Human controls destructive close"** (task's own explicit
+  words): `close_task_with_confirmation` is the ONLY action that
+  changes anything, and refuses outright (`CONFIRMATION_REQUIRED`)
+  unless the caller explicitly passes `confirmed=true` — there is no
+  automatic close anywhere in this module. Deliberately NOT wired to a
+  daily/weekly scheduler in this pass (disclosed scope cut, same "no
+  auto-loop yet" posture as PM/Planner's own manual sweeps) — a caller
+  gets the real, current data on every explicit call, at whatever
+  cadence they choose.
+- MCP tools: `terminal_pm_summary`, `terminal_pm_detect_stale_backlog`,
+  `terminal_pm_detect_duplicate_tasks`, `terminal_pm_close_task_with_
+  confirmation`.
+- Tests: `tests/test_pm_summary.py` (15, including a real controller-
+  failure-is-best-effort case and real `created_at` backdating via
+  direct row mutation to prove staleness detection against actual
+  elapsed time, not a mock), `tests/test_pm_summary_mcp_tools.py` (4,
+  the real MCP tool surface, including the confirm-then-succeed close
+  flow). Updated MCP tool-count assertions (122 -> 126). Full suite
+  green.
+
 **Phase E — Security/control plane:**
 - Least privilege per task/role/environment, secret redaction (this
   project's own existing `redaction.py` reused, not reinvented),
@@ -3105,6 +3165,19 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
     identity-based enforcement of WHO may supply that approval (no
     caller-identity system exists in this project's MCP layer to check
     against). Phases D-E remain entirely PLANNED, unbuilt.
+24. **Unified Task System §20.6 Phase D — PM summary + backlog hygiene
+    VERIFIED and live** (2026-09-07): `pm_summary.py` (new),
+    `terminal_pm_summary`/`detect_stale_backlog`/`detect_duplicate_
+    tasks`/`close_task_with_confirmation` — see Phase D's own
+    implementation note in §20.6 and §4h of `docs/CHATGPT_USAGE.md`.
+    End-to-end audit trail, knowledge capture, and resource/cost
+    awareness needed NO new code (already real via each checkpoint's
+    own event log, `session_knowledge.py`, and `ControllerService.
+    list_nodes()`/`pending_counts()` respectively) — disclosed
+    explicitly rather than silently claimed as newly built. "Human
+    controls destructive close" is real and enforced: the only mutating
+    action refuses without an explicit `confirmed=true`. Phase E
+    remains entirely PLANNED, unbuilt.
 
 ---
 
