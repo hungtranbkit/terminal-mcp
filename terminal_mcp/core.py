@@ -168,6 +168,54 @@ def _extract_composer_text(snapshot: list[str]) -> str:
     return ""
 
 
+def _codex_composer_buffer_complete(snapshot: list[str], text: str) -> bool:
+    """Recognize Codex's own bracketed-paste acknowledgement.
+
+    Codex intentionally replaces a long pasted draft with
+    ``[Pasted Content N chars]`` instead of rendering all text.  That marker
+    is stronger than a viewport substring check and is the only long-buffer
+    shortcut accepted by the verified-submit path; pager/unknown output does
+    not qualify.
+    """
+    if _sent_text_echoed(snapshot, text):
+        return True
+    visible = " ".join(snapshot)
+    match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", visible, re.IGNORECASE)
+    return bool(match and int(match.group(1)) >= len(text))
+
+
+def _codex_draft_in_composer(snapshot: list[str], text: str) -> bool:
+    """Return true only when this submission is still in Codex's composer."""
+    normalized_prefix = " ".join(text.split())[:80]
+    marker_indexes = [index for index, line in enumerate(snapshot)
+                      if re.match(r"^\s*[>›]\s*", line.strip())]
+    if not marker_indexes:
+        return False
+    last_marker = marker_indexes[-1]
+    if any(re.search(r"SUBMITTED\[|esc to interrupt", line, re.IGNORECASE)
+           for line in snapshot[last_marker + 1:]):
+        return False
+    body = re.sub(r"^[>›]\s*", "", snapshot[last_marker].strip())
+    if normalized_prefix and normalized_prefix in " ".join(body.split()):
+        return True
+    match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", body, re.IGNORECASE)
+    return bool(match and int(match.group(1)) >= len(text))
+
+
+def _codex_composer_marker_present(snapshot: list[str]) -> bool:
+    """Whether a live-looking Codex composer marker remains in the pane."""
+    markers = [index for index, line in enumerate(snapshot)
+               if re.match(r"^\s*[>›]\s*", line.strip())]
+    if not markers:
+        return False
+    last = markers[-1]
+    body = re.sub(r"^\s*[>›]\s*", "", snapshot[last].strip()).strip()
+    if not body or body.casefold().startswith("ask codex to do anything"):
+        return False
+    return not any(re.search(r"SUBMITTED\[|esc to interrupt", line, re.IGNORECASE)
+                   for line in snapshot[last + 1:])
+
+
 class TerminalService:
     def __init__(self, config: AppConfig, tmux: SessionBackend | None = None,
                  bindings: BindingStore | None = None,
@@ -264,7 +312,13 @@ class TerminalService:
         def evidence(lines: list[str], current: Submission) -> tuple[str, str]:
             if adapter.identify_target_state(lines) == "waiting":
                 return "PAGER", "approval_or_pager_visible"
-            if not _sent_text_echoed(lines, record.prompt):
+            if _codex_draft_in_composer(lines, record.prompt):
+                return "COMPOSER", "draft_still_in_composer"
+            if (current.enter_count > 0 and _codex_draft_in_composer(baseline, record.prompt)
+                    and not _codex_composer_marker_present(lines)):
+                return (ACK_RUNNING if adapter.identify_target_state(lines) == "running" else ACK_ACCEPTED,
+                        "composer_cleared_after_enter")
+            if not _codex_composer_buffer_complete(lines, record.prompt):
                 return "INCOMPLETE", "composer_buffer_not_fully_observed"
             if adapter.submit_ack_evidence(baseline, lines, record.prompt):
                 return (ACK_RUNNING if adapter.identify_target_state(lines) == "running" else ACK_ACCEPTED,
@@ -1638,13 +1692,28 @@ class TerminalService:
 
         def evidence(lines: list[str], current: Submission) -> tuple[str, str]:
             nonlocal baseline
-            if baseline is None:
+            if baseline is None or (not has_submitted_enter
+                                    and _codex_draft_in_composer(lines, text)
+                                    and not _codex_draft_in_composer(baseline, text)):
                 baseline = list(lines)
-                if not _sent_text_echoed(lines, text):
+                if not _codex_composer_buffer_complete(lines, text):
                     return "INCOMPLETE", "composer_buffer_not_fully_observed"
                 return "COMPOSER", "draft_still_in_composer"
             if adapter.identify_target_state(lines) == "waiting":
                 return "PAGER", "approval_or_pager_visible"
+            if _codex_draft_in_composer(lines, text):
+                return "COMPOSER", "draft_still_in_composer"
+            if (has_submitted_enter and baseline is not None
+                    and _codex_draft_in_composer(baseline, text)
+                    and not _codex_composer_marker_present(lines)):
+                return (ACK_RUNNING if adapter.identify_target_state(lines) == "running" else ACK_ACCEPTED,
+                        "composer_cleared_after_enter")
+            # A working footer before this submission has sent its first
+            # Enter is not acceptance evidence: it may belong to the prior
+            # turn. Require the complete draft to be observed before the
+            # first Enter; otherwise keep polling without any keypress.
+            if not has_submitted_enter and not _codex_composer_buffer_complete(lines, text):
+                return "INCOMPLETE", "composer_buffer_not_fully_observed"
             # An explicit Codex working footer is execution evidence in its
             # own right (and remains reliable when the submitted prompt has
             # already scrolled out of the bounded capture window).
@@ -1657,9 +1726,9 @@ class TerminalService:
             # After an Enter, the composer is expected to disappear, so its
             # absence is evidence of either acceptance or a stuck/changed
             # draft, not a reason to send the prompt again.
-            if not has_submitted_enter and not _sent_text_echoed(lines, text):
+            if not has_submitted_enter and not _codex_composer_buffer_complete(lines, text):
                 return "INCOMPLETE", "composer_buffer_not_fully_observed"
-            if has_submitted_enter and not _sent_text_echoed(lines, text):
+            if has_submitted_enter and not _codex_composer_buffer_complete(lines, text):
                 return "INCOMPLETE", "recovery withheld: composer_cleared_without_execution_evidence"
             return "COMPOSER", "draft_still_in_composer"
 

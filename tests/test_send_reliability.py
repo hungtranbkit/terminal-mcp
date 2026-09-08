@@ -27,6 +27,8 @@ import re
 import time
 from pathlib import Path
 
+import pytest
+
 from terminal_mcp.audit import AuditStore
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig
 from terminal_mcp.core import TerminalService, _extract_composer_text
@@ -248,6 +250,27 @@ def test_codex_normal_submit_confirms_without_recovery(tmux_session_factory, tmp
     assert "recovery_attempted" not in result
     pane = service.terminal_tail(session, 10)["output"]
     assert "SUBMITTED[1]: hello" in pane
+
+
+@pytest.mark.parametrize("required_enters", [2, 3])
+def test_codex_stale_working_is_not_ack_until_composer_clears(
+    tmux_session_factory, tmp_path, required_enters
+):
+    """A stale Working footer must not hide a draft still in the composer."""
+    session = f"test-codex-{required_enters}-enters"
+    # Use a direct command so the fixture can require exactly two or three
+    # Enter presses, matching the production reproduction.
+    command = (f"bash -lc 'CODEX_REQUIRED_ENTERS={required_enters} "
+               f"CODEX_FIXTURE_MODE=submit_after_n_enters exec -a codex "
+               f"python3 -u {CODEX_FIXTURE_PATH}'")
+    tmux_session_factory(session, command)
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "hello world", press_enter=True)
+    assert result["submit_status"] == "SUBMIT_CONFIRMED"
+    assert result["enter_count"] == required_enters
+    pane = service.terminal_tail(session, 20)["output"]
+    assert pane.count("SUBMITTED[") == 1
 
 
 def test_codex_stuck_composer_recovers_via_escape_then_enter(tmux_session_factory, tmp_path):
