@@ -3885,3 +3885,15 @@ than asserting it.
 until Phase 0 is fully green (all its bullets independently verified,
 not just "probably fine"). This section is docs-only as of
 2026-09-06.
+# P0 Codex verified-submit watchdog
+
+Codex prompt submission uses a durable, evidence-driven state machine shared
+by MCP, dashboard, queue, and supervisor paths. A submission is persisted as
+`QUEUED` before text injection, text is injected exactly once, then the
+adapter polls composer/output evidence at `0.4s` intervals. Retries send only
+`Enter`, up to `max_enter_attempts` (default `3`), and stop immediately on
+`ACCEPTED`/`RUNNING`. Pager or incomplete-buffer evidence becomes `STUCK`
+without pressing Enter. Active submissions are reconciled by a `1.5s`
+background sweeper after process restart; prompt text is stored only in a
+0600 local SQLite submission store and is not logged or returned by status
+APIs. Configuration is under `submit_watchdog` in `config.yaml`.

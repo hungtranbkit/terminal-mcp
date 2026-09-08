@@ -184,3 +184,11 @@ nodes:
 #   cache_ttl_seconds: 20.0
 #   warning_threshold_percent: 70.0
 #   critical_threshold_percent: 90.0
+submit_watchdog:
+  enabled: true
+  # Codex-only verified submit polling. Retries send Enter only; prompt text
+  # is persisted before the one-shot injection and is never re-injected.
+  poll_interval_seconds: 0.4
+  timeout_seconds: 5.0
+  max_enter_attempts: 3
+  sweeper_interval_seconds: 1.5

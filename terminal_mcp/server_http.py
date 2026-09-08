@@ -366,6 +366,14 @@ def main() -> None:
     maintenance_loop.start()
     atexit.register(maintenance_loop.stop)
 
+    # Durable Codex submissions are reconciled independently of request
+    # workers.  This is deliberately local to the already-built TerminalService
+    # (and therefore also covers dashboard/MCP/queue/supervisor sends) and
+    # never injects prompt text during recovery.
+    if config.submit_watchdog.enabled:
+        terminal.start_submission_sweeper()
+        atexit.register(terminal.stop_submission_sweeper)
+
     anyio.run(lambda: _serve(server))
 
 

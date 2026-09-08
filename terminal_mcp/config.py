@@ -108,6 +108,16 @@ class QueueConfig:
 
 
 @dataclass(frozen=True)
+class SubmitWatchdogConfig:
+    """Codex-only verified submit timing; retries are Enter-only."""
+    enabled: bool = True
+    poll_interval_seconds: float = 0.4
+    timeout_seconds: float = 5.0
+    max_enter_attempts: int = 3
+    sweeper_interval_seconds: float = 1.5
+
+
+@dataclass(frozen=True)
 class IntegrationLoopConfig:
     """3-role pipeline's own event-driven WAIT/wake background loop
     (integration_loop.py) -- a SEPARATE, independent global kill switch
@@ -456,6 +466,7 @@ class AppConfig:
     nodes: NodesConfig = NodesConfig()
     queue: QueueConfig = QueueConfig()
     integration_loop: IntegrationLoopConfig = IntegrationLoopConfig()
+    submit_watchdog: SubmitWatchdogConfig = SubmitWatchdogConfig()
     ai_usage: AiUsageConfig = AiUsageConfig()
     # Loop-protection metadata schema (see docs/prompt-submission.md, P11):
     # terminal_send_text/_granted accept optional origin/trace_id/parent_
@@ -537,6 +548,24 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     max_agent_bridge_depth = int(raw.get("max_agent_bridge_depth", 2))
     if max_agent_bridge_depth < 0:
         raise ValueError("max_agent_bridge_depth must be at least 0")
+
+    submit_raw = raw.get("submit_watchdog", {})
+    if not isinstance(submit_raw, dict):
+        raise ValueError("submit_watchdog must be a mapping")
+    submit_defaults = SubmitWatchdogConfig()
+    submit_config = SubmitWatchdogConfig(
+        enabled=bool(submit_raw.get("enabled", submit_defaults.enabled)),
+        poll_interval_seconds=float(submit_raw.get("poll_interval_seconds", submit_defaults.poll_interval_seconds)),
+        timeout_seconds=float(submit_raw.get("timeout_seconds", submit_defaults.timeout_seconds)),
+        max_enter_attempts=int(submit_raw.get("max_enter_attempts", submit_defaults.max_enter_attempts)),
+        sweeper_interval_seconds=float(submit_raw.get("sweeper_interval_seconds", submit_defaults.sweeper_interval_seconds)),
+    )
+    if not 0.3 <= submit_config.poll_interval_seconds <= 0.5:
+        raise ValueError("submit_watchdog.poll_interval_seconds must be between 0.3 and 0.5")
+    if submit_config.timeout_seconds <= 0 or submit_config.sweeper_interval_seconds < 1:
+        raise ValueError("submit_watchdog timeouts must be positive")
+    if not 1 <= submit_config.max_enter_attempts <= 5:
+        raise ValueError("submit_watchdog.max_enter_attempts must be between 1 and 5")
 
     nodes_raw = raw.get("nodes", {})
     if not isinstance(nodes_raw, dict):
@@ -687,6 +716,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         nodes=nodes_config,
         queue=_load_queue_config(raw.get("queue", {})),
         integration_loop=_load_integration_loop_config(raw.get("integration_loop", {})),
+        submit_watchdog=submit_config,
         ai_usage=_load_ai_usage_config(raw.get("ai_usage", {})),
     )
 

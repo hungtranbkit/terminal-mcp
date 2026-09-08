@@ -27,6 +27,8 @@ from .session_backend import SessionBackend
 from .session_knowledge import SessionKnowledgeStore, make_instance_id
 from .session_registry import SessionRegistryStore
 from .status import classify_status
+from .submit_watchdog import (ACK_ACCEPTED, ACK_RUNNING, ACK_STUCK, Submission,
+                               SubmissionStore, SubmissionSweeper, VerifiedSubmitWatchdog, WatchdogConfig)
 from .tmux import SEND_TEXT_ENTER_SETTLE_SECONDS, TmuxClient, TmuxError, iso_timestamp
 
 
@@ -221,6 +223,56 @@ class TerminalService:
         # this already-large class: one small, independently-testable
         # object, shared by both the dashboard routes and the MCP tools.
         self.lifecycle = SessionLifecycleService(config, self.tmux)
+        # Durable Codex submission FSM. It is deliberately separate from
+        # input_audit: audit rows redact prompt text, while recovery needs a
+        # private, 0600 local record to prove that a retry must never
+        # re-inject the prompt. All front doors share this TerminalService.
+        self.submissions = SubmissionStore(self.audit.path.with_name("prompt_submissions.db"))
+        watchdog_config = WatchdogConfig(
+            poll_interval_seconds=config.submit_watchdog.poll_interval_seconds,
+            timeout_seconds=config.submit_watchdog.timeout_seconds,
+            max_enter_attempts=config.submit_watchdog.max_enter_attempts,
+        )
+        self.submit_watchdog = VerifiedSubmitWatchdog(self.submissions, watchdog_config)
+        self.submission_sweeper = SubmissionSweeper(
+            self.submissions, self.recover_submission,
+            interval_seconds=config.submit_watchdog.sweeper_interval_seconds,
+        )
+
+    def start_submission_sweeper(self) -> None:
+        self.submission_sweeper.start()
+
+    def stop_submission_sweeper(self) -> None:
+        self.submission_sweeper.stop()
+
+    def recover_submission(self, record: Submission) -> None:
+        """Reconcile a durable in-flight Codex submission without injection."""
+        info = self.tmux.get_session(record.session)
+        if info is None or (info.pane_current_command or "").casefold() != "codex":
+            self.submissions.update(record.submission_id, ack_state=ACK_STUCK,
+                                    evidence="session_or_codex_not_available")
+            return
+        adapter = select_adapter(info.pane_current_command or "")
+        baseline = self.tmux.capture_lines(record.session, SEND_VERIFY_LINES)
+
+        def capture() -> list[str]:
+            return self.tmux.capture_lines(record.session, SEND_VERIFY_LINES)
+
+        def send_enter() -> None:
+            self.tmux.send_keys(record.session, ["Enter"])
+
+        def evidence(lines: list[str], current: Submission) -> tuple[str, str]:
+            if adapter.identify_target_state(lines) == "waiting":
+                return "PAGER", "approval_or_pager_visible"
+            if not _sent_text_echoed(lines, record.prompt):
+                return "INCOMPLETE", "composer_buffer_not_fully_observed"
+            if adapter.submit_ack_evidence(baseline, lines, record.prompt):
+                return (ACK_RUNNING if adapter.identify_target_state(lines) == "running" else ACK_ACCEPTED,
+                        "adapter_execution_evidence")
+            return "COMPOSER", "draft_still_in_composer"
+
+        self.submit_watchdog.run(record.submission_id, capture=capture, send_enter=send_enter,
+                                 evidence=evidence, inject=None)
 
     # Private, per-process convention for this TerminalService's OWN node
     # in the Persistent Session Registry -- see session_registry.py's own
@@ -1338,6 +1390,17 @@ class TerminalService:
                                       "Enter was sent; resolve the pending prompt first, then retry"),
                 }
 
+        # Codex's composer can swallow Enter (and long multiline drafts can
+        # temporarily be rendered as pager/composer chrome).  The verified
+        # path injects once, then only polls and sends Enter when the adapter
+        # still identifies our complete draft as pending.  It is intentionally
+        # before the legacy one-Enter path and is backend-neutral: tmux and
+        # Windows ConPTY both implement capture_lines/send_text/send_keys.
+        if press_enter and adapter.name == "codex" and self.config.submit_watchdog.enabled:
+            return self._verified_codex_submit_locked(
+                session, text, correlation_id, identity_before, command_before, adapter,
+            )
+
         self.tmux.send_text(session, text, press_enter=False)
         result: dict[str, Any] = {"sent": True, "enter_sent": False, "characters": len(text),
                                   "press_enter": press_enter, "correlation_id": correlation_id,
@@ -1534,6 +1597,99 @@ class TerminalService:
             "verification window" if reason == "confirmed" else reason
         )
         return result
+
+    def _verified_codex_submit_locked(self, session: str, text: str, correlation_id: str,
+                                      identity_before: SessionIdentity, command_before: str,
+                                      adapter: Any) -> dict[str, Any]:
+        """Codex-only durable submit path; never types the prompt twice."""
+        key = f"codex:{session}:{correlation_id}"
+        record, _ = self.submissions.create(idempotency_key=key, session=session,
+                                            agent_type=adapter.name, prompt=text)
+        # Baseline is the post-injection composer frame, never the pre-send
+        # screen. Comparing against the latter can mistake the text injection
+        # itself for execution evidence.
+        baseline: list[str] | None = None
+        has_submitted_enter = False
+        enter_calls = 0
+
+        def capture() -> list[str]:
+            return self.tmux.capture_lines(session, SEND_VERIFY_LINES)
+
+        def inject(prompt: str) -> None:
+            self.tmux.send_text(session, prompt, press_enter=False)
+
+        def send_enter() -> None:
+            nonlocal has_submitted_enter, enter_calls
+            info = self.tmux.get_session(session)
+            current = None if info is None else SessionIdentity.from_session_info(info)
+            command = "" if info is None else (info.pane_current_command or "")
+            if current is None or not identity_before.matches(current) or command != command_before:
+                raise TmuxError("IDENTITY_CHANGED_BEFORE_RETRY")
+            enter_calls += 1
+            # Codex's known composer-swallow signature can require clearing
+            # the still-focused composer before the final bounded retry. This
+            # is still one Enter attempt (and never re-injects text); pager /
+            # incomplete-buffer paths never reach this callback.
+            if enter_calls >= 3:
+                self.tmux.send_keys(session, ["Escape"])
+                time.sleep(SEND_TEXT_ENTER_SETTLE_SECONDS)
+            self.tmux.send_keys(session, ["Enter"])
+            has_submitted_enter = True
+
+        def evidence(lines: list[str], current: Submission) -> tuple[str, str]:
+            nonlocal baseline
+            if baseline is None:
+                baseline = list(lines)
+                if not _sent_text_echoed(lines, text):
+                    return "INCOMPLETE", "composer_buffer_not_fully_observed"
+                return "COMPOSER", "draft_still_in_composer"
+            if adapter.identify_target_state(lines) == "waiting":
+                return "PAGER", "approval_or_pager_visible"
+            # An explicit Codex working footer is execution evidence in its
+            # own right (and remains reliable when the submitted prompt has
+            # already scrolled out of the bounded capture window).
+            if adapter.identify_target_state(lines) == "running":
+                return ACK_RUNNING, "adapter_working_indicator"
+            if baseline is not None and adapter.submit_ack_evidence(baseline, lines, text):
+                state = ACK_RUNNING if adapter.identify_target_state(lines) == "running" else ACK_ACCEPTED
+                return state, "adapter_execution_evidence"
+            # Before the first Enter, a complete echo is the safety gate.
+            # After an Enter, the composer is expected to disappear, so its
+            # absence is evidence of either acceptance or a stuck/changed
+            # draft, not a reason to send the prompt again.
+            if not has_submitted_enter and not _sent_text_echoed(lines, text):
+                return "INCOMPLETE", "composer_buffer_not_fully_observed"
+            if has_submitted_enter and not _sent_text_echoed(lines, text):
+                return "INCOMPLETE", "recovery withheld: composer_cleared_without_execution_evidence"
+            return "COMPOSER", "draft_still_in_composer"
+
+        try:
+            result = self.submit_watchdog.run(record.submission_id, capture=capture,
+                                              send_enter=send_enter, evidence=evidence,
+                                              inject=inject)
+        except (TmuxError, ValueError) as exc:
+            self.submissions.update(record.submission_id, ack_state=ACK_STUCK, evidence=str(exc))
+            result = self.submissions.get(record.submission_id).public()  # type: ignore[union-attr]
+        state = result["ack_state"]
+        delivery = DELIVERY_SUBMIT_CONFIRMED if state in (ACK_ACCEPTED, ACK_RUNNING) else DELIVERY_UNKNOWN
+        return {
+            "sent": True, "enter_sent": result["enter_count"] > 0,
+            "characters": len(text), "press_enter": True, "correlation_id": correlation_id,
+            "agent_type": adapter.name, "submission_id": result["submission_id"],
+            "ack_state": state, "attempts": result["attempts"],
+            "enter_count": result["enter_count"], "evidence": result["evidence"],
+            **({"recovery_attempted": True,
+               "recovery_enter_count": result["enter_count"] - 1}
+               if result["enter_count"] > 1 and state != ACK_RUNNING else {}),
+            "delivery_state": delivery, "submit_status": to_legacy_submit_status(delivery),
+            "submit_reason": (
+                (next((item for item in reversed(result["evidence"]) if "withheld" in item),
+                      result["evidence"][-1]) if state == ACK_STUCK and result["evidence"]
+                 else "verified-submit-watchdog")
+                if state != ACK_ACCEPTED or result["enter_count"] <= 1
+                else "verified-submit-watchdog recovery"
+            ),
+        }
 
     def _poll_for_ack_evidence(self, session: str, typed_snapshot: list[str], first_after: list[str] | None,
                                adapter: Any, text: str, *, deadline: float) -> tuple[bool, list[str] | None]:
