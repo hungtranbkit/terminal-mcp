@@ -115,6 +115,7 @@ class SubmitWatchdogConfig:
     timeout_seconds: float = 5.0
     max_enter_attempts: int = 3
     sweeper_interval_seconds: float = 1.5
+    retry_agent_types: tuple[str, ...] = ("codex",)
 
 
 @dataclass(frozen=True)
@@ -559,6 +560,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         timeout_seconds=float(submit_raw.get("timeout_seconds", submit_defaults.timeout_seconds)),
         max_enter_attempts=int(submit_raw.get("max_enter_attempts", submit_defaults.max_enter_attempts)),
         sweeper_interval_seconds=float(submit_raw.get("sweeper_interval_seconds", submit_defaults.sweeper_interval_seconds)),
+        retry_agent_types=tuple(submit_raw.get("retry_agent_types", submit_defaults.retry_agent_types)),
     )
     if not 0.3 <= submit_config.poll_interval_seconds <= 0.5:
         raise ValueError("submit_watchdog.poll_interval_seconds must be between 0.3 and 0.5")
@@ -566,6 +568,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         raise ValueError("submit_watchdog timeouts must be positive")
     if not 1 <= submit_config.max_enter_attempts <= 5:
         raise ValueError("submit_watchdog.max_enter_attempts must be between 1 and 5")
+    if not submit_config.retry_agent_types or not all(isinstance(agent, str) and agent for agent in submit_config.retry_agent_types):
+        raise ValueError("submit_watchdog.retry_agent_types must be a non-empty list of agent types")
 
     nodes_raw = raw.get("nodes", {})
     if not isinstance(nodes_raw, dict):

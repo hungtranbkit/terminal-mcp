@@ -85,3 +85,23 @@ def test_different_prompt_cannot_reuse_submission_key(tmp_path: Path):
     store.create(idempotency_key="same", session="codex", agent_type="codex", prompt="one")
     with pytest.raises(ValueError, match="DIFFERENT_PROMPT"):
         store.create(idempotency_key="same", session="codex", agent_type="codex", prompt="two")
+
+
+def test_claude_watchdog_is_single_submit_even_when_evidence_stays_pending(tmp_path: Path):
+    store = SubmissionStore(tmp_path / "claude.db")
+    watchdog = VerifiedSubmitWatchdog(store, WatchdogConfig(
+        poll_interval_seconds=.05, timeout_seconds=.25, max_enter_attempts=5,
+    ))
+    record, _ = store.create(idempotency_key="claude-single", session="claude-disposable",
+                             agent_type="claude", prompt="one prompt only")
+    enters: list[int] = []
+    result = watchdog.run(
+        record.submission_id,
+        capture=lambda: ["> one prompt only", "Working"],
+        inject=lambda _text: None,
+        send_enter=lambda: enters.append(1),
+        evidence=lambda _lines, _record: ("COMPOSER", "draft_still_in_composer"),
+    )
+    assert enters == [1]
+    assert result["enter_count"] == 1
+    assert result["ack_state"] == ACK_STUCK

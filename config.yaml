@@ -192,3 +192,5 @@ submit_watchdog:
   timeout_seconds: 5.0
   max_enter_attempts: 3
   sweeper_interval_seconds: 1.5
+  # Only Codex may receive automatic Enter retries.
+  retry_agent_types: [codex]

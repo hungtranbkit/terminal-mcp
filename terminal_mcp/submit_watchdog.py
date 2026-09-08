@@ -173,6 +173,7 @@ class WatchdogConfig:
     poll_interval_seconds: float = 0.4
     timeout_seconds: float = 5.0
     max_enter_attempts: int = 3
+    retry_agent_types: frozenset[str] = frozenset({"codex"})
 
 
 class VerifiedSubmitWatchdog:
@@ -228,7 +229,9 @@ class VerifiedSubmitWatchdog:
                 self.store.update(submission_id, evidence=reason)
                 time.sleep(self.config.poll_interval_seconds)
                 continue
-            if current.enter_count >= self.config.max_enter_attempts:
+            max_enter_attempts = (self.config.max_enter_attempts
+                                  if record.agent_type in self.config.retry_agent_types else 1)
+            if current.enter_count >= max_enter_attempts:
                 break
             # A slow TUI may still be consuming the previous Enter. Require
             # either a composer redraw or two stable polls (~0.8s by default)

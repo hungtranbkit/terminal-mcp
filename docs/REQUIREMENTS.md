@@ -3897,3 +3897,11 @@ without pressing Enter. Active submissions are reconciled by a `1.5s`
 background sweeper after process restart; prompt text is stored only in a
 0600 local SQLite submission store and is not logged or returned by status
 APIs. Configuration is under `submit_watchdog` in `config.yaml`.
+
+The retry allowlist is agent-specific: `retry_agent_types: [codex]` is the
+only production setting that permits automatic Enter retries. Claude and
+unknown agents use single-submit semantics—one injection and at most the
+initial Enter; no watchdog/sweeper retry or prompt resend. Unconfirmed Claude
+delivery is reported as `DELIVERY_UNKNOWN`/`STUCK`, never guessed as success.
+All MCP, dashboard, queue, supervisor, controller, Linux tmux, and Windows
+ConPTY callers converge on the same backend/agent policy.

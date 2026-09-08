@@ -280,6 +280,7 @@ class TerminalService:
             poll_interval_seconds=config.submit_watchdog.poll_interval_seconds,
             timeout_seconds=config.submit_watchdog.timeout_seconds,
             max_enter_attempts=config.submit_watchdog.max_enter_attempts,
+            retry_agent_types=frozenset(config.submit_watchdog.retry_agent_types),
         )
         self.submit_watchdog = VerifiedSubmitWatchdog(self.submissions, watchdog_config)
         self.submission_sweeper = SubmissionSweeper(
@@ -295,6 +296,10 @@ class TerminalService:
 
     def recover_submission(self, record: Submission) -> None:
         """Reconcile a durable in-flight Codex submission without injection."""
+        if record.agent_type != "codex":
+            self.submissions.update(record.submission_id, ack_state=ACK_STUCK,
+                                    evidence="single_submit_policy_no_retry")
+            return
         info = self.tmux.get_session(record.session)
         if info is None or (info.pane_current_command or "").casefold() != "codex":
             self.submissions.update(record.submission_id, ack_state=ACK_STUCK,
