@@ -35,7 +35,7 @@ input_policy:
   allow_send_text: true
   allow_keys: [Enter, Escape, Up, Down, Left, Right, Tab]
   sensitive_keys_require_confirmation: [C-c, C-d]
-  max_text_length: 12000
+  max_text_length: 30000
   allowed_sensitive_commands: []
 
 # Supervisor Loop v1 — detection + durable event queue only (see README.md
