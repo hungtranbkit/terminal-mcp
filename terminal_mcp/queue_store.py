@@ -285,6 +285,9 @@ class QueueTask:
     # query is unfiltered unless a caller explicitly asks for a project,
     # so a task without one behaves exactly as it did before.
     project_id: str | None = None
+    # Orchestration V1: which user-visible deliverable this task rolls up
+    # into. Nullable -- a task with no outcome behaves exactly as before.
+    outcome_id: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "QueueTask":
@@ -311,6 +314,7 @@ class QueueTask:
             migration_history=tuple(_parse_json_dict_list(row["migration_history"])),
             at_risk=bool(row["at_risk"]),
             project_id=(row["project_id"] if "project_id" in row.keys() else None),
+            outcome_id=(row["outcome_id"] if "outcome_id" in row.keys() else None),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -335,6 +339,7 @@ class QueueTask:
             "migration_history": list(self.migration_history),
             "at_risk": self.at_risk,
             "project_id": self.project_id,
+            "outcome_id": self.outcome_id,
         }
 
 
@@ -643,6 +648,49 @@ def _add_v7_verify_jobs(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_verify_jobs_task ON verify_jobs(task_id)")
 
 
+def _add_v8_outcomes(connection: sqlite3.Connection) -> None:
+    """Orchestration V1: the OUTCOME layer -- the unit of user-visible
+    completion that sits BETWEEN a backlog item and the tasks that deliver it.
+
+    Before this, the hierarchy was exactly two levels and welded 1:1:
+    backlog_service.dispatch created one queue task per item and then refused
+    ever to do it again (ALREADY_DISPATCHED). There was no way to say "this
+    deliverable took five tasks", and therefore no way to say whether the
+    DELIVERABLE was done -- only whether individual tasks were.
+
+    queue_tasks.outcome_id is nullable and additive: every existing task and
+    every existing query behaves exactly as before. An outcome lives in the
+    SAME database as the tasks that roll up into it, so status rollup is one
+    query rather than a cross-store join that could observe a torn state."""
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS outcomes (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            backlog_id TEXT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL,
+            priority TEXT NOT NULL DEFAULT 'P2',
+            evidence TEXT NOT NULL DEFAULT '{}',
+            blocked_reason TEXT,
+            history TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+    """)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_outcomes_project_status ON outcomes(project_id, status)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_outcomes_backlog ON outcomes(backlog_id)")
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(queue_tasks)")}
+    if "outcome_id" not in columns:
+        connection.execute("ALTER TABLE queue_tasks ADD COLUMN outcome_id TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_queue_tasks_outcome ON queue_tasks(outcome_id, status)")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
@@ -659,6 +707,9 @@ QUEUE_MIGRATIONS = [
     Migration(7, "P0.5 Verify Queue: verify_jobs satellite table (UNIQUE(task_id, attempt) is the "
                  "duplicate-prevention primitive); no task status or transition edge changes",
               _add_v7_verify_jobs),
+    Migration(8, "Orchestration V1: outcomes table + queue_tasks.outcome_id (nullable, additive) -- "
+                 "the user-visible deliverable one backlog item may need N tasks to reach",
+              _add_v8_outcomes),
 ]
 
 

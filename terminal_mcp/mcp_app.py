@@ -32,6 +32,7 @@ from .queue_loop import QueueLoop
 from .backlog_service import BacklogService
 from .event_bus import KNOWN_EVENT_TYPES, EventBus
 from .lease import DEFAULT_RESOURCE_LOCK_TTL_SECONDS, ResourceLockStore
+from .outcomes import OutcomeError, OutcomeStore
 from .project_service import ProjectService
 from .queue_service import QueueService
 from .release_service import ReleaseService
@@ -2345,6 +2346,115 @@ def build_mcp(service: TerminalService | None = None,
             return {"error": "INVALID_REQUEST", "detail": str(exc)}
 
     # ------------------------------------------------------------------
+    # Orchestration V1: the OUTCOME layer -- the unit of user-visible
+    # completion between a backlog item and the tasks that deliver it.
+    #
+    # The rule these tools exist to enforce: an outcome is NOT done because
+    # its children are done. Children finishing is necessary, never
+    # sufficient; every acceptance criterion needs its own evidence.
+    # ------------------------------------------------------------------
+    outcomes = OutcomeStore(queue.store)
+
+    @server.tool()
+    def terminal_outcome_create(project_id: str, title: str, acceptance_criteria: list[str],
+                                description: str = "", backlog_id: str | None = None,
+                                priority: str = "P2", actor: str = "mcp") -> dict:
+        """Declare a user-visible deliverable that may take SEVERAL tasks.
+
+        `acceptance_criteria` is REQUIRED and is the contract for done:
+        terminal_outcome_complete demands separate, checkable evidence for
+        each one. An outcome without criteria could be completed with an
+        empty payload, so it is refused at creation instead.
+
+        Use this when "did X ship?" is a question someone will ask. Use
+        terminal_task_create alone when the task IS the deliverable."""
+        try:
+            outcome = outcomes.create(project_id, title, acceptance_criteria=acceptance_criteria,
+                                      description=description, backlog_id=backlog_id,
+                                      priority=priority, actor=actor)
+        except OutcomeError as exc:
+            return {"error": "INVALID_OUTCOME", "detail": str(exc)}
+        return {"outcome": outcome.to_dict()}
+
+    @server.tool()
+    def terminal_outcome_attach_task(outcome_id: str, task_id: str, actor: str = "mcp") -> dict:
+        """Link an existing task to an outcome. MANY tasks per outcome --
+        that is the point; the previous backlog->task model was welded 1:1
+        and refused a second dispatch forever. A task with no project
+        inherits the outcome's."""
+        try:
+            return outcomes.attach_task(outcome_id, task_id, actor=actor)
+        except OutcomeError as exc:
+            return {"error": "ATTACH_REFUSED", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_outcome_status(outcome_id: str, refresh: bool = True) -> dict:
+        """One outcome with its child-task rollup.
+
+        `refresh` re-derives OPEN/IN_PROGRESS/AWAITING_ACCEPTANCE from the
+        children first. Note it can never derive DONE: reaching DONE
+        requires acceptance evidence and only terminal_outcome_complete can
+        do it. AWAITING_ACCEPTANCE is the state a naive implementation
+        would have called done -- all work finished, nothing verified."""
+        try:
+            if refresh:
+                outcomes.refresh_status(outcome_id)
+        except OutcomeError as exc:
+            return {"error": "OUTCOME_NOT_FOUND", "detail": str(exc)}
+        outcome = outcomes.get(outcome_id)
+        if outcome is None:
+            return {"error": "OUTCOME_NOT_FOUND", "outcome_id": outcome_id}
+        return {"outcome": outcome.to_dict(), "progress": outcomes.progress(outcome_id)}
+
+    @server.tool()
+    def terminal_outcome_list(project_id: str | None = None, status: str | None = None,
+                              backlog_id: str | None = None, limit: int = 100) -> dict:
+        """Outcomes, optionally scoped. This is the read that answers "what
+        is this project actually trying to ship", as opposed to
+        terminal_queue_list_all which answers "what work is queued"."""
+        rows = [o.to_dict() for o in outcomes.list_outcomes(
+            project_id=project_id, status=status, backlog_id=backlog_id, limit=limit)]
+        return {"outcomes": rows, "count": len(rows)}
+
+    @server.tool()
+    def terminal_outcome_complete(outcome_id: str, evidence: dict, actor: str = "mcp") -> dict:
+        """Mark a deliverable DONE -- the only route, and the strictest gate
+        in this system.
+
+        `evidence` maps EACH acceptance criterion to its own evidence
+        object. Two independent conditions, both required: no child task
+        may still be open, AND every criterion must have evidence that is
+        more than a self-report and does not contradict itself.
+
+        Refusals are structured, naming the missing or rejected criteria,
+        so weak evidence can be replaced rather than the call being lost."""
+        return outcomes.complete(outcome_id, evidence=evidence, actor=actor)
+
+    @server.tool()
+    def terminal_outcome_block(outcome_id: str, reason: str, actor: str = "mcp") -> dict:
+        """Park an outcome that cannot progress. A blocked outcome is never
+        silently rolled forward by the child-task rollup."""
+        try:
+            return {"outcome": outcomes.block(outcome_id, reason=reason, actor=actor).to_dict()}
+        except OutcomeError as exc:
+            return {"error": "INVALID_TRANSITION", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_outcome_unblock(outcome_id: str, actor: str = "mcp") -> dict:
+        """Clear a block and re-derive status from the child tasks."""
+        try:
+            return {"outcome": outcomes.unblock(outcome_id, actor=actor).to_dict()}
+        except OutcomeError as exc:
+            return {"error": "INVALID_TRANSITION", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_outcome_trace(outcome_id: str) -> dict:
+        """backlog_id -> outcome -> tasks -> worker/branch/commit/evidence
+        in one read. The chain a project report has to be able to walk to
+        answer "how do we know this shipped"."""
+        return outcomes.trace(outcome_id)
+
+    # ------------------------------------------------------------------
     # P0.7 Project APIs -- the PROJECT-level view, for ChatGPT.
     #
     # Pure composition over P0.1-P0.6 plus the backlog: NO new table, no
@@ -2359,7 +2469,8 @@ def build_mcp(service: TerminalService | None = None,
     # ------------------------------------------------------------------
     projects = ProjectService(queue=queue, backlog=backlog, events=events,
                               verify=getattr(queue, "verify_queue", None), locks=locks,
-                              registry=getattr(controller, "registry", None))
+                              registry=getattr(controller, "registry", None),
+                              outcomes=outcomes)
 
     @server.tool()
     def terminal_project_status(project_id: str) -> dict:
