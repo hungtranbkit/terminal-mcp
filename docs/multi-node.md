@@ -1091,6 +1091,57 @@ state touched) using the real `network_bind` + `LanCidrGuardMiddleware`:
 [OFF-ALLOWLIST] src=192.168.1.132 -> HTTP 403 Forbidden: source address not in the allowed LAN range
 ```
 
+### Binding LAN and overlay at the same time
+
+`TERMINAL_MCP_LAN_BIND` accepts a **comma-separated list**, and the
+controller opens one socket per address (loopback always, unchanged).
+This exists because a single bind makes overlay adoption all-or-nothing:
+repointing the one bind at the tailnet address would cut the heartbeat
+path out from under every node already on the LAN, since they push to
+`http://192.168.1.132:8766`. Binding both lets LAN nodes and off-LAN
+nodes coexist, during the move and after it.
+
+```ini
+[Service]
+Environment=TERMINAL_MCP_TRUSTED_VPN_CIDRS=100.64.0.0/10
+Environment=TERMINAL_MCP_LAN_BIND=192.168.1.132,100.81.85.120
+Environment=TERMINAL_MCP_ALLOWED_NODE_CIDRS=192.168.1.0/24,100.64.0.0/10
+```
+
+Semantics worth knowing:
+
+- **The CIDR allowlist is global, not per-socket.** A source is allowed if
+  it matches any entry, whichever bound socket it arrived on. Pairing each
+  bind to its own range would be marginally tighter, but the flat env var
+  cannot express the pairing and the practical gap is nil (nothing routes
+  tailnet traffic to the LAN address or vice versa).
+- **Every bound socket is guarded.** The guard matches the arrival socket
+  against the whole bind set — a single-address guard would treat traffic
+  on the second socket as "not the LAN socket" and wave it through
+  completely unchecked. `tests/test_multi_address_bind.py` pins this.
+- **Auto-derivation unions across binds** when
+  `TERMINAL_MCP_ALLOWED_NODE_CIDRS` is unset: each bind contributes its
+  NIC subnet, or the declared overlay range containing it, or its
+  conventional `/24`. A bind whose range is missing would be fail-closed
+  for all of its peers.
+- **Every address in the list is validated**, not just the first — a
+  public address anywhere in it is refused.
+- `resolve_lan_bind()` (singular) is retained for `describe_endpoints`/
+  doctor/dashboard and returns the FIRST bind. Anything that opens
+  sockets or builds the guard must use `resolve_lan_binds()`.
+
+Live acceptance evidence (2026-09-09, disposable port 18798, real LAN and
+Tailscale interfaces, no production state touched):
+
+```
+[gate] binds -> ['192.168.1.132', '100.81.85.120']
+[gate] cidrs -> ['192.168.1.0/24', '100.64.0.0/10']
+[bind] [('127.0.0.1', 18798), ('192.168.1.132', 18798), ('100.81.85.120', 18798)]
+192.168.1.132 -> 192.168.1.132 : HTTP 200
+100.81.85.120 -> 100.81.85.120 : HTTP 200
+127.0.0.1     -> 127.0.0.1     : HTTP 200
+```
+
 **Still required before an off-LAN node is production-ready** (not done by
 this change): the node itself must join the tailnet, its `endpoint` must be
 its overlay address, and the controller service must actually be restarted

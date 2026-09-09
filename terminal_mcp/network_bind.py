@@ -38,6 +38,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import socket
+from typing import Sequence
 
 from .lan_discovery import is_trusted_node_address, local_ipv4_subnets, trusted_vpn_cidrs
 
@@ -50,19 +51,10 @@ class NetworkBindError(ValueError):
     pass
 
 
-def resolve_lan_bind(raw: str | None) -> str | None:
-    """`raw` is TERMINAL_MCP_LAN_BIND's raw value: unset/empty -> None
-    (today's exact, unchanged loopback-only behavior); "auto" -> this
-    host's own first UP/private-subnet NIC address (lan_discovery.
-    local_ipv4_subnets -- the SAME real subnet detection LAN discovery
-    itself uses, so "the LAN" always means the same thing across this
-    project); an explicit dotted-quad -- validated private/link-local,
-    never a public address (this is a BIND address, not a scan target,
-    but the safety bar is the same: never let this process listen on
-    something reachable from outside this LAN)."""
-    if not raw or not raw.strip():
-        return None
-    value = raw.strip()
+def _resolve_one_bind(value: str) -> str:
+    """Validate ONE bind address (the body resolve_lan_bind always had,
+    lifted out unchanged so the plural entry point below and the
+    singular one can never drift apart in what they accept)."""
     if value.lower() == "auto":
         subnets = local_ipv4_subnets()
         if not subnets:
@@ -86,7 +78,91 @@ def resolve_lan_bind(raw: str | None) -> str | None:
     return value
 
 
-def resolve_allowed_cidrs(raw: str | None, lan_bind_ip: str | None) -> tuple[ipaddress.IPv4Network, ...]:
+def resolve_lan_binds(raw: str | None) -> tuple[str, ...]:
+    """TERMINAL_MCP_LAN_BIND, plural form: a COMMA-SEPARATED list, so this
+    controller can be reachable on more than one network at once -- the
+    real case this exists for is "LAN + overlay VPN simultaneously"
+    (192.168.1.132 for the nodes already on this LAN, plus this host's
+    own Tailscale 100.x address for nodes on other internet connections),
+    which otherwise forces an all-or-nothing migration: repointing the
+    single bind at the tailnet would cut the heartbeat path out from
+    under every existing LAN node at once.
+
+    Loopback is NEVER listed here -- build_listen_sockets always adds it,
+    unchanged. Duplicates are collapsed, order preserved. Unset/empty ->
+    () (today's exact loopback-only behaviour)."""
+    if not raw or not raw.strip():
+        return ()
+    binds: list[str] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        resolved = _resolve_one_bind(part)
+        if resolved not in binds:
+            binds.append(resolved)
+    return tuple(binds)
+
+
+def resolve_lan_bind(raw: str | None) -> str | None:
+
+    """Singular view of resolve_lan_binds: the FIRST configured bind, or
+    None. Retained because `describe_endpoints`/doctor/dashboard and this
+    module's own long-standing tests all speak in terms of "the" LAN bind;
+    anything that actually opens sockets or builds the CIDR guard must use
+    the plural form, or it will silently ignore every address after the
+    first. Same validation either way -- see _resolve_one_bind."""
+    binds = resolve_lan_binds(raw)
+    return binds[0] if binds else None
+
+
+def _as_bind_tuple(lan_bind_ip: str | None | Sequence[str]) -> tuple[str, ...]:
+    """Every public entry point here accepts EITHER the singular
+    `str | None` shape it has always accepted, OR a sequence of bind
+    addresses -- so adding multi-bind support changed no existing caller
+    or test, and a caller that was passing one string keeps working
+    byte-for-byte."""
+    if lan_bind_ip is None:
+        return ()
+    if isinstance(lan_bind_ip, str):
+        return (lan_bind_ip,)
+    return tuple(lan_bind_ip)
+
+
+def _derive_cidr_for_bind(lan_bind_ip: str) -> ipaddress.IPv4Network:
+    """Auto-derivation for ONE bind address -- its own NIC subnet, else
+    the declared overlay range containing it, else its conventional /24."""
+    for subnet in local_ipv4_subnets():
+        if str(subnet.local_ip) == lan_bind_ip:
+            return subnet.network
+    # An overlay-VPN bind address is never one of local_ipv4_subnets()'s
+    # own results (that helper deliberately filters to LAN-scannable
+    # ranges only), so the /24 fallback below would derive a range far
+    # too narrow to contain the tailnet's other peers -- a Tailscale
+    # peer is anywhere in 100.64.0.0/10, not in the bind address's own
+    # /24. Derive the operator's own declared range instead, which is
+    # exactly the set of peers they said they trust.
+    bind_addr = ipaddress.IPv4Address(lan_bind_ip)
+    for network in trusted_vpn_cidrs():
+        if bind_addr in network:
+            _log.info("network_bind: %s is inside declared trusted overlay range %s -- using it as the "
+                     "allowed-source CIDR list", lan_bind_ip, network)
+            return network
+    # lan_bind_ip was given explicitly (not "auto") and doesn't match any
+    # currently-UP NIC's own subnet (e.g. configured ahead of the NIC
+    # coming up, or a static/manually-assigned address ip addr wouldn't
+    # necessarily surface the same way) -- fall back to this address's
+    # own conventional /24, still verified private by resolve_lan_bind
+    # already having accepted it. Never wider than /24 by inference alone.
+    network = ipaddress.IPv4Network(f"{lan_bind_ip}/24", strict=False)
+    _log.warning("network_bind: could not find %s among this host's own UP NIC subnets -- "
+                "derived allowlist %s from its conventional /24 instead; set "
+                "TERMINAL_MCP_ALLOWED_NODE_CIDRS explicitly if this is wrong", lan_bind_ip, network)
+    return network
+
+
+def resolve_allowed_cidrs(raw: str | None,
+                          lan_bind_ip: str | None | Sequence[str]) -> tuple[ipaddress.IPv4Network, ...]:
     """`raw` is TERMINAL_MCP_ALLOWED_NODE_CIDRS's raw value (comma-
     separated CIDRs). Explicit value: every entry must itself be a
     private/link-local range (rejects a typo'd public CIDR outright,
@@ -117,44 +193,30 @@ def resolve_allowed_cidrs(raw: str | None, lan_bind_ip: str | None) -> tuple[ipa
                 )
             networks.append(network)
         return tuple(networks)
-    if lan_bind_ip is None:
+    binds = _as_bind_tuple(lan_bind_ip)
+    if not binds:
         return ()
-    for subnet in local_ipv4_subnets():
-        if str(subnet.local_ip) == lan_bind_ip:
-            return (subnet.network,)
-    # An overlay-VPN bind address is never one of local_ipv4_subnets()'s
-    # own results (that helper deliberately filters to LAN-scannable
-    # ranges only), so the /24 fallback below would derive a range far
-    # too narrow to contain the tailnet's other peers -- a Tailscale
-    # peer is anywhere in 100.64.0.0/10, not in the bind address's own
-    # /24. Derive the operator's own declared range instead, which is
-    # exactly the set of peers they said they trust.
-    bind_addr = ipaddress.IPv4Address(lan_bind_ip)
-    for network in trusted_vpn_cidrs():
-        if bind_addr in network:
-            _log.info("network_bind: %s is inside declared trusted overlay range %s -- using it as the "
-                     "allowed-source CIDR list", lan_bind_ip, network)
-            return (network,)
-    # lan_bind_ip was given explicitly (not "auto") and doesn't match any
-    # currently-UP NIC's own subnet (e.g. configured ahead of the NIC
-    # coming up, or a static/manually-assigned address ip addr wouldn't
-    # necessarily surface the same way) -- fall back to this address's
-    # own conventional /24, still verified private by resolve_lan_bind
-    # already having accepted it. Never wider than /24 by inference alone.
-    network = ipaddress.IPv4Network(f"{lan_bind_ip}/24", strict=False)
-    _log.warning("network_bind: could not find %s among this host's own UP NIC subnets -- "
-                "derived allowlist %s from its conventional /24 instead; set "
-                "TERMINAL_MCP_ALLOWED_NODE_CIDRS explicitly if this is wrong", lan_bind_ip, network)
-    return (network,)
+    # UNION across every bind address -- with LAN + overlay bound at once,
+    # each socket's own peers must be represented or that socket is
+    # fail-closed for everyone (LanCidrGuardMiddleware rejects an empty/
+    # non-matching allowlist rather than falling open).
+    derived: list[ipaddress.IPv4Network] = []
+    for bind in binds:
+        network = _derive_cidr_for_bind(bind)
+        if network not in derived:
+            derived.append(network)
+    return tuple(derived)
 
 
-def build_listen_sockets(port: int, lan_bind_ip: str | None) -> list[socket.socket]:
+def build_listen_sockets(port: int, lan_bind_ip: str | None | Sequence[str]) -> list[socket.socket]:
     """Loopback ALWAYS included -- this must never regress existing
     loopback-only behavior (tunnels, local tools, tests all depend on
-    it). lan_bind_ip, when given, is a SECOND, additional socket -- never
-    a replacement for the loopback one."""
+    it). lan_bind_ip, when given, adds one ADDITIONAL socket per address
+    -- never a replacement for the loopback one. Accepts a single address
+    (unchanged) or several, so the controller can serve its LAN and its
+    overlay-VPN address at the same time."""
     sockets = []
-    for host in ([LOOPBACK] if lan_bind_ip is None else [LOOPBACK, lan_bind_ip]):
+    for host in [LOOPBACK, *_as_bind_tuple(lan_bind_ip)]:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, port))
@@ -178,18 +240,21 @@ def describe_endpoints(*, port: int, lan_bind_env: str | None, cidrs_env: str | 
     rule does) -- reported as an honest, standing reminder while a LAN
     bind is active, never a false "verified" claim."""
     try:
-        lan_bind_ip = resolve_lan_bind(lan_bind_env)
+        lan_binds = resolve_lan_binds(lan_bind_env)
     except NetworkBindError as exc:
         return {"loopback": f"http://{LOOPBACK}:{port}", "lan": None, "lan_error": str(exc), "tunnel": tunnel_note}
-    if lan_bind_ip is None:
+    if not lan_binds:
         return {"loopback": f"http://{LOOPBACK}:{port}", "lan": None, "tunnel": tunnel_note}
+    lan_urls = [f"http://{ip}:{port}" for ip in lan_binds]
     try:
-        allowed = resolve_allowed_cidrs(cidrs_env, lan_bind_ip)
+        allowed = resolve_allowed_cidrs(cidrs_env, lan_binds)
     except NetworkBindError as exc:
-        return {"loopback": f"http://{LOOPBACK}:{port}", "lan": f"http://{lan_bind_ip}:{port}",
+        return {"loopback": f"http://{LOOPBACK}:{port}", "lan": lan_urls[0], "lans": lan_urls,
                "lan_error": str(exc), "tunnel": tunnel_note}
     return {
-        "loopback": f"http://{LOOPBACK}:{port}", "lan": f"http://{lan_bind_ip}:{port}",
+        # "lan" stays a single string for every existing reader; "lans"
+        # is the full list once more than one address is bound.
+        "loopback": f"http://{LOOPBACK}:{port}", "lan": lan_urls[0], "lans": lan_urls,
         "allowed_cidrs": [str(c) for c in allowed], "firewall_verified": False,
         "firewall_reminder": "This process enforces the allowed_cidrs list itself (LanCidrGuardMiddleware), "
                              "but has no way to confirm an OS firewall rule also restricts this port -- run "

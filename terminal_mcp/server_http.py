@@ -161,19 +161,24 @@ async def _serve(server) -> None:
     starlette_app = server.streamable_http_app(
         streamable_http_path=HTTP_PATH, json_response=True, host=HTTP_HOST,
     )
-    lan_bind_ip = network_bind.resolve_lan_bind(os.environ.get("TERMINAL_MCP_LAN_BIND"))
-    allowed_cidrs = network_bind.resolve_allowed_cidrs(os.environ.get("TERMINAL_MCP_ALLOWED_NODE_CIDRS"), lan_bind_ip)
-    if lan_bind_ip:
+    # PLURAL -- TERMINAL_MCP_LAN_BIND may list several addresses so this
+    # controller is reachable on its LAN and its overlay VPN at the same
+    # time. Using the singular resolve_lan_bind() here would silently bind
+    # only the first and leave every later address unreachable AND
+    # unguarded.
+    lan_bind_ips = network_bind.resolve_lan_binds(os.environ.get("TERMINAL_MCP_LAN_BIND"))
+    allowed_cidrs = network_bind.resolve_allowed_cidrs(os.environ.get("TERMINAL_MCP_ALLOWED_NODE_CIDRS"), lan_bind_ips)
+    if lan_bind_ips:
         _log.warning(
-            "network_bind: LAN bind enabled on %s:%d, allowed source CIDRs=%s -- run "
+            "network_bind: LAN bind enabled on %s (port %d), allowed source CIDRs=%s -- run "
             "'terminal-mcp-doctor connection' for OS-firewall guidance if you haven't applied one yet "
             "(this process enforces the same allowlist itself either way, see network_middleware.py)",
-            lan_bind_ip, HTTP_PORT, [str(c) for c in allowed_cidrs],
+            list(lan_bind_ips), HTTP_PORT, [str(c) for c in allowed_cidrs],
         )
-    starlette_app.add_middleware(network_middleware.LanCidrGuardMiddleware, lan_bind_ip=lan_bind_ip, allowed_cidrs=allowed_cidrs)
+    starlette_app.add_middleware(network_middleware.LanCidrGuardMiddleware, lan_bind_ip=lan_bind_ips, allowed_cidrs=allowed_cidrs)
     starlette_app.add_middleware(SecurityHeadersMiddleware)
     starlette_app.add_middleware(RequestIdMiddleware)
-    sockets = network_bind.build_listen_sockets(HTTP_PORT, lan_bind_ip)
+    sockets = network_bind.build_listen_sockets(HTTP_PORT, lan_bind_ips)
     config = uvicorn.Config(starlette_app, log_level="info", log_config=None)
     await uvicorn.Server(config).serve(sockets=sockets)
 
