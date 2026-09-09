@@ -51,6 +51,11 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_node_status",
         # P0.3: probed tool/runtime capability axis, used for routing.
         "terminal_node_capabilities",
+        # P0.4: task lease verbs (renew/release/handoff + holder read).
+        "terminal_task_renew_lease",
+        "terminal_task_release_claim",
+        "terminal_task_handoff",
+        "terminal_task_lease_holder",
         "terminal_node_sessions",
         "terminal_registry_list",
         "terminal_registry_get",

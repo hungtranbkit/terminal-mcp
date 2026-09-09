@@ -7,6 +7,7 @@ capabilities are a SEPARATE field from `labels` (operator tags).
 """
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -164,10 +165,26 @@ def test_migrates_a_copy_of_the_REAL_production_registry(tmp_path):
     node_count = before.execute("select count(*) from nodes").fetchone()[0]
     before.close()
 
+    # capture what the source DB actually holds BEFORE migrating, so the
+    # assertion is "migration preserves and never invents", not "production
+    # happens to be empty" -- the latter was true only until the fleet was
+    # redeployed and started reporting real capabilities.
+    src = sqlite3.connect(copy)
+    has_column = "capabilities" in {r[1] for r in src.execute("PRAGMA table_info(nodes)")}
+    original = ({r[0]: r[1] for r in src.execute("select id, capabilities from nodes")}
+                if has_column else {})
+    src.close()
+
     registry = NodeRegistry(copy)
 
     after = sqlite3.connect(copy)
     assert after.execute("select count(*) from nodes").fetchone()[0] == node_count
     assert "capabilities" in {r[1] for r in after.execute("PRAGMA table_info(nodes)")}
-    # pre-existing nodes default to empty, never to a guessed capability
-    assert all(n.capabilities == () for n in registry.list())
+    for node in registry.list():
+        if has_column:
+            # preserved exactly -- migration must not rewrite real data
+            assert list(node.capabilities) == json.loads(original[node.id] or "[]")
+        else:
+            # a pre-existing DB without the column defaults to empty,
+            # never to a guessed capability
+            assert node.capabilities == ()

@@ -1135,6 +1135,140 @@ class QueueStore:
                 self._pause_lane_locked(connection, row["session"], reason=f"coordinator: {reason}")
         return updated
 
+    # ------------------------------------------------- P0.4 task lease API
+    # claim_next_task already stamps claim_token + lease_expires_at
+    # atomically; what was missing is everything AFTER the claim. Note
+    # reconcile_stale_claims' own docstring already assumed "a healthy
+    # engine keeps renewing ... well within the lease" -- renew_task_lease
+    # is the method that assumption was written against and which did not
+    # exist until now. Without it a genuinely-alive worker on a long task
+    # silently loses its claim at TTL and gets reconciled out from under
+    # itself.
+    #
+    # Every verb here requires the CURRENT claim_token: a holder whose
+    # lease already expired and was reclaimed by someone else can never
+    # renew, release or hand off the new holder's work. Same rule as
+    # event_bus.ack and lease.PaneLeaseStore.
+
+    LEASE_STATES = (PRECHECK, DISPATCHING, RUNNING, VERIFYING)
+
+    def renew_task_lease(self, task_id: str, claim_token: str, *,
+                         lease_seconds: float = 300.0) -> QueueTask | None:
+        """Extend an ACTIVE claim. Returns the updated task, or None if the
+        token does not match the current holder (or the task is no longer
+        in a leaseable state) -- never raises for a lost race, because
+        losing a lease is an ordinary outcome a worker must handle."""
+        new_expiry = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                   time.gmtime(time.time() + lease_seconds))
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status FROM queue_tasks WHERE id = ? AND claim_token = ?",
+                (task_id, claim_token)).fetchone()
+            if row is None or row["status"] not in self.LEASE_STATES:
+                connection.rollback()
+                return None
+            connection.execute(
+                "UPDATE queue_tasks SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND claim_token = ?",
+                (new_expiry, iso_now(), task_id, claim_token))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_task(task_id)
+
+    def release_task_claim(self, task_id: str, claim_token: str, *,
+                           reason: str | None = None) -> QueueTask | None:
+        """Give a claim back BEFORE its TTL expires -- the graceful form of
+        what reconcile_stale_claims does forcibly after a crash. The task
+        returns to QUEUED with its claim fields cleared, exactly the shape
+        reconciliation produces, so a released task and a reconciled one
+        are indistinguishable downstream.
+
+        Returns None if the token is not the current holder's."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status FROM queue_tasks WHERE id = ? AND claim_token = ?",
+                (task_id, claim_token)).fetchone()
+            if row is None or row["status"] not in self.LEASE_STATES:
+                connection.rollback()
+                return None
+            updated = self._transition_locked(
+                connection, task_id, row["status"], QUEUED,
+                event_type="CLAIM_RELEASED", reason=reason or "claim released by holder",
+                extra_fields={"claimed_by": None, "claim_token": None, "lease_expires_at": None})
+            connection.commit()
+            return updated
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def handoff_task(self, task_id: str, claim_token: str, *, to_worker: str,
+                     to_session: str | None = None, reason: str,
+                     lease_seconds: float = 300.0) -> QueueTask | None:
+        """Transfer an ACTIVE claim to another worker without the task ever
+        returning to the queue -- the verb worker -> verifier needs.
+
+        Distinct from reassign_task on purpose: that moves a task's LANE
+        and deliberately REFUSES a task that is actively claimed
+        (TaskAlreadyClaimedError), which is exactly the case here. This
+        moves the CLAIM, keeps the same task_id/prompt/attempt_count, and
+        appends to the same append-only `migration_history` column so the
+        provenance trail stays in one place rather than two.
+
+        `to_session` is optional: handing work to a verifier on the SAME
+        lane is the common case, and moving lanes as well is allowed but
+        never implied."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, session, claimed_by, migration_history FROM queue_tasks "
+                "WHERE id = ? AND claim_token = ?", (task_id, claim_token)).fetchone()
+            if row is None or row["status"] not in self.LEASE_STATES:
+                connection.rollback()
+                return None
+            history = _parse_json_list(row["migration_history"])
+            history.append({"at": iso_now(), "event": "handoff",
+                            "from_worker": row["claimed_by"], "to_worker": to_worker,
+                            "from_session": row["session"],
+                            "to_session": to_session or row["session"], "reason": reason})
+            new_token = new_task_id()
+            new_expiry = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                       time.gmtime(time.time() + lease_seconds))
+            connection.execute(
+                "UPDATE queue_tasks SET claimed_by = ?, claim_token = ?, lease_expires_at = ?, "
+                "session = ?, migration_history = ?, updated_at = ? WHERE id = ? AND claim_token = ?",
+                (to_worker, new_token, new_expiry, to_session or row["session"],
+                 json.dumps(history), iso_now(), task_id, claim_token))
+            self._record_event_locked(connection, session=row["session"], task_id=task_id,
+                                      event_type="CLAIM_HANDOFF",
+                                      reason=f"{row['claimed_by']} -> {to_worker}: {reason}")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_task(task_id)
+
+    def lease_holder(self, task_id: str) -> dict[str, Any] | None:
+        """Who currently holds this task and until when -- the read a
+        supervisor/dashboard needs without exposing the token itself."""
+        task = self.get_task(task_id)
+        if task is None or not task.claim_token:
+            return None
+        return {"task_id": task.id, "claimed_by": task.claimed_by,
+                "lease_expires_at": task.lease_expires_at, "status": task.status,
+                "session": task.session}
+
     def reconcile_stale_claims(self, session: str | None = None, *, now: str | None = None) -> list[str]:
         """Restart-safe reconciliation (item 8): a task stuck in
         PRECHECK or DISPATCHING past its own lease_expires_at means the
