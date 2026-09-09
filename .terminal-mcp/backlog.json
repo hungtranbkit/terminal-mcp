@@ -1626,20 +1626,20 @@
     },
     {
       "id": "blg_dell5530_lost_sessions",
-      "title": "dell-5530 dropped offline and came back with 3 of 6 sessions gone",
-      "description": "2026-09-09 ~22:30 local: dell-5530 stopped heartbeating mid-session and was unreachable at the network layer (100% packet loss) for several minutes, then returned online and is now heartbeating normally -- but reports 3 sessions instead of 6. Consistent with the known property that dell-5530's ConPTY sessions are in-process children of the node-agent and do NOT survive its restart. Which 3 survived is not yet identified; the controller can enumerate them, this was observed from an ad-hoc script that has no node client. Not caused by any change in this session: only the controller's queue.db was written, and dell-5530 was never touched.",
-      "status": "BACKLOG",
+      "title": "dell-5530 node-agent restarted: 3 of 6 ConPTY sessions lost (wcodex, wdeploy, win3)",
+      "description": "2026-09-09 ~22:30 local: dell-5530 stopped heartbeating for several minutes, then resumed. IDENTIFIED: 3 of its 6 ConPTY sessions are gone. LIVE: win1, win2, wtest (all ACTIVE). LOST: wcodex (codex agent), wdeploy (shell), win3 (shell) -- all now MISSING in the node's own registry and all marked recoverable=true, cwd C:\\\\Users\\\\tranv\\\\terminal-mcp. Consistent with the known property that dell-5530's ConPTY sessions are in-process children of the node-agent and do not survive its restart. Node is healthy now (version 0.12.0, agent_generation e19d32ef22e3bdf3). Not caused by any change in this session: only the controller's queue.db was written and dell-5530 was never touched.",
+      "status": "READY",
       "priority": "P1",
       "type": "incident",
       "order": 35,
       "created_at": "2026-09-09T15:53:21.099701+00:00",
-      "updated_at": "2026-09-09T15:53:21.099701+00:00",
+      "updated_at": "2026-09-09T15:57:01.814325+00:00",
       "source": "observed-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
-        "Identify which 3 sessions survived and which 3 were lost",
-        "Determine whether the host rebooted, slept, or the agent restarted",
-        "Decide whether the lost sessions need recreating"
+        "Decide whether wcodex / wdeploy / win3 should be recreated",
+        "If yes, reopen them from the node registry (all three are recoverable=true)",
+        "Confirm win1 / win2 / wtest stayed untouched throughout"
       ],
       "tags": [
         "dell-5530",
@@ -1658,9 +1658,11 @@
         "tests": [],
         "deploys": [],
         "notes": [
-          "Heartbeats every ~21s returning 200 until 22:30:52, then a gap, then resumed; 45 heartbeats in the following 20 minutes.",
-          "Direct ping and node-agent port remain unreachable from the controller, while heartbeats (outbound node->controller) work -- so the node can reach us but we cannot reach it.",
-          "Relevant to the already-pending dell-5530 maintenance window (token rotation + orphaned Scheduled Task), which costs the ConPTY sessions anyway."
+          "Queried the node agent directly at http://192.168.1.250:8790 with the controller's own bearer token, read from the running process environment and never printed.",
+          "GET /v1/sessions -> 3: win1, win2, wtest. GET /v1/registry -> wcodex/wdeploy/win3 are MISSING with recoverable=true; win1/win2/wtest are ACTIVE.",
+          "CORRECTION to the earlier read in this session: dell-5530 is NOT unreachable. That conclusion came from ping (ICMP, blocked by default on Windows) plus a curl to the WRONG PORT -- 8766 is the controller, the node agent listens on 8790. On 8790 it answers HTTP 200. The heartbeat gap was real; 'network-layer unreachable' was not.",
+          "wtest -- flagged in project memory as a live attended session -- SURVIVED.",
+          "Relevant to the pending dell-5530 maintenance window (token rotation + orphaned Scheduled Task), which costs the ConPTY sessions anyway: 3 are already gone."
         ]
       },
       "history": [
@@ -1668,6 +1670,12 @@
           "at": "2026-09-09T15:53:21.099701+00:00",
           "event": "created",
           "by": "observed-2026-09-09"
+        },
+        {
+          "at": "2026-09-09T15:57:01.814325+00:00",
+          "event": "updated",
+          "by": "mcp",
+          "note": "identified the 3 lost and 3 surviving sessions; corrected the reachability claim"
         }
       ]
     }
