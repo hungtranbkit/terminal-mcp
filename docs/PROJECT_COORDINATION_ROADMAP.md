@@ -159,7 +159,7 @@ make it another export target — never a second writable source of truth.
 | P0.2 event bus | M | Low-Med | New table, reuses claim semantics |
 | P0.3 capability axis | S | Low | Must be probe-based |
 | P0.4 task lease API | S | Low | Columns exist |
-| P0.5 verify queue | M | **Med** | Changes who verifies — keep old default |
+| P0.5 verify queue | M | **Med** | ~~Changes who verifies~~ **SHIPPED** — opt-in per task, old default kept |
 | P0.6 resource lock | S | Low | Generalise pane lease |
 | P0.7 project APIs | S | Low | Additive tools |
 | P1.1 per-project coordinator | L | **Med-High** | LLM in the loop; keep gate deterministic |
@@ -196,7 +196,42 @@ migration v6 verified against a copy of the real production `queue.db`
 and the bus proven with two real OS processes claiming 30 events with zero
 duplicates and zero losses. Full suite 2276 passed.
 
-## Next: P0.5 (P0.1-P0.4 shipped)
+## P0.5 SHIPPED 2026-09-09 — verify queue with capability routing
+
+Verification is now claimable work routed by capability. The `verify_jobs`
+satellite table (migration v7) carries required capabilities, implementer,
+branch/commit, verifier, evidence and an append-only audit trail; the task
+keeps its existing status vocabulary, and **P0.5 added zero task statuses and
+zero task transition edges** — asserted structurally by a test against
+`VALID_TRANSITIONS`, not left to review.
+
+The medium-risk item flagged in the table below ("changes who verifies — keep
+old default") was handled by making the opt-in **per task**, via each task's
+own `completion_policy["verify"]`, rather than a global switch. No existing
+task has that key, so in-session verification remains the default for every
+lane that exists, and there is no flag to forget to leave off.
+
+- **Routing:** AND semantics over reported facts only — probed P0.3
+  capabilities plus `platform`/`session_backend`/`shell_capabilities`. Nothing
+  inferred; no application name special-cased. Including `platform` makes
+  `windows` route to dell-5530 without redeploying its pre-P0.3 agent.
+  `macos` is deliberately NOT routable (the node agent has no Darwin branch,
+  so the MacBook reports `platform=linux`) — stated rather than papered over.
+- **Evidence-gated pass:** more than a self-report, and not self-contradicted
+  (`exit_code != 0` / `passed: false` / `tests_failed > 0` refused).
+- **Lease reuse:** P0.4 semantics exactly — token + expiry, `BEGIN IMMEDIATE`,
+  and handoff rotates the token so the old holder cannot mutate the result.
+- **No verifier:** a visible hold with a routability reason, never a silent
+  pass and never a dropped task.
+- **Duplicates:** `UNIQUE (task_id, attempt)` in the schema, so restart-safe;
+  a genuine retry gets its own job and the prior verdict survives.
+
+12 new MCP tools (156 total), one read-only dashboard route. Migration v7
+verified against a copy of the real production `queue.db` (38 tasks / 246
+events, every existing row byte-identical, `verify_jobs` empty). Full suite
+2369 passed.
+
+## Next: P0.6 (P0.1-P0.5 shipped)
 
 **P0.3 shipped 2026-09-09**: probed tool/runtime capabilities
 (git/node/npm/python/docker/dotnet/playwright/tmux/rustc/go/java) now ride

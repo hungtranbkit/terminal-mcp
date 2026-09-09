@@ -582,6 +582,67 @@ def _add_v6_project_dimension(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_queue_lanes_project ON queue_lanes(project)")
 
 
+def _add_v7_verify_jobs(connection: sqlite3.Connection) -> None:
+    """P0.5 Verify Queue. A verify_jobs row is a SATELLITE of a queue_task,
+    never a second copy of it: the task keeps its own existing status
+    (VERIFYING while a job is outstanding, then COMPLETED/FAILED/BLOCKED
+    exactly as today) and this table records WHO must verify it, WITH what
+    capabilities, and WHAT the outcome was. No task status is added and no
+    task transition edge changes -- see verify_queue.py's own module
+    docstring for the full mapping and why it is deliberately not a second
+    state machine over the same task.
+
+    UNIQUE(task_id, attempt) is the duplicate-prevention primitive the
+    whole "no duplicate verify job on retry/restart" requirement rests on:
+    a retry bumps attempt_count (see _transition_locked), so a genuine
+    re-attempt gets its own job while a repeated ensure_verify_job for the
+    SAME attempt is an idempotent no-op rather than a second job. Nothing
+    below relies on an in-process guard.
+
+    Entirely additive: a database that never creates a verify job is
+    byte-for-byte the same queue as before, which is what keeps in-session
+    verification the untouched default."""
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS verify_jobs (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            session TEXT NOT NULL,
+            project_id TEXT,
+            backlog_id TEXT,
+            status TEXT NOT NULL,
+            required_capabilities TEXT NOT NULL DEFAULT '[]',
+            require_independent INTEGER NOT NULL DEFAULT 1,
+            fallback TEXT NOT NULL DEFAULT 'in_session',
+            implementer TEXT,
+            branch TEXT,
+            commit_sha TEXT,
+            verifier TEXT,
+            verifier_node_id TEXT,
+            claim_token TEXT,
+            lease_expires_at TEXT,
+            claim_count INTEGER NOT NULL DEFAULT 0,
+            evidence TEXT,
+            failure_summary TEXT,
+            block_reason TEXT,
+            history TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            claimed_at TEXT,
+            completed_at TEXT,
+            UNIQUE (task_id, attempt)
+        )
+    """)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_verify_jobs_status_created "
+        "ON verify_jobs(status, created_at)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_verify_jobs_project_status "
+        "ON verify_jobs(project_id, status)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_verify_jobs_task ON verify_jobs(task_id)")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
@@ -595,6 +656,9 @@ QUEUE_MIGRATIONS = [
     Migration(6, "P0.1 Project Dimension: queue_tasks.project_id (nullable) + project indexes; "
                  "queue_lanes.project (added v4, never populated) is REUSED as the lane key",
               _add_v6_project_dimension),
+    Migration(7, "P0.5 Verify Queue: verify_jobs satellite table (UNIQUE(task_id, attempt) is the "
+                 "duplicate-prevention primitive); no task status or transition edge changes",
+              _add_v7_verify_jobs),
 ]
 
 

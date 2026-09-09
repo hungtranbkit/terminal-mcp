@@ -4074,3 +4074,89 @@ ConPTY callers converge on the same backend/agent policy.
   and returns HTTP 404 for the new refresh endpoint. `wtest` is live and
   attached, so no node-agent restart was performed; dashboard Codex
 capability remains pending deployment/restart-safe refresh.
+
+# 2026-09-09 P0.5 Verify Queue + capability routing
+
+Verification becomes **claimable work routed by capability** instead of a
+state only the implementing session can leave. Previously a task reaching
+`VERIFYING` could be advanced by exactly one actor: the queue engine's tick,
+reading the same session the work ran in, looking for a completion marker.
+That cannot express "verify this on a Windows node with .NET, and not by the
+agent that wrote the code".
+
+**No new task state, no new task transition edge.** A `verify_jobs` row
+(migration v7) is a *satellite* of a `queue_tasks` row, never a parallel copy.
+Every verify outcome lands on an edge that already existed:
+
+| verify job status | task transition | evidence required |
+| --- | --- | --- |
+| `VERIFIED_PASS` | `VERIFYING -> COMPLETED` | yes — gated |
+| `VERIFIED_FAIL` | `VERIFYING -> FAILED` | structured failure summary |
+| `NEEDS_REWORK` | `VERIFYING -> FAILED` | structured failure summary |
+| `VERIFY_BLOCKED` | `VERIFYING -> BLOCKED` | structured failure summary |
+| `VERIFY_CANCELLED` | none | n/a |
+
+`VERIFIED_FAIL` and `NEEDS_REWORK` deliberately share one task status: the
+task vocabulary has no separate "needs rework" state and inventing one would
+duplicate the state machine. The distinction is kept on the job, and `FAILED`
+is the status with an existing way out (`terminal_queue_retry` -> `QUEUED`).
+This mirrors how `record_coordinator_decision` already maps the Coordinator's
+four-value vocabulary onto existing task statuses in one place.
+
+**Job lifecycle:** `VERIFY_PENDING -> VERIFY_CLAIMED -> VERIFY_RUNNING ->`
+one of the terminal results above. Release and lease expiry both return a job
+to `VERIFY_PENDING` in identical shape. `VERIFY_BLOCKED` is recoverable
+(`terminal_verify_requeue`), not terminal.
+
+**Backward compatibility is structural, not a flag.** Nothing creates a verify
+job unless a task's own `completion_policy["verify"]` asks for one. No existing
+task carries that key, so every existing lane behaves exactly as before, and
+in-session verification remains the default. There is no global switch to
+forget to leave off.
+
+**Capability routing** uses AND semantics over a node's *reported* facts only:
+probed tool capabilities (P0.3) plus `platform`, `session_backend` and
+`shell_capabilities`. Nothing is inferred — a Windows box is not assumed to
+build WebView2. Arbitrary capabilities (`webview2`, `browser`) become routable
+when a node probes them via `TERMINAL_MCP_CAPABILITY_PROBES`; no application
+name is special-cased. Including `platform` means `windows` routes to
+dell-5530 today even though that node still reports an empty probed list.
+**Known limitation:** `macos` is not routable — the node agent has no Darwin
+branch (only `windows_agent.py` sets a platform), so the MacBook reports
+`platform=linux`. Fixing that changes what `choose_node(required_platform=...)`
+matches for existing callers and is therefore out of P0.5's scope.
+
+**Evidence gate.** `VERIFIED_PASS` requires evidence that is more than an agent
+self-report (`summary`/`message`/`note`/... alone are refused) and is not
+contradicted by itself (`exit_code != 0`, `passed: false`, `tests_failed > 0`
+are all refused as `EVIDENCE_REJECTED`, with the reason; the job stays claimed
+so real evidence can be supplied). A negative verdict requires a structured,
+non-empty `failure_summary`, every string of which is redacted before storage.
+
+**Lease ownership.** Verify jobs reuse P0.4's semantics: `claim_token` +
+`lease_expires_at`, every mutating verb matching on the current token under
+`BEGIN IMMEDIATE`. `terminal_verify_handoff` rotates the token, so a previous
+holder cannot mutate the result after a handoff. `terminal_verify_reconcile`
+returns expired leases to the pool and closes jobs whose task left `VERIFYING`
+— as `VERIFIED_PASS` carrying the task's own recorded evidence when the
+in-session path completed it, never by the reconciler's fiat.
+
+**No capable verifier** is a visible hold, never a silent pass: with
+`fallback: "in_session"` (default) the existing marker path keeps running; with
+`fallback: "hold"` in-session completion is suppressed and the job waits with a
+`routability` reason ("no online node reports dotnet+windows", or "the only
+capable node is the implementer"). Neither path can auto-pass or drop a task.
+
+**Duplicate prevention** is `UNIQUE (task_id, attempt)` in the schema, not an
+in-process guard, so it survives restart. A genuine retry bumps `attempt_count`
+and gets its own job, preserving the previous attempt's verdict and reasons.
+
+**Traceability:** `terminal_verify_trace(task_id)` returns
+`backlog_id -> task -> implementer -> branch/commit -> verify job -> verifier ->
+evidence -> result` plus an append-only audit trail (actor, time, reason) of
+every state change. `claim_token` is never returned by any read.
+
+**12 MCP tools** (`terminal_verify_request/list/claim/start/renew/release/
+handoff/complete/fail/requeue/trace/reconcile`, total 156) and one read-only
+dashboard route, `GET /dashboard/api/verify/queue` (status counts, verifier,
+required capabilities, age, block reason).

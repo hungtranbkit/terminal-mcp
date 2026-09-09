@@ -151,9 +151,18 @@ class TickResult:
 class QueueEngine:
     def __init__(self, store: QueueStore, ops: SessionOps, *, coordinator: CoordinatorGate | None = None,
                 claimed_by: str = DEFAULT_CLAIMED_BY, lease_seconds: float = DEFAULT_LEASE_SECONDS,
-                on_completed: Callable[[QueueTask], None] | None = None) -> None:
+                on_completed: Callable[[QueueTask], None] | None = None,
+                verify_queue: Any = None) -> None:
         self.store = store
         self.ops = ops
+        # P0.5 Verify Queue -- OPTIONAL, and inert unless a task's OWN
+        # completion_policy carries a `verify` block. Wiring a
+        # VerifyQueue here does NOT change how any existing lane behaves:
+        # a task with no verify policy takes exactly the code path it
+        # took before, including the in-session marker check below. See
+        # verify_queue.py's own module docstring for why the opt-in is
+        # per-task rather than a global switch.
+        self.verify_queue = verify_queue
         self.coordinator = coordinator or CoordinatorGate()
         self.claimed_by = claimed_by
         self.lease_seconds = lease_seconds
@@ -358,8 +367,17 @@ class QueueEngine:
                 return TickResult(session, "RUNNING", task_id=task_id)
             # Anything else (IDLE/WAITING_INPUT/UNKNOWN) -- the agent has
             # gone quiet; move to VERIFYING to look for real evidence.
-            self.store.transition_task(task_id, VERIFYING, event_type="VERIFYING")
-            return TickResult(session, "VERIFYING", task_id=task_id, detail=f"state={state}")
+            #
+            # P0.5: if THIS task asked for external verification, the job
+            # is created here and it performs the RUNNING -> VERIFYING
+            # transition itself, in the same transaction, so a job can
+            # never exist for a task that never entered VERIFYING.
+            requested = self._request_verification(task)
+            if requested is None:
+                self.store.transition_task(task_id, VERIFYING, event_type="VERIFYING")
+                return TickResult(session, "VERIFYING", task_id=task_id, detail=f"state={state}")
+            return TickResult(session, "VERIFY_REQUESTED", task_id=task_id,
+                              detail=f"state={state}, verify_job={requested.id}")
 
         # current_status == VERIFYING: look for a verified completion
         # marker -- item 11's "không phụ thuộc heuristic final report
@@ -369,6 +387,15 @@ class QueueEngine:
         # VERIFYING, awaiting either a later marker or an explicit
         # terminal_queue_verify call (queue_service.py) -- there is no
         # code path here that reaches COMPLETED without real evidence.
+        # P0.5: a task holding an OPEN verify job with the `hold` fallback
+        # must not be completed from its own session's output. Demanding
+        # an independent verifier and then accepting the implementer's own
+        # marker when none is available would defeat the entire point --
+        # so the task waits here, visibly, rather than being passed.
+        held = self._external_verification_hold(task_id)
+        if held is not None:
+            return TickResult(session, "AWAITING_EXTERNAL_VERIFICATION", task_id=task_id, detail=held)
+
         capture = self.ops.terminal_tail(session, 200)
         output = capture.get("output", "")
         marker = parse_completion_marker(output)
@@ -387,6 +414,50 @@ class QueueEngine:
             return TickResult(session, "RUNNING", task_id=task_id, detail="false alarm, re-armed")
         return TickResult(session, "AWAITING_VERIFICATION", task_id=task_id,
                           detail="no verified completion marker yet")
+
+    def _request_verification(self, task: QueueTask) -> Any:
+        """Create this task's verify job if -- and only if -- its own
+        completion_policy asked for one and a VerifyQueue is wired.
+        Returns the job, or None to mean "carry on exactly as before".
+
+        Idempotent by construction: ensure_verify_job keys on (task_id,
+        attempt), so a re-entered tick or a restart mid-transition
+        produces the same job rather than a second one. A failure to
+        create the job is deliberately NOT fatal -- the task falls back to
+        the ordinary in-session path rather than being stranded in
+        RUNNING, the same posture _notify_completed takes."""
+        if self.verify_queue is None:
+            return None
+        from .verify_queue import VerifyQueue
+        policy = VerifyQueue.verify_policy_for(task)
+        if policy is None:
+            return None
+        try:
+            return self.verify_queue.ensure_verify_job(
+                task,
+                required_capabilities=policy.get("required_capabilities", ()),
+                require_independent=bool(policy.get("require_independent", True)),
+                fallback=policy.get("fallback", "in_session"),
+                backlog_id=policy.get("backlog_id"),
+                branch=policy.get("branch") or task.metadata.get("branch"),
+                commit_sha=policy.get("commit_sha") or task.metadata.get("commit_sha"),
+            )
+        except Exception:  # noqa: BLE001 -- never strand a task on a verify-queue glitch
+            return None
+
+    def _external_verification_hold(self, task_id: str) -> str | None:
+        """A short reason string when in-session completion must be
+        suppressed for this task, else None."""
+        if self.verify_queue is None:
+            return None
+        try:
+            job = self.verify_queue.open_job_for_task(task_id)
+        except Exception:  # noqa: BLE001
+            return None
+        if job is None or job.fallback != "hold":
+            return None
+        return (f"verify job {job.id} is {job.status} and requires an independent verifier "
+                f"({', '.join(job.required_capabilities) or 'no capability constraint'})")
 
     def _notify_completed(self, task: QueueTask) -> None:
         if self.on_completed is None:

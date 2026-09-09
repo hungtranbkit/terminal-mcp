@@ -127,8 +127,16 @@ def build_mcp(service: TerminalService | None = None,
     # still have to check). on_completed publishes a Handoff for any
     # task whose own metadata opts in (integration_store.py's own
     # publish_handoff_for_completed_task) -- a no-op for every other task.
+    # P0.5: give the verify queue the node registry so it can EXPLAIN an
+    # unroutable job ("no online node reports dotnet+windows") instead of
+    # leaving it mysteriously pending, and hand the same VerifyQueue to
+    # the engine. Both are inert for every task that does not carry a
+    # `verify` block in its own completion_policy -- which is all of them
+    # today, so no existing lane changes behaviour.
+    if controller is not None:
+        queue.verify_queue.registry = getattr(controller, "registry", None)
     queue_engine = QueueEngine(queue.store, controller, coordinator=CoordinatorGate(),
-                              on_completed=_on_task_completed)
+                              on_completed=_on_task_completed, verify_queue=queue.verify_queue)
     queue.engine = queue.engine or queue_engine
     integration.engine = integration.engine or IntegrationEngine(integration.store, queue.store)
     # Event-driven WAIT/wake background loop (integration_loop.py) --
@@ -2361,6 +2369,220 @@ def build_mcp(service: TerminalService | None = None,
             return {"handed_off": True, "task_id": task_id, "claimed_by": task.claimed_by,
                     "session": task.session, "claim_token": task.claim_token,
                     "lease_expires_at": task.lease_expires_at}
+
+        # ------------------------------------------------------------------
+        # P0.5 Verify Queue. Verification as CLAIMABLE WORK routed by
+        # capability, so a verifier can be chosen for what it can actually
+        # run rather than being whichever session did the implementing.
+        #
+        # Every one of these is additive: a task that does not carry a
+        # `verify` block in its own completion_policy never produces a
+        # job, and the in-session marker path (queue_engine's own
+        # _check_completion) remains the default and is untouched.
+        # ------------------------------------------------------------------
+
+        @server.tool()
+        def terminal_verify_request(task_id: str, required_capabilities: list[str] | None = None,
+                                    require_independent: bool = True,
+                                    fallback: str = "in_session", backlog_id: str | None = None,
+                                    branch: str | None = None, commit_sha: str | None = None,
+                                    actor: str = "mcp") -> dict:
+            """Open a verify job for a task whose implementation is done.
+
+            IDEMPOTENT per (task_id, attempt): calling twice returns the
+            SAME job -- the guarantee is a UNIQUE constraint in the
+            database, so it survives a restart. A genuine retry (which
+            bumps attempt_count) gets its own job, so a reworked
+            implementation is verified afresh instead of overwriting the
+            previous attempt's verdict.
+
+            `fallback` decides what happens while no capable verifier
+            exists: "in_session" (default) lets the existing in-session
+            evidence check keep running; "hold" suppresses it, so a job
+            demanding independent verification is never quietly signed off
+            by the implementer. Neither ever auto-passes the task.
+
+            Moves the task RUNNING -> VERIFYING in the same transaction
+            when it is not already there."""
+            task = queue.store.get_task(task_id)
+            if task is None:
+                return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+            try:
+                job = queue.verify_queue.ensure_verify_job(
+                    task, required_capabilities=tuple(required_capabilities or ()),
+                    require_independent=require_independent, fallback=fallback,
+                    backlog_id=backlog_id, branch=branch, commit_sha=commit_sha, actor=actor)
+            except (ValueError, KeyError) as exc:
+                return {"error": "VERIFY_REQUEST_REFUSED", "task_id": task_id, "reason": str(exc)}
+            return {"job": job.to_dict(), "routability": queue.verify_queue.routability(job)}
+
+        @server.tool()
+        def terminal_verify_list(status: str | None = None, project_id: str | None = None,
+                                 task_id: str | None = None, limit: int = 50) -> dict:
+            """Verify jobs with everything needed to act on them: status,
+            required capabilities, verifier, age, and -- for anything still
+            pending -- WHY it has not been picked up (no capable node
+            online, or the only capable node is the implementer).
+
+            This is the read a coordinator/ChatGPT uses to answer "what is
+            waiting on verification and what is blocking it"."""
+            jobs = queue.verify_queue.list_jobs(status=status, project_id=project_id,
+                                          task_id=task_id, limit=limit)
+            rows = []
+            for job in jobs:
+                entry = job.to_dict()
+                if job.status == "VERIFY_PENDING":
+                    entry["routability"] = queue.verify_queue.routability(job)
+                rows.append(entry)
+            return {"jobs": rows, "count": len(rows),
+                    "stats": queue.verify_queue.stats(project_id=project_id)}
+
+        @server.tool()
+        def terminal_verify_claim(verifier: str, capabilities: list[str] | None = None,
+                                  project_id: str | None = None, verifier_node_id: str | None = None,
+                                  lease_seconds: float = 600.0) -> dict:
+            """Claim the oldest pending verify job THIS verifier can
+            actually do. `capabilities` is what the verifier HAS; a job
+            matches only when every capability it requires is present (AND,
+            never OR).
+
+            Refuses a job whose implementer is this same verifier when the
+            job asked for independence. Returns {"claimed": false} when
+            nothing matches -- an ordinary outcome, not an error.
+
+            The returned claim_token is required by every subsequent verb
+            and is the ONLY thing that authorises them; keep it."""
+            job = queue.verify_queue.claim_next(
+                verifier=verifier, capabilities=tuple(capabilities or ()),
+                project_id=project_id, verifier_node_id=verifier_node_id,
+                lease_seconds=lease_seconds)
+            if job is None:
+                return {"claimed": False,
+                        "reason": "no pending verify job matches these capabilities "
+                                  "(or the only match is this verifier's own work)"}
+            return {"claimed": True, "job": job.to_dict(include_token=True)}
+
+        @server.tool()
+        def terminal_verify_start(job_id: str, claim_token: str, detail: str | None = None) -> dict:
+            """VERIFY_CLAIMED -> VERIFY_RUNNING: verification has actually
+            begun, as distinct from merely being held."""
+            job = queue.verify_queue.start(job_id, claim_token, detail=detail)
+            if job is None:
+                return {"started": False, "job_id": job_id,
+                        "reason": "claim_token is not the current holder, or the job is not claimed"}
+            return {"started": True, "job": job.to_dict()}
+
+        @server.tool()
+        def terminal_verify_renew(job_id: str, claim_token: str,
+                                  lease_seconds: float = 600.0) -> dict:
+            """Extend an active verify lease. A verifier that stops
+            renewing is treated as crashed and its job returns to the pool
+            -- so a long verification MUST renew."""
+            job = queue.verify_queue.renew(job_id, claim_token, lease_seconds=lease_seconds)
+            if job is None:
+                return {"renewed": False, "job_id": job_id,
+                        "reason": "claim_token is not the current holder, or the job is not claimed"}
+            return {"renewed": True, "job_id": job_id, "lease_expires_at": job.lease_expires_at,
+                    "status": job.status}
+
+        @server.tool()
+        def terminal_verify_release(job_id: str, claim_token: str,
+                                    reason: str | None = None) -> dict:
+            """Give a verify claim back before its TTL. The job returns to
+            the pending pool in exactly the shape crash-recovery produces,
+            so the next claimer cannot tell the difference."""
+            job = queue.verify_queue.release(job_id, claim_token, reason=reason)
+            if job is None:
+                return {"released": False, "job_id": job_id,
+                        "reason": "claim_token is not the current holder, or the job is not claimed"}
+            return {"released": True, "job": job.to_dict()}
+
+        @server.tool()
+        def terminal_verify_handoff(job_id: str, claim_token: str, to_verifier: str, reason: str,
+                                    to_node_id: str | None = None,
+                                    lease_seconds: float = 600.0) -> dict:
+            """Pass an ACTIVE verify claim to another verifier without the
+            job returning to the pool. The token is ROTATED: the previous
+            holder can no longer renew, complete, fail or hand off this
+            job, because every one of those verbs matches on the current
+            token."""
+            job = queue.verify_queue.handoff(job_id, claim_token, to_verifier=to_verifier,
+                                       reason=reason, to_node_id=to_node_id,
+                                       lease_seconds=lease_seconds)
+            if job is None:
+                return {"handed_off": False, "job_id": job_id,
+                        "reason": "claim_token is not the current holder, or the job is not claimed"}
+            return {"handed_off": True, "job": job.to_dict(include_token=True)}
+
+        @server.tool()
+        def terminal_verify_complete(job_id: str, claim_token: str, evidence: dict) -> dict:
+            """VERIFIED_PASS -- the only route to it, and EVIDENCE-GATED.
+
+            An agent saying it worked is NOT evidence. The payload must
+            carry something checkable (exit_code, command, test_results,
+            completion_marker, commit_sha, artifact, ...) and must not
+            contradict itself: exit_code != 0, passed=false or
+            tests_failed > 0 are all refused as EVIDENCE_REJECTED, with
+            the reason, and the job stays claimed so real evidence can be
+            supplied instead.
+
+            On acceptance the task moves VERIFYING -> COMPLETED with the
+            evidence stored in its own verification_evidence column, in
+            the same transaction as the verdict."""
+            return queue.verify_queue.complete(job_id, claim_token, evidence=evidence)
+
+        @server.tool()
+        def terminal_verify_fail(job_id: str, claim_token: str, result: str,
+                                 failure_summary: dict) -> dict:
+            """A negative verdict: VERIFIED_FAIL, NEEDS_REWORK or
+            VERIFY_BLOCKED.
+
+            `failure_summary` must be a structured, non-empty object --
+            "it failed" is not something anyone can act on. Every string
+            in it is redacted before storage, so a pasted log carrying a
+            token does not become a durable leak.
+
+            VERIFIED_FAIL and NEEDS_REWORK both put the TASK in FAILED
+            (from where the existing terminal_queue_retry returns it to
+            QUEUED); the distinction between them is preserved on the job.
+            VERIFY_BLOCKED puts the task in BLOCKED and is itself
+            recoverable via terminal_verify_requeue."""
+            return queue.verify_queue.fail(job_id, claim_token, result=result,
+                                     failure_summary=failure_summary)
+
+        @server.tool()
+        def terminal_verify_requeue(job_id: str, reason: str, actor: str = "mcp") -> dict:
+            """VERIFY_BLOCKED -> VERIFY_PENDING: the explicit way back for
+            a job that was blocked on an environment which has since
+            returned."""
+            job = queue.verify_queue.requeue(job_id, actor=actor, reason=reason)
+            if job is None:
+                return {"requeued": False, "job_id": job_id,
+                        "reason": "job not found, or not in VERIFY_BLOCKED"}
+            return {"requeued": True, "job": job.to_dict()}
+
+        @server.tool()
+        def terminal_verify_trace(task_id: str) -> dict:
+            """The full traceability chain for one task in a single read:
+            backlog_id -> task -> implementer -> branch/commit -> verify
+            job -> verifier -> evidence -> result, with the append-only
+            audit trail (actor, time, reason) of every state change.
+
+            Assembled from what is actually recorded -- a field nothing
+            ever set comes back null rather than being inferred."""
+            return queue.verify_queue.trace(task_id)
+
+        @server.tool()
+        def terminal_verify_reconcile() -> dict:
+            """Restart/crash recovery for the verify queue.
+
+            Returns expired verifier leases to the pending pool (never
+            losing the job), and closes jobs whose task left VERIFYING by
+            another route -- as VERIFIED_PASS carrying the task's OWN
+            recorded evidence when the in-session path completed it, or
+            VERIFY_CANCELLED otherwise. Idempotent; a verdict is never
+            invented."""
+            return queue.verify_queue.reconcile()
 
         @server.tool()
         def terminal_task_lease_holder(task_id: str) -> dict:

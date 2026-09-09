@@ -47,7 +47,7 @@ Two facts that reframe everything below:
 | 6 | Availability / heartbeat / quota | **PARTIAL** | `node_registry.classify_capacity`, heartbeat 20s, `capacity_status` | Heartbeat + EWMA-smoothed, duration-aware overload heuristic (healthy/busy/overloaded) is real and live. **`max_sessions` is stored but never enforced** — no admission control anywhere. |
 | 7 | Shared-file / resource ownership lock | **PARTIAL** | `lease.py` (pane), `git_worktree.py` + `git_isolation_service.py`, coordinator's `expected_cwd` check | Per-task **git worktree + branch isolation** is real and wired into task creation (`terminal_task_create_isolated`), enforced at dispatch by the existing coordinator check. **No generic named-resource lock** (e.g. "own this file/module"). |
 | 8 | Event bus | **PARTIAL → EXISTS (P0.2)** | `queue_events` (241), `integration_events` (0), `supervisor_events` (60) | Three **separate append-only per-store logs**, not a bus: no subscribe, no cross-store ordering, no fan-out. Real types include `ENQUEUED/CLAIMED/DISPATCHED/STARTED/VERIFYING/VERIFIED/COORDINATOR_*/LANE_PAUSED`. **Absent from the target list:** `WORKER_IDLE`, `PREVIEW_FAILED`, `USER_FEEDBACK`, `MERGE_CONFLICT` (integration has its own equivalents but unused). |
-| 9 | Verify queue by capability | **PARTIAL** | `VERIFYING`/`VERIFIED` states (15 real), `queue_engine` verification, `verification_nonce`/`verification_evidence` columns | Verification is a **state of the same task in the same session**, not a queue a separate verifier claims. No capability routing. |
+| 9 | Verify queue by capability | **EXISTS** (P0.5, 2026-09-09) | `verify_queue.py`, `verify_jobs` (migration v7), 12 `terminal_verify_*` tools | Was PARTIAL: verification was a **state of the same task in the same session**. Now a claimable job routed by capability (AND over probed + platform facts), with lease/token ownership, an evidence gate stricter than the task-side one, and duplicate prevention in the schema. Reuses the existing `VERIFYING`/`COMPLETED` states and `verification_evidence` column — **zero new task statuses or edges**. |
 | 10 | Merge / integration queue | **BUILT, UNUSED** | `integration_store.py` (pipelines/handoffs/batches/events), `claim_next_handoff(project, lease_seconds)`, `integration_engine.tick(project)`, 68 tests | A genuine **project-scoped, leased, claimable merge queue with its own state machine and conflict-rework routing** already exists — and has **0 production rows**. This is the single biggest piece of already-built leverage. |
 | 11 | Preview-fast queue | **MISSING** | — | No preview concept anywhere in source or DB. |
 | 12 | Per-project coordinator, event-driven | **PARTIAL** | `coordinator.py` (production-used, 32 decisions), `queue_loop.py` | Gate is **deterministic by explicit design** and **fail-closed** (any unreadable evidence → NEEDS_HUMAN, never READY). It has a **pluggable `scope_reasoner`** for the one judgment-needing check — the natural LLM seam. But it is **per-task, per-lane/session — not per-project**, and the loop **polls** rather than reacting to events. |
@@ -79,8 +79,16 @@ Item 5 (worker capability) moved PARTIAL → EXISTS: the tool/runtime axis
 it lacked is now probed per node and queryable with AND semantics. Item 4
 gained the post-claim verbs it was missing (renew/release/handoff) —
 including renew, which `reconcile_stale_claims` already assumed existed.
-Items 9/11/13 are unchanged — P0 deliberately did not touch verification
-routing, preview, or portfolio scheduling.
+Items 11/13 are unchanged — P0 deliberately did not touch preview or
+portfolio scheduling.
+
+**After P0.5 (2026-09-09): ≈ 13.5 / 20 ≈ 68 %.** Item 9 (verify queue by
+capability) moved PARTIAL → EXISTS: verification is now a claimable job routed
+by capability rather than a state only the implementing session can leave,
+built on P0.2's bus vocabulary, P0.3's capability axis and P0.4's lease verbs
+— which is why it was sequenced last. The medium risk flagged for it ("changes
+who verifies") was retired by making the opt-in per task rather than global:
+every existing lane still verifies in-session, unchanged.
 
 The weighting matters more than the number: the *hard, safety-critical* primitives
 (atomic claim, lease, state machine, fail-closed gate, idempotency, audit) are the

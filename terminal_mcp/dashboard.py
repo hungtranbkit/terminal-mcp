@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import secrets
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
@@ -7111,6 +7112,65 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return blocked
         limit_raw = request.query_params.get("limit")
         result = await anyio.to_thread.run_sync(lambda: queue.recent_events(limit=int(limit_raw) if limit_raw else 30))
+        return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
+    def _age_seconds(iso_timestamp: str | None) -> float | None:
+        """Seconds since an iso_now()-shaped UTC timestamp. Returns None
+        rather than 0 for anything unparseable -- "age unknown" and "brand
+        new" must not look the same on a queue-age display."""
+        if not iso_timestamp:
+            return None
+        try:
+            parsed = datetime.strptime(iso_timestamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+
+    @server.custom_route("/dashboard/api/verify/queue", methods=["GET"], include_in_schema=False)
+    async def verify_queue_route(request: Request) -> JSONResponse:
+        """P0.5 verify-queue visibility: counts by status plus the rows,
+        each with its verifier, required capabilities, age, and -- for
+        anything still pending -- why it has not been picked up.
+
+        Read-only and fleet-level, the same posture (and the same
+        _read_guard) as the queue/integration summary routes immediately
+        above; never a second task store, this reads straight off
+        queue_service's own VerifyQueue. `claim_token` is deliberately
+        absent: it authorises mutation, and this is an observability
+        endpoint."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        project_id = request.query_params.get("project_id") or None
+        status = request.query_params.get("status") or None
+        limit_raw = request.query_params.get("limit")
+
+        def _collect() -> dict:
+            jobs = queue.verify_queue.list_jobs(status=status, project_id=project_id,
+                                          limit=int(limit_raw) if limit_raw else 50)
+            rows = []
+            for job in jobs:
+                entry = {
+                    "id": job.id, "task_id": job.task_id, "attempt": job.attempt,
+                    "session": job.session, "project_id": job.project_id,
+                    "backlog_id": job.backlog_id, "status": job.status,
+                    "required_capabilities": list(job.required_capabilities),
+                    "implementer": job.implementer, "verifier": job.verifier,
+                    "verifier_node_id": job.verifier_node_id,
+                    "lease_expires_at": job.lease_expires_at, "claim_count": job.claim_count,
+                    "block_reason": job.block_reason, "branch": job.branch,
+                    "commit_sha": job.commit_sha, "created_at": job.created_at,
+                    "updated_at": job.updated_at, "completed_at": job.completed_at,
+                    "age_seconds": _age_seconds(job.created_at),
+                }
+                if job.status == "VERIFY_PENDING":
+                    entry["routability"] = queue.verify_queue.routability(job)
+                rows.append(entry)
+            return {"stats": queue.verify_queue.stats(project_id=project_id),
+                    "jobs": rows, "count": len(rows),
+                    "project_id": project_id, "status": status}
+
+        result = await anyio.to_thread.run_sync(_collect)
         return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/queue/loop-status", methods=["GET"], include_in_schema=False)

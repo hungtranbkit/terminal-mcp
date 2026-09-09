@@ -1428,6 +1428,9 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/queue/global-inbox": {"GET", "HEAD"},
         "/dashboard/api/queue/recent-events": {"GET", "HEAD"},
         "/dashboard/api/queue/loop-status": {"GET", "HEAD"},
+        # P0.5 Verify Queue visibility (read-only, _read_guard only --
+        # same fleet-level posture as the queue/integration summaries).
+        "/dashboard/api/verify/queue": {"GET", "HEAD"},
         "/dashboard/api/integration/fleet-overview": {"GET", "HEAD"},
         # Unified Task System: Global Tasks Kanban (queue.board()) --
         # another later, separate feature, same as the Task Manager routes
