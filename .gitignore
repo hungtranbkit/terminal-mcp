@@ -34,7 +34,15 @@ run-node-agent.ps1
 run/
 runtime/
 state/
-.terminal-mcp/
+# Local runtime state for this repo's own node-agent/backlog dir.
+# NOTE: the directory contents are ignored, NOT the directory itself --
+# git cannot re-include a file whose PARENT directory is excluded, so
+# `.terminal-mcp/*` + a negation is the only shape that lets the Project
+# Backlog be tracked while the lock/state files stay local.
+.terminal-mcp/*
+# The backlog IS the project's plan -- tracked on purpose so it survives a
+# clone and reaches other nodes (see docs/backlog.md, "Tracked vs ignored").
+!.terminal-mcp/backlog.json
 
 # Editor and OS-local files
 .DS_Store

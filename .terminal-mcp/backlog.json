@@ -1,0 +1,813 @@
+{
+  "schema_version": 1,
+  "project": {
+    "project_id": "git:github.com/hungtranbkit/terminal-mcp",
+    "source": "git_remote",
+    "repo_root": "/home/dell/workspace/terminal-mcp",
+    "name": "terminal-mcp",
+    "git_remote": "https://github.com/hungtranbkit/terminal-mcp.git",
+    "git_branch": "main",
+    "is_portable": true
+  },
+  "revision": 1,
+  "updated_at": "2026-09-09T08:02:29.712071+00:00",
+  "items": [
+    {
+      "id": "blg_f52a999971d9",
+      "title": "dell-5530 maintenance window: rotate leaked node token, re-parent orphaned Scheduled Task, decide auto-logon",
+      "description": "One window closes three things at once. The node token was exposed in a transcript on 2026-09-09 and is still live (risk bounded to LAN: agent binds 192.168.1.250:8790, node not on tailnet). The agent is ALSO orphaned from its Scheduled Task (task state Ready, LastTaskResult 0x8007042B) so Stop-ScheduledTask is a no-op and RestartOnFailure gives no auto-restart. Costs all 6 ConPTY sessions - they are in-process children of the agent and cannot survive a restart by design. Runbook is in the multi-node memory note.",
+      "status": "BACKLOG",
+      "priority": "P0",
+      "type": "chore",
+      "order": 1,
+      "created_at": "2026-09-09T08:02:29.711842+00:00",
+      "updated_at": "2026-09-09T08:02:29.711846+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Snapshot sessions + each running claude's transcript id before shutdown",
+        "Graceful POST /v1/internal/shutdown (schtasks /end is a no-op on the orphan)",
+        "New token written to C:\\Users\\tranv\\.terminal-mcp\\node-agent.token AND controller node-agent-tokens.env",
+        "Start-ScheduledTask; task state shows Running and tracks the live agent",
+        "Old token returns 401, new token 200, verified from the node side",
+        "Decide BootTrigger vs LogonType=InteractiveToken (auto-logon) - do NOT switch to S4U without checking the show_on_desktop ConPTY path",
+        "Sessions recreated and claude --resume'd per snapshot"
+      ],
+      "tags": [
+        "dell-5530",
+        "security",
+        "ops"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.711862+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_1f40adaadc46",
+      "title": "Rate-limit / lockout on node-agent bearer auth",
+      "description": "Token comparison is constant-time but unbounded: an attacker on the LAN (or on any network a node is exposed to) can attempt tokens indefinitely. Found in the 2026-09-09 internet-connectivity audit.",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "feature",
+      "order": 2,
+      "created_at": "2026-09-09T08:02:29.711872+00:00",
+      "updated_at": "2026-09-09T08:02:29.711873+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Repeated 401s from one source are throttled or locked out",
+        "Legitimate heartbeat traffic (20s interval) is never throttled",
+        "Lockout state cannot wedge a node permanently"
+      ],
+      "tags": [
+        "security",
+        "node-agent"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.711883+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_a3cc401d8275",
+      "title": "Node token rotation and revocation mechanism",
+      "description": "There is no rotation/revocation path today - rotating a token is a manual, per-node, restart-requiring edit of two files (proven twice on 2026-09-09: macbook rotated, dell-5530 deferred because its restart costs 6 sessions). Roadmap Phase 5 names this.",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "feature",
+      "order": 3,
+      "created_at": "2026-09-09T08:02:29.711889+00:00",
+      "updated_at": "2026-09-09T08:02:29.711890+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "A token can be rotated without hand-editing files on both sides",
+        "Revocation takes effect without a full node restart, or the restart cost is documented per platform",
+        "Old token is provably rejected afterwards"
+      ],
+      "tags": [
+        "security",
+        "ops"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.711897+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_0393ee9bd3d2",
+      "title": "Validate node endpoint scheme: refuse plaintext http:// to a non-private host",
+      "description": "config.py accepts any non-empty string as nodes.remote[].endpoint. A plaintext http:// endpoint pointed at a public host would send the bearer token in the clear on every request. RemoteNodeClient already verifies TLS correctly for https:// - only the scheme check is missing.",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "bug",
+      "order": 4,
+      "created_at": "2026-09-09T08:02:29.711902+00:00",
+      "updated_at": "2026-09-09T08:02:29.711904+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "http:// to a public address is refused at config load with a clear error",
+        "http:// to a private/LAN/overlay address still works (today's deployments)",
+        "https:// unaffected"
+      ],
+      "tags": [
+        "security",
+        "config"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.711910+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_316183197b4c",
+      "title": "terminal-mcp-doctor reports 'lan: not configured' while the service IS LAN-bound",
+      "description": "The CLI reads its OWN environment, not the running service's, so describe_endpoints reports loopback-only even though the service is bound to 192.168.1.132 and 100.81.85.120. The dashboard route is correct because it runs in-process. describe_endpoints' docstring claims it 'always reflects what the RUNNING process actually resolved' - true for the dashboard, false for the CLI.",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "bug",
+      "order": 5,
+      "created_at": "2026-09-09T08:02:29.711914+00:00",
+      "updated_at": "2026-09-09T08:02:29.711916+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "doctor reports the bind addresses the live service actually has",
+        "Or the docstring/output is corrected to say it reflects the CLI's own env",
+        "No false 'not configured' when a LAN/overlay bind is active"
+      ],
+      "tags": [
+        "observability",
+        "doctor"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.711921+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_65725709747b",
+      "title": "Live remote-node auto-dispatch smoke test through the real RemoteNodeClient",
+      "description": "REQUIREMENTS Backlog item 1. Gate before config.queue.enabled can be turned on against any real lane. Needs 0 dropped / 0 duplicate dispatch across restart and reconnect. m910 is the low-risk candidate (tmux-backed, restart-safe since the KillMode fix); dell-5530 is not, its sessions cannot survive an agent restart.",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "test",
+      "order": 6,
+      "created_at": "2026-09-09T08:02:29.711926+00:00",
+      "updated_at": "2026-09-09T08:02:29.711927+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Auto-dispatch verified end-to-end against a real remote node",
+        "0 dropped and 0 duplicate dispatch across a controller restart",
+        "Same across a node reconnect"
+      ],
+      "tags": [
+        "queue",
+        "multi-node"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.711932+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_7c61b4068f9a",
+      "title": "Direct-send reliability fix: deploy and live-reverify on dell-5530",
+      "description": "REQUIREMENTS Backlog item 7. Fix is shipped locally; verifying it is Windows-ConPTY-specific and needs a real dell-5530 restart, so it rides the same maintenance window as the token rotation.",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "bug",
+      "order": 7,
+      "created_at": "2026-09-09T08:02:29.711936+00:00",
+      "updated_at": "2026-09-09T08:02:29.711937+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Fix running on dell-5530",
+        "Direct send verified live on a real Windows session"
+      ],
+      "tags": [
+        "dell-5530",
+        "windows",
+        "send"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.711942+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_8b17cc479e6f",
+      "title": "Internet node transport: outbound WSS node->controller (roadmap Phase 2)",
+      "description": "The 2026-09-09 audit's core finding: the data plane is controller->node (inbound to the node), so a NAT'd node is visible-but-uncontrollable - heartbeat lands, dashboard shows ONLINE, every real operation fails. Overlay VPN (now unblocked) is a workaround, not a fix; outbound WSS removes the inbound requirement entirely and is the only option that scales past hand-configured peers.",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "feature",
+      "order": 8,
+      "created_at": "2026-09-09T08:02:29.711946+00:00",
+      "updated_at": "2026-09-09T08:02:29.711947+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "A node behind NAT with no inbound port is fully controllable",
+        "Reconnect/backoff across sleep, Wi-Fi change and IP change without manual re-registration",
+        "Tasks enqueued while offline auto-dispatch on reconnect with no duplicates"
+      ],
+      "tags": [
+        "multi-node",
+        "internet",
+        "roadmap"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.711953+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_2f6ac3f0ab9a",
+      "title": "Node self-registration with an enrollment token",
+      "description": "An unknown node_id heartbeat is refused NODE_NOT_FOUND, and dashboard onboarding health-probes the node, so onboarding needs controller->node reachability AND a manual controller-side action. The goal 'install agent, paste token, it appears' is not achievable today.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "feature",
+      "order": 9,
+      "created_at": "2026-09-09T08:02:29.711956+00:00",
+      "updated_at": "2026-09-09T08:02:29.711958+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "A new machine can enroll with only an enrollment token",
+        "No inbound reachability to the node required at enrollment",
+        "Enrollment is auditable and the token is single-use or scoped"
+      ],
+      "tags": [
+        "multi-node",
+        "onboarding"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.711963+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_84f09bbc1798",
+      "title": "registry_list / registry_search are not fleet-aware",
+      "description": "REQUIREMENTS Backlog item 13. terminal_registry_reopen is fleet-aware and node_agent now exposes /v1/registry, but the list/search surfaces (MCP + dashboard Persistent Registry panel) remain local-node-only.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "feature",
+      "order": 10,
+      "created_at": "2026-09-09T08:02:29.711966+00:00",
+      "updated_at": "2026-09-09T08:02:29.711968+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "registry_list/search span every online node",
+        "Dashboard Persistent Registry panel shows remote sessions",
+        "Per-node failure is tolerated like the other fleet reads"
+      ],
+      "tags": [
+        "multi-node",
+        "registry"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.711973+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_d5bc555bcee1",
+      "title": "Codex --resume support for registry_reopen",
+      "description": "REQUIREMENTS Backlog item 11. Claude has --resume wiring; Codex does not, so a recovered Codex session starts fresh. Relevant now that macbook and dell-5530 both run Codex.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "feature",
+      "order": 11,
+      "created_at": "2026-09-09T08:02:29.711976+00:00",
+      "updated_at": "2026-09-09T08:02:29.711978+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "A recovered Codex session resumes its conversation",
+        "Resume is verified before success is reported (no fake resurrection)"
+      ],
+      "tags": [
+        "recovery",
+        "codex"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.711983+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_20dc778df7ac",
+      "title": "macOS nodes report platform='linux' in the node registry",
+      "description": "node_agent.py's heartbeat defaults platform='linux' and macOS uses that same path, so macbook is registered as linux. Cosmetic today but wrong for any platform-aware routing or capability decision later.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "bug",
+      "order": 12,
+      "created_at": "2026-09-09T08:02:29.711987+00:00",
+      "updated_at": "2026-09-09T08:02:29.711988+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "A macOS node reports platform='macos' (or darwin) in the registry",
+        "Linux and Windows nodes unchanged",
+        "Dashboard/doctor show the real platform"
+      ],
+      "tags": [
+        "multi-node",
+        "macos"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.711993+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_80635ab65719",
+      "title": "Production session_registry is polluted with ~268 test-artifact rows",
+      "description": "268 of 513 rows are test session names (test-*, mcprec-*, lifecycle-*). Cause is known and documented in conftest: the live service observes test tmux sessions on the shared tmux server and records them. Harmless but noisy, and it makes the registry hard to read.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "chore",
+      "order": 13,
+      "created_at": "2026-09-09T08:02:29.711997+00:00",
+      "updated_at": "2026-09-09T08:02:29.711998+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Test-named rows cleaned out of the production registry",
+        "A documented periodic cleanup, or tests stop creating rows the live service picks up"
+      ],
+      "tags": [
+        "hygiene",
+        "tests"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.712003+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_8a1389e7caeb",
+      "title": "Two pre-existing test_kill_reopen failures from stale tmux sessions",
+      "description": "test_dashboard_kill_route_refuses_protected_session and test_dashboard_rename_route_refuses_protected_session fail on clean main too, with 'duplicate session: lifecycle-protected-dashboard-rename' - leftover sessions on the shared tmux server, not a code defect. They have been masking real signal in every full-suite run this session.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "test",
+      "order": 14,
+      "created_at": "2026-09-09T08:02:29.712007+00:00",
+      "updated_at": "2026-09-09T08:02:29.712009+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Both pass on a clean checkout",
+        "The test cleans up or uniquifies its session name so it cannot collide again"
+      ],
+      "tags": [
+        "tests",
+        "hygiene"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.712014+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_6855fba78a9b",
+      "title": "Flaky tests under full-suite load",
+      "description": "test_integration_loop::test_two_concurrent_loop_instances_never_double_merge_the_same_handoff, test_dashboard_nodes::test_nodes_list_shows_local_node_online_after_a_get and test_p0_hardening::test_prompt_injection_in_pane_output_remains_inert_data each failed once in a full run and passed in isolation on both the branch and clean main. Timing-sensitive; they cost real triage time repeatedly.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "test",
+      "order": 15,
+      "created_at": "2026-09-09T08:02:29.712018+00:00",
+      "updated_at": "2026-09-09T08:02:29.712020+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Each is made deterministic or explicitly marked/quarantined",
+        "A full run is reproducibly green apart from known-skipped tests"
+      ],
+      "tags": [
+        "tests",
+        "flaky"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.712024+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_13988f78525d",
+      "title": "Heartbeat replay protection (nonce/timestamp)",
+      "description": "node_heartbeat authenticates the bearer token but has no nonce or timestamp, so a captured heartbeat can be replayed. Low impact today (LAN-only, and a heartbeat only writes metrics) but it is a real gap once nodes are on the internet.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "feature",
+      "order": 16,
+      "created_at": "2026-09-09T08:02:29.712028+00:00",
+      "updated_at": "2026-09-09T08:02:29.712030+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "A replayed heartbeat is rejected",
+        "Clock skew tolerated sensibly"
+      ],
+      "tags": [
+        "security"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.712034+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_178d7b6506b7",
+      "title": "Audit rows are per-node, not centrally aggregated",
+      "description": "Each node writes its own audit.db. There is no fleet-wide audit view, so answering 'who sent what, where' means reading N databases.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "feature",
+      "order": 17,
+      "created_at": "2026-09-09T08:02:29.712038+00:00",
+      "updated_at": "2026-09-09T08:02:29.712040+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Fleet-wide audit query across online nodes",
+        "Per-node failure tolerated like other fleet reads"
+      ],
+      "tags": [
+        "observability",
+        "multi-node"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.712045+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_8d84b5006691",
+      "title": "Per-node config lineage requires a manual rebuild on every pull",
+      "description": "m910's config derives from the Dell's config.yaml (rebuild on the new upstream base + re-apply 3 edits) while macbook's derives from config.example.yaml (preserve verbatim). Both are locally modified so every git pull refuses until config.yaml is checked out first. This is error-prone and was hand-done twice on 2026-09-09.",
+      "status": "BACKLOG",
+      "priority": "P3",
+      "type": "chore",
+      "order": 18,
+      "created_at": "2026-09-09T08:02:29.712049+00:00",
+      "updated_at": "2026-09-09T08:02:29.712050+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Node-specific config is not a modified copy of a tracked file",
+        "A pull needs no manual config surgery",
+        "Existing per-node differences preserved"
+      ],
+      "tags": [
+        "ops",
+        "multi-node"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.712055+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    },
+    {
+      "id": "blg_d24c11c71a35",
+      "title": "Review codex_yolo default (--dangerously-bypass-approvals-and-sandbox)",
+      "description": "SessionLifecycleConfig.codex_yolo defaults to True, so ANY deployment that never mentions the setting launches Codex with approvals and sandbox bypassed. Currently inert on m910/macbook (m910 has no codex; macbook now DOES, so it is live there). Decide whether the safe default should be False with an explicit opt-in.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "chore",
+      "order": 19,
+      "created_at": "2026-09-09T08:02:29.712059+00:00",
+      "updated_at": "2026-09-09T08:02:29.712060+00:00",
+      "source": "session-audit-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Default decided deliberately and documented",
+        "If it stays True, the risk is stated where an operator will see it",
+        "Per-node override is easy"
+      ],
+      "tags": [
+        "security",
+        "codex"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:02:29.712065+00:00",
+          "event": "created",
+          "by": "session-audit-2026-09-09"
+        }
+      ]
+    }
+  ]
+}
