@@ -160,7 +160,7 @@ make it another export target — never a second writable source of truth.
 | P0.3 capability axis | S | Low | Must be probe-based |
 | P0.4 task lease API | S | Low | Columns exist |
 | P0.5 verify queue | M | **Med** | ~~Changes who verifies~~ **SHIPPED** — opt-in per task, old default kept |
-| P0.6 resource lock | S | Low | Generalise pane lease |
+| P0.6 resource lock | S | Low | **SHIPPED** — pane lease generalised, hot path byte-identical |
 | P0.7 project APIs | S | Low | Additive tools |
 | P1.1 per-project coordinator | L | **Med-High** | LLM in the loop; keep gate deterministic |
 | P1.2 activate integration | M | **Med** | Real merges into real branches |
@@ -231,7 +231,50 @@ verified against a copy of the real production `queue.db` (38 tasks / 246
 events, every existing row byte-identical, `verify_jobs` empty). Full suite
 2369 passed.
 
-## Next: P0.6 (P0.1-P0.5 shipped)
+## P0.6 SHIPPED 2026-09-09 — named-resource ownership lock
+
+`lease.ResourceLockStore`: "no two agents touch the same file / module /
+branch at once", built by GENERALISING the pane lease rather than writing a
+second lock.
+
+The reusable part was never the pane — it was the atomic check-and-set in
+`acquire()`, the single statement whose exact shape was arrived at by
+reproducing a real race (a `SELECT`-then-write let two callers both win).
+That algorithm now lives in `_LeaseTable`, parameterised by table and key
+column, and both stores are thin specialisations. **`PaneLeaseStore` is
+unchanged** in table, columns, method names, signatures, return types and
+TTL — it is on `core.py`'s send hot path — and the generated SQL is asserted
+**byte-identical to the shipped statement**, not merely assumed equivalent
+because the behavioural tests still pass.
+
+Separate `resource_locks` table in the same `leases.db`: the two have
+genuinely different lifetimes (20s vs minutes) and subjects, so mixing
+long-lived agent locks into the table every send contends on would be risk
+for no gain — while the shared file inherits the existing `/health/ready`
+check and backup procedure.
+
+What a resource lock adds that a pane does not:
+- **Project scoping** — `src/app.py` in one project is a different resource
+  from `src/app.py` in another; a global key space would make unrelated
+  repos block each other. Uses P0.1's canonical `project_id`.
+- **Holder reporting on refusal** — a primitive that only says "no" leaves
+  the caller nothing to act on. Refusals name the owner, reason and expiry.
+- **All-or-nothing `acquire_many`** — the deadlock story. Two agents each
+  needing `{a, b}` and taking them one at a time can finish holding one
+  apiece forever; one transaction makes that impossible.
+- **Audited operator override** — `force_release` is a separate verb, not a
+  flag, requiring an actor and a reason and reporting whose lock was broken.
+
+**Advisory by design.** Nothing can physically stop an agent editing a file
+it did not lock; these are a durable, crash-recoverable way for cooperating
+agents to agree. Deliberately **no waiter queue** — blocking inside a lock
+primitive is how a fleet deadlocks.
+
+8 new MCP tools (164 total). Migration v2 verified on a copy of the real
+production `leases.db` (`pane_leases` byte-identical, `resource_locks`
+empty, re-apply a no-op). 35 new tests.
+
+## Next: P0.7 (P0.1-P0.6 shipped)
 
 **P0.3 shipped 2026-09-09**: probed tool/runtime capabilities
 (git/node/npm/python/docker/dotnet/playwright/tmux/rustc/go/java) now ride

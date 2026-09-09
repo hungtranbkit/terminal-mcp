@@ -19,7 +19,7 @@ from typing import Any
 
 from .audit import AuditStore
 from .config import MaintenanceConfig
-from .lease import PaneLeaseStore
+from .lease import PaneLeaseStore, ResourceLockStore
 from .supervisor2 import SupervisorV2Store
 
 _LOGGER = logging.getLogger(__name__)
@@ -43,7 +43,8 @@ def checkpoint_wal(path: Path) -> None:
 class MaintenanceLoop:
     def __init__(self, *, audit: AuditStore, supervisor2_store: SupervisorV2Store | None,
                 bindings_path: Path | None, config: MaintenanceConfig,
-                leases: PaneLeaseStore | None = None) -> None:
+                leases: PaneLeaseStore | None = None,
+                resource_locks: ResourceLockStore | None = None) -> None:
         self._audit = audit
         self._supervisor2_store = supervisor2_store
         self._bindings_path = bindings_path
@@ -52,6 +53,10 @@ class MaintenanceLoop:
         # the same shared on-disk store every TerminalService uses unless
         # a caller (tests) injects an isolated one.
         self._leases = leases or PaneLeaseStore()
+        # Same database file, same housekeeping cadence -- constructed
+        # here rather than passed in because, like _leases, there is
+        # exactly one sensible instance and it is cheap to open.
+        self._resource_locks = resource_locks or ResourceLockStore(self._leases.path)
         self._config = config
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -90,9 +95,17 @@ class MaintenanceLoop:
             result["leases_pruned"] = self._leases.prune_expired()
         except Exception:
             _LOGGER.exception("maintenance: lease prune failed")
+        try:
+            # P0.6: the same housekeeping for resource_locks. Also
+            # harmless to skip -- acquire()'s expiry check makes a lapsed
+            # row reclaimable without this -- but a fleet that locks many
+            # files would otherwise keep a row per resource ever touched.
+            result["resource_locks_pruned"] = self._resource_locks.prune_expired()
+        except Exception:
+            _LOGGER.exception("maintenance: resource lock prune failed")
         for path in self._db_paths():
             checkpoint_wal(path)
-        if any(result.get(k) for k in ("audit_pruned", "actions_pruned", "leases_pruned")):
+        if any(result.get(k) for k in ("audit_pruned", "actions_pruned", "leases_pruned", "resource_locks_pruned")):
             _LOGGER.info("maintenance: pruned rows", extra=result)
         return result
 

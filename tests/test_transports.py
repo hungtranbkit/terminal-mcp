@@ -86,7 +86,7 @@ async def test_stdio_real_handshake_and_tools(tmp_path):
     assert initialized.server_info.name == "terminal-mcp"
     assert initialized.server_info.version == __version__
     names = {tool.name for tool in tools.tools}
-    assert len(names) == 156  # +12 P0.5 Verify Queue (terminal_verify_request/list/claim/start/renew/release/handoff/complete/fail/requeue/trace/reconcile); +1 P0.3 terminal_node_capabilities; +4 P0.4 task lease verbs
+    assert len(names) == 164  # +8 P0.6 resource locks (terminal_resource_lock/_lock_many/_renew/_unlock/_unlock_all/_holder/_locks/_force_unlock); +12 P0.5 Verify Queue; +4 P0.4 task lease verbs
     assert {"terminal_tail", "terminal_send_keys", "terminal_exit_copy_mode",
             "terminal_bind", "terminal_tail_bound"} <= names
 
@@ -139,7 +139,7 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
     # global INPUT_DISABLED gate; INPUT_DISABLED itself stays covered in test_permissions.py.
     assert text_disabled["error"] == "ACCESS_DENIED"
     assert keys_disabled["error"] == "ACCESS_DENIED"
-    assert len(tools.tools) == 156  # +12 P0.5 Verify Queue (terminal_verify_request/list/claim/start/renew/release/handoff/complete/fail/requeue/trace/reconcile); +1 P0.3 terminal_node_capabilities; +4 P0.4 task lease verbs
+    assert len(tools.tools) == 164  # +8 P0.6 resource locks (terminal_resource_lock/_lock_many/_renew/_unlock/_unlock_all/_holder/_locks/_force_unlock); +12 P0.5 Verify Queue; +4 P0.4 task lease verbs
 
 
 @pytest.mark.anyio
