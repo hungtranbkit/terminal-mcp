@@ -1555,7 +1555,7 @@
       "type": "chore",
       "order": 34,
       "created_at": "2026-09-09T15:47:37.060915+00:00",
-      "updated_at": "2026-09-09T15:51:32.410035+00:00",
+      "updated_at": "2026-09-09T15:53:21.099701+00:00",
       "source": "operator-request",
       "dependencies": [],
       "acceptance_criteria": [
@@ -1588,7 +1588,8 @@
           "Deleted: 37 tasks, 242 events, 4 lanes. Verified: every kept task row byte-identical, 0 orphan events referencing a deleted task, integrity ok, 33 lanes retained.",
           "Also removed claude-qtest-shell-1 (1 event, 1 lane, 0 tasks) -- same test family; leaving one orphan qtest lane would have defeated the cleanup.",
           "Second pass (same session, explicitly requested): p0-4-lease-smoke also purged -- 1 task, 5 events, 1 lane. The production queue now holds 0 tasks and 0 events; 32 lane rows remain, all empty. Schema and user_version=7 intact, integrity ok.",
-          "Third pass: 10 empty test/scratch LANE rows removed (codex-mcp-smoke-*, codex-cli-policy-*, codex-mcp-policy-*, claude-cli-policy-*, claude-mcp-policy-*, codex-policy-smoke-*). Classified against the live fleet first -- every lane belonging to a live local tmux session or a live remote session was KEPT. 22 lanes remain. DELIBERATELY NOT DELETED: window/window2 (named as protected production sessions in this codebase's own safety notes) and win4 (cannot be verified while dell-5530 is unreachable). Queue totals now: 0 tasks, 0 events, 22 lanes."
+          "Third pass: 10 empty test/scratch LANE rows removed (codex-mcp-smoke-*, codex-cli-policy-*, codex-mcp-policy-*, claude-cli-policy-*, claude-mcp-policy-*, codex-policy-smoke-*). Classified against the live fleet first -- every lane belonging to a live local tmux session or a live remote session was KEPT. 22 lanes remain. DELIBERATELY NOT DELETED: window/window2 (named as protected production sessions in this codebase's own safety notes) and win4 (cannot be verified while dell-5530 is unreachable). Queue totals now: 0 tasks, 0 events, 22 lanes.",
+          "Fourth pass: window/window2 lane rows removed on explicit request. Confirmed not live on any node first (local tmux, m910, macbook, dell-5530's reported set). These were empty queue_lanes METADATA rows -- no tmux/ConPTY session was touched. 20 lanes remain, all corresponding to live sessions except win4."
         ]
       },
       "history": [
@@ -1614,6 +1615,59 @@
           "event": "updated",
           "by": "mcp",
           "note": "10 empty test lanes purged; 3 ambiguous lanes deliberately kept"
+        },
+        {
+          "at": "2026-09-09T15:53:21.099701+00:00",
+          "event": "updated",
+          "by": "mcp",
+          "note": "window/window2 lane rows purged"
+        }
+      ]
+    },
+    {
+      "id": "blg_dell5530_lost_sessions",
+      "title": "dell-5530 dropped offline and came back with 3 of 6 sessions gone",
+      "description": "2026-09-09 ~22:30 local: dell-5530 stopped heartbeating mid-session and was unreachable at the network layer (100% packet loss) for several minutes, then returned online and is now heartbeating normally -- but reports 3 sessions instead of 6. Consistent with the known property that dell-5530's ConPTY sessions are in-process children of the node-agent and do NOT survive its restart. Which 3 survived is not yet identified; the controller can enumerate them, this was observed from an ad-hoc script that has no node client. Not caused by any change in this session: only the controller's queue.db was written, and dell-5530 was never touched.",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "incident",
+      "order": 35,
+      "created_at": "2026-09-09T15:53:21.099701+00:00",
+      "updated_at": "2026-09-09T15:53:21.099701+00:00",
+      "source": "observed-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Identify which 3 sessions survived and which 3 were lost",
+        "Determine whether the host rebooted, slept, or the agent restarted",
+        "Decide whether the lost sessions need recreating"
+      ],
+      "tags": [
+        "dell-5530",
+        "incident",
+        "sessions"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": "dell-5530",
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": [
+          "Heartbeats every ~21s returning 200 until 22:30:52, then a gap, then resumed; 45 heartbeats in the following 20 minutes.",
+          "Direct ping and node-agent port remain unreachable from the controller, while heartbeats (outbound node->controller) work -- so the node can reach us but we cannot reach it.",
+          "Relevant to the already-pending dell-5530 maintenance window (token rotation + orphaned Scheduled Task), which costs the ConPTY sessions anyway."
+        ]
+      },
+      "history": [
+        {
+          "at": "2026-09-09T15:53:21.099701+00:00",
+          "event": "created",
+          "by": "observed-2026-09-09"
         }
       ]
     }
