@@ -48,7 +48,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from .schema import Migration, apply_migrations
 
@@ -285,6 +285,9 @@ class QueueTask:
     # query is unfiltered unless a caller explicitly asks for a project,
     # so a task without one behaves exactly as it did before.
     project_id: str | None = None
+    # Orchestration V1: which user-visible deliverable this task rolls up
+    # into. Nullable -- a task with no outcome behaves exactly as before.
+    outcome_id: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "QueueTask":
@@ -311,6 +314,7 @@ class QueueTask:
             migration_history=tuple(_parse_json_dict_list(row["migration_history"])),
             at_risk=bool(row["at_risk"]),
             project_id=(row["project_id"] if "project_id" in row.keys() else None),
+            outcome_id=(row["outcome_id"] if "outcome_id" in row.keys() else None),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -335,6 +339,7 @@ class QueueTask:
             "migration_history": list(self.migration_history),
             "at_risk": self.at_risk,
             "project_id": self.project_id,
+            "outcome_id": self.outcome_id,
         }
 
 
@@ -643,6 +648,49 @@ def _add_v7_verify_jobs(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_verify_jobs_task ON verify_jobs(task_id)")
 
 
+def _add_v8_outcomes(connection: sqlite3.Connection) -> None:
+    """Orchestration V1: the OUTCOME layer -- the unit of user-visible
+    completion that sits BETWEEN a backlog item and the tasks that deliver it.
+
+    Before this, the hierarchy was exactly two levels and welded 1:1:
+    backlog_service.dispatch created one queue task per item and then refused
+    ever to do it again (ALREADY_DISPATCHED). There was no way to say "this
+    deliverable took five tasks", and therefore no way to say whether the
+    DELIVERABLE was done -- only whether individual tasks were.
+
+    queue_tasks.outcome_id is nullable and additive: every existing task and
+    every existing query behaves exactly as before. An outcome lives in the
+    SAME database as the tasks that roll up into it, so status rollup is one
+    query rather than a cross-store join that could observe a torn state."""
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS outcomes (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            backlog_id TEXT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL,
+            priority TEXT NOT NULL DEFAULT 'P2',
+            evidence TEXT NOT NULL DEFAULT '{}',
+            blocked_reason TEXT,
+            history TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+    """)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_outcomes_project_status ON outcomes(project_id, status)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_outcomes_backlog ON outcomes(backlog_id)")
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(queue_tasks)")}
+    if "outcome_id" not in columns:
+        connection.execute("ALTER TABLE queue_tasks ADD COLUMN outcome_id TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_queue_tasks_outcome ON queue_tasks(outcome_id, status)")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
@@ -659,6 +707,9 @@ QUEUE_MIGRATIONS = [
     Migration(7, "P0.5 Verify Queue: verify_jobs satellite table (UNIQUE(task_id, attempt) is the "
                  "duplicate-prevention primitive); no task status or transition edge changes",
               _add_v7_verify_jobs),
+    Migration(8, "Orchestration V1: outcomes table + queue_tasks.outcome_id (nullable, additive) -- "
+                 "the user-visible deliverable one backlog item may need N tasks to reach",
+              _add_v8_outcomes),
 ]
 
 
@@ -1085,6 +1136,96 @@ class QueueStore:
                 return task
         return None  # every QUEUED task (if any) is still waiting on an unmet dependency
 
+    class DependencyError(ValueError):
+        """A depends_on edge that would deadlock the lane forever.
+
+        Raised at CREATION time, never at dispatch. The dispatch check
+        (_dependencies_satisfied_locked) is deliberately fail-closed: an
+        unsatisfiable dependency simply never becomes dispatchable. That is
+        the right behaviour for a dependency that is merely NOT DONE YET,
+        and exactly the wrong behaviour for one that can never be satisfied
+        -- a cycle, or an id that does not exist. Those produce a lane that
+        is silently, permanently idle: no event, no error, no alarm. So they
+        are refused up front instead."""
+
+    def dependency_cycle(self, task_id: str, depends_on: Sequence[str]) -> list[str] | None:
+        """The cycle `task_id` would join by depending on `depends_on`, or
+        None. Returns the actual path so an operator sees WHICH tasks form
+        it rather than just "cycle detected"."""
+        with self._connection() as connection:
+            return self._dependency_cycle_locked(connection, task_id, list(depends_on or ()))
+
+    def _dependency_cycle_locked(self, connection: sqlite3.Connection, task_id: str,
+                                 depends_on: list[str]) -> list[str] | None:
+        # Iterative DFS from each proposed edge back through existing
+        # depends_on rows. Iterative, not recursive: a deep chain must not
+        # blow the Python stack inside a write transaction.
+        for first in depends_on:
+            stack: list[tuple[str, list[str]]] = [(first, [task_id, first])]
+            seen: set[str] = set()
+            while stack:
+                current, path = stack.pop()
+                if current == task_id:
+                    return path
+                if current in seen:
+                    continue
+                seen.add(current)
+                row = connection.execute(
+                    "SELECT depends_on FROM queue_tasks WHERE id = ?", (current,)).fetchone()
+                if row is None:
+                    continue
+                for nxt in _parse_json_list(row["depends_on"]):
+                    stack.append((nxt, [*path, nxt]))
+        return None
+
+    def validate_dependencies(self, task_id: str, depends_on: Sequence[str], *,
+                              require_existing: bool = True) -> None:
+        """Refuse a depends_on set that can never be satisfied. Raises
+        DependencyError; returns None when the edges are sound.
+
+        `require_existing` is an escape hatch for a caller that legitimately
+        creates a batch of interdependent tasks and cannot order them --
+        it still checks for cycles, only skipping the existence check."""
+        wanted = [str(d) for d in (depends_on or ()) if str(d)]
+        if not wanted:
+            return
+        if task_id in wanted:
+            raise self.DependencyError(f"{task_id} cannot depend on itself")
+        with self._connection() as connection:
+            if require_existing:
+                missing = [d for d in wanted if connection.execute(
+                    "SELECT 1 FROM queue_tasks WHERE id = ?", (d,)).fetchone() is None]
+                if missing:
+                    raise self.DependencyError(
+                        f"depends_on references task(s) that do not exist: {', '.join(missing)} -- "
+                        f"a missing dependency is treated as unmet forever, so the task would "
+                        f"never dispatch")
+            cycle = self._dependency_cycle_locked(connection, task_id, wanted)
+        if cycle:
+            raise self.DependencyError("dependency cycle: " + " -> ".join(cycle))
+
+    def dependency_deadlocks(self) -> list[dict[str, Any]]:
+        """Diagnostic over EXISTING rows: every non-terminal task whose
+        dependencies can never be satisfied, and why. This is what turns a
+        silently-idle lane into an answerable question."""
+        stuck = []
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT id, session, status, depends_on FROM queue_tasks "
+                "WHERE depends_on != '[]' AND depends_on IS NOT NULL").fetchall()
+            for row in rows:
+                if row["status"] in TERMINAL_STATUSES:
+                    continue
+                deps = _parse_json_list(row["depends_on"])
+                cycle = self._dependency_cycle_locked(connection, row["id"], deps)
+                missing = [d for d in deps if connection.execute(
+                    "SELECT 1 FROM queue_tasks WHERE id = ?", (d,)).fetchone() is None]
+                if cycle or missing:
+                    stuck.append({"task_id": row["id"], "session": row["session"],
+                                  "status": row["status"], "cycle": cycle,
+                                  "missing_dependencies": missing})
+        return stuck
+
     def _dependencies_satisfied_locked(self, connection: sqlite3.Connection, task: QueueTask) -> bool:
         """Phase 2 dependency gating (item 3's own "task kế có đủ
         prerequisite... phụ thuộc task chưa xong không"): a purely
@@ -1366,7 +1507,13 @@ class QueueStore:
             if row is None or row["status"] not in self.LEASE_STATES:
                 connection.rollback()
                 return None
-            history = _parse_json_list(row["migration_history"])
+            # _parse_json_dict_list, NOT _parse_json_list: migration_history
+            # holds DICTS (reassign_task writes them the same way). The list
+            # variant coerces every element with str(), which turned each
+            # prior entry into a Python repr string that QueueTask.from_row
+            # then silently dropped -- so the first handoff of a task erased
+            # all of its earlier migration/handoff provenance.
+            history = _parse_json_dict_list(row["migration_history"])
             history.append({"at": iso_now(), "event": "handoff",
                             "from_worker": row["claimed_by"], "to_worker": to_worker,
                             "from_session": row["session"],

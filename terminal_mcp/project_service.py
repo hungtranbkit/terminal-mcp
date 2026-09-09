@@ -86,7 +86,9 @@ class ProjectService:
     conflated them would be lying quietly."""
 
     def __init__(self, *, queue: Any = None, backlog: Any = None, events: Any = None,
-                 verify: Any = None, locks: Any = None, registry: Any = None) -> None:
+                 verify: Any = None, locks: Any = None, registry: Any = None,
+                 outcomes: Any = None) -> None:
+        self.outcomes = outcomes
         self.queue = queue
         self.backlog = backlog
         self.events = events
@@ -159,11 +161,37 @@ class ProjectService:
                               if status not in (COMPLETED, "SKIPPED", "CANCELLED")),
             "workers": workers,
             "blockers": blockers,
+            "outcomes": self._outcomes_section(project_id),
             "verification": self._verify_section(project_id),
             "resource_locks": self._locks_section(project_id),
             "events": self._events_section(project_id),
             "backlog": self._backlog_section(project_id),
         }
+
+    def _outcomes_section(self, project_id: str) -> dict[str, Any] | None:
+        """What the project is trying to SHIP, as opposed to what work is
+        queued. AWAITING_ACCEPTANCE is called out separately because it is
+        the actionable state: all the work is finished and nobody has
+        evidenced that the deliverable actually works."""
+        if self.outcomes is None:
+            return None
+        rows = self.outcomes.list_outcomes(project_id=project_id, limit=200)
+        counts: dict[str, int] = {}
+        for outcome in rows:
+            counts[outcome.status] = counts.get(outcome.status, 0) + 1
+        detail = []
+        for outcome in rows:
+            if outcome.status in ("DONE", "CANCELLED"):
+                continue
+            progress = self.outcomes.progress(outcome.id)
+            detail.append({"outcome_id": outcome.id, "title": outcome.title,
+                           "status": outcome.status, "priority": outcome.priority,
+                           "blocked_reason": outcome.blocked_reason,
+                           "progress": progress,
+                           "acceptance_criteria": list(outcome.acceptance_criteria)})
+        return {"counts": counts, "open": detail,
+                "awaiting_acceptance": [d for d in detail
+                                        if d["status"] == "AWAITING_ACCEPTANCE"]}
 
     def _verify_section(self, project_id: str) -> dict[str, Any] | None:
         if self.verify is None:

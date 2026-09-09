@@ -36,6 +36,12 @@ from .queue_store import (
 )
 
 
+_PENDING_TASK_ID = "__task_being_created__"
+"""A task cannot depend on itself before it has an id. This stand-in lets
+the cycle walk run against the real graph without inventing a row -- any
+path that returns to it is a cycle the new edges would close."""
+
+
 class QueueService:
     def __init__(self, store: QueueStore | None = None, *,
                 on_completed: Callable[[Any], None] | None = None, planner: Any = None) -> None:
@@ -189,6 +195,17 @@ class QueueService:
             target = UNASSIGNED_LANE
         task = {"prompt": prompt, "title": title or "", "priority": priority, "metadata": full_metadata}
         if depends_on:
+            # Validate BEFORE the row exists. The dispatch-time check is
+            # fail-closed, which is right for a dependency that is merely not
+            # done yet and exactly wrong for one that can NEVER be satisfied:
+            # a cycle or a typo'd id produces a lane that is silently,
+            # permanently idle -- no event, no error, no alarm. Creation is
+            # the only place it can still be reported to whoever caused it.
+            try:
+                self.store.validate_dependencies(_PENDING_TASK_ID, depends_on)
+            except QueueStore.DependencyError as exc:
+                return {"error": "INVALID_DEPENDENCY", "detail": str(exc),
+                        "depends_on": list(depends_on)}
             task["depends_on"] = list(depends_on)
         (task_id,) = self.store.append_tasks(target, [task])
         accepted = self._accepted(target, task_id)
