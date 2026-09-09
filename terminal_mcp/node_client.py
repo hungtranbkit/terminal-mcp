@@ -64,11 +64,13 @@ class NodeClient(Protocol):
                        grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]: ...
     def registry_reopen(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
                         grant_mode: str = "none", requested_by: str | None = None) -> dict[str, Any]: ...
+    def registry_list(self, *, recoverable_only: bool = False) -> dict[str, Any]: ...
     def list_killed_sessions(self) -> dict[str, Any]: ...
     def grant_read(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]: ...
     def grant_input(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]: ...
     def health(self) -> dict[str, Any]: ...
     def metrics(self) -> dict[str, Any]: ...
+    def refresh_capabilities(self) -> dict[str, Any]: ...
     def knowledge_search(self, query: str, *, session_name: str | None = None, project: str | None = None,
                          since: str | None = None, until: str | None = None, limit: int = 20) -> dict[str, Any]: ...
     def knowledge_timeline(self, session_name: str, *, since: str | None = None, until: str | None = None,
@@ -152,6 +154,18 @@ class LocalNodeClient:
         return self._terminal.terminal_registry_reopen(name, agent_type=agent_type, cwd=cwd,
                                                         grant_mode=grant_mode, requested_by=requested_by)
 
+    def registry_list(self, *, recoverable_only: bool = False) -> dict[str, Any]:
+        # Auto Recovery follow-up (2026-09-07): the fleet-aware read this
+        # feature's own reconciliation engine needs -- session_registry.
+        # py is per-node-agent-process-local (each node has its OWN
+        # session_registry.db), so a recovery engine running on the
+        # controller has no other way to see a REMOTE node's own
+        # registry rows. Real gap identified in this feature's own audit
+        # (registry_list/_search/_get were never fleet-aware before this
+        # -- see docs/REQUIREMENTS.md's own Phase 0 note on that
+        # disclosed scope cut).
+        return self._terminal.terminal_registry_list(recoverable_only=recoverable_only)
+
     def list_killed_sessions(self) -> dict[str, Any]:
         return self._terminal.terminal_list_killed_sessions()
 
@@ -169,6 +183,15 @@ class LocalNodeClient:
         collected = host_metrics.collect(workspace_path=str(self._terminal.config.session_lifecycle.allowed_cwd_roots[0])
                                          if self._terminal.config.session_lifecycle.allowed_cwd_roots else "/")
         return collected.__dict__
+
+    def refresh_capabilities(self) -> dict[str, Any]:
+        from .agent_availability import available_agent_types
+        from .launcher_resolution import resolve_launcher
+        commands = self._terminal.config.session_lifecycle.launch_commands
+        return {
+            "agent_types": list(available_agent_types(commands)),
+            "launcher_paths": {agent: resolve_launcher(command) for agent, command in commands},
+        }
 
     def knowledge_search(self, query: str, *, session_name: str | None = None, project: str | None = None,
                          since: str | None = None, until: str | None = None, limit: int = 20) -> dict[str, Any]:
@@ -314,6 +337,9 @@ class RemoteNodeClient:
             "agent_type": agent_type, "cwd": cwd, "grant_mode": grant_mode, "requested_by": requested_by,
         })
 
+    def registry_list(self, *, recoverable_only: bool = False) -> dict[str, Any]:
+        return self._request("GET", "/v1/registry", params={"recoverable_only": int(recoverable_only)})
+
     def list_killed_sessions(self) -> dict[str, Any]:
         return self._request("GET", "/v1/killed-sessions")
 
@@ -330,6 +356,9 @@ class RemoteNodeClient:
 
     def metrics(self) -> dict[str, Any]:
         return self._request("GET", "/v1/metrics")
+
+    def refresh_capabilities(self) -> dict[str, Any]:
+        return self._request("POST", "/v1/capabilities/refresh")
 
     def knowledge_search(self, query: str, *, session_name: str | None = None, project: str | None = None,
                          since: str | None = None, until: str | None = None, limit: int = 20) -> dict[str, Any]:

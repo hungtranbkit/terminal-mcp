@@ -16,6 +16,27 @@ allowed_session_patterns:
 max_capture_lines: 2000
 default_tail_lines: 1000
 
+# Prompt submission reliability. Codex gets a bounded, evidence-gated
+# Enter retry for its known composer debounce race; generic/Claude behavior
+# remains the historical single-Enter policy. `fixed_enter_count` is an
+# explicit emergency fallback only and stays disabled by default.
+submit:
+  default:
+    max_enter_attempts: 1
+    enter_interval_ms: 180
+    verify_after_each_enter: true
+    fixed_enter_count: 0
+  codex:
+    max_enter_attempts: 3
+    enter_interval_ms: 180
+    verify_after_each_enter: true
+    fixed_enter_count: 0
+  claude:
+    max_enter_attempts: 1
+    enter_interval_ms: 180
+    verify_after_each_enter: true
+    fixed_enter_count: 0
+
 input_policy:
   allowed_session_patterns:
     - "claude-*"
@@ -120,6 +141,8 @@ session_lifecycle:
   launch_commands:
     claude: claude
     codex: codex
+  # Codex 0.153.4 audited flag; set false to restore approval/sandbox mode.
+  codex_yolo: true
   create_ready_timeout_seconds: 6
   default_grant_mode: none
 
@@ -192,5 +215,6 @@ submit_watchdog:
   timeout_seconds: 5.0
   max_enter_attempts: 3
   sweeper_interval_seconds: 1.5
-  # Only Codex may receive automatic Enter retries.
+  # Only Codex may receive automatic Enter retries. Unknown/other agents
+  # are single-submit and become DELIVERY_UNKNOWN/STUCK if unconfirmed.
   retry_agent_types: [codex]

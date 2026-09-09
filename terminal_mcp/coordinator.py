@@ -46,7 +46,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .core import RECOVERY_STATE_FAILED, RECOVERY_STATE_RESTORING
+from .core import RECOVERY_STATE_RESUMED_OK
 from .queue_store import COMPLETED, QueueStore, QueueTask
 
 READY = "READY"
@@ -518,7 +518,18 @@ class CoordinatorGate:
         #     human/operator resolution (a fresh registry_reopen retry,
         #     or accepting a plain new session) before this task's own
         #     session can be dispatched into again.
-        if session.recovery_state in (RECOVERY_STATE_RESTORING, RECOVERY_STATE_FAILED):
+        # Auto Recovery follow-up (2026-09-07): the same gate now also
+        # covers the 3 new automatic-reconciliation states (recovery_
+        # engine.py) -- RECOVERY_PENDING (about to attempt, not started),
+        # RECOVERY_DEGRADED (a real new process exists but WITHOUT
+        # verified conversation continuity), RECOVERY_BLOCKED (policy/
+        # metadata explicitly refused an attempt) -- every one of these
+        # is "do not trust this session's own continuity yet" exactly
+        # like RESTORING/RECOVERY_FAILED already were, so this is a
+        # denylist-of-the-one-good-value check now rather than an
+        # allowlist of two, automatically covering any of these five
+        # without needing its own separate branch.
+        if session.recovery_state is not None and session.recovery_state != RECOVERY_STATE_RESUMED_OK:
             return CoordinatorDecision(
                 NEEDS_HUMAN, evidence={"recovery_state": session.recovery_state},
                 reason=f"session's own conversation recovery is {session.recovery_state} -- "

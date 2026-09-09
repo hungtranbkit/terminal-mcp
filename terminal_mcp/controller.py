@@ -122,6 +122,30 @@ class ControllerService:
                                        session_backend=session_backend, shell_capabilities=shell_capabilities,
                                        wsl_available=wsl_available)
 
+    def refresh_node_capabilities(self, node_id: str) -> dict[str, Any]:
+        """Ask one node to re-probe launchers and update only capabilities.
+
+        This is intentionally separate from heartbeat metrics: a user-level
+        Windows PATH may change while the node remains healthy, and a
+        capability refresh must not manufacture a new liveness sample.
+        """
+        client = self._clients.get(node_id)
+        if client is None:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": "no client"}
+        try:
+            result = client.refresh_capabilities()
+        except NodeClientError as exc:
+            return {"error": "CAPABILITY_REFRESH_UNAVAILABLE", "node_id": node_id, "detail": str(exc)}
+        if "error" in result:
+            return {**result, "node_id": node_id}
+        agent_types = tuple(result.get("agent_types") or ())
+        node = self.registry.update_capabilities(node_id, agent_types=agent_types,
+                                                 agent_version=result.get("agent_version"))
+        if node is None:
+            return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+        return {"ok": True, "node_id": node_id, "agent_types": list(agent_types),
+                "launcher_paths": result.get("launcher_paths") or {}}
+
     # -- session location resolution ---------------------------------------
 
     def invalidate_session_location(self, session: str) -> None:
@@ -267,6 +291,29 @@ class ControllerService:
         docstring), exactly what recovering a gone session needs."""
         return self._route(name, "registry_reopen", lambda client, bare: client.registry_reopen(
             bare, agent_type=agent_type, cwd=cwd, grant_mode=grant_mode, requested_by=requested_by))
+
+    def registry_list(self, node_id: str, *, recoverable_only: bool = False) -> dict[str, Any]:
+        """Auto Recovery follow-up (2026-09-07): the fleet-aware read a
+        reconciliation engine needs -- session_registry.py is per-node-
+        agent-process-local (each node has its OWN session_registry.db),
+        so this is the only way to see a REMOTE node's own registry rows
+        at all. Node-keyed (not session-keyed like _route above), since
+        this reads a whole node's registry, not one session's routed
+        operation -- NODE_UNREACHABLE for an unregistered/unreachable
+        node, never a silent empty list that could be mistaken for
+        "this node genuinely has zero registry rows"."""
+        client = self._clients.get(node_id)
+        if client is None:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": "no client configured for this node"}
+        try:
+            result = client.registry_list(recoverable_only=recoverable_only)
+        except NodeClientError as exc:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
+        if isinstance(result, dict):
+            node = self.registry.get(node_id)
+            result.setdefault("node_id", node_id)
+            result.setdefault("node_name", node.display_name if node else node_id)
+        return result
 
     def terminal_rename_session(self, name: str, new_name: str, *,
                                 requested_by: str | None = None) -> dict[str, Any]:
@@ -657,6 +704,14 @@ class ControllerService:
                 # fallback... Fail rõ ràng" requirement.
                 return {"error": "NODE_UNREACHABLE", "node_id": node_id,
                         "detail": f"node status={explicit_node.status!r}, not online"}
+            if agent_type != "shell" and agent_type not in explicit_node.agent_types:
+                # Keep explicit-node creation honest too.  The dashboard
+                # normally disables this choice from the same capability
+                # field, but an API caller must not bypass the gate and then
+                # discover a launcher failure on the remote node.
+                return {"error": "AGENT_TYPE_NOT_AVAILABLE_ON_TARGET", "node_id": node_id,
+                        "detail": f"agent_type={agent_type!r} not available on {node_id!r} "
+                                  f"(has {explicit_node.agent_types!r})"}
 
         client = self._clients.get(node_id)
         if client is None:

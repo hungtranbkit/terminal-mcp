@@ -148,6 +148,15 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_emergency_resume",
         # AI Usage: read-only integration with the local AI Usage Monitor.
         "terminal_ai_usage_status",
+        # Auto Recovery: session recovery after reboot/crash/node-agent restart.
+        "terminal_recovery_set_policy",
+        "terminal_recovery_status",
+        "terminal_recovery_list",
+        "terminal_recover_session",
+        "terminal_recovery_reconcile_node",
+        "terminal_checkpoint_session",
+        "terminal_recovery_loop_status",
+        "terminal_recovery_loop_run_once",
     }
 
 

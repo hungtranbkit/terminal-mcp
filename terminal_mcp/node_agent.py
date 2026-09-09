@@ -48,6 +48,7 @@ from starlette.websockets import WebSocket
 
 from . import __version__, host_metrics
 from .agent_availability import available_agent_types
+from .launcher_resolution import resolve_launcher
 from .config import load_config
 from .core import TerminalService
 from .node_client import LocalNodeClient
@@ -151,6 +152,16 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
             return blocked
         result = await anyio.to_thread.run_sync(lambda: client.metrics())
         return JSONResponse(result)
+
+    async def refresh_capabilities(request: Request) -> JSONResponse:
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        commands = terminal.config.session_lifecycle.launch_commands
+        return JSONResponse({
+            "agent_types": list(available_agent_types(commands)),
+            "launcher_paths": {agent: resolve_launcher(command) for agent, command in commands},
+            "agent_version": __version__,
+        })
 
     async def list_sessions(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
@@ -306,6 +317,18 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         ))
         return JSONResponse(result)
 
+    async def registry_list(request: Request) -> JSONResponse:
+        # Auto Recovery follow-up (2026-09-07): the fleet-aware read a
+        # reconciliation engine running on the controller needs --
+        # session_registry.py is per-node-agent-process-local (each node
+        # has its OWN session_registry.db), so this is the only way the
+        # controller can see a REMOTE node's own registry rows at all.
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        recoverable_only = request.query_params.get("recoverable_only") == "1"
+        result = await anyio.to_thread.run_sync(lambda: client.registry_list(recoverable_only=recoverable_only))
+        return JSONResponse(result)
+
     async def killed_sessions(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
             return blocked
@@ -457,6 +480,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
     routes = [
         Route("/v1/health", health, methods=["GET"]),
         Route("/v1/metrics", metrics, methods=["GET"]),
+        Route("/v1/capabilities/refresh", refresh_capabilities, methods=["POST"]),
         Route("/v1/sessions", list_sessions, methods=["GET"]),
         Route("/v1/sessions", create_session, methods=["POST"]),
         Route("/v1/sessions/{name}/status", session_status, methods=["GET"]),
@@ -471,6 +495,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         Route("/v1/sessions/{name}/rename", rename_session, methods=["POST"]),
         Route("/v1/sessions/{name}/reopen", reopen_session, methods=["POST"]),
         Route("/v1/sessions/{name}/registry-reopen", registry_reopen_session, methods=["POST"]),
+        Route("/v1/registry", registry_list, methods=["GET"]),
         Route("/v1/sessions/{name}/grant-read", session_grant_read, methods=["POST"]),
         Route("/v1/sessions/{name}/grant-input", session_grant_input, methods=["POST"]),
         Route("/v1/killed-sessions", killed_sessions, methods=["GET"]),

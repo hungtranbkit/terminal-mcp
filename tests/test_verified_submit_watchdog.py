@@ -88,6 +88,7 @@ def test_different_prompt_cannot_reuse_submission_key(tmp_path: Path):
 
 
 def test_claude_watchdog_is_single_submit_even_when_evidence_stays_pending(tmp_path: Path):
+    """A non-Codex record can never inherit Codex's Enter retry budget."""
     store = SubmissionStore(tmp_path / "claude.db")
     watchdog = VerifiedSubmitWatchdog(store, WatchdogConfig(
         poll_interval_seconds=.05, timeout_seconds=.25, max_enter_attempts=5,

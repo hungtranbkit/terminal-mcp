@@ -25,6 +25,8 @@ from .planner_store import PlannerStore
 from .pm_service import PMService
 from .pm_store import PMStore
 from .queue_service import QueueService
+from .recovery_engine import RecoveryEngine
+from .recovery_loop import RecoveryLoop
 from . import network_bind, network_middleware
 from .node_client import LocalNodeClient
 from .node_registry import NodeRegistry
@@ -298,10 +300,17 @@ def main() -> None:
         return [{"name": item.name, "agent_type": item.pane_current_command} for item in items]
 
     ai_usage = AiUsageService(config.ai_usage, session_lister=_local_sessions_for_ai_usage)
+    # Auto Recovery: ONE shared instance, same "constructed once, shared
+    # by both build_mcp and register_dashboard" discipline as ai_usage/
+    # queue/integration/pm above -- both surfaces read/write the exact
+    # same registry/lock state, never two independently-drifting copies.
+    recovery = RecoveryEngine(terminal.session_registry, controller, terminal.leases, config.auto_recovery)
+    recovery.loop = RecoveryLoop(recovery, controller, poll_interval_seconds=config.auto_recovery.reconcile_poll_seconds)
     server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
-                       planner=planner, ai_usage=ai_usage)
+                       planner=planner, ai_usage=ai_usage, recovery=recovery)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
-                       queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage)
+                       queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
+                       recovery=recovery)
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)
@@ -357,6 +366,20 @@ def main() -> None:
     if config.integration_loop.enabled:
         integration.loop.start()
         atexit.register(integration.loop.stop)
+
+    # Auto Recovery's own optional background reconciliation loop
+    # (recovery_loop.py) -- default False, an INDEPENDENT global kill
+    # switch (see AutoRecoveryConfig's own docstring: unlike ai_usage's
+    # default-on read, this takes real autonomous ACTION -- spawns a
+    # real new process -- and must stay an explicit operator opt-in).
+    # The INSTANCE itself is constructed just above (recovery.loop),
+    # shared with register_dashboard -- this is only responsible for
+    # starting/stopping it based on config. terminal_recover_session/
+    # terminal_recovery_reconcile_node (manual) always work regardless
+    # of whether this automatic loop is enabled.
+    if config.auto_recovery.enabled:
+        recovery.loop.start()
+        atexit.register(recovery.loop.stop)
 
     # P1 hardening item #9: unconditional, unlike the supervisor loop
     # above -- audit.db accumulates from any terminal_send_text/_keys call

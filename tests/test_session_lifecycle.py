@@ -185,6 +185,34 @@ def test_create_launcher_never_accepts_raw_command_from_caller(tmp_path, lifecyc
     assert result["error"] == "INVALID_AGENT_TYPE"
 
 
+def test_codex_resume_uses_bounded_workspace_argv_without_yolo(tmp_path, monkeypatch):
+    config = _lifecycle_config(tmp_path)
+    service = TerminalService(config)
+    captured = {}
+
+    def fake_create(name, agent_type, cwd, *, show_on_desktop=False, extra_args=()):
+        captured.update(name=name, agent_type=agent_type, cwd=cwd, extra_args=extra_args)
+        return {"session": name, "agent_type": agent_type, "cwd": str(tmp_path), "state": "READY"}
+
+    monkeypatch.setattr(service.lifecycle, "create", fake_create)
+    monkeypatch.setattr(service, "_start_knowledge_capture_for_new_session", lambda _name: None)
+    monkeypatch.setattr(service.session_registry, "upsert_seen", lambda *args, **kwargs: None)
+
+    conversation_id = "01a07b29-5e51-7e82-891d-2ebcef15419c"
+    result = service.terminal_create_session(
+        "codex-lc-resume", "codex", str(tmp_path), resume_session_id=conversation_id,
+    )
+
+    assert "error" not in result
+    assert captured["extra_args"] == (
+        "--ask-for-approval", "never", "--sandbox", "workspace-write",
+        "resume", conversation_id,
+    )
+    assert "--dangerously-bypass-approvals-and-sandbox" not in captured["extra_args"]
+    assert result["conversation_id"] == conversation_id
+    assert result["resumed_from"] == conversation_id
+
+
 def test_session_lifecycle_disabled_blocks_create(tmp_path):
     config = _lifecycle_config(tmp_path, enabled=False)
     service = TerminalService(config)

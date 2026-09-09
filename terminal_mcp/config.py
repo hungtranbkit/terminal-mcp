@@ -108,6 +108,64 @@ class QueueConfig:
 
 
 @dataclass(frozen=True)
+class SubmitProfile:
+    """Bounded, evidence-gated Enter submission policy for one agent."""
+    max_enter_attempts: int = 1
+    enter_interval_ms: int = 180
+    verify_after_each_enter: bool = True
+    fixed_enter_count: int = 0
+
+
+@dataclass(frozen=True)
+class SubmitConfig:
+    default: SubmitProfile = SubmitProfile()
+    # Programmatic/default AppConfig preserves the historical single-Enter
+    # behavior; the production config.yaml opts Codex into the verified
+    # three-attempt profile explicitly.
+    codex: SubmitProfile = SubmitProfile()
+    # Claude and unknown agents are deliberately single-submit: one injected
+    # prompt and at most the initial Enter, never watchdog Enter retries.
+    claude: SubmitProfile = SubmitProfile()
+
+
+@dataclass(frozen=True)
+class AutoRecoveryConfig:
+    """Auto Recovery (2026-09-07, task: "Auto Recovery cho session sau
+    reboot/crash/node-agent restart") -- see recovery_engine.py's own
+    module docstring for the full design. Disabled by default (`enabled
+    = False`), same posture as every other autonomous-background-thread
+    config in this project (queue/supervisor/integration_loop) --
+    UNLIKE ai_usage's own default-on read, this one takes real
+    autonomous ACTION (spawns a real new process) and must be an
+    explicit operator opt-in. A per-session override still exists
+    (session_registry.py's own `auto_recovery_enabled` column) even
+    once this global switch is on.
+
+    max_attempts: bounded retry -- a session whose own recovery_attempts
+    (session_registry.py) already reached this is refused (BLOCKED,
+    never a silent infinite retry loop) until a human intervenes
+    (terminal_recover_session's own `force=True` explicitly resets and
+    retries anyway, an explicit override).
+    lock_ttl_seconds: the recovery lock's own TTL (reuses lease.py's
+    already-real, already-tested PaneLeaseStore -- never a second lock
+    table) -- sized comfortably above one real registry_reopen attempt's
+    own worst-case duration (RESUME_VERIFY_TIMEOUT_SECONDS=15s plus
+    create/launch overhead, core.py) so a genuinely in-flight attempt is
+    never falsely reclaimed, short enough that a crashed attempt's lock
+    is not stuck for long.
+    reconcile_poll_seconds: the background reconciliation loop's own
+    fallback poll interval (mirrors queue_loop.py/integration_loop.py's
+    own pattern) -- the REAL trigger is a node ONLINE transition
+    (node_registry.py's own sync_status_transitions, already real), this
+    is only the safety-net poll for whatever that misses (e.g. a node
+    that was already online when this loop started)."""
+    enabled: bool = False
+    max_attempts: int = 3
+    lock_ttl_seconds: float = 60.0
+    reconcile_poll_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
 class SubmitWatchdogConfig:
     """Codex-only verified submit timing; retries are Enter-only."""
     enabled: bool = True
@@ -279,6 +337,9 @@ class SessionLifecycleConfig:
     protected_sessions: tuple[str, ...] = ("terminal-mcp",)
     launch_commands: tuple[tuple[str, str], ...] = (("claude", "claude"), ("codex", "codex"))
     resume_capable_agent_types: tuple[str, ...] = ("claude",)
+    # Codex CLI's current, audited YOLO flag. Shared by create and
+    # registry-reopen; never assembled by individual callers.
+    codex_yolo: bool = True
     create_ready_timeout_seconds: float = 5.0
     default_grant_mode: str = "none"
 
@@ -466,9 +527,11 @@ class AppConfig:
     ask_chatgpt: AskChatGptConfig = AskChatGptConfig()
     nodes: NodesConfig = NodesConfig()
     queue: QueueConfig = QueueConfig()
+    submit: SubmitConfig = SubmitConfig()
     integration_loop: IntegrationLoopConfig = IntegrationLoopConfig()
     submit_watchdog: SubmitWatchdogConfig = SubmitWatchdogConfig()
     ai_usage: AiUsageConfig = AiUsageConfig()
+    auto_recovery: AutoRecoveryConfig = AutoRecoveryConfig()
     # Loop-protection metadata schema (see docs/prompt-submission.md, P11):
     # terminal_send_text/_granted accept optional origin/trace_id/parent_
     # turn_id/depth kwargs (all unused by every current caller -- MCP tools,
@@ -501,6 +564,57 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     max_lines = int(raw.get("max_capture_lines", 2000))
     tail_lines = int(raw.get("default_tail_lines", 200))
     input_raw = raw.get("input_policy", {})
+    submit_raw = raw.get("submit", {})
+    if not isinstance(submit_raw, dict):
+        raise ValueError("submit must be a mapping")
+
+    def load_submit_profile(raw_profile: object, default: SubmitProfile) -> SubmitProfile:
+        if not isinstance(raw_profile, dict):
+            raw_profile = {}
+        max_attempts = int(raw_profile.get("max_enter_attempts", default.max_enter_attempts))
+        interval_ms = int(raw_profile.get("enter_interval_ms", default.enter_interval_ms))
+        fixed_count = int(raw_profile.get("fixed_enter_count", default.fixed_enter_count))
+        if not 1 <= max_attempts <= 5:
+            raise ValueError("submit.*.max_enter_attempts must be between 1 and 5")
+        if not 50 <= interval_ms <= 1000:
+            raise ValueError("submit.*.enter_interval_ms must be between 50 and 1000")
+        if not 0 <= fixed_count <= 5:
+            raise ValueError("submit.*.fixed_enter_count must be between 0 and 5")
+        return SubmitProfile(max_enter_attempts=max_attempts, enter_interval_ms=interval_ms,
+                             verify_after_each_enter=bool(raw_profile.get(
+                                 "verify_after_each_enter", default.verify_after_each_enter)),
+                             fixed_enter_count=fixed_count)
+
+    submit_defaults = SubmitConfig()
+    submit_config = SubmitConfig(
+        default=load_submit_profile(submit_raw.get("default", {}), submit_defaults.default),
+        codex=load_submit_profile(submit_raw.get("codex", {}), submit_defaults.codex),
+        claude=load_submit_profile(submit_raw.get("claude", {}), submit_defaults.claude),
+    )
+    # Environment overrides are intentionally narrow and numeric; they are
+    # useful for a live node/backend diagnosis without embedding secrets or
+    # prompt content in config.
+    submit_env_names = (
+        "TERMINAL_MCP_CODEX_SUBMIT_ENTER_MAX_ATTEMPTS",
+        "TERMINAL_MCP_CODEX_SUBMIT_ENTER_INTERVAL_MS",
+        "TERMINAL_MCP_CODEX_SUBMIT_VERIFY_AFTER_EACH_ENTER",
+        "TERMINAL_MCP_CODEX_SUBMIT_FIXED_ENTER_COUNT",
+    )
+    if any(os.environ.get(name) is not None for name in submit_env_names):
+        submit_config = SubmitConfig(
+            default=submit_config.default,
+            codex=load_submit_profile({
+                "max_enter_attempts": os.environ.get("TERMINAL_MCP_CODEX_SUBMIT_ENTER_MAX_ATTEMPTS",
+                                                    submit_config.codex.max_enter_attempts),
+                "enter_interval_ms": os.environ.get("TERMINAL_MCP_CODEX_SUBMIT_ENTER_INTERVAL_MS",
+                                                     submit_config.codex.enter_interval_ms),
+                "verify_after_each_enter": os.environ.get("TERMINAL_MCP_CODEX_SUBMIT_VERIFY_AFTER_EACH_ENTER",
+                                                          str(submit_config.codex.verify_after_each_enter)).lower() == "true",
+                "fixed_enter_count": os.environ.get("TERMINAL_MCP_CODEX_SUBMIT_FIXED_ENTER_COUNT",
+                                                    submit_config.codex.fixed_enter_count),
+            }, submit_config.codex),
+            claude=submit_config.claude,
+        )
 
     def string_tuple(name: str, default: tuple[str, ...], *, allow_empty: bool = False) -> tuple[str, ...]:
         value = input_raw.get(name, list(default))
@@ -719,10 +833,28 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ask_chatgpt=_load_ask_chatgpt_config(raw.get("ask_chatgpt", {})),
         nodes=nodes_config,
         queue=_load_queue_config(raw.get("queue", {})),
+        submit=submit_config,
         integration_loop=_load_integration_loop_config(raw.get("integration_loop", {})),
         submit_watchdog=submit_config,
         ai_usage=_load_ai_usage_config(raw.get("ai_usage", {})),
+        auto_recovery=_load_auto_recovery_config(raw.get("auto_recovery", {})),
     )
+
+
+def _load_auto_recovery_config(raw: object) -> AutoRecoveryConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    max_attempts = int(raw.get("max_attempts", AutoRecoveryConfig.max_attempts))
+    lock_ttl = float(raw.get("lock_ttl_seconds", AutoRecoveryConfig.lock_ttl_seconds))
+    reconcile_poll = float(raw.get("reconcile_poll_seconds", AutoRecoveryConfig.reconcile_poll_seconds))
+    if max_attempts < 1:
+        raise ValueError("auto_recovery.max_attempts must be at least 1")
+    if lock_ttl <= 0:
+        raise ValueError("auto_recovery.lock_ttl_seconds must be positive")
+    if reconcile_poll < 0.5:
+        raise ValueError("auto_recovery.reconcile_poll_seconds must be at least 0.5")
+    return AutoRecoveryConfig(enabled=bool(raw.get("enabled", False)), max_attempts=max_attempts,
+                              lock_ttl_seconds=lock_ttl, reconcile_poll_seconds=reconcile_poll)
 
 
 def _load_ai_usage_config(raw: object) -> AiUsageConfig:
@@ -828,10 +960,16 @@ def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
                                  list(SessionLifecycleConfig.resume_capable_agent_types))
     if not isinstance(resume_capable_raw, list) or not all(isinstance(a, str) and a for a in resume_capable_raw):
         raise ValueError("session_lifecycle.resume_capable_agent_types must be a list of strings")
+    codex_yolo_raw = raw.get("codex_yolo", SessionLifecycleConfig.codex_yolo)
+    if not isinstance(codex_yolo_raw, bool):
+        raise ValueError("session_lifecycle.codex_yolo must be a boolean")
+    if os.environ.get("TERMINAL_MCP_CODEX_YOLO") is not None:
+        codex_yolo_raw = os.environ["TERMINAL_MCP_CODEX_YOLO"].strip().lower() == "true"
     return SessionLifecycleConfig(
         enabled=enabled, allowed_cwd_roots=tuple(roots), protected_sessions=protected_set,
         launch_commands=tuple(sorted(launch_raw.items())), create_ready_timeout_seconds=timeout,
         default_grant_mode=grant_mode, resume_capable_agent_types=tuple(resume_capable_raw),
+        codex_yolo=codex_yolo_raw,
     )
 
 

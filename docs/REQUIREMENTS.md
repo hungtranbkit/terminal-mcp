@@ -3952,3 +3952,29 @@ initial Enter; no watchdog/sweeper retry or prompt resend. Unconfirmed Claude
 delivery is reported as `DELIVERY_UNKNOWN`/`STUCK`, never guessed as success.
 All MCP, dashboard, queue, supervisor, controller, Linux tmux, and Windows
 ConPTY callers converge on the same backend/agent policy.
+
+# 2026-09-07 Codex capability refresh + submit reliability checkpoint
+
+- Capability detection now resolves launchers against the live Windows user
+  PATH (including `HKCU\\Environment\\Path`) and returns an absolute launcher
+  path for actual spawning. The node-agent exposes authenticated
+  `POST /v1/capabilities/refresh`; the controller/dashboard proxy is
+  `POST /dashboard/api/nodes/{node_id}/refresh-capabilities`. The refresh
+  updates only capability fields, not liveness or metrics.
+- Prompt submission has a shared agent-specific profile. Production
+  `config.yaml` uses Codex `max_enter_attempts: 3`, `enter_interval_ms: 180`,
+  and `verify_after_each_enter: true`; each retry requires the Codex adapter
+  to still prove the same draft is pending. Generic/Claude remain single-
+  Enter by default. `fixed_enter_count` is disabled unless explicitly set.
+- This policy is fail-closed by agent type across MCP, dashboard, queue,
+  supervisor, controller, Linux tmux, and Windows ConPTY paths: Codex alone
+  may send bounded Enter retries. Claude injects once and sends at most its
+  initial Enter; it never receives watchdog/sweeper Enter retries. Unknown
+  agents use the single-submit default and unresolved delivery is reported as
+  `DELIVERY_UNKNOWN`/`STUCK` rather than guessed or duplicated.
+- Receipts add `enter_count`, `attempts`, `evidence`, and
+  `submit_latency_ms`; prompt content is never logged by this telemetry.
+- Live dell-5530 agent generation `a10b3f91e292b679` is still version 0.12.0
+  and returns HTTP 404 for the new refresh endpoint. `wtest` is live and
+  attached, so no node-agent restart was performed; dashboard Codex
+capability remains pending deployment/restart-safe refresh.

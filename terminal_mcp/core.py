@@ -118,6 +118,31 @@ RESUME_VERIFY_POLL_INTERVAL_SECONDS = 0.3
 RECOVERY_STATE_RESTORING = "RESTORING"
 RECOVERY_STATE_RESUMED_OK = "RESUMED_OK"
 RECOVERY_STATE_FAILED = "RECOVERY_FAILED"
+# Auto Recovery follow-up (2026-09-07, task: "Auto Recovery cho session
+# sau reboot/crash/node-agent restart") -- three genuinely NEW states an
+# AUTOMATIC reconciliation pass (recovery_engine.py) can reach that the
+# pre-existing three above never needed: a manual terminal_registry_
+# reopen call is always either "in flight" (RESTORING) or "resolved"
+# (RESUMED_OK/RECOVERY_FAILED) with no queueing concept. The automatic
+# engine needs to represent "decided to attempt, not started yet"
+# (RECOVERY_PENDING -- e.g. waiting on the recovery lock, or a backoff
+# window), "a real new process was created but WITHOUT conversation
+# continuity" (RECOVERY_DEGRADED -- a real, disclosed partial success:
+# never confused with RECOVERY_STATE_RESUMED_OK, which specifically
+# means continuity was verified), and "policy/metadata explicitly
+# refused an attempt" (RECOVERY_BLOCKED -- e.g. auto_recovery disabled
+# for this session, or REOPEN_METADATA_INCOMPLETE -- persisted here so
+# a caller/dashboard sees WHY nothing happened, not just silence).
+# RECOVERY_STATE_RESTORING/RESUMED_OK are reused AS-IS for "an attempt
+# is actively in flight" / "a real new process was created WITH
+# verified conversation continuity" -- the automatic engine's own
+# "RECOVERING"/"RECOVERED" vocabulary from the task's own wording maps
+# directly onto these two already-real, already-load-bearing values
+# (coordinator.py's gate, dashboard.py's display) rather than a
+# needless rename of either.
+RECOVERY_STATE_PENDING = "RECOVERY_PENDING"
+RECOVERY_STATE_DEGRADED = "RECOVERY_DEGRADED"
+RECOVERY_STATE_BLOCKED = "RECOVERY_BLOCKED"
 # Live-tested against the real Codex CLI (not just a synthetic fixture):
 # the base 0.6s window is fine for a simple shell but too short for an
 # LLM-backed agent CLI to visibly start responding -- a real send that
@@ -185,21 +210,35 @@ def _codex_composer_buffer_complete(snapshot: list[str], text: str) -> bool:
 
 
 def _codex_draft_in_composer(snapshot: list[str], text: str) -> bool:
-    """Return true only when this submission is still in Codex's composer."""
+    """Return true only when this submission is still in Codex's composer.
+
+    A plain text search is intentionally insufficient: Codex scrollback can
+    contain the same prompt prefix and a stale ``Working`` footer can belong
+    to an earlier turn.  The composer marker (``>``/``›``) plus either the
+    submitted text prefix or Codex's bracketed-paste marker is the stronger
+    per-attempt signal used to suppress false ACKs.
+    """
     normalized_prefix = " ".join(text.split())[:80]
     marker_indexes = [index for index, line in enumerate(snapshot)
                       if re.match(r"^\s*[>›]\s*", line.strip())]
     if not marker_indexes:
         return False
+    # A submitted Codex turn may leave the historical `> prompt` line in
+    # scrollback.  It is not the live composer when a submission/working
+    # result follows it; only the last active marker can be the draft.
     last_marker = marker_indexes[-1]
     if any(re.search(r"SUBMITTED\[|esc to interrupt", line, re.IGNORECASE)
            for line in snapshot[last_marker + 1:]):
         return False
-    body = re.sub(r"^[>›]\s*", "", snapshot[last_marker].strip())
-    if normalized_prefix and normalized_prefix in " ".join(body.split()):
-        return True
-    match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", body, re.IGNORECASE)
-    return bool(match and int(match.group(1)) >= len(text))
+    for line in snapshot[last_marker:last_marker + 1]:
+        stripped = line.strip()
+        body = re.sub(r"^[>›]\s*", "", stripped)
+        if normalized_prefix and normalized_prefix in " ".join(body.split()):
+            return True
+        match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", body, re.IGNORECASE)
+        if match and int(match.group(1)) >= len(text):
+            return True
+    return False
 
 
 def _codex_composer_marker_present(snapshot: list[str]) -> bool:
@@ -297,6 +336,9 @@ class TerminalService:
     def recover_submission(self, record: Submission) -> None:
         """Reconcile a durable in-flight Codex submission without injection."""
         if record.agent_type != "codex":
+            # Claude and unknown agents are single-submit by policy.  A
+            # durable row must never turn the background sweeper into a later
+            # Enter sender for those backends.
             self.submissions.update(record.submission_id, ack_state=ACK_STUCK,
                                     evidence="single_submit_policy_no_retry")
             return
@@ -1229,10 +1271,15 @@ class TerminalService:
         """
         if "correlation_id" in result:
             result.setdefault("submission_id", result["correlation_id"])
+        started = result.pop("_submit_started_monotonic", None)
+        if started is not None:
+            result.setdefault("submit_latency_ms", round((time.monotonic() - started) * 1000, 1))
         delivery_state = result.get("delivery_state")
         enter_sent = bool(result.get("enter_sent"))
         recovered = bool(result.get("recovery_attempted"))
         result.setdefault("activation_attempts", (2 if recovered else 1) if enter_sent else 0)
+        result.setdefault("enter_count", result.get("activation_attempts", 0))
+        result.setdefault("attempts", result.get("enter_count", 0))
         if delivery_state == DELIVERY_TEXT_SENT:
             result.setdefault("evidence", [self._EVIDENCE_TEXT_SENT])
         elif delivery_state == DELIVERY_SUBMIT_CONFIRMED:
@@ -1397,6 +1444,7 @@ class TerminalService:
         # second, narrower check scoped to the send itself, catching a
         # target destroyed/recreated under the same name in the brief
         # window between that caller-level check and the actual send.
+        submit_started = time.monotonic()
         try:
             info_before = self.tmux.get_session(session)
         except TmuxError:
@@ -1405,7 +1453,8 @@ class TerminalService:
             return {"sent": False, "enter_sent": False, "characters": len(text), "press_enter": press_enter,
                     "correlation_id": correlation_id, "delivery_state": DELIVERY_ERROR,
                     "submit_status": to_legacy_submit_status(DELIVERY_ERROR),
-                    "error": "SESSION_NOT_FOUND", "session": session}
+                    "error": "SESSION_NOT_FOUND", "session": session,
+                    "_submit_started_monotonic": submit_started}
         identity_before = SessionIdentity.from_session_info(info_before)
         command_before = info_before.pane_current_command or ""
         adapter = select_adapter(command_before)
@@ -1456,14 +1505,24 @@ class TerminalService:
         # before the legacy one-Enter path and is backend-neutral: tmux and
         # Windows ConPTY both implement capture_lines/send_text/send_keys.
         if press_enter and adapter.name == "codex" and self.config.submit_watchdog.enabled:
-            return self._verified_codex_submit_locked(
+            verified = self._verified_codex_submit_locked(
                 session, text, correlation_id, identity_before, command_before, adapter,
             )
+            # That path builds its receipt from the watchdog record rather
+            # than from the dict below, so it would otherwise be the ONE
+            # path whose result reaches _enrich_receipt with no start time
+            # and therefore no submit_latency_ms -- precisely the Codex
+            # submit whose latency is most worth measuring. Re-attach the
+            # same clock every other path uses so the metric is uniform.
+            verified.setdefault("_submit_started_monotonic", submit_started)
+            return verified
 
         self.tmux.send_text(session, text, press_enter=False)
         result: dict[str, Any] = {"sent": True, "enter_sent": False, "characters": len(text),
                                   "press_enter": press_enter, "correlation_id": correlation_id,
-                                  "agent_type": adapter.name}
+                                  "agent_type": adapter.name,
+                                  "_submit_started_monotonic": submit_started,
+                                  "enter_count": 0, "attempts": 0}
         if not press_enter:
             result["delivery_state"] = DELIVERY_TEXT_SENT
             result["submit_status"] = to_legacy_submit_status(DELIVERY_TEXT_SENT)
@@ -1502,6 +1561,8 @@ class TerminalService:
 
         self.tmux.send_keys(session, ["Enter"])
         result["enter_sent"] = True
+        result["enter_count"] = 1
+        result["attempts"] = 1
         if typed_snapshot is None:
             # No reliable pre-Enter baseline to diff against -- verification
             # itself is compromised (a capture failure right after a
@@ -1520,6 +1581,72 @@ class TerminalService:
                           else SEND_VERIFY_TIMEOUT_SECONDS)
 
         _, after, reason = self._poll_for_submission(session, typed_snapshot, timeout=verify_timeout)
+
+        # Codex's known debounce/composer-swallow race gets a bounded,
+        # evidence-gated Enter retry profile.  This is deliberately before
+        # the older Escape+Enter recovery: a second Enter is the least
+        # invasive action when the exact draft is still visibly pending.
+        # The durable watchdog config is the single policy source.  The
+        # retry block below is Codex-only; Claude/unknown agents never enter
+        # it and therefore never receive an automatic retry.
+        profile = self.config.submit_watchdog
+        if adapter.name == "codex" and (profile.max_enter_attempts > 1 or profile.fixed_enter_count > 0):
+            confirmed, latest = self._poll_for_ack_evidence(
+                session, typed_snapshot, after, adapter, text,
+                deadline=time.monotonic() + profile.enter_interval_ms / 1000.0,
+            ) if profile.verify_after_each_enter else (False, after)
+            if confirmed:
+                result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
+                result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
+                result["evidence"] = ["OUTPUT_CHANGED"]
+                return result
+            attempt_limit = max(profile.max_enter_attempts, profile.fixed_enter_count)
+            for attempt in range(2, attempt_limit + 1):
+                pending = (
+                    latest is not None
+                    and adapter.stuck_composer_evidence(typed_snapshot, latest)
+                    and adapter.safe_recovery_allowed(latest)
+                    and _sent_text_echoed(latest, text)
+                )
+                if not pending and profile.fixed_enter_count <= 0:
+                    break
+                # Re-pin identity and command immediately before every retry.
+                try:
+                    retry_info = self.tmux.get_session(session)
+                except TmuxError:
+                    retry_info = None
+                retry_identity = (None if retry_info is None else SessionIdentity.from_session_info(retry_info))
+                retry_command = (retry_info.pane_current_command or "") if retry_info is not None else ""
+                if (retry_identity is None or not identity_before.matches(retry_identity)
+                        or retry_command != command_before):
+                    break
+                time.sleep(profile.enter_interval_ms / 1000.0)
+                self.tmux.send_keys(session, ["Enter"])
+                result["enter_count"] = attempt
+                result["attempts"] = attempt
+                if profile.fixed_enter_count > 0:
+                    result.setdefault("evidence", []).append("FIXED_ENTER_FALLBACK")
+                result.setdefault("evidence", []).append("PENDING_COMPOSER_RETRY")
+                try:
+                    latest = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
+                except TmuxError:
+                    latest = None
+                if latest is None:
+                    break
+                confirmed, latest = self._poll_for_ack_evidence(
+                    session, typed_snapshot, latest, adapter, text,
+                    deadline=time.monotonic() + profile.enter_interval_ms / 1000.0,
+                ) if profile.verify_after_each_enter else (False, latest)
+                if confirmed:
+                    result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
+                    result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
+                    result.setdefault("evidence", []).append("OUTPUT_CHANGED")
+                    result["submit_reason"] = f"confirmed after {attempt} Enter attempts"
+                    return result
+            result["delivery_state"] = DELIVERY_UNKNOWN
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
+            result["submit_reason"] = "Codex submission remained unconfirmed after evidence-gated Enter retries"
+            return result
 
         # Escape+Enter recovery: gated strictly on this specific adapter's
         # own evidence for this specific attempt -- see the adapter
@@ -1590,6 +1717,8 @@ class TerminalService:
             time.sleep(SEND_TEXT_ENTER_SETTLE_SECONDS)
             self.tmux.send_keys(session, ["Enter"])
             result["recovery_attempted"] = True
+            result["enter_count"] = max(int(result.get("enter_count", 1)), 2)
+            result["attempts"] = result["enter_count"]
             _, after2, _ = self._poll_for_submission(session, pre_recovery_snapshot,
                                                       timeout=RECOVERY_VERIFY_TIMEOUT_SECONDS)
             confirmed2 = after2 is not None and adapter.submit_ack_evidence(pre_recovery_snapshot, after2, text)
@@ -2765,7 +2894,11 @@ class TerminalService:
         so a LATER registry_reopen -- even after this process's own
         node-agent restarts -- can find it. A non-resume-capable
         agent_type (including "shell") is completely unaffected: no extra
-        args, no conversation_id recorded, exactly today's behavior."""
+        args, no conversation_id recorded, exactly today's behavior. Codex is
+        an explicit exception when a caller supplies resume_session_id:
+        Codex 0.153.4 requires `--ask-for-approval never --sandbox
+        workspace-write resume <id>`, and recovery must not use the normal
+        new-session YOLO flag."""
         action = "create_session"
         if (error := require_session_lifecycle(self.config)) is not None:
             self.audit.record(action=action, session=name, result="BLOCKED", reason=error)
@@ -2775,7 +2908,19 @@ class TerminalService:
             return {"error": "INVALID_GRANT_MODE", "session": name}
         conversation_id: str | None = None
         extra_args: tuple[str, ...] = ()
-        if agent_type in self.config.session_lifecycle.resume_capable_agent_types:
+        if agent_type == "codex" and resume_session_id:
+            # Keep every value as a separate argv token; no shell parsing or
+            # interpolation is involved. Recovery is explicitly bounded to
+            # the workspace and approval policy requested by the caller.
+            conversation_id = resume_session_id
+            extra_args = ("--ask-for-approval", "never", "--sandbox", "workspace-write",
+                          "resume", resume_session_id)
+        elif agent_type == "codex" and self.config.session_lifecycle.codex_yolo:
+            # Audited against Codex CLI --help on local and Windows 0.153.4:
+            # one argv token, never shell-concatenated or duplicated.
+            extra_args += ("--dangerously-bypass-approvals-and-sandbox",)
+        if agent_type in self.config.session_lifecycle.resume_capable_agent_types and not (
+                agent_type == "codex" and resume_session_id):
             if resume_session_id:
                 conversation_id = resume_session_id
                 extra_args = ("--resume", resume_session_id)
@@ -3196,6 +3341,13 @@ class TerminalService:
             "conversation_id": record.conversation_id, "resumable": record.resumable,
             "recovery_state": record.recovery_state, "recovery_detail": record.recovery_detail,
             "recovery_updated_at": record.recovery_updated_at,
+            # Auto Recovery follow-up (2026-09-07) -- see session_registry.
+            # py's own migration docstring for what each of these means.
+            "stable_session_id": record.stable_session_id, "worktree_path": record.worktree_path,
+            "auto_recovery_enabled": record.auto_recovery_enabled,
+            "last_checkpoint_at": record.last_checkpoint_at,
+            "last_checkpoint_detail": record.last_checkpoint_detail,
+            "recovery_generation": record.recovery_generation, "recovery_attempts": record.recovery_attempts,
         }
 
     def terminal_registry_list(self, *, recoverable_only: bool = False) -> dict[str, Any]:

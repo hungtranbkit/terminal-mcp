@@ -10,6 +10,8 @@ from .core import TerminalService
 from .coordinator import CoordinatorGate
 from .integration_engine import IntegrationEngine
 from .ai_usage_service import AiUsageService
+from .recovery_engine import RecoveryEngine
+from .recovery_loop import RecoveryLoop
 from .integration_loop import IntegrationLoop
 from .task_migration import TaskMigrationPlanner
 from .integration_service import IntegrationService
@@ -43,7 +45,8 @@ def build_mcp(service: TerminalService | None = None,
               pm: PMService | None = None,
               planner: PlannerService | None = None,
               release: ReleaseService | None = None,
-              ai_usage: AiUsageService | None = None) -> MCPServer:
+              ai_usage: AiUsageService | None = None,
+              recovery: RecoveryEngine | None = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -81,6 +84,19 @@ def build_mcp(service: TerminalService | None = None,
         return [{"name": item.name, "agent_type": item.pane_current_command} for item in items]
 
     ai_usage = ai_usage or AiUsageService(terminal.config.ai_usage, session_lister=_local_sessions_for_ai_usage)
+    # Auto Recovery (2026-09-07): constructed here (not started -- see
+    # server_http.py's own config.auto_recovery.enabled gate for that
+    # background loop) so terminal_recover_session/reconcile_node below
+    # always work even with the automatic loop off, same "manual call
+    # always available, only the *automatic* trigger is gated" posture
+    # as queue.loop/integration.loop. Reuses terminal.leases (the SAME
+    # already-real PaneLeaseStore instance send/verify locking already
+    # uses) for the recovery lock -- never a second lock table; keys are
+    # namespaced ("recovery:...") so there is no collision risk.
+    recovery = recovery or RecoveryEngine(terminal.session_registry, controller, terminal.leases,
+                                          terminal.config.auto_recovery)
+    recovery.loop = recovery.loop or RecoveryLoop(
+        recovery, controller, poll_interval_seconds=terminal.config.auto_recovery.reconcile_poll_seconds)
     supervisor = supervisor or SupervisorService(terminal, SupervisorStore())
     supervisor_v2 = supervisor_v2 or build_supervisor_v2(supervisor)
     controller = controller or build_default_controller(terminal)
@@ -640,6 +656,115 @@ def build_mcp(service: TerminalService | None = None,
         _refresh_local_heartbeat()
         return controller.terminal_registry_reopen(session_name, agent_type=agent_type, cwd=cwd,
                                                     requested_by="mcp")
+
+    # -- Auto Recovery (2026-09-07, task: "Auto Recovery cho session sau
+    # reboot/crash/node-agent restart") -- see recovery_engine.py's own
+    # module docstring. terminal_registry_reopen above is the underlying
+    # ONE-SESSION-AT-A-TIME manual action (unchanged); the tools below
+    # are this feature's own additions: policy control, bulk/fleet
+    # status, and the manual equivalents of what the (optional,
+    # off-by-default) automatic background loop does for itself.
+
+    @server.tool()
+    def terminal_recovery_set_policy(node_id: str, session_name: str, enabled: bool | None) -> dict:
+        """Per-session Auto Recovery override -- True/False explicitly
+        opts this ONE session in/out regardless of the global config.
+        auto_recovery.enabled default; enabled=null clears the override
+        back to "inherit the global default". Returns REGISTRY_RECORD_
+        NOT_FOUND if this (node_id, session_name) has no registry row
+        yet (nothing to set a policy on)."""
+        ok = terminal.session_registry.set_auto_recovery_enabled(node_id, session_name, enabled)
+        if not ok:
+            return {"error": "REGISTRY_RECORD_NOT_FOUND", "node_id": node_id, "session": session_name}
+        record = terminal.session_registry.get(node_id, session_name)
+        return {"node_id": node_id, "session": session_name, "auto_recovery_enabled": record.auto_recovery_enabled}
+
+    @server.tool()
+    def terminal_recovery_status(node_id: str, session_name: str) -> dict:
+        """One session's own current recovery state -- status/
+        recoverable/resumable (already-real registry fields) PLUS this
+        feature's own auto_recovery_enabled/recovery_generation/
+        recovery_attempts/last_checkpoint_at. REGISTRY_RECORD_NOT_FOUND
+        if this session has no registry row at all."""
+        if node_id == controller.local_node_id:
+            record_dict = terminal.terminal_registry_get(session_name)
+        else:
+            listing = controller.registry_list(node_id)
+            if "error" in listing:
+                return listing
+            record_dict = next((r for r in listing.get("records", []) if r["session_name"] == session_name), None)
+            if record_dict is None:
+                return {"error": "REGISTRY_RECORD_NOT_FOUND", "node_id": node_id, "session": session_name}
+        return record_dict
+
+    @server.tool()
+    def terminal_recovery_list(node_id: str, recoverable_only: bool = True) -> dict:
+        """Bulk, per-node view (task item 7's own "bulk view cho node
+        sau reboot") -- every registry row for `node_id`, or only the
+        ones with enough saved metadata to actually recover
+        (recoverable_only=True, the default -- matches terminal_
+        registry_list's own local-node equivalent)."""
+        if node_id == controller.local_node_id:
+            return terminal.terminal_registry_list(recoverable_only=recoverable_only)
+        return controller.registry_list(node_id, recoverable_only=recoverable_only)
+
+    @server.tool()
+    def terminal_recover_session(node_id: str, session_name: str, force: bool = False) -> dict:
+        """Manually triggers exactly ONE recovery attempt for this
+        session -- the SAME code path the automatic background loop
+        uses (never a second implementation), real exactly-once locking
+        (RECOVERY_IN_PROGRESS if another attempt is already in flight),
+        real policy/max_attempts gating unless force=true (an explicit
+        human override of both). Never silently reports a fake resume:
+        a session with no conversation_id on record comes back
+        recovery_state=RECOVERY_DEGRADED (a real new process, but no
+        conversation continuity to verify), never RESUMED_OK."""
+        return recovery.recover_session(node_id, session_name, requested_by="mcp", force=force)
+
+    @server.tool()
+    def terminal_recovery_reconcile_node(node_id: str) -> dict:
+        """Manually triggers one full reconciliation pass for `node_id`
+        -- one terminal_recover_session-equivalent attempt per
+        recoverable row on that node, never force (policy/max_attempts
+        still apply per-session; use terminal_recover_session directly
+        with force=true for one specific stuck session). The SAME call
+        the automatic background loop makes for itself on a node ONLINE
+        transition."""
+        return {"results": recovery.reconcile_node(node_id, requested_by="mcp")}
+
+    @server.tool()
+    def terminal_checkpoint_session(node_id: str, session_name: str, detail: str) -> dict:
+        """Records that this session's own state was confirmed durably
+        safe as of now (`detail` is the caller's own claim of what makes
+        it safe, e.g. "task abc123 reached COMPLETED") -- NEVER a claim
+        of capturing unsubmitted composer text, which is genuinely
+        unrecoverable once the underlying process is gone (see recovery
+        _engine.py's own module docstring)."""
+        return recovery.checkpoint(node_id, session_name, detail=detail)
+
+    @server.tool()
+    def terminal_recovery_loop_status() -> dict:
+        """Whether the AUTOMATIC background reconciliation loop
+        (recovery_loop.py) is actually running right now -- distinct
+        from config.auto_recovery.enabled (the global gate this loop's
+        own start/stop is conditioned on in server_http.py, not
+        reported here directly) and from any single session's own
+        auto_recovery_enabled override."""
+        if recovery.loop is None:
+            return {"running": False, "poll_interval_seconds": None, "last_cycle_at": None, "last_error": None}
+        return recovery.loop.status()
+
+    @server.tool()
+    def terminal_recovery_loop_run_once() -> dict:
+        """Manually forces exactly one full cycle of the automatic
+        reconciliation loop -- reconciles every currently-ONLINE node
+        not yet seen by this loop instance, or that just reconnected,
+        regardless of whether the background loop itself is currently
+        running. Useful for tests/smoke or to force immediate recovery
+        without waiting for the next automatic interval."""
+        if recovery.loop is None:
+            return {"error": "RECOVERY_LOOP_NOT_CONFIGURED"}
+        return {"results": recovery.loop.run_one_cycle()}
 
     @server.tool()
     def terminal_registry_purge(session_name: str) -> dict:

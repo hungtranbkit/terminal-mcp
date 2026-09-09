@@ -374,6 +374,17 @@ class NodeRegistry:
             )
         return self.get(node_id, now=now)
 
+    def update_capabilities(self, node_id: str, *, agent_types: tuple[str, ...],
+                            agent_version: str | None) -> Node | None:
+        """Apply an authenticated live capability re-probe without faking a
+        metrics heartbeat or changing node liveness/capacity fields."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE nodes SET agent_types = ?, agent_version = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(list(agent_types)), agent_version, _iso(_now()), node_id),
+            )
+        return self.get(node_id) if cursor.rowcount else None
+
     # -- reads (status is ALWAYS derived here, never trusted from storage) --
 
     def _row_to_node(self, row: sqlite3.Row, *, now: datetime) -> Node:

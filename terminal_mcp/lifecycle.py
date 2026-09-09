@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import AppConfig
+from .launcher_resolution import resolve_launcher
 from .permissions import SENSITIVE_SESSION_WORDS, valid_new_session_name
 from .session_backend import SessionBackend
 from .tmux import TmuxError
@@ -70,7 +71,14 @@ class SessionLifecycleService:
     def launch_command_for(self, agent_type: str) -> str | None:
         if agent_type == "shell":
             return None
-        return dict(self.config.session_lifecycle.launch_commands).get(agent_type)
+        configured = dict(self.config.session_lifecycle.launch_commands).get(agent_type)
+        if not configured:
+            return None
+        # Resolve at create time, not only at node-agent startup.  The
+        # returned absolute path is what the backend actually spawns, so a
+        # Windows node-agent with a stale inherited PATH still launches the
+        # same binary that capability detection verified.
+        return resolve_launcher(configured)
 
     def validate_create(self, name: str, agent_type: str) -> dict[str, Any] | None:
         if not valid_new_session_name(name):

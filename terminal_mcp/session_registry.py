@@ -60,6 +60,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import uuid
+
 from .schema import Migration, apply_migrations
 
 def _add_conversation_continuity_columns(connection: sqlite3.Connection) -> None:
@@ -67,6 +69,56 @@ def _add_conversation_continuity_columns(connection: sqlite3.Connection) -> None
     connection.execute("ALTER TABLE session_records ADD COLUMN recovery_state TEXT")
     connection.execute("ALTER TABLE session_records ADD COLUMN recovery_detail TEXT")
     connection.execute("ALTER TABLE session_records ADD COLUMN recovery_updated_at TEXT")
+
+
+def _add_auto_recovery_columns(connection: sqlite3.Connection) -> None:
+    """Auto Recovery follow-up (2026-09-07, task: "Auto Recovery cho
+    session sau reboot/crash/node-agent restart") -- see recovery_
+    engine.py's own module docstring for the full design this schema
+    supports.
+
+    stable_session_id: an immutable UUID, generated ONCE and never
+    changed again (survives Rename Session, which already updates
+    session_name/keeps everything else attached to the same row --
+    this is a SEPARATE, explicit stable identity a caller can key task/
+    binding cross-references off of without caring whether a display
+    name ever changes). Backfilled for every pre-existing row below so
+    no row is ever left without one.
+    worktree_path: the git worktree this session's own cwd lives in, if
+    any (git isolation, §20.4 -- reused field name matching git_
+    isolation_service.py's own vocabulary, never a duplicate concept).
+    auto_recovery_enabled: tri-state (NULL = inherit the global config.
+    auto_recovery.enabled default; 0/1 = an explicit per-session
+    override) -- a session-level policy knob, real per-session opt-out
+    even while the global engine is on.
+    last_checkpoint_at/last_checkpoint_detail: the last point this
+    session's own state was confirmed durably safe to recover FROM (see
+    recovery_engine.py's own checkpoint() -- deliberately never claims
+    to capture UNSUBMITTED composer text, which is genuinely
+    unrecoverable once the underlying process is gone; see that
+    module's docstring for why).
+    recovery_generation/recovery_attempts: real, durable counters for
+    exactly-once/bounded-retry recovery -- generation increments on
+    every NEW recovery attempt (never re-used across attempts, so a
+    stale in-flight check can never be confused with a fresh one);
+    attempts is the running count this session's own recovery has been
+    tried, checked against config.auto_recovery.max_attempts before a
+    new one is ever started."""
+    connection.execute("ALTER TABLE session_records ADD COLUMN stable_session_id TEXT")
+    connection.execute("ALTER TABLE session_records ADD COLUMN worktree_path TEXT")
+    connection.execute("ALTER TABLE session_records ADD COLUMN auto_recovery_enabled INTEGER")
+    connection.execute("ALTER TABLE session_records ADD COLUMN last_checkpoint_at TEXT")
+    connection.execute("ALTER TABLE session_records ADD COLUMN last_checkpoint_detail TEXT")
+    connection.execute("ALTER TABLE session_records ADD COLUMN recovery_generation INTEGER NOT NULL DEFAULT 0")
+    connection.execute("ALTER TABLE session_records ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0")
+    rows = connection.execute(
+        "SELECT node_id, session_name FROM session_records WHERE stable_session_id IS NULL"
+    ).fetchall()
+    for row in rows:
+        connection.execute(
+            "UPDATE session_records SET stable_session_id = ? WHERE node_id = ? AND session_name = ?",
+            (str(uuid.uuid4()), row[0], row[1]),
+        )
 
 
 REGISTRY_MIGRATIONS: list[Migration] = [
@@ -84,6 +136,8 @@ REGISTRY_MIGRATIONS: list[Migration] = [
     # can't be verified must say so, never silently look like an
     # ordinary fresh session.
     Migration(2, "add conversation_id + recovery_state columns", _add_conversation_continuity_columns),
+    Migration(3, "Auto Recovery: stable_session_id + worktree_path + policy + checkpoint + generation columns",
+             _add_auto_recovery_columns),
 ]
 
 STATUS_ACTIVE = "ACTIVE"
@@ -184,6 +238,13 @@ class SessionRecord:
     recovery_state: str | None = None
     recovery_detail: str | None = None
     recovery_updated_at: str | None = None
+    stable_session_id: str | None = None
+    worktree_path: str | None = None
+    auto_recovery_enabled: bool | None = None
+    last_checkpoint_at: str | None = None
+    last_checkpoint_detail: str | None = None
+    recovery_generation: int = 0
+    recovery_attempts: int = 0
 
     @property
     def recoverable(self) -> bool:
@@ -233,6 +294,11 @@ def _from_row(row: sqlite3.Row | None) -> SessionRecord | None:
         notes=row["notes"], tags=tuple(json.loads(row["tags"] or "[]")),
         conversation_id=row["conversation_id"], recovery_state=row["recovery_state"],
         recovery_detail=row["recovery_detail"], recovery_updated_at=row["recovery_updated_at"],
+        stable_session_id=row["stable_session_id"], worktree_path=row["worktree_path"],
+        auto_recovery_enabled=(bool(row["auto_recovery_enabled"]) if row["auto_recovery_enabled"] is not None
+                               else None),
+        last_checkpoint_at=row["last_checkpoint_at"], last_checkpoint_detail=row["last_checkpoint_detail"],
+        recovery_generation=row["recovery_generation"], recovery_attempts=row["recovery_attempts"],
     )
 
 
@@ -425,7 +491,8 @@ class SessionRegistryStore:
                     launcher_type: str | None = None, last_known_state: str | None = None,
                     read_granted: bool = False, input_granted: bool = False,
                     binding_names: tuple[str, ...] = (), backfill_project: bool = True,
-                    conversation_id: str | None = None, now: str | None = None) -> SessionRecord:
+                    conversation_id: str | None = None, worktree_path: str | None = None,
+                    now: str | None = None) -> SessionRecord:
         """Called on every reconcile pass for a session CURRENTLY observed
         alive -- status always becomes ACTIVE (a session that reappears
         after being MISSING/KILLED/OFFLINE is exactly as "back" as one
@@ -466,6 +533,13 @@ class SessionRegistryStore:
         metadata_complete = bool(agent_type) and (agent_type == "shell" or bool(cwd))
         created_at = existing.created_at if existing else now
         binding_json = json.dumps(list(binding_names) or (list(existing.binding_names) if existing else []))
+        # stable_session_id: generated ONCE, only reaches the row on the
+        # INSERT branch below (the ON CONFLICT...DO UPDATE never mentions
+        # this column, so an existing row's own value is always left
+        # untouched -- see this column's own migration docstring for why
+        # it must never change once assigned).
+        stable_session_id = existing.stable_session_id if existing else str(uuid.uuid4())
+        worktree_path = worktree_path or (existing.worktree_path if existing else None)
         with self._connection() as connection:
             connection.execute(
                 """INSERT INTO session_records
@@ -473,9 +547,10 @@ class SessionRegistryStore:
                     git_branch, last_commit, agent_type, launch_command, launcher_type,
                     created_at, last_seen_at, last_activity_at, last_known_state, status,
                     killed_at, deleted_at, offline_at, metadata_complete,
-                    read_granted, input_granted, grant_updated_at, binding_names, conversation_id)
+                    read_granted, input_granted, grant_updated_at, binding_names, conversation_id,
+                    stable_session_id, worktree_path)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE',
-                           NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
+                           NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(node_id, session_name) DO UPDATE SET
                        node_name = excluded.node_name, backend_type = excluded.backend_type,
                        cwd = excluded.cwd, repo_root = excluded.repo_root,
@@ -490,13 +565,14 @@ class SessionRegistryStore:
                        read_granted = excluded.read_granted, input_granted = excluded.input_granted,
                        grant_updated_at = excluded.grant_updated_at, binding_names = excluded.binding_names,
                        conversation_id = COALESCE(excluded.conversation_id, session_records.conversation_id),
+                       worktree_path = COALESCE(excluded.worktree_path, session_records.worktree_path),
                        recovery_state = NULL, recovery_detail = NULL
                 """,
                 (node_id, session_name, node_name, backend_type, cwd, repo_root, git_remote,
                  git_branch, last_commit, agent_type, launch_command, launcher_type,
                  created_at, now, now, last_known_state,
                  int(metadata_complete), int(read_granted), int(input_granted), now, binding_json,
-                 conversation_id),
+                 conversation_id, stable_session_id, worktree_path),
             )
         return self.get(node_id, session_name)
 
@@ -518,6 +594,79 @@ class SessionRegistryStore:
                 "WHERE node_id = ? AND session_name = ?",
                 (recovery_state, detail, now, node_id, session_name),
             )
+
+    # -- Auto Recovery (2026-09-07) ------------------------------------------
+
+    def set_auto_recovery_enabled(self, node_id: str, session_name: str, enabled: bool | None) -> bool:
+        """Per-session policy override -- tri-state: True/False is an
+        explicit opt-in/opt-out for THIS session regardless of the
+        global config.auto_recovery.enabled default; None clears the
+        override back to "inherit the global default" (see recovery_
+        engine.py's own `_recovery_allowed` for exactly how the two
+        combine). Returns False if the row doesn't exist (nothing to
+        set a policy on yet)."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE session_records SET auto_recovery_enabled = ? WHERE node_id = ? AND session_name = ?",
+                (None if enabled is None else int(enabled), node_id, session_name),
+            )
+        return cursor.rowcount == 1
+
+    def checkpoint(self, node_id: str, session_name: str, *, detail: str, now: str | None = None) -> bool:
+        """Records "this session's own state was confirmed durably safe
+        as of `now`" -- see this column's own migration docstring for
+        why this deliberately never captures unsubmitted composer text
+        (impossible to do safely; see recovery_engine.py's own
+        docstring). Returns False if the row doesn't exist."""
+        now = now or _now_iso()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE session_records SET last_checkpoint_at = ?, last_checkpoint_detail = ? "
+                "WHERE node_id = ? AND session_name = ?",
+                (now, detail, node_id, session_name),
+            )
+        return cursor.rowcount == 1
+
+    def begin_recovery_attempt(self, node_id: str, session_name: str, *, now: str | None = None) -> int | None:
+        """Bumps recovery_generation (a NEW, never-reused number for
+        THIS attempt -- see this column's own migration docstring for
+        why exactly-once recovery depends on this) and recovery_
+        attempts (the running total, checked by the engine against
+        config.auto_recovery.max_attempts before this is ever called).
+        Returns the new generation number, or None if the row doesn't
+        exist (the engine never attempts recovery for a session with no
+        registry row at all -- there is nothing to recover FROM)."""
+        now = now or _now_iso()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE session_records SET recovery_generation = recovery_generation + 1, "
+                "recovery_attempts = recovery_attempts + 1, recovery_updated_at = ? "
+                "WHERE node_id = ? AND session_name = ?",
+                (now, node_id, session_name),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = connection.execute(
+                "SELECT recovery_generation FROM session_records WHERE node_id = ? AND session_name = ?",
+                (node_id, session_name),
+            ).fetchone()
+        return int(row["recovery_generation"]) if row else None
+
+    def reset_recovery_attempts(self, node_id: str, session_name: str) -> bool:
+        """Called once a session is seen genuinely ACTIVE again (same
+        "resolved, start counting fresh next time" posture as recovery_
+        state's own clear-on-ACTIVE in upsert_seen) -- NOT called
+        automatically by upsert_seen itself, since a plain ordinary
+        reconcile pass has no opinion on whether the LAST time this
+        session went missing was ever actually auto-recovered vs. just
+        happened to come back on its own; the engine calls this
+        explicitly once IT confirms a recovery actually succeeded."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE session_records SET recovery_attempts = 0 WHERE node_id = ? AND session_name = ?",
+                (node_id, session_name),
+            )
+        return cursor.rowcount == 1
 
     def mark_missing(self, node_id: str, session_names_seen: set[str], *, now: str | None = None) -> list[str]:
         """The other half of reconcile: any record for `node_id` that was

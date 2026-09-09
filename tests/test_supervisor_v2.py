@@ -481,6 +481,12 @@ def test_send_result_never_contains_raw_prompt_text(tmp_path, tmux_session_facto
         # activation_attempts is a small int (0/1/2) -- none of these can
         # ever carry raw prompt content either.
         "submission_id", "agent_type", "evidence", "activation_attempts", "stage",
+        # Submit-profile work: enter_count/attempts are small ints and
+        # submit_latency_ms is a rounded float (core.py sets all three from
+        # counters/timers, never from prompt text) -- extending this
+        # allowlist is a DELIBERATE decision each time, which is exactly
+        # why it is an allowlist and not a denylist.
+        "enter_count", "attempts", "submit_latency_ms",
     }
     if "correlation_id" in parsed:
         assert isinstance(parsed["correlation_id"], str) and "y" not in parsed["correlation_id"]

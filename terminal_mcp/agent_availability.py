@@ -19,7 +19,7 @@ platform here, not special-cased to Windows.
 """
 from __future__ import annotations
 
-import shutil
+from .launcher_resolution import resolve_launcher
 
 
 def available_agent_types(launch_commands: tuple[tuple[str, str], ...]) -> tuple[str, ...]:
@@ -36,6 +36,6 @@ def available_agent_types(launch_commands: tuple[tuple[str, str], ...]) -> tuple
     for agent_type, launcher in launch_commands:
         if agent_type == "shell":
             continue  # already included unconditionally above
-        if shutil.which(launcher) is not None:
+        if resolve_launcher(launcher) is not None:
             available.append(agent_type)
     return tuple(available)

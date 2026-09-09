@@ -24,6 +24,7 @@ from .controller import ControllerService, build_default_controller
 from .node_client import NodeClientError, RemoteNodeClient
 from .core import TerminalService
 from .ai_usage_service import AiUsageService
+from .recovery_engine import RecoveryEngine
 from .integration_service import IntegrationService
 from .integration_store import IntegrationStore
 from .node_models import NODE_ONLINE, SESSION_BACKEND_TMUX, node_to_dict
@@ -5977,7 +5978,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        integration: IntegrationService | None = None,
                        pm: PMService | None = None,
                        planner: PlannerService | None = None,
-                       ai_usage: AiUsageService | None = None) -> None:
+                       ai_usage: AiUsageService | None = None,
+                       recovery: RecoveryEngine | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -6034,6 +6036,12 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 return []
             return [{"name": item.name, "agent_type": item.pane_current_command} for item in items]
         ai_usage = AiUsageService(terminal.config.ai_usage, session_lister=_local_sessions_for_ai_usage)
+    if recovery is None:
+        # No persistent store of its own (reuses terminal.session_
+        # registry + terminal.leases, both already real) -- no private-
+        # temp-file discipline needed here either, same posture as
+        # ai_usage above.
+        recovery = RecoveryEngine(terminal.session_registry, controller, terminal.leases, terminal.config.auto_recovery)
     if pm is None:
         # Same private-temp-file discipline as queue/integration's own
         # defaults just above -- server_http.py's real main() always
@@ -6810,6 +6818,76 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         force = request.query_params.get("force") == "1"
         result = await anyio.to_thread.run_sync(lambda: ai_usage.get_usage(force=force))
         return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
+    # -- Auto Recovery (item 7: "hiện recovery state, last checkpoint,
+    # resume-capable yes/no, nút Recover/Retry/Disable Auto Recovery, và
+    # warning rõ khi session không có conversation_id. Có bulk view cho
+    # node sau reboot").
+
+    @server.custom_route("/dashboard/api/recovery", methods=["GET"], include_in_schema=False)
+    async def recovery_list_route(request: Request) -> JSONResponse:
+        # Same _read_guard-only posture as every other fleet-level read
+        # route -- bulk per-node view, not one session's own content.
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.query_params.get("node_id") or controller.local_node_id
+        recoverable_only = request.query_params.get("recoverable_only") != "0"  # default True
+        if node_id == controller.local_node_id:
+            result = await anyio.to_thread.run_sync(
+                lambda: terminal.terminal_registry_list(recoverable_only=recoverable_only))
+        else:
+            result = await anyio.to_thread.run_sync(
+                lambda: controller.registry_list(node_id, recoverable_only=recoverable_only))
+        return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/recovery/recover", methods=["POST"], include_in_schema=False)
+    async def recovery_recover_route(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        node_id = body.get("node_id") if isinstance(body, dict) else None
+        session_name = body.get("session_name") if isinstance(body, dict) else None
+        force = bool(body.get("force")) if isinstance(body, dict) else False
+        if not isinstance(node_id, str) or not node_id or not isinstance(session_name, str) or not session_name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        _log.info("dashboard recovery_recover node_id=%s session=%s force=%s identity=%s",
+                 node_id, session_name, force, identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(
+            lambda: recovery.recover_session(node_id, session_name,
+                                             requested_by=(identity.email if identity else None) or "dashboard",
+                                             force=force))
+        status_code = 200 if "error" not in result else 400
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/recovery/policy", methods=["POST"], include_in_schema=False)
+    async def recovery_policy_route(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        node_id = body.get("node_id") if isinstance(body, dict) else None
+        session_name = body.get("session_name") if isinstance(body, dict) else None
+        enabled = body.get("enabled") if isinstance(body, dict) else None  # true/false/null (tri-state)
+        if not isinstance(node_id, str) or not node_id or not isinstance(session_name, str) or not session_name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        _log.info("dashboard recovery_policy node_id=%s session=%s enabled=%s identity=%s",
+                 node_id, session_name, enabled, identity.email if identity else None)
+        ok = await anyio.to_thread.run_sync(
+            lambda: terminal.session_registry.set_auto_recovery_enabled(node_id, session_name, enabled))
+        if not ok:
+            return JSONResponse({"error": "REGISTRY_RECORD_NOT_FOUND"}, status_code=404)
+        record = terminal.session_registry.get(node_id, session_name)
+        return JSONResponse({"node_id": node_id, "session_name": session_name,
+                             "auto_recovery_enabled": record.auto_recovery_enabled},
+                            headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/tasks/board", methods=["GET"], include_in_schema=False)
     async def tasks_board(request: Request) -> JSONResponse:
@@ -8393,6 +8471,16 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
         result = await anyio.to_thread.run_sync(_compute)
         status_code = 200 if "error" not in result else 404
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/refresh-capabilities", methods=["POST"], include_in_schema=False)
+    async def node_refresh_capabilities(request: Request) -> JSONResponse:
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        result = await anyio.to_thread.run_sync(lambda: controller.refresh_node_capabilities(node_id))
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 502)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/supervisor", methods=["GET"], include_in_schema=False)

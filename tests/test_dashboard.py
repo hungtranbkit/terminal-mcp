@@ -574,10 +574,16 @@ def test_session_input_sends_text_to_allowed_session(input_config, tmux_session_
     # submission reliability upgrade, P6) -- popped the same way, checked
     # for the same value, not pinned into the literal dict below.
     assert body.pop("submission_id") == correlation_id
+    # submit_latency_ms is a real wall-clock measurement -- presence/type
+    # checked, never pinned by value (it differs every run).
+    latency = body.pop("submit_latency_ms")
+    assert isinstance(latency, (int, float)) and latency >= 0
     assert body == {"session": session, "sent": True, "characters": len("echo hi"),
                     "press_enter": False, "submit_status": "TEXT_SENT",
                     "delivery_state": "TEXT_SENT", "enter_sent": False,
-                    "agent_type": "generic", "evidence": ["TEXT_SENT"], "activation_attempts": 0}
+                    "agent_type": "generic", "evidence": ["TEXT_SENT"], "activation_attempts": 0,
+                    # No Enter was requested, so both counters stay 0.
+                    "enter_count": 0, "attempts": 0}
 
 
 def test_session_input_idempotency_key_prevents_duplicate_send(input_config, tmux_session_factory):
@@ -1335,6 +1341,9 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
               if hasattr(route, "methods")}
     assert routes == {
         "/dashboard": {"GET", "HEAD"},
+        # Multi-node capability refresh (this batch) -- listed so this
+        # inventory guard keeps catching UNINTENDED route changes.
+        "/dashboard/api/nodes/{node_id}/refresh-capabilities": {"POST"},
         "/dashboard/sessions": {"GET", "HEAD"},
         "/dashboard/api/sessions": {"GET", "HEAD"},
         "/dashboard/api/session": {"GET", "HEAD"},
@@ -1423,6 +1432,10 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/ai-usage": {"GET", "HEAD"},
         "/dashboard/api/tasks/reassign": {"POST"},
         "/dashboard/requirements": {"GET", "HEAD"},
+        # Auto Recovery -- another later, separate feature.
+        "/dashboard/api/recovery": {"GET", "HEAD"},
+        "/dashboard/api/recovery/recover": {"POST"},
+        "/dashboard/api/recovery/policy": {"POST"},
     }
     # The web terminal's WebSocket route is registered too, just outside
     # this HTTP-methods-only dict (WebSocketRoute has no .methods).
