@@ -30,6 +30,7 @@ from typing import Any, Callable
 
 from .dor_gate import check_definition_of_ready
 from .permissions import valid_session_name
+from .verify_queue import VerifyQueue
 from .queue_store import (
     TERMINAL_STATUSES, UNASSIGNED_LANE, VERIFYING, InvalidTransitionError, TaskAlreadyClaimedError, QueueStore,
 )
@@ -63,6 +64,20 @@ class QueueService:
         # enabled gate starts/stops the real, wired-up loop rather than a
         # second, disconnected one.
         self.loop: Any = None
+        # P0.5 Verify Queue, over the SAME store -- a verify job and the
+        # task it verifies must commit together, which is only possible
+        # in one database. Its `registry` (used solely to explain WHY a
+        # job is unroutable) is assigned later by mcp_app.py, the same
+        # deferred pattern as engine/planner above; without one,
+        # routability answers "unknown" rather than guessing.
+        #
+        # NAMED verify_queue, not `verify`: this class already has a
+        # verify() METHOD (the explicit human/ChatGPT evidence-supplying
+        # fallback, exposed as terminal_queue_verify). Binding an
+        # attribute called `verify` here silently shadowed it and turned
+        # that tool into "'VerifyQueue' object is not callable" -- caught
+        # by test_integration_mcp_tools, not by review.
+        self.verify_queue = VerifyQueue(self.store)
 
     def _validate_session(self, session: str) -> dict[str, Any] | None:
         if not session or not valid_session_name(session):

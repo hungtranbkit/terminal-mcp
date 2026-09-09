@@ -54,6 +54,15 @@ def test_migrates_a_copy_of_the_REAL_production_database(tmp_path):
     before = sqlite3.connect(copy)
     tasks_before = before.execute("select count(*) from queue_tasks").fetchone()[0]
     events_before = before.execute("select count(*) from queue_events").fetchone()[0]
+    # Capture the ACTUAL project_id of every row first. The original
+    # version of this test asserted every production task had project_id
+    # IS NULL -- true on the day it was written, and false the moment any
+    # real work set one (a P0.4 lease smoke did). That made it a snapshot
+    # of the environment rather than a property of the migration. The
+    # invariant it always MEANT to assert is the one below: migrating
+    # preserves whatever was there and invents nothing.
+    scoped_before = {row[0]: row[1] for row in
+                     before.execute("select id, project_id from queue_tasks")}
     before.close()
 
     QueueStore(copy)
@@ -61,9 +70,9 @@ def test_migrates_a_copy_of_the_REAL_production_database(tmp_path):
     after = sqlite3.connect(copy)
     assert after.execute("select count(*) from queue_tasks").fetchone()[0] == tasks_before
     assert after.execute("select count(*) from queue_events").fetchone()[0] == events_before
-    # every pre-existing row is untouched/unscoped
-    assert after.execute(
-        "select count(*) from queue_tasks where project_id is null").fetchone()[0] == tasks_before
+    scoped_after = {row[0]: row[1] for row in
+                    after.execute("select id, project_id from queue_tasks")}
+    assert scoped_after == scoped_before, "migration changed an existing task's project scope"
 
 
 # ------------------------------------------------- backward compatibility
