@@ -164,14 +164,17 @@ async def test_repo_outside_allowed_roots_still_briefs(tmp_path):
 
 @pytest.mark.anyio
 async def test_brief_works_with_no_backlog_service_at_all(tmp_path, repo):
-    """A deployment without a backlog must brief exactly as before."""
+    """A deployment that opts OUT of the backlog must brief exactly as
+    before -- `default_optional_services=False` is that opt-out, made
+    explicit when build_mcp started defaulting backlog/events so the stdio
+    and HTTP tool surfaces stopped silently diverging."""
     config = make_config(tmp_path)
     terminal = TerminalService(config)
     terminal.session_knowledge.ensure_meta(
         terminal.REGISTRY_LOCAL_NODE_ID, "brief-sess", "i",
         cwd=str(repo), agent_type="shell", backend_type="tmux", lifecycle_state="ACTIVE")
     terminal.grants.set_read("brief-sess", True, granted_by="test")
-    server = build_mcp(terminal)
+    server = build_mcp(terminal, default_optional_services=False)
     out = await _brief(server)
     assert "project_backlog" not in out
     assert out["recovery_brief_text"]

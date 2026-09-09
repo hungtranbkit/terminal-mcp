@@ -19,6 +19,7 @@ from typing import Any
 
 from .audit import AuditStore
 from .config import MaintenanceConfig
+from .event_bus import EventBus
 from .lease import PaneLeaseStore, ResourceLockStore
 from .supervisor2 import SupervisorV2Store
 
@@ -44,7 +45,8 @@ class MaintenanceLoop:
     def __init__(self, *, audit: AuditStore, supervisor2_store: SupervisorV2Store | None,
                 bindings_path: Path | None, config: MaintenanceConfig,
                 leases: PaneLeaseStore | None = None,
-                resource_locks: ResourceLockStore | None = None) -> None:
+                resource_locks: ResourceLockStore | None = None,
+                events: Any = None) -> None:
         self._audit = audit
         self._supervisor2_store = supervisor2_store
         self._bindings_path = bindings_path
@@ -57,6 +59,7 @@ class MaintenanceLoop:
         # here rather than passed in because, like _leases, there is
         # exactly one sensible instance and it is cheap to open.
         self._resource_locks = resource_locks or ResourceLockStore(self._leases.path)
+        self._events = events or EventBus()
         self._config = config
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -110,7 +113,10 @@ class MaintenanceLoop:
         return result
 
     def _db_paths(self) -> list[Path]:
-        paths = [self._audit.path, self._leases.path]
+        # events.db was missing here: the bus is a durable append-only log
+        # that grows forever and was never WAL-checkpointed or pruned by any
+        # code path. An unlisted store simply never gets maintained.
+        paths = [self._audit.path, self._leases.path, self._events.path]
         if self._supervisor2_store is not None:
             paths.append(self._supervisor2_store.path)
         if self._bindings_path is not None:

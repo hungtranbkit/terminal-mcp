@@ -1158,12 +1158,12 @@
       "id": "blg_28ecd90066a7",
       "title": "P0.7 Project-level MCP APIs for ChatGPT (status/submit_goal/events/report/pause/resume/assign)",
       "description": "11 terminal_backlog_* tools plus terminal_project_list exist; project verbs do not. Pause/resume exist only per lane (LANE_PAUSED x6) and generalise.",
-      "status": "BACKLOG",
+      "status": "DONE",
       "priority": "P1",
       "type": "feature",
       "order": 26,
       "created_at": "2026-09-09T10:04:42.240138+00:00",
-      "updated_at": "2026-09-09T10:04:42.240139+00:00",
+      "updated_at": "2026-09-09T16:08:32.203726+00:00",
       "source": "coordination-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -1180,20 +1180,41 @@
       "session": null,
       "node_id": null,
       "queue_task_id": null,
-      "branch": null,
+      "branch": "feat/p0-7-project-apis",
       "worktree": null,
       "blocked_reason": null,
       "evidence": {
-        "commits": [],
-        "tests": [],
-        "deploys": [],
-        "notes": []
+        "commits": [
+          "7f5f4fe",
+          "a87682e"
+        ],
+        "tests": [
+          "2463 passed (2 known pre-existing kill_reopen failures)",
+          "35 new tests: tests/test_project_service.py (27), tests/test_project_mcp_tools.py (8)"
+        ],
+        "deploys": [
+          "terminal-mcp-http.service on a87682e, dirty:false, 15/15 local sessions intact"
+        ],
+        "notes": [
+          "Normalised: this item and a duplicate created during the P0.7 phase described the same work; the duplicate was removed and its evidence folded in here.",
+          "NO new state: a test asserts the module has neither CREATE TABLE nor Migration(, and that exercising it leaves the queue schema and user_version untouched.",
+          "submit_goal records intent only -- a test asserts no queue task is created.",
+          "Pause/resume asymmetry live-smoked on the real store: a foreign 'operator: DO NOT RESUME' pause was skipped and reported, and only force=true overrode it.",
+          "assign-by-capability verified against the LIVE registry: [playwright,linux]->local, [windows]->dell-5530 (empty probed list, routed on platform), [windows,dotnet]->none.",
+          "Renamed match_verifier_nodes -> match_nodes_by_capability; P0.7 is the second caller proving it was never verifier-specific."
+        ]
       },
       "history": [
         {
           "at": "2026-09-09T10:04:42.240145+00:00",
           "event": "created",
           "by": "coordination-audit-2026-09-09"
+        },
+        {
+          "at": "2026-09-09T16:08:32.203726+00:00",
+          "event": "completed",
+          "by": "mcp",
+          "note": "P0.7 shipped; duplicate item folded in"
         }
       ]
     },
@@ -1423,68 +1444,6 @@
           "event": "completed",
           "by": "mcp",
           "note": "shipped and deployed"
-        }
-      ]
-    },
-    {
-      "id": "blg_p0_7_project_apis",
-      "title": "P0.7 Project APIs for ChatGPT",
-      "description": "Project-level status/submit_goal/events/report/pause/resume/assign as a pure composition over P0.1-P0.6 plus the backlog. Completes P0.",
-      "status": "DONE",
-      "priority": "P2",
-      "type": "feature",
-      "order": 32,
-      "created_at": "2026-09-09T14:47:20.368461+00:00",
-      "updated_at": "2026-09-09T14:47:20.368461+00:00",
-      "source": "coordination-roadmap",
-      "dependencies": [],
-      "acceptance_criteria": [
-        "ChatGPT can ask what a project is doing in one call",
-        "A goal can be submitted without starting work",
-        "Project pause/resume never undoes someone else's pause"
-      ],
-      "tags": [
-        "coordination",
-        "P0"
-      ],
-      "assignee": null,
-      "session": null,
-      "node_id": null,
-      "queue_task_id": null,
-      "branch": "feat/p0-7-project-apis",
-      "worktree": null,
-      "blocked_reason": null,
-      "evidence": {
-        "commits": [
-          "7f5f4fe",
-          "a87682e"
-        ],
-        "tests": [
-          "2463 passed (2 known pre-existing kill_reopen failures)",
-          "35 new tests: tests/test_project_service.py (27), tests/test_project_mcp_tools.py (8)"
-        ],
-        "deploys": [
-          "terminal-mcp-http.service on a87682e, dirty:false, 15/15 local sessions intact"
-        ],
-        "notes": [
-          "NO new state: a test asserts the module has neither CREATE TABLE nor Migration(, and that exercising it leaves the queue schema and user_version untouched.",
-          "submit_goal records intent only -- a test asserts no queue task is created.",
-          "Pause/resume asymmetry live-smoked on the real store: a foreign 'operator: DO NOT RESUME' pause was skipped and reported, and only force=true overrode it.",
-          "assign-by-capability verified against the LIVE registry: [playwright,linux]->local, [windows]->dell-5530 (empty probed list, routed on platform), [windows,dotnet]->none.",
-          "Renamed match_verifier_nodes -> match_nodes_by_capability; P0.7 is the second caller proving it was never verifier-specific."
-        ]
-      },
-      "history": [
-        {
-          "at": "2026-09-09T14:47:20.368461+00:00",
-          "event": "created",
-          "by": "coordination-roadmap"
-        },
-        {
-          "at": "2026-09-09T14:47:20.368461+00:00",
-          "event": "completed",
-          "by": "mcp",
-          "note": "P0.7 shipped; P0 complete"
         }
       ]
     },

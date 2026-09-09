@@ -53,7 +53,8 @@ def build_mcp(service: TerminalService | None = None,
               recovery: RecoveryEngine | None = None,
               backlog: BacklogService | None = None,
               events: EventBus | None = None,
-              resource_locks: ResourceLockStore | None = None) -> MCPServer:
+              resource_locks: ResourceLockStore | None = None,
+              default_optional_services: bool = True) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -119,6 +120,17 @@ def build_mcp(service: TerminalService | None = None,
         publish_handoff_for_completed_task(task, integration.store)
 
     queue = queue or QueueService(on_completed=_on_task_completed)
+    # `backlog` and `events` used to have NO default, while server.py calls
+    # build_mcp() bare -- so the stdio surface silently exposed 19 fewer
+    # tools than the HTTP one, and the contract test (which builds the stdio
+    # server) could not see them at all. Defaulting them makes ONE tool
+    # surface, and the contract test now covers every tool. Pass
+    # default_optional_services=False for a rig that deliberately wants the
+    # narrower surface.
+    if default_optional_services:
+        backlog = backlog if backlog is not None else BacklogService(
+            terminal.config, queue=queue, controller=controller)
+        events = events if events is not None else EventBus()
     # Phase 2 (task: "Supervisor Queue v2 Phase 2 -- Coordinator Agent"):
     # one shared QueueEngine over the SAME queue store + the SAME
     # (already node-aware) controller every other routed tool in this

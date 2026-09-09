@@ -131,9 +131,14 @@ async def test_revision_conflict_through_the_tool(rig):
 
 @pytest.mark.anyio
 async def test_backlog_tools_absent_when_not_configured(tmp_path):
-    """A deployment without a backlog service must not advertise the
-    tools at all, rather than registering ones that always fail."""
+    """A deployment that deliberately opts OUT must not advertise the
+    tools at all, rather than registering ones that always fail.
+
+    `default_optional_services=False` is that opt-out. It became explicit
+    when build_mcp started defaulting backlog/events: previously "not
+    configured" was the accident of server.py calling build_mcp() bare,
+    which silently gave the stdio surface 19 fewer tools than HTTP."""
     config = make_config(tmp_path)
-    server = build_mcp(TerminalService(config))
+    server = build_mcp(TerminalService(config), default_optional_services=False)
     names = {t.name for t in await server.list_tools()}
     assert not any(n.startswith("terminal_backlog_") for n in names)

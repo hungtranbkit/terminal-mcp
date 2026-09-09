@@ -128,11 +128,33 @@ def _create_resource_locks(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_resource_locks_owner ON resource_locks(owner_id)")
 
 
+def _create_resource_lock_overrides(connection: sqlite3.Connection) -> None:
+    """Durable record of every FORCED lock break. Separate table, not a
+    column on resource_locks: the lock row is DELETED by the override, so
+    anything written onto it would vanish with it."""
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS resource_lock_overrides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL,
+            resource_key TEXT NOT NULL,
+            previous_owner TEXT,
+            previous_reason TEXT,
+            actor TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            at TEXT NOT NULL
+        )
+    """)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lock_overrides_project ON resource_lock_overrides(project_id)")
+
+
 LEASE_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: pane_leases as of the P0 Part B cross-process lease", lambda connection: None),
     Migration(2, "P0.6: resource_locks -- named-resource ownership lock sharing pane_leases' "
                  "atomic acquire algorithm and database file, but never its table",
               _create_resource_locks),
+    Migration(3, "P0-A: resource_lock_overrides -- durable audit of every forced lock break",
+              _create_resource_lock_overrides),
 ]
 
 
@@ -502,9 +524,33 @@ class ResourceLockStore(_LeaseTable):
         previous = self._public(self._holder_row(key))
         with self._connection() as connection:
             cursor = connection.execute("DELETE FROM resource_locks WHERE lock_key = ?", (key,))
+            # PERSIST the override. This used to return actor/reason to the
+            # caller and store nothing -- so breaking someone else's lock
+            # left no durable record of who did it or why, which is the one
+            # thing an override must never be able to do quietly.
+            if cursor.rowcount == 1:
+                connection.execute(
+                    "INSERT INTO resource_lock_overrides (project_id, resource_key, previous_owner, "
+                    "previous_reason, actor, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (project_id, resource_key, (previous or {}).get("owner_id"),
+                     (previous or {}).get("reason"), actor, reason,
+                     datetime.now(timezone.utc).isoformat()))
         return {"released": cursor.rowcount == 1, "previous_holder": previous,
                 "actor": actor, "reason": reason,
                 "project_id": project_id, "resource_key": resource_key}
+
+    def override_history(self, *, project_id: str | None = None,
+                         limit: int = 100) -> list[dict[str, Any]]:
+        """Every forced lock break, newest first -- the audit trail that
+        makes force_release accountable rather than merely possible."""
+        clause = "WHERE project_id = ? " if project_id else ""
+        params: list[Any] = [project_id] if project_id else []
+        params.append(limit)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM resource_lock_overrides {clause}ORDER BY id DESC LIMIT ?",
+                params).fetchall()
+        return [dict(row) for row in rows]
 
     @staticmethod
     def _public(row: dict[str, Any] | None) -> dict[str, Any] | None:

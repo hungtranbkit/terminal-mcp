@@ -235,6 +235,13 @@ class EventBus:
         params.append(MAX_ATTEMPTS)
         token = uuid.uuid4().hex
         with self._connection(immediate=True) as connection:
+            # Dead-letter FIRST, in the same write lock. MAX_ATTEMPTS used to
+            # be a claim FILTER only: an event that burned its budget simply
+            # stopped being returned here, and sat in PENDING/CLAIMED forever
+            # -- never FAILED, absent from stats(), invisible to every
+            # operator view. A poison event has to become visible, not just
+            # stop moving.
+            self._dead_letter_exhausted_locked(connection, now_iso, project_id)
             row = connection.execute(query, params).fetchone()
             if row is None:
                 return None
@@ -244,6 +251,39 @@ class EventBus:
                 (CLAIMED, consumer, token, _iso(now + timedelta(seconds=lease_seconds)), row["seq"]))
             claimed = connection.execute("SELECT * FROM events WHERE seq = ?", (row["seq"],)).fetchone()
         return _row_to_dict(claimed)
+
+    def _dead_letter_exhausted_locked(self, connection, now_iso: str,
+                                      project_id: str | None) -> int:
+        """Move every event that has exhausted MAX_ATTEMPTS and is not
+        actively leased into FAILED, with a reason. Idempotent: a row
+        already FAILED/ACKED is not matched."""
+        clause = "AND project_id = ? " if project_id is not None else ""
+        params: list[Any] = [FAILED,
+                             f"dead-lettered after {MAX_ATTEMPTS} delivery attempts without an ack",
+                             PENDING, CLAIMED, now_iso, MAX_ATTEMPTS]
+        if project_id is not None:
+            params.append(project_id)
+        cursor = connection.execute(
+            "UPDATE events SET status = ?, last_error = COALESCE(last_error, ?), "
+            "claimed_by = NULL, claim_token = NULL, lease_expires_at = NULL "
+            f"WHERE (status = ? OR (status = ? AND lease_expires_at < ?)) "
+            f"AND attempt_count >= ? {clause}", params)
+        return cursor.rowcount
+
+    def dead_letters(self, *, project_id: str | None = None,
+                     limit: int = 100) -> list[dict[str, Any]]:
+        """Events that gave up. The read an operator needs to answer "what
+        did the bus stop trying to deliver, and why"."""
+        clause = "AND project_id = ? " if project_id is not None else ""
+        params: list[Any] = [FAILED]
+        if project_id is not None:
+            params.append(project_id)
+        params.append(limit)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM events WHERE status = ? {clause}ORDER BY seq DESC LIMIT ?",
+                params).fetchall()
+        return [_row_to_dict(row) for row in rows]
 
     def ack(self, event_id: str, claim_token: str) -> bool:
         """Only the CURRENT token may ack -- a consumer whose lease expired

@@ -42,7 +42,9 @@ async def test_all_event_tools_registered(rig):
 
 @pytest.mark.anyio
 async def test_tools_absent_without_a_bus(tmp_path):
-    server = build_mcp(TerminalService(make_config(tmp_path)))
+    # default_optional_services=False is the explicit opt-out; build_mcp
+    # now defaults the bus so stdio and HTTP expose one identical surface.
+    server = build_mcp(TerminalService(make_config(tmp_path)), default_optional_services=False)
     names = {t.name for t in await server.list_tools()}
     assert not any(n.startswith("terminal_event_") for n in names)
 
