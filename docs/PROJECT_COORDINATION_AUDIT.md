@@ -54,7 +54,7 @@ Two facts that reframe everything below:
 | 13 | Global portfolio scheduler | **MISSING** | `queue_service.rebalance(project, sessions)` | Rebalance moves tasks **between sessions inside one project label**, dry-run by default, and depends on `planner` (0 rows). No cross-project resource allocation, no priority arbitration between projects. |
 | 14 | Module/outcome owner on child tasks | **PARTIAL** | `planner_store.plan_proposals` (0 rows), `parent_task_id`/`acceptance_criteria` in task `metadata` | Split-into-children exists via metadata on ordinary tasks (deliberately no new table). Never used in production. No "module owner" concept. |
 | 15 | Dependency graph / DAG | **PARTIAL** | `queue_tasks.depends_on` (JSON list), enforced in `next_dispatchable_task` | **Fail-closed and cross-lane**: every `depends_on` id must be COMPLETED, and a *missing* id counts as unmet. It is a dependency **list**, not a graph object — no cycle detection, no critical path, no visualisation. |
-| 16 | Project APIs for ChatGPT | **PARTIAL** | 134 MCP tools; `terminal_project_list` + 11 `terminal_backlog_*` | Backlog CRUD/dispatch/complete is strong. **Missing at project level:** `submit_goal`, `plan`, `assign`, `events`, `report`, `pause`, `resume`, `status`. Pause/resume exist only per **lane** (`LANE_PAUSED` ×6). |
+| 16 | Project APIs for ChatGPT | **EXISTS** (P0.7, 2026-09-09) | `project_service.py`, 7 `terminal_project_*` tools (171 total) | Was PARTIAL: everything existed but only one layer at a time. Now `status`/`submit_goal`/`events`/`report`/`pause`/`resume`/`assign` at project level, as **pure composition over P0.1-P0.6** — no table, no migration, no loop. `submit_goal` records intent and never dispatches; project resume never undoes a pause it did not place. |
 | 17 | Runtime state ↔ canonical backlog sync | **PARTIAL** | `backlog_service.export_file/import_file`, `git_isolation_service` | Controller DB is authoritative; file is an export/import projection with merge-by-id. Per-task worktrees mean workers don't contend on one branch. **There is no `TASKS.json` in this repo** — the canonical backlog is `.terminal-mcp/backlog.json` (tracked). |
 | 18 | Idempotency / recovery / restart | **EXISTS** | `audit.idempotent_sends` (437), `claim_token` reconcile, `recovery_engine.py`/`recovery_loop.py`, `AGENT_GENERATION` | Idempotency keys are production-used. Stale-claim reconciliation, restart-safe ticks, and an (off-by-default) auto-recovery engine exist. Node `agent_generation` distinguishes process lifetimes. |
 | 19 | Audit trail / decision log | **EXISTS** | `audit.db` (12434), `COORDINATOR_DECISION` events, `queue_events` (241), `supervisor_actions` | Every send is audited with hashes (never raw prompt text). Coordinator decisions are persisted **with their reasons** and re-read to enforce a review-attempt budget. |
@@ -97,6 +97,16 @@ atomic check-and-set — the statement whose exact shape came from reproducing
 a real race — now serves both subjects, and the pane path's generated SQL is
 asserted byte-identical to what shipped. The remaining P0 item is 16 (project
 APIs for ChatGPT), which is additive tooling over what now exists.
+
+**After P0.7 (2026-09-09): ≈ 14.5 / 20 ≈ 73 %. P0 IS COMPLETE.** Item 16
+(project APIs) moved PARTIAL → EXISTS, and did so by adding **no state at
+all** — it is a facade over the six primitives P0.1-P0.6 built, which is the
+clearest evidence those primitives were the right ones. What remains
+un-shipped is now genuinely the P1/P2 work the audit always described as
+orchestration: items 11 (preview queue) and 13 (portfolio scheduler) are still
+MISSING, item 10 (integration queue) is still BUILT-UNUSED with 0 production
+rows, and item 12 (per-project event-driven coordinator) is still PARTIAL and
+still polling. None of those are blocked on a missing primitive any more.
 
 The weighting matters more than the number: the *hard, safety-critical* primitives
 (atomic claim, lease, state machine, fail-closed gate, idempotency, audit) are the

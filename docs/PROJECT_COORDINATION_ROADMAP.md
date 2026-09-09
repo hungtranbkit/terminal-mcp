@@ -161,7 +161,7 @@ make it another export target — never a second writable source of truth.
 | P0.4 task lease API | S | Low | Columns exist |
 | P0.5 verify queue | M | **Med** | ~~Changes who verifies~~ **SHIPPED** — opt-in per task, old default kept |
 | P0.6 resource lock | S | Low | **SHIPPED** — pane lease generalised, hot path byte-identical |
-| P0.7 project APIs | S | Low | Additive tools |
+| P0.7 project APIs | S | Low | **SHIPPED** — pure composition, no new state |
 | P1.1 per-project coordinator | L | **Med-High** | LLM in the loop; keep gate deterministic |
 | P1.2 activate integration | M | **Med** | Real merges into real branches |
 | P2.1 portfolio scheduler | M | Med | Needs P0.1 + P0.3 first |
@@ -274,7 +274,46 @@ primitive is how a fleet deadlocks.
 production `leases.db` (`pane_leases` byte-identical, `resource_locks`
 empty, re-apply a no-op). 35 new tests.
 
-## Next: P0.7 (P0.1-P0.6 shipped)
+## P0.7 SHIPPED 2026-09-09 — project APIs for ChatGPT (P0 COMPLETE)
+
+`project_service.ProjectService` + 7 tools: `terminal_project_status`,
+`_submit_goal`, `_events`, `_report`, `_pause`, `_resume`, `_assign` (171 tools
+total).
+
+**Pure composition — no new state.** No table, no migration, no background
+loop; a test asserts the module contains neither `CREATE TABLE` nor
+`Migration(`, and that calling it leaves the queue schema and `user_version`
+untouched. Every number is read live from the store that owns it: lanes/tasks
+from P0.1's `project_id`, events from P0.2's bus plus derived `queue_events`,
+capability routing from P0.3, worker leases from P0.4, verification from P0.5,
+locks from P0.6, plans from the backlog. A project view holding its own copy
+of anything would immediately be a second source of truth to drift.
+
+**Nothing here starts work.** `submit_goal` records an *intent* in the backlog
+and deliberately does not create or dispatch a queue task — autonomous
+dispatch stays behind its existing two-gate opt-in, and a "submit a goal" API
+that quietly queued work would be exactly that bypass. A test asserts no queue
+task appears.
+
+**Pause and resume are deliberately not symmetric.** Pausing a project pauses
+every lane it owns; resuming un-pauses only the lanes *this project's pause*
+paused, matched via a marker in `paused_reason`. A lane an operator paused for
+an unrelated reason is skipped and reported with its reason. Silently undoing
+a deliberate pause would be the most dangerous thing in this layer, so
+`force=true` exists but announces itself in the result.
+
+`assign` moves a task only when given an explicit `session`; with
+`capabilities` it *resolves candidates and stops*, because picking a lane on a
+remote node is not a decision a facade should make silently. It uses the same
+matcher as verifier routing — renamed `match_verifier_nodes` →
+`match_nodes_by_capability`, since P0.7 is the second caller that proves it was
+never verifier-specific.
+
+**P0 is now complete (P0.1–P0.7).** ChatGPT can ask what a project is doing,
+submit a goal, read its events, get a throughput report, pause/resume it, and
+route work by capability.
+
+## Next: P1 (all of P0 shipped)
 
 **P0.3 shipped 2026-09-09**: probed tool/runtime capabilities
 (git/node/npm/python/docker/dotnet/playwright/tmux/rustc/go/java) now ride

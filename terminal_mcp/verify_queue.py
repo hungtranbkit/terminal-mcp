@@ -289,11 +289,17 @@ def node_capability_set(node: Any) -> frozenset[str]:
     return frozenset(values)
 
 
-def match_verifier_nodes(nodes: Iterable[Any], required: Sequence[str], *,
-                         online_only: bool = True) -> list[Any]:
+def match_nodes_by_capability(nodes: Iterable[Any], required: Sequence[str], *,
+                              online_only: bool = True) -> list[Any]:
     """Nodes whose reported capability set is a SUPERSET of `required`
     (AND semantics). An empty requirement matches every node, keeping an
-    unconstrained caller's behaviour unchanged."""
+    unconstrained caller's behaviour unchanged.
+
+    Named for what it does, not for its first caller: P0.5 introduced it
+    for verifier selection, and P0.7's terminal_project_assign is the
+    second caller that proves it was never verifier-specific. One matcher,
+    so "which node can do this" cannot mean two different things in two
+    places."""
     from .node_models import NODE_ONLINE
     wanted = frozenset(str(item) for item in required)
     matched = []
@@ -781,17 +787,25 @@ class VerifyQueue:
         counts.update({row["status"]: row["count"] for row in rows})
         return counts
 
-    def routability(self, job: VerifyJob) -> dict[str, Any]:
+    def routability(self, job: VerifyJob, *, registry: Any = None) -> dict[str, Any]:
         """Can anything in the fleet actually verify this job right now,
         and if not, WHY -- the answer requirement 5 needs so a held job is
         visibly held rather than mysteriously stuck.
 
-        Returns unknown (never a guess) when no registry is wired, which
-        is the honest answer for a VerifyQueue constructed without one."""
-        if self.registry is None:
+        `registry` overrides this store's own, for a caller that has one
+        when this store does not. P0.7's ProjectService is exactly that
+        case: it holds the node registry itself, and without this it could
+        only ever report "routability unknown" for a project's pending
+        verification -- the least useful possible answer, and one the
+        caller had the data to improve on.
+
+        Returns unknown (never a guess) when no registry is available at
+        all, which is the honest answer rather than a fabricated one."""
+        registry = registry if registry is not None else self.registry
+        if registry is None:
             return {"routable": None, "reason": "no node registry wired -- routability unknown",
                     "candidates": []}
-        nodes = match_verifier_nodes(self.registry.list(), job.required_capabilities)
+        nodes = match_nodes_by_capability(registry.list(), job.required_capabilities)
         candidates = [node.id for node in nodes]
         if not candidates:
             return {"routable": False, "candidates": [],
