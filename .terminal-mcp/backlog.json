@@ -9,8 +9,8 @@
     "git_branch": "main",
     "is_portable": true
   },
-  "revision": 5,
-  "updated_at": "2026-09-09T11:05:25.803254+00:00",
+  "revision": 6,
+  "updated_at": "2026-09-09T11:29:08.252866+00:00",
   "items": [
     {
       "id": "blg_f52a999971d9",
@@ -979,12 +979,12 @@
       "id": "blg_6eab4ad84c79",
       "title": "P0.4 Task lease API: claim/renew/release/handoff",
       "description": "queue_tasks.claim_token/lease_expires_at are stamped atomically already, but there is no renew/release/handoff verb for tasks (handoff exists only in the unused integration store). A worker crash should free a task deterministically.",
-      "status": "BACKLOG",
+      "status": "DONE",
       "priority": "P2",
       "type": "feature",
       "order": 23,
       "created_at": "2026-09-09T10:04:42.240098+00:00",
-      "updated_at": "2026-09-09T10:04:42.240100+00:00",
+      "updated_at": "2026-09-09T11:29:08.239481+00:00",
       "source": "coordination-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -1004,16 +1004,29 @@
       "worktree": null,
       "blocked_reason": null,
       "evidence": {
-        "commits": [],
-        "tests": [],
+        "commits": [
+          "782a078"
+        ],
+        "tests": [
+          "2309 passed"
+        ],
         "deploys": [],
-        "notes": []
+        "notes": [
+          "deployed; renew/release/handoff live-smoked on the real queue store"
+        ]
       },
       "history": [
         {
           "at": "2026-09-09T10:04:42.240106+00:00",
           "event": "created",
           "by": "coordination-audit-2026-09-09"
+        },
+        {
+          "at": "2026-09-09T11:29:08.239481+00:00",
+          "event": "completed",
+          "by": "mcp",
+          "verified_by": "evidence",
+          "queue_task_id": null
         }
       ]
     },
