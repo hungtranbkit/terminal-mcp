@@ -668,7 +668,13 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     if not isinstance(submit_raw, dict):
         raise ValueError("submit_watchdog must be a mapping")
     submit_defaults = SubmitWatchdogConfig()
-    submit_config = SubmitWatchdogConfig(
+    # NOTE: a DIFFERENT name from the SubmitConfig built earlier in this
+    # function. Both used to be called `submit_config`, so this assignment
+    # silently clobbered the parsed per-agent submit profiles -- see the
+    # AppConfig(...) call below, where `submit=` then received a
+    # SubmitWatchdogConfig. That made the whole `submit:` config block and
+    # every TERMINAL_MCP_CODEX_SUBMIT_* env override dead config.
+    watchdog_config = SubmitWatchdogConfig(
         enabled=bool(submit_raw.get("enabled", submit_defaults.enabled)),
         poll_interval_seconds=float(submit_raw.get("poll_interval_seconds", submit_defaults.poll_interval_seconds)),
         timeout_seconds=float(submit_raw.get("timeout_seconds", submit_defaults.timeout_seconds)),
@@ -676,13 +682,13 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         sweeper_interval_seconds=float(submit_raw.get("sweeper_interval_seconds", submit_defaults.sweeper_interval_seconds)),
         retry_agent_types=tuple(submit_raw.get("retry_agent_types", submit_defaults.retry_agent_types)),
     )
-    if not 0.3 <= submit_config.poll_interval_seconds <= 0.5:
+    if not 0.3 <= watchdog_config.poll_interval_seconds <= 0.5:
         raise ValueError("submit_watchdog.poll_interval_seconds must be between 0.3 and 0.5")
-    if submit_config.timeout_seconds <= 0 or submit_config.sweeper_interval_seconds < 1:
+    if watchdog_config.timeout_seconds <= 0 or watchdog_config.sweeper_interval_seconds < 1:
         raise ValueError("submit_watchdog timeouts must be positive")
-    if not 1 <= submit_config.max_enter_attempts <= 5:
+    if not 1 <= watchdog_config.max_enter_attempts <= 5:
         raise ValueError("submit_watchdog.max_enter_attempts must be between 1 and 5")
-    if not submit_config.retry_agent_types or not all(isinstance(agent, str) and agent for agent in submit_config.retry_agent_types):
+    if not watchdog_config.retry_agent_types or not all(isinstance(agent, str) and agent for agent in watchdog_config.retry_agent_types):
         raise ValueError("submit_watchdog.retry_agent_types must be a non-empty list of agent types")
 
     nodes_raw = raw.get("nodes", {})
@@ -835,7 +841,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         queue=_load_queue_config(raw.get("queue", {})),
         submit=submit_config,
         integration_loop=_load_integration_loop_config(raw.get("integration_loop", {})),
-        submit_watchdog=submit_config,
+        submit_watchdog=watchdog_config,
         ai_usage=_load_ai_usage_config(raw.get("ai_usage", {})),
         auto_recovery=_load_auto_recovery_config(raw.get("auto_recovery", {})),
     )
