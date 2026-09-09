@@ -12,8 +12,11 @@ Two independent layers of protection for the LAN socket, so this stays
 safe even on a host where this project has no permission to touch the OS
 firewall (a real, disclosed possibility -- see firewall_script's own
 docstring):
-  1. The bind address itself is a single, specific private IPv4 address
-     (validated via lan_discovery.is_lan_scannable) -- never a wildcard.
+  1. The bind address itself is a single, specific non-public IPv4
+     address (validated via lan_discovery.is_trusted_node_address: a
+     private/link-local one, or one inside an operator-declared
+     TERMINAL_MCP_TRUSTED_VPN_CIDRS overlay range) -- never a wildcard,
+     never a globally-routable address.
   2. LanCidrGuardMiddleware (network_middleware.py) rejects, at the
      application layer, any connection that arrived on that LAN socket
      from an IP outside the configured/derived private CIDR allowlist --
@@ -36,7 +39,7 @@ import ipaddress
 import logging
 import socket
 
-from .lan_discovery import is_lan_scannable, local_ipv4_subnets
+from .lan_discovery import is_trusted_node_address, local_ipv4_subnets, trusted_vpn_cidrs
 
 _log = logging.getLogger(__name__)
 
@@ -72,10 +75,13 @@ def resolve_lan_bind(raw: str | None) -> str | None:
         addr = ipaddress.IPv4Address(value)
     except ValueError as exc:
         raise NetworkBindError(f"TERMINAL_MCP_LAN_BIND={value!r} is not a valid IPv4 address") from exc
-    if not is_lan_scannable(addr):
+    if not is_trusted_node_address(addr):
         raise NetworkBindError(
-            f"TERMINAL_MCP_LAN_BIND={value!r} is not a private/link-local address -- refusing to bind a "
-            "controller HTTP socket to it (this must be a LAN address, never a public one)"
+            f"TERMINAL_MCP_LAN_BIND={value!r} is not a private/link-local address, and is not covered by "
+            "TERMINAL_MCP_TRUSTED_VPN_CIDRS -- refusing to bind a controller HTTP socket to it (this must "
+            "be a LAN or declared-overlay address, never a public one). To bind this controller's own "
+            "overlay-VPN address (e.g. a Tailscale 100.64.0.0/10 one) so remote nodes can reach it without "
+            "any inbound port-forward, declare that range in TERMINAL_MCP_TRUSTED_VPN_CIDRS first."
         )
     return value
 
@@ -103,10 +109,11 @@ def resolve_allowed_cidrs(raw: str | None, lan_bind_ip: str | None) -> tuple[ipa
                 network = ipaddress.IPv4Network(part, strict=False)
             except ValueError as exc:
                 raise NetworkBindError(f"TERMINAL_MCP_ALLOWED_NODE_CIDRS entry {part!r} is not a valid CIDR") from exc
-            if not is_lan_scannable(network.network_address):
+            if not is_trusted_node_address(network.network_address):
                 raise NetworkBindError(
-                    f"TERMINAL_MCP_ALLOWED_NODE_CIDRS entry {part!r} is not a private/link-local range -- "
-                    "refusing (this allowlist must only ever cover LAN addresses)"
+                    f"TERMINAL_MCP_ALLOWED_NODE_CIDRS entry {part!r} is not a private/link-local range and "
+                    "is not covered by TERMINAL_MCP_TRUSTED_VPN_CIDRS -- refusing (this allowlist must only "
+                    "ever cover LAN or declared-overlay addresses)"
                 )
             networks.append(network)
         return tuple(networks)
@@ -115,6 +122,19 @@ def resolve_allowed_cidrs(raw: str | None, lan_bind_ip: str | None) -> tuple[ipa
     for subnet in local_ipv4_subnets():
         if str(subnet.local_ip) == lan_bind_ip:
             return (subnet.network,)
+    # An overlay-VPN bind address is never one of local_ipv4_subnets()'s
+    # own results (that helper deliberately filters to LAN-scannable
+    # ranges only), so the /24 fallback below would derive a range far
+    # too narrow to contain the tailnet's other peers -- a Tailscale
+    # peer is anywhere in 100.64.0.0/10, not in the bind address's own
+    # /24. Derive the operator's own declared range instead, which is
+    # exactly the set of peers they said they trust.
+    bind_addr = ipaddress.IPv4Address(lan_bind_ip)
+    for network in trusted_vpn_cidrs():
+        if bind_addr in network:
+            _log.info("network_bind: %s is inside declared trusted overlay range %s -- using it as the "
+                     "allowed-source CIDR list", lan_bind_ip, network)
+            return (network,)
     # lan_bind_ip was given explicitly (not "auto") and doesn't match any
     # currently-UP NIC's own subnet (e.g. configured ahead of the NIC
     # coming up, or a static/manually-assigned address ip addr wouldn't

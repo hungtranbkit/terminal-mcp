@@ -62,7 +62,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from .lan_discovery import is_lan_scannable
+from .lan_discovery import is_trusted_node_address
 
 _HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$")
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
@@ -86,7 +86,9 @@ class ValidationError(ValueError):
 def validate_hostname_or_ip(value: str, *, allow_public: bool = False) -> str:
     """For a DIRECT (lan_ssh) target: must be a syntactically valid
     hostname or IPv4 literal, and every address it resolves to must be
-    LAN-scannable (see lan_discovery.is_lan_scannable) unless
+    a trusted node address (see lan_discovery.is_trusted_node_address:
+    LAN-scannable, or inside an operator-declared TERMINAL_MCP_TRUSTED_
+    VPN_CIDRS overlay range such as Tailscale's 100.64.0.0/10) unless
     allow_public is explicitly set (an admin-only config override, off
     by default) -- checking EVERY resolved address, not just the first,
     is deliberate: a hostname resolving to a mix of private and public
@@ -113,11 +115,13 @@ def validate_hostname_or_ip(value: str, *, allow_public: bool = False) -> str:
             raise ValidationError("host did not resolve to any address")
     if not allow_public:
         for addr in addresses:
-            if not isinstance(addr, ipaddress.IPv4Address) or not is_lan_scannable(addr):
+            if not isinstance(addr, ipaddress.IPv4Address) or not is_trusted_node_address(addr):
                 raise ValidationError(
                     f"{value!r} resolves to {addr} which is not a private/LAN address -- "
-                    "refused (SSRF protection); enable nodes.remote_connect.allow_public_manual_add "
-                    "to override for a deliberately-public target"
+                    "refused (SSRF protection); declare an overlay-VPN range in "
+                    "TERMINAL_MCP_TRUSTED_VPN_CIDRS (e.g. 100.64.0.0/10 for Tailscale) to add a node "
+                    "reachable over that overlay, or enable nodes.remote_connect."
+                    "allow_public_manual_add to override for a deliberately-public target"
                 )
     return value
 
