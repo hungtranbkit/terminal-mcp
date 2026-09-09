@@ -48,6 +48,7 @@ from starlette.websockets import WebSocket
 
 from . import __version__, host_metrics
 from .agent_availability import available_agent_types
+from .capability_probe import probe_capabilities
 from .launcher_resolution import resolve_launcher
 from .config import load_config
 from .core import TerminalService
@@ -560,6 +561,10 @@ async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller
                 "metrics": metrics.__dict__, "tmux_session_count": len(session_rows),
                 "agent_counts": agent_counts, "agent_types": list(agent_types),
                 "agent_version": __version__, "agent_generation": AGENT_GENERATION, "labels": [],
+                # P0.3: probed tool/runtime capabilities. Cached with a TTL
+                # inside probe_capabilities, so a 20s heartbeat does not
+                # re-walk PATH every cycle.
+                "capabilities": list(probe_capabilities()),
                 "platform": platform, "session_backend": session_backend,
                 "shell_capabilities": list(shell_capabilities), "wsl_available": wsl_available,
             }).encode()

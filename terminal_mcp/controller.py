@@ -95,17 +95,21 @@ class ControllerService:
     # MUST be push-based (task item 2) -- see node_agent.py.
     def refresh_local_heartbeat(self, *, tmux_session_count: int, agent_counts: dict[str, int],
                                 agent_types: tuple[str, ...], agent_version: str | None) -> Node | None:
+        from .capability_probe import probe_capabilities
         metrics = host_metrics.collect(workspace_path=self.local_workspace_root)
         return self.registry.heartbeat(
             self.local_node_id, metrics=metrics, tmux_session_count=tmux_session_count,
             agent_counts=agent_counts, agent_types=agent_types, agent_version=agent_version,
             labels=(), latency_ms=0.0,
+            # The local node probes itself the same way a remote agent does.
+            capabilities=probe_capabilities(),
         )
 
     def receive_remote_heartbeat(self, node_id: str, *, metrics: host_metrics.NodeMetrics,
                                  tmux_session_count: int, agent_counts: dict[str, int],
                                  agent_types: tuple[str, ...], agent_version: str | None,
                                  labels: tuple[str, ...], platform: str = "linux",
+                                 capabilities: tuple[str, ...] = (),
                                  session_backend: str = "tmux", shell_capabilities: tuple[str, ...] = (),
                                  wsl_available: bool = False) -> Node | None:
         """Called by the heartbeat-receiving HTTP route (dashboard.py) once
@@ -120,7 +124,7 @@ class ControllerService:
                                        agent_counts=agent_counts, agent_types=agent_types,
                                        agent_version=agent_version, labels=labels, platform=platform,
                                        session_backend=session_backend, shell_capabilities=shell_capabilities,
-                                       wsl_available=wsl_available)
+                                       wsl_available=wsl_available, capabilities=capabilities)
 
     def refresh_node_capabilities(self, node_id: str) -> dict[str, Any]:
         """Ask one node to re-probe launchers and update only capabilities.

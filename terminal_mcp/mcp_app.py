@@ -2270,6 +2270,34 @@ def build_mcp(service: TerminalService | None = None,
             return {"stats": events.stats(project_id=project_id)}
 
 
+    @server.tool()
+    def terminal_node_capabilities(required: list[str] | None = None,
+                                   online_only: bool = True) -> dict:
+        """Tool/runtime capabilities each node ACTUALLY has (probed, never
+        declared) -- the axis needed to route work like "needs Playwright"
+        or "needs .NET" to a node that can really run it.
+
+        `required` filters with AND semantics: a node must have EVERY
+        listed capability. Omit it to list every node's capabilities.
+
+        A node running an older agent reports an EMPTY list and therefore
+        matches only an empty requirement -- it is never assumed capable.
+        Capabilities are distinct from `labels` (operator-supplied tags)
+        and from `agent_types` (claude/codex launchers)."""
+        if controller is None:
+            return {"error": "CONTROLLER_UNAVAILABLE"}
+        wanted = tuple(required or ())
+        nodes = controller.registry.nodes_with_capabilities(wanted, online_only=online_only)
+        return {
+            "required": list(wanted),
+            "online_only": online_only,
+            "matches": [{"node_id": n.id, "platform": n.platform, "status": n.status,
+                         "capabilities": list(n.capabilities),
+                         "agent_types": list(n.agent_types)} for n in nodes],
+            "match_count": len(nodes),
+        }
+
+
     return server
 
 

@@ -107,6 +107,11 @@ class NodeCapabilities:
     agent_types: tuple[str, ...] = ("shell",)
     agent_version: str | None = None  # this project's own __version__ on that node
     labels: tuple[str, ...] = ()
+    # P0.3: PROBED tool/runtime capabilities (git/node/docker/dotnet/
+    # playwright/...). Deliberately separate from `labels`, which is an
+    # operator-supplied grouping tag -- see capability_probe.py for why
+    # conflating declared and probed capability is the bug this avoids.
+    capabilities: tuple[str, ...] = ()
     platform: str = PLATFORM_LINUX
     session_backend: str = SESSION_BACKEND_TMUX
     shell_capabilities: tuple[str, ...] = ()
@@ -150,6 +155,11 @@ class Node:
     agent_types: tuple[str, ...] = ()
     agent_version: str | None = None
     labels: tuple[str, ...] = ()
+    # P0.3: PROBED tool/runtime capabilities (git/node/docker/dotnet/
+    # playwright/...). Deliberately separate from `labels`, which is an
+    # operator-supplied grouping tag -- see capability_probe.py for why
+    # conflating declared and probed capability is the bug this avoids.
+    capabilities: tuple[str, ...] = ()
     max_sessions: int | None = None
     capacity_status: str = CAPACITY_UNKNOWN
     overload_reasons: tuple[str, ...] = ()
@@ -182,7 +192,8 @@ def node_to_dict(node: Node) -> dict[str, Any]:
         "disk_used_bytes": node.disk_used_bytes, "disk_free_bytes": node.disk_free_bytes,
         "tmux_session_count": node.tmux_session_count, "agent_counts": node.agent_counts,
         "agent_types": list(node.agent_types), "agent_version": node.agent_version,
-        "labels": list(node.labels), "max_sessions": node.max_sessions,
+        "labels": list(node.labels), "capabilities": list(node.capabilities),
+        "max_sessions": node.max_sessions,
         "capacity_status": node.capacity_status, "overload_reasons": list(node.overload_reasons),
         "registered_at": node.registered_at, "updated_at": node.updated_at,
         "platform": node.platform, "session_backend": node.session_backend,

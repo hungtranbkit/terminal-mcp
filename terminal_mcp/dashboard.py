@@ -8791,6 +8791,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 agent_version=body.get("agent_version"), labels=tuple(body.get("labels") or ()),
                 platform=body.get("platform") or "linux", session_backend=body.get("session_backend") or "tmux",
                 shell_capabilities=tuple(body.get("shell_capabilities") or ()),
+                # P0.3: an older agent simply omits this and gets () --
+                # never assumed capable.
+                capabilities=tuple(body.get("capabilities") or ()),
                 wsl_available=bool(body.get("wsl_available", False)),
             )
             if node is None:
