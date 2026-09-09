@@ -311,7 +311,7 @@ def main() -> None:
     # the SAME config/audit/queue the rest of this process uses, so its
     # allowed_cwd_roots path gate, its audit trail, and its dispatch path
     # are the existing ones rather than parallel copies.
-    backlog = BacklogService(config, audit=terminal.audit, queue=queue)
+    backlog = BacklogService(config, audit=terminal.audit, queue=queue, controller=controller)
     server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
                        planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,

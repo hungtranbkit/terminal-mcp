@@ -30,14 +30,16 @@ Two hard gates:
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
 
 from . import backlog_store as store
+from .backlog_db import BacklogDB
 from .backlog_store import (
     OPEN_STATUSES, PRIORITIES, STATUS_BACKLOG, STATUS_BLOCKED, STATUS_DONE,
     STATUS_IN_PROGRESS, STATUS_NEEDS_REVIEW, STATUS_READY, STATUSES, TYPES,
-    BacklogError, backlog_path, file_lock, new_item_id, now_iso,
+    BacklogError, backlog_path, new_item_id, now_iso,
 )
 from .lifecycle import resolve_cwd
 from .project_identity import ProjectIdentity, resolve_project
@@ -53,18 +55,42 @@ _MAX_TITLE = 300
 _MAX_ITEMS = 2000
 
 
+_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _project_lock(project_id: str) -> threading.Lock:
+    """One lock per project. The controller is the single writer now, so
+    the contention this guards is between its OWN concurrent requests --
+    the cross-agent race is still handled by expected_revision."""
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(project_id)
+        if lock is None:
+            lock = threading.Lock()
+            _LOCKS[project_id] = lock
+        return lock
+
+
 class BacklogService:
-    def __init__(self, config: Any, *, audit: Any = None, queue: Any = None) -> None:
+    def __init__(self, config: Any, *, audit: Any = None, queue: Any = None,
+                 controller: Any = None, db: BacklogDB | None = None) -> None:
         self.config = config
         self.audit = audit
         self.queue = queue
+        # `controller` lets a project be resolved for a session on ANY
+        # node (from that node's own registry record) -- without it this
+        # service can still resolve a project from a LOCAL path, which is
+        # all a single-node deployment needs.
+        self.controller = controller
+        self.db = db or BacklogDB()
 
     # ---------------------------------------------------------------- paths
     def _resolve(self, path: str | None) -> tuple[ProjectIdentity | None, dict[str, Any] | None]:
-        """path (any dir inside a project) -> canonical identity, or an
-        error dict. Order matters: the allowed_cwd_roots gate runs BEFORE
-        any git introspection, so a traversal attempt is refused without
-        this process ever touching the target directory."""
+        """LOCAL path -> canonical identity. Still gated by
+        lifecycle.resolve_cwd (the same allowed_cwd_roots + symlink check
+        session creation uses), and the DISCOVERED repo root is
+        re-checked, since walking up out of an allowed subdirectory would
+        otherwise escape."""
         resolved, error = resolve_cwd(path, self.config)
         if error is not None:
             return None, {"error": "PATH_NOT_ALLOWED", "detail": error, "path": path}
@@ -73,12 +99,50 @@ class BacklogService:
             return None, {"error": "NOT_A_PROJECT", "path": str(resolved),
                           "detail": "not inside a git repository -- a backlog belongs to a project, "
                                     "so this is refused rather than creating one in an arbitrary directory"}
-        # The repo root itself must ALSO be inside an allowed root: a repo
-        # can be discovered by walking up out of an allowed subdirectory.
         root_ok, root_error = resolve_cwd(identity.repo_root, self.config)
         if root_error is not None:
             return None, {"error": "PATH_NOT_ALLOWED", "detail": root_error, "path": identity.repo_root}
         return identity, None
+
+    def _project(self, *, project_id: str | None = None, path: str | None = None,
+                 node_id: str | None = None, session: str | None = None) -> tuple[dict | None, dict | None]:
+        """Resolve WHICH project a call is about, in precedence order:
+
+          1. `project_id` -- already canonical, used as-is. This is how a
+             caller addresses a project whose checkout is on some OTHER
+             machine (or on no machine this controller can see).
+          2. `node_id` + `session` -- ask the OWNING node's registry. This
+             is the path that makes a remote session's backlog reachable:
+             the controller cannot stat a path on another machine, but it
+             can read what that node reported about the session.
+          3. `path` -- a local checkout, gated by allowed_cwd_roots.
+          4. Nothing -- the server's own default root, same as before.
+
+        Deliberately NOT "guess from the first project we know about": an
+        ambiguous call must fail loudly rather than edit the wrong
+        project's plan."""
+        if project_id:
+            known = self.db.project(project_id)
+            identity = {"project_id": project_id,
+                        "name": (known or {}).get("name") or project_id.rsplit("/", 1)[-1],
+                        "source": (known or {}).get("source") or "explicit",
+                        "git_remote": (known or {}).get("git_remote"),
+                        "is_portable": bool((known or {}).get("is_portable", 1)),
+                        "repo_root": None}
+            return identity, None
+        if node_id and session:
+            if self.controller is None:
+                return None, {"error": "NO_CONTROLLER",
+                              "detail": "this service was built without a controller, so a project can "
+                                        "only be resolved from a local path"}
+            resolved = self.controller.resolve_project_for_session(node_id, session)
+            if "error" in resolved:
+                return None, resolved
+            return resolved, None
+        identity, error = self._resolve(path)
+        if error is not None:
+            return None, error
+        return identity.to_dict(), None
 
     def _audit(self, action: str, *, result: str, reason: str | None = None) -> None:
         if self.audit is None:
@@ -90,18 +154,17 @@ class BacklogService:
             pass
 
     # ---------------------------------------------------------------- read
-    def get(self, path: str | None = None, *, status: str | list[str] | None = None,
-            priority: str | list[str] | None = None, type: str | None = None,
-            tag: str | None = None, assignee: str | None = None,
+    def get(self, path: str | None = None, *, project_id: str | None = None,
+            node_id: str | None = None, session: str | None = None,
+            status: str | list[str] | None = None, priority: str | list[str] | None = None,
+            type: str | None = None, tag: str | None = None, assignee: str | None = None,
             include_terminal: bool = True, limit: int = 500) -> dict[str, Any]:
-        identity, error = self._resolve(path)
+        identity, error = self._project(project_id=project_id, path=path,
+                                        node_id=node_id, session=session)
         if error is not None:
             return error
-        file = backlog_path(identity.repo_root)
-        try:
-            document, repairs = store.load(file)
-        except BacklogError as exc:
-            return {"error": "BACKLOG_UNREADABLE", "detail": str(exc), "path": str(file)}
+        pid = identity["project_id"]
+        document = self.db.document(pid)
 
         wanted_status = _as_set(status)
         wanted_priority = _as_set(priority)
@@ -122,88 +185,122 @@ class BacklogService:
             items.append(item)
         items.sort(key=lambda i: (PRIORITIES.index(i["priority"]) if i["priority"] in PRIORITIES else 9,
                                   i.get("order", 0), i.get("created_at", "")))
-        counts: dict[str, int] = {s: 0 for s in STATUSES}
+        counts: dict[str, int] = {st: 0 for st in STATUSES}
         for item in document["items"]:
             counts[item["status"]] = counts.get(item["status"], 0) + 1
         return {
-            "project": identity.to_dict(),
-            "backlog_file": str(file),
-            "exists": file.exists(),
+            "project": identity,
             "revision": document["revision"],
             "schema_version": document["schema_version"],
             "counts": counts,
-            "open_total": sum(counts.get(s, 0) for s in OPEN_STATUSES),
+            "open_total": sum(counts.get(st, 0) for st in OPEN_STATUSES),
             "total": len(document["items"]),
             "returned": len(items[:limit]),
             "items": items[:limit],
-            "repairs": repairs,
+            "exists": bool(self.db.project(pid)),
+            "repairs": [],
         }
 
-    def validate(self, path: str | None = None) -> dict[str, Any]:
-        """Check a possibly hand-edited file and, if anything needed
-        normalising, WRITE the normalised form back (task item 3's
-        `sync`). Reports exactly what changed rather than silently
-        rewriting the user's file."""
-        identity, error = self._resolve(path)
+    def list_projects(self) -> dict[str, Any]:
+        """Every project this controller holds a backlog for, plus (when a
+        controller is wired) every git project the FLEET is working on --
+        so a project with sessions but no backlog yet is still visible
+        rather than invisible until someone remembers it."""
+        stored = {p["project_id"]: p for p in self.db.list_projects()}
+        discovered: dict[str, Any] = {}
+        node_errors: dict[str, str] = {}
+        if self.controller is not None:
+            found = self.controller.discover_projects()
+            node_errors = found.get("node_errors", {})
+            for entry in found.get("projects", []):
+                discovered[entry["project_id"]] = entry
+        rows = []
+        for pid in sorted(set(stored) | set(discovered)):
+            store_row = stored.get(pid) or {}
+            live = discovered.get(pid) or {}
+            rows.append({
+                "project_id": pid,
+                "name": store_row.get("name") or live.get("name"),
+                "git_remote": store_row.get("git_remote") or live.get("git_remote"),
+                "is_portable": bool(store_row.get("is_portable", live.get("is_portable", True))),
+                "has_backlog": pid in stored,
+                "total": store_row.get("total", 0),
+                "open_total": store_row.get("open_total", 0),
+                "revision": store_row.get("revision", 0),
+                "nodes": live.get("nodes", []),
+                "checkouts": live.get("checkouts", []),
+                "session_count": live.get("session_count", 0),
+            })
+        rows.sort(key=lambda r: (-r["open_total"], -r["session_count"], r["project_id"]))
+        return {"projects": rows, "node_errors": node_errors}
+
+    def validate(self, path: str | None = None, *, project_id: str | None = None,
+                 node_id: str | None = None, session: str | None = None) -> dict[str, Any]:
+        """Re-normalise a project's stored items. With the controller DB as
+        the source of truth there is no hand-edited file to repair on the
+        hot path -- this now guards against a payload written by an older
+        schema, and stays as the explicit "check my backlog" call."""
+        identity, error = self._project(project_id=project_id, path=path,
+                                        node_id=node_id, session=session)
         if error is not None:
             return error
-        file = backlog_path(identity.repo_root)
-        if not file.exists():
-            return {"project": identity.to_dict(), "backlog_file": str(file), "exists": False,
-                    "valid": True, "repairs": [], "written": False}
-        try:
-            with file_lock(file):
-                document, repairs = store.load(file)
-                written = False
-                if repairs:
-                    document = store.save(file, document)
-                    written = True
-        except BacklogError as exc:
-            return {"error": "BACKLOG_UNREADABLE", "detail": str(exc), "path": str(file), "valid": False}
+        pid = identity["project_id"]
+        repairs: list[str] = []
+        items = [store.normalise_item(i, repairs=repairs) for i in self.db.items(pid)]
+        items = [i for i in items if i]
+        written = False
+        if repairs:
+            self.db.replace_items(pid, items)
+            written = True
         self._audit("backlog_validate", result="ok" if not repairs else "repaired")
-        return {"project": identity.to_dict(), "backlog_file": str(file), "exists": True,
-                "valid": True, "repairs": repairs, "written": written,
-                "revision": document["revision"], "total": len(document["items"])}
+        return {"project": identity, "valid": True, "repairs": repairs, "written": written,
+                "revision": self.db.revision(pid), "total": len(items)}
 
     # --------------------------------------------------------------- write
     def _mutate(self, path: str | None, expected_revision: int | None,
-                mutator: Any, *, action: str) -> dict[str, Any]:
-        """One locked read-modify-write for every mutating operation, so
-        atomicity/locking/revision/audit are implemented exactly once."""
-        identity, error = self._resolve(path)
+                mutator: Any, *, action: str, project_id: str | None = None,
+                node_id: str | None = None, session: str | None = None) -> dict[str, Any]:
+        """One serialized read-modify-write for every mutating operation.
+
+        The lock is now a PROCESS-WIDE lock per project rather than an
+        fcntl lock on a repo file: the controller is the single writer,
+        so contention is between its own threads/requests, and SQLite's
+        own transaction makes the swap atomic. `expected_revision` still
+        gives cross-AGENT optimistic concurrency -- two ChatGPT sessions
+        editing the same project still conflict safely."""
+        identity, error = self._project(project_id=project_id, path=path,
+                                        node_id=node_id, session=session)
         if error is not None:
             return error
-        file = backlog_path(identity.repo_root)
-        try:
-            with file_lock(file):
-                document, repairs = store.load(file)
-                if expected_revision is not None and int(expected_revision) != document["revision"]:
-                    self._audit(action, result="conflict")
-                    return {"error": "REVISION_CONFLICT", "expected_revision": int(expected_revision),
-                            "actual_revision": document["revision"], "backlog_file": str(file),
-                            "detail": "another agent wrote this backlog first -- re-read it and retry "
-                                      "so their change is not clobbered"}
-                if not document.get("project"):
-                    document["project"] = identity.to_dict()
-                outcome = mutator(document)
-                if isinstance(outcome, dict) and "error" in outcome:
-                    self._audit(action, result="refused", reason=outcome["error"])
-                    return outcome
-                if len(document["items"]) > _MAX_ITEMS:
-                    return {"error": "BACKLOG_TOO_LARGE", "limit": _MAX_ITEMS}
-                document = store.save(file, document)
-        except BacklogError as exc:
-            self._audit(action, result="error", reason=str(exc)[:200])
-            return {"error": "BACKLOG_WRITE_FAILED", "detail": str(exc), "path": str(file)}
+        pid = identity["project_id"]
+        lock = _project_lock(pid)
+        with lock:
+            self.db.ensure_project(identity)
+            current = self.db.revision(pid)
+            if expected_revision is not None and int(expected_revision) != current:
+                self._audit(action, result="conflict")
+                return {"error": "REVISION_CONFLICT", "expected_revision": int(expected_revision),
+                        "actual_revision": current, "project_id": pid,
+                        "detail": "another agent wrote this backlog first -- re-read it and retry "
+                                  "so their change is not clobbered"}
+            document = {"items": self.db.items(pid), "project": identity}
+            outcome = mutator(document)
+            if isinstance(outcome, dict) and "error" in outcome:
+                self._audit(action, result="refused", reason=outcome["error"])
+                return outcome
+            if len(document["items"]) > _MAX_ITEMS:
+                return {"error": "BACKLOG_TOO_LARGE", "limit": _MAX_ITEMS}
+            revision = self.db.replace_items(pid, document["items"])
         self._audit(action, result="ok")
-        result = {"project": identity.to_dict(), "backlog_file": str(file),
-                  "revision": document["revision"], "repairs": repairs}
+        result = {"project": identity, "revision": revision, "repairs": []}
         if isinstance(outcome, dict):
             result.update(outcome)
         return result
 
     def add(self, path: str | None = None, *, tasks: list[dict[str, Any]],
-            expected_revision: int | None = None, source: str = "mcp") -> dict[str, Any]:
+            expected_revision: int | None = None, source: str = "mcp",
+            project_id: str | None = None, project_node_id: str | None = None,
+            project_session: str | None = None) -> dict[str, Any]:
         if not isinstance(tasks, list) or not tasks:
             return {"error": "INVALID_REQUEST", "detail": "tasks must be a non-empty list"}
         for entry in tasks:
@@ -231,10 +328,13 @@ class BacklogService:
                 created.append(item)
             return {"created": created, "created_ids": [i["id"] for i in created]}
 
-        return self._mutate(path, expected_revision, _apply, action="backlog_add")
+        return self._mutate(path, expected_revision, _apply, action="backlog_add",
+                            project_id=project_id, node_id=project_node_id, session=project_session)
 
     def update(self, path: str | None = None, *, task_id: str, patch: dict[str, Any],
-               expected_revision: int | None = None, actor: str = "mcp") -> dict[str, Any]:
+               expected_revision: int | None = None, actor: str = "mcp",
+                 project_id: str | None = None, project_node_id: str | None = None,
+                 project_session: str | None = None) -> dict[str, Any]:
         if not isinstance(patch, dict) or not patch:
             return {"error": "INVALID_REQUEST", "detail": "patch must be a non-empty object"}
         rejected = sorted(set(patch) - _WRITABLE)
@@ -263,10 +363,13 @@ class BacklogService:
                                     "changed": sorted(patch)})
             return {"task_id": task_id, "item": item, "before": before}
 
-        return self._mutate(path, expected_revision, _apply, action="backlog_update")
+        return self._mutate(path, expected_revision, _apply, action="backlog_update",
+                            project_id=project_id, node_id=project_node_id, session=project_session)
 
     def bulk_update(self, path: str | None = None, *, updates: list[dict[str, Any]],
-                    expected_revision: int | None = None, actor: str = "mcp") -> dict[str, Any]:
+                    expected_revision: int | None = None, actor: str = "mcp",
+                 project_id: str | None = None, project_node_id: str | None = None,
+                 project_session: str | None = None) -> dict[str, Any]:
         """Several patches under ONE lock + ONE revision bump -- reordering
         a board is otherwise N writes and N conflict windows."""
         if not isinstance(updates, list) or not updates:
@@ -295,11 +398,14 @@ class BacklogService:
                 return {"error": "TASK_NOT_FOUND", "task_ids": missing}
             return {"updated_ids": applied}
 
-        return self._mutate(path, expected_revision, _apply, action="backlog_bulk_update")
+        return self._mutate(path, expected_revision, _apply, action="backlog_bulk_update",
+                            project_id=project_id, node_id=project_node_id, session=project_session)
 
     def claim(self, path: str | None = None, *, task_id: str, session: str | None = None,
               node_id: str | None = None, assignee: str | None = None,
-              expected_revision: int | None = None) -> dict[str, Any]:
+              expected_revision: int | None = None,
+              project_id: str | None = None, project_node_id: str | None = None,
+              project_session: str | None = None) -> dict[str, Any]:
         """Take ownership and move to IN_PROGRESS. Refuses to steal an
         item another session already holds unless it is being reassigned
         explicitly (assignee given)."""
@@ -323,10 +429,13 @@ class BacklogService:
                                     "node_id": item["node_id"]})
             return {"task_id": task_id, "item": item}
 
-        return self._mutate(path, expected_revision, _apply, action="backlog_claim")
+        return self._mutate(path, expected_revision, _apply, action="backlog_claim",
+                            project_id=project_id, node_id=project_node_id, session=project_session)
 
     def block(self, path: str | None = None, *, task_id: str, reason: str,
-              expected_revision: int | None = None, actor: str = "mcp") -> dict[str, Any]:
+              expected_revision: int | None = None, actor: str = "mcp",
+                 project_id: str | None = None, project_node_id: str | None = None,
+                 project_session: str | None = None) -> dict[str, Any]:
         if not str(reason or "").strip():
             return {"error": "BLOCKED_REASON_REQUIRED"}
 
@@ -341,12 +450,15 @@ class BacklogService:
                                     "reason": reason})
             return {"task_id": task_id, "item": item}
 
-        return self._mutate(path, expected_revision, _apply, action="backlog_block")
+        return self._mutate(path, expected_revision, _apply, action="backlog_block",
+                            project_id=project_id, node_id=project_node_id, session=project_session)
 
     def complete(self, path: str | None = None, *, task_id: str,
                  commit: str | None = None, test: str | None = None, deploy: str | None = None,
                  note: str | None = None, expected_revision: int | None = None,
-                 actor: str = "mcp") -> dict[str, Any]:
+                 actor: str = "mcp",
+                 project_id: str | None = None, project_node_id: str | None = None,
+                 project_session: str | None = None) -> dict[str, Any]:
         """The VERIFIED-DONE gate (task item 7). DONE requires either
         real evidence, or a linked queue task that actually reached
         COMPLETED -- queue_store's own comment defines COMPLETED as the
@@ -384,10 +496,13 @@ class BacklogService:
             return {"task_id": task_id, "item": item,
                     "verified_by": "queue_task" if verified_by_queue else "evidence"}
 
-        return self._mutate(path, expected_revision, _apply, action="backlog_complete")
+        return self._mutate(path, expected_revision, _apply, action="backlog_complete",
+                            project_id=project_id, node_id=project_node_id, session=project_session)
 
     def dispatch(self, path: str | None = None, *, task_id: str, session: str | None = None,
-                 prompt: str | None = None, expected_revision: int | None = None) -> dict[str, Any]:
+                 prompt: str | None = None, expected_revision: int | None = None,
+                 project_id: str | None = None, project_node_id: str | None = None,
+                 project_session: str | None = None) -> dict[str, Any]:
         """Backlog (intent) -> Queue (execution), the ONE crossing point.
         Creates a real queue task via the existing canonical
         QueueService.create_task and records the link on BOTH sides."""
@@ -410,9 +525,9 @@ class BacklogService:
             try:
                 task = self.queue.create_task(
                     item["title"], body, session=session, project=project,
-                    metadata={"backlog_id": item["id"], "backlog_file": str(backlog_path(
-                        (document.get("project") or {}).get("repo_root") or ".")),
-                        "acceptance_criteria": item.get("acceptance_criteria") or []},
+                    metadata={"backlog_id": item["id"],
+                              "backlog_project_id": project,
+                              "acceptance_criteria": item.get("acceptance_criteria") or []},
                 )
             except Exception as exc:  # noqa: BLE001 - surfaced, never swallowed
                 return {"error": "QUEUE_CREATE_FAILED", "detail": f"{type(exc).__name__}: {exc}"}
@@ -428,14 +543,70 @@ class BacklogService:
             created.update({"queue_task": task})
             return {"task_id": task_id, "queue_task_id": queue_task_id, "item": item}
 
-        result = self._mutate(path, expected_revision, _apply, action="backlog_dispatch")
+        result = self._mutate(path, expected_revision, _apply, action="backlog_dispatch",
+                            project_id=project_id, node_id=project_node_id, session=project_session)
         if "error" not in result:
             result.update(created)
         return result
 
 
+    # ------------------------------------------------------ export / import
+    def export_file(self, path: str | None = None, *, project_id: str | None = None) -> dict[str, Any]:
+        """Write a project's backlog out to `<repo>/.terminal-mcp/backlog.json`.
+
+        This is what keeps the portability and git-review benefits now
+        that the controller DB is authoritative: the file is a
+        PROJECTION, committed deliberately, not the thing agents race on.
+        `path` must be a local checkout (allowed_cwd_roots gated) -- the
+        controller can only write to a filesystem it actually has."""
+        identity, error = self._resolve(path)
+        if error is not None:
+            return error
+        pid = project_id or identity.project_id
+        document = self.db.document(pid)
+        if not self.db.project(pid):
+            return {"error": "NO_BACKLOG_FOR_PROJECT", "project_id": pid}
+        document["project"] = identity.to_dict()
+        file = backlog_path(identity.repo_root)
+        try:
+            store.save(file, {**document, "revision": document["revision"] - 1})
+        except BacklogError as exc:
+            return {"error": "EXPORT_FAILED", "detail": str(exc), "path": str(file)}
+        self._audit("backlog_export", result="ok")
+        return {"project": identity.to_dict(), "backlog_file": str(file),
+                "exported": len(document["items"]), "revision": document["revision"]}
+
+    def import_file(self, path: str | None = None, *, replace: bool = False) -> dict[str, Any]:
+        """Read `<repo>/.terminal-mcp/backlog.json` back into the
+        controller DB -- how a backlog committed by a teammate (or by an
+        older file-based deployment) reaches this controller.
+
+        MERGE by default: an incoming item with a known id updates it, an
+        unknown id is added, and nothing local is deleted. `replace=True`
+        is the deliberate destructive form."""
+        identity, error = self._resolve(path)
+        if error is not None:
+            return error
+        file = backlog_path(identity.repo_root)
+        if not file.exists():
+            return {"error": "NO_BACKLOG_FILE", "path": str(file)}
+        try:
+            document, repairs = store.load(file)
+        except BacklogError as exc:
+            return {"error": "BACKLOG_UNREADABLE", "detail": str(exc), "path": str(file)}
+        pid = identity.project_id
+        lock = _project_lock(pid)
+        with lock:
+            self.db.ensure_project(identity.to_dict())
+            outcome = self.db.import_document(pid, document, replace=replace)
+        self._audit("backlog_import", result="ok")
+        return {"project": identity.to_dict(), "backlog_file": str(file),
+                "repairs": repairs, "replaced": replace, **outcome}
+
     # ------------------------------------------------- knowledge-store seam
-    def open_items_for_brief(self, path: str | None = None, *, limit: int = 20) -> dict[str, Any]:
+    def open_items_for_brief(self, path: str | None = None, *, limit: int = 20,
+                             project_id: str | None = None, project_node_id: str | None = None,
+                             project_session: str | None = None) -> dict[str, Any]:
         """The interface the Project Brief (session_knowledge) should call
         for "Open / Unrun Tasks" instead of keeping its own second list
         (task item 13). Deliberately a THIN projection of `get`, not a new
@@ -449,14 +620,14 @@ class BacklogService:
         Kept intentionally small and side-effect-free so the paused
         project-scoped-knowledge work can adopt it later without this
         MVP having to guess that feature's own shape."""
-        result = self.get(path, include_terminal=False, limit=500)
+        result = self.get(path, include_terminal=False, limit=500, project_id=project_id,
+                          node_id=project_node_id, session=project_session)
         if "error" in result:
             return result
         items = result["items"]
         unrun = [i for i in items if not i.get("queue_task_id")]
         return {
             "project": result["project"],
-            "backlog_file": result["backlog_file"],
             "revision": result["revision"],
             "counts": result["counts"],
             "open_total": result["open_total"],

@@ -684,74 +684,7 @@ class TerminalService:
         if brief is None:
             return {"error": "NO_KNOWLEDGE_FOUND", "session": session_name,
                     "reason": "no captured output for this session on this node"}
-        brief = self._attach_project_backlog(brief)
         return {"session": session_name, **brief}
-
-    def _backlog_service(self) -> Any:
-        """Lazily built, cached. Deliberately NOT a constructor argument:
-        every TerminalService in the codebase (and every test) would then
-        have to know about the backlog, when only this one brief path
-        needs it. Constructed with THIS service's own config, so the
-        backlog's allowed_cwd_roots path gate is the same one session
-        creation uses -- never a second, looser policy."""
-        service = getattr(self, "_backlog_service_cached", None)
-        if service is None:
-            from .backlog_service import BacklogService
-            service = BacklogService(self.config)
-            self._backlog_service_cached = service
-        return service
-
-    def _attach_project_backlog(self, brief: dict[str, Any]) -> dict[str, Any]:
-        """Project Brief <- Project Backlog (docs/backlog.md's own
-        "Project Brief integration"). A recovery brief already knows which
-        REPO the session was working in (meta.repo_root), and the backlog
-        is keyed on exactly that repo -- so the brief can show what the
-        PROJECT still intends to do without keeping a second, drifting
-        list of its own. `unrun` (never dispatched) is the part that
-        matters most here: nothing is executing those and nothing else
-        will mention them.
-
-        Never fatal. A session outside allowed_cwd_roots, a non-repo cwd,
-        a project with no backlog file, or an unreadable one all attach a
-        structured `available: false` + reason instead of failing the
-        brief -- recovering context must not depend on the backlog being
-        present."""
-        meta = brief.get("meta") or {}
-        repo_root = meta.get("repo_root")
-        if not repo_root:
-            brief["project_backlog"] = {"available": False, "reason": "SESSION_NOT_IN_A_REPO"}
-            return brief
-        try:
-            result = self._backlog_service().open_items_for_brief(repo_root, limit=15)
-        except Exception as exc:  # noqa: BLE001 - a brief must never fail on this
-            brief["project_backlog"] = {"available": False, "reason": "BACKLOG_ERROR",
-                                        "detail": f"{type(exc).__name__}: {exc}"}
-            return brief
-        if "error" in result:
-            brief["project_backlog"] = {"available": False, "reason": result["error"],
-                                        "detail": result.get("detail")}
-            return brief
-        result["available"] = True
-        brief["project_backlog"] = result
-
-        lines = [
-            f"-- open project backlog: {result['open_total']} open, "
-            f"{result['unrun_total']} never dispatched (source of truth: {result['backlog_file']}) --"
-        ]
-        for item in result["open_items"]:
-            marker = "" if item.get("queue_task_id") else "  [unrun]"
-            lines.append(f"[{item['priority']}] {item['status']:<12} {item['id']}  {item['title']}{marker}")
-        if not result["open_items"]:
-            lines.append("(no open backlog items for this project)")
-        brief["recovery_brief_text"] = brief.get("recovery_brief_text", "") + "\n" + "\n".join(lines)
-        # Backlog titles/descriptions are written by AGENTS through the
-        # backlog API. That is deliberate, structured data rather than raw
-        # pane scrape -- but it is still not this server's own words, and a
-        # confused/compromised agent could park injection text in a title
-        # that then lands in another agent's brief. Marked untrusted for
-        # the same reason recent_chunks is.
-        brief["untrusted_fields"] = list(brief.get("untrusted_fields") or []) + ["project_backlog"]
-        return brief
 
     def terminal_knowledge_checkpoint(self, session_name: str, summary: str) -> dict[str, Any]:
         """A MANUAL checkpoint -- a human/agent explicitly marking "this

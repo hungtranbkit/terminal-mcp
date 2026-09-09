@@ -817,8 +817,18 @@ def build_mcp(service: TerminalService | None = None,
         text), never a claim that the old process or its RAM is being
         resurrected (recovered_process is always false). Use this before
         starting a fresh agent in the same project so it has real prior
-        context instead of none."""
-        return terminal.terminal_knowledge_recover(session_name)
+        context instead of none.
+
+        Also carries `project_backlog`: what the PROJECT still intends to
+        do, from the controller's canonical project-keyed backlog. That
+        join happens HERE rather than inside the node's own service --
+        the node holds no canonical backlog, only the controller does, so
+        attaching it at the node would have silently produced an empty
+        list for every remote session."""
+        brief = terminal.terminal_knowledge_recover(session_name)
+        if backlog is not None and "error" not in brief:
+            brief = _attach_project_backlog(backlog, controller, brief, session_name)
+        return brief
 
     @server.tool()
     def terminal_knowledge_checkpoint(session_name: str, summary: str) -> dict:
@@ -1980,7 +1990,9 @@ def build_mcp(service: TerminalService | None = None,
     if backlog is not None:
 
         @server.tool()
-        def terminal_backlog_get(path: str | None = None, status: str | None = None,
+        def terminal_backlog_get(path: str | None = None, project_id: str | None = None,
+                                 project_node_id: str | None = None, project_session: str | None = None,
+                                 status: str | None = None,
                                  priority: str | None = None, type: str | None = None,
                                  tag: str | None = None, assignee: str | None = None,
                                  include_terminal: bool = True, limit: int = 500) -> dict:
@@ -1988,11 +2000,19 @@ def build_mcp(service: TerminalService | None = None,
 
             WORKFLOW: get -> analyse -> add/update -> dispatch -> verify -> complete.
 
-            `path` is any directory inside the project (a session's cwd is
-            fine); identity is resolved from the git REPO, so every
-            session on that repo sees the SAME backlog regardless of which
-            subdirectory it sits in. Omit `path` to use the server's
-            default root.
+            THREE ways to say WHICH project, in precedence order:
+              - `project_id` (e.g. "git:github.com/acme/widget") -- works
+                even when no checkout exists on this machine.
+              - `project_node_id` + `project_session` -- "the project THIS
+                session is working on", resolved from the owning node's
+                own registry. Use this for a session on a remote node.
+              - `path` -- a local checkout; identity comes from its git
+                REPO, so every checkout of that repo maps to one backlog.
+            Omit all three to use the server's default root.
+
+            The backlog is stored CONTROLLER-side keyed by that canonical
+            project id, so every node and session working the same repo
+            sees one shared backlog -- not one per checkout.
 
             Returns the canonical `project` identity, `revision` (pass it
             back as expected_revision when you write, to avoid clobbering
@@ -2003,11 +2023,16 @@ def build_mcp(service: TerminalService | None = None,
             Status values: BACKLOG (captured), READY (groomed), IN_PROGRESS,
             BLOCKED, NEEDS_REVIEW (done but unverified), DONE (verified),
             CANCELLED. Priority: P0..P3."""
-            return backlog.get(path, status=status, priority=priority, type=type, tag=tag,
-                               assignee=assignee, include_terminal=include_terminal, limit=limit)
+            return backlog.get(path, project_id=project_id, node_id=project_node_id,
+                               session=project_session, status=status, priority=priority,
+                               type=type, tag=tag, assignee=assignee,
+                               include_terminal=include_terminal, limit=limit)
 
         @server.tool()
         def terminal_backlog_add(tasks: list[dict], path: str | None = None,
+                                 project_id: str | None = None,
+                                 project_node_id: str | None = None,
+                                 project_session: str | None = None,
                                  expected_revision: int | None = None,
                                  source: str = "chatgpt") -> dict:
             """ADD backlog items. Use this the MOMENT new work is
@@ -2022,7 +2047,9 @@ def build_mcp(service: TerminalService | None = None,
             dependencies, tags, order.
 
             Returns created_ids and the new revision."""
-            return backlog.add(path, tasks=tasks, expected_revision=expected_revision, source=source)
+            return backlog.add(path, tasks=tasks, expected_revision=expected_revision, source=source,
+                               project_id=project_id, project_node_id=project_node_id,
+                               project_session=project_session)
 
         @server.tool()
         def terminal_backlog_update(task_id: str, patch: dict, path: str | None = None,
@@ -2110,6 +2137,44 @@ def build_mcp(service: TerminalService | None = None,
                                     note=note, expected_revision=expected_revision, actor=actor)
 
         @server.tool()
+        def terminal_project_list() -> dict:
+            """List the GIT PROJECTS this fleet works on, auto-detected.
+
+            Merges two sources: projects that already have a backlog, and
+            projects discovered live from every online node's session
+            registry (repo_root/git_remote per session). Every checkout of
+            one repo -- worktrees, scratch clones, a different path on each
+            machine -- collapses onto ONE project_id.
+
+            Use this to find the project_id to pass to the other backlog
+            tools, and to see which projects have sessions but no backlog
+            captured yet. Each row carries nodes, checkouts, session_count,
+            has_backlog, open_total."""
+            return backlog.list_projects()
+
+        @server.tool()
+        def terminal_backlog_export(path: str, project_id: str | None = None) -> dict:
+            """Write a project's backlog out to
+            `<repo>/.terminal-mcp/backlog.json` in a LOCAL checkout, so it
+            can be committed and reviewed in git.
+
+            The controller DB stays the source of truth; this file is a
+            deliberate projection, not the thing agents race on. `path`
+            must be a checkout this server can actually write to."""
+            return backlog.export_file(path, project_id=project_id)
+
+        @server.tool()
+        def terminal_backlog_import(path: str, replace: bool = False) -> dict:
+            """Read `<repo>/.terminal-mcp/backlog.json` back into the
+            controller's backlog -- how a backlog committed by a teammate
+            (or produced by an older file-based deployment) gets adopted.
+
+            MERGES by default: a known item id is updated, an unknown one
+            added, and nothing local is deleted. Pass replace=true for the
+            deliberate destructive form."""
+            return backlog.import_file(path, replace=replace)
+
+        @server.tool()
         def terminal_backlog_validate(path: str | None = None) -> dict:
             """Validate the backlog file after a MANUAL edit (a human
             editing .terminal-mcp/backlog.json by hand is expected and
@@ -2120,3 +2185,52 @@ def build_mcp(service: TerminalService | None = None,
 
 
     return server
+
+
+def _attach_project_backlog(backlog: Any, controller: Any, brief: dict, session_name: str) -> dict:
+    """Project Brief <- Project Backlog. Resolves the session's project
+    the way the new architecture requires: by asking the OWNING NODE's
+    registry (via the controller) when possible, falling back to the
+    repo_root the brief itself reports for a local session.
+
+    Never fatal: a session in no repo, a project with no backlog, or any
+    lookup failure attaches {"available": false, "reason": ...} and
+    leaves the rest of the brief intact -- recovering context must not
+    depend on a backlog existing."""
+    meta = brief.get("meta") or {}
+    node_id = meta.get("node_id")
+    result = None
+    try:
+        if controller is not None and node_id and node_id != "local":
+            result = backlog.open_items_for_brief(None, project_node_id=node_id,
+                                                  project_session=session_name, limit=15)
+        elif meta.get("repo_root"):
+            result = backlog.open_items_for_brief(meta["repo_root"], limit=15)
+        else:
+            brief["project_backlog"] = {"available": False, "reason": "SESSION_NOT_IN_A_REPO"}
+            return brief
+    except Exception as exc:  # noqa: BLE001 - a brief must never fail on this
+        brief["project_backlog"] = {"available": False, "reason": "BACKLOG_ERROR",
+                                    "detail": f"{type(exc).__name__}: {exc}"}
+        return brief
+    if result is None or "error" in result:
+        brief["project_backlog"] = {"available": False,
+                                    "reason": (result or {}).get("error", "UNKNOWN"),
+                                    "detail": (result or {}).get("detail")}
+        return brief
+    result["available"] = True
+    brief["project_backlog"] = result
+    lines = [f"-- open project backlog: {result['open_total']} open, "
+             f"{result['unrun_total']} never dispatched "
+             f"(project {result['project']['project_id']}) --"]
+    for item in result["open_items"]:
+        marker = "" if item.get("queue_task_id") else "  [unrun]"
+        lines.append(f"[{item['priority']}] {item['status']:<12} {item['id']}  {item['title']}{marker}")
+    if not result["open_items"]:
+        lines.append("(no open backlog items for this project)")
+    brief["recovery_brief_text"] = brief.get("recovery_brief_text", "") + "\n" + "\n".join(lines)
+    # Backlog text is written by AGENTS through the backlog API -- structured
+    # and deliberate, but not this server's own words, and a confused agent
+    # could park injection text in a title that reaches another agent's brief.
+    brief["untrusted_fields"] = list(brief.get("untrusted_fields") or []) + ["project_backlog"]
+    return brief

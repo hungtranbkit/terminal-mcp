@@ -1,39 +1,26 @@
-"""Real concurrent writers -- separate OS PROCESSES, not threads, because
-the guarantee under test is an `fcntl.flock` advisory lock, which is
-per-process. Threads in one interpreter would not exercise it honestly.
+"""Concurrent writers against the controller-side backlog.
+
+The concurrency model CHANGED with the store: it used to be N processes
+racing on a repo file guarded by fcntl.flock; it is now the controller as
+single writer, so the real races are (a) its own concurrent threads and
+(b) two AGENTS editing the same project, which `expected_revision`
+guards. These tests cover both, rather than continuing to test a file
+lock that no longer governs anything.
 """
 from __future__ import annotations
 
-import json
-import subprocess
-import sys
-import textwrap
-from pathlib import Path
+import threading
 
 import pytest
 
-from terminal_mcp import backlog_store as store
+from terminal_mcp.backlog_db import BacklogDB
 from terminal_mcp.backlog_service import BacklogService
 from tests.test_backlog import make_config, make_repo
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
-WRITER = textwrap.dedent("""
-    import sys
-    sys.path.insert(0, {root!r})
-    from terminal_mcp.backlog_service import BacklogService
-    from tests.test_backlog import make_config
-    svc = BacklogService(make_config({allowed!r}))
-    for n in range({count}):
-        svc.add({repo!r}, tasks=[{{"title": "{tag}-%d" % n}}])
-""")
-
-
-def _spawn(tmp_path: Path, repo: Path, tag: str, count: int) -> subprocess.Popen:
-    code = WRITER.format(root=str(REPO_ROOT), allowed=str(tmp_path), repo=str(repo),
-                         count=count, tag=tag)
-    return subprocess.Popen([sys.executable, "-c", code], cwd=str(REPO_ROOT),
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+@pytest.fixture(autouse=True)
+def _isolated_backlog_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_BACKLOG_DB", str(tmp_path / "backlog.db"))
 
 
 @pytest.fixture
@@ -41,40 +28,74 @@ def repo(tmp_path):
     return make_repo(tmp_path / "widget")
 
 
-def test_parallel_writers_never_lose_an_item_or_corrupt_the_file(tmp_path, repo):
-    """Two processes appending simultaneously. Without the lock this is
-    a classic lost-update: both read revision N, both write N+1, one
-    item vanishes. With it, every item survives."""
-    per_writer = 12
-    procs = [_spawn(tmp_path, repo, tag, per_writer) for tag in ("alpha", "beta")]
-    for proc in procs:
-        out, err = proc.communicate(timeout=120)
-        assert proc.returncode == 0, f"writer failed: {err or out}"
-
-    path = store.backlog_path(repo)
-    document = json.loads(path.read_text())          # parses => never corrupted
-    titles = [i["title"] for i in document["items"]]
-    assert len(titles) == per_writer * 2, f"lost updates: {len(titles)} of {per_writer * 2}"
-    assert len({t for t in titles}) == per_writer * 2
-    assert sorted(titles) == sorted([f"alpha-{n}" for n in range(per_writer)]
-                                    + [f"beta-{n}" for n in range(per_writer)])
-    # revision advanced once per successful write
-    assert document["revision"] == per_writer * 2
-    # ids stayed unique across processes
-    assert len({i["id"] for i in document["items"]}) == per_writer * 2
+@pytest.fixture
+def svc(tmp_path):
+    return BacklogService(make_config(tmp_path), db=BacklogDB(tmp_path / "backlog.db"))
 
 
-def test_no_temp_files_survive_concurrent_writes(tmp_path, repo):
-    procs = [_spawn(tmp_path, repo, tag, 6) for tag in ("a", "b")]
-    for proc in procs:
-        proc.communicate(timeout=120)
-    leftovers = list(store.backlog_path(repo).parent.glob(".backlog-*.tmp"))
-    assert leftovers == [], f"atomic write left temp files behind: {leftovers}"
+def test_parallel_threads_never_lose_an_item(svc, repo):
+    """Without the per-project lock this is a lost update: two threads
+    read the same item list, both append, one append vanishes."""
+    per_thread = 12
+    errors: list[str] = []
+
+    def writer(tag: str) -> None:
+        for n in range(per_thread):
+            out = svc.add(str(repo), tasks=[{"title": f"{tag}-{n}"}])
+            if "error" in out:
+                errors.append(out["error"])
+
+    threads = [threading.Thread(target=writer, args=(tag,)) for tag in ("alpha", "beta")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert errors == [], errors
+    items = svc.get(str(repo))["items"]
+    titles = sorted(i["title"] for i in items)
+    assert len(titles) == per_thread * 2, f"lost updates: {len(titles)}"
+    assert titles == sorted([f"alpha-{n}" for n in range(per_thread)]
+                            + [f"beta-{n}" for n in range(per_thread)])
+    assert len({i["id"] for i in items}) == per_thread * 2      # ids stayed unique
 
 
-def test_lock_file_does_not_pollute_the_item_list(tmp_path, repo):
-    svc = BacklogService(make_config(tmp_path))
-    svc.add(str(repo), tasks=[{"title": "x"}])
-    assert svc.get(str(repo))["total"] == 1
-    # the .lock file lives beside the backlog and is never parsed as data
-    assert store.backlog_path(repo).with_name("backlog.json.lock").exists()
+def test_revision_advances_once_per_write(svc, repo):
+    svc.add(str(repo), tasks=[{"title": "a"}])
+    svc.add(str(repo), tasks=[{"title": "b"}])
+    assert svc.get(str(repo))["revision"] == 2
+
+
+def test_two_agents_conflict_safely(svc, repo):
+    """The cross-AGENT race the controller cannot serialize away: both
+    read revision N, both try to write. The stale one is refused."""
+    tid = svc.add(str(repo), tasks=[{"title": "x"}])["created_ids"][0]
+    rev = svc.get(str(repo))["revision"]
+    assert "error" not in svc.update(str(repo), task_id=tid, patch={"title": "agent-A"},
+                                     expected_revision=rev)
+    out = svc.update(str(repo), task_id=tid, patch={"title": "agent-B"}, expected_revision=rev)
+    assert out["error"] == "REVISION_CONFLICT"
+    assert svc.get(str(repo))["items"][0]["title"] == "agent-A"   # A's write survived
+
+
+def test_concurrent_writes_to_DIFFERENT_projects_do_not_block_each_other(tmp_path, svc):
+    """The lock is per PROJECT, not global -- two projects must not
+    serialize behind each other."""
+    a = make_repo(tmp_path / "a", remote="https://github.com/acme/a.git")
+    b = make_repo(tmp_path / "b", remote="https://github.com/acme/b.git")
+    done: list[str] = []
+
+    def writer(repo_path, tag):
+        for n in range(8):
+            svc.add(str(repo_path), tasks=[{"title": f"{tag}-{n}"}])
+        done.append(tag)
+
+    threads = [threading.Thread(target=writer, args=(a, "A")),
+               threading.Thread(target=writer, args=(b, "B"))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert sorted(done) == ["A", "B"]
+    assert svc.get(str(a))["total"] == 8
+    assert svc.get(str(b))["total"] == 8

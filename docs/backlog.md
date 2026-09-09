@@ -21,38 +21,78 @@ traceable. This is why the audit that preceded implementation mattered:
 incident and release all layer on it via metadata rather than adding
 tables), and this feature adds **no** second task engine.
 
-## Source of truth: a file in the repo
+## Source of truth: the controller, keyed by project
 
-`<repo-root>/.terminal-mcp/backlog.json`
+**`project_id` (canonical, git-derived) → controller-side SQLite.**
+The repo file `<repo>/.terminal-mcp/backlog.json` is an **export/import
+projection**, not the live store.
 
-**Why a file, not a controller DB.** It travels with a clone, diffs and
-reverts in git, is readable by a human with no server running, and is not
-stranded on one machine — the exact failure the multi-node work spent so
-long avoiding. A controller-side index may be layered later; the file
-stays authoritative.
+### Why this changed (measured, not assumed)
 
-**Why JSON, not YAML** (PyYAML is already a dependency, so this was a real
-choice): JSON round-trips byte-exactly — no anchors/aliases/tags, no
-`yes → True` surprises — and a hand-edit that breaks it fails loudly at
-parse time rather than silently changing a value's type. Merge-friendliness
-is handled by the *serialisation shape* instead: fixed key order, one item
-per line-block, trailing newline. Two agents appending different items
-produce a clean line-oriented diff.
+The first design made the repo file authoritative. Measuring the actual
+fleet killed that:
 
-### Tracked vs ignored — a deliberate choice you should make
+| project | nodes | checkouts |
+|---|---|---|
+| `git:github.com/hungtranbkit/terminal-mcp` | local, m910, macbook | **7** |
+| `git:github.com/hungtranbkit/offline-pos` | dell-5530, local | 3 |
 
-The file is **not** auto-committed and nothing here ever runs `git commit`.
+One project genuinely lives in many checkouts on many machines. A backlog
+stored in *one* checkout is invisible to every other node working the
+same project — verified: the controller answered `PATH_NOT_ALLOWED` for
+m910's, macbook's and dell-5530's checkout paths, because **those paths do
+not exist on the controller at all**. The old "portable, reaches other
+nodes" claim was not true in practice.
 
-- **Tracked (recommended, and the default posture):** the plan is
-  reviewable, survives a fresh clone, and teammates/agents on other
-  machines see it. Cost: backlog edits show up in `git status` and can
-  collide in a merge (mitigated by the line-oriented format above).
-- **Ignored:** add `.terminal-mcp/` to `.gitignore`. The backlog becomes
-  local scratch — fine for a personal repo, but it will **not** reach
-  another node, which defeats most of the point.
+The *identity* half was already right — all 7 checkouts collapse to one
+`project_id`. Only the **storage** was wrong. So the controller (the one
+point every node already talks to) holds the canonical backlog, and the
+file keeps the portability/review benefits without being what agents race
+on.
 
-The `.lock` file beside it (`backlog.json.lock`) is an implementation
-detail and should be gitignored either way.
+### Addressing a project
+
+Three ways, in precedence order:
+
+1. **`project_id`** — e.g. `git:github.com/acme/widget`. Works with no
+   checkout on this machine at all.
+2. **`project_node_id` + `project_session`** — "the project THIS session
+   is working on", resolved from the **owning node's own registry**. This
+   is what makes a remote session's backlog reachable: the controller
+   cannot stat a path on another machine, but it can read what that node
+   reported.
+3. **`path`** — a local checkout, gated by `allowed_cwd_roots`.
+
+Ambiguity fails loudly rather than guessing — editing the wrong project's
+plan is worse than an error.
+
+### Export / import
+
+- `terminal_backlog_export(path)` writes the project's backlog to a local
+  checkout's `.terminal-mcp/backlog.json` — commit it for review and
+  portability.
+- `terminal_backlog_import(path)` reads it back. **Merges by default**: a
+  known item id is updated, an unknown one added, and nothing local is
+  deleted — adopting a teammate's committed backlog must never silently
+  drop work only this controller knows about. `replace=True` is the
+  deliberate destructive form.
+
+Hand-edits to a committed file are still supported; the repair now
+happens at the **import** boundary, and a corrupt or newer-schema file is
+refused there while the controller's own backlog stays untouched.
+
+### Concurrency
+
+The model changed with the store. The controller is the single writer, so:
+
+- a **per-project** in-process lock serializes its own concurrent
+  requests (per project, so two projects never block each other),
+- SQLite's transaction makes the item swap atomic,
+- **`expected_revision` still guards the cross-agent race** — two ChatGPT
+  sessions editing one project conflict safely with `REVISION_CONFLICT`.
+
+The old `fcntl.flock` on a repo file no longer governs anything and was
+removed rather than left as decoration.
 
 ## Project identity
 
@@ -154,6 +194,19 @@ than silently assumed.
 - Dashboard writes additionally pass `_mutation_guard` (Cloudflare Access
   / webauth identity).
 
+## Auto-detecting git projects
+
+`terminal_project_list` answers "what projects is this fleet working on?"
+from data every node **already records** — no new tracking, no scanning,
+no config. Each node's session registry stores `repo_root`/`git_remote`/
+`git_branch` per session; normalising each remote collapses every checkout
+of one repo onto one `project_id`.
+
+It merges that live discovery with the projects that already have a
+backlog, so a project with sessions but **no backlog captured yet** is
+visible rather than forgotten. Each row carries `nodes`, `checkouts`,
+`session_count`, `has_backlog`, `open_total`.
+
 ## MCP tools
 
 | Tool | Purpose |
@@ -166,7 +219,10 @@ than silently assumed.
 | `terminal_backlog_dispatch` | promote to a real queue task (the crossing point) |
 | `terminal_backlog_block` | BLOCKED + required reason |
 | `terminal_backlog_complete` | DONE, evidence-gated |
-| `terminal_backlog_validate` | re-validate / normalise after a manual edit |
+| `terminal_backlog_validate` | re-normalise a project's stored items |
+| `terminal_backlog_export` | write the backlog to a local checkout's file (commit it) |
+| `terminal_backlog_import` | read a committed file back in (merges by default) |
+| `terminal_project_list` | auto-detected git projects across the fleet |
 
 ## Dashboard panel
 
