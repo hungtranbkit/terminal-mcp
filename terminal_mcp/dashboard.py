@@ -838,6 +838,7 @@ DASHBOARD_HTML = """<!doctype html>
           <a href="/dashboard/sessions" id="sessionsAdminLink" role="menuitem">⚙ Quản lý session</a>
           <a href="/dashboard/nodes" id="nodesAdminLink" role="menuitem">🖥 Nodes</a>
           <a href="/dashboard/tasks" id="globalTasksLink" role="menuitem">🗂 Global Tasks</a>
+          <a href="/dashboard/backlog" id="backlogLink" role="menuitem">📋 Project Backlog</a>
           <a href="/dashboard/requirements" id="requirementsLink" role="menuitem" target="_blank" rel="noopener">📄 Requirements</a>
           <button type="button" id="openSupervisorPanelBtn" role="menuitem">🧭 Supervisor / Coordinator</button>
           <button type="button" id="openTaskInboxBtn" role="menuitem">📥 Task Inbox</button>
@@ -5697,6 +5698,315 @@ GLOBAL_TASKS_HTML = """<!doctype html>
 # reused for every session, and webauth_dashboard.py's APP_WEBTERM_HTML
 # is this string with the same handful of literal-substring rewrites
 # every other page here already gets (see that module).
+# Project Backlog panel -- a VIEW over the existing /dashboard/api/backlog
+# routes, exactly like GLOBAL_TASKS_HTML is a view over the task board.
+# It is its OWN page (matching /dashboard/nodes and /dashboard/tasks)
+# rather than a new tab inside DASHBOARD_HTML: that main template is
+# already ~3.6k lines and its fetch() surface is pinned by a test, so a
+# separate page keeps this change reviewable and cannot regress the
+# session UI.
+#
+# Every value rendered here comes from a backlog file that agents (and
+# humans) write, so this builds DOM with textContent throughout and never
+# assigns innerHTML from backlog data -- an item titled "<img onerror=...>"
+# must render as text, not markup.
+BACKLOG_HTML = """<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Project Backlog</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#5b8cff; --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono','Courier New',monospace; }
+    * { box-sizing:border-box }
+    html, body { height:100vh; height:100dvh; overflow:hidden }
+    body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text); display:flex; flex-direction:column }
+    header { flex:0 0 auto; display:flex; justify-content:space-between; gap:16px; align-items:center; padding:14px 24px; border-bottom:1px solid var(--line); flex-wrap:wrap }
+    h1 { margin:0; font-size:18px } .muted { color:var(--muted) }
+    a.back { color:var(--muted); text-decoration:none; font-size:12px; border:1px solid var(--line); border-radius:999px; padding:4px 10px }
+    a.back:hover { color:var(--text); border-color:var(--muted) }
+    button.icon-btn { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:5px 11px; cursor:pointer; font:inherit; font-size:12px }
+    button.icon-btn:hover { background:#233252 }
+    button.icon-btn[disabled] { opacity:.45; cursor:default }
+    input[type=text], select, textarea { padding:6px 9px; border-radius:6px; border:1px solid var(--line); background:#0f1730; color:var(--text); font:inherit; font-size:12px }
+    .toolbar { flex:0 0 auto; display:flex; gap:10px; align-items:center; padding:10px 24px; border-bottom:1px solid var(--line); flex-wrap:wrap }
+    .toolbar label { font-size:11px; color:var(--muted); display:flex; gap:5px; align-items:center }
+    #pathInput { min-width:320px; flex:1 }
+    main { flex:1; min-height:0; overflow:auto; padding:14px 24px 24px }
+    #meta { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px; font-size:12px }
+    .stat { background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:3px 12px }
+    .stat b { color:var(--text) } .stat.open b { color:var(--accent) }
+    .stat.blocked b { color:var(--red) } .stat.progress b { color:var(--amber) } .stat.done b { color:var(--green) }
+    .chip { display:inline-block; border-radius:999px; padding:1px 8px; border:1px solid var(--line); font-size:10px; color:var(--muted) }
+    .chip.p-P0 { color:var(--red); border-color:var(--red) } .chip.p-P1 { color:var(--amber); border-color:var(--amber) }
+    .chip.s-DONE { color:var(--green); border-color:var(--green) }
+    .chip.s-BLOCKED { color:var(--red); border-color:var(--red) }
+    .chip.s-IN_PROGRESS { color:var(--amber); border-color:var(--amber) }
+    .chip.s-READY, .chip.s-NEEDS_REVIEW { color:var(--accent); border-color:var(--accent) }
+    .chip.link { color:var(--accent); border-color:var(--accent); text-decoration:none }
+    .item { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-bottom:8px }
+    .item .it-title { font-weight:600; word-break:break-word; margin-bottom:4px }
+    .item .it-desc { color:var(--muted); font-size:12px; white-space:pre-wrap; word-break:break-word; margin-bottom:6px }
+    .item .it-meta { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:6px }
+    .item .it-actions { display:flex; gap:6px; flex-wrap:wrap }
+    .it-ac { color:var(--muted); font-size:11px; margin:4px 0 6px; padding-left:16px }
+    .it-blocked { color:var(--red); font-size:11px; margin-bottom:6px }
+    .it-error { color:var(--red); font-size:11px; margin-top:6px; min-height:12px }
+    #addPanel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-bottom:14px }
+    #addPanel[hidden] { display:none }
+    #addPanel .row { display:flex; gap:10px; flex-wrap:wrap; margin-top:8px; align-items:flex-end }
+    #addPanel label { font-size:11px; color:var(--muted); display:flex; flex-direction:column; gap:3px }
+    #addPanel textarea { min-width:320px; min-height:52px; flex:1 }
+    #err { color:var(--red); font-size:12px; min-height:15px; margin-bottom:8px }
+    #empty { color:var(--muted); font-size:12px; padding:24px 4px; text-align:center }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>&#128203; Project Backlog</h1>
+      <div class="muted">K&#7871; ho&#7841;ch theo D&#7920; &#193;N (file trong repo) &#8212; kh&#225;c v&#7899;i Task Queue l&#224; th&#7921;c thi runtime</div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span id="proj" class="muted"></span>
+      <a class="back" href="/dashboard/tasks">&#128451; Global Tasks</a>
+      <a class="back" href="/dashboard/sessions">&#8592; Sessions</a>
+    </div>
+  </header>
+  <div class="toolbar">
+    <input type="text" id="pathInput" placeholder="&#272;&#432;&#7901;ng d&#7851;n b&#7845;t k&#7923; trong project (vd /home/dell/workspace/terminal-mcp)">
+    <button class="icon-btn" id="loadBtn">Load</button>
+    <label>Status
+      <select id="fStatus"><option value="">t&#7845;t c&#7843;</option><option>BACKLOG</option><option>READY</option><option>IN_PROGRESS</option><option>BLOCKED</option><option>NEEDS_REVIEW</option><option>DONE</option><option>CANCELLED</option></select>
+    </label>
+    <label>Priority
+      <select id="fPriority"><option value="">t&#7845;t c&#7843;</option><option>P0</option><option>P1</option><option>P2</option><option>P3</option></select>
+    </label>
+    <label><input type="checkbox" id="fOpenOnly"> ch&#7881; c&#242;n m&#7903;</label>
+    <button class="icon-btn" id="newBtn">+ Th&#234;m task</button>
+  </div>
+  <main>
+    <div id="err"></div>
+    <div id="addPanel" hidden>
+      <b>Th&#234;m backlog item</b>
+      <div class="row">
+        <label style="flex:1">Title<input type="text" id="ntTitle" placeholder="Vi&#7879;c c&#7847;n l&#224;m"></label>
+        <label>Priority<select id="ntPriority"><option>P0</option><option>P1</option><option selected>P2</option><option>P3</option></select></label>
+        <label>Type<select id="ntType"><option>feature</option><option>bug</option><option>chore</option><option>incident</option><option>research</option><option>docs</option><option>test</option></select></label>
+      </div>
+      <div class="row">
+        <label style="flex:1">Description<textarea id="ntDesc"></textarea></label>
+        <label style="flex:1">Acceptance criteria (m&#7895;i d&#242;ng 1 &#253;)<textarea id="ntAc"></textarea></label>
+      </div>
+      <div class="row"><button class="icon-btn" id="ntSave">L&#432;u</button><button class="icon-btn" id="ntCancel">H&#7911;y</button></div>
+    </div>
+    <div id="meta"></div>
+    <div id="list"></div>
+    <div id="empty" hidden>Ch&#432;a c&#243; backlog item n&#224;o cho project n&#224;y.</div>
+  </main>
+<script>
+(function () {
+  "use strict";
+  var listEl = document.getElementById('list'), metaEl = document.getElementById('meta');
+  var errEl = document.getElementById('err'), emptyEl = document.getElementById('empty');
+  var pathEl = document.getElementById('pathInput'), projEl = document.getElementById('proj');
+  var addPanel = document.getElementById('addPanel');
+  var state = { revision: null, path: '' };
+
+  var STORE_KEY = 'terminal-mcp.backlog.path';
+  try { pathEl.value = localStorage.getItem(STORE_KEY) || ''; } catch (e) {}
+
+  function clean(v) { return (v === null || v === undefined) ? '' : String(v); }
+  function setErr(m) { errEl.textContent = clean(m); }
+
+  function chip(text, cls) {
+    var el = document.createElement('span');
+    el.className = 'chip' + (cls ? ' ' + cls : '');
+    el.textContent = clean(text);           // never innerHTML: backlog text is agent-written
+    return el;
+  }
+
+  async function api(url, options) {
+    var response = await fetch(url, Object.assign({cache: 'no-store'}, options || {}));
+    var body = null;
+    try { body = await response.json(); } catch (e) { body = null; }
+    if (!response.ok || (body && body.error)) {
+      var detail = body && (body.detail || body.error) || ('HTTP ' + response.status);
+      throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+    }
+    return body;
+  }
+
+  function stat(label, value, cls) {
+    var el = document.createElement('span');
+    el.className = 'stat' + (cls ? ' ' + cls : '');
+    el.append(document.createTextNode(label + ' '));
+    var b = document.createElement('b'); b.textContent = String(value); el.append(b);
+    return el;
+  }
+
+  function renderMeta(data) {
+    metaEl.replaceChildren();
+    var counts = data.counts || {};
+    metaEl.append(stat('open', data.open_total || 0, 'open'));
+    metaEl.append(stat('in progress', counts.IN_PROGRESS || 0, 'progress'));
+    metaEl.append(stat('blocked', counts.BLOCKED || 0, 'blocked'));
+    metaEl.append(stat('done', counts.DONE || 0, 'done'));
+    metaEl.append(stat('total', data.total || 0));
+    metaEl.append(chip('rev ' + clean(data.revision)));
+    if (!data.exists) metaEl.append(chip('chưa có file'));
+    var file = chip(clean(data.backlog_file)); file.title = clean(data.backlog_file); metaEl.append(file);
+    if (data.repairs && data.repairs.length) {
+      var r = chip('repairs: ' + data.repairs.length); r.title = data.repairs.join('\n'); metaEl.append(r);
+    }
+    projEl.textContent = data.project ? clean(data.project.project_id) : '';
+    projEl.title = data.project ? clean(data.project.repo_root) : '';
+  }
+
+  function actionBtn(label, handler) {
+    var b = document.createElement('button'); b.className = 'icon-btn'; b.textContent = label;
+    b.onclick = handler; return b;
+  }
+
+  function renderItem(item) {
+    var card = document.createElement('div'); card.className = 'item';
+    var title = document.createElement('div'); title.className = 'it-title';
+    title.textContent = clean(item.title);
+    card.append(title);
+    if (item.description) {
+      var d = document.createElement('div'); d.className = 'it-desc'; d.textContent = clean(item.description);
+      card.append(d);
+    }
+    var meta = document.createElement('div'); meta.className = 'it-meta';
+    meta.append(chip(item.status, 's-' + clean(item.status)));
+    meta.append(chip(item.priority, 'p-' + clean(item.priority)));
+    meta.append(chip(item.type));
+    meta.append(chip('#' + clean(item.id).slice(4, 12)));
+    if (item.session) meta.append(chip('session ' + clean(item.session)));
+    if (item.queue_task_id) {
+      var q = document.createElement('a');
+      q.className = 'chip link'; q.href = '/dashboard/tasks';
+      q.textContent = 'queue ' + clean(item.queue_task_id).slice(0, 8);
+      q.title = 'Dispatched -> queue task ' + clean(item.queue_task_id);
+      meta.append(q);
+    }
+    (item.tags || []).forEach(function (t) { meta.append(chip('#' + clean(t))); });
+    card.append(meta);
+    if (item.blocked_reason) {
+      var b = document.createElement('div'); b.className = 'it-blocked';
+      b.textContent = 'BLOCKED: ' + clean(item.blocked_reason); card.append(b);
+    }
+    if (item.acceptance_criteria && item.acceptance_criteria.length) {
+      var ul = document.createElement('ul'); ul.className = 'it-ac';
+      item.acceptance_criteria.forEach(function (c) {
+        var li = document.createElement('li'); li.textContent = clean(c); ul.append(li);
+      });
+      card.append(ul);
+    }
+    var itemErr = document.createElement('div'); itemErr.className = 'it-error';
+    var actions = document.createElement('div'); actions.className = 'it-actions';
+
+    function run(promiseFactory) {
+      itemErr.textContent = '';
+      promiseFactory().then(load).catch(function (e) { itemErr.textContent = clean(e.message || e); });
+    }
+    ['BACKLOG', 'READY', 'NEEDS_REVIEW'].forEach(function (target) {
+      if (item.status === target || item.status === 'DONE') return;
+      actions.append(actionBtn('&#8594; ' + target, function () {
+        run(function () {
+          return api('/dashboard/api/backlog/update', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({path: state.path, task_id: item.id,
+                                  patch: {status: target}, expected_revision: state.revision})});
+        });
+      }));
+    });
+    if (!item.queue_task_id && item.status !== 'DONE') {
+      actions.append(actionBtn('Dispatch', function () {
+        var session = window.prompt('Dispatch tới session nào? (bỏ trống = chưa gán)', item.session || '');
+        if (session === null) return;
+        run(function () {
+          return api('/dashboard/api/backlog/dispatch', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({path: state.path, task_id: item.id,
+                                  session: session || null, expected_revision: state.revision})});
+        });
+      }));
+    }
+    if (item.status !== 'DONE') {
+      actions.append(actionBtn('Complete', function () {
+        var commit = window.prompt('Evidence: commit SHA / test result (bắt buộc — DONE cần bằng chứng)', '');
+        if (commit === null) return;
+        run(function () {
+          return api('/dashboard/api/backlog/complete', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({path: state.path, task_id: item.id,
+                                  commit: commit || null, expected_revision: state.revision})});
+        });
+      }));
+    }
+    card.append(actions); card.append(itemErr);
+    return card;
+  }
+
+  async function load() {
+    setErr('');
+    var path = pathEl.value.trim();
+    state.path = path;
+    try { localStorage.setItem(STORE_KEY, path); } catch (e) {}
+    var params = new URLSearchParams();
+    if (path) params.set('path', path);
+    var st = document.getElementById('fStatus').value;
+    var pr = document.getElementById('fPriority').value;
+    if (st) params.set('status', st);
+    if (pr) params.set('priority', pr);
+    if (document.getElementById('fOpenOnly').checked) params.set('include_terminal', '0');
+    try {
+      var data = await api('/dashboard/api/backlog?' + params.toString());
+      state.revision = data.revision;
+      renderMeta(data);
+      listEl.replaceChildren();
+      (data.items || []).forEach(function (item) { listEl.append(renderItem(item)); });
+      emptyEl.hidden = (data.items || []).length > 0;
+    } catch (e) {
+      listEl.replaceChildren(); metaEl.replaceChildren(); emptyEl.hidden = true;
+      setErr(e.message || e);
+    }
+  }
+
+  document.getElementById('loadBtn').onclick = load;
+  document.getElementById('fStatus').onchange = load;
+  document.getElementById('fPriority').onchange = load;
+  document.getElementById('fOpenOnly').onchange = load;
+  pathEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') load(); });
+  document.getElementById('newBtn').onclick = function () { addPanel.hidden = !addPanel.hidden; };
+  document.getElementById('ntCancel').onclick = function () { addPanel.hidden = true; };
+  document.getElementById('ntSave').onclick = async function () {
+    setErr('');
+    var title = document.getElementById('ntTitle').value.trim();
+    if (!title) { setErr('Title không được trống'); return; }
+    var ac = document.getElementById('ntAc').value.split('\n').map(function (x) { return x.trim(); }).filter(Boolean);
+    try {
+      await api('/dashboard/api/backlog/add', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({path: state.path || pathEl.value.trim(), expected_revision: state.revision,
+          tasks: [{title: title, description: document.getElementById('ntDesc').value,
+                   priority: document.getElementById('ntPriority').value,
+                   type: document.getElementById('ntType').value, acceptance_criteria: ac}]})});
+      document.getElementById('ntTitle').value = ''; document.getElementById('ntDesc').value = '';
+      document.getElementById('ntAc').value = ''; addPanel.hidden = true;
+      await load();
+    } catch (e) { setErr(e.message || e); }
+  };
+
+  if (pathEl.value.trim()) load();
+})();
+</script>
+</body>
+</html>
+"""
+
+
 WEBTERM_HTML = """<!doctype html>
 <html lang="vi">
 <head>
@@ -6229,6 +6539,22 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return blocked
         return HTMLResponse(
             GLOBAL_TASKS_HTML,
+            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
+        )
+
+    @server.custom_route("/dashboard/backlog", methods=["GET"], include_in_schema=False)
+    async def dashboard_backlog(request: Request) -> HTMLResponse | JSONResponse:
+        # Same _read_guard as /dashboard/tasks and /dashboard/nodes: a VIEW
+        # over the existing /dashboard/api/backlog routes, not a new
+        # privilege surface. Every write the page performs goes back
+        # through those routes, which are themselves _mutation_guard'ed
+        # AND path-gated by BacklogService -- the page cannot reach a
+        # project the API would refuse.
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(
+            BACKLOG_HTML,
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
