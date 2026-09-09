@@ -154,3 +154,20 @@ New pieces: **EVENT BUS**, **PORTFOLIO SCHEDULER**, **capability routing**,
 | **Project-level MCP APIs** | **BUILD on backlog tools** | 11 backlog tools exist; project verbs missing |
 
 Only **five** genuinely new components — and three of them are thin.
+
+## Implementation status (2026-09-09)
+
+**P0.1 Project Dimension — DONE.** `queue_tasks.project_id` added by
+migration v6 (nullable), `queue_lanes.project` (added v4, never populated)
+**reused** rather than duplicated, and `backlog_projects` reused as the
+project registry — no third store. Legacy rows stay `NULL` and behave
+exactly as before.
+
+**P0.2 Event Bus — DONE.** New `events.db` (`event_bus.py`) with
+publish/list/claim/ack/release/fail/retry/stats, `BEGIN IMMEDIATE` claim,
+claim-token leases, unique idempotency keys and an attempt budget. The
+three existing per-store logs are untouched.
+
+**Deliberately NOT done in P0:** no consumer loop is started, no
+autonomous coordinator, no portfolio scheduling. The bus is a durable
+mailbox that something must explicitly ask to read.
