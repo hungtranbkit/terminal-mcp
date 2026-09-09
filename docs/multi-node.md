@@ -996,6 +996,108 @@ state and linger were confirmed by inspection instead.
   detected with real MAC, both `22`/`8790` open, `os_guess=linux`,
   `status=already_connected`.
 
+## Reaching a node over the internet (audit 2026-09-09)
+
+**Read this before assuming any node works off-LAN.** The data plane is
+`controller -> node`, not the reverse: `RemoteNodeClient` (node_client.py)
+dials the node's registered `endpoint` for EVERY operation (list/status/
+tail/send/create/kill/...). Only the *heartbeat* travels node -> controller.
+So a node behind NAT/CGNAT with no inbound reachability is **visible but
+uncontrollable** — its heartbeat lands, its dashboard row goes ONLINE, and
+every actual operation against it fails. Do not read a green node row as
+proof the node is usable.
+
+Three consequences that were each verified live during this audit:
+
+1. **The Cloudflare Access tunnel does not carry node traffic.** The
+   `cloudflared-terminal-mcp-dashboard` ingress only maps `^/dashboard(...)$`
+   and `^/(login|logout|app)(...)$` to the controller, and Cloudflare Access
+   fronts it — an unauthenticated POST to the heartbeat path over that
+   hostname returns `302` to the Access login page (`auth_status: NONE`,
+   `service_token_status: false`), never `401` from this application. A
+   node agent sends no Access service-token headers, so it cannot heartbeat
+   through that hostname. That tunnel is ChatGPT/browser -> controller only,
+   exactly like the separate OpenAI Secure MCP Tunnel
+   (`terminal-mcp-tunnel.service`, loopback `8767`). Neither is a node
+   transport.
+2. **`cloudflare_ssh` is a bootstrap transport, not a data plane.** The
+   "Connect Node -> SSH via Cloudflare Tunnel" flow installs the agent over
+   an Access-gated SSH session, then registers a plain
+   `http://{bind_host}:{agent_port}` endpoint (dashboard.py). The ongoing
+   control channel is that direct address — it does not ride the tunnel.
+   The section below ("If M910 needs to be reachable from outside the LAN")
+   describes step 1 only.
+3. **Overlay VPN is the only zero-inbound-port path that works today**, and
+   until this audit it was blocked in three places at once — see next.
+
+### Trusted overlay ranges (`TERMINAL_MCP_TRUSTED_VPN_CIDRS`)
+
+Tailscale is already installed and running on this controller host, and an
+overlay VPN is the one option that needs **no port-forward on the node**:
+both sides dial out to the coordination service, and the controller then
+reaches the node on its stable overlay address.
+
+The blocker (found and fixed 2026-09-09): a Tailscale address is in
+**100.64.0.0/10 (CGNAT), which Python's `ipaddress` does NOT classify as
+private** — verified live, `IPv4Address("100.81.85.120").is_private` is
+`False`. `lan_discovery.is_lan_scannable()` therefore rejected it, and that
+one predicate gated all three node-connectivity paths independently:
+
+| Gate | Effect before the fix |
+| --- | --- |
+| `network_bind.resolve_lan_bind` | controller refuses to bind its own Tailscale IP, so no node can reach it over the overlay |
+| `network_bind.resolve_allowed_cidrs` | `LanCidrGuardMiddleware` allowlist refuses a `100.64.0.0/10` entry |
+| `remote_connect.validate_hostname_or_ip` | dashboard "Connect Node" refuses a Tailscale-addressed node as an SSRF target |
+
+`is_lan_scannable()` is deliberately **unchanged** — it also governs active
+subnet scanning, and a `/10` shared with every other tailnet is precisely
+what this project must never port-sweep. Instead the three gates above now
+call `lan_discovery.is_trusted_node_address()`, which is
+`is_lan_scannable() OR inside an operator-declared range`.
+
+Declared via one env var on the **controller** service, empty by default
+(unset == today's exact behaviour, no range is trusted implicitly):
+
+```ini
+# ~/.config/systemd/user/terminal-mcp-http.service.d/override.conf
+[Service]
+Environment=TERMINAL_MCP_TRUSTED_VPN_CIDRS=100.64.0.0/10
+Environment=TERMINAL_MCP_LAN_BIND=100.x.y.z          # this host's own tailnet IP
+Environment=TERMINAL_MCP_ALLOWED_NODE_CIDRS=100.64.0.0/10
+```
+
+Guard rails, all covered by `tests/test_trusted_vpn_cidrs.py`:
+
+- A **globally-routable** entry is refused outright (`8.8.8.0/24`,
+  `0.0.0.0/0`) — the override may widen the gate to an overlay, never to
+  the internet. Loopback/multicast/reserved are refused too.
+- A malformed entry **raises rather than being skipped**: silently dropping
+  one entry would leave an operator believing a range is trusted while the
+  real gate stayed closed.
+- When the bind address is an overlay address, the allowlist auto-derives
+  the **declared range**, not the bind address's conventional `/24` —
+  tailnet peers are scattered across the whole `/10`, so the `/24` fallback
+  would be far too narrow.
+- Loopback is still always bound; the LAN/overlay socket is an addition.
+
+Live acceptance evidence (2026-09-09, disposable port, no production
+state touched) using the real `network_bind` + `LanCidrGuardMiddleware`:
+
+```
+[gate] resolve_lan_bind -> 100.81.85.120
+[gate] resolve_allowed_cidrs -> ['100.64.0.0/10']
+[bind] listening on [('127.0.0.1', 18799), ('100.81.85.120', 18799)]
+[OVERLAY-PEER ] src=100.81.85.120 -> HTTP 200 {"ok":true,"seen_from":"100.81.85.120"}
+[OFF-ALLOWLIST] src=192.168.1.132 -> HTTP 403 Forbidden: source address not in the allowed LAN range
+```
+
+**Still required before an off-LAN node is production-ready** (not done by
+this change): the node itself must join the tailnet, its `endpoint` must be
+its overlay address, and the controller service must actually be restarted
+with the env above — none of which this audit performed against the live
+deployment. `TERMINAL_MCP_TRUSTED_VPN_CIDRS` only removes the code-level
+refusal; it does not configure the overlay for you.
+
 ### If M910 needs to be reachable from outside the LAN
 
 Not done in this pass -- M910 is only ever reached over the LAN today

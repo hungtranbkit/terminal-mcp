@@ -3808,6 +3808,53 @@ are real and green. No code changed for this audit; it is a documentation
 pass over already-real evidence plus one new disclosed scope decision
 (m910 smoke test deliberately deferred, not silently dropped).
 
+#### Internet-connectivity audit (2026-09-09) — what is actually true today
+
+Full audit of "can a PC on another internet connection become a node
+today". Answer: **no, not without an overlay VPN**, and until this pass
+even the overlay path was refused by the code. Nothing in the roadmap
+above was found to be overstated — Phase 2 really is unimplemented — but
+three specifics were being read too optimistically in practice and are
+now written down in `docs/multi-node.md`'s own "Reaching a node over the
+internet" section:
+
+- **The data plane is `controller -> node`, inbound to the node.** Only
+  the heartbeat is outbound. A NAT'd node is therefore *visible but
+  uncontrollable*: heartbeat lands, dashboard row goes ONLINE, every real
+  operation fails. A green node row is not evidence the node is usable.
+- **Neither existing tunnel carries node traffic.** The Cloudflare Access
+  dashboard tunnel is browser/ChatGPT -> controller (verified live: an
+  unauthenticated heartbeat POST over it returns `302` to the Access
+  login page, `auth_status: NONE`, never this app's own `401`), and the
+  OpenAI Secure MCP Tunnel is loopback `8767`. `cloudflare_ssh` is a
+  *bootstrap* transport — it installs the agent, then registers a plain
+  `http://{bind_host}:{port}` endpoint that does not ride the tunnel.
+- **Overlay VPN was blocked in three independent places.** Tailscale
+  addresses are CGNAT `100.64.0.0/10`, which Python's `ipaddress` does
+  not treat as private (verified live), so `is_lan_scannable()` refused
+  them in `resolve_lan_bind`, `resolve_allowed_cidrs`, and
+  `remote_connect.validate_hostname_or_ip` at once. Fixed this pass by
+  the opt-in `TERMINAL_MCP_TRUSTED_VPN_CIDRS` + `is_trusted_node_address()`
+  (default empty == unchanged behaviour; globally-routable entries
+  refused; `is_lan_scannable()` itself deliberately untouched because it
+  also gates active subnet scanning). Live-verified end-to-end against
+  the real bind + CIDR-guard path on a disposable port.
+
+Live fleet state at audit time: `local`, `dell-5530` (Windows) and `m910`
+(Linux) all ONLINE with fresh heartbeats and agent `0.12.0`; `macbook`
+correctly derived OFFLINE (~100 min stale). All four endpoints are
+plaintext `http://192.168.1.x:8790` — LAN only.
+
+Gaps deliberately NOT closed this pass (no acceptance evidence available
+without changing production): no node self-registration (an unknown
+`node_id` heartbeat is refused `NODE_NOT_FOUND`, so onboarding still
+requires a controller-side operator action *and* controller -> node
+reachability at onboarding time); no token rotation/revocation; no
+rate-limit or lockout on node-agent bearer auth; no replay protection
+(no nonce/timestamp) on heartbeats; `endpoint` scheme is unvalidated, so
+a plaintext `http://` endpoint to a public host would leak the bearer
+token; audit rows are written per-node, not centrally.
+
 ### Phase 1 — Controller decoupling
 
 Separate the Controller/Dashboard/Queue/Coordinator/Registry roles from
