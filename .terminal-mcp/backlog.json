@@ -1555,7 +1555,7 @@
       "type": "chore",
       "order": 34,
       "created_at": "2026-09-09T15:47:37.060915+00:00",
-      "updated_at": "2026-09-09T15:49:34.626537+00:00",
+      "updated_at": "2026-09-09T15:51:32.410035+00:00",
       "source": "operator-request",
       "dependencies": [],
       "acceptance_criteria": [
@@ -1577,7 +1577,7 @@
       "evidence": {
         "commits": [],
         "tests": [
-          "243 passed across the production-data-reading suites after both purges"
+          "201-243 passed across the production-data-reading suites after each pass"
         ],
         "deploys": [
           "data-only change to ~/.local/state/terminal-mcp/queue.db; no code, no restart"
@@ -1587,7 +1587,8 @@
           "clear_tasks() only CANCELS, so a hard purge needed raw SQL -- done in ONE BEGIN IMMEDIATE transaction across events, tasks and lanes.",
           "Deleted: 37 tasks, 242 events, 4 lanes. Verified: every kept task row byte-identical, 0 orphan events referencing a deleted task, integrity ok, 33 lanes retained.",
           "Also removed claude-qtest-shell-1 (1 event, 1 lane, 0 tasks) -- same test family; leaving one orphan qtest lane would have defeated the cleanup.",
-          "Second pass (same session, explicitly requested): p0-4-lease-smoke also purged -- 1 task, 5 events, 1 lane. The production queue now holds 0 tasks and 0 events; 32 lane rows remain, all empty. Schema and user_version=7 intact, integrity ok."
+          "Second pass (same session, explicitly requested): p0-4-lease-smoke also purged -- 1 task, 5 events, 1 lane. The production queue now holds 0 tasks and 0 events; 32 lane rows remain, all empty. Schema and user_version=7 intact, integrity ok.",
+          "Third pass: 10 empty test/scratch LANE rows removed (codex-mcp-smoke-*, codex-cli-policy-*, codex-mcp-policy-*, claude-cli-policy-*, claude-mcp-policy-*, codex-policy-smoke-*). Classified against the live fleet first -- every lane belonging to a live local tmux session or a live remote session was KEPT. 22 lanes remain. DELIBERATELY NOT DELETED: window/window2 (named as protected production sessions in this codebase's own safety notes) and win4 (cannot be verified while dell-5530 is unreachable). Queue totals now: 0 tasks, 0 events, 22 lanes."
         ]
       },
       "history": [
@@ -1607,6 +1608,12 @@
           "event": "updated",
           "by": "mcp",
           "note": "p0-4-lease-smoke purged as well; queue fully clear of test rows"
+        },
+        {
+          "at": "2026-09-09T15:51:32.410035+00:00",
+          "event": "updated",
+          "by": "mcp",
+          "note": "10 empty test lanes purged; 3 ambiguous lanes deliberately kept"
         }
       ]
     }
