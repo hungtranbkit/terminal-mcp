@@ -1492,12 +1492,12 @@
       "id": "blg_backfill_project_ids",
       "title": "Backfill project_id on the 37 unscoped production queue tasks",
       "description": "P0.1 added queue_tasks.project_id as nullable and nothing backfilled it, so terminal_project_status reports 0 lanes / 0 tasks for the real terminal-mcp project while its backlog shows 26 open. P0.1 shipped backfill_project_ids(resolver, dry_run=True) for exactly this. DRY RUN on 2026-09-09: 37 candidates, 37 would resolve to git:github.com/hungtranbkit/terminal-mcp, 0 unresolved. It only ever fills rows where project_id IS NULL, so it cannot re-home a task that already has one. Needs an explicit decision to write to production.",
-      "status": "BACKLOG",
+      "status": "DONE",
       "priority": "P2",
       "type": "chore",
       "order": 33,
       "created_at": "2026-09-09T14:47:20.368461+00:00",
-      "updated_at": "2026-09-09T14:47:20.368461+00:00",
+      "updated_at": "2026-09-09T15:33:40.518293+00:00",
       "source": "p0.7-live-smoke",
       "dependencies": [],
       "acceptance_criteria": [
@@ -1518,10 +1518,18 @@
       "blocked_reason": null,
       "evidence": {
         "commits": [],
-        "tests": [],
-        "deploys": [],
+        "tests": [
+          "184 passed across the production-data-reading suites after the write (test_project_dimension, test_verify_queue, test_project_service, test_project_mcp_tools, test_queue_store)"
+        ],
+        "deploys": [
+          "data-only change to ~/.local/state/terminal-mcp/queue.db; no code, no restart"
+        ],
         "notes": [
-          "Dry run measured 2026-09-09: 37/37 resolvable, 0 unresolved."
+          "37/37 scoped to git:github.com/hungtranbkit/terminal-mcp, 0 unresolved.",
+          "Live-safe backup taken first via sqlite3 .backup API (the sqlite3 CLI is NOT installed on this host -- a shell `.backup` silently produced an empty file, caught before relying on it).",
+          "Verified row-by-row, not from a summary: all 38 rows present, project_id changed on exactly 37, every change NULL -> value, NO other field (session/status/attempt_count/title/prompt) changed, and the pre-existing p0-4-smoke scope untouched. integrity ok.",
+          "Resolution was well-founded, not a path guess: claude-qtest-1/2/3 ran in three separate scratch CLONES (/home/dell/workspace/qtest-scratch-N) that normalise onto one canonical id via source=git_remote -- the many-checkouts-one-project case P0.1 exists for.",
+          "Honest scope note: all 37 are queue-development leftovers (21 CANCELLED, 15 COMPLETED, 1 BLOCKED). terminal_project_status now reports real history and throughput (15 completed over 30 days) but only 1 open task -- a simulated test blocker, not live work."
         ]
       },
       "history": [
@@ -1529,6 +1537,12 @@
           "at": "2026-09-09T14:47:20.368461+00:00",
           "event": "created",
           "by": "p0.7-live-smoke"
+        },
+        {
+          "at": "2026-09-09T15:33:40.518293+00:00",
+          "event": "completed",
+          "by": "mcp",
+          "note": "backfill applied to production and verified row-by-row"
         }
       ]
     }
