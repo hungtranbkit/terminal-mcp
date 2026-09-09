@@ -39,14 +39,14 @@ Two facts that reframe everything below:
 
 | # | Capability | Status | Evidence (file · table · test) | Real behaviour & limits |
 |---|---|---|---|---|
-| 1 | Project registry | **PARTIAL** | `project_identity.py`, `backlog_db.backlog_projects`, `controller.discover_projects()`, `tests/test_backlog.py` | Canonical `project_id` from normalised git remote; 7 checkouts of terminal-mcp across 3 nodes collapse to one id. Fleet discovery works (6 projects live). But only 1 project has state, and `queue_lanes.project` is unused (`None` everywhere) — the queue does not know about projects. |
+| 1 | Project registry | **PARTIAL → improved (P0.1)** | `project_identity.py`, `backlog_db.backlog_projects`, `controller.discover_projects()`, `tests/test_backlog.py` | Canonical `project_id` from normalised git remote; 7 checkouts of terminal-mcp across 3 nodes collapse to one id. Fleet discovery works (6 projects live). But only 1 project has state, and `queue_lanes.project` is unused (`None` everywhere) — the queue does not know about projects. |
 | 2 | Persistent project knowledge | **PARTIAL** | `session_knowledge.py` (3462 sessions), `_project_matches` | Rich and durable, but **session-scoped**. Project filtering is a **fuzzy substring word-match** over `cwd/repo_root/display_name` — not the canonical `project_id`. No project-level state object. |
 | 3 | Task registry / runtime state | **EXISTS** | `queue_store.queue_tasks` (37), `VALID_TRANSITIONS`, `tests/test_queue_store.py` | Full explicit state machine (QUEUED→PRECHECK→READY→DISPATCHING→RUNNING→VERIFYING→COMPLETED + BLOCKED/FAILED/PAUSED/WAITING_SESSION/DISPATCH_UNCERTAIN). Invalid transitions raise. Production-verified. |
 | 4 | Atomic claim + lease | **EXISTS** | `queue_store.claim_next_task` (BEGIN IMMEDIATE + `claim_token` + `lease_expires_at`), `lease.PaneLeaseStore` (`acquire/renew/release/holder/prune_expired`), `integration_store.claim_next_handoff` | Genuine TOCTOU-closing atomic claim. Pane lease is cross-process, TTL-based, crash-recoverable. **Handoff** is the only claim path with an explicit `handoff` concept; task-level handoff between workers is not modelled. |
 | 5 | Worker capability registry | **PARTIAL** | `nodes.db`: `platform`, `session_backend`, `shell_capabilities`, `wsl_available`, `agent_types`, `labels` | Real per-node capability: dell-5530 = `windows`/`windows_pty`/`["powershell","cmd"]`/wsl=1/`["shell","claude","codex"]`. **Missing the tool/runtime axis** the target needs — nothing expresses "has Playwright", "can build WPF", "has WebView2". `labels` exists but is empty everywhere. |
 | 6 | Availability / heartbeat / quota | **PARTIAL** | `node_registry.classify_capacity`, heartbeat 20s, `capacity_status` | Heartbeat + EWMA-smoothed, duration-aware overload heuristic (healthy/busy/overloaded) is real and live. **`max_sessions` is stored but never enforced** — no admission control anywhere. |
 | 7 | Shared-file / resource ownership lock | **PARTIAL** | `lease.py` (pane), `git_worktree.py` + `git_isolation_service.py`, coordinator's `expected_cwd` check | Per-task **git worktree + branch isolation** is real and wired into task creation (`terminal_task_create_isolated`), enforced at dispatch by the existing coordinator check. **No generic named-resource lock** (e.g. "own this file/module"). |
-| 8 | Event bus | **PARTIAL** | `queue_events` (241), `integration_events` (0), `supervisor_events` (60) | Three **separate append-only per-store logs**, not a bus: no subscribe, no cross-store ordering, no fan-out. Real types include `ENQUEUED/CLAIMED/DISPATCHED/STARTED/VERIFYING/VERIFIED/COORDINATOR_*/LANE_PAUSED`. **Absent from the target list:** `WORKER_IDLE`, `PREVIEW_FAILED`, `USER_FEEDBACK`, `MERGE_CONFLICT` (integration has its own equivalents but unused). |
+| 8 | Event bus | **PARTIAL → EXISTS (P0.2)** | `queue_events` (241), `integration_events` (0), `supervisor_events` (60) | Three **separate append-only per-store logs**, not a bus: no subscribe, no cross-store ordering, no fan-out. Real types include `ENQUEUED/CLAIMED/DISPATCHED/STARTED/VERIFYING/VERIFIED/COORDINATOR_*/LANE_PAUSED`. **Absent from the target list:** `WORKER_IDLE`, `PREVIEW_FAILED`, `USER_FEEDBACK`, `MERGE_CONFLICT` (integration has its own equivalents but unused). |
 | 9 | Verify queue by capability | **PARTIAL** | `VERIFYING`/`VERIFIED` states (15 real), `queue_engine` verification, `verification_nonce`/`verification_evidence` columns | Verification is a **state of the same task in the same session**, not a queue a separate verifier claims. No capability routing. |
 | 10 | Merge / integration queue | **BUILT, UNUSED** | `integration_store.py` (pipelines/handoffs/batches/events), `claim_next_handoff(project, lease_seconds)`, `integration_engine.tick(project)`, 68 tests | A genuine **project-scoped, leased, claimable merge queue with its own state machine and conflict-rework routing** already exists — and has **0 production rows**. This is the single biggest piece of already-built leverage. |
 | 11 | Preview-fast queue | **MISSING** | — | No preview concept anywhere in source or DB. |
@@ -69,7 +69,14 @@ Two facts that reframe everything below:
 - PARTIAL (13): 1, 2, 5, 6, 7, 8, 9, 12, 14, 15, 16, 17, 20
 - MISSING (2): 11, 13
 
-**≈ 11.25 / 20 ≈ 56 % of the target foundation already exists.**
+**≈ 11.25 / 20 ≈ 56 % at audit time (2026-09-09, pre-P0).**
+
+**After P0.1 + P0.2 (implemented 2026-09-09): ≈ 12.25 / 20 ≈ 61 %.**
+Item 8 (event bus) moved PARTIAL → EXISTS; item 1 (project registry) gained
+a real runtime dimension (`queue_tasks.project_id`, `queue_lanes.project`
+now populated-capable) on top of the existing `backlog_projects` registry.
+Items 9/11/13 are unchanged — P0 deliberately did not touch verification
+routing, preview, or portfolio scheduling.
 
 The weighting matters more than the number: the *hard, safety-critical* primitives
 (atomic claim, lease, state machine, fail-closed gate, idempotency, audit) are the

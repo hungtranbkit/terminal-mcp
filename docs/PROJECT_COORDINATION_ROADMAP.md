@@ -14,7 +14,7 @@ existing MCP tools working unchanged.
 
 ## P0 — remove coordination overhead now (highest value / lowest risk)
 
-### P0.1 Give the runtime a project dimension
+### P0.1 Give the runtime a project dimension — ✅ DONE (2026-09-09)
 - **Change:** populate `queue_lanes.project` and `queue_tasks.metadata.project_id`
   with the **canonical** `project_id`, resolved via `project_identity` /
   `controller.resolve_project_for_session(node, session)` — not the free-text
@@ -25,7 +25,7 @@ existing MCP tools working unchanged.
   stay `NULL` and are simply excluded from project views.
 - **Risk:** low. Additive; nothing reads `project` today.
 
-### P0.2 Event bus (new, small)
+### P0.2 Event bus (new, small) — ✅ DONE (2026-09-09)
 - **Change:** one `events` table — `(id, project_id, type, subject, payload,
   created_at, consumed_by, consumed_at)` — plus `publish()` / `claim_next(type[],
   consumer)` using the **same `BEGIN IMMEDIATE` + lease pattern** as
@@ -188,8 +188,31 @@ terminal_node_capabilities(node_id)          -> tool/runtime axis
 Existing and unchanged: all 11 `terminal_backlog_*`, `terminal_project_list`, the
 20 `terminal_queue_*`, 16 `terminal_task_*`, 13 `terminal_integration_*`.
 
-## Start here
+## Start here — DONE
 
-**P0.1 + P0.2** (project dimension + event bus). Everything else in P0 either
-needs them or becomes trivial once they exist, and neither changes any existing
-behaviour — they are additive.
+**P0.1 + P0.2 shipped 2026-09-09**, additive and backward-compatible:
+migration v6 verified against a copy of the real production `queue.db`
+(37 tasks / 241 events preserved, every legacy row `project_id IS NULL`),
+and the bus proven with two real OS processes claiming 30 events with zero
+duplicates and zero losses. Full suite 2276 passed.
+
+## Next: P0.3
+
+**P0.3 Worker capability registry (tool/runtime axis)** is the right next
+step, for three concrete reasons:
+
+1. It is the **last P0 prerequisite for routing.** P0.5 (verify queue) and
+   P2.1 (portfolio scheduler) both need to answer "which node can do this
+   kind of work"; today the fleet only knows platform/shell/agent_types.
+2. It is **low risk and additive** — one nullable column (or the already
+   empty `labels`), populated by probe the way `available_agent_types`
+   already probes launchers. Nothing routes on it until something asks.
+3. The fleet **already proves the need**: dell-5530 is Windows/ConPTY,
+   m910 and macbook are POSIX/tmux, and macbook has claude+codex while
+   m910 has claude only — but nothing expresses "can run Playwright" or
+   "can build WPF/WebView2", which is exactly the Linux-HTML vs
+   Windows-WPF split the target architecture routes on.
+
+P0.4 (task lease API) is a close second and is nearly free — the
+`claim_token`/`lease_expires_at` columns already exist and are stamped
+atomically; only the renew/release/handoff verbs are missing.
