@@ -49,6 +49,8 @@ async def test_server_registers_v1_and_binding_tools():
         "supervisor2_list_actions",
         "terminal_list_nodes",
         "terminal_node_status",
+        # P0.3: probed tool/runtime capability axis, used for routing.
+        "terminal_node_capabilities",
         "terminal_node_sessions",
         "terminal_registry_list",
         "terminal_registry_get",

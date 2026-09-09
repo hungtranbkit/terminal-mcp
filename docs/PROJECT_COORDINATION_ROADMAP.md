@@ -38,7 +38,7 @@ existing MCP tools working unchanged.
   append-only per-store logs with no subscribe and no cross-store ordering.
 - **Risk:** low-medium. New table, no change to existing writers.
 
-### P0.3 Worker capability registry (tool/runtime axis)
+### P0.3 Worker capability registry (tool/runtime axis) — ✅ DONE (2026-09-09)
 - **Change:** extend node heartbeat with a `capabilities` list — e.g.
   `playwright`, `dotnet`, `wpf`, `webview2`, `docker`, `node`, `python` — detected
   the way `agent_types` already is (`available_agent_types` probes real launchers).
@@ -196,10 +196,13 @@ migration v6 verified against a copy of the real production `queue.db`
 and the bus proven with two real OS processes claiming 30 events with zero
 duplicates and zero losses. Full suite 2276 passed.
 
-## Next: P0.3
+## Next: P0.4 (P0.3 shipped)
 
-**P0.3 Worker capability registry (tool/runtime axis)** is the right next
-step, for three concrete reasons:
+**P0.3 shipped 2026-09-09**: probed tool/runtime capabilities
+(git/node/npm/python/docker/dotnet/playwright/tmux/rustc/go/java) now ride
+the heartbeat, stored in a dedicated `nodes.capabilities` column and
+queryable with AND semantics via `terminal_node_capabilities`. It was
+built for these reasons, which still describe why it mattered:
 
 1. It is the **last P0 prerequisite for routing.** P0.5 (verify queue) and
    P2.1 (portfolio scheduler) both need to answer "which node can do this
@@ -213,6 +216,14 @@ step, for three concrete reasons:
    "can build WPF/WebView2", which is exactly the Linux-HTML vs
    Windows-WPF split the target architecture routes on.
 
-P0.4 (task lease API) is a close second and is nearly free — the
+**P0.4 (task lease API) is now next** and is nearly free: the
 `claim_token`/`lease_expires_at` columns already exist and are stamped
-atomically; only the renew/release/handoff verbs are missing.
+atomically by `claim_next_task`; only the renew/release/handoff verbs are
+missing. With P0.1-P0.3 in place it is the last primitive P0.5's verify
+queue needs before a verifier other than the worker can safely hold a
+task.
+
+**A deployment note P0.3 surfaced:** capabilities are reported by the
+NODE, so remote nodes only advertise them after their agent is redeployed.
+Until then they report an empty list and are correctly treated as
+"not known to be capable" rather than assumed capable.

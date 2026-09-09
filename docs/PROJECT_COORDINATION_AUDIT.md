@@ -43,7 +43,7 @@ Two facts that reframe everything below:
 | 2 | Persistent project knowledge | **PARTIAL** | `session_knowledge.py` (3462 sessions), `_project_matches` | Rich and durable, but **session-scoped**. Project filtering is a **fuzzy substring word-match** over `cwd/repo_root/display_name` — not the canonical `project_id`. No project-level state object. |
 | 3 | Task registry / runtime state | **EXISTS** | `queue_store.queue_tasks` (37), `VALID_TRANSITIONS`, `tests/test_queue_store.py` | Full explicit state machine (QUEUED→PRECHECK→READY→DISPATCHING→RUNNING→VERIFYING→COMPLETED + BLOCKED/FAILED/PAUSED/WAITING_SESSION/DISPATCH_UNCERTAIN). Invalid transitions raise. Production-verified. |
 | 4 | Atomic claim + lease | **EXISTS** | `queue_store.claim_next_task` (BEGIN IMMEDIATE + `claim_token` + `lease_expires_at`), `lease.PaneLeaseStore` (`acquire/renew/release/holder/prune_expired`), `integration_store.claim_next_handoff` | Genuine TOCTOU-closing atomic claim. Pane lease is cross-process, TTL-based, crash-recoverable. **Handoff** is the only claim path with an explicit `handoff` concept; task-level handoff between workers is not modelled. |
-| 5 | Worker capability registry | **PARTIAL** | `nodes.db`: `platform`, `session_backend`, `shell_capabilities`, `wsl_available`, `agent_types`, `labels` | Real per-node capability: dell-5530 = `windows`/`windows_pty`/`["powershell","cmd"]`/wsl=1/`["shell","claude","codex"]`. **Missing the tool/runtime axis** the target needs — nothing expresses "has Playwright", "can build WPF", "has WebView2". `labels` exists but is empty everywhere. |
+| 5 | Worker capability registry | **PARTIAL → EXISTS (P0.3)** | `nodes.db`: `platform`, `session_backend`, `shell_capabilities`, `wsl_available`, `agent_types`, `labels` | Real per-node capability: dell-5530 = `windows`/`windows_pty`/`["powershell","cmd"]`/wsl=1/`["shell","claude","codex"]`. **Missing the tool/runtime axis** the target needs — nothing expresses "has Playwright", "can build WPF", "has WebView2". `labels` exists but is empty everywhere. |
 | 6 | Availability / heartbeat / quota | **PARTIAL** | `node_registry.classify_capacity`, heartbeat 20s, `capacity_status` | Heartbeat + EWMA-smoothed, duration-aware overload heuristic (healthy/busy/overloaded) is real and live. **`max_sessions` is stored but never enforced** — no admission control anywhere. |
 | 7 | Shared-file / resource ownership lock | **PARTIAL** | `lease.py` (pane), `git_worktree.py` + `git_isolation_service.py`, coordinator's `expected_cwd` check | Per-task **git worktree + branch isolation** is real and wired into task creation (`terminal_task_create_isolated`), enforced at dispatch by the existing coordinator check. **No generic named-resource lock** (e.g. "own this file/module"). |
 | 8 | Event bus | **PARTIAL → EXISTS (P0.2)** | `queue_events` (241), `integration_events` (0), `supervisor_events` (60) | Three **separate append-only per-store logs**, not a bus: no subscribe, no cross-store ordering, no fan-out. Real types include `ENQUEUED/CLAIMED/DISPATCHED/STARTED/VERIFYING/VERIFIED/COORDINATOR_*/LANE_PAUSED`. **Absent from the target list:** `WORKER_IDLE`, `PREVIEW_FAILED`, `USER_FEEDBACK`, `MERGE_CONFLICT` (integration has its own equivalents but unused). |
@@ -71,10 +71,12 @@ Two facts that reframe everything below:
 
 **≈ 11.25 / 20 ≈ 56 % at audit time (2026-09-09, pre-P0).**
 
-**After P0.1 + P0.2 (implemented 2026-09-09): ≈ 12.25 / 20 ≈ 61 %.**
+**After P0.1 + P0.2 + P0.3 (implemented 2026-09-09): ≈ 12.75 / 20 ≈ 64 %.**
 Item 8 (event bus) moved PARTIAL → EXISTS; item 1 (project registry) gained
 a real runtime dimension (`queue_tasks.project_id`, `queue_lanes.project`
 now populated-capable) on top of the existing `backlog_projects` registry.
+Item 5 (worker capability) moved PARTIAL → EXISTS: the tool/runtime axis
+it lacked is now probed per node and queryable with AND semantics.
 Items 9/11/13 are unchanged — P0 deliberately did not touch verification
 routing, preview, or portfolio scheduling.
 
