@@ -16,6 +16,11 @@ from terminal_mcp.queue_store import COMPLETED, DISPATCHING, RUNNING, VERIFYING,
 from tests.test_backlog import make_config, make_repo
 
 
+@pytest.fixture(autouse=True)
+def _isolated_backlog_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_BACKLOG_DB", str(tmp_path / "backlog.db"))
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"

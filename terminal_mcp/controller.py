@@ -429,6 +429,104 @@ class ControllerService:
         return {"query": query, "results": results[:limit], "node_errors": errors,
                 "untrusted_output": True, "untrusted_fields": ["results"]}
 
+    def discover_projects(self) -> dict[str, Any]:
+        """Auto-detect the GIT PROJECTS this fleet is actually working on,
+        from data every node already records -- no new tracking, no
+        scanning, no config.
+
+        Each node's session registry already stores repo_root/git_remote/
+        git_branch per session (session_registry.probe_project_info fills
+        them at capture time). Normalising each git_remote through
+        project_identity collapses every checkout of one repository --
+        worktrees, scratch clones, a different path on every machine --
+        onto ONE canonical project_id. Measured on this deployment: 7
+        checkouts of terminal-mcp across 3 nodes resolve to a single id.
+
+        This is what makes a project-keyed backlog possible: "which
+        project is this session working on" is answerable for a REMOTE
+        session without the controller ever touching that node's
+        filesystem (it cannot -- those paths do not exist here)."""
+        from .project_identity import normalise_git_remote
+
+        projects: dict[str, dict[str, Any]] = {}
+        errors: dict[str, str] = {}
+        for node in self.registry.list():
+            if node.status != NODE_ONLINE:
+                continue
+            client = self._clients.get(node.id)
+            if client is None:
+                continue
+            try:
+                response = client.registry_list(recoverable_only=False)
+            except NodeClientError as exc:
+                errors[node.id] = str(exc)
+                continue
+            if "error" in response:
+                errors[node.id] = str(response["error"])
+                continue
+            for row in response.get("records", []):
+                repo_root = row.get("repo_root")
+                if not repo_root:
+                    continue  # a session not in a repo belongs to no project
+                remote = normalise_git_remote(row.get("git_remote"))
+                project_id = f"git:{remote}" if remote else f"path:{repo_root}"
+                entry = projects.setdefault(project_id, {
+                    "project_id": project_id, "is_portable": bool(remote),
+                    "name": (remote.rsplit("/", 1)[-1] if remote else Path(repo_root).name),
+                    "git_remote": row.get("git_remote"), "nodes": set(),
+                    "checkouts": set(), "branches": set(), "sessions": [],
+                })
+                # Every remote node labels its own rows "local" (core.py's
+                # REGISTRY_LOCAL_NODE_ID convention) -- overwrite with the
+                # real node id, exactly like the fleet knowledge search
+                # has to.
+                entry["nodes"].add(node.id)
+                entry["checkouts"].add(repo_root)
+                if row.get("git_branch"):
+                    entry["branches"].add(row["git_branch"])
+                entry["sessions"].append({"node_id": node.id, "session_name": row.get("session_name"),
+                                          "status": row.get("status")})
+        result = []
+        for entry in projects.values():
+            entry["nodes"] = sorted(entry["nodes"])
+            entry["checkouts"] = sorted(entry["checkouts"])
+            entry["branches"] = sorted(entry["branches"])
+            entry["session_count"] = len(entry["sessions"])
+            result.append(entry)
+        result.sort(key=lambda e: (-e["session_count"], e["project_id"]))
+        return {"projects": result, "node_errors": errors}
+
+    def resolve_project_for_session(self, node_id: str, session_name: str) -> dict[str, Any]:
+        """"Which project is THIS session working on?" -- answered from the
+        owning node's own registry record, never from the controller's
+        filesystem. That distinction is the whole point: a session on m910
+        or dell-5530 has a repo_root this controller cannot stat."""
+        from .project_identity import normalise_git_remote
+
+        client = self._clients.get(node_id)
+        if client is None:
+            return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+        try:
+            response = client.registry_list(recoverable_only=False)
+        except NodeClientError as exc:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
+        for row in response.get("records", []):
+            if row.get("session_name") != session_name:
+                continue
+            repo_root = row.get("repo_root")
+            if not repo_root:
+                return {"error": "SESSION_NOT_IN_A_REPO", "node_id": node_id, "session": session_name}
+            remote = normalise_git_remote(row.get("git_remote"))
+            return {
+                "project_id": f"git:{remote}" if remote else f"path:{repo_root}",
+                "name": (remote.rsplit("/", 1)[-1] if remote else Path(repo_root).name),
+                "source": "git_remote" if remote else "path",
+                "git_remote": row.get("git_remote"), "git_branch": row.get("git_branch"),
+                "repo_root": repo_root, "is_portable": bool(remote),
+                "node_id": node_id, "session": session_name,
+            }
+        return {"error": "SESSION_NOT_FOUND", "node_id": node_id, "session": session_name}
+
     def terminal_grant_session_read(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
         """Node-aware equivalent of TerminalService.grant_session_read --
         real bug fixed here (found live against a Windows session named

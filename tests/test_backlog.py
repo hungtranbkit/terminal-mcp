@@ -45,6 +45,15 @@ def make_config(*roots: Path) -> AppConfig:
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_backlog_db(tmp_path, monkeypatch):
+    """The backlog is now a CONTROLLER-side DB, so it is shared exactly
+    like session_registry/grants are -- conftest redirects XDG_STATE_HOME
+    once per test SESSION, not per test. Without this every test here
+    would write into one backlog.db and see each other's projects."""
+    monkeypatch.setenv("TERMINAL_MCP_BACKLOG_DB", str(tmp_path / "backlog.db"))
+
+
 @pytest.fixture
 def repo(tmp_path):
     return make_repo(tmp_path / "widget")
@@ -115,10 +124,12 @@ def test_get_on_project_with_no_backlog_returns_empty_plus_metadata(svc, repo):
     assert out["revision"] == 0
 
 
-def test_add_creates_file_and_items(svc, repo):
+def test_add_stores_items_without_touching_the_repo(svc, repo):
+    """The controller DB is authoritative now -- add() must NOT write into
+    the checkout. The file only appears when export_file is called."""
     out = svc.add(str(repo), tasks=[{"title": "First"}, {"title": "Second", "priority": "P0"}])
     assert len(out["created_ids"]) == 2 and out["revision"] == 1
-    assert store.backlog_path(repo).exists()
+    assert not store.backlog_path(repo).exists()
     got = svc.get(str(repo))
     assert [i["title"] for i in got["items"]] == ["Second", "First"]  # P0 sorts first
 
@@ -129,8 +140,9 @@ def test_add_rejects_empty_title_and_bad_enums(svc, repo):
     assert svc.add(str(repo), tasks=[{"title": "x", "priority": "P9"}])["error"] == "INVALID_PRIORITY"
 
 
-def test_file_is_valid_json_with_schema_version(svc, repo):
+def test_exported_file_is_valid_json_with_schema_version(svc, repo):
     svc.add(str(repo), tasks=[{"title": "x"}])
+    svc.export_file(str(repo))
     doc = json.loads(store.backlog_path(repo).read_text())
     assert doc["schema_version"] == store.SCHEMA_VERSION
     assert doc["project"]["project_id"] == "git:github.com/acme/widget"
@@ -240,48 +252,60 @@ def test_survives_a_fresh_service_instance(tmp_path, repo):
     assert [i["title"] for i in fresh.get(str(repo))["items"]] == ["persisted"]
 
 
-def test_write_is_atomic_no_partial_file(svc, repo):
+def test_export_is_atomic_no_partial_file(svc, repo):
     svc.add(str(repo), tasks=[{"title": f"t{n}"} for n in range(50)])
+    svc.export_file(str(repo))
     path = store.backlog_path(repo)
     json.loads(path.read_text())                            # parses => never truncated
     assert not list(path.parent.glob(".backlog-*.tmp"))     # no temp files left behind
 
 
 # ------------------------------------------------------------ manual edits
-def test_hand_edited_file_is_repaired_not_rejected(svc, repo):
+def test_hand_edited_file_is_repaired_on_import(svc, repo):
+    """A human editing a committed backlog by hand is still supported --
+    the repair now happens at the IMPORT boundary."""
     svc.add(str(repo), tasks=[{"title": "x"}])
+    svc.export_file(str(repo))
     path = store.backlog_path(repo)
     doc = json.loads(path.read_text())
     doc["items"][0]["status"] = "WHATEVER"
     doc["items"].append({"title": "added by hand"})          # no id
     path.write_text(json.dumps(doc))
-    out = svc.get(str(repo))
-    assert out["total"] == 2 and out["repairs"]
-    assert all(i["id"].startswith("blg_") for i in out["items"])
+    out = svc.import_file(str(repo))
+    assert out["repairs"]
+    got = svc.get(str(repo))
+    assert got["total"] == 2
+    assert all(i["id"].startswith("blg_") for i in got["items"])
+    assert all(i["status"] in store.STATUSES for i in got["items"])
 
 
-def test_validate_writes_back_the_repaired_form(svc, repo):
+def test_import_normalises_a_bad_enum(svc, repo):
     svc.add(str(repo), tasks=[{"title": "x"}])
+    svc.export_file(str(repo))
     path = store.backlog_path(repo)
     doc = json.loads(path.read_text()); doc["items"][0]["priority"] = "URGENT"
     path.write_text(json.dumps(doc))
-    out = svc.validate(str(repo))
-    assert out["written"] is True and out["repairs"]
-    assert json.loads(path.read_text())["items"][0]["priority"] == "P2"
+    svc.import_file(str(repo))
+    assert svc.get(str(repo))["items"][0]["priority"] == "P2"
 
 
-def test_broken_json_reports_clearly(svc, repo):
+def test_broken_json_reports_clearly_on_import(svc, repo):
+    """A corrupt committed file must fail the IMPORT loudly and leave the
+    controller's own backlog untouched."""
     svc.add(str(repo), tasks=[{"title": "x"}])
+    svc.export_file(str(repo))
     store.backlog_path(repo).write_text("{not json")
-    assert svc.get(str(repo))["error"] == "BACKLOG_UNREADABLE"
+    assert svc.import_file(str(repo))["error"] == "BACKLOG_UNREADABLE"
+    assert svc.get(str(repo))["total"] == 1          # DB survived
 
 
 def test_newer_schema_version_is_refused_not_downgraded(svc, repo):
     svc.add(str(repo), tasks=[{"title": "x"}])
+    svc.export_file(str(repo))
     path = store.backlog_path(repo)
     doc = json.loads(path.read_text()); doc["schema_version"] = 999
     path.write_text(json.dumps(doc))
-    assert svc.get(str(repo))["error"] == "BACKLOG_UNREADABLE"
+    assert svc.import_file(str(repo))["error"] == "BACKLOG_UNREADABLE"
 
 
 # ------------------------------------------------------------ verified done

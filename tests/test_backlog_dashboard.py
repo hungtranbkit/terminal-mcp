@@ -20,6 +20,11 @@ BACKLOG_ROUTES = ("/dashboard/api/backlog", "/dashboard/api/backlog/add",
                   "/dashboard/api/backlog/complete")
 
 
+@pytest.fixture(autouse=True)
+def _isolated_backlog_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_BACKLOG_DB", str(tmp_path / "backlog.db"))
+
+
 @pytest.fixture
 def rig(tmp_path):
     repo = make_repo(tmp_path / "widget")

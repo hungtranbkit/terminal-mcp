@@ -3706,15 +3706,32 @@ cannot key a shared backlog. Hence `project_identity.py`.
   committed file) → `PROJECT.yaml`'s `project.code` → real repo root
   path (flagged `is_portable: false`). A non-repo directory is refused
   `NOT_A_PROJECT` instead of getting a backlog somewhere meaningless.
-- **Storage** (`backlog_store.py`): JSON chosen over YAML deliberately
+- **Storage (REVISED 2026-09-09, after measuring the fleet)**: the
+  SOURCE OF TRUTH is a controller-side SQLite store keyed by the
+  canonical `project_id` (`backlog_db.py`); the repo file is an
+  export/import projection. The original file-as-truth design was
+  disproven by measurement: `terminal-mcp` lives in **7 checkouts across
+  3 nodes** and `offline-pos` in 3 across 2, and the controller answered
+  `PATH_NOT_ALLOWED` for every remote checkout path because those paths
+  do not exist on it. A backlog in one checkout was invisible to every
+  other node working the same project. Identity was already correct (all
+  7 checkouts collapse to one id) — only storage was wrong. A project is
+  now addressable by `project_id`, by `project_node_id`+`project_session`
+  (resolved from the OWNING node's registry, so a remote session's
+  backlog is reachable without the controller touching that filesystem),
+  or by a local `path`. `terminal_project_list` auto-detects the fleet's
+  git projects from data nodes already record.
+- **File format** (`backlog_store.py`): JSON chosen over YAML deliberately
   (byte-exact round-trip, loud parse failure, no `yes→True` surprises);
   merge-friendliness handled by a fixed key order + one item per
   line-block. Atomic write (temp + `os.replace`), `fcntl.flock` on a
   separate `.lock` file, and a `revision` counter.
-- **Concurrency**: `expected_revision` gives optimistic concurrency —
-  a stale write is refused `REVISION_CONFLICT`, never silently clobbered.
-  Proven with REAL parallel processes (not threads, since the guarantee
-  is a per-process advisory lock): 24 concurrent appends, 0 lost.
+- **Concurrency**: a per-PROJECT in-process lock (the controller is the
+  single writer) plus SQLite's transaction, with `expected_revision`
+  still guarding the cross-AGENT race — a stale write is refused
+  `REVISION_CONFLICT`, never silently clobbered. Two projects never block
+  each other. The old `fcntl.flock` on a repo file no longer governs
+  anything and was removed rather than left as decoration.
 - **Verified-done gate**: `backlog_complete` requires real evidence
   (commit/test/deploy) OR a linked queue task that reached `COMPLETED`
   (which `queue_store.py` itself defines as the spec's `VERIFIED_DONE`).
