@@ -33,6 +33,7 @@ from .planner_service import PlannerService
 from .planner_store import PlannerStore
 from .pm_service import PMService
 from .pm_store import PMStore
+from .backlog_service import BacklogService
 from .queue_service import QueueService
 from .queue_store import QueueStore
 from .supervisor import SupervisorService, SupervisorStore
@@ -5979,7 +5980,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        pm: PMService | None = None,
                        planner: PlannerService | None = None,
                        ai_usage: AiUsageService | None = None,
-                       recovery: RecoveryEngine | None = None) -> None:
+                       recovery: RecoveryEngine | None = None,
+                       backlog: BacklogService | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -8482,6 +8484,71 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         result = await anyio.to_thread.run_sync(lambda: controller.refresh_node_capabilities(node_id))
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 502)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+
+    # ---------------------------------------------------------------- Project Backlog
+    # Read is gated like every other dashboard read; every WRITE goes
+    # through _mutation_guard (Cloudflare Access / webauth identity) AND
+    # the service's own allowed_cwd_roots path gate, so the browser
+    # surface can never reach a project the MCP surface could not.
+    @server.custom_route("/dashboard/api/backlog", methods=["GET"], include_in_schema=False)
+    async def backlog_get(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        if backlog is None:
+            return JSONResponse({"error": "BACKLOG_UNAVAILABLE"}, status_code=503)
+        params = request.query_params
+        result = await anyio.to_thread.run_sync(lambda: backlog.get(
+            params.get("path") or None, status=params.get("status") or None,
+            priority=params.get("priority") or None, type=params.get("type") or None,
+            tag=params.get("tag") or None,
+            include_terminal=params.get("include_terminal", "1") != "0",
+            limit=int(params.get("limit") or 500)))
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    async def _backlog_write(request: Request, handler) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        if backlog is None:
+            return JSONResponse({"error": "BACKLOG_UNAVAILABLE"}, status_code=503)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        actor = (identity.email if identity else None) or "dashboard"
+        result = await anyio.to_thread.run_sync(lambda: handler(body, actor))
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/backlog/add", methods=["POST"], include_in_schema=False)
+    async def backlog_add(request: Request) -> JSONResponse:
+        return await _backlog_write(request, lambda body, actor: backlog.add(
+            body.get("path"), tasks=body.get("tasks") or [],
+            expected_revision=body.get("expected_revision"), source=actor))
+
+    @server.custom_route("/dashboard/api/backlog/update", methods=["POST"], include_in_schema=False)
+    async def backlog_update(request: Request) -> JSONResponse:
+        return await _backlog_write(request, lambda body, actor: backlog.update(
+            body.get("path"), task_id=body.get("task_id", ""), patch=body.get("patch") or {},
+            expected_revision=body.get("expected_revision"), actor=actor))
+
+    @server.custom_route("/dashboard/api/backlog/dispatch", methods=["POST"], include_in_schema=False)
+    async def backlog_dispatch(request: Request) -> JSONResponse:
+        return await _backlog_write(request, lambda body, actor: backlog.dispatch(
+            body.get("path"), task_id=body.get("task_id", ""), session=body.get("session"),
+            expected_revision=body.get("expected_revision")))
+
+    @server.custom_route("/dashboard/api/backlog/complete", methods=["POST"], include_in_schema=False)
+    async def backlog_complete(request: Request) -> JSONResponse:
+        return await _backlog_write(request, lambda body, actor: backlog.complete(
+            body.get("path"), task_id=body.get("task_id", ""), commit=body.get("commit"),
+            test=body.get("test"), deploy=body.get("deploy"), note=body.get("note"),
+            expected_revision=body.get("expected_revision"), actor=actor))
 
     @server.custom_route("/dashboard/api/supervisor", methods=["GET"], include_in_schema=False)
     async def supervisor_summary(request: Request) -> JSONResponse:

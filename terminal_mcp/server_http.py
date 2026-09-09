@@ -24,6 +24,7 @@ from .planner_service import PlannerService
 from .planner_store import PlannerStore
 from .pm_service import PMService
 from .pm_store import PMStore
+from .backlog_service import BacklogService
 from .queue_service import QueueService
 from .recovery_engine import RecoveryEngine
 from .recovery_loop import RecoveryLoop
@@ -306,11 +307,16 @@ def main() -> None:
     # same registry/lock state, never two independently-drifting copies.
     recovery = RecoveryEngine(terminal.session_registry, controller, terminal.leases, config.auto_recovery)
     recovery.loop = RecoveryLoop(recovery, controller, poll_interval_seconds=config.auto_recovery.reconcile_poll_seconds)
+    # Project Backlog (planning layer above the queue). Constructed with
+    # the SAME config/audit/queue the rest of this process uses, so its
+    # allowed_cwd_roots path gate, its audit trail, and its dispatch path
+    # are the existing ones rather than parallel copies.
+    backlog = BacklogService(config, audit=terminal.audit, queue=queue)
     server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
-                       planner=planner, ai_usage=ai_usage, recovery=recovery)
+                       planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
-                       recovery=recovery)
+                       recovery=recovery, backlog=backlog)
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)

@@ -3682,6 +3682,71 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
 
 ---
 
+## Project Backlog (planning layer) — IMPLEMENTED
+
+Full design: `docs/backlog.md`. Example file: `docs/examples/backlog.example.json`.
+
+Answers "what does THIS PROJECT intend to do", as opposed to the Task
+Queue's "what is executing now". Source of truth is a file **inside the
+project repo** — `.terminal-mcp/backlog.json` — so the plan is portable,
+versionable, reviewable in git, and shared by every session on that repo
+regardless of which subdirectory each one sits in.
+
+**Audit first, per the task's own instruction.** The pre-implementation
+audit found that `queue_store.queue_tasks` is the ONE canonical task
+table and that planner/PM/incident/release all layer on it via `metadata`
+rather than adding tables — so this feature adds **no** second task
+engine. It also found the only existing notion of "project" was
+`queue_lanes.project`, a free-text label set per session lane, which
+cannot key a shared backlog. Hence `project_identity.py`.
+
+- **Identity** (`project_identity.py`): from the REPO, never the cwd
+  string. `git remote origin` normalised (all URL styles collapse to one
+  id; embedded credentials stripped so a token can never land in a
+  committed file) → `PROJECT.yaml`'s `project.code` → real repo root
+  path (flagged `is_portable: false`). A non-repo directory is refused
+  `NOT_A_PROJECT` instead of getting a backlog somewhere meaningless.
+- **Storage** (`backlog_store.py`): JSON chosen over YAML deliberately
+  (byte-exact round-trip, loud parse failure, no `yes→True` surprises);
+  merge-friendliness handled by a fixed key order + one item per
+  line-block. Atomic write (temp + `os.replace`), `fcntl.flock` on a
+  separate `.lock` file, and a `revision` counter.
+- **Concurrency**: `expected_revision` gives optimistic concurrency —
+  a stale write is refused `REVISION_CONFLICT`, never silently clobbered.
+  Proven with REAL parallel processes (not threads, since the guarantee
+  is a per-process advisory lock): 24 concurrent appends, 0 lost.
+- **Verified-done gate**: `backlog_complete` requires real evidence
+  (commit/test/deploy) OR a linked queue task that reached `COMPLETED`
+  (which `queue_store.py` itself defines as the spec's `VERIFIED_DONE`).
+  `backlog_update` cannot set DONE at all. An agent asserting completion
+  is not accepted.
+- **Traceability**: `backlog_dispatch` creates a real queue task through
+  the existing canonical `QueueService.create_task` and links both ways
+  (`item.queue_task_id`, queue `metadata.backlog_id`), giving
+  backlog_id → queue task_id → session → commit/test.
+- **Security**: every path goes through `lifecycle.resolve_cwd` — the
+  same `allowed_cwd_roots` + symlink gate session creation uses — run
+  BEFORE any git introspection, with the discovered repo root re-checked
+  (walking up out of an allowed subdirectory would otherwise escape).
+  Every write is audited; dashboard writes also pass `_mutation_guard`.
+- **Surface**: 9 MCP tools (`terminal_backlog_*`) whose descriptions
+  teach the workflow `get → analyse → add/update → dispatch → verify →
+  complete`, plus `GET /dashboard/api/backlog` and
+  `POST /dashboard/api/backlog/{add,update,dispatch,complete}`.
+- **Git posture**: the file is NEVER auto-committed. Tracked is the
+  recommended default (reviewable, reaches other nodes); ignoring
+  `.terminal-mcp/` makes it local scratch. Tradeoff documented in
+  `docs/backlog.md`.
+
+**Deliberately deferred, not silently dropped:** the Project Brief
+integration is an interface only — `BacklogService.open_items_for_brief()`
+returns open/unrun items in the shape a brief needs, so the paused
+project-scoped-knowledge work can adopt it without this MVP guessing that
+feature's shape. The dashboard ships API routes; a rich Kanban-style
+backlog panel was not attempted (the task asked for minimum viable, and
+`dashboard.py` is 8.5k lines — a large UI change belongs in its own
+change with its own review).
+
 ## Internet / VPS migration roadmap (PLANNED — docs only, no code yet)
 
 Goal: today, the Controller/Dashboard/Queue/Coordinator/Registry all run
