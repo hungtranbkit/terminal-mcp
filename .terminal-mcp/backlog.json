@@ -1034,12 +1034,12 @@
       "id": "blg_369316d4b7b0",
       "title": "P0.5 Verify queue with capability routing",
       "description": "Verification is currently a STATE of the same task in the same session (15 real VERIFIED), so a different worker cannot verify. Publish VERIFY_PENDING{project,capability} on WORKER_DONE and let a verifier claim by capability. Keep in-session verification as the default until a verifier pool exists.",
-      "status": "BACKLOG",
+      "status": "DONE",
       "priority": "P2",
       "type": "feature",
       "order": 24,
       "created_at": "2026-09-09T10:04:42.240112+00:00",
-      "updated_at": "2026-09-09T10:04:42.240114+00:00",
+      "updated_at": "2026-09-09T12:28:12.960880+00:00",
       "source": "coordination-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -1055,20 +1055,40 @@
       "session": null,
       "node_id": null,
       "queue_task_id": null,
-      "branch": null,
+      "branch": "feat/p0-5-verify-queue",
       "worktree": null,
       "blocked_reason": null,
       "evidence": {
-        "commits": [],
-        "tests": [],
-        "deploys": [],
-        "notes": []
+        "commits": [
+          "7369b0e",
+          "c5b43e5"
+        ],
+        "tests": [
+          "2370 passed (2 known pre-existing kill_reopen failures)",
+          "61 new tests: tests/test_verify_queue.py (54), tests/test_verify_queue_mcp_tools.py (7)"
+        ],
+        "deploys": [
+          "terminal-mcp-http.service on c5b43e5, dirty:false, 15/15 local sessions intact"
+        ],
+        "notes": [
+          "Verifier other than the worker CAN claim: proven live -- handoff local-verifier -> macbook-verifier, old token rejected NOT_LEASE_HOLDER.",
+          "Routing respects capability against the REAL fleet: [playwright,linux]->local, [windows]->dell-5530 (empty probed list, routed on reported platform), [windows,dotnet]->none.",
+          "In-session verification unchanged: opt-in is per task via completion_policy['verify']; no existing task carries it. Zero new task statuses, zero new transition edges (asserted structurally against VALID_TRANSITIONS).",
+          "Migration v7 verified on a copy of the real production queue.db: 38 tasks / 246 events, every row byte-identical, verify_jobs empty, re-apply a no-op.",
+          "macos deliberately NOT routable -- node agent has no Darwin branch, MacBook reports platform=linux. Documented, not papered over."
+        ]
       },
       "history": [
         {
           "at": "2026-09-09T10:04:42.240120+00:00",
           "event": "created",
           "by": "coordination-audit-2026-09-09"
+        },
+        {
+          "at": "2026-09-09T12:28:12.960880+00:00",
+          "event": "completed",
+          "by": "mcp",
+          "note": "P0.5 shipped, deployed, live-smoked"
         }
       ]
     },
