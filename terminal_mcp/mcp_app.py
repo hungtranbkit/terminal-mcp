@@ -2298,6 +2298,79 @@ def build_mcp(service: TerminalService | None = None,
         }
 
 
+
+    # ------------------------------------------------------------------
+    # P0.4 Task lease verbs. claim_next_task already stamped the lease
+    # atomically; these are the operations AFTER the claim. Every one
+    # requires the CURRENT claim_token, so a holder whose lease expired
+    # and was reclaimed cannot act on the new holder's work.
+    # ------------------------------------------------------------------
+    if queue is not None:
+
+        @server.tool()
+        def terminal_task_renew_lease(task_id: str, claim_token: str,
+                                      lease_seconds: float = 300.0) -> dict:
+            """Extend an active task claim.
+
+            A long-running worker MUST renew: a task past its
+            lease_expires_at is treated as a crashed worker and reconciled
+            back to QUEUED by reconcile_stale_claims. Returns
+            {"renewed": false} if the token is not the current holder's --
+            losing a lease is an ordinary outcome to handle, not an
+            error."""
+            task = queue.store.renew_task_lease(task_id, claim_token, lease_seconds=lease_seconds)
+            if task is None:
+                return {"renewed": False, "task_id": task_id,
+                        "reason": "claim_token is not the current holder, or the task is not leased"}
+            return {"renewed": True, "task_id": task_id,
+                    "lease_expires_at": task.lease_expires_at, "status": task.status}
+
+        @server.tool()
+        def terminal_task_release_claim(task_id: str, claim_token: str,
+                                        reason: str | None = None) -> dict:
+            """Give a claim back BEFORE its TTL expires -- the graceful
+            form of what crash-reconciliation does forcibly. The task
+            returns to QUEUED with claim fields cleared, so a released
+            task and a reconciled one are indistinguishable downstream."""
+            task = queue.store.release_task_claim(task_id, claim_token, reason=reason)
+            if task is None:
+                return {"released": False, "task_id": task_id,
+                        "reason": "claim_token is not the current holder, or the task is not leased"}
+            return {"released": True, "task_id": task_id, "status": task.status}
+
+        @server.tool()
+        def terminal_task_handoff(task_id: str, claim_token: str, to_worker: str,
+                                  reason: str, to_session: str | None = None,
+                                  lease_seconds: float = 300.0) -> dict:
+            """Transfer an ACTIVE claim to another worker WITHOUT the task
+            returning to the queue -- the verb a worker -> verifier
+            handoff needs.
+
+            Distinct from terminal_task_reassign, which moves a task's
+            LANE and deliberately refuses an actively-claimed task. This
+            moves the CLAIM: same task_id, same prompt/attempt_count, a
+            fresh token for the receiver, and an appended entry in the
+            same migration_history trail. `to_session` is optional --
+            handing to a verifier on the same lane is the common case."""
+            task = queue.store.handoff_task(task_id, claim_token, to_worker=to_worker,
+                                            to_session=to_session, reason=reason,
+                                            lease_seconds=lease_seconds)
+            if task is None:
+                return {"handed_off": False, "task_id": task_id,
+                        "reason": "claim_token is not the current holder, or the task is not leased"}
+            return {"handed_off": True, "task_id": task_id, "claimed_by": task.claimed_by,
+                    "session": task.session, "claim_token": task.claim_token,
+                    "lease_expires_at": task.lease_expires_at}
+
+        @server.tool()
+        def terminal_task_lease_holder(task_id: str) -> dict:
+            """Who holds this task's lease and until when. Never returns
+            the claim_token itself -- that is the holder's capability, not
+            an observability field."""
+            holder = queue.store.lease_holder(task_id)
+            return holder or {"task_id": task_id, "held": False}
+
+
     return server
 
 

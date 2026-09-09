@@ -48,7 +48,7 @@ existing MCP tools working unchanged.
 - **Risk:** low. Detection must be *probe-based*, never declared, matching the
   existing "capability is reported by the node, never guessed centrally" rule.
 
-### P0.4 Runtime task lease surfaced as an API
+### P0.4 Runtime task lease surfaced as an API — ✅ DONE (2026-09-09)
 - **Change:** expose `claim/renew/release/handoff` for tasks the way panes already
   have them, so a worker crash frees a task deterministically.
 - **Reuse:** `queue_tasks.claim_token`/`lease_expires_at` already exist and are
@@ -196,7 +196,7 @@ migration v6 verified against a copy of the real production `queue.db`
 and the bus proven with two real OS processes claiming 30 events with zero
 duplicates and zero losses. Full suite 2276 passed.
 
-## Next: P0.4 (P0.3 shipped)
+## Next: P0.5 (P0.1-P0.4 shipped)
 
 **P0.3 shipped 2026-09-09**: probed tool/runtime capabilities
 (git/node/npm/python/docker/dotnet/playwright/tmux/rustc/go/java) now ride
@@ -216,12 +216,24 @@ built for these reasons, which still describe why it mattered:
    "can build WPF/WebView2", which is exactly the Linux-HTML vs
    Windows-WPF split the target architecture routes on.
 
-**P0.4 (task lease API) is now next** and is nearly free: the
-`claim_token`/`lease_expires_at` columns already exist and are stamped
-atomically by `claim_next_task`; only the renew/release/handoff verbs are
-missing. With P0.1-P0.3 in place it is the last primitive P0.5's verify
-queue needs before a verifier other than the worker can safely hold a
-task.
+**P0.4 shipped 2026-09-09**: `renew_task_lease`, `release_task_claim`,
+`handoff_task` and `lease_holder`, all token-gated and BEGIN IMMEDIATE.
+Notably `reconcile_stale_claims`' own docstring already assumed "a healthy
+engine keeps renewing ... well within the lease" -- renew is the method
+that assumption was written against and which did not exist, so a
+genuinely-alive worker on a long task could be reconciled out from under
+itself.
+
+`handoff_task` is deliberately distinct from the existing
+`reassign_task`: that one moves a task's LANE and REFUSES an actively
+claimed task (TaskAlreadyClaimedError), which is exactly the worker ->
+verifier case. Handoff moves the CLAIM instead -- same task_id, fresh
+token for the receiver, appended to the same migration_history trail.
+
+**P0.5 (verify queue with capability routing) is now next**, and every
+primitive it needs is in place: P0.2's bus carries VERIFY_PENDING, P0.3
+routes by capability, and P0.4 lets a verifier take the task from the
+worker without it round-tripping through QUEUED.
 
 **A deployment note P0.3 surfaced:** capabilities are reported by the
 NODE, so remote nodes only advertise them after their agent is redeployed.
