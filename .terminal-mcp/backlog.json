@@ -9,8 +9,8 @@
     "git_branch": "main",
     "is_portable": true
   },
-  "revision": 2,
-  "updated_at": "2026-09-09T10:05:00.597379+00:00",
+  "revision": 4,
+  "updated_at": "2026-09-09T10:31:52.608812+00:00",
   "items": [
     {
       "id": "blg_f52a999971d9",
@@ -813,12 +813,12 @@
       "id": "blg_ca6fab42369f",
       "title": "P0.1 Give the runtime a project dimension (canonical project_id on lanes/tasks)",
       "description": "queue_lanes.project is NULL on all 35 lanes and queue_tasks has no canonical project. Backfill from each lane's session repo_root via project_identity/resolve_project_for_session. Columns already exist; additive.",
-      "status": "BACKLOG",
+      "status": "DONE",
       "priority": "P1",
       "type": "feature",
       "order": 20,
       "created_at": "2026-09-09T10:04:42.240021+00:00",
-      "updated_at": "2026-09-09T10:04:42.240030+00:00",
+      "updated_at": "2026-09-09T10:31:52.579177+00:00",
       "source": "coordination-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -838,16 +838,29 @@
       "worktree": null,
       "blocked_reason": null,
       "evidence": {
-        "commits": [],
-        "tests": [],
+        "commits": [
+          "5169127"
+        ],
+        "tests": [
+          "2276 passed"
+        ],
         "deploys": [],
-        "notes": []
+        "notes": [
+          "shipped, deployed, live-smoked"
+        ]
       },
       "history": [
         {
           "at": "2026-09-09T10:04:42.240048+00:00",
           "event": "created",
           "by": "coordination-audit-2026-09-09"
+        },
+        {
+          "at": "2026-09-09T10:31:52.579177+00:00",
+          "event": "completed",
+          "by": "mcp",
+          "verified_by": "evidence",
+          "queue_task_id": null
         }
       ]
     },
@@ -855,12 +868,12 @@
       "id": "blg_174c308c03ea",
       "title": "P0.2 Event bus (project-scoped, claimable, leased)",
       "description": "queue_events/integration_events/supervisor_events are three append-only per-store logs with no subscribe and no cross-store ordering. Build one events table with publish()/claim_next() reusing the BEGIN IMMEDIATE + lease pattern from claim_next_task.",
-      "status": "BACKLOG",
+      "status": "DONE",
       "priority": "P1",
       "type": "feature",
       "order": 21,
       "created_at": "2026-09-09T10:04:42.240062+00:00",
-      "updated_at": "2026-09-09T10:04:42.240064+00:00",
+      "updated_at": "2026-09-09T10:31:52.591281+00:00",
       "source": "coordination-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -880,16 +893,29 @@
       "worktree": null,
       "blocked_reason": null,
       "evidence": {
-        "commits": [],
-        "tests": [],
+        "commits": [
+          "5169127"
+        ],
+        "tests": [
+          "2276 passed"
+        ],
         "deploys": [],
-        "notes": []
+        "notes": [
+          "shipped, deployed, live-smoked"
+        ]
       },
       "history": [
         {
           "at": "2026-09-09T10:04:42.240075+00:00",
           "event": "created",
           "by": "coordination-audit-2026-09-09"
+        },
+        {
+          "at": "2026-09-09T10:31:52.591281+00:00",
+          "event": "completed",
+          "by": "mcp",
+          "verified_by": "evidence",
+          "queue_task_id": null
         }
       ]
     },
