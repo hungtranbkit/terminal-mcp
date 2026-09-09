@@ -1344,6 +1344,67 @@
           "by": "coordination-audit-2026-09-09"
         }
       ]
+    },
+    {
+      "id": "blg_dash_project_picker",
+      "title": "Dashboard backlog panel: select by canonical project, not by local path",
+      "description": "The panel could only be pointed at a local filesystem path, which names a CHECKOUT rather than a project and can only reach repos on the controller's own box. Adds a project picker over a new /dashboard/api/projects and threads project_id through all five backlog routes.",
+      "status": "DONE",
+      "priority": "P2",
+      "type": "feature",
+      "order": 31,
+      "created_at": "2026-09-09T12:57:20.730714+00:00",
+      "updated_at": "2026-09-09T12:57:20.730714+00:00",
+      "source": "parked-work-2026-09-09",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Panel selects a project by canonical project_id",
+        "project_id reaches read AND every mutating route",
+        "A project with no local checkout is addressable"
+      ],
+      "tags": [
+        "dashboard",
+        "backlog",
+        "project"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": "main",
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [
+          "9268ecf"
+        ],
+        "tests": [
+          "2393 passed (2 known pre-existing kill_reopen failures)",
+          "24 new/updated tests across test_backlog_dashboard.py, test_backlog_panel.py"
+        ],
+        "deploys": [
+          "terminal-mcp-http.service on 9268ecf, dirty:false, 15/15 local sessions intact"
+        ],
+        "notes": [
+          "Found and fixed a REAL pre-existing bug: BACKLOG_HTML's inline <script> had literal newlines inside JS string literals (non-raw Python triple-quoted string), a syntax error that killed the WHOLE script -- the panel had never run any JavaScript. No existing test parsed the JS.",
+          "Regression guarded two ways (narrow pure-Python check + node --check over all six dashboard templates); both verified to FAIL when the bug is reintroduced.",
+          "Discovery verified against real state: 6 distinct projects from the local node alone, with terminal-mcp collapsing 4 checkouts into one canonical id.",
+          "NOT verified end-to-end in a browser: /dashboard/* is behind Cloudflare Access, so the final click-through needs the user's authenticated session."
+        ]
+      },
+      "history": [
+        {
+          "at": "2026-09-09T12:57:20.730714+00:00",
+          "event": "created",
+          "by": "parked-work-2026-09-09"
+        },
+        {
+          "at": "2026-09-09T12:57:20.730714+00:00",
+          "event": "completed",
+          "by": "mcp",
+          "note": "shipped and deployed"
+        }
+      ]
     }
   ]
 }
