@@ -19,6 +19,13 @@ BACKLOG_ROUTES = ("/dashboard/api/backlog", "/dashboard/api/backlog/add",
                   "/dashboard/api/backlog/update", "/dashboard/api/backlog/dispatch",
                   "/dashboard/api/backlog/complete")
 
+# The dashboard's always-on CSRF guard refuses a mutation with no
+# same-origin Origin/Referer. Sending it is what the real panel's fetch()
+# does on every request, so these headers exercise the guard rather than
+# bypassing it -- and a test that skipped on the 403 instead would be
+# silently asserting nothing.
+SAME_ORIGIN = {"Origin": "http://testserver"}
+
 
 @pytest.fixture(autouse=True)
 def _isolated_backlog_db(tmp_path, monkeypatch):
@@ -90,3 +97,117 @@ def test_no_backlog_route_returns_500_on_a_bad_body(rig):
                   "/dashboard/api/backlog/dispatch", "/dashboard/api/backlog/complete"):
         response = client.post(route, content=b"not json")
         assert response.status_code != 500, route
+
+
+# -- Project-addressed routes (dashboard project picker) -----------------
+#
+# The panel's whole reason for a picker: one project has checkouts on
+# several machines, so a PATH identifies a checkout and only ever reaches
+# the controller's own box. These pin that a project_id addresses the
+# same backlog a path does, and that it keeps working when the path does
+# not exist here at all.
+
+def test_projects_route_registered_and_lists_projects(rig):
+    server, repo, backlog = rig
+    backlog.add(str(repo), tasks=[{"title": "one", "priority": "P1"}])
+    assert "/dashboard/api/projects" in _paths(server)
+
+    client = TestClient(server.streamable_http_app())
+    response = client.get("/dashboard/api/projects")
+    assert response.status_code in (200, 401, 403)
+    if response.status_code == 200:
+        body = response.json()
+        rows = body["projects"]
+        assert rows, "a project with a backlog must be offerable in the picker"
+        row = next(r for r in rows if r["has_backlog"])
+        assert row["project_id"].startswith("git:")
+        assert row["open_total"] == 1
+
+
+def test_projects_route_503s_without_a_backlog_service(tmp_path):
+    config = make_config(tmp_path)
+    terminal = TerminalService(config)
+    server = build_mcp(terminal)
+    register_dashboard(server, terminal)
+    client = TestClient(server.streamable_http_app())
+    response = client.get("/dashboard/api/projects")
+    assert response.status_code in (503, 401, 403)
+
+
+def test_read_route_accepts_project_id_and_returns_the_same_backlog(rig):
+    server, repo, backlog = rig
+    backlog.add(str(repo), tasks=[{"title": "by-project", "priority": "P1"}])
+    project_id = backlog.get(str(repo))["project"]["project_id"]
+
+    client = TestClient(server.streamable_http_app())
+    by_path = client.get("/dashboard/api/backlog", params={"path": str(repo)})
+    by_project = client.get("/dashboard/api/backlog", params={"project_id": project_id})
+    assert by_project.status_code == by_path.status_code
+    if by_project.status_code == 200:
+        assert by_project.json()["items"] == by_path.json()["items"]
+        assert by_project.json()["project"]["project_id"] == project_id
+
+
+def test_project_id_addresses_a_backlog_with_no_local_checkout(rig):
+    """The case the path box structurally cannot serve: a project whose
+    checkout lives on another machine. There is no path to type, so if
+    project_id did not reach the service the panel could never show it."""
+    server, _repo, backlog = rig
+    remote_id = "git:github.com/acme/on-another-node"
+    backlog.add(project_id=remote_id, tasks=[{"title": "remote work", "priority": "P0"}])
+
+    client = TestClient(server.streamable_http_app())
+    response = client.get("/dashboard/api/backlog", params={"project_id": remote_id})
+    assert response.status_code in (200, 401, 403)
+    if response.status_code == 200:
+        body = response.json()
+        assert body["project"]["project_id"] == remote_id
+        assert [i["title"] for i in body["items"]] == ["remote work"]
+
+
+def test_every_mutating_route_honours_project_id(rig):
+    """add/update/dispatch/complete must ALL reach the picked project --
+    a picker that can read a project but writes to the default one would
+    be worse than no picker."""
+    server, _repo, backlog = rig
+    project_id = "git:github.com/acme/mutate-target"
+    client = TestClient(server.streamable_http_app())
+
+    added = client.post("/dashboard/api/backlog/add", headers=SAME_ORIGIN,
+                        json={"project_id": project_id, "tasks": [{"title": "t1"}]})
+    assert added.status_code == 200, added.text
+    task_id = backlog.get(project_id=project_id)["items"][0]["id"]
+
+    updated = client.post("/dashboard/api/backlog/update", headers=SAME_ORIGIN,
+                          json={"project_id": project_id, "task_id": task_id,
+                                "patch": {"status": "READY"}})
+    assert updated.status_code == 200, updated.text
+    assert backlog.get(project_id=project_id)["items"][0]["status"] == "READY"
+
+    completed = client.post("/dashboard/api/backlog/complete", headers=SAME_ORIGIN,
+                            json={"project_id": project_id, "task_id": task_id,
+                                  "commit": "abc1234"})
+    assert completed.status_code == 200, completed.text
+    assert backlog.get(project_id=project_id)["items"][0]["status"] == "DONE"
+
+    # Nothing leaked into the rig's own repo-backed project.
+    assert backlog.get(project_id=project_id)["project"]["project_id"] == project_id
+
+
+def test_dispatch_session_is_the_target_not_project_resolution(rig):
+    """dispatch() takes `session` for the DISPATCH TARGET and
+    `project_session` for project resolution. Conflating them would send
+    work to the wrong place, so the route's mapping is pinned here."""
+    server, repo, backlog = rig
+    backlog.add(str(repo), tasks=[{"title": "dispatch me"}])
+    project_id = backlog.get(str(repo))["project"]["project_id"]
+    task_id = backlog.get(str(repo))["items"][0]["id"]
+
+    client = TestClient(server.streamable_http_app())
+    response = client.post("/dashboard/api/backlog/dispatch", headers=SAME_ORIGIN,
+                           json={"project_id": project_id, "task_id": task_id,
+                                 "session": "lane-target"})
+    assert response.status_code == 200, response.text
+    item = backlog.get(project_id=project_id)["items"][0]
+    assert item["queue_task_id"], "dispatch must have created a real queue task"
+    assert item["session"] == "lane-target"

@@ -1349,6 +1349,9 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # The panel PAGE itself (a view, like /dashboard/tasks) plus its
         # data routes.
         "/dashboard/backlog": {"GET", "HEAD"},
+        # Project picker: the canonical project list the backlog panel
+        # selects from (read-only, _read_guard like every other GET).
+        "/dashboard/api/projects": {"GET", "HEAD"},
         "/dashboard/api/backlog": {"GET", "HEAD"},
         "/dashboard/api/backlog/add": {"POST"},
         "/dashboard/api/backlog/update": {"POST"},

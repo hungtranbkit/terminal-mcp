@@ -5701,6 +5701,15 @@ GLOBAL_TASKS_HTML = """<!doctype html>
 # every other page here already gets (see that module).
 # Project Backlog panel -- a VIEW over the existing /dashboard/api/backlog
 # routes, exactly like GLOBAL_TASKS_HTML is a view over the task board.
+#
+# ADDRESSED BY PROJECT, NOT BY PATH. The panel's primary selector is a
+# picker over /dashboard/api/projects (canonical `git:host/org/repo` ids),
+# because one project has checkouts on several machines -- a path
+# identifies a CHECKOUT, not a project, and typing one could only ever
+# reach a repo on the box running the controller. The path box remains as
+# an explicit fallback for a local repo the fleet has not reported yet,
+# and is disabled while a project is picked so the two can never
+# disagree about which project is being edited.
 # It is its OWN page (matching /dashboard/nodes and /dashboard/tasks)
 # rather than a new tab inside DASHBOARD_HTML: that main template is
 # already ~3.6k lines and its fetch() surface is pinned by a test, so a
@@ -5775,7 +5784,11 @@ BACKLOG_HTML = """<!doctype html>
     </div>
   </header>
   <div class="toolbar">
-    <input type="text" id="pathInput" placeholder="&#272;&#432;&#7901;ng d&#7851;n b&#7845;t k&#7923; trong project (vd /home/dell/workspace/terminal-mcp)">
+    <label>Project
+      <select id="projectPicker"><option value="">&#8212; ch&#7885;n project &#8212;</option></select>
+    </label>
+    <button class="icon-btn" id="refreshProjects" title="Qu&#233;t l&#7841;i project t&#7915; git remote c&#7911;a to&#224;n fleet">&#8635;</button>
+    <input type="text" id="pathInput" placeholder="&#272;&#432;&#7901;ng d&#7851;n local (ch&#7881; d&#249;ng khi kh&#244;ng ch&#7885;n project)">
     <button class="icon-btn" id="loadBtn">Load</button>
     <label>Status
       <select id="fStatus"><option value="">t&#7845;t c&#7843;</option><option>BACKLOG</option><option>READY</option><option>IN_PROGRESS</option><option>BLOCKED</option><option>NEEDS_REVIEW</option><option>DONE</option><option>CANCELLED</option></select>
@@ -5812,10 +5825,30 @@ BACKLOG_HTML = """<!doctype html>
   var errEl = document.getElementById('err'), emptyEl = document.getElementById('empty');
   var pathEl = document.getElementById('pathInput'), projEl = document.getElementById('proj');
   var addPanel = document.getElementById('addPanel');
-  var state = { revision: null, path: '' };
+  var pickerEl = document.getElementById('projectPicker');
+  var state = { revision: null, path: '', projectId: '' };
 
   var STORE_KEY = 'terminal-mcp.backlog.path';
+  var PROJECT_KEY = 'terminal-mcp.backlog.project_id';
   try { pathEl.value = localStorage.getItem(STORE_KEY) || ''; } catch (e) {}
+  try { state.projectId = localStorage.getItem(PROJECT_KEY) || ''; } catch (e) {}
+
+  // A project is addressed by its CANONICAL id (git:host/org/repo), never
+  // by a path: one project has checkouts on several machines, so a path
+  // identifies a checkout, not a project. The path box stays as the
+  // fallback for a local repo the fleet has not reported yet, and is
+  // disabled whenever a project is picked so the two can never silently
+  // disagree about which project is being edited.
+  function selector() {
+    return state.projectId ? {project_id: state.projectId} : {path: state.path};
+  }
+
+  function syncPathEnabled() {
+    pathEl.disabled = !!state.projectId;
+    pathEl.title = state.projectId
+      ? 'Đang dùng project đã chọn — bỏ chọn project để nhập đường dẫn'
+      : '';
+  }
 
   function clean(v) { return (v === null || v === undefined) ? '' : String(v); }
   function setErr(m) { errEl.textContent = clean(m); }
@@ -5855,13 +5888,26 @@ BACKLOG_HTML = """<!doctype html>
     metaEl.append(stat('done', counts.DONE || 0, 'done'));
     metaEl.append(stat('total', data.total || 0));
     metaEl.append(chip('rev ' + clean(data.revision)));
-    if (!data.exists) metaEl.append(chip('chưa có file'));
-    var file = chip(clean(data.backlog_file)); file.title = clean(data.backlog_file); metaEl.append(file);
-    if (data.repairs && data.repairs.length) {
-      var r = chip('repairs: ' + data.repairs.length); r.title = data.repairs.join('\n'); metaEl.append(r);
+    if (!data.exists) metaEl.append(chip('chưa có backlog'));
+    var project = data.project || {};
+    // The store is controller-authoritative (P0.1): there is no backlog
+    // FILE any more, so show what actually identifies the project. The
+    // old chip rendered data.backlog_file, a field the response stopped
+    // carrying -- an always-empty chip.
+    if (project.git_remote) {
+      var remote = chip(clean(project.git_remote));
+      remote.title = 'git remote — mọi checkout của repo này là CÙNG một project';
+      metaEl.append(remote);
+    } else if (project.is_portable === false) {
+      var local = chip('local-only');
+      local.title = 'Không có git remote — id gắn với máy này, không theo được sang node khác';
+      metaEl.append(local);
     }
-    projEl.textContent = data.project ? clean(data.project.project_id) : '';
-    projEl.title = data.project ? clean(data.project.repo_root) : '';
+    if (data.repairs && data.repairs.length) {
+      var r = chip('repairs: ' + data.repairs.length); r.title = data.repairs.join('\\n'); metaEl.append(r);
+    }
+    projEl.textContent = clean(project.project_id);
+    projEl.title = clean(project.git_remote || project.repo_root || project.project_id);
   }
 
   function actionBtn(label, handler) {
@@ -5917,8 +5963,8 @@ BACKLOG_HTML = """<!doctype html>
         run(function () {
           return api('/dashboard/api/backlog/update', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({path: state.path, task_id: item.id,
-                                  patch: {status: target}, expected_revision: state.revision})});
+            body: JSON.stringify(Object.assign(selector(), {task_id: item.id,
+                                  patch: {status: target}, expected_revision: state.revision}))});
         });
       }));
     });
@@ -5929,8 +5975,8 @@ BACKLOG_HTML = """<!doctype html>
         run(function () {
           return api('/dashboard/api/backlog/dispatch', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({path: state.path, task_id: item.id,
-                                  session: session || null, expected_revision: state.revision})});
+            body: JSON.stringify(Object.assign(selector(), {task_id: item.id,
+                                  session: session || null, expected_revision: state.revision}))});
         });
       }));
     }
@@ -5941,8 +5987,8 @@ BACKLOG_HTML = """<!doctype html>
         run(function () {
           return api('/dashboard/api/backlog/complete', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({path: state.path, task_id: item.id,
-                                  commit: commit || null, expected_revision: state.revision})});
+            body: JSON.stringify(Object.assign(selector(), {task_id: item.id,
+                                  commit: commit || null, expected_revision: state.revision}))});
         });
       }));
     }
@@ -5950,13 +5996,60 @@ BACKLOG_HTML = """<!doctype html>
     return card;
   }
 
+  async function loadProjects() {
+    try {
+      var data = await api('/dashboard/api/projects');
+    } catch (e) {
+      // A project list that cannot be fetched must not take the panel
+      // down: the path fallback still works, so say so and carry on.
+      setErr('Không tải được danh sách project (' + clean(e.message || e) + ') — vẫn dùng được ô đường dẫn');
+      return;
+    }
+    var rows = data.projects || [];
+    pickerEl.replaceChildren();
+    var none = document.createElement('option');
+    none.value = ''; none.textContent = '— dùng đường dẫn local —';
+    pickerEl.append(none);
+    rows.forEach(function (row) {
+      var opt = document.createElement('option');
+      opt.value = clean(row.project_id);
+      var label = clean(row.name || row.project_id);
+      var bits = [];
+      if (row.open_total) bits.push(row.open_total + ' open');
+      if (!row.has_backlog) bits.push('chưa có backlog');
+      if (row.session_count) bits.push(row.session_count + ' session');
+      var nodes = (row.nodes || []).length;
+      if (nodes > 1) bits.push(nodes + ' node');
+      opt.textContent = label + (bits.length ? '  (' + bits.join(', ') + ')' : '');
+      opt.title = clean(row.project_id);          // canonical id, always inspectable
+      pickerEl.append(opt);
+    });
+    // A stored selection that no longer exists must not silently load a
+    // DIFFERENT project: offer it explicitly as missing instead.
+    if (state.projectId && !rows.some(function (r) { return r.project_id === state.projectId; })) {
+      var stale = document.createElement('option');
+      stale.value = state.projectId;
+      stale.textContent = clean(state.projectId) + '  (không còn trong fleet)';
+      pickerEl.append(stale);
+    }
+    pickerEl.value = state.projectId;
+    if (data.node_errors && Object.keys(data.node_errors).length) {
+      // Reported, never hidden: a node that could not be reached means the
+      // list may be incomplete, and the operator should know which one.
+      setErr('Một số node không đọc được: ' + Object.keys(data.node_errors).join(', '));
+    }
+    syncPathEnabled();
+  }
+
   async function load() {
     setErr('');
     var path = pathEl.value.trim();
     state.path = path;
     try { localStorage.setItem(STORE_KEY, path); } catch (e) {}
+    try { localStorage.setItem(PROJECT_KEY, state.projectId); } catch (e) {}
     var params = new URLSearchParams();
-    if (path) params.set('path', path);
+    if (state.projectId) params.set('project_id', state.projectId);
+    else if (path) params.set('path', path);
     var st = document.getElementById('fStatus').value;
     var pr = document.getElementById('fPriority').value;
     if (st) params.set('status', st);
@@ -5975,7 +6068,28 @@ BACKLOG_HTML = """<!doctype html>
     }
   }
 
-  document.getElementById('loadBtn').onclick = load;
+  pickerEl.onchange = function () {
+    state.projectId = pickerEl.value;
+    syncPathEnabled();
+    // Selecting "dùng đường dẫn local" with an empty path box has nothing
+    // to load -- clear the view rather than firing a request that would
+    // silently fall back to the server's own default root.
+    if (!state.projectId && !pathEl.value.trim()) {
+      listEl.replaceChildren(); metaEl.replaceChildren();
+      projEl.textContent = ''; emptyEl.hidden = true; setErr('');
+      try { localStorage.setItem(PROJECT_KEY, ''); } catch (e) {}
+      return;
+    }
+    load();
+  };
+  document.getElementById('refreshProjects').onclick = function () { loadProjects(); };
+  document.getElementById('loadBtn').onclick = function () {
+    // Typing a path is an explicit choice to address a local checkout --
+    // honour it by dropping any picked project rather than ignoring the
+    // box the operator just typed into.
+    if (!pathEl.disabled && pathEl.value.trim()) { state.projectId = ''; pickerEl.value = ''; syncPathEnabled(); }
+    load();
+  };
   document.getElementById('fStatus').onchange = load;
   document.getElementById('fPriority').onchange = load;
   document.getElementById('fOpenOnly').onchange = load;
@@ -5986,21 +6100,24 @@ BACKLOG_HTML = """<!doctype html>
     setErr('');
     var title = document.getElementById('ntTitle').value.trim();
     if (!title) { setErr('Title không được trống'); return; }
-    var ac = document.getElementById('ntAc').value.split('\n').map(function (x) { return x.trim(); }).filter(Boolean);
+    var ac = document.getElementById('ntAc').value.split('\\n').map(function (x) { return x.trim(); }).filter(Boolean);
     try {
       await api('/dashboard/api/backlog/add', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({path: state.path || pathEl.value.trim(), expected_revision: state.revision,
+        body: JSON.stringify(Object.assign(selector(), {expected_revision: state.revision,
           tasks: [{title: title, description: document.getElementById('ntDesc').value,
                    priority: document.getElementById('ntPriority').value,
-                   type: document.getElementById('ntType').value, acceptance_criteria: ac}]})});
+                   type: document.getElementById('ntType').value, acceptance_criteria: ac}]}))});
       document.getElementById('ntTitle').value = ''; document.getElementById('ntDesc').value = '';
       document.getElementById('ntAc').value = ''; addPanel.hidden = true;
       await load();
     } catch (e) { setErr(e.message || e); }
   };
 
-  if (pathEl.value.trim()) load();
+  syncPathEnabled();
+  loadProjects().then(function () {
+    if (state.projectId || pathEl.value.trim()) load();
+  });
 })();
 </script>
 </body>
@@ -8880,6 +8997,25 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     # through _mutation_guard (Cloudflare Access / webauth identity) AND
     # the service's own allowed_cwd_roots path gate, so the browser
     # surface can never reach a project the MCP surface could not.
+    @server.custom_route("/dashboard/api/projects", methods=["GET"], include_in_schema=False)
+    async def backlog_projects(request: Request) -> JSONResponse:
+        """Every project this controller holds a backlog for, PLUS every
+        git project the fleet is actually working on -- so a project with
+        live sessions but no backlog yet is still offerable in the picker
+        rather than invisible until someone remembers to type its path.
+
+        This is what makes the panel addressable by canonical project
+        identity instead of by a local filesystem path: one project with
+        checkouts on three machines is ONE row here, which is the whole
+        reason the path-only UI was inadequate."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        if backlog is None:
+            return JSONResponse({"error": "BACKLOG_UNAVAILABLE"}, status_code=503)
+        result = await anyio.to_thread.run_sync(backlog.list_projects)
+        return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
     @server.custom_route("/dashboard/api/backlog", methods=["GET"], include_in_schema=False)
     async def backlog_get(request: Request) -> JSONResponse:
         blocked, _identity = _read_guard(request)
@@ -8888,14 +9024,35 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if backlog is None:
             return JSONResponse({"error": "BACKLOG_UNAVAILABLE"}, status_code=503)
         params = request.query_params
+        # project_id / node_id+session / path -- the SAME precedence
+        # BacklogService._project already defines. The route passes all
+        # three through rather than picking one, so the service stays the
+        # single place that decides, and the picker can address a project
+        # whose checkout is on another machine entirely.
         result = await anyio.to_thread.run_sync(lambda: backlog.get(
-            params.get("path") or None, status=params.get("status") or None,
+            params.get("path") or None,
+            project_id=params.get("project_id") or None,
+            node_id=params.get("node_id") or None,
+            session=params.get("session") or None,
+            status=params.get("status") or None,
             priority=params.get("priority") or None, type=params.get("type") or None,
             tag=params.get("tag") or None,
             include_terminal=params.get("include_terminal", "1") != "0",
             limit=int(params.get("limit") or 500)))
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    def _project_selector(body: dict) -> dict:
+        """Pull the project-addressing fields out of a mutation body.
+
+        `dispatch`/`complete` already take `session` to mean the DISPATCH
+        TARGET, so BacklogService names the project-resolution ones
+        `project_node_id`/`project_session`. Mapping them in one helper
+        keeps that distinction from being re-derived (and eventually got
+        wrong) at each of the four call sites."""
+        return {"project_id": body.get("project_id") or None,
+                "project_node_id": body.get("node_id") or None,
+                "project_session": body.get("project_session") or None}
 
     async def _backlog_write(request: Request, handler) -> JSONResponse:
         blocked, identity = _mutation_guard(request)
@@ -8918,26 +9075,30 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     async def backlog_add(request: Request) -> JSONResponse:
         return await _backlog_write(request, lambda body, actor: backlog.add(
             body.get("path"), tasks=body.get("tasks") or [],
-            expected_revision=body.get("expected_revision"), source=actor))
+            expected_revision=body.get("expected_revision"), source=actor,
+            **_project_selector(body)))
 
     @server.custom_route("/dashboard/api/backlog/update", methods=["POST"], include_in_schema=False)
     async def backlog_update(request: Request) -> JSONResponse:
         return await _backlog_write(request, lambda body, actor: backlog.update(
             body.get("path"), task_id=body.get("task_id", ""), patch=body.get("patch") or {},
-            expected_revision=body.get("expected_revision"), actor=actor))
+            expected_revision=body.get("expected_revision"), actor=actor,
+            **_project_selector(body)))
 
     @server.custom_route("/dashboard/api/backlog/dispatch", methods=["POST"], include_in_schema=False)
     async def backlog_dispatch(request: Request) -> JSONResponse:
         return await _backlog_write(request, lambda body, actor: backlog.dispatch(
             body.get("path"), task_id=body.get("task_id", ""), session=body.get("session"),
-            expected_revision=body.get("expected_revision")))
+            expected_revision=body.get("expected_revision"),
+            **_project_selector(body)))
 
     @server.custom_route("/dashboard/api/backlog/complete", methods=["POST"], include_in_schema=False)
     async def backlog_complete(request: Request) -> JSONResponse:
         return await _backlog_write(request, lambda body, actor: backlog.complete(
             body.get("path"), task_id=body.get("task_id", ""), commit=body.get("commit"),
             test=body.get("test"), deploy=body.get("deploy"), note=body.get("note"),
-            expected_revision=body.get("expected_revision"), actor=actor))
+            expected_revision=body.get("expected_revision"), actor=actor,
+            **_project_selector(body)))
 
     @server.custom_route("/dashboard/api/supervisor", methods=["GET"], include_in_schema=False)
     async def supervisor_summary(request: Request) -> JSONResponse:
