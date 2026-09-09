@@ -229,11 +229,54 @@ terminal_backlog_complete(path=..., task_id="blg_...", commit="a1b2c3d",
 backlog and dispatch later. That is how work stops being lost between
 sessions.
 
-## Project Brief integration
+## Project Brief integration — WIRED
 
-`BacklogService.open_items_for_brief()` is the seam the Project Brief
-should call for "Open / Unrun Tasks" rather than keeping a second list —
-`unrun` means never dispatched (no `queue_task_id`), the items nothing
-else will mention. It is a thin projection of `get`, so a brief can never
-drift from the backlog. The paused project-scoped-knowledge work can adopt
-it later without this MVP guessing that feature's shape.
+A session's recovery brief (`terminal_knowledge_recover`, backed by
+`session_knowledge.recovery_brief`) already knows which **repo** the
+session was working in (`meta.repo_root`), and the backlog is keyed on
+exactly that repo — so the brief reports what the project still intends
+to do instead of keeping a second, drifting list.
+
+The brief gains a `project_backlog` field:
+
+```jsonc
+"project_backlog": {
+  "available": true,
+  "project": { "project_id": "git:github.com/acme/widget", ... },
+  "backlog_file": "/repo/.terminal-mcp/backlog.json",
+  "open_total": 7, "unrun_total": 3,
+  "counts": { "BACKLOG": 5, "IN_PROGRESS": 2, ... },
+  "open_items":  [ { "id", "title", "status", "priority", "type",
+                     "queue_task_id", "tags", "blocked_reason" } ],
+  "unrun_items": [ ... ]                 // never dispatched
+}
+```
+
+and `recovery_brief_text` gains a readable block, with `[unrun]` marking
+items nothing is executing:
+
+```
+-- open project backlog: 2 open, 1 never dispatched (source of truth: /repo/.terminal-mcp/backlog.json) --
+[P0] BACKLOG      blg_1c77e0aa3b52  Flaky test: test_session_reattach times out  [unrun]
+[P1] IN_PROGRESS  blg_9f2c1a4b77de  Add rate limiting to the public API
+```
+
+Design points worth keeping:
+
+- **Read, never cached.** The brief reads the backlog file each time, so
+  it cannot drift from the source of truth — pinned by a test that adds an
+  item between two briefs.
+- **Never fatal.** A session outside `allowed_cwd_roots`, a non-repo cwd,
+  a project with no backlog, or a corrupt file each attach
+  `{"available": false, "reason": ...}` and leave the rest of the brief
+  intact. Recovering context must not depend on the backlog existing.
+- **Marked untrusted.** `project_backlog` is added to the brief's
+  `untrusted_fields`. Backlog text is deliberate structured data rather
+  than a raw pane scrape, but it is still *agent-written* — a confused or
+  compromised agent could park injection text in a title that then lands
+  in another agent's brief.
+- **Same path gate.** The `BacklogService` is built from the
+  `TerminalService`'s own config, so `allowed_cwd_roots` is the one used
+  for session creation — never a second, looser policy. It is lazily
+  constructed rather than a constructor argument, so no other caller (or
+  test) has to know the backlog exists.

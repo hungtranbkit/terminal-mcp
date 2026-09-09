@@ -3738,11 +3738,14 @@ cannot key a shared backlog. Hence `project_identity.py`.
   `.terminal-mcp/` makes it local scratch. Tradeoff documented in
   `docs/backlog.md`.
 
-**Deliberately deferred, not silently dropped:** the Project Brief
-integration is an interface only — `BacklogService.open_items_for_brief()`
-returns open/unrun items in the shape a brief needs, so the paused
-project-scoped-knowledge work can adopt it without this MVP guessing that
-feature's shape.
+**Project Brief integration — WIRED.** A session's recovery brief
+(`terminal_knowledge_recover`) now carries a `project_backlog` field and a
+readable block in `recovery_brief_text` listing the project's open items,
+with `[unrun]` marking those never dispatched. It reads the backlog file
+each time (no cached second copy, pinned by a test), is never fatal (a
+non-repo cwd, a repo outside `allowed_cwd_roots`, a missing or corrupt
+file each degrade to `available: false` with a reason), and is added to
+the brief's `untrusted_fields` because backlog text is agent-written.
 
 **Dashboard panel — SHIPPED** (`/dashboard/backlog`). Built as its own
 page in the `/dashboard/nodes` + `/dashboard/tasks` family rather than a
