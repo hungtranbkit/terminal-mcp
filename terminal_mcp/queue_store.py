@@ -281,6 +281,10 @@ class QueueTask:
     original_owner: str | None = None
     migration_history: tuple[dict[str, Any], ...] = ()
     at_risk: bool = False
+    # P0.1 Project Dimension. None = legacy/unscoped: every pre-existing
+    # query is unfiltered unless a caller explicitly asks for a project,
+    # so a task without one behaves exactly as it did before.
+    project_id: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "QueueTask":
@@ -306,6 +310,7 @@ class QueueTask:
             original_owner=row["original_owner"],
             migration_history=tuple(_parse_json_dict_list(row["migration_history"])),
             at_risk=bool(row["at_risk"]),
+            project_id=(row["project_id"] if "project_id" in row.keys() else None),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -329,6 +334,7 @@ class QueueTask:
             "original_owner": self.original_owner,
             "migration_history": list(self.migration_history),
             "at_risk": self.at_risk,
+            "project_id": self.project_id,
         }
 
 
@@ -551,6 +557,31 @@ def _add_v5_dispatch_idempotency_key_if_missing(connection: sqlite3.Connection) 
         connection.execute("ALTER TABLE queue_tasks ADD COLUMN dispatch_idempotency_key TEXT")
 
 
+def _add_v6_project_dimension(connection: sqlite3.Connection) -> None:
+    """P0.1 Project Dimension. Additive and NULLABLE on purpose: a task
+    with project_id IS NULL behaves EXACTLY as before this migration --
+    every existing query is unfiltered unless a caller opts in, so a
+    legacy database keeps working untouched.
+
+    Only queue_tasks gains a column. `queue_lanes.project` already exists
+    (migration v4) and was simply never populated -- it is REUSED as the
+    lane-level project key rather than adding a second, competing column.
+    The canonical value in both is the project_identity id
+    (e.g. "git:github.com/acme/widget"), never a free-text label.
+
+    An index is added because project-scoped listing/claiming is the whole
+    point; without it every project query degrades to a table scan as the
+    queue grows."""
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(queue_tasks)")}
+    if "project_id" not in columns:
+        connection.execute("ALTER TABLE queue_tasks ADD COLUMN project_id TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_queue_tasks_project_status "
+        "ON queue_tasks(project_id, status)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_queue_lanes_project ON queue_lanes(project)")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
@@ -561,6 +592,9 @@ QUEUE_MIGRATIONS = [
                  "lane project/last_rebalance_at", _add_v4_migration_columns),
     Migration(5, "heal a real, already-migrated database missing dispatch_idempotency_key "
                  "(see this function's own docstring)", _add_v5_dispatch_idempotency_key_if_missing),
+    Migration(6, "P0.1 Project Dimension: queue_tasks.project_id (nullable) + project indexes; "
+                 "queue_lanes.project (added v4, never populated) is REUSED as the lane key",
+              _add_v6_project_dimension),
 ]
 
 
@@ -682,6 +716,80 @@ class QueueStore:
             "total_count": len(tasks),
         }
 
+    # ---------------------------------------------------- P0.1 project reads
+    def list_tasks_for_project(self, project_id: str, *, status: str | None = None,
+                               limit: int = 200) -> list[QueueTask]:
+        """Project-scoped listing. A SEPARATE method rather than a new
+        argument on an existing one: every current caller keeps its exact
+        signature and behaviour, and nothing starts filtering implicitly.
+        Tasks with project_id IS NULL (every legacy row) are never
+        returned here -- they belong to no project by definition."""
+        query = "SELECT * FROM queue_tasks WHERE project_id = ?"
+        params: list[Any] = [project_id]
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY priority DESC, position ASC LIMIT ?"
+        params.append(int(limit))
+        with self._connection() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [QueueTask.from_row(row) for row in rows]
+
+    def project_task_counts(self, project_id: str) -> dict[str, int]:
+        """status -> count for one project: the cheap read a project
+        status API needs without pulling every row."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT status, COUNT(*) AS n FROM queue_tasks WHERE project_id = ? GROUP BY status",
+                (project_id,)).fetchall()
+        return {row["status"]: row["n"] for row in rows}
+
+    def set_task_project(self, task_id: str, project_id: str | None) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE queue_tasks SET project_id = ?, updated_at = ? WHERE id = ?",
+                (project_id, iso_now(), task_id))
+        return cursor.rowcount > 0
+
+    def backfill_project_ids(self, resolver: Any, *, dry_run: bool = True) -> dict[str, Any]:
+        """P0.1 backfill. `resolver(session) -> project_id | None` is
+        supplied by the caller, so this store never learns how a project
+        is derived.
+
+        SAFE BY CONSTRUCTION: only ever fills rows where project_id IS
+        NULL, so it can never overwrite or re-home a task that already
+        has one; and it defaults to dry_run so the plan is inspectable
+        before anything is written."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT id, session FROM queue_tasks WHERE project_id IS NULL").fetchall()
+        planned: dict[str, str] = {}
+        unresolved = 0
+        cache: dict[str, str | None] = {}
+        for row in rows:
+            session = row["session"]
+            if session not in cache:
+                try:
+                    cache[session] = resolver(session)
+                except Exception:  # noqa: BLE001 - one bad resolve must not abort the backfill
+                    cache[session] = None
+            project_id = cache[session]
+            if project_id:
+                planned[row["id"]] = project_id
+            else:
+                unresolved += 1
+        if not dry_run and planned:
+            now = iso_now()
+            with self._connection() as connection:
+                connection.executemany(
+                    "UPDATE queue_tasks SET project_id = ?, updated_at = ? WHERE id = ? AND project_id IS NULL",
+                    [(pid, now, tid) for tid, pid in planned.items()])
+        by_project: dict[str, int] = {}
+        for pid in planned.values():
+            by_project[pid] = by_project.get(pid, 0) + 1
+        return {"dry_run": dry_run, "candidates": len(rows), "planned": len(planned),
+                "unresolved": unresolved, "by_project": by_project}
+
     def list_all_lanes(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
             sessions = [row["session"] for row in connection.execute("SELECT session FROM queue_lanes").fetchall()]
@@ -738,12 +846,13 @@ class QueueStore:
                 connection.execute(
                     "INSERT INTO queue_tasks (id, session, position, title, prompt, status, created_at, "
                     "attempt_count, max_attempts, completion_policy, metadata, updated_at, priority, depends_on, "
-                    "original_owner) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
+                    "original_owner, project_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (task_id, session, next_position + offset, task.get("title") or "", task["prompt"], QUEUED, now,
                      int(task.get("max_attempts") or 3), json.dumps(task.get("completion_policy") or {}),
                      json.dumps(task.get("metadata") or {}), now, int(task.get("priority") or 0),
-                     json.dumps(list(task.get("depends_on") or [])), session),
+                     json.dumps(list(task.get("depends_on") or [])), session,
+                     task.get("project_id")),
                 )
                 self._record_event_locked(connection, session=session, task_id=task_id, event_type="ENQUEUED",
                                           reason=None)
