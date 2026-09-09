@@ -26,20 +26,30 @@ _log = logging.getLogger(__name__)
 
 
 class LanCidrGuardMiddleware:
-    def __init__(self, app, *, lan_bind_ip: str | None, allowed_cidrs: tuple[ipaddress.IPv4Network, ...]) -> None:
+    def __init__(self, app, *, lan_bind_ip, allowed_cidrs: tuple[ipaddress.IPv4Network, ...]) -> None:
         self.app = app
+        # Accepts the singular `str | None` shape it has always accepted,
+        # or a sequence -- the controller can bind its LAN address and its
+        # overlay-VPN address at the same time, and EVERY such socket must
+        # be guarded, not just the first one.
+        if lan_bind_ip is None:
+            self.lan_bind_ips: frozenset[str] = frozenset()
+        elif isinstance(lan_bind_ip, str):
+            self.lan_bind_ips = frozenset({lan_bind_ip})
+        else:
+            self.lan_bind_ips = frozenset(lan_bind_ip)
         self.lan_bind_ip = lan_bind_ip
         self.allowed_cidrs = allowed_cidrs
 
     async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] != "http" or self.lan_bind_ip is None:
+        if scope["type"] != "http" or not self.lan_bind_ips:
             await self.app(scope, receive, send)
             return
         server = scope.get("server")
         local_ip = server[0] if server else None
-        if local_ip != self.lan_bind_ip:
+        if local_ip not in self.lan_bind_ips:
             # Arrived on the loopback socket (or anything else) -- this
-            # guard only ever governs the LAN socket specifically.
+            # guard only ever governs the LAN/overlay sockets specifically.
             await self.app(scope, receive, send)
             return
         client = scope.get("client")

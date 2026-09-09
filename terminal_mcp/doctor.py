@@ -74,7 +74,8 @@ def _print_human(result: dict) -> None:
     print("  controller endpoints:")
     print(f"    loopback: {endpoints.get('loopback')}")
     if endpoints.get("lan"):
-        print(f"    lan:      {endpoints['lan']}  (allowed_cidrs={endpoints.get('allowed_cidrs')})")
+        for url in endpoints.get("lans") or [endpoints["lan"]]:
+            print(f"    lan:      {url}  (allowed_cidrs={endpoints.get('allowed_cidrs')})")
         print(f"    ⚠ {endpoints.get('firewall_reminder')}")
     elif endpoints.get("lan_error"):
         print(f"    lan:      DISABLED -- {endpoints['lan_error']}")
