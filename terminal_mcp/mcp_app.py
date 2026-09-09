@@ -30,6 +30,7 @@ from .pm_summary import (
 from .queue_engine import QueueEngine
 from .queue_loop import QueueLoop
 from .backlog_service import BacklogService
+from .event_bus import KNOWN_EVENT_TYPES, EventBus
 from .queue_service import QueueService
 from .release_service import ReleaseService
 from .release_store import ReleaseStore
@@ -48,7 +49,8 @@ def build_mcp(service: TerminalService | None = None,
               release: ReleaseService | None = None,
               ai_usage: AiUsageService | None = None,
               recovery: RecoveryEngine | None = None,
-              backlog: BacklogService | None = None) -> MCPServer:
+              backlog: BacklogService | None = None,
+              events: EventBus | None = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -2182,6 +2184,90 @@ def build_mcp(service: TerminalService | None = None,
             repaired form only if something actually changed. Use this if
             _get reports non-empty `repairs`."""
             return backlog.validate(path)
+
+
+
+    # ------------------------------------------------------------------
+    # P0.2 Event Bus. Publish/claim/ack only -- NOTHING here starts an
+    # autonomous consumer. Turning events into automatic dispatch is a
+    # later phase behind the existing two-gate opt-in.
+    # ------------------------------------------------------------------
+    if events is not None:
+
+        @server.tool()
+        def terminal_event_publish(type: str, project_id: str | None = None,
+                                   entity_type: str | None = None, entity_id: str | None = None,
+                                   payload: dict | None = None, correlation_id: str | None = None,
+                                   idempotency_key: str | None = None) -> dict:
+            """Append an event to the project-scoped bus.
+
+            Known types: TASK_CREATED, TASK_READY, WORKER_IDLE, WORKER_DONE,
+            VERIFY_PENDING, MERGE_CONFLICT, TEST_FAILED, PREVIEW_FAILED,
+            USER_FEEDBACK (others are accepted -- the bus does not police
+            vocabulary).
+
+            `payload` is for SAFE METADATA AND REFERENCES ONLY -- never raw
+            prompt text; this store follows audit.py's rule of recording
+            references/hashes rather than content.
+
+            Passing `idempotency_key` makes a retry a no-op: the ORIGINAL
+            event is returned with duplicate=true and nothing new is
+            created. `project_id=null` publishes an unscoped/global event,
+            which a project-scoped claim will never receive."""
+            return events.publish(type, project_id=project_id, entity_type=entity_type,
+                                  entity_id=entity_id, payload=payload,
+                                  correlation_id=correlation_id, idempotency_key=idempotency_key)
+
+        @server.tool()
+        def terminal_event_list(project_id: str | None = None, types: list[str] | None = None,
+                                status: str | None = None, since_seq: int | None = None,
+                                limit: int = 100) -> dict:
+            """Read events in order. Ordering is guaranteed PER PROJECT
+            (filter by project_id, ordered by ascending `seq`); a global
+            total order across the other stores' own logs is NOT promised.
+            Page with `since_seq` from the last row you saw."""
+            return {"events": events.list_events(project_id=project_id, types=types,
+                                                 status=status, since_seq=since_seq, limit=limit),
+                    "known_types": list(KNOWN_EVENT_TYPES)}
+
+        @server.tool()
+        def terminal_event_claim(consumer: str, project_id: str | None = None,
+                                 types: list[str] | None = None,
+                                 lease_seconds: float = 300.0) -> dict:
+            """Atomically claim the OLDEST eligible event and take a lease
+            on it. Two consumers can never claim the same event. An event
+            whose lease EXPIRES becomes claimable again, so a consumer that
+            crashes mid-handling never strands it.
+
+            Returns the event plus a `claim_token` you must pass to
+            terminal_event_ack/_release. Returns {} when nothing matches."""
+            claimed = events.claim_next(consumer=consumer, project_id=project_id,
+                                        types=types, lease_seconds=lease_seconds)
+            return claimed or {}
+
+        @server.tool()
+        def terminal_event_ack(event_id: str, claim_token: str) -> dict:
+            """Mark a claimed event handled. Requires the CURRENT token, so
+            a consumer whose lease already expired and was reclaimed cannot
+            ack someone else's work."""
+            return {"acked": events.ack(event_id, claim_token), "event_id": event_id}
+
+        @server.tool()
+        def terminal_event_release(event_id: str, claim_token: str, error: str | None = None) -> dict:
+            """Hand a claimed event back for another consumer to take."""
+            return {"released": events.release(event_id, claim_token, error=error),
+                    "event_id": event_id}
+
+        @server.tool()
+        def terminal_event_retry(event_id: str) -> dict:
+            """Operator action: put a FAILED event back in play and reset
+            its attempt budget."""
+            return {"retried": events.retry(event_id), "event_id": event_id}
+
+        @server.tool()
+        def terminal_event_stats(project_id: str | None = None) -> dict:
+            """Event counts by status, optionally for one project."""
+            return {"stats": events.stats(project_id=project_id)}
 
 
     return server

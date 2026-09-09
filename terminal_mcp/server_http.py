@@ -25,6 +25,7 @@ from .planner_store import PlannerStore
 from .pm_service import PMService
 from .pm_store import PMStore
 from .backlog_service import BacklogService
+from .event_bus import EventBus
 from .queue_service import QueueService
 from .recovery_engine import RecoveryEngine
 from .recovery_loop import RecoveryLoop
@@ -312,8 +313,11 @@ def main() -> None:
     # allowed_cwd_roots path gate, its audit trail, and its dispatch path
     # are the existing ones rather than parallel copies.
     backlog = BacklogService(config, audit=terminal.audit, queue=queue, controller=controller)
+    # P0.2: the bus is CONSTRUCTED (so publish/claim tools exist) but no
+    # consumer loop is started here -- autonomous coordination stays off.
+    events = EventBus()
     server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
-                       planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog)
+                       planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog, events=events)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
                        recovery=recovery, backlog=backlog)
