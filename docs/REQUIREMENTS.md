@@ -3742,10 +3742,21 @@ cannot key a shared backlog. Hence `project_identity.py`.
 integration is an interface only — `BacklogService.open_items_for_brief()`
 returns open/unrun items in the shape a brief needs, so the paused
 project-scoped-knowledge work can adopt it without this MVP guessing that
-feature's shape. The dashboard ships API routes; a rich Kanban-style
-backlog panel was not attempted (the task asked for minimum viable, and
-`dashboard.py` is 8.5k lines — a large UI change belongs in its own
-change with its own review).
+feature's shape.
+
+**Dashboard panel — SHIPPED** (`/dashboard/backlog`). Built as its own
+page in the `/dashboard/nodes` + `/dashboard/tasks` family rather than a
+new tab inside the ~3.6k-line main template, whose fetch() surface is
+pinned by an exact-count test — the only edit there is one nav link. Per
+project: counts/filters, add, status moves, Dispatch, Complete (which
+prompts for evidence, so the verified-done gate is visible in the UI),
+and a queue chip linking a dispatched item to Global Tasks. Every write
+sends `expected_revision`, so the UI cannot bypass optimistic
+concurrency. Because backlog text is agent-written and rendered in a
+browser, the page builds content with `textContent` only — no
+`innerHTML`/`outerHTML` assignment, no inline `on*=` handlers — pinned by
+`tests/test_backlog_panel.py`, whose assertion matches the assignment
+rather than the word so it cannot rot into a weak test.
 
 ## Internet / VPS migration roadmap (PLANNED — docs only, no code yet)
 

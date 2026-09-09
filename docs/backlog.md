@@ -168,7 +168,38 @@ than silently assumed.
 | `terminal_backlog_complete` | DONE, evidence-gated |
 | `terminal_backlog_validate` | re-validate / normalise after a manual edit |
 
-Dashboard: `GET /dashboard/api/backlog`, `POST /dashboard/api/backlog/{add,update,dispatch,complete}`.
+## Dashboard panel
+
+**`/dashboard/backlog`** — its own page, reachable from the main
+dashboard menu (📋 Project Backlog), alongside `/dashboard/nodes` and
+`/dashboard/tasks`. It is a *view* over the API routes below, not a new
+privilege surface: reads pass `_read_guard`, and every write goes back
+through the `_mutation_guard`-ed API, which is itself path-gated by
+`BacklogService` — the page cannot reach a project the API would refuse.
+
+It shows, per project (enter any path inside the repo; it is remembered
+in `localStorage`):
+
+- counts — open / in progress / blocked / done / total, plus `rev`, the
+  backlog file path, and a `repairs` chip if the file needed normalising
+- filters — status, priority, and an "only open" toggle
+- per item — status/priority/type chips, tags, acceptance criteria,
+  blocked reason, the owning session, and a **queue** chip linking to
+  Global Tasks when the item has been dispatched
+- actions — add, move status, **Dispatch** (prompts for a session), and
+  **Complete** (prompts for evidence, because the API requires it)
+
+Every write sends `expected_revision`, so the UI cannot bypass the
+optimistic-concurrency check that protects concurrent agents.
+
+**XSS posture is deliberate here**, because backlog text is written by
+*agents* into a repo file and rendered in a browser: the page builds all
+content with `textContent` and never assigns `innerHTML`/`outerHTML`, has
+no inline `on*=` handler attributes, and `tests/test_backlog_panel.py`
+pins all three (an item titled `<img src=x onerror=...>` renders as
+text).
+
+API routes: `GET /dashboard/api/backlog`, `POST /dashboard/api/backlog/{add,update,dispatch,complete}`.
 
 ## The workflow ChatGPT should follow
 
