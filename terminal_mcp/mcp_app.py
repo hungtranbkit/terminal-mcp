@@ -31,6 +31,7 @@ from .queue_engine import QueueEngine
 from .queue_loop import QueueLoop
 from .backlog_service import BacklogService
 from .event_bus import KNOWN_EVENT_TYPES, EventBus
+from .lease import DEFAULT_RESOURCE_LOCK_TTL_SECONDS, ResourceLockStore
 from .queue_service import QueueService
 from .release_service import ReleaseService
 from .release_store import ReleaseStore
@@ -50,7 +51,8 @@ def build_mcp(service: TerminalService | None = None,
               ai_usage: AiUsageService | None = None,
               recovery: RecoveryEngine | None = None,
               backlog: BacklogService | None = None,
-              events: EventBus | None = None) -> MCPServer:
+              events: EventBus | None = None,
+              resource_locks: ResourceLockStore | None = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -2194,6 +2196,140 @@ def build_mcp(service: TerminalService | None = None,
             return backlog.validate(path)
 
 
+
+    # ------------------------------------------------------------------
+    # P0.6 Named-resource ownership lock. "No two agents touch the same
+    # file / module / branch at once."
+    #
+    # Same TTL + owner semantics as the pane lease, and the SAME atomic
+    # acquire (lease.py's _LeaseTable, inherited rather than copied). It
+    # is a separate TABLE from pane_leases in the same database: the two
+    # have different lifetimes and different subjects, and pane_leases is
+    # on the send hot path.
+    #
+    # ADVISORY, by design. Nothing here can physically stop an agent from
+    # editing a file it did not lock -- these tools give coordinating
+    # agents a durable, crash-recoverable way to agree, which is what a
+    # fleet of cooperating workers actually needs. Treating it as
+    # enforcement would be a false guarantee.
+    # ------------------------------------------------------------------
+    locks = resource_locks or ResourceLockStore()
+
+    @server.tool()
+    def terminal_resource_lock(project_id: str, resource_key: str, owner_id: str,
+                               ttl_seconds: float = DEFAULT_RESOURCE_LOCK_TTL_SECONDS,
+                               reason: str | None = None) -> dict:
+        """Claim exclusive ownership of ONE named resource in a project --
+        a file, a module, a branch, a migration, anything two agents must
+        not touch at once.
+
+        `resource_key` is the caller's own naming scheme (e.g.
+        "src/app.py", "branch:main", "db:migrations"); it is scoped to
+        `project_id`, so the same key in two projects is two independent
+        locks. `owner_id` should identify one WORKER (or one task
+        attempt), the same way the pane lease uses a correlation id.
+
+        On refusal this returns WHO holds it and until when, so the caller
+        can wait, pick different work, or escalate -- it never blocks.
+        Re-acquiring your own lock is idempotent and refreshes the TTL; a
+        lock whose holder stopped renewing is reclaimable by anyone."""
+        try:
+            return locks.acquire(project_id, resource_key, owner_id,
+                                 ttl_seconds=ttl_seconds, reason=reason)
+        except ValueError as exc:
+            return {"error": "INVALID_REQUEST", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_resource_lock_many(project_id: str, resource_keys: list[str], owner_id: str,
+                                    ttl_seconds: float = DEFAULT_RESOURCE_LOCK_TTL_SECONDS,
+                                    reason: str | None = None) -> dict:
+        """ALL of these resources, or NONE of them, in one transaction.
+
+        Use this instead of several terminal_resource_lock calls whenever
+        a task needs more than one resource. Two agents that each need
+        {a, b} and take them one at a time can end up holding one apiece
+        and waiting on each other forever; taking the whole set under a
+        single write lock makes that impossible -- the loser gets nothing
+        and can retry cleanly. Returns the first conflicting resource and
+        its holder."""
+        try:
+            return locks.acquire_many(project_id, resource_keys, owner_id,
+                                      ttl_seconds=ttl_seconds, reason=reason)
+        except ValueError as exc:
+            return {"error": "INVALID_REQUEST", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_resource_renew(project_id: str, resource_key: str, owner_id: str,
+                                ttl_seconds: float = DEFAULT_RESOURCE_LOCK_TTL_SECONDS) -> dict:
+        """Extend a lock you still hold. A holder that stops renewing is
+        treated as gone and its lock becomes reclaimable -- so long work
+        MUST renew, the same contract as the queue task lease. Renewing an
+        already-expired lock fails: re-acquire instead (and accept that
+        you may lose the race)."""
+        try:
+            return locks.renew(project_id, resource_key, owner_id, ttl_seconds=ttl_seconds)
+        except ValueError as exc:
+            return {"error": "INVALID_REQUEST", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_resource_unlock(project_id: str, resource_key: str, owner_id: str) -> dict:
+        """Release your own lock. Never removes another owner's active
+        lock -- if it returns released=false, yours had already expired and
+        been reclaimed by someone else."""
+        try:
+            return {"released": locks.release(project_id, resource_key, owner_id),
+                    "project_id": project_id, "resource_key": resource_key}
+        except ValueError as exc:
+            return {"error": "INVALID_REQUEST", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_resource_unlock_all(owner_id: str, project_id: str | None = None) -> dict:
+        """Drop every lock this owner holds -- what a worker calls when it
+        finishes or aborts, so a completed agent never leaves a resource
+        pinned until its TTL lapses."""
+        try:
+            return {"released": locks.release_all(owner_id, project_id=project_id),
+                    "owner_id": owner_id, "project_id": project_id}
+        except ValueError as exc:
+            return {"error": "INVALID_REQUEST", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_resource_holder(project_id: str, resource_key: str) -> dict:
+        """Who holds this resource and until when. An EXPIRED lock is
+        still reported (with expired: true) rather than hidden -- "nobody
+        holds this" and "the last holder died and nobody has taken it
+        since" are different answers."""
+        try:
+            holder = locks.holder(project_id, resource_key)
+        except ValueError as exc:
+            return {"error": "INVALID_REQUEST", "detail": str(exc)}
+        return holder or {"project_id": project_id, "resource_key": resource_key, "held": False}
+
+    @server.tool()
+    def terminal_resource_locks(project_id: str | None = None, owner_id: str | None = None,
+                                include_expired: bool = False) -> dict:
+        """Every lock currently held, optionally filtered by project or
+        owner -- the read a coordinator needs to answer "what is pinned
+        right now and by whom"."""
+        rows = locks.list_locks(project_id=project_id, owner_id=owner_id,
+                                include_expired=include_expired)
+        return {"locks": rows, "count": len(rows)}
+
+    @server.tool()
+    def terminal_resource_force_unlock(project_id: str, resource_key: str, actor: str,
+                                       reason: str) -> dict:
+        """Operator override: break a lock REGARDLESS of owner.
+
+        A deliberately separate verb from terminal_resource_unlock, not a
+        flag on it: breaking someone else's lock is a different action
+        from giving up your own and should be impossible to do by
+        accident. Requires an actor and a reason, and reports whose lock
+        was broken. Use it when a holder is genuinely gone but its TTL has
+        not yet lapsed -- otherwise just wait for expiry."""
+        try:
+            return locks.force_release(project_id, resource_key, actor=actor, reason=reason)
+        except ValueError as exc:
+            return {"error": "INVALID_REQUEST", "detail": str(exc)}
 
     # ------------------------------------------------------------------
     # P0.2 Event Bus. Publish/claim/ack only -- NOTHING here starts an

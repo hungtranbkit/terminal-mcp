@@ -4160,3 +4160,59 @@ every state change. `claim_token` is never returned by any read.
 handoff/complete/fail/requeue/trace/reconcile`, total 156) and one read-only
 dashboard route, `GET /dashboard/api/verify/queue` (status counts, verifier,
 required capabilities, age, block reason).
+
+# 2026-09-09 P0.6 Named-resource ownership lock
+
+`lease.ResourceLockStore` answers "no two agents touch the same file / module
+/ branch at once", built by **generalising the pane lease**, not by adding a
+second lock.
+
+**What was actually reusable** was not the pane but the atomic check-and-set
+in `acquire()`: one `INSERT ... ON CONFLICT DO UPDATE ... WHERE` whose exact
+shape was arrived at by reproducing a real race (a `SELECT`-then-write let two
+concurrent callers both believe they had won). That algorithm now lives in
+`_LeaseTable`, parameterised by table and key column; `PaneLeaseStore` and
+`ResourceLockStore` are both thin specialisations of it.
+
+**The pane lease is unchanged** — table, columns, method names, signatures,
+return types and the 20s TTL. It is on `core.py`'s send hot path, the most
+safety-critical path in the codebase, so the generated SQL is asserted
+**byte-identical** to the statement that shipped rather than assumed
+equivalent because behavioural tests still pass.
+
+`resource_locks` is a **separate table in the same `leases.db`**. Separate,
+because the two have different lifetimes (20s vs minutes) and different
+subjects, and mixing long-lived agent locks into the table every send contends
+on would be risk for no gain. Same file, because `leases.db` is already
+covered by `/health/ready` and the documented backup procedure.
+
+Semantics match the pane lease — owner-scoped, TTL'd, crash-recoverable,
+idempotent re-acquire — plus what a shared resource needs and a pane does not:
+
+| Addition | Why |
+| --- | --- |
+| **Project scoping** (P0.1 `project_id`) | `src/app.py` in one project is a different resource from `src/app.py` in another; a global key space would make unrelated repos block each other |
+| **Holder returned on refusal** | A primitive that only says "no" leaves the caller nothing to act on; refusals name owner, reason and expiry |
+| **`acquire_many`, all-or-nothing** | Two agents each needing `{a, b}` and taking them one at a time can finish holding one apiece forever; one transaction makes that impossible. Keys are sorted, so differing call orders contend identically |
+| **`release_all(owner)`** | A finished worker never leaves a resource pinned until TTL |
+| **`force_release(actor, reason)`** | A separate verb, not a flag: breaking someone else's lock must be impossible by accident, and is reported with whose lock was broken |
+
+Default TTL is **300s**, matching `queue_store.renew_task_lease`, so a worker
+renews its task and its locks on one cadence. **A holder that stops renewing
+is treated as gone** and its lock becomes reclaimable; renewing an
+already-expired lock fails rather than silently extending.
+
+The composite primary key is `project_id + \x1f + resource_key`; both parts
+reject control characters, so the separator can never appear inside a part and
+collide two distinct resources. `lock_key` is internal and never returned.
+
+**Advisory, not enforcement.** Nothing here can physically stop an agent
+editing a file it did not lock — these give cooperating agents a durable,
+crash-recoverable way to agree. Claiming otherwise would be a false guarantee.
+Deliberately **no waiter queue**: a caller that cannot get a lock is told who
+holds it and decides for itself whether to wait, switch work, or escalate;
+blocking inside a lock primitive is how a fleet deadlocks.
+
+**8 MCP tools** (`terminal_resource_lock`, `_lock_many`, `_renew`, `_unlock`,
+`_unlock_all`, `_holder`, `_locks`, `_force_unlock`; total 164). Expired rows
+are pruned by the existing `maintenance` cycle alongside pane leases.
