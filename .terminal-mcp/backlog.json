@@ -1096,12 +1096,12 @@
       "id": "blg_3c5ca74405af",
       "title": "P0.6 Generalise pane lease into a named-resource ownership lock",
       "description": "lease.PaneLeaseStore is already pane_key-generic in everything but its name. Generalise to resource_key (file/module/branch) with the same TTL/owner/crash-recovery semantics.",
-      "status": "BACKLOG",
+      "status": "DONE",
       "priority": "P2",
       "type": "feature",
       "order": 25,
       "created_at": "2026-09-09T10:04:42.240125+00:00",
-      "updated_at": "2026-09-09T10:04:42.240127+00:00",
+      "updated_at": "2026-09-09T13:33:10.015839+00:00",
       "source": "coordination-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -1117,20 +1117,40 @@
       "session": null,
       "node_id": null,
       "queue_task_id": null,
-      "branch": null,
+      "branch": "feat/p0-6-resource-lock",
       "worktree": null,
       "blocked_reason": null,
       "evidence": {
-        "commits": [],
-        "tests": [],
-        "deploys": [],
-        "notes": []
+        "commits": [
+          "5fd7e41",
+          "da39470"
+        ],
+        "tests": [
+          "2428 passed (2 known pre-existing kill_reopen failures)",
+          "35 new tests: tests/test_resource_lock.py (27), tests/test_resource_lock_mcp_tools.py (8)"
+        ],
+        "deploys": [
+          "terminal-mcp-http.service on da39470, dirty:false, 15/15 local sessions intact"
+        ],
+        "notes": [
+          "Generalised rather than duplicated: the pane lease's atomic check-and-set moved into _LeaseTable and now serves both subjects. PaneLeaseStore's generated SQL asserted BYTE-IDENTICAL to the shipped statement; its 14 existing tests pass untouched.",
+          "Separate resource_locks table in the same leases.db -- different lifetimes (20s vs minutes), and pane_leases is on core.py's send hot path.",
+          "Live-smoked on the real production leases.db: contention reports the holder, project scoping proven against a real second project, all-or-nothing multi-acquire, two real threads racing opposite orders with exactly one winner holding BOTH, operator override, and the pane lease still working afterwards. All rows cleaned up.",
+          "Migration v2 verified on a copy first: pane_leases byte-identical, resource_locks empty, re-apply a no-op.",
+          "ADVISORY, not enforcement -- and deliberately no waiter queue."
+        ]
       },
       "history": [
         {
           "at": "2026-09-09T10:04:42.240133+00:00",
           "event": "created",
           "by": "coordination-audit-2026-09-09"
+        },
+        {
+          "at": "2026-09-09T13:33:10.015839+00:00",
+          "event": "completed",
+          "by": "mcp",
+          "note": "P0.6 shipped, deployed, live-smoked"
         }
       ]
     },
