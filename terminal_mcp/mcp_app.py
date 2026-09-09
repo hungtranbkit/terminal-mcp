@@ -32,6 +32,7 @@ from .queue_loop import QueueLoop
 from .backlog_service import BacklogService
 from .event_bus import KNOWN_EVENT_TYPES, EventBus
 from .lease import DEFAULT_RESOURCE_LOCK_TTL_SECONDS, ResourceLockStore
+from .project_service import ProjectService
 from .queue_service import QueueService
 from .release_service import ReleaseService
 from .release_store import ReleaseStore
@@ -2330,6 +2331,123 @@ def build_mcp(service: TerminalService | None = None,
             return locks.force_release(project_id, resource_key, actor=actor, reason=reason)
         except ValueError as exc:
             return {"error": "INVALID_REQUEST", "detail": str(exc)}
+
+    # ------------------------------------------------------------------
+    # P0.7 Project APIs -- the PROJECT-level view, for ChatGPT.
+    #
+    # Pure composition over P0.1-P0.6 plus the backlog: NO new table, no
+    # migration, no background loop. Every number is read live from the
+    # store that owns it, because a project view holding its own copy of
+    # anything would immediately be a second source of truth to drift.
+    #
+    # Nothing here starts work. submit_goal records an INTENT in the
+    # backlog and never dispatches -- autonomous dispatch stays behind its
+    # existing two-gate opt-in, and a "submit a goal" API that quietly
+    # queued work would be exactly that bypass.
+    # ------------------------------------------------------------------
+    projects = ProjectService(queue=queue, backlog=backlog, events=events,
+                              verify=getattr(queue, "verify_queue", None), locks=locks,
+                              registry=getattr(controller, "registry", None))
+
+    @server.tool()
+    def terminal_project_status(project_id: str) -> dict:
+        """What project X is doing RIGHT NOW, in one read.
+
+        Lanes (and whether each is paused, by whom), task counts, the
+        workers actually holding tasks with their lease expiry, the
+        blockers a human should look at, pending verification with WHY
+        anything unroutable is stuck, held resource locks, event counts
+        and backlog totals.
+
+        A section reads `null` when that subsystem is not wired on this
+        server -- distinct from zero, which means it is wired and empty.
+        Use terminal_project_list to find a project_id."""
+        return projects.status(project_id)
+
+    @server.tool()
+    def terminal_project_submit_goal(project_id: str, goal: str, priority: str = "P2",
+                                     description: str | None = None,
+                                     acceptance_criteria: list[str] | None = None,
+                                     type: str = "feature", actor: str = "mcp") -> dict:
+        """Record an INTENT for a project -- the "I want X" entry point.
+
+        Creates a BACKLOG item and deliberately does NOT create or
+        dispatch a queue task: submitting a goal never starts work. The
+        returned item id is what terminal_backlog_dispatch takes when you
+        decide it should actually run.
+
+        Use terminal_enqueue_task instead when you already know the exact
+        prompt and session and want it queued now."""
+        return projects.submit_goal(project_id, goal, priority=priority, description=description,
+                                    acceptance_criteria=acceptance_criteria, type=type, actor=actor)
+
+    @server.tool()
+    def terminal_project_events(project_id: str, since_seq: int | None = None,
+                                types: list[str] | None = None, limit: int = 100) -> dict:
+        """A project's two event streams, kept apart on purpose.
+
+        `bus` is the claimable/leased event bus; `queue` is the task state
+        machine's own audit trail, derived for this project (queue_events
+        has no project column of its own). They are NOT merged: different
+        id spaces, different meanings, and interleaving them by timestamp
+        would invent an ordering neither guarantees.
+
+        `since_seq` pages the bus stream; `types` filters both."""
+        return projects.project_events(project_id, since_seq=since_seq, types=types, limit=limit)
+
+    @server.tool()
+    def terminal_project_report(project_id: str, window_hours: float = 24.0) -> dict:
+        """What HAPPENED in a window, as opposed to what the queue looks
+        like now (terminal_project_status).
+
+        Throughput is counted from state TRANSITIONS, not current
+        statuses: a task that completed and was later retried is still a
+        completion that happened, and a snapshot would have lost it.
+        `current` is included alongside so both readings are visible."""
+        return projects.report(project_id, window_hours=window_hours)
+
+    @server.tool()
+    def terminal_project_pause(project_id: str, reason: str | None = None,
+                               actor: str = "mcp") -> dict:
+        """Pause dispatch for every lane this project owns.
+
+        A lane already paused is LEFT EXACTLY AS IT IS and reported --
+        overwriting its reason would destroy why someone else paused it.
+        Running tasks move to PAUSED with their prior status saved, the
+        same mechanism terminal_queue_pause uses per lane."""
+        return projects.pause(project_id, reason=reason, actor=actor)
+
+    @server.tool()
+    def terminal_project_resume(project_id: str, actor: str = "mcp",
+                                force: bool = False) -> dict:
+        """Resume the lanes THIS project's pause paused.
+
+        NOT the exact inverse of pause, on purpose: a lane paused by
+        something else -- an operator, a coordinator NEEDS_HUMAN decision
+        -- is SKIPPED and reported with its reason, because silently
+        undoing a deliberate pause is the worst thing this API could do.
+
+        `force=true` overrides that and says so in the result. It is an
+        explicit decision to override someone else, never a convenience."""
+        return projects.resume(project_id, actor=actor, force=force)
+
+    @server.tool()
+    def terminal_project_assign(project_id: str, task_id: str, session: str | None = None,
+                                node_id: str | None = None,
+                                capabilities: list[str] | None = None,
+                                actor: str = "mcp") -> dict:
+        """Route one of a project's tasks to somewhere that can run it.
+
+        Precedence: an explicit `session` assigns there; otherwise
+        `node_id` and/or `capabilities` RESOLVE candidate nodes and report
+        them WITHOUT moving the task -- picking a lane on a remote node is
+        a decision this tool will not make silently for you. Capability
+        matching is AND, over the same reported facts (probed tools plus
+        platform) P0.5 verifier routing uses.
+
+        Refuses a task that belongs to a different project."""
+        return projects.assign(project_id, task_id, session=session, node_id=node_id,
+                               capabilities=capabilities, actor=actor)
 
     # ------------------------------------------------------------------
     # P0.2 Event Bus. Publish/claim/ack only -- NOTHING here starts an

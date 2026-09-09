@@ -4216,3 +4216,66 @@ blocking inside a lock primitive is how a fleet deadlocks.
 **8 MCP tools** (`terminal_resource_lock`, `_lock_many`, `_renew`, `_unlock`,
 `_unlock_all`, `_holder`, `_locks`, `_force_unlock`; total 164). Expired rows
 are pruned by the existing `maintenance` cycle alongside pane leases.
+
+# 2026-09-09 P0.7 Project APIs — P0 complete
+
+`project_service.ProjectService` gives a project a single addressable view.
+Everything it reports already existed, but only one layer at a time: lanes are
+per session, events are on the bus, verify jobs are their own queue, locks are
+their own store, plans are in the backlog. Answering "what is project X doing"
+took six calls and knowing which six.
+
+**No new state.** No table, no migration, no background loop — asserted by a
+test that the module contains neither `CREATE TABLE` nor `Migration(`, and that
+exercising it leaves the queue schema and `user_version` unchanged. Every value
+is read live from the store that owns it:
+
+| Section | Source |
+| --- | --- |
+| lanes / tasks / workers | `queue_store` (`project_id`, P0.1; leases, P0.4) |
+| events | `event_bus` (P0.2) + `queue_events`, derived |
+| capability routing | `node_registry` (P0.3) |
+| verification | `verify_queue` (P0.5) |
+| resource locks | `lease.ResourceLockStore` (P0.6) |
+| plan / goals | `backlog_service` |
+
+A section reads `null` when that subsystem is not wired, which is deliberately
+distinct from `0` — "not wired" and "wired and empty" are different answers.
+
+**`queue_events` has no project column**, so a project's queue events are
+*derived*: by the lane's project, by a task in that lane, or by the event's own
+task. The last arm matters on its own — a task moved between lanes keeps its
+events attributed to the project rather than to whichever lane it sat in.
+
+**Submitting a goal never starts work.** `terminal_project_submit_goal` writes
+a backlog item — an intent — and does not create or dispatch a queue task.
+Autonomous dispatch stays behind its existing two-gate opt-in, and a goal API
+that quietly queued work would be exactly that bypass. `terminal_backlog_dispatch`
+remains the explicit crossing point.
+
+**Pause and resume are not symmetric, on purpose.** Pausing a project pauses
+every lane it owns, leaving an already-paused lane and its reason untouched.
+Resuming un-pauses only the lanes *this project's pause* paused, matched on a
+`project-pause[<project_id>]` marker written into `paused_reason`; a lane paused
+by an operator or by a coordinator `NEEDS_HUMAN` decision is **skipped and
+reported with its reason**. Silently undoing a deliberate pause would be the
+most dangerous thing in this layer. `force=true` overrides and says so in the
+result — an explicit decision to override someone, never a convenience default.
+
+**`terminal_project_assign`** moves a task only when given an explicit
+`session`. With `capabilities` it resolves candidate nodes and stops, because
+choosing a lane on a remote node is not a decision a facade should make
+silently. It refuses a task belonging to a different project. Matching is AND
+over reported facts (probed tools plus platform) via the shared
+`match_nodes_by_capability` — renamed from `match_verifier_nodes` in P0.5, since
+P0.7 is the second caller proving it was never verifier-specific.
+
+**`terminal_project_report`** counts state **transitions** in a window, not
+current statuses: a task that completed and was later retried is still a
+completion that happened. `current` is returned alongside so both readings are
+visible. Note `queue_events.timestamp` is second-granularity, so windows are
+meaningful at second resolution, not finer.
+
+**7 MCP tools** (`terminal_project_status`, `_submit_goal`, `_events`,
+`_report`, `_pause`, `_resume`, `_assign`; total 171). **This completes P0
+(P0.1–P0.7).**

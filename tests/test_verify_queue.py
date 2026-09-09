@@ -28,7 +28,7 @@ from terminal_mcp.verify_queue import (
     InvalidVerifyTransitionError,
     VerifyQueue,
     evidence_verdict,
-    match_verifier_nodes,
+    match_nodes_by_capability,
     node_capability_set,
 )
 
@@ -133,7 +133,7 @@ def test_cannot_open_a_verify_job_from_a_non_running_task(store, verify):
 def test_capability_matching_is_AND_not_OR():
     nodes = [node("both", capabilities=["playwright", "dotnet"]),
              node("one", capabilities=["playwright"])]
-    matched = match_verifier_nodes(nodes, ["playwright", "dotnet"])
+    matched = match_nodes_by_capability(nodes, ["playwright", "dotnet"])
     assert [n.id for n in matched] == ["both"]
 
 
@@ -144,15 +144,15 @@ def test_platform_is_a_routing_key_so_a_pre_probe_node_is_still_reachable():
     probed capability it never reported still does not match."""
     win = node("dell-5530", capabilities=[], platform="windows", backend="windows_pty")
     assert node_capability_set(win) == frozenset({"windows", "windows_pty"})
-    assert [n.id for n in match_verifier_nodes([win], ["windows"])] == ["dell-5530"]
-    assert match_verifier_nodes([win], ["dotnet"]) == []
-    assert match_verifier_nodes([win], ["windows", "dotnet"]) == []
+    assert [n.id for n in match_nodes_by_capability([win], ["windows"])] == ["dell-5530"]
+    assert match_nodes_by_capability([win], ["dotnet"]) == []
+    assert match_nodes_by_capability([win], ["windows", "dotnet"]) == []
 
 
 def test_offline_nodes_are_not_candidates():
     offline = node("gone", capabilities=["python"], status="offline")
-    assert match_verifier_nodes([offline], ["python"]) == []
-    assert [n.id for n in match_verifier_nodes([offline], ["python"], online_only=False)] == ["gone"]
+    assert match_nodes_by_capability([offline], ["python"]) == []
+    assert [n.id for n in match_nodes_by_capability([offline], ["python"], online_only=False)] == ["gone"]
 
 
 def test_verifier_without_every_required_capability_claims_nothing(store, verify):
@@ -173,7 +173,7 @@ def test_no_hardcoded_application_capabilities():
         assert application_name not in source, \
             f"{application_name} is named in the routing module -- routing must stay data-driven"
     custom = node("kiosk", capabilities=["webview2", "browser"], platform="windows")
-    assert [n.id for n in match_verifier_nodes([custom], ["webview2", "windows"])] == ["kiosk"]
+    assert [n.id for n in match_nodes_by_capability([custom], ["webview2", "windows"])] == ["kiosk"]
 
 
 # -- 3. Lease ownership -------------------------------------------------

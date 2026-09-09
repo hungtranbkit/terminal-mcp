@@ -799,6 +799,73 @@ class QueueStore:
             rows = connection.execute(query, params).fetchall()
         return [QueueTask.from_row(row) for row in rows]
 
+    def lanes_for_project(self, project_id: str) -> list[str]:
+        """Which lanes belong to a project -- the read every project-level
+        operation needs before it can act on anything.
+
+        A lane counts if EITHER its own `queue_lanes.project` names the
+        project (an explicitly scoped lane) OR it currently holds a task
+        scoped to it. Both, because the two were populated at different
+        times: `queue_lanes.project` has existed since migration v4 and
+        `queue_tasks.project_id` since P0.1, and a real deployment has
+        lanes with one, the other, or both. Taking the union means a
+        project-level pause cannot silently miss a lane that is genuinely
+        running its work."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT session FROM queue_lanes WHERE project = ? "
+                "UNION "
+                "SELECT DISTINCT session FROM queue_tasks WHERE project_id = ? "
+                "ORDER BY session",
+                (project_id, project_id)).fetchall()
+        return [row["session"] for row in rows]
+
+    _PROJECT_EVENT_SCOPE = (
+        "(session IN (SELECT session FROM queue_lanes WHERE project = ?) "
+        " OR session IN (SELECT DISTINCT session FROM queue_tasks WHERE project_id = ?) "
+        " OR task_id IN (SELECT id FROM queue_tasks WHERE project_id = ?))"
+    )
+    """queue_events carries no project_id of its own -- it predates P0.1
+    and is keyed by session/task. Rather than add a denormalised column
+    that could drift out of step with the task it describes, a project's
+    events are DERIVED the same way its lanes are: by the lane's project,
+    by a task in that lane, or by the event's own task. The task_id arm
+    matters on its own -- a task moved between lanes still has its events
+    attributed to the project, not to whichever lane it happened to sit in
+    at the time."""
+
+    def project_events(self, project_id: str, *, since: str | None = None,
+                       limit: int = 200) -> list[dict[str, Any]]:
+        """Newest-first queue events for everything belonging to a project."""
+        params: list[Any] = [project_id, project_id, project_id]
+        clause = ""
+        if since:
+            clause = " AND timestamp >= ?"
+            params.append(since)
+        params.append(int(limit))
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM queue_events WHERE {self._PROJECT_EVENT_SCOPE}{clause} "
+                f"ORDER BY id DESC LIMIT ?", params).fetchall()
+        return [dict(row) for row in rows]
+
+    def project_transition_counts(self, project_id: str, *, since: str | None = None) -> dict[str, int]:
+        """to_status -> how many transitions INTO it, for a project, in a
+        window. This is what makes a report about throughput rather than a
+        snapshot: `project_task_counts` says what the queue looks like
+        now, this says what actually happened."""
+        params: list[Any] = [project_id, project_id, project_id]
+        clause = ""
+        if since:
+            clause = " AND timestamp >= ?"
+            params.append(since)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT to_status, COUNT(*) AS n FROM queue_events "
+                f"WHERE {self._PROJECT_EVENT_SCOPE}{clause} AND to_status IS NOT NULL "
+                f"GROUP BY to_status", params).fetchall()
+        return {row["to_status"]: row["n"] for row in rows}
+
     def project_task_counts(self, project_id: str) -> dict[str, int]:
         """status -> count for one project: the cheap read a project
         status API needs without pulling every row."""
