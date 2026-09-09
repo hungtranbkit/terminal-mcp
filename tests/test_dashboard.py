@@ -1344,6 +1344,13 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # Multi-node capability refresh (this batch) -- listed so this
         # inventory guard keeps catching UNINTENDED route changes.
         "/dashboard/api/nodes/{node_id}/refresh-capabilities": {"POST"},
+        # Project Backlog (planning layer). Read is _read_guard'ed; every
+        # write is _mutation_guard'ed AND path-gated by the service.
+        "/dashboard/api/backlog": {"GET", "HEAD"},
+        "/dashboard/api/backlog/add": {"POST"},
+        "/dashboard/api/backlog/update": {"POST"},
+        "/dashboard/api/backlog/dispatch": {"POST"},
+        "/dashboard/api/backlog/complete": {"POST"},
         "/dashboard/sessions": {"GET", "HEAD"},
         "/dashboard/api/sessions": {"GET", "HEAD"},
         "/dashboard/api/session": {"GET", "HEAD"},

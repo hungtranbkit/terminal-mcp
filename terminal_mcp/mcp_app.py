@@ -29,6 +29,7 @@ from .pm_summary import (
 )
 from .queue_engine import QueueEngine
 from .queue_loop import QueueLoop
+from .backlog_service import BacklogService
 from .queue_service import QueueService
 from .release_service import ReleaseService
 from .release_store import ReleaseStore
@@ -46,7 +47,8 @@ def build_mcp(service: TerminalService | None = None,
               planner: PlannerService | None = None,
               release: ReleaseService | None = None,
               ai_usage: AiUsageService | None = None,
-              recovery: RecoveryEngine | None = None) -> MCPServer:
+              recovery: RecoveryEngine | None = None,
+              backlog: BacklogService | None = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -1966,5 +1968,155 @@ def build_mcp(service: TerminalService | None = None,
         short cache (but never forces the AI Usage Monitor to hit the
         real provider APIs early -- see its own docstring)."""
         return ai_usage.get_usage(force=force)
+
+
+    # ------------------------------------------------------------------
+    # Project Backlog (planning layer). Deliberately SEPARATE from the
+    # Task Queue below it: a backlog item is what the project INTENDS to
+    # do (durable, project-scoped, shared by every session on that repo);
+    # a queue task is what is EXECUTING now. backlog_dispatch is the one
+    # crossing point and records the link both ways.
+    # ------------------------------------------------------------------
+    if backlog is not None:
+
+        @server.tool()
+        def terminal_backlog_get(path: str | None = None, status: str | None = None,
+                                 priority: str | None = None, type: str | None = None,
+                                 tag: str | None = None, assignee: str | None = None,
+                                 include_terminal: bool = True, limit: int = 500) -> dict:
+            """READ a project's backlog. START HERE.
+
+            WORKFLOW: get -> analyse -> add/update -> dispatch -> verify -> complete.
+
+            `path` is any directory inside the project (a session's cwd is
+            fine); identity is resolved from the git REPO, so every
+            session on that repo sees the SAME backlog regardless of which
+            subdirectory it sits in. Omit `path` to use the server's
+            default root.
+
+            Returns the canonical `project` identity, `revision` (pass it
+            back as expected_revision when you write, to avoid clobbering
+            another agent), per-status `counts`, and the filtered `items`.
+            A project with no backlog yet returns exists=false and an
+            empty list -- that is success, not an error.
+
+            Status values: BACKLOG (captured), READY (groomed), IN_PROGRESS,
+            BLOCKED, NEEDS_REVIEW (done but unverified), DONE (verified),
+            CANCELLED. Priority: P0..P3."""
+            return backlog.get(path, status=status, priority=priority, type=type, tag=tag,
+                               assignee=assignee, include_terminal=include_terminal, limit=limit)
+
+        @server.tool()
+        def terminal_backlog_add(tasks: list[dict], path: str | None = None,
+                                 expected_revision: int | None = None,
+                                 source: str = "chatgpt") -> dict:
+            """ADD backlog items. Use this the MOMENT new work is
+            identified, even if nothing can run it yet -- capturing intent
+            is the point, and it is how work stops getting lost between
+            sessions. Do NOT create a queue task for future work; add it
+            here and dispatch later.
+
+            Each task needs `title`; optional: description, priority
+            (P0..P3, default P2), type (feature/bug/chore/incident/
+            research/docs/test), acceptance_criteria (list of strings),
+            dependencies, tags, order.
+
+            Returns created_ids and the new revision."""
+            return backlog.add(path, tasks=tasks, expected_revision=expected_revision, source=source)
+
+        @server.tool()
+        def terminal_backlog_update(task_id: str, patch: dict, path: str | None = None,
+                                    expected_revision: int | None = None,
+                                    actor: str = "chatgpt") -> dict:
+            """PATCH one item (title/description/status/priority/type/
+            order/tags/dependencies/acceptance_criteria/assignee/branch/
+            worktree...).
+
+            Cannot set status=DONE -- that is gated on evidence, use
+            terminal_backlog_complete. Setting status=BLOCKED requires
+            blocked_reason (or use terminal_backlog_block).
+
+            Pass expected_revision (from _get) for safe concurrent edits:
+            a stale write is refused with REVISION_CONFLICT instead of
+            overwriting another agent's change."""
+            return backlog.update(path, task_id=task_id, patch=patch,
+                                  expected_revision=expected_revision, actor=actor)
+
+        @server.tool()
+        def terminal_backlog_bulk_update(updates: list[dict], path: str | None = None,
+                                         expected_revision: int | None = None,
+                                         actor: str = "chatgpt") -> dict:
+            """Apply MANY patches in ONE atomic write (one revision bump)
+            -- use for re-prioritising or reordering a whole board, rather
+            than N separate updates each with its own conflict window.
+            Each entry: {"task_id": ..., "patch": {...}}."""
+            return backlog.bulk_update(path, updates=updates, expected_revision=expected_revision,
+                                       actor=actor)
+
+        @server.tool()
+        def terminal_backlog_claim(task_id: str, session: str | None = None,
+                                   node_id: str | None = None, assignee: str | None = None,
+                                   path: str | None = None,
+                                   expected_revision: int | None = None) -> dict:
+            """Take ownership of an item and mark it IN_PROGRESS. Refuses
+            with ALREADY_CLAIMED if another session holds it (pass
+            `assignee` to reassign deliberately). Use when an agent starts
+            work directly; use terminal_backlog_dispatch instead when the
+            work should go through the Task Queue."""
+            return backlog.claim(path, task_id=task_id, session=session, node_id=node_id,
+                                 assignee=assignee, expected_revision=expected_revision)
+
+        @server.tool()
+        def terminal_backlog_dispatch(task_id: str, session: str | None = None,
+                                      prompt: str | None = None, path: str | None = None,
+                                      expected_revision: int | None = None) -> dict:
+            """PROMOTE a backlog item into a real, executing queue task --
+            the ONE crossing point from planning to execution.
+
+            Creates the task through the canonical queue path and links
+            both ways (item.queue_task_id, and queue metadata.backlog_id),
+            so backlog_id -> queue task_id -> session -> commit/test stays
+            traceable. The item becomes IN_PROGRESS when dispatched to a
+            `session`, or READY when queued unassigned. The generated
+            prompt carries the item's acceptance_criteria unless you pass
+            your own `prompt`."""
+            return backlog.dispatch(path, task_id=task_id, session=session, prompt=prompt,
+                                    expected_revision=expected_revision)
+
+        @server.tool()
+        def terminal_backlog_block(task_id: str, reason: str, path: str | None = None,
+                                   expected_revision: int | None = None,
+                                   actor: str = "chatgpt") -> dict:
+            """Mark an item BLOCKED with a required, human-readable
+            reason. A blocked item stays in the open counts -- it is not
+            hidden or silently dropped."""
+            return backlog.block(path, task_id=task_id, reason=reason,
+                                 expected_revision=expected_revision, actor=actor)
+
+        @server.tool()
+        def terminal_backlog_complete(task_id: str, commit: str | None = None,
+                                      test: str | None = None, deploy: str | None = None,
+                                      note: str | None = None, path: str | None = None,
+                                      expected_revision: int | None = None,
+                                      actor: str = "chatgpt") -> dict:
+            """Mark an item DONE. **Requires real evidence** -- a commit
+            SHA, a test result, or a deploy ref -- OR a linked queue task
+            that actually reached COMPLETED (the queue's VERIFIED_DONE).
+
+            Saying "I finished it" is NOT accepted and returns
+            EVIDENCE_REQUIRED. If the work is finished but unverified, set
+            status=NEEDS_REVIEW via terminal_backlog_update instead."""
+            return backlog.complete(path, task_id=task_id, commit=commit, test=test, deploy=deploy,
+                                    note=note, expected_revision=expected_revision, actor=actor)
+
+        @server.tool()
+        def terminal_backlog_validate(path: str | None = None) -> dict:
+            """Validate the backlog file after a MANUAL edit (a human
+            editing .terminal-mcp/backlog.json by hand is expected and
+            supported). Reports what it had to normalise and rewrites the
+            repaired form only if something actually changed. Use this if
+            _get reports non-empty `repairs`."""
+            return backlog.validate(path)
+
 
     return server
