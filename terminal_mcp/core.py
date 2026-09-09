@@ -1589,7 +1589,13 @@ class TerminalService:
         # The durable watchdog config is the single policy source.  The
         # retry block below is Codex-only; Claude/unknown agents never enter
         # it and therefore never receive an automatic retry.
-        profile = self.config.submit_watchdog
+        # Per-AGENT submit profile, not the watchdog config. These used to be
+        # the same object because config.py rebound one variable name over
+        # the other, which made `submit:` and every TERMINAL_MCP_CODEX_SUBMIT_*
+        # override dead config -- and would have raised AttributeError here
+        # the moment this legacy path ran, since SubmitWatchdogConfig has no
+        # enter_interval_ms/verify_after_each_enter/fixed_enter_count.
+        profile = _submit_profile_for(self.config, adapter.name)
         if adapter.name == "codex" and (profile.max_enter_attempts > 1 or profile.fixed_enter_count > 0):
             confirmed, latest = self._poll_for_ack_evidence(
                 session, typed_snapshot, after, adapter, text,
@@ -3592,3 +3598,14 @@ class TerminalService:
                 "metadata_complete": item.metadata_complete, "killed_at": item.killed_at, "killed_by": item.killed_by,
             })
         return {"killed_sessions": entries}
+
+
+def _submit_profile_for(config: Any, agent_type: str) -> Any:
+    """The submit profile governing ONE agent type: an explicit per-agent
+    profile when config defines one, else the `default` profile. Claude and
+    unknown agents deliberately land on a single-Enter default -- only Codex
+    ships with a retry profile, matching submit_watchdog.retry_agent_types."""
+    submit = getattr(config, "submit", None)
+    if submit is None:
+        return None
+    return getattr(submit, agent_type, None) or submit.default
