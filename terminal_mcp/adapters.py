@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
 # P0 Part A: explicit delivery states. Pane-diff/line-growth is no longer
@@ -36,8 +37,38 @@ DELIVERY_SUBMIT_CONFIRMED = "SUBMIT_CONFIRMED"
 DELIVERY_UNKNOWN = "DELIVERY_UNKNOWN"
 DELIVERY_BLOCKED = "BLOCKED"
 DELIVERY_ERROR = "ERROR"
+# P0 (2026-09-11, live root cause -- see composer.py's module docstring):
+# DELIVERY_UNKNOWN used to absorb two *completely different* outcomes that
+# a caller must react to in opposite ways, which is what turned one live
+# ghost-suggestion misread into a repeating "send Enter again" loop:
+#
+#   NOT_ACTIVATED        -- positively established, from an ANSI composer
+#                           read, that there was NOTHING TO SUBMIT: the
+#                           composer is empty (blank, or showing only a
+#                           dim ghost suggestion). An Enter here is a
+#                           guaranteed no-op, so this is a definite,
+#                           evidenced answer -- NOT an ambiguous one --
+#                           and the correct caller response is "find out
+#                           why the text never arrived", never "press
+#                           Enter again".
+#   ACTIVATION_UNCERTAIN -- a REAL draft was in the composer, exactly one
+#                           Enter was delivered, and no positive evidence
+#                           of acceptance appeared inside the grace
+#                           window. Genuinely ambiguous; the prompt may
+#                           or may not have been submitted, so the text
+#                           must never be resent (activation-ambiguity
+#                           boundary, docs/prompt-submission.md).
+#
+# DELIVERY_UNKNOWN is KEPT, and still means exactly what it always did --
+# "Enter went out, evidence is inconclusive, and we could not even read
+# the composer to say which of the two above applies" (e.g. the Windows/
+# ConPTY backend, whose capture carries no SGR attributes at all). It is
+# the honest fallback, never a synonym for either of the new two.
+DELIVERY_NOT_ACTIVATED = "NOT_ACTIVATED"
+DELIVERY_ACTIVATION_UNCERTAIN = "ACTIVATION_UNCERTAIN"
 DELIVERY_STATES = (DELIVERY_TEXT_SENT, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_UNKNOWN,
-                    DELIVERY_BLOCKED, DELIVERY_ERROR)
+                    DELIVERY_BLOCKED, DELIVERY_ERROR,
+                    DELIVERY_NOT_ACTIVATED, DELIVERY_ACTIVATION_UNCERTAIN)
 
 # Legacy submit_status vocabulary (pre-dates this module) -- kept as the
 # public field every existing caller/test already reads, now *derived* from
@@ -48,6 +79,12 @@ DELIVERY_STATES = (DELIVERY_TEXT_SENT, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_UNKNO
 # distinguishes those three -- they only ever checked for the confirmed
 # case or treated anything else as "not proven".
 def to_legacy_submit_status(delivery_state: str) -> str:
+    # NOT_ACTIVATED/ACTIVATION_UNCERTAIN join BLOCKED/ERROR/UNKNOWN in the
+    # legacy catch-all deliberately: no pre-existing caller distinguishes
+    # anything but "confirmed" from "not proven", so widening this field's
+    # vocabulary would be a silent breaking change for every one of them.
+    # The new precision lives in `delivery_state` (and `submit_reason`),
+    # which is where a caller that wants it should look.
     if delivery_state in (DELIVERY_TEXT_SENT, DELIVERY_SUBMIT_CONFIRMED):
         return delivery_state
     return "SUBMIT_UNCONFIRMED"
@@ -70,6 +107,69 @@ def _match_any(patterns: tuple[re.Pattern[str], ...], text: str) -> bool:
     return any(pattern.search(text) for pattern in patterns)
 
 
+@dataclass(frozen=True)
+class SubmitPolicy:
+    """Per-agent submit rules, stated once and explicitly instead of being
+    re-derived from `adapter.name` string comparisons scattered through
+    core.py (there were four of those; they are the reason "Claude is
+    single-submit" was a convention rather than an enforced invariant).
+
+    uses_composer_evidence
+        Consult composer.read_composer (an ANSI capture) as the PRIMARY
+        submit evidence: an agent CLI with a real prompt composer can be
+        asked directly "is there still a draft in there?", which is far
+        stronger than any pane-diff heuristic. False for a plain shell,
+        which has no composer to read.
+    require_draft_before_enter
+        Refuse to deliver a bare Enter (terminal_send_keys(["Enter"]))
+        when the composer positively reads EMPTY. This is the direct fix
+        for the live loop: Enter into an empty composer is a guaranteed
+        no-op whose only observable result is an unconfirmable status,
+        so sending it teaches the caller nothing and risks accepting an
+        unrelated prompt. Never applied when the composer read is
+        UNKNOWN -- only a positive EMPTY reading withholds the key.
+    max_enter_attempts
+        Hard ceiling on Enter keystrokes for ONE submission, enforced
+        here and not by config alone. Claude is 1, always: the config's
+        own submit.claude profile can lower nothing and raise nothing.
+    allow_enter_retry / allow_escape_recovery
+        Whether the bounded, evidence-gated Codex retry profile and the
+        Escape+Enter stuck-composer recovery may run at all.
+    """
+    uses_composer_evidence: bool = False
+    require_draft_before_enter: bool = False
+    max_enter_attempts: int = 1
+    allow_enter_retry: bool = False
+    allow_escape_recovery: bool = False
+
+
+# Claude's policy is a hard invariant of this project (never auto-retry
+# Enter, never resend the prompt text, never let a sweeper press Enter
+# again) -- expressed as a module constant so a future edit to the Claude
+# adapter cannot quietly weaken it without touching this line.
+CLAUDE_SUBMIT_POLICY = SubmitPolicy(
+    uses_composer_evidence=True, require_draft_before_enter=True,
+    max_enter_attempts=1, allow_enter_retry=False, allow_escape_recovery=False,
+)
+# Codex keeps EXACTLY its existing behaviour: bounded, evidence-gated Enter
+# retries (count still comes from config.submit.codex / submit_watchdog)
+# plus the Escape+Enter recovery its own stuck_composer_evidence gates.
+CODEX_SUBMIT_POLICY = SubmitPolicy(
+    uses_composer_evidence=True, require_draft_before_enter=True,
+    max_enter_attempts=3, allow_enter_retry=True, allow_escape_recovery=True,
+)
+# Anything unrecognised is treated Claude-like (single submit, no retry) --
+# the deliberately conservative default the task requires for an unknown
+# agent. A plain shell keeps its historical, unrestricted behaviour: it has
+# no composer, processes Enter synchronously in canonical tty mode, and has
+# never had a swallow failure mode to protect against.
+UNKNOWN_AGENT_SUBMIT_POLICY = CLAUDE_SUBMIT_POLICY
+SHELL_SUBMIT_POLICY = SubmitPolicy(
+    uses_composer_evidence=False, require_draft_before_enter=False,
+    max_enter_attempts=1, allow_enter_retry=False, allow_escape_recovery=False,
+)
+
+
 class AgentAdapter(ABC):
     """Deterministic, per-target-CLI evidence rules for the input-delivery
     pipeline (core.py's _send_text_and_verify_locked). Every method is a
@@ -79,6 +179,10 @@ class AgentAdapter(ABC):
     tests/test_send_reliability.py / tests/test_adapters_real_cli.py."""
 
     name: str
+    #: Per-agent submit rules (see SubmitPolicy). Defaults to the
+    #: conservative Claude-like single-submit policy so a NEW adapter that
+    #: forgets to set one can never accidentally get retry behaviour.
+    submit_policy: SubmitPolicy = UNKNOWN_AGENT_SUBMIT_POLICY
 
     @abstractmethod
     def identify_target_state(self, lines: list[str]) -> str:
@@ -138,6 +242,7 @@ class GenericShellAdapter(AgentAdapter):
     target that was never RECOVERY_ELIGIBLE_COMMANDS-scoped keeps its
     already-tested behavior unchanged."""
     name = "generic"
+    submit_policy = SHELL_SUBMIT_POLICY
 
     def identify_target_state(self, lines: list[str]) -> str:
         return TARGET_UNKNOWN
@@ -243,6 +348,7 @@ class CodexAdapter(AgentAdapter):
     failure mode (see tests/fixtures/laggy_line_reader.py and the existing
     RECOVERY_ELIGIBLE_COMMANDS history this adapter now encodes)."""
     name = "codex"
+    submit_policy = CODEX_SUBMIT_POLICY
 
     def identify_target_state(self, lines: list[str]) -> str:
         tail = _tail(lines, 6)
@@ -356,6 +462,7 @@ class ClaudeAdapter(AgentAdapter):
     safe/conservative failure direction, never a false BLOCKED or a
     dropped send."""
     name = "claude"
+    submit_policy = CLAUDE_SUBMIT_POLICY
 
     def identify_target_state(self, lines: list[str]) -> str:
         tail = _tail(lines, 6)

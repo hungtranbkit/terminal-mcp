@@ -109,11 +109,34 @@ class QueueConfig:
 
 @dataclass(frozen=True)
 class SubmitProfile:
-    """Bounded, evidence-gated Enter submission policy for one agent."""
+    """Bounded, evidence-gated Enter submission policy for one agent.
+
+    settle_ms / composer_grace_ms (P0, 2026-09-11) make this fix's two
+    timing values operator-tunable instead of hardcoded module constants,
+    while keeping both BOUNDED and DETERMINISTIC -- a single fixed wait
+    and a single bounded polling deadline, never an open-ended retry loop:
+
+      settle_ms          the gap between the literal text write and the
+                         Enter keystroke (previously tmux.SEND_TEXT_ENTER_
+                         SETTLE_SECONDS, 80ms, unchanged as the default).
+                         Exists because two `tmux send-keys` calls fired
+                         back to back can land Enter while a TUI's own
+                         input debounce is still mid-cycle.
+      composer_grace_ms  how long a submit waits for POSITIVE evidence
+                         (the draft leaving the composer) before reporting
+                         ACTIVATION_UNCERTAIN. Previously core.RECOVERY_
+                         VERIFY_TIMEOUT_SECONDS (3s), unchanged as the
+                         default. A generous value only ever delays an
+                         honest "uncertain" verdict -- it can never cause
+                         an extra keystroke, because nothing in the Claude
+                         path sends one.
+    """
     max_enter_attempts: int = 1
     enter_interval_ms: int = 180
     verify_after_each_enter: bool = True
     fixed_enter_count: int = 0
+    settle_ms: int = 80
+    composer_grace_ms: int = 3000
 
 
 @dataclass(frozen=True)
@@ -580,10 +603,21 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             raise ValueError("submit.*.enter_interval_ms must be between 50 and 1000")
         if not 0 <= fixed_count <= 5:
             raise ValueError("submit.*.fixed_enter_count must be between 0 and 5")
+        settle_ms = int(raw_profile.get("settle_ms", default.settle_ms))
+        grace_ms = int(raw_profile.get("composer_grace_ms", default.composer_grace_ms))
+        # Bounded on both ends on purpose: 0 would re-open the original
+        # text/Enter race this project already has a live reproduction
+        # for, and an unbounded grace window would turn an honest
+        # "uncertain" verdict into a hang.
+        if not 0 < settle_ms <= 2000:
+            raise ValueError("submit.*.settle_ms must be between 1 and 2000")
+        if not 100 <= grace_ms <= 30000:
+            raise ValueError("submit.*.composer_grace_ms must be between 100 and 30000")
         return SubmitProfile(max_enter_attempts=max_attempts, enter_interval_ms=interval_ms,
                              verify_after_each_enter=bool(raw_profile.get(
                                  "verify_after_each_enter", default.verify_after_each_enter)),
-                             fixed_enter_count=fixed_count)
+                             fixed_enter_count=fixed_count,
+                             settle_ms=settle_ms, composer_grace_ms=grace_ms)
 
     submit_defaults = SubmitConfig()
     submit_config = SubmitConfig(

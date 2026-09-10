@@ -5,7 +5,7 @@ tmux panes) lives in test_send_reliability.py (Codex, via the reproduced
 fixture) and test_adapters_real_cli.py (both CLIs, live)."""
 from __future__ import annotations
 
-from terminal_mcp.adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STATES, DELIVERY_SUBMIT_CONFIRMED,
+from terminal_mcp.adapters import (DELIVERY_ACTIVATION_UNCERTAIN, DELIVERY_BLOCKED, DELIVERY_NOT_ACTIVATED, DELIVERY_ERROR, DELIVERY_STATES, DELIVERY_SUBMIT_CONFIRMED,
                                    DELIVERY_TEXT_SENT, DELIVERY_UNKNOWN, TARGET_RUNNING, TARGET_STATES,
                                    TARGET_UNKNOWN, TARGET_WAITING, ClaudeAdapter, CodexAdapter, GenericShellAdapter,
                                    select_adapter, to_legacy_submit_status)
@@ -23,10 +23,16 @@ def test_select_adapter_dispatches_by_command_case_insensitive():
 def test_to_legacy_submit_status_maps_every_delivery_state():
     assert to_legacy_submit_status(DELIVERY_TEXT_SENT) == "TEXT_SENT"
     assert to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED) == "SUBMIT_CONFIRMED"
-    for state in (DELIVERY_UNKNOWN, DELIVERY_BLOCKED, DELIVERY_ERROR):
+    # NOT_ACTIVATED/ACTIVATION_UNCERTAIN (P0, 2026-09-11) join the legacy
+    # catch-all deliberately -- the new precision is exposed via
+    # `delivery_state`, never by widening this legacy field's vocabulary
+    # under callers that only ever tested for "confirmed" vs "not proven".
+    for state in (DELIVERY_UNKNOWN, DELIVERY_BLOCKED, DELIVERY_ERROR,
+                  DELIVERY_NOT_ACTIVATED, DELIVERY_ACTIVATION_UNCERTAIN):
         assert to_legacy_submit_status(state) == "SUBMIT_UNCONFIRMED"
     assert set(DELIVERY_STATES) == {DELIVERY_TEXT_SENT, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_UNKNOWN,
-                                     DELIVERY_BLOCKED, DELIVERY_ERROR}
+                                     DELIVERY_BLOCKED, DELIVERY_ERROR,
+                                     DELIVERY_NOT_ACTIVATED, DELIVERY_ACTIVATION_UNCERTAIN}
 
 
 def test_generic_shell_adapter_never_recovers_and_uses_bare_diff():

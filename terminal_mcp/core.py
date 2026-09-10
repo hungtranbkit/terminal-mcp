@@ -7,9 +7,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
+from .adapters import (DELIVERY_ACTIVATION_UNCERTAIN, DELIVERY_BLOCKED, DELIVERY_ERROR,
+                       DELIVERY_NOT_ACTIVATED, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
                        DELIVERY_UNKNOWN, TARGET_WAITING, _sent_text_echoed, select_adapter,
                        to_legacy_submit_status)
+from .composer import (COMPOSER_DRAFT, COMPOSER_EMPTY, COMPOSER_UNKNOWN, ComposerSnapshot,
+                       draft_contains, read_composer)
 from .audit import AuditStore
 from .bindings import Binding, BindingStore, valid_binding_name
 from .config import AppConfig
@@ -167,23 +170,60 @@ WIDE_VERIFY_ADAPTERS = {"codex", "claude"}
 # enough that a genuinely short-lived, benign race (two callers happening
 # to target the same pane moments apart) serializes cleanly instead of
 # needlessly failing one of them.
+# Upper bound on how long a send waits for the target to RENDER a
+# just-written draft into its composer before pressing Enter (P0,
+# 2026-09-11). Sized from real observation: Claude Code 2.1.267 renders a
+# typed prompt within a few tens of ms, so this is generous headroom, not
+# a tuning parameter to chase. Never blocks anything else -- one bounded
+# poll, no keystroke.
+COMPOSER_READY_MAX_SECONDS = 1.0
 PANE_LEASE_WAIT_SECONDS = 5.0
 PANE_LEASE_POLL_INTERVAL_SECONDS = 0.1
 
 
 def _extract_composer_text(snapshot: list[str]) -> str:
     """Best-effort read of whatever text is currently sitting in a
-    composer's own last non-empty line, for `_send_enter_key_verified_
-    locked`'s own ack-evidence check -- that call never typed the text
-    itself (a bare Enter alone), so this is the only source for what
-    `adapters.py`'s own `submit_ack_evidence`/`_sent_text_echoed` should
-    require an echo of during the busy-window race case. Strips a
-    leading `"> "` composer-prompt marker (the shape every real Claude/
-    Codex composer and this project's own test fixtures use) if present
-    -- never a claim of parsing every possible composer chrome, just the
-    common, well-established one. An empty/unreadable snapshot returns
-    "" (falls back to `_sent_text_echoed`'s own documented trivially-
-    true behavior for nothing to attribute -- never raises)."""
+    composer's own last non-empty line.
+
+    P0 (2026-09-11): this is now a THIN wrapper over composer.read_
+    composer, and returns "" whenever the composer holds no REAL draft.
+    The previous implementation took the last non-empty line verbatim,
+    which -- against real Claude Code 2.1.267 -- returned the CLI's dim
+    ghost suggestion (an SGR-2 proposed reply rendered INSIDE an empty
+    composer) as though it were pending user text. That value was then
+    handed to adapters.submit_ack_evidence as the text an acceptance had
+    to echo, so a bare Enter into an empty composer was verified against
+    a string that had never been submitted and never would be. See
+    composer.py's module docstring for the full live root cause.
+
+    Callers should pass an ANSI-preserving capture (capture_lines(...,
+    ansi=True)); a stripped capture carries no attribute information, so
+    read_composer honestly reports COMPOSER_UNKNOWN and this returns ""
+    -- which keeps the old trivially-satisfied `_sent_text_echoed`
+    behaviour for "nothing to attribute" rather than inventing evidence.
+    """
+    parsed = read_composer(snapshot)
+    if parsed.state == COMPOSER_DRAFT:
+        return parsed.draft_text
+    if parsed.state == COMPOSER_EMPTY:
+        # Blank, or holding only a dim ghost suggestion: there is nothing
+        # this caller may legitimately attribute a submission to. THIS is
+        # the fix -- the old code returned the ghost text here.
+        return ""
+    # COMPOSER_UNKNOWN: either no composer marker at all, or a capture
+    # with no attribute information (a stripped capture, or the Windows
+    # backend). Dim-vs-real is genuinely undecidable, so fall back to the
+    # EXACT pre-existing heuristic rather than inventing a verdict --
+    # every caller that was correct before stays correct, and the
+    # busy-window echo guard `_send_enter_key_verified_locked` relies on
+    # keeps working unchanged on those backends.
+    return _legacy_composer_text(snapshot)
+
+
+def _legacy_composer_text(snapshot: list[str]) -> str:
+    """The original, attribute-blind "last non-empty line, minus a leading
+    `> ` marker" heuristic -- kept verbatim as the documented fallback for
+    captures that carry no SGR information (see _extract_composer_text)."""
     for line in reversed(snapshot):
         stripped = line.strip()
         if not stripped:
@@ -1458,6 +1498,7 @@ class TerminalService:
         identity_before = SessionIdentity.from_session_info(info_before)
         command_before = info_before.pane_current_command or ""
         adapter = select_adapter(command_before)
+        policy = adapter.submit_policy
 
         # URGENT bugfix (real report: text lands in the composer but never
         # submits until a human presses Enter -- for BOTH Claude and Codex):
@@ -1504,7 +1545,8 @@ class TerminalService:
         # still identifies our complete draft as pending.  It is intentionally
         # before the legacy one-Enter path and is backend-neutral: tmux and
         # Windows ConPTY both implement capture_lines/send_text/send_keys.
-        if press_enter and adapter.name == "codex" and self.config.submit_watchdog.enabled:
+        if (press_enter and adapter.name == "codex" and policy.allow_enter_retry
+                and self.config.submit_watchdog.enabled):
             verified = self._verified_codex_submit_locked(
                 session, text, correlation_id, identity_before, command_before, adapter,
             )
@@ -1531,10 +1573,32 @@ class TerminalService:
             typed_snapshot = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
         except TmuxError:
             typed_snapshot = None
-        # Same fixed settle window tmux.send_text itself uses for a
-        # press_enter=True call -- imported, not duplicated, so there is
-        # exactly one place that value is decided.
-        time.sleep(SEND_TEXT_ENTER_SETTLE_SECONDS)
+        # Bounded, deterministic settle window between the text write and
+        # the Enter keystroke -- ONE fixed wait, never a loop. Operator-
+        # tunable per agent (config submit.<agent>.settle_ms); the default
+        # is exactly tmux.SEND_TEXT_ENTER_SETTLE_SECONDS, so an
+        # unconfigured deployment behaves identically to before.
+        time.sleep(_settle_seconds(self.config, adapter.name))
+
+        # P0 (2026-09-11): read the composer in the unambiguous "typed, not
+        # yet submitted" window. The draft visible HERE is the exact thing
+        # whose disappearance later proves this attempt was accepted --
+        # causal evidence, not a correlated pane diff.
+        #
+        # Read AFTER the settle window and via a BOUNDED readiness poll,
+        # never a single shot taken the instant the bytes were written:
+        # dogfooding this fix against a real Claude Code 2.1.267 session
+        # caught exactly that race -- the capture landed in the frame
+        # before Claude had rendered the just-typed prompt, so the pre-Enter
+        # composer still showed the startup ghost suggestion and a send
+        # that genuinely succeeded was reported NOT_ACTIVATED. The poll
+        # waits for ANY real draft (not specifically our text): a prompt
+        # over the paste threshold is rendered by these CLIs as a
+        # "[Pasted text ...]" marker rather than the text itself, and that
+        # marker is still a perfectly good release key.
+        composer_before = (self._poll_for_composer_draft(session, deadline=time.monotonic()
+                                                         + _composer_ready_seconds(self.config, adapter.name))
+                           if policy.uses_composer_evidence else ComposerSnapshot(COMPOSER_UNKNOWN))
 
         # P0 Part A.3: the *second* revalidation point, immediately before
         # the Enter keystroke. Abort (never send Enter, never retarget by
@@ -1577,8 +1641,7 @@ class TerminalService:
         # here rather than recomputed from command_at_enter, which the
         # identity-match check just above already guarantees is identical
         # (this method returns before reaching here otherwise).
-        verify_timeout = (RECOVERY_VERIFY_TIMEOUT_SECONDS if adapter.name in WIDE_VERIFY_ADAPTERS
-                          else SEND_VERIFY_TIMEOUT_SECONDS)
+        verify_timeout = _verify_timeout_seconds(self.config, adapter.name)
 
         _, after, reason = self._poll_for_submission(session, typed_snapshot, timeout=verify_timeout)
 
@@ -1596,7 +1659,14 @@ class TerminalService:
         # the moment this legacy path ran, since SubmitWatchdogConfig has no
         # enter_interval_ms/verify_after_each_enter/fixed_enter_count.
         profile = _submit_profile_for(self.config, adapter.name)
-        if adapter.name == "codex" and (profile.max_enter_attempts > 1 or profile.fixed_enter_count > 0):
+        # P0 (2026-09-11): gated on the ADAPTER'S OWN SubmitPolicy, not on
+        # an `adapter.name == "codex"` string check. Same effect today
+        # (only CodexAdapter sets allow_enter_retry=True), but it makes
+        # "Claude/unknown agents are single-submit" a structural invariant
+        # of adapters.py instead of a convention four separate call sites
+        # in this file had to remember -- config alone can no longer grant
+        # Enter retries to an agent whose adapter forbids them.
+        if policy.allow_enter_retry and (profile.max_enter_attempts > 1 or profile.fixed_enter_count > 0):
             confirmed, latest = self._poll_for_ack_evidence(
                 session, typed_snapshot, after, adapter, text,
                 deadline=time.monotonic() + profile.enter_interval_ms / 1000.0,
@@ -1606,7 +1676,11 @@ class TerminalService:
                 result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
                 result["evidence"] = ["OUTPUT_CHANGED"]
                 return result
-            attempt_limit = max(profile.max_enter_attempts, profile.fixed_enter_count)
+            # The adapter's own ceiling always wins over config: a
+            # profile can narrow the retry budget, never widen it past
+            # what the agent's policy permits.
+            attempt_limit = min(max(profile.max_enter_attempts, profile.fixed_enter_count),
+                                policy.max_enter_attempts)
             for attempt in range(2, attempt_limit + 1):
                 pending = (
                     latest is not None
@@ -1665,7 +1739,8 @@ class TerminalService:
         # specific stuck-composer signature overrides that bare diff,
         # rather than only kicking in when the bare check already failed.
         needs_recovery = (
-            after is not None
+            policy.allow_escape_recovery
+            and after is not None
             and adapter.stuck_composer_evidence(typed_snapshot, after)
             and adapter.safe_recovery_allowed(after)
         )
@@ -1770,11 +1845,76 @@ class TerminalService:
         # dead session) still correctly times out into DELIVERY_UNKNOWN
         # -- this only removes the false negative for a send that WAS
         # about to be, and genuinely is, accepted.
+        # P0 (2026-09-11) -- composer evidence FIRST, for any adapter that
+        # has a composer to read. "The draft this attempt typed is no
+        # longer in the composer" is direct, causal proof of acceptance;
+        # a pane diff is not, and OUTPUT_CHANGED on its own must never be
+        # treated as an ACK (an Ink footer's spinner/elapsed-timer tick
+        # redraws the pane with nothing submitted at all). The pane-diff
+        # path below is kept unchanged as the fallback for adapters/
+        # backends where the composer cannot be read.
+        deadline = time.monotonic() + verify_timeout
+        if policy.uses_composer_evidence and composer_before.state == COMPOSER_DRAFT:
+            # The release key is whatever was ACTUALLY rendered in the
+            # composer, not the text we typed: over the paste threshold
+            # these CLIs render a "[Pasted text ...]" marker instead of the
+            # prompt, and that marker leaving the composer is exactly as
+            # good a proof of acceptance.
+            released, composer_after = self._poll_for_composer_release(
+                session, composer_before.draft_text, deadline=deadline)
+            result.update(self._composer_fields(composer_before, composer_after))
+            if released:
+                result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
+                result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
+                result["evidence"] = ["COMPOSER_RELEASED"]
+                result["submit_reason"] = ("confirmed: this attempt's own draft was visible in the composer "
+                                           "before Enter and had left it afterwards")
+                return result
+            if composer_after.state != COMPOSER_UNKNOWN:
+                # Positively still holding this attempt's draft: the Enter
+                # did not activate it. Never retried, never resent.
+                result["delivery_state"] = DELIVERY_ACTIVATION_UNCERTAIN
+                result["submit_status"] = to_legacy_submit_status(DELIVERY_ACTIVATION_UNCERTAIN)
+                result["evidence"] = ["COMPOSER_STILL_HOLDS_DRAFT"]
+                result["submit_reason"] = (
+                    "one Enter was delivered but this attempt's draft is still in the composer after the "
+                    "grace window -- not retried and the text was NOT resent (single-submit policy for "
+                    f"agent_type={adapter.name}); the prompt may still be pending, resolve manually")
+                return result
+            # Unreadable composer after the Enter proves nothing -- fall
+            # through to the pane-diff verification with a fresh, bounded
+            # budget rather than letting it decide the verdict.
+            deadline = time.monotonic() + verify_timeout
+        elif policy.uses_composer_evidence:
+            result.update(self._composer_fields(composer_before, composer_before))
+
         confirmed, after = self._poll_for_ack_evidence(session, typed_snapshot, after, adapter, text,
-                                                        deadline=time.monotonic() + verify_timeout)
+                                                        deadline=deadline)
         if confirmed:
             result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
             result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
+            return result
+        if (policy.uses_composer_evidence and composer_before.state == COMPOSER_EMPTY
+                and after is not None and not _sent_text_echoed(after, text)):
+            # The text was written to the pty, yet after the whole grace
+            # window it is nowhere on screen and the composer positively
+            # reads EMPTY (blank, or holding only a dim ghost suggestion).
+            # That is a definite delivery failure, not an ambiguous submit:
+            # say so, so the caller fixes the real problem instead of
+            # pressing Enter again at a composer with nothing in it.
+            # Deliberately decided only HERE, at the very end -- an EMPTY
+            # reading taken any earlier races the target's own render (a
+            # real false negative caught while dogfooding this fix against
+            # Claude Code 2.1.267).
+            result["delivery_state"] = DELIVERY_NOT_ACTIVATED
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_NOT_ACTIVATED)
+            result["evidence"] = ["COMPOSER_EMPTY_AFTER_TEXT_SEND"]
+            result["submit_reason"] = (
+                "the text was written to the pty but never appeared in the composer or anywhere on the "
+                "pane, so the Enter had nothing to submit"
+                + (f" (the pane shows {composer_before.ghost_text[:120]!r}, which is the agent's own dim "
+                   f"suggestion inside an EMPTY composer, not this prompt)"
+                   if composer_before.ghost_text else ""))
             return result
         result["delivery_state"] = DELIVERY_UNKNOWN
         result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
@@ -1899,6 +2039,103 @@ class TerminalService:
                 else "verified-submit-watchdog recovery"
             ),
         }
+
+    # ------------------------------------------------------------------
+    # Composer evidence (P0, 2026-09-11) -- see composer.py's docstring.
+    # ------------------------------------------------------------------
+
+    def _read_composer(self, session: str) -> ComposerSnapshot:
+        """Read the target's composer from an ANSI-PRESERVING capture.
+
+        `ansi=True` is the whole point: `tmux capture-pane -p` without
+        `-e` strips every SGR attribute, which is exactly what made a dim
+        ghost suggestion indistinguishable from a real pending draft and
+        produced the live incident this fix exists for. Backend-neutral --
+        capture_lines(..., ansi=...) is on the SessionBackend Protocol and
+        implemented by both TmuxClient and the Windows ConPTY backend
+        (where `ansi` is a documented no-op, so read_composer correctly
+        degrades to COMPOSER_UNKNOWN rather than guessing).
+
+        Never raises: a capture failure is COMPOSER_UNKNOWN, which every
+        caller must treat as "cannot tell", never as "nothing to submit".
+        """
+        lines = self._safe_ansi_capture(session)
+        if lines is None:
+            return ComposerSnapshot(COMPOSER_UNKNOWN)
+        return read_composer(lines, attributes_available=self._ansi_attributes_available())
+
+    def _poll_for_composer_draft(self, session: str, *, deadline: float) -> ComposerSnapshot:
+        """Bounded wait for the composer to show a REAL draft after a text
+        write. Returns as soon as one is visible, or the last reading at
+        the deadline (EMPTY/UNKNOWN, both of which the caller treats as
+        "no composer evidence available" rather than as a verdict).
+
+        Bounded and deterministic: one deadline, one poll interval, no
+        retry of anything -- not one extra byte is written to the target
+        by this method.
+        """
+        snapshot = self._read_composer(session)
+        while snapshot.state != COMPOSER_DRAFT and time.monotonic() < deadline:
+            time.sleep(SEND_VERIFY_POLL_INTERVAL_SECONDS)
+            snapshot = self._read_composer(session)
+        return snapshot
+
+    def _poll_for_composer_release(self, session: str, text: str, *,
+                                   deadline: float) -> tuple[bool, ComposerSnapshot]:
+        """Poll until the composer stops holding THIS attempt's own draft.
+
+        This is the strongest submit evidence available for a composer-
+        based agent CLI, and deliberately stronger than "the pane
+        changed": a live-redrawing Ink footer changes the pane on every
+        spinner tick with nothing submitted, whereas the draft leaving the
+        composer is a direct, causal consequence of the submission being
+        accepted. "Released" means the composer no longer contains this
+        text -- it went EMPTY (including to a dim ghost suggestion, which
+        is the normal post-submit rendering), or it now holds a genuinely
+        different draft.
+
+        A COMPOSER_UNKNOWN reading never counts as released: not being
+        able to see the composer is not evidence that it emptied.
+        Returns (released, last_snapshot).
+        """
+        snapshot = self._read_composer(session)
+        if snapshot.state == COMPOSER_UNKNOWN:
+            # The composer is not readable on this target right now (no
+            # box/marker to anchor on, an attribute-blind backend, a
+            # scrollback echo that cannot be told from a live prompt).
+            # Hand straight back so the caller falls through to the
+            # pre-existing pane-diff verification instead of burning the
+            # whole grace window on a question this cannot answer.
+            return False, snapshot
+        while True:
+            if snapshot.state != COMPOSER_UNKNOWN and not draft_contains(snapshot, text):
+                return True, snapshot
+            if time.monotonic() >= deadline:
+                return False, snapshot
+            time.sleep(SEND_VERIFY_POLL_INTERVAL_SECONDS)
+            snapshot = self._read_composer(session)
+
+    @staticmethod
+    def _composer_fields(before: ComposerSnapshot, after: ComposerSnapshot) -> dict[str, Any]:
+        """The before/after composer evidence attached to every receipt of
+        a composer-evidence send. Deliberately includes `ghost_text`: an
+        operator staring at a pane that appears to show their prompt needs
+        to be told, in the receipt itself, that what they are looking at
+        is the CLI's own dim suggestion and not their pending text --
+        otherwise the receipt is technically correct and still leads
+        straight back to the false conclusion that caused the incident."""
+        fields: dict[str, Any] = {
+            "composer_before": before.state,
+            "composer_after": after.state,
+        }
+        if before.draft_text:
+            fields["composer_draft_before"] = before.draft_text[:200]
+        if after.draft_text:
+            fields["composer_draft_after"] = after.draft_text[:200]
+        ghost = after.ghost_text or before.ghost_text
+        if ghost:
+            fields["composer_ghost_text"] = ghost[:200]
+        return fields
 
     def _poll_for_ack_evidence(self, session: str, typed_snapshot: list[str], first_after: list[str] | None,
                                adapter: Any, text: str, *, deadline: float) -> tuple[bool, list[str] | None]:
@@ -2084,46 +2321,151 @@ class TerminalService:
             self.leases.release(lock_key, correlation_id)
 
     def _send_enter_key_verified_locked(self, session: str, keys: list[str], *, correlation_id: str) -> dict[str, Any]:
+        """One bare Enter (`terminal_send_keys(["Enter"])`), composer-gated.
+
+        P0 ROOT CAUSE (live, 2026-09-10, hp-linux/hp1+hp2, real Claude
+        Code 2.1.267 -- full write-up in composer.py's module docstring):
+        Claude renders a DIM ghost suggestion inside an EMPTY composer,
+        `capture-pane` strips SGR, so an operator/orchestrator reading the
+        pane sees `> yes, publish the report` and concludes its prompt is
+        stuck unsubmitted. It then sends a bare Enter. That Enter reaches
+        a genuinely empty composer, Claude correctly does nothing and
+        emits zero bytes, the pane is byte-identical, and the old code
+        reported SUBMIT_UNCONFIRMED -- which reads like "Enter was
+        swallowed" and sends the caller straight back around the loop.
+        The real audit row from the incident:
+
+            send_keys hp1 ["Enter"] -> SENT_UNCONFIRMED
+            "the pane looked identical to its pre-send state throughout
+             the verification window"
+
+        Fix, in order:
+          1. Read the composer from an ANSI capture BEFORE sending.
+          2. If it positively reads EMPTY (blank, or ghost-only) and the
+             target is not showing a menu/approval prompt that Enter
+             would legitimately answer, WITHHOLD the key entirely and
+             return NOT_ACTIVATED with the ghost text quoted back. No
+             keystroke is sent, so nothing can be accidentally accepted,
+             and the caller is told the actionable fact ("there is
+             nothing in the composer") instead of an ambiguous one.
+          3. If a REAL draft is present, send exactly ONE Enter and
+             confirm by the draft leaving the composer -- direct causal
+             evidence, never a bare pane diff.
+          4. If the composer cannot be read (COMPOSER_UNKNOWN -- e.g. the
+             Windows backend, whose capture carries no attributes), fall
+             back to EXACTLY the previous pane-diff behaviour and report
+             DELIVERY_UNKNOWN. Never a false NOT_ACTIVATED.
+
+        Escape hatch: a WAITING target (menu/[y/n]/"press enter" widget)
+        legitimately has nothing in its composer and Enter is the correct
+        key for it, so step 2 never withholds there -- that case keeps the
+        pre-existing behaviour exactly.
+        """
         try:
             info_before = self.tmux.get_session(session)
         except TmuxError:
             info_before = None
         command_before = (info_before.pane_current_command if info_before is not None else "") or ""
         adapter = select_adapter(command_before)
+        policy = adapter.submit_policy
         try:
             typed_snapshot = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
         except TmuxError:
             typed_snapshot = None
 
+        # Read ONCE, before anything is sent: both the composer verdict and
+        # the legacy path's expected-echo text must describe the pre-Enter
+        # state. (Deriving the echo text from a post-Enter capture would
+        # read an already-cleared composer as "" and make the busy-window
+        # echo guard trivially satisfied -- a false SUBMIT_CONFIRMED.)
+        ansi_before = self._safe_ansi_capture(session) if policy.uses_composer_evidence else None
+        composer_before = (read_composer(ansi_before,
+                                         attributes_available=self._ansi_attributes_available())
+                           if ansi_before is not None else ComposerSnapshot(COMPOSER_UNKNOWN))
+        target_state = (adapter.identify_target_state(typed_snapshot)
+                        if typed_snapshot is not None else None)
+
+        if (policy.require_draft_before_enter and composer_before.state == COMPOSER_EMPTY
+                and target_state != TARGET_WAITING):
+            # Confirm with a SECOND independent read before withholding a
+            # key the caller explicitly asked for: a single capture can
+            # land mid-redraw, and wrongly refusing a legitimate Enter is
+            # its own failure mode. Two agreeing reads, one settle window
+            # apart -- bounded, no keystroke, no loop. Nothing was typed
+            # by this call, so a genuinely empty composer stays empty.
+            time.sleep(_settle_seconds(self.config, adapter.name))
+            confirm = self._read_composer(session)
+            if confirm.state != COMPOSER_EMPTY:
+                composer_before = confirm
+        if (policy.require_draft_before_enter and composer_before.state == COMPOSER_EMPTY
+                and target_state != TARGET_WAITING):
+            result: dict[str, Any] = {
+                "session": session, "sent": False, "enter_sent": False, "keys": keys,
+                "correlation_id": correlation_id, "agent_type": adapter.name,
+                "enter_count": 0, "attempts": 0,
+                "delivery_state": DELIVERY_NOT_ACTIVATED,
+                "submit_status": to_legacy_submit_status(DELIVERY_NOT_ACTIVATED),
+                "evidence": ["COMPOSER_EMPTY"],
+                "submit_reason": (
+                    "no Enter was sent: the composer is empty, so there is nothing to submit"
+                    + (f" -- the text visible in the pane ({composer_before.ghost_text[:120]!r}) is "
+                       f"{adapter.name}'s own dim suggestion rendered inside an EMPTY composer, not "
+                       f"pending input (tmux capture-pane strips the dim attribute, which is why it "
+                       f"looks like a stuck prompt). Send the prompt text itself with "
+                       f"terminal_send_text instead of pressing Enter again."
+                       if composer_before.ghost_text else
+                       ". Send the prompt text itself with terminal_send_text.")),
+            }
+            result.update(self._composer_fields(composer_before, composer_before))
+            return result
+
         self.tmux.send_keys(session, keys)
-        result: dict[str, Any] = {"session": session, "sent": True, "keys": keys,
-                                  "correlation_id": correlation_id, "agent_type": adapter.name}
+        result = {"session": session, "sent": True, "enter_sent": True, "keys": keys,
+                  "correlation_id": correlation_id, "agent_type": adapter.name,
+                  "enter_count": 1, "attempts": 1}
+        result.update(self._composer_fields(composer_before, composer_before))
+
+        verify_timeout = _verify_timeout_seconds(self.config, adapter.name)
+        deadline = time.monotonic() + verify_timeout
+
+        # Composer-evidence path: the draft we could SEE before the Enter
+        # is the thing whose disappearance proves acceptance.
+        if composer_before.state == COMPOSER_DRAFT:
+            released, composer_after = self._poll_for_composer_release(
+                session, composer_before.draft_text, deadline=deadline)
+            result.update(self._composer_fields(composer_before, composer_after))
+            if released:
+                result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
+                result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
+                result["evidence"] = ["COMPOSER_RELEASED"]
+                result["submit_reason"] = "confirmed: the pending draft left the composer after this Enter"
+                return result
+            if composer_after.state != COMPOSER_UNKNOWN:
+                result["delivery_state"] = DELIVERY_ACTIVATION_UNCERTAIN
+                result["submit_status"] = to_legacy_submit_status(DELIVERY_ACTIVATION_UNCERTAIN)
+                result["evidence"] = ["COMPOSER_STILL_HOLDS_DRAFT"]
+                result["submit_reason"] = (
+                    "one Enter was delivered but the draft is still in the composer after the grace "
+                    "window -- not retried (single-submit policy for this agent); resolve manually")
+                return result
+            # Unreadable composer after the Enter proves nothing -- fall
+            # through to the pre-existing pane-diff verification below with
+            # a fresh, bounded budget.
+            deadline = time.monotonic() + verify_timeout
+
         if typed_snapshot is None:
             result["delivery_state"] = DELIVERY_UNKNOWN
             result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
             result["submit_reason"] = "could not capture a pre-send baseline to verify against"
             return result
 
-        # The expected echo text for the busy-window ack check (see
-        # adapters.py's own submit_ack_evidence -- "if was_busy: return
-        # _sent_text_echoed(after, sent_text)") is read straight from the
-        # composer's OWN pre-Enter content, never blindly empty -- an
-        # empty sent_text would make _sent_text_echoed trivially True
-        # (by design, for a caller with genuinely nothing to attribute),
-        # which would silently defeat the exact busy-window race guard
-        # this whole mechanism exists for (found live, in this project's
-        # own test suite, before this line existed: a busy-footer-before-
-        # echo transitional frame was wrongly confirmed with no real
-        # echo ever checked). This call never typed the text itself, so
-        # there is no other source for it.
-        expected_text = _extract_composer_text(typed_snapshot)
-
-        verify_timeout = (RECOVERY_VERIFY_TIMEOUT_SECONDS if adapter.name in WIDE_VERIFY_ADAPTERS
-                          else SEND_VERIFY_TIMEOUT_SECONDS)
-        deadline = time.monotonic() + verify_timeout
+        # No readable composer (UNKNOWN), or a WAITING target: keep the
+        # pre-existing pane-diff verification EXACTLY as it was.
+        expected_text = _extract_composer_text(
+            ansi_before if ansi_before is not None else typed_snapshot)
         _, first_after, _reason = self._poll_for_submission(session, typed_snapshot, timeout=verify_timeout)
-        confirmed, after = self._poll_for_ack_evidence(session, typed_snapshot, first_after, adapter, expected_text,
-                                                       deadline=deadline)
+        confirmed, after = self._poll_for_ack_evidence(session, typed_snapshot, first_after, adapter,
+                                                       expected_text, deadline=deadline)
         if confirmed:
             result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
             result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
@@ -2131,10 +2473,29 @@ class TerminalService:
         else:
             result["delivery_state"] = DELIVERY_UNKNOWN
             result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
-            result["submit_reason"] = ("pane changed but no adapter ack evidence found in time" if after != typed_snapshot
-                                       else "the pane looked identical to its pre-send state throughout the "
-                                            "verification window")
+            result["submit_reason"] = ("pane changed but no adapter ack evidence found in time"
+                                       if after != typed_snapshot else
+                                       "the pane looked identical to its pre-send state throughout the "
+                                       "verification window")
         return result
+
+    def _safe_ansi_capture(self, session: str) -> list[str] | None:
+        """ANSI-preserving capture that never raises -- None when
+        unavailable. The TypeError guard covers a third-party/test backend
+        whose capture_lines predates the `ansi` keyword: degrading to
+        "cannot tell" is strictly better than crashing a send on it."""
+        try:
+            return self.tmux.capture_lines(session, SEND_VERIFY_LINES, ansi=True)
+        except (TmuxError, TypeError):
+            return None
+
+    def _ansi_attributes_available(self) -> bool | None:
+        """Whether this backend's ANSI capture really carries SGR runs --
+        asked of the backend, never inferred from the capture (see
+        composer.read_composer's docstring for why inference is wrong).
+        None for a backend that does not declare the capability at all, in
+        which case read_composer falls back to its own auto-detection."""
+        return getattr(self.tmux, "ansi_capture_supported", None)
 
     def terminal_exit_copy_mode(self, *, session: str | None = None,
                                 binding: str | None = None) -> dict[str, Any]:
@@ -3598,6 +3959,39 @@ class TerminalService:
                 "metadata_complete": item.metadata_complete, "killed_at": item.killed_at, "killed_by": item.killed_by,
             })
         return {"killed_sessions": entries}
+
+
+def _settle_seconds(config: Any, agent_type: str) -> float:
+    """Per-agent settle delay (seconds) between the text write and Enter --
+    config submit.<agent>.settle_ms, falling back to the historical
+    tmux.SEND_TEXT_ENTER_SETTLE_SECONDS for any config predating it."""
+    profile = _submit_profile_for(config, agent_type)
+    settle_ms = getattr(profile, "settle_ms", None)
+    return (settle_ms / 1000.0) if settle_ms else SEND_TEXT_ENTER_SETTLE_SECONDS
+
+
+def _composer_ready_seconds(config: Any, agent_type: str) -> float:
+    """Bounded budget for the composer to render a just-written draft
+    before Enter. Reuses the agent's own grace window rather than adding a
+    third knob, but is capped well below it: this only ever delays the
+    Enter of a send that is about to succeed anyway, and the cap keeps the
+    worst case comfortably inside the caller's existing latency budget."""
+    return min(_verify_timeout_seconds(config, agent_type), COMPOSER_READY_MAX_SECONDS)
+
+
+def _verify_timeout_seconds(config: Any, agent_type: str) -> float:
+    """Per-agent BOUNDED grace window for submit verification. Keeps the
+    pre-existing shape exactly -- the wider window only ever applied to
+    WIDE_VERIFY_ADAPTERS, since an LLM-backed CLI genuinely takes longer
+    to visibly respond than a plain shell -- and only makes that window's
+    length configurable (submit.<agent>.composer_grace_ms). A longer
+    window can never cause an extra keystroke: nothing in the Claude path
+    sends one, it only delays an honest "uncertain" verdict."""
+    if agent_type not in WIDE_VERIFY_ADAPTERS:
+        return SEND_VERIFY_TIMEOUT_SECONDS
+    profile = _submit_profile_for(config, agent_type)
+    grace_ms = getattr(profile, "composer_grace_ms", None)
+    return (grace_ms / 1000.0) if grace_ms else RECOVERY_VERIFY_TIMEOUT_SECONDS
 
 
 def _submit_profile_for(config: Any, agent_type: str) -> Any:

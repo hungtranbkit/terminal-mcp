@@ -35,6 +35,12 @@ PASTE_BUFFER_THRESHOLD = 4096
 
 
 class TmuxClient:
+    #: `capture-pane -e` really does preserve the SGR runs tmux's own
+    #: terminal emulation resolved for each cell -- which is what makes
+    #: composer.read_composer able to tell a dim ghost suggestion from a
+    #: real pending draft on this backend. See composer.py's docstring.
+    ansi_capture_supported = True
+
     SESSION_FORMAT = "|".join(
         (
             "#{session_name}",
