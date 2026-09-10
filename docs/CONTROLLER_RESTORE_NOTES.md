@@ -1,6 +1,34 @@
 # Restoring sessions after the Dell host goes off
 
-## dell-5530 (Windows) — automatic, no action needed
+## ⚠️ Status update: auto-takeover DISABLED (Dell is sleeping, not retired)
+
+The Dell host holds `192.168.1.132` as a **static** address
+(`ipv4.method: manual`), so it reclaims that address every time it wakes. If
+m910 had adopted it meanwhile, the two would collide the moment Dell came
+back — an ARP conflict that breaks the fleet for everyone.
+
+So `terminal-mcp-ip-takeover.timer` is **disabled**. The script is still
+installed and proven working; it is simply not armed while Dell is only
+asleep rather than permanently retired.
+
+**Consequence:** dell-5530 stays `offline` in the registry while Dell sleeps.
+Its agent and its sessions (`win1`, `win2`, `wtest`) keep running untouched —
+they just are not reachable from the m910 controller.
+
+**To make dell-5530 work while Dell is away, pick one:**
+
+1. **Move Dell off `.132` permanently** (best — costs no sessions). One command
+   on the Dell host, needs its sudo password:
+   ```bash
+   sudo nmcli connection modify Airport ipv4.addresses 192.168.1.133/24
+   sudo nmcli connection up Airport
+   ```
+   Then re-arm on m910: `sudo systemctl enable --now terminal-mcp-ip-takeover.timer`
+
+2. **Repoint dell-5530** — permanent and independent of Dell, but **destroys
+   `win1`/`win2`/`wtest`** (see below).
+
+## dell-5530 (Windows) — how the takeover works when armed
 
 The Windows agent has `--controller-url http://192.168.1.132:8766` baked in as
 a command-line argument and cannot be repointed without restarting it. Its
