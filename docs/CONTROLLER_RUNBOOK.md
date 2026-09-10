@@ -62,6 +62,43 @@ disabled for the same reason.
 Worker nodes point at the controller with `--controller-url
 http://192.168.1.109:8766`.
 
+### Current fleet (2026-09-10)
+
+| node_id | host | role |
+| --- | --- | --- |
+| `local` | m910 itself | controller + local tmux |
+| `macbook` | 192.168.1.138 | macOS worker (LaunchAgent) |
+| `dell-5530` | 192.168.1.250 | Windows worker (ConPTY) |
+| `dell-linux` | 192.168.1.132 | Linux worker -- the retired controller host |
+
+**`dell-linux` is the old Dell Latitude 5511, demoted to a plain worker.**
+Only `terminal-node-agent` runs there; its `terminal-mcp-http`,
+`terminal-mcp-tunnel`, `cloudflared-terminal-mcp-dashboard` and
+`terminal-mcp-tunnel-watchdog.timer` units stay **stopped and disabled**
+(§6). Its 15 long-lived tmux sessions (`terminal-mcp`, `codex-main`,
+`mesflow`, `promptflow`, ...) predate the agent and are never restarted by
+it -- that is what `KillMode=process` in the unit protects.
+
+### ⚠ `dell-linux` and the IP-takeover plan are mutually exclusive
+
+`docs/CONTROLLER_RESTORE_NOTES.md` describes m910 adopting `192.168.1.132`
+once the Dell host is powered off, so `dell-5530` reconnects without the
+restart that would destroy `win1`/`win2`/`wtest`. That plan and the
+`dell-linux` node above **cannot both be live**:
+
+* The takeover assumes `192.168.1.132` is permanently free. Keeping
+  `dell-linux` means that address stays occupied, so the takeover's guard
+  correctly refuses forever and `dell-5530` never reconnects that way.
+* Worse, if m910 ever adopts `192.168.1.132` **and the Dell host later comes
+  back**, both hosts hold one address -- the ARP conflict the guard exists to
+  prevent, only now triggered from the other direction, since the guard is
+  only checked before adoption and never re-checked afterwards.
+
+Pick one before arming any takeover timer. If the takeover is chosen,
+**remove the `dell-linux` entry from `nodes.remote` first** -- otherwise the
+controller ends up polling `http://192.168.1.132:8790`, which would then be
+m910's own address.
+
 ## 5. Moving the controller to another host
 
 1. **Back up** every DB with SQLite's online backup API (never `cp` a live DB):

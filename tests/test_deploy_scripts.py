@@ -92,3 +92,61 @@ def test_stability_script_never_disables_windows_update():
 def test_stability_script_adds_startup_trigger_not_only_logon():
     text = _read()
     assert "AtStartup" in text
+
+
+# -- deploy/install-node-agent.sh (Linux worker nodes) -----------------------
+# The systemd unit this installer WRITES is what actually runs on every Linux
+# worker node, so its two hard-won safety invariants are worth pinning here:
+# the script itself is not executed by this suite (it installs services), but
+# the unit text it emits is plain, greppable content.
+
+NODE_AGENT_INSTALLER = DEPLOY_DIR / "install-node-agent.sh"
+
+
+def _read_installer() -> str:
+    assert NODE_AGENT_INSTALLER.exists(), f"missing {NODE_AGENT_INSTALLER}"
+    return NODE_AGENT_INSTALLER.read_text(encoding="utf-8")
+
+
+def _installer_unit_sections() -> dict[str, list[str]]:
+    """Splits the systemd unit embedded in the installer into its real
+    sections. Only a line that is exactly a section header counts -- a
+    bracketed name mentioned inside a comment must not split anything,
+    and comment/blank lines are dropped so a key named in a comment is
+    never mistaken for a declaration."""
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for raw in _read_installer().splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            sections.setdefault(current, [])
+            continue
+        if current is None or not line or line.startswith("#"):
+            continue
+        sections[current].append(line)
+    return sections
+
+
+def test_node_agent_unit_sets_killmode_process():
+    """systemd's default KillMode=control-group SIGTERMs the whole cgroup on
+    stop/restart -- including a tmux server started from within it. That is
+    how session "m1" was destroyed by a routine node-agent restart on
+    2026-09-09; the controller unit carries the same setting for the same
+    reason (docs/CONTROLLER_RUNBOOK.md)."""
+    service = _installer_unit_sections()["Service"]
+    assert "KillMode=process" in service, \
+        "KillMode=process must be a real [Service] declaration, not only a comment"
+
+
+def test_node_agent_unit_declares_startlimit_in_unit_section():
+    """StartLimitIntervalSec/StartLimitBurst are parsed only in [Unit].
+    Placed in [Service], systemd logs "Unknown key ... ignoring" and the
+    rate limit silently does not exist (observed live installing the
+    dell-linux node on 2026-09-10)."""
+    sections = _installer_unit_sections()
+    for key in ("StartLimitIntervalSec", "StartLimitBurst"):
+        assert any(line.startswith(key) for line in sections["Unit"]), \
+            f"{key} must be declared in [Unit]"
+        assert not any(line.startswith(key) for line in sections["Service"]), \
+            f"{key} is ignored by systemd in [Service]"
