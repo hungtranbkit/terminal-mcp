@@ -59,8 +59,16 @@ curl -s http://127.0.0.1:8767/readyz           # MCP tunnel
 own remote nodes, in a loop. Its `terminal-node-agent.service` is stopped and
 disabled for the same reason.
 
-Worker nodes point at the controller with `--controller-url
-http://192.168.1.109:8766`.
+LAN worker nodes (`dell-5530`, `macbook`) point at the controller with
+`--controller-url http://192.168.1.109:8766`.
+
+`dell-linux` is **off-LAN** since 2026-09-10 and reaches the controller over
+the Tailscale overlay instead: `--controller-url http://100.117.214.87:8766`,
+with its own `endpoint` on `100.81.85.120:8790`. The controller binds both
+addresses at once (`30-tailnet-overlay.conf` drop-in) so the two groups
+coexist; no inbound port-forward is involved on either side. Full setup and
+node-recovery steps: `docs/multi-node.md`, "dell-linux over the Tailscale
+overlay".
 
 ## 5. Moving the controller to another host
 
@@ -129,3 +137,8 @@ up. Worker nodes reconnect on their own heartbeat interval (20s).
 
 Check afterwards: `/health/ready` is 200, `/version` is clean, and every
 expected node is `online` in the registry.
+
+`ss -ltn | grep 8766` must show **three** sockets — loopback, `192.168.1.109`
+and `100.117.214.87`. If the tailnet one is missing, `dell-linux` cannot
+heartbeat at all; check that the `30-tailnet-overlay.conf` drop-in survived
+(`systemctl --user show terminal-mcp-http -p Environment`).

@@ -1142,12 +1142,121 @@ Tailscale interfaces, no production state touched):
 127.0.0.1     -> 127.0.0.1     : HTTP 200
 ```
 
-**Still required before an off-LAN node is production-ready** (not done by
-this change): the node itself must join the tailnet, its `endpoint` must be
-its overlay address, and the controller service must actually be restarted
-with the env above — none of which this audit performed against the live
-deployment. `TERMINAL_MCP_TRUSTED_VPN_CIDRS` only removes the code-level
-refusal; it does not configure the overlay for you.
+**Done against the live deployment on 2026-09-10** — see
+"dell-linux over the Tailscale overlay" below. What that took, beyond the
+code-level permission this section describes: the node joined the tailnet,
+its `endpoint` became its overlay address, and the controller was restarted
+with the env above. `TERMINAL_MCP_TRUSTED_VPN_CIDRS` only removes the
+code-level refusal; it does not configure the overlay for you.
+
+### dell-linux over the Tailscale overlay (live since 2026-09-10)
+
+The first node actually running off-LAN. The Dell Latitude 5511 left
+`192.168.1.0/24` (it is now on a different network entirely) and reaches
+the controller only over the tailnet. **No inbound port-forward exists or
+is needed on either router** — Tailscale is an outbound-only WireGuard
+mesh, and it carries both directions of this protocol: the node's
+outbound heartbeat push, and the controller's calls back to the node's
+`:8790`.
+
+| | Address |
+| --- | --- |
+| controller (m910) | `100.117.214.87:8766` |
+| node (dell-linux) | `100.81.85.120:8790` |
+
+Controller side — `~/.config/systemd/user/terminal-mcp-http.service.d/30-tailnet-overlay.conf`:
+
+```ini
+[Service]
+Environment=TERMINAL_MCP_TRUSTED_VPN_CIDRS=100.64.0.0/10
+Environment=TERMINAL_MCP_LAN_BIND=192.168.1.109,100.117.214.87
+Environment=TERMINAL_MCP_ALLOWED_NODE_CIDRS=192.168.1.0/24,100.64.0.0/10
+```
+
+Additive on purpose: the LAN bind and loopback are untouched, so
+`dell-5530` and `macbook` keep the exact heartbeat path they already had.
+`TRUSTED_VPN_CIDRS` must be present or `network_bind` refuses to bind a
+`100.64.0.0/10` address at all. `config.yaml`'s `dell-linux` entry has its
+`hostname`/`endpoint` on the overlay address to match.
+
+Node side — `~/.config/systemd/user/terminal-node-agent.service` on the Dell:
+
+```
+ExecStart=.../terminal-node-agent --node-id dell-linux \
+    --controller-url http://100.117.214.87:8766 \
+    --host 100.81.85.120 --port 8790 --heartbeat-interval-seconds 20
+```
+
+`--host` is the node's own **tailnet** address, never `0.0.0.0`: the agent
+is reachable by the controller and by nothing on the public Internet.
+
+Two unit bugs were fixed here that are worth not regressing:
+
+- **`After=default.target` together with `WantedBy=default.target`** is an
+  ordering cycle; systemd resolves it by silently deleting the start job at
+  boot. The controller unit carries a comment about this exact bug — the
+  node unit still had it.
+- **`StartLimitIntervalSec`/`StartLimitBurst` in `[Service]`** are ignored by
+  modern systemd; they belong in `[Unit]`. That left the agent on the
+  5-starts-in-10s default, which is too tight for a unit whose bind address
+  only exists once `tailscaled` has configured `tailscale0`. Now
+  `600s`/`30` in `[Unit]`.
+
+**`deploy/install-node-agent.sh` still emits `After=default.target`** into the
+unit it generates, so a fresh install reintroduces the ordering cycle above and
+the new node silently fails to start at its first boot. Not fixed in the same
+change as this note on purpose: m910 is carrying unpushed commits that already
+touch that template's surrounding lines (the `StartLimit*` move and
+`KillMode=process`), and editing it from a second checkout would collide with
+them. Fix it wherever those commits land, not here.
+
+Live acceptance evidence (2026-09-10, disposable session, deleted after):
+
+```
+[health]  {"status": "ok", "node_id": "dell-linux", "version": "0.12.0"}
+[create]  tmcp-verify-... state=READY cwd=/home/dell/workspace
+[send]    pwd; hostname; uname -a  -> SUBMIT_CONFIRMED
+[tail]    /home/dell/workspace
+          dell-Latitude-5511
+          Linux dell-Latitude-5511 7.0.0-31-generic ... x86_64 GNU/Linux
+[delete]  {"deleted": true}   # sessions before == sessions after == []
+```
+
+Reconnect behaviour, both verified live rather than assumed: restarting the
+agent brings the heartbeat back within one interval, and stopping the
+controller makes the agent log `heartbeat push to controller failed (will
+retry)` and keep running on the **same PID** — it retries, it does not
+crash-loop.
+
+#### Recovering this node after a reinstall or a reboot
+
+After a plain reboot: nothing manual. `loginctl show-user dell -p Linger` is
+`Linger=yes` and the unit is `enabled`, so the agent comes back on its own;
+it retries until `tailscale0` exists. Long-lived tmux sessions do **not**
+survive a reboot — that is tmux, not this agent, and `tmux_session_count: 0`
+right after a boot is correct, not a fault.
+
+After a reinstall, in order:
+
+1. `tailscale up` — confirm this host still holds `100.81.85.120`
+   (`tailscale status`). If the tailnet address changed, it must be updated
+   in **both** the node's `--host` and the controller's `config.yaml`
+   `dell-linux` endpoint.
+2. Restore `~/workspace/terminal-mcp` and its `.venv`.
+3. Restore `node-agent.env` (mode `0600`, never committed — `*.env` is
+   gitignored). Its value must equal the controller's
+   `TERMINAL_MCP_NODE_TOKEN_DELL_LINUX`; compare `sha256sum` of the two, never
+   the tokens themselves. **Do not rotate it** — the same file is the only
+   copy on this node, and rotating means editing the controller too.
+4. Reinstall the unit above, then
+   `systemctl --user daemon-reload && systemctl --user enable --now terminal-node-agent`.
+5. Verify from the controller, not from here: the node is `online` with a
+   heartbeat younger than `degraded_after_seconds` (60s).
+
+Never register a second node id (`dell-linux-2`, a hostname-derived one, ...)
+to work around a node that looks offline. The registry row persists across
+outages by design — `status` is always derived from heartbeat age, never
+stored — so an offline `dell-linux` is a row to fix, never a row to replace.
 
 ### If M910 needs to be reachable from outside the LAN
 
