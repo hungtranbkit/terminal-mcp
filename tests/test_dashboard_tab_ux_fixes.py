@@ -90,14 +90,26 @@ def test_tabbar_row_has_the_load_bearing_min_width_zero():
     assert "min-width:0" in rule
 
 
-def test_tabbar_has_touch_friendly_scroll_properties():
+def test_tabbar_never_overflows_horizontally_and_tabs_wrap_within_a_node():
+    """Supersedes the original horizontal-drag fix (bug 2 in this module's
+    docstring). That fix made a one-row strip draggable sideways; grouping by
+    node removed the one-row strip entirely. Tabs now WRAP inside their own
+    node group, so no session is reachable only by discovering a horizontal
+    gesture -- a stronger version of the same guarantee. The strip scrolls
+    VERTICALLY instead, height-capped so a large fleet cannot push the
+    terminal off screen."""
     start = DASHBOARD_HTML.index(".tabbar {")
     end = DASHBOARD_HTML.index("}", start)
     rule = DASHBOARD_HTML[start:end]
-    assert "overflow-x:auto" in rule
-    assert "touch-action:pan-x" in rule
+    assert "overflow-x:hidden" in rule
+    assert "overflow-y:auto" in rule
+    assert "max-height:" in rule
     assert "-webkit-overflow-scrolling:touch" in rule
-    assert "overscroll-behavior-x:contain" in rule
+    assert "overscroll-behavior-y:contain" in rule
+    # The wrap itself is what replaces horizontal scrolling.
+    tabs_start = DASHBOARD_HTML.index(".node-tabs {")
+    tabs_rule = DASHBOARD_HTML[tabs_start:DASHBOARD_HTML.index("}", tabs_start)]
+    assert "flex-wrap:wrap" in tabs_rule
 
 
 def test_active_tab_scrolls_into_view_on_select():
@@ -144,9 +156,16 @@ def test_tab_dom_nodes_are_persistent_across_polls():
     assert "const tabEls = new Map();" in DASHBOARD_HTML
     assert "function buildTabEl(name)" in DASHBOARD_HTML
     assert "function updateTabEl(refs, row)" in DASHBOARD_HTML
-    # Reused (moved), not recreated, when a session that already has a
-    # tab appears again in a later poll.
-    assert "else { tabbarEl.append(refs.tab); }" in DASHBOARD_HTML
+    # Reused (moved), not recreated, when a session that already has a tab
+    # appears again in a later poll. Placement moved from the flat strip into
+    # the session's own node group; appendChild on an element already in the
+    # DOM still MOVES it, which is the property this test protects.
+    assert "if (!refs) { refs = buildTabEl(row.name); tabEls.set(row.name, refs); }" in DASHBOARD_HTML
+    assert "els.tabs.append(refs.tab);" in DASHBOARD_HTML
+    # The group sections get the same treatment, for the same reason: a header
+    # rebuilt every poll would fight the operator for the collapse toggle.
+    assert "const nodeGroupEls = new Map();" in DASHBOARD_HTML
+    assert "if (!els) { els = buildNodeGroupEl(group.id); nodeGroupEls.set(group.id, els); }" in DASHBOARD_HTML
 
 
 def test_click_and_keydown_handlers_are_rebound_on_every_update_not_just_build():
@@ -207,9 +226,15 @@ def test_mobile_tab_name_has_its_own_explicit_max_width():
 
 def test_tabbar_row_holds_only_the_tab_strip_no_action_buttons():
     start = DASHBOARD_HTML.index('<div class="tabbar-row">')
-    end = DASHBOARD_HTML.index("</div>", start) + len("</div>")
+    # The row now wraps the strip together with its own session filter, so it
+    # spans several nested divs -- bounded by the next sibling section rather
+    # than the first closing tag.
+    end = DASHBOARD_HTML.index('<section class="panel detail">', start)
     row_html = DASHBOARD_HTML[start:end]
     assert 'id="tabbar"' in row_html
+    # The filter is session NAVIGATION (it selects which sessions the strip
+    # shows), not one of the action buttons this test exists to keep out.
+    assert 'id="sessionFilter"' in row_html
     assert 'id="killedMenu"' not in row_html
     assert 'id="killedToggle"' not in row_html
     assert "New session" not in row_html

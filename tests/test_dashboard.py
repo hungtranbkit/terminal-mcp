@@ -816,7 +816,13 @@ def test_dashboard_attention_badge_and_sort_wiring_present():
     assert "class=\"attn-badge\"" not in DASHBOARD_HTML  # built via DOM, not a literal HTML string
     assert "badge.className = 'attn-badge'" in DASHBOARD_HTML
     assert "needs-attention" in DASHBOARD_HTML
-    assert "Rows already arrive sorted attention-first" in DASHBOARD_HTML  # no client-side re-sort
+    # The list is grouped by node now, so the server's single global ordering
+    # cannot survive on its own -- splitting one sorted list across N groups
+    # leaves each group sorted only by accident. buildNodeGroups re-applies
+    # the SAME precedence per node (attention first, then most-recent
+    # activity, then name) rather than inventing a different one.
+    assert "const attention = (b.state === 'WAITING_INPUT') - (a.state === 'WAITING_INPUT');" in DASHBOARD_HTML
+    assert "sessionActivityValue(b) - sessionActivityValue(a)" in DASHBOARD_HTML
 
 
 def test_dashboard_font_controls_present_bounded_and_persisted():
@@ -881,8 +887,15 @@ def test_dashboard_search_and_copy_do_not_persist_content():
     # browser-local tab-hide set this used to also include was removed
     # along with the top session-tabs bar it controlled -- see
     # test_browser_local_tab_hide_feature_removed_from_both_pages.)
+    # `storageKey` is the node-group collapse state (NODE_GROUP_JS): a map of
+    # node_id -> collapsed. Node ids are infrastructure identifiers the
+    # operator already sees in the group header, not session content -- the
+    # property this test actually protects is unchanged.
     keys = set(re.findall(r"localStorage\.(?:setItem|getItem)\(([A-Za-z_]+)", DASHBOARD_HTML))
-    assert keys == {"LAST_SESSION_KEY", "FONT_SIZE_KEY", "FULLSCREEN_KEY"}
+    assert keys == {"LAST_SESSION_KEY", "FONT_SIZE_KEY", "FULLSCREEN_KEY", "storageKey"}
+    # Still never a search term or any rendered output.
+    assert "localStorage.setItem('tmSearch" not in DASHBOARD_HTML
+    assert "localStorage.setItem(OUTPUT" not in DASHBOARD_HTML
 
 
 def test_dashboard_new_controls_disabled_without_a_selected_session():

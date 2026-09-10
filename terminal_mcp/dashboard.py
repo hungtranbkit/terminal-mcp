@@ -119,6 +119,132 @@ INPUT_ERROR_STATUS = {
 _node_to_dict = node_to_dict  # local alias -- every route below predates the move to node_models.py
 
 
+# ---------------------------------------------------------------------------
+# Session-list grouping by node -- ONE implementation, injected into every page
+# that lists sessions (the main dashboard's tab bar and the sessions admin
+# table). Both surfaces had drifted into their own per-row "node badge" before
+# this; a second, parallel grouping implementation would drift the same way,
+# so the ordering/labelling/collapse rules live here exactly once and each page
+# only supplies its own DOM.
+#
+# Injected by replacing the /*__NODE_GROUP_JS__*/ marker rather than via an
+# f-string: these page templates are plain triple-quoted strings full of
+# literal CSS/JS braces, and making them f-strings would require escaping
+# every one of them.
+# ---------------------------------------------------------------------------
+NODE_GROUP_JS = """
+    // ---- Node grouping (shared) ------------------------------------------
+    // Node status comes from the registry's own derived value (see
+    // node_models.NODE_STATUSES): "online" | "degraded" | "offline".
+    // "degraded" means a heartbeat older than degraded_after_seconds but not
+    // yet offline -- surfaced to an operator as "recent", which is what that
+    // state actually communicates: it was here a moment ago.
+    const NODE_STATUS_RANK = { online: 0, degraded: 1, offline: 2 };
+    const NODE_STATUS_LABEL = { online: 'online', degraded: 'recent', offline: 'offline' };
+
+    function nodeStatusRank(status) {
+      const rank = NODE_STATUS_RANK[status];
+      // An unknown/absent status sorts with offline rather than ahead of a
+      // node we positively know is online -- never optimistic about a node
+      // the registry has not vouched for.
+      return rank === undefined ? NODE_STATUS_RANK.offline : rank;
+    }
+
+    function nodeStatusLabel(status) {
+      return NODE_STATUS_LABEL[status] || 'unknown';
+    }
+
+    // Most recent activity/created timestamp on a row, as a comparable number.
+    function sessionActivityValue(row) {
+      const raw = row.activity || row.created;
+      if (!raw) return 0;
+      const parsed = Date.parse(raw);
+      if (!Number.isNaN(parsed)) return parsed;
+      const numeric = Number(raw);
+      return Number.isNaN(numeric) ? 0 : numeric * 1000;
+    }
+
+    // Groups `rows` (any /dashboard/api/sessions-shaped list) by node.
+    //
+    // `nodes` is the /dashboard/api/nodes list when the page has it, and may
+    // be empty/absent -- grouping still works from the rows alone, because
+    // every row carries node_id/node_name from the API (never inferred from
+    // the id, and never a hardcoded "local"/"dell"/"mac" anywhere here).
+    // Its real job is the other direction: a node that is ONLINE but has no
+    // sessions at all still gets a group, so an operator can see it is up and
+    // ready rather than wondering where it went.
+    // `options.includeEmptyOnline` (default true) is what reconciles the two
+    // competing rules: an online node with no sessions SHOULD show, so an
+    // operator can see it is up and free -- but while a search/filter is
+    // active it must NOT, because a group with no matches is exactly the
+    // noise the filter exists to remove. Callers pass false when filtering.
+    function buildNodeGroups(rows, nodes, options) {
+      const includeEmptyOnline = !options || options.includeEmptyOnline !== false;
+      const groups = new Map();
+      const ensure = (id, name, status) => {
+        let group = groups.get(id);
+        if (!group) { group = { id, name: name || id, status: status || null, sessions: [] }; groups.set(id, group); }
+        if (name && (!group.name || group.name === group.id)) group.name = name;
+        if (status && !group.status) group.status = status;
+        return group;
+      };
+      for (const row of rows || []) {
+        const id = row.node_id || 'local';
+        ensure(id, row.node_name, null).sessions.push(row);
+      }
+      for (const node of nodes || []) {
+        const id = node.id || node.node_id;
+        if (!id) continue;
+        const group = ensure(id, node.display_name, node.status);
+        group.status = node.status || group.status;
+        // Only surface a session-less node when it is actually reachable.
+        // An offline node with nothing on it is noise; an online one is
+        // information ("that node is up and free").
+        if (!group.sessions.length && (!includeEmptyOnline || node.status !== 'online')) groups.delete(id);
+      }
+      const ordered = [...groups.values()];
+      for (const group of ordered) {
+        // Within a node: attention first (a session waiting on input is the
+        // thing an operator came here for), then most-recent activity, then
+        // name so the order is stable between polls.
+        group.sessions.sort((a, b) => {
+          const attention = (b.state === 'WAITING_INPUT') - (a.state === 'WAITING_INPUT');
+          if (attention) return attention;
+          const activity = sessionActivityValue(b) - sessionActivityValue(a);
+          if (activity) return activity;
+          return String(a.name).localeCompare(String(b.name));
+        });
+      }
+      ordered.sort((a, b) => {
+        const rank = nodeStatusRank(a.status) - nodeStatusRank(b.status);
+        if (rank) return rank;
+        return String(a.name).localeCompare(String(b.name));
+      });
+      return ordered;
+    }
+
+    // Collapse state, per page and per node, in localStorage. Reading it can
+    // throw (Safari private mode), and a storage failure must never stop the
+    // list from rendering -- a group simply defaults to expanded.
+    function makeNodeCollapseStore(pageKey) {
+      const storageKey = 'tmNodeCollapse:' + pageKey;
+      let state = {};
+      try { state = JSON.parse(localStorage.getItem(storageKey) || '{}') || {}; } catch (error) { state = {}; }
+      return {
+        isCollapsed(nodeId) { return state[nodeId] === true; },
+        setCollapsed(nodeId, collapsed) {
+          if (collapsed) state[nodeId] = true; else delete state[nodeId];
+          try { localStorage.setItem(storageKey, JSON.stringify(state)); } catch (error) { /* non-fatal */ }
+        },
+        // A node holding the session the operator is actually looking at is
+        // force-revealed: a collapsed group must never hide the current
+        // session. This does not persist -- reopening the group by hand
+        // stays the remembered state.
+        reveal(nodeId) { if (state[nodeId]) delete state[nodeId]; },
+      };
+    }
+"""
+
 DASHBOARD_HTML = """<!doctype html>
 <html lang="vi">
 <head>
@@ -276,13 +402,48 @@ DASHBOARD_HTML = """<!doctype html>
        iOS rubber-band swipe on this strip from propagating anywhere else,
        not a page-scroll conflict (there isn't one). */
     .tabbar {
-      display:flex; align-items:stretch; overflow-x:auto; overflow-y:hidden; background:var(--panel);
+      display:flex; flex-direction:column; align-items:stretch; overflow-x:hidden; overflow-y:auto;
+      max-height:34vh; background:var(--panel);
       border-bottom:1px solid var(--line); scrollbar-width:thin;
-      -webkit-overflow-scrolling:touch; touch-action:pan-x; overscroll-behavior-x:contain;
+      -webkit-overflow-scrolling:touch; overscroll-behavior-y:contain;
     }
     .tabbar-empty { padding:12px 16px; color:var(--muted); font-size:13px }
+
+    /* ---- Node groups in the tab strip (see NODE_GROUP_JS) ----------------
+       The strip is now a stack of node sections rather than one flat row of
+       tabs. Each section is a header line plus that node's tabs, which WRAP
+       instead of scrolling off to the right -- requirement "không tràn ngang":
+       a session must never be reachable only by discovering a horizontal
+       scroll. The stack itself is height-capped and scrolls vertically, so a
+       fleet with many sessions cannot push the terminal off the screen. */
+    .tabbar-wrap { display:flex; flex-direction:column; min-width:0; flex:1 }
+    .tabbar-filter { padding:6px 10px; border-bottom:1px solid var(--line); background:var(--panel) }
+    .tabbar-filter input {
+      width:100%; background:#0e1526; border:1px solid var(--line); border-radius:8px; color:var(--text);
+      font:inherit; font-size:12px; padding:6px 10px;
+    }
+    .tabbar-filter input:focus { outline:none; border-color:var(--accent) }
+    .node-group { display:flex; flex-direction:column; min-width:0; border-bottom:1px solid var(--line) }
+    .node-group:last-child { border-bottom:none }
+    .node-group-toggle {
+      display:flex; align-items:center; gap:8px; width:100%; text-align:left; cursor:pointer;
+      background:#101728; border:0; border-bottom:1px solid transparent; color:var(--text);
+      font:inherit; font-size:11px; padding:5px 10px;
+    }
+    .node-group-toggle:hover { background:#16203a }
+    .node-group-toggle:focus-visible { outline:2px solid var(--accent); outline-offset:-2px }
+    .node-caret { flex:0 0 auto; color:var(--muted); width:9px }
+    .node-group-name { font-weight:700; letter-spacing:.02em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    .node-group-id { color:var(--muted); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    .node-group-status { flex:0 0 auto; border-radius:999px; padding:0 7px; font-size:10px; border:1px solid var(--line); color:var(--muted); white-space:nowrap }
+    .node-group-status.online { color:var(--green); border-color:rgba(67,209,124,.45) }
+    .node-group-status.degraded { color:var(--amber); border-color:rgba(255,200,87,.45) }
+    .node-group-status.offline { color:var(--red); border-color:rgba(255,107,107,.4) }
+    .node-group-count { margin-left:auto; flex:0 0 auto; color:var(--muted); font-size:10px; min-width:14px; text-align:right }
+    .node-tabs { display:flex; flex-wrap:wrap; align-items:stretch; min-width:0 }
+    .node-tabs-empty { padding:7px 12px; color:var(--muted); font-size:11px; font-style:italic }
     .tab {
-      position:relative; display:flex; align-items:center; gap:7px; flex:0 0 auto; max-width:220px; min-width:0;
+      position:relative; display:flex; align-items:center; gap:7px; flex:0 1 auto; max-width:220px; min-width:0;
       padding:9px 10px 9px 12px; cursor:pointer; color:var(--muted); border-right:1px solid var(--line);
       border-bottom:2px solid transparent; white-space:nowrap;
     }
@@ -705,6 +866,18 @@ DASHBOARD_HTML = """<!doctype html>
          rather than whatever's left over after the dot/close button. */
       .tab { min-width:clamp(110px, 30vw, 160px); max-width:220px; padding:8px 8px 8px 10px }
       .tab-name { font-size:12.5px; max-width:200px }
+      /* Compact node headers on a phone: the id drops (the display name
+         already identifies the node), the row keeps a 40px tap target, and
+         the strip gets a little less of the screen so the terminal keeps
+         most of it. Tabs WRAP within their node rather than scrolling off
+         to the right, so nothing is reachable only via a hidden gesture. */
+      .tabbar { max-height:38vh }
+      .node-group-toggle { padding:7px 10px; min-height:40px; font-size:11px }
+      .node-group-id { display:none }
+      /* 16px: iOS Safari auto-zooms the page for any input under 16px --
+         same reason the term-search input below holds that floor. */
+      .tabbar-filter { padding:5px 10px }
+      .tabbar-filter input { font-size:16px; padding:6px 9px }
       .detail { min-height:0 }
       /* Smaller, tighter terminal text fits substantially more real output on
          a phone screen without hurting readability; desktop sizing (14px/1.45
@@ -860,7 +1033,12 @@ DASHBOARD_HTML = """<!doctype html>
          "dải ngang phải ưu tiên session tabs 100% chiều rộng") -- New
          session/Đã kill moved to the header, see above. -->
     <div class="tabbar-row">
-      <nav class="tabbar" id="tabbar" role="tablist" aria-label="Sessions"></nav>
+      <div class="tabbar-wrap">
+        <div class="tabbar-filter">
+          <input type="search" id="sessionFilter" placeholder="Lọc session trên mọi node..." aria-label="Lọc session">
+        </div>
+        <nav class="tabbar" id="tabbar" role="tablist" aria-label="Sessions"></nav>
+      </div>
     </div>
     <section class="panel detail">
       <div id="summary" class="muted">Chọn một session để xem output.</div>
@@ -1096,6 +1274,13 @@ DASHBOARD_HTML = """<!doctype html>
     let autoFollow = true;
     let lastRenderedSession = null;
     let fullscreenTerminal = false;
+    /*__NODE_GROUP_JS__*/
+    // Node registry, polled on a slower cadence than sessions: it only feeds
+    // the group headers (status badge) and the "online but no sessions" group,
+    // neither of which needs the 5s session cadence. Grouping degrades
+    // gracefully to the rows' own node_id/node_name if this never loads.
+    let lastKnownNodes = [];
+    const nodeCollapse = makeNodeCollapseStore('dashboard');
     let lastKnownRows = []; // the most recent /dashboard/api/sessions rows, reused by openPermModal/openKillModal without a re-fetch
     let loadDetailSequence = 0; // generation counter -- see loadDetail's own guard for why a session-name check alone isn't enough
     // session name -> its persistent tab <div>, reused across every
@@ -1112,6 +1297,7 @@ DASHBOARD_HTML = """<!doctype html>
     // never be "stolen" by a rebuild again.
     const tabEls = new Map();
     const tabbarEl = document.querySelector('#tabbar');
+    const sessionFilterEl = document.querySelector('#sessionFilter');
     const outputEl = document.querySelector('#output');
     const summaryEl = document.querySelector('#summary');
     const grantBarEl = document.querySelector('#grantBar');
@@ -2274,7 +2460,10 @@ DASHBOARD_HTML = """<!doctype html>
       const closeBtn = document.createElement('button');
       closeBtn.type = 'button'; closeBtn.className = 'tab-close'; closeBtn.textContent = '✕';
       tab.append(dot, label, badge, closeBtn);
-      tabbarEl.append(tab);
+      // NOT appended to the strip here any more: renderRows places it inside
+      // its own node's group container. Creating it detached keeps this
+      // function's "build once, never recreate" contract intact (see the
+      // tabEls comment) while letting the node grouping own placement.
       return { tab, dot, label, badge, closeBtn };
     }
 
@@ -2317,39 +2506,107 @@ DASHBOARD_HTML = """<!doctype html>
       };
     }
 
+    // One group section per node, reused across polls exactly the way tabEls
+    // reuses tab elements -- a header rebuilt every 5s would fight the
+    // operator for the collapse toggle and steal focus mid-click.
+    const nodeGroupEls = new Map(); // node_id -> { section, header, caret, name, id, status, count, tabs }
+
+    function buildNodeGroupEl(nodeId) {
+      const section = document.createElement('div'); section.className = 'node-group';
+      const header = document.createElement('button');
+      header.type = 'button'; header.className = 'node-group-toggle';
+      const caret = document.createElement('span'); caret.className = 'node-caret';
+      const name = document.createElement('span'); name.className = 'node-group-name';
+      const id = document.createElement('span'); id.className = 'node-group-id';
+      const status = document.createElement('span'); status.className = 'node-group-status';
+      const count = document.createElement('span'); count.className = 'node-group-count';
+      header.append(caret, name, id, status, count);
+      const tabs = document.createElement('div'); tabs.className = 'node-tabs'; tabs.setAttribute('role', 'tablist');
+      section.append(header, tabs);
+      header.onclick = () => {
+        nodeCollapse.setCollapsed(nodeId, !nodeCollapse.isCollapsed(nodeId));
+        renderRows(lastKnownRows);
+      };
+      return { section, header, caret, name, id, status, count, tabs };
+    }
+
     function renderRows(rows) {
       lastKnownRows = rows;
+      const query = sessionFilterEl ? sessionFilterEl.value.trim().toLowerCase() : '';
+      const visibleRows = query ? rows.filter(row => row.name.toLowerCase().includes(query)) : rows;
+      // While filtering, a node with no matching session is hidden entirely
+      // (that is what a filter is for); unfiltered, an ONLINE node with no
+      // sessions still gets its own group so it reads as "up and idle"
+      // rather than silently missing.
+      const groups = buildNodeGroups(visibleRows, lastKnownNodes, { includeEmptyOnline: !query });
+      // A collapsed group must never hide the session actually being viewed.
+      if (selected) {
+        const owner = groups.find(group => group.sessions.some(row => row.name === selected));
+        if (owner) nodeCollapse.reveal(owner.id);
+      }
+
       const emptyEl = tabbarEl.querySelector('.tabbar-empty');
-      if (!rows.length) {
+      if (!groups.length) {
         if (!emptyEl) {
-          const empty = document.createElement('div'); empty.className = 'tabbar-empty'; empty.textContent = 'Không có session nào.';
+          const empty = document.createElement('div'); empty.className = 'tabbar-empty';
           tabbarEl.append(empty);
         }
+        tabbarEl.querySelector('.tabbar-empty').textContent =
+          query ? 'Không có session khớp bộ lọc.' : 'Không có session nào.';
         for (const [name, refs] of tabEls) { refs.tab.remove(); tabEls.delete(name); }
+        for (const [id, group] of nodeGroupEls) { group.section.remove(); nodeGroupEls.delete(id); }
         refreshTermActionMenu();
-        if (selected) { selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateLayoutState();
+        if (!rows.length && selected) { selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateLayoutState();
           if (fullscreenTerminal) setFullscreen(false, { persist: false });
           summaryEl.textContent = 'Session không còn tồn tại.'; outputEl.replaceChildren(); grantBarEl.hidden = true; }
         return;
       }
       if (emptyEl) emptyEl.remove();
-      // Drop tabs for sessions no longer in the list.
+      // Drop tabs for sessions no longer in the list (the FULL list, never
+      // the filtered view -- a filtered-out session still exists).
       const currentNames = new Set(rows.map(row => row.name));
       for (const [name, refs] of tabEls) {
         if (!currentNames.has(name)) { refs.tab.remove(); tabEls.delete(name); }
       }
-      // Rows already arrive sorted attention-first, then most-recent-
-      // activity, then name (see the /dashboard/api/sessions route) — no
-      // client-side reordering here, just placing each tab (reused if it
-      // already exists, built once if not) at its correct position.
+      // Drop group sections for nodes that are gone.
+      const currentNodeIds = new Set(groups.map(group => group.id));
+      for (const [id, group] of nodeGroupEls) {
+        if (!currentNodeIds.has(id)) { group.section.remove(); nodeGroupEls.delete(id); }
+      }
+      // Place each group, then each tab inside its own node's container.
       // appendChild on a node already in the DOM MOVES it rather than
-      // duplicating it, so this reorders in place without ever recreating
-      // an existing tab's element.
-      for (const row of rows) {
-        let refs = tabEls.get(row.name);
-        if (!refs) { refs = buildTabEl(row.name); tabEls.set(row.name, refs); }
-        else { tabbarEl.append(refs.tab); }
-        updateTabEl(refs, row);
+      // duplicating it, so this reorders in place without ever recreating an
+      // existing tab element -- the property the tabEls comment above exists
+      // to protect, now applied to the group sections too.
+      for (const group of groups) {
+        let els = nodeGroupEls.get(group.id);
+        if (!els) { els = buildNodeGroupEl(group.id); nodeGroupEls.set(group.id, els); }
+        tabbarEl.append(els.section);
+        const collapsed = nodeCollapse.isCollapsed(group.id);
+        els.section.className = 'node-group' + (collapsed ? ' collapsed' : '');
+        els.header.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+        els.header.title = group.id === group.name ? group.name : `${group.name} (${group.id})`;
+        els.caret.textContent = collapsed ? '\u25b8' : '\u25be';
+        els.name.textContent = group.name;
+        els.id.textContent = group.id === group.name ? '' : group.id;
+        els.status.className = 'node-group-status ' + (group.status || 'unknown');
+        els.status.textContent = nodeStatusLabel(group.status);
+        els.count.textContent = String(group.sessions.length);
+        els.tabs.hidden = collapsed;
+        if (!group.sessions.length) {
+          let none = els.tabs.querySelector('.node-tabs-empty');
+          if (!none) { none = document.createElement('div'); none.className = 'node-tabs-empty'; els.tabs.append(none); }
+          none.textContent = 'Node online, chưa có session.';
+          continue;
+        }
+        const none = els.tabs.querySelector('.node-tabs-empty');
+        if (none) none.remove();
+        for (const row of group.sessions) {
+          let refs = tabEls.get(row.name);
+          if (!refs) { refs = buildTabEl(row.name); tabEls.set(row.name, refs); }
+          els.tabs.append(refs.tab);
+          updateTabEl(refs, row);
+        }
       }
       // Task button pending-count badge (2026-09-07 checkpoint) --
       // reflects the CURRENTLY selected session's own row, refreshed on
@@ -3688,6 +3945,21 @@ DASHBOARD_HTML = """<!doctype html>
       }
     }
     refresh(); setInterval(refresh, 5000);
+    // Filter runs entirely against the rows already in hand -- no refetch,
+    // so typing stays responsive and never races the poll.
+    if (sessionFilterEl) sessionFilterEl.oninput = () => renderRows(lastKnownRows);
+
+    async function loadNodes() {
+      // Best-effort: the session list is this page's real content and must
+      // keep rendering if the node registry is briefly unavailable.
+      try {
+        const data = await fetchJSON('/dashboard/api/nodes', {cache: 'no-store'});
+        lastKnownNodes = data.nodes || [];
+        renderRows(lastKnownRows); // repaint headers with fresh status
+      } catch (error) { /* keep the last known node list */ }
+    }
+    loadNodes(); setInterval(loadNodes, 15000);
+
 
     // ---- connection health banner (OpenAI Secure MCP Tunnel) ---------------
     // One quiet, always-present label -- never a popup, never re-fetched on
@@ -3859,9 +4131,37 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     #csModal button.close { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 9px; cursor:pointer; font:inherit }
     #csModal .cs-error { color:#ff6b6b; font-size:12px; min-height:14px }
     #csModal .cs-hint { color:var(--muted); font-size:11px }
+    /* ---- Node groups (see NODE_GROUP_JS) --------------------------------
+       A header row per node, spanning the full table, with its own sessions
+       beneath it. Sticky so the node a row belongs to stays readable while
+       scrolling a long list -- the whole point of grouping is knowing WHERE
+       a session runs before acting on it. */
+    tbody tr.node-group-row td { padding:0; border-bottom:1px solid var(--line); background:#101728 }
+    tbody tr.node-group-row:hover { background:transparent }
+    .node-group-toggle {
+      display:flex; align-items:center; gap:9px; width:100%; text-align:left; cursor:pointer;
+      background:transparent; border:0; color:var(--text); font:inherit; font-size:12px; padding:8px 10px;
+    }
+    .node-group-toggle:hover { background:#16203a }
+    .node-group-toggle:focus-visible { outline:2px solid var(--accent); outline-offset:-2px }
+    .node-caret { flex:0 0 auto; color:var(--muted); width:10px }
+    .node-group-name { font-weight:700; letter-spacing:.02em }
+    .node-group-id { color:var(--muted); font-size:11px }
+    .node-group-status { border-radius:999px; padding:1px 8px; font-size:10px; border:1px solid var(--line); color:var(--muted); white-space:nowrap }
+    .node-group-status.online { color:var(--green); border-color:rgba(67,209,124,.45) }
+    .node-group-status.degraded { color:var(--amber); border-color:rgba(255,200,87,.45) }
+    .node-group-status.offline { color:var(--red); border-color:rgba(255,107,107,.4) }
+    .node-group-count { margin-left:auto; color:var(--muted); font-size:11px; white-space:nowrap }
+    tbody tr.node-empty-row td { color:var(--muted); font-size:12px; padding:10px 14px 10px 30px; border-bottom:1px solid var(--line) }
+    tbody tr.node-empty-row:hover { background:transparent }
+
     @media (max-width:760px) {
       header { padding:12px 14px } .toolbar { padding:8px 14px } main { padding:0 14px 14px }
       #bulkBar { padding:8px 14px }
+      /* Compact group header on a phone: the id drops (the display name
+         already identifies the node) and the row gets a bigger tap target. */
+      .node-group-toggle { padding:10px 10px; gap:7px; font-size:12px; min-height:44px }
+      .node-group-id { display:none }
     }
   </style>
 </head>
@@ -4060,7 +4360,39 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     };
     function inputBlockLabel(reason) { return INPUT_BLOCK_LABELS[reason] || reason; }
 
+    /*__NODE_GROUP_JS__*/
     let lastKnownRows = [];
+    // The node registry, purely so a node that is online with NO sessions can
+    // still be shown (it never appears in the sessions list by definition).
+    // Never required: grouping works from the rows' own node_id/node_name if
+    // this fetch fails, it just loses session-less nodes and status badges.
+    let lastKnownNodes = [];
+    const nodeCollapse = makeNodeCollapseStore('sessions');
+
+    function buildNodeHeaderRow(group, collapsed) {
+      const tr = document.createElement('tr');
+      tr.className = 'node-group-row' + (collapsed ? ' collapsed' : '');
+      const td = document.createElement('td'); td.colSpan = 8;
+      const btn = document.createElement('button');
+      btn.type = 'button'; btn.className = 'node-group-toggle';
+      btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      const caret = document.createElement('span'); caret.className = 'node-caret'; caret.textContent = collapsed ? '▸' : '▾';
+      const name = document.createElement('span'); name.className = 'node-group-name'; name.textContent = group.name;
+      // node_id is shown alongside the display name whenever they differ --
+      // the id is what every command/API call actually takes, so it must be
+      // readable here, not only the friendly label.
+      const idEl = document.createElement('span'); idEl.className = 'node-group-id';
+      if (group.id !== group.name) idEl.textContent = group.id;
+      const status = document.createElement('span');
+      status.className = 'node-group-status ' + (group.status || 'unknown');
+      status.textContent = nodeStatusLabel(group.status);
+      const count = document.createElement('span'); count.className = 'node-group-count';
+      count.textContent = group.sessions.length + ' session';
+      btn.append(caret, name, idEl, status, count);
+      btn.onclick = () => { nodeCollapse.setCollapsed(group.id, !collapsed); renderRows(lastKnownRows); };
+      td.appendChild(btn); tr.appendChild(td);
+      return tr;
+    }
     const bulkSelected = new Set();
     let protectedSessions = new Set();
     let sessionLifecycleEnabled = true; // optimistic default until the first /dashboard/api/sessions response is seen
@@ -4410,14 +4742,31 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         if (onlyGrantableEl.checked && !grantable(row)) return false;
         return true;
       });
-      if (!filtered.length) {
+      const filtering = Boolean(query) || onlyGrantableEl.checked;
+      // Session-less ONLINE nodes still get a group when nothing is being
+      // filtered (so "dell-linux is up and idle" is visible rather than
+      // absent); while filtering they are suppressed, because a group with
+      // no matching rows is the noise the filter is there to remove.
+      const groups = buildNodeGroups(filtered, lastKnownNodes, { includeEmptyOnline: !filtering });
+      if (!groups.length) {
         const tr = document.createElement('tr'); tr.className = 'empty-row';
         const td = document.createElement('td'); td.colSpan = 8;
         td.textContent = rows.length ? 'Không có session khớp bộ lọc.' : 'Không có session nào.';
         tr.appendChild(td); tbodyEl.appendChild(tr);
         return;
       }
-      for (const row of filtered) {
+      for (const group of groups) {
+        const collapsed = nodeCollapse.isCollapsed(group.id);
+        tbodyEl.appendChild(buildNodeHeaderRow(group, collapsed));
+        if (collapsed) continue;
+        if (!group.sessions.length) {
+          const emptyTr = document.createElement('tr'); emptyTr.className = 'node-empty-row';
+          const emptyTd = document.createElement('td'); emptyTd.colSpan = 8;
+          emptyTd.textContent = 'Node đang online, chưa có session nào.';
+          emptyTr.appendChild(emptyTd); tbodyEl.appendChild(emptyTr);
+          continue;
+        }
+      for (const row of group.sessions) {
         const tr = document.createElement('tr');
         if (row.state === 'WAITING_INPUT') tr.className = 'needs-attention';
 
@@ -4583,12 +4932,23 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
 
         tbodyEl.appendChild(tr);
       }
+      }
+    }
+
+    async function loadNodes() {
+      // Best-effort: a failure here must never break the session list, which
+      // is the actual content of this page.
+      try {
+        const data = await fetchJSON('/dashboard/api/nodes', {cache:'no-store'});
+        lastKnownNodes = data.nodes || [];
+      } catch (error) { /* keep the last known list */ }
     }
 
     async function load() {
       const data = await fetchJSON('/dashboard/api/sessions', {cache:'no-store'});
       const rows = data.sessions || [];
       lastKnownRows = rows;
+      await loadNodes();
       protectedSessions = new Set(data.protected_sessions || ['terminal-mcp']);
       sessionLifecycleEnabled = data.session_lifecycle_enabled !== false;
       webTerminalEnabled = data.web_terminal_enabled === true;
@@ -6396,6 +6756,18 @@ WEBTERM_HTML = """<!doctype html>
   </script>
 </body>
 </html>"""
+
+
+# One shared grouping implementation, injected into every page that lists
+# sessions. Done here, once, rather than per-template so a page can never
+# silently ship without it (a missing marker would leave its own group calls
+# undefined at load time, which the template tests below assert against).
+for _page_name in ("DASHBOARD_HTML", "SESSIONS_ADMIN_HTML"):
+    _page = globals()[_page_name]
+    if "/*__NODE_GROUP_JS__*/" not in _page:
+        raise AssertionError(f"{_page_name} lost its /*__NODE_GROUP_JS__*/ marker")
+    globals()[_page_name] = _page.replace("/*__NODE_GROUP_JS__*/", NODE_GROUP_JS, 1)
+del _page_name, _page
 
 
 def register_dashboard(server: MCPServer, terminal: TerminalService,
