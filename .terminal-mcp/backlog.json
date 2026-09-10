@@ -1637,6 +1637,275 @@
           "note": "identified the 3 lost and 3 surviving sessions; corrected the reachability claim"
         }
       ]
+    },
+    {
+      "id": "blg_orch_umbrella",
+      "title": "TERMINAL_MCP_ORCHESTRATION_V1 (umbrella)",
+      "description": "Turn Terminal MCP into a multi-project orchestration platform: ChatGPT submits a project-level goal and the runtime handles assignment, leases, locks, capability routing, verification, integration and reporting. Tracked in docs/ORCHESTRATION_ARCHITECTURE.md.",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "feature",
+      "order": 36,
+      "created_at": "2026-09-10T01:41:16.114137+00:00",
+      "updated_at": "2026-09-10T01:41:16.114137+00:00",
+      "source": "orchestration-v1",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "ChatGPT submits a goal without naming a session",
+        "Coordinator plans; scheduler assigns by capability",
+        "Verification and integration route automatically",
+        "Project report answers status without manual polling"
+      ],
+      "tags": [
+        "orchestration",
+        "umbrella"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-10T01:41:16.114137+00:00",
+          "event": "created",
+          "by": "orchestration-v1"
+        }
+      ]
+    },
+    {
+      "id": "blg_orch_p0a",
+      "title": "Orchestration P0-A: foundation fixes + outcome layer + event wiring + worker view",
+      "description": "Six audit-found defects fixed; OUTCOME layer (migration v8); event producers wired with actor/causation/cursors (events.db v2); WORKER view with five real roles.",
+      "status": "DONE",
+      "priority": "P1",
+      "type": "feature",
+      "order": 37,
+      "created_at": "2026-09-10T01:41:16.114137+00:00",
+      "updated_at": "2026-09-10T01:41:16.114137+00:00",
+      "source": "orchestration-v1",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Outcome cannot reach DONE from children alone",
+        "Queue and verify queue publish to the bus",
+        "Worker roles are an enum, declared vs probed preserved"
+      ],
+      "tags": [
+        "orchestration",
+        "P0-A"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [
+          "10ee503",
+          "ee9e666",
+          "27af365",
+          "45b2d89",
+          "6604433"
+        ],
+        "tests": [
+          "2538 passed (2 known pre-existing kill_reopen failures)",
+          "77 new tests across foundations/outcomes/event wiring/worker registry"
+        ],
+        "deploys": [
+          "terminal-mcp-http on 6604433; queue.db v8, events.db v2, leases.db v3"
+        ],
+        "notes": [
+          "Live-smoked on production stores: outcome with 2 tasks, capability-routed verify, acceptance gate refused a self-report then accepted per-criterion evidence, 9-event attributed stream. All smoke rows cleaned up.",
+          "Tool surface 202, stdio == HTTP for the first time."
+        ]
+      },
+      "history": [
+        {
+          "at": "2026-09-10T01:41:16.114137+00:00",
+          "event": "created",
+          "by": "orchestration-v1"
+        }
+      ]
+    },
+    {
+      "id": "blg_orch_coordinator",
+      "title": "Orchestration P1: Project Coordinator framework + one provider",
+      "description": "Event-driven per-project coordinator: bounded context package in, schema-validated structured actions out, policy gate, deterministic executor, idempotency and loop prevention. NO LLM provider abstraction exists anywhere in the codebase today -- this must be built from scratch, with a mock provider for tests. The LLM never mutates the DB directly.",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "feature",
+      "order": 38,
+      "created_at": "2026-09-10T01:41:16.114137+00:00",
+      "updated_at": "2026-09-10T01:41:16.114137+00:00",
+      "source": "orchestration-v1",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Coordinator proposes actions; a deterministic executor applies them",
+        "Invalid or hallucinated actions are rejected by schema + policy",
+        "Re-processing the same event does not duplicate actions",
+        "A mock provider makes the whole path testable without an LLM"
+      ],
+      "tags": [
+        "orchestration",
+        "coordinator"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-10T01:41:16.114137+00:00",
+          "event": "created",
+          "by": "orchestration-v1"
+        }
+      ]
+    },
+    {
+      "id": "blg_orch_scheduler",
+      "title": "Orchestration P1: Portfolio Scheduler across projects",
+      "description": "Deterministic cross-project scheduling: project priority, fairness, starvation avoidance, reservation of scarce workers (e.g. the single Windows verifier). MUST compose over the existing pm_router two-phase algorithm (hard constraints then scoring, already with fairness and score_breakdown) rather than replacing it.",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "feature",
+      "order": 39,
+      "created_at": "2026-09-10T01:41:16.114137+00:00",
+      "updated_at": "2026-09-10T01:41:16.114137+00:00",
+      "source": "orchestration-v1",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Two projects cannot double-allocate one worker",
+        "P0 preempts without starving P2",
+        "Every allocation decision is explainable"
+      ],
+      "tags": [
+        "orchestration",
+        "scheduler"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-10T01:41:16.114137+00:00",
+          "event": "created",
+          "by": "orchestration-v1"
+        }
+      ]
+    },
+    {
+      "id": "blg_orch_integrator_worktree",
+      "title": "Integration engine merges in the SHARED repo path -- must use its own worktree first",
+      "description": "integration_engine._merge runs `git checkout <integration_branch>` in pipeline.repo_path. Activating the merge queue as-is would switch branches under a live human working tree. Also: _merge catches only (OSError, TimeoutExpired) while _run_git defaults check=True, so CalledProcessError escapes tick(); pre-merge target SHA is never recorded; and integrator identity is the constant 'integration-engine'. BLOCKS activating the merge queue.",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "bug",
+      "order": 40,
+      "created_at": "2026-09-10T01:41:16.114137+00:00",
+      "updated_at": "2026-09-10T01:41:16.114137+00:00",
+      "source": "orchestration-v1",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "The integrator merges in its own worktree, never the shared checkout",
+        "A failing git command is handled, not raised out of tick()",
+        "Pre-merge target SHA and real conflict evidence are recorded"
+      ],
+      "tags": [
+        "orchestration",
+        "integration",
+        "safety"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-10T01:41:16.114137+00:00",
+          "event": "created",
+          "by": "orchestration-v1"
+        }
+      ]
+    },
+    {
+      "id": "blg_orch_no_workers_declared",
+      "title": "No worker has a capability profile, so capability routing has zero candidates",
+      "description": "pm_store.capability_profiles has 0 production rows, so terminal_worker_roles reports 0 for every role and pm_router.route_task always returns NO_ELIGIBLE_WORKER. The fleet cannot verify or route anything until real sessions are declared with roles and skills. Needs a decision on which live sessions should be declared as WORKER/VERIFIER and with what skills.",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "chore",
+      "order": 41,
+      "created_at": "2026-09-10T01:41:16.114137+00:00",
+      "updated_at": "2026-09-10T01:41:16.114137+00:00",
+      "source": "orchestration-v1",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "Live sessions have capability profiles with roles",
+        "terminal_worker_roles reports a non-zero VERIFIER count",
+        "A capability-routed verify job finds a real candidate"
+      ],
+      "tags": [
+        "orchestration",
+        "worker"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-10T01:41:16.114137+00:00",
+          "event": "created",
+          "by": "orchestration-v1"
+        }
+      ]
     }
   ]
 }
