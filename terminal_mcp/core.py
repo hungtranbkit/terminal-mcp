@@ -2578,7 +2578,17 @@ class TerminalService:
         return {"sessions": sessions,
                "session_lifecycle_enabled": self.config.session_lifecycle.enabled,
                "protected_sessions": list(self.config.session_lifecycle.protected_sessions),
-               "web_terminal_enabled": self.config.dashboard.web_terminal_enabled}
+               "web_terminal_enabled": self.config.dashboard.web_terminal_enabled,
+               # Raw key sends (arrows/Tab/Escape) are their own capability,
+               # separately switchable from text submission. Reported so the
+               # dashboard can DISABLE those controls with a reason instead of
+               # offering a button that silently fails at the API -- a
+               # deployment with allow_send_keys off, or an allow_keys list
+               # missing the arrows, is a configuration decision the operator
+               # should see, not a dead control.
+               "send_keys_enabled": self.config.permissions.allow_send_keys,
+               "allowed_keys": sorted(set(self.config.input_policy.allow_keys)),
+               "sensitive_keys": sorted(set(self.config.input_policy.sensitive_keys_require_confirmation))}
 
     def _reopen_would_be_complete(self, info: Any) -> bool:
         """Preview-only version of _capture_reopen_metadata's own

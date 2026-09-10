@@ -968,7 +968,11 @@ def test_dashboard_health_indicator_no_new_backend_route():
     # registry/reopen and registry/purge -- registry LISTING itself
     # (loadRegistry) goes through the shared fetchJSON() wrapper, already
     # counted once, so it adds no new literal call site of its own.
-    assert DASHBOARD_HTML.count("fetch(") == 22  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere), registry/reopen, registry/purge, watchdog/acknowledge, session/rename (Rename Session feature), task/cancel-or-retry (taskAction, Task Manager UI), session/queue/pause, session/queue/resume, session/queue/enqueue (Task Manager UI), postJSON's own internal fetch() (queue/reorder + tasks/reassign, Move-Task/priority-edit UI)
+    # 23 with session/keys: the interactive key pad's own POST. It is a
+    # separate call site from session/input on purpose -- a key press and a
+    # text submission are different capabilities with different server-side
+    # policy (permissions.allow_send_keys vs input_policy.allow_send_text).
+    assert DASHBOARD_HTML.count("fetch(") == 23  # sessions, session detail, session/input, session/keys, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere), registry/reopen, registry/purge, watchdog/acknowledge, session/rename (Rename Session feature), task/cancel-or-retry (taskAction, Task Manager UI), session/queue/pause, session/queue/resume, session/queue/enqueue (Task Manager UI), postJSON's own internal fetch() (queue/reorder + tasks/reassign, Move-Task/priority-edit UI)
 
 
 def test_dashboard_auth_required_distinguished_from_offline():
@@ -1268,25 +1272,27 @@ def test_dashboard_grantbar_hidden_attribute_actually_hides_it():
 def test_dashboard_detail_grid_rows_match_children_one_to_one():
     # DOM/CSS layout contract, the direct cause of a real overlap an
     # earlier hotfix fixed: .detail's grid-template-rows must always list
-    # exactly as many tracks as .detail has direct children (now 5:
-    # #summary, #grantBar, .term, #inputNote, #inputBar -- the top
-    # session-tabs bar that used to be a 6th child was removed outright,
-    # see the UI-cleanup regression tests above), or auto-placement
+    # exactly as many tracks as .detail has direct children (now 7:
+    # #summary, #grantBar, .term, #inputNote, #remoteComposer, #keyPad,
+    # #inputBar -- the remote-composer mirror and the interactive key pad
+    # were added between the note and the composer), or auto-placement
     # silently hands the one flexible (minmax(0,1fr)) track to the wrong
     # element and lets its content overflow into the rows below it. Two
     # invariants are asserted here so this can't silently regress again:
-    # the explicit row-track COUNT must equal 5, and every one of the 5
-    # children must carry its own explicit `grid-row:N` (not rely on
+    # the explicit row-track COUNT must equal the child count, and every
+    # child must carry its own explicit `grid-row:N` (not rely on
     # sequential auto-placement, which reassigns everyone once any one of
-    # them toggles display:none -- e.g. the now-permanently-hidden
-    # #grantBar above).
+    # them toggles display:none -- e.g. the hideable #grantBar/#keyPad/
+    # #remoteComposer, all three of which are routinely hidden).
     detail_rule = re.search(r"\.detail \{ display:grid; grid-template-rows:([^;]+);", DASHBOARD_HTML)
     assert detail_rule is not None
     tracks = detail_rule.group(1).split()
-    assert len(tracks) == 5
-    assert tracks == ["auto", "auto", "minmax(0,1fr)", "auto", "auto"]  # .term (position 3) is the ONE growing track
+    assert len(tracks) == 7
+    # .term (position 3) is still the ONE growing track.
+    assert tracks == ["auto", "auto", "minmax(0,1fr)", "auto", "auto", "auto", "auto"]
     expected_grid_rows = {
-        "#summary": 1, "#grantBar": 2, ".term": 3, "#inputNote": 4, "#inputBar": 5,
+        "#summary": 1, "#grantBar": 2, ".term": 3, "#inputNote": 4,
+        "#remoteComposer": 5, "#keyPad": 6, "#inputBar": 7,
     }
     for selector, row in expected_grid_rows.items():
         assert f"grid-row:{row};" in DASHBOARD_HTML or f"grid-row:{row} " in DASHBOARD_HTML, \
@@ -1374,6 +1380,12 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/sessions": {"GET", "HEAD"},
         "/dashboard/api/session": {"GET", "HEAD"},
         "/dashboard/api/session/input": {"POST"},
+        # Interactive key sends (arrows/Tab/Esc/Enter) for menus and
+        # completions -- a distinct capability from text submission above,
+        # with its own permission (permissions.allow_send_keys) and its own
+        # allowlist (input_policy.allow_keys), so it is a distinct route
+        # rather than a mode of session/input.
+        "/dashboard/api/session/keys": {"POST"},
         "/dashboard/api/session/grant-read": {"POST"},
         "/dashboard/api/session/grant-input": {"POST"},
         "/dashboard/api/session/create": {"POST"},

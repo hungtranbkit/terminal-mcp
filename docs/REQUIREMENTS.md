@@ -4358,3 +4358,86 @@ that can restart them must be disabled too. No canonical divergence resulted
 **Config now lives outside the repo** (`~/.config/terminal-mcp/config.yaml`).
 In-tree host config makes the checkout permanently dirty and makes "which commit
 is running" unanswerable.
+
+# 2026-09-10 Dashboard: node-grouped session lists + interactive keys
+
+Two behaviour changes to the dashboard UI. Both are user-visible, so they are
+recorded here rather than only in the commit log.
+
+## Session lists are grouped by node
+
+Previously both session lists (the main dashboard's tab strip and
+`/dashboard/sessions`) were flat, and a session's node showed only as a small
+per-row badge that was **hidden when `node_id` was `local`** — so on a fleet
+the local node was indistinguishable from "no node information at all".
+
+Now, on both surfaces:
+
+* one group per node, with a header carrying display name, `node_id` (when it
+  differs from the name), status and session count;
+* nodes sort **online → recent → offline**; within a node, attention-first,
+  then most-recent activity, then name;
+* groups collapse/expand, remembered in `localStorage` per page
+  (`tmNodeCollapse:<page>`), and the group holding the currently-viewed
+  session is always revealed;
+* an **online** node with no sessions still gets a group with a small empty
+  state, so an idle node reads as "up and free" rather than missing — except
+  while a filter is active, where a group with no matches is suppressed;
+* the main dashboard gained a session filter box that searches across groups.
+
+`degraded` (the registry's own term for "heartbeat stale but not yet offline")
+is surfaced to the operator as **recent**. An unknown status sorts with
+offline — never ahead of a node the registry has positively vouched for.
+
+The grouping logic lives in exactly one place (`dashboard.NODE_GROUP_JS`),
+injected into both pages; node identity is never hardcoded, it is read from
+`node_id`/`node_name` on the existing `/dashboard/api/sessions` rows and from
+`/dashboard/api/nodes` for status and for session-less nodes.
+
+**Layout change:** the main dashboard's tab strip no longer scrolls
+horizontally. Tabs wrap inside their node group and the strip scrolls
+vertically with a height cap, so no session is reachable only by discovering a
+sideways gesture. This supersedes the earlier horizontal-drag fix.
+
+## Interactive key sends (arrows / Tab / Esc / Enter)
+
+The dashboard could send text but not keys, so a session sitting on an agent's
+numbered menu could not be answered from the dashboard at all — an escape
+sequence typed into the composer is typed, not pressed.
+
+* New route `POST /dashboard/api/session/keys`, calling the **existing**
+  `terminal_send_keys` (same allowlist, same sensitive-key confirmation, same
+  durable pane lease as a text send). Remote sessions resolve through
+  `controller.resolve_session` exactly as `session/input` does.
+* Key sends remain their own capability: `permissions.allow_send_keys` plus
+  `input_policy.allow_keys`. `/dashboard/api/sessions` now reports
+  `send_keys_enabled`, `allowed_keys` and `sensitive_keys` so the UI **disables
+  unavailable keys with the reason** instead of offering a control that fails.
+* On-screen pad (↑ ↓ ← → Tab Esc ⏎) — on a phone this is the only way to send
+  these at all, so the buttons carry a 44px touch target. On desktop an opt-in
+  "bắt phím" mode routes those keys from the composer to the terminal;
+  Escape always leaves the mode and modified presses (Alt/Ctrl/Meta,
+  Shift+Tab) stay with the browser, so the keyboard is never trapped.
+* Works on tmux and on Windows ConPTY: `WindowsSessionBackend.KEY_BYTES`
+  already maps every key the pad offers, asserted by a test so a future pad
+  addition cannot silently no-op on Windows.
+
+## Remote composer mirror
+
+The dashboard now shows what the **agent** currently has on screen as an
+interactive choice — a numbered menu, or a composer line with text already in
+it — read from the same pane tail the output view already polls (no second
+capture, which has a real side effect on the pane).
+
+It is rendered **separately from the operator's draft**, never merged: a poll
+that overwrote a half-typed message is the data loss this separation exists to
+prevent. Copying the mirrored content into the composer is an explicit button,
+and it confirms first when a draft is in progress; a remote change arriving
+mid-draft is highlighted, not applied. Draft dirtiness follows the existing
+per-session `drafts` map rather than a second notion of "what the user typed".
+
+Detection is a heuristic over pane text and is deliberately conservative
+(≥2 numbered lines for a menu; a prompt line with non-empty content for a
+composer). It was validated against real Claude output on a live Windows
+ConPTY session — both a 3-option menu with its selected line, and a composer
+holding real typed text.

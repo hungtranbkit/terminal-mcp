@@ -74,6 +74,16 @@ def _read_requirements_doc() -> str:
 
 
 INPUT_ERROR_STATUS = {
+    # Raw key sends (terminal_send_keys) -- a distinct capability from text
+    # submission, with its own refusals. SEND_KEYS_DISABLED/KEY_NOT_ALLOWED
+    # are configuration decisions, not caller mistakes, so the dashboard shows
+    # them as a disabled control rather than a failed click (see the
+    # send_keys_* fields on /dashboard/api/sessions).
+    "SEND_KEYS_DISABLED": 403,
+    "KEY_NOT_ALLOWED": 400,
+    "CONFIRMATION_REQUIRED": 409,
+    "TOO_MANY_KEYS": 400,
+    "PANE_IN_COPY_MODE": 409,
     "ACCESS_DENIED": 403,
     "INPUT_DISABLED": 403,
     "SENSITIVE_TARGET": 403,
@@ -472,13 +482,14 @@ DASHBOARD_HTML = """<!doctype html>
     .tab-close:hover { background:#3a2430; color:#ff9f9f }
     .tab-close:disabled { visibility:hidden !important; cursor:not-allowed }
     /* Layout bugfix (real-device report), still applicable with the
-       top session-tabs bar removed: .detail's 5 direct children in DOM
-       order are #summary, #grantBar, .term, #inputNote, #inputBar --
-       grid-template-rows must list exactly 5 tracks, in that order, with
-       .term (the actual output viewport) as the one flexible track, or
-       its intended growing row silently goes to #summary instead and lets
-       its content overflow into the rows below. */
-    .detail { display:grid; grid-template-rows:auto auto minmax(0,1fr) auto auto; min-width:0; min-height:0 }
+       top session-tabs bar removed: .detail's 7 direct children in DOM
+       order are #summary, #grantBar, .term, #inputNote, #remoteComposer,
+       #keyPad, #inputBar -- grid-template-rows must list exactly that many
+       tracks, in that order, with .term (the actual output viewport) as the
+       one flexible track, or its intended growing row silently goes to
+       #summary instead and lets its content overflow into the rows below.
+       ADD A TRACK HERE whenever a child is added between them. */
+    .detail { display:grid; grid-template-rows:auto auto minmax(0,1fr) auto auto auto auto; min-width:0; min-height:0 }
     #grantBar[hidden] { display:none } /* the plain #grantBar{display:flex} rule below would otherwise outrank the UA's own [hidden] default */
     #summary { grid-row:1; padding:14px 16px; border-bottom:1px solid var(--line) }
     .state-WAITING_INPUT { color:var(--amber) } .state-RUNNING { color:var(--green) }
@@ -583,7 +594,7 @@ DASHBOARD_HTML = """<!doctype html>
        Send button (core.py's own terminal_send_text press_enter
        semantics, and the idempotency-key/delivery-state handling in the
        JS below, are untouched -- only the visual chrome around them). */
-    #inputBar { grid-row:5; display:flex; align-items:center; gap:8px; padding:10px 16px; background:var(--term-bg); border-top:1px solid var(--line) }
+    #inputBar { grid-row:7; display:flex; align-items:center; gap:8px; padding:10px 16px; background:var(--term-bg); border-top:1px solid var(--line) }
     #inputPrompt { flex:0 0 auto; color:var(--ansi-10); font-weight:700; user-select:none }
     #inputBar input[type=text] { flex:1; min-width:0; background:transparent; border:none; color:var(--term-fg); padding:8px 2px; font:inherit }
     #inputBar input[type=text]:focus { outline:none }
@@ -593,6 +604,44 @@ DASHBOARD_HTML = """<!doctype html>
     #inputBar button:disabled { opacity:.5; cursor:not-allowed }
     #inputBar label { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:12px; white-space:nowrap }
     #inputNote { grid-row:4; padding:6px 16px 0; font-size:12px; color:var(--muted) }
+
+    /* ---- Remote composer mirror + interactive key pad -------------------
+       Two separate rows on purpose: the mirror is what the AGENT has on
+       screen (read-only), the composer below is the operator's own draft.
+       Keeping them visually distinct is the whole point -- a merged box is
+       how a half-typed message gets silently replaced by a poll. */
+    #remoteComposer { grid-row:5; padding:8px 16px 0; min-width:0 }
+    #remoteComposer[hidden] { display:none }
+    .rc-head { display:flex; align-items:center; gap:8px; font-size:11px; color:var(--muted); flex-wrap:wrap }
+    .rc-title { font-weight:700; letter-spacing:.03em; text-transform:uppercase }
+    .rc-kind { color:var(--ansi-11) }
+    .rc-sync { margin-left:auto; background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); font:inherit; font-size:11px; padding:3px 9px; cursor:pointer }
+    .rc-sync:hover { background:#233252 }
+    .rc-body {
+      margin:4px 0 0; padding:7px 10px; background:#0e1526; border:1px solid var(--line); border-left:3px solid var(--ansi-11);
+      border-radius:6px; font:inherit; font-size:12px; color:var(--term-fg); white-space:pre-wrap; word-break:break-word;
+      max-height:22vh; overflow:auto;
+    }
+    /* Only ever a highlight, never an automatic overwrite: the agent's state
+       changed while the operator had a draft in progress. */
+    #remoteComposer.rc-changed .rc-body { border-left-color:var(--amber) }
+    #remoteComposer.rc-changed .rc-sync { border-color:var(--amber); color:var(--amber) }
+
+    #keyPad { grid-row:6; display:flex; align-items:center; gap:6px; padding:8px 16px 0; flex-wrap:wrap }
+    #keyPad[hidden] { display:none }
+    .kp-label { color:var(--muted); font-size:11px }
+    .kp-btn {
+      min-width:38px; min-height:34px; background:#19243b; border:1px solid var(--line); border-radius:7px;
+      color:var(--text); font:inherit; font-size:13px; cursor:pointer; padding:4px 9px;
+    }
+    .kp-btn:hover:not(:disabled) { background:#233252 }
+    .kp-btn:active:not(:disabled) { background:#2c3f66 }
+    /* A key the deployment does not allow is visibly refused, with the
+       reason in its title -- never a button that fails silently on click. */
+    .kp-btn:disabled { opacity:.35; cursor:not-allowed }
+    .kp-enter { color:var(--ansi-10) }
+    .kp-mode { display:flex; align-items:center; gap:5px; margin-left:auto; color:var(--muted); font-size:11px; white-space:nowrap }
+    #inputBar input[type=text].key-mode { color:var(--ansi-11) }
     #inputNote.error { color:#ff6b6b }
     /* Compact single-line entry point only now -- "Quyền: <label>" plus one
        "🔐 Quyền truy cập" button that opens #permModal, which does all the
@@ -900,6 +949,14 @@ DASHBOARD_HTML = """<!doctype html>
          the app-shell above means there is no page scroll left to carry it
          away regardless. */
       #inputBar { padding:8px 10px; gap:6px }
+      /* Phone: the key pad IS the way to send arrows/Tab at all -- a mobile
+         soft keyboard has no such keys -- so the buttons get a real 44px
+         touch target and the row wraps instead of overflowing sideways. */
+      #keyPad { padding:6px 10px 0; gap:5px }
+      .kp-btn { min-width:44px; min-height:44px; font-size:14px }
+      .kp-mode { margin-left:0; width:100% }
+      #remoteComposer { padding:6px 10px 0 }
+      .rc-body { max-height:26vh; font-size:12px }
       #inputBar input[type=text] { padding:7px 9px; font-size:16px }
       #inputBar button { padding:7px 10px; font-size:13px }
       #inputBar label { font-size:11px }
@@ -937,6 +994,8 @@ DASHBOARD_HTML = """<!doctype html>
       body.fullscreen-terminal #summary,
       body.fullscreen-terminal #grantBar,
       body.fullscreen-terminal #inputNote,
+      body.fullscreen-terminal #remoteComposer,
+      body.fullscreen-terminal #keyPad,
       body.fullscreen-terminal #inputBar { display:none }
       body.fullscreen-terminal main { padding:0; gap:0 }
       body.fullscreen-terminal .detail { grid-template-rows:minmax(0,1fr) }
@@ -1079,6 +1138,32 @@ DASHBOARD_HTML = """<!doctype html>
         <pre id="output"></pre>
       </div>
       <div id="inputNote"></div>
+      <!-- Remote composer mirror: what the AGENT currently has on screen as
+           an interactive choice/prompt (a numbered menu, a confirmation, a
+           completion list). Read-only and deliberately SEPARATE from the
+           draft box below -- the two are different things, and merging them
+           silently is how a half-typed message gets destroyed by a poll. -->
+      <div id="remoteComposer" hidden>
+        <div class="rc-head">
+          <span class="rc-title">Trên terminal</span>
+          <span class="rc-kind" id="remoteComposerKind"></span>
+          <button type="button" class="rc-sync" id="remoteComposerSync" title="Chép nội dung này vào ô nhập bên dưới">⇩ Chép vào ô nhập</button>
+        </div>
+        <pre class="rc-body" id="remoteComposerBody"></pre>
+      </div>
+      <div id="keyPad" hidden>
+        <span class="kp-label">Phím:</span>
+        <button type="button" class="kp-btn" data-key="Up" title="Mũi tên lên (↑)">↑</button>
+        <button type="button" class="kp-btn" data-key="Down" title="Mũi tên xuống (↓)">↓</button>
+        <button type="button" class="kp-btn" data-key="Left" title="Mũi tên trái (←)">←</button>
+        <button type="button" class="kp-btn" data-key="Right" title="Mũi tên phải (→)">→</button>
+        <button type="button" class="kp-btn" data-key="Tab" title="Tab (autocomplete/chuyển mục)">Tab</button>
+        <button type="button" class="kp-btn" data-key="Escape" title="Escape">Esc</button>
+        <button type="button" class="kp-btn kp-enter" data-key="Enter" title="Enter">⏎</button>
+        <label class="kp-mode" title="Khi bật, ↑ ↓ ← → và Tab gõ từ bàn phím sẽ gửi thẳng vào terminal thay vì di chuyển con trỏ trong ô nhập. Esc để tắt.">
+          <input type="checkbox" id="keyModeToggle"> Bắt phím
+        </label>
+      </div>
       <div id="inputBar">
         <span id="inputPrompt">❯</span>
         <input type="text" id="inputText" placeholder="Nhập text để gửi vào session..." disabled>
@@ -1404,6 +1489,12 @@ DASHBOARD_HTML = """<!doctype html>
     const inputTextEl = document.querySelector('#inputText');
     const inputEnterEl = document.querySelector('#inputEnter');
     const inputSendEl = document.querySelector('#inputSend');
+    const keyPadEl = document.querySelector('#keyPad');
+    const keyModeToggleEl = document.querySelector('#keyModeToggle');
+    const remoteComposerEl = document.querySelector('#remoteComposer');
+    const remoteComposerKindEl = document.querySelector('#remoteComposerKind');
+    const remoteComposerBodyEl = document.querySelector('#remoteComposerBody');
+    const remoteComposerSyncEl = document.querySelector('#remoteComposerSync');
     const termMenuBtnEl = document.querySelector('#termMenuBtn');
     const termOpenRealBtnEl = document.querySelector('#termOpenRealBtn');
     const termCopyAttachBtnEl = document.querySelector('#termCopyAttachBtn');
@@ -1996,10 +2087,179 @@ DASHBOARD_HTML = """<!doctype html>
     function refreshInputControls() {
       const enabled = Boolean(selected) && inputAllowed;
       inputTextEl.disabled = !enabled; inputSendEl.disabled = !enabled;
+      refreshKeyPad();
       if (!selected) { setInputNote(''); }
       else if (!inputAllowed) { setInputNote('Input bị tắt cho session này (permission hoặc input_policy).', false); }
       else { setInputNote(''); }
     }
+
+    // ---- Interactive key sends (arrows / Tab / Esc / Enter) --------------
+    // A menu, a completion list or a confirmation reacts to a real KEY, not
+    // to text -- writing "\x1b[A" into the composer types those characters,
+    // it does not press Up. So these go through terminal_send_keys (the same
+    // MCP tool and the same allow_keys policy), never through the text path.
+    //
+    // Capability is server-reported, never assumed: permissions.
+    // allow_send_keys can be off, and input_policy.allow_keys can omit any
+    // individual key. A key the deployment does not allow is shown DISABLED
+    // with the reason, rather than as a button that fails on click.
+    let sendKeysEnabled = true;      // permissions.allow_send_keys
+    let allowedKeys = new Set();     // input_policy.allow_keys
+    let keysCapabilityKnown = false; // nothing reported yet -> stay quiet
+
+    function keyIsAvailable(key) {
+      return sendKeysEnabled && (!keysCapabilityKnown || allowedKeys.has(key));
+    }
+
+    function refreshKeyPad() {
+      const usable = Boolean(selected) && inputAllowed;
+      keyPadEl.hidden = !usable;
+      if (!usable) { setKeyMode(false); return; }
+      for (const btn of keyPadEl.querySelectorAll('.kp-btn')) {
+        const key = btn.dataset.key;
+        const available = keyIsAvailable(key);
+        btn.disabled = !available;
+        btn.title = available ? btn.dataset.titleOn || btn.title
+          : (!sendKeysEnabled
+              ? 'Gửi phím đang tắt trên deployment này (permissions.allow_send_keys)'
+              : `Phím "${key}" không nằm trong input_policy.allow_keys`);
+      }
+      const anyNavKey = ['Up', 'Down', 'Left', 'Right', 'Tab'].some(keyIsAvailable);
+      keyModeToggleEl.disabled = !anyNavKey;
+      if (!anyNavKey) setKeyMode(false);
+    }
+
+    async function sendKeys(keys) {
+      if (!selected) return;
+      const targetSession = selected;
+      const usable = keys.filter(keyIsAvailable);
+      if (!usable.length) { setInputNote('Phím này không được phép trên deployment hiện tại.', true); return; }
+      try {
+        const response = await fetch('/dashboard/api/session/keys', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name: targetSession, keys: usable}),
+        });
+        // Error is read from the BODY, never from the status code alone --
+        // this app answers legitimate denials (KEY_NOT_ALLOWED,
+        // SEND_KEYS_DISABLED, PANE_IN_COPY_MODE) with a real JSON reason,
+        // and treating any non-2xx as a transport failure is the exact
+        // regression fetchJSON's own auth/offline detection exists to avoid.
+        const data = await response.json().catch(() => ({}));
+        if (data.error) {
+          if (selected === targetSession) {
+            setInputNote(`Không gửi được phím: ${data.error}${data.reason ? ' -- ' + data.reason : ''}`, true);
+          }
+          return;
+        }
+        if (selected === targetSession) setInputNote('');
+        // The pane has almost certainly changed (a menu moved, a completion
+        // expanded). Refresh now instead of waiting out the poll interval,
+        // so the mirror below reflects the new selection immediately -- the
+        // task's own "lần poll tiếp theo phản ánh lựa chọn/composer mới".
+        loadDetail();
+      } catch (error) {
+        setInputNote('Không gửi được phím: mất kết nối.', true);
+      }
+    }
+
+    for (const btn of keyPadEl.querySelectorAll('.kp-btn')) {
+      btn.dataset.titleOn = btn.title;
+      btn.onclick = () => sendKeys([btn.dataset.key]);
+    }
+
+    // Key-capture mode: while ON and the composer has focus, the navigation
+    // keys drive the TERMINAL instead of the text box. Off by default,
+    // because silently stealing Tab from a text field breaks keyboard
+    // navigation for anyone who did not ask for it.
+    let keyModeOn = false;
+    const CAPTURED_KEYS = { ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right', Tab: 'Tab' };
+
+    function setKeyMode(on) {
+      keyModeOn = Boolean(on) && !keyModeToggleEl.disabled;
+      keyModeToggleEl.checked = keyModeOn;
+      inputTextEl.classList.toggle('key-mode', keyModeOn);
+      inputTextEl.placeholder = keyModeOn
+        ? 'Chế độ bắt phím: ↑ ↓ ← → Tab gửi thẳng vào terminal (Esc để tắt)'
+        : 'Nhập text để gửi vào session...';
+    }
+    keyModeToggleEl.onchange = () => setKeyMode(keyModeToggleEl.checked);
+
+    inputTextEl.addEventListener('keydown', event => {
+      if (!keyModeOn) return;
+      // Escape always LEAVES the mode rather than being swallowed -- the
+      // accessibility escape hatch, so the keyboard is never trapped.
+      if (event.key === 'Escape') { setKeyMode(false); return; }
+      const mapped = CAPTURED_KEYS[event.key];
+      if (!mapped || !keyIsAvailable(mapped)) return;
+      // Modified presses (Alt+Tab, Ctrl+Arrow for word jumps, Shift+Tab out
+      // of the field) stay with the browser.
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
+      if (event.key === 'Tab' && event.shiftKey) return;
+      event.preventDefault();
+      sendKeys([mapped]);
+    });
+
+    // ---- Remote composer mirror -----------------------------------------
+    // What the agent currently has on screen as an interactive choice, read
+    // off the SAME pane tail the output view already polls -- no extra API
+    // and no second capture of the pane.
+    //
+    // Deliberately NOT written straight into the draft box: the draft is the
+    // operator's, the mirror is the agent's, and a poll that overwrites a
+    // half-typed message is exactly the data loss this separation prevents.
+    // Copying across is a button, and it warns before discarding a dirty
+    // draft.
+    const MENU_LINE_RE = /^\s*[❯>*]?\s*(\d+)[.)]\s+\S/;
+    const SELECTED_LINE_RE = /^\s*[❯>*]\s*\S/;
+    let localDraftDirty = false;
+    let lastRemoteComposerText = '';
+
+    inputTextEl.addEventListener('input', () => { localDraftDirty = inputTextEl.value.length > 0; });
+
+    function detectRemoteComposer(outputText) {
+      if (!outputText) return null;
+      const lines = outputText.replace(/\s+$/, '').split('\n');
+      const tail = lines.slice(-14);
+      const menu = tail.filter(line => MENU_LINE_RE.test(line));
+      if (menu.length >= 2) {
+        const marked = tail.filter(line => MENU_LINE_RE.test(line) && SELECTED_LINE_RE.test(line));
+        return {
+          kind: marked.length ? 'menu lựa chọn (đang chọn dòng có ❯)' : 'menu lựa chọn',
+          text: menu.join('\n'),
+        };
+      }
+      // A composer/prompt line with something already typed into it.
+      for (let i = tail.length - 1; i >= 0; i -= 1) {
+        const line = tail[i];
+        const match = line.match(/^\s*[❯>](.*)$/);
+        if (match && match[1].trim()) return { kind: 'composer', text: match[1].trim() };
+      }
+      return null;
+    }
+
+    function renderRemoteComposer(outputText) {
+      const detected = detectRemoteComposer(outputText);
+      if (!detected) {
+        remoteComposerEl.hidden = true; lastRemoteComposerText = ''; return;
+      }
+      const changed = detected.text !== lastRemoteComposerText;
+      lastRemoteComposerText = detected.text;
+      remoteComposerEl.hidden = false;
+      remoteComposerKindEl.textContent = detected.kind;
+      remoteComposerBodyEl.textContent = detected.text;
+      // A change while the operator is mid-draft is flagged, never applied:
+      // they decide whether the agent's new state replaces what they typed.
+      remoteComposerEl.classList.toggle('rc-changed', changed && localDraftDirty);
+      remoteComposerSyncEl.textContent = localDraftDirty ? '⇩ Thay ô nhập (đang có draft)' : '⇩ Chép vào ô nhập';
+    }
+
+    remoteComposerSyncEl.onclick = () => {
+      if (localDraftDirty && !confirm('Ô nhập đang có nội dung bạn gõ dở. Thay bằng nội dung từ terminal?')) return;
+      inputTextEl.value = lastRemoteComposerText;
+      localDraftDirty = inputTextEl.value.length > 0;
+      inputTextEl.focus();
+      remoteComposerEl.classList.remove('rc-changed');
+    };
     // P0-4: a fresh idempotency key per click/Enter -- if the fetch below
     // fails ambiguously (e.g. a network drop after the send already
     // reached the server) and the UI is retried, the retry replays the
@@ -2058,7 +2318,7 @@ DASHBOARD_HTML = """<!doctype html>
           // (switched away and, less commonly, something already wrote a
           // new draft for it while gone).
           if (selected === targetSession) {
-            if (inputTextEl.value === sentText) { inputTextEl.value = ''; drafts.set(targetSession, ''); }
+            if (inputTextEl.value === sentText) { inputTextEl.value = ''; drafts.set(targetSession, ''); localDraftDirty = false; }
             // "Accepted" vs "Unknown" -- SUBMIT_CONFIRMED/TEXT_SENT (a
             // plain append, nothing to confirm) clear the note entirely;
             // DELIVERY_UNKNOWN (Enter was sent but no adapter evidence
@@ -2313,6 +2573,13 @@ DASHBOARD_HTML = """<!doctype html>
       if (selected) { drafts.set(selected, inputTextEl.value); }
       selected = name; inputAllowed = false;
       inputTextEl.value = drafts.get(name) || '';
+      // The draft and its dirty flag belong to the SESSION, not to the box:
+      // switching tabs must not make another session's untouched draft look
+      // like something the operator just typed, nor keep the previous
+      // session's mirrored composer on screen.
+      localDraftDirty = inputTextEl.value.length > 0;
+      lastRemoteComposerText = ''; remoteComposerEl.hidden = true;
+      remoteComposerEl.classList.remove('rc-changed');
       // The previous session's output must never remain visible under the
       // new session's name while its own detail fetch is still in flight
       // (a tab click must not have to wait for the next 5s poll either).
@@ -2710,6 +2977,13 @@ DASHBOARD_HTML = """<!doctype html>
       const rows = data.sessions || [];
       sessionLifecycleEnabled = data.session_lifecycle_enabled === true;
       protectedSessions = new Set(data.protected_sessions || []);
+      // Key-send capability is whatever the server reports -- never assumed.
+      // An older server that does not report it leaves keysCapabilityKnown
+      // false, which keeps the pad usable rather than dead (the API itself
+      // still enforces the real policy and returns KEY_NOT_ALLOWED).
+      if (Array.isArray(data.allowed_keys)) { allowedKeys = new Set(data.allowed_keys); keysCapabilityKnown = true; }
+      if (typeof data.send_keys_enabled === 'boolean') sendKeysEnabled = data.send_keys_enabled;
+      refreshKeyPad();
       webTerminalEnabled = data.web_terminal_enabled === true;
       // A 200 response can still legitimately carry data.error (e.g.
       // READ_DISABLED globally, alongside a correctly-empty `sessions: []`)
@@ -3873,6 +4147,9 @@ DASHBOARD_HTML = """<!doctype html>
       const switchedSession = selected !== lastRenderedSession;
       if (switchedSession) setAutoFollow(true); // opening a session always starts followed
       renderAnsi(outputEl, clean(data.tail.output));
+      // Same pane text the output view just rendered -- the mirror never
+      // triggers its own capture of the session.
+      renderRemoteComposer(clean(data.tail.output));
       // Blinking cursor glyph at the very end of the rendered output --
       // purely cosmetic (task item 1/6, "clear cursor"); only ever appended
       // on this success path, never for the READ_RESTRICTED placeholder or
@@ -7404,6 +7681,55 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         send_fn = terminal.terminal_send_text_granted if use_granted else terminal.terminal_send_text
         result = await anyio.to_thread.run_sync(
             lambda: send_fn(name, text, press_enter=press_enter, idempotency_key=idempotency_key)
+        )
+        status_code = 200
+        if "error" in result:
+            status_code = INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/keys", methods=["POST"], include_in_schema=False)
+    async def session_keys(request: Request) -> JSONResponse:
+        """Raw key sends (arrows/Tab/Enter/Escape) from the dashboard.
+
+        Deliberately the SAME terminal_send_keys the MCP tool surface already
+        uses -- key sends have their own permission (permissions.allow_send_keys),
+        their own allowlist (input_policy.allow_keys), their own confirmation
+        rule for sensitive keys, and the same durable pane lease as a text
+        send. A dashboard-specific shortcut around any of that would be a
+        second, weaker input path to the same panes.
+
+        Arrows and Tab are NOT simulated as text: a menu or a completion
+        reacts to the real key, and writing an escape sequence into the
+        composer would type it, not press it.
+        """
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        keys = body.get("keys") if isinstance(body, dict) else None
+        confirm_sensitive = bool(body.get("confirm_sensitive", False)) if isinstance(body, dict) else False
+        if not isinstance(name, str) or not name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        if not isinstance(keys, list) or not keys or not all(isinstance(key, str) and key for key in keys):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        _log.info("dashboard session_keys session=%s keys=%s identity=%s",
+                  name, keys, identity.email if identity else None)
+        # Same node-aware resolution session_input uses -- a granted session
+        # on a remote node (a Windows ConPTY session, say) must get its arrow
+        # keys routed to that node, never silently attempted locally.
+        target = name
+        if "/" not in name:
+            resolution = await anyio.to_thread.run_sync(controller.resolve_session, name)
+            if resolution.get("error") == "AMBIGUOUS_SESSION":
+                return JSONResponse(resolution, status_code=409, headers={"Cache-Control": "no-store"})
+            if "error" not in resolution and resolution["node_id"] != controller.local_node_id:
+                target = f"{resolution['node_id']}/{resolution['session']}"
+        result = await anyio.to_thread.run_sync(
+            lambda: controller.terminal_send_keys(target, list(keys), confirm_sensitive=confirm_sensitive)
         )
         status_code = 200
         if "error" in result:
