@@ -35,6 +35,7 @@ from .event_wiring import build_queue_event_sink, build_verify_event_sink
 from .lease import DEFAULT_RESOURCE_LOCK_TTL_SECONDS, ResourceLockStore
 from .outcomes import OutcomeError, OutcomeStore
 from .project_service import ProjectService
+from .worker_registry import ALL_ROLES, WorkerRegistry
 from .queue_service import QueueService
 from .release_service import ReleaseService
 from .release_store import ReleaseStore
@@ -2362,6 +2363,76 @@ def build_mcp(service: TerminalService | None = None,
             return locks.force_release(project_id, resource_key, actor=actor, reason=reason)
         except ValueError as exc:
             return {"error": "INVALID_REQUEST", "detail": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Orchestration V1: the WORKER view -- roles, capabilities, liveness.
+    #
+    # A composition, not a fourth store: declared skills live in pm_store,
+    # PROBED tools and liveness in the node registry, current work in
+    # queue_tasks. A `workers` table would duplicate all three and drift.
+    # ------------------------------------------------------------------
+    workers = WorkerRegistry(pm_store=pm.store if pm is not None else None,
+                             node_registry=getattr(controller, "registry", None),
+                             queue=queue)
+
+    @server.tool()
+    def terminal_worker_declare(node_id: str, session: str, roles: list[str] | None = None,
+                                skills: list[dict] | None = None,
+                                runtime_tools: list[str] | None = None,
+                                project_affinity: str | None = None,
+                                os: str | None = None, max_queued: int | None = None) -> dict:
+        """Declare what a session is FOR: its runtime roles, its skills, and
+        optionally which project it belongs to.
+
+        `roles` must come from WORKER / VERIFIER / INTEGRATOR / DEPLOYER /
+        COORDINATOR. A session may hold SEVERAL -- the same session can
+        implement one project's work and verify another's. Previously role
+        was free text compared by string equality, so a typo silently
+        created a new role nothing would ever match.
+
+        Declared capabilities are kept DISTINCT from probed ones: what an
+        operator asserts a session can do is never merged into what a node
+        was measured to have."""
+        return workers.declare(node_id, session, roles=roles, skills=skills,
+                               runtime_tools=runtime_tools, project_affinity=project_affinity,
+                               os=os, max_queued=max_queued)
+
+    @server.tool()
+    def terminal_worker_list(role: str | None = None, project_id: str | None = None,
+                             required_capabilities: list[str] | None = None,
+                             online_only: bool = True, trust_declared: bool = True) -> dict:
+        """Who can do work right now, and what each of them can do.
+
+        Filters are AND. `trust_declared=false` matches only PROBED
+        capability -- what a scheduler should use before sending work
+        somewhere expensive, since a declared tool is an assertion and a
+        probed one is a measurement.
+
+        Each row reports `capability_age_seconds`: node capabilities carry
+        no verified_at, so heartbeat age is the only honest freshness
+        signal and it is surfaced rather than assumed fresh."""
+        rows = [w.to_dict() for w in workers.list_workers(
+            role=role, project_id=project_id,
+            required_capabilities=tuple(required_capabilities or ()),
+            online_only=online_only, trust_declared=trust_declared)]
+        return {"workers": rows, "count": len(rows), "roles": list(ALL_ROLES)}
+
+    @server.tool()
+    def terminal_worker_status(node_id: str, session: str) -> dict:
+        """One worker: roles, both capability sets, liveness, current task
+        and queue depth."""
+        worker = workers.get(node_id, session)
+        if worker is None:
+            return {"error": "WORKER_NOT_FOUND", "node_id": node_id, "session": session}
+        return {"worker": worker.to_dict()}
+
+    @server.tool()
+    def terminal_worker_roles() -> dict:
+        """How many LIVE workers hold each role -- the read that answers
+        "can this fleet verify anything at all right now", which is exactly
+        the question that decides whether a verify job will ever be
+        claimed or sit pending forever."""
+        return {"summary": workers.roles_summary(), "roles": list(ALL_ROLES)}
 
     # ------------------------------------------------------------------
     # Orchestration V1: the OUTCOME layer -- the unit of user-visible

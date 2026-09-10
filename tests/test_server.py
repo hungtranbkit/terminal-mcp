@@ -117,6 +117,11 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_outcome_block",
         "terminal_outcome_unblock",
         "terminal_outcome_trace",
+        # Orchestration V1: the worker view (roles/capabilities/liveness).
+        "terminal_worker_declare",
+        "terminal_worker_list",
+        "terminal_worker_status",
+        "terminal_worker_roles",
         "terminal_node_sessions",
         "terminal_registry_list",
         "terminal_registry_get",
