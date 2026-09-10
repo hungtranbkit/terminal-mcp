@@ -403,9 +403,28 @@ class VerifyQueue:
     mistake, since it would put a second, unvalidated writer on
     queue_tasks."""
 
-    def __init__(self, store: QueueStore | None = None, *, registry: Any = None) -> None:
+    def __init__(self, store: QueueStore | None = None, *, registry: Any = None,
+                 event_sink: Any = None) -> None:
         self.store = store or QueueStore()
         self.registry = registry
+        # Orchestration V1: the bus DEFINED VERIFY_PENDING and this queue
+        # never emitted it, so nothing could react to "this needs
+        # verifying". Optional and exception-swallowing for the same reason
+        # the queue's sink is: a publish glitch must not undo a verdict.
+        self._event_sink = event_sink
+
+    def _emit(self, job: "VerifyJob") -> None:
+        if self._event_sink is None:
+            return
+        try:
+            self._event_sink({"job_id": job.id, "task_id": job.task_id,
+                              "project_id": job.project_id, "status": job.status,
+                              "attempt": job.attempt, "verifier": job.verifier,
+                              "implementer": job.implementer,
+                              "required_capabilities": list(job.required_capabilities),
+                              "block_reason": job.block_reason})
+        except Exception:  # noqa: BLE001 -- never let publishing undo a verdict
+            pass
 
     # -- internals -------------------------------------------------------
 
@@ -419,8 +438,16 @@ class VerifyQueue:
             connection.execute("BEGIN IMMEDIATE")
             yield connection
             connection.commit()
+            # This transaction may have moved a TASK (ensure_verify_job does
+            # RUNNING -> VERIFYING through the store's own chokepoint), which
+            # queues a pending bus event on the STORE. We commit on our own
+            # connection, so the store's context manager never runs and never
+            # drains -- without this the event would leak into whatever
+            # unrelated queue operation happened to commit next.
+            self.store._drain_events()
         except Exception:
             connection.rollback()
+            self.store._discard_events()
             raise
         finally:
             connection.close()
@@ -523,7 +550,9 @@ class VerifyQueue:
                  backlog_id, VERIFY_PENDING, json.dumps([str(c) for c in required_capabilities]),
                  int(require_independent), fallback, current["claimed_by"], branch, commit_sha,
                  history, now, now))
-            return VerifyJob.from_row(self._row(connection, job_id))
+            job = VerifyJob.from_row(self._row(connection, job_id))
+        self._emit(job)
+        return job
 
     @staticmethod
     def verify_policy_for(task: QueueTask) -> dict[str, Any] | None:
@@ -560,13 +589,15 @@ class VerifyQueue:
                 if row["require_independent"] and row["implementer"] and row["implementer"] == verifier:
                     continue
                 token = new_task_id()
-                return self._set_status_locked(
+                claimed = self._set_status_locked(
                     connection, row, VERIFY_CLAIMED, actor=verifier, event="CLAIMED",
                     reason=None,
                     fields={"verifier": verifier, "verifier_node_id": verifier_node_id,
                             "claim_token": token, "lease_expires_at": _lease_expiry(lease_seconds),
                             "claimed_at": iso_now(), "claim_count": row["claim_count"] + 1,
                             "block_reason": None})
+                self._emit(claimed)
+                return claimed
         return None
 
     def start(self, job_id: str, claim_token: str, *, detail: str | None = None) -> VerifyJob | None:
@@ -682,6 +713,7 @@ class VerifyQueue:
                 connection, row, VERIFIED_PASS, actor=actor or row["verifier"], event="VERIFIED_PASS",
                 reason=None, fields={"evidence": json.dumps(clean), "completed_at": iso_now(),
                                      "claim_token": None, "lease_expires_at": None})
+        self._emit(job)
         return {"ok": True, "job": job.to_dict(), "task_status": COMPLETED}
 
     def fail(self, job_id: str, claim_token: str, *, result: str, failure_summary: dict[str, Any],
@@ -726,6 +758,7 @@ class VerifyQueue:
                 fields["completed_at"] = None  # VERIFY_BLOCKED is recoverable, not terminal
             job = self._set_status_locked(connection, row, result, actor=actor or row["verifier"],
                                           event=result, reason=headline, fields=fields)
+        self._emit(job)
         return {"ok": True, "job": job.to_dict(), "task_status": target_status}
 
     def requeue(self, job_id: str, *, actor: str, reason: str) -> VerifyJob | None:

@@ -54,8 +54,29 @@ MERGE_CONFLICT = "MERGE_CONFLICT"
 TEST_FAILED = "TEST_FAILED"
 PREVIEW_FAILED = "PREVIEW_FAILED"
 USER_FEEDBACK = "USER_FEEDBACK"
-KNOWN_EVENT_TYPES = (TASK_CREATED, TASK_READY, WORKER_IDLE, WORKER_DONE, VERIFY_PENDING,
-                     MERGE_CONFLICT, TEST_FAILED, PREVIEW_FAILED, USER_FEEDBACK)
+KNOWN_EVENT_TYPES = (
+    # Goal / planning
+    "GOAL_SUBMITTED", "REQUIREMENT_CHANGED",
+    # Task lifecycle -- emitted by queue_store's own transition chokepoint
+    "TASK_CREATED", "TASK_READY", "TASK_CLAIMED", "TASK_STARTED", "WORKER_DONE",
+    "TASK_COMPLETED", "TASK_FAILED", "TASK_BLOCKED",
+    # Leases
+    "LEASE_RELEASED", "LEASE_EXPIRED", "TASK_HANDOFF",
+    # Verification
+    "VERIFY_PENDING", "VERIFY_CLAIMED", "VERIFY_PASS", "VERIFY_FAIL", "VERIFY_BLOCKED",
+    # Outcome
+    "OUTCOME_CREATED", "OUTCOME_AWAITING_ACCEPTANCE", "OUTCOME_DONE", "OUTCOME_BLOCKED",
+    # Integration / delivery
+    "MERGE_PENDING", "MERGE_CONFLICT", "TEST_FAILED", "PREVIEW_FAILED",
+    # Fleet / resources
+    "WORKER_IDLE", "NODE_LOST", "RESOURCE_CONFLICT",
+    # Human
+    "USER_FEEDBACK", "PROJECT_BLOCKED",
+)
+"""The vocabulary this system actually emits, aligned with the orchestration
+design. Still NOT enforced by publish() -- a caller may emit any non-empty
+string, deliberately, so an experiment does not require a schema change. This
+tuple is the documented set producers use and consumers can rely on."""
 
 PENDING = "PENDING"
 CLAIMED = "CLAIMED"
@@ -65,8 +86,51 @@ FAILED = "FAILED"
 DEFAULT_LEASE_SECONDS = 300.0
 MAX_ATTEMPTS = 5
 
+def _add_v2_provenance_and_cursors(connection: sqlite3.Connection) -> None:
+    """Orchestration V1. Three additions the event-driven coordinator needs
+    and the bus did not have.
+
+    `actor` -- the PUBLISHER was anonymous. `claimed_by` records who
+    consumed an event; nothing recorded who emitted it, so "why did this
+    happen" could not be answered from the log itself.
+
+    `causation_id` -- there was only a flat `correlation_id` (and nothing
+    in the repo ever populated it). Correlation groups events that belong
+    to one activity; causation says THIS event happened BECAUSE OF that
+    one. A coordinator that reacts to events by emitting more events makes
+    a chain, and without causation the chain is unreconstructable -- which
+    is exactly how a feedback loop hides.
+
+    `event_cursors` -- consumption was claim/ack ONLY: one event, one
+    consumer, and an ack destroyed it for everyone else. A coordinator that
+    wants to READ the stream (rather than consume it exclusively) had no
+    durable resume point, so a restart either reprocessed from the
+    beginning or silently skipped. A cursor is a per-consumer high-water
+    mark, advanced only forward, that survives restart and never competes
+    with another consumer for the same event."""
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(events)")}
+    if "actor" not in columns:
+        connection.execute("ALTER TABLE events ADD COLUMN actor TEXT")
+    if "causation_id" not in columns:
+        connection.execute("ALTER TABLE events ADD COLUMN causation_id TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_causation ON events(causation_id)")
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS event_cursors (
+            consumer TEXT NOT NULL,
+            project_id TEXT NOT NULL DEFAULT '',
+            last_seq INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (consumer, project_id)
+        )
+    """)
+
+
 EVENT_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: project-scoped claimable event bus", lambda connection: None),
+    Migration(2, "Orchestration V1: events.actor + events.causation_id + event_cursors "
+                 "(durable per-consumer high-water mark, non-destructive reads)",
+              _add_v2_provenance_and_cursors),
 ]
 
 
@@ -147,7 +211,8 @@ class EventBus:
     def publish(self, type: str, *, project_id: str | None = None,
                 entity_type: str | None = None, entity_id: str | None = None,
                 payload: dict[str, Any] | None = None, correlation_id: str | None = None,
-                idempotency_key: str | None = None) -> dict[str, Any]:
+                idempotency_key: str | None = None, actor: str | None = None,
+                causation_id: str | None = None) -> dict[str, Any]:
         """Append one event. `project_id=None` is a legitimate, unscoped
         (global) event -- it is simply never returned by a project-scoped
         claim.
@@ -170,10 +235,10 @@ class EventBus:
                     return _row_to_dict(existing) | {"duplicate": True}
             connection.execute(
                 "INSERT INTO events (id, project_id, type, entity_type, entity_id, payload, "
-                "correlation_id, idempotency_key, status, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "correlation_id, idempotency_key, status, created_at, actor, causation_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (event_id, project_id, type, entity_type, entity_id, body,
-                 correlation_id, idempotency_key, PENDING, now))
+                 correlation_id, idempotency_key, PENDING, now, actor, causation_id))
             row = connection.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
         return _row_to_dict(row) | {"duplicate": False}
 
@@ -269,6 +334,89 @@ class EventBus:
             f"WHERE (status = ? OR (status = ? AND lease_expires_at < ?)) "
             f"AND attempt_count >= ? {clause}", params)
         return cursor.rowcount
+
+    # ------------------------------------------------- consumer cursors
+    #
+    # A NON-DESTRUCTIVE alternative to claim/ack. claim/ack is the right
+    # model for WORK (one event, one worker, exactly-once effort). A cursor
+    # is the right model for OBSERVATION (many independent readers, each
+    # with its own durable position, none consuming the event from the
+    # others). The coordinator needs the second: it reads the stream to
+    # decide, and other consumers must still see the same events.
+
+    def read_since(self, consumer: str, *, project_id: str | None = None,
+                   types: list[str] | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """Events this consumer has not yet acknowledged, oldest first.
+
+        Does NOT advance the cursor -- reading and committing a position are
+        deliberately separate calls, so a consumer that crashes mid-handling
+        re-reads rather than silently skipping. That makes delivery
+        at-least-once, which is why every producer stamps an
+        idempotency_key."""
+        scope = project_id or ""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT last_seq FROM event_cursors WHERE consumer = ? AND project_id = ?",
+                (consumer, scope)).fetchone()
+            last_seq = row["last_seq"] if row else 0
+            query = "SELECT * FROM events WHERE seq > ? "
+            params: list[Any] = [last_seq]
+            if project_id is not None:
+                query += "AND project_id = ? "
+                params.append(project_id)
+            if types:
+                query += f"AND type IN ({','.join('?' * len(types))}) "
+                params.extend(types)
+            query += "ORDER BY seq ASC LIMIT ?"
+            params.append(limit)
+            rows = connection.execute(query, params).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def commit_cursor(self, consumer: str, seq: int, *,
+                      project_id: str | None = None) -> int:
+        """Advance a consumer's high-water mark. MONOTONIC: a lower seq is
+        ignored rather than applied, so an out-of-order or replayed commit
+        can never rewind a consumer and cause reprocessing."""
+        scope = project_id or ""
+        now = _iso(_now())
+        with self._connection(immediate=True) as connection:
+            connection.execute(
+                "INSERT INTO event_cursors (consumer, project_id, last_seq, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(consumer, project_id) DO UPDATE SET "
+                "last_seq = MAX(event_cursors.last_seq, excluded.last_seq), "
+                "updated_at = excluded.updated_at",
+                (consumer, scope, int(seq), now))
+            row = connection.execute(
+                "SELECT last_seq FROM event_cursors WHERE consumer = ? AND project_id = ?",
+                (consumer, scope)).fetchone()
+        return row["last_seq"]
+
+    def cursor(self, consumer: str, *, project_id: str | None = None) -> dict[str, Any]:
+        scope = project_id or ""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM event_cursors WHERE consumer = ? AND project_id = ?",
+                (consumer, scope)).fetchone()
+        return dict(row) if row is not None else {
+            "consumer": consumer, "project_id": scope, "last_seq": 0, "updated_at": None}
+
+    def causation_chain(self, event_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Walk BACKWARDS from an event to the one that caused it, and so
+        on. The read that answers "why did this happen" -- and the one that
+        makes a coordinator feedback loop visible instead of merely
+        suspected."""
+        chain: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        current = event_id
+        with self._connection() as connection:
+            while current and current not in seen and len(chain) < limit:
+                seen.add(current)
+                row = connection.execute("SELECT * FROM events WHERE id = ?", (current,)).fetchone()
+                if row is None:
+                    break
+                chain.append(_row_to_dict(row))
+                current = row["causation_id"]
+        return chain
 
     def dead_letters(self, *, project_id: str | None = None,
                      limit: int = 100) -> list[dict[str, Any]]:

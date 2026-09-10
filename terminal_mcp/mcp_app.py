@@ -31,6 +31,7 @@ from .queue_engine import QueueEngine
 from .queue_loop import QueueLoop
 from .backlog_service import BacklogService
 from .event_bus import KNOWN_EVENT_TYPES, EventBus
+from .event_wiring import build_queue_event_sink, build_verify_event_sink
 from .lease import DEFAULT_RESOURCE_LOCK_TTL_SECONDS, ResourceLockStore
 from .outcomes import OutcomeError, OutcomeStore
 from .project_service import ProjectService
@@ -132,6 +133,23 @@ def build_mcp(service: TerminalService | None = None,
         backlog = backlog if backlog is not None else BacklogService(
             terminal.config, queue=queue, controller=controller)
         events = events if events is not None else EventBus()
+
+    # Orchestration V1: connect the deterministic runtime to the bus. Until
+    # now the bus DEFINED the vocabulary (TASK_CREATED, VERIFY_PENDING,
+    # WORKER_DONE) that the queue and verify queue produce, and neither ever
+    # called publish() -- six subsystems, zero coupling, one event in
+    # production. Everything above them was waiting on a stream nobody fed.
+    #
+    # Attaching a sink is READ-ONLY with respect to behaviour: it adds rows
+    # to events.db and changes nothing about how a task is claimed,
+    # dispatched or verified. Nothing consumes the stream automatically --
+    # autonomous coordination stays behind its existing gates.
+    if events is not None:
+        if getattr(queue.store, "_event_sink", None) is None:
+            queue.store._event_sink = build_queue_event_sink(events)
+        verify_queue = getattr(queue, "verify_queue", None)
+        if verify_queue is not None and getattr(verify_queue, "_event_sink", None) is None:
+            verify_queue._event_sink = build_verify_event_sink(events)
     # Phase 2 (task: "Supervisor Queue v2 Phase 2 -- Coordinator Agent"):
     # one shared QueueEngine over the SAME queue store + the SAME
     # (already node-aware) controller every other routed tool in this
