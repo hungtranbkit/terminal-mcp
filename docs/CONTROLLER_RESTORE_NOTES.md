@@ -28,6 +28,32 @@ they just are not reachable from the m910 controller.
 2. **Repoint dell-5530** — permanent and independent of Dell, but **destroys
    `win1`/`win2`/`wtest`** (see below).
 
+3. **Do nothing — read them by qualified name.** Verified live on 2026-09-10:
+   the controller already reaches dell-5530 fine (`terminal-mcp-doctor nodes`
+   reports `test_connection: ok=True latency_ms≈44`). Only the *heartbeat*
+   goes to the dead `192.168.1.132:8766`, and heartbeat freshness is what
+   `status=online` means — it is not what reachability means.
+
+   `resolve_session` skips non-online nodes **only when resolving a bare
+   name**; a qualified `node/session` name is routed on the configured client
+   alone. So these work right now, with no restart and no session loss:
+
+   ```
+   terminal_status  dell-5530/win1
+   terminal_tail    dell-5530/win1
+   ```
+
+   What stays broken until the heartbeat is fixed: bare `win1`, and
+   `terminal_list_sessions`, which lists dell-5530 under
+   `unreachable_nodes` and omits its three sessions.
+
+   So "not reachable from the m910 controller" above is too strong — reads
+   work today; only *discovery by bare name* does not. Input is routed by the
+   same qualified-name path and the node reports `input_allowed: true`, but
+   that was deliberately **not** exercised: all three sessions have live
+   Claude prompts in flight (win1 is sitting on a numbered choice), and a
+   stray keystroke there is not a reversible test.
+
 ## dell-5530 (Windows) — how the takeover works when armed
 
 The Windows agent has `--controller-url http://192.168.1.132:8766` baked in as
