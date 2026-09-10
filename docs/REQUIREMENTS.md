@@ -4279,3 +4279,47 @@ meaningful at second resolution, not finer.
 **7 MCP tools** (`terminal_project_status`, `_submit_goal`, `_events`,
 `_report`, `_pause`, `_resume`, `_assign`; total 171). **This completes P0
 (P0.1–P0.7).**
+
+# 2026-09-10 Orchestration V1 — P0-A foundations
+
+Full architecture: **`docs/ORCHESTRATION_ARCHITECTURE.md`**.
+
+A six-domain audit of the runtime established the starting point: the
+primitives are broad and well-built, but **inert and not wired to each other**.
+Production held 0 queue tasks, 0 verify jobs, 0 resource locks, 0 capability
+profiles, 0 integration rows and 1 event. The bus's own vocabulary
+(`TASK_CREATED`, `VERIFY_PENDING`, `WORKER_DONE`, `MERGE_CONFLICT`) named
+exactly the signals the queue, verify queue and locks produce — and none of
+them called `publish()`.
+
+**Six defects fixed**, each with a regression test proven to fail without the
+fix: `handoff_task` destroyed a task's migration provenance; no dependency
+cycle detection existed anywhere (a cycle silently deadlocked a lane forever,
+with no event and no alarm); the event bus never dead-lettered, so a poison
+event stayed `PENDING` and invisible; `events.db` was never maintained;
+`force_release` recorded nothing; and the stdio tool surface silently lagged
+HTTP by 19 tools that consequently had no contract test.
+
+**The OUTCOME layer** (migration v8, additive and nullable). Backlog→task was
+welded 1:1 and one-shot, so a deliverable spanning several tasks was
+inexpressible. An outcome is the user-visible unit, and the rule that makes it
+worth having is that **an outcome is not done because its children are done** —
+the rollup structurally cannot reach `DONE`; `AWAITING_ACCEPTANCE` is the
+state a naive implementation would have called done, and completion requires
+evidence named against **each** acceptance criterion.
+
+**Events wired.** Optional sinks on `QueueStore`/`VerifyQueue`, mapped in
+`event_wiring.py` so the stores stay ignorant of the bus. Delivery is
+at-least-once by construction (different databases, no cross-store
+transaction), covered by idempotency keyed on the `queue_events` row id. Bus
+migration v2 adds `actor`, `causation_id` and `event_cursors` — a durable
+per-consumer high-water mark that reads non-destructively and never rewinds.
+**Nothing consumes the stream automatically**; autonomy stays behind its
+existing gates.
+
+**The WORKER view** — five real roles (`WORKER`/`VERIFIER`/`INTEGRATOR`/
+`DEPLOYER`/`COORDINATOR`, previously free text compared by string equality), a
+worker may hold several, and declared capability is never merged with probed
+capability. Composition over `pm_store` + node registry + queue; no new table.
+
+Tool surface: **202**, one surface for stdio and HTTP.

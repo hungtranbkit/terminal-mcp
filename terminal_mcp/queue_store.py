@@ -44,6 +44,7 @@ import contextlib
 import json
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -718,7 +719,24 @@ class QueueStore:
     same pattern as supervisor.py's SupervisorStore (0700 state dir,
     0600 db file, WAL, row_factory=Row), migrations via schema.py."""
 
-    def __init__(self, path: str | Path | None = None) -> None:
+    def __init__(self, path: str | Path | None = None, *,
+                 event_sink: Any = None) -> None:
+        # Orchestration V1: an OPTIONAL callable invoked once per recorded
+        # queue event, AFTER the transaction that produced it has committed.
+        #
+        # After-commit, not inside: the bus is a different database, so there
+        # is no cross-store atomicity to be had. Publishing inside the
+        # transaction would mean an event could exist for a transition that
+        # then rolled back -- strictly worse than the reverse. Publishing
+        # after means a crash in the gap loses the event, which is why every
+        # event carries an idempotency_key derived from the queue_events row
+        # id: the next producer to touch that row republishes harmlessly.
+        #
+        # A sink that raises is swallowed. A publishing glitch must never
+        # un-commit a real state transition -- the same posture
+        # queue_engine._notify_completed already takes.
+        self._event_sink = event_sink
+        self._pending_events = threading.local()
         self.path = Path(path) if path is not None else default_queue_db_path()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with self._connection() as connection:
@@ -741,8 +759,39 @@ class QueueStore:
         try:
             yield connection
             connection.commit()
+            self._drain_events()
+        except BaseException:
+            self._discard_events()
+            raise
         finally:
             connection.close()
+
+    def _queue_event(self, entry: dict[str, Any]) -> None:
+        if self._event_sink is None:
+            return
+        if not hasattr(self._pending_events, "items"):
+            self._pending_events.items = []
+        self._pending_events.items.append(entry)
+
+    def _drain_events(self) -> None:
+        """Publish everything the just-committed transaction recorded."""
+        if self._event_sink is None:
+            return
+        items = getattr(self._pending_events, "items", None)
+        if not items:
+            return
+        self._pending_events.items = []
+        for entry in items:
+            try:
+                self._event_sink(entry)
+            except Exception:  # noqa: BLE001 -- see __init__: never un-commit a transition
+                pass
+
+    def _discard_events(self) -> None:
+        """The transaction rolled back, so nothing happened -- an event
+        describing it would be a lie."""
+        if hasattr(self._pending_events, "items"):
+            self._pending_events.items = []
 
     # -- lane-level -------------------------------------------------------
 
@@ -1316,6 +1365,7 @@ class QueueStore:
             task = self._next_dispatchable_locked(connection, session)
             if task is None:
                 connection.rollback()
+                self._discard_events()
                 return None
             claim_token = new_task_id()
             lease_expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ",
@@ -1326,9 +1376,11 @@ class QueueStore:
                              "lease_expires_at": lease_expires_at},
             )
             connection.commit()
+            self._drain_events()
             return updated
         except Exception:
             connection.rollback()
+            self._discard_events()
             raise
         finally:
             connection.close()
@@ -1440,13 +1492,16 @@ class QueueStore:
                 (task_id, claim_token)).fetchone()
             if row is None or row["status"] not in self.LEASE_STATES:
                 connection.rollback()
+                self._discard_events()
                 return None
             connection.execute(
                 "UPDATE queue_tasks SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND claim_token = ?",
                 (new_expiry, iso_now(), task_id, claim_token))
             connection.commit()
+            self._drain_events()
         except Exception:
             connection.rollback()
+            self._discard_events()
             raise
         finally:
             connection.close()
@@ -1469,15 +1524,18 @@ class QueueStore:
                 (task_id, claim_token)).fetchone()
             if row is None or row["status"] not in self.LEASE_STATES:
                 connection.rollback()
+                self._discard_events()
                 return None
             updated = self._transition_locked(
                 connection, task_id, row["status"], QUEUED,
                 event_type="CLAIM_RELEASED", reason=reason or "claim released by holder",
                 extra_fields={"claimed_by": None, "claim_token": None, "lease_expires_at": None})
             connection.commit()
+            self._drain_events()
             return updated
         except Exception:
             connection.rollback()
+            self._discard_events()
             raise
         finally:
             connection.close()
@@ -1506,6 +1564,7 @@ class QueueStore:
                 "WHERE id = ? AND claim_token = ?", (task_id, claim_token)).fetchone()
             if row is None or row["status"] not in self.LEASE_STATES:
                 connection.rollback()
+                self._discard_events()
                 return None
             # _parse_json_dict_list, NOT _parse_json_list: migration_history
             # holds DICTS (reassign_task writes them the same way). The list
@@ -1530,8 +1589,10 @@ class QueueStore:
                                       event_type="CLAIM_HANDOFF",
                                       reason=f"{row['claimed_by']} -> {to_worker}: {reason}")
             connection.commit()
+            self._drain_events()
         except Exception:
             connection.rollback()
+            self._discard_events()
             raise
         finally:
             connection.close()
@@ -1783,9 +1844,11 @@ class QueueStore:
             row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
             if row is None:
                 connection.rollback()
+                self._discard_events()
                 raise KeyError(f"no such task: {task_id}")
             if row["status"] not in self._MIGRATABLE_STATUSES:
                 connection.rollback()
+                self._discard_events()
                 raise TaskAlreadyClaimedError(
                     f"{task_id}: status is {row['status']!r}, no longer eligible for reassignment "
                     f"(expected one of {self._MIGRATABLE_STATUSES})"
@@ -1819,8 +1882,10 @@ class QueueStore:
             self._record_event_locked(connection, session=to_session, task_id=task_id, event_type="MIGRATED_IN",
                                       reason=reason, metadata={"from": from_session, "actor": actor})
             connection.commit()
+            self._drain_events()
         except Exception:
             connection.rollback()
+            self._discard_events()
             raise
         finally:
             connection.close()
@@ -1894,6 +1959,7 @@ class QueueStore:
             ).fetchone()
             if existing_new_lane is not None:
                 connection.rollback()
+                self._discard_events()
                 raise ValueError(f"a queue lane already exists for {new_session!r}")
             now = iso_now()
             connection.execute(
@@ -1984,12 +2050,29 @@ class QueueStore:
     def _record_event_locked(self, connection: sqlite3.Connection, *, session: str, task_id: str | None,
                              event_type: str, reason: str | None, from_status: str | None = None,
                              to_status: str | None = None, metadata: dict[str, Any] | None = None) -> None:
-        connection.execute(
+        cursor = connection.execute(
             "INSERT INTO queue_events (timestamp, session, task_id, event_type, from_status, to_status, reason, "
             "metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (iso_now(), session, task_id, event_type, from_status, to_status, reason,
              json.dumps(metadata) if metadata else None),
         )
+        # Every queue event flows through here -- all 14 call sites -- so
+        # hooking the bus at this one point gives complete coverage instead
+        # of each caller having to remember to publish.
+        if self._event_sink is not None:
+            project_id = None
+            outcome_id = None
+            if task_id:
+                row = connection.execute(
+                    "SELECT project_id, outcome_id FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+                if row is not None:
+                    project_id = row["project_id"]
+                    outcome_id = row["outcome_id"] if "outcome_id" in row.keys() else None
+            self._queue_event({
+                "queue_event_id": cursor.lastrowid, "session": session, "task_id": task_id,
+                "event_type": event_type, "from_status": from_status, "to_status": to_status,
+                "reason": reason, "project_id": project_id, "outcome_id": outcome_id,
+            })
 
     def record_event(self, *, session: str, task_id: str | None, event_type: str, reason: str | None = None,
                      metadata: dict[str, Any] | None = None) -> None:
