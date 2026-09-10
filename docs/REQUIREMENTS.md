@@ -4323,3 +4323,38 @@ worker may hold several, and declared capability is never merged with probed
 capability. Composition over `pm_store` + node registry + queue; no new table.
 
 Tool surface: **202**, one surface for stdio and HTTP.
+
+# 2026-09-10 Controller migrated to m910
+
+The Dell Latitude that ran the controller was being powered off, so the
+controller/orchestrator moved to **m910** (`mesflow@192.168.1.109`). Full
+procedure, rollback and the split-brain discipline: **`docs/CONTROLLER_RUNBOOK.md`**.
+
+**m910 is now primary.** Same commit as verified `origin/main`, `dirty: false`,
+services `enabled` with linger so they survive reboot. Both tunnels moved with
+their existing IDs, so `terminal-dashboard.mesflow.net`, `terminal-login.mesflow.net`
+and the OpenAI MCP endpoint are **unchanged for clients**.
+
+**Canonical vs node-local state.** Only controller-canonical stores were
+migrated (`queue`, `backlog`, `events`, `nodes`, `integration`, `release_store`,
+`planner_store`, `pm_store`, `supervisor`, `connections`, `webauth`). The
+session-scoped stores (`session_registry`, `session_knowledge`, `grants`,
+`bindings`, `audit`, `prompt_submissions`, `killed_sessions`, `leases`) are
+**node-local** and were deliberately not copied: the new host has its own, and
+overwriting them would make m910's `local` node claim the old host's 528
+sessions. Project identity, backlog counts and revision are preserved exactly.
+
+**`local` means the host the controller runs on.** m910 was removed from
+`nodes.remote` and its own node agent stopped and disabled — leaving either in
+place would have made the controller register itself as one of its own remote
+nodes, in a loop.
+
+**Split-brain: one real trap found.** `terminal-mcp-tunnel-watchdog.timer` fired
+every 45 s and *restarted the controller it was watching*, silently resurrecting
+the old one ~30 s after it was stopped. Stopping services is not enough — timers
+that can restart them must be disabled too. No canonical divergence resulted
+(every store was byte-identical to the final sync; only heartbeat rows differed).
+
+**Config now lives outside the repo** (`~/.config/terminal-mcp/config.yaml`).
+In-tree host config makes the checkout permanently dirty and makes "which commit
+is running" unanswerable.
