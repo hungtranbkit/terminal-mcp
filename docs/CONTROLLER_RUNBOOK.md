@@ -99,6 +99,35 @@ Pick one before arming any takeover timer. If the takeover is chosen,
 controller ends up polling `http://192.168.1.132:8790`, which would then be
 m910's own address.
 
+### `dell-5530`'s heartbeat relay (temporary)
+
+`terminal-mcp-heartbeat-relay-dell-5530.service` on m910 exists because that
+node's agent has `--controller-url http://192.168.1.132:8766` baked into its
+command line and its ConPTY sessions are **direct children of the agent
+process** (verified: `win1`/`win2`/`wtest` all have PPID 12284, the agent) --
+so restarting it to repoint it destroys live work. Unlike tmux, which is a
+separate server that outlives its parent, `WindowsSessionBackend` holds
+sessions in an in-process dict; there is no reattach path.
+
+The node is otherwise fine, so `deploy/node-heartbeat-relay.py` pulls its real
+`/v1/health`, `/v1/metrics` and `/v1/sessions` and posts them to the heartbeat
+endpoint on its behalf. It never invents liveness: if any pull fails it posts
+nothing and the node ages out to offline normally, and it refuses outright if
+the endpoint reports a different `node_id` than the one being relayed.
+
+**This is a bridge, not a fixture.** `run-node-agent.ps1` on the node has
+already been corrected to `192.168.1.109`, so the next time its Scheduled Task
+(`TerminalMcpNodeAgent-dell-5530`) starts, the node heartbeats for itself and
+the relay is redundant:
+
+```bash
+systemctl --user disable --now terminal-mcp-heartbeat-relay-dell-5530
+```
+
+A checkpoint taken before any of this -- the three sessions' `claude
+--session-id` values, so they can be brought back with `claude --resume` --
+is at `~/terminal-mcp-migration-backup/dell5530-checkpoint-*/`.
+
 ## 5. Moving the controller to another host
 
 1. **Back up** every DB with SQLite's online backup API (never `cp` a live DB):
