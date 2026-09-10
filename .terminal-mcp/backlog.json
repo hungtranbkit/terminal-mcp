@@ -1906,6 +1906,111 @@
           "by": "orchestration-v1"
         }
       ]
+    },
+    {
+      "id": "blg_dell5530_repoint_m910",
+      "title": "Repoint dell-5530 node agent to the m910 controller (costs win1/win2/wtest)",
+      "description": "After the 2026-09-10 controller migration, dell-5530's Windows agent still points at the retired Dell Linux controller (http://192.168.1.132:8766) and therefore shows OFFLINE in the m910 registry. dell-5530 itself is healthy and unaffected by the Dell Linux box being powered off -- it is a separate machine and win1/win2/wtest keep running. Repointing is ONE line:\n\n  file: C:\\\\Users\\\\tranv\\\\terminal-mcp\\\\run-node-agent.ps1\n  change: --controller-url http://192.168.1.132:8766\n      to: --controller-url http://192.168.1.109:8766\n  then restart the node-agent Scheduled Task.\n\nNOT DONE AUTOMATICALLY: the restart kills win1/win2/wtest, because dell-5530's ConPTY sessions are in-process children of the agent and do not survive its restart. That is a user decision, and it pairs naturally with the already-pending dell-5530 maintenance window (token rotation + orphaned Scheduled Task), which costs those sessions anyway.",
+      "status": "READY",
+      "priority": "P1",
+      "type": "chore",
+      "order": 42,
+      "created_at": "2026-09-10T02:19:16.180597+00:00",
+      "updated_at": "2026-09-10T02:19:16.180597+00:00",
+      "source": "controller-migration-2026-09-10",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "dell-5530 reports online in the m910 node registry",
+        "Its sessions are listable and readable from the m910 controller",
+        "win1/win2/wtest are recreated or their loss is accepted deliberately"
+      ],
+      "tags": [
+        "dell-5530",
+        "migration",
+        "windows"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": "dell-5530",
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": "needs a user-chosen maintenance window: the agent restart costs 3 ConPTY sessions",
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": [
+          "Verified 2026-09-10: agent healthy (generation e19d32ef22e3bdf3), sessions win1/win2/wtest live.",
+          "The exact controller-url line was read read-only via a disposable session that was removed afterwards; no restart, no change applied."
+        ]
+      },
+      "history": [
+        {
+          "at": "2026-09-10T02:19:16.180597+00:00",
+          "event": "created",
+          "by": "controller-migration"
+        }
+      ]
+    },
+    {
+      "id": "blg_controller_migration_m910",
+      "title": "Migrate Terminal MCP controller from Dell Linux to m910",
+      "description": "Emergency relocation of the controller/orchestrator before the Dell host is powered off.",
+      "status": "DONE",
+      "priority": "P0",
+      "type": "chore",
+      "order": 43,
+      "created_at": "2026-09-10T02:19:16.180597+00:00",
+      "updated_at": "2026-09-10T02:19:16.180597+00:00",
+      "source": "controller-migration-2026-09-10",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "m910 runs the controller from a verified commit",
+        "Canonical project/backlog state present and integrity-verified on m910",
+        "Dashboard/MCP/service healthy on m910 and surviving Dell being down",
+        "No split-brain; rollback backup exists"
+      ],
+      "tags": [
+        "migration",
+        "controller",
+        "m910"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": "m910",
+      "queue_task_id": null,
+      "branch": "main",
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [
+          "bd0373e"
+        ],
+        "tests": [
+          "MCP live verification on the running m910 endpoint: 202 tools, fleet node list, project status, local (m1) and remote (mac1) session read"
+        ],
+        "deploys": [
+          "m910 terminal-mcp-http @ 8f6c4b2 dirty:false; both tunnels moved with their existing IDs so public hostnames are unchanged"
+        ],
+        "notes": [
+          "Canonical state migrated with SQLite online backup + integrity check; every row count matched the source exactly. Node-local stores deliberately NOT copied.",
+          "SPLIT-BRAIN TRAP FOUND: terminal-mcp-tunnel-watchdog.timer fired every 45s and restarted the controller it was watching, resurrecting the old one ~30s after it was stopped. Disabled; verified down past the timer interval. No canonical divergence resulted.",
+          "Dell services stopped + disabled, unit files intact for rollback. Full backup at /home/dell/terminal-mcp-migration-backup-20260910-085344 (268MB, all 19 DBs + configs + session manifest) -- MUST be copied off Dell before power-off."
+        ]
+      },
+      "history": [
+        {
+          "at": "2026-09-10T02:19:16.180597+00:00",
+          "event": "created",
+          "by": "controller-migration"
+        },
+        {
+          "at": "2026-09-10T02:19:16.180597+00:00",
+          "event": "completed",
+          "by": "mcp"
+        }
+      ]
     }
   ]
 }
