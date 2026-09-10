@@ -513,6 +513,40 @@ class NodesConfig:
 
 
 @dataclass(frozen=True)
+class SessionAccessConfig:
+    """What a session may be read from / sent to, when no explicit grant says
+    otherwise.
+
+    This REPLACES the old session-name whitelist as the enforcement input.
+    Access is now decided by explicit, user-issued grants (grants.db) plus
+    this default policy -- never by whether a session's NAME happens to match
+    a glob in config.yaml. The whitelist produced a genuinely contradictory
+    state that was reported as a bug: a session could list `allowed=false`
+    (name not in the glob list) while `effective_read`/`effective_input` were
+    both true (an explicit grant said so), and the two fields meant different
+    things that looked like they should agree.
+
+    Defaults are deliberately CLOSED. A session nobody has granted anything on
+    is discoverable (its name/size/activity are `tmux ls` metadata, which was
+    always visible) but its CONTENT is not readable and it accepts no input
+    until a user says so on the dashboard. Opening that by default would be a
+    strictly weaker posture than the whitelist it replaces.
+
+    `allowed_session_patterns`/`input_policy.allowed_session_patterns` are
+    still PARSED, but only as a one-time migration source -- see
+    TerminalService.migrate_whitelist_to_grants. They no longer authorize
+    anything by themselves.
+    """
+    default_read: bool = False
+    default_input: bool = False
+    # One-time conversion of the old name whitelist into real grants, so a
+    # deployment upgrading to this does not silently lose access to every
+    # session it had whitelisted. Idempotent: it only ever ADDS a grant for a
+    # session that has none.
+    migrate_whitelist_on_start: bool = True
+
+
+@dataclass(frozen=True)
 class AppConfig:
     permissions: PermissionsConfig
     allowed_session_patterns: tuple[str, ...]
@@ -524,6 +558,7 @@ class AppConfig:
     maintenance: MaintenanceConfig = MaintenanceConfig()
     session_lifecycle: SessionLifecycleConfig = SessionLifecycleConfig()
     session_knowledge: SessionKnowledgeConfig = SessionKnowledgeConfig()
+    session_access: SessionAccessConfig = SessionAccessConfig()
     ask_chatgpt: AskChatGptConfig = AskChatGptConfig()
     nodes: NodesConfig = NodesConfig()
     queue: QueueConfig = QueueConfig()
@@ -836,6 +871,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         maintenance=_load_maintenance_config(raw.get("maintenance", {})),
         session_lifecycle=_load_session_lifecycle_config(raw.get("session_lifecycle", {})),
         session_knowledge=_load_session_knowledge_config(raw.get("session_knowledge", {})),
+        session_access=_load_session_access_config(raw.get("session_access", {})),
         ask_chatgpt=_load_ask_chatgpt_config(raw.get("ask_chatgpt", {})),
         nodes=nodes_config,
         queue=_load_queue_config(raw.get("queue", {})),
@@ -905,6 +941,18 @@ def _load_session_knowledge_config(raw: object) -> SessionKnowledgeConfig:
     if not isinstance(raw, dict):
         return SessionKnowledgeConfig()
     return SessionKnowledgeConfig(enabled=bool(raw.get("enabled", False)))
+
+
+def _load_session_access_config(raw: object) -> SessionAccessConfig:
+    if not isinstance(raw, dict):
+        return SessionAccessConfig()
+    defaults = SessionAccessConfig()
+    return SessionAccessConfig(
+        default_read=bool(raw.get("default_read", defaults.default_read)),
+        default_input=bool(raw.get("default_input", defaults.default_input)),
+        migrate_whitelist_on_start=bool(raw.get("migrate_whitelist_on_start",
+                                                defaults.migrate_whitelist_on_start)),
+    )
 
 
 def _load_maintenance_config(maintenance_raw: object) -> MaintenanceConfig:

@@ -136,6 +136,7 @@ def test_recent_completed_and_failed_are_capped_and_sorted(rig):
 
 # -- dashboard HTTP routes ----------------------------------------------------
 
+@pytest.mark.closed_access
 def test_dashboard_tasks_route_requires_read_authorization(rig):
     # A name OUTSIDE the "tm-*" static whitelist and with no dashboard
     # grant either -- _read_authorized must actually refuse this, not
@@ -200,6 +201,7 @@ def test_dashboard_enqueue_pause_resume_retry_cancel_round_trip(rig):
     assert cancelled.json()["task"]["status"] == "CANCELLED"
 
 
+@pytest.mark.closed_access
 def test_dashboard_task_actions_require_read_authorization(rig):
     client = rig["client"]
     name = _unique("other-noauth")
@@ -363,6 +365,7 @@ def test_dashboard_tasks_create_route_without_session_lands_in_backlog(rig):
     assert board["backlog"][0]["session"] is None
 
 
+@pytest.mark.closed_access
 def test_dashboard_tasks_create_route_with_session_requires_read_authorization(rig):
     client = rig["client"]
     name = _unique("other-noauth")  # never granted read -- must be refused, not silently created
@@ -401,6 +404,7 @@ def test_dashboard_tasks_assign_route_moves_same_task_no_duplicate(rig):
     assert board["queued"][0]["id"] == task_id
 
 
+@pytest.mark.closed_access
 def test_dashboard_tasks_assign_route_requires_read_authorization_on_target_session(rig):
     client = rig["client"]
     created = client.post("/dashboard/api/tasks/create", json={"title": "t", "prompt": "p"})

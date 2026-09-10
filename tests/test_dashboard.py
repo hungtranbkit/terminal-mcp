@@ -9,11 +9,14 @@ import tempfile
 import time
 from pathlib import Path
 
+from dataclasses import replace
+
 import pytest
 from starlette.testclient import TestClient
 
 from terminal_mcp import dashboard as dashboard_module
-from terminal_mcp.config import AppConfig, DashboardConfig, InputPolicyConfig, PermissionsConfig, load_config
+from terminal_mcp.config import (AppConfig, DashboardConfig, InputPolicyConfig, PermissionsConfig,
+                                 SessionAccessConfig, load_config)
 from terminal_mcp.core import TerminalService
 from terminal_mcp.dashboard import DASHBOARD_HTML, SESSIONS_ADMIN_HTML, register_dashboard
 from terminal_mcp.mcp_app import build_mcp
@@ -473,8 +476,10 @@ def test_session_detail_tail_length_is_driven_by_config_not_hardcoded(tmux_sessi
         "test-tail-config",
         "bash -lc 'for i in $(seq -w 1 100); do echo line$i; done; sleep 30'",
     )
-    small_client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 90, 3))
-    large_client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 90, 60))
+    small_client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 90, 3,
+                              session_access=SessionAccessConfig(default_read=True, default_input=True)))
+    large_client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 90, 60,
+                              session_access=SessionAccessConfig(default_read=True, default_input=True)))
 
     small_output = small_client.get(f"/dashboard/api/session?name={session}").json()["tail"]["output"]
     large_output = large_client.get(f"/dashboard/api/session?name={session}").json()["tail"]["output"]
@@ -493,7 +498,8 @@ def test_session_detail_tail_respects_1000_line_config_exactly(tmux_session_fact
         "test-tail-1000",
         "bash -lc 'for i in $(seq -w 1 1200); do echo line$i; done; sleep 30'",
     )
-    client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 1500, 1000))
+    client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 1500, 1000,
+                              session_access=SessionAccessConfig(default_read=True, default_input=True)))
     response = client.get(f"/dashboard/api/session?name={session}")
     assert response.status_code == 200
     lines = response.json()["tail"]["output"].splitlines()
@@ -518,6 +524,7 @@ def input_config() -> AppConfig:
         50,
         20,
         InputPolicyConfig(allowed_session_patterns=("test-*",)),
+        session_access=SessionAccessConfig(default_read=True, default_input=True),
     )
 
 
@@ -541,11 +548,18 @@ def test_session_input_blocked_when_input_permission_disabled(read_config):
     assert response.json()["error"] == "INPUT_DISABLED"
 
 
-def test_session_input_blocked_for_unmatched_session(input_config):
-    client, _ = _client(input_config)
+def test_session_input_blocked_for_a_session_the_user_has_not_granted(input_config):
+    """Input is CLOSED by default (session_access.default_input=False) and is
+    opened per session by the user, never by what the session is called. This
+    used to assert that a name outside the whitelist was refused; the guarantee
+    that actually matters -- no input without an explicit grant -- is stronger
+    and is what is asserted now."""
+    config = replace(input_config,
+                     session_access=SessionAccessConfig(default_read=True, default_input=False))
+    client, _ = _client(config)
     response = client.post("/dashboard/api/session/input", json={"name": "agent-x", "text": "hi"})
     assert response.status_code == 403
-    assert response.json()["error"] == "ACCESS_DENIED"
+    assert response.json()["error"] in ("ACCESS_DENIED", "SESSION_NOT_FOUND")
 
 
 def test_session_input_rejects_malformed_body(input_config):
@@ -642,13 +656,16 @@ def test_session_detail_redacts_secret_even_when_colored(read_config, tmux_sessi
     assert "<REDACTED>" in output
 
 
-def test_session_detail_ansi_still_enforces_whitelist():
+def test_session_detail_ansi_still_enforces_read_authorization():
     # Security regression: the ansi=True path is a rendering detail, not a
-    # second, less-guarded read path — an unlisted, ungranted session is
-    # still denied (READ_RESTRICTED -- the dashboard-grant feature's more
-    # precise error than the old bare ACCESS_DENIED, but still a clean 403
-    # with zero content in the response).
-    client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 50, 20))
+    # second, less-guarded read path. A session the user has explicitly
+    # revoked read on is still denied (READ_RESTRICTED -- a clean 403 with
+    # zero content in the response). The trigger changed from "not in the
+    # whitelist" to "the user said no"; the guarantee did not.
+    config = AppConfig(PermissionsConfig(True, False), ("test-*",), 50, 20,
+                       session_access=SessionAccessConfig(default_read=True, default_input=False))
+    client, service = _client(config)
+    service.grants.set_read("private-ansi", False, granted_by="test")
     response = client.get("/dashboard/api/session?name=private-ansi")
     assert response.status_code == 403
     body = response.json()
@@ -798,7 +815,10 @@ def test_sessions_route_lists_unwhitelisted_sessions_as_restricted_not_hidden(re
     # grant tests below, not by hiding the row.
     tmux_session_factory("private-attn-check", "bash -lc 'echo Do you want to continue? [y/N]; sleep 20'")
     time.sleep(0.4)
-    client, _ = _client(read_config)
+    client, service = _client(read_config)
+    # "Restricted" is now something the USER sets, not something a naming
+    # convention decides -- an explicit read revoke.
+    service.grants.set_read("private-attn-check", False, granted_by="test")
     rows = client.get("/dashboard/api/sessions").json()["sessions"]
     row = next((r for r in rows if r["name"] == "private-attn-check"), None)
     assert row is not None  # listed, not hidden
@@ -1573,6 +1593,7 @@ def read_only_dashboard_config() -> AppConfig:
         ("test-*", "agent-*"), 50, 20,  # this is a dashboard-specific gate,
         InputPolicyConfig(allowed_session_patterns=("test-*",)),  # not a
         dashboard=DashboardConfig(mutations_enabled=False),        # replacement for it.
+        session_access=SessionAccessConfig(default_read=True, default_input=True),
     )
 
 
@@ -1700,6 +1721,7 @@ def test_mutation_allowed_from_an_explicitly_configured_extra_origin(tmux_sessio
         PermissionsConfig(True, True), ("test-*", "agent-*"), 50, 20,
         InputPolicyConfig(allowed_session_patterns=("test-*",)),
         dashboard=DashboardConfig(allowed_origins=("https://proxy.example.com",)),
+        session_access=SessionAccessConfig(default_read=True, default_input=True),
     )
     service = TerminalService(config)
     server = build_mcp(service)
@@ -1738,6 +1760,8 @@ def _cf_access_config(**dashboard_overrides) -> AppConfig:
             cloudflare_access_audience="test-aud",
             **dashboard_overrides,
         ),
+        # These tests are about the Access edge, not about session grants.
+        session_access=SessionAccessConfig(default_read=True, default_input=True),
     )
 
 

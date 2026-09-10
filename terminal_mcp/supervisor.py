@@ -34,7 +34,6 @@ from typing import Any, Callable
 from .audit import sanitized_preview, text_fingerprint
 from .config import AppConfig, SupervisorConfig
 from .core import TerminalService
-from .permissions import session_allowed
 from .schema import Migration, apply_migrations
 from .status import (KNOWN_VERIFIER_KINDS, SUPERVISOR_STATES, classify_supervisor_state,
                      parse_completion_marker, parse_evidence_markers, to_legacy_event_type,
@@ -861,7 +860,14 @@ class SupervisorService:
             _LOGGER.warning("supervisor: could not list sessions for config-pattern watch sync", exc_info=True)
             return
         for item in sessions:
-            if not session_allowed(item.name, self.terminal.config):
+            # Readability is the supervisor's real prerequisite: it watches a
+            # session by CAPTURING its output, so a session it cannot read is
+            # a watch that can only ever report nothing. That used to be
+            # approximated by the session-name whitelist; it is now asked
+            # directly of the canonical gate (grants + session_access
+            # defaults), so a granted session is watchable and an ungranted
+            # one is not, regardless of what it is called.
+            if not self.terminal._read_authorized(item.name):
                 continue
             if any(fnmatch.fnmatchcase(item.name, pattern) for pattern in self.config.watched_session_patterns):
                 self.store.upsert_watch("session", item.name, source="config_pattern")

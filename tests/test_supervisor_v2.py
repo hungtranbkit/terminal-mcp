@@ -17,7 +17,7 @@ import pytest
 _TRIVIAL_PASSING_VERIFIER = [sys.executable, "-c", "exit(0)"]
 
 from terminal_mcp.audit import AuditStore
-from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig, SupervisorConfig
+from terminal_mcp.config import SessionAccessConfig, AppConfig, InputPolicyConfig, PermissionsConfig, SupervisorConfig
 from terminal_mcp.core import TerminalService
 from terminal_mcp.supervisor import SupervisorService, SupervisorStore
 from terminal_mcp.supervisor2 import build_supervisor_v2
@@ -400,13 +400,15 @@ def test_execute_send_still_respects_terminal_input_disabled(tmp_path, tmux_sess
 
 
 def test_execute_send_still_respects_input_policy_denied_pattern(tmp_path, tmux_session_factory):
-    # allowed_session_patterns includes this session for *reading*, but
-    # input_policy only allows "test-*" here too — use a session outside
-    # input_policy specifically to prove the send path's own guard still runs.
+    # The premise -- readable but NOT sendable -- used to come from two
+    # separate name whitelists. Both are retired, so it is now expressed as
+    # what it always meant: read is open by policy, INPUT is not granted.
+    # The point of the test is unchanged: the send path runs its own guard.
     terminal = TerminalService(AppConfig(
         PermissionsConfig(True, True), ("test-*", "agent-*"), 50, 20,
-        InputPolicyConfig(allowed_session_patterns=("agent-*",)),  # deliberately excludes "test-*"
+        InputPolicyConfig(allowed_session_patterns=("agent-*",)),
         supervisor=SupervisorConfig(v2_enabled=True),
+        session_access=SessionAccessConfig(default_read=True, default_input=False),
     ))
     session_factory_name = "test-v2-policyoff"
     import subprocess

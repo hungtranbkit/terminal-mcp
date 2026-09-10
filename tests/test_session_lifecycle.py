@@ -303,6 +303,7 @@ def test_create_initial_prompt_goes_through_reliable_submission_once(tmp_path, l
     assert output.count("echo hello-lifecycle") == 1
 
 
+@pytest.mark.closed_access
 def test_create_initial_prompt_without_permission_reports_denied_not_silent(tmp_path, lifecycle_session_factory):
     config = _lifecycle_config(tmp_path)
     service = TerminalService(config)

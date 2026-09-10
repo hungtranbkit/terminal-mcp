@@ -47,7 +47,7 @@ from starlette.websockets import WebSocket
 from .controller import ControllerService
 from .core import TerminalService
 from .dashboard import DASHBOARD_HTML, INPUT_ERROR_STATUS, SESSIONS_ADMIN_HTML, WEBTERM_HTML
-from .permissions import input_session_allowed, session_allowed, valid_session_name
+from .permissions import valid_session_name
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
 from .webauth import SESSION_COOKIE_NAME, SESSION_TTL, WebAuthStore
@@ -430,15 +430,21 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
         if blocked is not None:
             return blocked
         name = request.query_params.get("name", "")
-        if not session_allowed(name, terminal.config) and not (
-            (grant := terminal.grants.get(name)) is not None and grant.read_enabled
-        ):
+        # The canonical read gate, not a re-derivation of it: grants plus
+        # the session_access default policy, with the sensitive-name floor.
+        # This used to be "whitelisted OR granted", which is precisely the
+        # split that let the list and the detail view disagree.
+        if not terminal._read_authorized(name):
             block_reason = await anyio.to_thread.run_sync(terminal._input_grant_block_reason, name)
             return JSONResponse(
                 {"error": "READ_RESTRICTED", "session": name, "input_block_reason": block_reason},
                 status_code=403, headers={"Cache-Control": "no-store"},
             )
-        use_granted = not session_allowed(name, terminal.config)
+        # A grant carries a pinned identity the *_granted variants
+        # re-validate at use time; without one the plain variants apply the
+        # same default policy. Chosen by whether a grant EXISTS, never by
+        # whether the name matched a glob.
+        use_granted = terminal.grants.get(name) is not None
         status_fn = terminal.terminal_status_granted if use_granted else terminal.terminal_status
         tail_fn = (lambda: terminal.terminal_tail_granted(name, ansi=True)) if use_granted \
             else (lambda: terminal.terminal_tail(name, ansi=True))
@@ -462,11 +468,12 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
         if "error" in tail:
             return JSONResponse(tail, status_code=403 if tail["error"] == "READ_RESTRICTED" else 404)
         grant = terminal.grants.get(name)
-        input_allowed = bool(
-            terminal.config.permissions.terminal_input
-            and (input_session_allowed(name, terminal.config) or (grant is not None and grant.input_enabled))
-        )
-        allowed = session_allowed(name, terminal.config)
+        input_ok, _input_reason = terminal._input_authorized_with_grant(name, grant)
+        input_allowed = bool(terminal.config.permissions.terminal_input and input_ok)
+        # DEPRECATED field, kept for existing callers -- now an alias of the
+        # real read authorization so it can never contradict input_allowed /
+        # the list's effective_read again.
+        allowed = terminal._read_authorized_with_grant(name, grant)
         body = {
             "session": name, "status": status, "tail": tail, "input_allowed": input_allowed,
             "allowed": allowed,
@@ -496,7 +503,7 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         _log.info("webauth session_input session=%s username=%s", name, user.username)
         grant = terminal.grants.get(name)
-        use_granted = grant is not None and not input_session_allowed(name, terminal.config)
+        use_granted = grant is not None
         send_fn = terminal.terminal_send_text_granted if use_granted else terminal.terminal_send_text
         result = await anyio.to_thread.run_sync(
             lambda: send_fn(name, text, press_enter=press_enter, idempotency_key=idempotency_key)

@@ -475,6 +475,7 @@ def test_session_detail_reaches_a_remote_only_session(tmp_path):
     assert body["input_allowed"] is True
 
 
+@pytest.mark.closed_access
 def test_session_detail_remote_read_restricted_when_not_effective(tmp_path):
     client, controller, _service = _client(tmp_path)
     _heartbeat_local(controller)

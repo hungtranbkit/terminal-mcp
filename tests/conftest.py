@@ -6,12 +6,61 @@ import time
 
 import pytest
 
-from terminal_mcp.config import AppConfig, PermissionsConfig
+from terminal_mcp.config import AppConfig, PermissionsConfig, SessionAccessConfig
+
+
+# The session-name whitelist no longer authorizes anything (see
+# SessionAccessConfig): access comes from explicit grants plus this default
+# policy. Production defaults are CLOSED. This fixture opens read/input
+# explicitly, because the tests using it are exercising something else
+# entirely -- ANSI rendering, redaction, Cloudflare Access, tail bounds --
+# and a session is just the vehicle. A test that is actually about
+# authorization builds its own config and grants explicitly.
+_OPEN_ACCESS = SessionAccessConfig(default_read=True, default_input=True)
 
 
 @pytest.fixture
 def read_config() -> AppConfig:
-    return AppConfig(PermissionsConfig(True, False), ("test-*", "agent-*"), 50, 20)
+    return AppConfig(PermissionsConfig(True, False), ("test-*", "agent-*"), 50, 20,
+                     session_access=_OPEN_ACCESS)
+
+
+# ---------------------------------------------------------------------------
+# Session access defaults for the SUITE.
+#
+# Production defaults are CLOSED (see SessionAccessConfig): a session nobody
+# has granted anything on is discoverable but not readable. This suite was
+# written when the session-name whitelist authorized reads, so hundreds of
+# tests express "this session is accessible" as "its name matches my config's
+# patterns" while actually testing something else entirely -- ANSI rendering,
+# queue dispatch, node routing, Windows backends.
+#
+# Rather than rewrite that assertion in every one of them, the shared DEFAULT
+# instance every AppConfig falls back to is opened here. Tests that are
+# genuinely about authorization -- test_dashboard_grants.py,
+# test_p0_grant_authorization_hotfix.py, test_session_access_no_whitelist.py,
+# test_supervisor.py -- pass their own SessionAccessConfig explicitly and are
+# unaffected by this, which is what keeps it from masking a real regression.
+_ACCESS_DEFAULT = AppConfig.__dataclass_fields__["session_access"].default
+object.__setattr__(_ACCESS_DEFAULT, "default_read", True)
+object.__setattr__(_ACCESS_DEFAULT, "default_input", True)
+
+
+@pytest.fixture(autouse=True)
+def _session_access_policy(request):
+    """Per-test override of the suite-wide OPEN default above.
+
+    A test marked `@pytest.mark.closed_access` runs against the production
+    posture -- nothing readable or sendable without an explicit grant -- which
+    is what every "this must be refused" test actually means now that refusal
+    no longer comes from a session's name.
+    """
+    closed = request.node.get_closest_marker("closed_access") is not None
+    object.__setattr__(_ACCESS_DEFAULT, "default_read", not closed)
+    object.__setattr__(_ACCESS_DEFAULT, "default_input", not closed)
+    yield
+    object.__setattr__(_ACCESS_DEFAULT, "default_read", True)
+    object.__setattr__(_ACCESS_DEFAULT, "default_input", True)
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -85,6 +134,10 @@ def pytest_configure(config: pytest.Config) -> None:
     a regression to chase further."""
     import tempfile
     os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="terminal-mcp-test-state-")
+    config.addinivalue_line(
+        "markers",
+        "closed_access: run with session_access defaults CLOSED (the production posture) -- "
+        "for tests asserting that access is REFUSED without an explicit grant")
 
 
 def tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

@@ -596,6 +596,16 @@ def main(argv: list[str] | None = None) -> int:
     token = _read_token(args.token, args.token_file)
     config = load_config(args.config)
     terminal = TerminalService(config)
+    # Retired session-name whitelist -> real grants, same as the controller
+    # does at its own startup. Every node type runs this so a fleet cannot end
+    # up with one machine still honouring a whitelist the others dropped.
+    try:
+        _migration = terminal.migrate_whitelist_to_grants()
+        if _migration.get("read_granted") or _migration.get("input_granted") or _migration.get("errors"):
+            _log.info("session-access migration: read=%s input=%s errors=%s",
+                      _migration.get("read_granted"), _migration.get("input_granted"), _migration.get("errors"))
+    except Exception:  # noqa: BLE001 -- never block startup on a migration
+        _log.exception("session-access migration failed -- grants left unchanged")
     app = build_node_agent(node_id=args.node_id, terminal=terminal, token=token,
                            workspace_root=(config.session_lifecycle.allowed_cwd_roots[0]
                                           if config.session_lifecycle.allowed_cwd_roots else "/"))

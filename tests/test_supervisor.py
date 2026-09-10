@@ -4,14 +4,18 @@ import time
 
 import pytest
 
-from terminal_mcp.config import AppConfig, PermissionsConfig, SupervisorConfig
+from terminal_mcp.config import SessionAccessConfig, AppConfig, PermissionsConfig, SupervisorConfig
 from terminal_mcp.core import TerminalService
 from terminal_mcp.supervisor import SupervisorService, SupervisorStore, watch_key
 
 
 def _config(**overrides) -> AppConfig:
     supervisor = SupervisorConfig(**overrides)
-    return AppConfig(PermissionsConfig(True, False), ("test-*", "agent-*"), 50, 20, supervisor=supervisor)
+    # The supervisor's prerequisite is READABILITY, not a session name. These
+    # tests are about watch/poll/event behaviour, so reads are open by policy
+    # and the few tests that are about REFUSAL revoke a grant explicitly.
+    return AppConfig(PermissionsConfig(True, False), ("test-*", "agent-*"), 50, 20, supervisor=supervisor,
+                     session_access=SessionAccessConfig(default_read=True, default_input=False))
 
 
 def _service(tmp_path, **supervisor_overrides) -> SupervisorService:
@@ -81,11 +85,27 @@ def test_load_config_supervisor_disabled_by_default(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_watch_refuses_denied_session(tmp_path):
+def test_watch_refuses_a_session_the_user_has_revoked(tmp_path):
+    """Access is decided by what the user granted, not by the session's name.
+
+    This used to assert that a name simply absent from the whitelist was
+    refused. With the whitelist retired, "the user does not want this read"
+    is expressed the way the user actually expresses it -- an explicit grant
+    with read revoked -- and the supervisor must honour that, because a watch
+    it cannot read is a watch that can only ever report nothing.
+    """
     svc = _service(tmp_path)
+    svc.terminal.grants.set_read("private-not-allowed", False, granted_by="test")
     result = svc.watch(session="private-not-allowed")
     assert result["error"] == "ACCESS_DENIED"
     assert svc.list_watches()["watches"] == []
+
+
+def test_watch_refuses_a_sensitive_name_outright(tmp_path):
+    """The one name-based rule that survives: a sensitive-worded session is
+    refused with no grant and no default policy able to open it."""
+    svc = _service(tmp_path)
+    assert svc.watch(session="prod-database")["error"] == "ACCESS_DENIED"
 
 
 def test_watch_refuses_unknown_binding(tmp_path):
@@ -104,8 +124,10 @@ def test_watch_requires_exactly_one_target(tmp_path):
 def test_run_once_never_polls_a_denied_session_even_if_db_is_tampered(tmp_path):
     # Defense in depth: even if a watch row for a denied session existed
     # (should be impossible via watch()), _poll_one goes through
-    # terminal_status(), which re-checks the whitelist independently.
+    # terminal_status(), which re-checks authorization independently -- now
+    # against grants + default policy rather than the retired whitelist.
     svc = _service(tmp_path)
+    svc.terminal.grants.set_read("private-not-allowed", False, granted_by="test")
     svc.store.upsert_watch("session", "private-not-allowed", source="manual")
     result = svc._poll_one(svc.store.get_watch(watch_key("session", "private-not-allowed")))
     assert result["event_type"] == "watch_target_missing"

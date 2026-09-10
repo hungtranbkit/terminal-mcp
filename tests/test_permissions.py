@@ -1,3 +1,5 @@
+import pytest
+
 from terminal_mcp.config import AppConfig, PermissionsConfig
 from terminal_mcp.core import TerminalService
 from terminal_mcp.permissions import session_allowed
@@ -22,6 +24,7 @@ def test_input_disabled_by_default(read_config):
     assert service.terminal_send_keys("test-any", ["Enter"])["error"] == "INPUT_DISABLED"
 
 
+@pytest.mark.closed_access
 def test_key_allowlist_rejects_arbitrary_key():
     cfg = AppConfig(PermissionsConfig(True, True), ("test-*",), 50, 20)
     service = TerminalService(cfg)

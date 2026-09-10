@@ -4441,3 +4441,101 @@ Detection is a heuristic over pane text and is deliberately conservative
 composer). It was validated against real Claude output on a live Windows
 ConPTY session — both a 3-option menu with its selected line, and a composer
 holding real typed text.
+
+# 2026-09-10 Session whitelist REMOVED — grants are the source of truth
+
+## What changed
+
+The session-name whitelist (`allowed_session_patterns` /
+`input_policy.allowed_session_patterns`) **no longer authorizes anything**.
+Access to a session is decided by:
+
+1. an explicit user grant (`grants.db`), else
+2. `session_access.default_read` / `session_access.default_input`,
+
+with a small set of hard floors that survive unchanged (below).
+
+### Why
+
+Deciding access from a session's NAME produced a state operators reported as a
+bug: a row showing `allowed=false` beside `effective_read=true` /
+`effective_input=true`. Both fields were "correct" — `allowed` was the static
+whitelist result, `effective_*` was whitelist-OR-grant — but they look like
+they must agree, and every consumer had to know which one was the real gate.
+It also meant that granting access to one session required editing config.yaml
+and restarting the service, which is precisely what a per-session grant exists
+to avoid.
+
+### `allowed` is deprecated
+
+`allowed` is now an **alias of the real read authorization** in both
+`terminal_list_sessions` and `dashboard_list_sessions`, so it can never
+contradict `effective_read` again. Nothing in the runtime reads it to make a
+decision. Existing callers keep working; new ones should read
+`effective_read` / `effective_input`.
+
+## Config
+
+```yaml
+session_access:
+  default_read: false          # a session nobody has granted: content not readable
+  default_input: false         # ...and it accepts no input
+  migrate_whitelist_on_start: true
+```
+
+Defaults are CLOSED, deliberately: opening reads by default would be a weaker
+posture than the whitelist it replaces. Discovery is unaffected and always was
+— session name/size/activity are `tmux ls` metadata, never pane content.
+
+## Migration — nobody loses access
+
+`TerminalService.migrate_whitelist_to_grants()` runs at startup on **every**
+node type (controller, Linux node agent, Windows agent). For each session that
+exists right now and that the retired whitelist would have authorized, it
+writes a real grant. It is strictly additive and idempotent:
+
+* a session that already has a grant is left alone in either direction — a
+  user who deliberately REVOKED read on a still-whitelisted session does not
+  have it handed back;
+* only running sessions are converted, because an input grant pins the
+  session's current identity and there is nothing to pin for a name that is
+  not running;
+* nothing is ever revoked, and a failure never blocks startup.
+
+## Security boundaries that did NOT change
+
+Removing the whitelist is not open access. Still enforced:
+
+* account/webauth/Cloudflare Access on the dashboard, and node bearer tokens
+  between controller and node agents;
+* the **sensitive-name floor** — a session whose name contains `root`, `ssh`,
+  `password`, `secret` or `database` is refused regardless of any grant or
+  default policy. This is the one name-based rule kept, because it guards
+  against a careless default, not against a naming convention;
+* `input_policy.denied_session_patterns` — a config-level DENY list, which a
+  grant may not override;
+* the global `permissions.terminal_read` / `terminal_input` /
+  `allow_send_keys` switches;
+* input grants still pin session identity and re-validate it at send time, so
+  a session recreated under the same name never inherits input authorization.
+
+## Code paths updated
+
+`core.py` (`_read_authorized_with_grant`, `_input_authorized_with_grant`, both
+list builders, rename target check), `supervisor.py` (watch sync now asks the
+canonical gate — readability is the supervisor's real prerequisite, since it
+watches by capturing output), `dashboard.py` and `webauth_dashboard.py`
+(session detail / input / status-tail routing).
+
+`permissions.session_allowed` / `input_session_allowed` remain **only** as the
+migration's input and are documented as such. They must not be reintroduced
+into an enforcement path.
+
+## Known limitation at time of writing
+
+The controller and its local node are fully converted. **Remote node agents
+still run the previous build**, so rows they report continue to show the old
+`allowed=false` beside `effective_read=true`. Those nodes pick up the new
+semantics when their agent is redeployed; on `dell-5530` that redeploy is
+gated on the ConPTY session-loss constraint documented in
+CONTROLLER_RUNBOOK.md.

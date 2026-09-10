@@ -288,6 +288,17 @@ def main() -> None:
                       if config.session_lifecycle.allowed_cwd_roots else "/")
     registry = NodeRegistry(overload_thresholds=config.nodes.overload_thresholds,
                             heartbeat_thresholds=config.nodes.heartbeat_thresholds)
+    # Retired session-name whitelist -> real grants. Runs on EVERY node type
+    # (controller and node agent alike) so a fleet does not end up with one
+    # machine still honouring a whitelist the others have dropped. Additive,
+    # idempotent, and never fatal -- see migrate_whitelist_to_grants.
+    try:
+        _migration = terminal.migrate_whitelist_to_grants()
+        if _migration.get("read_granted") or _migration.get("input_granted") or _migration.get("errors"):
+            _log.info("session-access migration: read=%s input=%s errors=%s",
+                      _migration.get("read_granted"), _migration.get("input_granted"), _migration.get("errors"))
+    except Exception:  # noqa: BLE001 -- never block startup on a migration
+        _log.exception("session-access migration failed -- grants left unchanged")
     controller = ControllerService(registry, local_client=LocalNodeClient(terminal),
                                    local_workspace_root=workspace_root)
     register_remote_nodes(controller, config)

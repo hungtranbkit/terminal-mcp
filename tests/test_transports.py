@@ -34,15 +34,54 @@ def wait_for_port(host: str, port: int, timeout: float = 8) -> None:
     raise AssertionError(f"HTTP MCP did not listen on {host}:{port}")
 
 
+
+def _grants_db(tmp_dir, *, revoked=(), read_only=()) -> str:
+    """A grants store with read explicitly REVOKED for `sessions`.
+
+    The server under test runs in another process, so a revoke cannot be
+    issued through it mid-test. Denial used to come free from a name not
+    matching the whitelist; it is now user state, so the state is seeded.
+    """
+    import pathlib
+    from terminal_mcp.grants import SessionGrantStore
+    path = pathlib.Path(tmp_dir) / "grants.db"
+    store = SessionGrantStore(path)
+    for name in revoked:
+        store.set_read(name, False, granted_by="test-setup")
+    for name in read_only:
+        # read granted, input NOT: the gate requires BOTH on a grant, so this
+        # is how "readable but not sendable" is expressed now that the two
+        # name whitelists that used to encode it are gone.
+        store.set_read(name, True, granted_by="test-setup")
+    return str(path)
+
+def _config_with_open_access(tmp_dir, *, default_input: bool = False) -> str:
+    """The repo's own config.yaml, plus an explicit `session_access` block.
+
+    These tests launch a REAL server in a separate process, so the suite-wide
+    access default set in conftest cannot reach it -- that server loads this
+    file and gets the shipped production posture, which grants nothing. The
+    repo config is deliberately left alone (it is also a node's config), so
+    the override is written to a temp copy instead.
+    """
+    import pathlib
+    source = pathlib.Path(__file__).parents[1] / "config.yaml"
+    target = pathlib.Path(tmp_dir) / "config-open-access.yaml"
+    target.write_text(source.read_text()
+                      + "\n\nsession_access:\n  default_read: true\n  default_input: "
+                      + ("true" if default_input else "false") + "\n",
+                      encoding="utf-8")
+    return str(target)
 @pytest.fixture(scope="module")
 def http_server(tmp_path_factory):
     with socket.socket() as probe:
         probe.bind((HTTP_HOST, 0))
         port = probe.getsockname()[1]
     env = os.environ.copy()
-    env["TERMINAL_MCP_CONFIG"] = str(
-        __import__("pathlib").Path(__file__).parents[1] / "config.yaml"
-    )
+    env["TERMINAL_MCP_CONFIG"] = _config_with_open_access(
+        tmp_path_factory.mktemp("http-config"), default_input=True)
+    env["TERMINAL_MCP_GRANTS_DB"] = _grants_db(
+        tmp_path_factory.mktemp("http-grants"), revoked=("private-http",), read_only=("test-http-secure",))
     env["TERMINAL_MCP_BINDINGS_DB"] = str(tmp_path_factory.mktemp("http-bindings") / "bindings.db")
     env["TERMINAL_MCP_AUDIT_DB"] = str(tmp_path_factory.mktemp("http-audit") / "audit.db")
     launch = (
@@ -76,7 +115,7 @@ async def test_stdio_real_handshake_and_tools(tmp_path):
     params = StdioServerParameters(
         command=str(root / ".venv/bin/terminal-mcp"),
         cwd=str(root),
-        env={"TERMINAL_MCP_CONFIG": str(root / "config.yaml"),
+        env={"TERMINAL_MCP_CONFIG": _config_with_open_access(tmp_path),
              "TERMINAL_MCP_BINDINGS_DB": str(tmp_path / "bindings.db")},
     )
     async with stdio_client(params) as streams:
@@ -230,7 +269,8 @@ def test_real_server_http_main_wires_request_id_and_security_headers(tmp_path_fa
         port = probe.getsockname()[1]
     env = os.environ.copy()
     root = __import__("pathlib").Path(__file__).parents[1]
-    env["TERMINAL_MCP_CONFIG"] = str(root / "config.yaml")
+    env["TERMINAL_MCP_CONFIG"] = _config_with_open_access(
+        tmp_path_factory.mktemp("mainpath-config"), default_input=True)
     env["TERMINAL_MCP_BINDINGS_DB"] = str(tmp_path_factory.mktemp("mainpath-bindings") / "bindings.db")
     env["TERMINAL_MCP_AUDIT_DB"] = str(tmp_path_factory.mktemp("mainpath-audit") / "audit.db")
     env["TERMINAL_MCP_SUPERVISOR_DB"] = str(tmp_path_factory.mktemp("mainpath-supervisor") / "supervisor.db")

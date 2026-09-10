@@ -29,7 +29,7 @@ from .recovery_engine import RecoveryEngine
 from .integration_service import IntegrationService
 from .integration_store import IntegrationStore
 from .node_models import NODE_ONLINE, SESSION_BACKEND_TMUX, node_to_dict
-from .permissions import input_session_allowed, session_allowed, valid_session_name
+from .permissions import valid_session_name
 from .planner_service import PlannerService
 from .planner_store import PlannerStore
 from .pm_service import PMService
@@ -2218,14 +2218,14 @@ DASHBOARD_HTML = """<!doctype html>
 
     function detectRemoteComposer(outputText) {
       if (!outputText) return null;
-      const lines = outputText.replace(/\s+$/, '').split('\n');
+      const lines = outputText.replace(/\s+$/, '').split('\\n');
       const tail = lines.slice(-14);
       const menu = tail.filter(line => MENU_LINE_RE.test(line));
       if (menu.length >= 2) {
         const marked = tail.filter(line => MENU_LINE_RE.test(line) && SELECTED_LINE_RE.test(line));
         return {
           kind: marked.length ? 'menu lựa chọn (đang chọn dòng có ❯)' : 'menu lựa chọn',
-          text: menu.join('\n'),
+          text: menu.join('\\n'),
         };
       }
       // A composer/prompt line with something already typed into it.
@@ -7519,12 +7519,21 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # never reaches terminal_status/_granted at all: a clear,
         # explicit READ_RESTRICTED response, never a silent failure or a
         # generic 404 that could be mistaken for "session doesn't exist".
-        if not session_allowed(name, terminal.config) and not (
-            (grant := terminal.grants.get(name)) is not None and grant.read_enabled
-        ):
-            # Not authorized against the LOCAL whitelist/grants store --
-            # before giving up, check whether this bare name actually
-            # lives on a REMOTE node (task item 9: the real bug this
+        # The canonical read gate, not a re-derivation of it: grants plus
+        # the session_access default policy, with the sensitive-name floor.
+        # This used to be "whitelisted OR granted", which is precisely the
+        # split that let the list and the detail view disagree.
+        # Remote-first resolution. This branch used to be entered when the
+        # session was "not authorized locally", which worked only because an
+        # unlisted name was automatically unauthorized. With the whitelist
+        # retired and reads possibly open by default, that condition is no
+        # longer a proxy for "not here" -- a REMOTE session would authorize
+        # locally and then 404 against the local tmux. The real question was
+        # always whether the session exists on THIS node.
+        local_session = await anyio.to_thread.run_sync(terminal.tmux.get_session, name)
+        if local_session is None or not terminal._read_authorized(name):
+            # Not here (or not readable here) -- before giving up, check
+            # whether this bare name actually lives on a REMOTE node (task item 9: the real bug this
             # fixes -- a session like "window" on dell-5530 was correctly
             # LISTED by /dashboard/api/sessions (that route already merges
             # in fleet-wide rows) but this route only ever consulted the
@@ -7539,16 +7548,28 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 return await _remote_session_detail(resolution["node_id"], resolution["session"])
             if resolution.get("error") == "AMBIGUOUS_SESSION":
                 return JSONResponse(resolution, status_code=409, headers={"Cache-Control": "no-store"})
-            # Proactive, not just reactive: an operator opening a
-            # never-granted session sees up front whether input would ALSO
-            # be blocked by policy once read is granted, rather than only
-            # discovering it after a first click.
-            block_reason = await anyio.to_thread.run_sync(terminal._input_grant_block_reason, name)
-            return JSONResponse(
-                {"error": "READ_RESTRICTED", "session": name, "input_block_reason": block_reason},
-                status_code=403, headers={"Cache-Control": "no-store"},
-            )
-        use_granted = not session_allowed(name, terminal.config)
+            if terminal._read_authorized(name):
+                # Authorized here, just not present on any node -- fall
+                # through to the local path so this answers SESSION_NOT_FOUND
+                # (404) like it always has. Returning READ_RESTRICTED for a
+                # name that simply does not exist would report an access
+                # problem the caller does not have.
+                pass
+            else:
+                # Proactive, not just reactive: an operator opening a
+                # never-granted session sees up front whether input would ALSO
+                # be blocked by policy once read is granted, rather than only
+                # discovering it after a first click.
+                block_reason = await anyio.to_thread.run_sync(terminal._input_grant_block_reason, name)
+                return JSONResponse(
+                    {"error": "READ_RESTRICTED", "session": name, "input_block_reason": block_reason},
+                    status_code=403, headers={"Cache-Control": "no-store"},
+                )
+        # A grant carries a pinned identity the *_granted variants
+        # re-validate at use time; without one the plain variants apply the
+        # same default policy. Chosen by whether a grant EXISTS, never by
+        # whether the name matched a glob.
+        use_granted = terminal.grants.get(name) is not None
         status_fn = terminal.terminal_status_granted if use_granted else terminal.terminal_status
         tail_fn = (lambda: terminal.terminal_tail_granted(name, ansi=True)) if use_granted \
             else (lambda: terminal.terminal_tail(name, ansi=True))
@@ -7598,11 +7619,12 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # -- the dashboard only ever reveals its input composer when this
         # is true, never merely because read succeeded.
         grant = terminal.grants.get(name)
-        input_allowed = bool(
-            terminal.config.permissions.terminal_input
-            and (input_session_allowed(name, terminal.config) or (grant is not None and grant.input_enabled))
-        )
-        allowed = session_allowed(name, terminal.config)
+        input_ok, _input_reason = terminal._input_authorized_with_grant(name, grant)
+        input_allowed = bool(terminal.config.permissions.terminal_input and input_ok)
+        # DEPRECATED field, kept for existing callers -- now an alias of the
+        # real read authorization so it can never contradict input_allowed /
+        # the list's effective_read again.
+        allowed = terminal._read_authorized_with_grant(name, grant)
         body = {
             "session": name, "status": status, "tail": tail, "input_allowed": input_allowed,
             "allowed": allowed,
@@ -7653,7 +7675,11 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # pinned identity against the session's current tmux identity at
         # send time.
         grant = terminal.grants.get(name)
-        if grant is None and not input_session_allowed(name, terminal.config):
+        # Same correction as the detail route above: "does this session live
+        # on another node?" is a question about EXISTENCE here, not about
+        # local authorization -- which is no longer a proxy for it.
+        local_session = await anyio.to_thread.run_sync(terminal.tmux.get_session, name)
+        if local_session is None or (grant is None and not terminal._input_authorized(name)[0]):
             # No local grant and not locally input-whitelisted -- before
             # falling through to terminal_send_text's generic
             # ACCESS_DENIED, check whether this bare name actually lives
@@ -7677,7 +7703,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
             if resolution.get("error") == "AMBIGUOUS_SESSION":
                 return JSONResponse(resolution, status_code=409, headers={"Cache-Control": "no-store"})
-        use_granted = grant is not None and not input_session_allowed(name, terminal.config)
+        use_granted = grant is not None
         send_fn = terminal.terminal_send_text_granted if use_granted else terminal.terminal_send_text
         result = await anyio.to_thread.run_sync(
             lambda: send_fn(name, text, press_enter=press_enter, idempotency_key=idempotency_key)

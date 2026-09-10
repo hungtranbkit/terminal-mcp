@@ -26,7 +26,7 @@ import time
 
 from starlette.testclient import TestClient
 
-from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig
+from terminal_mcp.config import SessionAccessConfig, AppConfig, InputPolicyConfig, PermissionsConfig
 from terminal_mcp.core import TerminalService
 from terminal_mcp.dashboard import register_dashboard
 from terminal_mcp.mcp_app import build_mcp
@@ -37,6 +37,13 @@ def _config(*, terminal_input=True, allowed_sensitive_commands=()) -> AppConfig:
         PermissionsConfig(True, terminal_input), ("test-*", "agent-*"), 50, 20,
         InputPolicyConfig(allowed_session_patterns=("test-*",),
                           allowed_sensitive_commands=allowed_sensitive_commands),
+        # This file is about the GRANT mechanism itself -- "no access, then a
+        # user grants it, then they revoke it" -- so it models a deployment
+        # that has chosen CLOSED defaults. With open defaults there would be
+        # nothing for a read grant to widen. Both settings are supported
+        # configurations; the retired piece is deciding any of this from the
+        # session's NAME.
+        session_access=SessionAccessConfig(default_read=False, default_input=False),
     )
 
 
@@ -253,12 +260,17 @@ def test_input_grant_refused_when_global_terminal_input_is_disabled(tmp_path, tm
 # ---------------------------------------------------------------------------
 
 
-def test_grant_never_affects_a_different_whitelisted_session(tmp_path, tmux_session_factory):
+def test_grant_never_affects_a_different_granted_session(tmp_path, tmux_session_factory):
     granted_name = "newsession-isolated"
+    # Was "a whitelisted session"; with the whitelist retired the equivalent
+    # is simply a SECOND session the user has granted -- the property under
+    # test (one grant never leaks into another session) is unchanged.
     whitelisted = tmux_session_factory("test-still-normal", "bash -lc 'sleep 20'")
     tmux_session_factory(granted_name, "bash -lc 'sleep 20'")
     time.sleep(0.2)
     client, service = _client(_config(), grants_path=tmp_path / "grants.db")
+    service.grants.set_read(whitelisted, True, granted_by="test")
+    service.grant_session_input(whitelisted, True, granted_by="test")
 
     client.post("/dashboard/api/session/grant-read", json={"name": granted_name, "enabled": True})
     client.post("/dashboard/api/session/grant-input", json={"name": granted_name, "enabled": True})
@@ -268,7 +280,12 @@ def test_grant_never_affects_a_different_whitelisted_session(tmp_path, tmux_sess
     detail = client.get(f"/dashboard/api/session?name={whitelisted}")
     assert detail.status_code == 200
     assert detail.json()["input_allowed"] is True
-    assert service.grants.get(whitelisted) is None  # never touched
+    # The property under test is isolation: granting one session must not
+    # modify another's grant. It used to be expressed as "the other session
+    # has no grant at all", which only held because the whitelist was what
+    # authorized it. Now both are grant-backed, so compare the row itself.
+    assert service.grants.get(whitelisted).granted_by == "test"
+    assert service.grants.get(whitelisted).session == whitelisted
 
 
 def test_sensitive_named_session_can_never_be_granted(tmp_path, tmux_session_factory):
@@ -344,7 +361,10 @@ def test_dashboard_grant_widens_discovery_and_the_plain_mcp_tools_consistently(t
     assert sent.get("would_send") is True
 
     row_after = next(s for s in service.terminal_list_sessions()["sessions"] if s["name"] == session)
-    assert row_after["allowed"] is False  # static whitelist result itself never changes
+    # `allowed` is a deprecated ALIAS of the real read authorization now --
+    # it moves WITH the grant instead of reporting a whitelist that no
+    # longer exists. That agreement is the whole point of the change.
+    assert row_after["allowed"] == row_after["effective_read"]
     assert row_after["read_allowed"] is True
     assert row_after["read_granted"] is True
     assert row_after["input_allowed"] is True
@@ -399,7 +419,9 @@ def test_terminal_list_sessions_shows_a_promptflow_like_granted_session(tmp_path
     service.grant_session_input(session, True, granted_by="test-operator")
 
     row = next(r for r in service.terminal_list_sessions()["sessions"] if r["name"] == session)
-    assert row["allowed"] is False  # still not statically whitelisted
+    # `allowed` now tracks the real read authorization, so a granted
+    # session reports True here instead of contradicting itself.
+    assert row["allowed"] == row["effective_read"] is True
     assert row["read_allowed"] is True and row["read_granted"] is True
     assert row["input_allowed"] is True and row["input_granted"] is True
     assert "output" not in row and "last_output" not in row  # discovery, never content
@@ -490,6 +512,9 @@ def test_terminal_bind_accepts_a_granted_session_denies_an_ungranted_one(tmp_pat
 
     whitelisted = tmux_session_factory("test-bindable", "bash -lc 'sleep 20'")
     time.sleep(0.2)
+    # Bindability comes from a grant now, not from the name matching "test-*".
+    service.grant_session_read(whitelisted, True, granted_by="test")
+    service.grant_session_input(whitelisted, True, granted_by="test")
     bound = service.terminal_bind("still-works", whitelisted)
     assert "error" not in bound
     service.terminal_unbind("still-works")

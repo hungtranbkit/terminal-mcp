@@ -775,20 +775,34 @@ class TerminalService:
     # every call site below defers to them rather than re-deriving it.
 
     def _read_authorized_with_grant(self, session: str, grant: SessionGrant | None) -> bool:
-        """True iff the static read whitelist authorizes `session`, OR an
-        active grant's read_enabled does. `grant` is a parameter (rather
-        than looked up here) so a caller iterating many sessions (the list
-        endpoints) can pass in one bulk SessionGrantStore.list() fetch
-        instead of one query per session -- see _read_authorized below for
-        the single-session convenience wrapper every other call site uses.
-        Sensitive-worded names are refused even with a grant, as defense
-        in depth: grant_session_read already refuses to grant one in the
-        first place, so this should be unreachable, not a new hole."""
-        if session_allowed(session, self.config):
-            return True
+        """True iff an explicit grant authorizes reading `session`, or the
+        deployment's default access policy does.
+
+        The session-NAME whitelist is deliberately not consulted. It used to
+        be the first branch here, and it is what produced the contradictory
+        state this replaced: a session could report `allowed=false` (its name
+        matched no glob) while `effective_read` was true (a grant said so),
+        two fields that look like they must agree and did not. Access is now
+        decided by what a user actually granted, plus session_access defaults
+        -- never by whether someone happened to name a session "test-foo".
+
+        `grant` is a parameter (rather than looked up here) so a caller
+        iterating many sessions (the list endpoints) can pass in one bulk
+        SessionGrantStore.list() fetch instead of one query per session.
+
+        Sensitive-worded names are refused outright, grant or no grant, and
+        regardless of the default policy: that floor is the one name-based
+        rule that survives, because it protects against a session called
+        "root-shell" being opened up by a careless default, not against a
+        naming convention.
+        """
+        if not valid_session_name(session):
+            return False
         if any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS):
             return False
-        return bool(grant and grant.read_enabled)
+        if grant is not None:
+            return bool(grant.read_enabled)
+        return bool(self.config.session_access.default_read)
 
     def _read_authorized(self, session: str) -> bool:
         return self._read_authorized_with_grant(session, self.grants.get(session))
@@ -839,9 +853,19 @@ class TerminalService:
         literally zero extra cost, never a new tmux round-trip."""
         if session_input_denied_by_pattern(session, self.config):
             return False, None
-        if input_session_allowed(session, self.config):
-            return True, None
-        if not grant or not grant.read_enabled or not grant.input_enabled:
+        if not valid_session_name(session):
+            return False, None
+        if any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS):
+            return False, None
+        # No session-name whitelist branch here any more -- see
+        # _read_authorized_with_grant for why. An explicit grant decides;
+        # absent one, the deployment's default policy does. The identity
+        # re-validation below is deliberately reached ONLY through a real
+        # grant: a default-policy allowance has no pinned identity to
+        # compare against, so it cannot claim one.
+        if grant is None:
+            return bool(self.config.session_access.default_input), None
+        if not grant.read_enabled or not grant.input_enabled:
             return False, None
         current = current_identity
         if current is None:
@@ -1033,7 +1057,14 @@ class TerminalService:
                 item.name, grant, current_identity=SessionIdentity.from_session_info(item))
             input_allowed = bool(self.config.permissions.terminal_input and input_ok)
             row = {
-                "name": item.name, "allowed": session_allowed(item.name, self.config), "attached": item.attached,
+                # DEPRECATED FIELD. `allowed` used to be the session-name
+                # whitelist result, which is exactly how a row could report
+                # allowed=false next to effective_read=true and look broken.
+                # It is now an alias of the real read authorization, so the
+                # two can never disagree again. Read effective_read/
+                # effective_input; this stays only so existing callers keep
+                # working.
+                "name": item.name, "allowed": read_allowed, "attached": item.attached,
                 "windows": item.windows, "created": iso_timestamp(item.created_epoch),
                 "activity": iso_timestamp(item.activity_epoch),
                 "read_allowed": read_allowed, "read_granted": read_granted,
@@ -2517,7 +2548,9 @@ class TerminalService:
             grant = grants_by_session.get(item.name)
             grant_read = bool(grant and grant.read_enabled)
             grant_input = bool(grant and grant.input_enabled)
-            allowed = session_allowed(item.name, self.config)
+            # DEPRECATED -- alias of the real read authorization, never the
+            # name whitelist. See terminal_list_sessions for the full note.
+            allowed = self._read_authorized_with_grant(item.name, grant)
             input_ok, input_identity_reason = self._input_authorized_with_grant(
                 item.name, grant, current_identity=SessionIdentity.from_session_info(item))
             effective_input = bool(self.config.permissions.terminal_input and input_ok)
@@ -2653,6 +2686,69 @@ class TerminalService:
             and self._input_authorized_with_grant(session, grant)[0]
         )
         return {"exists": True, "input": input_enabled, "attached": info.attached}
+
+    def migrate_whitelist_to_grants(self) -> dict[str, Any]:
+        """One-time conversion of the retired session-name whitelist into real
+        grants, so upgrading does not silently revoke access.
+
+        The whitelist used to authorize by itself. Now only grants and the
+        session_access defaults do -- which means every session that was
+        readable ONLY because its name matched a glob would go dark on the
+        first restart after this change. That is the "không làm mất quyền
+        user đã setup" requirement, and it is why this runs at startup on
+        every node type (controller and node agent alike).
+
+        Strictly additive and idempotent:
+
+        * a session that already has a grant is left completely alone, in
+          either direction -- a user who deliberately REVOKED read on a
+          still-whitelisted session must not have it handed back;
+        * only sessions that actually exist right now are converted, because
+          an input grant pins the session's current identity and there is
+          nothing to pin for a name that is not running;
+        * nothing is ever revoked here.
+
+        Returns a summary for the caller to log. Never raises: a migration
+        failure must not stop the service from starting, it just leaves the
+        grants as they were.
+        """
+        summary: dict[str, Any] = {"read_granted": [], "input_granted": [], "skipped_existing": [], "errors": []}
+        if not self.config.session_access.migrate_whitelist_on_start:
+            summary["skipped"] = "disabled by session_access.migrate_whitelist_on_start"
+            return summary
+        patterns = tuple(self.config.allowed_session_patterns)
+        input_patterns = tuple(self.config.input_policy.allowed_session_patterns)
+        if not patterns and not input_patterns:
+            return summary
+        try:
+            items = self.tmux.list_sessions()
+        except TmuxError as exc:
+            summary["errors"].append(f"list_sessions failed: {exc}")
+            return summary
+        existing = {grant.session for grant in self.grants.list()}
+        for item in items:
+            name = item.name
+            if name in existing:
+                summary["skipped_existing"].append(name)
+                continue
+            wants_read = session_allowed(name, self.config)
+            wants_input = input_session_allowed(name, self.config) and not session_input_denied_by_pattern(
+                name, self.config)
+            if not wants_read and not wants_input:
+                continue
+            # Input implies read: the grant store refuses input without it.
+            result = self.grant_session_read(name, True, granted_by="whitelist-migration")
+            if "error" in result:
+                summary["errors"].append(f"{name}: read grant failed: {result['error']}")
+                continue
+            summary["read_granted"].append(name)
+            if wants_input:
+                result = self.grant_session_input(name, True, granted_by="whitelist-migration")
+                if "error" in result:
+                    summary["errors"].append(f"{name}: input grant failed: {result['error']}")
+                else:
+                    summary["input_granted"].append(name)
+        return summary
 
     def grant_session_read(self, session: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
         if (error := require_read(self.config)) is not None:
@@ -3232,12 +3328,16 @@ class TerminalService:
             # either -- symmetric with the check above.
             self.audit.record(action=action, session=name, result="BLOCKED", reason="TARGET_NAME_PROTECTED")
             return {"error": "TARGET_NAME_PROTECTED", "session": name, "new_name": new_name}
-        if not session_allowed(new_name, self.config):
-            # The new name must stay inside the SAME static whitelist
-            # every session name is already held to -- a rename must
-            # never be a back door out of allowed_session_patterns (e.g.
-            # into a SENSITIVE_SESSION_WORDS name without an exact
-            # whitelist entry).
+        if (not valid_session_name(new_name)
+                or any(word in new_name.casefold() for word in SENSITIVE_SESSION_WORDS)):
+            # The name whitelist is gone, but the reason THIS check existed
+            # is not: a rename must never be a back door into a
+            # SENSITIVE_SESSION_WORDS name ("prod-database", "ssh-tunnel"),
+            # which _read_authorized_with_grant refuses outright and which no
+            # grant or default policy can open. Renaming into one would
+            # otherwise strand the session as permanently unreadable, or --
+            # worse, if that floor ever regressed -- quietly relabel a
+            # granted session as a sensitive one.
             self.audit.record(action=action, session=name, result="BLOCKED", reason="TARGET_NAME_NOT_ALLOWED")
             return {"error": "TARGET_NAME_NOT_ALLOWED", "session": name, "new_name": new_name}
         try:
