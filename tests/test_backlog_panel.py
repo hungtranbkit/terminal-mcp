@@ -15,6 +15,8 @@ import shutil
 import subprocess
 
 import pytest
+
+from tests.conftest import find_node
 from starlette.testclient import TestClient
 
 from terminal_mcp.backlog_service import BacklogService
@@ -246,7 +248,7 @@ def test_every_dashboard_template_script_parses(tmp_path, name):
     template, not just the one that was broken -- the mistake is a
     property of embedding JS in a non-raw Python string, so any of them
     could acquire it."""
-    node = shutil.which("node")
+    node = find_node()
     if node is None:
         pytest.skip("node not installed on this host")
     import terminal_mcp.dashboard as dashboard_module

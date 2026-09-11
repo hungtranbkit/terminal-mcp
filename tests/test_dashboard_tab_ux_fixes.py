@@ -43,6 +43,7 @@ import tempfile
 from pathlib import Path
 
 from terminal_mcp.dashboard import DASHBOARD_HTML, SESSIONS_ADMIN_HTML
+from tests.conftest import find_node
 
 
 # -- Item 1: reachable node/host selector ------------------------------------
@@ -255,7 +256,7 @@ def test_no_duplicate_element_ids_for_the_relocated_killed_menu():
 
 
 def test_syntax_of_the_full_tab_bar_script_block(tmp_path):
-    node = shutil.which("node")
+    node = find_node()
     if node is None:
         import pytest
         pytest.skip("node not available -- structural assertions above still ran")

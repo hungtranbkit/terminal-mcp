@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+from pathlib import Path
 import time
 
 import pytest
@@ -138,6 +140,28 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "closed_access: run with session_access defaults CLOSED (the production posture) -- "
         "for tests asserting that access is REFUSED without an explicit grant")
+
+
+def find_node() -> str | None:
+    """Path to a JS engine, PATH or not.
+
+    The dashboard's inline scripts are only ever parsed by these tests, and
+    on this fleet node is installed through nvm -- which puts it on PATH via
+    a shell function in an interactive profile, so `shutil.which("node")`
+    finds nothing under pytest. The result was 23 tests reporting "node not
+    installed on this host" and skipping, on a host that has node 24, for as
+    long as the suite has existed. Those are exactly the tests that would
+    have caught the `.split('\n')` syntax error that shipped a dead
+    dashboard panel, so a silent skip here is expensive.
+    """
+    found = shutil.which("node") or shutil.which("nodejs")
+    if found:
+        return found
+    candidates = sorted(Path.home().glob(".nvm/versions/node/*/bin/node"), reverse=True)
+    for candidate in candidates:
+        if os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
 
 
 def tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

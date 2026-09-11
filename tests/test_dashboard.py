@@ -12,6 +12,8 @@ from pathlib import Path
 from dataclasses import replace
 
 import pytest
+
+from tests.conftest import find_node
 from starlette.testclient import TestClient
 
 from terminal_mcp import dashboard as dashboard_module
@@ -1192,7 +1194,7 @@ def test_dashboard_ansi_renderer_strips_osc_sequences():
     # dropped like every other non-SGR sequence already is.
     assert "const OSC_RE = " in DASHBOARD_HTML
     assert "text = text.replace(OSC_RE, '');" in DASHBOARD_HTML
-    node = shutil.which("node")
+    node = find_node()
     if not node:
         pytest.skip("node not available -- semantic regex check skipped, source-level assertions above still ran")
     # Extract just the self-contained SGR/OSC parsing logic (CSI_RE, OSC_RE,
@@ -1244,7 +1246,7 @@ def test_dashboard_ansi_renderer_consumes_dec_private_mode_and_full_csi_grammar(
     # '?' parameter byte that class never matched at all), plus real
     # cursor-movement/erase sequences a live TUI redraw emits. Broadened
     # to the full ECMA-48 CSI grammar (see CSI_RE's own comment).
-    node = shutil.which("node")
+    node = find_node()
     if not node:
         pytest.skip("node not available -- semantic regex check skipped")
     start = DASHBOARD_HTML.index("const CSI_RE = ")
