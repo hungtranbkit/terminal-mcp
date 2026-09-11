@@ -70,6 +70,7 @@ class NodeClient(Protocol):
     def grant_input(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]: ...
     def health(self) -> dict[str, Any]: ...
     def metrics(self) -> dict[str, Any]: ...
+    def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]: ...
     def refresh_capabilities(self) -> dict[str, Any]: ...
     def knowledge_search(self, query: str, *, session_name: str | None = None, project: str | None = None,
                          since: str | None = None, until: str | None = None, limit: int = 20) -> dict[str, Any]: ...
@@ -183,6 +184,10 @@ class LocalNodeClient:
         collected = host_metrics.collect(workspace_path=str(self._terminal.config.session_lifecycle.allowed_cwd_roots[0])
                                          if self._terminal.config.session_lifecycle.allowed_cwd_roots else "/")
         return collected.__dict__
+
+    def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]:
+        from . import node_profile
+        return node_profile.inventory(tuple(roles))
 
     def refresh_capabilities(self) -> dict[str, Any]:
         from .agent_availability import available_agent_types
@@ -356,6 +361,9 @@ class RemoteNodeClient:
 
     def metrics(self) -> dict[str, Any]:
         return self._request("GET", "/v1/metrics")
+
+    def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]:
+        return self._request("GET", "/v1/environment?roles=" + ",".join(roles))
 
     def refresh_capabilities(self) -> dict[str, Any]:
         return self._request("POST", "/v1/capabilities/refresh")

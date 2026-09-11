@@ -952,6 +952,29 @@ def build_mcp(service: TerminalService | None = None,
         return [_node_to_dict(n) for n in controller.list_nodes()]
 
     @server.tool()
+    def terminal_fleet_environment(roles: str = "node") -> dict:
+        """Audit every node's ENVIRONMENT in one call: tools, services and
+        auth readiness against deploy/node-profile.yaml.
+
+        Answers "if this controller went away, which node could actually take
+        over?" -- a question source-code convergence cannot answer, because a
+        node on the right commit is still useless without a Claude login, tmux
+        or Tailscale. Each node reports PASS/MISSING/DRIFT/NEEDS_AUTH per
+        requirement plus the one-time command to fix it.
+
+        Auth is reported as STATUS ONLY. No credential is read, printed or
+        transmitted, and nothing here can be replayed as one. `roles` is a
+        comma-separated list (node, controller).
+
+        A node that cannot answer -- offline, or running a build older than
+        this audit -- is reported as unavailable with the reason, never as
+        passing. `failover_ready_count` is the number that matters: how many
+        nodes could carry the fleet right now.
+        """
+        _refresh_local_heartbeat()
+        return controller.fleet_environment(tuple(filter(None, roles.split(","))))
+
+    @server.tool()
     def terminal_node_status(node_id: str) -> dict:
         """Detail for one node_id (from terminal_list_nodes) --
         NODE_NOT_FOUND if it was never registered."""

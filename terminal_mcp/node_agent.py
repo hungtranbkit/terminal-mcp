@@ -50,6 +50,7 @@ from . import __version__, host_metrics
 from .agent_availability import available_agent_types
 from .capability_probe import probe_capabilities
 from .contract import describe as contract_describe
+from . import node_profile
 from .launcher_resolution import resolve_launcher
 from .config import load_config
 from .core import TerminalService
@@ -154,6 +155,23 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
             return blocked
         result = await anyio.to_thread.run_sync(lambda: client.metrics())
         return JSONResponse(result)
+
+    async def environment(request: Request) -> JSONResponse:
+        """This node's audit against deploy/node-profile.yaml.
+
+        Lets a controller ask the whole fleet "who is missing what?" in one
+        pass instead of someone logging into each machine and finding out at
+        failover time. Carries statuses and remediation commands only --
+        never credential contents, by construction (see node_profile).
+        """
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        roles = tuple(filter(None, (request.query_params.get("roles") or "node").split(",")))
+        try:
+            result = await anyio.to_thread.run_sync(lambda: node_profile.inventory(roles))
+        except node_profile.ProfileError as exc:
+            return JSONResponse({"error": "PROFILE_UNAVAILABLE", "detail": str(exc)}, status_code=503)
+        return JSONResponse({"node_id": node_id, **result})
 
     async def refresh_capabilities(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
@@ -482,6 +500,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
     routes = [
         Route("/v1/health", health, methods=["GET"]),
         Route("/v1/metrics", metrics, methods=["GET"]),
+        Route("/v1/environment", environment, methods=["GET"]),
         Route("/v1/capabilities/refresh", refresh_capabilities, methods=["POST"]),
         Route("/v1/sessions", list_sessions, methods=["GET"]),
         Route("/v1/sessions", create_session, methods=["POST"]),

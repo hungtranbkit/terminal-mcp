@@ -135,6 +135,55 @@ class ControllerService:
                                        contract_version=contract_version,
                                        contract_capabilities=contract_capabilities)
 
+    def fleet_environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]:
+        """Ask every node what it is missing, in one pass.
+
+        The point is to stop discovering at failover time that a surviving
+        node has no Claude login or no Tailscale. A node that cannot answer is
+        reported as UNAVAILABLE with the reason -- never as passing, and never
+        as a hard error that hides the nodes that DID answer. A node running a
+        build older than the environment audit is exactly that case, and says
+        so, which is itself the signal that it needs converging.
+        """
+        report: list[dict[str, Any]] = []
+        for node in self.registry.list():
+            entry: dict[str, Any] = {"node_id": node.id, "status": node.status,
+                                     "contract_version": node.contract_version}
+            client = self._clients.get(node.id)
+            if client is None:
+                entry.update({"environment": None, "failover_ready": False,
+                              "detail": "no client configured for this node"})
+                report.append(entry)
+                continue
+            try:
+                result = client.environment(roles)
+            except Exception as exc:  # noqa: BLE001 -- one unreachable node must not hide the rest
+                entry.update({"environment": None, "failover_ready": False,
+                              "detail": f"environment audit unavailable: {type(exc).__name__}: {exc}"})
+                report.append(entry)
+                continue
+            if not isinstance(result, dict) or "checks" not in result:
+                entry.update({"environment": None, "failover_ready": False,
+                              "detail": "node did not return an environment audit "
+                                        "(it predates this build -- converge it first)"})
+                report.append(entry)
+                continue
+            entry.update({"environment": result,
+                          "failover_ready": bool(result.get("failover_ready")),
+                          "missing_failover_auth": result.get("missing_failover_auth", []),
+                          "blocking": result.get("blocking", []),
+                          "profile_fingerprint": result.get("profile_fingerprint")})
+            report.append(entry)
+
+        ready = [e["node_id"] for e in report if e["failover_ready"]]
+        return {
+            "nodes": report,
+            "failover_ready_nodes": ready,
+            # The number the M910-off gate actually turns on: how many nodes
+            # could carry the fleet if this controller went away.
+            "failover_ready_count": len(ready),
+        }
+
     def refresh_node_capabilities(self, node_id: str) -> dict[str, Any]:
         """Ask one node to re-probe launchers and update only capabilities.
 

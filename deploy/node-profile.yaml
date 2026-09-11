@@ -1,0 +1,253 @@
+# Declarative environment profile for a Terminal MCP node.
+#
+# WHY THIS EXISTS
+# ---------------
+# Converging source code is not enough. A node can run the exact same commit
+# and still be useless for failover because it has no Claude login, no tmux, or
+# no Tailscale. That failure is invisible until you actually need the node --
+# which is the worst possible moment to discover it.
+#
+# This file is the machine-readable answer to "what does a node need to be
+# able to take over?", checked by `terminal-mcp-node-doctor` and reported per
+# node so the whole fleet can be asked once instead of logging into each box.
+#
+# NO SECRETS. Ever. Auth entries below describe how to CHECK that a credential
+# is present and usable; the credential itself never leaves the machine it was
+# created on, and nothing here is copied between nodes. A node that is missing
+# an auth reports NEEDS_AUTH with the exact one-time command to fix it.
+#
+# Versioning: `profile_version` is bumped when a requirement changes in a way
+# that should make an already-passing node re-check itself. `schema_version`
+# is bumped only when the SHAPE of this file changes, which is what a loader
+# refuses to guess at.
+
+schema_version: 1
+profile_version: 1
+
+# ---------------------------------------------------------------------------
+# Roles. A machine may hold several: M910 is controller+node today, HP is
+# becoming the same. Requirements are the union of the roles a node holds.
+# ---------------------------------------------------------------------------
+roles:
+
+  node:
+    description: >-
+      Runs terminal-node-agent: owns local sessions, serves the /v1 API, and
+      keeps working when the controller is unreachable.
+    tools:
+      - name: python
+        binary: python3
+        version_command: ["python3", "--version"]
+        min_version: "3.11"
+        required: true
+      - name: git
+        binary: git
+        version_command: ["git", "--version"]
+        required: true
+      - name: tmux
+        binary: tmux
+        version_command: ["tmux", "-V"]
+        required: true
+        os: [linux, darwin]          # Windows uses ConPTY, not tmux
+      - name: tailscale
+        binary: tailscale
+        version_command: ["tailscale", "version"]
+        required: true
+        note: >-
+          The overlay is how a node stays reachable when the LAN or the
+          controller is gone. Without it a surviving node is unreachable,
+          which is survival in name only.
+      - name: claude
+        binary: claude
+        version_command: ["claude", "--version"]
+        required: false
+        note: Required only if this node should run Claude agent sessions.
+      - name: codex
+        binary: codex
+        version_command: ["codex", "--version"]
+        required: false
+    services:
+      - name: terminal-node-agent
+        kind: systemd-user
+        os: [linux]
+        must_be: enabled           # enabled, so it returns after a reboot
+        # A controller serves its OWN machine as the `local` node in-process,
+        # so running a node agent beside it would make the controller register
+        # itself as one of its own remote nodes. docs/CONTROLLER_RUNBOOK.md
+        # calls that out; the agent is deliberately disabled on such a host.
+        unless_roles: [controller]
+      - name: com.terminal-mcp.node-agent
+        kind: launchd
+        os: [darwin]
+        must_be: loaded
+      - name: TerminalMcpNodeAgent
+        kind: windows-scheduled-task
+        os: [windows]
+        must_be: ready
+    ports:
+      - port: 8790
+        bind: overlay              # tailnet address, not loopback
+        description: node agent /v1 API
+
+  controller:
+    description: >-
+      Runs terminal-mcp-http: MCP surface, dashboard, cross-node routing and
+      the recovery loop. A fleet needs at least two of these to survive losing
+      one machine.
+    tools:
+      - name: python
+        binary: python3
+        version_command: ["python3", "--version"]
+        min_version: "3.11"
+        required: true
+      - name: git
+        binary: git
+        version_command: ["git", "--version"]
+        required: true
+    services:
+      - name: terminal-mcp-http
+        kind: systemd-user
+        os: [linux]
+        must_be: enabled
+    ports:
+      - port: 8766
+        bind: overlay
+        description: >-
+          MCP + dashboard. MUST be reachable on the overlay, not loopback --
+          a controller bound to 127.0.0.1 survives a failover without being
+          able to serve one.
+    optional_tools:
+      - name: cloudflared
+        binary: cloudflared
+        required: false
+        note: Only if this controller terminates a public tunnel.
+
+# ---------------------------------------------------------------------------
+# Auth capabilities.
+#
+# Every probe here is EXISTENCE- or STATUS-only. None of them reads, prints,
+# transmits or compares credential material, and none is ever copied between
+# machines. A missing credential produces an actionable one-time command that
+# a human runs ON that machine -- usually a device/browser flow that cannot be
+# copied anyway.
+# ---------------------------------------------------------------------------
+auth:
+  - id: claude_auth
+    provider: anthropic
+    description: Claude CLI is logged in and can start agent sessions.
+    probe:
+      kind: file_exists
+      # Presence only. The file is never opened.
+      paths:
+        - "~/.claude/.credentials.json"
+        - "~/.config/claude/.credentials.json"
+    setup_command: "claude   # then complete the login prompt"
+    expiry: unknown
+
+  - id: codex_auth
+    provider: openai
+    description: Codex CLI is logged in.
+    probe:
+      kind: file_exists
+      paths:
+        - "~/.codex/auth.json"
+    setup_command: "codex login"
+    expiry: unknown
+
+  - id: tailscale_auth
+    provider: tailscale
+    description: Node is joined to the tailnet and the backend is running.
+    probe:
+      kind: command_json
+      command: ["tailscale", "status", "--json"]
+      # Read one non-secret field; the auth key itself is never surfaced.
+      ready_when: {field: "BackendState", equals: "Running"}
+    setup_command: "sudo tailscale up"
+
+  - id: github_auth
+    provider: github
+    description: Can push/pull to GitHub.
+    probe:
+      kind: any_of
+      probes:
+        - {kind: command_ok, command: ["gh", "auth", "status"]}
+        - {kind: file_exists, paths: ["~/.ssh/id_ed25519", "~/.ssh/id_rsa"]}
+        - {kind: file_exists, paths: ["~/.git-credentials"]}
+    setup_command: "gh auth login   # or install a deploy key"
+
+  - id: cloudflare_auth
+    provider: cloudflare
+    description: cloudflared has an account certificate for named tunnels.
+    probe:
+      kind: any_of
+      probes:
+        # cert.pem authorises CREATING tunnels; a node that only RUNS an
+        # already-created one needs just its credentials file. Requiring the
+        # cert would report a working tunnel host as unauthenticated.
+        - {kind: file_exists, paths: ["~/.cloudflared/cert.pem"]}
+        - {kind: glob_exists, patterns: ["~/.cloudflared/*.json"]}
+    setup_command: "cloudflared tunnel login"
+
+  - id: ssh_inbound
+    provider: openssh
+    description: >-
+      This node can be administered over SSH from a peer. Without it a node
+      can be read but never repaired, which is what made hp-linux unauditable.
+    probe:
+      kind: file_exists
+      paths:
+        - "~/.ssh/authorized_keys"
+    setup_command: "install the controller's public key into ~/.ssh/authorized_keys"
+
+# ---------------------------------------------------------------------------
+# The set that actually decides whether a node can carry the fleet.
+#
+# This is the distinction that matters: a missing GitHub push credential is
+# annoying, but it must never be allowed to read as "this node cannot take
+# over". Only the entries below block failover.
+# ---------------------------------------------------------------------------
+minimum_failover_auth_set:
+  node:
+    - tailscale_auth      # otherwise the survivor is unreachable
+    - claude_auth         # otherwise agent sessions cannot continue
+  controller:
+    - tailscale_auth
+    - claude_auth
+  # Deliberately NOT here, and why:
+  #   github_auth     -- needed to PUSH code, never to keep a session alive.
+  #   cloudflare_auth -- only for public tunnels; internal failover is
+  #                      overlay-only by design.
+  #   codex_auth      -- only if this node runs Codex sessions specifically.
+  advisory:
+    - github_auth
+    - codex_auth
+    - cloudflare_auth
+    - ssh_inbound
+
+# ---------------------------------------------------------------------------
+# What replicates between nodes and what must never leave one.
+# ---------------------------------------------------------------------------
+state_ownership:
+  replicated:
+    description: >-
+      Non-secret desired state a takeover node needs to be useful. Owned by
+      the node the session lives on; other nodes hold a read cache.
+    stores:
+      - session_registry.db   # desired_state, stable ids, tombstones, recovery
+      - grants.db             # user-granted read/input
+      - bindings.db
+      - backlog.db
+      - queue.db
+  local_only:
+    description: >-
+      Never replicated, never copied, never included in a bundle or backup
+      that leaves the machine.
+    stores:
+      - node-agent-tokens.env
+      - "~/.claude/.credentials.json"
+      - "~/.codex/auth.json"
+      - "~/.cloudflared/*.json"
+      - "~/.cloudflared/cert.pem"
+      - "~/.ssh/*"
+      - leases.db             # process-local, meaningless on another host
+      - audit.db              # per-host record, not a shared truth
