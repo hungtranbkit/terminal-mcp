@@ -11,14 +11,69 @@ Audited 2026-09-11. Controller at `37ffbbb`.
 
 ## Gate criteria
 
+The gate now requires **two independent remote self-host control planes**, and
+every takeover node meeting its `minimum_failover_auth_set`. One surviving
+control plane is not redundancy; it is the same single point of failure moved
+to a different machine.
+
 | # | Criterion | State |
 | --- | --- | --- |
+| 0 | ≥2 remote control planes, independent and autostarting | ❌ **FAIL** — HP has one; Dell's is installed but disabled |
+| 0b | Every takeover node meets `minimum_failover_auth_set` | ❌ **UNVERIFIED** — 4 of 5 nodes cannot answer the audit yet |
 | a | HP + Dell have an independent, healthy, **autostarting** control plane | ⚠️ **PARTIAL** — HP: yes (active+enabled+linger). Dell: installed but disabled |
 | b | Cluster still queries/routes with M910 absent | ❌ **FAIL** — no federation; routing is M910-only |
 | c | Windows/Mac workloads survive M910 and keep an alternate control path | ⚠️ **PARTIAL** — they survive; Windows has no alternate path at all |
 | d | Recovery / grants / bindings / tombstones correct | ✅ **PASS** |
 | e | Reconnect does not duplicate | ✅ **PASS** |
 | f | Cold-boot acceptance on two alternate control planes | ❌ **NOT DONE** — needs a maintenance window |
+
+## Environment convergence — the gap source-code convergence hid
+
+Converging commits is not enough: a node on the right commit is still useless
+at failover without a Claude login, tmux or Tailscale. `deploy/node-profile.yaml`
+declares what each role needs; `terminal-mcp-node-doctor` audits a machine
+against it; `terminal_fleet_environment` asks the whole fleet at once.
+
+    terminal-mcp-node-doctor --role node --role controller
+    # MCP: terminal_fleet_environment(roles="node,controller")
+
+Live, right now:
+
+    failover_ready_count: 1   (and that node is M910 itself)
+
+    local        ready=True   v1
+    hp-linux     ready=False  v0   environment audit unavailable (build predates it)
+    dell-linux   ready=False  v0   environment audit unavailable
+    dell-5530    ready=False  v0   environment audit unavailable
+    macbook      ready=False  v0   environment audit unavailable
+
+The four remote nodes are not *failing* the audit — they cannot yet *take* it.
+That is reported as unavailable with the reason, never as passing, and it is
+itself the signal that they need converging first.
+
+M910's own audit, as an example of what the others will produce:
+
+| Requirement | Status |
+| --- | --- |
+| python, git, tmux, tailscale, claude, cloudflared | PASS |
+| terminal-mcp-http service | PASS (enabled) |
+| claude_auth, tailscale_auth | PASS — **the failover-critical pair** |
+| cloudflare_auth, ssh_inbound | PASS |
+| codex, codex_auth | MISSING / NEEDS_AUTH (advisory) |
+| github_auth | NEEDS_AUTH (advisory) |
+
+`github_auth` being absent is exactly why the 19 commits here cannot be pushed
+— and it correctly does **not** make this node unfit to carry the fleet. That
+separation is the point of `minimum_failover_auth_set`.
+
+### Secrets are never synchronised
+
+No credential is copied between machines by any of this. Every auth probe is
+existence- or status-only; a gap produces a one-time command a human runs on
+that machine, usually a device/browser flow that could not be copied anyway.
+`state_ownership` in the profile records what replicates (desired state,
+grants, bindings, project/task metadata) and what is local-only (node tokens,
+CLI credentials, SSH keys, leases, audit).
 
 ## What is proven
 
