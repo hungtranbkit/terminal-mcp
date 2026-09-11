@@ -375,3 +375,54 @@ def test_soft_reconnect_is_tried_before_the_attempt_budget_is_spent(registry, co
     registry.mark_missing("n1", set())
     controller.live_sessions = {}
     assert "error" not in engine.recover_session("n1", "flappy")
+
+
+# -- staleness: a long-dead record is not today's problem -------------------
+
+def _age_record(registry, node_id, name, seconds):
+    """Backdate last_seen_at so the record looks that old."""
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+    when = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+    with sqlite3.connect(registry.path) as conn:
+        conn.execute("UPDATE session_records SET last_seen_at = ? WHERE node_id = ? AND session_name = ?",
+                     (when, node_id, name))
+
+
+def test_a_long_dead_record_is_not_auto_resurrected(registry, controller, lease_store):
+    """Measured on the real deployment before this bound existed: 207 MISSING
+    records, 136 of them "recoverable" -- almost all disposable test sessions
+    that ended normally weeks earlier. Turning auto-recovery on would have
+    spawned 136 real processes."""
+    _make_missing_record(registry, node_id="n1", name="ancient")
+    _age_record(registry, "n1", "ancient", 10 * 86400)
+    engine = _engine(registry, controller, lease_store,
+                     AutoRecoveryConfig(enabled=True, max_missing_age_seconds=86400))
+
+    result = engine.recover_session("n1", "ancient")
+    assert result["error"] == "RECOVERY_STALE"
+    assert controller.reopen_calls == []
+
+
+def test_a_recently_lost_record_is_still_recovered(registry, controller, lease_store):
+    _make_missing_record(registry, node_id="n1", name="fresh")
+    engine = _engine(registry, controller, lease_store,
+                     AutoRecoveryConfig(enabled=True, max_missing_age_seconds=86400))
+    assert "error" not in engine.recover_session("n1", "fresh")
+    assert len(controller.reopen_calls) == 1
+
+
+def test_a_human_can_still_force_an_old_session_back(registry, controller, lease_store):
+    _make_missing_record(registry, node_id="n1", name="ancient")
+    _age_record(registry, "n1", "ancient", 10 * 86400)
+    engine = _engine(registry, controller, lease_store,
+                     AutoRecoveryConfig(enabled=True, max_missing_age_seconds=86400))
+    assert "error" not in engine.recover_session("n1", "ancient", force=True)
+
+
+def test_zero_disables_the_staleness_bound(registry, controller, lease_store):
+    _make_missing_record(registry, node_id="n1", name="ancient")
+    _age_record(registry, "n1", "ancient", 10 * 86400)
+    engine = _engine(registry, controller, lease_store,
+                     AutoRecoveryConfig(enabled=True, max_missing_age_seconds=0))
+    assert "error" not in engine.recover_session("n1", "ancient")

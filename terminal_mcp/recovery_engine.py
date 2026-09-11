@@ -58,6 +58,8 @@ attempt, independent of the lock (survives a lock TTL expiry/crash
 mid-attempt without ever being confused with an earlier attempt)."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import logging
 import uuid
 from typing import Any
@@ -110,6 +112,34 @@ class RecoveryEngine:
         if self.config.enabled:
             return True, None
         return False, "auto_recovery.enabled is False globally, and this session has no per-session override"
+
+    def _staleness_reason(self, record) -> str | None:
+        """Why this record is too old to resurrect automatically, or None.
+
+        This registry keeps a row for every session that ever existed,
+        including disposable ones from test runs that ended normally, so
+        "MISSING and metadata_complete" is not on its own a reason to spawn a
+        process today. Age runs from last_seen_at -- when the session was last
+        observed ALIVE. An unparseable timestamp is treated as NOT stale:
+        refusing recovery on a formatting problem would be the worse failure.
+        """
+        limit = self.config.max_missing_age_seconds
+        if not limit:
+            return None
+        last_seen = getattr(record, "last_seen_at", None)
+        if not last_seen:
+            return None
+        try:
+            seen_at = datetime.fromisoformat(last_seen)
+        except (TypeError, ValueError):
+            return None
+        if seen_at.tzinfo is None:
+            seen_at = seen_at.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - seen_at).total_seconds()
+        if age <= limit:
+            return None
+        return (f"last seen alive {int(age)}s ago, beyond auto_recovery."
+                f"max_missing_age_seconds={int(limit)} -- reopen it explicitly if it is still wanted")
 
     def _live_sessions_on(self, node_id: str) -> set[str] | None:
         """Names currently LIVE on `node_id`, or None if that can't be known.
@@ -200,6 +230,12 @@ class RecoveryEngine:
                     "recovery_state": RECOVERY_STATE_RECONNECTED,
                     "detail": "runtime session still alive; registry reconciled without a respawn"}
         if not force:
+            stale_reason = self._staleness_reason(record)
+            if stale_reason is not None:
+                self.registry.set_recovery_state(node_id, session_name, RECOVERY_STATE_BLOCKED,
+                                                 detail=stale_reason)
+                return {"error": "RECOVERY_STALE", "node_id": node_id, "session": session_name,
+                        "reason": stale_reason}
             allowed, reason = self._recovery_allowed(record)
             if not allowed:
                 self.registry.set_recovery_state(node_id, session_name, RECOVERY_STATE_BLOCKED, detail=reason)

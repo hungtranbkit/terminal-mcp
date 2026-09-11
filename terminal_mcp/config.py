@@ -160,6 +160,27 @@ class AutoRecoveryConfig:
     is only the safety-net poll for whatever that misses (e.g. a node
     that was already online when this loop started)."""
     enabled: bool = False
+    # Staleness bound. A session that went MISSING long ago is not something
+    # today's reconcile pass should resurrect: this registry accumulates a row
+    # for every session that ever existed, including disposable ones from test
+    # runs that ended normally. Measured live on this deployment before this
+    # existed: 207 MISSING records, 136 of them "recoverable" -- enabling
+    # auto-recovery globally would have spawned 136 real processes, nearly all
+    # of them long-dead test sessions.
+    #
+    # Age is measured from last_seen_at (when the session was last observed
+    # ALIVE). 0 disables the bound. An explicit human force=True always
+    # bypasses it -- reopening something old on purpose stays possible.
+    #
+    # One hour, not a day: a node coming back from a reboot rejoins within
+    # minutes, so anything a legitimate recovery needs to catch is very
+    # recent. Measured against this deployment's real registry, the two
+    # windows are worlds apart -- a 24h bound left 135 of 136 "recoverable"
+    # records eligible, a 1h bound leaves 2, and the age histogram has an
+    # actual gap there (nothing between ~8 minutes and ~10 hours). The long
+    # tail is disposable test sessions that ended normally and must never be
+    # resurrected.
+    max_missing_age_seconds: float = 3600.0
     max_attempts: int = 3
     lock_ttl_seconds: float = 60.0
     reconcile_poll_seconds: float = 30.0
@@ -889,14 +910,18 @@ def _load_auto_recovery_config(raw: object) -> AutoRecoveryConfig:
     max_attempts = int(raw.get("max_attempts", AutoRecoveryConfig.max_attempts))
     lock_ttl = float(raw.get("lock_ttl_seconds", AutoRecoveryConfig.lock_ttl_seconds))
     reconcile_poll = float(raw.get("reconcile_poll_seconds", AutoRecoveryConfig.reconcile_poll_seconds))
+    max_missing_age = float(raw.get("max_missing_age_seconds", AutoRecoveryConfig.max_missing_age_seconds))
     if max_attempts < 1:
         raise ValueError("auto_recovery.max_attempts must be at least 1")
     if lock_ttl <= 0:
         raise ValueError("auto_recovery.lock_ttl_seconds must be positive")
     if reconcile_poll < 0.5:
         raise ValueError("auto_recovery.reconcile_poll_seconds must be at least 0.5")
+    if max_missing_age < 0:
+        raise ValueError("auto_recovery.max_missing_age_seconds must be >= 0 (0 disables the bound)")
     return AutoRecoveryConfig(enabled=bool(raw.get("enabled", False)), max_attempts=max_attempts,
-                              lock_ttl_seconds=lock_ttl, reconcile_poll_seconds=reconcile_poll)
+                              lock_ttl_seconds=lock_ttl, reconcile_poll_seconds=reconcile_poll,
+                              max_missing_age_seconds=max_missing_age)
 
 
 def _load_ai_usage_config(raw: object) -> AiUsageConfig:
