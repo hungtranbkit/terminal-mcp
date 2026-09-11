@@ -131,6 +131,25 @@ roles:
 # a human runs ON that machine -- usually a device/browser flow that cannot be
 # copied anyway.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Skill packs: prompt-level skills a worker session can run (docs/
+# GSTACK_INTEGRATION.md). Deliberately NOT in minimum_failover_auth_set and
+# never `required`: a skill pack produces review/QA findings, it does not
+# keep a session alive, so a node missing one is fully functional. The
+# doctor reports it so a project that has ENABLED a stage can see whether
+# the node it routes to can actually serve it.
+# ---------------------------------------------------------------------------
+skill_packs:
+  - id: gstack
+    provider: gstack
+    description: Garry Tan's Claude Code / Codex skill pack (review, QA, ship, retro).
+    hosts: [claude, codex]
+    # Pin what the project has actually audited. An older install reports
+    # DRIFT rather than PASS -- see GstackProvider.
+    min_version: "1.84.1.0"
+    required: false
+    install_hint: "see docs/GSTACK_INTEGRATION.md -- operator-run, pinned to a commit"
+
 auth:
   - id: claude_auth
     provider: anthropic

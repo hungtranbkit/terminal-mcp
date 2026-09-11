@@ -301,6 +301,9 @@ def inventory(roles: tuple[str, ...] = ("node",), *, profile: dict[str, Any] | N
             seen.add(key)
             checks.append(check_service(entry, os_name, roles))
 
+    for entry in data.get("skill_packs", []):
+        checks.append(check_skill_pack(entry))
+
     for entry in data.get("auth", []):
         checks.append(check_auth(entry))
 
@@ -361,6 +364,44 @@ def _format_human(result: dict[str, Any]) -> str:
         lines.append("  FAILOVER BLOCKED -- unmet requirements: " + ", ".join(result["blocking"]))
     lines.append(f"  FAILOVER_READY: {result['failover_ready']}")
     return "\n".join(lines)
+
+
+def check_skill_pack(entry: dict[str, Any]) -> Check:
+    """Is a prompt-level skill pack installed on this machine, for which host?
+
+    Reuses skill_provider's reader rather than restating where gstack puts
+    its files -- two answers to that question would drift, and the doctor's
+    job is to report the same truth the resolver acts on.
+
+    Never `required`: a node without a skill pack runs sessions perfectly
+    well. This is reported so a project that has enabled a stage can see
+    whether the node it routes to can serve it.
+    """
+    from .skill_provider import STATUS_DRIFT, STATUS_READY, GstackProvider
+
+    pack_id = entry["id"]
+    if entry.get("provider") != "gstack":
+        return Check(pack_id, "skill_pack", UNKNOWN, False,
+                     detail=f"no reader for provider {entry.get('provider')!r}")
+    provider = GstackProvider(minimum_version=entry.get("min_version"))
+    hosts = tuple(entry.get("hosts") or ("claude",))
+    reports = {host: provider.status(host) for host in hosts}
+    ready = sorted(host for host, status in reports.items() if status.status == STATUS_READY)
+    if ready:
+        version = next(reports[host].version for host in ready)
+        return Check(pack_id, "skill_pack", PASS, False,
+                     detail=f"available for {', '.join(ready)}",
+                     found_version=version, wanted_version=entry.get("min_version"))
+    drifted = [host for host, status in reports.items() if status.status == STATUS_DRIFT]
+    if drifted:
+        status = reports[drifted[0]]
+        return Check(pack_id, "skill_pack", DRIFT, False, detail=status.detail,
+                     found_version=status.version, wanted_version=entry.get("min_version"),
+                     remediation=entry.get("install_hint"))
+    detail = "; ".join(f"{host}: {status.status.lower()}" for host, status in sorted(reports.items()))
+    return Check(pack_id, "skill_pack", MISSING, False, detail=detail,
+                 wanted_version=entry.get("min_version"),
+                 remediation=entry.get("install_hint"))
 
 
 def detect_roles() -> tuple[str, ...]:

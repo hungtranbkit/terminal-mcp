@@ -234,3 +234,58 @@ def test_an_installed_but_disabled_unit_still_counts_as_holding_the_role(monkeyp
 
     monkeypatch.setattr(np.subprocess, "run", fake_missing)
     assert np._has_systemd_user_unit("terminal-mcp-http") is False
+
+
+# -- skill packs -------------------------------------------------------------
+
+def test_a_missing_skill_pack_is_reported_but_never_blocks_failover(monkeypatch, tmp_path):
+    # A node without a skill pack runs sessions perfectly well; reporting it
+    # as a failover blocker would be the same category error as the role
+    # detection bug above.
+    monkeypatch.setenv("CLAUDE_SKILLS_HOME", str(tmp_path / "none"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "none-codex"))
+    entry = {"id": "gstack", "provider": "gstack", "hosts": ["claude", "codex"],
+             "min_version": "1.84.1.0", "install_hint": "see the doc"}
+    check = np.check_skill_pack(entry)
+    assert check.status == np.MISSING
+    assert check.required is False
+    assert check.remediation == "see the doc"
+
+
+def test_an_installed_skill_pack_passes_with_its_version(monkeypatch, tmp_path):
+    root = tmp_path / "skills" / "gstack"
+    (root / "review").mkdir(parents=True)
+    (root / "review" / "SKILL.md").write_text("---\nname: review\n---\n")
+    (root / "VERSION").write_text("1.84.1.0\n")
+    monkeypatch.setenv("CLAUDE_SKILLS_HOME", str(tmp_path / "skills"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "none-codex"))
+    check = np.check_skill_pack({"id": "gstack", "provider": "gstack",
+                                 "hosts": ["claude"], "min_version": "1.84.1.0"})
+    assert check.status == np.PASS
+    assert check.found_version == "1.84.1.0"
+
+
+def test_an_outdated_skill_pack_reports_drift(monkeypatch, tmp_path):
+    root = tmp_path / "skills" / "gstack"
+    (root / "review").mkdir(parents=True)
+    (root / "review" / "SKILL.md").write_text("---\nname: review\n---\n")
+    (root / "VERSION").write_text("1.0.0.0\n")
+    monkeypatch.setenv("CLAUDE_SKILLS_HOME", str(tmp_path / "skills"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "none-codex"))
+    check = np.check_skill_pack({"id": "gstack", "provider": "gstack",
+                                 "hosts": ["claude"], "min_version": "1.84.1.0"})
+    assert check.status == np.DRIFT
+    assert check.required is False
+
+
+def test_an_unknown_provider_is_unknown_not_a_crash():
+    check = np.check_skill_pack({"id": "whatever", "provider": "not-a-thing"})
+    assert check.status == np.UNKNOWN
+
+
+def test_the_shipped_profile_declares_gstack_as_optional():
+    profile = np.load_profile()
+    packs = {entry["id"]: entry for entry in profile.get("skill_packs", [])}
+    assert "gstack" in packs
+    assert packs["gstack"].get("required") is False
+    assert packs["gstack"].get("min_version")          # pinned, not floating
