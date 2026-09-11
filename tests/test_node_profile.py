@@ -10,6 +10,7 @@ credential contents.
 from __future__ import annotations
 
 import json
+import subprocess
 import textwrap
 
 import pytest
@@ -189,3 +190,47 @@ def test_this_machine_audits_without_raising():
     assert result["os"] in ("linux", "darwin", "windows")
     assert isinstance(result["failover_ready"], bool)
     assert result["profile_fingerprint"]
+
+
+# -- which roles the audit runs as -------------------------------------------
+
+def test_detect_roles_reports_controller_when_the_unit_is_installed(monkeypatch):
+    # Getting this wrong is not cosmetic: the node-agent requirement is
+    # `unless_roles: [controller]`, so a controller audited as a plain node
+    # is told its deliberately-disabled agent blocks failover.
+    monkeypatch.setattr(np, "_has_systemd_user_unit", lambda unit: unit == "terminal-mcp-http")
+    assert np.detect_roles() == ("node", "controller")
+
+
+def test_detect_roles_reports_only_node_without_a_controller_unit(monkeypatch):
+    monkeypatch.setattr(np, "_has_systemd_user_unit", lambda unit: False)
+    assert np.detect_roles() == ("node",)
+
+
+def test_a_controller_is_not_told_its_disabled_node_agent_blocks_failover(monkeypatch):
+    # The end-to-end consequence of the two above.
+    monkeypatch.setattr(np, "_has_systemd_user_unit", lambda unit: unit == "terminal-mcp-http")
+    result = np.inventory(np.detect_roles(), os_name="linux")
+    agent = [c for c in result["checks"] if c["id"] == "terminal-node-agent"]
+    assert agent and all(c["status"] == np.SKIPPED for c in agent)
+    assert "terminal-node-agent" not in result["blocking"]
+
+
+def test_an_installed_but_disabled_unit_still_counts_as_holding_the_role(monkeypatch):
+    # A controller stopped for maintenance has not stopped being one; only
+    # "not-found" means the role is absent.
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 1, stdout="disabled\n", stderr="")
+
+    monkeypatch.setattr(np.subprocess, "run", fake_run)
+    assert np._has_systemd_user_unit("terminal-mcp-http") is True
+
+    def fake_missing(cmd, **kwargs):
+        # Verbatim what `systemctl --user is-enabled <missing>` returns.
+        return subprocess.CompletedProcess(cmd, 4, stdout="not-found\n", stderr="")
+
+    monkeypatch.setattr(np.subprocess, "run", fake_missing)
+    assert np._has_systemd_user_unit("terminal-mcp-http") is False

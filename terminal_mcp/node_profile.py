@@ -363,6 +363,45 @@ def _format_human(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def detect_roles() -> tuple[str, ...]:
+    """The roles this machine actually holds, rather than an assumption.
+
+    Defaulting to ("node",) makes the audit WRONG on a controller: the
+    node-agent requirement is `unless_roles: [controller]`, so a
+    controller (which serves its own machine in-process and must not run
+    an agent against itself) was told its correctly-disabled agent was a
+    failover blocker. An audit that reports a deliberate configuration as
+    a fault is worse than no audit -- the same class of mis-read as
+    running `systemctl --user` with no user bus and believing the empty
+    answer.
+
+    Detection is by what is INSTALLED as a unit, not by what is running:
+    a controller stopped for maintenance still holds the role.
+    """
+    roles = ["node"]
+    if _has_systemd_user_unit("terminal-mcp-http"):
+        roles.append("controller")
+    return tuple(roles)
+
+
+def _has_systemd_user_unit(unit: str) -> bool:
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    try:
+        proc = subprocess.run(["systemctl", "--user", "is-enabled", unit],
+                              capture_output=True, text=True, env=env,
+                              timeout=_PROBE_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.SubprocessError, AttributeError):
+        return False
+    # systemd answers a missing unit with exit code 4 and the literal
+    # "not-found"; every other state (disabled/static/masked/enabled) means
+    # the unit file IS installed here, which is what holding a role means.
+    if proc.returncode == 4:
+        return False
+    state = ((proc.stdout or "") + (proc.stderr or "")).strip().lower()
+    return bool(state) and "not-found" not in state
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
     parser = argparse.ArgumentParser(
@@ -371,11 +410,12 @@ def main(argv: list[str] | None = None) -> int:
                     "Reports PASS/MISSING/DRIFT/NEEDS_AUTH per requirement. "
                     "Never reads, prints or transmits credential contents.")
     parser.add_argument("--role", action="append", dest="roles",
-                        help="role this node holds (repeatable); default: node")
+                        help="role this node holds (repeatable); default: detected "
+                             "from the units installed on this machine")
     parser.add_argument("--profile", default=None, help="path to a profile file")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     args = parser.parse_args(argv)
-    roles = tuple(args.roles or ("node",))
+    roles = tuple(args.roles) if args.roles else detect_roles()
     try:
         result = inventory(roles, profile=load_profile(args.profile))
     except ProfileError as exc:
