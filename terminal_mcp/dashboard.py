@@ -2386,7 +2386,11 @@ DASHBOARD_HTML = """<!doctype html>
       INVALID_SESSION: 'tên session không hợp lệ',
     };
     function inputBlockLabel(reason) { return INPUT_BLOCK_LABELS[reason] || reason; }
-    function grantable(row) { return !row.allowed; } // the one, reused "has anything to grant" test
+    // Access is open by default, so "can this row's access be changed?" is
+    // now always yes. This previously meant "is outside the static
+    // whitelist", which under default-open reads false for every accessible
+    // session -- hiding the controls from the rows that most need them.
+    function grantable(row) { return true; }
     // 'full' (xem + gửi) | 'read' (chỉ xem) | 'none' (chưa cấp quyền) --
     // derived from the durable grant itself (grants.py), NOT from
     // effective_read/effective_input (which fold in the static whitelist
@@ -4345,6 +4349,11 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     .perm-badge.read { color:#8fb8ff; border-color:#8fb8ff }
     .perm-badge.none { color:#ff9f9f; border-color:#ff9f9f }
     .perm-badge.stale { color:var(--amber); border-color:var(--amber) } /* stored grant present but not currently effective (e.g. IDENTITY_MISMATCH) */
+    /* Access column: the effective state, then the two optional locks. */
+    .access-locks { display:flex; align-items:center; gap:10px; flex-wrap:wrap }
+    .lock-toggle { display:inline-flex; align-items:center; gap:4px; font-size:11px; color:var(--muted); cursor:pointer; white-space:nowrap }
+    .lock-toggle input { cursor:pointer }
+    .lock-toggle input:disabled { cursor:wait; opacity:.5 }
     .attach-dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--line); margin-right:5px; vertical-align:middle }
     .attach-dot.on { background:var(--green) }
     .row-actions { display:flex; gap:6px; align-items:center; white-space:nowrap }
@@ -4429,6 +4438,8 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     .node-group-status.degraded { color:var(--amber); border-color:rgba(255,200,87,.45) }
     .node-group-status.offline { color:var(--red); border-color:rgba(255,107,107,.4) }
     .node-group-count { margin-left:auto; color:var(--muted); font-size:11px; white-space:nowrap }
+    .node-select-all { margin-left:auto; margin-right:10px; background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--muted); font:inherit; font-size:11px; padding:2px 9px; cursor:pointer }
+    .node-select-all:hover { color:var(--text); border-color:var(--muted) }
     tbody tr.node-empty-row td { color:var(--muted); font-size:12px; padding:10px 14px 10px 30px; border-bottom:1px solid var(--line) }
     tbody tr.node-empty-row:hover { background:transparent }
 
@@ -4608,7 +4619,31 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     }
     function tmuxAttachCommand(session) { return `tmux attach -t ${shellQuote(session)}`; }
 
-    function grantable(row) { return !row.allowed; }
+    // Access is open by default; these two switches are the OPT-OUT. One
+    // call site for both, node-qualified so a session on a remote node is
+    // locked on the node that owns it rather than against the local store.
+    async function setSessionAccess(row, body) {
+      const name = (row.node_id && row.node_id !== 'local') ? `${row.node_id}/${row.name}` : row.name;
+      try {
+        const response = await fetch('/dashboard/api/session/access', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name, ...body}),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (data.error) { alert('Không đổi được quyền: ' + data.error); return false; }
+        return true;
+      } catch (error) {
+        alert('Không đổi được quyền: mất kết nối.');
+        return false;
+      }
+    }
+
+    // Every real session's access can be changed now. This used to mean "is
+    // outside the static whitelist, so there is something to grant" -- under
+    // default-open that reads false for every ACCESSIBLE session, which would
+    // have quietly removed the bulk checkbox from exactly the rows an
+    // operator wants to lock.
+    function grantable(row) { return true; }
     function grantState(row) {
       if (row.grant && row.grant.input_enabled) return 'full';
       if (row.grant && row.grant.read_enabled) return 'read';
@@ -4667,7 +4702,25 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       count.textContent = group.sessions.length + ' session';
       btn.append(caret, name, idEl, status, count);
       btn.onclick = () => { nodeCollapse.setCollapsed(group.id, !collapsed); renderRows(lastKnownRows); };
-      td.appendChild(btn); tr.appendChild(td);
+      td.appendChild(btn);
+      // Bulk-by-node without a second mechanism: select this node's sessions
+      // into the existing bulk bar, which already knows how to apply a
+      // preset to a selection.
+      if (group.sessions.length) {
+        const pick = document.createElement('button');
+        pick.type = 'button'; pick.className = 'node-select-all';
+        const allSelected = group.sessions.every(row => bulkSelected.has(row.name));
+        pick.textContent = allSelected ? 'Bỏ chọn node' : 'Chọn cả node';
+        pick.onclick = (event) => {
+          event.stopPropagation();
+          for (const row of group.sessions) {
+            if (allSelected) bulkSelected.delete(row.name); else bulkSelected.add(row.name);
+          }
+          renderBulkBar(); renderRows(lastKnownRows);
+        };
+        td.appendChild(pick);
+      }
+      tr.appendChild(td);
       return tr;
     }
     const bulkSelected = new Set();
@@ -5074,27 +5127,51 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         }
         tr.appendChild(tdName);
 
+        // ---- Access column: EFFECTIVE access plus optional locks ----------
+        //
+        // Access is open by default now: a session is readable and writable
+        // the moment it exists, with no grant step. So this column answers
+        // "what is true right now?" and offers two switches to turn it OFF.
+        // It used to report the static name allowlist beside an
+        // effective state that could disagree with it -- the contradiction
+        // that made a usable session look forbidden.
         const tdPerm = document.createElement('td');
+        const locks = document.createElement('div'); locks.className = 'access-locks';
+
         const permBadge = document.createElement('span'); permBadge.className = 'perm-badge';
-        if (!grantable(row)) { permBadge.classList.add('whitelist'); permBadge.textContent = 'Whitelist tĩnh'; }
-        else {
-          const state = grantState(row);
-          const granted = grantStateLabel(state);
-          const effective = effectiveLabel(row);
-          permBadge.classList.add(state);
-          // P0 fix: a STORED grant of "Xem + gửi" whose runtime is
-          // actually blocked (most commonly IDENTITY_MISMATCH -- the
-          // session was recreated, e.g. a tmux-server restart, since the
-          // grant was pinned) must never render as a plain, unqualified
-          // "Xem + gửi" here -- that's exactly what let this list badge
-          // claim send access was active while ChatGPT/terminal_send_text
-          // was actually refused. Same "Đã cấp: X · Hiệu lực: Y" wording
-          // this project's own term-bar grant card (#grantBar) and
-          // #permModal already use when the two diverge.
-          permBadge.textContent = granted === effective ? granted : `Đã cấp: ${granted} · Hiệu lực: ${effective}`;
-          if (granted !== effective) permBadge.classList.add('stale');
+        const readOn = row.effective_read !== false;
+        const inputOn = row.effective_input !== false;
+        if (readOn && inputOn) { permBadge.classList.add('full'); permBadge.textContent = 'Xem + gửi'; }
+        else if (readOn) { permBadge.classList.add('read'); permBadge.textContent = 'Chỉ xem (đã khoá gửi)'; }
+        else { permBadge.classList.add('none'); permBadge.textContent = '🔒 Đã khoá'; }
+        // A stored grant whose runtime is actually blocked (most commonly
+        // IDENTITY_MISMATCH -- the session was recreated since the grant was
+        // pinned) must never read as plain "Xem + gửi": that is what let this
+        // badge claim send access while terminal_send_text was refused.
+        if (row.input_denied_reason && inputOn === false && readOn) {
+            permBadge.classList.add('stale');
+            permBadge.title = 'Gửi bị chặn: ' + row.input_denied_reason;
         }
-        tdPerm.appendChild(permBadge);
+        locks.appendChild(permBadge);
+
+        const makeLock = (label, on, kind) => {
+          const wrap = document.createElement('label'); wrap.className = 'lock-toggle';
+          const box = document.createElement('input'); box.type = 'checkbox'; box.checked = on;
+          box.setAttribute('aria-label', `${label} cho ${row.name}`);
+          box.onchange = async () => {
+            box.disabled = true;
+            const body = kind === 'read' ? {read: box.checked} : {input: box.checked};
+            const ok = await setSessionAccess(row, body);
+            box.disabled = false;
+            if (!ok) box.checked = on;   // server refused -- do not lie about state
+            else load();
+          };
+          wrap.append(box, document.createTextNode(label));
+          return wrap;
+        };
+        locks.appendChild(makeLock('Xem', readOn, 'read'));
+        locks.appendChild(makeLock('Gửi', inputOn, 'input'));
+        tdPerm.appendChild(locks);
         tr.appendChild(tdPerm);
 
         // Process/session liveness ("● Running" -- always true for a row
@@ -7761,6 +7838,42 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if "error" in result:
             status_code = INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/access", methods=["POST"], include_in_schema=False)
+    async def session_access(request: Request) -> JSONResponse:
+        """Turn a session's view/send access OFF or back ON.
+
+        Access is OPEN by default -- a session is readable and writable the
+        moment it exists -- so this route is the opt-out, not the setup step.
+        It routes through the controller to the session's home node, which
+        owns its grants, and returns the same shape the MCP permission tools
+        do, so the UI can render what actually took effect rather than what it
+        asked for.
+        """
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        read = body.get("read")
+        send = body.get("input")
+        if read is None and send is None:
+            return JSONResponse({"error": "NOTHING_TO_CHANGE"}, status_code=400)
+        actor = identity.email if identity else "dashboard"
+        _log.info("dashboard session_access session=%s read=%s input=%s identity=%s",
+                  name, read, send, actor)
+        result = await anyio.to_thread.run_sync(lambda: controller.set_session_permissions(
+            name, read=read, input=send, actor=actor))
+        status = 200
+        if "error" in result:
+            status = 409 if result["error"] == "REVISION_CONFLICT" else \
+                INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status, headers={"Cache-Control": "no-store"})
 
     def _qualify_grant_name(name: str, body: dict) -> str:
         """A grant-read/grant-input request's `name` is qualified with an

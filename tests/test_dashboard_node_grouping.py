@@ -227,3 +227,49 @@ def test_both_session_list_pages_render(tmp_path):
         assert response.status_code == 200, path
         assert "buildNodeGroups" in response.text, path
         assert "__NODE_GROUP_JS__" not in response.text, path
+
+
+# -- optional access locks (default-open model) ------------------------------
+
+def test_the_access_column_shows_effective_state_with_two_optional_locks():
+    """Access is open by default, so this column answers "what is true now?"
+    and offers two switches to turn it OFF. It used to report the static name
+    allowlist beside an effective state that could disagree with it -- the
+    contradiction that made a perfectly usable session look forbidden."""
+    assert "access-locks" in SESSIONS_ADMIN_HTML
+    assert "lock-toggle" in SESSIONS_ADMIN_HTML
+    assert "const readOn = row.effective_read !== false;" in SESSIONS_ADMIN_HTML
+    assert "makeLock('Xem'" in SESSIONS_ADMIN_HTML
+    assert "makeLock('Gửi'" in SESSIONS_ADMIN_HTML
+
+
+def test_a_lock_defaults_to_on_and_reverts_if_the_server_refuses():
+    """The checkbox reflects EFFECTIVE access, so it starts ON. If the server
+    refuses the change it snaps back -- the UI must never show a lock state
+    the server did not actually apply."""
+    assert "box.checked = on;" in SESSIONS_ADMIN_HTML
+    assert "if (!ok) box.checked = on;" in SESSIONS_ADMIN_HTML
+
+
+def test_locking_a_remote_session_is_qualified_to_its_home_node():
+    """A session on another node is locked on the node that OWNS its grants,
+    not against the local store."""
+    assert "const name = (row.node_id && row.node_id !== 'local') ? `${row.node_id}/${row.name}` : row.name;" \
+        in SESSIONS_ADMIN_HTML
+
+
+def test_bulk_by_node_reuses_the_existing_selection_bar():
+    """Bulk-by-node without a second mechanism: the group header selects that
+    node's sessions into the bulk bar that already knows how to apply a
+    preset."""
+    assert "node-select-all" in SESSIONS_ADMIN_HTML
+    assert "Chọn cả node" in SESSIONS_ADMIN_HTML
+    assert "event.stopPropagation();" in SESSIONS_ADMIN_HTML   # must not toggle collapse
+
+
+def test_every_row_can_have_its_access_changed():
+    """`grantable` used to mean "outside the whitelist". Under default-open
+    that reads false for every ACCESSIBLE session, which would have hidden the
+    controls from exactly the rows an operator wants to lock."""
+    for page in (DASHBOARD_HTML, SESSIONS_ADMIN_HTML):
+        assert "function grantable(row) { return true; }" in page

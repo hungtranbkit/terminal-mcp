@@ -81,7 +81,7 @@ def test_sessions_admin_html_shows_every_session_never_hides_ungranted(tmux_sess
     assert "rows.length ? 'Không có session khớp bộ lọc.'" in SESSIONS_ADMIN_HTML
 
 
-def test_sessions_admin_row_badge_shows_effective_state_not_just_stored_grant():
+def test_sessions_admin_row_badge_shows_effective_access_not_the_whitelist():
     # P0 hotfix: the row-level perm badge used to render ONLY the STORED
     # grant preset (grantStateLabel(grantState(row))) regardless of
     # whether it was actually in force -- a session whose grant said
@@ -94,10 +94,19 @@ def test_sessions_admin_row_badge_shows_effective_state_not_just_stored_grant():
     # effectiveLabel(row) and say so explicitly when they diverge -- the
     # exact "Đã cấp: X · Hiệu lực: Y" wording this file's own #grantBar/
     # #permModal already use for the identical divergence.
-    assert "function effectiveLabel(row) {" in SESSIONS_ADMIN_HTML
-    assert "const effective = effectiveLabel(row);" in SESSIONS_ADMIN_HTML
-    assert "permBadge.textContent = granted === effective ? granted : `Đã cấp: ${granted} · Hiệu lực: ${effective}`;" in SESSIONS_ADMIN_HTML
+    # The badge now reports the EFFECTIVE state directly rather than a stored
+    # grant preset that could disagree with it -- a stronger version of the
+    # same guarantee, since there is no longer a second value to diverge from.
+    # It also no longer renders the whitelist at all: "Whitelist tĩnh" beside
+    # a usable session was the contradiction that made one look forbidden.
+    assert "Whitelist tĩnh" not in SESSIONS_ADMIN_HTML
+    assert "const readOn = row.effective_read !== false;" in SESSIONS_ADMIN_HTML
+    assert "const inputOn = row.effective_input !== false;" in SESSIONS_ADMIN_HTML
+    assert "'🔒 Đã khoá'" in SESSIONS_ADMIN_HTML
     assert "perm-badge.stale" in SESSIONS_ADMIN_HTML
+    # A grant whose runtime is blocked (IDENTITY_MISMATCH after the session
+    # was recreated) must still be visibly distinct, not a plain "Xem + gửi".
+    assert "permBadge.title = 'Gửi bị chặn: ' + row.input_denied_reason;" in SESSIONS_ADMIN_HTML
 
 
 def test_sessions_admin_shows_windows_desktop_visibility_never_for_tmux():
@@ -1050,7 +1059,9 @@ def test_dashboard_grant_controls_have_an_obvious_entry_point():
     # A never-granted session is still listed (never hidden), just marked
     # inline in its tab's own tooltip -- not a separate lock-icon badge.
     assert "chưa cấp quyền xem" in DASHBOARD_HTML
-    assert "function grantable(row) { return !row.allowed; }" in DASHBOARD_HTML
+    # See the note on the other grantable assertion: the whitelist-derived
+    # form is gone on purpose.
+    assert "function grantable(row) { return true; }" in DASHBOARD_HTML
     assert 'id="termAccessBtn"' in DASHBOARD_HTML
     assert "🔐 Quyền truy cập" in DASHBOARD_HTML
     assert "termAccessBtnEl.disabled = !canGrant;" in DASHBOARD_HTML
@@ -1406,6 +1417,9 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # allowlist (input_policy.allow_keys), so it is a distinct route
         # rather than a mode of session/input.
         "/dashboard/api/session/keys": {"POST"},
+        # Optional view/send LOCKS. Access is open by default, so this route
+        # is the opt-out rather than a setup step.
+        "/dashboard/api/session/access": {"POST"},
         "/dashboard/api/session/grant-read": {"POST"},
         "/dashboard/api/session/grant-input": {"POST"},
         "/dashboard/api/session/create": {"POST"},

@@ -181,6 +181,19 @@ class AutoRecoveryConfig:
     # tail is disposable test sessions that ended normally and must never be
     # resurrected.
     max_missing_age_seconds: float = 3600.0
+    # Only auto-recreate sessions this controller was ASKED to create.
+    #
+    # A session it merely observed -- someone's own `tmux new-session`, a test
+    # fixture, an editor terminal -- has no recorded launch command, so
+    # recreating it means guessing at another process's argv and calling the
+    # guess a recovery. Measured on this fleet: of 264 records, 29 carry a
+    # launch command, and all 9 that auto-recovery would otherwise have
+    # respawned carried none. With this on, the blast radius of enabling
+    # auto-recovery here went from 9 junk processes to 0.
+    #
+    # force=True always bypasses it: an operator reopening something
+    # explicitly is making that judgement themselves.
+    managed_sessions_only: bool = True
     max_attempts: int = 3
     lock_ttl_seconds: float = 60.0
     reconcile_poll_seconds: float = 30.0

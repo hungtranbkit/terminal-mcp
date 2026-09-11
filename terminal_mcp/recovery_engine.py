@@ -113,6 +113,33 @@ class RecoveryEngine:
             return True, None
         return False, "auto_recovery.enabled is False globally, and this session has no per-session override"
 
+    def _unmanaged_reason(self, record) -> str | None:
+        """Why this session is not ours to recreate, or None.
+
+        The controller recreates only what it was ASKED to create. A session
+        it merely observed -- someone's own `tmux new-session`, a test
+        fixture, an editor's terminal -- has no recorded launch command, so
+        recreating it would be guessing at another process's argv and cwd and
+        calling the guess a recovery.
+
+        This is the disposability signal the registry was missing. Measured on
+        this fleet: of 264 records, 29 carry a launch command, and every one
+        of the 9 that auto-recovery would otherwise have respawned carried
+        none -- all of them disposable sessions from test runs. It separates
+        cleanly because `launch_command` is written by the lifecycle API at
+        creation and by nothing else.
+
+        force=True bypasses it: an operator explicitly reopening something is
+        making that judgement themselves.
+        """
+        if not self.config.managed_sessions_only:
+            return None
+        if getattr(record, "launch_command", None):
+            return None
+        return ("session has no recorded launch command -- it was discovered, not created "
+                "through this controller, so there is nothing to recreate it FROM; "
+                "reopen it explicitly if that is wanted")
+
     def _staleness_reason(self, record) -> str | None:
         """Why this record is too old to resurrect automatically, or None.
 
@@ -230,6 +257,12 @@ class RecoveryEngine:
                     "recovery_state": RECOVERY_STATE_RECONNECTED,
                     "detail": "runtime session still alive; registry reconciled without a respawn"}
         if not force:
+            unmanaged_reason = self._unmanaged_reason(record)
+            if unmanaged_reason is not None:
+                self.registry.set_recovery_state(node_id, session_name, RECOVERY_STATE_BLOCKED,
+                                                 detail=unmanaged_reason)
+                return {"error": "RECOVERY_UNMANAGED", "node_id": node_id, "session": session_name,
+                        "reason": unmanaged_reason}
             stale_reason = self._staleness_reason(record)
             if stale_reason is not None:
                 self.registry.set_recovery_state(node_id, session_name, RECOVERY_STATE_BLOCKED,

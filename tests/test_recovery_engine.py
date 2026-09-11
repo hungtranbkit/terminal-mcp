@@ -68,14 +68,18 @@ def _make_missing_record(registry, node_id="dell-5530", name="wtest", *, convers
 
 
 def _engine(registry, controller, lease_store, config=None):
-    return RecoveryEngine(registry, controller, lease_store, config or AutoRecoveryConfig(enabled=True))
+    # managed_sessions_only is a POLICY (only recreate what we were asked to
+    # create); these tests exercise the engine's mechanics, so they opt out of
+    # it explicitly. The three tests that are ABOUT that policy set it on.
+    return RecoveryEngine(registry, controller, lease_store,
+                          config or AutoRecoveryConfig(enabled=True, managed_sessions_only=False))
 
 
 # -- policy gate --------------------------------------------------------
 
 def test_recover_session_blocked_when_globally_disabled_and_no_override(registry, controller, lease_store):
     _make_missing_record(registry)
-    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=False))
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=False, managed_sessions_only=False))
     result = engine.recover_session("dell-5530", "wtest")
     assert result["error"] == "RECOVERY_BLOCKED"
     assert controller.reopen_calls == []
@@ -86,7 +90,7 @@ def test_recover_session_blocked_when_globally_disabled_and_no_override(registry
 def test_per_session_override_enables_even_when_global_disabled(registry, controller, lease_store):
     _make_missing_record(registry)
     registry.set_auto_recovery_enabled("dell-5530", "wtest", True)
-    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=False))
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=False, managed_sessions_only=False))
     result = engine.recover_session("dell-5530", "wtest")
     assert "error" not in result
     assert controller.reopen_calls == ["dell-5530/wtest"]
@@ -95,7 +99,7 @@ def test_per_session_override_enables_even_when_global_disabled(registry, contro
 def test_per_session_override_disables_even_when_global_enabled(registry, controller, lease_store):
     _make_missing_record(registry)
     registry.set_auto_recovery_enabled("dell-5530", "wtest", False)
-    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True))
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True, managed_sessions_only=False))
     result = engine.recover_session("dell-5530", "wtest")
     assert result["error"] == "RECOVERY_BLOCKED"
     assert controller.reopen_calls == []
@@ -103,7 +107,7 @@ def test_per_session_override_disables_even_when_global_enabled(registry, contro
 
 def test_force_bypasses_the_policy_gate(registry, controller, lease_store):
     _make_missing_record(registry)
-    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=False))
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=False, managed_sessions_only=False))
     result = engine.recover_session("dell-5530", "wtest", force=True)
     assert "error" not in result
     assert controller.reopen_calls == ["dell-5530/wtest"]
@@ -131,7 +135,7 @@ def test_max_attempts_blocks_further_automatic_recovery(registry, controller, le
     _make_missing_record(registry)
     for _ in range(3):
         registry.begin_recovery_attempt("dell-5530", "wtest")
-    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True, max_attempts=3))
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True, max_attempts=3, managed_sessions_only=False))
     result = engine.recover_session("dell-5530", "wtest")
     assert result["error"] == "RECOVERY_BLOCKED"
     assert "max_attempts" in result["reason"]
@@ -142,7 +146,7 @@ def test_force_bypasses_max_attempts_too(registry, controller, lease_store):
     _make_missing_record(registry)
     for _ in range(5):
         registry.begin_recovery_attempt("dell-5530", "wtest")
-    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True, max_attempts=3))
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True, max_attempts=3, managed_sessions_only=False))
     result = engine.recover_session("dell-5530", "wtest", force=True)
     assert "error" not in result
     assert controller.reopen_calls == ["dell-5530/wtest"]
@@ -216,7 +220,7 @@ def test_the_lock_is_released_even_when_the_attempt_fails(registry, controller, 
 
 def test_each_attempt_gets_a_new_never_reused_generation(registry, controller, lease_store):
     _make_missing_record(registry)
-    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True, max_attempts=10))
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True, max_attempts=10, managed_sessions_only=False))
     r1 = engine.recover_session("dell-5530", "wtest")
     # Force it back to MISSING for a second real attempt.
     registry.mark_missing("dell-5530", set())
@@ -285,7 +289,7 @@ def test_auto_recovery_never_resurrects_an_intentionally_killed_session(registry
     """
     registry.upsert_seen("dell-5530", "wtest", agent_type="claude", cwd="C:\\Dev\\proj")
     registry.mark_killed("dell-5530", "wtest", killed_by="operator")
-    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True))
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True, managed_sessions_only=False))
 
     result = engine.recover_session("dell-5530", "wtest")
     assert result["error"] == "RECOVERY_TOMBSTONED"
@@ -298,7 +302,7 @@ def test_a_human_can_still_force_a_killed_session_back(registry, controller, lea
     explicit human override and is exactly how the Reopen path behaves."""
     registry.upsert_seen("dell-5530", "wtest", agent_type="claude", cwd="C:\\Dev\\proj")
     registry.mark_killed("dell-5530", "wtest", killed_by="operator")
-    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True))
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True, managed_sessions_only=False))
 
     result = engine.recover_session("dell-5530", "wtest", force=True, requested_by="operator")
     assert "error" not in result, result
@@ -312,7 +316,7 @@ def test_reconcile_pass_skips_killed_but_still_recovers_a_crashed_one(registry, 
     registry.upsert_seen("n1", "stopped-on-purpose", agent_type="claude", cwd="/w")
     registry.mark_killed("n1", "stopped-on-purpose", killed_by="operator")
     controller.registry_rows["n1"] = [{"session_name": "crashed"}, {"session_name": "stopped-on-purpose"}]
-    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True))
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True, managed_sessions_only=False))
 
     results = engine.reconcile_node("n1")
     by_session = {r.get("session"): r for r in results}
@@ -334,7 +338,7 @@ def test_a_session_that_is_alive_again_is_reconnected_not_respawned(registry, co
     """
     _make_missing_record(registry, node_id="n1", name="survivor")
     controller.live_sessions = {"survivor": "n1"}
-    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True))
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True, managed_sessions_only=False))
 
     result = engine.recover_session("n1", "survivor")
     assert result["soft_reconnect"] is True
@@ -348,7 +352,7 @@ def test_liveness_on_a_different_node_does_not_count_as_reconnect(registry, cont
     to it would silently rebind this record onto someone else's process."""
     _make_missing_record(registry, node_id="n1", name="shared-name")
     controller.live_sessions = {"shared-name": "n2"}
-    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True))
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True, managed_sessions_only=False))
 
     result = engine.recover_session("n1", "shared-name")
     assert result.get("soft_reconnect") is not True
@@ -361,7 +365,7 @@ def test_soft_reconnect_is_tried_before_the_attempt_budget_is_spent(registry, co
     _make_missing_record(registry, node_id="n1", name="flappy")
     controller.live_sessions = {"flappy": "n1"}
     engine = _engine(registry, controller, lease_store,
-                     AutoRecoveryConfig(enabled=True, max_attempts=1))
+                     AutoRecoveryConfig(enabled=True, max_attempts=1, managed_sessions_only=False))
     # Flap it: MISSING -> reconnected -> MISSING -> ... A session that keeps
     # coming back on its own must never spend the budget, however many times
     # the node drops.
@@ -397,7 +401,7 @@ def test_a_long_dead_record_is_not_auto_resurrected(registry, controller, lease_
     _make_missing_record(registry, node_id="n1", name="ancient")
     _age_record(registry, "n1", "ancient", 10 * 86400)
     engine = _engine(registry, controller, lease_store,
-                     AutoRecoveryConfig(enabled=True, max_missing_age_seconds=86400))
+                     AutoRecoveryConfig(enabled=True, max_missing_age_seconds=86400, managed_sessions_only=False))
 
     result = engine.recover_session("n1", "ancient")
     assert result["error"] == "RECOVERY_STALE"
@@ -407,7 +411,7 @@ def test_a_long_dead_record_is_not_auto_resurrected(registry, controller, lease_
 def test_a_recently_lost_record_is_still_recovered(registry, controller, lease_store):
     _make_missing_record(registry, node_id="n1", name="fresh")
     engine = _engine(registry, controller, lease_store,
-                     AutoRecoveryConfig(enabled=True, max_missing_age_seconds=86400))
+                     AutoRecoveryConfig(enabled=True, max_missing_age_seconds=86400, managed_sessions_only=False))
     assert "error" not in engine.recover_session("n1", "fresh")
     assert len(controller.reopen_calls) == 1
 
@@ -416,7 +420,7 @@ def test_a_human_can_still_force_an_old_session_back(registry, controller, lease
     _make_missing_record(registry, node_id="n1", name="ancient")
     _age_record(registry, "n1", "ancient", 10 * 86400)
     engine = _engine(registry, controller, lease_store,
-                     AutoRecoveryConfig(enabled=True, max_missing_age_seconds=86400))
+                     AutoRecoveryConfig(enabled=True, max_missing_age_seconds=86400, managed_sessions_only=False))
     assert "error" not in engine.recover_session("n1", "ancient", force=True)
 
 
@@ -424,5 +428,46 @@ def test_zero_disables_the_staleness_bound(registry, controller, lease_store):
     _make_missing_record(registry, node_id="n1", name="ancient")
     _age_record(registry, "n1", "ancient", 10 * 86400)
     engine = _engine(registry, controller, lease_store,
-                     AutoRecoveryConfig(enabled=True, max_missing_age_seconds=0))
+                     AutoRecoveryConfig(enabled=True, max_missing_age_seconds=0, managed_sessions_only=False))
     assert "error" not in engine.recover_session("n1", "ancient")
+
+
+# -- only recreate what we were asked to create -----------------------------
+
+def test_a_discovered_session_is_not_auto_recreated(registry, controller, lease_store):
+    """The controller recreates only what it was ASKED to create.
+
+    A session it merely observed -- someone's own `tmux new-session`, a test
+    fixture, an editor terminal -- has no recorded launch command, so
+    recreating it would be guessing at another process's argv and calling the
+    guess a recovery. This is the disposability signal the registry was
+    missing: measured on the real fleet, 29 of 264 records carried a launch
+    command, and all 9 that auto-recovery would have respawned carried none.
+    """
+    registry.upsert_seen("n1", "someones-own-tmux", agent_type="shell", cwd="/w")
+    registry.mark_missing("n1", set())
+    engine = _engine(registry, controller, lease_store,
+                     AutoRecoveryConfig(enabled=True, managed_sessions_only=True))
+
+    result = engine.recover_session("n1", "someones-own-tmux")
+    assert result["error"] == "RECOVERY_UNMANAGED"
+    assert controller.reopen_calls == []
+
+
+def test_a_managed_session_is_still_recovered(registry, controller, lease_store):
+    registry.upsert_seen("n1", "ours", agent_type="claude", cwd="/w", launch_command="claude")
+    registry.mark_missing("n1", set())
+    engine = _engine(registry, controller, lease_store,
+                     AutoRecoveryConfig(enabled=True, managed_sessions_only=True))
+    assert "error" not in engine.recover_session("n1", "ours")
+    assert len(controller.reopen_calls) == 1
+
+
+def test_a_human_can_still_force_an_unmanaged_session_back(registry, controller, lease_store):
+    """An operator explicitly reopening something is making that judgement
+    themselves."""
+    registry.upsert_seen("n1", "someones-own-tmux", agent_type="shell", cwd="/w")
+    registry.mark_missing("n1", set())
+    engine = _engine(registry, controller, lease_store,
+                     AutoRecoveryConfig(enabled=True, managed_sessions_only=True))
+    assert "error" not in engine.recover_session("n1", "someones-own-tmux", force=True)
