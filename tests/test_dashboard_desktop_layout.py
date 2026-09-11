@@ -233,3 +233,34 @@ def test_no_horizontal_overflow_on_desktop(desktop_page):
         desktop_page.wait_for_timeout(300)
         assert not desktop_page.evaluate(
             "() => document.documentElement.scrollWidth > window.innerWidth + 1")
+
+
+def test_the_per_session_access_control_is_visible_under_default_open(desktop_page):
+    """It was invisible on every session, which is the same as absent.
+
+    renderGrantBar began `if (allowed) return` -- "statically whitelisted,
+    nothing to grant/revoke, ever". Under default-open `allowed` is an
+    alias of read authorization and is true for every accessible session,
+    so the one place an operator can see and change a session's access
+    rendered nothing, everywhere. Same mistake as
+    `grantable(row) = !row.allowed`, which was fixed in the two list views
+    and missed here.
+    """
+    desktop_page.set_viewport_size({"width": DESKTOP[0], "height": DESKTOP[1]})
+    _select(desktop_page, "m2")
+    assert desktop_page.evaluate(
+        "() => { const g = document.querySelector('#grantBar');"
+        "        return !g.hidden && getComputedStyle(g).display !== 'none'; }")
+    text = desktop_page.evaluate("() => document.querySelector('#grantBar').textContent")
+    # Wording says access is already on and the button takes it away.
+    assert "mặc định" in text
+    assert "Khoá" in text
+    assert "whitelist" not in text.casefold()
+
+
+def test_showing_the_access_control_does_not_cost_the_terminal_its_share(desktop_page):
+    desktop_page.set_viewport_size({"width": DESKTOP[0], "height": DESKTOP[1]})
+    _select(desktop_page, "m2")
+    share = desktop_page.evaluate(
+        "() => document.querySelector('#output').getBoundingClientRect().height / window.innerHeight")
+    assert share >= MIN_DESKTOP_OUTPUT_SHARE

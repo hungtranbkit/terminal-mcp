@@ -2970,15 +2970,23 @@ DASHBOARD_HTML = """<!doctype html>
     // separate overlay design structurally avoids.
     function renderGrantBar(name, allowed, grant, restricted, inputBlockReason, effectiveInput) {
       grantBarEl.replaceChildren();
-      grantBarEl.hidden = true;
-      if (allowed) return; // statically whitelisted -- nothing to grant/revoke, ever
+      // This used to be `if (allowed) return` -- "statically whitelisted,
+      // nothing to grant/revoke, ever". Under default-open `allowed` is an
+      // alias of read authorization and is TRUE for every accessible
+      // session, so the control disappeared from all of them: the one place
+      // an operator can see and change a session's access showed nothing,
+      // on every session. Same mistake as `grantable(row) = !row.allowed`,
+      // fixed in the two list views and missed here.
       grantBarEl.hidden = false;
-      const state = grant && grant.input_enabled ? 'full' : grant && grant.read_enabled ? 'read' : 'none';
-      const granted = grantStateLabel(state);
       const effective = restricted ? 'Không truy cập' : (effectiveInput ? 'Xem + gửi' : 'Chỉ xem');
+      const locked = restricted || !effectiveInput;
       const label = document.createElement('span');
-      label.textContent = granted === effective ? `Quyền: ${effective}` : `Đã cấp: ${granted} · Hiệu lực: ${effective}`;
-      const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = '🔐 Quyền truy cập';
+      label.textContent = locked ? `🔒 ${effective}` : `Quyền: ${effective} (mặc định)`;
+      if (locked && inputBlockReason) { label.title = inputBlockReason; }
+      const btn = document.createElement('button'); btn.type = 'button';
+      // Wording says what the button is FOR. Access is already on; this is
+      // how you take it away, not how you obtain it.
+      btn.textContent = locked ? '🔐 Mở khoá / đổi quyền' : '🔐 Khoá quyền truy cập';
       btn.onclick = () => openPermModal(name);
       grantBarEl.append(label, btn);
     }
