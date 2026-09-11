@@ -66,7 +66,7 @@ from .core import (
     RECOVERY_STATE_BLOCKED, RECOVERY_STATE_DEGRADED, RECOVERY_STATE_PENDING, RECOVERY_STATE_RESUMED_OK,
 )
 from .lease import PaneLeaseStore
-from .session_registry import SessionRegistryStore
+from .session_registry import STATUS_KILLED, SessionRegistryStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -128,6 +128,20 @@ class RecoveryEngine:
         if not record.recoverable:
             return {"error": "NOT_RECOVERABLE", "node_id": node_id, "session": session_name,
                     "status": record.status, "metadata_complete": record.metadata_complete}
+        # TOMBSTONE. `recoverable` deliberately includes KILLED so a human can
+        # press Reopen on it from the killed-sessions list -- that is a real,
+        # wanted feature and it still works (force=True, which is what an
+        # explicit human trigger passes). What must never happen is the
+        # BACKGROUND pass making that call on the operator's behalf:
+        # "restore what a reboot took away" and "undo what the operator chose"
+        # are different things, and only the first may happen by itself.
+        # DELETED never reaches here at all -- it is not in RECOVERABLE_STATUSES.
+        if not force and record.status == STATUS_KILLED:
+            reason = ("session was intentionally killed (tombstone) -- automatic recovery never "
+                      "undoes an operator's own stop; reopen it explicitly if that is wanted")
+            self.registry.set_recovery_state(node_id, session_name, RECOVERY_STATE_BLOCKED, detail=reason)
+            return {"error": "RECOVERY_TOMBSTONED", "node_id": node_id, "session": session_name,
+                    "status": record.status, "reason": reason}
         if not force:
             allowed, reason = self._recovery_allowed(record)
             if not allowed:

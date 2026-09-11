@@ -260,3 +260,52 @@ def test_checkpoint_on_a_session_with_no_registry_row(registry, controller, leas
     engine = _engine(registry, controller, lease_store)
     result = engine.checkpoint("dell-5530", "no-such-session", detail="x")
     assert result["error"] == "REGISTRY_RECORD_NOT_FOUND"
+
+
+# -- tombstones: intentional stop must never be auto-resurrected ------------
+
+def test_auto_recovery_never_resurrects_an_intentionally_killed_session(registry, controller, lease_store):
+    """A session the user deliberately killed is a TOMBSTONE, not a crash.
+
+    `recoverable` deliberately includes KILLED so a human can press Reopen on
+    it from the killed-sessions list -- that is a real, wanted feature. But the
+    BACKGROUND reconcile pass must never make that decision on the user's
+    behalf: "restore what a reboot took away" and "undo what the operator
+    chose" are different things, and only the first one may happen by itself.
+    """
+    registry.upsert_seen("dell-5530", "wtest", agent_type="claude", cwd="C:\\Dev\\proj")
+    registry.mark_killed("dell-5530", "wtest", killed_by="operator")
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True))
+
+    result = engine.recover_session("dell-5530", "wtest")
+    assert result["error"] == "RECOVERY_TOMBSTONED"
+    assert result["status"] == "KILLED"
+    assert controller.reopen_calls == []
+
+
+def test_a_human_can_still_force_a_killed_session_back(registry, controller, lease_store):
+    """The tombstone stops the ENGINE, never the operator -- force=True is an
+    explicit human override and is exactly how the Reopen path behaves."""
+    registry.upsert_seen("dell-5530", "wtest", agent_type="claude", cwd="C:\\Dev\\proj")
+    registry.mark_killed("dell-5530", "wtest", killed_by="operator")
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True))
+
+    result = engine.recover_session("dell-5530", "wtest", force=True, requested_by="operator")
+    assert "error" not in result, result
+    assert len(controller.reopen_calls) == 1
+
+
+def test_reconcile_pass_skips_killed_but_still_recovers_a_crashed_one(registry, controller, lease_store):
+    """The distinction that matters, in one pass: MISSING (the node died under
+    it) is restored; KILLED (the user stopped it) is left alone."""
+    _make_missing_record(registry, node_id="n1", name="crashed")
+    registry.upsert_seen("n1", "stopped-on-purpose", agent_type="claude", cwd="/w")
+    registry.mark_killed("n1", "stopped-on-purpose", killed_by="operator")
+    controller.registry_rows["n1"] = [{"session_name": "crashed"}, {"session_name": "stopped-on-purpose"}]
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True))
+
+    results = engine.reconcile_node("n1")
+    by_session = {r.get("session"): r for r in results}
+    assert by_session["stopped-on-purpose"]["error"] == "RECOVERY_TOMBSTONED"
+    assert "error" not in by_session["crashed"], by_session["crashed"]
+    assert [call for call in controller.reopen_calls if "stopped-on-purpose" in call] == []
