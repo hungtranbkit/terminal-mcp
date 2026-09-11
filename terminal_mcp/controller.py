@@ -929,6 +929,18 @@ class ControllerService:
                 row = dict(row)
                 row.setdefault("node_id", node.id)
                 row.setdefault("node_name", node.display_name)
+                # `allowed` is a DEPRECATED alias of read authorization, kept
+                # only so older callers keep working. A remote agent old
+                # enough to still compute it from its own session-name
+                # whitelist reports False for sessions this fleet can plainly
+                # read -- which is exactly the contradictory
+                # "allowed=false next to effective_read=true" state the
+                # default-open model exists to remove, and it survived here
+                # because the local listing was normalised and this merge was
+                # not. Never widens access: it only restates the answer
+                # effective_read already gave.
+                if "effective_read" in row:
+                    row["allowed"] = bool(row["effective_read"])
                 sessions.append(row)
         return {"sessions": sessions, "unreachable_nodes": unreachable}
 
