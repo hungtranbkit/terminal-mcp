@@ -163,6 +163,18 @@ class SessionGrantStore:
                 )
         return self.get(session)  # type: ignore[return-value]
 
+    def delete(self, session: str) -> bool:
+        """Remove a grant row entirely.
+
+        Under the default-open model this is how a session returns to the
+        DEFAULT, which is not the same as writing read_enabled=0: absence of a
+        record means allow, a record reading 0 means someone said no. Keeping
+        those distinguishable is the whole point.
+        """
+        with self._connection() as connection:
+            cursor = connection.execute("DELETE FROM session_grants WHERE session = ?", (session,))
+            return cursor.rowcount > 0
+
     def rename_session(self, old: str, new: str) -> bool:
         """Rename Session feature: re-keys an existing grant's PRIMARY KEY
         in place -- read/input flags and the tmux identity pin

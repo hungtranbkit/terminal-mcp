@@ -2687,6 +2687,57 @@ class TerminalService:
         )
         return {"exists": True, "input": input_enabled, "attached": info.attached}
 
+    # Grant rows written by the system itself, as bookkeeping rather than as
+    # anyone's security decision. `system:session_deleted` is the teardown
+    # record left when a session is removed; under a closed default it also
+    # read as "deny", which is not what it ever meant.
+    SYSTEM_AUTHORED_GRANT_PREFIX = "system:"
+    # The retired whitelist migration also wrote rows nobody chose: a session
+    # that matched a READ-only pattern got read=1/input=0, which under the
+    # default-open model actively BLOCKS input that would otherwise be
+    # allowed. Measured on this fleet, two sessions were stuck exactly that
+    # way. These rows are bookkeeping too, and are cleared the same way.
+    SYSTEM_AUTHORED_GRANT_MARKERS = ("system:", "whitelist-migration", "migration")
+
+    def migrate_deny_records_to_default_open(self) -> dict[str, Any]:
+        """Clear deny rows that were never a user's decision.
+
+        Absence of a record now means ALLOW, so a leftover row reading
+        read_enabled=0 is the only thing that can still block a session -- and
+        most of those were written by the system, not by a person. Those are
+        removed; a deny an actual actor authored is LEFT ALONE, because that is
+        someone deliberately locking a session and this migration has no
+        business overruling it.
+
+        The distinction is `granted_by`: rows the system wrote are prefixed
+        `system:`. Measured on this fleet before the change, every single deny
+        row was `system:session_deleted` and not one was user-authored.
+
+        Idempotent, additive in effect (it only ever widens access to the new
+        default), and never fatal.
+        """
+        summary: dict[str, Any] = {"cleared": [], "preserved_user_denies": [], "errors": []}
+        try:
+            rows = self.grants.list()
+        except Exception as exc:  # noqa: BLE001 -- never block startup on a migration
+            summary["errors"].append(str(exc))
+            return summary
+        for grant in rows:
+            if grant.read_enabled and grant.input_enabled:
+                continue
+            author = (grant.granted_by or "")
+            if any(author.startswith(marker) for marker in self.SYSTEM_AUTHORED_GRANT_MARKERS):
+                try:
+                    self.grants.delete(grant.session)
+                    summary["cleared"].append(grant.session)
+                except Exception as exc:  # noqa: BLE001
+                    summary["errors"].append(f"{grant.session}: {exc}")
+            elif not grant.read_enabled:
+                # A real person turned this off. Leave it.
+                summary["preserved_user_denies"].append(
+                    {"session": grant.session, "granted_by": grant.granted_by})
+        return summary
+
     def migrate_whitelist_to_grants(self) -> dict[str, Any]:
         """One-time conversion of the retired session-name whitelist into real
         grants, so upgrading does not silently revoke access.
@@ -2713,7 +2764,16 @@ class TerminalService:
         grants as they were.
         """
         summary: dict[str, Any] = {"read_granted": [], "input_granted": [], "skipped_existing": [], "errors": []}
-        if not self.config.session_access.migrate_whitelist_on_start:
+        access = self.config.session_access
+        if access.default_read and access.default_input:
+            # Nothing to migrate: absence of a record already means allow, and
+            # writing rows here would only ever NARROW access -- a read-only
+            # whitelist match becomes read=1/input=0, which blocks input the
+            # default would have permitted. That is the exact failure this
+            # model exists to remove.
+            summary["skipped"] = "defaults are open; a whitelist grant could only narrow access"
+            return summary
+        if not access.migrate_whitelist_on_start:
             summary["skipped"] = "disabled by session_access.migrate_whitelist_on_start"
             return summary
         patterns = tuple(self.config.allowed_session_patterns)

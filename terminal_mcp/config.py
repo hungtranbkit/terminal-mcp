@@ -547,19 +547,32 @@ class SessionAccessConfig:
     both true (an explicit grant said so), and the two fields meant different
     things that looked like they should agree.
 
-    Defaults are deliberately CLOSED. A session nobody has granted anything on
-    is discoverable (its name/size/activity are `tmux ls` metadata, which was
-    always visible) but its CONTENT is not readable and it accepts no input
-    until a user says so on the dashboard. Opening that by default would be a
-    strictly weaker posture than the whitelist it replaces.
+    Defaults are OPEN: a session the owner just created, or that was just
+    discovered, is readable and writable immediately, with no grant step.
+    Deliberate, and an explicit product decision -- the closed default that
+    preceded it produced exactly one recurring outcome, a brand-new session
+    stuck behind a permission nobody had granted yet, which is worse than
+    useless for a session manager.
+
+    ABSENCE OF A RECORD MEANS ALLOW, not deny. A grant row now exists only
+    because someone deliberately CHANGED something, and its most useful shape
+    is an explicit revoke -- an optional lock, never a prerequisite.
+
+    This does not make the deployment open. The boundaries that actually gate
+    access are untouched: account/webauth/Cloudflare Access on the dashboard,
+    node bearer tokens between controller and agents, the sensitive-name floor
+    (root/ssh/password/secret/database, refused whatever any policy says),
+    input_policy.denied_session_patterns, and the global
+    permissions.terminal_read/terminal_input switches. What is gone is the
+    per-session paperwork, not the perimeter.
 
     `allowed_session_patterns`/`input_policy.allowed_session_patterns` are
     still PARSED, but only as a one-time migration source -- see
     TerminalService.migrate_whitelist_to_grants. They no longer authorize
     anything by themselves.
     """
-    default_read: bool = False
-    default_input: bool = False
+    default_read: bool = True
+    default_input: bool = True
     # One-time conversion of the old name whitelist into real grants, so a
     # deployment upgrading to this does not silently lose access to every
     # session it had whitelisted. Idempotent: it only ever ADDS a grant for a

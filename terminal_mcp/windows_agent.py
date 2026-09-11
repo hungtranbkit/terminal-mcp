@@ -116,6 +116,17 @@ def main(argv: list[str] | None = None) -> int:
                       _migration.get("read_granted"), _migration.get("input_granted"), _migration.get("errors"))
     except Exception:  # noqa: BLE001 -- never block startup on a migration
         _log.exception("session-access migration failed -- grants left unchanged")
+    # Default-open model: clear deny rows the SYSTEM wrote as bookkeeping so
+    # they stop reading as a security decision. A deny an actual person
+    # authored is preserved.
+    try:
+        _deny_migration = terminal.migrate_deny_records_to_default_open()
+        if _deny_migration.get("cleared") or _deny_migration.get("errors"):
+            _log.info("session-access migration: cleared system deny rows=%s preserved=%s errors=%s",
+                      _deny_migration.get("cleared"), _deny_migration.get("preserved_user_denies"),
+                      _deny_migration.get("errors"))
+    except Exception:  # noqa: BLE001 -- never block startup on a migration
+        _log.exception("deny-record migration failed -- grants left unchanged")
     workspace_root = (config.session_lifecycle.allowed_cwd_roots[0]
                       if config.session_lifecycle.allowed_cwd_roots else "/")
     app = build_node_agent(node_id=args.node_id, terminal=terminal, token=token, workspace_root=workspace_root)
