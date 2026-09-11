@@ -1352,7 +1352,7 @@ DASHBOARD_HTML = """<!doctype html>
           <a href="/dashboard/requirements" id="requirementsLink" role="menuitem" target="_blank" rel="noopener">📄 Requirements</a>
           <button type="button" id="openSupervisorPanelBtn" role="menuitem">🧭 Supervisor / Coordinator</button>
           <button type="button" id="openTaskInboxBtn" role="menuitem">📥 Task Inbox</button>
-          <button type="button" id="openAiUsageBtn" role="menuitem">📊 AI Usage</button>
+          <a href="/dashboard/ai-usage" id="aiUsageLink" role="menuitem">📊 AI Usage</a>
         </div>
       </div>
     </div>
@@ -4088,7 +4088,13 @@ DASHBOARD_HTML = """<!doctype html>
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape' && document.body.classList.contains('ai-usage-visible')) closeAiUsage();
     });
-    openAiUsageBtnEl.onclick = () => { closeAllMenus(); openAiUsage(); };
+    // The menu entry is a link to /dashboard/ai-usage now, so this button no
+    // longer exists. The in-page panel it opened proxied a separate local
+    // service (ai_usage_client.py, 127.0.0.1:8787) that is not running on
+    // this host; the report page reads local CLI artefacts directly instead.
+    // Guarded rather than assumed present: an unguarded onclick on null
+    // throws and takes the whole dashboard script down with it.
+    if (openAiUsageBtnEl) { openAiUsageBtnEl.onclick = () => { closeAllMenus(); openAiUsage(); }; }
 
     // ---- Supervisor/Coordinator panel's own Queue/Coordinator +
     // Integration sections (task: Dashboard Supervisor/Coordinator panel)
@@ -6592,6 +6598,344 @@ NODES_ADMIN_HTML = """<!doctype html>
 # ?session=) pre-fills the session filter so the per-session Task button
 # elsewhere can deep-link here filtered to one session without this page
 # needing any server-side templating of its own.
+# ---------------------------------------------------------------------------
+# AI Usage report page.
+#
+# Its data comes from files the coding CLIs already wrote on this machine
+# (ai_usage_local.py / ai_usage_index.py) -- never from a provider's usage
+# API, and never from an inference request made just to read a header.
+#
+# Two different things are shown, and the page keeps them apart on purpose:
+#   (A) rolling 5h token ACTIVITY, summed from transcript timestamps;
+#   (B) subscription quota window and reset time, shown ONLY where a CLI
+#       actually recorded one. On this host Claude records none, so it reads
+#       "Not observed" rather than a guessed "5h from session start".
+# ---------------------------------------------------------------------------
+AI_USAGE_HTML = """<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>AI Usage — Terminal MCP</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd;
+      --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#3b78ff;
+      --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono','Courier New',monospace;
+    }
+    * { box-sizing:border-box }
+    body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text) }
+    a { color:var(--accent) }
+    header { display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+             padding:14px max(16px, env(safe-area-inset-right)) 14px max(16px, env(safe-area-inset-left));
+             border-bottom:1px solid var(--line) }
+    h1 { margin:0; font-size:17px }
+    .muted { color:var(--muted) }
+    .spacer { flex:1 }
+    .btn { background:#19243b; border:1px solid var(--line); color:var(--text); border-radius:8px;
+           padding:7px 12px; font:13px var(--mono); cursor:pointer; min-height:40px }
+    .btn:active { background:#223052 }
+    main { padding:14px max(16px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)) }
+    .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:10px; margin-bottom:14px }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 14px; min-width:0 }
+    .card h2 { margin:0 0 6px; font-size:11px; font-weight:700; letter-spacing:.05em;
+               text-transform:uppercase; color:var(--muted) }
+    .card .big { font-size:22px; font-weight:700; word-break:break-all }
+    .card .sub { font-size:11px; color:var(--muted); margin-top:4px }
+    .split { display:flex; gap:10px; flex-wrap:wrap; font-size:11px; color:var(--muted); margin-top:6px }
+    .split b { color:var(--text); font-weight:700 }
+    .filters { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px }
+    .filters select, .filters input { background:var(--panel); border:1px solid var(--line); color:var(--text);
+                                      border-radius:8px; padding:8px 10px; font:16px var(--mono); min-height:40px }
+    .wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px; background:var(--panel) }
+    table { border-collapse:collapse; width:100%; min-width:820px }
+    th, td { padding:9px 11px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--line) }
+    th:first-child, td:first-child, th.l, td.l { text-align:left }
+    th { position:sticky; top:0; background:#0e1526; cursor:pointer; user-select:none; font-size:11px;
+         text-transform:uppercase; letter-spacing:.04em; color:var(--muted); z-index:1 }
+    th.sorted::after { content:' \\2195'; color:var(--accent) }
+    tbody tr:hover { background:#17203a }
+    tbody tr.detail-row td { background:#0e1526; text-align:left; white-space:normal; font-size:12px; color:var(--muted) }
+    .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:1px 8px;
+            font-size:10px; color:var(--muted); white-space:nowrap }
+    .pill.ok { color:var(--green); border-color:var(--green) }
+    .pill.sub { color:var(--amber); border-color:var(--amber) }
+    .pill.none { color:var(--muted) }
+    .expand { background:none; border:none; color:var(--muted); cursor:pointer; font:12px var(--mono); padding:0 6px }
+    .empty { padding:26px; text-align:center; color:var(--muted) }
+    .note { font-size:12px; color:var(--muted); margin:14px 0 0; line-height:1.6 }
+    @media (max-width:760px) {
+      header { padding:10px 12px; gap:8px } h1 { font-size:15px }
+      main { padding:10px 12px 24px }
+      .card .big { font-size:19px }
+      .filters select, .filters input { flex:1 1 140px }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📊 AI Usage</h1>
+    <span class="muted" id="sourceLine">đang tải…</span>
+    <span class="spacer"></span>
+    <label class="muted" style="font-size:12px"><input type="checkbox" id="autoRefresh" checked> Tự làm mới</label>
+    <button class="btn" id="refreshBtn" type="button">Làm mới</button>
+    <a class="btn" href="/dashboard" style="text-decoration:none; display:inline-flex; align-items:center">← Dashboard</a>
+  </header>
+  <main>
+    <div class="cards" id="cards"></div>
+    <div class="filters">
+      <select id="fNode"><option value="">Tất cả node</option></select>
+      <select id="fAgent"><option value="">Tất cả agent</option></select>
+      <select id="fProject"><option value="">Tất cả project</option></select>
+      <input type="search" id="fSearch" placeholder="Lọc theo tên session..." aria-label="Lọc session">
+    </div>
+    <div class="wrap">
+      <table id="tbl">
+        <thead><tr>
+          <th class="l" data-k="session">Session</th>
+          <th class="l" data-k="agent">Agent</th>
+          <th class="l" data-k="project">Project</th>
+          <th data-k="i">5h Input</th>
+          <th data-k="o">5h Output</th>
+          <th data-k="cr">5h Cache Read</th>
+          <th data-k="cw">5h Cache Write</th>
+          <th data-k="t" class="sorted">5h Total</th>
+          <th data-k="today">Today</th>
+          <th data-k="life">Lifetime</th>
+          <th data-k="act">Hoạt động</th>
+          <th class="l">Quota</th>
+          <th></th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <p class="note" id="provenance"></p>
+  </main>
+  <script>
+    const $ = (s) => document.querySelector(s);
+    let data = null, sortKey = 't', sortDir = -1;
+    const expanded = new Set();
+
+    const fmt = (n) => (n || 0).toLocaleString('en-US');
+    const short = (n) => {
+      n = n || 0;
+      if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+      return String(n);
+    };
+    const ago = (ts) => {
+      if (!ts) return '—';
+      const s = Math.max(0, Date.now() / 1000 - ts);
+      if (s < 90) return Math.round(s) + 's';
+      if (s < 5400) return Math.round(s / 60) + 'm';
+      if (s < 172800) return Math.round(s / 3600) + 'h';
+      return Math.round(s / 86400) + 'd';
+    };
+
+    function quotaCell(row) {
+      const q = (data.quota_windows || []).filter((w) => w.agent === row.agent);
+      const observed = q.filter((w) => w.observed);
+      if (!observed.length) {
+        const span = document.createElement('span');
+        span.className = 'pill none';
+        span.textContent = 'Not observed';
+        const why = q.length ? q[0].detail : '';
+        if (why) span.title = why;
+        return span;
+      }
+      const frag = document.createDocumentFragment();
+      for (const w of observed) {
+        const span = document.createElement('span');
+        span.className = 'pill sub';
+        const pct = w.used_percent == null ? '?' : Math.round(w.used_percent) + '%';
+        let text = w.label + ' ' + pct;
+        if (w.resets_at) {
+          const left = Math.max(0, w.resets_at - Date.now() / 1000);
+          text += ' · reset ' + (left > 3600 ? Math.round(left / 3600) + 'h' : Math.round(left / 60) + 'm');
+        }
+        span.textContent = text;
+        span.title = 'Nguồn: ' + w.source;
+        frag.appendChild(span);
+      }
+      return frag;
+    }
+
+    function visibleRows() {
+      const node = $('#fNode').value, agent = $('#fAgent').value, project = $('#fProject').value;
+      const q = $('#fSearch').value.trim().toLowerCase();
+      return (data.sessions || []).filter((r) =>
+        (!node || r.node_id === node) && (!agent || r.agent === agent) &&
+        (!project || (r.project || '') === project) &&
+        (!q || (r.session || r.agent_session_id || '').toLowerCase().includes(q)));
+    }
+
+    const KEY = {
+      session: (r) => (r.session || r.agent_session_id || '').toLowerCase(),
+      agent: (r) => r.agent, project: (r) => r.project || '',
+      i: (r) => r.rolling_5h.input, o: (r) => r.rolling_5h.output,
+      cr: (r) => r.rolling_5h.cache_read, cw: (r) => r.rolling_5h.cache_write,
+      t: (r) => r.rolling_5h.total, today: (r) => r.today.total,
+      life: (r) => r.lifetime.total, act: (r) => r.last_activity || 0,
+    };
+
+    function render() {
+      if (!data) return;
+      const total = data.totals;
+      const cards = [
+        ['5h Total', short(total.rolling_5h.total), total.rolling_5h.messages + ' message',
+         [['In', total.rolling_5h.input], ['Out', total.rolling_5h.output],
+          ['C·Read', total.rolling_5h.cache_read], ['C·Write', total.rolling_5h.cache_write]]],
+        ['Today', short(total.today.total), total.today.messages + ' message', null],
+        ['Lifetime', short(total.lifetime.input + total.lifetime.output +
+          total.lifetime.cache_read + total.lifetime.cache_write),
+         total.lifetime.events + ' assistant turn', null],
+        ['Sessions', String((data.sessions || []).length),
+         (data.sessions || []).filter((s) => s.is_subagent).length + ' subagent', null],
+      ];
+      const cardsEl = $('#cards'); cardsEl.replaceChildren();
+      for (const [title, big, sub, split] of cards) {
+        const el = document.createElement('div'); el.className = 'card';
+        const h = document.createElement('h2'); h.textContent = title;
+        const b = document.createElement('div'); b.className = 'big'; b.textContent = big;
+        const s = document.createElement('div'); s.className = 'sub'; s.textContent = sub;
+        el.append(h, b, s);
+        if (split) {
+          const row = document.createElement('div'); row.className = 'split';
+          for (const [label, value] of split) {
+            const span = document.createElement('span');
+            const strong = document.createElement('b'); strong.textContent = short(value);
+            span.append(label + ' ', strong);
+            row.appendChild(span);
+          }
+          el.appendChild(row);
+        }
+        cardsEl.appendChild(el);
+      }
+
+      for (const [sel, key] of [['#fNode', 'node_id'], ['#fAgent', 'agent'], ['#fProject', 'project']]) {
+        const el = $(sel), keep = el.value;
+        const values = [...new Set((data.sessions || []).map((r) => r[key]).filter(Boolean))].sort();
+        el.replaceChildren();
+        const all = document.createElement('option'); all.value = '';
+        all.textContent = el.id === 'fNode' ? 'Tất cả node' : el.id === 'fAgent' ? 'Tất cả agent' : 'Tất cả project';
+        el.appendChild(all);
+        for (const v of values) {
+          const opt = document.createElement('option'); opt.value = v;
+          opt.textContent = el.id === 'fProject' ? v.split('/').slice(-2).join('/') : v;
+          el.appendChild(opt);
+        }
+        el.value = values.includes(keep) ? keep : '';
+      }
+
+      const rows = visibleRows().sort((a, b) => {
+        const x = KEY[sortKey](a), y = KEY[sortKey](b);
+        return (x < y ? -1 : x > y ? 1 : 0) * sortDir;
+      });
+      const body = $('#tbody'); body.replaceChildren();
+      if (!rows.length) {
+        const tr = document.createElement('tr'); const td = document.createElement('td');
+        td.colSpan = 13; td.className = 'empty';
+        td.textContent = 'Không có dữ liệu usage nào khớp bộ lọc.';
+        tr.appendChild(td); body.appendChild(tr);
+      }
+      for (const r of rows) {
+        const tr = document.createElement('tr');
+        const id = r.agent + ':' + r.agent_session_id;
+        const cells = [
+          [r.session || r.agent_session_id.slice(0, 8), 'l'],
+          [r.agent + (r.is_subagent ? ' · sub' : ''), 'l'],
+          [(r.project || '—').split('/').slice(-2).join('/'), 'l'],
+          [fmt(r.rolling_5h.input)], [fmt(r.rolling_5h.output)],
+          [fmt(r.rolling_5h.cache_read)], [fmt(r.rolling_5h.cache_write)],
+          [fmt(r.rolling_5h.total)], [short(r.today.total)], [short(r.lifetime.total)],
+          [ago(r.last_activity)],
+        ];
+        for (const [text, cls] of cells) {
+          const td = document.createElement('td');
+          if (cls) td.className = cls;
+          td.textContent = text;
+          tr.appendChild(td);
+        }
+        const tdQuota = document.createElement('td'); tdQuota.className = 'l';
+        tdQuota.appendChild(quotaCell(r)); tr.appendChild(tdQuota);
+        const tdX = document.createElement('td');
+        const btn = document.createElement('button');
+        btn.className = 'expand'; btn.type = 'button';
+        btn.textContent = expanded.has(id) ? '▾' : '▸';
+        btn.title = 'Chi tiết';
+        btn.onclick = () => { expanded.has(id) ? expanded.delete(id) : expanded.add(id); render(); };
+        tdX.appendChild(btn); tr.appendChild(tdX);
+        body.appendChild(tr);
+
+        if (expanded.has(id)) {
+          const detail = document.createElement('tr'); detail.className = 'detail-row';
+          const td = document.createElement('td'); td.colSpan = 13;
+          const lines = [
+            ['conversation', r.agent_session_id],
+            ['stable_session_id', r.stable_session_id || '—'],
+            ['node', r.node_id], ['model', r.model || '—'],
+            ['cli version', r.cli_version || '—'], ['pid', r.pid == null ? '—' : String(r.pid)],
+            ['git branch', r.git_branch || '—'],
+            ['subagent (sidechain)', r.is_subagent ? 'yes' : 'no'],
+            ['messages 5h / lifetime', r.rolling_5h.messages + ' / ' + r.lifetime.messages],
+            ['lifetime in/out/cr/cw', [r.lifetime.input, r.lifetime.output,
+              r.lifetime.cache_read, r.lifetime.cache_write].map(fmt).join(' / ')],
+            ['nguồn số liệu', r.source],
+          ];
+          for (const [k, v] of lines) {
+            const row = document.createElement('div');
+            const b = document.createElement('b'); b.textContent = k + ': ';
+            row.append(b, document.createTextNode(v));
+            td.appendChild(row);
+          }
+          detail.appendChild(td); body.appendChild(detail);
+        }
+      }
+
+      for (const th of document.querySelectorAll('th[data-k]'))
+        th.classList.toggle('sorted', th.dataset.k === sortKey);
+
+      const src = data.sources || {};
+      $('#sourceLine').textContent =
+        'Claude: ' + (src.claude ? src.claude.status : '?') +
+        ' · Codex: ' + (src.codex ? src.codex.status : '?');
+      const notes = [data.window.note];
+      for (const w of data.quota_windows || [])
+        if (!w.observed && w.detail) notes.push(w.agent + ': ' + w.detail);
+      notes.push('Nguồn: ' + (src.claude ? src.claude.detail : '') + ' · ' + (src.codex ? src.codex.detail : ''));
+      $('#provenance').textContent = notes.join('  •  ');
+    }
+
+    async function load(force) {
+      try {
+        const response = await fetch('/dashboard/api/ai-usage/local' + (force ? '?refresh=1' : ''),
+                                     {cache: 'no-store'});
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        data = await response.json();
+        render();
+      } catch (err) {
+        $('#sourceLine').textContent = 'Không tải được dữ liệu: ' + err.message;
+      }
+    }
+
+    for (const th of document.querySelectorAll('th[data-k]'))
+      th.onclick = () => {
+        const k = th.dataset.k;
+        if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = -1; }
+        render();
+      };
+    for (const sel of ['#fNode', '#fAgent', '#fProject']) $(sel).onchange = render;
+    $('#fSearch').oninput = render;
+    $('#refreshBtn').onclick = () => load(true);
+    load(true);
+    setInterval(() => { if ($('#autoRefresh').checked) load(true); }, 30000);
+  </script>
+</body>
+</html>
+"""
+
 GLOBAL_TASKS_HTML = """<!doctype html>
 <html lang="vi">
 <head>
@@ -7831,6 +8175,62 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             NODES_ADMIN_HTML,
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
+
+    @server.custom_route("/dashboard/ai-usage", methods=["GET"], include_in_schema=False)
+    async def dashboard_ai_usage_page(request: Request) -> HTMLResponse | JSONResponse:
+        # Same _read_guard as every other dashboard view. Read-only: the page
+        # never writes and its data comes from files the CLIs already wrote.
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(
+            AI_USAGE_HTML,
+            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
+        )
+
+    @server.custom_route("/dashboard/api/ai-usage/local", methods=["GET"], include_in_schema=False)
+    async def dashboard_ai_usage_local(request: Request) -> JSONResponse:
+        """Usage read from local CLI artefacts. No provider API is contacted.
+
+        `?refresh=1` ingests whatever has been appended since the last read
+        (byte offsets per file, event ids for exactly-once); without it the
+        already-indexed data is served, so a poll cannot be made expensive by
+        asking for it often.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        from .ai_usage_index import AiUsageIndex
+
+        def _build() -> dict[str, Any]:
+            index = AiUsageIndex()
+            ingest = None
+            if request.query_params.get("refresh"):
+                ingest = index.refresh(node_id=terminal.REGISTRY_LOCAL_NODE_ID)
+            # tmux session name -> stable_session_id, resolved fresh so a
+            # renamed or restarted session keeps its usage history instead of
+            # splitting it across two rows.
+            names: dict[str, str] = {}
+            try:
+                for record in terminal.session_registry.list(
+                        node_id=terminal.REGISTRY_LOCAL_NODE_ID):
+                    if record.stable_session_id:
+                        names[record.session_name] = record.stable_session_id
+            except Exception:  # noqa: BLE001 -- a registry hiccup must not blank the page
+                names = {}
+            report = index.report(session_names=names)
+            if ingest is not None:
+                report["ingest"] = ingest
+            return report
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001 -- a report page never 500s the dashboard
+            return JSONResponse({"error": "AI_USAGE_INDEX_FAILED", "detail": str(exc),
+                                 "sessions": [], "quota_windows": [],
+                                 "totals": {"rolling_5h": {}, "today": {}, "lifetime": {}}},
+                                status_code=200)
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/tasks", methods=["GET"], include_in_schema=False)
     async def dashboard_global_tasks(request: Request) -> HTMLResponse | JSONResponse:
