@@ -74,7 +74,12 @@ def test_stale_identity_pin_is_flagged_but_explained_and_exits_zero(tmp_path, mo
     result = json.loads(capsys.readouterr().out)
     row = next(r for r in result["flagged"] if r["session"] == name)
     assert row["node_id"] == "local"
-    assert row["reason"] == "IDENTITY_MISMATCH"
+    # Was IDENTITY_MISMATCH, back when a stale pin REFUSED input. Under the
+    # default-open policy it no longer does -- a record must never deny what
+    # having no record would allow -- so this is now reported as an inert
+    # grant rather than as a denial, and effective_input stays true.
+    assert row["reason"] == "STALE_IDENTITY_PIN"
+    assert row["stale_identity_pin"] is True
     assert row["explained"] is True
     assert code == 0  # an explained, expected state -- never a failure exit
 
@@ -98,3 +103,49 @@ def test_human_output_labels_stale_pin_as_re_grant_to_fix(tmp_path, monkeypatch,
     assert code == 0
     assert "re-grant to fix" in out
     assert name in out
+
+
+def test_a_grant_for_a_session_on_no_node_is_reported_as_orphaned(
+    tmp_path, monkeypatch, capsys, tmux_cleanup,
+):
+    """The blind spot the per-node loop cannot cover.
+
+    It only ever inspects rows returned by a node listing, so a grant whose
+    session exists nowhere is invisible to it -- which is the shape the live
+    `mesflow` grant had: issued while the session ran on the controller,
+    still sitting there after it moved elsewhere.
+    """
+    monkeypatch.setenv("TERMINAL_MCP_NODE_REGISTRY_DB", str(tmp_path / "nodes.db"))
+    grants_path = tmp_path / "grants.db"
+    monkeypatch.setenv("TERMINAL_MCP_GRANTS_DB", str(grants_path))
+    config_path = _write_config(tmp_path)
+
+    store = SessionGrantStore(grants_path)
+    store.set_read("test-doctor-grants-nowhere", True, granted_by="tester")
+
+    code = doctor.main(["grants", "--json", "--config", config_path])
+    result = json.loads(capsys.readouterr().out)
+
+    orphans = {row["session"] for row in result["orphaned_grants"]}
+    assert "test-doctor-grants-nowhere" in orphans
+    assert code == 0  # housekeeping, not a failure
+
+
+def test_a_grant_whose_session_is_live_is_not_called_orphaned(
+    tmp_path, monkeypatch, capsys, tmux_cleanup,
+):
+    monkeypatch.setenv("TERMINAL_MCP_NODE_REGISTRY_DB", str(tmp_path / "nodes.db"))
+    grants_path = tmp_path / "grants.db"
+    monkeypatch.setenv("TERMINAL_MCP_GRANTS_DB", str(grants_path))
+    config_path = _write_config(tmp_path)
+
+    name = "test-doctor-grants-present"
+    tmux_cleanup.append(name)
+    subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", str(tmp_path),
+                    "bash -lc 'sleep 30'"], check=True)
+    SessionGrantStore(grants_path).set_read(name, True, granted_by="tester")
+
+    doctor.main(["grants", "--json", "--config", config_path])
+    result = json.loads(capsys.readouterr().out)
+
+    assert name not in {row["session"] for row in result["orphaned_grants"]}

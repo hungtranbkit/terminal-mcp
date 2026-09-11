@@ -913,6 +913,25 @@ class TerminalService:
             return True, None
         return False, "IDENTITY_MISMATCH"
 
+    def _grant_pin_is_stale(self, session: str, grant, current_identity=None) -> bool:
+        """Does this grant point at a session instance that is gone?
+
+        Under a default-OPEN policy such a grant decides nothing -- the
+        default does (see _stale_pin_fallback) -- so it is inert rather than
+        authoritative, and callers that show or audit grants need to be able
+        to say so. Uses the identity the caller already has when there is
+        one; only resolves fresh when there is not.
+        """
+        if grant is None or not grant.pinned_session_id:
+            return False
+        current = current_identity if current_identity is not None else self.resolve_identity(session)
+        if current is None:
+            return True
+        pinned = SessionIdentity(name=session, session_id=grant.pinned_session_id,
+                                 pane_id=grant.pinned_pane_id or "",
+                                 created_epoch=grant.pinned_created_epoch or 0)
+        return not pinned.matches(current)
+
     def _input_authorized(self, session: str) -> tuple[bool, str | None]:
         return self._input_authorized_with_grant(session, self.grants.get(session))
 
@@ -1090,9 +1109,11 @@ class TerminalService:
             read_granted = bool(grant and grant.read_enabled)
             input_granted = bool(grant and grant.input_enabled)
             read_allowed = self._read_authorized_with_grant(item.name, grant)
+            identity = SessionIdentity.from_session_info(item)
             input_ok, input_specific_reason = self._input_authorized_with_grant(
-                item.name, grant, current_identity=SessionIdentity.from_session_info(item))
+                item.name, grant, current_identity=identity)
             input_allowed = bool(self.config.permissions.terminal_input and input_ok)
+            stale_pin = self._grant_pin_is_stale(item.name, grant, identity)
             row = {
                 # DEPRECATED FIELD. `allowed` used to be the session-name
                 # whitelist result, which is exactly how a row could report
@@ -1127,6 +1148,13 @@ class TerminalService:
                 # is what's off).
                 "input_denied_reason": (input_specific_reason if (self.config.permissions.terminal_input
                                                                    and not input_allowed) else None),
+                # A grant pinned to a session instance that is gone. Under an
+                # open default it no longer BLOCKS anything (it used to, which
+                # made a record worse than no record) -- so it no longer shows
+                # up as a denial reason either, and this is the only way a
+                # dashboard or `doctor grants` can still see that the row is
+                # inert and wants re-granting or clearing.
+                "stale_identity_pin": stale_pin,
                 # P0 CONTROL-PLANE HOTFIX (task: "P0 AUDIT/RECOVERY --
                 # window/window2 transcript collision"): passthrough of
                 # SessionInfo.resume_conversation_id -- see its own
@@ -2877,13 +2905,7 @@ class TerminalService:
         # server restarted, or the session moved to another node). It then
         # decides nothing -- the default policy does -- so say so, rather
         # than leaving a row that looks authoritative but is inert.
-        stale_pin = False
-        if grant is not None and grant.pinned_session_id:
-            current = self.resolve_identity(session)
-            pinned = SessionIdentity(name=session, session_id=grant.pinned_session_id,
-                                     pane_id=grant.pinned_pane_id or "",
-                                     created_epoch=grant.pinned_created_epoch or 0)
-            stale_pin = current is None or not pinned.matches(current)
+        stale_pin = self._grant_pin_is_stale(session, grant)
         if sensitive:
             source = "sensitive_name_floor"
         elif grant is not None:

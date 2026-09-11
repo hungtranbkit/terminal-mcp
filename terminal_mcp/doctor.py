@@ -167,23 +167,26 @@ def cmd_grants(args: argparse.Namespace) -> int:
     """Fleet-wide grant-health diagnostic (task: "P0 HOTFIX REMOTE
     PERMISSION FLAP" -- item 8's own "invariant/assertion/doctor check").
 
-    Flags every session, on every reachable node, where an active input
-    grant (input_granted=true) is currently NOT effective
-    (effective_input=false) while the GLOBAL terminal_input permission is
-    on. This is deliberately a DIAGNOSTIC, never an auto-fix and never
-    proof of a bug on its own -- the single most common cause is the
-    identity-pinning invariant working exactly as designed (a session
-    was recreated, e.g. after a tmux-server restart, and its grant's
-    pinned identity no longer matches; see core.py's
-    _input_authorized_with_grant for the full reasoning and the real
-    incident that invariant itself was built to prevent). Each flagged
-    row is labeled with WHY: `input_denied_reason == "IDENTITY_MISMATCH"`
-    means "re-grant to fix" (an operator/dashboard action, not a code
-    change); any other case (reason is None despite the mismatch) is
-    genuinely unexpected and worth investigating -- this command exits
-    1 only for that second, unexplained case, never for a plain
-    identity-mismatch (which is an expected, self-explanatory state, not
-    a failure this CLI should gate on)."""
+    Flags two different things, on every reachable node.
+
+    1. An active input grant (input_granted=true) that is currently NOT
+       effective while the GLOBAL terminal_input permission is on. A real
+       denial: a lock, a denied pattern, or a sensitive-name floor.
+
+    2. A grant pinned to a session instance that no longer exists
+       (`stale_identity_pin`). This USED to appear as case 1 with
+       `input_denied_reason == "IDENTITY_MISMATCH"`, because a stale pin
+       refused input. It no longer does: under a default-open policy that
+       made a grant record strictly worse than having no record at all, so
+       a mismatched grant now grants nothing and falls through to the
+       default (see core.py's _stale_pin_fallback). The row is therefore
+       inert rather than harmful -- but it is still a grant that says
+       something untrue about a session, so it is worth reporting and
+       worth clearing or re-granting.
+
+    Both are DIAGNOSTICS, never auto-fixes. Exit code is 1 only for a
+    denial this command cannot explain -- never for a stale pin, which is
+    an expected, self-explanatory state."""
     from .agent_availability import available_agent_types  # noqa: F401 -- parity with cmd_nodes's own imports
     from .config import load_config
     from .controller import ControllerService
@@ -209,6 +212,7 @@ def cmd_grants(args: argparse.Namespace) -> int:
     controller.refresh_local_heartbeat(tmux_session_count=0, agent_counts={}, agent_types=(), agent_version=None)
 
     flagged = []
+    listed_by_node: dict[str, set[str]] = {}
     node_errors = {}
     for node in controller.list_nodes():
         if node.id != controller.local_node_id and node.status != NODE_ONLINE:
@@ -221,13 +225,42 @@ def cmd_grants(args: argparse.Namespace) -> int:
         except NodeClientError as exc:
             node_errors[node.id] = str(exc)
             continue
+        listed_by_node[node.id] = {row["name"] for row in sessions}
         for row in sessions:
+            stale = bool(row.get("stale_identity_pin"))
             if row.get("input_granted") and not row.get("effective_input"):
                 flagged.append({"node_id": node.id, "session": row["name"],
                                 "reason": row.get("input_denied_reason"),
-                                "explained": row.get("input_denied_reason") == "IDENTITY_MISMATCH"})
+                                "stale_identity_pin": stale,
+                                # A stale pin explains itself; anything else
+                                # that denies a granted input needs a reason.
+                                "explained": stale or bool(row.get("input_denied_reason"))})
+            elif stale:
+                # Not a denial any more -- an inert row, reported so it can be
+                # cleared rather than left looking authoritative.
+                flagged.append({"node_id": node.id, "session": row["name"],
+                                "reason": "STALE_IDENTITY_PIN", "stale_identity_pin": True,
+                                "explained": True})
 
-    result = {"flagged": flagged, "node_errors": node_errors}
+    # A grant whose session is not listed on ANY reachable node. The per-node
+    # loop above can never see these -- it only inspects rows that came back
+    # from a listing -- yet that is exactly the shape the live `mesflow` case
+    # had: granted here while it ran here, then moved to another node, so the
+    # grant sits on the controller pointing at nothing it can see. Only
+    # reported when every node answered: an unreachable node is a far likelier
+    # explanation for a missing session than a dead grant.
+    orphaned = []
+    if not node_errors:
+        seen = {name for names in listed_by_node.values() for name in names}
+        for grant in terminal.grants.list():
+            if grant.session not in seen:
+                orphaned.append({"session": grant.session,
+                                 "reason": "NO_SUCH_SESSION_ON_ANY_NODE",
+                                 "granted_by": grant.granted_by,
+                                 "read": bool(grant.read_enabled),
+                                 "input": bool(grant.input_enabled)})
+
+    result = {"flagged": flagged, "orphaned_grants": orphaned, "node_errors": node_errors}
     if args.json:
         print(json.dumps(result, sort_keys=True))
     else:
@@ -235,8 +268,18 @@ def cmd_grants(args: argparse.Namespace) -> int:
         if not flagged:
             print("  No granted-but-ineffective input sessions found.")
         for row in flagged:
-            label = "re-grant to fix (session was recreated)" if row["explained"] else "UNEXPLAINED -- investigate"
+            if row.get("stale_identity_pin"):
+                label = "re-grant to fix (session was recreated; the grant is inert, not blocking)"
+            elif row["explained"]:
+                label = "explained -- see reason"
+            else:
+                label = "UNEXPLAINED -- investigate"
             print(f"  [{row['node_id']}] {row['session']}: reason={row['reason']} -- {label}")
+        if orphaned:
+            print("  Grants whose session is not on any reachable node:")
+            for row in orphaned:
+                print(f"    {row['session']}: granted_by={row['granted_by']} "
+                      f"read={row['read']} input={row['input']} -- clear it, or the session moved")
         for node_id, detail in node_errors.items():
             print(f"  (could not check {node_id}: {detail})")
 
