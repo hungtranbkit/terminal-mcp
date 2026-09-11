@@ -13,7 +13,7 @@ Audited 2026-09-11. Controller at `37ffbbb`.
 
 | # | Criterion | State |
 | --- | --- | --- |
-| a | HP + Dell have an independent, healthy, **autostarting** control plane | ⚠️ **PARTIAL** — HP has a healthy controller, but no autostart on either |
+| a | HP + Dell have an independent, healthy, **autostarting** control plane | ⚠️ **PARTIAL** — HP: yes (active+enabled+linger). Dell: installed but disabled |
 | b | Cluster still queries/routes with M910 absent | ❌ **FAIL** — no federation; routing is M910-only |
 | c | Windows/Mac workloads survive M910 and keep an alternate control path | ⚠️ **PARTIAL** — they survive; Windows has no alternate path at all |
 | d | Recovery / grants / bindings / tombstones correct | ✅ **PASS** |
@@ -66,19 +66,28 @@ an explicit human; a staleness bound so a long-dead record is not resurrected.
 
 ## What is NOT proven — the blockers
 
-### B1. No second control plane is autostarting — P0
+### B1. One control plane autostarts; it is not reachable — P0
 
-HP already runs a **healthy full controller**: `/health/live`, `/health/ready`
-and `/version` all answer on `127.0.0.1:8766`, alongside its node agent on the
+HP runs a **healthy full controller**: `/health/live`, `/health/ready` and
+`/version` all answer on `127.0.0.1:8766`, alongside its node agent on the
 tailnet, with 19 local state DBs and `Linger=yes`.
 
-Two gaps:
+**Correction to an earlier reading in this audit.** A first pass reported "no
+systemd units on HP". That was wrong: the query ran in a session spawned by
+the node agent, which has no `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`, so
+`systemctl --user` could not reach the user bus and its error text was
+mis-read as empty output. Re-queried with the runtime dir set:
 
-* **No systemd unit exists for it** (`systemctl --user list-unit-files | grep
-  terminal` returns nothing). It is running from a manual launch, so a reboot
-  loses it.
-* It binds **loopback only**, so it cannot serve the cluster even if it
+    terminal-mcp-http     active=active   enabled=enabled
+    terminal-node-agent   active=inactive enabled=not-found
+
+So HP's controller **does** come back after a reboot (enabled + linger). Two
+real gaps remain:
+
+* It binds **loopback only**, so it cannot serve the cluster even though it
   survives.
+* HP's **node agent** has no unit at all — it is running from a manual launch
+  and would not come back.
 
 Dell Linux has the complete code and all 19 DBs but runs only the node agent;
 its `terminal-mcp-http` is installed and **disabled**.
@@ -117,22 +126,23 @@ Delivery needs either a credential or an operator action.
 
 | Node | Survives M910 off | Usable during | Autostart | Control plane | Verdict | % |
 | --- | --- | --- | --- | --- | --- | --- |
-| **hp-linux** | ✅ | ✅ tailnet + own controller | ❌ none | ✅ healthy, loopback-bound | **PARTIAL** | ~65% |
+| **hp-linux** | ✅ | ✅ tailnet + own controller | ✅ controller; ❌ agent | ✅ healthy, loopback-bound | **PARTIAL** | ~75% |
 | **dell-linux** | ✅ | ✅ tailnet + SSH | ✅ agent only | ❌ disabled | **PARTIAL** | ~55% |
 | **macbook** | ✅ | ✅ tailnet | ⚠️ login, not boot | ❌ | **PARTIAL** | ~45% |
 | **dell-5530** | ✅ sessions only | ❌ off-LAN | ⚠️ boot trigger, Interactive principal | ❌ | **FAIL** | ~30% |
 
-**Fleet readiness for an M910 power-off: ~50%.**
+**Fleet readiness for an M910 power-off: ~55%.**
 
 ## Exactly what remains before M910 can be powered off
 
 In order. Steps 1–3 are the minimum for a *safe* power-off; 4–5 are needed
 before anyone may say production-ready.
 
-1. **Give HP's controller a systemd unit and a routable bind.** No reboot
-   needed to install and `enable` it — the running process keeps serving, and
-   the unit takes effect at next boot. This alone converts B1 from "one manual
-   process" to "a control plane that comes back".
+1. **Bind HP's controller to its tailnet address, and give HP's node agent a
+   unit.** The controller unit already exists and is enabled — what is missing
+   is reachability (loopback-only today) and an autostarting agent beside it.
+   Neither needs a reboot: install and `enable` without `--now`, and the
+   running processes keep serving until the next boot picks the units up.
 2. **Deliver and apply the bundle** to HP and dell-linux, then confirm
    `contract_version: 1` on both. Blocked on a credential or an operator.
 3. **Windows: install Tailscale and repoint its controller-url to a tailnet
