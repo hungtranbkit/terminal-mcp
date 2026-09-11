@@ -15,6 +15,7 @@ from starlette.testclient import TestClient
 
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig, SessionLifecycleConfig
 from terminal_mcp.core import TerminalService
+from terminal_mcp.launcher_resolution import resolve_launcher
 from terminal_mcp.dashboard import register_dashboard
 from terminal_mcp.mcp_app import build_mcp
 
@@ -160,6 +161,15 @@ def test_create_claude_and_codex_use_server_side_allowlisted_launcher(
     # production nail/promptflow/codex-main sessions run) -- agent_type
     # never becomes client-supplied command text, only a lookup key into
     # config.session_lifecycle.launch_commands.
+    #
+    # Which of those binaries a given host has is an environment fact, not
+    # a property of this code: on a host without codex, returning
+    # LAUNCHER_NOT_CONFIGURED is the CORRECT behaviour, and is asserted by
+    # test_create_reports_launcher_not_configured_for_a_missing_binary
+    # below. So skip rather than fail -- an absent binary must not read as
+    # a regression in launcher dispatch.
+    if resolve_launcher(agent_type) is None:
+        pytest.skip(f"{agent_type!r} is not installed on this host")
     config = _lifecycle_config(tmp_path, timeout=8.0)
     service = TerminalService(config)
     name = lifecycle_session_factory(f"{session_prefix}1")
@@ -168,6 +178,22 @@ def test_create_claude_and_codex_use_server_side_allowlisted_launcher(
     assert result["state"] in ("READY", "CREATED")
     info = service.tmux.get_session(name)
     assert info is not None
+
+
+def test_create_reports_launcher_not_configured_for_a_missing_binary(tmp_path, lifecycle_session_factory):
+    # A known agent_type whose configured launcher is not present on this
+    # host. Pointing codex at a binary that cannot exist keeps the case
+    # host-independent -- it asserts the same thing whether or not the real
+    # codex is installed here.
+    config = _lifecycle_config(tmp_path, timeout=8.0,
+                               launch_commands=(("claude", "claude"),
+                                                ("codex", "terminal-mcp-no-such-binary")))
+    service = TerminalService(config)
+    name = lifecycle_session_factory("codex-lc-missing")
+    result = service.terminal_create_session(name, "codex")
+    assert result["error"] == "LAUNCHER_NOT_CONFIGURED"
+    assert result["state"] == "FAILED"
+    assert service.tmux.get_session(name) is None
 
 
 def test_create_launcher_never_accepts_raw_command_from_caller(tmp_path, lifecycle_session_factory):

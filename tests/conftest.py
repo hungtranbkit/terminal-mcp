@@ -144,6 +144,19 @@ def tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["tmux", *args], check=check, capture_output=True, text=True, timeout=10)
 
 
+# Set on every tmux session this fixture creates, and read back on a later
+# run to tell OUR OWN leftovers (from a run interrupted before teardown)
+# apart from a real session that merely shares the name. Without this, one
+# interrupted run poisoned that test's literal name on the host forever:
+# the guard below refused it on every subsequent run.
+OWNER_OPTION = "@terminal_mcp_test_session"
+
+
+def _is_test_owned(name: str) -> bool:
+    got = tmux("show-options", "-t", name, "-v", OWNER_OPTION, check=False)
+    return got.returncode == 0 and got.stdout.strip() == "1"
+
+
 @pytest.fixture
 def tmux_session_factory():
     """Creates a real tmux session for the duration of one test, then kills
@@ -165,6 +178,12 @@ def tmux_session_factory():
 
     def create(name: str, command: str = "bash") -> str:
         exists = tmux("has-session", "-t", name, check=False).returncode == 0
+        if exists and name not in created and _is_test_owned(name):
+            # Provably a leftover from an earlier test run of this suite
+            # (see OWNER_OPTION). A real, attended session can never carry
+            # that tag, so reaping this one cannot touch anyone's work.
+            tmux("kill-session", "-t", name, check=False)
+            exists = False
         if exists and name not in created:
             # A session by this name already exists and this fixture
             # instance did not make it -- refuse rather than kill it. Once
@@ -181,6 +200,7 @@ def tmux_session_factory():
         if exists:
             tmux("kill-session", "-t", name, check=False)
         tmux("new-session", "-d", "-s", name, command)
+        tmux("set-option", "-t", name, OWNER_OPTION, "1", check=False)
         created.add(name)
         time.sleep(0.15)
         return name

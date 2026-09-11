@@ -60,11 +60,15 @@ class _Controller:
 
 @pytest.fixture
 def engine(tmp_path):
+    # managed_sessions_only is a separate POLICY (only recreate what we were
+    # asked to create), covered in test_recovery_engine.py. These cases are
+    # about how the engine behaves when a NODE comes and goes, so they opt out
+    # of it and use plain discovered records.
     registry = SessionRegistryStore(tmp_path / "registry.db")
     controller = _Controller()
     store = PaneLeaseStore(tmp_path / "leases.db")
     return registry, controller, RecoveryEngine(registry, controller, store,
-                                                AutoRecoveryConfig(enabled=True))
+                                                AutoRecoveryConfig(enabled=True, managed_sessions_only=False))
 
 
 # -- node registry view of an absent controller/peer ------------------------
@@ -164,7 +168,7 @@ def test_recovery_respects_a_bounded_attempt_budget(engine, tmp_path):
     registry, controller, _ = engine
     store = PaneLeaseStore(tmp_path / "leases2.db")
     recovery = RecoveryEngine(registry, controller, store,
-                              AutoRecoveryConfig(enabled=True, max_attempts=2))
+                              AutoRecoveryConfig(enabled=True, max_attempts=2, managed_sessions_only=False))
 
     def _fail(qualified, *, requested_by=None):
         controller.reopen_calls.append(qualified)
