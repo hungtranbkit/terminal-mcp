@@ -873,12 +873,40 @@ class TerminalService:
                 return True, None
             current = self.resolve_identity(session)
         if current is None or not grant.pinned_session_id:
-            return False, "IDENTITY_MISMATCH"
+            return self._stale_pin_fallback(session)
         pinned = SessionIdentity(name=session, session_id=grant.pinned_session_id,
                                  pane_id=grant.pinned_pane_id or "", created_epoch=grant.pinned_created_epoch or 0)
         if not pinned.matches(current):
-            return False, "IDENTITY_MISMATCH"
+            return self._stale_pin_fallback(session)
         return True, None
+
+    def _stale_pin_fallback(self, session: str) -> tuple[bool, str | None]:
+        """What a grant pinned to an identity that is no longer live means.
+
+        The pin exists so a grant cannot CARRY OVER to a different session
+        that later takes the same name -- the user authorized session X,
+        not whatever inherits X's name. That is the whole of its job, and
+        it stays intact here: a mismatched grant grants nothing.
+
+        What it must not do is invent a denial. Under a default-OPEN
+        policy an ungranted session of this same name would be writable,
+        so refusing THIS one purely because a stale row happens to mention
+        the name makes the record strictly worse than no record at all --
+        the opposite of "absence of a record means allow". A live instance
+        of this: `mesflow` was granted while it ran on this host, later
+        moved to dell-linux, and every send was then refused with
+        IDENTITY_MISMATCH that no UI could explain, because the controller
+        resolves identity against its OWN tmux and can never match a
+        remote session's ids.
+
+        So a stale pin falls back to the default policy -- never more
+        permissive than an ungranted session, never less. A deployment
+        that closes the default keeps the old fail-closed answer, and an
+        explicit lock (read_enabled/input_enabled cleared) is checked
+        earlier and is unaffected by identity at all."""
+        if self.config.session_access.default_input:
+            return True, None
+        return False, "IDENTITY_MISMATCH"
 
     def _input_authorized(self, session: str) -> tuple[bool, str | None]:
         return self._input_authorized_with_grant(session, self.grants.get(session))
@@ -2836,6 +2864,17 @@ class TerminalService:
 
         sensitive = any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS)
         denied_by_pattern = session_input_denied_by_pattern(session, self.config)
+        # A grant can outlive the exact session it was issued for (tmux
+        # server restarted, or the session moved to another node). It then
+        # decides nothing -- the default policy does -- so say so, rather
+        # than leaving a row that looks authoritative but is inert.
+        stale_pin = False
+        if grant is not None and grant.pinned_session_id:
+            current = self.resolve_identity(session)
+            pinned = SessionIdentity(name=session, session_id=grant.pinned_session_id,
+                                     pane_id=grant.pinned_pane_id or "",
+                                     created_epoch=grant.pinned_created_epoch or 0)
+            stale_pin = current is None or not pinned.matches(current)
         if sensitive:
             source = "sensitive_name_floor"
         elif grant is not None:
@@ -2854,7 +2893,8 @@ class TerminalService:
             },
             "effective": {"read": read_effective, "input": input_effective},
             "source": source,
-            "inherited_from_default_policy": grant is None,
+            "stale_identity_pin": stale_pin,
+            "inherited_from_default_policy": grant is None or stale_pin,
             "default_policy": {"read": bool(self.config.session_access.default_read),
                                "input": bool(self.config.session_access.default_input)},
             "floors": {

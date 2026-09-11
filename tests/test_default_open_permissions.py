@@ -218,3 +218,87 @@ def test_the_whitelist_migration_is_inert_once_defaults_are_open(tmp_path):
     summary = svc.migrate_whitelist_to_grants()
     assert summary.get("skipped")
     assert summary["read_granted"] == []
+
+
+# -- a grant that outlived the session it was pinned to -----------------------
+
+def _grant_pinned_to_a_dead_identity(service, session: str) -> None:
+    """The exact row shape left behind when a granted session is gone:
+    read+input granted, pinned to ids that no longer resolve."""
+    service.grants.set_read(session, True, granted_by="test")
+    service.grants.set_input(session, True, granted_by="test",
+                             pinned_session_id="$99999", pinned_pane_id="%99999",
+                             pinned_created_epoch=1)
+
+
+def test_a_stale_identity_pin_falls_back_to_the_default_instead_of_denying(
+    tmp_path, tmux_session_factory,
+):
+    # Live in production as `mesflow`: granted while it ran on the
+    # controller, later moved to another node. The controller resolves
+    # identity against its OWN tmux, so the pin could never match again and
+    # every send was refused with IDENTITY_MISMATCH -- while an identical
+    # session with NO grant at all stayed writable. A record must never be
+    # worse than no record under a default-open policy.
+    service = _service(tmp_path)
+    name = _live(tmux_session_factory, "stalepin")
+    _grant_pinned_to_a_dead_identity(service, name)
+
+    allowed, reason = service._input_authorized(name)
+    assert allowed is True
+    assert reason is None
+
+
+def test_the_stale_pin_is_reported_so_the_row_is_not_silently_inert(
+    tmp_path, tmux_session_factory,
+):
+    service = _service(tmp_path)
+    name = _live(tmux_session_factory, "stalepin-desc")
+    _grant_pinned_to_a_dead_identity(service, name)
+
+    described = service.describe_session_permissions(name)
+    assert described["effective"] == {"read": True, "input": True}
+    assert described["stale_identity_pin"] is True
+    # The grant is not what decided this, and the answer says so.
+    assert described["inherited_from_default_policy"] is True
+    assert described["input_block_reason"] is None
+
+
+def test_a_matching_pin_is_not_reported_stale(tmp_path, tmux_session_factory):
+    service = _service(tmp_path)
+    name = _live(tmux_session_factory, "livepin")
+    identity = service.resolve_identity(name)
+    assert identity is not None
+    service.grants.set_read(name, True, granted_by="test")
+    service.grants.set_input(name, True, granted_by="test",
+                             pinned_session_id=identity.session_id,
+                             pinned_pane_id=identity.pane_id,
+                             pinned_created_epoch=identity.created_epoch)
+
+    described = service.describe_session_permissions(name)
+    assert described["stale_identity_pin"] is False
+    assert described["source"] == "explicit_grant"
+    assert described["effective"] == {"read": True, "input": True}
+
+
+def test_an_explicit_lock_still_wins_over_a_stale_pin(tmp_path, tmux_session_factory):
+    # Falling back to the default must not become a way for a deliberate
+    # lock to expire on its own.
+    service = _service(tmp_path)
+    name = _live(tmux_session_factory, "stalepin-locked")
+    _grant_pinned_to_a_dead_identity(service, name)
+    service.grants.set_input(name, False, granted_by="test")
+
+    allowed, _ = service._input_authorized(name)
+    assert allowed is False
+    assert service.describe_session_permissions(name)["effective"]["input"] is False
+
+
+def test_a_closed_default_keeps_the_old_fail_closed_answer(tmp_path, tmux_session_factory):
+    service = _service(tmp_path, access=SessionAccessConfig(default_read=True, default_input=False))
+    name = _live(tmux_session_factory, "stalepin-closed")
+    _grant_pinned_to_a_dead_identity(service, name)
+
+    allowed, reason = service._input_authorized(name)
+    assert allowed is False
+    assert reason == "IDENTITY_MISMATCH"
