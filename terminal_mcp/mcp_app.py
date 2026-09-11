@@ -952,6 +952,111 @@ def build_mcp(service: TerminalService | None = None,
         return [_node_to_dict(n) for n in controller.list_nodes()]
 
     @server.tool()
+    def session_get_permissions(session: str) -> dict:
+        """Read one session's permissions BEFORE changing them.
+
+        Returns `requested` (what a user actually granted, or null when
+        nobody has), `effective` (what is true right now), `source`
+        (explicit_grant / default_policy / sensitive_name_floor), the
+        deployment's default policy, the hard floors, and a `revision` to pass
+        back to session_set_permissions.
+
+        `source` is the field worth reading: "read: false" means something
+        very different when it comes from an explicit revoke than when it
+        comes from a default nobody has overridden.
+
+        Accepts a bare name or a qualified "node_id/session"; a session on a
+        remote node is answered by that node, which owns its grants.
+
+        There is no session-name whitelist. A session is not more or less
+        permitted because of what it is called -- only because of what a user
+        granted and what the default policy says. `allowed` still appears in
+        the result for older callers but is a DEPRECATED alias of effective
+        read and is never an input to any decision.
+        """
+        return controller.describe_session_permissions(session)
+
+    @server.tool()
+    def session_set_permissions(session: str, read: bool | None = None,
+                                input: bool | None = None,
+                                expected_revision: int | None = None,
+                                actor: str | None = None) -> dict:
+        """Grant or revoke read/input on one session, and return what actually
+        took effect (same shape as session_get_permissions).
+
+        Pass `expected_revision` from a prior read to make the write
+        conditional: if someone changed the permission in between you get
+        REVISION_CONFLICT with the current state, instead of silently erasing
+        their change. Omit it for an unconditional write. Setting what is
+        already set is a no-op, so a retry cannot double-apply.
+
+        Rules that cannot be overridden here: input implies read (asking for
+        input alone grants both); revoking read also revokes input; a session
+        whose name contains root/ssh/password/secret/database is refused
+        outright, grant or no grant; and the global permissions.terminal_input
+        switch still wins.
+
+        `actor` is recorded for the audit trail -- pass who asked.
+        """
+        return controller.set_session_permissions(
+            session, read=read, input=input, expected_revision=expected_revision, actor=actor)
+
+    @server.tool()
+    def session_grant(session: str, mode: str = "read", actor: str | None = None) -> dict:
+        """Convenience wrapper over session_set_permissions.
+
+        mode="read"      -> view output only
+        mode="read_send" -> view and type into the session
+        """
+        if mode not in ("read", "read_send"):
+            return {"error": "INVALID_GRANT_MODE", "session": session,
+                    "allowed_modes": ["read", "read_send"]}
+        return controller.set_session_permissions(
+            session, read=True, input=(mode == "read_send"), actor=actor)
+
+    @server.tool()
+    def session_revoke(session: str, scope: str = "all", actor: str | None = None) -> dict:
+        """Revoke access. scope="input" removes typing but keeps viewing;
+        scope="all" removes both (revoking read revokes input with it).
+
+        Takes effect immediately -- the next read or send is refused, with no
+        restart and no cache to wait out.
+        """
+        if scope not in ("input", "all"):
+            return {"error": "INVALID_SCOPE", "session": session, "allowed_scopes": ["input", "all"]}
+        if scope == "input":
+            return controller.set_session_permissions(session, input=False, actor=actor)
+        return controller.set_session_permissions(session, read=False, input=False, actor=actor)
+
+    @server.tool()
+    def session_bulk_set_permissions(sessions: list[str] | None = None, node_id: str | None = None,
+                                     read: bool | None = None, input: bool | None = None,
+                                     actor: str | None = None) -> dict:
+        """Apply the same change to many sessions at once -- an explicit list,
+        or every session on one node.
+
+        Deliberately NOT transactional across sessions: each is applied and
+        reported independently, so one failure never silently rolls back
+        changes that did succeed. The result lists each session's outcome.
+        Revision checking is not offered here: a conditional bulk write would
+        have to decide what to do when only some revisions match, and that
+        decision belongs to the caller, one session at a time.
+        """
+        targets: list[str] = list(sessions or [])
+        if node_id:
+            listing = controller.terminal_list_sessions()
+            targets += [row["name"] for row in listing.get("sessions", [])
+                        if row.get("node_id") == node_id and row["name"] not in targets]
+        if not targets:
+            return {"error": "NO_TARGETS", "detail": "pass `sessions`, `node_id`, or both"}
+        results = [{"session": name,
+                    **controller.set_session_permissions(name, read=read, input=input, actor=actor)}
+                   for name in targets]
+        changed = [r["session"] for r in results if "error" not in r]
+        failed = [{"session": r["session"], "error": r["error"]} for r in results if "error" in r]
+        return {"requested": len(targets), "changed": changed, "failed": failed, "results": results}
+
+    @server.tool()
     def terminal_fleet_environment(roles: str = "node") -> dict:
         """Audit every node's ENVIRONMENT in one call: tools, services and
         auth readiness against deploy/node-profile.yaml.

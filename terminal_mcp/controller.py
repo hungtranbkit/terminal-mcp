@@ -135,6 +135,18 @@ class ControllerService:
                                        contract_version=contract_version,
                                        contract_capabilities=contract_capabilities)
 
+    def describe_session_permissions(self, session: str) -> dict[str, Any]:
+        """Routed to the session's HOME NODE, which is authoritative for its
+        grants. No second copy is kept here: a cached permission is a
+        permission that can be wrong at exactly the wrong moment."""
+        return self._route(session, "describe_permissions", lambda client, name: client.describe_permissions(name))
+
+    def set_session_permissions(self, session: str, *, read: bool | None = None,
+                                input: bool | None = None, expected_revision: int | None = None,
+                                actor: str | None = None) -> dict[str, Any]:
+        return self._route(session, "set_permissions", lambda client, name: client.set_permissions(
+            name, read=read, input=input, expected_revision=expected_revision, actor=actor))
+
     def fleet_environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]:
         """Ask every node what it is missing, in one pass.
 

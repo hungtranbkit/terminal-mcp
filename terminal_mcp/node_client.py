@@ -71,6 +71,9 @@ class NodeClient(Protocol):
     def health(self) -> dict[str, Any]: ...
     def metrics(self) -> dict[str, Any]: ...
     def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]: ...
+    def describe_permissions(self, session: str) -> dict[str, Any]: ...
+    def set_permissions(self, session: str, *, read: bool | None, input: bool | None,
+                        expected_revision: int | None, actor: str | None) -> dict[str, Any]: ...
     def refresh_capabilities(self) -> dict[str, Any]: ...
     def knowledge_search(self, query: str, *, session_name: str | None = None, project: str | None = None,
                          since: str | None = None, until: str | None = None, limit: int = 20) -> dict[str, Any]: ...
@@ -188,6 +191,14 @@ class LocalNodeClient:
     def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]:
         from . import node_profile
         return node_profile.inventory(tuple(roles))
+
+    def describe_permissions(self, session: str) -> dict[str, Any]:
+        return self._terminal.describe_session_permissions(session)
+
+    def set_permissions(self, session: str, *, read=None, input=None,
+                        expected_revision=None, actor=None) -> dict[str, Any]:
+        return self._terminal.set_session_permissions(
+            session, read=read, input=input, expected_revision=expected_revision, actor=actor)
 
     def refresh_capabilities(self) -> dict[str, Any]:
         from .agent_availability import available_agent_types
@@ -364,6 +375,15 @@ class RemoteNodeClient:
 
     def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]:
         return self._request("GET", "/v1/environment?roles=" + ",".join(roles))
+
+    def describe_permissions(self, session: str) -> dict[str, Any]:
+        return self._request("GET", f"/v1/sessions/{session}/permissions")
+
+    def set_permissions(self, session: str, *, read=None, input=None,
+                        expected_revision=None, actor=None) -> dict[str, Any]:
+        return self._request("POST", f"/v1/sessions/{session}/permissions",
+                             {"read": read, "input": input,
+                              "expected_revision": expected_revision, "actor": actor})
 
     def refresh_capabilities(self) -> dict[str, Any]:
         return self._request("POST", "/v1/capabilities/refresh")

@@ -173,6 +173,33 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
             return JSONResponse({"error": "PROFILE_UNAVAILABLE", "detail": str(exc)}, status_code=503)
         return JSONResponse({"node_id": node_id, **result})
 
+    async def session_permissions(request: Request) -> JSONResponse:
+        """Effective + requested permissions for one session on THIS node.
+
+        The node that owns the session is authoritative for its grants; a
+        controller asks here rather than keeping a second copy that can drift.
+        """
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        result = await anyio.to_thread.run_sync(
+            lambda: client.describe_permissions(request.path_params["name"]))
+        return JSONResponse(result, status_code=400 if "error" in result else 200)
+
+    async def set_session_permissions(request: Request) -> JSONResponse:
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        result = await anyio.to_thread.run_sync(lambda: client.set_permissions(
+            request.path_params["name"], read=body.get("read"), input=body.get("input"),
+            expected_revision=body.get("expected_revision"), actor=body.get("actor")))
+        status = 200
+        if "error" in result:
+            status = 409 if result["error"] == "REVISION_CONFLICT" else 400
+        return JSONResponse(result, status_code=status)
+
     async def refresh_capabilities(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
             return blocked

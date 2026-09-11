@@ -2750,6 +2750,128 @@ class TerminalService:
                     summary["input_granted"].append(name)
         return summary
 
+    # -- session permission management (MCP/API surface) --------------------
+    #
+    # The session-name whitelist is gone from every decision here. A session's
+    # permissions come from an explicit user grant, or -- when none exists --
+    # from the deployment's session_access default policy. `allowed` is still
+    # reported for old callers but is a DEPRECATED alias of the effective read
+    # decision and never an input to one.
+
+    def describe_session_permissions(self, session: str) -> dict[str, Any]:
+        """Everything a caller needs to decide what to change, and to change
+        it safely: what was REQUESTED (the stored grant), what is EFFECTIVE
+        right now, where each answer came from, and the revision to pass back.
+
+        Reporting source is the part that stops guesswork: "false" means
+        something very different when it comes from an explicit revoke than
+        when it comes from a default policy nobody has overridden.
+        """
+        if not valid_session_name(session):
+            return {"error": "INVALID_SESSION", "session": session}
+        grant = self.grants.get(session)
+        read_effective = self._read_authorized_with_grant(session, grant)
+        input_ok, input_reason = self._input_authorized_with_grant(session, grant)
+        input_effective = bool(self.config.permissions.terminal_input and input_ok)
+
+        sensitive = any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS)
+        denied_by_pattern = session_input_denied_by_pattern(session, self.config)
+        if sensitive:
+            source = "sensitive_name_floor"
+        elif grant is not None:
+            source = "explicit_grant"
+        else:
+            source = "default_policy"
+
+        return {
+            "session": session,
+            # This service does not know its own node id (the controller
+            # owns that mapping); a caller that needs it qualifies the name.
+            "node_id": None,
+            "requested": {
+                "read": bool(grant.read_enabled) if grant else None,
+                "input": bool(grant.input_enabled) if grant else None,
+            },
+            "effective": {"read": read_effective, "input": input_effective},
+            "source": source,
+            "inherited_from_default_policy": grant is None,
+            "default_policy": {"read": bool(self.config.session_access.default_read),
+                               "input": bool(self.config.session_access.default_input)},
+            "floors": {
+                "sensitive_name": sensitive,
+                "input_denied_by_pattern": denied_by_pattern,
+                "global_input_enabled": bool(self.config.permissions.terminal_input),
+                "global_read_enabled": bool(self.config.permissions.terminal_read),
+            },
+            "input_block_reason": input_reason,
+            "revision": grant.revision if grant else 0,
+            "granted_by": grant.granted_by if grant else None,
+            "updated_at": grant.updated_at if grant else None,
+            # DEPRECATED. Alias of effective read, kept only so older callers
+            # keep working; never consulted when deciding anything.
+            "allowed": read_effective,
+        }
+
+    def set_session_permissions(self, session: str, *, read: bool | None = None,
+                                input: bool | None = None, expected_revision: int | None = None,
+                                actor: str | None = None) -> dict[str, Any]:
+        """Set read/input for one session. Returns the same shape as
+        describe_session_permissions, so a caller always sees what actually
+        took effect rather than assuming its request did.
+
+        `expected_revision` is optimistic concurrency: pass the revision you
+        read, and a concurrent change makes this fail with REVISION_CONFLICT
+        (plus the current state) instead of silently erasing that change.
+        Omit it for an unconditional write.
+
+        Idempotent: setting what is already set is a no-op that still returns
+        the current state, so a retried call cannot double-apply.
+        """
+        if not valid_session_name(session):
+            return {"error": "INVALID_SESSION", "session": session}
+        if read is None and input is None:
+            return {"error": "NOTHING_TO_CHANGE", "session": session}
+        if any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS):
+            # The one name-based floor kept on purpose: no grant and no policy
+            # may open a session called "prod-database".
+            return {"error": "SENSITIVE_SESSION_NOT_GRANTABLE", "session": session}
+
+        current = self.grants.get(session)
+        current_revision = current.revision if current else 0
+        if expected_revision is not None and expected_revision != current_revision:
+            return {"error": "REVISION_CONFLICT", "session": session,
+                    "expected_revision": expected_revision,
+                    "current_revision": current_revision,
+                    "current": self.describe_session_permissions(session)}
+
+        # Input implies read: the store refuses input without it, so asking
+        # for input alone on an ungranted session is a request to grant both.
+        want_read = read if read is not None else (current.read_enabled if current else
+                                                   bool(self.config.session_access.default_read))
+        if input:
+            want_read = True
+
+        result = self.grant_session_read(session, bool(want_read), granted_by=actor)
+        if "error" in result:
+            return {**result, "session": session}
+        input_not_applied = None
+        if input is not None and want_read:
+            input_result = self.grant_session_input(session, bool(input), granted_by=actor)
+            if "error" in input_result:
+                # A FLOOR refusing input is not a failure of the whole call:
+                # the read change already applied, and returning a bare error
+                # would hide that while telling the caller nothing about what
+                # is now true. Report it alongside the real state instead.
+                if input_result["error"] in ("INPUT_DISABLED", "ACTION_NOT_ALLOWED",
+                                             "SENSITIVE_TARGET", "ACCESS_DENIED"):
+                    input_not_applied = input_result["error"]
+                else:
+                    return {**input_result, "session": session}
+        described = self.describe_session_permissions(session)
+        if input_not_applied:
+            described["input_not_applied"] = input_not_applied
+        return described
+
     def grant_session_read(self, session: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
         if (error := require_read(self.config)) is not None:
             return {"error": error, "session": session}

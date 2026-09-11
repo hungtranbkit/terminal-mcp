@@ -52,6 +52,14 @@ async def test_server_registers_v1_and_binding_tools():
         # "which node could take over?" is answerable without logging into
         # each machine. Status only -- never credential contents.
         "terminal_fleet_environment",
+        # Session permission management: ChatGPT could rename a session but
+        # had no way to grant or revoke access to one -- that took an SSH
+        # session and a config edit.
+        "session_get_permissions",
+        "session_set_permissions",
+        "session_grant",
+        "session_revoke",
+        "session_bulk_set_permissions",
         "terminal_node_status",
         # P0.3: probed tool/runtime capability axis, used for routing.
         "terminal_node_capabilities",
