@@ -3,14 +3,14 @@
   "project": {
     "project_id": "git:github.com/hungtranbkit/terminal-mcp",
     "source": "git_remote",
-    "repo_root": "/home/dell/workspace/terminal-mcp",
+    "repo_root": "/home/mesflow/terminal-mcp",
     "name": "terminal-mcp",
     "git_remote": "https://github.com/hungtranbkit/terminal-mcp.git",
     "git_branch": "main",
     "is_portable": true
   },
-  "revision": 6,
-  "updated_at": "2026-09-09T11:29:08.252866+00:00",
+  "revision": 8,
+  "updated_at": "2026-09-11T17:09:43.483188+00:00",
   "items": [
     {
       "id": "blg_f52a999971d9",
@@ -1908,107 +1908,56 @@
       ]
     },
     {
-      "id": "blg_dell5530_repoint_m910",
-      "title": "Repoint dell-5530 node agent to the m910 controller (costs win1/win2/wtest)",
-      "description": "After the 2026-09-10 controller migration, dell-5530's Windows agent still points at the retired Dell Linux controller (http://192.168.1.132:8766) and therefore shows OFFLINE in the m910 registry. dell-5530 itself is healthy and unaffected by the Dell Linux box being powered off -- it is a separate machine and win1/win2/wtest keep running. Repointing is ONE line:\n\n  file: C:\\\\Users\\\\tranv\\\\terminal-mcp\\\\run-node-agent.ps1\n  change: --controller-url http://192.168.1.132:8766\n      to: --controller-url http://192.168.1.109:8766\n  then restart the node-agent Scheduled Task.\n\nNOT DONE AUTOMATICALLY: the restart kills win1/win2/wtest, because dell-5530's ConPTY sessions are in-process children of the agent and do not survive its restart. That is a user decision, and it pairs naturally with the already-pending dell-5530 maintenance window (token rotation + orphaned Scheduled Task), which costs those sessions anyway.",
-      "status": "READY",
-      "priority": "P1",
-      "type": "chore",
+      "id": "blg_c502dca1feef",
+      "title": "Research loop-engineering (cobusgreyling) for post-v1 orchestration primitives",
+      "description": "AUDIT AND MAP ONLY -- do not port the repo. Study https://github.com/cobusgreyling/loop-engineering and decide, primitive by primitive, what is worth adopting into ProjectFlow. Terminal MCP core stays the node/session/tmux/permission/recovery/federation layer; no business loop goes into it.\n\nFOCUS AREAS: loop lifecycle / state machine; context management; circuit breaker and stop policy; worktree isolation; Maker/Verifier split; readiness/doctor score; human gate and autonomy levels; persistent state and resume.\n\nCLASSIFY EVERY PRIMITIVE into exactly one of: ALREADY HAVE | OURS BETTER | LOOP-ENGINEERING BETTER | MISSING | ADOPT | ADAPT | REJECT. Name the ProjectFlow counterpart for each (coordinator gate, integration_reviewer, verify_queue, queue_engine, planner_service, pm_router, git_worktree, session_knowledge, dor_gate, skill_provider) rather than assuming a gap exists.\n\nPHASES:\n1. Freeze the Finish Gate baseline (prerequisite, not part of this item).\n2. Audit the repo independently -- read it against its own claims, verify names/versions/licence from the tree, never from prose.\n3. Architecture mapping using the classification above.\n4. Pick 3-5 primitives, no more. Justify each against a measured weakness, not novelty.\n5. Pilot in ProjectFlow on ONE disposable project. Never on a live project session.\n6. Integrate into the orchestration layer only if the pilot beats the baseline on the measured criteria below. If it does not, record that and stop -- a negative result closes this item successfully.\n\nCONSTRAINTS: no restart of any live node agent; no business loop in Terminal MCP core; adapter/interop over rewrite wherever the designs conflict; ProjectFlow verification keeps sole authority over DONE.",
+      "status": "BLOCKED",
+      "priority": "P2",
+      "type": "research",
       "order": 42,
-      "created_at": "2026-09-10T02:19:16.180597+00:00",
-      "updated_at": "2026-09-10T02:19:16.180597+00:00",
-      "source": "controller-migration-2026-09-10",
+      "created_at": "2026-09-11T17:09:23.026749+00:00",
+      "updated_at": "2026-09-11T17:09:23.026761+00:00",
+      "source": "user",
       "dependencies": [],
       "acceptance_criteria": [
-        "dell-5530 reports online in the m910 node registry",
-        "Its sessions are listable and readable from the m910 controller",
-        "win1/win2/wtest are recreated or their loss is accepted deliberately"
+        "A written mapping classifying every studied primitive as ALREADY HAVE / OURS BETTER / LOOP-ENGINEERING BETTER / MISSING / ADOPT / ADAPT / REJECT, each naming its ProjectFlow counterpart",
+        "Repo facts verified from the tree (skill/module names, version, licence, install mechanism), not from README prose",
+        "3-5 primitives selected, each justified against a measured weakness in the current pipeline",
+        "Pilot run on a disposable project only, with a baseline captured before it",
+        "MEASURED vs baseline: human intervention count",
+        "MEASURED vs baseline: useless/no-progress loop iterations",
+        "MEASURED vs baseline: duplicate prompts and duplicate sessions",
+        "MEASURED vs baseline: escaped bugs (defects reaching NEEDS_REVIEW or later)",
+        "MEASURED vs baseline: completion time and token cost per task",
+        "MEASURED vs baseline: rollback rate",
+        "Integration proceeds ONLY if the pilot beats baseline on these; a worse or neutral result is recorded and the item closes without integration",
+        "Terminal MCP core unchanged by this work -- no business loop added to it"
       ],
       "tags": [
-        "dell-5530",
-        "migration",
-        "windows"
+        "post-v1",
+        "research",
+        "orchestration",
+        "projectflow",
+        "waiting"
       ],
       "assignee": null,
       "session": null,
-      "node_id": "dell-5530",
+      "node_id": null,
       "queue_task_id": null,
       "branch": null,
       "worktree": null,
-      "blocked_reason": "needs a user-chosen maintenance window: the agent restart costs 3 ConPTY sessions",
+      "blocked_reason": "Terminal MCP v1 baseline + maintenance/failover acceptance. Do not start until FINISH_GATE v1 criteria are met: every node on 0.13.0/contract v1, cold-boot acceptance on >=2 nodes, commits pushed to a remote, and the M910 safe-off failover rehearsal passed.",
       "evidence": {
         "commits": [],
         "tests": [],
         "deploys": [],
-        "notes": [
-          "Verified 2026-09-10: agent healthy (generation e19d32ef22e3bdf3), sessions win1/win2/wtest live.",
-          "The exact controller-url line was read read-only via a disposable session that was removed afterwards; no restart, no change applied."
-        ]
+        "notes": []
       },
       "history": [
         {
-          "at": "2026-09-10T02:19:16.180597+00:00",
+          "at": "2026-09-11T17:09:23.026797+00:00",
           "event": "created",
-          "by": "controller-migration"
-        }
-      ]
-    },
-    {
-      "id": "blg_controller_migration_m910",
-      "title": "Migrate Terminal MCP controller from Dell Linux to m910",
-      "description": "Emergency relocation of the controller/orchestrator before the Dell host is powered off.",
-      "status": "DONE",
-      "priority": "P0",
-      "type": "chore",
-      "order": 43,
-      "created_at": "2026-09-10T02:19:16.180597+00:00",
-      "updated_at": "2026-09-10T02:19:16.180597+00:00",
-      "source": "controller-migration-2026-09-10",
-      "dependencies": [],
-      "acceptance_criteria": [
-        "m910 runs the controller from a verified commit",
-        "Canonical project/backlog state present and integrity-verified on m910",
-        "Dashboard/MCP/service healthy on m910 and surviving Dell being down",
-        "No split-brain; rollback backup exists"
-      ],
-      "tags": [
-        "migration",
-        "controller",
-        "m910"
-      ],
-      "assignee": null,
-      "session": null,
-      "node_id": "m910",
-      "queue_task_id": null,
-      "branch": "main",
-      "worktree": null,
-      "blocked_reason": null,
-      "evidence": {
-        "commits": [
-          "bd0373e"
-        ],
-        "tests": [
-          "MCP live verification on the running m910 endpoint: 202 tools, fleet node list, project status, local (m1) and remote (mac1) session read"
-        ],
-        "deploys": [
-          "m910 terminal-mcp-http @ 8f6c4b2 dirty:false; both tunnels moved with their existing IDs so public hostnames are unchanged"
-        ],
-        "notes": [
-          "Canonical state migrated with SQLite online backup + integrity check; every row count matched the source exactly. Node-local stores deliberately NOT copied.",
-          "SPLIT-BRAIN TRAP FOUND: terminal-mcp-tunnel-watchdog.timer fired every 45s and restarted the controller it was watching, resurrecting the old one ~30s after it was stopped. Disabled; verified down past the timer interval. No canonical divergence resulted.",
-          "Dell services stopped + disabled, unit files intact for rollback. Full backup at /home/dell/terminal-mcp-migration-backup-20260910-085344 (268MB, all 19 DBs + configs + session manifest) -- MUST be copied off Dell before power-off."
-        ]
-      },
-      "history": [
-        {
-          "at": "2026-09-10T02:19:16.180597+00:00",
-          "event": "created",
-          "by": "controller-migration"
-        },
-        {
-          "at": "2026-09-10T02:19:16.180597+00:00",
-          "event": "completed",
-          "by": "mcp"
+          "by": "user"
         }
       ]
     }
