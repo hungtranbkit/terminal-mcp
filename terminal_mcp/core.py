@@ -3293,6 +3293,11 @@ class TerminalService:
         self.session_registry.upsert_seen(
             self.REGISTRY_LOCAL_NODE_ID, name, backend_type=self._registry_backend_type(),
             cwd=result.get("cwd"), agent_type=agent_type, conversation_id=conversation_id,
+            # The launcher we ACTUALLY ran, from the same lookup that ran it --
+            # now the only place a launch_command is ever written, which is
+            # what its docstring always claimed.
+            launch_command=self.lifecycle.launch_command_for(agent_type),
+            launcher_type=agent_type,
             created_by_controller=True,
         )
 

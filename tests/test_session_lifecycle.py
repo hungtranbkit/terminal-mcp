@@ -569,3 +569,42 @@ async def test_mcp_tools_registered_for_session_lifecycle(tmp_path):
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+def test_a_created_session_records_both_provenance_and_its_real_launcher(
+    tmp_path, lifecycle_session_factory,
+):
+    """End-to-end through the real create path, passing nothing by hand.
+
+    Both fields are needed and they come from different places, which is
+    exactly how a unit test that supplies them itself misses a break: after
+    the discovery pass stopped inferring launch_command, the create path was
+    briefly the only writer left and did not write it -- which would have
+    made every session permanently ineligible for auto-recovery while every
+    test that set the field explicitly still passed.
+    """
+    if resolve_launcher("claude") is None:
+        pytest.skip("claude is not installed on this host")
+    config = _lifecycle_config(tmp_path, timeout=8.0)
+    service = TerminalService(config)
+    name = lifecycle_session_factory("claude-lc-provenance")
+    assert "error" not in service.terminal_create_session(name, "claude")
+
+    record = service.session_registry.get(service.REGISTRY_LOCAL_NODE_ID, name)
+    assert record is not None
+    assert record.created_by_controller is True
+    assert record.launch_command, "the launcher actually run must be recorded"
+
+
+def test_a_session_merely_observed_records_neither(tmp_path, tmux_session_factory):
+    # The complement, through the ordinary discovery path: a session running
+    # a recognised agent that this controller did not create.
+    config = _lifecycle_config(tmp_path, timeout=8.0)
+    service = TerminalService(config)
+    name = tmux_session_factory("lifecycle-observed", "bash -lc 'sleep 30'")
+    service.terminal_list_sessions()
+
+    record = service.session_registry.get(service.REGISTRY_LOCAL_NODE_ID, name)
+    assert record is not None
+    assert record.created_by_controller is False
+    assert not record.launch_command
