@@ -678,8 +678,14 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             raise ValueError(f"input_policy.{name} must be a {'possibly empty ' if allow_empty else 'non-empty '}list of strings")
         return tuple(value)
 
-    if not isinstance(patterns, list) or not patterns or not all(isinstance(p, str) and p for p in patterns):
-        raise ValueError("allowed_session_patterns must be a non-empty list of strings")
+    # May be EMPTY. This list no longer authorizes anything -- it is only the
+    # migration input that converts a pre-grants deployment's whitelist into
+    # real grants (see SessionAccessConfig). A deployment that has finished
+    # that migration, or was never on a whitelist at all, must be able to say
+    # so; requiring a non-empty list forced it to keep a dead setting alive,
+    # and a node agent written against the new model simply failed to start.
+    if not isinstance(patterns, list) or not all(isinstance(p, str) and p for p in patterns):
+        raise ValueError("allowed_session_patterns must be a list of non-empty strings (it may be empty)")
     if not 1 <= max_lines <= 100_000:
         raise ValueError("max_capture_lines must be between 1 and 100000")
     if not 1 <= tail_lines <= max_lines:
@@ -866,7 +872,10 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         max_capture_lines=max_lines,
         default_tail_lines=tail_lines,
         input_policy=InputPolicyConfig(
-            allowed_session_patterns=string_tuple("allowed_session_patterns", InputPolicyConfig.allowed_session_patterns),
+            # Empty is valid, same reason as allowed_session_patterns above:
+            # migration input, not an authorization list.
+            allowed_session_patterns=string_tuple("allowed_session_patterns",
+                                                  InputPolicyConfig.allowed_session_patterns, allow_empty=True),
             denied_session_patterns=string_tuple("denied_session_patterns", InputPolicyConfig.denied_session_patterns),
             allow_send_text=bool(input_raw.get("allow_send_text", True)),
             allow_keys=string_tuple("allow_keys", InputPolicyConfig.allow_keys),
