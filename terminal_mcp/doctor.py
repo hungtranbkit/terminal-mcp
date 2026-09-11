@@ -18,6 +18,8 @@ file, the node registry) never carry one in the first place, so there is
 nothing to redact, by construction."""
 from __future__ import annotations
 
+from . import contract
+
 import argparse
 import json
 import os
@@ -350,6 +352,15 @@ def _print_nodes_human(result: dict) -> None:
             capabilities.append("shells=" + ",".join(row["shell_capabilities"]))
         if capabilities:
             print(f"        capabilities: {', '.join(capabilities)}")
+        # Protocol generation. Printed whenever it is NOT an exact match, so a
+        # node running different code is visible here rather than only showing
+        # up later as a route that behaves oddly.
+        compat = contract.compatibility(row.get("contract_version"), row.get("contract_capabilities"))
+        if compat["status"] != "ok":
+            missing = ", ".join(compat["missing_capabilities"]) or "none"
+            print(f"        contract: {compat['status'].upper()} "
+                  f"(peer v{compat['peer_contract_version']} vs local v{compat['local_contract_version']}; "
+                  f"must not assume: {missing})")
         if row["overload_reasons"]:
             print(f"        overload_reasons: {', '.join(row['overload_reasons'])}")
         if "test_connection" in row:

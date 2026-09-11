@@ -171,6 +171,13 @@ class Node:
     session_backend: str = SESSION_BACKEND_TMUX
     shell_capabilities: tuple[str, ...] = ()
     wsl_available: bool = False
+    # PROTOCOL generation this node reported (contract.py), deliberately
+    # separate from `capabilities` above: those are PROBED tool features
+    # ("can this node run docker?"), this is "does this node speak the same
+    # wire contract?". 0 means the node reported nothing, which is recorded
+    # as legacy and never treated as compatible.
+    contract_version: int = 0
+    contract_capabilities: tuple[str, ...] = ()
 
 
 def node_to_dict(node: Node) -> dict[str, Any]:
@@ -193,6 +200,8 @@ def node_to_dict(node: Node) -> dict[str, Any]:
         "tmux_session_count": node.tmux_session_count, "agent_counts": node.agent_counts,
         "agent_types": list(node.agent_types), "agent_version": node.agent_version,
         "labels": list(node.labels), "capabilities": list(node.capabilities),
+        "contract_version": node.contract_version,
+        "contract_capabilities": list(node.contract_capabilities),
         "max_sessions": node.max_sessions,
         "capacity_status": node.capacity_status, "overload_reasons": list(node.overload_reasons),
         "registered_at": node.registered_at, "updated_at": node.updated_at,

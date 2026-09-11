@@ -9696,6 +9696,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 # never assumed capable.
                 capabilities=tuple(body.get("capabilities") or ()),
                 wsl_available=bool(body.get("wsl_available", False)),
+                # Protocol generation. A node that reports nothing stays at 0
+                # (legacy) rather than inheriting whatever it had before.
+                contract_version=int(body.get("contract_version") or 0),
+                contract_capabilities=tuple(body.get("contract_capabilities") or ()),
             )
             if node is None:
                 return {"error": "NODE_NOT_FOUND", "node_id": node_id}

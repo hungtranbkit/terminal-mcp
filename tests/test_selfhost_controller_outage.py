@@ -193,6 +193,23 @@ def test_recovery_is_idempotent_and_never_duplicates(orphaned_node):
         subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
 
 
+def test_health_reports_the_protocol_contract(orphaned_node):
+    """A peer must be able to ask what protocol this node speaks before
+    routing to it. `agent_generation` cannot answer that -- it is a random
+    token per process, so two builds look as different as two restarts.
+
+    This also guards the wiring itself: the first version of it referenced
+    contract_describe without importing it, and /v1/health answered 500.
+    """
+    from terminal_mcp import contract
+    port, _ = orphaned_node
+    health = _call(port, "/v1/health")
+    assert health["contract_version"] == contract.CONTRACT_VERSION
+    assert set(health["contract_capabilities"]) == set(contract.CAPABILITIES)
+    # Must NOT collide with the probed tool-capability field.
+    assert "capabilities" not in health
+
+
 def test_a_node_needs_no_whitelist_to_serve_itself(orphaned_node):
     """This agent runs with allowed_session_patterns completely empty. Before
     the whitelist was retired that config was rejected outright and the agent

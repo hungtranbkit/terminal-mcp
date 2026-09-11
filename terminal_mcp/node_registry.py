@@ -230,6 +230,13 @@ class NodeRegistry:
                 # not report them -- simply has an empty list rather than
                 # a wrong one.
                 ("capabilities", "TEXT NOT NULL DEFAULT '[]'"),
+                # PROTOCOL generation, deliberately separate from the tool
+                # capabilities above -- they answer different questions
+                # ("can this node run docker?" vs "does this node speak the
+                # same wire contract?"). 0 means the node reported nothing,
+                # which is recorded as legacy and never as compatible.
+                ("contract_version", "INTEGER NOT NULL DEFAULT 0"),
+                ("contract_capabilities", "TEXT NOT NULL DEFAULT '[]'"),
             ):
                 if column not in existing_columns:
                     connection.execute(f"ALTER TABLE nodes ADD COLUMN {column} {declaration}")
@@ -333,7 +340,9 @@ class NodeRegistry:
                  now: datetime | None = None, platform: str = PLATFORM_LINUX,
                  session_backend: str = SESSION_BACKEND_TMUX, shell_capabilities: tuple[str, ...] = (),
                  wsl_available: bool = False,
-                 capabilities: tuple[str, ...] = ()) -> Node | None:
+                 capabilities: tuple[str, ...] = (),
+                 contract_version: int = 0,
+                 contract_capabilities: tuple[str, ...] = ()) -> Node | None:
         """Writes a fresh sample, applies EWMA smoothing on top of
         whatever was previously stored, updates the sustained-high-CPU/
         load duration trackers, recomputes capacity_status/
@@ -387,6 +396,7 @@ class NodeRegistry:
                     capabilities = ?,
                     high_cpu_since = ?, high_load_since = ?, capacity_status = ?, overload_reasons = ?,
                     platform = ?, session_backend = ?, shell_capabilities = ?, wsl_available = ?,
+                    contract_version = ?, contract_capabilities = ?,
                     updated_at = ?
                 WHERE id = ?""",
                 (now_iso, latency_ms,
@@ -399,6 +409,7 @@ class NodeRegistry:
                  json.dumps(list(labels)), json.dumps(list(capabilities)),
                  high_cpu_since, high_load_since, capacity_status, json.dumps(reasons),
                  platform, session_backend, json.dumps(list(shell_capabilities)), int(wsl_available),
+                 int(contract_version), json.dumps(sorted(contract_capabilities)),
                  now_iso, node_id),
             )
         return self.get(node_id, now=now)
@@ -447,6 +458,8 @@ class NodeRegistry:
             session_backend=data.get("session_backend") or SESSION_BACKEND_TMUX,
             shell_capabilities=tuple(json.loads(data.get("shell_capabilities") or "[]")),
             wsl_available=bool(data.get("wsl_available") or 0),
+            contract_version=int(data.get("contract_version") or 0),
+            contract_capabilities=tuple(json.loads(data.get("contract_capabilities") or "[]")),
         )
 
     def _derive_status(self, last_heartbeat_at: str | None, now: datetime) -> str:

@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import host_metrics
+from . import contract, host_metrics
 from .node_client import LocalNodeClient, NodeClient, NodeClientError, RemoteNodeClient
 from .node_models import NODE_ONLINE, Node
 from .node_registry import NodeRegistry
@@ -103,6 +103,11 @@ class ControllerService:
             labels=(), latency_ms=0.0,
             # The local node probes itself the same way a remote agent does.
             capabilities=probe_capabilities(),
+            # ...and reports the SAME protocol generation a remote agent does.
+            # Without this the controller's own node read as legacy v0, which
+            # is both wrong and the most confusing possible starting point for
+            # diagnosing a real skew elsewhere.
+            **contract.describe_for_heartbeat(),
         )
 
     def receive_remote_heartbeat(self, node_id: str, *, metrics: host_metrics.NodeMetrics,
@@ -110,6 +115,8 @@ class ControllerService:
                                  agent_types: tuple[str, ...], agent_version: str | None,
                                  labels: tuple[str, ...], platform: str = "linux",
                                  capabilities: tuple[str, ...] = (),
+                                 contract_version: int = 0,
+                                 contract_capabilities: tuple[str, ...] = (),
                                  session_backend: str = "tmux", shell_capabilities: tuple[str, ...] = (),
                                  wsl_available: bool = False) -> Node | None:
         """Called by the heartbeat-receiving HTTP route (dashboard.py) once
@@ -124,7 +131,9 @@ class ControllerService:
                                        agent_counts=agent_counts, agent_types=agent_types,
                                        agent_version=agent_version, labels=labels, platform=platform,
                                        session_backend=session_backend, shell_capabilities=shell_capabilities,
-                                       wsl_available=wsl_available, capabilities=capabilities)
+                                       wsl_available=wsl_available, capabilities=capabilities,
+                                       contract_version=contract_version,
+                                       contract_capabilities=contract_capabilities)
 
     def refresh_node_capabilities(self, node_id: str) -> dict[str, Any]:
         """Ask one node to re-probe launchers and update only capabilities.

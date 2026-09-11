@@ -49,6 +49,7 @@ from starlette.websockets import WebSocket
 from . import __version__, host_metrics
 from .agent_availability import available_agent_types
 from .capability_probe import probe_capabilities
+from .contract import describe as contract_describe
 from .launcher_resolution import resolve_launcher
 from .config import load_config
 from .core import TerminalService
@@ -108,7 +109,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
 
     async def health(request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "node_id": node_id, "version": __version__,
-                             "agent_generation": AGENT_GENERATION})
+                             "agent_generation": AGENT_GENERATION, **contract_describe()})
 
     async def internal_shutdown(request: Request) -> JSONResponse:
         """Deterministic, graceful self-shutdown (Phase 0 node-agent
@@ -146,7 +147,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
             return blocked
         request.app.state.shutdown_event.set()
         return JSONResponse({"shutdown_requested": True, "node_id": node_id,
-                             "agent_generation": AGENT_GENERATION})
+                             "agent_generation": AGENT_GENERATION, **contract_describe()})
 
     async def metrics(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
@@ -561,6 +562,9 @@ async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller
                 "metrics": metrics.__dict__, "tmux_session_count": len(session_rows),
                 "agent_counts": agent_counts, "agent_types": list(agent_types),
                 "agent_version": __version__, "agent_generation": AGENT_GENERATION, "labels": [],
+                # Protocol generation + feature flags, so the controller can
+                # degrade LOUDLY against an older node instead of assuming.
+                **contract_describe(),
                 # P0.3: probed tool/runtime capabilities. Cached with a TTL
                 # inside probe_capabilities, so a 20s heartbeat does not
                 # re-walk PATH every cycle.
