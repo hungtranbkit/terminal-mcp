@@ -226,7 +226,9 @@ def test_mobile_tab_name_has_its_own_explicit_max_width():
 
 
 def test_tabbar_row_holds_only_the_tab_strip_no_action_buttons():
-    start = DASHBOARD_HTML.index('<div class="tabbar-row">')
+    # The row carries an id since the mobile-portrait redesign, where the
+    # same element becomes the Sessions bottom sheet.
+    start = DASHBOARD_HTML.index('<div class="tabbar-row" id="sessionsDrawer"')
     # The row now wraps the strip together with its own session filter, so it
     # spans several nested divs -- bounded by the next sibling section rather
     # than the first closing tag.

@@ -301,3 +301,27 @@ def test_no_python_source_file_contains_an_invalid_escape_sequence():
                     offenders.append(f"{path.relative_to(root)}:{token.start[0]} \\{body[index + 1]}")
                 index += 2
     assert not offenders, "invalid escape sequences (future SyntaxError): " + ", ".join(offenders)
+
+
+def test_no_dashboard_template_emits_a_stray_control_character():
+    """A subtler cousin of the invalid-escape bug above, and one that test
+    cannot see.
+
+    `content:'\\2022'` written in a NON-RAW Python string is a valid OCTAL
+    escape -- Python reads it as chr(0o202) + "2" and warns about nothing --
+    so the browser received U+0082 where a bullet was intended. Four CSS
+    glyphs shipped as mojibake that way. The rule that avoids the whole
+    class: put the literal character in the template, never a numeric
+    escape. A C0 control character in rendered output is never intentional.
+    """
+    import terminal_mcp.dashboard as dashboard_module
+
+    allowed = {"\n", "\t", "\r"}
+    for name in ("BACKLOG_HTML", "DASHBOARD_HTML", "GLOBAL_TASKS_HTML",
+                 "NODES_ADMIN_HTML", "SESSIONS_ADMIN_HTML", "WEBTERM_HTML"):
+        html = getattr(dashboard_module, name)
+        offenders = sorted({ch for ch in html if ord(ch) < 0x20 and ch not in allowed}
+                           | {ch for ch in html if 0x7f <= ord(ch) <= 0x9f})
+        assert not offenders, (
+            f"{name} contains control characters {[hex(ord(c)) for c in offenders]} -- "
+            "almost always a numeric escape in a non-raw Python string")

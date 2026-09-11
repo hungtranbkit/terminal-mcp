@@ -489,9 +489,14 @@ DASHBOARD_HTML = """<!doctype html>
        one flexible track, or its intended growing row silently goes to
        #summary instead and lets its content overflow into the rows below.
        ADD A TRACK HERE whenever a child is added between them. */
-    .detail { display:grid; grid-template-rows:auto auto minmax(0,1fr) auto auto auto auto; min-width:0; min-height:0 }
+    .detail { display:grid; grid-template-rows:auto minmax(0,1fr) auto auto auto auto; min-width:0; min-height:0 }
+    /* #summary and #grantBar are children of this wrapper now, not of the
+       grid, so the grid has one fewer track. #inspectorBackdrop is fixed
+       (out of flow) and never claims a row. */
+    #sessionInspector { grid-row:1; min-width:0 }
+    #inspectorBackdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:34 }
     #grantBar[hidden] { display:none } /* the plain #grantBar{display:flex} rule below would otherwise outrank the UA's own [hidden] default */
-    #summary { grid-row:1; padding:14px 16px; border-bottom:1px solid var(--line) }
+    #summary { padding:14px 16px; border-bottom:1px solid var(--line) }
     .state-WAITING_INPUT { color:var(--amber) } .state-RUNNING { color:var(--green) }
     /* P0 Part C states: VERIFYING (independent verification in progress --
        amber, same "needs a look" weight as WAITING_INPUT); FAILED/BLOCKED
@@ -506,7 +511,7 @@ DASHBOARD_HTML = """<!doctype html>
        state already shows via the tab bar's own dot + this bar's title,
        so a second, purely decorative status indicator here would be
        redundant chrome, not information. */
-    .term { grid-row:3; display:flex; flex-direction:column; min-height:0 }
+    .term { grid-row:2; display:flex; flex-direction:column; min-height:0 }
     .term-bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 10px; padding:7px 12px; background:#0e1526; border-bottom:1px solid var(--line) }
     .term-title { color:var(--muted); font-size:12px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
     /* flex:1 1 auto + min-width:0 (not flex:0 0 auto): a flex item's
@@ -594,7 +599,7 @@ DASHBOARD_HTML = """<!doctype html>
        Send button (core.py's own terminal_send_text press_enter
        semantics, and the idempotency-key/delivery-state handling in the
        JS below, are untouched -- only the visual chrome around them). */
-    #inputBar { grid-row:7; display:flex; align-items:center; gap:8px; padding:10px 16px; background:var(--term-bg); border-top:1px solid var(--line) }
+    #inputBar { grid-row:6; display:flex; align-items:center; gap:8px; padding:10px 16px; background:var(--term-bg); border-top:1px solid var(--line) }
     #inputPrompt { flex:0 0 auto; color:var(--ansi-10); font-weight:700; user-select:none }
     #inputBar input[type=text] { flex:1; min-width:0; background:transparent; border:none; color:var(--term-fg); padding:8px 2px; font:inherit }
     #inputBar input[type=text]:focus { outline:none }
@@ -603,14 +608,14 @@ DASHBOARD_HTML = """<!doctype html>
     #inputBar button:hover:not(:disabled) { background:#233252 }
     #inputBar button:disabled { opacity:.5; cursor:not-allowed }
     #inputBar label { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:12px; white-space:nowrap }
-    #inputNote { grid-row:4; padding:6px 16px 0; font-size:12px; color:var(--muted) }
+    #inputNote { grid-row:3; padding:6px 16px 0; font-size:12px; color:var(--muted) }
 
     /* ---- Remote composer mirror + interactive key pad -------------------
        Two separate rows on purpose: the mirror is what the AGENT has on
        screen (read-only), the composer below is the operator's own draft.
        Keeping them visually distinct is the whole point -- a merged box is
        how a half-typed message gets silently replaced by a poll. */
-    #remoteComposer { grid-row:5; padding:8px 16px 0; min-width:0 }
+    #remoteComposer { grid-row:4; padding:8px 16px 0; min-width:0 }
     #remoteComposer[hidden] { display:none }
     .rc-head { display:flex; align-items:center; gap:8px; font-size:11px; color:var(--muted); flex-wrap:wrap }
     .rc-title { font-weight:700; letter-spacing:.03em; text-transform:uppercase }
@@ -627,7 +632,7 @@ DASHBOARD_HTML = """<!doctype html>
     #remoteComposer.rc-changed .rc-body { border-left-color:var(--amber) }
     #remoteComposer.rc-changed .rc-sync { border-color:var(--amber); color:var(--amber) }
 
-    #keyPad { grid-row:6; display:flex; align-items:center; gap:6px; padding:8px 16px 0; flex-wrap:wrap }
+    #keyPad { grid-row:5; display:flex; align-items:center; gap:6px; padding:8px 16px 0; flex-wrap:wrap }
     #keyPad[hidden] { display:none }
     .kp-label { color:var(--muted); font-size:11px }
     .kp-btn {
@@ -649,7 +654,7 @@ DASHBOARD_HTML = """<!doctype html>
        multi-button inline bar) so re-enabling it can never reintroduce the
        real mobile overlap bug that #permModal's own separate, off-grid
        overlay design structurally avoids. */
-    #grantBar { grid-row:2; display:flex; align-items:center; gap:8px; padding:8px 16px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); flex-wrap:wrap }
+    #grantBar { display:flex; align-items:center; gap:8px; padding:8px 16px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); flex-wrap:wrap }
     #grantBar button { background:#2b3f66; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:6px 12px; cursor:pointer; font:inherit; font-size:12px }
     /* Quyền truy cập modal -- the single reusable UI for granting/revoking
        a non-whitelisted session's read/input grant, opened from a session
@@ -852,6 +857,29 @@ DASHBOARD_HTML = """<!doctype html>
        with no way to reach it, on every viewport narrower than the full
        tab strip's content width (mobile, not just very narrow desktop). */
     .tabbar-row { display:flex; align-items:stretch; background:var(--panel); border-bottom:1px solid var(--line); min-width:0 }
+    /* ---- Mobile-only chrome -------------------------------------------
+       Every one of these is display:none on desktop and is switched on by
+       the portrait media query at the bottom of this stylesheet. They are
+       declared here, outside it, so the shared look lives in one place. */
+    .m-btn { background:#19243b; border:1px solid var(--line); color:var(--text); border-radius:8px;
+             padding:8px 12px; font:13px var(--mono); cursor:pointer; min-height:44px; white-space:nowrap }
+    .m-btn:active { background:#223052 }
+    #mobileSessionsBtn, .m-title, .drawer-head, #keysToggleBtn { display:none }
+    .m-title { align-items:center; gap:7px; min-width:0; flex:1; font-size:14px }
+    #mobileSessionName { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    .m-dot { flex:0 0 auto; width:8px; height:8px; border-radius:50%; background:var(--muted) }
+    .m-dot.ok { background:var(--green) } .m-dot.warn { background:var(--amber) } .m-dot.bad { background:var(--red) }
+    .drawer-head { justify-content:space-between; align-items:center; padding:10px 14px;
+                   border-bottom:1px solid var(--line); background:var(--panel) }
+    /* One-tap "back to the bottom", floating over the output rather than
+       taking a row from it. Visible only while auto-follow is paused. */
+    #jumpFab { position:absolute; right:14px; bottom:14px; z-index:5; background:var(--accent); color:#fff;
+               border:none; border-radius:999px; padding:10px 16px; font:13px var(--mono); cursor:pointer;
+               min-height:44px; box-shadow:0 6px 18px rgba(0,0,0,.45) }
+    #jumpFab[hidden] { display:none }
+    /* .term is the positioning context for the FAB above; it already is a
+       bounded flex column, so this only adds the containing block. */
+    .term { position:relative }
     .tabbar-row .tabbar { flex:1; min-width:0; border-bottom:none }
     .killed-panel { min-width:260px; max-width:min(360px, calc(100vw - 24px)); max-height:60vh; overflow:auto }
     .killed-row { padding:8px 8px; border-radius:8px; font-size:12px }
@@ -991,8 +1019,7 @@ DASHBOARD_HTML = """<!doctype html>
          pure presentation. */
       body.fullscreen-terminal header,
       body.fullscreen-terminal .tabbar,
-      body.fullscreen-terminal #summary,
-      body.fullscreen-terminal #grantBar,
+      body.fullscreen-terminal #sessionInspector,
       body.fullscreen-terminal #inputNote,
       body.fullscreen-terminal #remoteComposer,
       body.fullscreen-terminal #keyPad,
@@ -1011,11 +1038,204 @@ DASHBOARD_HTML = """<!doctype html>
         padding-right:max(12px, env(safe-area-inset-right));
       }
     }
+
+    /* ================= MOBILE PORTRAIT: terminal-first =================
+       A phone in portrait is the one viewport where the desktop
+       information architecture actively fails: header + filter + tab strip
+       + status card + term bar + composer + key row left the OUTPUT -- the
+       only thing anyone opens this page to read -- with about a third of
+       the screen, and less once the tab strip filled up.
+
+       So portrait is not a squeezed desktop. Three rules:
+         1. exactly one row of chrome above the terminal, and one below;
+         2. the session list is a SHEET, not a permanent column;
+         3. status/permissions/keys are on demand, never in the way.
+
+       Landscape keeps the compact-desktop treatment from the block above,
+       where a horizontal strip costs little. Everything here is layout
+       only: no element leaves the DOM and no JS behaviour is conditioned
+       on width, so every feature stays reachable. */
+    @media (max-width:760px) and (orientation:portrait) {
+      /* -- header: one 44px row ------------------------------------- */
+      .header-id { display:none }          /* the product name is not what you need on a phone */
+      #mobileSessionsBtn { display:inline-flex; align-items:center }
+      .m-title { display:flex }
+      header {
+        gap:8px; padding:6px 10px;
+        padding-top:max(6px, env(safe-area-inset-top));
+        padding-left:max(10px, env(safe-area-inset-left));
+        padding-right:max(10px, env(safe-area-inset-right));
+      }
+      /* Status pills do not get to eat the row: LIVE stays (it is the one
+         thing worth a glance), the rest are reachable from the menu. */
+      .header-right { gap:4px; flex:0 0 auto }
+      .header-right .supervisor-badge, #killedMenu, #registryMenu, #watchdogMenu { display:none }
+      #liveBadge { font-size:0; line-height:0 }   /* the bullet alone, as a status dot */
+      /* Literal glyph, never a CSS hex escape: inside a non-raw Python
+         string a backslash followed by digits is a valid OCTAL escape, so
+         the intended bullet shipped as U+0082 instead -- and because the
+         escape is valid Python, no invalid-escape check catches it. */
+      #liveBadge::before { content:'●'; font-size:17px; line-height:1 }
+
+      /* -- sessions drawer: the tab strip, as a bottom sheet ---------- */
+      .tabbar-row {
+        position:fixed; left:0; right:0; bottom:0; z-index:35;
+        flex-direction:column; max-height:72dvh;
+        border-top:1px solid var(--line); border-bottom:none;
+        border-radius:14px 14px 0 0; box-shadow:0 -12px 32px rgba(0,0,0,.5);
+        transform:translateY(102%); transition:transform .18s ease-out;
+        padding-bottom:env(safe-area-inset-bottom);
+      }
+      body.sessions-open .tabbar-row { transform:translateY(0) }
+      .drawer-head { display:flex }
+      #sessionsDrawerBackdrop { position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:34 }
+      #sessionsDrawerBackdrop[hidden] { display:none }
+      /* The list scrolls INSIDE the sheet. Nothing here scrolls the page:
+         the shell is height-bounded and overflow:hidden. */
+      .tabbar-wrap { min-height:0; overflow:hidden }
+      .tabbar { max-height:none; flex:1; min-height:0; overflow-y:auto; -webkit-overflow-scrolling:touch }
+      /* Tabs stack as full-width rows in the sheet -- a horizontal strip
+         inside a vertical sheet would hide most of the list. */
+      .tabbar .tab { min-width:0; max-width:none; width:100%; min-height:44px }
+      .tab-name { max-width:none }
+
+      /* -- inspector: status + access, on demand --------------------- */
+      #sessionInspector {
+        position:fixed; left:0; right:0; bottom:0; z-index:35;
+        background:var(--panel); border-top:1px solid var(--line);
+        border-radius:14px 14px 0 0; box-shadow:0 -12px 32px rgba(0,0,0,.5);
+        max-height:70dvh; overflow-y:auto;
+        transform:translateY(102%); transition:transform .18s ease-out;
+        padding-bottom:env(safe-area-inset-bottom);
+      }
+      body.inspector-open #sessionInspector { transform:translateY(0) }
+      body.inspector-open #inspectorBackdrop { display:block }
+      /* With the inspector out of the flow, the grid is terminal +
+         composer rows -- nothing between the header and the output. */
+      .detail { grid-template-rows:minmax(0,1fr) auto auto auto auto }
+      .term { grid-row:1 } #inputNote { grid-row:2 } #remoteComposer { grid-row:3 }
+      #keyPad { grid-row:4 } #inputBar { grid-row:5 }
+
+      /* -- the terminal owns what is left ---------------------------- */
+      /* The tab strip is position:fixed here, so it leaves the grid flow
+         entirely and `.detail` becomes the FIRST in-flow item -- which
+         placed it in the `auto` track meant for the strip and collapsed
+         the terminal to its content height (measured: 31px of an 844px
+         screen). One track, and it is the flexible one. */
+      main { padding:0; gap:0; grid-template-rows:minmax(0,1fr) }
+      body.has-selection main { padding:0 }
+      .panel.detail { border:none; border-radius:0 }
+      /* term-bar stays one line: never wrapping into a second row that
+         silently costs another 30px of output. Measured at 390px before
+         this was tuned, the row was 455px wide and pushed the fullscreen
+         and "..." buttons off-screen -- and "..." is where Kill, Chi
+         tiết, Search and Copy live, so they were unreachable. Nothing may
+         be wider than the viewport here. */
+      .term-bar { flex-wrap:nowrap; padding:4px 8px; gap:6px; overflow:hidden }
+      .term-controls { flex-wrap:nowrap; gap:4px; flex:1 1 auto; min-width:0 }
+      .term-btn { padding:6px 8px; font-size:12px; min-height:36px; flex:0 0 auto }
+      /* The header already names the session; repeating it here is what
+         squeezed the controls out. */
+      .term-title { display:none }
+      /* Auto-follow becomes its state, not a sentence. Its label is JS
+         text, so the glyph is CSS and the word is hidden rather than
+         rewritten -- the button keeps its accessible text. */
+      #followToggle { font-size:0; padding:6px 9px }
+      #followToggle::before { content:'⇣'; font-size:15px; line-height:1 }
+      #followToggle.paused::before { content:'⏸'; font-size:13px }
+      #taskManagerBtn { font-size:0; padding:6px 9px }
+      #taskManagerBtn::before { content:'📋'; font-size:14px; line-height:1 }
+      #output { padding:8px 10px }
+
+      /* -- composer: sticky, one row, keys collapsed ----------------- */
+      #keysToggleBtn { display:inline-flex; align-items:center; padding:6px 10px; min-height:38px }
+      /* [hidden] (JS sets it whenever input is not usable) still wins;
+         this only decides whether a USABLE key row is expanded. */
+      #keyPad:not([hidden]) { display:none }
+      body.keys-open #keyPad:not([hidden]) { display:flex }
+      #inputBar {
+        padding-bottom:max(8px, env(safe-area-inset-bottom));
+        padding-left:max(10px, env(safe-area-inset-left));
+        padding-right:max(10px, env(safe-area-inset-right));
+        flex-wrap:nowrap; gap:6px; overflow:hidden;
+      }
+      /* The Send button and the Enter checkbox were off-screen at 390px --
+         the row measured 455px -- which made the composer unusable on the
+         exact device this redesign is for. The text box is the only part
+         that may absorb the squeeze; everything else keeps its size. */
+      #inputBar input[type=text] { flex:1 1 auto; min-width:0 }
+      #inputPrompt { display:none }
+      #inputBar button { flex:0 0 auto }
+      /* "Enter" becomes its glyph: the checkbox still carries the same
+         press_enter semantics and the same accessible label. */
+      #inputBar label { flex:0 0 auto; font-size:0; gap:0 }
+      #inputBar label::after { content:'⏎'; font-size:15px; margin-left:2px }
+      /* Bounded so a long mirrored prompt can never push the output out of
+         the viewport -- the exact failure this redesign exists to fix. */
+      .rc-body { max-height:18dvh }
+      #remoteComposer { padding-top:4px }
+      #inputNote { padding-top:2px }
+
+      /* -- when the on-screen keyboard is up ------------------------- */
+      /* interactive-widget=resizes-content (see the viewport meta) makes
+         iOS shrink the visual viewport instead of scrolling the page, so
+         dvh tracks it and the flex chain re-solves: the terminal shrinks
+         and the newest lines stay on screen. At that point the keyboard
+         itself provides the keys, so the quick-key row stands down. */
+      @media (max-height:520px) {
+        body.keys-open #keyPad:not([hidden]) { display:none }
+        .term-bar { padding:2px 8px }
+        #output { padding:6px 10px }
+      }
+    }
+    /* ---- Short viewports (phone in landscape, split-screen) ----------
+       Measured before this block existed: a 844x390 landscape phone gave
+       the output 20px -- 5% of the screen -- because the tab strip was
+       allowed 38vh and the status card sat above the terminal, on a
+       viewport with barely any height to give. Portrait solves this by
+       making both of those sheets; landscape keeps the strip (a
+       horizontal row is cheap when width is plentiful) but bounds it
+       properly and moves the status card out of the column. */
+    @media (max-height:560px) and (orientation:landscape) {
+      .tabbar { max-height:22vh }
+      .tabbar-filter { padding:3px 8px }
+      .tabbar-filter input { padding:4px 8px }
+      /* Same sheet treatment as portrait, for the same reason: a status
+         card between the header and the output is the single most
+         expensive row on a short screen. */
+      #sessionInspector {
+        position:fixed; left:auto; right:0; top:0; bottom:0; width:min(420px, 92vw); z-index:35;
+        background:var(--panel); border-left:1px solid var(--line);
+        max-height:100dvh; overflow-y:auto;
+        transform:translateX(102%); transition:transform .18s ease-out;
+      }
+      body.inspector-open #sessionInspector { transform:translateX(0) }
+      body.inspector-open #inspectorBackdrop { display:block }
+      .drawer-head { display:flex }
+      .detail { grid-template-rows:minmax(0,1fr) auto auto auto auto }
+      .term { grid-row:1 } #inputNote { grid-row:2 } #remoteComposer { grid-row:3 }
+      #keyPad { grid-row:4 } #inputBar { grid-row:5 }
+      .term-bar { flex-wrap:nowrap; padding:3px 8px }
+      #output { padding:6px 10px }
+      .rc-body { max-height:20dvh }
+    }
+    @media (prefers-reduced-motion:reduce) {
+      .tabbar-row, #sessionInspector { transition:none }
+    }
   </style>
 </head>
 <body>
   <header>
-    <div><h1>Terminal MCP</h1><div class="muted">Whitelisted tmux session monitor</div></div>
+    <!-- "Whitelisted tmux session monitor" is gone: session access is
+         default-open now (absence of a grant record means ALLOW), so the
+         word described a mechanism that no longer exists. -->
+    <div class="header-id"><h1>Terminal MCP</h1><div class="muted">tmux session monitor</div></div>
+    <!-- Mobile portrait header row: ONE line -- open Sessions, the active
+         session's name, its state dot. Everything else lives in the "⋯"
+         menu or the Inspector sheet, because on a phone the terminal has
+         to own the screen (see the portrait media query). -->
+    <button type="button" id="mobileSessionsBtn" class="m-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="sessionsDrawer">☰ Sessions</button>
+    <div class="m-title" id="mobileSessionTitle"><span class="m-dot" id="mobileSessionDot" hidden></span><span id="mobileSessionName">Chưa chọn session</span></div>
     <div class="header-right">
       <button id="supervisorBadge" class="supervisor-badge" type="button" hidden></button>
       <span class="supervisor-badge" id="connHealthBadge" title="Kết nối OpenAI Secure MCP Tunnel" hidden></span>
@@ -1091,7 +1311,16 @@ DASHBOARD_HTML = """<!doctype html>
          The strip itself now holds ONLY session tabs (task's own explicit
          "dải ngang phải ưu tiên session tabs 100% chiều rộng") -- New
          session/Đã kill moved to the header, see above. -->
-    <div class="tabbar-row">
+    <!-- On desktop this is the horizontal tab strip it has always been.
+         On a phone in portrait the SAME element becomes a bottom sheet
+         (see the portrait media query): identical DOM, identical JS, so
+         grouping-by-node, the filter, status dots and selection all keep
+         working exactly as before -- only where it sits changes. -->
+    <div class="tabbar-row" id="sessionsDrawer" role="group" aria-label="Sessions">
+      <div class="drawer-head">
+        <strong>Sessions</strong>
+        <button type="button" class="m-btn" id="sessionsDrawerClose" aria-label="Đóng danh sách session">✕</button>
+      </div>
       <div class="tabbar-wrap">
         <div class="tabbar-filter">
           <input type="search" id="sessionFilter" placeholder="Lọc session trên mọi node..." aria-label="Lọc session">
@@ -1099,9 +1328,22 @@ DASHBOARD_HTML = """<!doctype html>
         <nav class="tabbar" id="tabbar" role="tablist" aria-label="Sessions"></nav>
       </div>
     </div>
+    <div id="sessionsDrawerBackdrop" hidden></div>
     <section class="panel detail">
-      <div id="summary" class="muted">Chọn một session để xem output.</div>
-      <div id="grantBar" hidden></div>
+      <!-- Status card + access controls. A grid row on desktop; on a phone
+           in portrait this whole wrapper becomes a bottom sheet opened from
+           the "⋯" menu, so nothing sits between the header and the
+           terminal output. Wrapping them (rather than moving them) keeps
+           every existing JS reference to #summary/#grantBar valid. -->
+      <div id="sessionInspector">
+        <div class="drawer-head">
+          <strong>Chi tiết session</strong>
+          <button type="button" class="m-btn" id="inspectorClose" aria-label="Đóng chi tiết">✕</button>
+        </div>
+        <div id="summary" class="muted">Chọn một session để xem output.</div>
+        <div id="grantBar" hidden></div>
+      </div>
+      <div id="inspectorBackdrop" hidden></div>
       <div class="term">
         <div class="term-bar">
           <span class="term-title" id="termTitle"></span>
@@ -1113,6 +1355,7 @@ DASHBOARD_HTML = """<!doctype html>
               <button class="term-btn" id="termMenuBtn" type="button" disabled aria-haspopup="true" aria-expanded="false" title="Thêm tuỳ chọn">⋯</button>
               <div class="menu-panel" id="termMenuPanel" role="menu">
                 <button id="jumpBtn" type="button" disabled>↓ Jump to latest</button>
+                <button id="inspectorBtn" type="button" disabled>ℹ Chi tiết session</button>
                 <button id="searchToggleBtn" type="button" disabled>🔍 Tìm trong output</button>
                 <button id="copyBtn" type="button" disabled>⧉ Copy output</button>
                 <button id="fontDecBtn" type="button" disabled>A− Chữ nhỏ hơn</button>
@@ -1136,6 +1379,11 @@ DASHBOARD_HTML = """<!doctype html>
           <button id="searchCloseBtn" class="term-btn" type="button">✕</button>
         </div>
         <pre id="output"></pre>
+        <!-- Shown only while auto-follow is paused (the user scrolled up).
+             The "↓ Jump to latest" menu item still exists and does the same
+             thing; this is the one-tap version, which is what a phone
+             needs. -->
+        <button type="button" id="jumpFab" hidden>↓ Về cuối</button>
       </div>
       <div id="inputNote"></div>
       <!-- Remote composer mirror: what the AGENT currently has on screen as
@@ -1166,6 +1414,11 @@ DASHBOARD_HTML = """<!doctype html>
       </div>
       <div id="inputBar">
         <span id="inputPrompt">❯</span>
+        <!-- The quick-key row costs ~60px of a phone screen and is not
+             needed for most sends, so on portrait it collapses behind this
+             button (see #keyPad in the portrait media query). Hidden on
+             desktop, where the row simply stays open. -->
+        <button type="button" id="keysToggleBtn" class="m-btn" aria-expanded="false" aria-controls="keyPad" hidden>⌨ Phím</button>
         <input type="text" id="inputText" placeholder="Nhập text để gửi vào session..." disabled>
         <label><input type="checkbox" id="inputEnter" checked> Enter</label>
         <button id="inputSend" disabled>Gửi</button>
@@ -1512,6 +1765,65 @@ DASHBOARD_HTML = """<!doctype html>
     // the screen.
     function updateLayoutState() {
       document.body.classList.toggle('has-selection', Boolean(selected));
+      updateMobileHeadline();
+    }
+
+    // ---- mobile portrait: sessions sheet, inspector sheet, key row -------
+    // Pure presentation state. Each of these only toggles a body class that
+    // the portrait media query reads, so on desktop -- where none of those
+    // rules apply -- every one of them is inert and nothing here needs a
+    // width check of its own.
+    const mobileSessionsBtnEl = document.querySelector('#mobileSessionsBtn');
+    const sessionsDrawerEl = document.querySelector('#sessionsDrawer');
+    const sessionsDrawerCloseEl = document.querySelector('#sessionsDrawerClose');
+    const sessionsBackdropEl = document.querySelector('#sessionsDrawerBackdrop');
+    const inspectorEl = document.querySelector('#sessionInspector');
+    const inspectorBtnEl = document.querySelector('#inspectorBtn');
+    const inspectorCloseEl = document.querySelector('#inspectorClose');
+    const inspectorBackdropEl = document.querySelector('#inspectorBackdrop');
+    const keysToggleBtnEl = document.querySelector('#keysToggleBtn');
+    const jumpFabEl = document.querySelector('#jumpFab');
+    const mobileSessionNameEl = document.querySelector('#mobileSessionName');
+    const mobileSessionDotEl = document.querySelector('#mobileSessionDot');
+
+    function setSessionsDrawer(open) {
+      document.body.classList.toggle('sessions-open', open);
+      sessionsBackdropEl.hidden = !open;
+      mobileSessionsBtnEl.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (open) {
+        // The active session must be visible the moment the sheet opens,
+        // however far down a long list it sits.
+        const active = sessionsDrawerEl.querySelector('.tab.active');
+        if (active && active.scrollIntoView) { active.scrollIntoView({block:'nearest'}); }
+      }
+    }
+    function setInspector(open) {
+      document.body.classList.toggle('inspector-open', open);
+      inspectorBackdropEl.hidden = !open;
+    }
+    function setKeysOpen(open) {
+      document.body.classList.toggle('keys-open', open);
+      keysToggleBtnEl.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+    mobileSessionsBtnEl.onclick = () => setSessionsDrawer(!document.body.classList.contains('sessions-open'));
+    sessionsDrawerCloseEl.onclick = () => setSessionsDrawer(false);
+    sessionsBackdropEl.onclick = () => setSessionsDrawer(false);
+    inspectorBtnEl.onclick = () => { closeAllMenus(); setInspector(true); };
+    inspectorCloseEl.onclick = () => setInspector(false);
+    inspectorBackdropEl.onclick = () => setInspector(false);
+    keysToggleBtnEl.onclick = () => setKeysOpen(!document.body.classList.contains('keys-open'));
+
+    // The name in the one-line mobile header, mirroring the term-bar title.
+    function updateMobileHeadline() {
+      mobileSessionNameEl.textContent = selected || 'Chưa chọn session';
+      const row = selected ? (lastKnownRows || []).find((item) => item.name === selected) : null;
+      mobileSessionDotEl.hidden = !row;
+      if (row) {
+        mobileSessionDotEl.className = 'm-dot ' + (
+          row.state === 'RUNNING' ? 'ok'
+          : (row.state === 'WAITING_INPUT' || row.state === 'VERIFYING') ? 'warn'
+          : (row.state === 'FAILED' || row.state === 'BLOCKED' || row.state === 'ERROR') ? 'bad' : '');
+      }
     }
 
     // ---- Reusable "⋯" overflow menu (task item 3) --------------------------
@@ -1544,6 +1856,13 @@ DASHBOARD_HTML = """<!doctype html>
     }
     document.addEventListener('click', closeAllMenus);
     document.addEventListener('keydown', event => { if (event.key === 'Escape') closeAllMenus(); });
+    // Escape closes whichever sheet is up -- same affordance as every other
+    // overlay on this page.
+    document.addEventListener('keydown', event => {
+      if (event.key !== 'Escape') return;
+      if (document.body.classList.contains('sessions-open')) setSessionsDrawer(false);
+      if (document.body.classList.contains('inspector-open')) setInspector(false);
+    });
     wireMenu(document.querySelector('#headerMenu'), document.querySelector('#headerMenuBtn'));
     wireMenu(document.querySelector('#termMenu'), document.querySelector('#termMenuBtn'));
     wireMenu(document.querySelector('#killedMenu'), killedToggleEl);
@@ -1981,6 +2300,9 @@ DASHBOARD_HTML = """<!doctype html>
       autoFollow = value;
       followToggleEl.textContent = autoFollow ? 'Auto-follow: ON' : 'Auto-follow: PAUSED';
       followToggleEl.classList.toggle('paused', !autoFollow);
+      // Paused means the user scrolled up to read something. Offer the way
+      // back explicitly instead of yanking them down.
+      jumpFabEl.hidden = autoFollow || !selected;
     }
     function refreshTermControls() {
       followToggleEl.disabled = !selected;
@@ -1988,6 +2310,7 @@ DASHBOARD_HTML = """<!doctype html>
       taskManagerBtnEl.disabled = !selected;
       fullscreenBtnEl.disabled = !selected;
       searchToggleBtnEl.disabled = !selected;
+      inspectorBtnEl.disabled = !selected;
       copyBtnEl.disabled = !selected;
       termMenuBtnEl.disabled = !selected;
       termTitleEl.textContent = selected || '';
@@ -1999,6 +2322,7 @@ DASHBOARD_HTML = """<!doctype html>
       if (autoFollow) outputEl.scrollTop = outputEl.scrollHeight;
     };
     jumpBtnEl.onclick = () => { setAutoFollow(true); outputEl.scrollTop = outputEl.scrollHeight; };
+    jumpFabEl.onclick = () => { setAutoFollow(true); outputEl.scrollTop = outputEl.scrollHeight; };
 
     // ---- fullscreen terminal (mobile: CSS-only chrome hide; everywhere:
     // opportunistic real Fullscreen API) --------------------------------
@@ -2095,7 +2419,7 @@ DASHBOARD_HTML = """<!doctype html>
 
     // ---- Interactive key sends (arrows / Tab / Esc / Enter) --------------
     // A menu, a completion list or a confirmation reacts to a real KEY, not
-    // to text -- writing "\x1b[A" into the composer types those characters,
+    // to text -- writing an ESC[A sequence into the composer types those characters,
     // it does not press Up. So these go through terminal_send_keys (the same
     // MCP tool and the same allow_keys policy), never through the text path.
     //
@@ -2114,7 +2438,10 @@ DASHBOARD_HTML = """<!doctype html>
     function refreshKeyPad() {
       const usable = Boolean(selected) && inputAllowed;
       keyPadEl.hidden = !usable;
-      if (!usable) { setKeyMode(false); return; }
+      // A collapse toggle for a row that cannot be used would be a dead
+      // control; it appears and disappears with the row it opens.
+      keysToggleBtnEl.hidden = !usable;
+      if (!usable) { setKeyMode(false); setKeysOpen(false); return; }
       for (const btn of keyPadEl.querySelectorAll('.kp-btn')) {
         const key = btn.dataset.key;
         const available = keyIsAvailable(key);
@@ -2596,6 +2923,10 @@ DASHBOARD_HTML = """<!doctype html>
       // detail arrives and renderGrantBar repaints it for real.
       grantBarEl.hidden = true; grantBarEl.replaceChildren();
       setAutoFollow(true); refreshInputControls(); refreshTermControls(); updateLayoutState();
+      // Picking a session is the whole reason the sheet was open -- get out
+      // of the way and show the terminal, rather than leaving the list
+      // covering the output the user just asked for.
+      setSessionsDrawer(false);
       rememberSession(name);
       closeSearch(); // a search from a different session's content wouldn't make sense to keep open
       renderRows(lastKnownRows); // reflect the new active/selected row immediately, not just on the next 5s poll
@@ -4344,7 +4675,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
        so it never reads as a permission state. */
     .node-badge { display:inline-block; border-radius:999px; padding:1px 7px; font-size:10px; border:1px solid var(--line); color:var(--muted); margin-left:6px; vertical-align:middle; white-space:nowrap }
     .perm-badge { display:inline-block; border-radius:999px; padding:2px 9px; font-size:11px; border:1px solid var(--line); white-space:nowrap }
-    .perm-badge.whitelist { color:var(--muted) }
+    .perm-badge.default-open { color:var(--muted) }
     .perm-badge.full { color:var(--green); border-color:var(--green) }
     .perm-badge.read { color:#8fb8ff; border-color:#8fb8ff }
     .perm-badge.none { color:#ff9f9f; border-color:#ff9f9f }
@@ -4464,7 +4795,12 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
   <div class="toolbar">
     <button id="newSessionBtn" class="primary" type="button">+ Tạo session</button>
     <input type="text" id="searchBox" placeholder="Tìm theo tên session...">
-    <label><input type="checkbox" id="onlyGrantable"> Chỉ hiện session chưa whitelist</label>
+    <!-- Was "Chỉ hiện session chưa whitelist". Under default-open every
+         session is manageable, so that filter matched everything and hid
+         nothing -- a dead control describing a mechanism that no longer
+         exists. The question an operator actually has now is the opposite
+         one: which sessions has somebody deliberately LOCKED? -->
+    <label><input type="checkbox" id="onlyGrantable"> Chỉ hiện session đã khoá</label>
     <span id="count"></span>
   </div>
   <div id="bulkBar" hidden></div>
@@ -4644,6 +4980,12 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     // have quietly removed the bulk checkbox from exactly the rows an
     // operator wants to lock.
     function grantable(row) { return true; }
+    // Explicitly locked: an effective access that is OFF. Under default-open
+    // that can only be a deliberate revoke or a policy floor -- never the
+    // mere absence of a record, which now means allow.
+    function isLocked(row) {
+      return row.effective_read === false || row.effective_input === false;
+    }
     function grantState(row) {
       if (row.grant && row.grant.input_enabled) return 'full';
       if (row.grant && row.grant.read_enabled) return 'read';
@@ -5069,7 +5411,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       const query = searchEl.value.trim().toLowerCase();
       const filtered = rows.filter(row => {
         if (query && !row.name.toLowerCase().includes(query)) return false;
-        if (onlyGrantableEl.checked && !grantable(row)) return false;
+        if (onlyGrantableEl.checked && !isLocked(row)) return false;
         return true;
       });
       const filtering = Boolean(query) || onlyGrantableEl.checked;

@@ -130,7 +130,7 @@ def test_filtering_hides_groups_with_no_matches_on_both_pages():
     # Main dashboard: filter box drives the same grouping call.
     assert "{ includeEmptyOnline: !query }" in DASHBOARD_HTML
     assert 'id="sessionFilter"' in DASHBOARD_HTML
-    # Sessions admin: its existing search box + "chỉ hiện chưa whitelist".
+    # Sessions admin: its existing search box + "chỉ hiện session đã khoá".
     assert "{ includeEmptyOnline: !filtering }" in SESSIONS_ADMIN_HTML
     assert "const filtering = Boolean(query) || onlyGrantableEl.checked;" in SESSIONS_ADMIN_HTML
 

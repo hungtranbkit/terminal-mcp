@@ -78,8 +78,12 @@ def test_sessions_admin_html_shows_every_session_never_hides_ungranted(tmux_sess
     # out by default -- the "chỉ hiện session chưa whitelist" checkbox is
     # an opt-in narrowing filter, not the default view.
     assert 'id="onlyGrantable"' in SESSIONS_ADMIN_HTML
-    assert "Chỉ hiện session chưa whitelist" in SESSIONS_ADMIN_HTML
-    assert "onlyGrantableEl.checked && !grantable(row)) return false;" in SESSIONS_ADMIN_HTML
+    # The filter now answers the question default-open leaves open -- which
+    # sessions did someone deliberately LOCK -- rather than "which are
+    # outside the whitelist", which matched everything once the whitelist
+    # was retired.
+    assert "Chỉ hiện session đã khoá" in SESSIONS_ADMIN_HTML
+    assert "onlyGrantableEl.checked && !isLocked(row)) return false;" in SESSIONS_ADMIN_HTML
     assert "rows.length ? 'Không có session khớp bộ lọc.'" in SESSIONS_ADMIN_HTML
 
 
@@ -355,7 +359,9 @@ def test_dashboard_fullscreen_hides_chrome_and_fills_terminal_on_mobile():
     # config-driven line bound / ANSI rendering / auto-follow inside
     # #output are completely untouched by any of this (pure presentation).
     assert "body.fullscreen-terminal header," in DASHBOARD_HTML
-    assert "body.fullscreen-terminal #summary," in DASHBOARD_HTML
+    # #summary/#grantBar live inside #sessionInspector since the
+    # mobile-portrait redesign, so hiding the wrapper hides both.
+    assert "body.fullscreen-terminal #sessionInspector," in DASHBOARD_HTML
     # Regression guard: #grantBar went from always-empty (SHOW_GRANT_
     # CONTROLS=false) to real, often-visible content once the permission
     # modal work re-enabled it -- it was never in this hidden list before
@@ -363,7 +369,6 @@ def test_dashboard_fullscreen_hides_chrome_and_fills_terminal_on_mobile():
     # here would have made fullscreen mode visibly leak the permission bar
     # instead of showing "essentially only the terminal pane", exactly the
     # bug a real agent-browser screenshot caught before this test existed.
-    assert "body.fullscreen-terminal #grantBar," in DASHBOARD_HTML
     assert "body.fullscreen-terminal #inputBar { display:none }" in DASHBOARD_HTML
     # The tab bar replaced the old sidebar as the ONE nav surface (task
     # item 2/3/5) -- it must be in this hidden list exactly like the
@@ -1320,12 +1325,16 @@ def test_dashboard_detail_grid_rows_match_children_one_to_one():
     detail_rule = re.search(r"\.detail \{ display:grid; grid-template-rows:([^;]+);", DASHBOARD_HTML)
     assert detail_rule is not None
     tracks = detail_rule.group(1).split()
-    assert len(tracks) == 7
-    # .term (position 3) is still the ONE growing track.
-    assert tracks == ["auto", "auto", "minmax(0,1fr)", "auto", "auto", "auto", "auto"]
+    # Six since the mobile-portrait redesign: #summary and #grantBar are
+    # children of #sessionInspector now, which is the one grid item that
+    # replaces them (and becomes a sheet in portrait). #inspectorBackdrop is
+    # position:fixed and never claims a track.
+    assert len(tracks) == 6
+    # .term (position 2) is still the ONE growing track.
+    assert tracks == ["auto", "minmax(0,1fr)", "auto", "auto", "auto", "auto"]
     expected_grid_rows = {
-        "#summary": 1, "#grantBar": 2, ".term": 3, "#inputNote": 4,
-        "#remoteComposer": 5, "#keyPad": 6, "#inputBar": 7,
+        "#sessionInspector": 1, ".term": 2, "#inputNote": 3,
+        "#remoteComposer": 4, "#keyPad": 5, "#inputBar": 6,
     }
     for selector, row in expected_grid_rows.items():
         assert f"grid-row:{row};" in DASHBOARD_HTML or f"grid-row:{row} " in DASHBOARD_HTML, \
@@ -1543,15 +1552,32 @@ def test_dashboard_mobile_media_query_matches_landscape_phones_too():
     # stops applying mid-rotation even though the JS fullscreen state
     # (and selected session, auto-follow, font size) never changed.
     assert "@media (max-width:760px), (max-height:760px)" in DASHBOARD_HTML
-    # Only the one, combined VIEWPORT-breakpoint query should exist -- a
-    # second, width-only one would be exactly the kind of orientation trap
-    # this fixes if introduced by accident. The one other @media in the
-    # file (prefers-reduced-motion, for the blinking terminal cursor) is an
-    # accessibility-preference query, not a viewport breakpoint -- it can
-    # never create that trap, so it is fine for it to coexist.
-    assert DASHBOARD_HTML.count("@media (prefers-reduced-motion:reduce)") == 1
-    assert DASHBOARD_HTML.count("@media (max-width") == 1
-    assert DASHBOARD_HTML.count("@media") == 2
+    # The mobile-portrait redesign added two more viewport queries. Both are
+    # ORIENTATION-QUALIFIED refinements of the breakpoint above, which is
+    # what keeps them out of the trap this test exists for: rotating a phone
+    # swaps which refinement applies, and the base block keeps applying
+    # either way, so no rule silently stops mid-rotation.
+    portrait_start = DASHBOARD_HTML.index("@media (max-width:760px) and (orientation:portrait)")
+    portrait_end = DASHBOARD_HTML.index("@media (max-height:560px) and (orientation:landscape)")
+    for match in re.finditer(r"@media \([^)]*(?:max-width|max-height)[^{]*\{", DASHBOARD_HTML):
+        query = match.group(0)
+        if "max-width:760px), (max-height:760px" in query:
+            continue                                  # the base breakpoint
+        if "orientation:" in query:
+            continue                                  # an orientation-qualified refinement
+        # A query NESTED inside an orientation-qualified block inherits that
+        # qualifier, so it cannot strand a rule across a rotation either.
+        assert portrait_start < match.start() < portrait_end, \
+            f"viewport query without an orientation qualifier: {query.strip()}"
+    assert "@media (max-width:760px) and (orientation:portrait)" in DASHBOARD_HTML
+    assert "@media (max-height:560px) and (orientation:landscape)" in DASHBOARD_HTML
+    # prefers-reduced-motion is an accessibility preference, never a
+    # breakpoint, so any number of them is harmless here.
+    assert DASHBOARD_HTML.count("@media (prefers-reduced-motion:reduce)") >= 1
+    # Exactly two width-keyed queries: the base breakpoint and the portrait
+    # refinement. A third would need its own justification -- the loop above
+    # is what actually enforces the orientation rule.
+    assert DASHBOARD_HTML.count("@media (max-width") == 2
 
 
 def test_dashboard_fullscreen_rules_live_inside_the_orientation_safe_query():
