@@ -1755,7 +1755,7 @@ DASHBOARD_HTML = """<!doctype html>
     // captured -- never used by ansiRuns), final byte 0x40-0x7E ([@-~],
     // not just A-Za-z -- a handful of legitimate CSI final bytes fall
     // outside that narrower range).
-    const CSI_RE = /\\x1b\\[([0-?]*)[ -\/]*([@-~])/g;
+    const CSI_RE = /\\x1b\\[([0-?]*)[ -\\/]*([@-~])/g;
     // OSC sequences (ESC ] ... BEL-or-ESC\\) -- e.g. an OSC 8 hyperlink, or a
     // window-title set -- a real CLI can legitimately emit these (caught
     // live verifying this redesign against a real Claude Code session,
@@ -2209,8 +2209,8 @@ DASHBOARD_HTML = """<!doctype html>
     // half-typed message is exactly the data loss this separation prevents.
     // Copying across is a button, and it warns before discarding a dirty
     // draft.
-    const MENU_LINE_RE = /^\s*[❯>*]?\s*(\d+)[.)]\s+\S/;
-    const SELECTED_LINE_RE = /^\s*[❯>*]\s*\S/;
+    const MENU_LINE_RE = /^\\s*[❯>*]?\\s*(\\d+)[.)]\\s+\\S/;
+    const SELECTED_LINE_RE = /^\\s*[❯>*]\\s*\\S/;
     let localDraftDirty = false;
     let lastRemoteComposerText = '';
 
@@ -2218,7 +2218,7 @@ DASHBOARD_HTML = """<!doctype html>
 
     function detectRemoteComposer(outputText) {
       if (!outputText) return null;
-      const lines = outputText.replace(/\s+$/, '').split('\\n');
+      const lines = outputText.replace(/\\s+$/, '').split('\\n');
       const tail = lines.slice(-14);
       const menu = tail.filter(line => MENU_LINE_RE.test(line));
       if (menu.length >= 2) {
@@ -2231,7 +2231,7 @@ DASHBOARD_HTML = """<!doctype html>
       // A composer/prompt line with something already typed into it.
       for (let i = tail.length - 1; i >= 0; i -= 1) {
         const line = tail[i];
-        const match = line.match(/^\s*[❯>](.*)$/);
+        const match = line.match(/^\\s*[❯>](.*)$/);
         if (match && match[1].trim()) return { kind: 'composer', text: match[1].trim() };
       }
       return null;

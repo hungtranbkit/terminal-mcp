@@ -56,7 +56,10 @@ def session_allowed(session: str, config: AppConfig) -> bool:
 
 
 def binding_session_allowed(session: str, config: AppConfig) -> bool:
-    """Bindings never target sensitive sessions, even with an exact whitelist."""
+    """DEPRECATED -- no caller in any enforcement path. TerminalService.
+    _bind_authorized decides bind targets now, from the sensitive-name floor
+    plus ordinary read authorization. Kept only so an out-of-tree caller does
+    not break on upgrade; do not reintroduce it into a gate."""
     lowered = session.casefold()
     if any(word in lowered for word in SENSITIVE_SESSION_WORDS):
         return False

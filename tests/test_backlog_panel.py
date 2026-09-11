@@ -7,7 +7,10 @@ innerHTML from data and builds everything with textContent.
 """
 from __future__ import annotations
 
+import io
+import pathlib
 import re
+import tokenize
 import shutil
 import subprocess
 
@@ -253,3 +256,46 @@ def test_every_dashboard_template_script_parses(tmp_path, name):
     path.write_text(source)
     result = subprocess.run([node, "--check", str(path)], capture_output=True, text=True)
     assert result.returncode == 0, f"{name} inline script does not parse:\n{result.stderr}"
+
+
+# ---------------------------------------- the same mistake, one step earlier
+#
+# `\n` written as a raw newline (above) is the version that breaks TODAY.
+# `\s`, `\d`, `\S` in an embedded JS regex are the version that breaks
+# LATER: Python does not recognise them, so today it keeps the backslash
+# and the browser receives correct JS -- but an invalid escape sequence in
+# a non-raw literal is a documented future SyntaxError, and on that day
+# dashboard.py stops IMPORTING. That takes the controller down entirely,
+# not one panel. Ten of these had accumulated.
+#
+# The fix is per-escape doubling, never an `r` prefix: these literals also
+# contain `\\n`, which a raw string would ship to the browser as a literal
+# backslash-n.
+
+def test_no_python_source_file_contains_an_invalid_escape_sequence():
+    valid = set('\n\\\'"abfnrtv01234567xNuU')
+    root = pathlib.Path(__file__).resolve().parent.parent
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        if ".venv" in path.parts:
+            continue
+        try:
+            tokens = list(tokenize.generate_tokens(io.StringIO(path.read_text()).readline))
+        except (SyntaxError, tokenize.TokenError, UnicodeDecodeError):
+            continue
+        for token in tokens:
+            if token.type != tokenize.STRING:
+                continue
+            prefix = re.match(r"[A-Za-z]*", token.string).group(0).lower()
+            if "r" in prefix or "b" in prefix:
+                continue
+            body = token.string[len(prefix):]
+            index = 0
+            while True:
+                index = body.find("\\", index)
+                if index == -1 or index + 1 >= len(body):
+                    break
+                if body[index + 1] not in valid:
+                    offenders.append(f"{path.relative_to(root)}:{token.start[0]} \\{body[index + 1]}")
+                index += 2
+    assert not offenders, "invalid escape sequences (future SyntaxError): " + ", ".join(offenders)

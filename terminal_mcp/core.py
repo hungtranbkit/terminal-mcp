@@ -912,11 +912,15 @@ class TerminalService:
         return self._input_authorized_with_grant(session, self.grants.get(session))
 
     def _bind_authorized(self, session: str) -> bool:
-        """Canonical bind-target authorization: the same 'sensitive names
-        never bindable, even with an exact whitelist entry' floor
-        binding_session_allowed already enforced, plus (new) an active
-        read grant as an alternate path to the same read-level
-        authorization terminal_status/terminal_tail/etc. now accept.
+        """Canonical bind-target authorization: the 'sensitive names are
+        never bindable' floor, plus ordinary read authorization -- the
+        same answer terminal_status/terminal_tail/etc. give, so a session
+        you can read is a session you can observe through a binding.
+
+        No whitelist is consulted here any more. The helper that used to
+        (binding_session_allowed) is retained only as a deprecated
+        migration shim and has no caller in any enforcement path.
+
         Input through a resulting binding stays separately gated by the
         binding's own input_enabled flag plus _input_guard/
         _check_binding_identity on every actual send, exactly as before

@@ -20,6 +20,9 @@ What replaces it:
 """
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import time
 import uuid
 
@@ -192,3 +195,55 @@ def test_migration_never_resurrects_an_access_the_user_revoked(tmp_path, tmux_se
 
     service.migrate_whitelist_to_grants()
     assert service._read_authorized(session) is False
+
+
+# -- the whitelist stays out of enforcement, structurally --------------------
+
+_DEPRECATED_WHITELIST_HELPERS = ("session_allowed", "input_session_allowed",
+                                 "binding_session_allowed")
+
+# The ONE place a whitelist may still be read: converting an old config into
+# real grants, exactly once, so nobody loses access on upgrade.
+_MIGRATION_ONLY = "migrate_whitelist_to_grants"
+
+
+def _calls_in(source: str, function_name: str) -> list[str]:
+    """Names of the top-level functions/methods in `source` that call
+    `function_name`, by AST rather than by grep -- so a mention in a comment
+    or docstring (of which there are many, deliberately) is not a hit."""
+    tree = ast.parse(source)
+    callers: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Call):
+                continue
+            func = inner.func
+            name = getattr(func, "id", None) or getattr(func, "attr", None)
+            if name == function_name:
+                callers.append(node.name)
+                break
+    return callers
+
+
+@pytest.mark.parametrize("helper", _DEPRECATED_WHITELIST_HELPERS)
+def test_no_enforcement_path_calls_a_whitelist_helper(helper):
+    # Deciding access from a session's NAME is what produced the
+    # contradictory allowed=false + effective_read=true state this model
+    # replaced. Comments say so; this makes it enforceable, so the next
+    # person to reach for the convenient helper gets a failing test rather
+    # than a quietly reintroduced whitelist.
+    for path in sorted(Path(__file__).resolve().parent.parent.glob("terminal_mcp/*.py")):
+        if path.name == "permissions.py":      # where they are defined
+            continue
+        callers = [c for c in _calls_in(path.read_text(), helper) if c != _MIGRATION_ONLY]
+        assert not callers, f"{path.name}: {helper} is called from {callers}"
+
+
+def test_the_migration_is_still_allowed_to_read_the_old_whitelist():
+    # The complement of the test above: it must fail if the exemption stops
+    # describing something real, i.e. if the migration path is gone or
+    # renamed, rather than silently allowing nothing.
+    source = (Path(__file__).resolve().parent.parent / "terminal_mcp" / "core.py").read_text()
+    assert _MIGRATION_ONLY in _calls_in(source, "session_allowed")
