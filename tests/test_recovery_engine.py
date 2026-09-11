@@ -455,7 +455,11 @@ def test_a_discovered_session_is_not_auto_recreated(registry, controller, lease_
 
 
 def test_a_managed_session_is_still_recovered(registry, controller, lease_store):
-    registry.upsert_seen("n1", "ours", agent_type="claude", cwd="/w", launch_command="claude")
+    # created_by_controller, not launch_command, is what makes it ours: a
+    # discovery pass writes a launch_command for any pane running a known
+    # agent, so that field alone never proved anything.
+    registry.upsert_seen("n1", "ours", agent_type="claude", cwd="/w", launch_command="claude",
+                         created_by_controller=True)
     registry.mark_missing("n1", set())
     engine = _engine(registry, controller, lease_store,
                      AutoRecoveryConfig(enabled=True, managed_sessions_only=True))
@@ -471,3 +475,73 @@ def test_a_human_can_still_force_an_unmanaged_session_back(registry, controller,
     engine = _engine(registry, controller, lease_store,
                      AutoRecoveryConfig(enabled=True, managed_sessions_only=True))
     assert "error" not in engine.recover_session("n1", "someones-own-tmux", force=True)
+
+
+# -- provenance: what the controller is allowed to call "ours" ---------------
+
+def test_a_discovered_session_running_an_agent_is_not_recoverable(registry, controller, lease_store):
+    """The live hole this closes.
+
+    `managed_sessions_only` used to key on launch_command, on the belief
+    that only the lifecycle API ever wrote one. A discovery pass writes one
+    too -- it classifies whatever the pane is running and records the
+    matching launcher -- so somebody's own `claude`, or a session left on a
+    shared tmux server by a test run, looked exactly like a session this
+    controller had created, and auto-recovery would respawn it.
+    """
+    engine = _engine(registry, controller, lease_store,
+                     AutoRecoveryConfig(enabled=True, managed_sessions_only=True))
+    # Exactly what an ordinary reconcile pass produced for an observed pane.
+    registry.upsert_seen("local", "someones-own-claude", agent_type="claude", cwd="/tmp/proj")
+    registry.mark_missing("local", set())
+
+    result = engine.recover_session("local", "someones-own-claude")
+
+    assert result["error"] == "RECOVERY_UNMANAGED"
+    assert controller.reopen_calls == []
+
+
+def test_a_session_the_controller_created_is_recoverable(registry, controller, lease_store):
+    engine = _engine(registry, controller, lease_store,
+                     AutoRecoveryConfig(enabled=True, managed_sessions_only=True))
+    registry.upsert_seen("local", "ours", agent_type="claude", cwd="/tmp/proj",
+                         launch_command="claude", created_by_controller=True)
+    registry.mark_missing("local", set())
+
+    result = engine.recover_session("local", "ours")
+
+    assert "error" not in result, result
+
+
+def test_provenance_survives_the_discovery_passes_that_follow_a_create(registry, controller, lease_store):
+    # A created session is polled like any other from then on, and those
+    # polls must not quietly demote it to "discovered".
+    engine = _engine(registry, controller, lease_store,
+                     AutoRecoveryConfig(enabled=True, managed_sessions_only=True))
+    registry.upsert_seen("local", "ours", agent_type="claude", cwd="/tmp/proj",
+                         launch_command="claude", created_by_controller=True)
+    for _ in range(3):
+        registry.upsert_seen("local", "ours", agent_type="claude", cwd="/tmp/proj")
+    assert registry.get("local", "ours").created_by_controller is True
+
+    registry.mark_missing("local", set())
+    assert "error" not in engine.recover_session("local", "ours")
+
+
+def test_a_discovery_pass_can_never_claim_provenance_it_does_not_have(registry, controller, lease_store):
+    engine = _engine(registry, controller, lease_store,
+                     AutoRecoveryConfig(enabled=True, managed_sessions_only=True))
+    for _ in range(3):
+        registry.upsert_seen("local", "theirs", agent_type="claude", cwd="/tmp/proj")
+    assert registry.get("local", "theirs").created_by_controller is False
+
+
+def test_force_still_reopens_a_discovered_session(registry, controller, lease_store):
+    # An operator making the judgement themselves is the one way past it.
+    engine = _engine(registry, controller, lease_store,
+                     AutoRecoveryConfig(enabled=True, managed_sessions_only=True))
+    registry.upsert_seen("local", "theirs", agent_type="claude", cwd="/tmp/proj")
+    registry.mark_missing("local", set())
+
+    result = engine.recover_session("local", "theirs", force=True)
+    assert result.get("error") != "RECOVERY_UNMANAGED"

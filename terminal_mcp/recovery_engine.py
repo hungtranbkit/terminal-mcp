@@ -122,23 +122,31 @@ class RecoveryEngine:
         recreating it would be guessing at another process's argv and cwd and
         calling the guess a recovery.
 
-        This is the disposability signal the registry was missing. Measured on
-        this fleet: of 264 records, 29 carry a launch command, and every one
-        of the 9 that auto-recovery would otherwise have respawned carried
-        none -- all of them disposable sessions from test runs. It separates
-        cleanly because `launch_command` is written by the lifecycle API at
-        creation and by nothing else.
+        CORRECTION (found while auditing this live): this used to key on
+        `launch_command`, believing it "is written by the lifecycle API at
+        creation and by nothing else". That was not true. An ordinary
+        discovery pass classified the agent running in a pane and wrote the
+        matching launcher onto the record, so any observed session running a
+        recognised agent -- someone's own `claude` in their own terminal, a
+        session left by a test run on a shared tmux server -- carried a launch
+        command it never got from us and was indistinguishable from one this
+        controller created. On this fleet that was 26 such records, two of
+        them inside the recovery window, with auto-recovery on.
+
+        Provenance is now recorded rather than inferred: `created_by_
+        controller` is set once by the create path and latches. A session we
+        cannot prove we launched is not ours to relaunch.
 
         force=True bypasses it: an operator explicitly reopening something is
         making that judgement themselves.
         """
         if not self.config.managed_sessions_only:
             return None
-        if getattr(record, "launch_command", None):
+        if getattr(record, "created_by_controller", False) and getattr(record, "launch_command", None):
             return None
-        return ("session has no recorded launch command -- it was discovered, not created "
-                "through this controller, so there is nothing to recreate it FROM; "
-                "reopen it explicitly if that is wanted")
+        return ("this controller has no record of creating the session -- it was discovered, "
+                "not launched here, so there is nothing to recreate it FROM and recreating it "
+                "would be guessing at another process's argv; reopen it explicitly if that is wanted")
 
     def _staleness_reason(self, record) -> str | None:
         """Why this record is too old to resurrect automatically, or None.

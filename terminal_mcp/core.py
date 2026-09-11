@@ -402,7 +402,13 @@ class TerminalService:
             bindings_by_session: dict[str, list[str]] = {}
             for binding in self.bindings.list():
                 bindings_by_session.setdefault(binding.session, []).append(binding.name)
-            launch_commands_by_type = dict(self.config.session_lifecycle.launch_commands)
+            # NOTE: a discovery pass deliberately records no launch_command.
+            # agent_type below is an OBSERVATION of what the pane is running;
+            # turning that into "here is how to recreate this session" is how
+            # sessions the controller never launched came to look exactly like
+            # ones it did, which auto-recovery then acted on. Provenance is
+            # recorded explicitly at create time instead -- see
+            # session_registry's created_by_controller column.
             for item in items:
                 seen.add(item.name)
                 grant = grants_by_session.get(item.name)
@@ -412,11 +418,10 @@ class TerminalService:
                     if error is None:
                         cwd = str(resolved)
                 agent_type = self._classify_agent_type(item.pane_current_command)
-                launcher = launch_commands_by_type.get(agent_type) if agent_type else None
                 binding_names = tuple(bindings_by_session.get(item.name, ()))
                 self.session_registry.upsert_seen(
                     self.REGISTRY_LOCAL_NODE_ID, item.name, backend_type=self._registry_backend_type(),
-                    cwd=cwd, agent_type=agent_type, launch_command=launcher, launcher_type=agent_type,
+                    cwd=cwd, agent_type=agent_type, launcher_type=agent_type,
                     read_granted=bool(grant and grant.read_enabled), input_granted=bool(grant and grant.input_enabled),
                     binding_names=binding_names,
                 )
@@ -3275,14 +3280,21 @@ class TerminalService:
         if conversation_id:
             result["conversation_id"] = conversation_id
             result["resumed_from"] = resume_session_id
-            # Registry row may not exist yet at all (this is often the
-            # very FIRST time this session name is ever seen) -- upsert_
-            # seen is an INSERT-or-update, same call shape terminal_
-            # registry_reopen already uses right after its own create.
-            self.session_registry.upsert_seen(
-                self.REGISTRY_LOCAL_NODE_ID, name, backend_type=self._registry_backend_type(),
-                cwd=result.get("cwd"), agent_type=agent_type, conversation_id=conversation_id,
-            )
+        # Registry row may not exist yet at all (this is often the very FIRST
+        # time this session name is ever seen) -- upsert_seen is an INSERT-or-
+        # update, same call shape terminal_registry_reopen already uses right
+        # after its own create.
+        #
+        # Runs for EVERY successful create, not only a resume-capable one:
+        # `created_by_controller` is the only record of who launched this
+        # session, and auto-recovery may recreate nothing it cannot attribute.
+        # `launch_command` cannot stand in for it -- the discovery pass infers
+        # one from whatever the pane is running (see _sync_registry below).
+        self.session_registry.upsert_seen(
+            self.REGISTRY_LOCAL_NODE_ID, name, backend_type=self._registry_backend_type(),
+            cwd=result.get("cwd"), agent_type=agent_type, conversation_id=conversation_id,
+            created_by_controller=True,
+        )
 
         # Session Knowledge Store: start capture IMMEDIATELY, before
         # anything else below (in particular, before initial_prompt is

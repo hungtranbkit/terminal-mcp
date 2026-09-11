@@ -215,12 +215,26 @@ before anyone may say production-ready.
 Everything added on M910 is additive and reversible:
 
 * the contract columns default to 0 and older agents simply do not report them;
-* `session_access` defaults are closed, matching pre-change behaviour, and the
-  whitelist→grants migration only ever ADDS grants;
-* auto-recovery remains globally off;
+* `session_access` defaults are now OPEN (`default_read`/`default_input` true):
+  absence of a grant record means ALLOW, and the whitelist→grants migration is
+  inert while they are open, because the rows it used to write (`read=1`,
+  `input=0`) could only ever NARROW what the default already permits — that is
+  the bug it now refuses to reintroduce. Setting either default to false
+  restores the old closed behaviour without touching any stored grant;
+* auto-recovery is ON (`auto_recovery.enabled: true`) with
+  `managed_sessions_only: true` and `max_missing_age_seconds: 3600`, so it will
+  only ever recreate a session this controller was asked to create, that is not
+  tombstoned, and that has been missing for under an hour.
+
+  "Asked to create" is now recorded (`created_by_controller`), not inferred.
+  It previously keyed on `launch_command`, which a discovery pass also writes —
+  it classifies whatever the pane is running — so 26 sessions the controller
+  had merely observed, two of them inside the recovery window, were eligible
+  for respawn. Measured after the fix: 0 of 270 records carry provenance, so
+  nothing is auto-recoverable until this controller itself creates a session;
 * to undo the controller-side changes entirely:
   `git reset --hard eb9f51d && ./.venv/bin/pip install -e . && systemctl --user restart terminal-mcp-http`
-  (record the current sha first; the 15 commits are local-only and unpushed).
+  (record the current sha first; the commits are local-only and unpushed).
 
 ## Do not power off M910 today
 

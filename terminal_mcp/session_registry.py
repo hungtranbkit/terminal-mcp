@@ -121,6 +121,31 @@ def _add_auto_recovery_columns(connection: sqlite3.Connection) -> None:
         )
 
 
+def _add_launch_provenance_column(connection: sqlite3.Connection) -> None:
+    """`created_by_controller`: did WE launch this session, or did we just
+    find it running?
+
+    `launch_command` could not answer that, though managed_sessions_only
+    was written believing it could. An ordinary discovery pass infers a
+    launch command from the pane's CURRENT process (core.py classifies
+    `claude` in a pane, then looks the agent type up in
+    session_lifecycle.launch_commands) and COALESCEs it onto the record.
+    So every observed session running a recognised agent -- somebody's own
+    `claude` in their own terminal, a session from a test run on a shared
+    tmux server -- ended up carrying a launch command it never got from us,
+    and looked exactly like one this controller had created. With
+    auto-recovery enabled, that is the difference between restoring our own
+    work and spawning processes into someone else's terminal.
+
+    Provenance is now recorded, not inferred: set once by the lifecycle
+    create path and by nothing else. Existing rows default to 0, which is
+    the conservative answer -- a session the controller cannot prove it
+    created is reopened explicitly by a person, not automatically.
+    """
+    connection.execute(
+        "ALTER TABLE session_records ADD COLUMN created_by_controller INTEGER NOT NULL DEFAULT 0")
+
+
 REGISTRY_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: session_records", lambda connection: None),
     # Conversation-continuity follow-up (2026-09-07): `conversation_id`
@@ -138,6 +163,8 @@ REGISTRY_MIGRATIONS: list[Migration] = [
     Migration(2, "add conversation_id + recovery_state columns", _add_conversation_continuity_columns),
     Migration(3, "Auto Recovery: stable_session_id + worktree_path + policy + checkpoint + generation columns",
              _add_auto_recovery_columns),
+    Migration(4, "record whether the controller created a session, rather than inferring it",
+             _add_launch_provenance_column),
 ]
 
 STATUS_ACTIVE = "ACTIVE"
@@ -245,6 +272,10 @@ class SessionRecord:
     last_checkpoint_detail: str | None = None
     recovery_generation: int = 0
     recovery_attempts: int = 0
+    # True only when THIS controller launched the session, recorded once by
+    # the lifecycle create path. Never inferred from what the pane happens
+    # to be running -- see _add_launch_provenance_column.
+    created_by_controller: bool = False
 
     @property
     def recoverable(self) -> bool:
@@ -299,6 +330,7 @@ def _from_row(row: sqlite3.Row | None) -> SessionRecord | None:
                                else None),
         last_checkpoint_at=row["last_checkpoint_at"], last_checkpoint_detail=row["last_checkpoint_detail"],
         recovery_generation=row["recovery_generation"], recovery_attempts=row["recovery_attempts"],
+        created_by_controller=bool(row["created_by_controller"]),
     )
 
 
@@ -492,6 +524,7 @@ class SessionRegistryStore:
                     read_granted: bool = False, input_granted: bool = False,
                     binding_names: tuple[str, ...] = (), backfill_project: bool = True,
                     conversation_id: str | None = None, worktree_path: str | None = None,
+                    created_by_controller: bool = False,
                     now: str | None = None) -> SessionRecord:
         """Called on every reconcile pass for a session CURRENTLY observed
         alive -- status always becomes ACTIVE (a session that reappears
@@ -548,9 +581,9 @@ class SessionRegistryStore:
                     created_at, last_seen_at, last_activity_at, last_known_state, status,
                     killed_at, deleted_at, offline_at, metadata_complete,
                     read_granted, input_granted, grant_updated_at, binding_names, conversation_id,
-                    stable_session_id, worktree_path)
+                    stable_session_id, worktree_path, created_by_controller)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE',
-                           NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+                           NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(node_id, session_name) DO UPDATE SET
                        node_name = excluded.node_name, backend_type = excluded.backend_type,
                        cwd = excluded.cwd, repo_root = excluded.repo_root,
@@ -566,13 +599,18 @@ class SessionRegistryStore:
                        grant_updated_at = excluded.grant_updated_at, binding_names = excluded.binding_names,
                        conversation_id = COALESCE(excluded.conversation_id, session_records.conversation_id),
                        worktree_path = COALESCE(excluded.worktree_path, session_records.worktree_path),
+                       -- Latches TRUE and never back: a session this controller
+                       -- created stays ours through every later discovery pass,
+                       -- and a discovery pass can never claim one it did not.
+                       created_by_controller = MAX(excluded.created_by_controller,
+                                                   session_records.created_by_controller),
                        recovery_state = NULL, recovery_detail = NULL
                 """,
                 (node_id, session_name, node_name, backend_type, cwd, repo_root, git_remote,
                  git_branch, last_commit, agent_type, launch_command, launcher_type,
                  created_at, now, now, last_known_state,
                  int(metadata_complete), int(read_granted), int(input_granted), now, binding_json,
-                 conversation_id, stable_session_id, worktree_path),
+                 conversation_id, stable_session_id, worktree_path, int(created_by_controller)),
             )
         return self.get(node_id, session_name)
 
