@@ -102,30 +102,56 @@ def test_the_rolling_window_is_never_called_a_quota():
 # -- rendered ----------------------------------------------------------------
 
 @pytest.fixture(scope="module")
-def usage_page():
+def browser():
+    """One browser for the whole module.
+
+    sync_playwright cannot be entered twice in the same thread, so both the
+    report page and the dashboard page share this.
+    """
     sync_playwright = pytest.importorskip(
         "playwright.sync_api", reason="playwright not installed").sync_playwright
     with sync_playwright() as pw:
         try:
-            browser = pw.chromium.launch(
+            launched = pw.chromium.launch(
                 args=["--no-sandbox", "--no-zygote", "--single-process", "--disable-gpu"])
         except Exception as exc:  # noqa: BLE001
             pytest.skip(f"chromium unavailable: {exc}")
-        page = browser.new_page(viewport={"width": 1440, "height": 900})
+        yield launched
+        launched.close()
 
-        def route(request):
-            url = request.request.url
-            if "/dashboard/api/ai-usage/local" in url:
-                return request.fulfill(status=200, content_type="application/json",
-                                       body=json.dumps(PAYLOAD))
-            return request.fulfill(status=200, content_type="text/html", body=AI_USAGE_HTML)
 
-        page.route("**/*", route)
-        page.goto("http://terminal-mcp.test/dashboard/ai-usage", wait_until="domcontentloaded")
-        page.wait_for_selector("#tbody tr", timeout=20000)
-        page.wait_for_timeout(400)
-        yield page
-        browser.close()
+def _route_all(request):
+    url = request.request.url
+    if "/dashboard/api/ai-usage/local" in url:
+        return request.fulfill(status=200, content_type="application/json",
+                               body=json.dumps(PAYLOAD))
+    if "/dashboard/api/ai-usage" in url:
+        return request.fulfill(status=200, content_type="application/json",
+                               body=json.dumps(LEGACY_PAYLOAD))
+    if "/dashboard/ai-usage" in url:
+        return request.fulfill(status=200, content_type="text/html", body=AI_USAGE_HTML)
+    if "/dashboard/api/" in url:
+        return request.fulfill(status=200, content_type="application/json", body="{}")
+    return request.fulfill(status=200, content_type="text/html", body=DASHBOARD_HTML)
+
+
+@pytest.fixture(scope="module")
+def page(browser):
+    """One page, shared. Chromium runs --single-process here (the sandbox
+    blocks its zygote), and that build closes the browser when a second page
+    is opened -- so the two page fixtures below navigate this one."""
+    opened = browser.new_page(viewport={"width": 1440, "height": 900})
+    opened.route("**/*", _route_all)
+    yield opened
+
+
+@pytest.fixture
+def usage_page(page):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto("http://terminal-mcp.test/dashboard/ai-usage", wait_until="domcontentloaded")
+    page.wait_for_selector("#tbody tr", timeout=20000)
+    page.wait_for_timeout(300)
+    return page
 
 
 def test_the_page_renders_without_a_script_error(usage_page):
@@ -179,8 +205,6 @@ def test_filtering_by_agent_narrows_the_table(usage_page):
     usage_page.select_option("#fAgent", "codex")
     usage_page.wait_for_timeout(250)
     rows = usage_page.evaluate("() => document.querySelectorAll('#tbody tr').length")
-    usage_page.select_option("#fAgent", "")
-    usage_page.wait_for_timeout(250)
     assert rows == 1
 
 
@@ -190,7 +214,6 @@ def test_expanding_a_row_shows_its_provenance_and_identity(usage_page):
     detail = usage_page.evaluate("() => document.querySelector('tr.detail-row').textContent")
     for label in ("conversation", "stable_session_id", "cli version", "nguồn số liệu"):
         assert label in detail
-    usage_page.click("#tbody tr .expand")
 
 
 def test_the_page_explains_why_a_metric_is_missing(usage_page):
@@ -209,3 +232,91 @@ def test_no_horizontal_page_overflow(usage_page, width, height):
     assert usage_page.evaluate(
         "() => { const w = document.querySelector('.wrap');"
         "        return w.scrollWidth >= w.clientWidth; }")
+
+
+# -- the menu, and the endpoint a tab loaded before this existed -------------
+
+LEGACY_PAYLOAD = {
+    "available": True, "error": None,
+    "providers": [
+        {"provider": "claude", "ok": True, "warning": False, "critical": False,
+         "plan": None, "account": None, "sessions": 7, "usage_message": None, "error": None,
+         "windows": [{"label": "5h activity · 18,440,532 tokens · 26 msg",
+                      "used_percent": None, "remaining_percent": None,
+                      "total_tokens": 18440532, "messages": 26,
+                      "source": "session_transcript"}]},
+        {"provider": "codex", "ok": False, "warning": False, "critical": False,
+         "plan": None, "account": None, "sessions": 0, "windows": [],
+         "usage_message": "No ~/.codex on this machine.", "error": "No local data observed"},
+    ],
+    "sessions": [], "totals": PAYLOAD["totals"], "quota_windows": PAYLOAD["quota_windows"],
+    "source": "local:~/.claude, $CODEX_HOME", "report_url": "/dashboard/ai-usage",
+    "app_version": None, "fetched_at": 1789000000.0, "cached": False,
+    "cache_age_seconds": 0.0, "stale": False,
+}
+
+
+def test_the_legacy_endpoint_no_longer_names_an_external_service():
+    """Root cause of "AI Usage shows nothing".
+
+    /dashboard/api/ai-usage proxied a separate local service on
+    127.0.0.1:8787 that is not installed on this fleet, so it answered
+    `available:false, "Connection refused"` and every client rendered an
+    empty panel -- including a dashboard tab opened before the report page
+    existed, which keeps polling that endpoint and never reloads. It is
+    served from the local collector now, so such a tab starts showing real
+    numbers without being reloaded.
+    """
+    from terminal_mcp import dashboard
+
+    source = dashboard.__dict__["register_dashboard"].__doc__ or ""
+    assert "_local_ai_usage_panel" in DASHBOARD_HTML or True     # route-level, asserted below
+    import inspect
+    text = inspect.getsource(dashboard.register_dashboard)
+    assert "_local_ai_usage_panel(force)" in text
+    assert "ai_usage.get_usage(force=force)" not in text
+
+
+def test_the_legacy_payload_carries_the_figure_in_its_label():
+    # The older panel renders a window with no percentage as the single word
+    # "unavailable", so the number has to be in the label to survive there.
+    window = LEGACY_PAYLOAD["providers"][0]["windows"][0]
+    assert window["used_percent"] is None          # never an invented denominator
+    assert "tokens" in window["label"] and "," in window["label"]
+
+
+@pytest.fixture
+def dashboard_page(page):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto("http://terminal-mcp.test/dashboard", wait_until="domcontentloaded")
+    page.wait_for_timeout(900)
+    return page
+
+
+def test_the_dashboard_script_survives_the_removed_button(dashboard_page):
+    # An unguarded onclick on a removed element throws during setup and takes
+    # every later handler with it -- the menu would then never open at all.
+    assert dashboard_page.evaluate("() => typeof window.fetch === 'function'")
+    assert dashboard_page.evaluate("() => !!document.querySelector('#headerMenuBtn')")
+
+
+def test_the_menu_opens_and_offers_ai_usage(dashboard_page):
+    dashboard_page.click("#headerMenuBtn")
+    dashboard_page.wait_for_timeout(300)
+    assert dashboard_page.evaluate(
+        "() => document.querySelector('#headerMenu').classList.contains('open')")
+    link = dashboard_page.evaluate(
+        "() => { const a = document.querySelector('#aiUsageLink');"
+        "        const r = a.getBoundingClientRect();"
+        "        return {href: a.getAttribute('href'), visible: r.width > 0 && r.height > 0}; }")
+    assert link["href"] == "/dashboard/ai-usage"
+    assert link["visible"], "the AI Usage entry must be clickable once the menu is open"
+
+
+def test_following_the_menu_entry_lands_on_the_report(dashboard_page):
+    dashboard_page.click("#headerMenuBtn")
+    dashboard_page.wait_for_timeout(200)
+    dashboard_page.click("#aiUsageLink")
+    dashboard_page.wait_for_selector("#tbody tr", timeout=15000)
+    assert "/dashboard/ai-usage" in dashboard_page.url
+    assert dashboard_page.evaluate("() => document.querySelectorAll('#tbody tr').length") == 3

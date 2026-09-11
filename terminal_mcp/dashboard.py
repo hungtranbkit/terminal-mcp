@@ -9006,6 +9006,83 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         result = await anyio.to_thread.run_sync(integration.fleet_overview)
         return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
 
+    def _local_ai_usage_panel(force: bool) -> dict[str, Any]:
+        """The local report, in the shape the pre-existing panel renders.
+
+        Two clients read this route: the older in-page panel (which expects
+        `providers[]` with `windows[]`) and anything else already pointed at
+        it. Rather than break them, the local numbers are projected into that
+        shape, with the rolling-5h activity as a window that reports no
+        percentage -- because it is activity, not a quota, and inventing a
+        denominator for it would be the exact fiction this build refuses.
+        """
+        from .ai_usage_index import AiUsageIndex
+
+        index = AiUsageIndex()
+        if force:
+            index.refresh(node_id=terminal.REGISTRY_LOCAL_NODE_ID)
+        report = index.report()
+        providers = []
+        for agent in ("claude", "codex"):
+            rows = [row for row in report["sessions"] if row["agent"] == agent]
+            quota = [w for w in report["quota_windows"] if w["agent"] == agent]
+            observed = [w for w in quota if w["observed"]]
+            rolling_total = sum(r["rolling_5h"]["total"] for r in rows)
+            rolling_messages = sum(r["rolling_5h"]["messages"] for r in rows)
+            windows = [{
+                # The number lives in the label because the older panel renders
+                # a window with no percentage as the single word "unavailable".
+                # A tab still running that code then shows the figure anyway.
+                "label": (f"5h activity · {rolling_total:,} tokens"
+                          f" · {rolling_messages} msg"),
+                # Deliberately null: a percentage needs a limit, and no local
+                # artefact states one. The panel renders this as "unavailable"
+                # rather than a made-up bar.
+                "used_percent": None,
+                "remaining_percent": None,
+                "total_tokens": sum(r["rolling_5h"]["total"] for r in rows),
+                "messages": sum(r["rolling_5h"]["messages"] for r in rows),
+                "source": "session_transcript",
+            }]
+            for window in observed:
+                windows.append({
+                    "label": window["label"],
+                    "used_percent": window["used_percent"],
+                    "remaining_percent": (None if window["used_percent"] is None
+                                          else 100 - window["used_percent"]),
+                    "resets_at": window["resets_at"],
+                    "source": window["source"],
+                })
+            has_data = bool(rows)
+            providers.append({
+                "provider": agent,
+                "ok": has_data,
+                "warning": False,
+                "critical": False,
+                "plan": None,
+                "account": None,
+                "windows": windows if has_data else [],
+                "usage_message": (None if has_data else
+                                  (quota[0]["detail"] if quota else "No local data observed")),
+                "error": None if has_data else "No local data observed",
+                "sessions": len(rows),
+            })
+        return {
+            "available": True,
+            "error": None,
+            "providers": providers,
+            "sessions": report["sessions"],
+            "totals": report["totals"],
+            "quota_windows": report["quota_windows"],
+            "source": "local:~/.claude, $CODEX_HOME",
+            "report_url": "/dashboard/ai-usage",
+            "app_version": None,
+            "fetched_at": report["generated_at"],
+            "cached": not force,
+            "cache_age_seconds": 0.0,
+            "stale": False,
+        }
+
     @server.custom_route("/dashboard/api/ai-usage", methods=["GET"], include_in_schema=False)
     async def ai_usage_status_route(request: Request) -> JSONResponse:
         # Same _read_guard-only posture as the fleet-level routes just
@@ -9018,7 +9095,16 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         force = request.query_params.get("force") == "1"
-        result = await anyio.to_thread.run_sync(lambda: ai_usage.get_usage(force=force))
+        # Served from the LOCAL collector, not from the separate AI Usage
+        # Monitor this route used to proxy. That service is not installed on
+        # this fleet, so proxying it returned
+        # `available:false, "Connection refused"` and every client -- including
+        # a dashboard tab left open from before the report page existed --
+        # rendered an empty panel. Answering here from the same local data the
+        # report page uses means a stale tab starts showing real numbers
+        # without being reloaded, and nothing at runtime depends on an
+        # external project any more.
+        result = await anyio.to_thread.run_sync(lambda: _local_ai_usage_panel(force))
         return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
 
     # -- Auto Recovery (item 7: "hiện recovery state, last checkpoint,
