@@ -114,7 +114,16 @@ def test_tabbar_never_overflows_horizontally_and_tabs_wrap_within_a_node():
 
 
 def test_active_tab_scrolls_into_view_on_select():
-    assert "activeRefs.tab.scrollIntoView({ block: 'nearest', inline: 'nearest' })" in DASHBOARD_HTML
+    # scrollIntoView({block:'nearest'}) was not enough once the list became a
+    # vertical column: it also walks ancestors and re-aligns during the
+    # render that follows a click, which left the selected session scrolled
+    # out of sight (measured: 25px above the fold, under its own sticky node
+    # header). revealTab scrolls only when the row is genuinely not visible,
+    # accounts for the sticky header, and defers a frame so it never
+    # measures mid-layout.
+    assert "if (activeRefs) revealTab(activeRefs.tab);" in DASHBOARD_HTML
+    assert "function revealTab(tab)" in DASHBOARD_HTML
+    assert "requestAnimationFrame(() => revealTabNow(tab));" in DASHBOARD_HTML
 
 
 # -- Item 3: tab label is session name only ----------------------------------

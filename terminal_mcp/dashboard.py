@@ -451,6 +451,10 @@ DASHBOARD_HTML = """<!doctype html>
     .node-group-status.offline { color:var(--red); border-color:rgba(255,107,107,.4) }
     .node-group-count { margin-left:auto; flex:0 0 auto; color:var(--muted); font-size:10px; min-width:14px; text-align:right }
     .node-tabs { display:flex; flex-wrap:wrap; align-items:stretch; min-width:0 }
+    /* Node-group collapse sets `tabs.hidden`; without this the author
+       display:flex above silently won and collapsing a group changed
+       nothing at all (measured: tab strip 306px before and after). */
+    .node-tabs[hidden] { display:none }
     .node-tabs-empty { padding:7px 12px; color:var(--muted); font-size:11px; font-style:italic }
     .tab {
       position:relative; display:flex; align-items:center; gap:7px; flex:0 1 auto; max-width:220px; min-width:0;
@@ -470,6 +474,13 @@ DASHBOARD_HTML = """<!doctype html>
        both places, driven entirely by classify_status()'s existing state
        string, nothing new inferred from pane content here. */
     .attn-badge { display:inline-block; background:var(--amber); color:#231a00; font-size:11px; font-weight:700; padding:1px 6px; border-radius:4px; vertical-align:middle }
+    /* Same author-vs-UA precedence trap .task-pending-badge already carries
+       an override for: an author `display:inline-block` beats the browser's
+       own [hidden] rule at equal specificity, so `badge.hidden = true` did
+       nothing and EVERY session tab showed the amber "needs attention"
+       mark permanently -- 20 false alarms on this fleet, which is worse
+       than no signal at all. Verified live with getComputedStyle. */
+    .attn-badge[hidden] { display:none }
     .tab .attn-badge { flex:0 0 auto; margin-left:2px }
     /* Hover/focus-only close (kill) button -- kept a fixed 18px hit target
        even hidden (visibility, not display:none) so the tab's own layout
@@ -1037,6 +1048,52 @@ DASHBOARD_HTML = """<!doctype html>
         padding-left:max(12px, env(safe-area-inset-left));
         padding-right:max(12px, env(safe-area-inset-right));
       }
+    }
+
+    /* ================= WIDE SCREENS: the list is a column ==============
+       Same single list, laid out for the shape of the screen -- the
+       technique the portrait sheet below already uses.
+
+       Measured on this fleet (20 sessions, 5 nodes) before this block
+       existed: the horizontal strip stacked one wrapping row per node and
+       took 306px at 1440x900 / 342px at 1920x1080, pushing total chrome
+       above the terminal to 488px and 587px. The terminal got 36% of a
+       desktop screen while most of each node row sat empty -- the macbook
+       group rendered one tab and ~1300px of nothing.
+
+       A column costs a fixed 260px of width, which a desktop has, instead
+       of unbounded height, which it does not. Node grouping, the filter,
+       status dots, counts and collapse are untouched: this only changes
+       where the same elements sit. */
+    @media (min-width:1100px) {
+      main { grid-template-columns:260px minmax(0,1fr); grid-template-rows:minmax(0,1fr) }
+      .tabbar-row { grid-column:1; grid-row:1; flex-direction:column; min-height:0;
+                    border-right:1px solid var(--line); border-bottom:none }
+      .panel.detail { grid-column:2; grid-row:1 }
+      .tabbar-wrap { min-height:0; overflow:hidden }
+      .tabbar { flex:1; min-height:0; max-height:none; overflow-y:auto; flex-direction:column;
+                align-items:stretch }
+      /* Each node's sessions stack instead of wrapping across a wide row. */
+      .node-group { display:block }
+      .node-tabs { flex-direction:column; flex-wrap:nowrap }
+      .tabbar .tab { width:100%; max-width:none; min-width:0; border-right:none;
+                     border-bottom:1px solid var(--line) }
+      .tab-name { max-width:none }
+      /* The COLUMN gets a header so it reads as a panel rather than a list
+         starting abruptly under the app chrome. Scoped to the sessions
+         strip on purpose: the inspector is inline here, not a sheet, and
+         giving it a sheet header with a close button both looked broken
+         and cost ~55px of terminal height. */
+      #sessionsDrawer > .drawer-head { display:flex }
+      /* In a long scrolling column the node a row belongs to must stay on
+         screen, or a session name alone does not say which machine it is
+         on -- the exact thing grouping exists to answer. */
+      .node-group-toggle { position:sticky; top:0; z-index:2; background:var(--panel); gap:6px }
+      /* The display name already identifies the node; repeating its id in a
+         260px column is what truncated the name to "dell-5530 (...". */
+      .node-group-id { display:none }
+      #sessionsDrawerClose { display:none }   /* nothing to close on desktop */
+      #sessionInspector > .drawer-head { display:none }
     }
 
     /* ================= MOBILE PORTRAIT: terminal-first =================
@@ -1763,6 +1820,50 @@ DASHBOARD_HTML = """<!doctype html>
     // size); this only toggles the CSS class the mobile media query above
     // uses to reclaim the desktop-style outer padding once a session fills
     // the screen.
+    // Bring the active session's row into view ONLY when it is actually
+    // out of view, measured against the list's own scroll box.
+    //
+    // scrollIntoView({block:'nearest'}) was not enough: on the desktop
+    // column it left the selected session scrolled out of sight (measured:
+    // scrollTop 53 with the active row above the fold) because it also
+    // walks ancestors and re-aligns during the render that immediately
+    // follows a click. Scrolling only when required cannot drift a row
+    // that is already where the user can see it, in either layout.
+    function revealTab(tab) {
+      if (!tab) return;
+      // Next frame, not now: this runs right after renderRows() rebuilds the
+      // list, and measuring a row mid-layout gave a stale rectangle -- the
+      // first session in a group stayed scrolled 25px above the fold while
+      // the very same call a moment later corrected it.
+      requestAnimationFrame(() => revealTabNow(tab));
+    }
+
+    function revealTabNow(tab) {
+      if (!tab || !tab.isConnected) return;
+      const list = document.querySelector('#tabbar');
+      if (!list) return;
+      const row = tab.getBoundingClientRect();
+      const box = list.getBoundingClientRect();
+      // The node header is sticky in the column layout, so it covers the
+      // top of the scroll box. A row level with box.top is BEHIND it, not
+      // visible -- which is how the first session in a group ended up
+      // hidden under its own node header after being selected.
+      const header = tab.closest('.node-group')?.querySelector('.node-group-toggle');
+      const cover = (header && getComputedStyle(header).position === 'sticky')
+        ? header.getBoundingClientRect().height : 0;
+      if (row.top < box.top + cover) {
+        list.scrollTop -= (box.top + cover - row.top);
+      } else if (row.bottom > box.bottom) {
+        list.scrollTop += (row.bottom - box.bottom);
+      }
+      // Horizontal strip (landscape/tablet): the same question, other axis.
+      if (row.left < box.left) {
+        list.scrollLeft -= (box.left - row.left);
+      } else if (row.right > box.right) {
+        list.scrollLeft += (row.right - box.right);
+      }
+    }
+
     function updateLayoutState() {
       document.body.classList.toggle('has-selection', Boolean(selected));
       updateMobileHeadline();
@@ -1793,8 +1894,7 @@ DASHBOARD_HTML = """<!doctype html>
       if (open) {
         // The active session must be visible the moment the sheet opens,
         // however far down a long list it sits.
-        const active = sessionsDrawerEl.querySelector('.tab.active');
-        if (active && active.scrollIntoView) { active.scrollIntoView({block:'nearest'}); }
+        revealTab(sessionsDrawerEl.querySelector('.tab.active'));
       }
     }
     function setInspector(open) {
@@ -2900,7 +3000,14 @@ DASHBOARD_HTML = """<!doctype html>
       // never overwrite an in-progress, not-yet-saved draft with the
       // last-saved value for the same session, and must never reset
       // auto-follow/scroll/search state the user hasn't actually left.
-      if (selected === name) return;
+      if (selected === name) {
+        // Tapping the session you are already on is a no-op for STATE -- it
+        // must not clobber a draft or reset scroll/auto-follow. But it is
+        // not a no-op for the sheet: you asked for that session, so get out
+        // of the way and show it, exactly as picking a different one does.
+        setSessionsDrawer(false);
+        return;
+      }
       if (selected) { drafts.set(selected, inputTextEl.value); }
       selected = name; inputAllowed = false;
       inputTextEl.value = drafts.get(name) || '';
@@ -2937,7 +3044,7 @@ DASHBOARD_HTML = """<!doctype html>
       // tab is actually selected. 'nearest' -- never yanks an
       // already-visible tab to a different edge on every poll.
       const activeRefs = tabEls.get(name);
-      if (activeRefs) activeRefs.tab.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      if (activeRefs) revealTab(activeRefs.tab);
       // Fire immediately; loadDetail's own generation-sequence guard (see
       // below) discards this if the user switches again before it
       // resolves. A rejected fetch here is swallowed deliberately -- the
@@ -3191,6 +3298,9 @@ DASHBOARD_HTML = """<!doctype html>
         els.caret.textContent = collapsed ? '\u25b8' : '\u25be';
         els.name.textContent = group.name;
         els.id.textContent = group.id === group.name ? '' : group.id;
+        // A long display name ellipsizes in the 260px column; the full name
+        // and the node id stay reachable on hover rather than being lost.
+        els.header.title = group.id === group.name ? group.name : `${group.name} (${group.id})`;
         els.status.className = 'node-group-status ' + (group.status || 'unknown');
         els.status.textContent = nodeStatusLabel(group.status);
         els.count.textContent = String(group.sessions.length);
