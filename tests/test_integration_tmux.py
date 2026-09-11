@@ -37,6 +37,11 @@ def test_real_tmux_list_tail_status_and_denial(read_config, tmux_session_factory
                                 "input_allowed", "input_granted",
                                 "effective_read", "effective_input",
                                 "input_denied_reason",
+                                # Whether this session's grant is pinned to an instance
+                                # that no longer exists. Under default-open that no longer
+                                # blocks anything, so it is reported here rather than as a
+                                # denial reason.
+                                "stale_identity_pin",
                                 "resume_conversation_id"}  # no content field, ever
     assert "BUILD STEP 5" in service.terminal_tail("test-running", 20)["output"]
     # Discovery never grants access -- a revoked session still yields the
