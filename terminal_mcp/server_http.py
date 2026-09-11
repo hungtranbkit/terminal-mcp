@@ -4,6 +4,8 @@ import atexit
 import logging
 import os
 import secrets
+import socket
+import urllib.parse
 from pathlib import Path
 
 import anyio
@@ -12,7 +14,7 @@ import uvicorn
 from .ai_usage_service import AiUsageService
 from .config import load_config
 from .connection_store import ConnectionStore
-from .controller import ControllerService
+from .controller import LOCAL_NODE_ID, ControllerService
 from .core import TerminalService
 from .dashboard import node_token_env_var, register_dashboard
 from .health import register_health
@@ -42,6 +44,84 @@ _log = logging.getLogger(__name__)
 HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 8766
 HTTP_PATH = "/mcp"
+
+
+def endpoint_is_this_host(endpoint: str) -> bool:
+    """True if `endpoint`'s address belongs to the machine we are running on.
+
+    Guards the one topology mistake docs/CONTROLLER_RUNBOOK.md calls out by
+    name: the controller listing ITSELF in `nodes.remote`, so it registers
+    itself as one of its own remote nodes. That is easy to reach by accident
+    -- the repo ships a tracked `config.yaml`, and `default_config_path()`
+    falls back to it whenever TERMINAL_MCP_CONFIG is unset, so a controller
+    started by hand on a host that config still names as a worker registers
+    a loop back to itself.
+
+    Detection is a bind test rather than an interface enumeration: binding a
+    UDP socket to an address succeeds only on a host that actually owns that
+    address, it needs no third-party dependency (this project deliberately
+    has none for host introspection -- see host_metrics.py) and it behaves
+    the same on Linux, macOS and Windows. Port 0 is ephemeral, so this never
+    collides with anything already listening.
+    """
+    host = urllib.parse.urlsplit(endpoint).hostname
+    if not host:
+        return False
+    try:
+        candidates = socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)
+    except socket.gaierror:
+        # Unresolvable is not "local" -- leave it to fail loudly as an
+        # unreachable node rather than silently dropping it here.
+        return False
+    for family, socktype, proto, _canonname, sockaddr in candidates:
+        try:
+            probe = socket.socket(family, socktype, proto)
+        except OSError:
+            continue
+        try:
+            probe.bind(sockaddr)
+            return True
+        except OSError:
+            continue
+        finally:
+            probe.close()
+    return False
+
+
+def register_remote_nodes(controller, config) -> list[str]:
+    """Registers every `nodes.remote` entry on `controller`; returns the ids
+    actually registered.
+
+    Fails SOFT, never startup-fatal: a misconfigured or not-yet-deployed
+    worker (token not exported, typo'd endpoint) must never take down the
+    whole controller -- it just stays OFFLINE until onboarding finishes.
+
+    The one entry it refuses outright is THIS host. A controller listed in
+    its own `nodes.remote` registers itself as one of its own remote nodes,
+    which docs/CONTROLLER_RUNBOOK.md calls out by name. That is refused here
+    rather than left to config review, because the tracked `config.yaml`
+    these entries can come from outlives any single host's topology -- it
+    still described the previous controller as a worker after the fleet had
+    moved on.
+    """
+    registered: list[str] = []
+    for remote in config.nodes.remote_nodes:
+        if remote.node_id == LOCAL_NODE_ID or endpoint_is_this_host(remote.endpoint):
+            _log.error("nodes: refusing to register remote node %r (%s) -- that address is THIS host. "
+                       "A controller listed in its own nodes.remote registers itself as one of its own "
+                       "remote nodes; remove this entry from config.yaml.", remote.node_id, remote.endpoint)
+            continue
+        token = os.environ.get(remote.token_env)
+        if not token:
+            _log.warning("nodes: skipping remote node %r -- environment variable %s is not set "
+                        "(this node will not be registered until it is)", remote.node_id, remote.token_env)
+            continue
+        controller.register_remote_node(remote.node_id, display_name=remote.display_name, hostname=remote.hostname,
+                                        endpoint=remote.endpoint, token=token, max_sessions=remote.max_sessions,
+                                        timeout=remote.timeout_seconds)
+        _log.info("nodes: registered remote node %r (%s)", remote.node_id, remote.endpoint)
+        registered.append(remote.node_id)
+    return registered
 
 
 def bootstrap_secret_path(webauth_db_path: Path) -> Path:
@@ -210,21 +290,7 @@ def main() -> None:
                             heartbeat_thresholds=config.nodes.heartbeat_thresholds)
     controller = ControllerService(registry, local_client=LocalNodeClient(terminal),
                                    local_workspace_root=workspace_root)
-    for remote in config.nodes.remote_nodes:
-        # Fail SOFT, not startup-fatal: a misconfigured/not-yet-deployed
-        # remote node (token not exported yet, typo'd endpoint) must never
-        # take down the whole controller -- it just never leaves OFFLINE
-        # until the operator finishes onboarding it (task item 10's own
-        # "registry never disappears / marks stale" applies here too).
-        token = os.environ.get(remote.token_env)
-        if not token:
-            _log.warning("nodes: skipping remote node %r -- environment variable %s is not set "
-                        "(this node will not be registered until it is)", remote.node_id, remote.token_env)
-            continue
-        controller.register_remote_node(remote.node_id, display_name=remote.display_name, hostname=remote.hostname,
-                                        endpoint=remote.endpoint, token=token, max_sessions=remote.max_sessions,
-                                        timeout=remote.timeout_seconds)
-        _log.info("nodes: registered remote node %r (%s)", remote.node_id, remote.endpoint)
+    register_remote_nodes(controller, config)
 
     # ONE explicit, persistent (real default ~/.local/state/terminal-mcp/
     # connections.db) ConnectionStore, same "never fall into the private-

@@ -152,6 +152,12 @@ UNIT_CONTENT=$(cat <<EOF
 [Unit]
 Description=Terminal MCP node agent ($NODE_ID)
 After=default.target
+# StartLimit* belong to [Unit], NOT [Service]. systemd parses them only
+# here; left in [Service] it logs "Unknown key ... ignoring" and the
+# rate limit silently does not exist (seen live installing dell-linux
+# on 2026-09-10).
+StartLimitIntervalSec=300
+StartLimitBurst=8
 
 [Service]
 Type=simple
@@ -163,8 +169,13 @@ Restart=always
 RestartSec=3
 RestartSteps=6
 RestartMaxDelaySec=60
-StartLimitIntervalSec=300
-StartLimitBurst=8
+# KillMode=process, NOT the control-group default. The default SIGTERMs
+# the ENTIRE cgroup on stop/restart -- including any tmux server started
+# from within it. That is exactly how session "m1" was destroyed on m910
+# by a routine node-agent restart on 2026-09-09. tmux is meant to outlive
+# whatever started it; the controller unit sets this for the same reason
+# (see docs/CONTROLLER_RUNBOOK.md).
+KillMode=process
 MemoryMax=512M
 TasksMax=256
 ProtectSystem=full
