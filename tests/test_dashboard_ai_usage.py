@@ -86,11 +86,17 @@ def test_route_includes_local_session_correlation(tmp_path):
                                  "provider": "claude", "quota_available": True}]
 
 
-def test_dashboard_page_html_includes_the_ai_usage_panel(tmp_path):
+def test_the_menu_links_to_the_local_ai_usage_report(tmp_path):
+    # The menu used to open an in-page panel backed by a SEPARATE local
+    # service (ai_usage_client.py, 127.0.0.1:8787). It now links to
+    # /dashboard/ai-usage, which reads the CLIs' own local artefacts and
+    # therefore works whether or not that service is installed -- it is not
+    # installed on this fleet.
     client = _client(tmp_path, fetcher=_fetcher_returning({}))
     response = client.get("/dashboard")
     assert response.status_code == 200
     html = response.text
-    assert 'id="aiUsagePanel"' in html
-    assert 'id="openAiUsageBtn"' in html
+    assert 'href="/dashboard/ai-usage"' in html
+    assert 'id="aiUsageLink"' in html
+    assert 'id="openAiUsageBtn"' not in html
     assert "/dashboard/api/ai-usage" in html
