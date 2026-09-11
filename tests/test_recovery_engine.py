@@ -15,7 +15,7 @@ from terminal_mcp.core import (
     RECOVERY_STATE_BLOCKED, RECOVERY_STATE_DEGRADED, RECOVERY_STATE_RESUMED_OK,
 )
 from terminal_mcp.lease import PaneLeaseStore
-from terminal_mcp.recovery_engine import RecoveryEngine
+from terminal_mcp.recovery_engine import RECOVERY_STATE_RECONNECTED, RecoveryEngine
 from terminal_mcp.session_registry import SessionRegistryStore
 
 
@@ -34,6 +34,16 @@ class FakeController:
 
     def registry_list(self, node_id: str, *, recoverable_only: bool = False) -> dict:
         return {"records": self.registry_rows.get(node_id, [])}
+
+    # Liveness source for the SOFT_RECONNECT tier: a fleet listing, the same
+    # shape ControllerService.terminal_list_sessions returns. Deliberately NOT
+    # resolve_session -- that answers from a TTL'd location cache and would
+    # report a just-killed session as alive.
+    live_sessions: dict = {}
+
+    def terminal_list_sessions(self) -> dict:
+        return {"sessions": [{"name": name, "node_id": node}
+                             for name, node in self.live_sessions.items()]}
 
 
 @pytest.fixture
@@ -309,3 +319,59 @@ def test_reconcile_pass_skips_killed_but_still_recovers_a_crashed_one(registry, 
     assert by_session["stopped-on-purpose"]["error"] == "RECOVERY_TOMBSTONED"
     assert "error" not in by_session["crashed"], by_session["crashed"]
     assert [call for call in controller.reopen_calls if "stopped-on-purpose" in call] == []
+
+
+# -- SOFT_RECONNECT: the session came back on its own -----------------------
+
+def test_a_session_that_is_alive_again_is_reconnected_not_respawned(registry, controller, lease_store):
+    """The cheapest recovery is the one that spawns nothing.
+
+    A node-agent restart does not kill tmux, so a session marked MISSING while
+    the node was away is very often still sitting there when it returns.
+    Reopening it would hit SESSION_ALREADY_EXISTS and record a FAILED
+    recovery for a session that is in fact perfectly healthy -- an alarming,
+    wrong answer. Check liveness first and just reconcile the record.
+    """
+    _make_missing_record(registry, node_id="n1", name="survivor")
+    controller.live_sessions = {"survivor": "n1"}
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True))
+
+    result = engine.recover_session("n1", "survivor")
+    assert result["soft_reconnect"] is True
+    assert result["recovery_state"] == RECOVERY_STATE_RECONNECTED
+    assert controller.reopen_calls == []          # nothing was spawned
+    assert registry.get("n1", "survivor").status == "ACTIVE"
+
+
+def test_liveness_on_a_different_node_does_not_count_as_reconnect(registry, controller, lease_store):
+    """Same bare name on another node is a DIFFERENT session -- reconnecting
+    to it would silently rebind this record onto someone else's process."""
+    _make_missing_record(registry, node_id="n1", name="shared-name")
+    controller.live_sessions = {"shared-name": "n2"}
+    engine = _engine(registry, controller, lease_store, AutoRecoveryConfig(enabled=True))
+
+    result = engine.recover_session("n1", "shared-name")
+    assert result.get("soft_reconnect") is not True
+    assert len(controller.reopen_calls) == 1      # fell through to a real recovery
+
+
+def test_soft_reconnect_is_tried_before_the_attempt_budget_is_spent(registry, controller, lease_store):
+    """A session that keeps coming back on its own must never exhaust
+    max_attempts and end up BLOCKED."""
+    _make_missing_record(registry, node_id="n1", name="flappy")
+    controller.live_sessions = {"flappy": "n1"}
+    engine = _engine(registry, controller, lease_store,
+                     AutoRecoveryConfig(enabled=True, max_attempts=1))
+    # Flap it: MISSING -> reconnected -> MISSING -> ... A session that keeps
+    # coming back on its own must never spend the budget, however many times
+    # the node drops.
+    for _ in range(3):
+        registry.mark_missing("n1", set())
+        assert engine.recover_session("n1", "flappy")["soft_reconnect"] is True
+    assert registry.get("n1", "flappy").recovery_attempts == 0
+    assert controller.reopen_calls == []
+    # And once it is genuinely gone, recovery still works -- the budget was
+    # never consumed by the healthy reconnects above.
+    registry.mark_missing("n1", set())
+    controller.live_sessions = {}
+    assert "error" not in engine.recover_session("n1", "flappy")
