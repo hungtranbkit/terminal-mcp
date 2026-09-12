@@ -108,6 +108,38 @@ class FleetSyncService:
                           pushed=accepted, applied=merged["applied"],
                           skipped=merged["skipped"], rejected=merged["rejected"])
 
+    def probe(self, peer_node: str, *, transport: Callable[..., dict[str, Any]] | None = None,
+              endpoint: str | None = None) -> SyncResult:
+        """Knock before shipping anything.
+
+        An exchange sends this node's ENTIRE export -- on this fleet that is
+        363 session objects. Posting that at a route which may not exist is
+        how the controller learned, the hard way, that an agent without
+        /v1/fleet/* does not answer a tidy 404: it resets the connection
+        mid-body, so the failure arrives as `[Errno 104] Connection reset by
+        peer` and looks like a network fault rather than a missing feature.
+
+        An empty batch is a valid exchange under the same contract (merge of
+        nothing, then the peer's objects), so this costs one small request and
+        tells us whether the door opens at all.
+        """
+        send = transport or self._transport
+        if send is None:
+            raise RuntimeError("no transport configured for fleet sync")
+        try:
+            response = send(peer_node=peer_node, endpoint=endpoint, objects=[], since=None)
+        except Exception as exc:  # noqa: BLE001 -- an unreachable peer is normal
+            error = f"{type(exc).__name__}: {exc}"
+            self.store.record_sync(peer_node, endpoint=endpoint, error=error)
+            return SyncResult(peer_node=peer_node, ok=False, error=error,
+                              error_class=type(exc).__name__)
+        incoming = response.get("objects") or []
+        merged = self.store.merge(incoming, source_node=peer_node)
+        self.store.record_sync(peer_node, endpoint=endpoint, pulled=len(incoming))
+        return SyncResult(peer_node=peer_node, ok=True, pulled=len(incoming),
+                          applied=merged["applied"], skipped=merged["skipped"],
+                          rejected=merged["rejected"])
+
     def sweep(self, peers: Iterable[tuple[str, str | None]]) -> list[SyncResult]:
         """Every peer, one at a time, never stopping on a failure.
 

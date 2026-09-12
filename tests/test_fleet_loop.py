@@ -42,6 +42,7 @@ class _Sync:
     def __init__(self, nodes=(), outcomes=None, refresh_raises=False):
         self.refresh_calls = 0
         self.exchanges: list[str] = []
+        self.probes: list[str] = []
         self._outcomes = outcomes or {}
         self._refresh_raises = refresh_raises
         outer = self
@@ -59,6 +60,16 @@ class _Sync:
             class sync:  # noqa: N801 -- mirrors the real attribute path
                 @staticmethod
                 def exchange(node_id, transport=None, endpoint=None):
+                    outer.exchanges.append(node_id)
+                    return outer._outcomes.get(node_id, _Outcome(True, peer=node_id))
+
+                # An unproven peer is probed first (see FleetSyncService.probe).
+                # Both are recorded in `exchanges` so the existing tests still
+                # count "times we talked to this peer", which is what they are
+                # actually about.
+                @staticmethod
+                def probe(node_id, transport=None, endpoint=None):
+                    outer.probes.append(node_id)
                     outer.exchanges.append(node_id)
                     return outer._outcomes.get(node_id, _Outcome(True, peer=node_id))
 
@@ -384,3 +395,56 @@ def test_the_controller_attaches_the_loop_so_readiness_can_see_it():
     assert "fleet.attach_sync_loop(fleet_loop)" in source
     assert "fleet_loop.start()" in source
     assert "atexit.register(fleet_loop.stop)" in source
+
+
+# -- probe before pushing ---------------------------------------------------------
+
+def test_an_unproven_peer_is_probed_not_handed_the_whole_export():
+    """Measured on the real fleet: an agent without /v1/fleet/* does not
+    answer a tidy 404 -- it resets the connection while a 363-object export
+    is still going out, so the failure arrives as ECONNRESET and looks like a
+    network fault. Knock first."""
+    calls: list[str] = []
+
+    class _Probing(_Sync):
+        def __init__(self):
+            super().__init__(nodes=[_Node("hp-linux")])
+            outer = self
+
+            class _S:
+                local_node_id = "local"
+
+                @staticmethod
+                def refresh_local(**kwargs):
+                    return {}
+
+                class sync:  # noqa: N801
+                    @staticmethod
+                    def probe(node_id, transport=None, endpoint=None):
+                        calls.append("probe")
+                        return _Outcome(True, peer=node_id)
+
+                    @staticmethod
+                    def exchange(node_id, transport=None, endpoint=None):
+                        calls.append("exchange")
+                        return _Outcome(True, peer=node_id)
+
+            self.service = _S()
+
+    sync = _Probing()
+    loop = _loop(sync)
+    loop.run_once()
+    assert calls == ["probe"], "first contact must be cheap"
+    loop.run_once()
+    assert calls == ["probe", "exchange"], "a proven peer gets the real thing"
+
+
+@pytest.mark.parametrize("error", [
+    "NodeClientError: POST /v1/fleet/objects -> URLError: [Errno 104] Connection reset by peer",
+    "NodeClientError: POST /v1/fleet/objects -> URLError: [Errno 32] Broken pipe",
+])
+def test_a_reset_on_the_fleet_route_is_treated_as_an_unsupported_build(error):
+    """On a node whose heartbeat and status calls work, a reset on THIS route
+    specifically means the route is not there -- so it earns the long backoff
+    rather than being retried like a flaky network."""
+    assert _looks_unsupported(error) is True

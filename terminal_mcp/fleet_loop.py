@@ -67,6 +67,7 @@ class _PeerState:
     skip_cycles: int = 0
     failures: int = 0
     unsupported: bool = False
+    proven: bool = False       # has a real exchange with this peer ever worked?
     last_error: str | None = None
 
 
@@ -188,13 +189,22 @@ class FleetSyncLoop:
                                 "unsupported": state.unsupported,
                                 "reason": state.last_error})
                 continue
-            outcome = self._sync.service.sync.exchange(
-                node_id, transport=transport, endpoint=getattr(node, "endpoint", None))
+            # A peer we have never successfully exchanged with gets a small
+            # probe instead of the full export. See FleetSyncService.probe:
+            # posting 363 objects at a route that may not exist is what made
+            # the failure look like a network fault.
+            endpoint = getattr(node, "endpoint", None)
+            never_worked = state.failures > 0 or not state.proven
+            call = (self._sync.service.sync.probe if never_worked
+                    else self._sync.service.sync.exchange)
+            outcome = call(node_id, transport=transport, endpoint=endpoint)
             if outcome.ok:
                 state.failures = 0
                 state.unsupported = False
                 state.last_error = None
                 state.skip_cycles = 0
+                # Proven: from here on this peer gets the full exchange.
+                state.proven = True
             else:
                 state.failures += 1
                 state.last_error = outcome.error
@@ -245,4 +255,12 @@ def _looks_unsupported(error: str | None) -> bool:
     whole point of backing off differently.
     """
     text = (error or "").casefold()
-    return "404" in text or "not found" in text
+    if "404" in text or "not found" in text:
+        return True
+    # Measured on this fleet 2026-09-13: an agent without /v1/fleet/* does
+    # not answer a tidy 404. It resets the connection while the request body
+    # is still going out, so the client sees ECONNRESET or EPIPE. Those are
+    # ambiguous in general -- but on a node whose heartbeat and status calls
+    # are working, a reset on THIS route specifically means the route is not
+    # there.
+    return "connection reset" in text or "broken pipe" in text
