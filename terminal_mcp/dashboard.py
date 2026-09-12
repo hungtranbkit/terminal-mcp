@@ -7116,6 +7116,25 @@ FLEET_HTML = r"""<!doctype html>
     tr:last-child td { border-bottom:0 }
     tr.hit td { background:#17223b }
     .checks { display:grid; gap:7px; grid-template-columns:repeat(auto-fill, minmax(320px, 1fr)) }
+    .dep { border:1px solid var(--line); border-radius:12px; background:var(--panel);
+           padding:11px 13px; margin-bottom:10px }
+    .dep-head { display:flex; align-items:center; gap:9px; flex-wrap:wrap }
+    .dep-name { font-weight:700; font-size:13.5px }
+    /* Redundancy and deployability are DIFFERENT claims and get different
+       pills: a 1/2 target still ships, and merging the two is how someone
+       holds a release they could have sent. */
+    .dep-avail { font-size:10px; font-weight:700; padding:2px 8px; border-radius:999px;
+                 border:1px solid var(--green); color:var(--green); white-space:nowrap }
+    .dep-avail.no { border-color:var(--red); color:var(--red) }
+    .dep-paths { margin-top:9px; display:grid; gap:6px }
+    .dep-path { display:flex; align-items:center; gap:9px; flex-wrap:wrap;
+                border-top:1px solid var(--line); padding-top:7px; font-size:12px }
+    .dep-node { font-weight:700; min-width:104px }
+    .tick { font-size:11.5px; white-space:nowrap }
+    .tick.ok { color:var(--green) } .tick.no { color:var(--red) }
+    .tick.meh { color:var(--muted) }
+    .dep-warn { margin-top:8px; font-size:11.5px; color:var(--amber); line-height:1.55 }
+    .dep-reason { color:var(--muted); font-size:11px }
     .check { border:1px solid var(--line); border-radius:11px; padding:9px 11px; background:var(--panel) }
     .check b { font-size:12px }
     .note { font-size:11.5px; color:var(--muted); margin:18px 0 0; line-height:1.65 }
@@ -7138,6 +7157,9 @@ FLEET_HTML = r"""<!doctype html>
   <main>
     <h2>Readiness</h2>
     <div class="checks" id="checks"></div>
+
+    <h2>Deployment Redundancy</h2>
+    <div id="deploy"></div>
 
     <h2>Nodes</h2>
     <div class="wrap"><table id="nodes"><thead><tr>
@@ -7252,6 +7274,75 @@ FLEET_HTML = r"""<!doctype html>
       }
     }
 
+    // A tick is only ✓ on evidence. "not yet proven" gets its own neutral
+    // mark rather than a ✗, because "we have not checked" and "it is broken"
+    // are different things to tell an operator.
+    function tick(label, value) {
+      const state = value === true ? 'ok' : value === false ? 'no' : 'meh';
+      const glyph = value === true ? '✓' : value === false ? '✗' : '?';
+      return el('span', {className: 'tick ' + state, text: glyph + ' ' + label});
+    }
+
+    function fillDeployment(targets) {
+      const box = $('#deploy');
+      box.replaceChildren();
+      if (!targets.length) {
+        box.appendChild(el('div', {className: 'muted',
+          text: 'Chưa khai báo deployment target nào.'}));
+        return;
+      }
+      for (const target of targets) {
+        const card = el('div', {className: 'dep'});
+        card.dataset.target = target.target_id;
+        const head = el('div', {className: 'dep-head'});
+        head.append(el('span', {className: 'dep-name', text: target.display_name || target.target_id}),
+                    el('span', {className: 'pill ' + target.status,
+                      text: 'Redundancy ' + target.redundancy.label + ' ' + target.status}));
+        head.appendChild(el('span', {
+          className: 'dep-avail' + (target.deploy_available ? '' : ' no'),
+          text: target.deploy_available ? 'deploy khả dụng' : 'deploy KHÔNG khả dụng'}));
+        if (target.primary_node)
+          head.appendChild(el('span', {className: 'muted',
+            text: 'primary ' + target.primary_node}));
+        if ((target.backup_nodes || []).length)
+          head.appendChild(el('span', {className: 'muted',
+            text: 'backup ' + target.backup_nodes.join(', ')}));
+        card.appendChild(head);
+
+        const paths = el('div', {className: 'dep-paths'});
+        for (const path of target.paths || []) {
+          const row = el('div', {className: 'dep-path'});
+          row.append(el('span', {className: 'dep-node', text: path.node_id}),
+                     el('span', {className: 'pill ' + path.state, text: path.state}));
+          // SSH, deploy and VPN/transport each answered separately: an
+          // operator needs to know WHICH leg is broken, not just that one is.
+          row.appendChild(tick('SSH', path.last_probe_ok));
+          row.appendChild(tick('Deploy', path.deploy_prereqs_ok));
+          row.appendChild(tick(
+            (path.transport === 'tailscale' ? 'Tailscale'
+             : path.transport === 'lan' ? 'LAN'
+             : path.transport === 'tunnel' ? 'Tunnel' : 'VPN'),
+            path.transport && path.transport !== 'unknown' ? true : null));
+          row.appendChild(tick('Độc lập', path.independent));
+          if (path.latency_ms != null)
+            row.appendChild(el('span', {className: 'muted', text: Math.round(path.latency_ms) + 'ms'}));
+          row.appendChild(el('span', {className: 'muted',
+            text: 'probe ' + age(path.last_probe_at ? secondsSince(path.last_probe_at) : null)}));
+          row.appendChild(el('span', {className: 'dep-reason', text: path.reason || ''}));
+          paths.appendChild(row);
+        }
+        card.appendChild(paths);
+        for (const warning of target.warnings || [])
+          card.appendChild(el('div', {className: 'dep-warn', text: '⚠ ' + warning}));
+        box.appendChild(card);
+      }
+    }
+
+    function secondsSince(stamp) {
+      const parsed = Date.parse(stamp);
+      return Number.isNaN(parsed) ? null : (Date.now() - parsed) / 1000;
+    }
+
     function fillChecks(readiness) {
       const box = $('#checks');
       box.replaceChildren();
@@ -7275,10 +7366,12 @@ FLEET_HTML = r"""<!doctype html>
 
     async function load() {
       try {
-        const [view, readiness] = await Promise.all([
+        const [view, readiness, deployment] = await Promise.all([
           fetch('/dashboard/api/fleet', {cache: 'no-store'}).then((r) => r.json()),
           fetch('/dashboard/api/fleet/readiness', {cache: 'no-store'}).then((r) => r.json()),
+          fetch('/dashboard/api/deployment', {cache: 'no-store'}).then((r) => r.json()),
         ]);
+        fillDeployment(deployment.targets || []);
         fillNodes(view.nodes || []);
         fillSsh(view.ssh_targets || []);
         fillPeers(view.peers || []);
@@ -9354,6 +9447,71 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return blocked
         return JSONResponse({"targets": await anyio.to_thread.run_sync(fleet.ssh_inventory)},
                             headers={"Cache-Control": "no-store"})
+
+    def _deployment_service():
+        """Deployment targets/paths live in the SAME fleet store -- two more
+        replicated kinds, not a second registry."""
+        from .deployment_service import DeploymentRegistry, DeploymentService
+
+        view = fleet.offline_view()
+        online = {n["node_id"]: str(n.get("status") or "").casefold() != "offline"
+                  for n in view["nodes"] if n.get("node_id")}
+        aliases: dict[str, set[str]] = {}
+        for node in view["nodes"]:
+            node_id = node.get("node_id")
+            if not node_id:
+                continue
+            aliases[node_id] = {str(v) for v in (node.get("lan_ip"), node.get("tailscale_ip"),
+                                                 node.get("tailscale_hostname"),
+                                                 node.get("hostname")) if v}
+        for target in view["ssh_targets"]:
+            if target.get("node_id") and target.get("host"):
+                aliases.setdefault(target["node_id"], set()).add(str(target["host"]))
+        return DeploymentService(
+            DeploymentRegistry(fleet.store, local_node_id=fleet.local_node_id),
+            locks=terminal.leases if hasattr(terminal, "leases") else None,
+            node_online=lambda: online, node_aliases=lambda: aliases)
+
+    @server.custom_route("/dashboard/api/deployment", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_deployment(request: Request) -> JSONResponse:
+        """Redundancy per deployment target, from the local cache.
+
+        Read-only and network-free, like every other fleet read: the screen
+        an operator opens because something is already wrong must not depend
+        on the thing that is wrong.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        target_id = request.query_params.get("target")
+
+        def _build() -> dict[str, Any]:
+            service = _deployment_service()
+            if target_id:
+                evaluation = service.evaluate(target_id)
+                return evaluation or {"error": "UNKNOWN_TARGET", "target_id": target_id}
+            return {"targets": service.evaluate_all()}
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001 -- never 5xx the status screen
+            payload = {"error": "DEPLOYMENT_EVAL_FAILED", "detail": str(exc), "targets": []}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/deployment/dry-run", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_deployment_dry_run(request: Request) -> JSONResponse:
+        """What would happen if these nodes were gone. A READ: nothing is
+        taken offline, no probe runs, no lease is taken."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        target_id = request.query_params.get("target") or ""
+        offline = [n for n in (request.query_params.get("offline") or "").split(",") if n]
+        result = await anyio.to_thread.run_sync(
+            lambda: _deployment_service().dry_run_failover(target_id, assume_offline=offline))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/fleet/readiness", methods=["GET"],
                          include_in_schema=False)

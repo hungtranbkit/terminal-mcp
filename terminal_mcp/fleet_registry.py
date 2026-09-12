@@ -105,10 +105,20 @@ class SecretLeak(ValueError):
 # `*_ref`, `*_path` and `*_file` are explicitly allowed through: pointing AT
 # a secret is the supported pattern (connection_store.py's own token_file).
 _SECRET_NAME = re.compile(
+    # `authorization` is spelled out rather than relying on the `auth`
+    # alternative: these match whole underscore-separated SEGMENTS, so `auth`
+    # did not catch a field literally named `authorization` -- which is the
+    # single most likely name for one holding a Bearer token.
     r"(?:^|_)(?:secret|password|passwd|passphrase|token|apikey|api_key|"
-    r"private_key|privatekey|credential|auth|bearer|cookie|session_key)(?:$|_)",
+    r"private_key|privatekey|credential|auth|authorization|bearer|cookie|"
+    r"session_key)(?:$|_)",
     re.IGNORECASE)
-_REF_SUFFIX = re.compile(r"_(?:ref|path|file|env|status|state|url)$", re.IGNORECASE)
+# Suffixes that say "this field is metadata ABOUT a secret, not the secret":
+# a pointer, a status, or a boolean outcome. `_ok` was added when `auth_ok`
+# -- a plain True/False -- was refused; a field ending in `_ok` cannot
+# meaningfully carry a credential, while `auth`/`auth_token` still cannot get
+# through. Widen this list only for a suffix with that same property.
+_REF_SUFFIX = re.compile(r"_(?:ref|path|file|env|status|state|url|ok)$", re.IGNORECASE)
 # A PEM block is the one value-level check worth doing: it is unambiguous,
 # and it is exactly what "do not copy ~/.ssh/id_*" means in practice.
 _PEM = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")

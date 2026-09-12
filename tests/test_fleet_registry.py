@@ -435,3 +435,25 @@ def test_a_route_nobody_has_ever_verified_is_not_reported_as_fresh(tmp_path):
     checks = {c["check"]: c for c in FleetService(store, local_node_id="a").readiness()["checks"]}
     assert checks["stale_routes"]["status"] == WARN
     assert checks["stale_routes"]["evidence"]["never_verified"] == ["dell-linux"]
+
+
+@pytest.mark.parametrize("payload", [
+    {"auth_ok": True},
+    {"auth_status": "NEEDS_AUTH"},
+    {"deploy_prereqs_ok": False},
+])
+def test_a_boolean_outcome_about_a_secret_is_not_a_secret(payload):
+    """`auth_ok` is True or False. It says whether a credential worked, and
+    carries none -- so the guard must not refuse it, while still refusing
+    everything that could hold a value."""
+    assert scrub_payload(dict(payload)) == payload
+
+
+@pytest.mark.parametrize("payload", [
+    {"auth": "Bearer abc"},
+    {"auth_token": "abc"},
+    {"authorization": "Basic xyz"},
+])
+def test_widening_the_suffix_allowlist_did_not_open_the_door(payload):
+    with pytest.raises(SecretLeak):
+        scrub_payload(payload)

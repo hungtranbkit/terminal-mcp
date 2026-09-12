@@ -248,10 +248,56 @@ class FleetService:
             {"aged": [t.get("alias") for t in aged],
              "never_verified": [t.get("alias") for t in unverified]}))
 
+        # Deployment redundancy, folded into the SAME readiness report rather
+        # than a second doctor: an operator asking "is the fleet ok" should
+        # not have to know that redundancy lives somewhere else.
+        checks.extend(self._deployment_checks(stamp))
+
         worst = FAIL if any(c["status"] == FAIL for c in checks) else (
             WARN if any(c["status"] == WARN for c in checks) else PASS)
         return {"status": worst, "checks": checks, "local_node_id": self.local_node_id,
                 "generated_at": stamp.isoformat()}
+
+
+    def _deployment_checks(self, stamp: datetime) -> list[dict[str, Any]]:
+        """Per-target redundancy, reported as ordinary readiness checks.
+
+        A target that is DEGRADED but deployable is WARN, never FAIL -- the
+        release can still ship, and crying FAIL over it is how a team learns
+        to ignore this screen. Only a target that cannot deploy at all is
+        FAIL.
+        """
+        try:
+            from .deployment_redundancy import DEGRADED, FAIL as T_FAIL, READY as T_READY
+            from .deployment_service import DeploymentRegistry, DeploymentService
+        except Exception:  # noqa: BLE001 -- optional surface
+            return []
+        registry = DeploymentRegistry(self.store, local_node_id=self.local_node_id)
+        if not registry.targets():
+            return []
+        online = {}
+        for node in self.offline_view(now=stamp)["nodes"]:
+            node_id = node.get("node_id")
+            if node_id:
+                online[node_id] = str(node.get("status") or "").casefold() != "offline"
+        service = DeploymentService(registry, node_online=lambda: online)
+        checks: list[dict[str, Any]] = []
+        for evaluation in service.evaluate_all():
+            status = (PASS if evaluation["status"] == T_READY
+                      else WARN if evaluation["deploy_available"] else FAIL)
+            checks.append(_check(
+                f"deployment_redundancy:{evaluation['target_id']}", status,
+                (f"{evaluation['redundancy']['label']} independent path(s); "
+                 f"deploy {'available' if evaluation['deploy_available'] else 'UNAVAILABLE'}"),
+                {"status": evaluation["status"],
+                 "redundancy": evaluation["redundancy"],
+                 "deploy_available": evaluation["deploy_available"],
+                 "warnings": evaluation["warnings"],
+                 "paths": [{"node_id": p["node_id"], "state": p["state"],
+                            "independent": p["independent"], "depends_on": p["depends_on"],
+                            "reason": p["reason"]}
+                           for p in evaluation["paths"]]}))
+        return checks
 
 
 def _check(name: str, status: str, summary: str, evidence: dict[str, Any]) -> dict[str, Any]:

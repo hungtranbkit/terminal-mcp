@@ -1150,6 +1150,153 @@ def build_mcp(service: TerminalService | None = None,
             return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
         return {"local_node_id": service.local_node_id, "peers": service.store.peers()}
 
+    # ONE ResourceLockStore for this process, built before its first
+    # consumer rather than beside the resource-lock tools further down: the
+    # deploy lease needs the SAME store those tools use, and letting it fall
+    # back to None would silently disable the only thing stopping two
+    # dispatchers running one deploy.
+    _locks = resource_locks or ResourceLockStore()
+
+    def _deployment_service():
+        """Built over the SAME fleet store the rest of the fleet tools use --
+        deployment targets and paths are two more replicated kinds, not a
+        second registry."""
+        service = _fleet_service()
+        if service is None:
+            return None
+        from .deployment_service import DeploymentRegistry, DeploymentService
+
+        registry = DeploymentRegistry(service.store, local_node_id=service.local_node_id)
+        view = service.offline_view()
+        online = {n["node_id"]: str(n.get("status") or "").casefold() != "offline"
+                  for n in view["nodes"] if n.get("node_id")}
+        aliases: dict[str, set[str]] = {}
+        for node in view["nodes"]:
+            node_id = node.get("node_id")
+            if not node_id:
+                continue
+            aliases[node_id] = {str(v) for v in (node.get("lan_ip"),
+                                                 node.get("tailscale_ip"),
+                                                 node.get("tailscale_hostname"),
+                                                 node.get("hostname")) if v}
+        for target in view["ssh_targets"]:
+            if target.get("node_id") and target.get("host"):
+                aliases.setdefault(target["node_id"], set()).add(str(target["host"]))
+        return DeploymentService(registry, locks=_locks,
+                                 node_online=lambda: online,
+                                 node_aliases=lambda: aliases)
+
+    @server.tool()
+    def terminal_deployment_status(target_id: str = "") -> dict:
+        """Redundancy and deployability per deployment target.
+
+        Reports `READY` / `DEGRADED` / `FAIL` with `n/m` independent paths,
+        and `deploy_available` SEPARATELY -- a target with one working path
+        is DEGRADED but still shippable, and conflating those is how a team
+        holds a release it could have shipped.
+
+        A path only counts toward `n` when it has been PROVEN recently and
+        does not route through another management node for the same target.
+        A config file is a plan, not a route.
+        """
+        service = _deployment_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        if target_id:
+            evaluation = service.evaluate(target_id)
+            return evaluation or {"error": "UNKNOWN_TARGET", "target_id": target_id}
+        return {"targets": service.evaluate_all()}
+
+    @server.tool()
+    def terminal_deployment_upsert_target(target_id: str, display_name: str = "",
+                                          project_id: str = "", primary_node: str = "",
+                                          backup_nodes: str = "",
+                                          min_independent_paths: int = 2,
+                                          deploy_command_ref: str = "",
+                                          description: str = "") -> dict:
+        """Create or update a deployment target's metadata.
+
+        PRIMARY/BACKUP is a PREFERENCE that decides dispatch order, nothing
+        more -- it never overrides evidence about which paths actually work.
+        `backup_nodes` is a comma-separated list.
+        """
+        service = _deployment_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        from .deployment_redundancy import DeploymentTarget
+
+        backups = tuple(n.strip() for n in backup_nodes.split(",") if n.strip())
+        return service.registry.put_target(DeploymentTarget(
+            target_id=target_id, display_name=display_name or target_id,
+            project_id=project_id or None,
+            min_independent_paths=max(1, int(min_independent_paths)),
+            primary_node=primary_node or None, backup_nodes=backups,
+            deploy_command_ref=deploy_command_ref or None,
+            description=description or None))
+
+    @server.tool()
+    def terminal_deployment_upsert_path(target_id: str, node_id: str, host: str = "",
+                                        username: str = "", port: int = 22,
+                                        ssh_alias: str = "", transport: str = "unknown",
+                                        proxy_jump: str = "",
+                                        independence_group: str = "",
+                                        public_key_id: str = "",
+                                        host_key_fingerprint: str = "",
+                                        capabilities: str = "ssh,deploy",
+                                        role: str = "backup") -> dict:
+        """Declare one management node's route to one target.
+
+        Non-secret by construction: an address, a user, a port, a key
+        FINGERPRINT and a public-key id. The private key that makes the path
+        work stays on `node_id` and has no field here to travel in.
+
+        Declaring a path does not make it count. It is UNVERIFIED until a
+        probe succeeds.
+        """
+        service = _deployment_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        from .deployment_redundancy import DeploymentPath
+
+        return service.registry.put_path(DeploymentPath(
+            target_id=target_id, node_id=node_id, host=host or None,
+            username=username or None, port=int(port or 22),
+            ssh_alias=ssh_alias or None, transport=transport or "unknown",
+            proxy_jump=proxy_jump or None,
+            independence_group=independence_group or None,
+            public_key_id=public_key_id or None,
+            host_key_fingerprint=host_key_fingerprint or None,
+            capabilities=tuple(c.strip() for c in capabilities.split(",") if c.strip()),
+            role=role or "backup"))
+
+    @server.tool()
+    def terminal_deployment_choose_node(target_id: str) -> dict:
+        """Which node WOULD run a deploy for this target, and why that one.
+
+        Read-only: it takes no lease and dispatches nothing. Preference order
+        is primary then declared backups, but a dead primary is skipped and
+        the reason says so rather than silently substituting a machine.
+        """
+        service = _deployment_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        return service.choose(target_id)
+
+    @server.tool()
+    def terminal_deployment_dry_run_failover(target_id: str, assume_offline: str = "") -> dict:
+        """Answer "are we actually covered?" on a Tuesday rather than during
+        an incident.
+
+        Re-evaluates against a hypothesis -- nothing is taken offline, no
+        probe is run, no lease is taken. `assume_offline` is a comma-separated
+        list of node ids to pretend are dead.
+        """
+        service = _deployment_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        nodes = tuple(n.strip() for n in assume_offline.split(",") if n.strip())
+        return service.dry_run_failover(target_id, assume_offline=nodes)
+
     @server.tool()
     def terminal_fleet_environment(roles: str = "node") -> dict:
         """Audit every node's ENVIRONMENT in one call: tools, services and
@@ -2468,7 +2615,7 @@ def build_mcp(service: TerminalService | None = None,
     # fleet of cooperating workers actually needs. Treating it as
     # enforcement would be a false guarantee.
     # ------------------------------------------------------------------
-    locks = resource_locks or ResourceLockStore()
+    locks = _locks
 
     @server.tool()
     def terminal_resource_lock(project_id: str, resource_key: str, owner_id: str,

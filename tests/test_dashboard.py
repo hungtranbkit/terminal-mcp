@@ -1543,6 +1543,12 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/fleet/ssh": {"GET", "HEAD"},
         "/dashboard/api/fleet/readiness": {"GET", "HEAD"},
         "/dashboard/api/fleet/sync": {"POST"},
+        # Deployment redundancy: both READS. Choosing a node and taking a
+        # deploy lease are MCP operations, deliberately not a dashboard
+        # button -- a screen that can start a production deploy is a screen
+        # someone starts one from by accident.
+        "/dashboard/api/deployment": {"GET", "HEAD"},
+        "/dashboard/api/deployment/dry-run": {"GET", "HEAD"},
         # Terminal Wall -- a later, separate feature, and READ-ONLY by
         # design: both entries are GET/HEAD, and the absence of any POST
         # here is itself part of the guarantee that the monitor screen

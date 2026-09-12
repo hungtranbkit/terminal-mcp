@@ -60,6 +60,14 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_fleet_ssh_inventory",
         "terminal_fleet_readiness",
         "terminal_fleet_sync_status",
+        # Deployment redundancy: read status, declare targets/paths, ask who
+        # would deploy, and rehearse a failover. Nothing here runs a deploy --
+        # dispatch takes a lease and is a separate, deliberate call.
+        "terminal_deployment_status",
+        "terminal_deployment_upsert_target",
+        "terminal_deployment_upsert_path",
+        "terminal_deployment_choose_node",
+        "terminal_deployment_dry_run_failover",
         # Session permission management: ChatGPT could rename a session but
         # had no way to grant or revoke access to one -- that took an SSH
         # session and a config edit.
