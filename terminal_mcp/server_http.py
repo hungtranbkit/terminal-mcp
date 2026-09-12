@@ -25,6 +25,7 @@ from .planner_store import PlannerStore
 from .pm_service import PMService
 from .pm_store import PMStore
 from .backlog_service import BacklogService
+from .notes_service import NotesService
 from .event_bus import EventBus
 from .queue_service import QueueService
 from .recovery_engine import RecoveryEngine
@@ -313,14 +314,22 @@ def main() -> None:
     # allowed_cwd_roots path gate, its audit trail, and its dispatch path
     # are the existing ones rather than parallel copies.
     backlog = BacklogService(config, audit=terminal.audit, queue=queue, controller=controller)
+    # Notes / Ideas: ONE shared instance, same "constructed once, passed to
+    # both build_mcp and register_dashboard" discipline as queue/integration/
+    # pm/ai_usage above -- so the note_* MCP tools ChatGPT calls and the
+    # /dashboard/notes page a human browses read and write the SAME notes.db
+    # and the SAME attachment directory, never two drifting copies (each
+    # surface's own fallback default would otherwise build a private one).
+    notes = NotesService.from_config(config) if config.notes.enabled else None
     # P0.2: the bus is CONSTRUCTED (so publish/claim tools exist) but no
     # consumer loop is started here -- autonomous coordination stays off.
     events = EventBus()
     server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
-                       planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog, events=events)
+                       planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog, notes=notes,
+                       events=events)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
-                       recovery=recovery, backlog=backlog)
+                       recovery=recovery, backlog=backlog, notes=notes)
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)

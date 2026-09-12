@@ -155,3 +155,31 @@ supervisor:
 #       token_env: TERMINAL_MCP_NODE_TOKEN_M910
 #       max_sessions: 20
 #       timeout_seconds: 10.0
+
+# -- Notes / Ideas ("Ghi chú / Ý tưởng") -------------------------------------
+# The cross-project note store ChatGPT writes into when the user says "lưu
+# lại" (MCP tools note_create/note_search/...), browsable at /dashboard/notes.
+# Defaults are ON and need no configuration at all: the DB lands beside every
+# other store (~/.local/state/terminal-mcp/notes.db) and images go next to it
+# in notes_attachments/YYYY/MM/. Nothing is written until a note is created.
+#
+# notes:
+#   enabled: true
+#   # Empty means "beside the notes DB" -- set it to put the (potentially
+#   # large) image directory on a different disk. Backups must cover BOTH
+#   # this directory and notes.db; see docs/notes.md.
+#   attachments_dir: ""
+#   max_attachment_bytes: 10485760          # 10 MiB
+#   # Only types the server can content-sniff AND serve safely. A file whose
+#   # real bytes are not one of these is refused even if it is named .png.
+#   allowed_mime_types: ["image/png", "image/jpeg", "image/webp", "image/gif"]
+#   # EMPTY BY DEFAULT, and that is the security posture: with no root here
+#   # the note_add_attachment(source_path=...) transport is refused outright
+#   # (ATTACHMENT_SOURCE_DISABLED) and only in-band base64 / the dashboard's
+#   # own upload form can add images. Adding a root grants this store
+#   # permission to read files from exactly that subtree -- nothing wider.
+#   # Absolute paths only; symlinks are resolved before the check, so a link
+#   # inside a root pointing outside it does not pass.
+#   attachment_source_roots:
+#     - "~/Pictures/Screenshots"
+#     - "/tmp/chatgpt-drops"

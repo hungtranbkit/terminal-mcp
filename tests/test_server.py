@@ -230,6 +230,24 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_checkpoint_session",
         "terminal_recovery_loop_status",
         "terminal_recovery_loop_run_once",
+        # Notes / Ideas: the cross-project kho ghi chú (notes_store.py).
+        # Deliberately NOT terminal_*-prefixed -- these touch no terminal,
+        # session or node, and the name a model reads in a tool list is the
+        # main thing steering it to the right tool. Present on the STDIO
+        # surface too (this test builds it), which is the whole point of
+        # build_mcp's default_optional_services defaulting.
+        "note_create",
+        "note_get",
+        "note_search",
+        "note_list",
+        "note_update",
+        "note_delete",
+        "note_restore",
+        "note_add_attachment",
+        "note_remove_attachment",
+        "note_link_to_project",
+        "note_mark_applied",
+        "note_facets",
     }
 
 
