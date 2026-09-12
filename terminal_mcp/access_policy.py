@@ -130,8 +130,13 @@ _SECRET_NAME = re.compile(
     r"(?:^|_)(?:secret|password|passwd|passphrase|token|apikey|api_key|private_key|"
     r"privatekey|credential|auth|authorization|bearer|cookie|session_key)(?:$|_)",
     re.IGNORECASE)
+# `_reason` was added after the policy filter silently deleted
+# `auth_status_reason` -- the sentence explaining WHY a node's auth could not
+# be confirmed -- because the name starts with the `auth` segment. A field
+# ending in `_reason` holds a human-readable explanation, never a credential,
+# and dropping it makes a status less useful precisely when it is worst.
 _METADATA_SUFFIX = re.compile(
-    r"_(?:ref|path|file|env_name|status|state|source|url|ok|at|id|count|version)$",
+    r"_(?:ref|path|file|env_name|status|state|source|url|ok|at|id|count|version|reason)$",
     re.IGNORECASE)
 
 

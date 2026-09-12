@@ -41,6 +41,50 @@ class SessionLocation:
     cached_at: float
 
 
+# Fields that carry pane text and therefore must be re-redacted here.
+_OUTPUT_FIELDS = ("output", "last_output")
+
+
+def _reredact(result: dict[str, Any]) -> dict[str, Any]:
+    """Redact a routed result again, on THIS controller, before it leaves.
+
+    A remote node redacts with the rules ITS build shipped with. On this
+    fleet four of five node agents run an older release -- audited 2026-09-12,
+    contract_version 0 against the controller's 1 -- so trusting a node's
+    sanitizer means the weakest build in the fleet decides what leaves the
+    controller. Re-running the current rules here costs one pass over text we
+    already hold and removes that dependency entirely.
+
+    Idempotent: redacting already-redacted text is a no-op, so a modern node
+    is not penalised and `<REDACTED>` never nests.
+    """
+    if not isinstance(result, dict):
+        return result
+    from .core import _public_report, _REDACTION_TELEMETRY
+    from .redaction import redact_output, redaction_marker
+
+    for field in _OUTPUT_FIELDS:
+        value = result.get(field)
+        if not isinstance(value, str) or not value:
+            continue
+        text, report = redact_output(value)
+        _REDACTION_TELEMETRY.observe(report)
+        if report.get("redactions") or report.get("credential_files"):
+            marker = redaction_marker(report)
+            # Only append a marker the node did not already add, so a hop
+            # through the controller does not stack two of them.
+            if marker and "[REDACTED]" not in text:
+                text = text + "\n" + marker
+            existing = result.get("redaction") or {}
+            merged = _public_report(report)
+            if isinstance(existing, dict) and existing.get("values_redacted"):
+                merged["values_redacted"] += int(existing.get("values_redacted") or 0)
+                merged["redacted_by_node"] = True
+            result["redaction"] = merged
+        result[field] = text
+    return result
+
+
 class ControllerService:
     def __init__(self, registry: NodeRegistry, *, local_node_id: str = LOCAL_NODE_ID,
                 local_client: NodeClient | None = None, local_display_name: str = "Local",
@@ -309,13 +353,16 @@ class ControllerService:
         return result
 
     def terminal_tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]:
-        return self._route(session, "tail", lambda client, name: client.tail(name, lines, ansi=ansi))
+        return _reredact(self._route(session, "tail",
+                                     lambda client, name: client.tail(name, lines, ansi=ansi)))
 
     def terminal_status(self, session: str) -> dict[str, Any]:
-        return self._route(session, "status", lambda client, name: client.status(name))
+        return _reredact(self._route(session, "status",
+                                     lambda client, name: client.status(name)))
 
     def terminal_capture(self, session: str, start_line: int | None = None) -> dict[str, Any]:
-        return self._route(session, "capture", lambda client, name: client.capture(name, start_line))
+        return _reredact(self._route(session, "capture",
+                                     lambda client, name: client.capture(name, start_line)))
 
     def terminal_send_text(self, session: str, text: str, press_enter: bool = False, dry_run: bool = False,
                            **kwargs: Any) -> dict[str, Any]:

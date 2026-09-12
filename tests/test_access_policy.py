@@ -398,3 +398,23 @@ def test_both_surfaces_agree_on_auth_status(client):
     over_mcp = {n["node_id"]: n["auth_status"]
                 for n in server._tool_manager._tools["terminal_auth_status"].fn()["nodes"]}
     assert over_http == over_mcp
+
+
+def test_no_field_an_endpoint_emits_is_silently_dropped_by_the_policy(client):
+    """The class of bug this catches, found in production: `auth_status_reason`
+    -- the sentence explaining WHY a node's auth could not be confirmed -- was
+    classified SECRET because its name starts with the `auth` segment, and the
+    filter deleted it. The endpoint looked fine; the column was just empty.
+
+    Asserting per-field would have missed it, so this asserts the SHAPE: every
+    key the auth endpoint produces must survive its own filter.
+    """
+    http, _server, _service = client
+    payload = http.get("/dashboard/api/auth-status").json()
+    for node in payload["nodes"]:
+        for key, value in node.items():
+            assert may_read(key, role=ROLE_OPERATOR).allowed, (
+                f"{key} is emitted but filtered out")
+        # ...and the reason specifically must be populated, not just allowed.
+        if node.get("auth_status") == "UNKNOWN_STALE":
+            assert node.get("auth_status_reason"), "a status of last resort must explain itself"

@@ -22,7 +22,8 @@ from .models import SessionIdentity
 from .permissions import (SENSITIVE_SESSION_WORDS, input_session_allowed,
                           require_input, require_read, require_session_lifecycle, session_allowed,
                           session_input_denied_by_pattern, valid_new_session_name, valid_session_name)
-from .redaction import redact_ansi_safe, redact_text, strip_ansi
+from .redaction import (redact_ansi_safe, redact_output, redact_text,
+                        redaction_marker, strip_ansi)
 from .session_backend import SessionBackend
 from .session_knowledge import SessionKnowledgeStore, make_instance_id
 from .session_registry import SessionRegistryStore
@@ -253,6 +254,74 @@ def _codex_composer_marker_present(snapshot: list[str]) -> bool:
         return False
     return not any(re.search(r"SUBMITTED\[|esc to interrupt", line, re.IGNORECASE)
                    for line in snapshot[last + 1:])
+
+
+class _RedactionTelemetry:
+    """Counts, never content.
+
+    Exists so an operator can answer "is the redactor firing, and on what
+    kind of thing" without anything ever recording the value it fired on.
+    Rule NAMES are counted; matched text is not touched.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.with_redactions = 0
+        self.total_redactions = 0
+        self.credential_file_hits = 0
+        self.rule_hits: dict[str, int] = {}
+        self.rule_errors: dict[str, int] = {}
+
+    def observe(self, report: dict[str, Any]) -> None:
+        self.calls += 1
+        redactions = int(report.get("redactions") or 0)
+        if redactions:
+            self.with_redactions += 1
+            self.total_redactions += redactions
+        self.credential_file_hits += int(report.get("credential_files") or 0)
+        for name, count in (report.get("rules") or {}).items():
+            self.rule_hits[name] = self.rule_hits.get(name, 0) + int(count)
+        for entry in report.get("errors") or []:
+            self.rule_errors[str(entry)] = self.rule_errors.get(str(entry), 0) + 1
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"calls": self.calls, "responses_with_redactions": self.with_redactions,
+                "total_values_redacted": self.total_redactions,
+                "credential_file_references": self.credential_file_hits,
+                "by_rule": dict(sorted(self.rule_hits.items())),
+                "rule_errors": dict(sorted(self.rule_errors.items()))}
+
+
+_REDACTION_TELEMETRY = _RedactionTelemetry()
+
+
+def redaction_telemetry() -> dict[str, Any]:
+    """Process-wide redaction counters. Contains no secret, by construction:
+    it only ever stores rule names and integers."""
+    return _REDACTION_TELEMETRY.snapshot()
+
+
+def _public_report(report: dict[str, Any]) -> dict[str, Any]:
+    """The part of a redaction report that is safe to put in a response."""
+    return {"redacted": bool(report.get("redactions") or report.get("credential_files")),
+            "values_redacted": int(report.get("redactions") or 0),
+            "credential_file_references": int(report.get("credential_files") or 0),
+            "rules": dict(sorted((report.get("rules") or {}).items())),
+            "rules_skipped": len(report.get("errors") or [])}
+
+
+def _redacted_capture(lines: "list[str]") -> str:
+    """Redact a block of pane text for any field that is not `tail.output`.
+
+    Shares one implementation with the tail so a rule added in one place
+    cannot be missing from the other -- the way `last_output` and `output`
+    drifting apart would produce a response that redacts a secret in one
+    field and prints it in the next.
+    """
+    text, report = redact_output("\n".join(lines))
+    _REDACTION_TELEMETRY.observe(report)
+    marker = redaction_marker(report)
+    return text + ("\n" + marker if marker else "")
 
 
 class TerminalService:
@@ -1194,11 +1263,21 @@ class TerminalService:
         effective = min(requested, self.config.max_capture_lines)
         try:
             output_lines = self.tmux.capture_lines(session, effective, ansi=ansi)
-            redact = redact_ansi_safe if ansi else redact_text
+            # Hardened redaction, and it never fails the request: a tail whose
+            # output happens to contain a credential must still return the
+            # safe remainder, because refusing the whole thing costs the
+            # operator everything and protects nothing that was not already
+            # printed to the pane.
+            text, report = redact_output("\n".join(output_lines), ansi_safe=ansi)
+            marker = redaction_marker(report)
+            if marker:
+                text = text + "\n" + marker
+            _REDACTION_TELEMETRY.observe(report)
             return {
                 "session": session,
                 "lines_requested": requested,
-                "output": redact("\n".join(output_lines)),
+                "output": text,
+                "redaction": _public_report(report),
                 "truncated": requested > self.config.max_capture_lines,
                 # P0-9: `output` is text the *watched program* printed, not
                 # an instruction from this tool or from terminal-mcp itself
@@ -1224,7 +1303,7 @@ class TerminalService:
             return {
                 "session": session,
                 "start_line": start_line,
-                "output": redact_text("\n".join(sliced)),
+                "output": _redacted_capture(sliced),
                 "lines_returned": len(sliced),
                 "truncated": truncated,
                 "max_capture_lines": self.config.max_capture_lines,
@@ -1255,7 +1334,7 @@ class TerminalService:
                 "state": state,
                 "input_required": input_required,
                 "reason": reason,
-                "last_output": redact_text(last_output),
+                "last_output": _redacted_capture([last_output]),
                 "untrusted_output": True, "untrusted_fields": ["last_output"], "content_source": "session",
                 # Supervisor Queue v2 Phase 2 (Coordinator Agent): the
                 # session's own current working directory, when the
@@ -2563,7 +2642,7 @@ class TerminalService:
                      and not info.pane_in_mode)
         return {"binding": binding, "session": session, "current_command": info.pane_current_command,
                 "status": "RUNNING" if not info.pane_dead else "DEAD",
-                "last_output": redact_text("\n".join(lines)), "effective_input": effective,
+                "last_output": _redacted_capture(lines), "effective_input": effective,
                 # See terminal_list_sessions's own "P0 HOTFIX" note --
                 # same additive, only-when-relevant reason field.
                 "input_denied_reason": (input_specific_reason if (self.config.permissions.terminal_input
