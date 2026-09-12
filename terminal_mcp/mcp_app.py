@@ -3,6 +3,7 @@ from __future__ import annotations
 from mcp.server.mcpserver import MCPServer
 
 from . import __version__
+from .access_policy import ROLE_OPERATOR, filter_record, policy_table
 from .agent_availability import available_agent_types
 from .config import load_config
 from .controller import ControllerService, build_default_controller
@@ -435,6 +436,84 @@ def build_mcp(service: TerminalService | None = None,
                                   session: str | None = None) -> dict:
         """List sanitized input audit metadata; full prompts are never returned."""
         return terminal.terminal_list_input_audit(limit, binding, session)
+
+    @server.tool()
+    def terminal_audit_search(limit: int = 100, offset: int = 0, actor: str = "",
+                              action: str = "", result: str = "", session: str = "",
+                              node_id: str = "", since: str = "", until: str = "",
+                              query: str = "", denied_only: bool = False) -> dict:
+        """Search the operational audit log: who did what, where, when, and
+        whether it was allowed.
+
+        The same rows, filters and redaction the dashboard's Audit & Access
+        screen uses -- deliberately one implementation, because a surface
+        that can see something the other cannot is how an operator ends up
+        told to "just use the UI" for data the API refuses.
+
+        Returns OPERATIONAL fields in full (actor, action, session, node,
+        result, deny reason, correlation id, latency, policy source) plus a
+        REDACTED preview and a sha256 fingerprint of any text. No token,
+        password, passphrase, private key or cookie has a read path here --
+        see access_policy.
+        """
+        found = terminal.audit.search(
+            limit=limit, offset=offset, actor=actor or None, action=action or None,
+            result=result or None, session=session or None, node_id=node_id or None,
+            since=since or None, until=until or None, query=query or None,
+            denied_only=bool(denied_only))
+        found["events"] = [filter_record(event, role=ROLE_OPERATOR)
+                           for event in found["events"]]
+        return found
+
+    @server.tool()
+    def terminal_auth_status() -> dict:
+        """Which node/provider is authenticated, and which needs a human.
+
+        Status only, which is not a compromise but the design: readiness is
+        probed by existence and exit code, never by opening a credential, so
+        there is nothing here that could be replayed. An operator gets who is
+        logged in, who is NOT, since when, and what capability each node has.
+        """
+        service = _fleet_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        view = service.offline_view()
+        routes: dict[str, list[dict]] = {}
+        for target in view.get("ssh_targets", []):
+            if target.get("node_id"):
+                routes.setdefault(target["node_id"], []).append({
+                    "alias": target.get("alias"), "transport": target.get("transport"),
+                    "auth_status": target.get("credential_status"),
+                    "host_key_fingerprint": target.get("host_key_fingerprint"),
+                    "last_verified_at": target.get("last_verified_at")})
+        nodes = [filter_record({
+            "node_id": node.get("node_id"), "display_name": node.get("display_name"),
+            "auth_status": ("AUTHENTICATED" if node.get("status") == "online"
+                            else "UNREACHABLE"),
+            "auth_source": "node_agent_bearer_token",
+            "auth_token_ref": node.get("auth_token_ref"),
+            "capability": sorted(node.get("capabilities") or []),
+            "contract_version": node.get("contract_version"),
+            "agent_version": node.get("agent_version"),
+            "last_verified_at": node.get("last_heartbeat_at"),
+            "ssh_routes": routes.get(node.get("node_id"), []),
+        }, role=ROLE_OPERATOR) for node in view.get("nodes", [])]
+        return {"nodes": nodes, "readiness": service.readiness()}
+
+    @server.tool()
+    def terminal_access_policy() -> dict:
+        """The read-policy table: which fields are SECRET, which are
+        SENSITIVE_METADATA, which are ordinary OPERATIONAL data.
+
+        Published so an operator can read the rules rather than infer them
+        from what happens to be missing -- the confusion that started this
+        whole audit, where a surface that did not exist was mistaken for a
+        permission denial.
+        """
+        return {"tiers": policy_table(),
+                "note": ("SECRET has no read path for any role. SENSITIVE_METADATA is "
+                         "served redacted and fingerprinted. OPERATIONAL is served in "
+                         "full to any authenticated operator.")}
 
     @server.tool()
     def terminal_input_context(session: str | None = None,

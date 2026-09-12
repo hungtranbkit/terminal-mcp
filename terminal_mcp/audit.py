@@ -30,6 +30,28 @@ def _add_loop_protection_columns(connection: sqlite3.Connection) -> None:
     connection.execute("ALTER TABLE input_audit ADD COLUMN depth INTEGER")
 
 
+def _add_operator_debugging_columns(connection: sqlite3.Connection) -> None:
+    """The fields an operator actually needs to debug an incident.
+
+    `actor` matters most and was the real defect: the dashboard had been
+    smuggling the acting identity into `reason` (`reason=error or granted_by`),
+    so a row could carry EITHER who did it OR why it was denied, never both --
+    and a denied action lost the actor entirely, which is exactly the row you
+    most want to attribute.
+    """
+    connection.execute("ALTER TABLE input_audit ADD COLUMN actor TEXT")
+    connection.execute("ALTER TABLE input_audit ADD COLUMN node_id TEXT")
+    connection.execute("ALTER TABLE input_audit ADD COLUMN latency_ms REAL")
+    # Which rule decided, and which generation of it -- so "denied" can be
+    # traced to a grant, an input policy or a default rather than guessed at.
+    connection.execute("ALTER TABLE input_audit ADD COLUMN policy_source TEXT")
+    connection.execute("ALTER TABLE input_audit ADD COLUMN policy_version TEXT")
+    for column in ("timestamp", "actor", "action", "session", "result"):
+        connection.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_input_audit_{column} "
+            f"ON input_audit({column})")
+
+
 AUDIT_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: input_audit + idempotent_sends as of the P1 hardening pass", lambda connection: None),
     # P0 Part A.5: every send attempt (not just idempotency-keyed ones) now
@@ -46,6 +68,13 @@ AUDIT_MIGRATIONS: list[Migration] = [
     # docs/prompt-submission.md.
     Migration(3, "add input_audit.origin/trace_id/parent_turn_id/depth for P11 loop-protection metadata",
                _add_loop_protection_columns),
+    # Permission/audit policy audit, 2026-09-12: operators could not debug
+    # from this log because it recorded no actor, no node, no latency and no
+    # policy provenance -- and had no filters to find anything with. Additive
+    # and NULL for every existing row.
+    Migration(4, "add input_audit.actor/node_id/latency_ms/policy_source/policy_version "
+                 "+ query indexes for operator debugging",
+               _add_operator_debugging_columns),
 ]
 
 
@@ -148,21 +177,33 @@ class AuditStore:
                reason: str | None = None, source_transport: str = "mcp",
                correlation_id: str | None = None, origin: str | None = None,
                trace_id: str | None = None, parent_turn_id: str | None = None,
-               depth: int | None = None) -> None:
+               depth: int | None = None, actor: str | None = None,
+               node_id: str | None = None, latency_ms: float | None = None,
+               policy_source: str | None = None,
+               policy_version: str | None = None) -> None:
+        """`actor` and `reason` are SEPARATE fields and must stay that way.
+
+        They shared one column until 2026-09-12, which meant a denied action
+        recorded why it was denied and forgot who attempted it -- the single
+        most useful pairing in the whole log, and the one case where losing
+        half of it matters most.
+        """
         with self._connection() as connection:
             connection.execute(
                 """INSERT INTO input_audit
                 (timestamp, action, binding, session, text_sha256, text_preview,
                  text_length, keys, press_enter, result, reason, source_transport, server_version,
-                 correlation_id, origin, trace_id, parent_turn_id, depth)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 correlation_id, origin, trace_id, parent_turn_id, depth,
+                 actor, node_id, latency_ms, policy_source, policy_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (datetime.now(timezone.utc).isoformat(), action, binding, session,
                  text_fingerprint(text) if text is not None else None,
                  sanitized_preview(text) if text is not None else None,
                  len(text) if text is not None else None,
                  json.dumps(keys) if keys is not None else None, int(press_enter),
                  result, reason, source_transport, __version__, correlation_id,
-                 origin, trace_id, parent_turn_id, depth),
+                 origin, trace_id, parent_turn_id, depth,
+                 actor, node_id, latency_ms, policy_source, policy_version),
             )
 
     def prune(self, retention: int) -> int:
@@ -251,23 +292,94 @@ class AuditStore:
 
     def list(self, limit: int = 50, binding: str | None = None,
              session: str | None = None) -> list[dict[str, Any]]:
-        limit = max(1, min(limit, 500))
-        clauses, params = [], []
-        if binding is not None:
-            clauses.append("binding = ?")
-            params.append(binding)
-        if session is not None:
-            clauses.append("session = ?")
-            params.append(session)
+        """The original, unchanged signature -- every existing caller keeps
+        working. `search()` below is the one operators should use."""
+        return self.search(limit=limit, binding=binding, session=session)["events"]
+
+    def search(self, *, limit: int = 50, offset: int = 0, binding: str | None = None,
+               session: str | None = None, actor: str | None = None,
+               action: str | None = None, result: str | None = None,
+               node_id: str | None = None, since: str | None = None,
+               until: str | None = None, query: str | None = None,
+               denied_only: bool = False) -> dict[str, Any]:
+        """Find the rows that explain an incident.
+
+        Without this the log was a 50-row reverse-chronological list with no
+        way to narrow it -- which is not a privacy control, just an
+        unusable one. Every filter here is on OPERATIONAL fields (see
+        access_policy): who, what, where, when, allowed or denied.
+
+        `query` is a substring match over the OPERATIONAL text fields plus
+        the already-redacted preview. It deliberately does not search
+        text_sha256: letting a caller confirm a guessed plaintext by its
+        hash would turn a fingerprint back into an oracle.
+        """
+        limit = max(1, min(int(limit), 1000))
+        offset = max(0, int(offset))
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        def eq(column: str, value: Any) -> None:
+            if value is not None and value != "":
+                clauses.append(f"{column} = ?")
+                params.append(value)
+
+        eq("binding", binding)
+        eq("session", session)
+        eq("actor", actor)
+        eq("action", action)
+        eq("result", result)
+        eq("node_id", node_id)
+        if since:
+            clauses.append("timestamp >= ?")
+            params.append(since)
+        if until:
+            clauses.append("timestamp <= ?")
+            params.append(until)
+        if denied_only:
+            # What an operator asks first: "what got refused, and why".
+            clauses.append("(result LIKE 'DENIED%' OR result LIKE 'BLOCKED%' "
+                           "OR result LIKE '%FAILED%' OR reason IS NOT NULL)")
+        if query:
+            like = f"%{query}%"
+            clauses.append("(COALESCE(action,'') LIKE ? OR COALESCE(session,'') LIKE ? "
+                           "OR COALESCE(actor,'') LIKE ? OR COALESCE(reason,'') LIKE ? "
+                           "OR COALESCE(node_id,'') LIKE ? OR COALESCE(text_preview,'') LIKE ? "
+                           "OR COALESCE(correlation_id,'') LIKE ?)")
+            params.extend([like] * 7)
+
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        query = "SELECT * FROM input_audit" + where + " ORDER BY id DESC LIMIT ?"
         with self._connection() as connection:
-            rows = connection.execute(query, (*params, limit)).fetchall()
-        results = []
+            total = connection.execute(
+                "SELECT COUNT(*) FROM input_audit" + where, params).fetchone()[0]
+            rows = connection.execute(
+                "SELECT * FROM input_audit" + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset)).fetchall()
+        events = []
         for row in rows:
             item = dict(row)
             item["preview"] = item.pop("text_preview")
             item["keys"] = json.loads(item["keys"]) if item["keys"] else None
             item["press_enter"] = bool(item["press_enter"])
-            results.append(item)
-        return results
+            events.append(item)
+        return {"events": events, "total": int(total), "limit": limit, "offset": offset,
+                "returned": len(events),
+                "has_more": offset + len(events) < int(total)}
+
+    def distinct_values(self, column: str, *, limit: int = 200) -> list[str]:
+        """Values to populate a filter dropdown with.
+
+        Column is checked against a fixed allowlist rather than interpolated:
+        this string reaches SQL, and the one place a filter helper turns into
+        an injection is here.
+        """
+        allowed = {"actor", "action", "result", "session", "node_id",
+                   "source_transport", "policy_source"}
+        if column not in allowed:
+            return []
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT DISTINCT {column} FROM input_audit "
+                f"WHERE {column} IS NOT NULL AND {column} != '' "
+                f"ORDER BY {column} LIMIT ?", (max(1, min(int(limit), 500)),)).fetchall()
+        return [row[0] for row in rows]

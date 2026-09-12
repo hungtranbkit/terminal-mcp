@@ -1533,6 +1533,15 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/ai-usage": {"GET", "HEAD"},
         "/dashboard/api/tasks/reassign": {"POST"},
         "/dashboard/requirements": {"GET", "HEAD"},
+        # Permission/audit policy pass (2026-09-12). All READS: the audit
+        # log, who is authenticated, and the policy table itself. They exist
+        # because an operator previously had NO surface for any of them,
+        # which looks exactly like a deny-all rule from the outside.
+        "/dashboard/audit": {"GET", "HEAD"},
+        "/dashboard/api/audit": {"GET", "HEAD"},
+        "/dashboard/api/audit/export": {"GET", "HEAD"},
+        "/dashboard/api/auth-status": {"GET", "HEAD"},
+        "/dashboard/api/access-policy": {"GET", "HEAD"},
         # Fleet Metadata Registry -- a later, separate feature. Three reads
         # and exactly one write, and the write only touches METADATA: there is
         # no path from any of these to starting, stopping or typing into a

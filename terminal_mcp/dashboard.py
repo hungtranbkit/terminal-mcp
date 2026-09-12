@@ -20,6 +20,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 from . import lan_discovery, network_bind, remote_connect, tunnel_diagnostics
 from .cf_access import verify_access_assertion
 from .agent_availability import available_agent_types
+from .access_policy import filter_record, policy_table, role_for_identity
 from .connection_store import ConnectionStore, generate_node_token
 from .fleet_service import ControllerFleetSync, FleetService
 from .controller import ControllerService, build_default_controller
@@ -1356,6 +1357,7 @@ DASHBOARD_HTML = """<!doctype html>
           <button type="button" id="openTaskInboxBtn" role="menuitem">📥 Task Inbox</button>
           <a href="/dashboard/terminal-wall" id="terminalWallLink" role="menuitem">🧱 Terminal Wall</a>
           <a href="/dashboard/fleet" id="fleetRegistryLink" role="menuitem">🗺 Fleet Registry</a>
+          <a href="/dashboard/audit" id="auditLink" role="menuitem">🧾 Audit &amp; Access</a>
           <a href="/dashboard/ai-usage" id="aiUsageLink" role="menuitem">📊 AI Usage</a>
         </div>
       </div>
@@ -7400,6 +7402,289 @@ FLEET_HTML = r"""<!doctype html>
 """
 
 
+# ---------------------------------------------------------------------------
+# Audit & Access: the screen the 2026-09-12 permission audit found missing.
+#
+# Operators reported being "blocked" from the audit log. They were not being
+# denied -- there was no way to ask. A missing surface and a deny-all guard
+# look identical from outside, and both get resolved by someone turning off
+# a control that mattered.
+#
+# Raw string: this template writes JS escapes such as `.join('\n')` directly.
+# ---------------------------------------------------------------------------
+AUDIT_HTML = r"""<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Audit &amp; Access</title>
+  <style>
+    :root {
+      --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd;
+      --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#3b78ff;
+      --mono:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    * { box-sizing:border-box }
+    body { margin:0; font:14px/1.55 var(--mono); background:var(--bg); color:var(--text) }
+    a { color:var(--accent) }
+    header { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+             padding:12px max(14px, env(safe-area-inset-right)) 12px max(14px, env(safe-area-inset-left));
+             border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5 }
+    h1 { margin:0; font-size:16px; white-space:nowrap }
+    h2 { font-size:13.5px; margin:20px 0 9px; padding-bottom:6px; border-bottom:1px solid var(--line) }
+    .spacer { flex:1 }
+    .btn { background:var(--panel); border:1px solid var(--line); color:var(--text);
+           border-radius:9px; padding:7px 11px; font:13px var(--mono); cursor:pointer;
+           min-height:40px; display:inline-flex; align-items:center; gap:6px; text-decoration:none }
+    .btn:hover { border-color:#3a4a70 }
+    .btn.on { border-color:var(--accent); color:var(--accent) }
+    .bar { display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+           padding:10px max(14px, env(safe-area-inset-right)) 4px max(14px, env(safe-area-inset-left)) }
+    .bar select, .bar input { background:var(--panel); border:1px solid var(--line);
+                              color:var(--text); border-radius:8px; padding:8px 10px;
+                              font:16px var(--mono); min-height:40px }
+    main { padding:8px max(14px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom))
+                  max(14px, env(safe-area-inset-left)) }
+    .muted { color:var(--muted); font-size:12px }
+    .wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px; background:var(--panel) }
+    table { border-collapse:collapse; width:100%; min-width:900px }
+    th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line);
+             font-size:11.5px; vertical-align:top }
+    th { color:var(--muted); font-weight:700; font-size:10.5px; text-transform:uppercase;
+         letter-spacing:.04em; white-space:nowrap }
+    tr:last-child td { border-bottom:0 }
+    td.nowrap { white-space:nowrap }
+    .pill { font-size:10px; font-weight:700; padding:2px 7px; border-radius:999px;
+            border:1px solid var(--line); white-space:nowrap }
+    .pill.ok { color:var(--green); border-color:var(--green) }
+    .pill.deny { color:var(--red); border-color:var(--red) }
+    .pill.warn { color:var(--amber); border-color:var(--amber) }
+    .prev { color:var(--muted); max-width:380px; overflow:hidden; text-overflow:ellipsis;
+            display:block; white-space:nowrap }
+    .tier { display:grid; gap:6px; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)) }
+    .tierbox { border:1px solid var(--line); border-radius:11px; padding:9px 11px; background:var(--panel) }
+    .note { font-size:11.5px; color:var(--muted); margin:16px 0 0; line-height:1.65 }
+    @media (max-width:720px) {
+      header { padding:8px 12px } h1 { font-size:15px }
+      .bar { display:grid; grid-template-columns:1fr 1fr; gap:6px; padding:8px 12px 2px }
+      .bar select, .bar input { width:100%; min-width:0 }
+      #q { grid-column:1 / -1 }
+      main { padding:8px 12px 22px }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🧾 Audit &amp; Access</h1>
+    <span class="muted" id="status">đang tải…</span>
+    <span class="spacer"></span>
+    <button class="btn" id="deniedBtn" type="button" aria-pressed="false">Chỉ bị từ chối</button>
+    <a class="btn" id="exportBtn" href="/dashboard/api/audit/export">⇩ CSV</a>
+    <button class="btn" id="refreshBtn" type="button">Làm mới</button>
+    <a class="btn" href="/dashboard/fleet">🗺 Fleet</a>
+    <a class="btn" href="/dashboard">← Dashboard</a>
+  </header>
+  <div class="bar">
+    <select id="fActor" aria-label="Actor"><option value="">Tất cả actor</option></select>
+    <select id="fAction" aria-label="Action"><option value="">Tất cả action</option></select>
+    <select id="fResult" aria-label="Result"><option value="">Tất cả kết quả</option></select>
+    <select id="fNode" aria-label="Node"><option value="">Tất cả node</option></select>
+    <input type="search" id="q" placeholder="Tìm session / reason / correlation id…" aria-label="Tìm">
+  </div>
+  <main>
+    <h2>Audit log</h2>
+    <div class="wrap"><table id="log"><thead><tr>
+      <th>Thời điểm</th><th>Actor</th><th>Action</th><th>Session</th><th>Node</th>
+      <th>Kết quả</th><th>Lý do</th><th>Policy</th><th>Latency</th>
+      <th>Correlation</th><th>Fingerprint</th><th>Preview (đã redact)</th>
+    </tr></thead><tbody></tbody></table></div>
+    <div class="muted" id="paging" style="margin-top:8px"></div>
+
+    <h2>Auth &amp; capability</h2>
+    <div class="wrap"><table id="auth"><thead><tr>
+      <th>Node</th><th>Auth</th><th>Nguồn</th><th>Capability</th><th>Contract</th>
+      <th>Last verified</th><th>SSH routes</th>
+    </tr></thead><tbody></tbody></table></div>
+
+    <h2>Policy</h2>
+    <div class="tier" id="tiers"></div>
+    <p class="note" id="note"></p>
+  </main>
+  <script>
+    const $ = (s) => document.querySelector(s);
+    const state = {denied: false, offset: 0, limit: 100};
+
+    function el(tag, opts) {
+      const node = document.createElement(tag);
+      if (opts && opts.className) node.className = opts.className;
+      if (opts && opts.text != null) node.textContent = opts.text;
+      return node;
+    }
+
+    function cell(row, value, className) {
+      const td = el('td', {text: value == null || value === '' ? '—' : String(value)});
+      if (className) td.className = className;
+      row.appendChild(td);
+      return td;
+    }
+
+    function resultPill(result) {
+      const bad = /DENIED|BLOCKED|FAILED|ERROR/i.test(result || '');
+      const warn = /REVOKED|SKIPPED/i.test(result || '');
+      return el('span', {className: 'pill ' + (bad ? 'deny' : warn ? 'warn' : 'ok'),
+                         text: result || '—'});
+    }
+
+    function params() {
+      const search = new URLSearchParams();
+      for (const [key, sel] of [['actor', '#fActor'], ['action', '#fAction'],
+                                ['result', '#fResult'], ['node', '#fNode']]) {
+        const value = $(sel).value;
+        if (value) search.set(key, value);
+      }
+      if ($('#q').value.trim()) search.set('q', $('#q').value.trim());
+      if (state.denied) search.set('denied', '1');
+      search.set('limit', String(state.limit));
+      search.set('offset', String(state.offset));
+      return search;
+    }
+
+    function fillFilters(filters) {
+      for (const [key, sel] of [['actor', '#fActor'], ['action', '#fAction'],
+                                ['result', '#fResult'], ['node_id', '#fNode']]) {
+        const node = $(sel), keep = node.value;
+        const values = filters[key] || [];
+        const first = node.firstElementChild;
+        node.replaceChildren(first);
+        for (const value of values) {
+          const option = document.createElement('option');
+          option.value = value; option.textContent = value;
+          node.appendChild(option);
+        }
+        node.value = values.includes(keep) ? keep : '';
+      }
+    }
+
+    function fillLog(data) {
+      const body = $('#log').tBodies[0];
+      body.replaceChildren();
+      for (const event of data.events || []) {
+        const row = el('tr');
+        cell(row, event.timestamp, 'nowrap');
+        cell(row, event.actor, 'nowrap');
+        cell(row, event.action, 'nowrap');
+        cell(row, event.session, 'nowrap');
+        cell(row, event.node_id, 'nowrap');
+        const resultCell = el('td', {className: 'nowrap'});
+        resultCell.appendChild(resultPill(event.result));
+        row.appendChild(resultCell);
+        // The reason a thing was denied is the single most useful field in
+        // this table, so it is never truncated away.
+        cell(row, event.reason);
+        cell(row, [event.policy_source, event.policy_version].filter(Boolean).join(' ') || null,
+             'nowrap');
+        cell(row, event.latency_ms != null ? Math.round(event.latency_ms) + 'ms' : null, 'nowrap');
+        cell(row, event.correlation_id, 'nowrap');
+        // A fingerprint, shown short: it correlates two rows without being
+        // a way to recover what was sent.
+        cell(row, event.text_sha256 ? event.text_sha256.slice(0, 12) : null, 'nowrap');
+        const preview = el('td');
+        preview.appendChild(el('span', {className: 'prev', text: event.preview || '—'}));
+        if (event.preview) preview.title = event.preview;
+        row.appendChild(preview);
+        body.appendChild(row);
+      }
+      $('#paging').textContent = (data.total || 0) + ' sự kiện · đang xem '
+        + (data.offset + 1) + '–' + (data.offset + (data.returned || 0))
+        + (data.has_more ? ' · còn nữa' : '');
+    }
+
+    function fillAuth(payload) {
+      const body = $('#auth').tBodies[0];
+      body.replaceChildren();
+      for (const node of payload.nodes || []) {
+        const row = el('tr');
+        cell(row, node.display_name || node.node_id, 'nowrap');
+        const authCell = el('td', {className: 'nowrap'});
+        authCell.appendChild(el('span', {
+          className: 'pill ' + (node.auth_status === 'AUTHENTICATED' ? 'ok' : 'warn'),
+          text: node.auth_status}));
+        row.appendChild(authCell);
+        // The NAME of the variable holding the token, never its value.
+        cell(row, node.auth_source);
+        cell(row, (node.capability || []).join(', '));
+        cell(row, node.contract_version, 'nowrap');
+        cell(row, node.last_verified_at, 'nowrap');
+        cell(row, (node.ssh_routes || []).map(
+          (r) => r.alias + ' (' + r.transport + ', ' + (r.auth_status || '?') + ')').join('; '));
+        body.appendChild(row);
+      }
+    }
+
+    function fillTiers(tiers) {
+      const box = $('#tiers');
+      box.replaceChildren();
+      const groups = {};
+      for (const row of tiers || []) (groups[row.tier] = groups[row.tier] || []).push(row);
+      for (const tier of ['SECRET', 'SENSITIVE_METADATA', 'OPERATIONAL']) {
+        const rows = groups[tier] || [];
+        if (!rows.length) continue;
+        const card = el('div', {className: 'tierbox'});
+        card.appendChild(el('div', {
+          className: 'pill ' + (tier === 'SECRET' ? 'deny' : tier === 'OPERATIONAL' ? 'ok' : 'warn'),
+          text: tier}));
+        card.appendChild(el('div', {className: 'muted',
+          text: rows.map((r) => r.field).join(', ')}));
+        box.appendChild(card);
+      }
+    }
+
+    async function load() {
+      try {
+        const search = params();
+        $('#exportBtn').href = '/dashboard/api/audit/export?' + search.toString();
+        const [log, auth] = await Promise.all([
+          fetch('/dashboard/api/audit?' + search.toString(), {cache: 'no-store'}).then((r) => r.json()),
+          fetch('/dashboard/api/auth-status', {cache: 'no-store'}).then((r) => r.json()),
+        ]);
+        if (log.error) throw new Error(log.error);
+        fillFilters(log.filters || {});
+        fillLog(log);
+        fillAuth(auth);
+        fillTiers(auth.policy || []);
+        $('#status').textContent = 'role ' + (log.role || '?');
+        $('#note').textContent =
+          'Mọi field hiển thị ở đây đều đi qua bảng policy: SECRET (token, password, '
+          + 'passphrase, private key, cookie, bearer) không có đường đọc nào cho bất kỳ role '
+          + 'nào — bị loại bỏ hẳn chứ không phải che bằng dấu sao. SENSITIVE (preview, pane '
+          + 'text) đã redact và kèm sha256 để đối chiếu mà không khôi phục được nội dung gốc. '
+          + 'OPERATIONAL (ai, khi nào, làm gì, cho phép hay từ chối, vì sao, mất bao lâu, '
+          + 'policy nào quyết định) trả đầy đủ cho người vận hành đã xác thực.';
+      } catch (err) {
+        $('#status').textContent = 'lỗi tải: ' + err.message;
+      }
+    }
+
+    $('#refreshBtn').onclick = () => { state.offset = 0; load(); };
+    $('#deniedBtn').onclick = () => {
+      state.denied = !state.denied;
+      state.offset = 0;
+      $('#deniedBtn').classList.toggle('on', state.denied);
+      $('#deniedBtn').setAttribute('aria-pressed', String(state.denied));
+      load();
+    };
+    for (const sel of ['#fActor', '#fAction', '#fResult', '#fNode'])
+      $(sel).onchange = () => { state.offset = 0; load(); };
+    let timer = null;
+    $('#q').oninput = () => { clearTimeout(timer); timer = setTimeout(() => {
+      state.offset = 0; load(); }, 250); };
+    load();
+  </script>
+</body>
+</html>
+"""
+
+
 AI_USAGE_HTML = """<!doctype html>
 <html lang="vi">
 <head>
@@ -9292,6 +9577,14 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                                 headers={"Cache-Control": "no-store"}), None
         return _cloudflare_access_guard(request)
 
+    def _node_of(qualified: str | None) -> str | None:
+        """The node half of a `node/session` qualified name, for the audit's
+        own node_id column -- so "what happened on hp-linux" is a filter
+        rather than a string search."""
+        if not qualified or "/" not in str(qualified):
+            return None
+        return str(qualified).split("/", 1)[0] or None
+
     def _read_guard(request: Request):
         """P0 audit re-pass finding: GET/read routes (the dashboard page
         itself and every /dashboard/api/* GET) previously had NO app-level
@@ -9415,6 +9708,188 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return blocked
         return HTMLResponse(FLEET_HTML,
                             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
+
+    def _role(identity) -> str:
+        """Which role this request reads as.
+
+        Access-not-configured is OPERATOR, not anonymous: the deployment has
+        then chosen edge protection, and treating it as anonymous would lock
+        every self-hosted operator out of their own audit log -- the exact
+        over-restriction this pass was called to fix. A configured-but-
+        unverified request never reaches here; the guard already refused it.
+        """
+        configured = bool(terminal.config.dashboard.cloudflare_access_team_domain
+                          and terminal.config.dashboard.cloudflare_access_audience)
+        return role_for_identity(identity, access_configured=configured)
+
+    @server.custom_route("/dashboard/audit", methods=["GET"], include_in_schema=False)
+    async def dashboard_audit_page(request: Request) -> HTMLResponse | JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(AUDIT_HTML, headers={"Cache-Control": "no-store",
+                                                 "X-Frame-Options": "DENY"})
+
+    @server.custom_route("/dashboard/api/audit", methods=["GET"], include_in_schema=False)
+    async def dashboard_audit(request: Request) -> JSONResponse:
+        """The operational audit log, filterable.
+
+        This route is the substance of the 2026-09-12 permission audit: the
+        log had no HTTP surface at all, which is indistinguishable from a
+        deny-all rule from the outside and gets "fixed" by someone turning
+        off something that mattered.
+
+        Every field returned passes access_policy.may_read for the caller's
+        role, so SECRET fields cannot appear even if a future column is added
+        without anyone remembering to classify it -- an unknown
+        credential-shaped name defaults to SECRET.
+        """
+        blocked, identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        role = _role(identity)
+        params = request.query_params
+
+        def _int(name: str, default: int) -> int:
+            try:
+                return int(params.get(name, default))
+            except (TypeError, ValueError):
+                return default
+
+        def _build() -> dict[str, Any]:
+            found = terminal.audit.search(
+                limit=_int("limit", 100), offset=_int("offset", 0),
+                session=params.get("session"), actor=params.get("actor"),
+                action=params.get("action"), result=params.get("result"),
+                node_id=params.get("node"), binding=params.get("binding"),
+                since=params.get("since"), until=params.get("until"),
+                query=params.get("q"), denied_only=params.get("denied") == "1")
+            found["events"] = [filter_record(event, role=role) for event in found["events"]]
+            found["role"] = role
+            found["filters"] = {name: terminal.audit.distinct_values(name)
+                                for name in ("actor", "action", "result", "node_id")}
+            return found
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001 -- an audit screen never 5xxs
+            payload = {"error": "AUDIT_READ_FAILED", "detail": str(exc), "events": []}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/audit/export", methods=["GET"], include_in_schema=False)
+    async def dashboard_audit_export(request: Request) -> Response:
+        """The same rows as CSV, through the same filter and the same policy.
+
+        Sharing `search` + `filter_record` with the JSON route is the point:
+        an export that built its own row shape is how a redaction rule gets
+        applied in one place and forgotten in the other.
+        """
+        blocked, identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        role = _role(identity)
+        params = request.query_params
+
+        def _build() -> str:
+            import csv
+            import io
+
+            found = terminal.audit.search(
+                limit=min(int(params.get("limit", 1000) or 1000), 1000),
+                session=params.get("session"), actor=params.get("actor"),
+                action=params.get("action"), result=params.get("result"),
+                node_id=params.get("node"), since=params.get("since"),
+                until=params.get("until"), query=params.get("q"),
+                denied_only=params.get("denied") == "1")
+            rows = [filter_record(event, role=role) for event in found["events"]]
+            columns = ["timestamp", "actor", "action", "session", "node_id", "result",
+                       "reason", "policy_source", "policy_version", "latency_ms",
+                       "correlation_id", "source_transport", "server_version",
+                       "text_sha256", "text_length", "preview"]
+            buffer = io.StringIO()
+            writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key) for key in columns})
+            return buffer.getvalue()
+
+        body = await anyio.to_thread.run_sync(_build)
+        return Response(body, media_type="text/csv",
+                        headers={"Cache-Control": "no-store",
+                                 "Content-Disposition": 'attachment; filename="audit.csv"'})
+
+    @server.custom_route("/dashboard/api/auth-status", methods=["GET"], include_in_schema=False)
+    async def dashboard_auth_status(request: Request) -> JSONResponse:
+        """Which node/provider is authenticated, and which needs a human.
+
+        Status ONLY, and that is not a compromise -- it is the whole design:
+        node_profile probes existence and readiness without opening a
+        credential file, so there is nothing here that could be replayed even
+        if this route were left open. What an operator gets is exactly what
+        they need: who is logged in, who is NOT, since when, and the one-time
+        command to fix it.
+        """
+        blocked, identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        role = _role(identity)
+
+        def _build() -> dict[str, Any]:
+            nodes: list[dict[str, Any]] = []
+            view = fleet.offline_view()
+            ssh_by_node: dict[str, list[dict[str, Any]]] = {}
+            for target in view.get("ssh_targets", []):
+                if target.get("node_id"):
+                    ssh_by_node.setdefault(target["node_id"], []).append(target)
+            for node in view.get("nodes", []):
+                node_id = node.get("node_id")
+                routes = ssh_by_node.get(node_id, [])
+                nodes.append(filter_record({
+                    "node_id": node_id,
+                    "display_name": node.get("display_name"),
+                    "auth_status": ("AUTHENTICATED" if node.get("status") == "online"
+                                    else "UNREACHABLE"),
+                    "auth_source": "node_agent_bearer_token",
+                    # The NAME of the variable the owning machine reads its
+                    # token from. Never the value -- see fleet_registry's
+                    # scrub_payload, which refuses rather than strips.
+                    "auth_token_ref": node.get("auth_token_ref"),
+                    "capability": sorted(node.get("capabilities") or []),
+                    "contract_version": node.get("contract_version"),
+                    "agent_version": node.get("agent_version"),
+                    "last_verified_at": node.get("last_heartbeat_at"),
+                    "metadata_age_seconds": node.get("metadata_age_seconds"),
+                    "ssh_routes": [{
+                        "alias": route.get("alias"),
+                        "transport": route.get("transport"),
+                        "auth_status": route.get("credential_status"),
+                        "host_key_fingerprint": route.get("host_key_fingerprint"),
+                        "last_verified_at": route.get("last_verified_at"),
+                    } for route in routes],
+                }, role=role))
+            return {"role": role, "nodes": nodes,
+                    "readiness": fleet.readiness(),
+                    "policy": policy_table()}
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001
+            payload = {"error": "AUTH_STATUS_FAILED", "detail": str(exc), "nodes": []}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/access-policy", methods=["GET"], include_in_schema=False)
+    async def dashboard_access_policy(request: Request) -> JSONResponse:
+        """The policy table itself.
+
+        Served so an operator can read the rules rather than infer them from
+        what happens to be missing -- which is how a missing surface gets
+        mistaken for a security decision.
+        """
+        blocked, identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return JSONResponse({"role": _role(identity), "tiers": policy_table()},
+                            headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/fleet", methods=["GET"], include_in_schema=False)
     async def dashboard_fleet(request: Request) -> JSONResponse:
@@ -10330,7 +10805,11 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         terminal.audit.record(
             action="grant_read", session=name, result="GRANTED" if (enabled and "error" not in result)
             else ("REVOKED" if "error" not in result else "BLOCKED"),
-            reason=result.get("error") or granted_by, source_transport="dashboard",
+            # actor and reason are SEPARATE columns. They shared one until
+            # 2026-09-12, so a BLOCKED grant recorded why it failed and
+            # forgot who attempted it -- the one row where you most need both.
+            actor=granted_by, reason=result.get("error"), source_transport="dashboard",
+            node_id=_node_of(qualified), policy_source="session_grant",
         )
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
@@ -10364,7 +10843,11 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         terminal.audit.record(
             action="grant_input", session=name, result="GRANTED" if (enabled and "error" not in result)
             else ("REVOKED" if "error" not in result else "BLOCKED"),
-            reason=result.get("error") or granted_by, source_transport="dashboard",
+            # actor and reason are SEPARATE columns. They shared one until
+            # 2026-09-12, so a BLOCKED grant recorded why it failed and
+            # forgot who attempted it -- the one row where you most need both.
+            actor=granted_by, reason=result.get("error"), source_transport="dashboard",
+            node_id=_node_of(qualified), policy_source="session_grant",
         )
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})

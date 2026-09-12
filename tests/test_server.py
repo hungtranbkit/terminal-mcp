@@ -68,6 +68,13 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_deployment_upsert_path",
         "terminal_deployment_choose_node",
         "terminal_deployment_dry_run_failover",
+        # Permission/audit policy pass: the audit log, auth status and the
+        # policy table, all readable over MCP with exactly the same rows and
+        # redaction the dashboard shows -- one implementation, so neither
+        # surface can see something the other refuses.
+        "terminal_audit_search",
+        "terminal_auth_status",
+        "terminal_access_policy",
         # Session permission management: ChatGPT could rename a session but
         # had no way to grant or revoke access to one -- that took an SSH
         # session and a config edit.
