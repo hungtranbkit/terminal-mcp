@@ -192,6 +192,9 @@ class AiUsageIndex:
          CREATE INDEX IF NOT EXISTS usage_project ON usage_events (project);
          CREATE INDEX IF NOT EXISTS usage_model ON usage_events (agent, model);
          ALTER TABLE file_cursors ADD COLUMN carry_prompt_id TEXT;
+         """),
+        (3, "quota: normalised window, the remaining half, and the account tier",
+         """
          ALTER TABLE quota_windows ADD COLUMN window TEXT;
          ALTER TABLE quota_snapshots ADD COLUMN window TEXT;
          ALTER TABLE quota_snapshots ADD COLUMN remaining_percent REAL;

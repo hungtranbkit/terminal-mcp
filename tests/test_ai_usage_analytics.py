@@ -57,7 +57,7 @@ def index(tmp_path):
 def test_a_fresh_database_is_created_at_the_current_version(tmp_path):
     AiUsageIndex(tmp_path / "fresh.db")
     connection = sqlite3.connect(tmp_path / "fresh.db")
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
     columns = [row[1] for row in connection.execute("PRAGMA table_info(usage_events)")]
     for column in ("prompt_id", "collector_version", "parsing_confidence"):
         assert column in columns
@@ -88,7 +88,7 @@ def test_a_v1_database_is_upgraded_without_losing_events(tmp_path):
     AiUsageIndex(path)          # idempotent: running it twice is normal at startup
 
     connection = sqlite3.connect(path)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
     assert connection.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0] == 1
     columns = [row[1] for row in connection.execute("PRAGMA table_info(usage_events)")]
     assert "prompt_id" in columns
@@ -545,3 +545,40 @@ def test_a_broken_auth_probe_degrades_to_none(monkeypatch):
     monkeypatch.setattr(subprocess, "run",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("no claude")))
     assert _account_tier() is None
+
+
+def test_a_database_already_at_the_previous_version_still_gains_new_columns(tmp_path):
+    """The mistake this catches, found by deploying rather than by testing.
+
+    New ALTERs were added INSIDE migration 2, which the production database
+    had already run -- so they never executed there and the very next write
+    failed with "table quota_windows has no column named window". A fresh
+    database hid it (CREATE TABLE carries the columns) and the v1 test hid it
+    too (it starts below 2). Only a database sitting exactly at the previous
+    version exposes it.
+    """
+    path = tmp_path / "v2.db"
+    AiUsageIndex(path)                               # current, whatever that is
+    connection = sqlite3.connect(path)
+    current = connection.execute("PRAGMA user_version").fetchone()[0]
+    assert current >= 3
+    # Wind it back one step and drop what that step added.
+    connection.execute("PRAGMA user_version = 2")
+    connection.executescript("""
+        DROP TABLE quota_windows;
+        CREATE TABLE quota_windows (agent TEXT NOT NULL, label TEXT NOT NULL,
+            observed INTEGER NOT NULL, source TEXT NOT NULL, used_percent REAL,
+            resets_at REAL, detail TEXT, updated_at REAL NOT NULL,
+            PRIMARY KEY (agent, label));
+    """)
+    connection.commit(); connection.close()
+
+    index = AiUsageIndex(path)                       # must migrate 2 -> 3
+    connection = sqlite3.connect(path)
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == current
+    columns = [row[1] for row in connection.execute("PRAGMA table_info(quota_windows)")]
+    assert "window" in columns
+    connection.close()
+    # And the write that failed in production now succeeds.
+    index.refresh(claude_home=tmp_path / "noclaude", codex_home=tmp_path / "nocodex")
+    assert {w["window"] for w in index.report()["quota_windows"]} == {"5h", "1w"}
