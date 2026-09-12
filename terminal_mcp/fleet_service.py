@@ -55,6 +55,23 @@ class FleetService:
         self.store = store
         self.local_node_id = local_node_id
         self.sync = sync or FleetSyncService(store, local_node_id=local_node_id)
+        # Set by whoever starts the refresh loop. Optional: a node agent and
+        # every test construct this service without one, and readiness simply
+        # omits the loop check rather than inventing a verdict about a loop
+        # that does not exist here.
+        self._sync_loop: Any = None
+
+    def attach_sync_loop(self, loop: Any) -> None:
+        self._sync_loop = loop
+
+    def sync_loop_status(self) -> dict[str, Any] | None:
+        loop = self._sync_loop
+        if loop is None:
+            return None
+        try:
+            return loop.status()
+        except Exception:  # noqa: BLE001 -- readiness never fails on introspection
+            return {"enabled": True, "running": False, "last_error": "status unavailable"}
 
     # -- publishing this node's truth ---------------------------------------
 
@@ -169,6 +186,28 @@ class FleetService:
         stamp = now or _now()
         checks: list[dict[str, Any]] = []
         view = self.offline_view(now=stamp)
+
+        # A stale registry now has a specific, actionable cause: either the
+        # refresh loop is not running, or it is running and failing. Saying
+        # only "metadata is old" sends an operator looking at the nodes when
+        # the problem is on this box.
+        loop = self.sync_loop_status() if callable(getattr(self, "sync_loop_status", None)) else None
+        if loop is not None:
+            if not loop.get("enabled"):
+                status, summary = WARN, "fleet refresh loop is disabled by config"
+            elif not loop.get("running"):
+                status, summary = FAIL, "fleet refresh loop is not running; metadata will go stale"
+            elif loop.get("last_error"):
+                status, summary = WARN, f"last refresh cycle reported {loop['last_error']}"
+            else:
+                status, summary = PASS, (
+                    f"refreshing every {loop.get('interval_seconds')}s; "
+                    f"last cycle {loop.get('age_seconds')}s ago")
+            checks.append(_check("fleet_refresh_loop", status, summary, {
+                "enabled": loop.get("enabled"), "running": loop.get("running"),
+                "cycles": loop.get("cycles"), "age_seconds": loop.get("age_seconds"),
+                "interval_seconds": loop.get("interval_seconds"),
+                "peers": loop.get("peers")}))
 
         stale = [n for n in view["nodes"] if n.get("metadata_stale")]
         never = [n for n in view["nodes"] if n.get("metadata_age_seconds") is None]

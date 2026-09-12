@@ -464,6 +464,24 @@ class AskChatGptConfig:
 
 
 @dataclass(frozen=True)
+class FleetSyncConfig:
+    # ON by default, like MaintenanceConfig and for the same reason: this is
+    # not an optional feature, it is what keeps an already-shipped one
+    # telling the truth. Without it the fleet cache decays past
+    # fleet_service.STALE_AFTER_SECONDS (900) within fifteen minutes of every
+    # controller start, and every auth/readiness view can only answer
+    # UNKNOWN_STALE. See fleet_loop.py.
+    enabled: bool = True
+    # Three cycles of headroom under the 900s stale threshold, so two
+    # consecutive failed cycles still leave the data inside it.
+    interval_seconds: int = 300
+    # Separable: a deployment whose node agents all predate /v1/fleet/* keeps
+    # the local refresh (the half that makes its own dashboard correct)
+    # without emitting a 404 per node per cycle.
+    peer_exchange_enabled: bool = True
+
+
+@dataclass(frozen=True)
 class MaintenanceConfig:
     # P1 hardening item #9: periodic retention pruning (audit.db's
     # input_audit/idempotent_sends, supervisor.db's supervisor_actions --
@@ -603,6 +621,7 @@ class AppConfig:
     supervisor: SupervisorConfig = SupervisorConfig()
     dashboard: DashboardConfig = DashboardConfig()
     maintenance: MaintenanceConfig = MaintenanceConfig()
+    fleet_sync: FleetSyncConfig = FleetSyncConfig()
     session_lifecycle: SessionLifecycleConfig = SessionLifecycleConfig()
     session_knowledge: SessionKnowledgeConfig = SessionKnowledgeConfig()
     session_access: SessionAccessConfig = SessionAccessConfig()
@@ -925,6 +944,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ),
         dashboard=_load_dashboard_config(raw.get("dashboard", {})),
         maintenance=_load_maintenance_config(raw.get("maintenance", {})),
+        fleet_sync=_load_fleet_sync_config(raw.get("fleet_sync", {})),
         session_lifecycle=_load_session_lifecycle_config(raw.get("session_lifecycle", {})),
         session_knowledge=_load_session_knowledge_config(raw.get("session_knowledge", {})),
         session_access=_load_session_access_config(raw.get("session_access", {})),
@@ -1013,6 +1033,29 @@ def _load_session_access_config(raw: object) -> SessionAccessConfig:
         migrate_whitelist_on_start=bool(raw.get("migrate_whitelist_on_start",
                                                 defaults.migrate_whitelist_on_start)),
     )
+
+
+def _load_fleet_sync_config(raw: object) -> FleetSyncConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    interval = int(raw.get("interval_seconds", FleetSyncConfig.interval_seconds))
+    # The floor is 60s for the same reason maintenance has one: a tighter
+    # loop would re-project every store on this box continuously for data
+    # that changes on the order of minutes.
+    if interval < 60:
+        raise ValueError("fleet_sync.interval_seconds must be at least 60")
+    # An interval at or past the staleness threshold guarantees the very
+    # condition the loop exists to prevent, so it is refused rather than
+    # silently accepted.
+    if interval >= 900:
+        raise ValueError(
+            "fleet_sync.interval_seconds must be under 900 (the staleness "
+            "threshold) or the cache it refreshes is stale by definition")
+    return FleetSyncConfig(
+        enabled=bool(raw.get("enabled", FleetSyncConfig.enabled)),
+        interval_seconds=interval,
+        peer_exchange_enabled=bool(raw.get("peer_exchange_enabled",
+                                           FleetSyncConfig.peer_exchange_enabled)))
 
 
 def _load_maintenance_config(maintenance_raw: object) -> MaintenanceConfig:

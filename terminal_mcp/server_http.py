@@ -17,8 +17,9 @@ from .connection_store import ConnectionStore
 from .controller import LOCAL_NODE_ID, ControllerService
 from .core import TerminalService
 from .dashboard import node_token_env_var, register_dashboard
+from .fleet_loop import FleetSyncLoop, FleetSyncLoopConfig
 from .fleet_registry import FleetRegistryStore
-from .fleet_service import FleetService
+from .fleet_service import ControllerFleetSync, FleetService
 from .health import register_health
 from .integration_service import IntegrationService
 from .logging_setup import RequestIdMiddleware, SecurityHeadersMiddleware, configure_logging
@@ -509,6 +510,41 @@ def main() -> None:
     )
     maintenance_loop.start()
     atexit.register(maintenance_loop.stop)
+
+    # Fleet metadata refresh. Without it the registry decays past its own
+    # staleness threshold within fifteen minutes of every start, and every
+    # auth/readiness view can only answer UNKNOWN_STALE -- observed live on
+    # 2026-09-13 with the whole fleet 6.8 hours old. Never fatal: a
+    # controller must still serve sessions if the fleet cache cannot be
+    # opened at all.
+    if fleet is not None:
+        def _fleet_sources() -> dict:
+            """Local truth for the projectors. Each source is independently
+            failure-tolerant -- a refresh missing its SSH half is still worth
+            far more than no refresh."""
+            sessions, connections = [], []
+            try:
+                sessions = list(terminal.session_registry.list())
+            except Exception:  # noqa: BLE001
+                _log.exception("fleet sync: session registry unreadable")
+            try:
+                connections = list(connection_store.list())
+            except Exception:  # noqa: BLE001
+                _log.exception("fleet sync: connection store unreadable")
+            return {"sessions": sessions, "connections": connections}
+
+        fleet_loop = FleetSyncLoop(
+            sync=ControllerFleetSync(fleet, controller),
+            config=FleetSyncLoopConfig(
+                enabled=config.fleet_sync.enabled,
+                interval_seconds=config.fleet_sync.interval_seconds,
+                peer_exchange_enabled=config.fleet_sync.peer_exchange_enabled),
+            sources=_fleet_sources)
+        # So readiness can say WHY metadata is stale -- loop off, or loop
+        # failing -- instead of sending an operator to look at the nodes.
+        fleet.attach_sync_loop(fleet_loop)
+        fleet_loop.start()
+        atexit.register(fleet_loop.stop)
 
     # Durable Codex submissions are reconciled independently of request
     # workers.  This is deliberately local to the already-built TerminalService
