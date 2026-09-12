@@ -229,7 +229,72 @@ to a single column, the drawer goes full-screen).
 
 `_mutation_guard` = `dashboard.mutations_enabled` + same-origin CSRF check +
 Cloudflare Access JWT (when configured). Exactly the boundary every other
-dashboard mutation already goes through.
+dashboard mutation already goes through. **Every route above additionally
+passes `_notes_auth_guard`** — see "Authentication" below.
+
+## Authentication (application layer, not just the edge)
+
+**The Notes surface requires a real session in this process.** Every route in
+the table above — the page, the JSON API, and attachment serving — is behind
+`notes.require_auth`, which defaults to **true**.
+
+Why this is not left to Cloudflare Access: `cloudflared` connects to this
+process over **loopback**, so once a tunnel request arrives it is
+indistinguishable from a local one. Edge-only Access therefore says nothing
+to the application about the request in front of it — the exact gap
+`cf_access.py`'s own docstring warns about — and anything else that can reach
+the port (a tailnet peer, another process on the host) reads everything.
+Notes hold whatever the operator chose to keep, so that posture is wrong for
+them even though it is the historical one for the rest of `/dashboard/*`.
+
+**No third mechanism was added.** The guard accepts either of the two
+identities this project already has:
+
+1. a **webauth session cookie** (`webauth.py` — the `/login` path,
+   scrypt-hashed local account, 12h sessions, rate-limited), resolved through
+   the very same `WebAuthStore` that `/app/*` uses, so `terminal-mcp-webauth`,
+   `/logout`, and session expiry already control Notes access with no new
+   tooling; or
+2. a **verified Cloudflare Access assertion** (`cf_access.py`), when
+   `dashboard.cloudflare_access_team_domain` *and*
+   `dashboard.cloudflare_access_audience` are configured app-side.
+
+Refusals: a browser hitting the page with no session gets **303 → `/login`**;
+every API route answers **401 `LOGIN_REQUIRED`** (JSON, so the page's own
+`fetch()` can show "Phiên đăng nhập đã hết" with a link back rather than
+following a redirect into HTML). A user whose account is flagged
+`must_change_password` gets **403 `PASSWORD_CHANGE_REQUIRED`** — the same rule
+`webauth_dashboard._require_session_api` applies. **It fails closed**: a
+deployment that forgets to pass the store still refuses everything.
+
+This composes with, and never replaces, the pre-existing guards — CSRF
+(`ORIGIN_NOT_ALLOWED`), `dashboard.mutations_enabled`, and
+`notes.enabled` (503) are all still checked, and a valid session does not
+bypass any of them. It also changes nothing about the other `/dashboard/*`
+routes: this adds a boundary to the Notes surface only.
+
+To log in the first time, `server_http.py` writes a one-time bootstrap
+password to `~/.local/state/terminal-mcp/webauth-bootstrap.txt` (mode 600) on
+first start if no account exists; `terminal-mcp-webauth set-password <user>`
+changes it.
+
+### What this does NOT cover: the MCP surface
+
+The `note_*` MCP tools have **no per-tool authentication**, and that is
+deliberate. The entire `/mcp` transport — all 214 tools, including
+`terminal_send_text`, which types into a live agent session — is protected by
+transport-level controls only: loopback binding, `LanCidrGuardMiddleware`'s
+CIDR allowlist on any LAN/overlay socket, and the requirement that remote
+access arrive through an authenticated HTTPS tunnel. Bolting a notes-specific
+credential onto that one tool family would be a second, bespoke mechanism
+guarding the *least* dangerous tools on the surface, while
+`terminal_send_text` stayed open — security theater, not security.
+
+So the honest statement of residual risk: **anything permitted to speak MCP to
+this controller can read and write notes.** On this host that means loopback
+plus tailnet peers inside `100.64.0.0/10`. Narrowing it is an MCP-transport
+decision for the whole tool surface (per-client tokens or an authenticating
+proxy in front of `/mcp`), not something the Notes feature should solve alone.
 
 ## Security posture
 
@@ -269,6 +334,7 @@ Defaults work with no configuration at all. See the `notes:` block in
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `notes.enabled` | `true` | `false` removes the `note_*` tools and makes the routes answer 503 |
+| `notes.require_auth` | `true` | application-layer auth on every Notes HTTP route; `false` returns them to the unauthenticated posture of the rest of `/dashboard/*` |
 | `notes.attachments_dir` | *(empty)* | empty = beside the notes DB |
 | `notes.max_attachment_bytes` | `10485760` | 10 MiB |
 | `notes.allowed_mime_types` | png, jpeg, webp, gif | must be types the server can sniff *and* serve |
@@ -338,7 +404,9 @@ Tests:
 
 ## Limitations (V1)
 
-- Single-user, as described above.
+- Single-user, as described above — one local account gates the whole store;
+  there is no per-user scoping of individual notes.
+- The MCP tool surface is transport-authenticated only (see above).
 - Controller-local: notes are not replicated across nodes (an idea has no
   node; the controller is the one place it lives).
 - No semantic/vector search. FTS5 bm25 only — deliberate: V1 must not add a

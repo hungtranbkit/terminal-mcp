@@ -16,6 +16,7 @@ from terminal_mcp.dashboard import register_dashboard
 from terminal_mcp.mcp_app import build_mcp
 from terminal_mcp.notes_service import NotesService
 from terminal_mcp.notes_store import NotesStore
+from terminal_mcp.webauth import SESSION_COOKIE_NAME, WebAuthStore
 from tests.fixtures.notes_images import NOT_AN_IMAGE, jpeg_bytes, png_bytes
 
 # The dashboard's always-on CSRF guard refuses a mutation with no
@@ -48,22 +49,36 @@ def make_config(notes: NotesConfig | None = None, **dashboard_kwargs) -> AppConf
 
 def build_rig(tmp_path, *, config: AppConfig | None = None, notes: NotesService | None = None,
               pass_notes: bool = True):
+    """Returns (server, notes, webauth). The Notes surface requires an
+    application-layer session (notes.require_auth, default on -- see
+    tests/test_notes_auth.py for that boundary itself), so every rig here
+    carries a real WebAuthStore and the client below logs into it. These
+    tests are about the ROUTES' behaviour, so they run authenticated; the
+    unauthenticated cases live in test_notes_auth.py."""
     config = config or make_config()
     if notes is None and pass_notes:
         (tmp_path / "inbox").mkdir(exist_ok=True)
         notes = NotesService(NotesStore(tmp_path / "notes.db"),
                              attachments_dir=tmp_path / "attachments",
                              attachment_source_roots=(str(tmp_path / "inbox"),))
+    webauth = WebAuthStore(tmp_path / "webauth.db")
+    webauth.create_or_replace_user("operator", "correct horse battery staple")
     terminal = TerminalService(config)
     server = build_mcp(terminal, notes=notes)
-    register_dashboard(server, terminal, notes=notes)
-    return server, notes
+    register_dashboard(server, terminal, notes=notes, webauth=webauth)
+    return server, notes, webauth
+
+
+def authenticated_client(server, webauth) -> TestClient:
+    client = TestClient(server.streamable_http_app())
+    client.cookies.set(SESSION_COOKIE_NAME, webauth.create_session("operator"))
+    return client
 
 
 @pytest.fixture
 def rig(tmp_path):
-    server, notes = build_rig(tmp_path)
-    return TestClient(server.streamable_http_app()), notes, server
+    server, notes, webauth = build_rig(tmp_path)
+    return authenticated_client(server, webauth), notes, server
 
 
 def create(client, **fields):
@@ -99,6 +114,24 @@ def test_the_page_renders_in_vietnamese_and_is_not_framable(rig):
     assert "@media (max-width:860px)" in body
     # It talks only to its own routes -- no external CDN or font host.
     assert "https://" not in body.split("<script>")[1]
+
+
+def test_the_css_has_no_invalid_attribute_selectors(rig):
+    """Found by real-browser QA, and Firefox-only: `[data-open=1]` is an
+    INVALID selector -- an unquoted attribute value must be a CSS identifier,
+    and identifiers cannot start with a digit. Chromium parses it leniently;
+    Firefox drops the whole rule, so the drawer never slid in, the backdrop
+    never appeared and no toast was ever visible. Guarding the whole class
+    rather than the three rules that were wrong."""
+    import re
+    client, _, _ = rig
+    css = client.get("/dashboard/notes").text.split("<style>")[1].split("</style>")[0]
+    invalid = sorted(set(re.findall(r"\[[a-zA-Z-]+=[0-9][^\"'\]]*\]", css)))
+    assert invalid == [], invalid
+    # And the rules that drive the drawer/backdrop/toast are present in their
+    # quoted, valid form.
+    for rule in ('#drawer[data-open="1"]', '#backdrop[data-open="1"]', '#toast[data-open="1"]'):
+        assert rule in css, rule
 
 
 def test_the_page_references_only_its_own_api_routes(rig):
@@ -138,8 +171,8 @@ def test_uploads_are_behind_the_same_csrf_guard(rig):
 
 
 def test_mutations_disabled_blocks_writes_but_not_reads(tmp_path):
-    server, _ = build_rig(tmp_path, config=make_config(mutations_enabled=False))
-    client = TestClient(server.streamable_http_app())
+    server, _, webauth = build_rig(tmp_path, config=make_config(mutations_enabled=False))
+    client = authenticated_client(server, webauth)
     assert client.get("/dashboard/notes").status_code == 200
     assert client.get("/dashboard/api/notes").status_code == 200
     response = client.post("/dashboard/api/notes/create", json={"title": "x"}, headers=SAME_ORIGIN)
@@ -148,9 +181,9 @@ def test_mutations_disabled_blocks_writes_but_not_reads(tmp_path):
 
 
 def test_routes_answer_503_when_notes_are_disabled(tmp_path):
-    server, _ = build_rig(tmp_path, config=make_config(NotesConfig(enabled=False)),
-                          pass_notes=False)
-    client = TestClient(server.streamable_http_app())
+    server, _, webauth = build_rig(tmp_path, config=make_config(NotesConfig(enabled=False)),
+                                   pass_notes=False)
+    client = authenticated_client(server, webauth)
     registered = {route.path for route in server._custom_starlette_routes  # noqa: SLF001
                   if hasattr(route, "methods")}
     # Registered but unavailable -- never a 404 that looks like the feature
@@ -349,9 +382,9 @@ def test_hostile_uploads_are_refused_with_a_useful_status(rig, name, payload, mi
 
 
 def test_an_oversized_upload_is_refused_with_413(rig, tmp_path):
-    server, notes = build_rig(tmp_path)
+    server, notes, webauth = build_rig(tmp_path)
     notes.max_attachment_bytes = 64
-    client = TestClient(server.streamable_http_app())
+    client = authenticated_client(server, webauth)
     note = create(client, title="T")
     response = client.post("/dashboard/api/notes/attachment/upload",
                            data={"note_id": note["id"]},
@@ -427,10 +460,12 @@ def test_the_mcp_tools_and_the_dashboard_share_one_store(tmp_path):
 
     notes = NotesService(NotesStore(tmp_path / "notes.db"),
                          attachments_dir=tmp_path / "attachments")
+    webauth = WebAuthStore(tmp_path / "webauth.db")
+    webauth.create_or_replace_user("operator", "pw")
     terminal = TerminalService(make_config())
     server = build_mcp(terminal, notes=notes)
-    register_dashboard(server, terminal, notes=notes)
-    client = TestClient(server.streamable_http_app())
+    register_dashboard(server, terminal, notes=notes, webauth=webauth)
+    client = authenticated_client(server, webauth)
 
     note = create(client, title="Tạo từ web", summary="zzshared")
 

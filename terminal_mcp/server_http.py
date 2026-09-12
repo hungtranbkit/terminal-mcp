@@ -324,14 +324,20 @@ def main() -> None:
     # P0.2: the bus is CONSTRUCTED (so publish/claim tools exist) but no
     # consumer loop is started here -- autonomous coordination stays off.
     events = EventBus()
+    # ONE WebAuthStore for the whole process. Constructed HERE, before
+    # register_dashboard, rather than a few lines below where it used to be:
+    # the Notes routes authenticate against this exact store (see
+    # dashboard._notes_authenticated), so the /login session a human already
+    # holds is the same session those routes accept -- never a second store
+    # with its own users and its own sessions.
+    webauth = WebAuthStore()
+    _ensure_webauth_bootstrap(webauth)
     server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
                        planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog, notes=notes,
                        events=events)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
-                       recovery=recovery, backlog=backlog, notes=notes)
-    webauth = WebAuthStore()
-    _ensure_webauth_bootstrap(webauth)
+                       recovery=recovery, backlog=backlog, notes=notes, webauth=webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)
     register_health(server, terminal, supervisor)
 

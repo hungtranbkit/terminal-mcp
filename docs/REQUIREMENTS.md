@@ -88,6 +88,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Dashboard: Integration lane view (in Supervisor panel) | VERIFIED |
 | Dashboard: AI Usage panel (read-only, local AI Usage Monitor) | VERIFIED |
 | Notes / Ideas store (kho ghi chú: MCP `note_*` + `/dashboard/notes`) | VERIFIED |
+| Notes surface application-layer auth (webauth session or verified CF Access) | VERIFIED |
 | Dashboard: Requirements/Feature Matrix link | VERIFIED |
 | Permissions: read/input grants + effective permissions | VERIFIED |
 | Reliable prompt submission (press-enter, DELIVERY_UNKNOWN, idempotency) | VERIFIED |
@@ -3723,6 +3724,16 @@ Shape:
   is what keeps the `source_path` attachment transport refused until an
   operator grants specific directories.
 
+Authentication (hardening pass, same day): the whole Notes HTTP surface sits
+behind `notes.require_auth` (default true), satisfied by a webauth session
+cookie OR a verified Cloudflare Access assertion — the repo's two existing
+identities, no third mechanism. Edge-only Access was insufficient because
+cloudflared connects over loopback, making tunnel traffic indistinguishable
+from local traffic inside this process. Fails closed when no store is wired.
+The `note_*` MCP tools remain transport-authenticated only, like the other 202
+tools; see `docs/notes.md` for why a notes-only MCP credential would be
+theater next to `terminal_send_text`.
+
 V1 is fully local and deterministic — no embedding service, no LLM, no new
 infrastructure — which is a hard requirement, not a simplification: the kho
 must work with the machine offline. Semantic search could be layered behind
@@ -3737,8 +3748,8 @@ project — the model or the user attaches the image); image attachments only
 
 Tests: `tests/test_notes_store.py`, `tests/test_notes_attachments.py`,
 `tests/test_notes_mcp_tools.py`, `tests/test_notes_dashboard.py`,
-`tests/test_notes_config.py` (224 tests), plus the two existing inventory
-guards updated in the same commit (`tests/test_server.py`'s exact tool set
+`tests/test_notes_config.py`, `tests/test_notes_auth.py` (254 tests), plus the
+two existing inventory guards updated in the same commit (`tests/test_server.py`'s exact tool set
 and `tests/test_dashboard.py`'s exact route set).
 
 ---

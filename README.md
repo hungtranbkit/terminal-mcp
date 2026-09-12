@@ -430,6 +430,16 @@ mobile-friendly).
   on-disk name is a generated uuid, and the bytes are served only through
   `/dashboard/api/notes/attachment?id=...` — no static mount, no path ever
   accepted from a caller.
+- **The Notes web surface requires a real login** (`notes.require_auth`,
+  default on): the page, its JSON API and attachment serving all demand either
+  a webauth session cookie (the existing `/login` path) or a verified
+  Cloudflare Access assertion. Edge-only Access is not enough — `cloudflared`
+  connects over loopback, so a tunnel request is indistinguishable from a local
+  one once it arrives. No new auth mechanism was introduced; this reuses the
+  same `WebAuthStore` `/app/*` uses. The `note_*` MCP tools are covered by the
+  MCP transport's own controls only (loopback + CIDR allowlist + authenticated
+  tunnel) — see `docs/notes.md` for why gating one tool family there would be
+  theater.
 - Needs no configuration to work. To let `note_add_attachment(source_path=…)`
   read files already on this host, an operator must name the allowed
   directories in `notes.attachment_source_roots` — until then that transport
