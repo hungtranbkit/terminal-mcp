@@ -328,3 +328,66 @@ def test_raw_events_are_paginated(tmp_path, index):
 
 def test_the_page_size_is_bounded(tmp_path, index):
     assert index.raw_events(limit=100000)["limit"] == 500
+
+
+# -- backfill ----------------------------------------------------------------
+
+def test_events_indexed_before_prompts_existed_get_attributed(tmp_path):
+    """The v1 index problem, reproduced.
+
+    Events whose bytes were already read sit at EOF, so no ordinary refresh
+    will ever touch them again -- measured on the production index, 96.79%
+    of all tokens were attributed to "unassigned" and no cost was recorded.
+    """
+    home = tmp_path / "claude"
+    _write(home, [_prompt("p1", when=NOW - 300), _turn("a", when=NOW - 290),
+                  _turn("b", when=NOW - 280),
+                  {"type": "cost-state", "sessionId": "s1", "totalCostUSD": 4.2,
+                   "timestamp": "2026-09-11T00:00:00Z", "modelUsage": {}}])
+    index = AiUsageIndex(tmp_path / "usage.db")
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
+    # Simulate what the older collector left behind.
+    with index._connect() as connection:                        # noqa: SLF001
+        connection.execute("UPDATE usage_events SET prompt_id = NULL")
+        connection.execute("DELETE FROM prompts")
+        connection.execute("DELETE FROM session_costs")
+
+    filled = index.backfill(claude_home=home)
+    assert filled["events_attributed"] == 2
+    assert filled["prompts_new"] == 1
+    assert filled["costs_new"] == 1
+    assert index.top_prompts()["items"][0]["prompt_id"] == "p1"
+    assert index.summary()["estimated_cost_usd"] == pytest.approx(4.2)
+
+
+def test_backfill_is_idempotent_and_never_duplicates(tmp_path):
+    home = tmp_path / "claude"
+    _write(home, [_prompt("p1", when=NOW - 300), _turn("a", when=NOW - 290)])
+    index = AiUsageIndex(tmp_path / "usage.db")
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
+    before = index.summary()["totals"]
+    for _ in range(3):
+        index.backfill(claude_home=home)
+    assert index.summary()["totals"] == before
+    assert index.raw_events()["total"] == 1
+
+
+def test_backfill_reports_only_the_rows_it_changed(tmp_path):
+    # sqlite3's total_changes is cumulative for the connection; using it made
+    # the summary claim three times more work than it did.
+    home = tmp_path / "claude"
+    _write(home, [_prompt("p1", when=NOW - 300)] +
+           [_turn(f"t{i}", when=NOW - 290 + i) for i in range(5)])
+    index = AiUsageIndex(tmp_path / "usage.db")
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
+    with index._connect() as connection:                        # noqa: SLF001
+        connection.execute("UPDATE usage_events SET prompt_id = NULL")
+    assert index.backfill(claude_home=home)["events_attributed"] == 5
+
+
+def test_backfill_leaves_an_already_attributed_event_alone(tmp_path):
+    home = tmp_path / "claude"
+    _write(home, [_prompt("p1", when=NOW - 300), _turn("a", when=NOW - 290)])
+    index = AiUsageIndex(tmp_path / "usage.db")
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
+    assert index.backfill(claude_home=home)["events_attributed"] == 0
