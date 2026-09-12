@@ -292,7 +292,17 @@ def test_status_is_never_conveyed_by_colour_alone():
 
 SNAPSHOT = {
     "generated_at": 1789200000.0, "tail_lines": 16, "read_only": True, "cached": False,
-    "cache_age_seconds": 0.0, "unreachable_nodes": [], "running_within_seconds": 90.0,
+    "cache_age_seconds": 0.0, "running_within_seconds": 90.0,
+    "unreachable_nodes": [{"node_id": "dell-linux", "node_name": "dell-linux",
+                           "status": "offline"}],
+    "nodes": [
+        {"node_id": "local", "node_name": "Local", "online": True, "total": 3,
+         "counts": {"WAITING": 1, "IDLE": 1, "UNKNOWN": 1}},
+        {"node_id": "dell-linux", "node_name": "dell-linux", "online": False, "total": 1,
+         "counts": {"OFFLINE": 1}},
+        {"node_id": "hp-linux", "node_name": "hp-linux", "online": True, "total": 1,
+         "counts": {"RUNNING": 1}},
+    ],
     "counts": {"RUNNING": 1, "WAITING": 1, "IDLE": 1, "UNKNOWN": 1, "OFFLINE": 1},
     "boxes": [
         {"node_id": "hp-linux", "node_name": "hp-linux", "session": "hp1", "agent": "claude",
@@ -363,9 +373,20 @@ def screen(wall):
 
 
 def _cols(page):
-    return page.evaluate(
-        "() => getComputedStyle(document.querySelector('#wall'))"
-        ".gridTemplateColumns.split(' ').length")
+    """Columns of the terminal grid INSIDE a node section.
+
+    #wall itself is a vertical stack of node sections now -- sessions are
+    grouped per node and never mixed -- so the column count lives on
+    `.node-grid`. Measured on every section, and they must agree: one node
+    rendering at a different width than its neighbour would read as a layout
+    bug to anyone scanning the wall.
+    """
+    widths = page.evaluate(
+        "() => [...document.querySelectorAll('.node-grid')].map(g => "
+        "getComputedStyle(g).gridTemplateColumns.split(' ').length)")
+    assert widths, "no node section rendered"
+    assert len(set(widths)) == 1, f"node grids disagree on column count: {widths}"
+    return widths[0]
 
 
 def test_desktop_defaults_to_three_columns(screen):
@@ -395,7 +416,8 @@ def test_tablet_is_two_columns(screen):
 
 
 def test_every_box_shows_node_session_command_state_and_age(screen):
-    text = screen.evaluate("() => document.querySelector('.box').textContent")
+    text = screen.evaluate(
+        "() => document.querySelector('.box[data-session=\"hp1\"]').textContent")
     for fragment in ("hp1", "hp-linux", "claude", "RUNNING", "hoạt động"):
         assert fragment in text
 
@@ -450,7 +472,10 @@ def test_pausing_stops_the_refresh(screen):
 
 
 def test_clicking_a_box_opens_the_session_view(screen):
-    screen.click(".box")
+    # Addressed by session, not by position: sections are ordered local-first
+    # now, so "the first box" is a different session than it used to be and
+    # would silently retarget this test.
+    screen.click('.box[data-session="hp1"]')
     screen.wait_for_timeout(400)
     assert "session=hp1" in screen.url
 
@@ -629,17 +654,174 @@ def test_the_phone_spends_most_of_its_screen_on_terminals(screen):
     stack pushed the first tile to y=450 -- more than half the phone spent on
     controls, on the one screen whose job is showing terminals. The counts
     row scrolls sideways instead of wrapping, the filters sit two-up, and the
-    status line and back-link label drop out.
+    status line and back-link label drop out, which bought it back to 255.
+
+    Grouping by node then added a section header above the first tile, taking
+    it to 319. That header is content the wall is asked to show -- which node,
+    reachable or not, how many sessions -- not chrome, so the budget moves to
+    330 rather than the header being squeezed into illegibility. It still has
+    to stay inside the top 40% of the screen.
     """
     screen.set_viewport_size({"width": 390, "height": 844})
     screen.wait_for_timeout(300)
     try:
         top = screen.evaluate(
             "() => Math.round(document.querySelector('.box').getBoundingClientRect().top)")
-        assert top <= 300, f"first tile starts at y={top} on a 844px-tall phone"
+        assert top <= 330, f"first tile starts at y={top} on a 844px-tall phone"
+        assert top <= 0.4 * 844
         # And nothing may push the page sideways.
         assert screen.evaluate(
             "() => document.documentElement.scrollWidth <= window.innerWidth")
     finally:
         screen.set_viewport_size({"width": 1440, "height": 900})
         screen.wait_for_timeout(200)
+
+
+# -- grouping by node --------------------------------------------------------
+
+def test_sections_are_ordered_local_first_then_by_name():
+    """Stable, and stable for a reason: local is the node the operator is
+    standing on, and everything after it is alphabetical so the wall does not
+    reshuffle itself between polls the way an activity-ordered list would.
+    """
+    controller = _Controller(
+        [_row("z", node="macbook"), _row("a", node="hp-linux"),
+         _row("m", node="local"), _row("b", node="dell-linux")],
+        {name: dict(AGENT) for name in "zamb"})
+    payload = build_snapshot(controller, tracker=OutputChangeTracker())
+    assert [n["node_id"] for n in payload["nodes"]] == [
+        "local", "dell-linux", "hp-linux", "macbook"]
+
+
+def test_each_section_carries_its_own_reachability_and_tally():
+    controller = _Controller(
+        [_row("a", node="hp-linux"), _row("b", node="hp-linux"), _row("c")],
+        {"a": dict(AGENT), "b": {"exists": True, "state": "WAITING_INPUT",
+                                 "reason": "prompt detected"},
+         "c": dict(AGENT)},
+        unreachable=[{"node_id": "dell-linux", "node_name": "dell-linux",
+                      "status": "offline"}])
+    sections = {n["node_id"]: n for n
+                in build_snapshot(controller, tracker=OutputChangeTracker())["nodes"]}
+    assert sections["hp-linux"]["online"] is True
+    assert sections["hp-linux"]["total"] == 2
+    assert sections["hp-linux"]["counts"]["WAITING"] == 1
+    assert sections["dell-linux"]["online"] is False
+
+
+def test_a_node_that_is_merely_quiet_is_not_reported_offline():
+    """Reachability is a claim about the node, not about how busy its
+    sessions look. Only the fleet's own unreachable list may set it."""
+    controller = _Controller([_row("a", node="hp-linux")],
+                             {"a": {"exists": True, "state": "IDLE", "reason": "idle"}})
+    section = build_snapshot(controller, tracker=OutputChangeTracker())["nodes"][0]
+    assert section["node_id"] == "hp-linux"
+    assert section["online"] is True
+
+
+def test_an_unreachable_node_with_no_sessions_still_gets_a_section():
+    """Saying nothing about a node reads as "no sessions there", which is a
+    different and wrong statement from "we could not reach it"."""
+    controller = _Controller([], {}, unreachable=[
+        {"node_id": "dell-linux", "node_name": "dell-linux", "status": "offline"}])
+    sections = build_snapshot(controller, tracker=OutputChangeTracker())["nodes"]
+    assert [(n["node_id"], n["online"]) for n in sections] == [("dell-linux", False)]
+
+
+def test_the_wall_renders_one_section_per_node(screen):
+    ids = screen.evaluate(
+        "() => [...document.querySelectorAll('.node-sec')].map(s => s.dataset.node)")
+    assert ids == ["local", "dell-linux", "hp-linux"]
+    # And no tile sits outside a section, which is what "never mixed" means.
+    assert screen.evaluate(
+        "() => [...document.querySelectorAll('.box')]"
+        ".every(b => b.closest('.node-grid') !== null)")
+
+
+def test_a_section_header_states_node_reachability_and_counts(screen):
+    head = screen.evaluate(
+        "() => document.querySelector('.node-sec[data-node=\"hp-linux\"] .node-head')"
+        ".textContent")
+    assert "hp-linux" in head
+    assert "ONLINE" in head
+    assert "1 session" in head
+    assert "RUNNING" in head
+
+    offline = screen.evaluate(
+        "() => document.querySelector('.node-sec[data-node=\"dell-linux\"] .node-head')"
+        ".textContent")
+    assert "OFFLINE" in offline
+
+
+def test_filtering_hides_the_nodes_with_no_match(screen):
+    screen.select_option("#fNode", "hp-linux")
+    screen.wait_for_timeout(250)
+    try:
+        assert screen.evaluate(
+            "() => [...document.querySelectorAll('.node-sec')].map(s => s.dataset.node)"
+        ) == ["hp-linux"]
+    finally:
+        screen.select_option("#fNode", "")
+        screen.wait_for_timeout(250)
+
+
+def test_searching_leaves_only_the_sections_that_still_have_sessions(screen):
+    screen.fill("#fSearch", "m1")
+    screen.wait_for_timeout(250)
+    try:
+        ids = screen.evaluate(
+            "() => [...document.querySelectorAll('.node-sec')].map(s => s.dataset.node)")
+        assert ids == ["local"]
+        # The header reports the filtered count against the node's real total,
+        # so the operator can see the filter is hiding something.
+        assert "1/3 session" in screen.evaluate(
+            "() => document.querySelector('.node-head').textContent")
+    finally:
+        screen.fill("#fSearch", "")
+        screen.wait_for_timeout(250)
+
+
+def test_active_only_drops_whole_sections_that_have_nothing_active(screen):
+    screen.click("#activeOnly")
+    screen.wait_for_timeout(250)
+    try:
+        ids = screen.evaluate(
+            "() => [...document.querySelectorAll('.node-sec')].map(s => s.dataset.node)")
+        # local keeps its WAITING session; hp-linux keeps RUNNING; the offline
+        # node has nothing active and disappears.
+        assert ids == ["local", "hp-linux"]
+    finally:
+        screen.click("#activeOnly")
+        screen.wait_for_timeout(250)
+
+
+def test_a_node_starts_expanded_and_collapses_on_click(screen):
+    sel = '.node-sec[data-node="local"]'
+    assert screen.evaluate(f"() => document.querySelector('{sel} .node-grid').hidden") is False
+    assert screen.evaluate(
+        f"() => document.querySelector('{sel} .node-head').getAttribute('aria-expanded')") == "true"
+    screen.click(f"{sel} .node-head")
+    screen.wait_for_timeout(250)
+    try:
+        assert screen.evaluate(f"() => document.querySelector('{sel} .node-grid').hidden") is True
+        assert screen.evaluate(
+            f"() => document.querySelector('{sel} .node-head')"
+            ".getAttribute('aria-expanded')") == "false"
+        # Collapsing one node must not disturb another.
+        assert screen.evaluate(
+            "() => document.querySelector('.node-sec[data-node=\"hp-linux\"] .node-grid')"
+            ".hidden") is False
+    finally:
+        screen.click(f"{sel} .node-head")
+        screen.wait_for_timeout(250)
+
+
+def test_every_node_grid_agrees_on_the_column_count_at_each_width(screen):
+    """_cols asserts the sections agree; this pins the three widths the
+    feature promises: 3 on desktop, 2 on tablet, 1 on a phone."""
+    for width, expected in ((1440, 3), (900, 2), (390, 1)):
+        screen.set_viewport_size({"width": width, "height": 900})
+        screen.wait_for_timeout(250)
+        assert _cols(screen) == expected, width
+    screen.set_viewport_size({"width": 1440, "height": 900})
+    screen.wait_for_timeout(200)

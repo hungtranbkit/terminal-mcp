@@ -6657,9 +6657,33 @@ TERMINAL_WALL_HTML = r"""<!doctype html>
     main { padding:10px max(14px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom))
                    max(14px, env(safe-area-inset-left)) }
     /* Desktop default is three columns; the toggle overrides it. */
-    #wall { display:grid; gap:10px; grid-template-columns:repeat(3, minmax(0, 1fr)) }
-    #wall[data-cols="2"] { grid-template-columns:repeat(2, minmax(0, 1fr)) }
-    #wall[data-cols="4"] { grid-template-columns:repeat(4, minmax(0, 1fr)) }
+    /* Sessions are grouped per node, never mixed: #wall stacks the sections
+       and the terminal grid lives inside each one. The column count is set on
+       #wall and inherited by every grid, so the 2/3/4 toggle still drives the
+       whole screen from one place. */
+    #wall { display:flex; flex-direction:column; gap:18px }
+    .node-grid { display:grid; gap:10px; grid-template-columns:repeat(3, minmax(0, 1fr)) }
+    #wall[data-cols="2"] .node-grid { grid-template-columns:repeat(2, minmax(0, 1fr)) }
+    #wall[data-cols="4"] .node-grid { grid-template-columns:repeat(4, minmax(0, 1fr)) }
+    .node-sec { min-width:0 }
+    /* The whole header is the collapse control -- a <button> so Enter/Space
+       and screen readers get it for free. */
+    .node-head { width:100%; display:flex; align-items:center; gap:9px; flex-wrap:wrap;
+                 background:transparent; border:0; border-bottom:1px solid var(--line);
+                 color:var(--text); font:inherit; text-align:left; cursor:pointer;
+                 padding:4px 2px 7px; margin:0 0 10px }
+    .node-head:hover { border-bottom-color:#3a4a70 }
+    .node-head:focus-visible { outline:2px solid var(--accent); outline-offset:3px }
+    .node-caret { color:var(--muted); font-size:11px; width:11px; flex:none }
+    .node-title { font-weight:700; font-size:13.5px }
+    .node-meta { font-size:11px; color:var(--muted) }
+    /* Node reachability is a different claim from session state, so it gets
+       its own badge rather than borrowing the session palette. */
+    .node-state { font-size:10px; font-weight:700; letter-spacing:.03em; padding:2px 8px;
+                  border-radius:999px; border:1px solid var(--line); white-space:nowrap }
+    .node-state.online { color:var(--green); border-color:var(--green) }
+    .node-state.offline { color:var(--muted); border-style:dashed }
+    .node-tally { display:flex; gap:5px; flex-wrap:wrap; margin-left:auto }
     .box { background:var(--panel); border:1px solid var(--line); border-radius:12px;
            overflow:hidden; display:flex; flex-direction:column; cursor:pointer; min-width:0 }
     .box:hover { border-color:#3a4a70 }
@@ -6688,8 +6712,9 @@ TERMINAL_WALL_HTML = r"""<!doctype html>
     .box.stale .term { opacity:.55 }
     .empty { padding:30px; text-align:center; color:var(--muted) }
     .note { font-size:11.5px; color:var(--muted); margin:12px 0 0; line-height:1.6 }
-    @media (max-width:1100px) { #wall, #wall[data-cols="3"], #wall[data-cols="4"] {
-      grid-template-columns:repeat(2, minmax(0, 1fr)) } }
+    @media (max-width:1100px) {
+      .node-grid, #wall[data-cols="3"] .node-grid, #wall[data-cols="4"] .node-grid {
+        grid-template-columns:repeat(2, minmax(0, 1fr)) } }
     @media (max-width:720px) {
       /* Measured on a 390x844 phone: header + filter stack pushed the first
          tile to y=450 -- over half the screen spent on chrome before a single
@@ -6704,8 +6729,16 @@ TERMINAL_WALL_HTML = r"""<!doctype html>
       #backLink::before { content:'← '; font-size:13px }
       .bar { display:grid; grid-template-columns:1fr 1fr; gap:6px; padding:8px 12px 2px }
       main { padding:8px 12px 22px }
-      #wall, #wall[data-cols="2"], #wall[data-cols="3"], #wall[data-cols="4"] {
-        grid-template-columns:minmax(0, 1fr) }
+      #wall { gap:14px }
+      .node-grid, #wall[data-cols="2"] .node-grid, #wall[data-cols="3"] .node-grid,
+      #wall[data-cols="4"] .node-grid { grid-template-columns:minmax(0, 1fr) }
+      /* The node header is information, not chrome, but on a phone it still
+         has to be cheap: one tight line, and the per-state tally scrolls
+         sideways the same way the global counts do. */
+      .node-head { margin:0 0 7px; padding:2px 2px 5px; gap:7px }
+      .node-title { font-size:12.5px }
+      .node-tally { flex-wrap:nowrap; overflow-x:auto; scrollbar-width:none }
+      .node-tally::-webkit-scrollbar { display:none }
       .bar select, .bar input { flex:none; width:100%; min-width:0 }
       /* Two per row: node|state, agent|search. Only the toggle spans, so the
          filter block is three rows instead of four. */
@@ -6748,7 +6781,8 @@ TERMINAL_WALL_HTML = r"""<!doctype html>
   </main>
   <script>
     const $ = (s) => document.querySelector(s);
-    const state = {boxes: [], paused: false, activeOnly: false, cols: 3, tokens: new Map()};
+    const state = {boxes: [], nodes: [], paused: false, activeOnly: false, cols: 3,
+                   tokens: new Map(), collapsed: new Set()};
 
     const GLYPH = {RUNNING: '▶', WAITING: '⏳', ERROR: '✕', DONE: '✔',
                    IDLE: '⏸', UNKNOWN: '?', OFFLINE: '⊘'};
@@ -6823,27 +6857,93 @@ TERMINAL_WALL_HTML = r"""<!doctype html>
       return box;
     }
 
+    // Collapse state is per node and lives only in the page: it is a viewing
+    // preference, not fleet state, and every node starts expanded.
+    function sectionFor(node, rows) {
+      const sec = el('div', {className: 'node-sec'});
+      sec.dataset.node = node.node_id;
+
+      const head = el('button', {className: 'node-head'});
+      head.type = 'button';
+      const collapsed = state.collapsed.has(node.node_id);
+      head.setAttribute('aria-expanded', String(!collapsed));
+      head.append(el('span', {className: 'node-caret', text: collapsed ? '▸' : '▾'}),
+                  el('span', {className: 'node-title', text: node.node_name || node.node_id}));
+      // Node reachability comes from the fleet's own unreachable list, never
+      // from how quiet its sessions look.
+      head.appendChild(el('span', {className: 'node-state ' + (node.online ? 'online' : 'offline'),
+                                   text: node.online ? '● ONLINE' : '⊘ OFFLINE'}));
+      // Total is the node's whole inventory; the filtered count is only shown
+      // when it differs, so an unfiltered wall stays quiet.
+      const shown = rows.length === node.total ? String(node.total)
+                                               : rows.length + '/' + node.total;
+      head.appendChild(el('span', {className: 'node-meta', text: shown + ' session'}));
+
+      const tally = el('span', {className: 'node-tally'});
+      for (const key of ['RUNNING', 'WAITING', 'ERROR', 'IDLE', 'DONE', 'UNKNOWN', 'OFFLINE']) {
+        const n = (node.counts || {})[key];
+        if (!n) continue;
+        tally.appendChild(el('span', {className: 'badge ' + key,
+          text: (GLYPH[key] || '') + ' ' + n + ' ' + key}));
+      }
+      head.appendChild(tally);
+      sec.appendChild(head);
+
+      const grid = el('div', {className: 'node-grid'});
+      grid.hidden = collapsed;
+      sec.appendChild(grid);
+      head.onclick = () => {
+        if (state.collapsed.has(node.node_id)) state.collapsed.delete(node.node_id);
+        else state.collapsed.add(node.node_id);
+        render();
+      };
+      return {sec, grid};
+    }
+
     function render() {
       const wall = $('#wall');
       wall.dataset.cols = String(state.cols);
       const rows = visible();
       const seen = new Set();
-      const existing = new Map([...wall.children].map((c) => [c.dataset.session, c]));
-      wall.replaceChildren();
+      // Tiles are reused across polls; they are looked up by session name
+      // wherever they currently sit, so moving one between sections (a node
+      // that came back, say) does not force a rebuild.
+      const existing = new Map([...wall.querySelectorAll('.box')].map((c) => [c.dataset.session, c]));
+      const byNode = new Map();
       for (const b of rows) {
-        seen.add(b.session);
-        const prior = existing.get(b.session);
-        // Only rebuild a tile whose visible content actually changed: the
-        // token deliberately excludes the age, which ticks every second and
-        // would otherwise mark everything dirty on every poll.
-        if (prior && state.tokens.get(b.session) === b.change_token) {
-          const sub = prior.querySelector('.box-sub span:last-child');
-          if (sub) sub.textContent = ageLabel(b);
-          wall.appendChild(prior);
-          continue;
+        const key = b.node_id || 'local';
+        if (!byNode.has(key)) byNode.set(key, []);
+        byNode.get(key).push(b);
+      }
+      wall.replaceChildren();
+
+      // Section order comes from the server, so it is one testable rule
+      // rather than a sort restated here. A node with no matching session is
+      // dropped entirely -- an empty section reads as "nothing running here",
+      // which is not what a filter means.
+      const nodes = (state.nodes.length ? state.nodes
+                     : [...byNode.keys()].map((id) => ({node_id: id, node_name: id,
+                                                        online: true, total: 0, counts: {}})));
+      for (const node of nodes) {
+        const mine = byNode.get(node.node_id);
+        if (!mine || !mine.length) continue;
+        const {sec, grid} = sectionFor(node, mine);
+        for (const b of mine) {
+          seen.add(b.session);
+          const prior = existing.get(b.session);
+          // Only rebuild a tile whose visible content actually changed: the
+          // token deliberately excludes the age, which ticks every second and
+          // would otherwise mark everything dirty on every poll.
+          if (prior && state.tokens.get(b.session) === b.change_token) {
+            const sub = prior.querySelector('.box-sub span:last-child');
+            if (sub) sub.textContent = ageLabel(b);
+            grid.appendChild(prior);
+            continue;
+          }
+          state.tokens.set(b.session, b.change_token);
+          grid.appendChild(buildBox(b));
         }
-        state.tokens.set(b.session, b.change_token);
-        wall.appendChild(buildBox(b));
+        wall.appendChild(sec);
       }
       for (const key of [...state.tokens.keys()]) if (!seen.has(key)) state.tokens.delete(key);
       if (!rows.length) {
@@ -6887,6 +6987,7 @@ TERMINAL_WALL_HTML = r"""<!doctype html>
         if (!response.ok) throw new Error('HTTP ' + response.status);
         const data = await response.json();
         state.boxes = data.boxes || [];
+        state.nodes = data.nodes || [];
         renderCounts(data.counts || {});
         fillFilters();
         render();

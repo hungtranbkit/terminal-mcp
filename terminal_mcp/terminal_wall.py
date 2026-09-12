@@ -408,6 +408,7 @@ def build_snapshot(controller, *, tail_lines: int = DEFAULT_TAIL_LINES,
     for box in boxes:
         counts[box.state] = counts.get(box.state, 0) + 1
     return {
+        "nodes": _node_sections(boxes, unreachable),
         "generated_at": now,
         "tail_lines": tail_lines,
         "boxes": [box.as_dict() for box in boxes],
@@ -419,6 +420,49 @@ def build_snapshot(controller, *, tail_lines: int = DEFAULT_TAIL_LINES,
         "running_within_seconds": RUNNING_WITHIN_SECONDS,
         "read_only": True,
     }
+
+
+# A node is OFFLINE because the fleet said it did not answer -- never because
+# its sessions happen to look quiet. `unreachable_nodes` is the only evidence
+# admitted here.
+def _node_sections(boxes: list[WallBox],
+                   unreachable: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One section per node, in the order the wall should draw them.
+
+    Built here rather than in the browser so the ordering and the per-node
+    tallies are one testable thing instead of a rule restated in JavaScript.
+    """
+    offline_ids = {n.get("node_id") for n in unreachable}
+    sections: dict[str, dict[str, Any]] = {}
+    for box in boxes:
+        node_id = box.node_id or "local"
+        section = sections.setdefault(node_id, {
+            "node_id": node_id, "node_name": box.node_name or node_id,
+            "online": node_id not in offline_ids, "total": 0, "counts": {},
+        })
+        if box.node_name and section["node_name"] == node_id:
+            section["node_name"] = box.node_name
+        section["total"] += 1
+        section["counts"][box.state] = section["counts"].get(box.state, 0) + 1
+
+    # A node listed unreachable with no session rows at all still gets a
+    # section: saying nothing about it reads as "no sessions there", which is
+    # a different and wrong statement.
+    for node in unreachable:
+        node_id = node.get("node_id") or "?"
+        sections.setdefault(node_id, {
+            "node_id": node_id, "node_name": node.get("node_name") or node_id,
+            "online": False, "total": 0, "counts": {},
+        })
+
+    # Local first -- it is the node the operator is standing on -- then the
+    # rest by display name, so the wall does not reshuffle itself between
+    # polls the way an activity-ordered list would.
+    def order(section: dict[str, Any]) -> tuple[int, str]:
+        return (0 if section["node_id"] == "local" else 1,
+                str(section["node_name"]).casefold())
+
+    return sorted(sections.values(), key=order)
 
 
 def _epoch(value: Any) -> float | None:
