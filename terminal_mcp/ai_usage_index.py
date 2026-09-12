@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .ai_usage_local import (AGENT_CLAUDE, AGENT_CODEX, CLAUDE_QUOTA_UNOBSERVED,
+                             parse_claude_transcript,
                              SOURCE_CLI_STATE, SOURCE_TRANSCRIPT, SOURCE_UNAVAILABLE,
                              FileCursor, QuotaWindow, UsageEvent, claude_session_links,
                              codex_quota_windows, discover_claude_transcripts,
@@ -61,6 +62,7 @@ class AiUsageIndex:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
+            self._migrate(connection)
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS usage_events (
@@ -78,8 +80,24 @@ class AiUsageIndex:
                     git_branch TEXT,
                     is_subagent INTEGER NOT NULL DEFAULT 0,
                     cli_version TEXT,
-                    source TEXT NOT NULL
+                    source TEXT NOT NULL,
+                    -- v2. Listed here as well as in MIGRATIONS: a fresh
+                    -- database is created current and never runs the ALTERs,
+                    -- while an existing v1 one only runs them. Both end up
+                    -- with the same shape, which is the point.
+                    prompt_id TEXT,
+                    node_name TEXT,
+                    project_id TEXT,
+                    conversation_id TEXT,
+                    request_id TEXT,
+                    duration_ms INTEGER,
+                    status TEXT,
+                    collector_version TEXT,
+                    parsing_confidence REAL NOT NULL DEFAULT 1.0
                 );
+                CREATE INDEX IF NOT EXISTS usage_prompt ON usage_events (prompt_id);
+                CREATE INDEX IF NOT EXISTS usage_project ON usage_events (project);
+                CREATE INDEX IF NOT EXISTS usage_model ON usage_events (agent, model);
                 CREATE INDEX IF NOT EXISTS usage_ts ON usage_events (ts);
                 CREATE INDEX IF NOT EXISTS usage_session ON usage_events (agent_session_id);
                 CREATE TABLE IF NOT EXISTS file_cursors (
@@ -87,7 +105,10 @@ class AiUsageIndex:
                     inode INTEGER NOT NULL,
                     size INTEGER NOT NULL,
                     offset INTEGER NOT NULL,
-                    updated_at REAL NOT NULL
+                    updated_at REAL NOT NULL,
+                    -- Which prompt the last read ended inside, so a turn
+                    -- appended later still lands on the prompt that caused it.
+                    carry_prompt_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS quota_windows (
                     agent TEXT NOT NULL,
@@ -100,8 +121,98 @@ class AiUsageIndex:
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (agent, label)
                 );
+                -- A prompt someone typed. Preview is redacted and truncated;
+                -- the hash is of the ORIGINAL text so two identical prompts
+                -- group even when redaction rewrites them differently.
+                CREATE TABLE IF NOT EXISTS prompts (
+                    prompt_id TEXT PRIMARY KEY,
+                    agent_session_id TEXT NOT NULL,
+                    ts REAL NOT NULL,
+                    preview TEXT NOT NULL,
+                    text_hash TEXT NOT NULL,
+                    char_length INTEGER NOT NULL,
+                    source TEXT,
+                    project TEXT,
+                    git_branch TEXT
+                );
+                CREATE INDEX IF NOT EXISTS prompt_ts ON prompts (ts);
+                CREATE INDEX IF NOT EXISTS prompt_hash ON prompts (text_hash);
+                -- Cost as the CLI computed it, never a price table of ours.
+                CREATE TABLE IF NOT EXISTS session_costs (
+                    agent_session_id TEXT PRIMARY KEY,
+                    ts REAL NOT NULL,
+                    total_cost_usd REAL NOT NULL,
+                    per_model TEXT NOT NULL,
+                    message_count INTEGER,
+                    api_duration_ms INTEGER,
+                    source TEXT NOT NULL
+                );
+                -- Quota over time, so a window, a reset and a peak can be
+                -- reported later instead of only "right now".
+                CREATE TABLE IF NOT EXISTS quota_snapshots (
+                    taken_at REAL NOT NULL,
+                    agent TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    used_percent REAL,
+                    resets_at REAL,
+                    source TEXT NOT NULL,
+                    PRIMARY KEY (taken_at, agent, label)
+                );
+                CREATE INDEX IF NOT EXISTS quota_snap_ts ON quota_snapshots (taken_at);
                 """
             )
+
+    # Schema history. Each step is idempotent and additive: this database is
+    # a derived index, but the events in it took real time to parse and the
+    # cost rollups cannot be recomputed once a transcript rotates away, so it
+    # is migrated rather than rebuilt.
+    MIGRATIONS: tuple[tuple[int, str, str], ...] = (
+        (2, "usage_events: prompt attribution, provider/cost/provenance columns",
+         """
+         ALTER TABLE usage_events ADD COLUMN prompt_id TEXT;
+         ALTER TABLE usage_events ADD COLUMN node_name TEXT;
+         ALTER TABLE usage_events ADD COLUMN project_id TEXT;
+         ALTER TABLE usage_events ADD COLUMN conversation_id TEXT;
+         ALTER TABLE usage_events ADD COLUMN request_id TEXT;
+         ALTER TABLE usage_events ADD COLUMN duration_ms INTEGER;
+         ALTER TABLE usage_events ADD COLUMN status TEXT;
+         ALTER TABLE usage_events ADD COLUMN collector_version TEXT;
+         ALTER TABLE usage_events ADD COLUMN parsing_confidence REAL NOT NULL DEFAULT 1.0;
+         CREATE INDEX IF NOT EXISTS usage_prompt ON usage_events (prompt_id);
+         CREATE INDEX IF NOT EXISTS usage_project ON usage_events (project);
+         CREATE INDEX IF NOT EXISTS usage_model ON usage_events (agent, model);
+         ALTER TABLE file_cursors ADD COLUMN carry_prompt_id TEXT;
+         """),
+    )
+
+    COLLECTOR_VERSION = "2"
+
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version == 0:
+            # Either a brand-new database (the CREATE TABLEs below will make
+            # it current) or a v1 one. Distinguish by whether v1's own table
+            # already exists.
+            existing = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_events'"
+            ).fetchone()
+            version = 1 if existing else max(step[0] for step in self.MIGRATIONS)
+            if not existing:
+                connection.execute(f"PRAGMA user_version = {version}")
+                return
+        for number, _label, script in self.MIGRATIONS:
+            if number <= version:
+                continue
+            for statement in filter(None, (part.strip() for part in script.split(";"))):
+                try:
+                    connection.execute(statement)
+                except sqlite3.OperationalError as exc:
+                    # Re-running an ALTER that already landed is not a failure;
+                    # anything else is.
+                    if "duplicate column name" not in str(exc):
+                        raise
+            connection.execute(f"PRAGMA user_version = {number}")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10.0)
@@ -118,11 +229,15 @@ class AiUsageIndex:
             return None
         return FileCursor(row["path"], row["inode"], row["size"], row["offset"])
 
-    def _store_events(self, connection: sqlite3.Connection, events: Iterable[UsageEvent]) -> int:
+    def _store_events(self, connection: sqlite3.Connection, events: Iterable[UsageEvent],
+                      *, prompt_ids: list[str | None] | None = None) -> int:
+        events = list(events)
+        ids = prompt_ids or [None] * len(events)
         rows = [(e.event_id, e.agent, e.agent_session_id, e.node_id, e.timestamp, e.model,
                  e.input_tokens, e.output_tokens, e.cache_read_tokens, e.cache_write_tokens,
-                 e.project, e.git_branch, int(e.is_subagent), e.cli_version, e.source)
-                for e in events]
+                 e.project, e.git_branch, int(e.is_subagent), e.cli_version, e.source,
+                 prompt, self.COLLECTOR_VERSION)
+                for e, prompt in zip(events, ids)]
         if not rows:
             return 0
         before = connection.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0]
@@ -130,10 +245,62 @@ class AiUsageIndex:
             """INSERT OR IGNORE INTO usage_events
                (event_id, agent, agent_session_id, node_id, ts, model,
                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                project, git_branch, is_subagent, cli_version, source)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+                project, git_branch, is_subagent, cli_version, source,
+                prompt_id, collector_version)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
         after = connection.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0]
         return after - before
+
+    def _store_prompts(self, connection: sqlite3.Connection,
+                       prompts: Iterable[Any]) -> int:
+        rows = [(p.prompt_id, p.agent_session_id, p.timestamp, p.preview, p.text_hash,
+                 p.char_length, p.source, p.project, p.git_branch) for p in prompts]
+        if not rows:
+            return 0
+        before = connection.execute("SELECT COUNT(*) FROM prompts").fetchone()[0]
+        connection.executemany(
+            """INSERT OR IGNORE INTO prompts
+               (prompt_id, agent_session_id, ts, preview, text_hash, char_length,
+                source, project, git_branch) VALUES (?,?,?,?,?,?,?,?,?)""", rows)
+        return connection.execute("SELECT COUNT(*) FROM prompts").fetchone()[0] - before
+
+    def _store_costs(self, connection: sqlite3.Connection, costs: Iterable[Any]) -> int:
+        import json as _json
+        rows = [(c.agent_session_id, c.timestamp, c.total_cost_usd,
+                 _json.dumps(c.per_model), c.message_count, c.api_duration_ms,
+                 "session_transcript") for c in costs]
+        if not rows:
+            return 0
+        # A later cost-state supersedes an earlier one for the same session:
+        # it is a running total, not an increment.
+        connection.executemany(
+            """INSERT INTO session_costs
+               (agent_session_id, ts, total_cost_usd, per_model, message_count,
+                api_duration_ms, source) VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(agent_session_id) DO UPDATE SET
+                 ts=excluded.ts, total_cost_usd=excluded.total_cost_usd,
+                 per_model=excluded.per_model, message_count=excluded.message_count,
+                 api_duration_ms=excluded.api_duration_ms""", rows)
+        return len(rows)
+
+    def _carry_prompt(self, connection: sqlite3.Connection, path: Path) -> str | None:
+        """Which prompt the previous incremental read ended inside.
+
+        Without it, a turn appended after the offset would be attributed to
+        no prompt at all, and the Top Prompts table would quietly lose the
+        most recent -- and usually most interesting -- work.
+        """
+        row = connection.execute(
+            "SELECT carry_prompt_id FROM file_cursors WHERE path = ?", (str(path),)).fetchone()
+        return row["carry_prompt_id"] if row else None
+
+    def _remember_carry(self, connection: sqlite3.Connection, path: Path,
+                        prompt_id: str | None) -> None:
+        connection.execute(
+            """INSERT INTO file_cursors (path, inode, size, offset, updated_at, carry_prompt_id)
+               VALUES (?, 0, 0, 0, 0, ?)
+               ON CONFLICT(path) DO UPDATE SET carry_prompt_id = excluded.carry_prompt_id""",
+            (str(path), prompt_id))
 
     def refresh(self, *, node_id: str = "local", claude_home: Path | None = None,
                 codex_home: Path | None = None) -> dict[str, Any]:
@@ -145,7 +312,8 @@ class AiUsageIndex:
         """
         started = time.time()
         summary = {"files_seen": 0, "files_read": 0, "files_rescanned": 0,
-                   "events_new": 0, "lines_read": 0, "unparsed": 0, "agents": {}}
+                   "events_new": 0, "prompts_new": 0, "costs_new": 0,
+                   "lines_read": 0, "unparsed": 0, "agents": {}}
         sources = [(AGENT_CLAUDE, discover_claude_transcripts(claude_home)),
                    (AGENT_CODEX, discover_codex_logs(codex_home))]
         with self._connect() as connection:
@@ -162,13 +330,24 @@ class AiUsageIndex:
                         summary["files_rescanned"] += 1
                     if stored and start >= current.size:
                         continue        # nothing appended since last time
-                    outcome = parse_jsonl(path, node_id=node_id, agent=agent,
-                                          start_offset=start,
-                                          session_id=path.stem)
+                    if agent == AGENT_CLAUDE:
+                        carry = self._carry_prompt(connection, path) if start else None
+                        outcome = parse_claude_transcript(path, node_id=node_id,
+                                                          start_offset=start,
+                                                          carry_prompt_id=carry)
+                        prompt_ids = outcome.event_prompt_ids
+                        summary["prompts_new"] += self._store_prompts(connection, outcome.prompts)
+                        summary["costs_new"] += self._store_costs(connection, outcome.costs)
+                        self._remember_carry(connection, path, outcome.last_prompt_id)
+                    else:
+                        outcome = parse_jsonl(path, node_id=node_id, agent=agent,
+                                              start_offset=start, session_id=path.stem)
+                        prompt_ids = [None] * len(outcome.events)
                     summary["files_read"] += 1
                     summary["lines_read"] += outcome.lines_read
                     summary["unparsed"] += outcome.unparsed
-                    inserted = self._store_events(connection, outcome.events)
+                    inserted = self._store_events(connection, outcome.events,
+                                                  prompt_ids=prompt_ids)
                     summary["events_new"] += inserted
                     agent_new += inserted
                     connection.execute(
@@ -340,6 +519,293 @@ class AiUsageIndex:
                           "detail": "$CODEX_HOME/{sessions,logs,history}/**/*.jsonl"},
             },
         }
+
+
+    # -- analytics ------------------------------------------------------------
+    #
+    # Aggregation is computed in SQL over the raw events rather than kept in
+    # rollup tables. At this fleet's volume (thousands of events) a GROUP BY
+    # is instant and always consistent with the raw data; materialised
+    # rollups would add a second source of truth to keep correct for no gain
+    # yet. The indexes on ts/project/model are what make that hold as the
+    # table grows, and a rollup table is the documented next step if it
+    # stops holding.
+
+    BUCKETS = {"minute": 60, "hour": 3600, "day": 86400, "week": 604800}
+
+    def _where(self, filters: dict[str, Any] | None,
+               *, alias: str = "") -> tuple[str, list[Any]]:
+        """Filters shared by every analytics query, so the numbers on one
+        screen always describe the same slice.
+
+        `alias` qualifies every column. The prompts query joins usage_events
+        to prompts and BOTH carry `ts`, so an unqualified clause raised
+        "ambiguous column name: ts" and the whole Top Prompts table came back
+        empty -- with a 200, because an analytics query failing closed is
+        indistinguishable from having nothing to show.
+        """
+        filters = filters or {}
+        prefix = f"{alias}." if alias else ""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if filters.get("since") is not None:
+            clauses.append(f"{prefix}ts >= ?"); params.append(float(filters["since"]))
+        if filters.get("until") is not None:
+            clauses.append(f"{prefix}ts <= ?"); params.append(float(filters["until"]))
+        for column, key in (("node_id", "node_id"), ("agent", "agent"),
+                            ("model", "model"), ("project", "project"),
+                            ("agent_session_id", "agent_session_id")):
+            if filters.get(key):
+                clauses.append(f"{prefix}{column} = ?"); params.append(filters[key])
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    _TOKEN_SUMS = ("SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, "
+                   "SUM(cache_read_tokens) AS cache_read_tokens, "
+                   "SUM(cache_write_tokens) AS cache_write_tokens, "
+                   "SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) "
+                   "AS total_tokens, COUNT(*) AS requests")
+
+    def summary(self, *, now: float | None = None,
+                filters: dict[str, Any] | None = None) -> dict[str, Any]:
+        now = now or time.time()
+        where, params = self._where(filters)
+        with self._connect() as connection:
+            totals = dict(connection.execute(
+                f"SELECT {self._TOKEN_SUMS} FROM usage_events{where}", params).fetchone())
+            spans = {}
+            for label, seconds in (("1h", 3600), ("5h", ROLLING_WINDOW_SECONDS),
+                                   ("24h", 86400), ("7d", 604800), ("30d", 2592000)):
+                row = connection.execute(
+                    f"SELECT {self._TOKEN_SUMS} FROM usage_events WHERE ts >= ?",
+                    (now - seconds,)).fetchone()
+                spans[label] = {k: (row[k] or 0) for k in row.keys()}
+            cost = connection.execute(
+                "SELECT SUM(total_cost_usd) AS usd, COUNT(*) AS sessions FROM session_costs"
+            ).fetchone()
+            active = connection.execute(
+                "SELECT COUNT(DISTINCT agent_session_id) FROM usage_events WHERE ts >= ?",
+                (now - 86400,)).fetchone()[0]
+            peak = connection.execute(
+                f"""SELECT agent_session_id, project,
+                           SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens) AS total
+                    FROM usage_events WHERE ts >= ? GROUP BY agent_session_id
+                    ORDER BY total DESC LIMIT 1""", (now - 86400,)).fetchone()
+            top_project = connection.execute(
+                """SELECT project,
+                          SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens) AS total
+                   FROM usage_events WHERE ts >= ? AND project IS NOT NULL
+                   GROUP BY project ORDER BY total DESC LIMIT 1""", (now - 86400,)).fetchone()
+        return {
+            "generated_at": now,
+            "totals": {k: (totals[k] or 0) for k in totals},
+            "spans": spans,
+            "estimated_cost_usd": cost["usd"],
+            "cost_source": "session_transcript (CLI-computed)" if cost["usd"] is not None else None,
+            "cost_sessions": cost["sessions"],
+            "active_sessions_24h": active,
+            "peak_session_24h": (dict(peak) if peak else None),
+            "top_project_24h": (dict(top_project) if top_project else None),
+        }
+
+    def timeline(self, *, bucket: str = "hour", now: float | None = None,
+                 filters: dict[str, Any] | None = None) -> dict[str, Any]:
+        seconds = self.BUCKETS.get(bucket)
+        if seconds is None:
+            raise ValueError(f"unknown bucket: {bucket!r}")
+        where, params = self._where(filters)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""SELECT CAST(ts / {seconds} AS INTEGER) * {seconds} AS bucket_start,
+                           {self._TOKEN_SUMS}
+                    FROM usage_events{where}
+                    GROUP BY bucket_start ORDER BY bucket_start""", params).fetchall()
+        return {"bucket": bucket, "bucket_seconds": seconds,
+                "points": [{k: row[k] for k in row.keys()} for row in rows]}
+
+    def top_prompts(self, *, limit: int = 25, offset: int = 0,
+                    filters: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Which prompts cost the most.
+
+        A prompt's cost is every assistant turn attributed to it, which is
+        what makes this answerable at all -- the transcript has no field
+        linking a turn to a prompt, so attribution is positional and
+        recorded at ingest.
+        """
+        where, params = self._where(filters)
+        joined_where, joined_params = self._where(filters, alias="e")
+        sums = self._TOKEN_SUMS.replace("SUM(", "SUM(e.")
+        with self._connect() as connection:
+            grand = connection.execute(
+                f"SELECT SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens) "
+                f"FROM usage_events{where}", params).fetchone()[0] or 0
+            rows = connection.execute(
+                f"""SELECT e.prompt_id, {sums},
+                           MIN(e.ts) AS first_ts, MAX(e.ts) AS last_ts,
+                           e.agent_session_id, e.project, e.agent, e.node_id,
+                           GROUP_CONCAT(DISTINCT e.model) AS models,
+                           p.preview, p.text_hash, p.char_length, p.ts AS prompt_ts,
+                           p.git_branch
+                    FROM usage_events e LEFT JOIN prompts p ON p.prompt_id = e.prompt_id
+                    {joined_where}
+                    GROUP BY e.prompt_id
+                    ORDER BY total_tokens DESC LIMIT ? OFFSET ?""",
+                joined_params + [limit, offset]).fetchall()
+        items = []
+        for row in rows:
+            record = {k: row[k] for k in row.keys()}
+            record["share_percent"] = (round(record["total_tokens"] / grand * 100, 2)
+                                       if grand else 0.0)
+            record["duration_seconds"] = (record["last_ts"] - record["first_ts"]
+                                          if record["first_ts"] else 0)
+            if record.get("preview") is None:
+                # A turn with no prompt attributed: shown as unassigned rather
+                # than guessed at.
+                record["preview"] = None
+                record["unassigned"] = record["prompt_id"] is None
+            items.append(record)
+        return {"items": items, "limit": limit, "offset": offset, "grand_total": grand}
+
+    def top_sessions(self, *, now: float | None = None, limit: int = 50,
+                     filters: dict[str, Any] | None = None) -> dict[str, Any]:
+        now = now or time.time()
+        where, params = self._where(filters)
+        spans = {"5h": ROLLING_WINDOW_SECONDS, "24h": 86400, "7d": 604800, "30d": 2592000}
+        span_sql = ", ".join(
+            f"SUM(CASE WHEN ts >= {now - seconds} THEN "
+            f"input_tokens+output_tokens+cache_read_tokens+cache_write_tokens ELSE 0 END) "
+            f"AS tokens_{label}" for label, seconds in spans.items())
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""SELECT agent, agent_session_id, node_id, project, is_subagent,
+                           GROUP_CONCAT(DISTINCT model) AS models,
+                           {self._TOKEN_SUMS}, {span_sql},
+                           MAX(ts) AS last_activity, MIN(ts) AS first_seen
+                    FROM usage_events{where}
+                    GROUP BY agent, agent_session_id, is_subagent
+                    ORDER BY tokens_24h DESC, total_tokens DESC LIMIT ?""",
+                params + [limit]).fetchall()
+            costs = {r["agent_session_id"]: r["total_cost_usd"]
+                     for r in connection.execute("SELECT * FROM session_costs")}
+        items = []
+        for row in rows:
+            record = {k: row[k] for k in row.keys()}
+            record["is_subagent"] = bool(record["is_subagent"])
+            record["estimated_cost_usd"] = costs.get(record["agent_session_id"])
+            record["avg_tokens_per_request"] = (
+                round(record["total_tokens"] / record["requests"]) if record["requests"] else 0)
+            items.append(record)
+        return {"items": items, "limit": limit}
+
+    def top_projects(self, *, now: float | None = None, limit: int = 50,
+                     filters: dict[str, Any] | None = None) -> dict[str, Any]:
+        now = now or time.time()
+        where, params = self._where(filters)
+        spans = {"24h": 86400, "7d": 604800, "30d": 2592000}
+        span_sql = ", ".join(
+            f"SUM(CASE WHEN ts >= {now - seconds} THEN "
+            f"input_tokens+output_tokens+cache_read_tokens+cache_write_tokens ELSE 0 END) "
+            f"AS tokens_{label}" for label, seconds in spans.items())
+        # Previous 7d, so a trend is a comparison rather than a feeling.
+        prev_sql = (f"SUM(CASE WHEN ts >= {now - 1209600} AND ts < {now - 604800} THEN "
+                    f"input_tokens+output_tokens+cache_read_tokens+cache_write_tokens "
+                    f"ELSE 0 END) AS tokens_prev_7d")
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""SELECT COALESCE(project, 'unassigned') AS project,
+                           COUNT(DISTINCT agent_session_id) AS sessions,
+                           GROUP_CONCAT(DISTINCT model) AS models,
+                           {self._TOKEN_SUMS}, {span_sql}, {prev_sql},
+                           MAX(ts) AS last_activity
+                    FROM usage_events{where}
+                    GROUP BY COALESCE(project, 'unassigned')
+                    ORDER BY tokens_7d DESC, total_tokens DESC LIMIT ?""",
+                params + [limit]).fetchall()
+        items = []
+        for row in rows:
+            record = {k: row[k] for k in row.keys()}
+            previous = record.pop("tokens_prev_7d") or 0
+            current = record["tokens_7d"] or 0
+            record["trend_percent"] = (round((current - previous) / previous * 100, 1)
+                                       if previous else None)
+            items.append(record)
+        return {"items": items, "limit": limit}
+
+    def model_breakdown(self, *, filters: dict[str, Any] | None = None) -> dict[str, Any]:
+        where, params = self._where(filters)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""SELECT agent, COALESCE(model, 'unknown') AS model, {self._TOKEN_SUMS}
+                    FROM usage_events{where}
+                    GROUP BY agent, COALESCE(model, 'unknown')
+                    ORDER BY total_tokens DESC""", params).fetchall()
+            per_model_cost: dict[str, float] = {}
+            import json as _json
+            for row in connection.execute("SELECT per_model FROM session_costs"):
+                try:
+                    for model, usage in (_json.loads(row["per_model"]) or {}).items():
+                        cost = usage.get("costUSD")
+                        if not isinstance(cost, (int, float)):
+                            continue
+                        # cost-state names a model with its context variant
+                        # ("claude-opus-5[1m]") while an assistant turn names
+                        # the base model ("claude-opus-5"). Joining on the raw
+                        # string silently produced no cost at all for the
+                        # model doing all the work.
+                        key = model.split("[", 1)[0]
+                        per_model_cost[key] = per_model_cost.get(key, 0.0) + float(cost)
+                except (ValueError, AttributeError):
+                    continue
+        grand = sum(row["total_tokens"] or 0 for row in rows) or 0
+        items = []
+        for row in rows:
+            record = {k: row[k] for k in row.keys()}
+            record["share_percent"] = (round(record["total_tokens"] / grand * 100, 2)
+                                       if grand else 0.0)
+            record["estimated_cost_usd"] = per_model_cost.get(record["model"])
+            items.append(record)
+        return {"items": items, "grand_total": grand}
+
+    def raw_events(self, *, limit: int = 100, offset: int = 0,
+                   filters: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Paginated, because a raw event feed without a bound is a way to
+        make a dashboard poll expensive."""
+        limit = max(1, min(int(limit), 500))
+        where, params = self._where(filters)
+        with self._connect() as connection:
+            total = connection.execute(
+                f"SELECT COUNT(*) FROM usage_events{where}", params).fetchone()[0]
+            rows = connection.execute(
+                f"""SELECT * FROM usage_events{where}
+                    ORDER BY ts DESC LIMIT ? OFFSET ?""", params + [limit, offset]).fetchall()
+        return {"items": [{k: row[k] for k in row.keys()} for row in rows],
+                "total": total, "limit": limit, "offset": offset,
+                "has_more": offset + limit < total}
+
+    def record_quota_snapshot(self, *, now: float | None = None) -> int:
+        """Append the current windows to history.
+
+        Without this, quota is only ever "right now"; with it, a later report
+        can show when a window filled and when it reset.
+        """
+        now = now or time.time()
+        with self._connect() as connection:
+            windows = connection.execute("SELECT * FROM quota_windows").fetchall()
+            rows = [(now, w["agent"], w["label"],
+                     "provider_reported" if w["observed"] else "unavailable",
+                     w["used_percent"], w["resets_at"], w["source"]) for w in windows]
+            connection.executemany(
+                """INSERT OR IGNORE INTO quota_snapshots
+                   (taken_at, agent, label, state, used_percent, resets_at, source)
+                   VALUES (?,?,?,?,?,?,?)""", rows)
+        return len(rows)
+
+    def quota_history(self, *, since: float | None = None, limit: int = 500) -> dict[str, Any]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM quota_snapshots WHERE taken_at >= ?
+                   ORDER BY taken_at DESC LIMIT ?""",
+                (since or 0.0, limit)).fetchall()
+        return {"items": [{k: row[k] for k in row.keys()} for row in rows]}
 
 
 def _local_midnight(now: float) -> float:

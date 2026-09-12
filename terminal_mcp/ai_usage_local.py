@@ -473,3 +473,190 @@ def claude_session_links(home: Path | None = None) -> dict[str, dict[str, Any]]:
             "kind": data.get("kind"),
         }
     return links
+
+# -- prompts and cost, both read from the same transcripts --------------------
+
+# A prompt is a `user` entry the operator actually typed. The transcripts on
+# this host carry 157 of them in one session, each with its own promptId and
+# `promptSource: "typed"`; the other `user` entries are tool results and
+# attachments, whose content is a list of blocks rather than a string.
+PROMPT_SOURCES_TYPED = ("typed", "paste", "slash")
+
+# How much of a prompt is kept. Enough to recognise it in a table, never the
+# whole thing -- and redacted first (see redaction.redact_text, the same
+# function the terminal output path uses).
+PROMPT_PREVIEW_CHARS = 180
+
+
+@dataclass(frozen=True)
+class PromptRecord:
+    prompt_id: str
+    agent_session_id: str
+    timestamp: float
+    preview: str
+    text_hash: str
+    char_length: int
+    source: str | None = None
+    project: str | None = None
+    git_branch: str | None = None
+
+
+def _prompt_text(message: Any) -> str | None:
+    """The typed text of a prompt, or None when this is not one.
+
+    A list content block is a tool result or an attachment, never something a
+    person typed, so it is skipped rather than flattened -- flattening would
+    put file contents into a preview.
+    """
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    return None
+
+
+def claude_prompt(entry: dict[str, Any]) -> PromptRecord | None:
+    if entry.get("type") != "user" or entry.get("isMeta"):
+        return None
+    prompt_id = entry.get("promptId")
+    if not prompt_id:
+        return None
+    source = entry.get("promptSource")
+    if source is not None and source not in PROMPT_SOURCES_TYPED:
+        return None
+    text = _prompt_text(entry.get("message"))
+    if text is None:
+        return None
+    when = _iso_to_epoch(entry.get("timestamp"))
+    if when is None:
+        return None
+    from .redaction import redact_text
+
+    redacted = redact_text(text)
+    preview = redacted[:PROMPT_PREVIEW_CHARS]
+    if len(redacted) > PROMPT_PREVIEW_CHARS:
+        preview += "…"
+    # Hash the ORIGINAL text: the fingerprint has to group two identical
+    # prompts even when redaction rewrites part of them differently.
+    import hashlib
+
+    return PromptRecord(
+        prompt_id=str(prompt_id),
+        agent_session_id=str(entry.get("sessionId") or ""),
+        timestamp=when,
+        preview=preview,
+        text_hash=hashlib.sha256(text.encode("utf-8")).hexdigest()[:32],
+        char_length=len(text),
+        source=source,
+        project=entry.get("cwd"),
+        git_branch=entry.get("gitBranch"),
+    )
+
+
+@dataclass(frozen=True)
+class CostRecord:
+    """Cost as the CLI itself computed it.
+
+    Claude Code writes a `cost-state` entry carrying per-model costUSD and a
+    session total. Using that is strictly better than multiplying tokens by a
+    price table this project would have to keep correct: it is the vendor's
+    own arithmetic, and it is already on disk.
+    """
+
+    agent_session_id: str
+    timestamp: float
+    total_cost_usd: float
+    per_model: dict[str, dict[str, Any]]
+    message_count: int | None = None
+    api_duration_ms: int | None = None
+
+
+def claude_cost(entry: dict[str, Any]) -> CostRecord | None:
+    if entry.get("type") != "cost-state":
+        return None
+    total = entry.get("totalCostUSD")
+    if not isinstance(total, (int, float)):
+        return None
+    when = _iso_to_epoch(entry.get("timestamp")) or _iso_to_epoch(entry.get("startTime"))
+    if when is None:
+        when = 0.0
+    usage = entry.get("modelUsage")
+    return CostRecord(
+        agent_session_id=str(entry.get("sessionId") or ""),
+        timestamp=float(when),
+        total_cost_usd=float(total),
+        per_model=usage if isinstance(usage, dict) else {},
+        message_count=entry.get("messageCount"),
+        api_duration_ms=entry.get("totalAPIDuration"),
+    )
+
+
+@dataclass
+class RichParseOutcome(ParseOutcome):
+    """`parse_jsonl` plus the prompt and cost records the same pass found.
+
+    One pass, three kinds of record: re-reading a 13MB transcript twice to
+    collect prompts separately would undo the whole point of the offsets.
+    """
+
+    prompts: list[PromptRecord] = field(default_factory=list)
+    costs: list[CostRecord] = field(default_factory=list)
+    # Parallel to `events`: which prompt each turn was attributed to.
+    event_prompt_ids: list[str | None] = field(default_factory=list)
+    last_prompt_id: str | None = None
+
+
+def parse_claude_transcript(path: Path, *, node_id: str, start_offset: int = 0,
+                            carry_prompt_id: str | None = None) -> RichParseOutcome:
+    """Read usage, prompts and cost together, attributing each turn to the
+    prompt that caused it.
+
+    Attribution is positional: an assistant turn belongs to the most recent
+    typed prompt before it in the same file. The transcript has no field
+    linking the two (promptId appears only on `user` entries), and the
+    parentUuid chain runs through tool results, so position is what the data
+    actually supports. `carry_prompt_id` continues that across an incremental
+    read so a turn appended after the offset still lands on its prompt.
+    """
+    outcome = RichParseOutcome(end_offset=start_offset)
+    current_prompt = carry_prompt_id
+    try:
+        with path.open("rb") as handle:
+            handle.seek(start_offset)
+            for raw in handle:
+                if not raw.endswith(b"\n"):
+                    break
+                outcome.end_offset += len(raw)
+                text = raw.strip()
+                if not text:
+                    continue
+                outcome.lines_read += 1
+                try:
+                    entry = json.loads(text)
+                except (ValueError, UnicodeDecodeError):
+                    outcome.unparsed += 1
+                    continue
+                if not isinstance(entry, dict):
+                    outcome.unparsed += 1
+                    continue
+                try:
+                    prompt = claude_prompt(entry)
+                    if prompt is not None:
+                        outcome.prompts.append(prompt)
+                        current_prompt = prompt.prompt_id
+                        continue
+                    cost = claude_cost(entry)
+                    if cost is not None:
+                        outcome.costs.append(cost)
+                        continue
+                    event = claude_event(entry, node_id=node_id)
+                    if event is not None:
+                        outcome.events.append(event)
+                        outcome.event_prompt_ids.append(current_prompt)
+                except Exception:  # noqa: BLE001 -- one bad line never stops a file
+                    outcome.unparsed += 1
+    except OSError:
+        return outcome
+    outcome.last_prompt_id = current_prompt
+    return outcome

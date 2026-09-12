@@ -6625,51 +6625,95 @@ AI_USAGE_HTML = """<!doctype html>
       --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono','Courier New',monospace;
     }
     * { box-sizing:border-box }
-    body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text) }
+    html, body { height:100%; margin:0 }
+    body { font:14px/1.5 var(--mono); background:var(--bg); color:var(--text);
+           display:grid; grid-template-columns:196px 1fr; grid-template-rows:auto 1fr }
     a { color:var(--accent) }
-    header { display:flex; align-items:center; gap:12px; flex-wrap:wrap;
-             padding:14px max(16px, env(safe-area-inset-right)) 14px max(16px, env(safe-area-inset-left));
+    header { grid-column:1/-1; display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+             padding:12px max(16px, env(safe-area-inset-right)) 12px max(16px, env(safe-area-inset-left));
              border-bottom:1px solid var(--line) }
-    h1 { margin:0; font-size:17px }
-    .muted { color:var(--muted) }
-    .spacer { flex:1 }
+    h1 { margin:0; font-size:16px; white-space:nowrap }
+    .muted { color:var(--muted) } .spacer { flex:1 }
     .btn { background:#19243b; border:1px solid var(--line); color:var(--text); border-radius:8px;
-           padding:7px 12px; font:13px var(--mono); cursor:pointer; min-height:40px }
+           padding:7px 11px; font:13px var(--mono); cursor:pointer; min-height:40px;
+           display:inline-flex; align-items:center; gap:6px; text-decoration:none }
     .btn:active { background:#223052 }
-    main { padding:14px max(16px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)) }
-    .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:10px; margin-bottom:14px }
-    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 14px; min-width:0 }
-    .card h2 { margin:0 0 6px; font-size:11px; font-weight:700; letter-spacing:.05em;
+    .btn.on { border-color:var(--accent); color:var(--accent) }
+    nav { grid-row:2; border-right:1px solid var(--line); background:var(--panel);
+          padding:10px 8px; display:flex; flex-direction:column; gap:4px; overflow-y:auto }
+    nav button { background:none; border:none; color:var(--muted); text-align:left;
+                 padding:9px 11px; border-radius:8px; font:13px var(--mono); cursor:pointer;
+                 min-height:40px; width:100% }
+    nav button:hover { background:#17203a; color:var(--text) }
+    nav button.active { background:#17203a; color:var(--text); font-weight:700;
+                        box-shadow:inset 3px 0 0 var(--accent) }
+    nav .nav-title { font-size:10px; text-transform:uppercase; letter-spacing:.06em;
+                     color:var(--muted); padding:10px 11px 4px }
+    main { grid-row:2; min-width:0; overflow-y:auto;
+           padding:14px max(16px, env(safe-area-inset-right)) max(28px, env(safe-area-inset-bottom)) 14px }
+    .bar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px }
+    .bar select, .bar input { background:var(--panel); border:1px solid var(--line); color:var(--text);
+                              border-radius:8px; padding:8px 10px; font:16px var(--mono); min-height:40px }
+    .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(168px,1fr)); gap:10px; margin-bottom:14px }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:11px 13px; min-width:0 }
+    .card h2 { margin:0 0 5px; font-size:10px; font-weight:700; letter-spacing:.05em;
                text-transform:uppercase; color:var(--muted) }
-    .card .big { font-size:22px; font-weight:700; word-break:break-all }
-    .card .sub { font-size:11px; color:var(--muted); margin-top:4px }
-    .split { display:flex; gap:10px; flex-wrap:wrap; font-size:11px; color:var(--muted); margin-top:6px }
-    .split b { color:var(--text); font-weight:700 }
-    .filters { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px }
-    .filters select, .filters input { background:var(--panel); border:1px solid var(--line); color:var(--text);
-                                      border-radius:8px; padding:8px 10px; font:16px var(--mono); min-height:40px }
+    .card .big { font-size:20px; font-weight:700; word-break:break-all }
+    .card .sub { font-size:11px; color:var(--muted); margin-top:3px; word-break:break-all }
     .wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px; background:var(--panel) }
-    table { border-collapse:collapse; width:100%; min-width:820px }
-    th, td { padding:9px 11px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--line) }
+    table { border-collapse:collapse; width:100%; min-width:680px }
+    th, td { padding:8px 10px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--line) }
     th:first-child, td:first-child, th.l, td.l { text-align:left }
-    th { position:sticky; top:0; background:#0e1526; cursor:pointer; user-select:none; font-size:11px;
+    th { position:sticky; top:0; background:#0e1526; cursor:pointer; user-select:none; font-size:10px;
          text-transform:uppercase; letter-spacing:.04em; color:var(--muted); z-index:1 }
-    th.sorted::after { content:' \\2195'; color:var(--accent) }
+    th.sorted { color:var(--accent) }
     tbody tr:hover { background:#17203a }
-    tbody tr.detail-row td { background:#0e1526; text-align:left; white-space:normal; font-size:12px; color:var(--muted) }
+    tbody tr.clickable { cursor:pointer }
+    td.prompt { max-width:460px; white-space:normal; word-break:break-word; font-size:12.5px }
     .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:1px 8px;
             font-size:10px; color:var(--muted); white-space:nowrap }
-    .pill.ok { color:var(--green); border-color:var(--green) }
-    .pill.sub { color:var(--amber); border-color:var(--amber) }
-    .pill.none { color:var(--muted) }
-    .expand { background:none; border:none; color:var(--muted); cursor:pointer; font:12px var(--mono); padding:0 6px }
-    .empty { padding:26px; text-align:center; color:var(--muted) }
-    .note { font-size:12px; color:var(--muted); margin:14px 0 0; line-height:1.6 }
-    @media (max-width:760px) {
-      header { padding:10px 12px; gap:8px } h1 { font-size:15px }
-      main { padding:10px 12px 24px }
-      .card .big { font-size:19px }
-      .filters select, .filters input { flex:1 1 140px }
+    .pill.rep { color:var(--green); border-color:var(--green) }
+    .pill.est { color:var(--amber); border-color:var(--amber) }
+    .pill.na { color:var(--muted) }
+    .pill.warn { color:var(--red); border-color:var(--red) }
+    .empty { padding:24px; text-align:center; color:var(--muted) }
+    .note { font-size:11.5px; color:var(--muted); margin:12px 0 0; line-height:1.6 }
+    .chart { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+             padding:12px; margin-bottom:14px }
+    .chart .bars { display:flex; align-items:flex-end; gap:2px; height:132px; overflow-x:auto }
+    .chart .col { flex:1 0 7px; display:flex; flex-direction:column; justify-content:flex-end;
+                  min-width:7px; border-radius:2px 2px 0 0; overflow:hidden }
+    .chart .seg { width:100% }
+    .chart .seg.i { background:#3b78ff } .chart .seg.o { background:#43d17c }
+    .chart .seg.cr { background:#3a4f7a } .chart .seg.cw { background:#ffc857 }
+    .legend { display:flex; gap:12px; flex-wrap:wrap; font-size:11px; color:var(--muted); margin-top:8px }
+    .legend i { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:4px }
+    .drill { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+             padding:12px 14px; margin-bottom:14px }
+    .drill h3 { margin:0 0 8px; font-size:13px }
+    .kv { display:grid; grid-template-columns:auto 1fr; gap:3px 12px; font-size:12px }
+    .kv b { color:var(--muted); font-weight:400 }
+    @media (max-width:860px) {
+      body { grid-template-columns:1fr }
+      nav { grid-row:auto; grid-column:1; flex-direction:row; overflow-x:auto;
+            border-right:none; border-bottom:1px solid var(--line); padding:8px }
+      nav button { width:auto; white-space:nowrap; box-shadow:none }
+      nav button.active { box-shadow:inset 0 -3px 0 var(--accent) }
+      nav .nav-title { display:none }
+      main { grid-row:auto; padding:12px }
+      /* A wide table on a phone becomes one card per row -- an 11-column
+         grid squeezed into 390px is unreadable however it scrolls. */
+      table, thead, tbody, tr, th, td { display:block }
+      thead { display:none }
+      table { min-width:0 }
+      tbody tr { border-bottom:1px solid var(--line); padding:9px 11px }
+      tbody tr:last-child { border-bottom:none }
+      td { border:none; padding:2px 0; text-align:left; white-space:normal; display:flex;
+           justify-content:space-between; gap:12px }
+      td::before { content:attr(data-label); color:var(--muted); font-size:11px }
+      td:first-child { font-weight:700; padding-bottom:5px }
+      td.prompt { max-width:none }
+      .wrap { overflow-x:visible }
     }
   </style>
 </head>
@@ -6680,51 +6724,48 @@ AI_USAGE_HTML = """<!doctype html>
     <span class="spacer"></span>
     <label class="muted" style="font-size:12px"><input type="checkbox" id="autoRefresh" checked> Tự làm mới</label>
     <button class="btn" id="refreshBtn" type="button">Làm mới</button>
-    <a class="btn" href="/dashboard" style="text-decoration:none; display:inline-flex; align-items:center">← Dashboard</a>
+    <a class="btn" href="/dashboard">← Dashboard</a>
   </header>
+  <nav>
+    <div class="nav-title">Báo cáo</div>
+    <button type="button" data-tab="overview" class="active">Tổng quan</button>
+    <button type="button" data-tab="prompts">Top prompts</button>
+    <button type="button" data-tab="sessions">Top sessions</button>
+    <button type="button" data-tab="projects">Top projects</button>
+    <button type="button" data-tab="models">Model / provider</button>
+    <button type="button" data-tab="quota">Quota</button>
+    <button type="button" data-tab="events">Raw events</button>
+  </nav>
   <main>
-    <div class="cards" id="cards"></div>
-    <div class="filters">
-      <select id="fNode"><option value="">Tất cả node</option></select>
-      <select id="fAgent"><option value="">Tất cả agent</option></select>
-      <select id="fProject"><option value="">Tất cả project</option></select>
-      <input type="search" id="fSearch" placeholder="Lọc theo tên session..." aria-label="Lọc session">
+    <div class="bar">
+      <select id="fRange" aria-label="Khoảng thời gian">
+        <option value="1h">1 giờ</option><option value="5h">5 giờ</option>
+        <option value="24h" selected>24 giờ</option><option value="7d">7 ngày</option>
+        <option value="30d">30 ngày</option><option value="">Toàn bộ</option>
+      </select>
+      <select id="fNode" aria-label="Node"><option value="">Tất cả node</option></select>
+      <select id="fAgent" aria-label="Provider"><option value="">Tất cả provider</option></select>
+      <select id="fProject" aria-label="Project"><option value="">Tất cả project</option></select>
+      <select id="fModel" aria-label="Model"><option value="">Tất cả model</option></select>
+      <input type="search" id="fSearch" placeholder="Tìm..." aria-label="Tìm">
+      <a class="btn" id="exportBtn" href="#" download>⬇ CSV</a>
     </div>
-    <div class="wrap">
-      <table id="tbl">
-        <thead><tr>
-          <th class="l" data-k="session">Session</th>
-          <th class="l" data-k="agent">Agent</th>
-          <th class="l" data-k="project">Project</th>
-          <th data-k="i">5h Input</th>
-          <th data-k="o">5h Output</th>
-          <th data-k="cr">5h Cache Read</th>
-          <th data-k="cw">5h Cache Write</th>
-          <th data-k="t" class="sorted">5h Total</th>
-          <th data-k="today">Today</th>
-          <th data-k="life">Lifetime</th>
-          <th data-k="act">Hoạt động</th>
-          <th class="l">Quota</th>
-          <th></th>
-        </tr></thead>
-        <tbody id="tbody"></tbody>
-      </table>
-    </div>
+    <div id="view"></div>
     <p class="note" id="provenance"></p>
   </main>
   <script>
     const $ = (s) => document.querySelector(s);
-    let data = null, sortKey = 't', sortDir = -1;
-    const expanded = new Set();
+    const state = {tab: 'overview', data: {}, sort: {}, drill: null};
 
-    const fmt = (n) => (n || 0).toLocaleString('en-US');
+    const fmt = (n) => (n == null ? '—' : Number(n).toLocaleString('en-US'));
     const short = (n) => {
-      n = n || 0;
+      n = Number(n || 0);
       if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
       if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
       if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-      return String(n);
+      return String(Math.round(n));
     };
+    const usd = (n) => (n == null ? '—' : '$' + Number(n).toFixed(2));
     const ago = (ts) => {
       if (!ts) return '—';
       const s = Math.max(0, Date.now() / 1000 - ts);
@@ -6733,208 +6774,461 @@ AI_USAGE_HTML = """<!doctype html>
       if (s < 172800) return Math.round(s / 3600) + 'h';
       return Math.round(s / 86400) + 'd';
     };
+    const shortPath = (p) => (!p ? 'unassigned' : p.split('/').slice(-2).join('/'));
 
-    function quotaCell(row) {
-      const q = (data.quota_windows || []).filter((w) => w.agent === row.agent);
-      const observed = q.filter((w) => w.observed);
-      if (!observed.length) {
-        const span = document.createElement('span');
-        span.className = 'pill none';
-        span.textContent = 'Not observed';
-        const why = q.length ? q[0].detail : '';
-        if (why) span.title = why;
-        return span;
+    // Filters live in the URL so a link means the same thing when reopened.
+    function readUrl() {
+      const q = new URLSearchParams(location.search);
+      state.tab = q.get('tab') || 'overview';
+      for (const [key, sel] of [['range', '#fRange'], ['node_id', '#fNode'], ['agent', '#fAgent'],
+                                ['project', '#fProject'], ['model', '#fModel'], ['q', '#fSearch']]) {
+        const el = $(sel);
+        if (el && q.has(key)) el.value = q.get(key);
       }
-      const frag = document.createDocumentFragment();
-      for (const w of observed) {
-        const span = document.createElement('span');
-        span.className = 'pill sub';
-        const pct = w.used_percent == null ? '?' : Math.round(w.used_percent) + '%';
-        let text = w.label + ' ' + pct;
-        if (w.resets_at) {
-          const left = Math.max(0, w.resets_at - Date.now() / 1000);
-          text += ' · reset ' + (left > 3600 ? Math.round(left / 3600) + 'h' : Math.round(left / 60) + 'm');
-        }
-        span.textContent = text;
-        span.title = 'Nguồn: ' + w.source;
-        frag.appendChild(span);
+    }
+    function query(extra) {
+      const q = new URLSearchParams();
+      const range = $('#fRange').value;
+      if (range) q.set('range', range);
+      for (const [key, sel] of [['node_id', '#fNode'], ['agent', '#fAgent'],
+                                ['project', '#fProject'], ['model', '#fModel']]) {
+        if ($(sel).value) q.set(key, $(sel).value);
       }
-      return frag;
+      for (const [k, v] of Object.entries(extra || {})) q.set(k, v);
+      return q;
+    }
+    function syncUrl() {
+      const q = query({});
+      q.set('tab', state.tab);
+      if ($('#fSearch').value) q.set('q', $('#fSearch').value);
+      history.replaceState(null, '', location.pathname + '?' + q.toString());
+      $('#exportBtn').href = '/dashboard/api/ai-usage/export?' +
+        query({dataset: state.tab === 'overview' ? 'sessions' : state.tab, format: 'csv'});
     }
 
-    function visibleRows() {
-      const node = $('#fNode').value, agent = $('#fAgent').value, project = $('#fProject').value;
-      const q = $('#fSearch').value.trim().toLowerCase();
-      return (data.sessions || []).filter((r) =>
-        (!node || r.node_id === node) && (!agent || r.agent === agent) &&
-        (!project || (r.project || '') === project) &&
-        (!q || (r.session || r.agent_session_id || '').toLowerCase().includes(q)));
+    async function api(path, extra) {
+      const response = await fetch('/dashboard/api/ai-usage/' + path + '?' + query(extra),
+                                   {cache: 'no-store'});
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.json();
     }
 
-    const KEY = {
-      session: (r) => (r.session || r.agent_session_id || '').toLowerCase(),
-      agent: (r) => r.agent, project: (r) => r.project || '',
-      i: (r) => r.rolling_5h.input, o: (r) => r.rolling_5h.output,
-      cr: (r) => r.rolling_5h.cache_read, cw: (r) => r.rolling_5h.cache_write,
-      t: (r) => r.rolling_5h.total, today: (r) => r.today.total,
-      life: (r) => r.lifetime.total, act: (r) => r.last_activity || 0,
-    };
+    function el(tag, opts) {
+      const node = document.createElement(tag);
+      if (opts && opts.className) node.className = opts.className;
+      if (opts && opts.text != null) node.textContent = opts.text;
+      if (opts && opts.label) node.dataset.label = opts.label;
+      return node;
+    }
 
-    function render() {
-      if (!data) return;
-      const total = data.totals;
-      const cards = [
-        ['5h Total', short(total.rolling_5h.total), total.rolling_5h.messages + ' message',
-         [['In', total.rolling_5h.input], ['Out', total.rolling_5h.output],
-          ['C·Read', total.rolling_5h.cache_read], ['C·Write', total.rolling_5h.cache_write]]],
-        ['Today', short(total.today.total), total.today.messages + ' message', null],
-        ['Lifetime', short(total.lifetime.input + total.lifetime.output +
-          total.lifetime.cache_read + total.lifetime.cache_write),
-         total.lifetime.events + ' assistant turn', null],
-        ['Sessions', String((data.sessions || []).length),
-         (data.sessions || []).filter((s) => s.is_subagent).length + ' subagent', null],
-      ];
-      const cardsEl = $('#cards'); cardsEl.replaceChildren();
-      for (const [title, big, sub, split] of cards) {
-        const el = document.createElement('div'); el.className = 'card';
-        const h = document.createElement('h2'); h.textContent = title;
-        const b = document.createElement('div'); b.className = 'big'; b.textContent = big;
-        const s = document.createElement('div'); s.className = 'sub'; s.textContent = sub;
-        el.append(h, b, s);
-        if (split) {
-          const row = document.createElement('div'); row.className = 'split';
-          for (const [label, value] of split) {
-            const span = document.createElement('span');
-            const strong = document.createElement('b'); strong.textContent = short(value);
-            span.append(label + ' ', strong);
-            row.appendChild(span);
-          }
-          el.appendChild(row);
+    function table(columns, rows, opts) {
+      const wrap = el('div', {className: 'wrap'});
+      const tbl = document.createElement('table');
+      const thead = document.createElement('thead');
+      const hrow = document.createElement('tr');
+      for (const col of columns) {
+        const th = el('th', {text: col.title, className: col.left ? 'l' : ''});
+        if (col.key) {
+          th.dataset.k = col.key;
+          if (state.sort[state.tab] && state.sort[state.tab].key === col.key) th.classList.add('sorted');
+          th.onclick = () => {
+            // The first click on the column a table is ALREADY sorted by has
+            // no recorded direction, so negating it produced NaN and the
+            // comparator returned 0 -- the table simply did not move.
+            const cur = state.sort[state.tab] || {key: col.defaultKey, dir: -1};
+            const dir = (cur.key === col.key && Number.isFinite(cur.dir)) ? -cur.dir : -1;
+            state.sort[state.tab] = {key: col.key, dir};
+            render();
+          };
         }
-        cardsEl.appendChild(el);
+        hrow.appendChild(th);
       }
-
-      for (const [sel, key] of [['#fNode', 'node_id'], ['#fAgent', 'agent'], ['#fProject', 'project']]) {
-        const el = $(sel), keep = el.value;
-        const values = [...new Set((data.sessions || []).map((r) => r[key]).filter(Boolean))].sort();
-        el.replaceChildren();
-        const all = document.createElement('option'); all.value = '';
-        all.textContent = el.id === 'fNode' ? 'Tất cả node' : el.id === 'fAgent' ? 'Tất cả agent' : 'Tất cả project';
-        el.appendChild(all);
-        for (const v of values) {
-          const opt = document.createElement('option'); opt.value = v;
-          opt.textContent = el.id === 'fProject' ? v.split('/').slice(-2).join('/') : v;
-          el.appendChild(opt);
-        }
-        el.value = values.includes(keep) ? keep : '';
-      }
-
-      const rows = visibleRows().sort((a, b) => {
-        const x = KEY[sortKey](a), y = KEY[sortKey](b);
-        return (x < y ? -1 : x > y ? 1 : 0) * sortDir;
-      });
-      const body = $('#tbody'); body.replaceChildren();
+      thead.appendChild(hrow); tbl.appendChild(thead);
+      const tbody = document.createElement('tbody');
       if (!rows.length) {
-        const tr = document.createElement('tr'); const td = document.createElement('td');
-        td.colSpan = 13; td.className = 'empty';
-        td.textContent = 'Không có dữ liệu usage nào khớp bộ lọc.';
-        tr.appendChild(td); body.appendChild(tr);
-      }
-      for (const r of rows) {
         const tr = document.createElement('tr');
-        const id = r.agent + ':' + r.agent_session_id;
-        const cells = [
-          [r.session || r.agent_session_id.slice(0, 8), 'l'],
-          [r.agent + (r.is_subagent ? ' · sub' : ''), 'l'],
-          [(r.project || '—').split('/').slice(-2).join('/'), 'l'],
-          [fmt(r.rolling_5h.input)], [fmt(r.rolling_5h.output)],
-          [fmt(r.rolling_5h.cache_read)], [fmt(r.rolling_5h.cache_write)],
-          [fmt(r.rolling_5h.total)], [short(r.today.total)], [short(r.lifetime.total)],
-          [ago(r.last_activity)],
-        ];
-        for (const [text, cls] of cells) {
-          const td = document.createElement('td');
-          if (cls) td.className = cls;
-          td.textContent = text;
+        const td = el('td', {className: 'empty', text: (opts && opts.empty) || 'Không có dữ liệu.'});
+        td.colSpan = columns.length; tr.appendChild(td); tbody.appendChild(tr);
+      }
+      for (const row of rows) {
+        const tr = document.createElement('tr');
+        if (opts && opts.onClick) { tr.className = 'clickable'; tr.onclick = () => opts.onClick(row); }
+        for (const col of columns) {
+          const td = el('td', {className: col.cls || (col.left ? 'l' : ''), label: col.title});
+          const value = col.render(row);
+          if (value instanceof Node) td.appendChild(value); else td.textContent = value;
           tr.appendChild(td);
         }
-        const tdQuota = document.createElement('td'); tdQuota.className = 'l';
-        tdQuota.appendChild(quotaCell(r)); tr.appendChild(tdQuota);
-        const tdX = document.createElement('td');
-        const btn = document.createElement('button');
-        btn.className = 'expand'; btn.type = 'button';
-        btn.textContent = expanded.has(id) ? '▾' : '▸';
-        btn.title = 'Chi tiết';
-        btn.onclick = () => { expanded.has(id) ? expanded.delete(id) : expanded.add(id); render(); };
-        tdX.appendChild(btn); tr.appendChild(tdX);
-        body.appendChild(tr);
-
-        if (expanded.has(id)) {
-          const detail = document.createElement('tr'); detail.className = 'detail-row';
-          const td = document.createElement('td'); td.colSpan = 13;
-          const lines = [
-            ['conversation', r.agent_session_id],
-            ['stable_session_id', r.stable_session_id || '—'],
-            ['node', r.node_id], ['model', r.model || '—'],
-            ['cli version', r.cli_version || '—'], ['pid', r.pid == null ? '—' : String(r.pid)],
-            ['git branch', r.git_branch || '—'],
-            ['subagent (sidechain)', r.is_subagent ? 'yes' : 'no'],
-            ['messages 5h / lifetime', r.rolling_5h.messages + ' / ' + r.lifetime.messages],
-            ['lifetime in/out/cr/cw', [r.lifetime.input, r.lifetime.output,
-              r.lifetime.cache_read, r.lifetime.cache_write].map(fmt).join(' / ')],
-            ['nguồn số liệu', r.source],
-          ];
-          for (const [k, v] of lines) {
-            const row = document.createElement('div');
-            const b = document.createElement('b'); b.textContent = k + ': ';
-            row.append(b, document.createTextNode(v));
-            td.appendChild(row);
-          }
-          detail.appendChild(td); body.appendChild(detail);
-        }
+        tbody.appendChild(tr);
       }
-
-      for (const th of document.querySelectorAll('th[data-k]'))
-        th.classList.toggle('sorted', th.dataset.k === sortKey);
-
-      const src = data.sources || {};
-      $('#sourceLine').textContent =
-        'Claude: ' + (src.claude ? src.claude.status : '?') +
-        ' · Codex: ' + (src.codex ? src.codex.status : '?');
-      const notes = [data.window.note];
-      for (const w of data.quota_windows || [])
-        if (!w.observed && w.detail) notes.push(w.agent + ': ' + w.detail);
-      notes.push('Nguồn: ' + (src.claude ? src.claude.detail : '') + ' · ' + (src.codex ? src.codex.detail : ''));
-      $('#provenance').textContent = notes.join('  •  ');
+      tbl.appendChild(tbody); wrap.appendChild(tbl);
+      return wrap;
     }
 
-    async function load(force) {
+    function sorted(rows, fallbackKey) {
+      if (!state.sort[state.tab]) state.sort[state.tab] = {key: fallbackKey, dir: -1};
+      const s = state.sort[state.tab];
+      return [...rows].sort((a, b) => {
+        const x = a[s.key], y = b[s.key];
+        if (x == null && y == null) return 0;
+        if (x == null) return 1;
+        if (y == null) return -1;
+        return (x < y ? -1 : x > y ? 1 : 0) * s.dir;
+      });
+    }
+
+    function searchFilter(rows, fields) {
+      const q = $('#fSearch').value.trim().toLowerCase();
+      if (!q) return rows;
+      return rows.filter((r) => fields.some((f) => String(r[f] || '').toLowerCase().includes(q)));
+    }
+
+    function cards(items) {
+      const box = el('div', {className: 'cards'});
+      for (const [title, big, sub] of items) {
+        const card = el('div', {className: 'card'});
+        card.append(el('h2', {text: title}), el('div', {className: 'big', text: big}),
+                    el('div', {className: 'sub', text: sub || ''}));
+        box.appendChild(card);
+      }
+      return box;
+    }
+
+    function chart(points) {
+      const box = el('div', {className: 'chart'});
+      const bars = el('div', {className: 'bars'});
+      const max = Math.max(1, ...points.map((p) => p.total_tokens || 0));
+      for (const p of points) {
+        const col = el('div', {className: 'col'});
+        col.title = new Date(p.bucket_start * 1000).toLocaleString() + ' · ' +
+                    fmt(p.total_tokens) + ' tokens';
+        const height = Math.max(2, Math.round((p.total_tokens || 0) / max * 128));
+        for (const [cls, value] of [['cw', p.cache_write_tokens], ['cr', p.cache_read_tokens],
+                                    ['o', p.output_tokens], ['i', p.input_tokens]]) {
+          const part = Math.round((value || 0) / (p.total_tokens || 1) * height);
+          if (part > 0) {
+            const seg = el('div', {className: 'seg ' + cls});
+            seg.style.height = part + 'px';
+            col.appendChild(seg);
+          }
+        }
+        bars.appendChild(col);
+      }
+      box.appendChild(bars);
+      const legend = el('div', {className: 'legend'});
+      for (const [cls, label] of [['i', 'Input'], ['o', 'Output'],
+                                  ['cr', 'Cache read'], ['cw', 'Cache write']]) {
+        const span = el('span', {text: ' ' + label});
+        const dot = el('i', {className: 'seg ' + cls});
+        dot.classList.add(cls);
+        span.prepend(dot);
+        legend.appendChild(span);
+      }
+      box.appendChild(legend);
+      return box;
+    }
+
+    function quotaPill(window) {
+      const state_ = window.state || (window.observed ? 'provider_reported' : 'unavailable');
+      if (state_ === 'provider_reported') {
+        const pct = window.used_percent == null ? '?' : Math.round(window.used_percent) + '%';
+        let text = 'reported · ' + pct;
+        if (window.resets_at) {
+          const left = Math.max(0, window.resets_at - Date.now() / 1000);
+          text += ' · reset ' + (left > 3600 ? Math.round(left / 3600) + 'h' : Math.round(left / 60) + 'm');
+        }
+        return el('span', {className: 'pill rep', text});
+      }
+      if (state_ === 'locally_estimated') {
+        return el('span', {className: 'pill est', text: 'ƯỚC TÍNH · ' +
+          (window.used_percent == null ? '?' : Math.round(window.used_percent) + '%')});
+      }
+      const pill = el('span', {className: 'pill na', text: 'N/A'});
+      if (window.detail) pill.title = window.detail;
+      return pill;
+    }
+
+    // -- tabs ----------------------------------------------------------------
+    const TABS = {
+      overview: async () => {
+        const [summary, timeline, projects] = await Promise.all([
+          api('summary'), api('timeline', {bucket: bucketFor()}), api('projects', {limit: 5})]);
+        state.data.summary = summary;
+        const box = document.createDocumentFragment();
+        const s = summary.spans || {};
+        box.appendChild(cards([
+          ['Hôm nay (24h)', short(s['24h'] && s['24h'].total_tokens), (s['24h'] ? s['24h'].requests : 0) + ' request'],
+          ['7 ngày', short(s['7d'] && s['7d'].total_tokens), (s['7d'] ? s['7d'].requests : 0) + ' request'],
+          ['30 ngày', short(s['30d'] && s['30d'].total_tokens), (s['30d'] ? s['30d'].requests : 0) + ' request'],
+          ['Chi phí ước tính', usd(summary.estimated_cost_usd), summary.cost_source || 'không có nguồn'],
+          ['Session hoạt động', String(summary.active_sessions_24h || 0), '24 giờ qua'],
+          ['Session tốn nhất', summary.peak_session_24h ? short(summary.peak_session_24h.total) : '—',
+           summary.peak_session_24h ? shortPath(summary.peak_session_24h.project) : ''],
+          ['Project tốn nhất', summary.top_project_24h ? short(summary.top_project_24h.total) : '—',
+           summary.top_project_24h ? shortPath(summary.top_project_24h.project) : ''],
+          ['Quota thấp nhất', lowestQuota(), quotaNote()],
+        ]));
+        box.appendChild(chart(timeline.points || []));
+        box.appendChild(table([
+          {title: 'Project', left: true, key: 'project', render: (r) => shortPath(r.project)},
+          {title: 'Sessions', key: 'sessions', render: (r) => fmt(r.sessions)},
+          {title: '24h', key: 'tokens_24h', render: (r) => short(r.tokens_24h)},
+          {title: '7d', key: 'tokens_7d', render: (r) => short(r.tokens_7d)},
+          {title: 'Tổng', key: 'total_tokens', render: (r) => short(r.total_tokens)},
+        ], sorted(projects.items || [], 'tokens_7d').slice(0, 5), {}));
+        return box;
+      },
+
+      prompts: async () => {
+        const data = await api('prompts', {limit: 100});
+        const rows = searchFilter(data.items || [], ['preview', 'project', 'agent_session_id']);
+        return table([
+          {title: 'Prompt', left: true, cls: 'prompt', key: 'preview',
+           render: (r) => r.preview || (r.prompt_id ? '(không có preview)' : 'unassigned')},
+          {title: 'Project', left: true, key: 'project', render: (r) => shortPath(r.project)},
+          {title: 'Model', left: true, key: 'models', render: (r) => r.models || '—'},
+          {title: 'Input', key: 'input_tokens', render: (r) => fmt(r.input_tokens)},
+          {title: 'Output', key: 'output_tokens', render: (r) => fmt(r.output_tokens)},
+          {title: 'Tổng', key: 'total_tokens', render: (r) => fmt(r.total_tokens)},
+          {title: '% tổng', key: 'share_percent', render: (r) => r.share_percent + '%'},
+          {title: 'Turns', key: 'requests', render: (r) => fmt(r.requests)},
+          {title: 'Kéo dài', key: 'duration_seconds',
+           render: (r) => Math.round(r.duration_seconds / 60) + 'm'},
+          {title: 'Khi nào', key: 'last_ts', render: (r) => ago(r.last_ts)},
+        ], sorted(rows, 'total_tokens'), {onClick: (r) => { state.drill = {kind: 'prompt', row: r}; render(); }});
+      },
+
+      sessions: async () => {
+        const data = await api('sessions', {limit: 100});
+        const rows = searchFilter(data.items || [], ['agent_session_id', 'project', 'models']);
+        return table([
+          {title: 'Session', left: true, key: 'agent_session_id',
+           render: (r) => (r.agent_session_id || '').slice(0, 10) + (r.is_subagent ? ' · sub' : '')},
+          {title: 'Node', left: true, key: 'node_id', render: (r) => r.node_id},
+          {title: 'Project', left: true, key: 'project', render: (r) => shortPath(r.project)},
+          {title: 'Model', left: true, key: 'models', render: (r) => r.models || '—'},
+          {title: '5h', key: 'tokens_5h', render: (r) => short(r.tokens_5h)},
+          {title: '24h', key: 'tokens_24h', render: (r) => short(r.tokens_24h)},
+          {title: '7d', key: 'tokens_7d', render: (r) => short(r.tokens_7d)},
+          {title: 'Requests', key: 'requests', render: (r) => fmt(r.requests)},
+          {title: 'TB/req', key: 'avg_tokens_per_request', render: (r) => fmt(r.avg_tokens_per_request)},
+          {title: 'Chi phí', key: 'estimated_cost_usd', render: (r) => usd(r.estimated_cost_usd)},
+          {title: 'Quota 5h', left: true, render: () => quotaPill(quotaFor('5h'))},
+          {title: 'Quota 1w', left: true, render: () => quotaPill(quotaFor('1w'))},
+          {title: 'Hoạt động', key: 'last_activity', render: (r) => ago(r.last_activity)},
+        ], sorted(rows, 'tokens_24h'), {onClick: (r) => { state.drill = {kind: 'session', row: r}; render(); }});
+      },
+
+      projects: async () => {
+        const data = await api('projects', {limit: 100});
+        const rows = searchFilter(data.items || [], ['project', 'models']);
+        return table([
+          {title: 'Project', left: true, key: 'project', render: (r) => r.project},
+          {title: 'Sessions', key: 'sessions', render: (r) => fmt(r.sessions)},
+          {title: '24h', key: 'tokens_24h', render: (r) => short(r.tokens_24h)},
+          {title: '7d', key: 'tokens_7d', render: (r) => short(r.tokens_7d)},
+          {title: '30d', key: 'tokens_30d', render: (r) => short(r.tokens_30d)},
+          {title: 'All-time', key: 'total_tokens', render: (r) => short(r.total_tokens)},
+          {title: 'Requests', key: 'requests', render: (r) => fmt(r.requests)},
+          {title: 'Model', left: true, key: 'models', render: (r) => r.models || '—'},
+          {title: 'Trend 7d', key: 'trend_percent',
+           render: (r) => r.trend_percent == null ? '—' : (r.trend_percent > 0 ? '+' : '') + r.trend_percent + '%'},
+          {title: 'Hoạt động', key: 'last_activity', render: (r) => ago(r.last_activity)},
+        ], sorted(rows, 'tokens_7d'), {onClick: (r) => { state.drill = {kind: 'project', row: r}; render(); }});
+      },
+
+      models: async () => {
+        const data = await api('models');
+        return table([
+          {title: 'Provider', left: true, key: 'agent', render: (r) => r.agent},
+          {title: 'Model', left: true, key: 'model', render: (r) => r.model},
+          {title: 'Input', key: 'input_tokens', render: (r) => short(r.input_tokens)},
+          {title: 'Output', key: 'output_tokens', render: (r) => short(r.output_tokens)},
+          {title: 'Cache read', key: 'cache_read_tokens', render: (r) => short(r.cache_read_tokens)},
+          {title: 'Cache write', key: 'cache_write_tokens', render: (r) => short(r.cache_write_tokens)},
+          {title: 'Tổng', key: 'total_tokens', render: (r) => short(r.total_tokens)},
+          {title: 'Share', key: 'share_percent', render: (r) => r.share_percent + '%'},
+          {title: 'Chi phí', key: 'estimated_cost_usd', render: (r) => usd(r.estimated_cost_usd)},
+        ], sorted(data.items || [], 'total_tokens'), {});
+      },
+
+      quota: async () => {
+        const box = document.createDocumentFragment();
+        const windows = (state.data.local && state.data.local.quota_windows) || [];
+        const rows = [];
+        for (const agent of ['claude', 'codex']) {
+          for (const label of ['5h', '1w']) {
+            const found = windows.find((w) => w.agent === agent &&
+              (w.label === label || (label === '5h' && w.label === 'subscription')));
+            rows.push({agent, window: label, w: found || {state: 'unavailable',
+              detail: 'Không có artifact local nào khai báo cửa sổ này.'}});
+          }
+        }
+        box.appendChild(table([
+          {title: 'Provider', left: true, render: (r) => r.agent},
+          {title: 'Cửa sổ', left: true, render: (r) => r.window},
+          {title: 'Trạng thái', left: true, render: (r) => quotaPill(r.w)},
+          {title: 'Nguồn', left: true, render: (r) => (r.w.source || 'unavailable')},
+          {title: 'Ghi chú', left: true, cls: 'prompt', render: (r) => r.w.detail || '—'},
+        ], rows, {}));
+        const history = await api('quota-history', {limit: 50});
+        const h = el('div', {className: 'drill'});
+        h.appendChild(el('h3', {text: 'Lịch sử quota snapshot'}));
+        h.appendChild(el('div', {className: 'muted',
+          text: (history.items || []).length + ' snapshot đã ghi. Dùng để báo cáo peak/reset về sau.'}));
+        box.appendChild(h);
+        return box;
+      },
+
+      events: async () => {
+        const data = await api('events', {limit: 100});
+        return table([
+          {title: 'Thời điểm', left: true, key: 'ts', render: (r) => new Date(r.ts * 1000).toLocaleString()},
+          {title: 'Session', left: true, key: 'agent_session_id',
+           render: (r) => (r.agent_session_id || '').slice(0, 10)},
+          {title: 'Model', left: true, key: 'model', render: (r) => r.model || '—'},
+          {title: 'Input', key: 'input_tokens', render: (r) => fmt(r.input_tokens)},
+          {title: 'Output', key: 'output_tokens', render: (r) => fmt(r.output_tokens)},
+          {title: 'Cache read', key: 'cache_read_tokens', render: (r) => fmt(r.cache_read_tokens)},
+          {title: 'Cache write', key: 'cache_write_tokens', render: (r) => fmt(r.cache_write_tokens)},
+          {title: 'Nguồn', left: true, key: 'source', render: (r) => r.source},
+        ], sorted(data.items || [], 'ts'), {empty: 'Chưa có event nào trong khoảng đã chọn.'});
+      },
+    };
+
+    function bucketFor() {
+      const range = $('#fRange').value;
+      if (range === '1h' || range === '5h') return 'minute';
+      if (range === '24h' || !range) return 'hour';
+      if (range === '7d') return 'hour';
+      return 'day';
+    }
+    function quotaFor(label) {
+      const windows = (state.data.local && state.data.local.quota_windows) || [];
+      const found = windows.find((w) => w.label === label ||
+        (label === '5h' && w.label === 'subscription' && w.observed));
+      return found || {state: 'unavailable'};
+    }
+    function lowestQuota() {
+      const windows = ((state.data.local && state.data.local.quota_windows) || [])
+        .filter((w) => w.observed && w.used_percent != null);
+      if (!windows.length) return 'N/A';
+      const worst = windows.reduce((a, b) => (a.used_percent > b.used_percent ? a : b));
+      return Math.round(100 - worst.used_percent) + '% còn';
+    }
+    function quotaNote() {
+      const windows = (state.data.local && state.data.local.quota_windows) || [];
+      return windows.some((w) => w.observed) ? 'provider reported' : 'không provider nào báo';
+    }
+
+    function drillPanel() {
+      if (!state.drill) return null;
+      const box = el('div', {className: 'drill'});
+      const row = state.drill.row;
+      const head = el('h3', {text: 'Chi tiết · ' + state.drill.kind});
+      const close = el('button', {className: 'btn', text: '✕'});
+      close.style.float = 'right';
+      close.onclick = () => { state.drill = null; render(); };
+      box.append(close, head);
+      const kv = el('div', {className: 'kv'});
+      const fields = state.drill.kind === 'prompt'
+        ? [['prompt_id', row.prompt_id], ['session', row.agent_session_id], ['project', row.project],
+           ['branch', row.git_branch], ['models', row.models], ['turns', fmt(row.requests)],
+           ['input', fmt(row.input_tokens)], ['output', fmt(row.output_tokens)],
+           ['cache read', fmt(row.cache_read_tokens)], ['cache write', fmt(row.cache_write_tokens)],
+           ['tổng', fmt(row.total_tokens)], ['% tổng', row.share_percent + '%'],
+           ['hash', row.text_hash], ['độ dài prompt', fmt(row.char_length) + ' ký tự'],
+           ['preview', row.preview || '—']]
+        : state.drill.kind === 'session'
+        ? [['session', row.agent_session_id], ['node', row.node_id], ['project', row.project],
+           ['models', row.models], ['subagent', row.is_subagent ? 'yes' : 'no'],
+           ['requests', fmt(row.requests)], ['5h', fmt(row.tokens_5h)], ['24h', fmt(row.tokens_24h)],
+           ['7d', fmt(row.tokens_7d)], ['30d', fmt(row.tokens_30d)],
+           ['tổng', fmt(row.total_tokens)], ['chi phí', usd(row.estimated_cost_usd)]]
+        : [['project', row.project], ['sessions', fmt(row.sessions)], ['models', row.models],
+           ['24h', fmt(row.tokens_24h)], ['7d', fmt(row.tokens_7d)], ['30d', fmt(row.tokens_30d)],
+           ['all-time', fmt(row.total_tokens)], ['requests', fmt(row.requests)],
+           ['trend 7d', row.trend_percent == null ? '—' : row.trend_percent + '%']];
+      for (const [k, v] of fields) {
+        kv.append(el('b', {text: k}), el('span', {text: v == null ? '—' : String(v)}));
+      }
+      box.appendChild(kv);
+      if (state.drill.kind === 'project') {
+        const go = el('button', {className: 'btn', text: '→ Xem sessions của project này'});
+        go.onclick = () => {
+          $('#fProject').value = row.project;
+          state.drill = null; state.tab = 'sessions'; render();
+        };
+        box.appendChild(go);
+      }
+      return box;
+    }
+
+    async function render() {
+      syncUrl();
+      for (const btn of document.querySelectorAll('nav button'))
+        btn.classList.toggle('active', btn.dataset.tab === state.tab);
+      const view = $('#view');
+      view.replaceChildren();
+      const drill = drillPanel();
+      if (drill) view.appendChild(drill);
+      try {
+        const content = await TABS[state.tab]();
+        view.appendChild(content);
+      } catch (err) {
+        view.appendChild(el('div', {className: 'empty', text: 'Không tải được: ' + err.message}));
+      }
+    }
+
+    async function loadBase(force) {
       try {
         const response = await fetch('/dashboard/api/ai-usage/local' + (force ? '?refresh=1' : ''),
                                      {cache: 'no-store'});
-        if (!response.ok) throw new Error('HTTP ' + response.status);
-        data = await response.json();
-        render();
+        state.data.local = await response.json();
+        const src = state.data.local.sources || {};
+        $('#sourceLine').textContent = 'Claude: ' + (src.claude ? src.claude.status : '?') +
+                                       ' · Codex: ' + (src.codex ? src.codex.status : '?');
+        const notes = [state.data.local.window ? state.data.local.window.note : ''];
+        for (const w of state.data.local.quota_windows || [])
+          if (!w.observed && w.detail) notes.push(w.agent + ': ' + w.detail);
+        $('#provenance').textContent = notes.filter(Boolean).join('  •  ');
+        // Fill the filter selects from the sessions actually present.
+        const rows = state.data.local.sessions || [];
+        for (const [sel, key] of [['#fNode', 'node_id'], ['#fAgent', 'agent'],
+                                  ['#fProject', 'project'], ['#fModel', 'model']]) {
+          const el_ = $(sel), keep = el_.value;
+          const values = [...new Set(rows.map((r) => r[key]).filter(Boolean))].sort();
+          const first = el_.firstElementChild;
+          el_.replaceChildren(first);
+          for (const v of values) {
+            const opt = document.createElement('option');
+            opt.value = v; opt.textContent = key === 'project' ? shortPath(v) : v;
+            el_.appendChild(opt);
+          }
+          el_.value = values.includes(keep) ? keep : '';
+        }
       } catch (err) {
-        $('#sourceLine').textContent = 'Không tải được dữ liệu: ' + err.message;
+        $('#sourceLine').textContent = 'Không tải được nguồn: ' + err.message;
       }
     }
 
-    for (const th of document.querySelectorAll('th[data-k]'))
-      th.onclick = () => {
-        const k = th.dataset.k;
-        if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = -1; }
-        render();
-      };
-    for (const sel of ['#fNode', '#fAgent', '#fProject']) $(sel).onchange = render;
-    $('#fSearch').oninput = render;
-    $('#refreshBtn').onclick = () => load(true);
-    load(true);
-    setInterval(() => { if ($('#autoRefresh').checked) load(true); }, 30000);
+    for (const btn of document.querySelectorAll('nav button'))
+      btn.onclick = () => { state.tab = btn.dataset.tab; state.drill = null; render(); };
+    for (const sel of ['#fRange', '#fNode', '#fAgent', '#fProject', '#fModel'])
+      $(sel).onchange = () => render();
+    $('#fSearch').oninput = () => render();
+    $('#refreshBtn').onclick = async () => { await loadBase(true); render(); };
+
+    readUrl();
+    loadBase(true).then(render);
+    setInterval(async () => {
+      if ($('#autoRefresh').checked) { await loadBase(true); render(); }
+    }, 60000);
   </script>
 </body>
 </html>
 """
+
 
 GLOBAL_TASKS_HTML = """<!doctype html>
 <html lang="vi">
@@ -8187,6 +8481,130 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             AI_USAGE_HTML,
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
+
+    def _usage_filters(request: Request) -> dict[str, Any]:
+        """Filters shared by every analytics endpoint, parsed once.
+
+        `range` is a convenience over `since`: the UI speaks in windows
+        ("5h", "7d") and a URL that round-trips those is what makes a shared
+        link mean the same thing tomorrow.
+        """
+        import time as _time
+
+        query = request.query_params
+        spans = {"1h": 3600, "5h": 18000, "24h": 86400, "7d": 604800, "30d": 2592000}
+        filters: dict[str, Any] = {}
+        window = query.get("range")
+        if window in spans:
+            filters["since"] = _time.time() - spans[window]
+        for key in ("since", "until"):
+            if query.get(key):
+                try:
+                    filters[key] = float(query[key])
+                except ValueError:
+                    pass
+        for key in ("node_id", "agent", "model", "project", "agent_session_id"):
+            if query.get(key):
+                filters[key] = query[key]
+        return filters
+
+    def _usage_index():
+        from .ai_usage_index import AiUsageIndex
+
+        return AiUsageIndex()
+
+    def _usage_route(name: str, build):
+        """Register one analytics endpoint.
+
+        Every one of them is _read_guard'ed, read-only, and returns 200 with
+        an `error` field rather than a 5xx -- an analytics page that 500s
+        takes the whole screen down for a question that was only ever
+        informational.
+        """
+
+        async def handler(request: Request) -> JSONResponse:
+            blocked, _identity = _read_guard(request)
+            if blocked is not None:
+                return blocked
+            filters = _usage_filters(request)
+            try:
+                payload = await anyio.to_thread.run_sync(lambda: build(request, filters))
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse({"error": "AI_USAGE_QUERY_FAILED", "detail": str(exc),
+                                     "items": []}, status_code=200)
+            return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+        handler.__name__ = f"ai_usage_{name}"
+        server.custom_route(f"/dashboard/api/ai-usage/{name}", methods=["GET"],
+                            include_in_schema=False)(handler)
+
+    def _int_param(request: Request, key: str, default: int) -> int:
+        try:
+            return int(request.query_params.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    _usage_route("summary", lambda request, filters: _usage_index().summary(filters=filters))
+    _usage_route("timeline", lambda request, filters: _usage_index().timeline(
+        bucket=request.query_params.get("bucket", "hour"), filters=filters))
+    _usage_route("prompts", lambda request, filters: _usage_index().top_prompts(
+        limit=_int_param(request, "limit", 25), offset=_int_param(request, "offset", 0),
+        filters=filters))
+    _usage_route("sessions", lambda request, filters: _usage_index().top_sessions(
+        limit=_int_param(request, "limit", 50), filters=filters))
+    _usage_route("projects", lambda request, filters: _usage_index().top_projects(
+        limit=_int_param(request, "limit", 50), filters=filters))
+    _usage_route("models", lambda request, filters: _usage_index().model_breakdown(filters=filters))
+    _usage_route("events", lambda request, filters: _usage_index().raw_events(
+        limit=_int_param(request, "limit", 100), offset=_int_param(request, "offset", 0),
+        filters=filters))
+    _usage_route("quota-history", lambda request, filters: _usage_index().quota_history(
+        since=filters.get("since"), limit=_int_param(request, "limit", 500)))
+
+    @server.custom_route("/dashboard/api/ai-usage/export", methods=["GET"], include_in_schema=False)
+    async def ai_usage_export(request: Request) -> Response:
+        """CSV or JSON for whatever the filters currently select.
+
+        Deliberately the same filter parsing as the screen, so an export is
+        the thing you were looking at rather than a different query that
+        happens to be nearby.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        filters = _usage_filters(request)
+        dataset = request.query_params.get("dataset", "sessions")
+        fmt = request.query_params.get("format", "csv")
+        builders = {
+            "sessions": lambda index: index.top_sessions(limit=1000, filters=filters)["items"],
+            "projects": lambda index: index.top_projects(limit=1000, filters=filters)["items"],
+            "prompts": lambda index: index.top_prompts(limit=1000, filters=filters)["items"],
+            "models": lambda index: index.model_breakdown(filters=filters)["items"],
+            "events": lambda index: index.raw_events(limit=500, filters=filters)["items"],
+        }
+        if dataset not in builders:
+            return JSONResponse({"error": "UNKNOWN_DATASET", "known": sorted(builders)},
+                                status_code=400)
+        try:
+            rows = await anyio.to_thread.run_sync(lambda: builders[dataset](_usage_index()))
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"error": "AI_USAGE_EXPORT_FAILED", "detail": str(exc)},
+                                status_code=200)
+        if fmt == "json":
+            return JSONResponse({"dataset": dataset, "items": rows},
+                                headers={"Cache-Control": "no-store"})
+        import csv
+        import io
+
+        buffer = io.StringIO()
+        if rows:
+            writer = csv.DictWriter(buffer, fieldnames=list(rows[0].keys()), extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        return Response(
+            buffer.getvalue(), media_type="text/csv",
+            headers={"Cache-Control": "no-store",
+                     "Content-Disposition": f'attachment; filename="ai-usage-{dataset}.csv"'})
 
     @server.custom_route("/dashboard/api/ai-usage/local", methods=["GET"], include_in_schema=False)
     async def dashboard_ai_usage_local(request: Request) -> JSONResponse:
