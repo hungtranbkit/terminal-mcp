@@ -22,7 +22,7 @@ from .cf_access import verify_access_assertion
 from .agent_availability import available_agent_types
 from .access_policy import filter_record, policy_table, role_for_identity
 from .connection_store import ConnectionStore, generate_node_token
-from .fleet_service import ControllerFleetSync, FleetService
+from .fleet_service import ControllerFleetSync, FleetService, auth_status_for_node
 from .controller import ControllerService, build_default_controller
 from .node_client import NodeClientError, RemoteNodeClient
 from .core import TerminalService
@@ -9847,8 +9847,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 nodes.append(filter_record({
                     "node_id": node_id,
                     "display_name": node.get("display_name"),
-                    "auth_status": ("AUTHENTICATED" if node.get("status") == "online"
-                                    else "UNREACHABLE"),
+                    "auth_status": auth_status_for_node(node)[0],
+                    "auth_status_reason": auth_status_for_node(node)[1],
                     "auth_source": "node_agent_bearer_token",
                     # The NAME of the variable the owning machine reads its
                     # token from. Never the value -- see fleet_registry's

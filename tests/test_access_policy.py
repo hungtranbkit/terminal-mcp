@@ -237,6 +237,17 @@ def _config():
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("TERMINAL_MCP_AUDIT_DB", str(tmp_path / "audit.db"))
+    # A disposable fleet store passed to BOTH surfaces. Without it the MCP
+    # side falls back to opening the real ~/.local/state fleet_registry.db --
+    # the same "a test must never touch production state" discipline the rest
+    # of this codebase keeps, and the reason the two surfaces appeared to
+    # disagree about auth status when they were simply reading different
+    # databases.
+    from terminal_mcp.fleet_registry import FleetRegistryStore
+    from terminal_mcp.fleet_service import FleetService
+
+    fleet = FleetService(FleetRegistryStore(tmp_path / "fleet.db", local_node_id="local"),
+                         local_node_id="local")
     service = TerminalService(_config())
     service.audit.record(action="send_text", session="m1", result="SENT",
                          actor="alice@example.com", node_id="local",
@@ -245,8 +256,8 @@ def client(tmp_path, monkeypatch):
     service.audit.record(action="send_text", session="hp1", result="DENIED",
                          actor="bob@example.com", node_id="hp-linux",
                          reason="ACCESS_DENIED", policy_source="input_policy")
-    server = build_mcp(service)
-    register_dashboard(server, service)
+    server = build_mcp(service, fleet=fleet)
+    register_dashboard(server, service, fleet=fleet)
     return TestClient(server.streamable_http_app()), server, service
 
 
@@ -350,3 +361,40 @@ def test_reading_the_audit_is_not_gated_on_session_permissions(client):
                          result="SENT", actor="alice@example.com", text="x")
     sessions = {e["session"] for e in http.get("/dashboard/api/audit").json()["events"]}
     assert "not-whitelisted-at-all" in sessions
+
+
+# -- staleness --------------------------------------------------------------
+
+def test_a_stale_cache_never_reports_a_node_as_authenticated():
+    """Observed live on 2026-09-12, minutes after deploying this feature:
+    hp-linux had been offline for five minutes while the auth view reported
+    AUTHENTICATED, because it read `status` straight out of a 6.8-hour-old
+    cache. Asserting a live fact from stale evidence is the failure this
+    whole codebase refuses everywhere else.
+    """
+    from terminal_mcp.fleet_service import auth_status_for_node
+
+    stale = {"node_id": "hp-linux", "status": "online",
+             "metadata_stale": True, "metadata_age_seconds": 24474.0}
+    status, reason = auth_status_for_node(stale)
+    assert status == "UNKNOWN_STALE"
+    assert "6h old" in reason
+
+    fresh_online = {"node_id": "a", "status": "online", "metadata_stale": False,
+                    "metadata_age_seconds": 10.0}
+    assert auth_status_for_node(fresh_online)[0] == "AUTHENTICATED"
+
+    fresh_offline = {"node_id": "b", "status": "offline", "metadata_stale": False,
+                     "metadata_age_seconds": 10.0}
+    assert auth_status_for_node(fresh_offline)[0] == "UNREACHABLE"
+
+
+def test_both_surfaces_agree_on_auth_status(client):
+    """A status that disagreed between the dashboard and MCP would be worse
+    than either answer on its own."""
+    http, server, _service = client
+    over_http = {n["node_id"]: n["auth_status"]
+                 for n in http.get("/dashboard/api/auth-status").json()["nodes"]}
+    over_mcp = {n["node_id"]: n["auth_status"]
+                for n in server._tool_manager._tools["terminal_auth_status"].fn()["nodes"]}
+    assert over_http == over_mcp

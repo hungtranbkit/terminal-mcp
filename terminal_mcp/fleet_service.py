@@ -300,6 +300,31 @@ class FleetService:
         return checks
 
 
+
+def auth_status_for_node(node: dict[str, Any]) -> tuple[str, str]:
+    """Whether a node is authenticated -- or whether we simply cannot say.
+
+    The fleet view is a CACHE. Reading `status` straight out of it and
+    labelling the node AUTHENTICATED asserts something about right now from
+    evidence that may be hours old, which is how an operator gets told a dead
+    node is fine. Observed live on 2026-09-12: hp-linux had been offline for
+    five minutes while this reported AUTHENTICATED from a 6.8-hour-old cache.
+
+    So staleness wins over the cached verdict. "I don't know" is a worse
+    answer to give and a better one to be right about.
+    """
+    if node.get("metadata_stale"):
+        age = node.get("metadata_age_seconds")
+        when = f"{int(age // 3600)}h" if isinstance(age, (int, float)) and age >= 3600 else (
+            f"{int(age)}s" if isinstance(age, (int, float)) else "unknown age")
+        return "UNKNOWN_STALE", (
+            f"fleet metadata for this node is {when} old; its live auth state "
+            f"has not been observed since")
+    if str(node.get("status") or "").casefold() == "online":
+        return "AUTHENTICATED", "node answered its most recent heartbeat"
+    return "UNREACHABLE", f"node status is {node.get('status') or 'unknown'}"
+
+
 def _check(name: str, status: str, summary: str, evidence: dict[str, Any]) -> dict[str, Any]:
     return {"check": name, "status": status, "summary": summary, "evidence": evidence}
 

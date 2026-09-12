@@ -4,6 +4,7 @@ from mcp.server.mcpserver import MCPServer
 
 from . import __version__
 from .access_policy import ROLE_OPERATOR, filter_record, policy_table
+from .fleet_service import auth_status_for_node
 from .agent_availability import available_agent_types
 from .config import load_config
 from .controller import ControllerService, build_default_controller
@@ -488,8 +489,10 @@ def build_mcp(service: TerminalService | None = None,
                     "last_verified_at": target.get("last_verified_at")})
         nodes = [filter_record({
             "node_id": node.get("node_id"), "display_name": node.get("display_name"),
-            "auth_status": ("AUTHENTICATED" if node.get("status") == "online"
-                            else "UNREACHABLE"),
+            # Same helper the dashboard uses -- a status that disagreed
+            # between the two surfaces would be worse than either answer.
+            "auth_status": auth_status_for_node(node)[0],
+            "auth_status_reason": auth_status_for_node(node)[1],
             "auth_source": "node_agent_bearer_token",
             "auth_token_ref": node.get("auth_token_ref"),
             "capability": sorted(node.get("capabilities") or []),
