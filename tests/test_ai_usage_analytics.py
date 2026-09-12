@@ -282,8 +282,10 @@ def test_a_later_cost_state_supersedes_an_earlier_one(tmp_path, index):
     _write(home, [{"type": "cost-state", "sessionId": "s1", "totalCostUSD": 3.0,
                    "timestamp": "2026-09-11T01:00:00Z", "modelUsage": {}}])
     index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
-    # It is a running total, not an increment: 3.0, never 4.0.
-    assert index.summary()["estimated_cost_usd"] == pytest.approx(3.0)
+    # It is a running total, not an increment: 3.0, never 4.0. Checked on the
+    # lifetime figure, because the range-scoped one apportions by tokens and
+    # this fixture has no usage events to apportion across.
+    assert index.cost_for()["lifetime_usd"] == pytest.approx(3.0)
 
 
 # -- quota classification ----------------------------------------------------
@@ -391,3 +393,155 @@ def test_backfill_leaves_an_already_attributed_event_alone(tmp_path):
     index = AiUsageIndex(tmp_path / "usage.db")
     index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
     assert index.backfill(claude_home=home)["events_attributed"] == 0
+
+
+# -- cost is of the SELECTED RANGE -------------------------------------------
+
+def test_cost_used_to_ignore_the_range_and_now_does_not(tmp_path, index):
+    """The defect the card's label was hiding.
+
+    `estimated_cost_usd` was SUM(total_cost_usd) over every session ever,
+    shown beside token counts that DID respect the filter. A narrower range
+    must cost less, and the widest must equal what the CLI reported.
+    """
+    home = tmp_path / "claude"
+    _write(home, [_turn("old", when=NOW - 86400 * 5), _turn("new", when=NOW - 60),
+                  {"type": "cost-state", "sessionId": "s1", "totalCostUSD": 10.0,
+                   "timestamp": "2026-09-11T00:00:00Z", "modelUsage": {}}])
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
+
+    everything = index.cost_for()
+    recent = index.cost_for(filters={"since": NOW - 3600})
+    assert everything["usd"] == pytest.approx(10.0)          # sums back exactly
+    assert recent["usd"] == pytest.approx(5.0)               # half the tokens, half the cost
+    assert recent["usd"] < everything["usd"]
+
+
+def test_a_per_token_rate_from_cost_state_would_have_been_wrong(tmp_path, index):
+    """Why apportionment is by token SHARE, not by a recovered rate.
+
+    cost-state's token counts are the totals at the moment it was written,
+    which is less than the session went on to spend. Dividing costUSD by them
+    produced $112 against a CLI-reported $12.20 on this fleet. Splitting the
+    reported cost by share cannot exceed it, which this pins down.
+    """
+    home = tmp_path / "claude"
+    _write(home, [_turn(f"t{i}", when=NOW - 100 + i) for i in range(10)] +
+           [{"type": "cost-state", "sessionId": "s1", "totalCostUSD": 2.0,
+             "timestamp": "2026-09-11T00:00:00Z",
+             # Counts far smaller than the events, as a real snapshot is.
+             "modelUsage": {"claude-opus-5[1m]": {"inputTokens": 1, "outputTokens": 1,
+                                                  "cacheReadInputTokens": 1,
+                                                  "cacheCreationInputTokens": 1,
+                                                  "costUSD": 2.0}}}])
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
+    assert index.cost_for()["usd"] == pytest.approx(2.0)
+
+
+def test_tokens_from_a_session_with_no_cost_yet_are_reported_not_priced(tmp_path, index):
+    home = tmp_path / "claude"
+    _write(home, [_turn("a", when=NOW - 60)])                # a live session: no cost-state
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
+    cost = index.cost_for()
+    assert cost["usd"] is None
+    assert cost["unpriced_tokens"] == 100
+    assert cost["priced_sessions"] == 0
+
+
+def test_the_summary_states_which_range_its_numbers_describe(tmp_path, index):
+    summary = index.summary(now=NOW, filters={"since": NOW - 86400, "range_label": "Hôm nay"})
+    assert summary["range"]["label"] == "Hôm nay"
+    assert summary["range"]["since"] == pytest.approx(NOW - 86400)
+    assert summary["cost_method"]
+
+
+def test_a_presentation_label_is_never_used_as_a_sql_filter(index):
+    # range_label rides along on the filter dict; treating it as a column
+    # would raise rather than be ignored.
+    assert index.summary(filters={"range_label": "Hôm nay"})["totals"] is not None
+
+
+# -- quota windows -----------------------------------------------------------
+
+@pytest.mark.parametrize("label,expected", [
+    ("5h", "5h"), ("five_hour", "5h"), ("primary", "5h"), ("subscription", "5h"),
+    ("1w", "1w"), ("weekly", "1w"), ("seven_day", "1w"), ("secondary", "1w"),
+    ("something-else", None), (None, None),
+])
+def test_provider_wording_maps_to_the_window_it_means(label, expected):
+    from terminal_mcp.ai_usage_index import _normalise_window
+
+    assert _normalise_window(label) == expected
+
+
+def test_both_windows_exist_for_both_providers_even_with_no_data(tmp_path, index):
+    # An absent bar is indistinguishable from one nobody looked at.
+    index.refresh(claude_home=tmp_path / "noclaude", codex_home=tmp_path / "nocodex")
+    windows = index.report()["quota_windows"]
+    pairs = {(w["agent"], w["window"]) for w in windows}
+    assert pairs == {("claude", "5h"), ("claude", "1w"), ("codex", "5h"), ("codex", "1w")}
+    assert all(w["observed"] == 0 and w["used_percent"] is None for w in windows)
+    assert all(w["detail"] for w in windows)          # every N/A says why
+
+
+def test_a_reported_window_carries_both_halves(tmp_path, index):
+    codex = tmp_path / "codex" / "sessions"
+    codex.mkdir(parents=True)
+    (codex / "r.jsonl").write_text(json.dumps({
+        "timestamp": "2026-09-11T10:00:00Z",
+        "rate_limits": {"primary": {"used_percent": 30.0, "resets_in_seconds": 600}}}) + "\n",
+        encoding="utf-8")
+    index.refresh(claude_home=tmp_path / "noclaude", codex_home=tmp_path / "codex")
+    window = next(w for w in index.report()["quota_windows"]
+                  if w["agent"] == "codex" and w["window"] == "5h" and w["observed"])
+    assert window["used_percent"] == pytest.approx(30.0)
+    # The screen never has to do the subtraction silently.
+    assert window["remaining_percent"] == pytest.approx(70.0)
+    assert window["resets_at"] is not None
+
+
+def test_a_snapshot_records_the_window_and_the_tier_but_no_identity(tmp_path, index, monkeypatch):
+    monkeypatch.setattr("terminal_mcp.ai_usage_index._account_tier", lambda: "max")
+    index.refresh(claude_home=tmp_path / "noclaude", codex_home=tmp_path / "nocodex")
+    index.record_quota_snapshot(now=NOW)
+    items = index.quota_history()["items"]
+    assert {item["window"] for item in items} == {"5h", "1w"}
+    assert all(item["account_tier"] == "max" for item in items)
+    blob = json.dumps(items)
+    for secret in ("@", "orgId", "token", "sk-"):
+        assert secret not in blob
+
+
+def test_the_account_tier_probe_never_reaches_a_credential_file(monkeypatch):
+    """It shells out to `claude auth status --json`, which also prints an
+    email and an org id. Only the tier is kept, and .credentials.json is
+    never opened."""
+    import subprocess
+
+    from terminal_mcp.ai_usage_index import _account_tier
+
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(
+            args, 0, stdout=json.dumps({"subscriptionType": "max",
+                                        "email": "someone@example.com",
+                                        "orgId": "secret-org"}), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _account_tier() == "max"
+    assert calls == [["claude", "auth", "status", "--json"]]
+
+
+def test_a_broken_auth_probe_degrades_to_none(monkeypatch):
+    import subprocess
+
+    from terminal_mcp.ai_usage_index import _account_tier
+
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 1, stdout="", stderr="x"))
+    assert _account_tier() is None
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("no claude")))
+    assert _account_tier() is None

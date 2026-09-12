@@ -26,6 +26,9 @@ SUMMARY = {
                                              ("24h", 857800000, 240), ("7d", 1310000000, 900),
                                              ("30d", 1320000000, 950))},
     "estimated_cost_usd": 12.2, "cost_source": "session_transcript (CLI-computed)",
+    "cost_lifetime_usd": 12.2, "cost_method": "the CLI's own per-session cost, split by share",
+    "cost_unpriced_tokens": 0, "cost_priced_sessions": 5,
+    "range": {"label": "Hôm nay", "since": 1788913600.0, "until": None},
     "cost_sessions": 5, "active_sessions_24h": 3,
     "peak_session_24h": {"agent_session_id": "62f9b8e9", "project": "/home/me/workspace",
                          "total": 830500000},
@@ -93,11 +96,18 @@ LOCAL = {
     "sessions": [{"agent": "claude", "node_id": "local", "project": "/home/me/workspace",
                   "model": "claude-opus-5", "agent_session_id": "62f9b8e9"}],
     "quota_windows": [
-        {"agent": "claude", "label": "subscription", "observed": 0, "source": "unavailable",
-         "used_percent": None, "resets_at": None,
-         "detail": "Claude Code records no rate-limit or reset metadata."},
-        {"agent": "codex", "label": "subscription", "observed": 0, "source": "unavailable",
-         "used_percent": None, "resets_at": None, "detail": "No ~/.codex on this machine."}],
+        {"agent": "claude", "label": "5h", "window": "5h", "observed": 0,
+         "source": "unavailable", "used_percent": None, "remaining_percent": None,
+         "resets_at": None, "detail": "Claude Code records no rate-limit or reset metadata."},
+        {"agent": "claude", "label": "1w", "window": "1w", "observed": 0,
+         "source": "unavailable", "used_percent": None, "remaining_percent": None,
+         "resets_at": None, "detail": "Claude Code records no rate-limit or reset metadata."},
+        {"agent": "codex", "label": "5h", "window": "5h", "observed": 0,
+         "source": "unavailable", "used_percent": None, "remaining_percent": None,
+         "resets_at": None, "detail": "No ~/.codex on this machine."},
+        {"agent": "codex", "label": "1w", "window": "1w", "observed": 0,
+         "source": "unavailable", "used_percent": None, "remaining_percent": None,
+         "resets_at": None, "detail": "No ~/.codex on this machine."}],
     "sources": {"claude": {"status": "session_transcript", "detail": "~/.claude/projects/**"},
                 "codex": {"status": "unavailable", "detail": "$CODEX_HOME"}},
 }
@@ -197,7 +207,8 @@ def test_the_screen_renders_without_a_script_error(screen):
 
 def test_the_overview_answers_the_ten_second_questions(screen):
     text = screen.evaluate("() => document.querySelector('.cards').textContent")
-    for label in ("Hôm nay", "7 ngày", "30 ngày", "Chi phí ước tính",
+    # "Chi phí" now carries its range in the title rather than standing alone.
+    for label in ("Hôm nay", "7 ngày", "30 ngày", "Chi phí · ",
                   "Session hoạt động", "Session tốn nhất", "Project tốn nhất", "Quota thấp nhất"):
         assert label in text
     assert "$12.20" in text
@@ -337,3 +348,123 @@ def test_on_a_phone_a_table_row_becomes_a_card(screen):
         "() => getComputedStyle(document.querySelector('#view tbody td')).display") == "flex"
     assert screen.evaluate(
         "() => getComputedStyle(document.querySelector('#view thead')).display") == "none"
+
+
+# -- the two things the user could not read off the screen -------------------
+
+def test_the_cost_card_names_the_range_it_covers(screen):
+    """It read simply "Chi phí ước tính" while the figure behind it was a
+    lifetime sum -- shown beside token counts that DID respect the filter."""
+    text = screen.evaluate(
+        "() => [...document.querySelectorAll('.card')]"
+        ".find(c => c.textContent.includes('Chi phí')).textContent")
+    assert "Hôm nay" in text
+    assert "$12.20" in text
+
+
+@pytest.mark.parametrize("value,label", [("7d", "7 ngày"), ("30d", "30 ngày"),
+                                         ("", "Toàn bộ lịch sử"), ("5h", "5 giờ qua")])
+def test_the_cost_label_follows_the_range_filter(screen, value, label):
+    screen.select_option("#fRange", value)
+    screen.wait_for_timeout(500)
+    text = screen.evaluate(
+        "() => [...document.querySelectorAll('.card')]"
+        ".find(c => c.textContent.includes('Chi phí')).textContent")
+    assert label in text
+
+
+def test_the_quick_range_chips_drive_the_same_filter(screen):
+    screen.click("#rangeChips .chip[data-range='7d']")
+    screen.wait_for_timeout(500)
+    assert screen.evaluate("() => document.querySelector('#fRange').value") == "7d"
+    assert screen.evaluate(
+        "() => document.querySelector('#rangeChips .chip.on').dataset.range") == "7d"
+    assert any("range=7d" in url for url in SEEN)
+
+
+def test_both_claude_windows_are_always_drawn(screen):
+    cards = screen.evaluate("() => [...document.querySelectorAll('.qcard .qwin')].map(e => e.textContent)")
+    assert cards == ["Claude · cửa sổ 5 giờ", "Claude · cửa sổ 1 tuần"]
+
+
+def test_an_unmeasured_bar_is_empty_and_says_why(screen):
+    """The rule: an empty bar reads as unknown, a filled one reads as fact."""
+    assert screen.evaluate(
+        "() => [...document.querySelectorAll('.qtrack')].every(t => t.classList.contains('na'))")
+    assert screen.evaluate(
+        "() => [...document.querySelectorAll('.qfill')].every(f => !f.style.width)")
+    text = screen.evaluate("() => document.querySelector('.qcard').textContent")
+    assert "N/A" in text
+    assert "no rate-limit or reset metadata" in text
+    assert "%" not in text.split("nguồn")[0].replace("N/A", "")
+
+
+def test_a_reported_window_fills_its_bar_and_shows_the_countdown(shared_page):
+    import time as _time
+
+    reported = json.loads(json.dumps(LOCAL))
+    reported["quota_windows"][0].update(
+        {"observed": 1, "used_percent": 62.0, "remaining_percent": 38.0,
+         "source": "local_cli_state", "resets_at": _time.time() + 5400})
+    ENDPOINTS["local"] = reported
+    try:
+        shared_page.goto("http://terminal-mcp.test/dashboard/ai-usage",
+                         wait_until="domcontentloaded")
+        shared_page.wait_for_selector(".qcard", timeout=20000)
+        shared_page.wait_for_timeout(400)
+        card = shared_page.evaluate("() => document.querySelector('.qcard').textContent")
+        assert "REPORTED" in card and "62%" in card
+        assert "còn 38%" in card
+        assert "reset sau" in card
+        assert shared_page.evaluate(
+            "() => document.querySelector('.qfill').style.width") == "62%"
+    finally:
+        ENDPOINTS["local"] = LOCAL
+
+
+def test_a_provider_that_reports_remaining_is_converted_transparently(shared_page):
+    remaining_only = json.loads(json.dumps(LOCAL))
+    remaining_only["quota_windows"][0].update(
+        {"observed": 1, "used_percent": None, "remaining_percent": 25.0,
+         "source": "local_cli_state"})
+    ENDPOINTS["local"] = remaining_only
+    try:
+        shared_page.goto("http://terminal-mcp.test/dashboard/ai-usage",
+                         wait_until="domcontentloaded")
+        shared_page.wait_for_selector(".qcard", timeout=20000)
+        shared_page.wait_for_timeout(400)
+        card = shared_page.evaluate("() => document.querySelector('.qcard').textContent")
+        assert "75%" in card                       # 100 - 25, stated not hidden
+        assert "quy đổi" in card
+    finally:
+        ENDPOINTS["local"] = LOCAL
+
+
+def test_a_locally_derived_number_is_labelled_an_estimate(shared_page):
+    estimated = json.loads(json.dumps(LOCAL))
+    estimated["quota_windows"][0].update(
+        {"observed": 0, "used_percent": 40.0, "source": "local_estimate"})
+    ENDPOINTS["local"] = estimated
+    try:
+        shared_page.goto("http://terminal-mcp.test/dashboard/ai-usage",
+                         wait_until="domcontentloaded")
+        shared_page.wait_for_selector(".qcard", timeout=20000)
+        shared_page.wait_for_timeout(400)
+        card = shared_page.evaluate("() => document.querySelector('.qcard').textContent")
+        assert "ƯỚC TÍNH" in card and "REPORTED" not in card
+    finally:
+        ENDPOINTS["local"] = LOCAL
+
+
+def test_the_quota_tab_also_leads_with_the_bars(screen):
+    _open(screen, "quota")
+    assert screen.evaluate("() => document.querySelectorAll('.qcard').length") == 2
+
+
+@pytest.mark.parametrize("width,height", [(1440, 900), (390, 844)])
+def test_the_quota_bars_are_readable_at_both_sizes(screen, width, height):
+    screen.set_viewport_size({"width": width, "height": height})
+    screen.wait_for_timeout(400)
+    assert screen.evaluate("() => document.querySelectorAll('.qcard').length") == 2
+    assert not screen.evaluate(
+        "() => document.documentElement.scrollWidth > window.innerWidth + 1")

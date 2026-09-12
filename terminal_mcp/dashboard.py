@@ -6652,6 +6652,23 @@ AI_USAGE_HTML = """<!doctype html>
     main { grid-row:2; min-width:0; overflow-y:auto;
            padding:14px max(16px, env(safe-area-inset-right)) max(28px, env(safe-area-inset-bottom)) 14px }
     .bar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px }
+    .chips { display:flex; gap:6px }
+    .chip { padding:7px 12px }
+    /* Quota bars. A bar with no measurement is drawn empty and hatched, never
+       filled with a guess: an empty bar reads as "unknown", a filled one
+       reads as fact. */
+    .qgrid { display:grid; grid-template-columns:repeat(auto-fit, minmax(260px,1fr));
+             gap:10px; margin-bottom:14px }
+    .qcard { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 14px }
+    .qcard .qhead { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; margin-bottom:8px }
+    .qcard .qwin { font-weight:700; font-size:13.5px }
+    .qcard .qpct { margin-left:auto; font-size:18px; font-weight:700 }
+    .qtrack { height:12px; border-radius:999px; background:#0b1224; border:1px solid var(--line); overflow:hidden }
+    .qfill { height:100%; width:0; background:var(--green) }
+    .qfill.warn { background:var(--amber) } .qfill.crit { background:var(--red) }
+    .qtrack.na { background:repeating-linear-gradient(45deg,#0b1224,#0b1224 6px,#131c30 6px,#131c30 12px) }
+    .qmeta { display:flex; justify-content:space-between; gap:10px; margin-top:7px;
+             font-size:11.5px; color:var(--muted); flex-wrap:wrap }
     .bar select, .bar input { background:var(--panel); border:1px solid var(--line); color:var(--text);
                               border-radius:8px; padding:8px 10px; font:16px var(--mono); min-height:40px }
     .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(168px,1fr)); gap:10px; margin-bottom:14px }
@@ -6738,10 +6755,15 @@ AI_USAGE_HTML = """<!doctype html>
   </nav>
   <main>
     <div class="bar">
+      <span class="chips" id="rangeChips" role="group" aria-label="Khoảng thời gian nhanh">
+        <button type="button" class="btn chip" data-range="24h">Hôm nay</button>
+        <button type="button" class="btn chip" data-range="7d">7 ngày</button>
+        <button type="button" class="btn chip" data-range="30d">30 ngày</button>
+      </span>
       <select id="fRange" aria-label="Khoảng thời gian">
         <option value="1h">1 giờ</option><option value="5h">5 giờ</option>
-        <option value="24h" selected>24 giờ</option><option value="7d">7 ngày</option>
-        <option value="30d">30 ngày</option><option value="">Toàn bộ</option>
+        <option value="24h" selected>Hôm nay (24h)</option><option value="7d">7 ngày</option>
+        <option value="30d">30 ngày</option><option value="">Toàn bộ lịch sử</option>
       </select>
       <select id="fNode" aria-label="Node"><option value="">Tất cả node</option></select>
       <select id="fAgent" aria-label="Provider"><option value="">Tất cả provider</option></select>
@@ -6960,7 +6982,8 @@ AI_USAGE_HTML = """<!doctype html>
           ['Hôm nay (24h)', short(s['24h'] && s['24h'].total_tokens), (s['24h'] ? s['24h'].requests : 0) + ' request'],
           ['7 ngày', short(s['7d'] && s['7d'].total_tokens), (s['7d'] ? s['7d'].requests : 0) + ' request'],
           ['30 ngày', short(s['30d'] && s['30d'].total_tokens), (s['30d'] ? s['30d'].requests : 0) + ' request'],
-          ['Chi phí ước tính', usd(summary.estimated_cost_usd), summary.cost_source || 'không có nguồn'],
+          ['Chi phí · ' + rangeLabel(), usd(summary.estimated_cost_usd),
+           summary.cost_source ? 'CLI tính, chia theo range' : 'chưa có cost cho range này'],
           ['Session hoạt động', String(summary.active_sessions_24h || 0), '24 giờ qua'],
           ['Session tốn nhất', summary.peak_session_24h ? short(summary.peak_session_24h.total) : '—',
            summary.peak_session_24h ? shortPath(summary.peak_session_24h.project) : ''],
@@ -6968,6 +6991,7 @@ AI_USAGE_HTML = """<!doctype html>
            summary.top_project_24h ? shortPath(summary.top_project_24h.project) : ''],
           ['Quota thấp nhất', lowestQuota(), quotaNote()],
         ]));
+        box.appendChild(quotaStrip());
         box.appendChild(chart(timeline.points || []));
         box.appendChild(table([
           {title: 'Project', left: true, key: 'project', render: (r) => shortPath(r.project)},
@@ -7013,8 +7037,8 @@ AI_USAGE_HTML = """<!doctype html>
           {title: 'Requests', key: 'requests', render: (r) => fmt(r.requests)},
           {title: 'TB/req', key: 'avg_tokens_per_request', render: (r) => fmt(r.avg_tokens_per_request)},
           {title: 'Chi phí', key: 'estimated_cost_usd', render: (r) => usd(r.estimated_cost_usd)},
-          {title: 'Quota 5h', left: true, render: () => quotaPill(quotaFor('5h'))},
-          {title: 'Quota 1w', left: true, render: () => quotaPill(quotaFor('1w'))},
+          {title: 'Quota 5h', left: true, render: () => quotaPill(quotaFor('5h') || {})},
+          {title: 'Quota 1w', left: true, render: () => quotaPill(quotaFor('1w') || {})},
           {title: 'Hoạt động', key: 'last_activity', render: (r) => ago(r.last_activity)},
         ], sorted(rows, 'tokens_24h'), {onClick: (r) => { state.drill = {kind: 'session', row: r}; render(); }});
       },
@@ -7054,12 +7078,13 @@ AI_USAGE_HTML = """<!doctype html>
 
       quota: async () => {
         const box = document.createDocumentFragment();
+        box.appendChild(quotaStrip());
         const windows = (state.data.local && state.data.local.quota_windows) || [];
         const rows = [];
         for (const agent of ['claude', 'codex']) {
           for (const label of ['5h', '1w']) {
             const found = windows.find((w) => w.agent === agent &&
-              (w.label === label || (label === '5h' && w.label === 'subscription')));
+              (w.window === label || w.label === label));
             rows.push({agent, window: label, w: found || {state: 'unavailable',
               detail: 'Không có artifact local nào khai báo cửa sổ này.'}});
           }
@@ -7103,11 +7128,83 @@ AI_USAGE_HTML = """<!doctype html>
       if (range === '7d') return 'hour';
       return 'day';
     }
-    function quotaFor(label) {
+    const RANGE_LABEL = {'1h': '1 giờ qua', '5h': '5 giờ qua', '24h': 'Hôm nay',
+                         '7d': '7 ngày', '30d': '30 ngày', '': 'Toàn bộ lịch sử'};
+    function rangeLabel() {
+      const value = $('#fRange').value;
+      return RANGE_LABEL[value] !== undefined ? RANGE_LABEL[value] : 'Khoảng đã chọn';
+    }
+
+    // The two windows a Claude subscription is metered on. Both are ALWAYS
+    // drawn: a missing measurement is itself worth showing, and an absent bar
+    // is indistinguishable from one nobody looked at.
+    const QUOTA_WINDOWS = [
+      {key: '5h', title: 'Claude · cửa sổ 5 giờ'},
+      {key: '1w', title: 'Claude · cửa sổ 1 tuần'},
+    ];
+
+    function quotaFor(key) {
       const windows = (state.data.local && state.data.local.quota_windows) || [];
-      const found = windows.find((w) => w.label === label ||
-        (label === '5h' && w.label === 'subscription' && w.observed));
-      return found || {state: 'unavailable'};
+      return windows.find((w) => w.agent === 'claude' &&
+        (w.window === key || w.label === key)) || null;
+    }
+
+    function countdown(at) {
+      const left = Math.max(0, at - Date.now() / 1000);
+      if (left >= 3600) return Math.floor(left / 3600) + 'h' + Math.round((left % 3600) / 60) + 'm';
+      return Math.round(left / 60) + 'm';
+    }
+
+    function quotaCard(spec) {
+      const found = quotaFor(spec.key);
+      const card = el('div', {className: 'qcard'});
+      const head = el('div', {className: 'qhead'});
+      head.appendChild(el('span', {className: 'qwin', text: spec.title}));
+
+      // A provider that reports what is LEFT is converted here, and the
+      // conversion is stated on the card rather than hidden.
+      let used = null, derived = false;
+      if (found && found.used_percent != null) {
+        used = Number(found.used_percent);
+      } else if (found && found.remaining_percent != null) {
+        used = 100 - Number(found.remaining_percent);
+        derived = true;
+      }
+      const observed = used != null && found && found.observed;
+      const estimated = used != null && !observed;
+      const label = observed ? 'REPORTED' : estimated ? 'ƯỚC TÍNH' : 'N/A';
+      head.appendChild(el('span', {
+        className: 'pill ' + (observed ? 'rep' : estimated ? 'est' : 'na'), text: label}));
+      head.appendChild(el('span', {className: 'qpct',
+        text: used == null ? 'N/A' : Math.round(used) + '%'}));
+      card.appendChild(head);
+
+      const track = el('div', {className: 'qtrack' + (used == null ? ' na' : '')});
+      const fill = el('div', {className: 'qfill' +
+        (used >= 90 ? ' crit' : used >= 75 ? ' warn' : '')});
+      if (used != null) fill.style.width = Math.max(0, Math.min(100, used)) + '%';
+      track.appendChild(fill);
+      card.appendChild(track);
+
+      const meta = el('div', {className: 'qmeta'});
+      if (used == null) {
+        meta.appendChild(el('span', {text: (found && found.detail) ||
+          'Claude CLI không ghi quota vào state local trên máy này.'}));
+      } else {
+        meta.appendChild(el('span', {text: 'đã dùng ' + Math.round(used) + '% · còn ' +
+          Math.round(100 - used) + '%' + (derived ? ' (quy đổi: 100 − remaining)' : '')}));
+        meta.appendChild(el('span', {text: (found && found.resets_at)
+          ? 'reset sau ' + countdown(found.resets_at) : 'reset: không rõ'}));
+      }
+      meta.appendChild(el('span', {text: 'nguồn: ' + ((found && found.source) || 'unavailable')}));
+      card.appendChild(meta);
+      return card;
+    }
+
+    function quotaStrip() {
+      const grid = el('div', {className: 'qgrid'});
+      for (const spec of QUOTA_WINDOWS) grid.appendChild(quotaCard(spec));
+      return grid;
     }
     function lowestQuota() {
       const windows = ((state.data.local && state.data.local.quota_windows) || [])
@@ -7214,12 +7311,19 @@ AI_USAGE_HTML = """<!doctype html>
 
     for (const btn of document.querySelectorAll('nav button'))
       btn.onclick = () => { state.tab = btn.dataset.tab; state.drill = null; render(); };
+    function syncChips() {
+      for (const chip of document.querySelectorAll('#rangeChips .chip'))
+        chip.classList.toggle('on', chip.dataset.range === $('#fRange').value);
+    }
     for (const sel of ['#fRange', '#fNode', '#fAgent', '#fProject', '#fModel'])
-      $(sel).onchange = () => render();
+      $(sel).onchange = () => { syncChips(); render(); };
+    for (const chip of document.querySelectorAll('#rangeChips .chip'))
+      chip.onclick = () => { $('#fRange').value = chip.dataset.range; syncChips(); render(); };
     $('#fSearch').oninput = () => render();
     $('#refreshBtn').onclick = async () => { await loadBase(true); render(); };
 
     readUrl();
+    syncChips();
     loadBase(true).then(render);
     setInterval(async () => {
       if ($('#autoRefresh').checked) { await loadBase(true); render(); }

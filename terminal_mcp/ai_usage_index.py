@@ -119,6 +119,10 @@ class AiUsageIndex:
                     resets_at REAL,
                     detail TEXT,
                     updated_at REAL NOT NULL,
+                    -- Normalised to the windows a subscription is metered on
+                    -- ("5h" / "1w"), so the screen can ask for one by name
+                    -- rather than string-matching a provider's own wording.
+                    window TEXT,
                     PRIMARY KEY (agent, label)
                 );
                 -- A prompt someone typed. Preview is redacted and truncated;
@@ -157,6 +161,11 @@ class AiUsageIndex:
                     used_percent REAL,
                     resets_at REAL,
                     source TEXT NOT NULL,
+                    window TEXT,
+                    remaining_percent REAL,
+                    -- What the subscription is, never who owns it: no email,
+                    -- no org id, no token.
+                    account_tier TEXT,
                     PRIMARY KEY (taken_at, agent, label)
                 );
                 CREATE INDEX IF NOT EXISTS quota_snap_ts ON quota_snapshots (taken_at);
@@ -183,6 +192,10 @@ class AiUsageIndex:
          CREATE INDEX IF NOT EXISTS usage_project ON usage_events (project);
          CREATE INDEX IF NOT EXISTS usage_model ON usage_events (agent, model);
          ALTER TABLE file_cursors ADD COLUMN carry_prompt_id TEXT;
+         ALTER TABLE quota_windows ADD COLUMN window TEXT;
+         ALTER TABLE quota_snapshots ADD COLUMN window TEXT;
+         ALTER TABLE quota_snapshots ADD COLUMN remaining_percent REAL;
+         ALTER TABLE quota_snapshots ADD COLUMN account_tier TEXT;
          """),
     )
 
@@ -208,9 +221,14 @@ class AiUsageIndex:
                 try:
                     connection.execute(statement)
                 except sqlite3.OperationalError as exc:
-                    # Re-running an ALTER that already landed is not a failure;
-                    # anything else is.
-                    if "duplicate column name" not in str(exc):
+                    message = str(exc)
+                    # Two benign cases. Re-running an ALTER that already
+                    # landed, and altering a table this version introduced --
+                    # migrations run BEFORE the CREATE TABLE script, so on a
+                    # v1 database quota_snapshots does not exist yet and is
+                    # about to be created with these columns already in it.
+                    if ("duplicate column name" not in message
+                            and "no such table" not in message):
                         raise
             connection.execute(f"PRAGMA user_version = {number}")
 
@@ -416,8 +434,12 @@ class AiUsageIndex:
     def _refresh_quota(self, connection: sqlite3.Connection,
                        *, codex_home: Path | None = None) -> None:
         now = time.time()
+        # Both metered windows, always, for both providers. A window that
+        # nothing measured is still a row: an absent one is indistinguishable
+        # from one nobody looked at.
         windows: list[tuple[str, QuotaWindow]] = [
-            (AGENT_CLAUDE, unobserved_window("subscription", CLAUDE_QUOTA_UNOBSERVED))]
+            (AGENT_CLAUDE, unobserved_window("5h", CLAUDE_QUOTA_UNOBSERVED)),
+            (AGENT_CLAUDE, unobserved_window("1w", CLAUDE_QUOTA_UNOBSERVED))]
         codex_files = discover_codex_logs(codex_home)
         codex_found: list[QuotaWindow] = []
         for path in reversed(codex_files[-5:]):     # newest few carry the latest state
@@ -444,14 +466,17 @@ class AiUsageIndex:
         else:
             detail = ("No ~/.codex on this machine." if not codex_files
                       else "Codex logs present but contain no rate-limit metadata.")
-            windows.append((AGENT_CODEX, unobserved_window("subscription", detail)))
+            windows.extend([(AGENT_CODEX, unobserved_window("5h", detail)),
+                            (AGENT_CODEX, unobserved_window("1w", detail))])
         connection.execute("DELETE FROM quota_windows")
         connection.executemany(
-            """INSERT INTO quota_windows
-               (agent, label, observed, source, used_percent, resets_at, detail, updated_at)
-               VALUES (?,?,?,?,?,?,?,?)""",
+            """INSERT OR REPLACE INTO quota_windows
+               (agent, label, observed, source, used_percent, resets_at, detail,
+                updated_at, window)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             [(agent, w.label, int(w.observed), w.source, w.used_percent,
-              w.resets_at, w.detail, now) for agent, w in windows])
+              w.resets_at, w.detail, now, _normalise_window(w.label))
+             for agent, w in windows])
 
     # -- read -----------------------------------------------------------------
 
@@ -490,8 +515,16 @@ class AiUsageIndex:
                    GROUP BY agent, agent_session_id, is_subagent
                    ORDER BY last_ts DESC""",
                 (rolling_from,) * 5 + (today_from, today_from)).fetchall()
-            quota = [dict(r) for r in connection.execute(
-                "SELECT * FROM quota_windows ORDER BY agent, label")]
+            quota = []
+            for row in connection.execute("SELECT * FROM quota_windows ORDER BY agent, label"):
+                record = dict(row)
+                record.setdefault("window", None)
+                record["window"] = record["window"] or _normalise_window(record["label"])
+                # Providers differ on which half they state; both are carried
+                # so the screen never has to do the subtraction silently.
+                record["remaining_percent"] = (None if record["used_percent"] is None
+                                               else 100 - record["used_percent"])
+                quota.append(record)
             totals = connection.execute(
                 """SELECT COUNT(*) AS events,
                           SUM(input_tokens) AS input_tokens,
@@ -603,6 +636,7 @@ class AiUsageIndex:
             clauses.append(f"{prefix}ts >= ?"); params.append(float(filters["since"]))
         if filters.get("until") is not None:
             clauses.append(f"{prefix}ts <= ?"); params.append(float(filters["until"]))
+        # range_label is presentation metadata, never a filter column.
         for column, key in (("node_id", "node_id"), ("agent", "agent"),
                             ("model", "model"), ("project", "project"),
                             ("agent_session_id", "agent_session_id")):
@@ -616,9 +650,72 @@ class AiUsageIndex:
                    "SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) "
                    "AS total_tokens, COUNT(*) AS requests")
 
+    def cost_for(self, *, filters: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Cost of the SELECTED RANGE, not of all time.
+
+        This is the bug the card's label was hiding: `estimated_cost_usd` was
+        `SUM(total_cost_usd) FROM session_costs` -- every session, every day,
+        ignoring every filter -- while the screen showed it beside token
+        counts that DID respect the range. Changing the label alone would
+        have made a wrong number better documented.
+
+        A `cost-state` entry is a RUNNING total for a whole session, so a
+        range narrower than the session has to apportion. The obvious method
+        -- divide costUSD by the token counts in that same entry to recover a
+        per-token rate -- is wrong, and measurably so: those counts are the
+        totals AT THE MOMENT the entry was written, which is smaller than
+        what the session went on to spend, and the resulting rate produced
+        $112 for a fleet whose CLI reports $12.20.
+
+        So the session's reported cost is split by its share of that
+        session's own tokens. The full range then sums back to exactly what
+        the CLI reported, which is the property that makes the number
+        checkable.
+        """
+        where, params = self._where(filters)
+        with self._connect() as connection:
+            costs = {row["agent_session_id"]: row["total_cost_usd"]
+                     for row in connection.execute(
+                         "SELECT agent_session_id, total_cost_usd FROM session_costs")}
+            in_range = dict(connection.execute(
+                f"""SELECT agent_session_id,
+                           SUM(input_tokens + output_tokens + cache_read_tokens
+                               + cache_write_tokens) AS tokens
+                    FROM usage_events{where} GROUP BY agent_session_id""", params).fetchall())
+            whole = dict(connection.execute(
+                """SELECT agent_session_id,
+                          SUM(input_tokens + output_tokens + cache_read_tokens
+                              + cache_write_tokens) AS tokens
+                   FROM usage_events GROUP BY agent_session_id""").fetchall())
+            lifetime = connection.execute(
+                "SELECT SUM(total_cost_usd) FROM session_costs").fetchone()[0]
+        total = 0.0
+        priced = 0
+        unpriced_tokens = 0
+        for session, tokens in in_range.items():
+            session_cost = costs.get(session)
+            session_tokens = whole.get(session) or 0
+            if session_cost is None or session_tokens <= 0:
+                # A session the CLI has not written a cost for yet -- a live
+                # one, usually. Counted and reported, never guessed at.
+                unpriced_tokens += tokens or 0
+                continue
+            total += session_cost * ((tokens or 0) / session_tokens)
+            priced += 1
+        return {
+            "usd": round(total, 4) if priced else None,
+            "lifetime_usd": lifetime,
+            "method": ("the CLI's own per-session cost, split by that session's share of "
+                       "tokens inside the selected range"),
+            "source": "session_transcript (CLI-computed)" if priced else None,
+            "unpriced_tokens": unpriced_tokens,
+            "priced_sessions": priced,
+        }
+
     def summary(self, *, now: float | None = None,
                 filters: dict[str, Any] | None = None) -> dict[str, Any]:
         now = now or time.time()
+        cost = self.cost_for(filters=filters)
         where, params = self._where(filters)
         with self._connect() as connection:
             totals = dict(connection.execute(
@@ -630,9 +727,8 @@ class AiUsageIndex:
                     f"SELECT {self._TOKEN_SUMS} FROM usage_events WHERE ts >= ?",
                     (now - seconds,)).fetchone()
                 spans[label] = {k: (row[k] or 0) for k in row.keys()}
-            cost = connection.execute(
-                "SELECT SUM(total_cost_usd) AS usd, COUNT(*) AS sessions FROM session_costs"
-            ).fetchone()
+            cost_sessions = connection.execute(
+                "SELECT COUNT(*) FROM session_costs").fetchone()[0]
             active = connection.execute(
                 "SELECT COUNT(DISTINCT agent_session_id) FROM usage_events WHERE ts >= ?",
                 (now - 86400,)).fetchone()[0]
@@ -651,8 +747,19 @@ class AiUsageIndex:
             "totals": {k: (totals[k] or 0) for k in totals},
             "spans": spans,
             "estimated_cost_usd": cost["usd"],
-            "cost_source": "session_transcript (CLI-computed)" if cost["usd"] is not None else None,
-            "cost_sessions": cost["sessions"],
+            "cost_lifetime_usd": cost["lifetime_usd"],
+            "cost_source": cost["source"],
+            "cost_method": cost["method"],
+            "cost_unpriced_tokens": cost["unpriced_tokens"],
+            "cost_priced_sessions": cost["priced_sessions"],
+            "cost_sessions": cost_sessions,
+            # What the numbers on this payload actually describe, so the card
+            # can name its own range instead of leaving the reader to assume.
+            "range": {
+                "label": (filters or {}).get("range_label"),
+                "since": (filters or {}).get("since"),
+                "until": (filters or {}).get("until"),
+            },
             "active_sessions_24h": active,
             "peak_session_24h": (dict(peak) if peak else None),
             "top_project_24h": (dict(top_project) if top_project else None),
@@ -841,13 +948,18 @@ class AiUsageIndex:
         now = now or time.time()
         with self._connect() as connection:
             windows = connection.execute("SELECT * FROM quota_windows").fetchall()
+            tier = _account_tier()
             rows = [(now, w["agent"], w["label"],
                      "provider_reported" if w["observed"] else "unavailable",
-                     w["used_percent"], w["resets_at"], w["source"]) for w in windows]
+                     w["used_percent"], w["resets_at"], w["source"],
+                     _normalise_window(w["label"]),
+                     (None if w["used_percent"] is None else 100 - w["used_percent"]),
+                     tier) for w in windows]
             connection.executemany(
                 """INSERT OR IGNORE INTO quota_snapshots
-                   (taken_at, agent, label, state, used_percent, resets_at, source)
-                   VALUES (?,?,?,?,?,?,?)""", rows)
+                   (taken_at, agent, label, state, used_percent, resets_at, source,
+                    window, remaining_percent, account_tier)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""", rows)
         return len(rows)
 
     def quota_history(self, *, since: float | None = None, limit: int = 500) -> dict[str, Any]:
@@ -857,6 +969,43 @@ class AiUsageIndex:
                    ORDER BY taken_at DESC LIMIT ?""",
                 (since or 0.0, limit)).fetchall()
         return {"items": [{k: row[k] for k in row.keys()} for row in rows]}
+
+
+def _normalise_window(label: str | None) -> str | None:
+    """A provider's own wording mapped to the window it means.
+
+    Codex says "primary"/"secondary", Claude's subscription is metered on a
+    five-hour and a weekly window. The screen asks for "5h" or "1w"; this is
+    the one place that translation lives.
+    """
+    if not label:
+        return None
+    text = str(label).strip().lower()
+    if text in ("5h", "five_hour", "five-hour", "primary", "subscription"):
+        return "5h"
+    if text in ("1w", "week", "weekly", "seven_day", "secondary"):
+        return "1w"
+    return None
+
+
+def _account_tier() -> str | None:
+    """The subscription TYPE, read from the CLI's own auth status.
+
+    Deliberately only the tier: that command also prints an email and an org
+    id, and neither belongs in a usage index. Never the credential file.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(["claude", "auth", "status", "--json"],
+                                capture_output=True, text=True, timeout=8, check=False)
+        if result.returncode != 0:
+            return None
+        import json as _json
+
+        return _json.loads(result.stdout).get("subscriptionType")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 def _local_midnight(now: float) -> float:
