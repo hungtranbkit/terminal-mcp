@@ -87,6 +87,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Dashboard: Supervisor/Coordinator panel | VERIFIED |
 | Dashboard: Integration lane view (in Supervisor panel) | VERIFIED |
 | Dashboard: AI Usage panel (read-only, local AI Usage Monitor) | VERIFIED |
+| Notes / Ideas store (kho ghi chú: MCP `note_*` + `/dashboard/notes`) | VERIFIED |
 | Dashboard: Requirements/Feature Matrix link | VERIFIED |
 | Permissions: read/input grants + effective permissions | VERIFIED |
 | Reliable prompt submission (press-enter, DELIVERY_UNKNOWN, idempotency) | VERIFIED |
@@ -651,7 +652,7 @@ not placeholders).
   (`windows_webterm.py`, xterm.js) is UNAFFECTED — it gets the true raw
   byte stream directly from the reader loop, full color fidelity.
 
-## 15. API / MCP tool inventory (96 tools, from `tests/test_server.py`'s own exact set)
+## 15. API / MCP tool inventory (214 tools, from `tests/test_server.py`'s own exact set)
 
 Session ops: `terminal_list_sessions`, `terminal_tail`, `terminal_capture`,
 `terminal_status`, `terminal_send_text`, `terminal_send_keys`,
@@ -660,6 +661,11 @@ Bindings: `terminal_bind`, `terminal_get_binding`, `terminal_list_bindings`,
 `terminal_unbind`, `terminal_tail_bound`, `terminal_status_bound`,
 `terminal_send_bound`.
 Audit: `terminal_list_input_audit`, `terminal_input_context`.
+Notes / Ideas (the ONLY tools not `terminal_`-prefixed — they touch no
+terminal/session/node; see `docs/notes.md`): `note_create`, `note_get`,
+`note_search`, `note_list`, `note_update`, `note_delete`, `note_restore`,
+`note_add_attachment`, `note_remove_attachment`, `note_link_to_project`,
+`note_mark_applied`, `note_facets`.
 Lifecycle: `terminal_create_session`, `terminal_detach_session`,
 `terminal_delete_session`, `terminal_kill_session`,
 `terminal_rename_session`, `terminal_reopen_session`,
@@ -3679,6 +3685,61 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
     Monitor project itself — its own `/api/usage` was already a clean,
     sufficient, machine-readable JSON response; no separate commit was
     needed there. Tool count 130 -> 131.
+
+---
+
+## Notes / Ideas store (kho ghi chú dùng chung) — IMPLEMENTED
+
+Full design + every tool with JSON examples: `docs/notes.md`. ChatGPT-facing
+how-to: `docs/CHATGPT_USAGE.md` §7b.
+
+Answers "the user saw something good mid-chat and said *lưu lại*". Distinct
+from both neighbours it could be confused with:
+
+- **Project Backlog** answers *what a project intends to do* and lives in
+  one repo's own file. A note is captured BEFORE anyone knows which project
+  it belongs to, so it must not be repo-scoped — `project_id`/`project_name`
+  are nullable and attached later (`note_link_to_project`).
+- **Session Knowledge** captures what a session *emitted*, automatically,
+  with a retention cap. This holds what a human deliberately *kept*, with no
+  retention cap at all — an idea is never evicted to save space.
+
+Shape:
+
+- `terminal_mcp/notes_store.py` — SQLite (one controller-side `notes.db`) +
+  FTS5/bm25 over title/summary/original_content/analysis/tags, tracked
+  migration via `schema.apply_migrations`/`PRAGMA user_version`, soft delete
+  (`deleted_at`, which also leaves the search index).
+- `terminal_mcp/notes_service.py` — attachment BYTES on the filesystem
+  (`notes_attachments/YYYY/MM/<attachment-uuid>.<ext>`), MIME decided by
+  magic number, atomic write + fsync + `os.replace`, containment re-checked
+  on every read and unlink. The DB holds metadata only — never a base64
+  blob.
+- 12 `note_*` MCP tools (§15) and `/dashboard/notes` (gallery / list /
+  Kanban, Vietnamese, mobile) with 11 JSON routes behind the existing
+  `_read_guard`/`_mutation_guard` boundary.
+- `NotesConfig` (`notes:` in config.yaml). Defaults ON and need no
+  configuration; `notes.attachment_source_roots` is EMPTY by default, which
+  is what keeps the `source_path` attachment transport refused until an
+  operator grants specific directories.
+
+V1 is fully local and deterministic — no embedding service, no LLM, no new
+infrastructure — which is a hard requirement, not a simplification: the kho
+must work with the machine offline. Semantic search could be layered behind
+the same `note_search` contract later.
+
+Known V1 limitations (all deliberate, all in `docs/notes.md`): single-user
+(this dashboard has one operator identity, so there is no owner column and
+no half-built multi-tenancy); controller-local (an idea has no node); no
+automatic screenshot capture of a saved URL (no browser service in this
+project — the model or the user attaches the image); image attachments only
+(png/jpeg/webp/gif — the types the UI can actually preview).
+
+Tests: `tests/test_notes_store.py`, `tests/test_notes_attachments.py`,
+`tests/test_notes_mcp_tools.py`, `tests/test_notes_dashboard.py`,
+`tests/test_notes_config.py` (224 tests), plus the two existing inventory
+guards updated in the same commit (`tests/test_server.py`'s exact tool set
+and `tests/test_dashboard.py`'s exact route set).
 
 ---
 

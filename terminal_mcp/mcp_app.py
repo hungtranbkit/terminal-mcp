@@ -19,6 +19,8 @@ from .integration_store import publish_handoff_for_completed_task
 from .dor_gate import check_definition_of_ready
 from .git_isolation_service import GitIsolationService
 from .node_models import node_to_dict as _node_to_dict
+from .notes_service import NotesService
+from .notes_store import NotesError
 from .planner_service import PlannerService
 from .planner_store import PlannerStore
 from .pm_service import PMService
@@ -55,6 +57,7 @@ def build_mcp(service: TerminalService | None = None,
               ai_usage: AiUsageService | None = None,
               recovery: RecoveryEngine | None = None,
               backlog: BacklogService | None = None,
+              notes: NotesService | None = None,
               events: EventBus | None = None,
               resource_locks: ResourceLockStore | None = None,
               default_optional_services: bool = True) -> MCPServer:
@@ -133,6 +136,14 @@ def build_mcp(service: TerminalService | None = None,
     if default_optional_services:
         backlog = backlog if backlog is not None else BacklogService(
             terminal.config, queue=queue, controller=controller)
+        # Notes/Ideas: same "one tool surface" reasoning as backlog/events
+        # just above -- stdio and HTTP must expose the SAME note_* tools,
+        # so it defaults here rather than only where server_http.py builds
+        # it. Its own store honours TERMINAL_MCP_NOTES_DB then
+        # XDG_STATE_HOME (notes_store.default_notes_path), which is what
+        # keeps the test suite's redirected state dir isolating it too.
+        if notes is None and terminal.config.notes.enabled:
+            notes = NotesService.from_config(terminal.config)
         events = events if events is not None else EventBus()
 
     # Orchestration V1: connect the deterministic runtime to the bus. Until
@@ -3057,6 +3068,221 @@ def build_mcp(service: TerminalService | None = None,
             an observability field."""
             holder = queue.store.lease_holder(task_id)
             return holder or {"task_id": task_id, "held": False}
+
+
+    # -- Notes / Ideas (kho ghi chú dùng chung cho nhiều project --
+    # notes_store.py + notes_service.py). Deliberately NOT prefixed
+    # `terminal_` like every tool above: these do not touch a terminal,
+    # a session or a node, and the name a model reads in a tool list is
+    # the main thing steering it to the right tool. Local to the
+    # controller (one shared store), never routed per-node -- an idea has
+    # no node.
+
+    if notes is not None:
+
+        def _notes(operation, *args, **kwargs) -> dict:
+            """Every note_* tool answers with a dict, never an exception:
+            a NotesError's stable `code` becomes the response's own
+            `error` field (plus whatever detail the error carried), so a
+            caller branches on a documented string instead of parsing a
+            traceback out of a transport error."""
+            try:
+                return operation(*args, **kwargs)
+            except NotesError as exc:
+                return exc.to_dict()
+
+        @server.tool()
+        def note_create(title: str | None = None, summary: str = "", original_content: str = "",
+                        analysis: str = "", source_url: str | None = None,
+                        source_chat: str | None = None, source_session: str | None = None,
+                        type: str = "idea", status: str = "new", tags: list[str] | None = None,
+                        project_id: str | None = None, project_name: str | None = None,
+                        attachment_paths: list[str] | None = None,
+                        attachments_base64: list[dict] | None = None) -> dict:
+            """Save an idea/note/link the user just asked you to keep --
+            "lưu lại", "ghi chú cái này", "đưa vào kho ý tưởng".
+
+            Put the user's own material in `original_content` and YOUR
+            analysis in `analysis` -- they are separate fields on purpose,
+            so the note is still useful when the source URL dies. `title`
+            is optional (a short one is derived if you omit it). `type` is
+            one of idea/reference/todo/research/prompt/design/other;
+            `status` one of new/reviewing/planned/applied/archived.
+            `project_id`/`project_name` are optional and settable later
+            (note_link_to_project) -- do not guess a project just to fill
+            them.
+
+            Images: `attachments_base64` takes [{"filename": "shot.png",
+            "data_base64": "..."}] for bytes you hold in-band, and
+            `attachment_paths` takes absolute paths to files already on
+            this host (allowed only inside the operator-configured
+            notes.attachment_source_roots). Either way the bytes are
+            written to real files -- never stored base64 in the database.
+            A failed attachment never loses the note: the note is created
+            first and each attachment result is reported separately under
+            `attachment_results`."""
+            result = _notes(notes.create, title=title, summary=summary,
+                            original_content=original_content, analysis=analysis,
+                            source_url=source_url, source_chat=source_chat,
+                            source_session=source_session, type=type, status=status,
+                            tags=tags, project_id=project_id, project_name=project_name)
+            if "error" in result:
+                return result
+            attachment_results: list[dict] = []
+            for path in attachment_paths or []:
+                attachment_results.append(_notes(notes.add_attachment, result["id"], source_path=path))
+            for item in attachments_base64 or []:
+                if not isinstance(item, dict):
+                    attachment_results.append({"error": "ATTACHMENT_TRANSPORT_REQUIRED",
+                                               "message": "attachments_base64 items must be objects"})
+                    continue
+                attachment_results.append(_notes(
+                    notes.add_attachment, result["id"], filename=item.get("filename"),
+                    data_base64=item.get("data_base64"),
+                    declared_mime_type=item.get("mime_type")))
+            if attachment_results:
+                fresh = _notes(notes.get, result["id"])
+                if "error" not in fresh:
+                    result = fresh
+                result["attachment_results"] = attachment_results
+            return result
+
+        @server.tool()
+        def note_get(note_id: str, include_deleted: bool = False) -> dict:
+            """One note in full -- every field plus its attachments (each
+            with a `url` the dashboard serves the image from)."""
+            return _notes(notes.get, note_id, include_deleted=include_deleted)
+
+        @server.tool()
+        def note_search(query: str, type: str | None = None, status: str | None = None,
+                        tag: str | None = None, project: str | None = None,
+                        since: str | None = None, until: str | None = None,
+                        limit: int = 20, offset: int = 0, include_archived: bool = True) -> dict:
+            """Ranked full-text search across title + summary +
+            original_content + analysis + tags -- the tool to answer
+            "trước đây tôi có lưu ý tưởng nào về landing page MESFlow
+            không?".
+
+            Deterministic and fully local (SQLite FTS5 bm25, diacritics-
+            insensitive so "y tuong" finds "ý tưởng") -- no embedding
+            service, no network. Each hit carries `rank_position` (1 =
+            best; order by this), `score` (higher is more relevant), and a
+            short `excerpt` around the match, so you can summarise the
+            results yourself. `project` matches project_id or
+            project_name; `since`/`until` are ISO timestamps against
+            created_at. Archived notes ARE included by default here (a
+            recall question should not silently skip them). An empty
+            `query` degrades to a newest-first browse with the same
+            filters."""
+            return _notes(notes.search, query, type=type, status=status, tag=tag,
+                          project=project, since=since, until=until, limit=limit,
+                          offset=offset, include_archived=include_archived)
+
+        @server.tool()
+        def note_list(type: str | None = None, status: str | None = None, tag: str | None = None,
+                      project: str | None = None, since: str | None = None,
+                      until: str | None = None, sort: str = "newest", limit: int = 50,
+                      offset: int = 0, include_archived: bool = False) -> dict:
+            """Browse/filter notes without a text query. `sort` is
+            newest/oldest/updated; paginate with limit+offset (the
+            response carries total/has_more). Archived notes are hidden
+            unless include_archived=true or status="archived"."""
+            return _notes(notes.list, type=type, status=status, tag=tag, project=project,
+                          since=since, until=until, sort=sort, limit=limit, offset=offset,
+                          include_archived=include_archived)
+
+        @server.tool()
+        def note_update(note_id: str, title: str | None = None, summary: str | None = None,
+                        original_content: str | None = None, analysis: str | None = None,
+                        source_url: str | None = None, source_chat: str | None = None,
+                        source_session: str | None = None, type: str | None = None,
+                        status: str | None = None, tags: list[str] | None = None,
+                        project_id: str | None = None, project_name: str | None = None) -> dict:
+            """Partial update: ONLY the fields you actually pass are
+            written, so changing the status cannot blank the analysis.
+            Passing tags REPLACES the whole list (read the note first if
+            you mean to append)."""
+            fields = {key: value for key, value in (
+                ("title", title), ("summary", summary), ("original_content", original_content),
+                ("analysis", analysis), ("source_url", source_url), ("source_chat", source_chat),
+                ("source_session", source_session), ("type", type), ("status", status),
+                ("tags", tags), ("project_id", project_id), ("project_name", project_name),
+            ) if value is not None}
+            if not fields:
+                return {"error": "NOTHING_TO_UPDATE",
+                        "message": "pass at least one field to change"}
+            return _notes(notes.update, note_id, **fields)
+
+        @server.tool()
+        def note_delete(note_id: str, hard: bool = False) -> dict:
+            """Soft delete by default: the note leaves every listing and
+            the search index but is recoverable with note_restore, and its
+            image files are untouched. hard=true also removes the row and
+            unlinks the files -- irreversible, so only on an explicit
+            "xóa hẳn"."""
+            return _notes(notes.delete, note_id, hard=hard)
+
+        @server.tool()
+        def note_restore(note_id: str) -> dict:
+            """Undo a soft delete."""
+            return _notes(notes.restore, note_id)
+
+        @server.tool()
+        def note_add_attachment(note_id: str, filename: str | None = None,
+                                source_path: str | None = None,
+                                data_base64: str | None = None,
+                                mime_type: str | None = None) -> dict:
+            """Attach an image (png/jpeg/webp/gif) to an existing note --
+            e.g. the screenshot behind a saved URL, so the note survives
+            the page going away.
+
+            Exactly ONE transport per call, and both are real (this MCP
+            runtime has no binary channel, so there is no third):
+              - `data_base64`: the bytes in-band (a data: URI is accepted
+                too). Decoded here and written to a file.
+              - `source_path`: an ABSOLUTE path to a file already on this
+                host. Refused with ATTACHMENT_SOURCE_DISABLED unless the
+                operator has configured notes.attachment_source_roots, and
+                then only inside those roots.
+            The stored type is decided by the file's own bytes, not by
+            `filename` or `mime_type` -- a mismatch is refused
+            (ATTACHMENT_MIME_MISMATCH) rather than quietly corrected."""
+            return _notes(notes.add_attachment, note_id, filename=filename,
+                          source_path=source_path, data_base64=data_base64,
+                          declared_mime_type=mime_type)
+
+        @server.tool()
+        def note_remove_attachment(attachment_id: str) -> dict:
+            """Detach one image and delete its file. The note itself is
+            untouched."""
+            return _notes(notes.remove_attachment, attachment_id)
+
+        @server.tool()
+        def note_link_to_project(note_id: str, project_id: str | None = None,
+                                 project_name: str | None = None) -> dict:
+            """Attach a captured note to a project once it is clear which
+            one it belongs to. Pass project_id and/or project_name; only
+            the link changes, nothing else about the note."""
+            return _notes(notes.link_to_project, note_id, project_id=project_id,
+                          project_name=project_name)
+
+        @server.tool()
+        def note_mark_applied(note_id: str, applied_ref: str | None = None,
+                              project_id: str | None = None,
+                              project_name: str | None = None) -> dict:
+            """Mark that the idea actually got used: status becomes
+            "applied" and applied_at is stamped. `applied_ref` is a free
+            text pointer to where it landed (a commit, a PR, a task id);
+            passing a project also links it."""
+            return _notes(notes.mark_applied, note_id, applied_ref=applied_ref,
+                          project_id=project_id, project_name=project_name)
+
+        @server.tool()
+        def note_facets() -> dict:
+            """What values actually exist in the store (types, statuses,
+            tags, projects, counts) -- use it to offer the user real
+            filters instead of guessing tag spellings."""
+            return _notes(notes.facets)
 
 
     return server
