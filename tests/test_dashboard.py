@@ -1406,6 +1406,17 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # (ai_usage_index.py). No provider API, no mutation surface.
         "/dashboard/ai-usage": {"GET", "HEAD"},
         "/dashboard/api/ai-usage/local": {"GET", "HEAD"},
+        # Analytics behind the AI Usage screen. All read-only views over the
+        # local collector; none is a mutation surface.
+        "/dashboard/api/ai-usage/summary": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/timeline": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/prompts": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/sessions": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/projects": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/models": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/events": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/quota-history": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/export": {"GET", "HEAD"},
         # Multi-node capability refresh (this batch) -- listed so this
         # inventory guard keeps catching UNINTENDED route changes.
         "/dashboard/api/nodes/{node_id}/refresh-capabilities": {"POST"},
