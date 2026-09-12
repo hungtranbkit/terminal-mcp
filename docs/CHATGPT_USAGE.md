@@ -550,6 +550,55 @@ see REQUIREMENTS.md Backlog item 7).
   disruptive, outward-facing action on a live machine with real
   attended sessions.
 
+## 7b. Saving an idea ("lưu lại") — the notes/ideas store
+
+When the user says **"lưu lại"**, **"ghi chú cái này"**, **"lưu ý tưởng
+này"**, **"đưa vào kho ý tưởng"** — that is `note_create`, not a task and
+not a session operation. Full reference: [`notes.md`](notes.md).
+
+What to put where, because this is the part that decides whether the note
+is still useful in six weeks:
+
+- `original_content` — what the USER wanted kept, verbatim (the pasted
+  text, the link, their own words about why).
+- `analysis` — YOUR reading of it. Keep it separate: the note must stand
+  on its own after the source URL dies.
+- `source_url` — if there is one.
+- `tags` + `type` — real labels; call `note_facets` first if you want to
+  reuse the user's existing tag spellings rather than inventing near-
+  duplicates.
+- `project_id`/`project_name` — only if the user actually said which
+  project. Leave them empty otherwise and attach later with
+  `note_link_to_project`; a guessed project is worse than none.
+- `title` — optional; one is derived from the content if you omit it.
+
+An image the user just shared goes in the same call:
+`attachments_base64: [{"filename": "shot.png", "data_base64": "..."}]`.
+If the file is already on this host, `attachment_paths` takes absolute
+paths — but that transport is refused (`ATTACHMENT_SOURCE_DISABLED`)
+unless the operator configured `notes.attachment_source_roots`, so fall
+back to base64 rather than reporting failure to the user. A failed
+attachment never loses the note: check `attachment_results` in the
+response and tell the user which image did not make it.
+
+Confirm back with the note id and title, and mention the page
+(`/dashboard/notes`) where they can see it.
+
+Recall — **"trước đây tôi có lưu gì về X không?"** — is `note_search`.
+It is local and deterministic (SQLite FTS5 bm25, diacritics-insensitive:
+`y tuong` finds `ý tưởng`). Order results by `rank_position` (1 = best),
+not by `score`, and summarise from the `excerpt` + metadata each hit
+carries. Use `note_list` when the user is browsing by filter rather than
+searching by words.
+
+When an idea actually gets used, `note_mark_applied` with an
+`applied_ref` (commit / PR / task id) — that is what keeps the kho from
+turning into an undifferentiated pile.
+
+Deleting is soft by default and reversible with `note_restore`. Only pass
+`hard=true` on an explicit "xóa hẳn": it unlinks the image files and
+cannot be undone.
+
 ## 8. What NOT to do (anti-patterns, repeated for emphasis)
 
 - Never blind-resend a prompt on `DELIVERY_UNKNOWN` without checking

@@ -29,6 +29,8 @@ from .recovery_engine import RecoveryEngine
 from .integration_service import IntegrationService
 from .integration_store import IntegrationStore
 from .node_models import NODE_ONLINE, SESSION_BACKEND_TMUX, node_to_dict
+from .notes_service import NotesService
+from .notes_store import NotesError, NotesStore
 from .permissions import input_session_allowed, session_allowed, valid_session_name
 from .planner_service import PlannerService
 from .planner_store import PlannerStore
@@ -71,6 +73,32 @@ def _requirements_doc_path() -> Path:
 
 def _read_requirements_doc() -> str:
     return _requirements_doc_path().read_text(encoding="utf-8")
+
+
+# Notes/Ideas error code -> HTTP status. Same table-driven convention as
+# INPUT_ERROR_STATUS below; anything absent is a plain 400 (a bad request
+# from the caller), which is the correct default for every validation code
+# notes_store.py raises.
+_NOTES_ERROR_STATUS = {
+    "NOTE_NOT_FOUND": 404,
+    "NOTE_DELETED": 410,
+    "ATTACHMENT_NOT_FOUND": 404,
+    "ATTACHMENT_FILE_MISSING": 410,
+    "ATTACHMENT_TOO_LARGE": 413,
+    "ATTACHMENT_MIME_NOT_ALLOWED": 415,
+    "ATTACHMENT_MIME_MISMATCH": 415,
+    "ATTACHMENT_SOURCE_DISABLED": 403,
+    "ATTACHMENT_SOURCE_NOT_ALLOWED": 403,
+    "ATTACHMENT_PATH_OUTSIDE_STORE": 403,
+    "ATTACHMENT_UNREADABLE": 500,
+}
+
+
+def _notes_int(raw: str | None, default: int) -> int:
+    try:
+        return int(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
 
 
 INPUT_ERROR_STATUS = {
@@ -840,6 +868,7 @@ DASHBOARD_HTML = """<!doctype html>
           <a href="/dashboard/nodes" id="nodesAdminLink" role="menuitem">🖥 Nodes</a>
           <a href="/dashboard/tasks" id="globalTasksLink" role="menuitem">🗂 Global Tasks</a>
           <a href="/dashboard/backlog" id="backlogLink" role="menuitem">📋 Project Backlog</a>
+          <a href="/dashboard/notes" id="notesLink" role="menuitem">💡 Ghi chú / Ý tưởng</a>
           <a href="/dashboard/requirements" id="requirementsLink" role="menuitem" target="_blank" rel="noopener">📄 Requirements</a>
           <button type="button" id="openSupervisorPanelBtn" role="menuitem">🧭 Supervisor / Coordinator</button>
           <button type="button" id="openTaskInboxBtn" role="menuitem">📥 Task Inbox</button>
@@ -5779,6 +5808,7 @@ BACKLOG_HTML = """<!doctype html>
     </div>
     <div style="display:flex;gap:8px;align-items:center">
       <span id="proj" class="muted"></span>
+      <a class="back" href="/dashboard/notes">&#128161; Ghi ch&#250; / &#221; t&#432;&#7903;ng</a>
       <a class="back" href="/dashboard/tasks">&#128451; Global Tasks</a>
       <a class="back" href="/dashboard/sessions">&#8592; Sessions</a>
     </div>
@@ -6398,6 +6428,580 @@ WEBTERM_HTML = """<!doctype html>
 </html>"""
 
 
+# Notes / Ideas page (route /dashboard/notes). Self-contained like every
+# other page constant in this file -- no build step, no bundler, no CDN:
+# the dashboard is served from a loopback/tunnelled process that must
+# work with no outbound network at all.
+NOTES_HTML = """<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Ghi chú / Ý tưởng</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --panel2:#0f1730; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#5b8cff; --violet:#a78bfa; --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono','Courier New',monospace; --sans: system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif; }
+    * { box-sizing:border-box }
+    body { margin:0; font:14px/1.55 var(--sans); background:var(--bg); color:var(--text) }
+    a { color:var(--accent) }
+    header { display:flex; justify-content:space-between; gap:12px; align-items:center; padding:14px 20px; border-bottom:1px solid var(--line); flex-wrap:wrap }
+    h1 { margin:0; font-size:18px }
+    .muted { color:var(--muted) }
+    .sub { font-size:12px; color:var(--muted) }
+    .nav { display:flex; gap:8px; flex-wrap:wrap }
+    .nav a { color:var(--muted); text-decoration:none; font-size:12px; border:1px solid var(--line); border-radius:999px; padding:4px 10px }
+    .nav a:hover { color:var(--text); border-color:var(--muted) }
+    button { font:inherit; cursor:pointer }
+    .btn { background:#19243b; border:1px solid var(--line); border-radius:7px; color:var(--text); padding:7px 13px; font-size:13px }
+    .btn:hover { background:#233252 }
+    .btn.primary { background:var(--accent); border-color:var(--accent); color:#08112a; font-weight:600 }
+    .btn.danger { border-color:var(--red); color:var(--red) }
+    .btn.small { padding:3px 9px; font-size:11px; border-radius:6px }
+    .btn[disabled] { opacity:.45; cursor:default }
+    input[type=text], input[type=date], input[type=url], select, textarea { padding:8px 10px; border-radius:7px; border:1px solid var(--line); background:var(--panel2); color:var(--text); font:inherit; font-size:13px; width:100% }
+    textarea { min-height:80px; resize:vertical; font-family:var(--mono); font-size:12px }
+    .wrap { padding:16px 20px 40px; max-width:1500px; margin:0 auto }
+    #searchRow { display:flex; gap:10px; align-items:center; margin-bottom:12px }
+    #q { flex:1; font-size:15px; padding:12px 14px }
+    .filters { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; margin-bottom:12px }
+    .filters label { font-size:11px; color:var(--muted); display:flex; flex-direction:column; gap:4px; min-width:120px }
+    .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px; padding-bottom:10px; border-bottom:1px solid var(--line) }
+    .tabs { display:flex; gap:4px; background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:3px }
+    .tabs button { background:transparent; border:0; color:var(--muted); padding:5px 12px; border-radius:6px; font-size:12px }
+    .tabs button[aria-selected=true] { background:#233252; color:var(--text) }
+    .spacer { flex:1 }
+    .chip { display:inline-block; border-radius:999px; padding:1px 9px; border:1px solid var(--line); font-size:10px; color:var(--muted); white-space:nowrap }
+    .chip.s-new { color:var(--accent); border-color:var(--accent) }
+    .chip.s-reviewing { color:var(--amber); border-color:var(--amber) }
+    .chip.s-planned { color:var(--violet); border-color:var(--violet) }
+    .chip.s-applied { color:var(--green); border-color:var(--green) }
+    .chip.s-archived { color:var(--muted) }
+    .chip.tag { color:var(--text); background:#1b2540 }
+    .gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:14px }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; cursor:pointer; display:flex; flex-direction:column }
+    .card:hover { border-color:var(--accent) }
+    .card .thumb { width:100%; aspect-ratio:16/10; object-fit:cover; background:var(--panel2); display:block }
+    .card .body { padding:11px 12px 12px; display:flex; flex-direction:column; gap:6px }
+    .card .t { font-weight:600; font-size:13.5px; line-height:1.35; overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical }
+    .card .s { color:var(--muted); font-size:12px; overflow:hidden; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; white-space:pre-wrap; word-break:break-word }
+    .card .meta { display:flex; gap:5px; flex-wrap:wrap; align-items:center; margin-top:2px }
+    .card .when { font-size:10px; color:var(--muted) }
+    .rows { display:flex; flex-direction:column; gap:1px; background:var(--line); border:1px solid var(--line); border-radius:10px; overflow:hidden }
+    .row { background:var(--panel); padding:10px 12px; display:flex; gap:12px; align-items:flex-start; cursor:pointer }
+    .row:hover { background:#17223a }
+    .row .rt { flex:1; min-width:0 }
+    .row .rt b { font-size:13.5px; display:block; word-break:break-word }
+    .row .rt .s { color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    .row .rmeta { display:flex; gap:5px; flex-wrap:wrap; align-items:center; justify-content:flex-end; max-width:45% }
+    .board { display:grid; grid-template-columns:repeat(4,minmax(210px,1fr)); gap:12px }
+    .col { background:var(--panel2); border:1px solid var(--line); border-radius:12px; padding:10px; min-height:120px }
+    .col.drop { border-color:var(--accent); background:#151f3a }
+    .col h3 { margin:0 0 9px; font-size:12px; color:var(--muted); font-weight:600; display:flex; justify-content:space-between }
+    .col .card { margin-bottom:9px }
+    .col .card .body { padding:9px 10px }
+    .mv { display:flex; gap:4px; margin-top:4px; flex-wrap:wrap }
+    #empty { color:var(--muted); text-align:center; padding:50px 10px }
+    #err { color:var(--red); min-height:18px; font-size:12.5px; margin-bottom:8px }
+    #backdrop { position:fixed; inset:0; background:rgba(4,8,20,.66); display:none; z-index:20 }
+    #backdrop[data-open=1] { display:block }
+    #drawer { position:fixed; top:0; right:0; bottom:0; width:min(660px,100%); background:var(--bg); border-left:1px solid var(--line); z-index:21; transform:translateX(100%); transition:transform .16s ease-out; display:flex; flex-direction:column }
+    #drawer[data-open=1] { transform:none }
+    #drawer .dhead { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid var(--line) }
+    #drawer .dhead b { font-size:15px }
+    #drawer .dbody { flex:1; overflow:auto; padding:16px; display:flex; flex-direction:column; gap:13px }
+    #drawer .dfoot { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); flex-wrap:wrap }
+    .fld { display:flex; flex-direction:column; gap:5px }
+    .fld > span { font-size:11px; color:var(--muted) }
+    .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:10px }
+    .atts { display:grid; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); gap:10px }
+    .att { border:1px solid var(--line); border-radius:9px; overflow:hidden; background:var(--panel) }
+    .att img { width:100%; aspect-ratio:4/3; object-fit:cover; display:block; background:var(--panel2) }
+    .att .af { padding:5px 7px; display:flex; justify-content:space-between; gap:6px; align-items:center; font-size:10px; color:var(--muted) }
+    .att .af span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    .dz { border:1px dashed var(--line); border-radius:9px; padding:12px; text-align:center; color:var(--muted); font-size:12px }
+    .dz.over { border-color:var(--accent); color:var(--text) }
+    #toast { position:fixed; left:50%; bottom:22px; transform:translateX(-50%); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:9px 16px; font-size:13px; z-index:30; display:none }
+    #toast[data-open=1] { display:block }
+    #toast.bad { border-color:var(--red); color:var(--red) }
+    @media (max-width:860px) {
+      .wrap { padding:12px 12px 32px }
+      .board { grid-template-columns:1fr }
+      .gallery { grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:10px }
+      .filters label { min-width:calc(50% - 5px); flex:1 }
+      .row .rmeta { max-width:100%; justify-content:flex-start }
+      .row { flex-direction:column; gap:6px }
+      .grid2 { grid-template-columns:1fr }
+      #drawer { width:100% }
+      header { padding:11px 12px }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Ghi chú / Ý tưởng</h1>
+      <div class="sub">Kho dùng chung cho mọi project &mdash; ChatGPT lưu vào đây qua các tool note_*</div>
+    </div>
+    <div class="nav">
+      <span id="cnt" class="sub"></span>
+      <a href="/dashboard/backlog">Backlog</a>
+      <a href="/dashboard/tasks">Global Tasks</a>
+      <a href="/dashboard/sessions">Sessions</a>
+    </div>
+  </header>
+  <div class="wrap">
+    <div id="searchRow">
+      <input type="text" id="q" placeholder="Tìm trong các ý tưởng đã lưu…" autocomplete="off">
+      <button class="btn primary" id="newBtn">+ Ghi chú mới</button>
+    </div>
+    <div class="filters">
+      <label>Loại<select id="fType"></select></label>
+      <label>Trạng thái<select id="fStatus"></select></label>
+      <label>Tag<select id="fTag"></select></label>
+      <label>Dự án<select id="fProject"></select></label>
+      <label>Từ ngày<input type="date" id="fSince"></label>
+      <label>Đến ngày<input type="date" id="fUntil"></label>
+      <button class="btn" id="clearBtn">Xoá lọc</button>
+    </div>
+    <div class="bar">
+      <div class="tabs" role="tablist">
+        <button role="tab" id="vGallery" aria-selected="true">Thư viện</button>
+        <button role="tab" id="vList" aria-selected="false">Danh sách</button>
+        <button role="tab" id="vBoard" aria-selected="false">Bảng</button>
+      </div>
+      <label class="sub" style="display:flex;gap:6px;align-items:center">Sắp xếp
+        <select id="fSort" style="width:auto">
+          <option value="newest">Mới nhất</option>
+          <option value="oldest">Cũ nhất</option>
+          <option value="updated">Vừa sửa</option>
+        </select>
+      </label>
+      <label class="sub" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="fArchived" style="width:auto"> Hiện cả lưu trữ</label>
+      <div class="spacer"></div>
+      <button class="btn small" id="moreBtn" hidden>Tải thêm</button>
+    </div>
+    <div id="err"></div>
+    <div id="view"></div>
+    <div id="empty" hidden>Chưa có ghi chú nào khớp. Nói với ChatGPT &ldquo;lưu ý tưởng này&rdquo; để thêm, hoặc bấm &ldquo;+ Ghi chú mới&rdquo;.</div>
+  </div>
+
+  <div id="backdrop"></div>
+  <aside id="drawer" aria-hidden="true">
+    <div class="dhead">
+      <b id="dTitle">Chi tiết</b>
+      <button class="btn small" id="dClose">Đóng</button>
+    </div>
+    <div class="dbody" id="dBody"></div>
+    <div class="dfoot" id="dFoot"></div>
+  </aside>
+  <div id="toast"></div>
+
+<script>
+const TYPE_VI = {idea:'Ý tưởng', reference:'Tham khảo', todo:'Việc cần làm', research:'Nghiên cứu', prompt:'Prompt', design:'Thiết kế', other:'Khác'};
+const STATUS_VI = {new:'Mới', reviewing:'Đang xem', planned:'Sẽ làm', applied:'Đã áp dụng', archived:'Lưu trữ'};
+const BOARD_COLS = ['new','reviewing','planned','applied'];
+const state = {view:'gallery', items:[], total:0, offset:0, limit:48, facets:null, note:null, editing:false};
+
+const $ = (id) => document.getElementById(id);
+const esc = (value) => String(value === null || value === undefined ? '' : value)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+function toast(message, bad) {
+  const el = $('toast');
+  el.textContent = message;
+  el.className = bad ? 'bad' : '';
+  el.dataset.open = '1';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.dataset.open = '0'; }, bad ? 5000 : 2200);
+}
+function when(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return d.toLocaleString('vi-VN', {day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit'});
+}
+async function api(path, options) {
+  const response = await fetch(path, options || {});
+  let body = null;
+  try { body = await response.json(); } catch (e) { body = null; }
+  if (!response.ok) {
+    const message = (body && (body.message || body.error)) || ('HTTP ' + response.status);
+    throw new Error(message);
+  }
+  return body;
+}
+function postJSON(path, payload) {
+  return api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+}
+
+function filters() {
+  const params = new URLSearchParams();
+  const query = $('q').value.trim();
+  if (query) params.set('q', query);
+  for (const [key, id] of [['type','fType'],['status','fStatus'],['tag','fTag'],['project','fProject']]) {
+    const value = $(id).value;
+    if (value) params.set(key, value);
+  }
+  if ($('fSince').value) params.set('since', $('fSince').value);
+  if ($('fUntil').value) params.set('until', $('fUntil').value + 'T23:59:59Z');
+  if ($('fArchived').checked) params.set('include_archived', '1');
+  params.set('sort', $('fSort').value);
+  params.set('limit', String(state.limit));
+  return params;
+}
+
+async function loadFacets() {
+  try { state.facets = await api('/dashboard/api/notes/facets'); } catch (e) { return; }
+  const facets = state.facets;
+  const keep = (select, value) => { select.value = value; };
+  const typeSelect = $('fType'), statusSelect = $('fStatus'), tagSelect = $('fTag'), projectSelect = $('fProject');
+  const prev = [typeSelect.value, statusSelect.value, tagSelect.value, projectSelect.value];
+  typeSelect.innerHTML = '<option value="">tất cả</option>' + (facets.all_types || []).map(
+    (t) => '<option value="' + esc(t) + '">' + esc(TYPE_VI[t] || t) + (facets.types[t] ? ' (' + facets.types[t] + ')' : '') + '</option>').join('');
+  statusSelect.innerHTML = '<option value="">tất cả</option>' + (facets.all_statuses || []).map(
+    (s) => '<option value="' + esc(s) + '">' + esc(STATUS_VI[s] || s) + (facets.statuses[s] ? ' (' + facets.statuses[s] + ')' : '') + '</option>').join('');
+  tagSelect.innerHTML = '<option value="">tất cả</option>' + (facets.tags || []).map(
+    (t) => '<option value="' + esc(t.tag) + '">' + esc(t.tag) + ' (' + t.count + ')</option>').join('');
+  const projects = [];
+  const seen = {};
+  for (const p of (facets.projects || [])) {
+    const label = p.project_name || p.project_id;
+    if (!label || seen[label]) continue;
+    seen[label] = 1;
+    projects.push({label:label, count:p.count});
+  }
+  projectSelect.innerHTML = '<option value="">tất cả</option>' + projects.map(
+    (p) => '<option value="' + esc(p.label) + '">' + esc(p.label) + ' (' + p.count + ')</option>').join('');
+  keep(typeSelect, prev[0]); keep(statusSelect, prev[1]); keep(tagSelect, prev[2]); keep(projectSelect, prev[3]);
+}
+
+async function load(append) {
+  const params = filters();
+  state.offset = append ? state.offset + state.limit : 0;
+  params.set('offset', String(state.offset));
+  if (state.view === 'board') { params.set('limit', '200'); params.set('offset', '0'); }
+  $('err').textContent = '';
+  try {
+    const body = await api('/dashboard/api/notes?' + params.toString());
+    state.items = append ? state.items.concat(body.items || []) : (body.items || []);
+    state.total = body.total || 0;
+    $('moreBtn').hidden = !(body.has_more && state.view !== 'board');
+  } catch (e) {
+    $('err').textContent = 'Không tải được: ' + e.message;
+    state.items = []; state.total = 0;
+  }
+  render();
+}
+
+function firstImage(note) {
+  for (const att of (note.attachments || [])) {
+    if (att.mime_type && att.mime_type.indexOf('image/') === 0) return att;
+  }
+  return null;
+}
+function chips(note) {
+  const parts = ['<span class="chip s-' + esc(note.status) + '">' + esc(STATUS_VI[note.status] || note.status) + '</span>',
+                 '<span class="chip">' + esc(TYPE_VI[note.type] || note.type) + '</span>'];
+  const project = note.project_name || note.project_id;
+  if (project) parts.push('<span class="chip">' + esc(project) + '</span>');
+  for (const tag of (note.tags || []).slice(0, 4)) parts.push('<span class="chip tag">' + esc(tag) + '</span>');
+  if (note.attachment_count) parts.push('<span class="chip">' + note.attachment_count + ' ảnh</span>');
+  return parts.join(' ');
+}
+function cardHTML(note, draggable) {
+  const image = firstImage(note);
+  const preview = note.excerpt || note.summary || note.original_content || note.analysis || '';
+  return '<article class="card" data-id="' + esc(note.id) + '"' + (draggable ? ' draggable="true"' : '') + '>'
+    + (image ? '<img class="thumb" loading="lazy" alt="" src="' + esc(image.url) + '">' : '')
+    + '<div class="body"><div class="t">' + esc(note.title) + '</div>'
+    + (preview ? '<div class="s">' + esc(preview) + '</div>' : '')
+    + '<div class="meta">' + chips(note) + '</div>'
+    + '<div class="when">' + esc(when(note.created_at)) + '</div>'
+    + '</div></article>';
+}
+
+function render() {
+  const view = $('view');
+  $('cnt').textContent = state.total ? (state.total + ' ghi chú') : '';
+  $('empty').hidden = state.items.length > 0;
+  if (!state.items.length) { view.innerHTML = ''; return; }
+  if (state.view === 'gallery') {
+    view.innerHTML = '<div class="gallery">' + state.items.map((n) => cardHTML(n, false)).join('') + '</div>';
+  } else if (state.view === 'list') {
+    view.innerHTML = '<div class="rows">' + state.items.map((note) =>
+      '<div class="row" data-id="' + esc(note.id) + '"><div class="rt"><b>' + esc(note.title) + '</b>'
+      + '<div class="s">' + esc(note.excerpt || note.summary || note.original_content || '') + '</div></div>'
+      + '<div class="rmeta">' + chips(note) + '<span class="when">' + esc(when(note.created_at)) + '</span></div></div>'
+    ).join('') + '</div>';
+  } else {
+    view.innerHTML = '<div class="board">' + BOARD_COLS.map((status) => {
+      const items = state.items.filter((n) => n.status === status);
+      return '<section class="col" data-status="' + status + '"><h3><span>' + esc(STATUS_VI[status])
+        + '</span><span>' + items.length + '</span></h3>'
+        + items.map((note) => cardHTML(note, true)
+            + '<div class="mv" data-id="' + esc(note.id) + '">' + BOARD_COLS.filter((s) => s !== status).map(
+                (s) => '<button class="btn small mvBtn" data-to="' + s + '">&rarr; ' + esc(STATUS_VI[s]) + '</button>').join('')
+            + '</div>').join('')
+        + '</section>';
+    }).join('') + '</div>';
+  }
+  view.querySelectorAll('.card, .row').forEach((element) => {
+    element.addEventListener('click', (event) => {
+      if (event.target.closest('.mv')) return;
+      openDetail(element.dataset.id);
+    });
+  });
+  if (state.view === 'board') wireBoard(view);
+}
+
+function wireBoard(view) {
+  view.querySelectorAll('.mvBtn').forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      moveStatus(button.closest('.mv').dataset.id, button.dataset.to);
+    });
+  });
+  let dragging = null;
+  view.querySelectorAll('.card[draggable]').forEach((card) => {
+    card.addEventListener('dragstart', () => { dragging = card.dataset.id; });
+    card.addEventListener('dragend', () => { dragging = null; });
+  });
+  view.querySelectorAll('.col').forEach((column) => {
+    column.addEventListener('dragover', (event) => { event.preventDefault(); column.classList.add('drop'); });
+    column.addEventListener('dragleave', () => column.classList.remove('drop'));
+    column.addEventListener('drop', (event) => {
+      event.preventDefault();
+      column.classList.remove('drop');
+      if (dragging) moveStatus(dragging, column.dataset.status);
+    });
+  });
+}
+async function moveStatus(noteId, status) {
+  try {
+    await postJSON('/dashboard/api/notes/update', {id:noteId, status:status});
+    toast('Đã chuyển sang: ' + (STATUS_VI[status] || status));
+    await loadFacets(); await load(false);
+  } catch (e) { toast('Không đổi được trạng thái: ' + e.message, true); }
+}
+
+function closeDrawer() {
+  $('drawer').dataset.open = '0';
+  $('drawer').setAttribute('aria-hidden', 'true');
+  $('backdrop').dataset.open = '0';
+  state.note = null;
+}
+function openDrawer() {
+  $('drawer').dataset.open = '1';
+  $('drawer').setAttribute('aria-hidden', 'false');
+  $('backdrop').dataset.open = '1';
+}
+
+function fieldHTML(id, label, value, kind) {
+  if (kind === 'area') return '<label class="fld"><span>' + esc(label) + '</span><textarea id="' + id + '">' + esc(value) + '</textarea></label>';
+  if (kind === 'type' || kind === 'status') {
+    const source = kind === 'type' ? TYPE_VI : STATUS_VI;
+    return '<label class="fld"><span>' + esc(label) + '</span><select id="' + id + '">'
+      + Object.keys(source).map((k) => '<option value="' + k + '"' + (k === value ? ' selected' : '') + '>' + esc(source[k]) + '</option>').join('')
+      + '</select></label>';
+  }
+  return '<label class="fld"><span>' + esc(label) + '</span><input type="text" id="' + id + '" value="' + esc(value) + '"></label>';
+}
+
+function detailForm(note) {
+  return fieldHTML('eTitle', 'Tiêu đề', note.title || '', 'text')
+    + '<div class="grid2">' + fieldHTML('eType', 'Loại', note.type || 'idea', 'type')
+    + fieldHTML('eStatus', 'Trạng thái', note.status || 'new', 'status') + '</div>'
+    + fieldHTML('eSummary', 'Tóm tắt', note.summary || '', 'area')
+    + fieldHTML('eOriginal', 'Nội dung gốc', note.original_content || '', 'area')
+    + fieldHTML('eAnalysis', 'Phân tích', note.analysis || '', 'area')
+    + '<div class="grid2">' + fieldHTML('eTags', 'Tags (cách nhau bằng dấu phẩy)', (note.tags || []).join(', '), 'text')
+    + fieldHTML('eProject', 'Dự án', note.project_name || note.project_id || '', 'text') + '</div>'
+    + '<div class="grid2">' + fieldHTML('eUrl', 'Source URL', note.source_url || '', 'text')
+    + fieldHTML('eChat', 'Nguồn chat / session', note.source_chat || note.source_session || '', 'text') + '</div>';
+}
+
+function attachmentsHTML(note) {
+  if (!note.id) return '';
+  const items = (note.attachments || []).map((att) =>
+    '<div class="att"><a href="' + esc(att.url) + '" target="_blank" rel="noopener">'
+    + '<img loading="lazy" alt="' + esc(att.filename) + '" src="' + esc(att.url) + '"></a>'
+    + '<div class="af"><span title="' + esc(att.filename) + '">' + esc(att.filename) + '</span>'
+    + '<button class="btn small danger rmAtt" data-att="' + esc(att.id) + '">Xoá</button></div></div>').join('');
+  return '<div class="fld"><span>Ảnh đính kèm (' + (note.attachments || []).length + ')</span>'
+    + (items ? '<div class="atts">' + items + '</div>' : '')
+    + '<div class="dz" id="dz">Kéo ảnh vào đây hoặc <label style="color:var(--accent);cursor:pointer">chọn tệp'
+    + '<input type="file" id="fileInput" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden></label>'
+    + ' &mdash; PNG / JPEG / WebP / GIF</div></div>';
+}
+
+async function openDetail(noteId) {
+  try {
+    const note = await api('/dashboard/api/notes/note?id=' + encodeURIComponent(noteId));
+    state.note = note;
+    renderDetail();
+    openDrawer();
+  } catch (e) { toast('Không mở được ghi chú: ' + e.message, true); }
+}
+
+function openCreate() {
+  state.note = {id:null, type:'idea', status:'new', tags:[]};
+  renderDetail();
+  openDrawer();
+  setTimeout(() => { const el = $('eTitle'); if (el) el.focus(); }, 60);
+}
+
+function renderDetail() {
+  const note = state.note;
+  const isNew = !note.id;
+  $('dTitle').textContent = isNew ? 'Ghi chú mới' : 'Chi tiết ghi chú';
+  $('dBody').innerHTML = detailForm(note)
+    + (isNew ? '' : attachmentsHTML(note))
+    + (isNew ? '' : '<div class="sub">Tạo: ' + esc(when(note.created_at)) + ' &middot; Sửa: ' + esc(when(note.updated_at))
+        + (note.applied_at ? ' &middot; Áp dụng: ' + esc(when(note.applied_at)) : '')
+        + (note.applied_ref ? ' &middot; ' + esc(note.applied_ref) : '')
+        + '<br>' + esc(note.id) + '</div>');
+  const foot = [];
+  foot.push('<button class="btn primary" id="dSave">' + (isNew ? 'Tạo ghi chú' : 'Lưu thay đổi') + '</button>');
+  if (!isNew) {
+    if (note.status !== 'applied') foot.push('<button class="btn" id="dApplied">Đánh dấu đã áp dụng</button>');
+    foot.push('<div class="spacer"></div>');
+    foot.push('<button class="btn danger" id="dDel">Xoá</button>');
+  }
+  $('dFoot').innerHTML = foot.join('');
+  $('dSave').addEventListener('click', save);
+  if ($('dApplied')) $('dApplied').addEventListener('click', markApplied);
+  if ($('dDel')) $('dDel').addEventListener('click', remove);
+  if (!isNew) wireAttachments();
+}
+
+function formValues() {
+  const project = $('eProject').value.trim();
+  return {
+    title: $('eTitle').value, type: $('eType').value, status: $('eStatus').value,
+    summary: $('eSummary').value, original_content: $('eOriginal').value,
+    analysis: $('eAnalysis').value,
+    tags: $('eTags').value.split(',').map((t) => t.trim()).filter(Boolean),
+    project_name: project, source_url: $('eUrl').value.trim(), source_chat: $('eChat').value.trim(),
+  };
+}
+
+async function save() {
+  const values = formValues();
+  const isNew = !state.note.id;
+  $('dSave').disabled = true;
+  try {
+    if (isNew) {
+      const created = await postJSON('/dashboard/api/notes/create', values);
+      state.note = created;
+      toast('Đã tạo ghi chú');
+      renderDetail();
+    } else {
+      values.id = state.note.id;
+      state.note = await postJSON('/dashboard/api/notes/update', values);
+      toast('Đã lưu');
+      renderDetail();
+    }
+    await loadFacets(); await load(false);
+  } catch (e) {
+    toast('Không lưu được: ' + e.message, true);
+  } finally {
+    if ($('dSave')) $('dSave').disabled = false;
+  }
+}
+async function markApplied() {
+  const reference = prompt('Đã áp dụng ở đâu? (commit / PR / task &mdash; có thể bỏ trống)') ;
+  if (reference === null) return;
+  try {
+    state.note = await postJSON('/dashboard/api/notes/mark-applied', {id:state.note.id, applied_ref:reference || null});
+    toast('Đã đánh dấu áp dụng');
+    renderDetail();
+    await loadFacets(); await load(false);
+  } catch (e) { toast('Không đánh dấu được: ' + e.message, true); }
+}
+async function remove() {
+  if (!confirm('Xoá ghi chú này? Ghi chú vào thùng rác (xoá mềm) và có thể phục hồi bằng tool note_restore.')) return;
+  try {
+    await postJSON('/dashboard/api/notes/delete', {id:state.note.id});
+    toast('Đã xoá');
+    closeDrawer();
+    await loadFacets(); await load(false);
+  } catch (e) { toast('Không xoá được: ' + e.message, true); }
+}
+
+function wireAttachments() {
+  document.querySelectorAll('.rmAtt').forEach((button) => {
+    button.addEventListener('click', async (event) => {
+      event.preventDefault();
+      if (!confirm('Xoá ảnh này khỏi ghi chú?')) return;
+      try {
+        await postJSON('/dashboard/api/notes/attachment/remove', {id:button.dataset.att});
+        await openDetail(state.note.id);
+        toast('Đã xoá ảnh');
+        await load(false);
+      } catch (e) { toast('Không xoá được ảnh: ' + e.message, true); }
+    });
+  });
+  const zone = $('dz'), input = $('fileInput');
+  if (!zone || !input) return;
+  input.addEventListener('change', () => upload(input.files));
+  zone.addEventListener('dragover', (event) => { event.preventDefault(); zone.classList.add('over'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('over'));
+  zone.addEventListener('drop', (event) => {
+    event.preventDefault();
+    zone.classList.remove('over');
+    upload(event.dataTransfer.files);
+  });
+}
+async function upload(files) {
+  if (!files || !files.length || !state.note || !state.note.id) return;
+  for (const file of files) {
+    const form = new FormData();
+    form.append('note_id', state.note.id);
+    form.append('file', file);
+    try {
+      await api('/dashboard/api/notes/attachment/upload', {method:'POST', body:form});
+      toast('Đã thêm ' + file.name);
+    } catch (e) {
+      toast(file.name + ': ' + e.message, true);
+    }
+  }
+  await openDetail(state.note.id);
+  await load(false);
+}
+
+let searchTimer = null;
+$('q').addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => load(false), 220);
+});
+for (const id of ['fType','fStatus','fTag','fProject','fSince','fUntil','fSort','fArchived']) {
+  $(id).addEventListener('change', () => load(false));
+}
+$('clearBtn').addEventListener('click', () => {
+  for (const id of ['fType','fStatus','fTag','fProject','fSince','fUntil']) $(id).value = '';
+  $('fArchived').checked = false;
+  $('q').value = '';
+  load(false);
+});
+$('moreBtn').addEventListener('click', () => load(true));
+$('newBtn').addEventListener('click', openCreate);
+$('dClose').addEventListener('click', closeDrawer);
+$('backdrop').addEventListener('click', closeDrawer);
+document.addEventListener('keydown', (event) => { if (event.key === 'Escape') closeDrawer(); });
+for (const [id, view] of [['vGallery','gallery'],['vList','list'],['vBoard','board']]) {
+  $(id).addEventListener('click', () => {
+    state.view = view;
+    for (const other of ['vGallery','vList','vBoard']) $(other).setAttribute('aria-selected', String(other === id));
+    load(false);
+  });
+}
+
+loadFacets().then(() => load(false));
+</script>
+</body>
+</html>
+"""
+
+
 def register_dashboard(server: MCPServer, terminal: TerminalService,
                        supervisor: SupervisorService | None = None,
                        supervisor_v2: SupervisorV2Service | None = None,
@@ -6409,7 +7013,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        planner: PlannerService | None = None,
                        ai_usage: AiUsageService | None = None,
                        recovery: RecoveryEngine | None = None,
-                       backlog: BacklogService | None = None) -> None:
+                       backlog: BacklogService | None = None,
+                       notes: NotesService | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -6493,6 +7098,19 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         import tempfile
         planner = PlannerService(
             PlannerStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-planner-")) / "planner.db"), queue)
+    if notes is None and terminal.config.notes.enabled:
+        # SAME private-temp-file discipline as queue/integration/pm/planner
+        # above -- and here it covers a DIRECTORY too, not just a db: a
+        # test/ad-hoc caller must never write attachment IMAGES into the
+        # real ~/.local/state/terminal-mcp/notes_attachments either.
+        # server_http.py's real main() always constructs one explicit
+        # NotesService and passes the SAME instance to both build_mcp and
+        # register_dashboard, so the /dashboard/notes page and the note_*
+        # MCP tools read and write one store.
+        import tempfile
+        notes_root = Path(tempfile.mkdtemp(prefix="terminal-mcp-notes-"))
+        notes = NotesService(NotesStore(notes_root / "notes.db"),
+                             attachments_dir=notes_root / "attachments")
     discovery_config = terminal.config.nodes.discovery
     discovery = lan_discovery.DiscoveryService(
         agent_port=discovery_config.agent_port, concurrency=discovery_config.concurrency,
@@ -6674,6 +7292,283 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         return HTMLResponse(
             BACKLOG_HTML,
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
+        )
+
+    # -- Notes / Ideas (kho ghi chú -- notes_store.py/notes_service.py).
+    # A VIEW plus its own JSON surface, following the same posture as the
+    # backlog panel above: GET routes are _read_guard'ed (CF Access when
+    # configured), every mutation goes through _mutation_guard
+    # (mutations_enabled + same-origin CSRF + CF Access). Single-operator,
+    # exactly like every other route in this file -- see NotesService's own
+    # docstring for why there is deliberately no half-built per-user
+    # scoping here.
+
+    @server.custom_route("/dashboard/notes", methods=["GET"], include_in_schema=False)
+    async def dashboard_notes(request: Request) -> HTMLResponse | JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        disabled = _notes_disabled()
+        if disabled is not None:
+            return disabled
+        return HTMLResponse(
+            NOTES_HTML,
+            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
+        )
+
+    def _notes_disabled() -> JSONResponse | None:
+        """notes.enabled=false in config leaves the routes REGISTERED (same
+        posture as the backlog panel's own routes: a missing service answers
+        503, it does not 404 as if the feature never existed) -- so an
+        operator who turned it off sees a clear reason instead of a broken
+        page, and the page itself needs no separate build."""
+        if notes is None:
+            return JSONResponse({"error": "NOTES_DISABLED",
+                                 "message": "notes.enabled is false in this server's config"},
+                                status_code=503, headers={"Cache-Control": "no-store"})
+        return None
+
+    def _notes_json(operation, *args, **kwargs) -> JSONResponse:
+        """One error boundary for every notes route: a NotesError becomes
+        its own stable code with a matching HTTP status, so the page can
+        show the user something true instead of a generic 500."""
+        try:
+            return JSONResponse(operation(*args, **kwargs), headers={"Cache-Control": "no-store"})
+        except NotesError as exc:
+            status = _NOTES_ERROR_STATUS.get(exc.code, 400)
+            return JSONResponse(exc.to_dict(), status_code=status,
+                                headers={"Cache-Control": "no-store"})
+
+    async def _notes_body(request: Request) -> dict:
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 -- any malformed body is one answer
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    @server.custom_route("/dashboard/api/notes", methods=["GET"], include_in_schema=False)
+    async def notes_list(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        disabled = _notes_disabled()
+        if disabled is not None:
+            return disabled
+        params = request.query_params
+        query = (params.get("q") or "").strip()
+        filters = {
+            "type": params.get("type") or None,
+            "status": params.get("status") or None,
+            "tag": params.get("tag") or None,
+            "project": params.get("project") or None,
+            "since": params.get("since") or None,
+            "until": params.get("until") or None,
+            "limit": _notes_int(params.get("limit"), 50),
+            "offset": _notes_int(params.get("offset"), 0),
+            "include_archived": params.get("include_archived") == "1",
+        }
+        if query:
+            # A search is a recall request: archived hits are included
+            # unless the caller narrowed the status itself.
+            filters["include_archived"] = filters["include_archived"] or not filters["status"]
+            return _notes_json(notes.search, query, **filters)
+        filters["sort"] = params.get("sort") or "newest"
+        return _notes_json(notes.list, **filters)
+
+    @server.custom_route("/dashboard/api/notes/facets", methods=["GET"], include_in_schema=False)
+    async def notes_facets(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        disabled = _notes_disabled()
+        if disabled is not None:
+            return disabled
+        return _notes_json(notes.facets)
+
+    @server.custom_route("/dashboard/api/notes/note", methods=["GET"], include_in_schema=False)
+    async def notes_detail(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        disabled = _notes_disabled()
+        if disabled is not None:
+            return disabled
+        note_id = request.query_params.get("id")
+        if not note_id:
+            return JSONResponse({"error": "INVALID_REQUEST", "message": "id is required"},
+                                status_code=400)
+        return _notes_json(notes.get, note_id,
+                           include_deleted=request.query_params.get("include_deleted") == "1")
+
+    @server.custom_route("/dashboard/api/notes/create", methods=["POST"], include_in_schema=False)
+    async def notes_create(request: Request) -> JSONResponse:
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        disabled = _notes_disabled()
+        if disabled is not None:
+            return disabled
+        body = await _notes_body(request)
+        allowed = ("title", "summary", "original_content", "analysis", "source_url",
+                   "source_chat", "source_session", "type", "status", "tags",
+                   "project_id", "project_name")
+        fields = {key: body[key] for key in allowed if key in body}
+        return _notes_json(notes.create, **fields)
+
+    @server.custom_route("/dashboard/api/notes/update", methods=["POST"], include_in_schema=False)
+    async def notes_update(request: Request) -> JSONResponse:
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        disabled = _notes_disabled()
+        if disabled is not None:
+            return disabled
+        body = await _notes_body(request)
+        note_id = body.get("id") or body.get("note_id")
+        if not note_id:
+            return JSONResponse({"error": "INVALID_REQUEST", "message": "id is required"},
+                                status_code=400)
+        allowed = ("title", "summary", "original_content", "analysis", "source_url",
+                   "source_chat", "source_session", "type", "status", "tags",
+                   "project_id", "project_name", "applied_ref")
+        fields = {key: body[key] for key in allowed if key in body}
+        if not fields:
+            return JSONResponse({"error": "NOTHING_TO_UPDATE",
+                                 "message": "pass at least one field to change"}, status_code=400)
+        return _notes_json(notes.update, note_id, **fields)
+
+    @server.custom_route("/dashboard/api/notes/mark-applied", methods=["POST"], include_in_schema=False)
+    async def notes_mark_applied(request: Request) -> JSONResponse:
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        disabled = _notes_disabled()
+        if disabled is not None:
+            return disabled
+        body = await _notes_body(request)
+        note_id = body.get("id") or body.get("note_id")
+        if not note_id:
+            return JSONResponse({"error": "INVALID_REQUEST", "message": "id is required"},
+                                status_code=400)
+        return _notes_json(notes.mark_applied, note_id, applied_ref=body.get("applied_ref"),
+                           project_id=body.get("project_id"), project_name=body.get("project_name"))
+
+    @server.custom_route("/dashboard/api/notes/delete", methods=["POST"], include_in_schema=False)
+    async def notes_delete(request: Request) -> JSONResponse:
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        disabled = _notes_disabled()
+        if disabled is not None:
+            return disabled
+        body = await _notes_body(request)
+        note_id = body.get("id") or body.get("note_id")
+        if not note_id:
+            return JSONResponse({"error": "INVALID_REQUEST", "message": "id is required"},
+                                status_code=400)
+        return _notes_json(notes.delete, note_id, hard=bool(body.get("hard")))
+
+    @server.custom_route("/dashboard/api/notes/restore", methods=["POST"], include_in_schema=False)
+    async def notes_restore(request: Request) -> JSONResponse:
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        disabled = _notes_disabled()
+        if disabled is not None:
+            return disabled
+        body = await _notes_body(request)
+        note_id = body.get("id") or body.get("note_id")
+        if not note_id:
+            return JSONResponse({"error": "INVALID_REQUEST", "message": "id is required"},
+                                status_code=400)
+        return _notes_json(notes.restore, note_id)
+
+    @server.custom_route("/dashboard/api/notes/attachment/upload", methods=["POST"],
+                         include_in_schema=False)
+    async def notes_attachment_upload(request: Request) -> JSONResponse:
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        disabled = _notes_disabled()
+        if disabled is not None:
+            return disabled
+        try:
+            form = await request.form()
+        except Exception:  # noqa: BLE001 -- a malformed multipart body is one answer
+            return JSONResponse({"error": "INVALID_REQUEST", "message": "expected a multipart form"},
+                                status_code=400)
+        try:
+            note_id = str(form.get("note_id") or "")
+            upload = form.get("file")
+            if not note_id or upload is None or not hasattr(upload, "read"):
+                return JSONResponse({"error": "INVALID_REQUEST",
+                                     "message": "note_id and file are required"}, status_code=400)
+            # Read through the service's own size-capped reader rather than
+            # await upload.read() with no bound -- an oversized upload is
+            # refused on what was actually read, never buffered whole.
+            payload = await upload.read(notes.max_attachment_bytes + 1)
+            return _notes_json(notes.add_attachment, note_id,
+                               filename=getattr(upload, "filename", None), data=payload,
+                               declared_mime_type=getattr(upload, "content_type", None))
+        finally:
+            await form.close()
+
+    @server.custom_route("/dashboard/api/notes/attachment/remove", methods=["POST"],
+                         include_in_schema=False)
+    async def notes_attachment_remove(request: Request) -> JSONResponse:
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        disabled = _notes_disabled()
+        if disabled is not None:
+            return disabled
+        body = await _notes_body(request)
+        attachment_id = body.get("id") or body.get("attachment_id")
+        if not attachment_id:
+            return JSONResponse({"error": "INVALID_REQUEST", "message": "id is required"},
+                                status_code=400)
+        return _notes_json(notes.remove_attachment, attachment_id)
+
+    @server.custom_route("/dashboard/api/notes/attachment", methods=["GET"], include_in_schema=False)
+    async def notes_attachment(request: Request) -> Response:
+        """Serve an attachment's bytes. There is no static-file mount for
+        the attachment directory anywhere in this project, and deliberately
+        so: the only way out is this route, which looks the id up in the DB
+        and re-verifies containment (notes_service.open_attachment) -- so no
+        request can name a path, only an id.
+
+        nosniff + a Content-Type taken from the allowlist (never from the
+        request or the original filename) + attachment-not-inline
+        Content-Disposition on anything the page does not render itself.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        disabled = _notes_disabled()
+        if disabled is not None:
+            return disabled
+        attachment_id = request.query_params.get("id")
+        if not attachment_id:
+            return JSONResponse({"error": "INVALID_REQUEST", "message": "id is required"},
+                                status_code=400)
+        try:
+            record, payload = notes.open_attachment(attachment_id)
+        except NotesError as exc:
+            return JSONResponse(exc.to_dict(),
+                                status_code=_NOTES_ERROR_STATUS.get(exc.code, 400),
+                                headers={"Cache-Control": "no-store"})
+        return Response(
+            payload, media_type=record["mime_type"],
+            headers={
+                # The bytes are immutable (a new upload is a new id), so a
+                # long private cache is safe and keeps the gallery from
+                # refetching every image on each render.
+                "Cache-Control": "private, max-age=86400",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "default-src 'none'; sandbox",
+                "Content-Disposition": "inline; filename*=UTF-8''"
+                                       + quote(record["filename"], safe=""),
+            },
         )
 
     @server.custom_route("/dashboard/api/sessions", methods=["GET"], include_in_schema=False)

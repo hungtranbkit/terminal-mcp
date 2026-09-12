@@ -1357,6 +1357,24 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/backlog/update": {"POST"},
         "/dashboard/api/backlog/dispatch": {"POST"},
         "/dashboard/api/backlog/complete": {"POST"},
+    # Notes / Ideas (kho ghi chú dùng chung, notes_store.py) -- a later,
+    # separate feature, listed here so this inventory guard keeps
+    # catching UNINTENDED route changes. Same posture as the backlog
+    # block above: the page and every GET are _read_guard'ed, every POST
+    # is _mutation_guard'ed, and the attachment route serves by ID only
+    # (never a caller-supplied path).
+    "/dashboard/notes": {"GET", "HEAD"},
+    "/dashboard/api/notes": {"GET", "HEAD"},
+    "/dashboard/api/notes/facets": {"GET", "HEAD"},
+    "/dashboard/api/notes/note": {"GET", "HEAD"},
+    "/dashboard/api/notes/create": {"POST"},
+    "/dashboard/api/notes/update": {"POST"},
+    "/dashboard/api/notes/mark-applied": {"POST"},
+    "/dashboard/api/notes/delete": {"POST"},
+    "/dashboard/api/notes/restore": {"POST"},
+    "/dashboard/api/notes/attachment": {"GET", "HEAD"},
+    "/dashboard/api/notes/attachment/upload": {"POST"},
+    "/dashboard/api/notes/attachment/remove": {"POST"},
         "/dashboard/sessions": {"GET", "HEAD"},
         "/dashboard/api/sessions": {"GET", "HEAD"},
         "/dashboard/api/session": {"GET", "HEAD"},
