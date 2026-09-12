@@ -246,6 +246,18 @@ class RemoteNodeClient:
         self._token = token
         self.timeout = timeout
 
+    def fleet_exchange(self, *, objects: list[dict[str, Any]], since: str | None,
+                       source_node: str) -> dict[str, Any]:
+        """One fleet-metadata exchange with this node.
+
+        A node agent older than the fleet endpoint answers 404, which
+        _request turns into NodeClientError -- the caller records that node as
+        unsupported rather than failed, so rolling the fleet out one machine
+        at a time never makes the healthy ones look broken.
+        """
+        return self._request("POST", "/v1/fleet/objects",
+                             body={"objects": objects, "since": since, "from": source_node})
+
     def _request(self, method: str, path: str, *, params: dict[str, Any] | None = None,
                 body: dict[str, Any] | None = None) -> dict[str, Any]:
         url = f"{self.base_url}{path}"

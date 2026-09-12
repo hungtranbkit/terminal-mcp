@@ -52,6 +52,14 @@ async def test_server_registers_v1_and_binding_tools():
         # "which node could take over?" is answerable without logging into
         # each machine. Status only -- never credential contents.
         "terminal_fleet_environment",
+        # Fleet Metadata Registry: the replicated view, the SSH inventory, its
+        # readiness and its per-peer sync state. All four are reads, and all
+        # four answer from the LOCAL cache so they keep working when the
+        # controller does not.
+        "terminal_fleet_registry",
+        "terminal_fleet_ssh_inventory",
+        "terminal_fleet_readiness",
+        "terminal_fleet_sync_status",
         # Session permission management: ChatGPT could rename a session but
         # had no way to grant or revoke access to one -- that took an SSH
         # session and a config edit.

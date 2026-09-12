@@ -17,6 +17,8 @@ from .connection_store import ConnectionStore
 from .controller import LOCAL_NODE_ID, ControllerService
 from .core import TerminalService
 from .dashboard import node_token_env_var, register_dashboard
+from .fleet_registry import FleetRegistryStore
+from .fleet_service import FleetService
 from .health import register_health
 from .integration_service import IntegrationService
 from .logging_setup import RequestIdMiddleware, SecurityHeadersMiddleware, configure_logging
@@ -404,11 +406,27 @@ def main() -> None:
     # P0.2: the bus is CONSTRUCTED (so publish/claim tools exist) but no
     # consumer loop is started here -- autonomous coordination stays off.
     events = EventBus()
+    # ONE explicit, persistent Fleet Metadata Registry (real default
+    # ~/.local/state/terminal-mcp/fleet_registry.db), shared by the MCP tools
+    # and the dashboard -- same "never fall into the private-temp-file test
+    # default" discipline as ControllerService/NodeRegistry/ConnectionStore
+    # above. Sharing one instance also means the tool surface and the
+    # dashboard read the same replicated view rather than two copies that
+    # drift apart. Never fatal: a node whose state directory is unwritable
+    # must still serve sessions, so a failure here degrades the fleet view
+    # and nothing else.
+    fleet = None
+    try:
+        fleet = FleetService(FleetRegistryStore(local_node_id=controller.local_node_id),
+                             local_node_id=controller.local_node_id)
+    except Exception:  # noqa: BLE001 -- never block startup on the fleet cache
+        _log.exception("fleet registry unavailable -- fleet views will report it")
     server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
-                       planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog, events=events)
+                       planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog, events=events,
+                       fleet=fleet)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
-                       recovery=recovery, backlog=backlog)
+                       recovery=recovery, backlog=backlog, fleet=fleet)
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)

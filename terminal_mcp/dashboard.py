@@ -21,6 +21,7 @@ from . import lan_discovery, network_bind, remote_connect, tunnel_diagnostics
 from .cf_access import verify_access_assertion
 from .agent_availability import available_agent_types
 from .connection_store import ConnectionStore, generate_node_token
+from .fleet_service import ControllerFleetSync, FleetService
 from .controller import ControllerService, build_default_controller
 from .node_client import NodeClientError, RemoteNodeClient
 from .core import TerminalService
@@ -1354,6 +1355,7 @@ DASHBOARD_HTML = """<!doctype html>
           <button type="button" id="openSupervisorPanelBtn" role="menuitem">🧭 Supervisor / Coordinator</button>
           <button type="button" id="openTaskInboxBtn" role="menuitem">📥 Task Inbox</button>
           <a href="/dashboard/terminal-wall" id="terminalWallLink" role="menuitem">🧱 Terminal Wall</a>
+          <a href="/dashboard/fleet" id="fleetRegistryLink" role="menuitem">🗺 Fleet Registry</a>
           <a href="/dashboard/ai-usage" id="aiUsageLink" role="menuitem">📊 AI Usage</a>
         </div>
       </div>
@@ -6684,6 +6686,15 @@ TERMINAL_WALL_HTML = r"""<!doctype html>
     .node-state.online { color:var(--green); border-color:var(--green) }
     .node-state.offline { color:var(--muted); border-style:dashed }
     .node-tally { display:flex; gap:5px; flex-wrap:wrap; margin-left:auto }
+    /* Metadata freshness is a DIFFERENT claim from node reachability -- a
+       node can be answering right now while the fleet's record of it is
+       hours old -- so it gets its own badge rather than colouring the
+       existing one and conflating the two. */
+    .node-meta-stale { font-size:10px; font-weight:700; letter-spacing:.03em;
+                       padding:2px 8px; border-radius:999px; color:var(--amber);
+                       border:1px solid var(--amber); white-space:nowrap }
+    .node-link { font-size:10.5px; color:var(--accent); text-decoration:none;
+                 border-bottom:1px dotted currentColor }
     .box { background:var(--panel); border:1px solid var(--line); border-radius:12px;
            overflow:hidden; display:flex; flex-direction:column; cursor:pointer; min-width:0 }
     .box:hover { border-color:#3a4a70 }
@@ -6878,6 +6889,26 @@ TERMINAL_WALL_HTML = r"""<!doctype html>
       const shown = rows.length === node.total ? String(node.total)
                                                : rows.length + '/' + node.total;
       head.appendChild(el('span', {className: 'node-meta', text: shown + ' session'}));
+      // Fleet metadata staleness, when the registry could be read. Says how
+      // old, because "stale" without a number is not actionable.
+      if (node.metadata_stale) {
+        const badge = el('span', {className: 'node-meta-stale',
+          text: '⚠ METADATA ' + age(node.metadata_age_seconds)});
+        badge.title = 'Fleet metadata for this node has not been refreshed recently. '
+          + 'The node itself may still be answering — this is about the replicated record.';
+        head.appendChild(badge);
+      }
+      if (node.ssh_route_count) {
+        // A COUNT, never a route. Addresses, fingerprints and credential
+        // posture live behind the fleet view's own guard, not on a monitor.
+        const link = el('a', {className: 'node-link',
+          text: node.ssh_route_count + ' SSH route' + (node.ssh_route_count > 1 ? 's' : '')});
+        link.href = '/dashboard/fleet#node=' + encodeURIComponent(node.node_id);
+        link.title = 'Xem thông tin node & SSH trong Fleet Registry';
+        // The header is a collapse button; this link must not toggle it.
+        link.onclick = (event) => event.stopPropagation();
+        head.appendChild(link);
+      }
 
       const tally = el('span', {className: 'node-tally'});
       for (const key of ['RUNNING', 'WAITING', 'ERROR', 'IDLE', 'DONE', 'UNKNOWN', 'OFFLINE']) {
@@ -7029,6 +7060,247 @@ TERMINAL_WALL_HTML = r"""<!doctype html>
 
     load();
     setInterval(() => { if (!state.paused) load(); }, 6000);
+  </script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Fleet Registry: what every node knows about the fleet, including how to SSH
+# to it -- and deliberately NOT including anything that could be replayed as
+# a credential.
+#
+# Raw string: this template writes JS escapes such as `.join('\n')` directly.
+# ---------------------------------------------------------------------------
+FLEET_HTML = r"""<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Fleet Registry</title>
+  <style>
+    :root {
+      --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd;
+      --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#3b78ff;
+      --mono:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    * { box-sizing:border-box }
+    body { margin:0; font:14px/1.55 var(--mono); background:var(--bg); color:var(--text) }
+    a { color:var(--accent) }
+    header { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+             padding:12px max(14px, env(safe-area-inset-right)) 12px max(14px, env(safe-area-inset-left));
+             border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5 }
+    h1 { margin:0; font-size:16px; white-space:nowrap }
+    h2 { font-size:13.5px; margin:22px 0 9px; padding-bottom:6px; border-bottom:1px solid var(--line) }
+    .spacer { flex:1 }
+    .btn { background:var(--panel); border:1px solid var(--line); color:var(--text);
+           border-radius:9px; padding:7px 11px; font:13px var(--mono); cursor:pointer;
+           min-height:40px; display:inline-flex; align-items:center; gap:6px }
+    .btn:hover { border-color:#3a4a70 }
+    main { padding:10px max(14px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom))
+                   max(14px, env(safe-area-inset-left)) }
+    .muted { color:var(--muted); font-size:12px }
+    .pill { font-size:10px; font-weight:700; letter-spacing:.03em; padding:2px 8px;
+            border-radius:999px; border:1px solid var(--line); white-space:nowrap }
+    .pill.PASS, .pill.online, .pill.PRESENT { color:var(--green); border-color:var(--green) }
+    .pill.WARN, .pill.NEEDS_AUTH { color:var(--amber); border-color:var(--amber) }
+    .pill.FAIL, .pill.MISSING_CREDENTIAL { color:var(--red); border-color:var(--red) }
+    .pill.offline, .pill.UNKNOWN { color:var(--muted); border-style:dashed }
+    .wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px; background:var(--panel) }
+    table { border-collapse:collapse; width:100%; min-width:680px }
+    th, td { text-align:left; padding:8px 11px; border-bottom:1px solid var(--line);
+             font-size:12px; white-space:nowrap }
+    th { color:var(--muted); font-weight:700; font-size:11px; text-transform:uppercase;
+         letter-spacing:.04em }
+    tr:last-child td { border-bottom:0 }
+    tr.hit td { background:#17223b }
+    .checks { display:grid; gap:7px; grid-template-columns:repeat(auto-fill, minmax(320px, 1fr)) }
+    .check { border:1px solid var(--line); border-radius:11px; padding:9px 11px; background:var(--panel) }
+    .check b { font-size:12px }
+    .note { font-size:11.5px; color:var(--muted); margin:18px 0 0; line-height:1.65 }
+    @media (max-width:720px) {
+      header { padding:9px 12px } h1 { font-size:15px }
+      main { padding:8px 12px 24px }
+      th, td { padding:7px 9px }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🗺 Fleet Registry</h1>
+    <span class="muted" id="status">đang tải…</span>
+    <span class="spacer"></span>
+    <button class="btn" id="refreshBtn" type="button">Làm mới</button>
+    <a class="btn" href="/dashboard/terminal-wall">🧱 Terminal Wall</a>
+    <a class="btn" href="/dashboard">← Dashboard</a>
+  </header>
+  <main>
+    <h2>Readiness</h2>
+    <div class="checks" id="checks"></div>
+
+    <h2>Nodes</h2>
+    <div class="wrap"><table id="nodes"><thead><tr>
+      <th>Node</th><th>Trạng thái</th><th>Platform</th><th>LAN</th><th>Tailscale</th>
+      <th>Endpoint</th><th>Contract</th><th>Metadata</th><th>Nguồn</th>
+    </tr></thead><tbody></tbody></table></div>
+
+    <h2>SSH inventory</h2>
+    <div class="wrap"><table id="ssh"><thead><tr>
+      <th>Alias</th><th>Host</th><th>Port</th><th>User</th><th>Transport</th>
+      <th>Proxy/Jump</th><th>Host key</th><th>Credential</th><th>Nguồn</th><th>Verified</th>
+    </tr></thead><tbody></tbody></table></div>
+
+    <h2>Peer sync</h2>
+    <div class="wrap"><table id="peers"><thead><tr>
+      <th>Peer</th><th>Pull gần nhất</th><th>Push gần nhất</th><th>OK gần nhất</th>
+      <th>Đã kéo</th><th>Đã đẩy</th><th>Lỗi</th>
+    </tr></thead><tbody></tbody></table></div>
+
+    <p class="note" id="note"></p>
+  </main>
+  <script>
+    const $ = (s) => document.querySelector(s);
+
+    const age = (seconds) => {
+      if (seconds == null) return '—';
+      if (seconds < 90) return Math.round(seconds) + 's';
+      if (seconds < 5400) return Math.round(seconds / 60) + 'm';
+      if (seconds < 172800) return Math.round(seconds / 3600) + 'h';
+      return Math.round(seconds / 86400) + 'd';
+    };
+
+    function el(tag, opts) {
+      const node = document.createElement(tag);
+      if (opts && opts.className) node.className = opts.className;
+      if (opts && opts.text != null) node.textContent = opts.text;
+      return node;
+    }
+
+    function cell(row, value, className) {
+      const td = el('td', {text: value == null || value === '' ? '—' : String(value)});
+      if (className) { td.replaceChildren(el('span', {className: className, text: String(value)})); }
+      row.appendChild(td);
+      return td;
+    }
+
+    function fillNodes(nodes) {
+      const body = $('#nodes').tBodies[0];
+      body.replaceChildren();
+      for (const node of nodes) {
+        const row = el('tr');
+        row.dataset.node = node.node_id || '';
+        cell(row, node.display_name || node.node_id);
+        cell(row, node.status || 'unknown', 'pill ' + (node.status || 'UNKNOWN'));
+        cell(row, node.platform);
+        cell(row, node.lan_ip);
+        cell(row, node.tailscale_hostname || node.tailscale_ip);
+        cell(row, node.endpoint);
+        cell(row, node.contract_version);
+        const metaCell = el('td');
+        metaCell.appendChild(el('span', {
+          className: 'pill ' + (node.metadata_stale ? 'WARN' : 'PASS'),
+          text: (node.metadata_stale ? '⚠ ' : '') + age(node.metadata_age_seconds)}));
+        row.appendChild(metaCell);
+        cell(row, node.source_node);
+        body.appendChild(row);
+      }
+    }
+
+    function fillSsh(targets) {
+      const body = $('#ssh').tBodies[0];
+      body.replaceChildren();
+      for (const target of targets) {
+        const row = el('tr');
+        row.dataset.node = target.node_id || '';
+        cell(row, (target.aliases || [target.alias]).join(', '));
+        cell(row, target.host);
+        cell(row, target.port);
+        cell(row, target.username);
+        cell(row, target.transport, 'pill');
+        cell(row, target.proxy_jump);
+        // The FINGERPRINT is shown -- it is a hash, it is what pinning
+        // compares, and an operator needs it to verify a host. No key, no
+        // password, no token appears anywhere on this page.
+        cell(row, target.host_key_fingerprint ? target.host_key_fingerprint : 'chưa ghim');
+        cell(row, target.credential_status || 'UNKNOWN', 'pill ' + (target.credential_status || 'UNKNOWN'));
+        cell(row, target.source);
+        cell(row, age(target.last_verified_age_seconds));
+        body.appendChild(row);
+      }
+    }
+
+    function fillPeers(peers) {
+      const body = $('#peers').tBodies[0];
+      body.replaceChildren();
+      for (const peer of peers) {
+        const row = el('tr');
+        cell(row, peer.peer_node);
+        cell(row, peer.last_pull_at);
+        cell(row, peer.last_push_at);
+        cell(row, peer.last_ok_at);
+        cell(row, peer.objects_pulled);
+        cell(row, peer.objects_pushed);
+        cell(row, peer.last_error);
+        body.appendChild(row);
+      }
+      if (!peers.length) {
+        const row = el('tr');
+        const td = el('td', {text: 'Chưa đồng bộ với peer nào.'});
+        td.colSpan = 7; td.className = 'muted';
+        row.appendChild(td); body.appendChild(row);
+      }
+    }
+
+    function fillChecks(readiness) {
+      const box = $('#checks');
+      box.replaceChildren();
+      for (const check of (readiness.checks || [])) {
+        const card = el('div', {className: 'check'});
+        const head = el('div');
+        head.append(el('span', {className: 'pill ' + check.status, text: check.status}),
+                    document.createTextNode(' '),
+                    el('b', {text: check.check}));
+        card.appendChild(head);
+        card.appendChild(el('div', {className: 'muted', text: check.summary}));
+        box.appendChild(card);
+      }
+    }
+
+    function highlight() {
+      const wanted = new URLSearchParams(location.hash.slice(1)).get('node');
+      for (const row of document.querySelectorAll('tr[data-node]'))
+        row.classList.toggle('hit', !!wanted && row.dataset.node === wanted);
+    }
+
+    async function load() {
+      try {
+        const [view, readiness] = await Promise.all([
+          fetch('/dashboard/api/fleet', {cache: 'no-store'}).then((r) => r.json()),
+          fetch('/dashboard/api/fleet/readiness', {cache: 'no-store'}).then((r) => r.json()),
+        ]);
+        fillNodes(view.nodes || []);
+        fillSsh(view.ssh_targets || []);
+        fillPeers(view.peers || []);
+        fillChecks(readiness);
+        highlight();
+        $('#status').textContent = 'đọc từ cache local · ' + (view.nodes || []).length
+          + ' node · ' + (view.ssh_targets || []).length + ' SSH target';
+        $('#note').textContent =
+          'Trang này đọc từ bản sao metadata trên chính máy này, không gọi node nào — nên nó vẫn '
+          + 'trả lời khi controller mất mạng, đúng như một node sống sót sẽ thấy. '
+          + 'Chỉ có identity và reference: fingerprint host key (một hash, chính là thứ việc ghim '
+          + 'đem ra so) và trạng thái credential. Không có private key, password, passphrase hay '
+          + 'token nào được đồng bộ hay hiển thị; node thiếu credential báo MISSING_CREDENTIAL để '
+          + 'người thật cấp tại chỗ, không bao giờ copy từ máy khác.';
+      } catch (err) {
+        $('#status').textContent = 'lỗi tải: ' + err.message;
+      }
+    }
+
+    $('#refreshBtn').onclick = () => load();
+    window.addEventListener('hashchange', highlight);
+    load();
   </script>
 </body>
 </html>
@@ -8763,6 +9035,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        supervisor_v2: SupervisorV2Service | None = None,
                        controller: ControllerService | None = None,
                        connection_store: ConnectionStore | None = None,
+                       fleet: "FleetService | None" = None,
                        queue: QueueService | None = None,
                        integration: IntegrationService | None = None,
                        pm: PMService | None = None,
@@ -9009,6 +9282,101 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     # One fan-out per TTL window, shared by every open wall. Twenty sessions
     # cost ~20 node round-trips; without this, three open tabs would triple
     # that every few seconds for data that has not changed.
+    # Fleet Metadata Registry. Same private-temp-file discipline as
+    # connection_store above: a test caller of register_dashboard must never
+    # write into the real ~/.local/state/terminal-mcp/fleet_registry.db.
+    # server_http.py's main() passes the persistent one.
+    if fleet is None:
+        import tempfile as _tempfile
+
+        from .fleet_registry import FleetRegistryStore as _FleetStore
+        from .fleet_service import FleetService as _FleetService
+
+        fleet = _FleetService(
+            _FleetStore(Path(_tempfile.mkdtemp(prefix="terminal-mcp-fleet-")) / "fleet.db",
+                        local_node_id=controller.local_node_id),
+            local_node_id=controller.local_node_id)
+    _fleet_sync = ControllerFleetSync(fleet, controller)
+
+    def _fleet_sources() -> dict[str, Any]:
+        """The local truth the projectors read. Each source is optional and
+        failure-tolerant: a fleet view missing its SSH half is still worth
+        serving, and is far better than a 500 on the page an operator opens
+        precisely because something is already wrong."""
+        sessions: list[Any] = []
+        connections: list[Any] = []
+        try:
+            sessions = list(terminal.session_registry.list())
+        except Exception:  # noqa: BLE001
+            _log.exception("fleet: session registry unreadable")
+        try:
+            connections = list(connection_store.list())
+        except Exception:  # noqa: BLE001
+            _log.exception("fleet: connection store unreadable")
+        return {"sessions": sessions, "connections": connections}
+
+    @server.custom_route("/dashboard/fleet", methods=["GET"], include_in_schema=False)
+    async def dashboard_fleet_page(request: Request) -> HTMLResponse | JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(FLEET_HTML,
+                            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
+
+    @server.custom_route("/dashboard/api/fleet", methods=["GET"], include_in_schema=False)
+    async def dashboard_fleet(request: Request) -> JSONResponse:
+        """The whole replicated fleet, read from the LOCAL cache.
+
+        Deliberately does not contact any node: this is the same answer a
+        surviving node gives when the controller is gone, so the page an
+        operator opens during an outage behaves identically to the one they
+        already know.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        if request.query_params.get("refresh") == "1":
+            sources = await anyio.to_thread.run_sync(_fleet_sources)
+            await anyio.to_thread.run_sync(
+                lambda: fleet.refresh_local(nodes=controller.list_nodes(),
+                                            sessions=sources["sessions"],
+                                            connections=sources["connections"]))
+        return JSONResponse(await anyio.to_thread.run_sync(fleet.offline_view),
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/fleet/ssh", methods=["GET"], include_in_schema=False)
+    async def dashboard_fleet_ssh(request: Request) -> JSONResponse:
+        """SSH inventory: addresses, transports, fingerprints and credential
+        POSTURE. No key, no password, no token -- see fleet_registry's
+        scrub_payload, which refuses rather than strips."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return JSONResponse({"targets": await anyio.to_thread.run_sync(fleet.ssh_inventory)},
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/fleet/readiness", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_fleet_readiness(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return JSONResponse(await anyio.to_thread.run_sync(fleet.readiness),
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/fleet/sync", methods=["POST"], include_in_schema=False)
+    async def dashboard_fleet_sync(request: Request) -> JSONResponse:
+        """Run one exchange with every node. A mutation only in the sense that
+        it writes metadata -- nothing here can touch a session."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        sources = await anyio.to_thread.run_sync(_fleet_sources)
+        result = await anyio.to_thread.run_sync(
+            lambda: _fleet_sync.run_once(sessions=sources["sessions"],
+                                         connections=sources["connections"]))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
     _wall_cache = terminal_wall.WallSnapshotCache()
 
     @server.custom_route("/dashboard/terminal-wall", methods=["GET"], include_in_schema=False)
@@ -9038,8 +9406,30 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         force = request.query_params.get("refresh") == "1"
 
         def _build() -> dict[str, Any]:
+            # Freshness only, and never fatal: the wall's job is showing
+            # terminals, so a fleet cache that cannot be read costs the
+            # staleness badge and nothing else.
+            meta: dict[str, dict[str, Any]] = {}
+            try:
+                view = fleet.offline_view()
+                routes: dict[str, int] = {}
+                for target in view.get("ssh_targets", []):
+                    node_id = target.get("node_id")
+                    if node_id:
+                        routes[node_id] = routes.get(node_id, 0) + 1
+                for node in view.get("nodes", []):
+                    node_id = node.get("node_id")
+                    if node_id:
+                        meta[node_id] = {
+                            "metadata_stale": node.get("metadata_stale"),
+                            "metadata_age_seconds": node.get("metadata_age_seconds"),
+                            "ssh_route_count": routes.get(node_id, 0),
+                        }
+            except Exception:  # noqa: BLE001 -- a badge is never worth a 500
+                meta = {}
             return terminal_wall.build_snapshot(controller, tail_lines=lines,
-                                                tracker=_wall_cache.tracker)
+                                                tracker=_wall_cache.tracker,
+                                                fleet_meta=meta)
 
         try:
             payload = await anyio.to_thread.run_sync(

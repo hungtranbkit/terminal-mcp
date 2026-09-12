@@ -320,7 +320,8 @@ class WallSnapshotCache:
 
 def build_snapshot(controller, *, tail_lines: int = DEFAULT_TAIL_LINES,
                    now: float | None = None,
-                   tracker: "OutputChangeTracker | None" = None) -> dict[str, Any]:
+                   tracker: "OutputChangeTracker | None" = None,
+                   fleet_meta: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """Status + a short tail for every session the fleet can see, in one pass.
 
     Each session costs exactly ONE call to its node -- `terminal_status`
@@ -408,7 +409,7 @@ def build_snapshot(controller, *, tail_lines: int = DEFAULT_TAIL_LINES,
     for box in boxes:
         counts[box.state] = counts.get(box.state, 0) + 1
     return {
-        "nodes": _node_sections(boxes, unreachable),
+        "nodes": _node_sections(boxes, unreachable, fleet_meta),
         "generated_at": now,
         "tail_lines": tail_lines,
         "boxes": [box.as_dict() for box in boxes],
@@ -426,7 +427,9 @@ def build_snapshot(controller, *, tail_lines: int = DEFAULT_TAIL_LINES,
 # its sessions happen to look quiet. `unreachable_nodes` is the only evidence
 # admitted here.
 def _node_sections(boxes: list[WallBox],
-                   unreachable: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                   unreachable: list[dict[str, Any]],
+                   fleet_meta: dict[str, dict[str, Any]] | None = None,
+                   ) -> list[dict[str, Any]]:
     """One section per node, in the order the wall should draw them.
 
     Built here rather than in the browser so the ordering and the per-node
@@ -454,6 +457,21 @@ def _node_sections(boxes: list[WallBox],
             "node_id": node_id, "node_name": node.get("node_name") or node_id,
             "online": False, "total": 0, "counts": {},
         })
+
+    # Fleet-metadata freshness is a SEPARATE claim from node reachability: a
+    # node can be answering right now while the fleet's record of it is
+    # hours old, and an operator needs to know which of the two they are
+    # looking at. Only non-secret fields cross into the wall -- an age, a
+    # flag, and how many routes exist. Never an address, never a fingerprint,
+    # never a credential posture: the wall is a monitor, and the place to
+    # look up how to reach a machine is the fleet view behind its own guard.
+    for section in sections.values():
+        meta = (fleet_meta or {}).get(section["node_id"])
+        if not meta:
+            continue
+        section["metadata_stale"] = bool(meta.get("metadata_stale"))
+        section["metadata_age_seconds"] = meta.get("metadata_age_seconds")
+        section["ssh_route_count"] = int(meta.get("ssh_route_count") or 0)
 
     # Local first -- it is the node the operator is standing on -- then the
     # rest by display name, so the wall does not reshuffle itself between

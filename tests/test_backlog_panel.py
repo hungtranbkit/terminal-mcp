@@ -234,7 +234,7 @@ def test_no_separator_string_literal_holds_a_raw_control_char():
     node's job (below) -- attempting quote-parity in Python drowns in
     apostrophes inside comments, which is why this stays targeted."""
     for name in ("BACKLOG_HTML", "DASHBOARD_HTML", "GLOBAL_TASKS_HTML",
-                 "NODES_ADMIN_HTML", "SESSIONS_ADMIN_HTML", "WEBTERM_HTML", "AI_USAGE_HTML", "TERMINAL_WALL_HTML"):
+                 "NODES_ADMIN_HTML", "SESSIONS_ADMIN_HTML", "WEBTERM_HTML", "AI_USAGE_HTML", "TERMINAL_WALL_HTML", "FLEET_HTML"):
         import terminal_mcp.dashboard as dashboard_module
         js = _inline_scripts(getattr(dashboard_module, name))
         bad = re.findall(r"\.(?:split|join)\(\s*['\"][\n\t\r]", js)
@@ -242,7 +242,7 @@ def test_no_separator_string_literal_holds_a_raw_control_char():
 
 
 @pytest.mark.parametrize("name", ["BACKLOG_HTML", "DASHBOARD_HTML", "GLOBAL_TASKS_HTML",
-                                  "NODES_ADMIN_HTML", "SESSIONS_ADMIN_HTML", "WEBTERM_HTML", "AI_USAGE_HTML", "TERMINAL_WALL_HTML"])
+                                  "NODES_ADMIN_HTML", "SESSIONS_ADMIN_HTML", "WEBTERM_HTML", "AI_USAGE_HTML", "TERMINAL_WALL_HTML", "FLEET_HTML"])
 def test_every_dashboard_template_script_parses(tmp_path, name):
     """Parse each page's inline script with a real JS engine. Covers every
     template, not just the one that was broken -- the mistake is a
@@ -318,7 +318,7 @@ def test_no_dashboard_template_emits_a_stray_control_character():
 
     allowed = {"\n", "\t", "\r"}
     for name in ("BACKLOG_HTML", "DASHBOARD_HTML", "GLOBAL_TASKS_HTML",
-                 "NODES_ADMIN_HTML", "SESSIONS_ADMIN_HTML", "WEBTERM_HTML", "AI_USAGE_HTML", "TERMINAL_WALL_HTML"):
+                 "NODES_ADMIN_HTML", "SESSIONS_ADMIN_HTML", "WEBTERM_HTML", "AI_USAGE_HTML", "TERMINAL_WALL_HTML", "FLEET_HTML"):
         html = getattr(dashboard_module, name)
         offenders = sorted({ch for ch in html if ord(ch) < 0x20 and ch not in allowed}
                            | {ch for ch in html if 0x7f <= ord(ch) <= 0x9f})

@@ -416,6 +416,57 @@ def _print_nodes_human(result: dict) -> None:
             print(f"    - {skip['node_id']}: {skip['reason']}")
 
 
+def cmd_fleet(args: argparse.Namespace) -> int:
+    """Fleet-metadata readiness, read from THIS machine's local cache.
+
+    Deliberately does not talk to the controller or to any node: this command
+    has to work during exactly the outage it is meant to diagnose. It reports
+    what this machine last replicated and how old that is -- which is the
+    honest answer, and a far more useful one than a connection error.
+
+    Exit code follows the worst check: 0 for PASS, 1 for WARN, 2 for FAIL,
+    so a cron wrapper can tell "needs a human eventually" from "something is
+    wrong right now".
+    """
+    from .fleet_registry import FleetRegistryStore
+    from .fleet_service import FAIL, PASS, WARN, FleetService
+
+    try:
+        store = FleetRegistryStore(args.db, local_node_id=args.node_id or "local")
+    except Exception as exc:  # noqa: BLE001
+        payload = {"status": FAIL, "error": f"{type(exc).__name__}: {exc}", "checks": []}
+        print(json.dumps(payload, sort_keys=True) if args.json
+              else f"FAIL  fleet registry unreadable: {payload['error']}")
+        return 2
+
+    service = FleetService(store, local_node_id=args.node_id or "local")
+    # Pinned fingerprints come from the controller's ConnectionStore when this
+    # runs on the controller; elsewhere there is nothing to compare against
+    # and the mismatch check correctly reports PASS rather than guessing.
+    pinned: dict[str, str] = {}
+    try:
+        from .connection_store import ConnectionStore
+
+        for row in ConnectionStore().list():
+            if row.host_key_fingerprint:
+                pinned[str(row.node_id)] = str(row.host_key_fingerprint)
+    except Exception:  # noqa: BLE001 -- absent on a plain node, which is fine
+        pinned = {}
+
+    result = service.readiness(known_fingerprints=pinned)
+    if args.json:
+        print(json.dumps(result, sort_keys=True, default=str))
+    else:
+        view = service.offline_view()
+        print(f"Fleet metadata on {result['local_node_id']} "
+              f"({len(view['nodes'])} node(s), {len(view['ssh_targets'])} SSH target(s), "
+              f"{len(view['sessions'])} session(s) -- served from {view['served_from']})")
+        for check in result["checks"]:
+            print(f"  {check['status']:<5} {check['check']:<26} {check['summary']}")
+        print(f"  ----- {result['status']}")
+    return {PASS: 0, WARN: 1, FAIL: 2}.get(result["status"], 2)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="terminal-mcp-doctor")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -444,6 +495,13 @@ def build_parser() -> argparse.ArgumentParser:
     conversations.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of text")
     conversations.add_argument("--config", default=None, help="Path to config.yaml (default: the usual lookup)")
     conversations.set_defaults(func=cmd_conversations)
+
+    fleet = subparsers.add_parser("fleet", help="Diagnose fleet metadata sync, SSH inventory and "
+                                                "credential/fingerprint readiness (works offline)")
+    fleet.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of text")
+    fleet.add_argument("--db", default=None, help="Path to fleet_registry.db (default: the usual lookup)")
+    fleet.add_argument("--node-id", default=None, help="This machine's node id (default: local)")
+    fleet.set_defaults(func=cmd_fleet)
 
     return parser
 

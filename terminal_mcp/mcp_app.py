@@ -57,6 +57,7 @@ def build_mcp(service: TerminalService | None = None,
               backlog: BacklogService | None = None,
               events: EventBus | None = None,
               resource_locks: ResourceLockStore | None = None,
+              fleet: "FleetService | None" = None,
               default_optional_services: bool = True) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
@@ -1055,6 +1056,99 @@ def build_mcp(service: TerminalService | None = None,
         changed = [r["session"] for r in results if "error" not in r]
         failed = [{"session": r["session"], "error": r["error"]} for r in results if "error" in r]
         return {"requested": len(targets), "changed": changed, "failed": failed, "results": results}
+
+    _fleet_holder: dict[str, Any] = {"service": fleet, "tried": fleet is not None}
+
+    def _fleet_service():
+        """Built on first use so a caller that never asks about the fleet
+        never opens the database -- same laziness the node agent uses, and
+        for the same reason: this must not be able to stop anything else
+        working."""
+        if _fleet_holder.get("service") is None and not _fleet_holder.get("tried"):
+            _fleet_holder["tried"] = True
+            try:
+                from .fleet_registry import FleetRegistryStore
+                from .fleet_service import FleetService
+
+                node_id = controller.local_node_id if controller else "local"
+                _fleet_holder["service"] = FleetService(
+                    FleetRegistryStore(local_node_id=node_id), local_node_id=node_id)
+            except Exception:  # noqa: BLE001 -- never break the tool surface
+                _fleet_holder["service"] = None
+        return _fleet_holder.get("service")
+
+    @server.tool()
+    def terminal_fleet_registry(kind: str = "") -> dict:
+        """The fleet as this machine last replicated it: nodes, sessions,
+        projects and SSH targets, read from the LOCAL durable cache.
+
+        Answers with the controller gone. That is the point -- every node that
+        has synced once holds a complete copy, so "what machines exist, how do
+        I reach them, what was running where" survives losing m910.
+
+        Metadata only. No pane text, no prompt, no credential: see
+        fleet_registry.scrub_payload, which REFUSES a payload naming a secret
+        rather than quietly dropping the field.
+
+        `kind` optionally narrows to node/session/project/ssh_target.
+        """
+        service = _fleet_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        view = service.offline_view()
+        if kind:
+            keep = {"node": "nodes", "session": "sessions", "project": "projects",
+                    "ssh_target": "ssh_targets"}.get(kind)
+            if not keep:
+                return {"error": "UNKNOWN_KIND",
+                        "known": ["node", "session", "project", "ssh_target"]}
+            return {"kind": kind, keep: view[keep], "served_from": view["served_from"]}
+        return view
+
+    @server.tool()
+    def terminal_fleet_ssh_inventory() -> dict:
+        """Every SSH target the fleet knows, ordered the way you would try
+        them: pinned connections first, then tailnet ahead of LAN (a tailnet
+        address still works from outside the building, which is where you are
+        when you need this).
+
+        Returns addresses, ports, usernames, transports, proxy/jump metadata,
+        host key FINGERPRINTS and credential POSTURE. It never returns a key,
+        a password, a passphrase or a token -- a node lacking a credential
+        reports MISSING_CREDENTIAL so a human provisions it there, rather than
+        one being copied from a machine that has it.
+        """
+        service = _fleet_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        return {"targets": service.ssh_inventory()}
+
+    @server.tool()
+    def terminal_fleet_readiness() -> dict:
+        """PASS/WARN/FAIL per fleet-metadata check, with the evidence.
+
+        Covers registry sync age, contract version drift, missing SSH
+        credentials, unpinned or stale routes, peer sync failures, and host
+        key MISMATCH -- which is FAIL rather than WARN because it is the one
+        condition here that can mean a node is being impersonated.
+        """
+        service = _fleet_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        return service.readiness()
+
+    @server.tool()
+    def terminal_fleet_sync_status() -> dict:
+        """Per-peer sync bookkeeping: when each peer was last pulled from,
+        pushed to, whether the last attempt failed and why.
+
+        A peer that is down is a normal state, not an error -- the local copy
+        keeps answering, which is what this whole subsystem is for.
+        """
+        service = _fleet_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        return {"local_node_id": service.local_node_id, "peers": service.store.peers()}
 
     @server.tool()
     def terminal_fleet_environment(roles: str = "node") -> dict:

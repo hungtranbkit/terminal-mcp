@@ -100,8 +100,30 @@ def _auth_ok(request: Request, expected_token: str) -> bool:
 
 
 def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
-                     workspace_root: str = "/") -> Starlette:
+                     workspace_root: str = "/",
+                     fleet: "FleetService | None" = None) -> Starlette:
     client = LocalNodeClient(terminal)
+
+    # Built lazily and cached: a node agent must still start and serve
+    # sessions on a box where the fleet cache cannot be opened (read-only
+    # state dir, a disk that filled). A fleet endpoint that answers
+    # FLEET_REGISTRY_UNAVAILABLE is a degraded fleet; an agent that refuses
+    # to boot is a lost node.
+    _fleet: dict[str, object] = {"service": fleet, "tried": fleet is not None}
+
+    def fleet_service():
+        if not _fleet["tried"]:
+            _fleet["tried"] = True
+            try:
+                from .fleet_registry import FleetRegistryStore
+                from .fleet_service import FleetService
+
+                _fleet["service"] = FleetService(
+                    FleetRegistryStore(local_node_id=node_id), local_node_id=node_id)
+            except Exception:  # noqa: BLE001 -- never block the agent on this
+                _log.exception("fleet registry unavailable on this node")
+                _fleet["service"] = None
+        return _fleet["service"]
 
     def require_auth(request: Request) -> JSONResponse | None:
         if not _auth_ok(request, token):
@@ -376,6 +398,49 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         result = await anyio.to_thread.run_sync(lambda: client.registry_list(recoverable_only=recoverable_only))
         return JSONResponse(result)
 
+    async def fleet_objects(request: Request) -> JSONResponse:
+        """The peer half of fleet metadata sync -- merge what came in, answer
+        with what this node has.
+
+        Deliberately symmetric with the caller (see fleet_sync.py): a node
+        running this IS a peer, not a passive spoke. It is what makes the
+        fleet view survive the controller disappearing -- every node that has
+        synced once holds a complete durable copy on its own disk.
+
+        Read-write on METADATA only, and never on a session: nothing reachable
+        from here can start, stop, rename or type into anything. Payloads are
+        scrubbed on the way in by `merge`, which REFUSES a secret rather than
+        stripping it, so a peer cannot push credentials onto this node.
+        """
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        service = fleet_service()
+        if service is None:
+            return JSONResponse({"error": "FLEET_REGISTRY_UNAVAILABLE",
+                                 "objects": [], "merge": {}}, status_code=200)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 -- a malformed body is a client error
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        source = str(body.get("from") or "peer")
+        result = await anyio.to_thread.run_sync(
+            lambda: service.sync.handle_exchange(body, source_node=source))
+        return JSONResponse(result)
+
+    async def fleet_view(request: Request) -> JSONResponse:
+        """This node's own answer to "what does the fleet look like" -- read
+        entirely from its local cache, so it keeps answering with the
+        controller gone. That is the whole point of the endpoint existing on
+        the AGENT rather than only on the controller."""
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        service = fleet_service()
+        if service is None:
+            return JSONResponse({"error": "FLEET_REGISTRY_UNAVAILABLE"}, status_code=200)
+        return JSONResponse(await anyio.to_thread.run_sync(service.offline_view))
+
     async def killed_sessions(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
             return blocked
@@ -547,6 +612,10 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         Route("/v1/sessions/{name}/grant-read", session_grant_read, methods=["POST"]),
         Route("/v1/sessions/{name}/grant-input", session_grant_input, methods=["POST"]),
         Route("/v1/killed-sessions", killed_sessions, methods=["GET"]),
+        # Fleet metadata: an exchange (POST) and this node's own cached view
+        # (GET). Metadata only -- no session control reachable from either.
+        Route("/v1/fleet/objects", fleet_objects, methods=["POST"]),
+        Route("/v1/fleet/view", fleet_view, methods=["GET"]),
         Route("/v1/knowledge/search", knowledge_search, methods=["GET"]),
         Route("/v1/knowledge/timeline/{name}", knowledge_timeline, methods=["GET"]),
         Route("/v1/knowledge/recover/{name}", knowledge_recover, methods=["GET"]),

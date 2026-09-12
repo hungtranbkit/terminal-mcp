@@ -1533,6 +1533,16 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/ai-usage": {"GET", "HEAD"},
         "/dashboard/api/tasks/reassign": {"POST"},
         "/dashboard/requirements": {"GET", "HEAD"},
+        # Fleet Metadata Registry -- a later, separate feature. Three reads
+        # and exactly one write, and the write only touches METADATA: there is
+        # no path from any of these to starting, stopping or typing into a
+        # session. The reads answer from the LOCAL cache on purpose, so they
+        # keep working when the fleet does not.
+        "/dashboard/fleet": {"GET", "HEAD"},
+        "/dashboard/api/fleet": {"GET", "HEAD"},
+        "/dashboard/api/fleet/ssh": {"GET", "HEAD"},
+        "/dashboard/api/fleet/readiness": {"GET", "HEAD"},
+        "/dashboard/api/fleet/sync": {"POST"},
         # Terminal Wall -- a later, separate feature, and READ-ONLY by
         # design: both entries are GET/HEAD, and the absence of any POST
         # here is itself part of the guarantee that the monitor screen
