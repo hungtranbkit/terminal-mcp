@@ -1533,6 +1533,12 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/ai-usage": {"GET", "HEAD"},
         "/dashboard/api/tasks/reassign": {"POST"},
         "/dashboard/requirements": {"GET", "HEAD"},
+        # Terminal Wall -- a later, separate feature, and READ-ONLY by
+        # design: both entries are GET/HEAD, and the absence of any POST
+        # here is itself part of the guarantee that the monitor screen
+        # cannot send input to a session.
+        "/dashboard/terminal-wall": {"GET", "HEAD"},
+        "/dashboard/api/terminal-wall": {"GET", "HEAD"},
         # Auto Recovery -- another later, separate feature.
         "/dashboard/api/recovery": {"GET", "HEAD"},
         "/dashboard/api/recovery/recover": {"POST"},

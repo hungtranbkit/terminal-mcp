@@ -25,6 +25,7 @@ from .controller import ControllerService, build_default_controller
 from .node_client import NodeClientError, RemoteNodeClient
 from .core import TerminalService
 from .ai_usage_service import AiUsageService
+from . import terminal_wall
 from .recovery_engine import RecoveryEngine
 from .integration_service import IntegrationService
 from .integration_store import IntegrationStore
@@ -1352,6 +1353,7 @@ DASHBOARD_HTML = """<!doctype html>
           <a href="/dashboard/requirements" id="requirementsLink" role="menuitem" target="_blank" rel="noopener">📄 Requirements</a>
           <button type="button" id="openSupervisorPanelBtn" role="menuitem">🧭 Supervisor / Coordinator</button>
           <button type="button" id="openTaskInboxBtn" role="menuitem">📥 Task Inbox</button>
+          <a href="/dashboard/terminal-wall" id="terminalWallLink" role="menuitem">🧱 Terminal Wall</a>
           <a href="/dashboard/ai-usage" id="aiUsageLink" role="menuitem">📊 AI Usage</a>
         </div>
       </div>
@@ -6611,6 +6613,327 @@ NODES_ADMIN_HTML = """<!doctype html>
 #       actually recorded one. On this host Claude records none, so it reads
 #       "Not observed" rather than a guessed "5h from session start".
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Terminal Wall: many sessions at once, and which of them have stopped.
+#
+# READ-ONLY BY CONSTRUCTION. There is no composer, no key pad and no call to
+# any send endpoint on this page -- a monitor that can type is a monitor that
+# will eventually type into the wrong session.
+# ---------------------------------------------------------------------------
+# Raw: this template writes JS escapes such as `.join('\n')` directly.
+# In a non-raw literal Python would turn that into a real newline inside a
+# JS string -- a syntax error that kills the whole script, which is exactly
+# what happened here and what the backlog-panel guard now catches.
+TERMINAL_WALL_HTML = r"""<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Terminal Wall — Terminal MCP</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd;
+      --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#3b78ff; --term-bg:#0c0c0c;
+      --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono','Courier New',monospace;
+    }
+    * { box-sizing:border-box }
+    body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text) }
+    a { color:var(--accent); text-decoration:none }
+    header { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+             padding:12px max(14px, env(safe-area-inset-right)) 12px max(14px, env(safe-area-inset-left));
+             border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5 }
+    h1 { margin:0; font-size:16px; white-space:nowrap }
+    .muted { color:var(--muted) } .spacer { flex:1 }
+    .btn { background:#19243b; border:1px solid var(--line); color:var(--text); border-radius:8px;
+           padding:7px 11px; font:13px var(--mono); cursor:pointer; min-height:40px;
+           display:inline-flex; align-items:center; gap:6px }
+    .btn.on { border-color:var(--accent); color:var(--accent) }
+    .bar { display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+           padding:10px max(14px, env(safe-area-inset-right)) 4px max(14px, env(safe-area-inset-left)) }
+    .bar select, .bar input { background:var(--panel); border:1px solid var(--line); color:var(--text);
+                              border-radius:8px; padding:8px 10px; font:16px var(--mono); min-height:40px }
+    .counts { display:flex; gap:6px; flex-wrap:wrap }
+    main { padding:10px max(14px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom))
+                   max(14px, env(safe-area-inset-left)) }
+    /* Desktop default is three columns; the toggle overrides it. */
+    #wall { display:grid; gap:10px; grid-template-columns:repeat(3, minmax(0, 1fr)) }
+    #wall[data-cols="2"] { grid-template-columns:repeat(2, minmax(0, 1fr)) }
+    #wall[data-cols="4"] { grid-template-columns:repeat(4, minmax(0, 1fr)) }
+    .box { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+           overflow:hidden; display:flex; flex-direction:column; cursor:pointer; min-width:0 }
+    .box:hover { border-color:#3a4a70 }
+    .box:focus-visible { outline:2px solid var(--accent); outline-offset:2px }
+    .box-head { padding:8px 10px; display:flex; align-items:center; gap:7px; flex-wrap:wrap;
+                border-bottom:1px solid var(--line) }
+    .box-name { font-weight:700; font-size:13px; overflow:hidden; text-overflow:ellipsis;
+                white-space:nowrap; min-width:0 }
+    .box-node { font-size:10.5px; color:var(--muted); white-space:nowrap }
+    .box-sub { padding:4px 10px; font-size:11px; color:var(--muted); display:flex;
+               justify-content:space-between; gap:8px; flex-wrap:wrap }
+    /* Status never relies on colour alone: every badge carries a glyph and a
+       word, so it survives colour blindness and a greyscale screenshot. */
+    .badge { font-size:10px; font-weight:700; letter-spacing:.03em; padding:2px 7px;
+             border-radius:999px; border:1px solid var(--line); white-space:nowrap; margin-left:auto }
+    .badge.RUNNING { color:var(--green); border-color:var(--green) }
+    .badge.WAITING { color:var(--amber); border-color:var(--amber) }
+    .badge.ERROR   { color:var(--red); border-color:var(--red) }
+    .badge.DONE    { color:#8fb8ff; border-color:#8fb8ff }
+    .badge.IDLE, .badge.UNKNOWN { color:var(--muted) }
+    .badge.OFFLINE { color:var(--muted); border-style:dashed }
+    .term { background:var(--term-bg); color:#cccccc; font-size:10.5px; line-height:1.35;
+            padding:7px 9px; margin:0; white-space:pre-wrap; word-break:break-word;
+            height:190px; overflow:hidden; display:flex; flex-direction:column;
+            justify-content:flex-end }
+    .box.stale .term { opacity:.55 }
+    .empty { padding:30px; text-align:center; color:var(--muted) }
+    .note { font-size:11.5px; color:var(--muted); margin:12px 0 0; line-height:1.6 }
+    @media (max-width:1100px) { #wall, #wall[data-cols="3"], #wall[data-cols="4"] {
+      grid-template-columns:repeat(2, minmax(0, 1fr)) } }
+    @media (max-width:720px) {
+      /* Measured on a 390x844 phone: header + filter stack pushed the first
+         tile to y=450 -- over half the screen spent on chrome before a single
+         terminal was visible, on the one screen whose job is showing
+         terminals. Everything below buys that space back. */
+      header { padding:8px 12px; gap:6px } h1 { font-size:15px }
+      .btn { padding:6px 9px; min-height:36px }
+      /* The badges already say RUNNING/IDLE/..., so the status line goes
+         first, then the back-link's label (the arrow still reads as "back"). */
+      #status { display:none }
+      #backLink { font-size:0 }
+      #backLink::before { content:'← '; font-size:13px }
+      .bar { display:grid; grid-template-columns:1fr 1fr; gap:6px; padding:8px 12px 2px }
+      main { padding:8px 12px 22px }
+      #wall, #wall[data-cols="2"], #wall[data-cols="3"], #wall[data-cols="4"] {
+        grid-template-columns:minmax(0, 1fr) }
+      .bar select, .bar input { flex:none; width:100%; min-width:0 }
+      /* Two per row: node|state, agent|search. Only the toggle spans, so the
+         filter block is three rows instead of four. */
+      #activeOnly { grid-column:1 / -1 }
+      /* The badges stay on ONE line and scroll sideways rather than wrapping
+         to a second row -- five states wrapped cost 24px of every screen. */
+      #counts { flex-wrap:nowrap; overflow-x:auto; max-width:100%;
+                -webkit-overflow-scrolling:touch; scrollbar-width:none }
+      #counts::-webkit-scrollbar { display:none }
+      #colToggle { display:none }   /* one column is the only sensible width here */
+      .term { height:150px }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🧱 Terminal Wall</h1>
+    <span class="counts" id="counts"></span>
+    <span class="spacer"></span>
+    <span class="muted" id="status">đang tải…</span>
+    <button class="btn" id="pauseBtn" type="button" aria-pressed="false">⏸ Tạm dừng</button>
+    <button class="btn" id="refreshBtn" type="button">Làm mới</button>
+    <a class="btn" id="backLink" href="/dashboard" aria-label="Về Dashboard">← Dashboard</a>
+  </header>
+  <div class="bar">
+    <select id="fNode" aria-label="Node"><option value="">Tất cả node</option></select>
+    <select id="fState" aria-label="Trạng thái"><option value="">Tất cả trạng thái</option></select>
+    <select id="fAgent" aria-label="Agent"><option value="">Tất cả agent</option></select>
+    <input type="search" id="fSearch" placeholder="Tìm session..." aria-label="Tìm session">
+    <button class="btn" id="activeOnly" type="button" aria-pressed="false">Chỉ session đang hoạt động</button>
+    <span id="colToggle" class="counts" role="group" aria-label="Số cột">
+      <button class="btn" type="button" data-cols="2">2</button>
+      <button class="btn" type="button" data-cols="3">3</button>
+      <button class="btn" type="button" data-cols="4">4</button>
+    </span>
+  </div>
+  <main>
+    <div id="wall" data-cols="3"></div>
+    <p class="note" id="note"></p>
+  </main>
+  <script>
+    const $ = (s) => document.querySelector(s);
+    const state = {boxes: [], paused: false, activeOnly: false, cols: 3, tokens: new Map()};
+
+    const GLYPH = {RUNNING: '▶', WAITING: '⏳', ERROR: '✕', DONE: '✔',
+                   IDLE: '⏸', UNKNOWN: '?', OFFLINE: '⊘'};
+
+    const age = (seconds) => {
+      if (seconds == null) return '—';
+      if (seconds < 90) return Math.round(seconds) + 's';
+      if (seconds < 5400) return Math.round(seconds / 60) + 'm';
+      if (seconds < 172800) return Math.round(seconds / 3600) + 'h';
+      return Math.round(seconds / 86400) + 'd';
+    };
+
+    // "hoạt động 3s" is a claim that output appeared 3s ago. We may only make
+    // it about a change this wall actually saw; otherwise the number is a
+    // lower bound on silence since we started watching, and says so.
+    function ageLabel(b) {
+      if (b.age_seconds == null) return '—';
+      return (b.age_is_witnessed ? 'hoạt động ' : 'theo dõi ') + age(b.age_seconds);
+    }
+
+    function el(tag, opts) {
+      const node = document.createElement(tag);
+      if (opts && opts.className) node.className = opts.className;
+      if (opts && opts.text != null) node.textContent = opts.text;
+      return node;
+    }
+
+    function visible() {
+      const node = $('#fNode').value, st = $('#fState').value, agent = $('#fAgent').value;
+      const q = $('#fSearch').value.trim().toLowerCase();
+      return state.boxes.filter((b) =>
+        (!node || b.node_id === node) &&
+        (!st || b.state === st) &&
+        (!agent || (b.command || b.agent) === agent) &&
+        (!q || (b.session || '').toLowerCase().includes(q)) &&
+        (!state.activeOnly || ['RUNNING', 'WAITING', 'ERROR'].includes(b.state)));
+    }
+
+    function buildBox(b) {
+      const box = el('div', {className: 'box'});
+      box.tabIndex = 0;
+      box.dataset.session = b.session;
+      const open = () => {
+        if (b.offline || b.session === '(node unreachable)') return;
+        // The wall never sends anything; it hands off to the existing
+        // session view, which is where input belongs.
+        location.href = '/dashboard?session=' + encodeURIComponent(b.session);
+      };
+      box.onclick = open;
+      box.onkeydown = (event) => { if (event.key === 'Enter') open(); };
+
+      const head = el('div', {className: 'box-head'});
+      head.append(el('span', {className: 'box-name', text: b.session}),
+                  el('span', {className: 'box-node', text: b.node_name || b.node_id}));
+      const badge = el('span', {className: 'badge ' + b.state,
+                                text: (GLYPH[b.state] || '') + ' ' + b.state});
+      badge.title = b.reason || '';
+      head.appendChild(badge);
+      box.appendChild(head);
+
+      const sub = el('div', {className: 'box-sub'});
+      const when = el('span', {text: ageLabel(b)});
+      when.title = b.age_is_witnessed
+        ? 'Đo từ lần output thật sự thay đổi mà màn hình này nhìn thấy.'
+        : 'Chưa từng thấy output đổi kể từ khi bắt đầu theo dõi — đây là thời gian im lặng tối thiểu, không phải mốc hoạt động.';
+      sub.append(el('span', {text: b.command || b.agent || '—'}), when);
+      box.appendChild(sub);
+
+      const term = el('pre', {className: 'term', text: (b.lines || []).join('\n')});
+      box.appendChild(term);
+      if (b.age_seconds != null && b.age_seconds > 3600) box.classList.add('stale');
+      return box;
+    }
+
+    function render() {
+      const wall = $('#wall');
+      wall.dataset.cols = String(state.cols);
+      const rows = visible();
+      const seen = new Set();
+      const existing = new Map([...wall.children].map((c) => [c.dataset.session, c]));
+      wall.replaceChildren();
+      for (const b of rows) {
+        seen.add(b.session);
+        const prior = existing.get(b.session);
+        // Only rebuild a tile whose visible content actually changed: the
+        // token deliberately excludes the age, which ticks every second and
+        // would otherwise mark everything dirty on every poll.
+        if (prior && state.tokens.get(b.session) === b.change_token) {
+          const sub = prior.querySelector('.box-sub span:last-child');
+          if (sub) sub.textContent = ageLabel(b);
+          wall.appendChild(prior);
+          continue;
+        }
+        state.tokens.set(b.session, b.change_token);
+        wall.appendChild(buildBox(b));
+      }
+      for (const key of [...state.tokens.keys()]) if (!seen.has(key)) state.tokens.delete(key);
+      if (!rows.length) {
+        wall.appendChild(el('div', {className: 'empty',
+          text: 'Không có session nào khớp bộ lọc.'}));
+      }
+      for (const btn of document.querySelectorAll('#colToggle .btn'))
+        btn.classList.toggle('on', Number(btn.dataset.cols) === state.cols);
+    }
+
+    function fillFilters() {
+      for (const [sel, pick] of [['#fNode', (b) => b.node_id],
+                                 ['#fState', (b) => b.state],
+                                 ['#fAgent', (b) => b.command || b.agent]]) {
+        const node = $(sel), keep = node.value;
+        const values = [...new Set(state.boxes.map(pick).filter(Boolean))].sort();
+        const first = node.firstElementChild;
+        node.replaceChildren(first);
+        for (const value of values) {
+          const opt = document.createElement('option');
+          opt.value = value; opt.textContent = value;
+          node.appendChild(opt);
+        }
+        node.value = values.includes(keep) ? keep : '';
+      }
+    }
+
+    function renderCounts(counts) {
+      const box = $('#counts');
+      box.replaceChildren();
+      for (const key of ['RUNNING', 'WAITING', 'ERROR', 'IDLE', 'DONE', 'UNKNOWN', 'OFFLINE']) {
+        if (!counts[key]) continue;
+        box.appendChild(el('span', {className: 'badge ' + key,
+          text: (GLYPH[key] || '') + ' ' + counts[key] + ' ' + key}));
+      }
+    }
+
+    async function load() {
+      try {
+        const response = await fetch('/dashboard/api/terminal-wall', {cache: 'no-store'});
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const data = await response.json();
+        state.boxes = data.boxes || [];
+        renderCounts(data.counts || {});
+        fillFilters();
+        render();
+        $('#status').textContent = state.paused ? 'đã tạm dừng'
+          : (data.cached ? 'cache ' + data.cache_age_seconds + 's' : 'vừa cập nhật');
+        // The threshold is read off the payload, never hard-coded here: a
+        // page that states its own number goes stale the first time the
+        // server's constant is tuned.
+        const within = Math.round(data.running_within_seconds || 0);
+        $('#note').textContent =
+          'Chỉ đọc: màn hình này không gửi phím hay text vào bất kỳ session nào. ' +
+          'Trạng thái suy ra từ status/activity/output sẵn có — RUNNING chỉ khi màn hình này ' +
+          'TỰ nhìn thấy output đổi trong ' + within + ' giây gần nhất, nên một agent còn sống mà ' +
+          'đứng yên sẽ hiện IDLE. Session chưa từng thấy đổi output sẽ ở "?" tối đa ' + within +
+          ' giây (thời gian theo dõi chưa đủ để kết luận) rồi chuyển sang IDLE.';
+      } catch (err) {
+        $('#status').textContent = 'lỗi tải: ' + err.message;
+      }
+    }
+
+    $('#pauseBtn').onclick = () => {
+      state.paused = !state.paused;
+      $('#pauseBtn').classList.toggle('on', state.paused);
+      $('#pauseBtn').setAttribute('aria-pressed', String(state.paused));
+      $('#pauseBtn').textContent = state.paused ? '▶ Tiếp tục' : '⏸ Tạm dừng';
+      $('#status').textContent = state.paused ? 'đã tạm dừng' : 'đang chạy';
+    };
+    $('#refreshBtn').onclick = () => load();
+    $('#activeOnly').onclick = () => {
+      state.activeOnly = !state.activeOnly;
+      $('#activeOnly').classList.toggle('on', state.activeOnly);
+      $('#activeOnly').setAttribute('aria-pressed', String(state.activeOnly));
+      render();
+    };
+    for (const sel of ['#fNode', '#fState', '#fAgent']) $(sel).onchange = render;
+    $('#fSearch').oninput = render;
+    for (const btn of document.querySelectorAll('#colToggle .btn'))
+      btn.onclick = () => { state.cols = Number(btn.dataset.cols); render(); };
+
+    load();
+    setInterval(() => { if (!state.paused) load(); }, 6000);
+  </script>
+</body>
+</html>
+"""
+
+
 AI_USAGE_HTML = """<!doctype html>
 <html lang="vi">
 <head>
@@ -6833,6 +7156,14 @@ AI_USAGE_HTML = """<!doctype html>
                                    {cache: 'no-store'});
       if (!response.ok) throw new Error('HTTP ' + response.status);
       return response.json();
+    }
+
+    // "hoạt động 3s" is a claim that output appeared 3s ago. We may only make
+    // it about a change this wall actually saw; otherwise the number is a
+    // lower bound on silence since we started watching, and says so.
+    function ageLabel(b) {
+      if (b.age_seconds == null) return '—';
+      return (b.age_is_witnessed ? 'hoạt động ' : 'theo dõi ') + age(b.age_seconds);
     }
 
     function el(tag, opts) {
@@ -8573,6 +8904,49 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             NODES_ADMIN_HTML,
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
+
+    # One fan-out per TTL window, shared by every open wall. Twenty sessions
+    # cost ~20 node round-trips; without this, three open tabs would triple
+    # that every few seconds for data that has not changed.
+    _wall_cache = terminal_wall.WallSnapshotCache()
+
+    @server.custom_route("/dashboard/terminal-wall", methods=["GET"], include_in_schema=False)
+    async def dashboard_terminal_wall(request: Request) -> HTMLResponse | JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(
+            TERMINAL_WALL_HTML,
+            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
+        )
+
+    @server.custom_route("/dashboard/api/terminal-wall", methods=["GET"], include_in_schema=False)
+    async def dashboard_terminal_wall_snapshot(request: Request) -> JSONResponse:
+        """Status + a short tail for every visible session, in one request.
+
+        _read_guard only: this is a read of the same status/tail the session
+        views already expose, and the wall has no write path at all.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            lines = int(request.query_params.get("lines", terminal_wall.DEFAULT_TAIL_LINES))
+        except (TypeError, ValueError):
+            lines = terminal_wall.DEFAULT_TAIL_LINES
+        force = request.query_params.get("refresh") == "1"
+
+        def _build() -> dict[str, Any]:
+            return terminal_wall.build_snapshot(controller, tail_lines=lines,
+                                                tracker=_wall_cache.tracker)
+
+        try:
+            payload = await anyio.to_thread.run_sync(
+                lambda: _wall_cache.get(_build, force=force))
+        except Exception as exc:  # noqa: BLE001 -- a monitor never 5xxs the screen
+            return JSONResponse({"error": "TERMINAL_WALL_FAILED", "detail": str(exc),
+                                 "boxes": [], "counts": {}}, status_code=200)
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/ai-usage", methods=["GET"], include_in_schema=False)
     async def dashboard_ai_usage_page(request: Request) -> HTMLResponse | JSONResponse:
