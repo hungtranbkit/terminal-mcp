@@ -25,6 +25,9 @@ def test_the_servable_mime_list_never_drifts_from_the_sniffer():
 def test_defaults_are_on_with_no_config_section_at_all():
     config = _load_notes_config({})
     assert config.enabled is True
+    # Secure by default: the Notes HTTP surface demands a real session even
+    # when nothing is configured (see tests/test_notes_auth.py).
+    assert config.require_auth is True
     assert config.attachments_dir == ""
     assert config.max_attachment_bytes == 10 * 1024 * 1024
     # The source_path transport is OFF until an operator names a root.
@@ -39,12 +42,14 @@ def test_a_non_dict_section_degrades_to_defaults():
 def test_a_full_section_loads(tmp_path):
     config = _load_notes_config({
         "enabled": False,
+        "require_auth": False,
         "attachments_dir": str(tmp_path / "att"),
         "max_attachment_bytes": 2048,
         "allowed_mime_types": ["image/png", "image/webp"],
         "attachment_source_roots": [str(tmp_path / "inbox"), "~/Pictures"],
     })
     assert config.enabled is False
+    assert config.require_auth is False
     assert config.attachments_dir == str(tmp_path / "att")
     assert config.max_attachment_bytes == 2048
     assert config.allowed_mime_types == ("image/png", "image/webp")
@@ -91,6 +96,12 @@ def test_the_repo_config_yaml_still_loads_with_the_new_section(tmp_path):
             continue
         config = load_config(path)
         assert config.notes.enabled in (True, False)
+
+
+def test_require_auth_must_be_opted_out_of_explicitly():
+    """A typo'd or absent key must never silently open the surface."""
+    for raw in ({}, {"require_auth": True}, {"enabled": True}, {"requireauth": False}):
+        assert _load_notes_config(raw).require_auth is True
 
 
 def test_a_yaml_section_round_trips_through_load_config(tmp_path):

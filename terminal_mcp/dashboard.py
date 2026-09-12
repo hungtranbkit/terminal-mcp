@@ -13,7 +13,9 @@ from urllib.parse import quote, urlparse
 import anyio
 from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from starlette.responses import (
+    HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response,
+)
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
@@ -41,6 +43,7 @@ from .queue_service import QueueService
 from .queue_store import QueueStore
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
+from .webauth import SESSION_COOKIE_NAME, WebAuthStore
 from .webterm import WebTerminalProcess, pump_websocket
 from .webterm_assets import ASSETS
 
@@ -6476,7 +6479,11 @@ NOTES_HTML = """<!doctype html>
     .chip.s-applied { color:var(--green); border-color:var(--green) }
     .chip.s-archived { color:var(--muted) }
     .chip.tag { color:var(--text); background:#1b2540 }
-    .gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:14px }
+    /* align-items:start, not the grid default of stretch: a text-only card
+       must not be padded out to the height of an image card sharing its
+       row (real-browser QA showed exactly that -- big dead space under
+       every short card). Each card takes its natural height instead. */
+    .gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:14px; align-items:start }
     .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; cursor:pointer; display:flex; flex-direction:column }
     .card:hover { border-color:var(--accent) }
     .card .thumb { width:100%; aspect-ratio:16/10; object-fit:cover; background:var(--panel2); display:block }
@@ -6502,9 +6509,9 @@ NOTES_HTML = """<!doctype html>
     #empty { color:var(--muted); text-align:center; padding:50px 10px }
     #err { color:var(--red); min-height:18px; font-size:12.5px; margin-bottom:8px }
     #backdrop { position:fixed; inset:0; background:rgba(4,8,20,.66); display:none; z-index:20 }
-    #backdrop[data-open=1] { display:block }
+    #backdrop[data-open="1"] { display:block }
     #drawer { position:fixed; top:0; right:0; bottom:0; width:min(660px,100%); background:var(--bg); border-left:1px solid var(--line); z-index:21; transform:translateX(100%); transition:transform .16s ease-out; display:flex; flex-direction:column }
-    #drawer[data-open=1] { transform:none }
+    #drawer[data-open="1"] { transform:none }
     #drawer .dhead { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid var(--line) }
     #drawer .dhead b { font-size:15px }
     #drawer .dbody { flex:1; overflow:auto; padding:16px; display:flex; flex-direction:column; gap:13px }
@@ -6520,7 +6527,7 @@ NOTES_HTML = """<!doctype html>
     .dz { border:1px dashed var(--line); border-radius:9px; padding:12px; text-align:center; color:var(--muted); font-size:12px }
     .dz.over { border-color:var(--accent); color:var(--text) }
     #toast { position:fixed; left:50%; bottom:22px; transform:translateX(-50%); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:9px 16px; font-size:13px; z-index:30; display:none }
-    #toast[data-open=1] { display:block }
+    #toast[data-open="1"] { display:block }
     #toast.bad { border-color:var(--red); color:var(--red) }
     @media (max-width:860px) {
       .wrap { padding:12px 12px 32px }
@@ -6624,10 +6631,24 @@ async function api(path, options) {
   let body = null;
   try { body = await response.json(); } catch (e) { body = null; }
   if (!response.ok) {
+    // A session that expired while the tab sat open is the one failure the
+    // user can actually fix, so name it and offer the way back instead of
+    // reporting a bare HTTP 401.
+    if (response.status === 401 || (body && body.error === 'LOGIN_REQUIRED')) {
+      needsLogin();
+      throw new Error('Phiên đăng nhập đã hết. Cần đăng nhập lại.');
+    }
+    if (body && body.error === 'PASSWORD_CHANGE_REQUIRED') {
+      throw new Error('Cần đổi mật khẩu trước khi dùng: mở /app/password');
+    }
     const message = (body && (body.message || body.error)) || ('HTTP ' + response.status);
     throw new Error(message);
   }
   return body;
+}
+function needsLogin() {
+  const banner = $('err');
+  banner.innerHTML = 'Phiên đăng nhập đã hết. <a href="/login">Đăng nhập lại</a> rồi tải lại trang.';
 }
 function postJSON(path, payload) {
   return api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
@@ -7014,7 +7035,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        ai_usage: AiUsageService | None = None,
                        recovery: RecoveryEngine | None = None,
                        backlog: BacklogService | None = None,
-                       notes: NotesService | None = None) -> None:
+                       notes: NotesService | None = None,
+                       webauth: WebAuthStore | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -7304,17 +7326,83 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     # scoping here.
 
     @server.custom_route("/dashboard/notes", methods=["GET"], include_in_schema=False)
-    async def dashboard_notes(request: Request) -> HTMLResponse | JSONResponse:
+    async def dashboard_notes(request: Request) -> Response:
         blocked, _identity = _read_guard(request)
         if blocked is not None:
             return blocked
         disabled = _notes_disabled()
         if disabled is not None:
             return disabled
+        unauthorised = _notes_auth_guard(request, page=True)
+        if unauthorised is not None:
+            return unauthorised
         return HTMLResponse(
             NOTES_HTML,
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
+
+    def _notes_authenticated(request: Request) -> tuple[bool, str | None]:
+        """Is this request carrying one of the two identities this project
+        already has? Returns (authenticated, reason-if-not).
+
+        Deliberately NOT a third auth mechanism. webauth.py's session
+        cookie and cf_access.py's verified assertion are the repo's two
+        existing standards; this reads both and requires either. The
+        cookie is resolved through WebAuthStore.resolve_session exactly as
+        webauth_dashboard._session_user does -- same store, same TTL, same
+        revocation, so `terminal-mcp-webauth` and /logout already control
+        access here with no new tooling.
+
+        Note the asymmetry with the rest of /dashboard/*: those routes stay
+        as they are (this change widens nothing), while the Notes routes
+        ADD this requirement on top. Accepting a webauth session on a
+        /dashboard/* path is new -- webauth.py's docstring describes the
+        two entry points as sharing no session state -- but it is strictly
+        a tightening of a surface that previously required nothing at all,
+        and it avoids either duplicating the whole Notes UI under /app/ or
+        forcing Cloudflare Access on operators who use the password path.
+        """
+        if webauth is not None:
+            token = request.cookies.get(SESSION_COOKIE_NAME)
+            if token:
+                user = webauth.resolve_session(token)
+                if user is not None:
+                    if user.must_change_password:
+                        # Same rule as webauth_dashboard._require_session_api:
+                        # a forced password change reaches nothing but
+                        # /app/password and /logout.
+                        return False, "PASSWORD_CHANGE_REQUIRED"
+                    return True, None
+        team_domain = terminal.config.dashboard.cloudflare_access_team_domain
+        audience = terminal.config.dashboard.cloudflare_access_audience
+        if team_domain and audience:
+            # Configured Access: _read_guard/_mutation_guard have already
+            # rejected anything unverified before this point, so reaching
+            # here with Access configured means the assertion was good.
+            assertion = (request.headers.get("cf-access-jwt-assertion")
+                         or request.cookies.get("CF_Authorization"))
+            if verify_access_assertion(assertion, team_domain=team_domain, audience=audience) is not None:
+                return True, None
+        return False, "LOGIN_REQUIRED"
+
+    def _notes_auth_guard(request: Request, *, page: bool = False):
+        """The Notes surface's own boundary. `page=True` redirects a browser
+        to the login form (a human navigating); everything else answers a
+        JSON 401 so the page's own fetch() sees a parseable error instead of
+        following a redirect into HTML."""
+        if not terminal.config.notes.require_auth:
+            return None
+        authenticated, reason = _notes_authenticated(request)
+        if authenticated:
+            return None
+        if page and reason == "LOGIN_REQUIRED":
+            return RedirectResponse("/login", status_code=303)
+        status = 403 if reason == "PASSWORD_CHANGE_REQUIRED" else 401
+        return JSONResponse(
+            {"error": reason,
+             "message": ("log in at /login first -- the Notes surface requires an "
+                         "authenticated session, not just edge protection")},
+            status_code=status, headers={"Cache-Control": "no-store"})
 
     def _notes_disabled() -> JSONResponse | None:
         """notes.enabled=false in config leaves the routes REGISTERED (same
@@ -7354,6 +7442,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         disabled = _notes_disabled()
         if disabled is not None:
             return disabled
+        unauthorised = _notes_auth_guard(request)
+        if unauthorised is not None:
+            return unauthorised
         params = request.query_params
         query = (params.get("q") or "").strip()
         filters = {
@@ -7383,6 +7474,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         disabled = _notes_disabled()
         if disabled is not None:
             return disabled
+        unauthorised = _notes_auth_guard(request)
+        if unauthorised is not None:
+            return unauthorised
         return _notes_json(notes.facets)
 
     @server.custom_route("/dashboard/api/notes/note", methods=["GET"], include_in_schema=False)
@@ -7393,6 +7487,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         disabled = _notes_disabled()
         if disabled is not None:
             return disabled
+        unauthorised = _notes_auth_guard(request)
+        if unauthorised is not None:
+            return unauthorised
         note_id = request.query_params.get("id")
         if not note_id:
             return JSONResponse({"error": "INVALID_REQUEST", "message": "id is required"},
@@ -7408,6 +7505,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         disabled = _notes_disabled()
         if disabled is not None:
             return disabled
+        unauthorised = _notes_auth_guard(request)
+        if unauthorised is not None:
+            return unauthorised
         body = await _notes_body(request)
         allowed = ("title", "summary", "original_content", "analysis", "source_url",
                    "source_chat", "source_session", "type", "status", "tags",
@@ -7423,6 +7523,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         disabled = _notes_disabled()
         if disabled is not None:
             return disabled
+        unauthorised = _notes_auth_guard(request)
+        if unauthorised is not None:
+            return unauthorised
         body = await _notes_body(request)
         note_id = body.get("id") or body.get("note_id")
         if not note_id:
@@ -7445,6 +7548,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         disabled = _notes_disabled()
         if disabled is not None:
             return disabled
+        unauthorised = _notes_auth_guard(request)
+        if unauthorised is not None:
+            return unauthorised
         body = await _notes_body(request)
         note_id = body.get("id") or body.get("note_id")
         if not note_id:
@@ -7461,6 +7567,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         disabled = _notes_disabled()
         if disabled is not None:
             return disabled
+        unauthorised = _notes_auth_guard(request)
+        if unauthorised is not None:
+            return unauthorised
         body = await _notes_body(request)
         note_id = body.get("id") or body.get("note_id")
         if not note_id:
@@ -7476,6 +7585,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         disabled = _notes_disabled()
         if disabled is not None:
             return disabled
+        unauthorised = _notes_auth_guard(request)
+        if unauthorised is not None:
+            return unauthorised
         body = await _notes_body(request)
         note_id = body.get("id") or body.get("note_id")
         if not note_id:
@@ -7492,6 +7604,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         disabled = _notes_disabled()
         if disabled is not None:
             return disabled
+        unauthorised = _notes_auth_guard(request)
+        if unauthorised is not None:
+            return unauthorised
         try:
             form = await request.form()
         except Exception:  # noqa: BLE001 -- a malformed multipart body is one answer
@@ -7522,6 +7637,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         disabled = _notes_disabled()
         if disabled is not None:
             return disabled
+        unauthorised = _notes_auth_guard(request)
+        if unauthorised is not None:
+            return unauthorised
         body = await _notes_body(request)
         attachment_id = body.get("id") or body.get("attachment_id")
         if not attachment_id:
@@ -7547,6 +7665,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         disabled = _notes_disabled()
         if disabled is not None:
             return disabled
+        unauthorised = _notes_auth_guard(request)
+        if unauthorised is not None:
+            return unauthorised
         attachment_id = request.query_params.get("id")
         if not attachment_id:
             return JSONResponse({"error": "INVALID_REQUEST", "message": "id is required"},

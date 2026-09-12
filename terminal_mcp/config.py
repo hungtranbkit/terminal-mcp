@@ -253,6 +253,28 @@ class NotesConfig:
     files from exactly that subtree -- never an implicit licence to read
     anywhere the server process happens to have access to."""
     enabled: bool = True
+    # Application-layer authentication for the Notes HTTP surface (the
+    # page, its JSON API, and attachment serving). ON by default, and
+    # unlike every other gate in this file that default is a TIGHTENING of
+    # what the route would otherwise do, not a feature switch: notes hold
+    # whatever the operator chose to keep, so "reachable the socket is
+    # reachable" is the wrong posture for them even though it is the
+    # historical one for /dashboard/*.
+    #
+    # Satisfied by EITHER of the two identities this project already has
+    # (no third mechanism is introduced -- see dashboard._notes_auth_guard):
+    # a webauth session cookie (webauth.py, the /login path) or a verified
+    # Cloudflare Access assertion (cf_access.py, when
+    # dashboard.cloudflare_access_team_domain/audience are configured).
+    # Edge-only Access is explicitly NOT enough: cloudflared connects to
+    # this process over loopback, so tunnel traffic is indistinguishable
+    # from local traffic once it arrives -- exactly the gap cf_access.py's
+    # own docstring warns about.
+    #
+    # Set false only for a genuinely single-user loopback-only box where
+    # logging in is pure friction; it returns these routes to the same
+    # unauthenticated posture the rest of /dashboard/* still has.
+    require_auth: bool = True
     attachments_dir: str = ""
     max_attachment_bytes: int = 10 * 1024 * 1024
     allowed_mime_types: tuple[str, ...] = ("image/png", "image/jpeg", "image/webp", "image/gif")
@@ -932,6 +954,7 @@ def _load_notes_config(raw: object) -> NotesConfig:
             raise ValueError(f"notes.attachment_source_roots entries must be absolute paths: {root}")
     return NotesConfig(
         enabled=bool(raw.get("enabled", NotesConfig.enabled)),
+        require_auth=bool(raw.get("require_auth", NotesConfig.require_auth)),
         attachments_dir=str(raw.get("attachments_dir", NotesConfig.attachments_dir) or ""),
         max_attachment_bytes=max_bytes,
         allowed_mime_types=allowed,

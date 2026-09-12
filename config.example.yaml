@@ -165,6 +165,15 @@ supervisor:
 #
 # notes:
 #   enabled: true
+#   # Application-layer auth on /dashboard/notes and every Notes API route.
+#   # ON by default -- Cloudflare Access at the edge is NOT sufficient, because
+#   # cloudflared connects over loopback and tunnel traffic is therefore
+#   # indistinguishable from local traffic once it reaches this process.
+#   # Satisfied by a webauth session cookie (the /login path) OR a verified
+#   # Cloudflare Access assertion when dashboard.cloudflare_access_team_domain
+#   # and _audience are configured. No third mechanism exists. Set false only
+#   # for a loopback-only single-user box where logging in is pure friction.
+#   require_auth: true
 #   # Empty means "beside the notes DB" -- set it to put the (potentially
 #   # large) image directory on a different disk. Backups must cover BOTH
 #   # this directory and notes.db; see docs/notes.md.
