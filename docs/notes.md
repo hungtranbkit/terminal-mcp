@@ -384,7 +384,32 @@ print(NotesStore().reindex_all(), "notes reindexed")
 
 ## Running it
 
-Nothing extra to start: the notes surface is part of the normal server.
+Nothing extra to start *on the server side*: the notes surface is part of the
+normal server. But for the `note_*` tools to appear in **ChatGPT's** tool list,
+the tunnel that carries MCP has to be up — the endpoint is loopback-only:
+
+```bash
+terminal-mcp-doctor connection      # mcp_local vs tunnel_process/tunnel_ready
+systemctl --user start terminal-mcp-tunnel.service     # if the tunnel is down
+```
+
+A dead tunnel is the usual reason a freshly added tool family "doesn't exist"
+in the client: the server advertises it correctly, but `tools/list` never
+reaches the server and the client shows its cached list. Verify what the server
+really advertises, independently of any client:
+
+```bash
+python - <<'EOF'
+import asyncio
+from mcp import Client
+async def main():
+    async with Client('http://127.0.0.1:8766/mcp') as c:
+        tools = getattr(await c.list_tools(), 'tools', [])
+        print(sorted(t.name for t in tools if t.name.startswith('note_')))
+asyncio.run(main())
+EOF
+```
+
 
 ```bash
 # HTTP + dashboard

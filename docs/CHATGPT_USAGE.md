@@ -22,13 +22,39 @@ only, nothing to call yet. Never treat a PLANNED item as available.
 
 ## 1. Quick start
 
-- The production control plane is `terminal-mcp-http.service` (a
-  user-scoped systemd unit — `systemctl --user status
-  terminal-mcp-http.service`, not a system-wide one), serving the MCP
-  endpoint at `http://127.0.0.1:8766/mcp` and the dashboard at
+- The production control plane serves the MCP endpoint at
+  `http://127.0.0.1:8766/mcp` and the dashboard at
   `http://127.0.0.1:8766/dashboard` (both loopback-only; a real
   deployment fronts this with an authenticated tunnel/Cloudflare Access
-  — see `docs/REQUIREMENTS.md` §16 for exact config keys).
+  — see `docs/REQUIREMENTS.md` §16 for exact config keys). **Which unit
+  serves it depends on the host**, and getting this wrong sends you
+  debugging a process that is not running:
+    - `terminal-mcp-fed-controller.service` — the self-hosted/federated
+      layout (dell-linux today). Its code authority is a worktree pinned
+      by `PYTHONPATH=`, and its state lives under a separate
+      `XDG_STATE_HOME`, so `/version` is the only reliable way to tell
+      which commit is actually answering.
+    - `terminal-mcp-http.service` — the original layout. On a
+      fed-controller host this unit is **retired**: it is kept as a
+      rollback point but must never start, because it would race the
+      real controller for `127.0.0.1:8766` and crash-loop on
+      `EADDRINUSE`.
+  `systemctl --user list-units 'terminal-mcp*'` tells you which one is
+  live; `curl -s localhost:8766/version` proves what it is running.
+
+- **If your MCP client shows no tools at all (or a stale list missing
+  recently-added ones), the server is almost certainly fine and the
+  TUNNEL is down.** The endpoint above is loopback-only; ChatGPT reaches
+  it through `terminal-mcp-tunnel.service` (the OpenAI Secure MCP
+  Tunnel, profile `terminal-mcp`, targeting `http://127.0.0.1:8766/mcp`).
+  If that unit is dead, `tools/list` never reaches this server and the
+  client falls back to whatever it cached — which is exactly how a newly
+  added tool family appears to "not exist". Diagnose with
+  `terminal-mcp-doctor connection`: it distinguishes `mcp_local`
+  (the server itself) from `tunnel_process`/`tunnel_ready` (the path to
+  ChatGPT) and prints the exact remediation. `tunnel_ready: unknown` in
+  the first ~30s after a restart is normal — it means "no successful
+  control-plane poll yet", not a fault.
 - `config.yaml` gates most of what you can do: `permissions.
   terminal_read`/`terminal_input` (read/send at all), `session_
   lifecycle.enabled` (create/kill/reopen/rename), `supervisor.enabled`/
