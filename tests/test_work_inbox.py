@@ -234,3 +234,140 @@ def test_summary_reports_real_counts(service):
     assert summary["counts"][wi.PLANNING] == 1
     assert summary["planning_active"] == 1
     assert summary["claimed_by"] == ["planner-1"]
+
+
+# -- the bridge into the execution queue (pipeline) ---------------------------
+
+class _FakeQueue:
+    """Stands in for QueueService: records enqueues, honours request_key."""
+
+    def __init__(self):
+        self.calls = []
+        self._by_key = {}
+
+    def enqueue(self, session, prompt, *, title=None, priority=0, metadata=None,
+                request_key=None):
+        if request_key and request_key in self._by_key:
+            return {"status": "TASK_ACCEPTED", "task_id": self._by_key[request_key],
+                    "session": session, "deduplicated": True}
+        task_id = f"task_{len(self.calls)}"
+        if request_key:
+            self._by_key[request_key] = task_id
+        self.calls.append({"session": session, "prompt": prompt, "title": title,
+                           "priority": priority, "metadata": metadata or {},
+                           "request_key": request_key})
+        return {"status": "TASK_ACCEPTED", "task_id": task_id, "session": session,
+                "deduplicated": False}
+
+
+def test_a_ready_issue_becomes_a_real_queue_task(service):
+    from terminal_mcp.work_inbox import promote_to_queue
+
+    issue_id = service.capture("- do the thing\n")["issues"][0]["issue_id"]
+    service.transition(issue_id, wi.READY)
+    queue = _FakeQueue()
+    result = promote_to_queue(service, issue_id, session="demo-work", queue=queue)
+    assert result["status"] == "PROMOTED"
+    # On a real lane, not the unassigned backlog where tasks sit forever.
+    assert queue.calls[0]["session"] == "demo-work"
+    assert service.store.get(issue_id).state == wi.EXECUTING
+    assert service.store.get(issue_id).queue_task_id == result["task_id"]
+
+
+def test_the_issue_id_is_the_request_key(service):
+    from terminal_mcp.work_inbox import promote_to_queue
+
+    issue_id = service.capture("- do the thing\n")["issues"][0]["issue_id"]
+    service.transition(issue_id, wi.READY)
+    queue = _FakeQueue()
+    promote_to_queue(service, issue_id, session="demo-work", queue=queue)
+    assert queue.calls[0]["request_key"] == f"issue:{issue_id}"
+
+
+def test_promoting_twice_returns_the_same_task(service):
+    from terminal_mcp.work_inbox import promote_to_queue
+
+    issue_id = service.capture("- do the thing\n")["issues"][0]["issue_id"]
+    service.transition(issue_id, wi.READY)
+    queue = _FakeQueue()
+    first = promote_to_queue(service, issue_id, session="demo-work", queue=queue)
+    second = promote_to_queue(service, issue_id, session="demo-work", queue=queue)
+    assert second["status"] == "ALREADY_PROMOTED"
+    assert second["task_id"] == first["task_id"]
+    assert len(queue.calls) == 1          # no second task was created
+
+
+def test_a_finished_issue_is_not_promoted(service):
+    from terminal_mcp.work_inbox import promote_to_queue
+
+    issue_id = service.capture("- x\n")["issues"][0]["issue_id"]
+    service.transition(issue_id, wi.DONE)
+    queue = _FakeQueue()
+    assert promote_to_queue(service, issue_id, session="demo-work",
+                            queue=queue)["error"] == "ISSUE_TERMINAL"
+    assert queue.calls == []
+
+
+def test_a_failed_enqueue_leaves_the_issue_untouched(service):
+    from terminal_mcp.work_inbox import promote_to_queue
+
+    class _Refusing:
+        def enqueue(self, *a, **k):
+            return {"error": "LANE_NOT_A_WORK_SESSION"}
+
+    issue_id = service.capture("- x\n")["issues"][0]["issue_id"]
+    service.transition(issue_id, wi.READY)
+    result = promote_to_queue(service, issue_id, session="m1", queue=_Refusing())
+    assert result["error"] == "ENQUEUE_FAILED"
+    # Not silently marked EXECUTING when nothing was queued.
+    assert service.store.get(issue_id).state == wi.READY
+    assert service.store.get(issue_id).queue_task_id is None
+
+
+class _FakeQueueStore:
+    def __init__(self, statuses):
+        self.statuses = statuses
+
+    def get_task(self, task_id):
+        status = self.statuses.get(task_id)
+        if status is None:
+            return None
+        return type("T", (), {"status": status})()
+
+
+def test_issue_state_follows_the_queue(service):
+    from terminal_mcp.work_inbox import promote_to_queue, sync_from_queue
+
+    issue_id = service.capture("- x\n")["issues"][0]["issue_id"]
+    service.transition(issue_id, wi.READY)
+    queue = _FakeQueue()
+    task_id = promote_to_queue(service, issue_id, session="demo-work",
+                               queue=queue)["task_id"]
+    moved = sync_from_queue(service, queue_store=_FakeQueueStore({task_id: "COMPLETED"}))
+    assert moved and moved[0]["state"] == wi.DONE
+    assert service.store.get(issue_id).state == wi.DONE
+
+
+def test_a_failed_task_marks_the_issue_failed_not_lost(service):
+    from terminal_mcp.work_inbox import promote_to_queue, sync_from_queue
+
+    issue_id = service.capture("- x\n")["issues"][0]["issue_id"]
+    service.transition(issue_id, wi.READY)
+    queue = _FakeQueue()
+    task_id = promote_to_queue(service, issue_id, session="demo-work",
+                               queue=queue)["task_id"]
+    sync_from_queue(service, queue_store=_FakeQueueStore({task_id: "FAILED"}))
+    # Visible and retriable, never silently dropped.
+    assert service.store.get(issue_id).state == wi.FAILED
+
+
+def test_a_still_running_task_does_not_move_the_issue(service):
+    from terminal_mcp.work_inbox import promote_to_queue, sync_from_queue
+
+    issue_id = service.capture("- x\n")["issues"][0]["issue_id"]
+    service.transition(issue_id, wi.READY)
+    queue = _FakeQueue()
+    task_id = promote_to_queue(service, issue_id, session="demo-work",
+                               queue=queue)["task_id"]
+    assert sync_from_queue(service, queue_store=_FakeQueueStore({task_id: "RUNNING"})) == []
+    assert service.store.get(issue_id).state == wi.EXECUTING

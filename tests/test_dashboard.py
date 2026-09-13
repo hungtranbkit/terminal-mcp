@@ -1561,6 +1561,12 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/procedures": {"GET", "HEAD"},
         "/dashboard/api/policy": {"GET", "HEAD"},
         "/dashboard/api/telemetry": {"GET", "HEAD"},
+        # Rapid Capture Inbox. The read is _read_guard'ed like every other GET;
+        # capture and bulk-priority are _mutation_guard'ed writes, because they
+        # create and reprioritise durable issue records.
+        "/dashboard/api/inbox": {"GET", "HEAD"},
+        "/dashboard/api/inbox/capture": {"POST"},
+        "/dashboard/api/inbox/priority": {"POST"},
         # Fleet Metadata Registry -- a later, separate feature. Three reads
         # and exactly one write, and the write only touches METADATA: there is
         # no path from any of these to starting, stopping or typing into a

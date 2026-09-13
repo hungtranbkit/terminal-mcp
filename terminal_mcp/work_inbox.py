@@ -625,3 +625,81 @@ class InboxService:
             "planner_concurrency": self.planner_concurrency,
             "claimed_by": sorted({issue.claimed_by for issue in active if issue.claimed_by}),
         }
+
+
+# -- the bridge into the execution queue --------------------------------------
+
+def promote_to_queue(service: "InboxService", issue_id: str, *, session: str,
+                     queue: Any, actor: str = "pool",
+                     prompt: str | None = None) -> dict[str, Any]:
+    """Turn a planned issue into a real queue task on a real lane.
+
+    This is the join between the two halves of Work mode. Without it an issue
+    could reach READY and simply stop: the inbox had nowhere to hand it, and a
+    task created with no lane sat in the unassigned backlog indefinitely --
+    persisted, visible, and never executed by anyone.
+
+    The queue keeps ownership of execution. This creates a task through the
+    SAME QueueService a dashboard or ChatGPT submission uses, so the gate,
+    guarded send, dispatch idempotency and restart recovery are the ones
+    already in production rather than a second path that would drift.
+
+    The issue id IS the request key. A retry -- a double click, a reconnect, a
+    planner that runs twice -- therefore returns the task already created for
+    that issue instead of a second one.
+    """
+    issue = service.store.get(issue_id)
+    if issue is None:
+        return {"error": "ISSUE_NOT_FOUND", "issue_id": issue_id}
+    if issue.state in TERMINAL_STATES:
+        return {"error": "ISSUE_TERMINAL", "issue_id": issue_id, "state": issue.state}
+    if issue.queue_task_id:
+        # Already promoted. Report the existing task rather than making another.
+        return {"status": "ALREADY_PROMOTED", "issue_id": issue_id,
+                "task_id": issue.queue_task_id, "state": issue.state}
+
+    body = prompt or issue.raw_text
+    accepted = queue.enqueue(session, body, title=issue.short_title,
+                             priority=issue.priority,
+                             metadata={"issue_id": issue_id,
+                                       "rough_type": issue.rough_type,
+                                       "difficulty": issue.rough_difficulty},
+                             request_key=f"issue:{issue_id}")
+    if accepted.get("error"):
+        return {"error": "ENQUEUE_FAILED", "issue_id": issue_id, "detail": accepted}
+
+    task_id = accepted["task_id"]
+    issue = service.store.get(issue_id)
+    issue.queue_task_id = task_id
+    issue.state = EXECUTING
+    service.store._write(issue)
+    service.store.record_event(issue_id, kind="promoted", to_state=EXECUTING, actor=actor,
+                               detail=f"queue task {task_id} on lane {session}")
+    return {"status": "PROMOTED", "issue_id": issue_id, "task_id": task_id,
+            "session": session, "deduplicated": accepted.get("deduplicated", False)}
+
+
+def sync_from_queue(service: "InboxService", *, queue_store: Any,
+                    actor: str = "pool") -> list[dict[str, Any]]:
+    """Move issues forward to match what their queue tasks actually did.
+
+    The queue is the authority on execution, so this reads its state rather
+    than tracking the same thing twice. An issue whose task finished becomes
+    DONE; one whose task failed becomes FAILED and stays visible for retry.
+    """
+    moved: list[dict[str, Any]] = []
+    for issue in service.store.list_issues(state=EXECUTING, limit=500):
+        if not issue.queue_task_id:
+            continue
+        task = queue_store.get_task(issue.queue_task_id)
+        if task is None:
+            continue
+        target = {"COMPLETED": DONE, "FAILED": FAILED, "CANCELLED": CANCELLED,
+                  "BLOCKED": BLOCKED}.get(task.status)
+        if target is None:
+            continue
+        service.transition(issue.issue_id, target, actor=actor,
+                           detail=f"queue task {issue.queue_task_id} is {task.status}")
+        moved.append({"issue_id": issue.issue_id, "state": target,
+                      "task_id": issue.queue_task_id})
+    return moved

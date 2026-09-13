@@ -7852,6 +7852,21 @@ WORK_HTML = r"""<!doctype html>
         <div id="works"></div>
         <h2>Workers</h2>
         <div id="workers"></div>
+        <h2>Inbox <span class="muted" id="inMeta"></span></h2>
+        <div class="row">
+          <textarea id="inCapture" rows="3"
+                    placeholder="Dán nhiều issue một lúc, mỗi dòng một gạch đầu dòng…"></textarea>
+        </div>
+        <div class="row">
+          <input id="inProject" placeholder="project (tuỳ chọn)">
+          <button class="btn small primary" id="inCaptureBtn" type="button">Ghi nhận</button>
+          <select id="inFilter" aria-label="Lọc theo trạng thái">
+            <option value="">tất cả trạng thái</option>
+          </select>
+          <button class="btn small" id="inRefreshBtn" type="button">Làm mới</button>
+          <span class="muted" id="inMsg"></span>
+        </div>
+        <div id="inbox"></div>
         <h2>Knowledge <span class="muted" id="kMeta"></span></h2>
         <div class="row">
           <input id="kQuery" placeholder="tìm trong knowledge map…">
@@ -8333,6 +8348,99 @@ WORK_HTML = r"""<!doctype html>
       return await response.json();
     }
 
+    const INBOX_STATE_CLASS = {
+      NEW: 'warn', TRIAGED: 'warn', PLANNING: 'ok', NEEDS_USER_HINT: 'bad',
+      NEEDS_REDEFINE: 'bad', READY: 'ok', EXECUTING: 'ok', PREVIEW_READY: 'ok',
+      VERIFYING: 'ok', DONE: 'ok', FAILED: 'bad', BLOCKED: 'bad',
+      REWORK: 'warn', DUPLICATE: 'muted', CANCELLED: 'muted',
+    };
+
+    async function loadInbox() {
+      const box = $('#inbox');
+      try {
+        const filter = $('#inFilter').value;
+        const data = await getJSON('/dashboard/api/inbox'
+          + (filter ? '?state=' + encodeURIComponent(filter) : ''));
+        if (data.error) { muted(box, data.detail || data.error); return; }
+        const summary = data.summary || {};
+        const counts = summary.counts || {};
+        // Counts come from the persisted issue store. A count taken from a
+        // transport queue is what made this screen read zero while work was
+        // actually in flight.
+        $('#inMeta').textContent = (summary.total || 0) + ' issue · '
+          + Object.keys(counts).map((k) => k + ' ' + counts[k]).join(' · ')
+          + ' · planner ' + (summary.planning_active || 0)
+          + '/' + (summary.planner_concurrency || 0);
+
+        const select = $('#inFilter');
+        if (select.options.length <= 1) {
+          Object.keys(INBOX_STATE_CLASS).forEach((state) => {
+            const option = document.createElement('option');
+            option.value = state; option.textContent = state;
+            select.append(option);
+          });
+          select.value = filter;
+        }
+
+        const issues = data.issues || [];
+        if (!issues.length) { muted(box, 'Chưa có issue nào.'); return; }
+        replace(box, issues.map((issue) => {
+          const row = el('div', {className: 'row'});
+          row.append(pill(issue.state, INBOX_STATE_CLASS[issue.state] || 'muted'));
+          row.append(el('b', {text: issue.title}));
+          const meta = [issue.project, issue.module, issue.type,
+                        'difficulty ' + issue.difficulty,
+                        'p' + issue.priority].filter(Boolean).join(' · ');
+          row.append(el('span', {className: 'muted', text: meta}));
+          if (issue.claimed_by) row.append(pill('planner ' + issue.claimed_by, 'ok'));
+          if (issue.queue_task_id) {
+            row.append(pill('task ' + issue.queue_task_id.slice(0, 8), 'ok'));
+          }
+          if (issue.duplicate_of) {
+            row.append(pill('dup of ' + issue.duplicate_of.slice(0, 10), 'muted'));
+          }
+          if ((issue.questions || []).length) {
+            row.append(el('br'));
+            row.append(el('span', {className: 'muted',
+                                   text: 'hỏi developer: ' + issue.questions.join(' | ')}));
+          }
+          row.append(el('br'));
+          row.append(el('span', {className: 'muted',
+                                 text: issue.issue_id + ' · cập nhật ' + ago(issue.updated_at)}));
+          return row;
+        }));
+      } catch (err) {
+        muted(box, 'lỗi tải inbox: ' + err.message);
+      }
+    }
+
+    async function captureIssues() {
+      const text = $('#inCapture').value;
+      if (!text.trim()) { $('#inMsg').textContent = 'Chưa có nội dung'; return; }
+      $('#inMsg').textContent = 'đang ghi nhận…';
+      try {
+        const response = await fetch('/dashboard/api/inbox/capture', {
+          method: 'POST', credentials: 'same-origin',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({text: text, project: $('#inProject').value.trim() || null}),
+        });
+        const data = await response.json();
+        if (data.error) { $('#inMsg').textContent = 'lỗi: ' + data.error; return; }
+        // Only clear the box once the server has confirmed the write, so a
+        // failed capture never looks like it succeeded.
+        $('#inCapture').value = '';
+        $('#inMsg').textContent = data.captured + ' issue · ' + data.new + ' mới · '
+          + data.duplicates + ' trùng';
+        loadInbox();
+      } catch (err) {
+        $('#inMsg').textContent = 'lỗi: ' + err.message;
+      }
+    }
+
+    $('#inCaptureBtn').onclick = () => captureIssues();
+    $('#inRefreshBtn').onclick = () => loadInbox();
+    $('#inFilter').onchange = () => loadInbox();
+
     async function loadKnowledge(query) {
       const box = $('#knowledge');
       try {
@@ -8498,6 +8606,7 @@ WORK_HTML = r"""<!doctype html>
 
     function loadContext() {
       loadPolicy();
+      loadInbox();
       loadKnowledge('');
       loadProcedures();
       loadTelemetry();
@@ -10860,6 +10969,112 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         except Exception as exc:  # noqa: BLE001
             payload = {"workers": [], "error": "WORKERS_READ_FAILED", "detail": str(exc)}
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    def _inbox_service():
+        from .work_inbox import InboxService, InboxStore
+
+        if "inbox" not in _work_holder:
+            _work_holder["inbox"] = InboxService(InboxStore())
+        return _work_holder["inbox"]
+
+    @server.custom_route("/dashboard/api/inbox", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_inbox(request: Request) -> JSONResponse:
+        """Captured issues and their state counts.
+
+        Counts come from the persisted issue store, never from a Claude
+        prompt buffer -- a queue that only exists in a transport is exactly
+        what made the Tasks modal read zero while work was in flight.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        state = request.query_params.get("state") or ""
+        project = request.query_params.get("project") or ""
+        try:
+            limit = max(1, min(int(request.query_params.get("limit") or 100), 300))
+        except ValueError:
+            limit = 100
+
+        def _build() -> dict[str, Any]:
+            service = _inbox_service()
+            issues = service.store.list_issues(state=state or None,
+                                               project=project or None, limit=limit)
+            return {"summary": service.summary(),
+                    "issues": [{"issue_id": i.issue_id, "title": i.short_title,
+                                "state": i.state, "type": i.rough_type,
+                                "difficulty": i.rough_difficulty, "priority": i.priority,
+                                "project": i.project, "module": i.likely_module,
+                                "duplicate_of": i.duplicate_of, "claimed_by": i.claimed_by,
+                                "queue_task_id": i.queue_task_id,
+                                "questions": list(i.questions),
+                                "human_hints": list(i.human_hints),
+                                "created_at": i.created_at, "updated_at": i.updated_at}
+                               for i in issues]}
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001 -- a status screen never 5xxs
+            payload = {"error": "INBOX_READ_FAILED", "detail": str(exc),
+                       "issues": [], "summary": {}}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/inbox/capture", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_inbox_capture(request: Request) -> JSONResponse:
+        """Capture a pasted batch as persisted issues. Mutation-guarded."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        text = str(body.get("text") or "")
+        if not text.strip():
+            return JSONResponse({"error": "TEXT_REQUIRED"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        try:
+            priority = int(body.get("priority") or 0)
+        except (TypeError, ValueError):
+            priority = 0
+        result = await anyio.to_thread.run_sync(lambda: _inbox_service().capture(
+            text, project=body.get("project") or None, priority=priority,
+            source="dashboard", actor=(identity.email if identity else None)))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/inbox/priority", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_inbox_priority(request: Request) -> JSONResponse:
+        """Bulk priority change over selected issues."""
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        ids = [str(i) for i in (body.get("issue_ids") or []) if str(i).strip()]
+        if not ids:
+            return JSONResponse({"error": "ISSUE_IDS_REQUIRED"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        try:
+            priority = int(body.get("priority"))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "PRIORITY_REQUIRED"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+
+        def _apply() -> dict[str, Any]:
+            service = _inbox_service()
+            changed = []
+            for issue_id in ids:
+                issue = service.store.get(issue_id)
+                if issue is None:
+                    continue
+                issue.priority = priority
+                service.store._write(issue)
+                service.store.record_event(issue_id, kind="priority",
+                                           detail=f"priority -> {priority}")
+                changed.append(issue_id)
+            return {"changed": changed, "priority": priority}
+
+        return JSONResponse(await anyio.to_thread.run_sync(_apply),
+                            headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/knowledge", methods=["GET"],
                          include_in_schema=False)
