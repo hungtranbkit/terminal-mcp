@@ -1552,6 +1552,15 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/work/continue": {"POST"},
         "/dashboard/api/work/control": {"POST"},
         "/dashboard/api/work/approve": {"POST"},
+        # Project Knowledge, runbook registry, Work Policy and telemetry --
+        # a later, separate feature. All four are READS: they render status
+        # panels on the Work page. None can index the map, run a procedure,
+        # edit the policy or write telemetry, so none is a control surface
+        # wearing a panel's clothes.
+        "/dashboard/api/knowledge": {"GET", "HEAD"},
+        "/dashboard/api/procedures": {"GET", "HEAD"},
+        "/dashboard/api/policy": {"GET", "HEAD"},
+        "/dashboard/api/telemetry": {"GET", "HEAD"},
         # Fleet Metadata Registry -- a later, separate feature. Three reads
         # and exactly one write, and the write only touches METADATA: there is
         # no path from any of these to starting, stopping or typing into a

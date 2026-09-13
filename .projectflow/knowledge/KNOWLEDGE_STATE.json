@@ -1,0 +1,90 @@
+{
+  "last_indexed_at": "2026-09-13T12:25:19.316669+00:00",
+  "last_indexed_commit": "6d7d8d186c7ff9be4e8366ecea7b72be24f92a02",
+  "modules": {
+    "fleet": {
+      "last_verified_at": "2026-09-13T12:09:05.525477+00:00",
+      "last_verified_commit": "6d7d8d186c7ff9be4e8366ecea7b72be24f92a02",
+      "paths": [
+        "terminal_mcp/fleet_registry.py",
+        "terminal_mcp/terminal_wall.py"
+      ],
+      "summary": "Fleet metadata sync and the Terminal Wall snapshot builder. Secrets are refused, never replicated; RUNNING requires a witnessed output change."
+    },
+    "knowledge": {
+      "last_verified_at": "2026-09-13T12:09:05.506822+00:00",
+      "last_verified_commit": "6d7d8d186c7ff9be4e8366ecea7b72be24f92a02",
+      "paths": [
+        "terminal_mcp/project_knowledge.py",
+        "terminal_mcp/context_pack.py"
+      ],
+      "summary": "The persistent knowledge map and module context packs. The map is a map; current code and git are the source of truth."
+    },
+    "planner": {
+      "last_verified_at": "2026-09-13T12:09:05.511477+00:00",
+      "last_verified_commit": "6d7d8d186c7ff9be4e8366ecea7b72be24f92a02",
+      "paths": [
+        "terminal_mcp/bug_spec.py",
+        "terminal_mcp/task_classifier.py"
+      ],
+      "summary": "Bug Planner to Executor contract: spec levels, completeness gate, difficulty triage, developer assist, budgets, and the FAST_FIX/NORMAL/SAFE classifier."
+    },
+    "policy": {
+      "last_verified_at": "2026-09-13T12:09:05.520834+00:00",
+      "last_verified_commit": "6d7d8d186c7ff9be4e8366ecea7b72be24f92a02",
+      "paths": [
+        "terminal_mcp/work_policy.py",
+        ".projectflow/policies"
+      ],
+      "summary": "Canonical Work Policy, its loader, subset loading and execution bindings."
+    },
+    "procedures": {
+      "last_verified_at": "2026-09-13T12:09:05.516176+00:00",
+      "last_verified_commit": "6d7d8d186c7ff9be4e8366ecea7b72be24f92a02",
+      "paths": [
+        "terminal_mcp/procedures.py",
+        "scripts/agent"
+      ],
+      "summary": "Runbook registry. Metadata plus a link, never a script body. Green results are cached by dependency fingerprint."
+    },
+    "queue": {
+      "last_verified_at": "2026-09-13T12:09:05.502122+00:00",
+      "last_verified_commit": "6d7d8d186c7ff9be4e8366ecea7b72be24f92a02",
+      "paths": [
+        "terminal_mcp/queue_engine.py",
+        "terminal_mcp/queue_store.py"
+      ],
+      "summary": "Task queue and its state machine. RUNNING never goes straight to COMPLETED; it passes VERIFYING. Completion evidence is read after the instruction sentence."
+    },
+    "security": {
+      "last_verified_at": "2026-09-13T12:09:05.530209+00:00",
+      "last_verified_commit": "6d7d8d186c7ff9be4e8366ecea7b72be24f92a02",
+      "paths": [
+        "terminal_mcp/access_policy.py",
+        "terminal_mcp/redaction.py"
+      ],
+      "summary": "Three-tier read policy and output redaction before any payload leaves."
+    },
+    "work_runtime": {
+      "last_verified_at": "2026-09-13T12:09:05.492722+00:00",
+      "last_verified_commit": "6d7d8d186c7ff9be4e8366ecea7b72be24f92a02",
+      "paths": [
+        "terminal_mcp/work_store.py",
+        "terminal_mcp/work_service.py",
+        "terminal_mcp/work_loop.py",
+        "terminal_mcp/work_eligibility.py"
+      ],
+      "summary": "Work runs, approvals, progress and the coordinator tick. Lanes are opt-in via the '-work' session suffix, decided in work_eligibility."
+    },
+    "work_ui": {
+      "last_verified_at": "2026-09-13T12:09:05.497470+00:00",
+      "last_verified_commit": "6d7d8d186c7ff9be4e8366ecea7b72be24f92a02",
+      "paths": [
+        "terminal_mcp/dashboard.py"
+      ],
+      "summary": "Server-rendered dashboard templates: Terminal Wall, Fleet, Audit, Work. Each template is a separate HTML constant in one module."
+    }
+  },
+  "schema_version": 1,
+  "topics": {}
+}

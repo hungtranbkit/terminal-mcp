@@ -7773,6 +7773,9 @@ WORK_HTML = r"""<!doctype html>
     .row:first-of-type { border-top:0 }
     .grow { flex:1; min-width:0 }
     .ellip { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12.5px }
+    input, select { width:100%; background:#0c1222; border:1px solid var(--line);
+                    color:var(--text); border-radius:9px; padding:9px 10px;
+                    font:13px var(--mono); margin-bottom:7px; min-height:40px }
     textarea { width:100%; background:#0c1222; border:1px solid var(--line); color:var(--text);
                border-radius:10px; padding:10px; font:14px var(--mono); min-height:86px }
     .unmet { font-size:11.5px; color:var(--amber); margin-top:6px; line-height:1.6 }
@@ -7814,6 +7817,7 @@ WORK_HTML = r"""<!doctype html>
     <span class="muted" id="status">đang tải…</span>
     <span class="spacer"></span>
     <button class="btn small" id="liveBtn" type="button" aria-pressed="true">⏸ Tạm dừng</button>
+    <span class="muted" id="policyBadge" title="Work Policy đang áp dụng">policy …</span>
     <button class="btn small" id="refreshBtn" type="button">Làm mới</button>
     <a class="btn small" href="/dashboard/work">🧩 Work</a>
     <a class="btn small" href="/dashboard">🖥 Terminal</a>
@@ -7822,9 +7826,43 @@ WORK_HTML = r"""<!doctype html>
     <div class="cols">
       <section id="list">
         <h2>Work runs</h2>
+        <button class="btn small primary" id="newBtn" type="button">＋ Work mới</button>
+        <div class="card" id="createCard" hidden>
+          <h2>Tạo Work</h2>
+          <input id="cProject" placeholder="project / repo (tuỳ chọn)">
+          <input id="cLane" placeholder="worker session (phải kết thúc -work)" list="laneList">
+          <datalist id="laneList"></datalist>
+          <input id="cTitle" placeholder="Tiêu đề">
+          <textarea id="cPrompt" placeholder="Task đầu tiên: mô tả việc cần làm…"></textarea>
+          <div class="row">
+            <select id="cMode" aria-label="Mode">
+              <option value="NORMAL">NORMAL</option>
+              <option value="FAST_FIX">⚡ FAST_FIX</option>
+              <option value="SAFE">🔒 SAFE</option>
+            </select>
+            <input id="cPriority" type="number" value="0" aria-label="Priority" style="width:88px">
+            <input id="cModule" placeholder="module (tuỳ chọn)">
+          </div>
+          <div class="row">
+            <button class="btn primary" id="cSubmit" type="button">Tạo Work</button>
+            <button class="btn small" id="cCancel" type="button">Huỷ</button>
+            <span class="muted" id="cMsg"></span>
+          </div>
+        </div>
         <div id="works"></div>
         <h2>Workers</h2>
         <div id="workers"></div>
+        <h2>Knowledge <span class="muted" id="kMeta"></span></h2>
+        <div class="row">
+          <input id="kQuery" placeholder="tìm trong knowledge map…">
+          <button class="btn small" id="kSearchBtn" type="button">Tìm</button>
+          <button class="btn small" id="kRefreshBtn" type="button">Làm mới</button>
+        </div>
+        <div id="knowledge"></div>
+        <h2>Runbooks</h2>
+        <div id="procedures"></div>
+        <h2>Telemetry <span class="muted" id="tMeta"></span></h2>
+        <div id="telemetry"></div>
       </section>
       <section id="detail"></section>
     </div>
@@ -8192,6 +8230,13 @@ WORK_HTML = r"""<!doctype html>
         state.detail = state.selected
           ? await api('/dashboard/api/work?work=' + encodeURIComponent(state.selected))
           : null;
+        const lanes = $('#laneList');
+        lanes.replaceChildren();
+        for (const worker of state.workers) {
+          const option = document.createElement('option');
+          option.value = worker.session;
+          lanes.appendChild(option);
+        }
         renderList();
         renderWorkers();
         renderDetail();
@@ -8210,6 +8255,260 @@ WORK_HTML = r"""<!doctype html>
     }
 
     $('#refreshBtn').onclick = () => load();
+    // -- create ------------------------------------------------------------
+
+    function setCreateVisible(visible) {
+      $('#createCard').hidden = !visible;
+      $('#newBtn').hidden = visible;
+      if (visible) $('#cTitle').focus();
+    }
+
+    $('#newBtn').onclick = () => setCreateVisible(true);
+    $('#cCancel').onclick = () => { setCreateVisible(false); $('#cMsg').textContent = ''; };
+    $('#cSubmit').onclick = async () => {
+      const lane = $('#cLane').value.trim();
+      const title = $('#cTitle').value.trim();
+      const prompt = $('#cPrompt').value.trim();
+      if (!lane || !title || !prompt) {
+        $('#cMsg').textContent = 'Cần worker session, tiêu đề và task.';
+        return;
+      }
+      // Checked here too so the operator gets the rule immediately rather
+      // than a round-trip; the server refuses it regardless.
+      if (!/-work$/.test(lane)) {
+        $('#cMsg').textContent = 'Session phải kết thúc bằng -work. Session thường '
+          + 'không bao giờ được Work Runtime điều khiển.';
+        return;
+      }
+      $('#cSubmit').disabled = true;
+      $('#cMsg').textContent = 'đang tạo…';
+      const result = await api('/dashboard/api/work/create', {
+        title: title, goal: $('#cPrompt').value.trim(), lane: lane,
+        project_id: $('#cProject').value.trim() || null,
+        tasks: [{title: title, prompt: prompt,
+                 priority: Number($('#cPriority').value || 0),
+                 metadata: {mode: $('#cMode').value,
+                            module: $('#cModule').value.trim() || null}}]});
+      $('#cSubmit').disabled = false;
+      if (result.error) {
+        $('#cMsg').textContent = result.error + (result.detail ? ' — ' + result.detail : '');
+        return;
+      }
+      // Select the new run so it is visible immediately with its real state,
+      // rather than leaving the operator to find it in the list.
+      state.selected = result.work.work_id;
+      $('#cMsg').textContent = '';
+      $('#cTitle').value = ''; $('#cPrompt').value = '';
+      setCreateVisible(false);
+      load();
+    };
+
+    // -- knowledge, runbooks, policy, telemetry ----------------------------
+    // Loaded on open and on demand, NOT on the 6s work poll: these move at the
+    // speed of commits, and re-fetching them every six seconds would spend
+    // real work to re-render an unchanged panel.
+    //
+    // Built with el()/textContent like the rest of this page. Everything here
+    // is text read off disk -- module summaries, runbook commands, git
+    // reasons -- so it is never interpolated into markup.
+
+    function confidenceClass(level) {
+      return level === 'HIGH' ? 'ok' : level === 'MEDIUM' ? 'warn' : 'bad';
+    }
+
+    function pill(text, cls) {
+      return el('span', {className: 'pill ' + cls, text: text});
+    }
+
+    function replace(box, nodes) {
+      box.replaceChildren.apply(box, nodes);
+    }
+
+    function muted(box, text) {
+      replace(box, [el('p', {className: 'muted', text: text})]);
+    }
+
+    async function getJSON(url) {
+      const response = await fetch(url, {credentials: 'same-origin'});
+      return await response.json();
+    }
+
+    async function loadKnowledge(query) {
+      const box = $('#knowledge');
+      try {
+        const data = await getJSON(query
+          ? '/dashboard/api/knowledge?action=search&q=' + encodeURIComponent(query)
+          : '/dashboard/api/knowledge');
+        if (data.error === 'NO_KNOWLEDGE_MAP' || data.error === 'NOT_A_GIT_REPOSITORY') {
+          $('#kMeta').textContent = '';
+          muted(box, 'Chưa có knowledge map cho project này.');
+          return;
+        }
+        if (data.error) throw new Error(data.detail || data.error);
+
+        if (query) {
+          const hits = data.matches || [];
+          $('#kMeta').textContent = hits.length + ' kết quả cho "' + query + '"';
+          if (!hits.length) {
+            // The map is a map: absence here is not absence in the code.
+            muted(box, 'Không có kết quả trong knowledge map. Không thấy ở đây '
+                     + 'không có nghĩa là không có trong code.');
+            return;
+          }
+          replace(box, hits.map((hit) => {
+            const row = el('div', {className: 'row'});
+            row.append(el('code', {text: hit.document + ':' + hit.line}));
+            if (hit.heading) row.append(el('span', {className: 'muted', text: hit.heading}));
+            row.append(el('span', {text: hit.text}));
+            return row;
+          }));
+          return;
+        }
+
+        const modules = data.modules || [];
+        const stale = modules.filter((m) => m.confidence === 'LOW').length;
+        $('#kMeta').textContent = modules.length + ' module'
+          + (data.last_indexed_commit
+              ? ' · indexed ' + String(data.last_indexed_commit).slice(0, 8) : '')
+          + (stale ? ' · ' + stale + ' cần kiểm tra lại' : '');
+        if (!modules.length) { muted(box, 'Chưa index module nào.'); return; }
+        replace(box, modules.map((module) => {
+          const row = el('div', {className: 'row'});
+          row.append(el('b', {text: module.name}));
+          row.append(pill(module.confidence, confidenceClass(module.confidence)));
+          // The REASON travels with the badge: a bare label tells a reader
+          // what to feel, the reason tells them what to do next.
+          if (module.confidence_reason) {
+            row.append(el('span', {className: 'muted', text: module.confidence_reason}));
+          }
+          if (module.summary) {
+            row.append(el('br'));
+            row.append(el('span', {className: 'muted', text: module.summary}));
+          }
+          return row;
+        }));
+      } catch (err) {
+        muted(box, 'lỗi tải knowledge: ' + err.message);
+      }
+    }
+
+    async function loadProcedures() {
+      const box = $('#procedures');
+      try {
+        const data = await getJSON('/dashboard/api/procedures');
+        if (data.error) { muted(box, data.detail || data.error); return; }
+        const rows = data.procedures || [];
+        const auto = data.auto_invokable_risk || [];
+        if (!rows.length) { muted(box, 'Chưa đăng ký runbook nào.'); return; }
+        replace(box, rows.map((procedure) => {
+          // A registered runbook whose script is gone is BROKEN and says so.
+          // Showing it as available would send a worker to run something
+          // that cannot run.
+          const state = !procedure.script_exists ? ['BROKEN', 'bad']
+            : procedure.last_success_at ? ['VERIFIED', 'ok'] : ['UNVERIFIED', 'warn'];
+          const row = el('div', {className: 'row'});
+          row.append(el('b', {text: procedure.id}));
+          row.append(pill(state[0], state[1]));
+          if (auto.indexOf(procedure.risk) === -1) row.append(pill('cần duyệt', 'warn'));
+          row.append(el('span', {className: 'muted',
+                                 text: (procedure.command || []).join(' ')}));
+          row.append(el('br'));
+          row.append(el('span', {className: 'muted',
+            text: procedure.last_success_at
+              ? 'lần chạy xanh gần nhất: ' + procedure.last_success_at
+              : 'chưa có lần chạy xanh nào được ghi nhận'}));
+          return row;
+        }));
+      } catch (err) {
+        muted(box, 'lỗi tải runbooks: ' + err.message);
+      }
+    }
+
+    async function loadPolicy() {
+      const badge = $('#policyBadge');
+      try {
+        const data = await getJSON('/dashboard/api/policy');
+        if (data.error) { badge.textContent = 'policy: không đọc được'; return; }
+        badge.textContent = 'Policy v' + data.version
+          + (data.override_present ? ' + override ' + (data.override_version || '?') : '')
+          + (data.source === 'built-in' ? ' (mặc định)' : '');
+        badge.title = (data.drift || []).join(' · ') || ('Đã nạp từ ' + data.source);
+      } catch (err) {
+        badge.textContent = 'policy: lỗi';
+      }
+    }
+
+    function tokenText(tokens) {
+      // Provenance travels with the number wherever it is shown. A figure we
+      // did not measure must never look like one we did.
+      if (!tokens || tokens.value === null || tokens.value === undefined) {
+        return 'không có số liệu'
+          + (tokens && tokens.method ? ' (' + tokens.method + ')' : '');
+      }
+      const n = Number(tokens.value).toLocaleString('en-US');
+      if (tokens.source === 'ESTIMATED') return '~' + n + ' (ước lượng)';
+      if (tokens.source === 'PARTIAL') {
+        return n + ' (thiếu ' + (tokens.missing_tasks || 0) + ' task)';
+      }
+      return n;
+    }
+
+    function metric(label, value, note) {
+      const line = el('div');
+      line.append(el('span', {text: label + ': '}));
+      line.append(el('b', {text: value}));
+      if (note) line.append(el('span', {className: 'muted', text: ' ' + note}));
+      return line;
+    }
+
+    async function loadTelemetry() {
+      const box = $('#telemetry');
+      try {
+        const data = await getJSON('/dashboard/api/telemetry');
+        if (data.error) { muted(box, data.detail || data.error); return; }
+        if (!data.tasks) {
+          $('#tMeta').textContent = '';
+          muted(box, 'Chưa có telemetry.');
+          return;
+        }
+        $('#tMeta').textContent = data.tasks + ' task';
+        // "chưa đủ dữ liệu" rather than 0%: no data and a zero rate are
+        // different facts, and conflating them flatters the system.
+        const hitRate = (data.runbook_hit_rate === null
+                         || data.runbook_hit_rate === undefined)
+          ? 'chưa đủ dữ liệu' : Math.round(data.runbook_hit_rate * 100) + '%';
+        const preview = (data.median_seconds_to_preview === null
+                         || data.median_seconds_to_preview === undefined)
+          ? 'chưa có preview nào' : Math.round(data.median_seconds_to_preview) + 's';
+        const wrap = el('div', {className: 'row'});
+        wrap.append(metric('token', tokenText(data.tokens)));
+        wrap.append(metric('runbook hit rate', hitRate));
+        wrap.append(metric('file đã đọc', String(data.files_read),
+                           '· lượt search: ' + data.search_rounds));
+        wrap.append(metric('redefine', String(data.redefine_count),
+                           '· hỏi developer: ' + data.assist_requests));
+        wrap.append(metric('time-to-preview (median)', preview,
+                           data.tasks_without_preview
+                             ? '(' + data.tasks_without_preview + ' task không preview)' : ''));
+        replace(box, [wrap]);
+      } catch (err) {
+        muted(box, 'lỗi tải telemetry: ' + err.message);
+      }
+    }
+
+    function loadContext() {
+      loadPolicy();
+      loadKnowledge('');
+      loadProcedures();
+      loadTelemetry();
+    }
+
+    $('#kSearchBtn').onclick = () => loadKnowledge($('#kQuery').value.trim());
+    $('#kQuery').onkeydown = (event) => {
+      if (event.key === 'Enter') loadKnowledge($('#kQuery').value.trim());
+    };
+    $('#kRefreshBtn').onclick = () => loadContext();
+
     $('#liveBtn').onclick = () => {
       state.live = !state.live;
       $('#liveBtn').textContent = state.live ? '⏸ Tạm dừng' : '▶ Tiếp tục';
@@ -8217,6 +8516,7 @@ WORK_HTML = r"""<!doctype html>
       if (state.live) load();
     };
     load();
+    loadContext();
     // Polling, not a fake animation: every number on this screen comes from
     // a real read of the queue and the work store.
     setInterval(() => { if (state.live) load(); }, 6000);
@@ -10559,6 +10859,139 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             payload = await anyio.to_thread.run_sync(_build)
         except Exception as exc:  # noqa: BLE001
             payload = {"workers": [], "error": "WORKERS_READ_FAILED", "detail": str(exc)}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/knowledge", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_knowledge(request: Request) -> JSONResponse:
+        """The project knowledge map: status, one document, or a search.
+
+        Read-only. Confidence per module is recomputed here on every read
+        from git and the working tree, never served from a stored value --
+        a stored confidence is a claim about a repository state that has
+        since moved on.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        action = request.query_params.get("action") or "status"
+        query = request.query_params.get("q") or ""
+        document = request.query_params.get("document") or ""
+
+        def _build() -> dict[str, Any]:
+            from .project_knowledge import ProjectKnowledge, canonical_root
+
+            root = canonical_root(request.query_params.get("project") or os.getcwd())
+            if root is None:
+                return {"error": "NOT_A_GIT_REPOSITORY", "modules": []}
+            knowledge = ProjectKnowledge(root)
+            if not knowledge.exists():
+                return {"error": "NO_KNOWLEDGE_MAP", "modules": [],
+                        "detail": "nothing indexed for this project yet"}
+            if action == "show":
+                return knowledge.show(document or None)
+            if action == "search":
+                return knowledge.search(query) if query.strip() else {
+                    "error": "QUERY_REQUIRED", "matches": []}
+            if action == "validate":
+                return knowledge.validate()
+            return knowledge.status()
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001 -- a status screen never 5xxs
+            payload = {"error": "KNOWLEDGE_READ_FAILED", "detail": str(exc), "modules": []}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/procedures", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_procedures(request: Request) -> JSONResponse:
+        """Registered runbooks with their CURRENT status.
+
+        Read-only: this route lists, it never runs. Running a procedure is a
+        separate, explicit decision -- and anything above preview risk is not
+        auto-invokable at all.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+
+        def _build() -> dict[str, Any]:
+            from . import procedures as _procedures
+            from .project_knowledge import ProjectKnowledge, canonical_root
+
+            root = canonical_root(request.query_params.get("project") or os.getcwd())
+            if root is None:
+                return {"error": "NOT_A_GIT_REPOSITORY", "procedures": []}
+            knowledge = ProjectKnowledge(root)
+            registry = _procedures.ProcedureRegistry(knowledge)
+            return {"procedures": registry.list(),
+                    "discovered": _procedures.discover_existing(root),
+                    "auto_invokable_risk": list(_procedures.AUTO_INVOKABLE_RISK)}
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001
+            payload = {"error": "PROCEDURES_READ_FAILED", "detail": str(exc),
+                       "procedures": []}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/policy", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_policy(request: Request) -> JSONResponse:
+        """The effective Work Policy: version, hash, override and any drift.
+
+        Section BODIES are omitted unless asked for by name. The policy is
+        long, this is a status panel, and shipping the whole document to
+        render a version badge is the waste the policy itself prohibits.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        wanted = [s.strip() for s in (request.query_params.get("sections") or "").split(",")
+                  if s.strip()]
+
+        def _build() -> dict[str, Any]:
+            from . import work_policy as _policy
+
+            policy = _policy.load_policy(request.query_params.get("project") or os.getcwd())
+            payload = policy.as_dict()
+            payload["section_titles"] = dict(_policy.SECTIONS)
+            if wanted:
+                payload["text"] = policy.load(wanted)
+            return payload
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001
+            payload = {"error": "POLICY_READ_FAILED", "detail": str(exc)}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/telemetry", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_telemetry(request: Request) -> JSONResponse:
+        """What recent Work tasks cost, with every number's provenance intact."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        work_id = request.query_params.get("work") or ""
+        project_id = request.query_params.get("project_id") or ""
+
+        def _build() -> dict[str, Any]:
+            from .work_telemetry import TelemetryStore
+
+            store = TelemetryStore()
+            try:
+                if work_id:
+                    return {"work_id": work_id, "tasks": store.for_work(work_id)}
+                return store.summary(project_id=project_id or None)
+            finally:
+                store.close()
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001
+            payload = {"error": "TELEMETRY_READ_FAILED", "detail": str(exc), "tasks": 0}
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/work/create", methods=["POST"],

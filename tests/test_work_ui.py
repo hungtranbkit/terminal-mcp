@@ -312,7 +312,9 @@ def page(request):
 
         view.route("**/*", route)
         view.goto("http://terminal-mcp.test/dashboard/work", wait_until="domcontentloaded")
-        view.wait_for_selector(".card", timeout=20000)
+        # A VISIBLE card: the create form is a .card that starts hidden, and
+        # waiting on the bare selector resolved to it and timed out.
+        view.wait_for_selector("#works .card", timeout=20000)
         view.wait_for_timeout(400)
         yield view
         browser.close()

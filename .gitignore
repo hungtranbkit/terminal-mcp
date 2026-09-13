@@ -49,3 +49,10 @@ state/
 .idea/
 .vscode/
 *.swp
+
+# Project knowledge / runbook registry.
+# The map, its documents and the runbook DEFINITIONS are shared -- that is the
+# point of a canonical map that does not diverge between worktrees.
+# The knowledge LOCK is per-process and the log directory is per-machine.
+.projectflow/knowledge/.knowledge.lock
+.projectflow/**/*.tmp

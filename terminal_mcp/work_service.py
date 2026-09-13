@@ -20,11 +20,13 @@ nothing on its own.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
 from . import work_store as ws
 from .work_eligibility import Eligibility, evaluate as evaluate_eligibility, is_work_session
+from .work_policy import load_policy
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -92,7 +94,8 @@ class WorkService:
 
     def create(self, *, title: str, goal: str, lane: str, project_id: str | None = None,
                done_criteria: Sequence[str] = (), created_by: str | None = None,
-               tasks: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
+               tasks: Sequence[dict[str, Any]] = (),
+               project_root: str | None = None) -> dict[str, Any]:
         """Create a run on a `-work` lane, optionally with its initial plan.
 
         The lane is validated by NAME here, before anything is written: a run
@@ -104,8 +107,26 @@ class WorkService:
                     "detail": (f"{lane!r} does not end in '-work'. Work runs are only "
                                f"created on opt-in work sessions; ordinary sessions keep "
                                f"their existing behaviour untouched.")}
+        # Bind the Work Policy at creation, not at execution: the binding is
+        # what makes "which rules did this run operate under" answerable
+        # later, and a run that never records one leaves that unanswerable.
+        # A policy that cannot be read must not block the run -- the failure
+        # is recorded in metadata so it is visible rather than assumed fine.
+        metadata: dict[str, Any] = {}
+        try:
+            policy = load_policy(project_root or os.getcwd())
+            metadata["policy"] = policy.binding().as_dict()
+            if policy.drift:
+                metadata["policy"]["drift"] = list(policy.drift)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            # Unreadable or malformed policy file. Programming errors are NOT
+            # caught here: swallowing one would record a bug as a handled
+            # "policy unavailable" state and hide it indefinitely.
+            metadata["policy"] = {"error": type(exc).__name__, "detail": str(exc)[:200]}
+            _LOGGER.warning("work create: policy could not be loaded: %s", exc)
         run = self.store.create_run(title=title, goal=goal, lane=lane, project_id=project_id,
-                                    done_criteria=done_criteria, created_by=created_by)
+                                    done_criteria=done_criteria, created_by=created_by,
+                                    metadata=metadata)
         added: list[dict[str, Any]] = []
         if tasks:
             plan = self.plan(run.work_id, tasks, actor=created_by)

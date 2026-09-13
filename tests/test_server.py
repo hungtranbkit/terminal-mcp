@@ -85,6 +85,16 @@ async def test_server_registers_v1_and_binding_tools():
         "work_request_approval",
         "work_approve",
         "work_control",
+        # Project Knowledge, runbook registry, Work Policy and telemetry.
+        # Reads, plus two deliberate writes: recording ONE verified module,
+        # and a worker reporting what its own task cost. Running a procedure
+        # above preview risk still needs an explicit approval.
+        "work_knowledge",
+        "work_knowledge_record",
+        "work_procedures",
+        "work_policy",
+        "work_telemetry",
+        "work_telemetry_report",
         # Session permission management: ChatGPT could rename a session but
         # had no way to grant or revoke access to one -- that took an SSH
         # session and a config edit.

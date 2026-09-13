@@ -1380,6 +1380,11 @@ def build_mcp(service: TerminalService | None = None,
         nodes = tuple(n.strip() for n in assume_offline.split(",") if n.strip())
         return service.dry_run_failover(target_id, assume_offline=nodes)
 
+    def _telemetry_now() -> str:
+        from datetime import datetime, timezone
+
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
     _work_holder: dict[str, Any] = {"service": work, "tried": work is not None}
 
     def _work_service():
@@ -1514,6 +1519,244 @@ def build_mcp(service: TerminalService | None = None,
         if service is None:
             return {"error": "WORK_RUNTIME_UNAVAILABLE"}
         return service.control(work_id, action, actor=actor or None, reason=reason or None)
+
+    # -- project knowledge, runbooks, policy and telemetry -------------------
+    #
+    # All READ-ONLY except the explicit knowledge refresh and the runbook
+    # runner, which is itself refused for anything above preview risk. These
+    # surfaces exist so a worker can consult what is already known instead of
+    # re-deriving it -- the whole point being to spend fewer tokens, so each
+    # one returns a small answer rather than a document dump.
+
+    def _project_root(project_path: str = "") -> str:
+        import os as _os
+
+        return project_path.strip() or _os.getcwd()
+
+    def _knowledge(project_path: str = ""):
+        from .project_knowledge import ProjectKnowledge, canonical_root
+
+        root = canonical_root(_project_root(project_path))
+        return ProjectKnowledge(root) if root else None
+
+    @server.tool()
+    def work_knowledge(action: str = "status", query: str = "", document: str = "",
+                       project_path: str = "") -> dict:
+        """The project's knowledge map: status / show / search / validate.
+
+        Consult this BEFORE exploring a repository broadly -- that ordering is
+        the token saving. The map is a map: current code and git history are
+        the source of truth and override anything stored here, which is why
+        every module reports a confidence WITH the reason it holds.
+
+        `status` lists modules with confidence (HIGH/MEDIUM/LOW, derived from
+        what changed under their paths, never a fabricated percentage).
+        `show` returns one document; `search` returns matching lines with
+        their headings; `validate` reports claims that no longer hold.
+        """
+        knowledge = _knowledge(project_path)
+        if knowledge is None:
+            return {"error": "NOT_A_GIT_REPOSITORY",
+                    "detail": "a knowledge map needs a project to live in"}
+        if not knowledge.exists() and action != "status":
+            return {"error": "NO_KNOWLEDGE_MAP",
+                    "detail": "nothing indexed yet for this project"}
+        try:
+            if action == "status":
+                return knowledge.status()
+            if action == "show":
+                return knowledge.show(document or None)
+            if action == "search":
+                if not query.strip():
+                    return {"error": "QUERY_REQUIRED"}
+                return knowledge.search(query)
+            if action == "validate":
+                return knowledge.validate()
+        except Exception as exc:  # noqa: BLE001 -- a read surface never raises
+            return {"error": "KNOWLEDGE_READ_FAILED", "detail": str(exc)}
+        return {"error": "UNKNOWN_ACTION", "action": action,
+                "allowed": ["status", "show", "search", "validate"]}
+
+    @server.tool()
+    def work_knowledge_record(module: str, paths: str, summary: str = "",
+                              project_path: str = "", owner: str = "worker") -> dict:
+        """Record or refresh ONE module in the map, after verifying it.
+
+        Per-module on purpose: refreshing a whole map because one file moved
+        is the cost this system exists to avoid. `paths` is comma-separated.
+
+        Never write a secret here. Name the environment VARIABLE; its value is
+        refused outright rather than quietly stripped.
+        """
+        knowledge = _knowledge(project_path)
+        if knowledge is None:
+            return {"error": "NOT_A_GIT_REPOSITORY"}
+        wanted = [p.strip() for p in paths.split(",") if p.strip()]
+        if not module.strip() or not wanted:
+            return {"error": "MODULE_AND_PATHS_REQUIRED"}
+        try:
+            state = knowledge.record_module(module.strip(), paths=wanted,
+                                            summary=summary, owner=owner)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": type(exc).__name__, "detail": str(exc)}
+        return state.as_dict()
+
+    @server.tool()
+    def work_procedures(action: str = "list", procedure_id: str = "",
+                        project_path: str = "", allow_risky: bool = False) -> dict:
+        """Registered runbooks: list / run / discover.
+
+        Look here before doing a repeated operation by hand. A green result is
+        reused rather than re-run when nothing it depends on has changed, and
+        a passing run returns ONE line -- the log stays on disk and only a
+        failure brings back its failing region.
+
+        Anything above preview risk is never invoked automatically; it needs
+        `allow_risky`, which is a deliberate human decision, not a default.
+        """
+        from . import procedures as _procedures
+
+        knowledge = _knowledge(project_path)
+        if knowledge is None:
+            return {"error": "NOT_A_GIT_REPOSITORY"}
+        registry = _procedures.ProcedureRegistry(knowledge)
+        try:
+            if action == "list":
+                return {"procedures": registry.list()}
+            if action == "discover":
+                return {"found": _procedures.discover_existing(knowledge.root),
+                        "note": "reuse what a project already has before adding a script"}
+            if action == "run":
+                if not procedure_id.strip():
+                    return {"error": "PROCEDURE_ID_REQUIRED"}
+                result = registry.run(procedure_id.strip(), allow_risky=allow_risky)
+                return {**result.as_dict(), "line": result.one_line()}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "PROCEDURE_FAILED", "detail": str(exc)}
+        return {"error": "UNKNOWN_ACTION", "action": action,
+                "allowed": ["list", "run", "discover"]}
+
+    @server.tool()
+    def work_policy(action: str = "status", sections: str = "",
+                    project_path: str = "", session: str = "") -> dict:
+        """The canonical Work Policy this project runs under.
+
+        A `-work` session loads this before executing, so the rules do not
+        depend on chat history surviving. `sections` is a comma-separated
+        subset -- load only what the decision at hand needs, because pulling
+        twenty sections to answer one question is the waste the policy itself
+        prohibits.
+
+        `status` reports version, hash, override and any drift; `load` returns
+        the requested sections plus the binding to record on the task;
+        `ensure` materialises the file into a project that has none.
+        """
+        from . import work_policy as _policy
+
+        root = _project_root(project_path)
+        try:
+            if action == "status":
+                return _policy.load_policy(root).as_dict()
+            if action == "load":
+                wanted = [s.strip() for s in sections.split(",") if s.strip()]
+                return _policy.policy_for_task(root, session=session or None,
+                                               sections=wanted)
+            if action == "ensure":
+                return _policy.ensure_policy_file(root)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "POLICY_READ_FAILED", "detail": str(exc)}
+        return {"error": "UNKNOWN_ACTION", "action": action,
+                "allowed": ["status", "load", "ensure"]}
+
+    @server.tool()
+    def work_telemetry_report(task_id: str, work_id: str = "", bug_id: str = "",
+                              project_id: str = "", module: str = "",
+                              execution_mode: str = "", spec_level: str = "",
+                              difficulty: str = "", files_read: int = 0,
+                              search_rounds: int = 0, runbook_hits: int = 0,
+                              runbook_misses: int = 0, redefine_count: int = 0,
+                              assist_requests: int = 0, tokens_used: int = -1,
+                              tokens_source: str = "", previewed: bool = False,
+                              outcome: str = "") -> dict:
+        """A worker reports what its OWN task cost. The only honest source.
+
+        The controller cannot observe how many files an agent read or how many
+        tokens its provider charged -- so it does not guess. Anything not
+        reported here stays unreported rather than being filled in with a
+        plausible number.
+
+        `tokens_used` left at -1 means "not available", which is recorded as
+        exactly that. `tokens_source` should be EXACT when a provider reported
+        the figure and ESTIMATED when it was derived; an unrecognised value is
+        treated as ESTIMATED, because a count of unknown origin is at best an
+        estimate.
+        """
+        from .work_telemetry import EXACT, TaskTelemetry, TelemetryStore, TokenCount
+
+        if not task_id.strip():
+            return {"error": "TASK_ID_REQUIRED"}
+        store = TelemetryStore()
+        try:
+            existing = next((row for row in store.recent(limit=500)
+                             if row.get("task_id") == task_id.strip()), None)
+            # Re-reporting the same task UPDATES its row rather than adding a
+            # second one, so a worker can report progress and then completion.
+            known_id = (existing or {}).get("telemetry_id")
+            record = TaskTelemetry(task_id=task_id.strip(), work_id=work_id or None, bug_id=bug_id or None,
+                project_id=project_id or None, module=module or None,
+                execution_mode=execution_mode or None, spec_level=spec_level or None,
+                difficulty=difficulty or None,
+                files_read=max(0, int(files_read)),
+                search_rounds=max(0, int(search_rounds)),
+                runbook_hits=max(0, int(runbook_hits)),
+                runbook_misses=max(0, int(runbook_misses)),
+                redefine_count=max(0, int(redefine_count)),
+                assist_requests=max(0, int(assist_requests)),
+                started_at=(existing or {}).get("started_at") or _telemetry_now())
+            if known_id:
+                record.telemetry_id = known_id
+            if int(tokens_used) >= 0:
+                record.tokens = (TokenCount.reported(int(tokens_used), by="worker")
+                                 if tokens_source.upper() == EXACT
+                                 else TokenCount(value=int(tokens_used),
+                                                 source="ESTIMATED",
+                                                 method="reported by worker as an estimate"))
+            if previewed:
+                record.mark_preview()
+            elif (existing or {}).get("first_preview_at"):
+                record.first_preview_at = existing["first_preview_at"]
+            if outcome.strip():
+                record.finish(outcome.strip())
+            store.save(record)
+            return {"recorded": record.telemetry_id, "line": record.one_line()}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "TELEMETRY_WRITE_FAILED", "detail": str(exc)}
+        finally:
+            store.close()
+
+    @server.tool()
+    def work_telemetry(work_id: str = "", project_id: str = "", limit: int = 100) -> dict:
+        """What recent Work tasks actually cost.
+
+        Token counts carry their provenance: EXACT when a runtime reported
+        one, ESTIMATED when derived, PARTIAL for a total missing some inputs,
+        UNAVAILABLE when nothing reported anything. A number that was not
+        measured is never presented as one -- an invented figure would
+        corrupt every efficiency decision made from it afterwards.
+        """
+        from .work_telemetry import TelemetryStore
+
+        try:
+            store = TelemetryStore()
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "TELEMETRY_UNAVAILABLE", "detail": str(exc)}
+        try:
+            if work_id.strip():
+                return {"work_id": work_id, "tasks": store.for_work(work_id.strip())}
+            return store.summary(limit=max(1, min(int(limit or 100), 500)),
+                                 project_id=project_id or None)
+        finally:
+            store.close()
 
     @server.tool()
     def terminal_fleet_environment(roles: str = "node") -> dict:
