@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from mcp.server.mcpserver import MCPServer
 
 from . import __version__
@@ -9,7 +11,7 @@ from .agent_availability import available_agent_types
 from .config import load_config
 from .controller import ControllerService, build_default_controller
 from .core import TerminalService
-from .coordinator import CoordinatorGate
+from .coordinator import CoordinatorGate, node_aware_repo_evidence
 from .integration_engine import IntegrationEngine
 from .ai_usage_service import AiUsageService
 from .recovery_engine import RecoveryEngine
@@ -38,6 +40,8 @@ from .lease import DEFAULT_RESOURCE_LOCK_TTL_SECONDS, ResourceLockStore
 from .outcomes import OutcomeError, OutcomeStore
 from .project_service import ProjectService
 from .worker_registry import ALL_ROLES, WorkerRegistry
+
+_LOGGER = logging.getLogger(__name__)
 from .queue_service import QueueService
 from .release_service import ReleaseService
 from .release_store import ReleaseStore
@@ -174,7 +178,15 @@ def build_mcp(service: TerminalService | None = None,
     # today, so no existing lane changes behaviour.
     if controller is not None:
         queue.verify_queue.registry = getattr(controller, "registry", None)
-    queue_engine = QueueEngine(queue.store, controller, coordinator=CoordinatorGate(),
+    # The pre-dispatch gate must read repo evidence where the SESSION lives.
+    # Given only a cwd it ran git locally, so a session on another node made
+    # it report "could not read git/repo status" about a repository that was
+    # perfectly healthy -- just not on this host. Handing it the controller's
+    # node adapter lets it ask the right machine.
+    _gate = CoordinatorGate(evidence_collector=node_aware_repo_evidence(
+        local_node_id=getattr(controller, "local_node_id", None),
+        node_client_factory=(controller.client_for if controller is not None else None)))
+    queue_engine = QueueEngine(queue.store, controller, coordinator=_gate,
                               on_completed=_on_task_completed, verify_queue=queue.verify_queue)
     queue.engine = queue.engine or queue_engine
     integration.engine = integration.engine or IntegrationEngine(integration.store, queue.store)
@@ -363,6 +375,23 @@ def build_mcp(service: TerminalService | None = None,
             )
             queue.store.record_event(session=session, task_id=active_task["id"], event_type="RAW_SEND_DURING_ACTIVE_QUEUE_TASK",
                                      reason="terminal_send_text called directly while a queue task was active")
+            # Reconcile the bypass onto the TASK too, not only the event log.
+            # An event nobody reads left the task looking untouched while its
+            # prompt had in fact been delivered -- the queue said one thing and
+            # the worker was doing another, with nothing on screen to say why.
+            if not dry_run:
+                try:
+                    queue.store.record_manual_dispatch(active_task["id"], detail={
+                        "at": _telemetry_now(),
+                        "via": "terminal_send_text",
+                        "sent": bool(result.get("sent")),
+                        "submit_status": result.get("submit_status"),
+                        "idempotency_key": idempotency_key,
+                        "note": "delivered outside the queue; the queue did not dispatch this task",
+                    })
+                except Exception:  # noqa: BLE001 -- reconciliation must never break a real send
+                    _LOGGER.warning("could not reconcile manual dispatch onto task %s",
+                                    active_task["id"], exc_info=True)
         return result
 
     @server.tool()
@@ -2180,7 +2209,7 @@ def build_mcp(service: TerminalService | None = None,
 
     @server.tool()
     def terminal_enqueue_task(session: str, prompt: str, title: str | None = None, priority: int = 0,
-                              metadata: dict | None = None) -> dict:
+                              metadata: dict | None = None, request_key: str | None = None) -> dict:
         """THE RECOMMENDED default for any normal ChatGPT/UI/API-
         originated task (item 12) -- creates a durable, restart-safe
         task record for `session`'s own queue BEFORE anything is ever
@@ -2192,7 +2221,8 @@ def build_mcp(service: TerminalService | None = None,
         progress. Always appends (never cancels anything already
         queued). The task's own prompt is stored VERBATIM -- nothing
         here rewrites it."""
-        return queue.enqueue(session, prompt, title=title, priority=priority, metadata=metadata)
+        return queue.enqueue(session, prompt, title=title, priority=priority, metadata=metadata,
+                             request_key=request_key)
 
     @server.tool()
     def terminal_task_status(task_id: str) -> dict:
@@ -2204,7 +2234,7 @@ def build_mcp(service: TerminalService | None = None,
     @server.tool()
     def terminal_task_create(title: str, prompt: str, assigned_session_id: str | None = None,
                              priority: int = 0, project: str | None = None,
-                             metadata: dict | None = None) -> dict:
+                             metadata: dict | None = None, request_key: str | None = None) -> dict:
         """Unified Task System's canonical task-creation entry point
         (docs/REQUIREMENTS.md §20) -- the ONE way to create a Global
         Task, whether or not a session is known yet. assigned_session_id
@@ -2220,7 +2250,7 @@ def build_mcp(service: TerminalService | None = None,
         (visible in terminal_task_board's per-card metadata) for the
         Kanban's own project affinity/grouping."""
         return queue.create_task(title, prompt, session=assigned_session_id, priority=priority,
-                                 project=project, metadata=metadata)
+                                 project=project, metadata=metadata, request_key=request_key)
 
     @server.tool()
     def terminal_task_assign(task_id: str, session: str) -> dict:

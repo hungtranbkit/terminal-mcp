@@ -289,6 +289,10 @@ class QueueTask:
     # Orchestration V1: which user-visible deliverable this task rolls up
     # into. Nullable -- a task with no outcome behaves exactly as before.
     outcome_id: str | None = None
+    # The caller's own key for the REQUEST that created this task, so a
+    # retry returns this task instead of making a second one. Nullable:
+    # a task created without one behaves exactly as before.
+    request_key: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "QueueTask":
@@ -299,6 +303,7 @@ class QueueTask:
             attempt_count=row["attempt_count"], max_attempts=row["max_attempts"],
             completion_policy=_parse_json_object(row["completion_policy"]),
             last_error=row["last_error"], correlation_id=row["correlation_id"],
+            request_key=(row["request_key"] if "request_key" in row.keys() else None),
             metadata=_parse_json_object(row["metadata"]), updated_at=row["updated_at"],
             paused_from_status=row["paused_from_status"],
             priority=row["priority"], depends_on=tuple(_parse_json_list(row["depends_on"])),
@@ -325,7 +330,8 @@ class QueueTask:
             "created_at": self.created_at, "started_at": self.started_at, "completed_at": self.completed_at,
             "attempt_count": self.attempt_count, "max_attempts": self.max_attempts,
             "completion_policy": self.completion_policy, "last_error": self.last_error,
-            "correlation_id": self.correlation_id, "metadata": self.metadata, "updated_at": self.updated_at,
+            "correlation_id": self.correlation_id, "request_key": self.request_key,
+            "metadata": self.metadata, "updated_at": self.updated_at,
             "paused_from_status": self.paused_from_status,
             "priority": self.priority, "depends_on": list(self.depends_on), "node_id": self.node_id,
             "claimed_by": self.claimed_by, "claim_token": self.claim_token,
@@ -692,6 +698,31 @@ def _add_v8_outcomes(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_queue_tasks_outcome ON queue_tasks(outcome_id, status)")
 
 
+def _add_v9_request_key(connection: sqlite3.Connection) -> None:
+    """Idempotent task CREATION.
+
+    The queue already had idempotency for the DISPATCH side -- a sticky
+    key derived from (task_id, attempt) so a retried send cannot deliver a
+    prompt twice. Creation had none, so a caller that retried after a
+    timeout, or a client that resent on reconnect, silently produced a
+    SECOND task for one request. For an agent-driven caller that is the
+    common case, not the rare one.
+
+    `request_key` is nullable and additive: every existing row and every
+    existing call behaves exactly as before. The UNIQUE index is PARTIAL --
+    NULLs are excluded -- so tasks created without a key are unaffected and
+    can still be created freely. The uniqueness is enforced by the database
+    rather than by a read-then-write in the service, because two concurrent
+    retries of the same request would otherwise both find nothing and both
+    insert."""
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(queue_tasks)")}
+    if "request_key" not in columns:
+        connection.execute("ALTER TABLE queue_tasks ADD COLUMN request_key TEXT")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_tasks_request_key "
+        "ON queue_tasks(request_key) WHERE request_key IS NOT NULL")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
@@ -711,6 +742,9 @@ QUEUE_MIGRATIONS = [
     Migration(8, "Orchestration V1: outcomes table + queue_tasks.outcome_id (nullable, additive) -- "
                  "the user-visible deliverable one backlog item may need N tasks to reach",
               _add_v8_outcomes),
+    Migration(9, "idempotent creation: queue_tasks.request_key (nullable) + a PARTIAL unique "
+                 "index, so a retried create returns the SAME task instead of a second one",
+              _add_v9_request_key),
 ]
 
 
@@ -1077,13 +1111,13 @@ class QueueStore:
                 connection.execute(
                     "INSERT INTO queue_tasks (id, session, position, title, prompt, status, created_at, "
                     "attempt_count, max_attempts, completion_policy, metadata, updated_at, priority, depends_on, "
-                    "original_owner, project_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "original_owner, project_id, request_key) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (task_id, session, next_position + offset, task.get("title") or "", task["prompt"], QUEUED, now,
                      int(task.get("max_attempts") or 3), json.dumps(task.get("completion_policy") or {}),
                      json.dumps(task.get("metadata") or {}), now, int(task.get("priority") or 0),
                      json.dumps(list(task.get("depends_on") or [])), session,
-                     task.get("project_id")),
+                     task.get("project_id"), task.get("request_key") or None),
                 )
                 self._record_event_locked(connection, session=session, task_id=task_id, event_type="ENQUEUED",
                                           reason=None)
@@ -1091,6 +1125,52 @@ class QueueStore:
 
     def append_tasks(self, session: str, tasks: list[dict[str, Any]]) -> list[str]:
         return self.set_tasks(session, tasks, replace_pending=False)
+
+    def record_manual_dispatch(self, task_id: str, *, detail: dict[str, Any]) -> dict[str, Any] | None:
+        """Reconcile a send that went round the queue onto the task itself.
+
+        An event alone was not enough. Every API and every UI reads the TASK,
+        so a task whose prompt had really been delivered by hand still looked
+        untouched -- the queue said PAUSED, the worker was busy, and the
+        screen showed neither. Recording it here means "dispatched outside
+        the queue" is a visible fact rather than a discrepancy someone has to
+        notice.
+
+        Deliberately does NOT move the task's status. The queue genuinely did
+        not dispatch it, and claiming otherwise would make the state machine
+        lie about its own behaviour. What changes is that the bypass is now
+        on the record.
+        """
+        with self._connection() as connection:
+            row = connection.execute("SELECT metadata FROM queue_tasks WHERE id = ?",
+                                     (task_id,)).fetchone()
+            if row is None:
+                return None
+            try:
+                metadata = json.loads(row["metadata"] or "{}")
+            except ValueError:
+                metadata = {}
+            history = list(metadata.get("manual_dispatch_history") or [])
+            history.append(detail)
+            metadata["manual_dispatch"] = detail
+            metadata["manual_dispatch_history"] = history[-10:]
+            connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                               (json.dumps(metadata), iso_now(), task_id))
+        return detail
+
+    def task_by_request_key(self, request_key: str) -> dict[str, Any] | None:
+        """The task a previous call with this key already created, if any.
+
+        Returns the WHOLE task rather than just its id: a caller retrying
+        wants the same answer it would have got the first time, including
+        the state the task has reached since.
+        """
+        if not request_key:
+            return None
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM queue_tasks WHERE request_key = ?", (request_key,)).fetchone()
+        return QueueTask.from_row(row).to_dict() if row is not None else None
 
     def move_task_to_session(self, task_id: str, new_session: str) -> dict[str, Any]:
         """Unified Task System checkpoint (2026-09-07): reassigns an
