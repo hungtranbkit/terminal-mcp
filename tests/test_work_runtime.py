@@ -686,3 +686,72 @@ def test_a_waiting_approval_is_warn_never_fail(work):
     by_check = {c["check"]: c for c in readiness["checks"]}
     assert by_check["work_waiting_approvals"]["status"] == "WARN"
     assert readiness["status"] == "WARN"
+
+
+# -- the engine must not read its own prompt back as evidence -------------------------
+
+def test_an_echoed_prompt_is_never_accepted_as_a_completion():
+    """Found by dogfooding on the live controller, and it invalidated every
+    completion this engine had ever verified.
+
+    `build_dispatch_text` writes a COMPLETE, VALID, nonce-bound marker into
+    the pane as the instruction, and `verify_completion_marker` checks only
+    task_id/attempt/nonce -- every one of which that instruction contains. So
+    the engine read its own prompt back and called it evidence: a worker
+    running `sleep` forever, printing nothing, had its task marked COMPLETED.
+    """
+    from terminal_mcp.queue_engine import (build_dispatch_text,
+                                           completion_after_instruction,
+                                           instruction_marker_line)
+    from terminal_mcp.status import parse_completion_marker, verify_completion_marker
+
+    class _Task:
+        id = "task-abc"
+        prompt = "do the thing"
+        attempt_count = 0
+        verification_nonce = "NONCE"
+
+    dispatched = _Task()
+    prompt = build_dispatch_text(dispatched, nonce="NONCE")
+    marker_line = instruction_marker_line(dispatched, nonce="NONCE")
+    assert marker_line in prompt, "the instruction really does contain a valid marker"
+
+    def completed(pane: str) -> bool:
+        worker_output = completion_after_instruction(pane, instruction=marker_line)
+        return verify_completion_marker(
+            parse_completion_marker(worker_output),
+            task_id="task-abc", attempt=1, nonce="NONCE", nonce_consumed=False)
+
+    assert completed(prompt) is False, "a worker that did nothing is not done"
+    assert completed(prompt + "\nstill thinking\n") is False
+    assert completed(prompt + "\n" + marker_line + "\n") is True, (
+        "a worker that really printed it IS done")
+    assert completed(prompt + "\nwork\n" + marker_line + "\nmore\n") is True
+
+
+def test_a_scrolled_away_instruction_does_not_hide_a_real_completion():
+    """The tail is bounded. If our prompt has scrolled out, everything left
+    is the worker's -- including the marker it printed."""
+    from terminal_mcp.queue_engine import completion_after_instruction, instruction_marker_line
+
+    class _Task:
+        id = "task-abc"
+        attempt_count = 0
+
+    marker_line = instruction_marker_line(_Task(), nonce="NONCE")
+    remaining = completion_after_instruction("...earlier output\n" + marker_line + "\n",
+                                             instruction=marker_line)
+    assert marker_line in remaining
+
+
+def test_the_anchor_sentence_is_the_one_we_actually_send():
+    """The anchor must stay byte-identical between the text we send and the
+    text we look for -- a drifting copy would silently stop protecting."""
+    from terminal_mcp.queue_engine import COMPLETION_INSTRUCTION_SENTENCE, build_dispatch_text
+
+    class _Task:
+        id = "t"
+        prompt = "p"
+        attempt_count = 0
+
+    assert COMPLETION_INSTRUCTION_SENTENCE in build_dispatch_text(_Task(), nonce="N")

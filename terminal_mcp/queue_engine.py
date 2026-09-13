@@ -115,6 +115,14 @@ real diff already exists to check against), not here -- this is only
 the worker-facing half of the mechanism."""
 
 
+# The one sentence that is unmistakably OUR prompt rather than a worker's
+# output. `completion_after_instruction` anchors on it, so it must stay
+# byte-identical between the text we send and the text we look for.
+COMPLETION_INSTRUCTION_SENTENCE = (
+    "When (and only when) the above task is FULLY complete, print exactly one "
+    "line in this exact format (once), then stop:")
+
+
 def build_dispatch_text(task: QueueTask, *, nonce: str) -> str:
     """The 'wrapper rất ngắn' item 7 explicitly allows and limits: the
     task's own prompt is included VERBATIM, first, unmodified -- nothing
@@ -129,12 +137,64 @@ def build_dispatch_text(task: QueueTask, *, nonce: str) -> str:
         f"{task.prompt}\n\n"
         f"---\n"
         f"{REQUIREMENTS_REMINDER}\n\n"
-        f"When (and only when) the above task is FULLY complete, print exactly one line in this "
-        f"exact format (once), then stop:\n"
+        f"{COMPLETION_INSTRUCTION_SENTENCE}\n"
         f"###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1 task_id={task.id} "
         f"attempt={task.attempt_count + 1} nonce={nonce} status=completion_candidate "
         f"summary_sha256={hashlib.sha256(task.id.encode()).hexdigest()[:16]}###\n"
     )
+
+
+def instruction_marker_line(task: "QueueTask", *, nonce: str) -> str:
+    """The exact marker string `build_dispatch_text` puts in the PROMPT.
+
+    It exists so the verifier can tell that text apart from a marker the
+    worker actually printed -- see `completion_after_instruction`.
+    """
+    return (f"###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1 "
+            f"task_id={task.id} attempt={task.attempt_count + 1} nonce={nonce} "
+            f"status=completion_candidate "
+            f"summary_sha256={hashlib.sha256(task.id.encode()).hexdigest()[:16]}###")
+
+
+def completion_after_instruction(output: str, *, instruction: str) -> str:
+    """The part of the pane that is a WORKER's output, not our own prompt.
+
+    Found by dogfooding on 2026-09-13, and it invalidated every completion
+    this engine had ever verified: `build_dispatch_text` writes a COMPLETE,
+    VALID, nonce-bound marker into the pane as the instruction, and
+    `verify_completion_marker` checks only task_id/attempt/nonce -- every one
+    of which that instruction contains. So the engine read its own prompt
+    back and called it evidence. A worker that ran `sleep` forever and
+    printed nothing had its task marked COMPLETED.
+
+    The fix is positional and deliberately minimal: nothing about what the
+    agent is told to print changes, so Claude/Codex behaviour is untouched.
+    We simply refuse to look for the worker's marker anywhere at or before
+    our own.
+
+    If the instruction is not in the captured tail (it scrolled away), the
+    whole capture is a worker's output and is returned unchanged -- the only
+    markers left are ones it printed.
+    """
+    if not output or not instruction:
+        return output or ""
+    # Anchor on the instruction SENTENCE, not the marker. `rfind` on the
+    # marker alone lands on the WORKER's copy when it printed one, and then
+    # discards exactly the evidence we came for. The sentence is unique to
+    # our own prompt: a worker that prints only the marker never reproduces
+    # it, so its last occurrence reliably locates our block.
+    anchor = output.rfind(COMPLETION_INSTRUCTION_SENTENCE)
+    if anchor == -1:
+        # Our prompt is not in view at all -- everything here is the
+        # worker's, including any marker it printed.
+        return output
+    after_sentence = output[anchor + len(COMPLETION_INSTRUCTION_SENTENCE):]
+    # Skip past the template marker that follows the sentence; whatever
+    # comes after that is the worker speaking.
+    index = after_sentence.find(instruction)
+    if index == -1:
+        return after_sentence
+    return after_sentence[index + len(instruction):]
 
 
 @dataclass(frozen=True)
@@ -398,6 +458,13 @@ class QueueEngine:
 
         capture = self.ops.terminal_tail(session, 200)
         output = capture.get("output", "")
+        # Only look at what the WORKER wrote. Our own dispatched prompt
+        # contains a fully valid marker, and reading that back as evidence is
+        # how a session that did nothing got marked COMPLETED.
+        if task.verification_nonce:
+            output = completion_after_instruction(
+                output,
+                instruction=instruction_marker_line(task, nonce=task.verification_nonce))
         marker = parse_completion_marker(output)
         verified = verify_completion_marker(
             marker, task_id=task_id, attempt=task.attempt_count, nonce=task.verification_nonce,
