@@ -390,3 +390,10 @@ def test_live_polling_can_be_paused(page):
     assert page.evaluate("() => document.querySelector('#liveBtn').getAttribute('aria-pressed')") == "false"
     page.click("#liveBtn")
     page.wait_for_timeout(200)
+
+
+def test_an_unknown_agent_is_shown_as_unknown_not_guessed():
+    """The session listing carries no agent field. Defaulting to 'shell'
+    labelled a Claude worker wrong, which is worse than saying nothing."""
+    assert "worker.agent_type || 'agent ?'" in WORK_HTML
+    assert "|| 'shell'" not in WORK_HTML

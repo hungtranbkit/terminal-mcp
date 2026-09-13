@@ -7938,8 +7938,12 @@ WORK_HTML = r"""<!doctype html>
                     el('span', {className: 'pill WORK', text: 'WORK'}),
                     el('span', {className: 'pill ' + worker.state, text: worker.state}));
         card.appendChild(head);
+        // The session listing carries no agent field, so an unknown agent is
+        // shown as unknown. Defaulting to 'shell' labelled a Claude worker
+        // wrong, which is worse than saying nothing -- and adding a status
+        // round-trip per worker to a 6s poll is not worth a cosmetic label.
         card.appendChild(el('div', {className: 'muted',
-          text: [worker.node_id || 'local', worker.agent_type || 'shell'].join(' · ')}));
+          text: [worker.node_id || 'local', worker.agent_type || 'agent ?'].join(' · ')}));
         if (worker.current_task)
           card.appendChild(el('div', {className: 'muted ellip',
             text: '▶ ' + worker.current_task.title + ' (' + worker.current_task.status + ')'}));
