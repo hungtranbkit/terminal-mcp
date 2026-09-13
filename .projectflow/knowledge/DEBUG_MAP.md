@@ -35,3 +35,30 @@ Search keywords: `auth_status_for_node`, `UNKNOWN_STALE`.
 ## Fleet peers
 **Past fix:** peers failed with ECONNRESET rather than 404 because agents reset
 mid-body on a 363-object export. `probe()` sends an empty batch first.
+
+## MCP tunnel split-brain (2026-09-13)
+
+Search keywords: `tunnel-client`, `tunnel_id`, `client_instance_id`,
+`terminal-mcp-tunnel`, `ExecCondition`.
+
+**Symptom:** the session list flickered between full and empty, and
+`terminal_send_text` returned SESSION_NOT_FOUND immediately after
+`terminal_input_context` had found that same session.
+
+**Cause:** TWO `tunnel-client` processes served ONE OpenAI tunnel id
+(m910 and dell-linux). Requests alternated between two controllers with
+different views: m910 saw the whole fleet, dell-linux's fallback
+controller knew only itself. Not a cache bug inside one process -- two
+hosts answering one tunnel.
+
+**How to recognise it again:** compare `client_instance_id` in the
+tunnel-client logs on each host. One tunnel id must have exactly one
+instance. `tunnel_restart_count` climbing in the watchdog log while the
+unit keeps stopping is the other tell.
+
+**Fix:** `ExecCondition=` guard on dell-linux's tunnel unit
+(`terminal-mcp-tunnel-guard condition`) so the fallback only takes the
+tunnel when m910 is unreachable, plus a 60s `enforce` timer that stops a
+duplicate if a boot race started one anyway. ExecCondition rather than
+ExecStartPre: a non-zero exit SKIPS the unit instead of failing it, so
+`Restart=always` does not fight the guard.
