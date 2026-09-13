@@ -224,7 +224,8 @@ def test_the_ui_states_the_isolation_rule_rather_than_leaving_it_implied():
     # several JS string literals, so a phrase spanning a join never appears
     # in the template source even though the reader sees it.
     assert "Work Runtime chỉ tự động điều khiển session có hậu tố -work" in WORK_HTML
-    assert "giữ nguyên hành vi cũ: không bị claim" in WORK_HTML
+    assert "Session thường giữ nguyên hành vi cũ: " in WORK_HTML
+    assert "không bao giờ chứa session thường" in WORK_HTML
     assert "trạng thái thật trong queue" in WORK_HTML
 
 

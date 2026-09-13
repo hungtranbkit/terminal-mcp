@@ -1547,6 +1547,7 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # separate routes so a read can never be mistaken for an action.
         "/dashboard/work": {"GET", "HEAD"},
         "/dashboard/api/work": {"GET", "HEAD"},
+        "/dashboard/api/work/workers": {"GET", "HEAD"},
         "/dashboard/api/work/create": {"POST"},
         "/dashboard/api/work/continue": {"POST"},
         "/dashboard/api/work/control": {"POST"},

@@ -7723,18 +7723,18 @@ WORK_HTML = r"""<!doctype html>
   <style>
     :root {
       --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd;
-      --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#3b78ff;
+      --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#3b78ff; --dim:#1c2540;
       --mono:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
     * { box-sizing:border-box }
     body { margin:0; font:14px/1.55 var(--mono); background:var(--bg); color:var(--text) }
     a { color:var(--accent) }
     header { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
-             padding:12px max(14px, env(safe-area-inset-right)) 12px max(14px, env(safe-area-inset-left));
+             padding:11px max(14px, env(safe-area-inset-right)) 11px max(14px, env(safe-area-inset-left));
              border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5 }
     h1 { margin:0; font-size:16px; white-space:nowrap }
-    h2 { font-size:12.5px; margin:16px 0 8px; color:var(--muted); text-transform:uppercase;
-         letter-spacing:.05em }
+    h2 { font-size:11.5px; margin:15px 0 8px; color:var(--muted); text-transform:uppercase;
+         letter-spacing:.06em }
     .spacer { flex:1 }
     .btn { background:var(--panel); border:1px solid var(--line); color:var(--text);
            border-radius:9px; padding:8px 12px; font:13px var(--mono); cursor:pointer;
@@ -7742,44 +7742,69 @@ WORK_HTML = r"""<!doctype html>
     .btn:hover { border-color:#3a4a70 }
     .btn.primary { border-color:var(--accent); color:var(--accent) }
     .btn.danger { border-color:var(--red); color:var(--red) }
+    .btn.small { min-height:34px; padding:5px 10px; font-size:12px }
     main { padding:10px max(14px, env(safe-area-inset-right)) max(28px, env(safe-area-inset-bottom))
                    max(14px, env(safe-area-inset-left)) }
     .muted { color:var(--muted); font-size:12px }
     .pill { font-size:10px; font-weight:700; padding:2px 8px; border-radius:999px;
-            border:1px solid var(--line); white-space:nowrap }
-    .pill.RUNNING, .pill.COMPLETE { color:var(--green); border-color:var(--green) }
-    .pill.WAITING_APPROVAL, .pill.PAUSED, .pill.VERIFYING { color:var(--amber); border-color:var(--amber) }
-    .pill.BLOCKED, .pill.FAILED { color:var(--red); border-color:var(--red) }
+            border:1px solid var(--line); white-space:nowrap; display:inline-block }
+    .pill.RUNNING, .pill.COMPLETE, .pill.COMPLETED, .pill.BUSY { color:var(--green); border-color:var(--green) }
+    .pill.VERIFYING, .pill.WAITING_APPROVAL, .pill.PAUSED, .pill.DISPATCHING,
+    .pill.DISPATCH_UNCERTAIN, .pill.PRECHECK, .pill.REVISION_REQUIRED {
+      color:var(--amber); border-color:var(--amber) }
+    .pill.BLOCKED, .pill.FAILED, .pill.OFFLINE, .pill.UNAVAILABLE, .pill.CANCELLED {
+      color:var(--red); border-color:var(--red) }
     .pill.WORK { color:var(--accent); border-color:var(--accent) }
+    .pill.QUEUED, .pill.READY, .pill.IDLE, .pill.DRAFT { color:var(--muted) }
     .card { border:1px solid var(--line); border-radius:12px; background:var(--panel);
             padding:12px 14px; margin-bottom:10px }
     .card.selected { border-color:var(--accent) }
     .card-head { display:flex; align-items:center; gap:9px; flex-wrap:wrap }
     .title { font-weight:700; font-size:14px }
-    .bar { height:6px; border-radius:999px; background:#1c2540; margin-top:9px; overflow:hidden }
-    .bar > i { display:block; height:100%; background:var(--green) }
-    /* "Need from you" is the whole point of opening this on a phone, so it
-       sits above the plan rather than below it. */
+    .bar { height:6px; border-radius:999px; background:var(--dim); margin-top:9px; overflow:hidden }
+    .bar > i { display:block; height:100%; background:var(--green); transition:width .4s }
+    /* "Need from you" is why this screen gets opened on a phone, so it sits
+       above everything including the run's own header. */
     .need { border:1px solid var(--amber); border-radius:12px; padding:11px 13px;
-            margin-bottom:10px; background:#1a1a10 }
+            margin-bottom:10px; background:#191606 }
     .need h3 { margin:0 0 6px; font-size:13px; color:var(--amber) }
     .row { display:flex; align-items:center; gap:9px; flex-wrap:wrap;
            padding:7px 0; border-top:1px solid var(--line) }
     .row:first-of-type { border-top:0 }
     .grow { flex:1; min-width:0 }
-    .task-title { font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    .ellip { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12.5px }
     textarea { width:100%; background:#0c1222; border:1px solid var(--line); color:var(--text);
-               border-radius:10px; padding:10px; font:14px var(--mono); min-height:88px }
+               border-radius:10px; padding:10px; font:14px var(--mono); min-height:86px }
     .unmet { font-size:11.5px; color:var(--amber); margin-top:6px; line-height:1.6 }
-    .empty { padding:26px; text-align:center; color:var(--muted) }
-    .cols { display:grid; gap:12px; grid-template-columns:minmax(0,340px) minmax(0,1fr) }
-    @media (max-width:860px) {
+    .err { font-size:11.5px; color:var(--red); margin-top:4px; line-height:1.55;
+           overflow-wrap:anywhere }
+    .empty { padding:22px; text-align:center; color:var(--muted) }
+    .cols { display:grid; gap:12px; grid-template-columns:minmax(0,350px) minmax(0,1fr) }
+    /* The lifecycle, drawn so an operator can see WHERE a task is rather
+       than decoding a status word. Steps past the current one stay dim. */
+    .flow { display:flex; gap:4px; flex-wrap:wrap; margin-top:7px }
+    .step { font-size:9.5px; letter-spacing:.03em; padding:2px 6px; border-radius:5px;
+            background:var(--dim); color:var(--muted); white-space:nowrap }
+    .step.done { background:#14301f; color:var(--green) }
+    .step.at { background:#2a2408; color:var(--amber); font-weight:700 }
+    .step.bad { background:#2e1414; color:var(--red); font-weight:700 }
+    .dep { font-size:10.5px; color:var(--muted) }
+    table { border-collapse:collapse; width:100%; min-width:520px }
+    th, td { text-align:left; padding:6px 9px; border-bottom:1px solid var(--line);
+             font-size:11.5px; vertical-align:top }
+    th { color:var(--muted); font-weight:700; font-size:10.5px; text-transform:uppercase }
+    tr:last-child td { border-bottom:0 }
+    .wrap { overflow-x:auto }
+    .note { font-size:11.5px; color:var(--muted); margin:16px 0 0; line-height:1.65 }
+    @media (max-width:900px) {
       .cols { grid-template-columns:minmax(0,1fr) }
       header { padding:9px 12px } h1 { font-size:15px }
       main { padding:8px 12px 26px }
-      /* On a phone the detail comes first: you opened this to act on one
-         thing, not to browse a list. */
+      /* On a phone you opened this to act on ONE thing, not to browse. */
       #detail { order:-1 }
+      #list { order:1 }
+      table { min-width:0 }
+      th:nth-child(n+5), td:nth-child(n+5) { display:none }
     }
   </style>
 </head>
@@ -7788,28 +7813,48 @@ WORK_HTML = r"""<!doctype html>
     <h1>🧩 Work</h1>
     <span class="muted" id="status">đang tải…</span>
     <span class="spacer"></span>
-    <button class="btn" id="refreshBtn" type="button">Làm mới</button>
-    <a class="btn" href="/dashboard">← Terminal</a>
+    <button class="btn small" id="liveBtn" type="button" aria-pressed="true">⏸ Tạm dừng</button>
+    <button class="btn small" id="refreshBtn" type="button">Làm mới</button>
+    <a class="btn small" href="/dashboard/work">🧩 Work</a>
+    <a class="btn small" href="/dashboard">🖥 Terminal</a>
   </header>
   <main>
     <div class="cols">
       <section id="list">
         <h2>Work runs</h2>
         <div id="works"></div>
+        <h2>Workers</h2>
+        <div id="workers"></div>
       </section>
       <section id="detail"></section>
     </div>
-    <p class="muted" id="note"></p>
+    <p class="note" id="note"></p>
   </main>
   <script>
     const $ = (s) => document.querySelector(s);
-    const state = {works: [], selected: null, detail: null};
+    const state = {works: [], workers: [], selected: null, detail: null, live: true};
+
+    // The task lifecycle, in the order it really happens. Drawn as steps so
+    // an operator sees WHERE a task is instead of decoding one word.
+    const FLOW = ['QUEUED', 'PRECHECK', 'READY', 'DISPATCHING', 'RUNNING', 'VERIFYING', 'COMPLETED'];
+    const BAD = {BLOCKED: 1, FAILED: 1, CANCELLED: 1, REVISION_REQUIRED: 1,
+                 DISPATCH_UNCERTAIN: 1, WAITING_SESSION: 1, PAUSED: 1};
 
     function el(tag, opts) {
       const node = document.createElement(tag);
       if (opts && opts.className) node.className = opts.className;
       if (opts && opts.text != null) node.textContent = opts.text;
       return node;
+    }
+
+    function ago(stamp) {
+      if (!stamp) return '—';
+      const seconds = (Date.now() - Date.parse(stamp)) / 1000;
+      if (Number.isNaN(seconds)) return '—';
+      if (seconds < 90) return Math.round(seconds) + 's';
+      if (seconds < 5400) return Math.round(seconds / 60) + 'm';
+      if (seconds < 172800) return Math.round(seconds / 3600) + 'h';
+      return Math.round(seconds / 86400) + 'd';
     }
 
     async function api(path, body) {
@@ -7820,6 +7865,29 @@ WORK_HTML = r"""<!doctype html>
       const response = await fetch(path, options);
       return response.json();
     }
+
+    function progressBar(percent) {
+      const bar = el('div', {className: 'bar'});
+      const fill = el('i');
+      fill.style.width = Math.max(0, Math.min(100, percent || 0)) + '%';
+      bar.appendChild(fill);
+      return bar;
+    }
+
+    function flowStrip(status) {
+      const strip = el('div', {className: 'flow'});
+      const index = FLOW.indexOf(status);
+      for (let i = 0; i < FLOW.length; i += 1) {
+        const cls = index === -1 ? '' : i < index ? ' done' : i === index ? ' at' : '';
+        strip.appendChild(el('span', {className: 'step' + cls, text: FLOW[i]}));
+      }
+      // A status outside the happy path is shown as its own terminal step
+      // rather than silently leaving every step dim.
+      if (BAD[status]) strip.appendChild(el('span', {className: 'step bad', text: status}));
+      return strip;
+    }
+
+    // -- left column -------------------------------------------------------
 
     function renderList() {
       const box = $('#works');
@@ -7834,39 +7902,66 @@ WORK_HTML = r"""<!doctype html>
         const head = el('div', {className: 'card-head'});
         head.append(el('span', {className: 'title', text: work.title}),
                     el('span', {className: 'pill ' + work.state, text: work.state}));
+        if (work.needs_you)
+          head.appendChild(el('span', {className: 'pill WAITING_APPROVAL',
+                                       text: '⚠ cần bạn (' + work.needs_you + ')'}));
+        if (work.blocked_tasks)
+          head.appendChild(el('span', {className: 'pill BLOCKED',
+                                       text: '⛔ ' + work.blocked_tasks + ' blocked'}));
         card.appendChild(head);
-        card.appendChild(el('div', {className: 'muted',
-          text: (work.lane || '—') + ' · ' + (work.progress.done_tasks) + '/' +
-                (work.progress.total_tasks) + ' task · ' + work.progress.percent + '%'}));
-        const bar = el('div', {className: 'bar'});
-        const fill = el('i');
-        fill.style.width = work.progress.percent + '%';
-        bar.appendChild(fill);
-        card.appendChild(bar);
+        const meta = [work.project_id || 'no project',
+                      work.progress.done_tasks + '/' + work.progress.total_tasks + ' task',
+                      work.progress.percent + '%',
+                      'sửa ' + ago(work.updated_at)];
+        card.appendChild(el('div', {className: 'muted', text: meta.join(' · ')}));
+        if ((work.running_workers || []).length)
+          card.appendChild(el('div', {className: 'muted',
+            text: '▶ đang chạy trên: ' + work.running_workers.join(', ')}));
+        card.appendChild(progressBar(work.progress.percent));
         card.onclick = () => { state.selected = work.work_id; load(); };
         box.appendChild(card);
       }
     }
 
-    function renderDetail() {
-      const box = $('#detail');
+    function renderWorkers() {
+      const box = $('#workers');
       box.replaceChildren();
-      const data = state.detail;
-      if (!data || data.error) {
+      if (!state.workers.length) {
         box.appendChild(el('div', {className: 'empty',
-          text: data && data.error ? data.error : 'Chọn một Work để xem chi tiết.'}));
+          text: 'Chưa có session -work nào. Chỉ session có hậu tố -work mới là worker.'}));
         return;
       }
-      const work = data.work;
+      for (const worker of state.workers) {
+        const card = el('div', {className: 'card'});
+        const head = el('div', {className: 'card-head'});
+        head.append(el('span', {className: 'title', text: worker.session}),
+                    el('span', {className: 'pill WORK', text: 'WORK'}),
+                    el('span', {className: 'pill ' + worker.state, text: worker.state}));
+        card.appendChild(head);
+        card.appendChild(el('div', {className: 'muted',
+          text: [worker.node_id || 'local', worker.agent_type || 'shell'].join(' · ')}));
+        if (worker.current_task)
+          card.appendChild(el('div', {className: 'muted ellip',
+            text: '▶ ' + worker.current_task.title + ' (' + worker.current_task.status + ')'}));
+        // Why a worker is not usable, stated -- "no workers" with no reason
+        // is how an operator concludes the runtime is broken.
+        if (!worker.eligible)
+          card.appendChild(el('div', {className: 'err', text: worker.detail || worker.reason}));
+        box.appendChild(card);
+      }
+    }
 
-      // Need from you -- approvals first, because that is what an operator
-      // opened this screen to resolve.
+    // -- detail ------------------------------------------------------------
+
+    function renderApprovals(box, data) {
       for (const approval of data.pending_approvals || []) {
         const need = el('div', {className: 'need'});
         need.appendChild(el('h3', {text: '⚠ Cần bạn duyệt'}));
         need.appendChild(el('div', {text: approval.summary}));
         need.appendChild(el('div', {className: 'muted',
-          text: approval.kind + ' · yêu cầu bởi ' + approval.requested_by}));
+          text: approval.kind + ' · yêu cầu bởi ' + approval.requested_by
+                + ' · ' + ago(approval.requested_at)}));
+        if (approval.detail) need.appendChild(el('div', {className: 'muted', text: approval.detail}));
         const actions = el('div', {className: 'row'});
         const approve = el('button', {className: 'btn primary', text: '✓ Duyệt'});
         approve.onclick = async () => {
@@ -7884,7 +7979,10 @@ WORK_HTML = r"""<!doctype html>
         need.appendChild(actions);
         box.appendChild(need);
       }
+    }
 
+    function renderOverview(box, data) {
+      const work = data.work;
       const card = el('div', {className: 'card'});
       const head = el('div', {className: 'card-head'});
       head.append(el('span', {className: 'title', text: work.title}),
@@ -7892,48 +7990,61 @@ WORK_HTML = r"""<!doctype html>
       if (data.lane_is_work_session)
         head.appendChild(el('span', {className: 'pill WORK', text: 'WORK'}));
       card.appendChild(head);
-      card.appendChild(el('div', {className: 'muted', text: work.goal}));
-      const bar = el('div', {className: 'bar'});
-      const fill = el('i');
-      fill.style.width = data.progress.percent + '%';
-      bar.appendChild(fill);
-      card.appendChild(bar);
       card.appendChild(el('div', {className: 'muted',
-        text: data.progress.percent + '% · ' + data.progress.done_tasks + '/' +
-              data.progress.total_tasks + ' task xong'}));
-      // Why it is not finished -- stated, not left to be inferred from a
-      // progress bar that has stopped moving.
+        text: [work.project_id || 'no project', work.lane || '—',
+               'sửa ' + ago(work.updated_at)].join(' · ')}));
+      card.appendChild(el('h2', {text: 'Goal'}));
+      card.appendChild(el('div', {text: work.goal}));
+      if ((work.done_criteria || []).length) {
+        card.appendChild(el('h2', {text: 'Done criteria'}));
+        for (const criterion of work.done_criteria)
+          card.appendChild(el('div', {className: 'muted', text: '• ' + criterion}));
+      }
+      const constraints = (work.metadata && work.metadata.constraints) || [];
+      if (constraints.length) {
+        card.appendChild(el('h2', {text: 'Constraints'}));
+        for (const constraint of constraints)
+          card.appendChild(el('div', {className: 'muted', text: '• ' + constraint}));
+      }
+      card.appendChild(progressBar(data.progress.percent));
+      card.appendChild(el('div', {className: 'muted',
+        text: data.progress.percent + '% · ' + data.progress.done_tasks + '/'
+              + data.progress.total_tasks + ' task xong · trọng số '
+              + data.progress.done_weight + '/' + data.progress.total_weight}));
+      // Why it is not finished -- stated, never left to be inferred from a
+      // progress bar that stopped moving.
       if (!data.contract.satisfied && (data.contract.unmet || []).length) {
         const unmet = el('div', {className: 'unmet'});
         unmet.textContent = 'Chưa đạt: ' + data.contract.unmet.map(
           (u) => u.title ? (u.reason + ' (' + u.title + ')') : u.reason).join('; ');
         card.appendChild(unmet);
       }
-      if ((work.done_criteria || []).length)
-        card.appendChild(el('div', {className: 'muted',
-          text: 'Done criteria: ' + work.done_criteria.join(' · ')}));
+      if (work.paused_reason) card.appendChild(el('div', {className: 'err', text: work.paused_reason}));
+      if (work.failure_reason) card.appendChild(el('div', {className: 'err', text: work.failure_reason}));
       box.appendChild(card);
+    }
 
-      // Composer -- the durable way to add an instruction without typing
-      // into a session that is mid-turn.
-      const composer = el('div', {className: 'card'});
-      composer.appendChild(el('h2', {text: 'Giao thêm việc'}));
+    function renderComposer(box, work) {
+      const card = el('div', {className: 'card'});
+      card.appendChild(el('h2', {text: 'Giao thêm việc'}));
       const input = el('textarea');
-      input.placeholder = 'Mô tả task tiếp theo…';
       input.id = 'composer';
-      composer.appendChild(input);
+      input.placeholder = 'Mô tả task tiếp theo… (vào hàng đợi, không gõ thẳng vào session đang bận)';
+      card.appendChild(input);
+      const controls = el('div', {className: 'row'});
       const send = el('button', {className: 'btn primary', text: '➤ Thêm vào hàng đợi'});
+      send.id = 'sendBtn';
       send.onclick = async () => {
         if (!input.value.trim()) return;
-        await api('/dashboard/api/work/continue',
-                  {work_id: work.work_id, prompt: input.value});
+        send.disabled = true;
+        await api('/dashboard/api/work/continue', {work_id: work.work_id, prompt: input.value});
         input.value = '';
+        send.disabled = false;
         load();
       };
-      const controls = el('div', {className: 'row'});
       controls.appendChild(send);
       for (const action of ['pause', 'resume', 'cancel']) {
-        const button = el('button', {className: 'btn', text: action});
+        const button = el('button', {className: 'btn small', text: action});
         button.onclick = async () => {
           await api('/dashboard/api/work/control', {work_id: work.work_id, action});
           load();
@@ -7941,75 +8052,170 @@ WORK_HTML = r"""<!doctype html>
         controls.appendChild(button);
       }
       if (work.lane) {
-        const open = el('a', {className: 'btn', text: '🖥 Mở terminal'});
+        const open = el('a', {className: 'btn small', text: '🖥 Open Terminal'});
         open.href = '/dashboard?session=' + encodeURIComponent(work.lane);
         controls.appendChild(open);
       }
-      composer.appendChild(controls);
-      box.appendChild(composer);
+      card.appendChild(controls);
+      box.appendChild(card);
+    }
 
-      const plan = el('div', {className: 'card'});
-      plan.appendChild(el('h2', {text: 'Plan'}));
+    function renderPlan(box, data) {
+      const card = el('div', {className: 'card'});
+      card.appendChild(el('h2', {text: 'Plan / Task DAG'}));
+      const byId = {};
+      for (const task of data.tasks || []) byId[task.queue_task_id] = task.title;
       for (const task of data.tasks || []) {
         const row = el('div', {className: 'row'});
-        row.append(el('span', {className: 'grow task-title', text: task.title}),
-                   el('span', {className: 'pill ' + (task.queue_status || ''),
-                               text: task.queue_status || 'UNBOUND'}));
-        if (!task.required) row.appendChild(el('span', {className: 'muted', text: 'optional'}));
-        plan.appendChild(row);
+        const left = el('div', {className: 'grow'});
+        left.appendChild(el('div', {className: 'ellip', text: task.title}));
+        const bits = ['w' + task.weight, task.required ? 'required' : 'optional'];
+        if (task.priority) bits.push('prio ' + task.priority);
+        if (task.attempts != null) bits.push('attempt ' + task.attempts + '/' + (task.max_attempts || '?'));
+        if (task.worker_session) bits.push('@' + task.worker_session);
+        left.appendChild(el('div', {className: 'muted', text: bits.join(' · ')}));
+        if ((task.depends_on || []).length)
+          left.appendChild(el('div', {className: 'dep',
+            text: '↳ sau: ' + task.depends_on.map((d) => byId[d] || d).join(', ')}));
+        left.appendChild(flowStrip(task.queue_status));
+        if (task.last_error) left.appendChild(el('div', {className: 'err', text: task.last_error}));
+        if (task.coordinator_reason && /NEEDS|BLOCK|loop/i.test(task.coordinator_reason))
+          left.appendChild(el('div', {className: 'err', text: task.coordinator_reason}));
+        row.appendChild(left);
+        row.appendChild(el('span', {className: 'pill ' + (task.queue_status || ''),
+                                    text: task.queue_status || 'UNBOUND'}));
+        card.appendChild(row);
       }
       if (!(data.tasks || []).length)
-        plan.appendChild(el('div', {className: 'muted', text: 'Chưa có task.'}));
-      box.appendChild(plan);
-
-      if ((data.artifacts || []).length) {
-        const artifacts = el('div', {className: 'card'});
-        artifacts.appendChild(el('h2', {text: 'Artifacts'}));
-        for (const artifact of data.artifacts) {
-          const row = el('div', {className: 'row'});
-          row.append(el('span', {className: 'grow task-title',
-                                 text: artifact.kind + ': ' + artifact.reference}));
-          artifacts.appendChild(row);
-        }
-        box.appendChild(artifacts);
-      }
-
-      const activity = el('div', {className: 'card'});
-      activity.appendChild(el('h2', {text: 'Activity'}));
-      for (const event of (data.events || []).slice(0, 12)) {
-        const row = el('div', {className: 'row'});
-        row.append(el('span', {className: 'grow task-title', text: event.summary}),
-                   el('span', {className: 'muted', text: event.kind}));
-        activity.appendChild(row);
-      }
-      box.appendChild(activity);
+        card.appendChild(el('div', {className: 'muted', text: 'Chưa có task.'}));
+      box.appendChild(card);
     }
+
+    function renderQueue(box, data) {
+      const card = el('div', {className: 'card'});
+      card.appendChild(el('h2', {text: 'Queue'}));
+      const wrap = el('div', {className: 'wrap'});
+      const table = el('table');
+      const thead = el('thead');
+      const hrow = el('tr');
+      for (const label of ['#', 'Task', 'State', 'Prio', 'Attempt', 'Worker'])
+        hrow.appendChild(el('th', {text: label}));
+      thead.appendChild(hrow);
+      table.appendChild(thead);
+      const body = el('tbody');
+      const ordered = (data.tasks || []).slice().sort(
+        (a, b) => (a.queue_position || 0) - (b.queue_position || 0));
+      for (const task of ordered) {
+        const row = el('tr');
+        row.appendChild(el('td', {text: String(task.queue_position != null ? task.queue_position : '—')}));
+        row.appendChild(el('td', {text: task.title}));
+        const stateCell = el('td');
+        stateCell.appendChild(el('span', {className: 'pill ' + (task.queue_status || ''),
+                                          text: task.queue_status || 'UNBOUND'}));
+        row.appendChild(stateCell);
+        row.appendChild(el('td', {text: String(task.priority != null ? task.priority : 0)}));
+        row.appendChild(el('td', {text: String(task.attempts != null ? task.attempts : '—')}));
+        row.appendChild(el('td', {text: task.claimed_by || task.worker_session || '—'}));
+        body.appendChild(row);
+      }
+      table.appendChild(body);
+      wrap.appendChild(table);
+      card.appendChild(wrap);
+      box.appendChild(card);
+    }
+
+    function renderArtifacts(box, data) {
+      if (!(data.artifacts || []).length) return;
+      const card = el('div', {className: 'card'});
+      card.appendChild(el('h2', {text: 'Artifacts / Evidence'}));
+      for (const artifact of data.artifacts) {
+        const row = el('div', {className: 'row'});
+        row.append(el('span', {className: 'grow ellip',
+                               text: artifact.kind + ': ' + artifact.reference}),
+                   el('span', {className: 'muted', text: ago(artifact.created_at)}));
+        if (artifact.summary) row.appendChild(el('div', {className: 'muted', text: artifact.summary}));
+        card.appendChild(row);
+      }
+      box.appendChild(card);
+    }
+
+    function renderActivity(box, data) {
+      const card = el('div', {className: 'card'});
+      card.appendChild(el('h2', {text: 'Activity'}));
+      for (const event of (data.events || []).slice(0, 20)) {
+        const row = el('div', {className: 'row'});
+        row.append(el('span', {className: 'grow ellip', text: event.summary}),
+                   el('span', {className: 'muted', text: event.kind}),
+                   el('span', {className: 'muted', text: ago(event.created_at)}));
+        card.appendChild(row);
+      }
+      if (!(data.events || []).length)
+        card.appendChild(el('div', {className: 'muted', text: 'Chưa có sự kiện.'}));
+      box.appendChild(card);
+    }
+
+    function renderDetail() {
+      const box = $('#detail');
+      box.replaceChildren();
+      const data = state.detail;
+      if (!data || data.error) {
+        box.appendChild(el('div', {className: 'empty',
+          text: data && data.error ? data.error : 'Chọn một Work để xem chi tiết.'}));
+        return;
+      }
+      renderApprovals(box, data);
+      renderOverview(box, data);
+      renderComposer(box, data.work);
+      renderPlan(box, data);
+      renderQueue(box, data);
+      renderArtifacts(box, data);
+      renderActivity(box, data);
+    }
+
+    // -- loading -----------------------------------------------------------
 
     async function load() {
       try {
-        const listing = await api('/dashboard/api/work');
+        const [listing, workers] = await Promise.all([
+          api('/dashboard/api/work'),
+          api('/dashboard/api/work/workers'),
+        ]);
         state.works = listing.works || [];
+        state.workers = workers.workers || [];
+        if (state.selected && !state.works.some((w) => w.work_id === state.selected))
+          state.selected = null;
         if (!state.selected && state.works.length) state.selected = state.works[0].work_id;
         state.detail = state.selected
           ? await api('/dashboard/api/work?work=' + encodeURIComponent(state.selected))
           : null;
         renderList();
+        renderWorkers();
         renderDetail();
-        $('#status').textContent = state.works.length + ' work';
+        $('#status').textContent = state.works.length + ' work · ' + state.workers.length
+          + ' worker' + (state.live ? '' : ' · đã tạm dừng');
         $('#note').textContent =
-          'Work Runtime chỉ tự động điều khiển session có hậu tố -work. Session thường '
-          + 'giữ nguyên hành vi cũ: không bị claim, không bị tự gửi prompt, không bị đổi '
-          + 'state. Tiến độ tính từ trọng số task và trạng thái thật trong queue, không '
-          + 'phải từ phần trăm do model tự báo; một Work chỉ COMPLETE khi mọi task bắt '
-          + 'buộc đã xong, không có task blocked và không còn approval chờ.';
+          'Work Runtime chỉ tự động điều khiển session có hậu tố -work; danh sách Workers ở '
+          + 'đây không bao giờ chứa session thường. Session thường giữ nguyên hành vi cũ: '
+          + 'không bị claim, không bị tự gửi prompt, không bị đổi state. Tiến độ tính từ '
+          + 'trọng số task và trạng thái thật trong queue, không phải phần trăm do model tự '
+          + 'báo; một Work chỉ COMPLETE khi mọi task bắt buộc đã xong, không có task blocked '
+          + 'và không còn approval chờ.';
       } catch (err) {
         $('#status').textContent = 'lỗi tải: ' + err.message;
       }
     }
 
     $('#refreshBtn').onclick = () => load();
+    $('#liveBtn').onclick = () => {
+      state.live = !state.live;
+      $('#liveBtn').textContent = state.live ? '⏸ Tạm dừng' : '▶ Tiếp tục';
+      $('#liveBtn').setAttribute('aria-pressed', String(state.live));
+      if (state.live) load();
+    };
     load();
-    setInterval(load, 10000);
+    // Polling, not a fake animation: every number on this screen comes from
+    // a real read of the queue and the work store.
+    setInterval(() => { if (state.live) load(); }, 6000);
   </script>
 </body>
 </html>
@@ -10311,6 +10517,44 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             payload = await anyio.to_thread.run_sync(_build)
         except Exception as exc:  # noqa: BLE001 -- a status screen never 5xxs
             payload = {"error": "WORK_READ_FAILED", "detail": str(exc), "works": []}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/work/workers", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_work_workers(request: Request) -> JSONResponse:
+        """The `-work` sessions the runtime may drive, and nothing else.
+
+        An ordinary session must never appear in this list even as a rejected
+        candidate: the UI labels it "Workers", and a human seeing their own
+        terminal there would reasonably conclude the runtime had taken it
+        over. Rejected `-work` sessions DO stay, with the reason -- those are
+        workers, and "why is mine not being used" is the question this
+        answers.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+
+        def _build() -> dict[str, Any]:
+            try:
+                listing = controller.terminal_list_sessions()
+            except Exception as exc:  # noqa: BLE001
+                return {"workers": [], "error": "SESSION_LISTING_UNAVAILABLE",
+                        "detail": str(exc)}
+            nodes = {}
+            if fleet is not None:
+                try:
+                    nodes = {n["node_id"]: n for n in fleet.offline_view()["nodes"]
+                             if n.get("node_id")}
+                except Exception:  # noqa: BLE001 -- freshness is a bonus here
+                    nodes = {}
+            return _work_service().workers(sessions=listing.get("sessions") or [],
+                                           nodes=nodes)
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001
+            payload = {"workers": [], "error": "WORKERS_READ_FAILED", "detail": str(exc)}
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/work/create", methods=["POST"],

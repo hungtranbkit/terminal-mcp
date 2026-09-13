@@ -45,6 +45,10 @@ DONE_STATUSES = frozenset({Q_COMPLETED})
 # outcome contract exists to make.
 RESOLVED_STATUSES = frozenset({Q_COMPLETED, Q_SKIPPED, Q_CANCELLED})
 STUCK_STATUSES = frozenset({Q_BLOCKED, Q_FAILED})
+# A task the fleet is actively working: used to say which worker is busy and
+# to show a run's running workers without asking each session.
+RUNNING_STATUSES = frozenset({"DISPATCHING", "RUNNING", "VERIFYING", "DISPATCH_UNCERTAIN"})
+ACTIVE_QUEUE_STATUSES = RUNNING_STATUSES | frozenset({"PRECHECK", "READY"})
 
 # Kinds of approval gate. Named so a policy can require one without the
 # caller inventing a string.
@@ -269,9 +273,21 @@ class WorkService:
             queue_task = states.get(task["work_task_id"]) or {}
             tasks.append({**task,
                           "queue_status": queue_task.get("status"),
-                          "queue_position": queue_task.get("queue_position"),
+                          "queue_position": queue_task.get("position"),
+                          "priority": queue_task.get("priority"),
                           "attempts": queue_task.get("attempt_count"),
-                          "depends_on": queue_task.get("depends_on") or []})
+                          "max_attempts": queue_task.get("max_attempts"),
+                          "depends_on": queue_task.get("depends_on") or [],
+                          # Which session is actually holding this task. The
+                          # lane is where it was queued; `claimed_by` is who
+                          # took it, and they can differ after a rebalance.
+                          "worker_session": queue_task.get("session") or task.get("lane"),
+                          "claimed_by": queue_task.get("claimed_by"),
+                          "node_id": queue_task.get("node_id"),
+                          "last_error": queue_task.get("last_error"),
+                          "coordinator_reason": queue_task.get("coordinator_reason"),
+                          "started_at": queue_task.get("started_at"),
+                          "completed_at": queue_task.get("completed_at")})
         contract = self.evaluate_contract(work_id)
         return {
             "work": run.as_dict(),
@@ -286,9 +302,76 @@ class WorkService:
         }
 
     def list_runs(self, **kwargs: Any) -> dict[str, Any]:
-        runs = self.store.list_runs(**kwargs)
-        return {"works": [{**run.as_dict(), "progress": self.progress(run.work_id).as_dict()}
-                          for run in runs]}
+        """Enough per row to triage a list without opening every run.
+
+        `needs_you` and `blocked_tasks` are the two an operator scans for, so
+        they are computed here rather than left for the UI to derive -- a
+        second implementation of "is this stuck" is a second thing to get
+        wrong.
+        """
+        works = []
+        for run in self.store.list_runs(**kwargs):
+            progress = self.progress(run.work_id)
+            states = self._queue_states(run.work_id)
+            running = sorted({str(q.get("session")) for q in states.values()
+                              if str(q.get("status") or "") in RUNNING_STATUSES
+                              and q.get("session")})
+            pending = self.store.approvals_for(run.work_id, pending_only=True)
+            works.append({**run.as_dict(), "progress": progress.as_dict(),
+                          "running_workers": running,
+                          "blocked_tasks": progress.blocked_tasks,
+                          "needs_you": len(pending),
+                          "needs_you_summary": pending[0]["summary"] if pending else None})
+        return {"works": works}
+
+    def workers(self, *, sessions: Iterable[dict[str, Any]],
+                nodes: dict[str, dict[str, Any]] | None = None,
+                statuses: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+        """The `-work` sessions, and only those.
+
+        An ordinary session must never appear here even as a rejected
+        candidate: this list is what the UI labels "Workers", and a human
+        reading their own terminal in that list would reasonably conclude the
+        runtime had taken it over. Rejections that matter -- a `-work` session
+        that is stale or unwritable -- are kept, because those ARE workers and
+        the operator needs to know why one is not being used.
+        """
+        out: list[dict[str, Any]] = []
+        lanes: dict[str, dict[str, Any]] = {}
+        for row in sessions:
+            name = row.get("name") or row.get("session")
+            if not is_work_session(name):
+                continue
+            node_id = row.get("node_id")
+            verdict = evaluate_eligibility(
+                name, status=(statuses or {}).get(name, {"exists": True}),
+                node=(nodes or {}).get(node_id) if node_id else None,
+                input_allowed=row.get("input_allowed"),
+                input_denied_reason=row.get("input_denied_reason"))
+            current = None
+            if self.queue is not None:
+                try:
+                    lane = lanes.get(name) or self.queue.status(name)
+                    lanes[name] = lane
+                    task = lane.get("current_task")
+                    if task and str(task.get("status") or "") in ACTIVE_QUEUE_STATUSES:
+                        current = {"task_id": task.get("id"), "title": task.get("title"),
+                                   "status": task.get("status")}
+                except Exception:  # noqa: BLE001 -- a worker list never 5xxs
+                    lane = {}
+            state = ("OFFLINE" if not verdict.eligible and verdict.reason in
+                     ("SESSION_MISSING", "SESSION_DEAD", "NODE_UNREACHABLE")
+                     else "BUSY" if current else "IDLE" if verdict.eligible else "UNAVAILABLE")
+            out.append({
+                "session": name, "node_id": node_id,
+                "agent_type": row.get("agent_type") or row.get("current_command"),
+                "state": state, "eligible": verdict.eligible,
+                "reason": verdict.reason, "detail": verdict.detail,
+                "current_task": current,
+                "is_work_session": True})
+        out.sort(key=lambda w: (0 if w["state"] == "BUSY" else 1 if w["state"] == "IDLE" else 2,
+                                w["session"]))
+        return {"workers": out}
 
     # -- control -------------------------------------------------------------
 
