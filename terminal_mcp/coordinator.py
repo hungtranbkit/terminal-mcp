@@ -42,6 +42,8 @@ affirmatively passed.
 from __future__ import annotations
 
 import re
+import inspect
+import os
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -119,6 +121,22 @@ class RepoEvidenceError(RuntimeError):
     NEVER as "assume clean and proceed"."""
 
 
+class RepoEvidenceUnavailable(RepoEvidenceError):
+    """The evidence could not be COLLECTED here -- as distinct from a repo
+    that was read and found wanting.
+
+    The difference is the whole point. A controller cannot see the filesystem
+    of a session running on another node, so a local `git status` against that
+    session's cwd fails with "not a git repository" -- which reads exactly like
+    a broken repo and is nothing of the sort. Reporting that as a repo failure
+    is a FALSE NEGATIVE: it blames the worker's repo for the controller having
+    looked in the wrong place.
+
+    Still fail-closed by default -- the gate refuses to dispatch on unverified
+    evidence -- but with an accurate reason and a deliberate, auditable opt-in,
+    rather than a misleading one and no way forward."""
+
+
 @dataclass(frozen=True)
 class RepoEvidence:
     branch: str
@@ -144,7 +162,8 @@ class RepoEvidence:
         return self.has_upstream and self.ahead > 0 and self.behind > 0
 
 
-def git_repo_evidence(cwd: str, *, timeout: float = 10.0) -> RepoEvidence:
+def git_repo_evidence(cwd: str, node_id: str | None = None, *,
+                      timeout: float = 10.0) -> RepoEvidence:
     """The default RepoEvidenceCollector: real `git status --porcelain`/
     `rev-parse`/`rev-list` subprocess calls against `cwd`. Raises
     RepoEvidenceError on ANY failure a real repo could not legitimately
@@ -152,7 +171,21 @@ def git_repo_evidence(cwd: str, *, timeout: float = 10.0) -> RepoEvidence:
     not a git repo at all -- rather than returning a "looks clean"
     default, which is exactly the fail-open behavior item 7 forbids. A
     branch with no upstream configured is NOT such a failure (see
-    RepoEvidence.has_upstream)."""
+    RepoEvidence.has_upstream).
+
+    `node_id` is accepted so every collector shares one signature. This one
+    only ever reads the LOCAL filesystem, so a caller that hands it a remote
+    session's cwd gets RepoEvidenceUnavailable rather than a local `git` run
+    against a path that means nothing on this host."""
+    if not os.path.isdir(cwd):
+        # The single most common way this is reached is a session on another
+        # node: its cwd is perfectly valid THERE and absent here. Saying
+        # "could not read git status" would pin that on the repo.
+        raise RepoEvidenceUnavailable(
+            f"{cwd!r} does not exist on this host"
+            + (f" -- the session runs on node {node_id!r}, whose filesystem this "
+               f"controller cannot see" if node_id else ""))
+
     def run(*args: str, allow_failure: bool = False) -> tuple[int, str]:
         try:
             result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
@@ -189,7 +222,60 @@ def git_repo_evidence(cwd: str, *, timeout: float = 10.0) -> RepoEvidence:
                         has_upstream=has_upstream, ahead=ahead, behind=behind)
 
 
-RepoEvidenceCollector = Callable[[str], RepoEvidence]
+# (cwd, node_id) -> evidence. node_id is None for a local session.
+RepoEvidenceCollector = Callable[..., RepoEvidence]
+
+
+def node_aware_repo_evidence(local_node_id: str | None = None,
+                             node_client_factory: Callable[[str], Any] | None = None,
+                             ) -> RepoEvidenceCollector:
+    """Collect evidence where the session actually lives.
+
+    Local session -> read this filesystem, exactly as before.
+    Remote session -> ask THAT node through the node adapter. A node whose
+    agent predates the repo-evidence endpoint answers 404, which is reported
+    as UNAVAILABLE (we could not look) and never as a repo failure.
+    """
+    def collect(cwd: str, node_id: str | None = None, **kwargs: Any) -> RepoEvidence:
+        if node_id is None or (local_node_id is not None and node_id == local_node_id):
+            return git_repo_evidence(cwd, node_id, **kwargs)
+        if node_client_factory is None:
+            raise RepoEvidenceUnavailable(
+                f"session is on node {node_id!r} and this controller has no node "
+                f"adapter configured to ask it for repo evidence")
+        try:
+            client = node_client_factory(node_id)
+        except Exception as exc:  # noqa: BLE001 -- any lookup failure is "cannot look"
+            raise RepoEvidenceUnavailable(
+                f"no reachable node adapter for {node_id!r}: {exc}") from exc
+        if client is None or not hasattr(client, "repo_evidence"):
+            raise RepoEvidenceUnavailable(
+                f"node {node_id!r} does not expose repo evidence (its agent predates "
+                f"the /v1/repo-evidence endpoint)")
+        try:
+            payload = client.repo_evidence(cwd)
+        except Exception as exc:  # noqa: BLE001
+            raise RepoEvidenceUnavailable(
+                f"node {node_id!r} could not be asked for repo evidence: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise RepoEvidenceUnavailable(
+                f"node {node_id!r} returned no usable repo evidence for {cwd!r}: {payload!r}")
+        if payload.get("error"):
+            # The node ANSWERED and says the repo is bad. That is real evidence
+            # about its own filesystem, not a failure to look -- so it fails
+            # closed as a repo problem and is not waivable by
+            # allow_unverified_repo, which exists only for "we could not see".
+            raise RepoEvidenceError(
+                f"node {node_id!r} could not read the repo at {cwd!r}: "
+                f"{payload.get('detail') or payload.get('error')}")
+        status_lines = tuple(payload.get("status_lines") or ())
+        return RepoEvidence(
+            branch=str(payload.get("branch") or ""), head=str(payload.get("head") or ""),
+            clean=bool(payload.get("clean", not status_lines)), status_lines=status_lines,
+            has_upstream=bool(payload.get("has_upstream", False)),
+            ahead=int(payload.get("ahead") or 0), behind=int(payload.get("behind") or 0))
+
+    return collect
 
 
 @dataclass(frozen=True)
@@ -355,6 +441,25 @@ class CoordinatorGate:
         # HIGH/CRITICAL (§20.1's own risk_level field) and whose
         # project has opted this specific level into the requirement.
         self.require_approval_for_risk_levels = require_approval_for_risk_levels
+
+    def _collect_repo_evidence(self, cwd: str, node_id: str | None) -> RepoEvidence:
+        """Call the configured collector, whichever signature it has.
+
+        Collectors predating node-awareness take only `cwd`; several tests and
+        embeddings supply one. Rather than force every caller to change at
+        once, the node is passed when the collector can accept it and dropped
+        when it cannot -- a one-argument collector is inherently local, which
+        is exactly what it was before.
+        """
+        collector = self.evidence_collector
+        try:
+            signature = inspect.signature(collector)
+        except (TypeError, ValueError):  # pragma: no cover - exotic callables
+            return collector(cwd)
+        takes_node = len(signature.parameters) > 1 or any(
+            parameter.kind is inspect.Parameter.VAR_POSITIONAL
+            for parameter in signature.parameters.values())
+        return collector(cwd, node_id) if takes_node else collector(cwd)
 
     def review(self, task: QueueTask, *, store: QueueStore, session: SessionSnapshot,
               other_active: tuple[OtherLaneSnapshot, ...] = ()) -> CoordinatorDecision:
@@ -568,12 +673,35 @@ class CoordinatorGate:
         repo: RepoEvidence | None = None
         if session.cwd:
             try:
-                repo = self.evidence_collector(session.cwd)
+                repo = self._collect_repo_evidence(session.cwd, session.node_id)
+            except RepoEvidenceUnavailable as exc:
+                # We could not LOOK. That is not evidence the repo is bad, and
+                # reporting it as such sends an operator to debug a healthy
+                # repository. Still fail-closed -- dispatching on unverified
+                # evidence is exactly what this gate exists to prevent -- but
+                # with the real reason and a deliberate way through.
+                if task.metadata.get("allow_unverified_repo"):
+                    repo = None
+                else:
+                    return CoordinatorDecision(
+                        NEEDS_HUMAN,
+                        evidence={"repo_evidence_unavailable": str(exc),
+                                  "session_node_id": session.node_id,
+                                  "cwd": session.cwd,
+                                  "override": "set task metadata allow_unverified_repo=true to "
+                                              "dispatch without repo verification"},
+                        reason=f"repo evidence for {session.cwd!r} could not be collected "
+                               f"({exc}) -- fail-closed, refusing to dispatch",
+                        required_actions=[
+                            "give this node a repo-evidence capable agent, or set "
+                            "allow_unverified_repo on the task to accept dispatch without it"],
+                    )
             except RepoEvidenceError as exc:
                 return CoordinatorDecision(
                     NEEDS_HUMAN, evidence={"repo_evidence_error": str(exc)},
                     reason=f"could not read git/repo status for {session.cwd!r} -- fail-closed, refusing to dispatch",
                 )
+        if repo is not None:
             if not repo.clean and not task.metadata.get("allow_dirty_repo"):
                 return CoordinatorDecision(
                     NEEDS_REWORK, blockers=repo.status_lines,

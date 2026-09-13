@@ -71,6 +71,7 @@ class NodeClient(Protocol):
     def health(self) -> dict[str, Any]: ...
     def metrics(self) -> dict[str, Any]: ...
     def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]: ...
+    def repo_evidence(self, cwd: str) -> dict[str, Any]: ...
     def describe_permissions(self, session: str) -> dict[str, Any]: ...
     def set_permissions(self, session: str, *, read: bool | None, input: bool | None,
                         expected_revision: int | None, actor: str | None) -> dict[str, Any]: ...
@@ -191,6 +192,19 @@ class LocalNodeClient:
     def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]:
         from . import node_profile
         return node_profile.inventory(tuple(roles))
+
+    def repo_evidence(self, cwd: str) -> dict[str, Any]:
+        """Git metadata for a path on THIS host (controller == node here)."""
+        from .coordinator import RepoEvidenceError, git_repo_evidence
+
+        try:
+            evidence = git_repo_evidence(cwd)
+        except RepoEvidenceError as exc:
+            return {"error": "REPO_EVIDENCE_FAILED", "detail": str(exc)}
+        return {"cwd": cwd, "branch": evidence.branch, "head": evidence.head,
+                "clean": evidence.clean, "status_lines": list(evidence.status_lines),
+                "has_upstream": evidence.has_upstream,
+                "ahead": evidence.ahead, "behind": evidence.behind}
 
     def describe_permissions(self, session: str) -> dict[str, Any]:
         return self._terminal.describe_session_permissions(session)
@@ -387,6 +401,19 @@ class RemoteNodeClient:
 
     def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]:
         return self._request("GET", "/v1/environment?roles=" + ",".join(roles))
+
+    def repo_evidence(self, cwd: str) -> dict[str, Any]:
+        """Ask THIS node for git metadata about one of its own paths.
+
+        A node whose agent predates this endpoint answers 404. That is
+        surfaced as an error payload rather than swallowed, because the
+        caller must tell "this repo is dirty" apart from "this node cannot
+        say" -- confusing the two is the bug this endpoint exists to fix.
+        """
+        import urllib.parse as _urlparse
+
+        return self._request(
+            "GET", "/v1/repo-evidence?cwd=" + _urlparse.quote(str(cwd), safe=""))
 
     def describe_permissions(self, session: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/sessions/{session}/permissions")

@@ -53,6 +53,8 @@ from .contract import describe as contract_describe
 from . import node_profile
 from .launcher_resolution import resolve_launcher
 from .config import load_config
+from .coordinator import RepoEvidenceError, git_repo_evidence
+from .lifecycle import resolve_cwd
 from .core import TerminalService
 from .node_client import LocalNodeClient
 from .webterm import WebTerminalProcess, pump_websocket
@@ -177,6 +179,43 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
             return blocked
         result = await anyio.to_thread.run_sync(lambda: client.metrics())
         return JSONResponse(result)
+
+    async def repo_evidence(request: Request) -> JSONResponse:
+        """Git branch/HEAD/dirty state for a path ON THIS NODE.
+
+        Exists because the controller cannot see this node's filesystem: its
+        pre-dispatch gate needs repo evidence for a session running here, and
+        running `git` locally against this node's cwd told it only that the
+        path does not exist -- which it then reported as a broken repo.
+
+        Metadata ONLY. Branch name, commit id, porcelain status lines and
+        ahead/behind counts; never file contents, never a diff. The path is
+        confined to this node's configured allowed_cwd_roots, so this cannot
+        be used to probe arbitrary directories.
+        """
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        cwd = (request.query_params.get("cwd") or "").strip()
+        if not cwd:
+            return JSONResponse({"error": "CWD_REQUIRED"}, status_code=400)
+        resolved, error = resolve_cwd(cwd, config)
+        if error is not None:
+            return JSONResponse({"error": "PATH_NOT_ALLOWED", "detail": error},
+                                status_code=403)
+        try:
+            evidence = git_repo_evidence(str(resolved))
+        except RepoEvidenceError as exc:
+            # A real repo problem on this node -- reported as such, and
+            # distinct from "this node cannot answer", which is a transport
+            # failure the caller sees as a non-200 instead.
+            return JSONResponse({"error": "REPO_EVIDENCE_FAILED", "detail": str(exc)},
+                                status_code=200)
+        return JSONResponse({
+            "cwd": str(resolved), "branch": evidence.branch, "head": evidence.head,
+            "clean": evidence.clean, "status_lines": list(evidence.status_lines),
+            "has_upstream": evidence.has_upstream,
+            "ahead": evidence.ahead, "behind": evidence.behind,
+        })
 
     async def environment(request: Request) -> JSONResponse:
         """This node's audit against deploy/node-profile.yaml.
@@ -593,6 +632,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         Route("/v1/health", health, methods=["GET"]),
         Route("/v1/metrics", metrics, methods=["GET"]),
         Route("/v1/environment", environment, methods=["GET"]),
+        Route("/v1/repo-evidence", repo_evidence, methods=["GET"]),
         Route("/v1/capabilities/refresh", refresh_capabilities, methods=["POST"]),
         Route("/v1/sessions", list_sessions, methods=["GET"]),
         Route("/v1/sessions", create_session, methods=["POST"]),
