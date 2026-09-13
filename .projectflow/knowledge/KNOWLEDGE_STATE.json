@@ -1,6 +1,6 @@
 {
-  "last_indexed_at": "2026-09-13T12:25:19.316669+00:00",
-  "last_indexed_commit": "6d7d8d186c7ff9be4e8366ecea7b72be24f92a02",
+  "last_indexed_at": "2026-09-13T12:45:59.094264+00:00",
+  "last_indexed_commit": "bfedc09f16232dd233a28b6f287628de64a4b6e9",
   "modules": {
     "fleet": {
       "last_verified_at": "2026-09-13T12:09:05.525477+00:00",
