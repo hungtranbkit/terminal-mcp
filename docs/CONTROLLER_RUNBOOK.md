@@ -24,7 +24,8 @@ commit is running?" unanswerable — `/version` reports `dirty: true` forever.
 
 | Unit | Purpose |
 | --- | --- |
-| `terminal-mcp-http.service` | the controller: MCP + dashboard, `127.0.0.1:8766` + `192.168.1.109:8766` |
+| `terminal-mcp-http.service` | the ORIGINAL controller: MCP + dashboard, `127.0.0.1:8766` + `192.168.1.109:8766`. **Retired on a fed-controller host** (kept as the rollback point; must never start there — it would race the real controller for the port) |
+| `terminal-mcp-fed-controller.service` | the self-hosted controller that serves `127.0.0.1:8766` on dell-linux today; code authority is a `PYTHONPATH=` worktree, state under its own `XDG_STATE_HOME` |
 | `cloudflared-terminal-mcp-dashboard.service` | Cloudflare tunnel → `terminal-dashboard.mesflow.net`, `terminal-login.mesflow.net` |
 | `terminal-mcp-tunnel.service` | OpenAI MCP tunnel (`tunnel-client`), local admin on `127.0.0.1:8767` |
 
