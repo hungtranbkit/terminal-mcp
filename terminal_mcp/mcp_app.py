@@ -60,6 +60,7 @@ def build_mcp(service: TerminalService | None = None,
               events: EventBus | None = None,
               resource_locks: ResourceLockStore | None = None,
               fleet: "FleetService | None" = None,
+              work: Any = None,
               default_optional_services: bool = True) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
@@ -1378,6 +1379,141 @@ def build_mcp(service: TerminalService | None = None,
             return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
         nodes = tuple(n.strip() for n in assume_offline.split(",") if n.strip())
         return service.dry_run_failover(target_id, assume_offline=nodes)
+
+    _work_holder: dict[str, Any] = {"service": work, "tried": work is not None}
+
+    def _work_service():
+        """Built on first use, over the SAME queue every other surface uses."""
+        if _work_holder.get("service") is None and not _work_holder.get("tried"):
+            _work_holder["tried"] = True
+            try:
+                from .work_service import WorkService
+                from .work_store import WorkStore
+
+                _work_holder["service"] = WorkService(
+                    WorkStore(), queue=queue, controller=controller)
+            except Exception:  # noqa: BLE001 -- never break the tool surface
+                _work_holder["service"] = None
+        return _work_holder.get("service")
+
+    @server.tool()
+    def work_create(title: str, goal: str, lane: str, project_id: str = "",
+                    done_criteria: str = "", tasks_json: str = "",
+                    created_by: str = "") -> dict:
+        """Create a Work run on a `-work` session, optionally with its plan.
+
+        `lane` MUST end in `-work`. That is the whole opt-in model: the Work
+        runtime only ever drives sessions named for it, and an ordinary
+        session keeps its current behaviour untouched -- it is never claimed,
+        never prompted and never has its state changed by this runtime.
+
+        The plan is written as REAL tasks in the existing queue, so ordering,
+        dependencies, the pre-dispatch gate, guarded sending and restart
+        recovery are the ones already in production, not a second copy.
+
+        `done_criteria` is a newline- or `;`-separated list. `tasks_json` is a
+        JSON array of {title, prompt, weight, required, priority}.
+        """
+        import json as _json
+
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        criteria = [c.strip() for c in done_criteria.replace(";", "\n").splitlines()
+                    if c.strip()]
+        try:
+            tasks = _json.loads(tasks_json) if tasks_json.strip() else []
+        except ValueError as exc:
+            return {"error": "TASKS_JSON_INVALID", "detail": str(exc)}
+        if not isinstance(tasks, list):
+            return {"error": "TASKS_JSON_INVALID", "detail": "expected a JSON array"}
+        return service.create(title=title, goal=goal, lane=lane,
+                              project_id=project_id or None, done_criteria=criteria,
+                              created_by=created_by or None, tasks=tasks)
+
+    @server.tool()
+    def work_status(work_id: str) -> dict:
+        """A Work run in full: state, progress, tasks with their QUEUE status,
+        approvals, artifacts, recent events, and the outcome contract.
+
+        `progress` is computed from task weights and the queue's own record.
+        It is never parsed out of anything a model wrote about itself, and
+        `contract.satisfied` is false until every required task is genuinely
+        complete with no blocker and no open gate.
+        """
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return service.status(work_id)
+
+    @server.tool()
+    def work_list(state: str = "", project_id: str = "",
+                  include_finished: bool = False) -> dict:
+        """Work runs with their progress."""
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return service.list_runs(state=state or None, project_id=project_id or None,
+                                 include_terminal=bool(include_finished))
+
+    @server.tool()
+    def work_continue(work_id: str, prompt: str, title: str = "", weight: float = 1.0,
+                      required: bool = True, priority: int = 0) -> dict:
+        """Enqueue more work into an existing run -- the durable way to hand a
+        busy session a task.
+
+        This is the answer to "I need to give it something to do but its input
+        box is occupied": the task lands in the durable queue and is dispatched
+        when the worker is free, instead of being typed at a session mid-turn.
+        """
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return service.plan(work_id, [{"title": title or prompt[:60], "prompt": prompt,
+                                       "weight": weight, "required": required,
+                                       "priority": priority}])
+
+    @server.tool()
+    def work_approve(approval_id: str, decided_by: str, decision: str = "APPROVED",
+                     note: str = "") -> dict:
+        """Decide an approval gate.
+
+        `decided_by` is required and may NOT be whoever requested the gate --
+        an agent that can approve what it asked for has not been gated at all.
+        """
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return service.decide_approval(approval_id, decision=decision.upper(),
+                                       decided_by=decided_by, note=note or None)
+
+    @server.tool()
+    def work_request_approval(work_id: str, kind: str, summary: str, requested_by: str,
+                              detail: str = "") -> dict:
+        """Open an approval gate on a Work run -- production deploy, a
+        destructive change, a credential change, or anything else irreversible
+        enough that a human should see it first.
+
+        Independent tasks keep running: the gate lives on the approval record,
+        not on the whole lane.
+        """
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return service.request_approval(work_id, kind=kind, summary=summary,
+                                        requested_by=requested_by, detail=detail or None)
+
+    @server.tool()
+    def work_control(work_id: str, action: str, actor: str = "", reason: str = "") -> dict:
+        """pause / resume / cancel / block / fail a Work run.
+
+        Pause stops NEW dispatch and does not kill a worker mid-task; cancel
+        stops the lane without reaching out to destroy an external process.
+        """
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return service.control(work_id, action, actor=actor or None, reason=reason or None)
 
     @server.tool()
     def terminal_fleet_environment(roles: str = "node") -> dict:

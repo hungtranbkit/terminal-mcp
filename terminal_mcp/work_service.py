@@ -370,6 +370,87 @@ class WorkService:
                     pass
         return {"approval": approval, "work": (self.store.get_run(work_id) or run).as_dict()}
 
+    # -- observability ---------------------------------------------------------
+
+    def observability(self) -> dict[str, Any]:
+        """The counters an operator needs to answer "is Work healthy".
+
+        Deliberately cheap: counts over the runs this store already holds,
+        no fan-out to any node. A health view that needs the fleet to be up
+        is useless exactly when it is needed.
+        """
+        runs = self.store.list_runs(include_terminal=False, limit=500)
+        by_state: dict[str, int] = {}
+        queued = runnable = blocked = 0
+        for run in runs:
+            by_state[run.state] = by_state.get(run.state, 0) + 1
+            progress = self.progress(run.work_id)
+            blocked += progress.blocked_tasks
+            queued += max(0, progress.total_tasks - progress.done_tasks)
+            if run.state in (ws.READY, ws.RUNNING):
+                runnable += 1
+        pending = self.store.pending_approvals()
+        return {"active_runs": len(runs), "by_state": by_state,
+                "queued_tasks": queued, "runnable_runs": runnable,
+                "blocked_tasks": blocked,
+                "waiting_approvals": len(pending),
+                "approvals": [{"approval_id": a["approval_id"], "work_id": a["work_id"],
+                               "kind": a["kind"], "summary": a["summary"],
+                               "requested_by": a["requested_by"]} for a in pending[:20]]}
+
+    def readiness(self, *, loop_status: dict[str, Any] | None = None) -> dict[str, Any]:
+        """PASS/WARN/FAIL for the Work runtime.
+
+        A disabled coordinator is PASS, not a warning: Work is opt-in, and a
+        deployment that has not turned it on is in a correct state, not a
+        degraded one. Reporting otherwise would train an operator to ignore
+        this section on every box that does not use the feature.
+        """
+        checks: list[dict[str, Any]] = []
+        counters = self.observability()
+
+        if loop_status is None:
+            checks.append({"check": "work_coordinator", "status": "PASS",
+                           "summary": "Work runtime is not enabled on this controller",
+                           "evidence": {"enabled": False}})
+        elif not loop_status.get("enabled"):
+            checks.append({"check": "work_coordinator", "status": "PASS",
+                           "summary": "Work coordinator disabled by config (opt-in feature)",
+                           "evidence": loop_status})
+        elif not loop_status.get("running"):
+            checks.append({"check": "work_coordinator", "status": "FAIL",
+                           "summary": "Work coordinator is enabled but not running; "
+                                      "runs will not advance",
+                           "evidence": loop_status})
+        elif loop_status.get("last_error"):
+            checks.append({"check": "work_coordinator", "status": "WARN",
+                           "summary": f"last tick reported {loop_status['last_error']}",
+                           "evidence": loop_status})
+        else:
+            checks.append({"check": "work_coordinator", "status": "PASS",
+                           "summary": f"ticking every {loop_status.get('interval_seconds')}s",
+                           "evidence": {"ticks": loop_status.get("ticks"),
+                                        "age_seconds": loop_status.get("age_seconds")}})
+
+        # A waiting approval is not a fault -- it is the system correctly
+        # asking a human. WARN so it is visible, never FAIL.
+        checks.append({
+            "check": "work_waiting_approvals",
+            "status": "WARN" if counters["waiting_approvals"] else "PASS",
+            "summary": (f"{counters['waiting_approvals']} approval(s) waiting on a human"
+                        if counters["waiting_approvals"] else "no approval is waiting"),
+            "evidence": {"approvals": counters["approvals"]}})
+        checks.append({
+            "check": "work_blocked_tasks",
+            "status": "WARN" if counters["blocked_tasks"] else "PASS",
+            "summary": (f"{counters['blocked_tasks']} task(s) blocked"
+                        if counters["blocked_tasks"] else "no task is blocked"),
+            "evidence": {"blocked_tasks": counters["blocked_tasks"]}})
+
+        worst = ("FAIL" if any(c["status"] == "FAIL" for c in checks)
+                 else "WARN" if any(c["status"] == "WARN" for c in checks) else "PASS")
+        return {"status": worst, "checks": checks, "counters": counters}
+
     # -- worker eligibility ---------------------------------------------------
 
     def eligible_workers(self, *, sessions: Iterable[dict[str, Any]],

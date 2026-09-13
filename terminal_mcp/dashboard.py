@@ -471,6 +471,9 @@ DASHBOARD_HTML = """<!doctype html>
     .tab-dot.on { background:var(--green) }
     .tab-dot.err { background:var(--red) } /* real supervisor state (FAILED/ERROR/BLOCKED) -- never a fake/invented one */
     .tab-dot.idle { background:var(--muted) }
+    .work-badge { font-size:8.5px; font-weight:700; letter-spacing:.04em; padding:1px 4px;
+                  border-radius:4px; border:1px solid var(--accent); color:var(--accent);
+                  vertical-align:middle }
     .tab-name { overflow:hidden; text-overflow:ellipsis; font-size:13px; font-weight:600 }
     /* Compact attention badge -- reused identically in the tab bar and the
        viewer header (#summary) so a WAITING_INPUT session is obvious in
@@ -1358,6 +1361,7 @@ DASHBOARD_HTML = """<!doctype html>
           <a href="/dashboard/terminal-wall" id="terminalWallLink" role="menuitem">🧱 Terminal Wall</a>
           <a href="/dashboard/fleet" id="fleetRegistryLink" role="menuitem">🗺 Fleet Registry</a>
           <a href="/dashboard/audit" id="auditLink" role="menuitem">🧾 Audit &amp; Access</a>
+          <a href="/dashboard/work" id="workLink" role="menuitem">🧩 Work</a>
           <a href="/dashboard/ai-usage" id="aiUsageLink" role="menuitem">📊 AI Usage</a>
         </div>
       </div>
@@ -3205,7 +3209,20 @@ DASHBOARD_HTML = """<!doctype html>
       tab.title = `${row.name} · ${row.windows} window · ${row.attached ? 'Terminal attached' : 'No terminal attached'}`
         + (row.effective_read ? '' : ' · chưa cấp quyền xem');
       dot.className = tabDotClass(row);
+      // A `-work` session is labelled so an operator can tell at a glance
+      // which terminals the Work runtime may drive. The badge is a LABEL,
+      // not a control: the session stays an ordinary terminal here, and
+      // nothing about this tab behaves differently because of it.
+      const isWorkSession = /-work$/.test(row.name);
       label.textContent = row.name;
+      if (isWorkSession) {
+        label.textContent = row.name + ' ';
+        const workBadge = document.createElement('span');
+        workBadge.className = 'work-badge';
+        workBadge.textContent = 'WORK';
+        workBadge.title = 'Session này có thể được Work Runtime điều khiển tự động';
+        label.appendChild(workBadge);
+      }
       badge.hidden = !needsAttention;
 
       const isProtected = protectedSessions.has(row.name);
@@ -7685,6 +7702,320 @@ AUDIT_HTML = r"""<!doctype html>
 """
 
 
+# ---------------------------------------------------------------------------
+# Work mode. Terminal mode is untouched -- this is a SECOND view, reachable
+# from the menu, and a session without the `-work` suffix never appears here
+# as something the runtime drives.
+#
+# Mobile-first on purpose: the two things an operator needs away from a desk
+# are "what does it need from me" and "can I send it the next instruction",
+# so approvals and the composer come before the plan, and the raw terminal is
+# a link rather than an embedded pane.
+#
+# Raw string: this template writes JS escapes such as `.join('\n')` directly.
+# ---------------------------------------------------------------------------
+WORK_HTML = r"""<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Work Runtime</title>
+  <style>
+    :root {
+      --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd;
+      --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#3b78ff;
+      --mono:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    * { box-sizing:border-box }
+    body { margin:0; font:14px/1.55 var(--mono); background:var(--bg); color:var(--text) }
+    a { color:var(--accent) }
+    header { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+             padding:12px max(14px, env(safe-area-inset-right)) 12px max(14px, env(safe-area-inset-left));
+             border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5 }
+    h1 { margin:0; font-size:16px; white-space:nowrap }
+    h2 { font-size:12.5px; margin:16px 0 8px; color:var(--muted); text-transform:uppercase;
+         letter-spacing:.05em }
+    .spacer { flex:1 }
+    .btn { background:var(--panel); border:1px solid var(--line); color:var(--text);
+           border-radius:9px; padding:8px 12px; font:13px var(--mono); cursor:pointer;
+           min-height:42px; display:inline-flex; align-items:center; gap:6px; text-decoration:none }
+    .btn:hover { border-color:#3a4a70 }
+    .btn.primary { border-color:var(--accent); color:var(--accent) }
+    .btn.danger { border-color:var(--red); color:var(--red) }
+    main { padding:10px max(14px, env(safe-area-inset-right)) max(28px, env(safe-area-inset-bottom))
+                   max(14px, env(safe-area-inset-left)) }
+    .muted { color:var(--muted); font-size:12px }
+    .pill { font-size:10px; font-weight:700; padding:2px 8px; border-radius:999px;
+            border:1px solid var(--line); white-space:nowrap }
+    .pill.RUNNING, .pill.COMPLETE { color:var(--green); border-color:var(--green) }
+    .pill.WAITING_APPROVAL, .pill.PAUSED, .pill.VERIFYING { color:var(--amber); border-color:var(--amber) }
+    .pill.BLOCKED, .pill.FAILED { color:var(--red); border-color:var(--red) }
+    .pill.WORK { color:var(--accent); border-color:var(--accent) }
+    .card { border:1px solid var(--line); border-radius:12px; background:var(--panel);
+            padding:12px 14px; margin-bottom:10px }
+    .card.selected { border-color:var(--accent) }
+    .card-head { display:flex; align-items:center; gap:9px; flex-wrap:wrap }
+    .title { font-weight:700; font-size:14px }
+    .bar { height:6px; border-radius:999px; background:#1c2540; margin-top:9px; overflow:hidden }
+    .bar > i { display:block; height:100%; background:var(--green) }
+    /* "Need from you" is the whole point of opening this on a phone, so it
+       sits above the plan rather than below it. */
+    .need { border:1px solid var(--amber); border-radius:12px; padding:11px 13px;
+            margin-bottom:10px; background:#1a1a10 }
+    .need h3 { margin:0 0 6px; font-size:13px; color:var(--amber) }
+    .row { display:flex; align-items:center; gap:9px; flex-wrap:wrap;
+           padding:7px 0; border-top:1px solid var(--line) }
+    .row:first-of-type { border-top:0 }
+    .grow { flex:1; min-width:0 }
+    .task-title { font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    textarea { width:100%; background:#0c1222; border:1px solid var(--line); color:var(--text);
+               border-radius:10px; padding:10px; font:14px var(--mono); min-height:88px }
+    .unmet { font-size:11.5px; color:var(--amber); margin-top:6px; line-height:1.6 }
+    .empty { padding:26px; text-align:center; color:var(--muted) }
+    .cols { display:grid; gap:12px; grid-template-columns:minmax(0,340px) minmax(0,1fr) }
+    @media (max-width:860px) {
+      .cols { grid-template-columns:minmax(0,1fr) }
+      header { padding:9px 12px } h1 { font-size:15px }
+      main { padding:8px 12px 26px }
+      /* On a phone the detail comes first: you opened this to act on one
+         thing, not to browse a list. */
+      #detail { order:-1 }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🧩 Work</h1>
+    <span class="muted" id="status">đang tải…</span>
+    <span class="spacer"></span>
+    <button class="btn" id="refreshBtn" type="button">Làm mới</button>
+    <a class="btn" href="/dashboard">← Terminal</a>
+  </header>
+  <main>
+    <div class="cols">
+      <section id="list">
+        <h2>Work runs</h2>
+        <div id="works"></div>
+      </section>
+      <section id="detail"></section>
+    </div>
+    <p class="muted" id="note"></p>
+  </main>
+  <script>
+    const $ = (s) => document.querySelector(s);
+    const state = {works: [], selected: null, detail: null};
+
+    function el(tag, opts) {
+      const node = document.createElement(tag);
+      if (opts && opts.className) node.className = opts.className;
+      if (opts && opts.text != null) node.textContent = opts.text;
+      return node;
+    }
+
+    async function api(path, body) {
+      const options = body
+        ? {method: 'POST', headers: {'Content-Type': 'application/json'},
+           body: JSON.stringify(body)}
+        : {cache: 'no-store'};
+      const response = await fetch(path, options);
+      return response.json();
+    }
+
+    function renderList() {
+      const box = $('#works');
+      box.replaceChildren();
+      if (!state.works.length) {
+        box.appendChild(el('div', {className: 'empty', text: 'Chưa có Work nào.'}));
+        return;
+      }
+      for (const work of state.works) {
+        const card = el('div', {className: 'card' + (work.work_id === state.selected ? ' selected' : '')});
+        card.dataset.work = work.work_id;
+        const head = el('div', {className: 'card-head'});
+        head.append(el('span', {className: 'title', text: work.title}),
+                    el('span', {className: 'pill ' + work.state, text: work.state}));
+        card.appendChild(head);
+        card.appendChild(el('div', {className: 'muted',
+          text: (work.lane || '—') + ' · ' + (work.progress.done_tasks) + '/' +
+                (work.progress.total_tasks) + ' task · ' + work.progress.percent + '%'}));
+        const bar = el('div', {className: 'bar'});
+        const fill = el('i');
+        fill.style.width = work.progress.percent + '%';
+        bar.appendChild(fill);
+        card.appendChild(bar);
+        card.onclick = () => { state.selected = work.work_id; load(); };
+        box.appendChild(card);
+      }
+    }
+
+    function renderDetail() {
+      const box = $('#detail');
+      box.replaceChildren();
+      const data = state.detail;
+      if (!data || data.error) {
+        box.appendChild(el('div', {className: 'empty',
+          text: data && data.error ? data.error : 'Chọn một Work để xem chi tiết.'}));
+        return;
+      }
+      const work = data.work;
+
+      // Need from you -- approvals first, because that is what an operator
+      // opened this screen to resolve.
+      for (const approval of data.pending_approvals || []) {
+        const need = el('div', {className: 'need'});
+        need.appendChild(el('h3', {text: '⚠ Cần bạn duyệt'}));
+        need.appendChild(el('div', {text: approval.summary}));
+        need.appendChild(el('div', {className: 'muted',
+          text: approval.kind + ' · yêu cầu bởi ' + approval.requested_by}));
+        const actions = el('div', {className: 'row'});
+        const approve = el('button', {className: 'btn primary', text: '✓ Duyệt'});
+        approve.onclick = async () => {
+          await api('/dashboard/api/work/approve',
+                    {approval_id: approval.approval_id, decision: 'APPROVED'});
+          load();
+        };
+        const reject = el('button', {className: 'btn danger', text: '✕ Từ chối'});
+        reject.onclick = async () => {
+          await api('/dashboard/api/work/approve',
+                    {approval_id: approval.approval_id, decision: 'REJECTED'});
+          load();
+        };
+        actions.append(approve, reject);
+        need.appendChild(actions);
+        box.appendChild(need);
+      }
+
+      const card = el('div', {className: 'card'});
+      const head = el('div', {className: 'card-head'});
+      head.append(el('span', {className: 'title', text: work.title}),
+                  el('span', {className: 'pill ' + work.state, text: work.state}));
+      if (data.lane_is_work_session)
+        head.appendChild(el('span', {className: 'pill WORK', text: 'WORK'}));
+      card.appendChild(head);
+      card.appendChild(el('div', {className: 'muted', text: work.goal}));
+      const bar = el('div', {className: 'bar'});
+      const fill = el('i');
+      fill.style.width = data.progress.percent + '%';
+      bar.appendChild(fill);
+      card.appendChild(bar);
+      card.appendChild(el('div', {className: 'muted',
+        text: data.progress.percent + '% · ' + data.progress.done_tasks + '/' +
+              data.progress.total_tasks + ' task xong'}));
+      // Why it is not finished -- stated, not left to be inferred from a
+      // progress bar that has stopped moving.
+      if (!data.contract.satisfied && (data.contract.unmet || []).length) {
+        const unmet = el('div', {className: 'unmet'});
+        unmet.textContent = 'Chưa đạt: ' + data.contract.unmet.map(
+          (u) => u.title ? (u.reason + ' (' + u.title + ')') : u.reason).join('; ');
+        card.appendChild(unmet);
+      }
+      if ((work.done_criteria || []).length)
+        card.appendChild(el('div', {className: 'muted',
+          text: 'Done criteria: ' + work.done_criteria.join(' · ')}));
+      box.appendChild(card);
+
+      // Composer -- the durable way to add an instruction without typing
+      // into a session that is mid-turn.
+      const composer = el('div', {className: 'card'});
+      composer.appendChild(el('h2', {text: 'Giao thêm việc'}));
+      const input = el('textarea');
+      input.placeholder = 'Mô tả task tiếp theo…';
+      input.id = 'composer';
+      composer.appendChild(input);
+      const send = el('button', {className: 'btn primary', text: '➤ Thêm vào hàng đợi'});
+      send.onclick = async () => {
+        if (!input.value.trim()) return;
+        await api('/dashboard/api/work/continue',
+                  {work_id: work.work_id, prompt: input.value});
+        input.value = '';
+        load();
+      };
+      const controls = el('div', {className: 'row'});
+      controls.appendChild(send);
+      for (const action of ['pause', 'resume', 'cancel']) {
+        const button = el('button', {className: 'btn', text: action});
+        button.onclick = async () => {
+          await api('/dashboard/api/work/control', {work_id: work.work_id, action});
+          load();
+        };
+        controls.appendChild(button);
+      }
+      if (work.lane) {
+        const open = el('a', {className: 'btn', text: '🖥 Mở terminal'});
+        open.href = '/dashboard?session=' + encodeURIComponent(work.lane);
+        controls.appendChild(open);
+      }
+      composer.appendChild(controls);
+      box.appendChild(composer);
+
+      const plan = el('div', {className: 'card'});
+      plan.appendChild(el('h2', {text: 'Plan'}));
+      for (const task of data.tasks || []) {
+        const row = el('div', {className: 'row'});
+        row.append(el('span', {className: 'grow task-title', text: task.title}),
+                   el('span', {className: 'pill ' + (task.queue_status || ''),
+                               text: task.queue_status || 'UNBOUND'}));
+        if (!task.required) row.appendChild(el('span', {className: 'muted', text: 'optional'}));
+        plan.appendChild(row);
+      }
+      if (!(data.tasks || []).length)
+        plan.appendChild(el('div', {className: 'muted', text: 'Chưa có task.'}));
+      box.appendChild(plan);
+
+      if ((data.artifacts || []).length) {
+        const artifacts = el('div', {className: 'card'});
+        artifacts.appendChild(el('h2', {text: 'Artifacts'}));
+        for (const artifact of data.artifacts) {
+          const row = el('div', {className: 'row'});
+          row.append(el('span', {className: 'grow task-title',
+                                 text: artifact.kind + ': ' + artifact.reference}));
+          artifacts.appendChild(row);
+        }
+        box.appendChild(artifacts);
+      }
+
+      const activity = el('div', {className: 'card'});
+      activity.appendChild(el('h2', {text: 'Activity'}));
+      for (const event of (data.events || []).slice(0, 12)) {
+        const row = el('div', {className: 'row'});
+        row.append(el('span', {className: 'grow task-title', text: event.summary}),
+                   el('span', {className: 'muted', text: event.kind}));
+        activity.appendChild(row);
+      }
+      box.appendChild(activity);
+    }
+
+    async function load() {
+      try {
+        const listing = await api('/dashboard/api/work');
+        state.works = listing.works || [];
+        if (!state.selected && state.works.length) state.selected = state.works[0].work_id;
+        state.detail = state.selected
+          ? await api('/dashboard/api/work?work=' + encodeURIComponent(state.selected))
+          : null;
+        renderList();
+        renderDetail();
+        $('#status').textContent = state.works.length + ' work';
+        $('#note').textContent =
+          'Work Runtime chỉ tự động điều khiển session có hậu tố -work. Session thường '
+          + 'giữ nguyên hành vi cũ: không bị claim, không bị tự gửi prompt, không bị đổi '
+          + 'state. Tiến độ tính từ trọng số task và trạng thái thật trong queue, không '
+          + 'phải từ phần trăm do model tự báo; một Work chỉ COMPLETE khi mọi task bắt '
+          + 'buộc đã xong, không có task blocked và không còn approval chờ.';
+      } catch (err) {
+        $('#status').textContent = 'lỗi tải: ' + err.message;
+      }
+    }
+
+    $('#refreshBtn').onclick = () => load();
+    load();
+    setInterval(load, 10000);
+  </script>
+</body>
+</html>
+"""
+
+
 AI_USAGE_HTML = """<!doctype html>
 <html lang="vi">
 <head>
@@ -9947,6 +10278,118 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             locks=terminal.leases if hasattr(terminal, "leases") else None,
             node_online=lambda: online, node_aliases=lambda: aliases)
 
+    def _work_service():
+        """One WorkService over the same queue every other surface uses."""
+        from .work_service import WorkService
+        from .work_store import WorkStore
+
+        if _work_holder.get("service") is None:
+            _work_holder["service"] = WorkService(WorkStore(), queue=queue,
+                                                  controller=controller, fleet=fleet)
+        return _work_holder["service"]
+
+    @server.custom_route("/dashboard/api/work", methods=["GET"], include_in_schema=False)
+    async def dashboard_work_list(request: Request) -> JSONResponse:
+        """Work runs, or one run in full when `?work=` is given.
+
+        Read-only. Creating and controlling work are POSTs below, and they
+        are separate routes so a read cannot be confused for an action.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        work_id = request.query_params.get("work")
+
+        def _build() -> dict[str, Any]:
+            service = _work_service()
+            if work_id:
+                return service.status(work_id)
+            return service.list_runs(
+                include_terminal=request.query_params.get("finished") == "1")
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001 -- a status screen never 5xxs
+            payload = {"error": "WORK_READ_FAILED", "detail": str(exc), "works": []}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/work/create", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_work_create(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        lane = str(body.get("lane") or "")
+        result = await anyio.to_thread.run_sync(lambda: _work_service().create(
+            title=str(body.get("title") or ""), goal=str(body.get("goal") or ""),
+            lane=lane, project_id=body.get("project_id") or None,
+            done_criteria=body.get("done_criteria") or [],
+            created_by=(identity.email if identity else None),
+            tasks=body.get("tasks") or []))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/work/continue", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_work_continue(request: Request) -> JSONResponse:
+        """Enqueue another task into a run -- the durable way to hand a busy
+        worker something to do without typing into its session mid-turn."""
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        prompt = str(body.get("prompt") or "")
+        if not prompt.strip():
+            return JSONResponse({"error": "TASK_PROMPT_REQUIRED"}, status_code=400)
+        result = await anyio.to_thread.run_sync(lambda: _work_service().plan(
+            str(body.get("work_id") or ""),
+            [{"title": body.get("title") or prompt[:60], "prompt": prompt,
+              "weight": float(body.get("weight") or 1.0),
+              "required": bool(body.get("required", True))}]))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/work/control", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_work_control(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        result = await anyio.to_thread.run_sync(lambda: _work_service().control(
+            str(body.get("work_id") or ""), str(body.get("action") or ""),
+            actor=(identity.email if identity else None),
+            reason=body.get("reason")))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/work/approve", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_work_approve(request: Request) -> JSONResponse:
+        """Decide a gate. The decider is the VERIFIED Access identity, never a
+        value the caller supplies -- an approval whose approver is
+        self-declared is not an approval."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        decided_by = (identity.email if identity else None) or "dashboard:unverified"
+        result = await anyio.to_thread.run_sync(lambda: _work_service().decide_approval(
+            str(body.get("approval_id") or ""),
+            decision=str(body.get("decision") or "APPROVED").upper(),
+            decided_by=decided_by, note=body.get("note")))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/work", methods=["GET"], include_in_schema=False)
+    async def dashboard_work_page(request: Request) -> HTMLResponse | JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(WORK_HTML, headers={"Cache-Control": "no-store",
+                                                "X-Frame-Options": "DENY"})
+
     @server.custom_route("/dashboard/api/deployment", methods=["GET"],
                          include_in_schema=False)
     async def dashboard_deployment(request: Request) -> JSONResponse:
@@ -10009,6 +10452,16 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             lambda: _fleet_sync.run_once(sessions=sources["sessions"],
                                          connections=sources["connections"]))
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    _work_holder: dict[str, Any] = {"service": None}
+
+    async def _json_body(request: Request) -> dict[str, Any]:
+        """A malformed body is a client error, not a 500."""
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return {}
+        return body if isinstance(body, dict) else {}
 
     _wall_cache = terminal_wall.WallSnapshotCache()
 

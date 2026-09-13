@@ -75,6 +75,16 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_audit_search",
         "terminal_auth_status",
         "terminal_access_policy",
+        # Work Runtime V1. Kept deliberately small -- the template's own
+        # "MCP SURFACE — GIỮ NHỎ": create, read, enqueue more, gate, decide,
+        # control. Everything else is the existing queue/task surface.
+        "work_create",
+        "work_status",
+        "work_list",
+        "work_continue",
+        "work_request_approval",
+        "work_approve",
+        "work_control",
         # Session permission management: ChatGPT could rename a session but
         # had no way to grant or revoke access to one -- that took an SSH
         # session and a config edit.

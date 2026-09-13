@@ -432,3 +432,257 @@ def test_the_queue_itself_refuses_a_worker_declaring_completion():
 
     assert "COMPLETED" not in VALID_TRANSITIONS["RUNNING"]
     assert "COMPLETED" in VALID_TRANSITIONS["VERIFYING"]
+
+
+# -- the coordinator loop -------------------------------------------------------------
+
+from terminal_mcp.work_loop import WorkCoordinatorLoop, WorkLoopConfig  # noqa: E402
+
+
+def _loop(service, **overrides):
+    config = {"enabled": True, "interval_seconds": 60}
+    config.update(overrides)
+    evidence = {
+        "sessions": [{"name": "mesflow-work", "node_id": "local", "input_allowed": True},
+                     {"name": "m1", "node_id": "local", "input_allowed": True}],
+        "nodes": {"local": {"node_id": "local", "status": "online", "metadata_stale": False}},
+        "statuses": {"mesflow-work": {"exists": True}, "m1": {"exists": True}},
+    }
+    return WorkCoordinatorLoop(service=service, config=WorkLoopConfig(**config),
+                               evidence=lambda: evidence)
+
+
+def test_the_coordinator_is_off_by_default():
+    """The fleet refresh loop only re-projects local data; this one can cause
+    an agent to be handed work. A capability that acts on its own starts
+    disabled."""
+    assert WorkLoopConfig().enabled is False
+
+
+def test_a_tick_enables_dispatch_only_on_the_work_lane(work):
+    service, _store, queue = work
+    service.create(title="T", goal="G", lane="mesflow-work",
+                   tasks=[{"title": "a", "prompt": "p"}])
+    # A lane on an ordinary session, with queued work, that must be left alone.
+    queue.enqueue("m1", "a human's own queued task")
+
+    _loop(service).tick()
+    assert queue.status("mesflow-work")["auto_dispatch_enabled"] is True
+    assert queue.status("m1")["auto_dispatch_enabled"] is False, (
+        "an ordinary lane must never be auto-enabled by the Work runtime")
+
+
+def test_dispatch_is_never_enabled_on_a_non_work_lane_even_if_a_run_names_one(work):
+    """Defence in depth: the store refuses to create such a run, but if one
+    ever existed the single privileged action must still refuse it. This is
+    the one function whose bug puts an agent in front of a human."""
+    service, store, queue = work
+    run = store.create_run(title="sneaky", goal="g", lane="m1", state=ws.READY)
+    store.add_task(run.work_id, title="a", lane="m1")
+    queue.enqueue("m1", "human task")
+
+    _loop(service).tick()
+    assert queue.status("m1")["auto_dispatch_enabled"] is False
+
+
+def test_pausing_a_run_disables_its_lane(work):
+    service, _store, queue = work
+    work_id = service.create(title="T", goal="G", lane="mesflow-work",
+                             tasks=[{"title": "a", "prompt": "p"}])["work"]["work_id"]
+    loop = _loop(service)
+    loop.tick()
+    assert queue.status("mesflow-work")["auto_dispatch_enabled"] is True
+
+    service.control(work_id, "pause", actor="hung")
+    loop.tick()
+    assert queue.status("mesflow-work")["auto_dispatch_enabled"] is False
+
+
+def test_an_ineligible_lane_is_not_enabled_and_the_reason_is_reported(work):
+    service, _store, queue = work
+    service.create(title="T", goal="G", lane="mesflow-work",
+                   tasks=[{"title": "a", "prompt": "p"}])
+    loop = WorkCoordinatorLoop(
+        service=service, config=WorkLoopConfig(enabled=True),
+        evidence=lambda: {
+            "sessions": [{"name": "mesflow-work", "node_id": "hp", "input_allowed": True}],
+            "nodes": {"hp": {"node_id": "hp", "status": "online",
+                             "metadata_stale": True, "metadata_age_seconds": 9000}},
+            "statuses": {"mesflow-work": {"exists": True}}})
+    report = loop.tick()["runs"][0]
+    assert report["eligibility"]["reason"] == NODE_METADATA_STALE
+    assert queue.status("mesflow-work")["auto_dispatch_enabled"] is False
+
+
+def test_the_coordinator_completes_a_run_only_via_the_contract(work):
+    service, _store, queue = work
+    result = service.create(title="T", goal="G", lane="mesflow-work",
+                            tasks=[{"title": "a", "prompt": "p"}])
+    work_id = result["work"]["work_id"]
+    loop = _loop(service)
+    loop.tick()
+    assert service.store.get_run(work_id).state == ws.RUNNING
+
+    loop.tick()
+    assert service.store.get_run(work_id).state == ws.RUNNING, "nothing is done yet"
+
+    _complete(queue, "mesflow-work", result["tasks"][0]["queue_task_id"])
+    loop.tick()
+    run = service.store.get_run(work_id)
+    assert run.state == ws.COMPLETE
+    # ...and a completed run stops its lane.
+    assert queue.status("mesflow-work")["auto_dispatch_enabled"] is False
+    kinds = [e["kind"] for e in service.store.events_for(work_id)]
+    assert "contract_satisfied" in kinds
+
+
+def test_a_blocked_task_surfaces_as_a_blocked_run(work):
+    """A run going nowhere has to say so rather than stalling silently."""
+    service, _store, queue = work
+    result = service.create(title="T", goal="G", lane="mesflow-work",
+                            tasks=[{"title": "a", "prompt": "p"}])
+    loop = _loop(service)
+    loop.tick()
+    task_id = result["tasks"][0]["queue_task_id"]
+    queue.store.transition_task(task_id, "PRECHECK", event_type="t")
+    queue.store.transition_task(task_id, "BLOCKED", event_type="t")
+    loop.tick()
+    assert service.store.get_run(result["work"]["work_id"]).state == ws.BLOCKED
+
+
+def test_a_pending_approval_stops_the_run_completing(work):
+    service, _store, queue = work
+    result = service.create(title="T", goal="G", lane="mesflow-work",
+                            tasks=[{"title": "a", "prompt": "p"}])
+    work_id = result["work"]["work_id"]
+    loop = _loop(service)
+    loop.tick()
+    _complete(queue, "mesflow-work", result["tasks"][0]["queue_task_id"])
+    service.request_approval(work_id, kind="production_deploy",
+                             summary="restart", requested_by="agent:worker")
+    loop.tick()
+    assert service.store.get_run(work_id).state != ws.COMPLETE
+
+    service.decide_approval(
+        service.store.approvals_for(work_id, pending_only=True)[0]["approval_id"],
+        decision=ws.APPROVAL_APPROVED, decided_by="human:hung")
+    loop.tick()
+    assert service.store.get_run(work_id).state == ws.COMPLETE
+
+
+def test_one_bad_run_never_stops_the_rest_of_the_tick(work, monkeypatch):
+    service, store, _queue = work
+    good = service.create(title="good", goal="g", lane="mesflow-work",
+                          tasks=[{"title": "a", "prompt": "p"}])["work"]["work_id"]
+    bad = store.create_run(title="bad", goal="g", lane="mesflow-work", state=ws.READY)
+
+    real = service.evaluate_contract
+
+    def explode(work_id):
+        if work_id == bad.work_id:
+            raise RuntimeError("boom")
+        return real(work_id)
+
+    monkeypatch.setattr(service, "evaluate_contract", explode)
+    result = _loop(service).tick()
+    assert any(e.startswith(bad.work_id) for e in result["errors"])
+    assert any(r["work_id"] == good for r in result["runs"])
+
+
+def test_a_terminal_run_is_not_reprocessed(work):
+    service, store, _queue = work
+    work_id = service.create(title="T", goal="G", lane="mesflow-work")["work"]["work_id"]
+    store.transition_run(work_id, ws.CANCELLED)
+    assert _loop(service).tick()["runs"] == []
+
+
+def test_the_tick_never_raises_even_with_no_evidence(work):
+    service, _store, _queue = work
+    service.create(title="T", goal="G", lane="mesflow-work",
+                   tasks=[{"title": "a", "prompt": "p"}])
+
+    def explode():
+        raise OSError("cannot list sessions")
+
+    loop = WorkCoordinatorLoop(service=service, config=WorkLoopConfig(enabled=True),
+                               evidence=explode)
+    result = loop.tick()
+    assert any(e.startswith("evidence:") for e in result["errors"])
+
+
+def test_the_loop_thread_survives_a_throwing_tick(work, monkeypatch):
+    import time as _time
+
+    service, _store, _queue = work
+    loop = _loop(service, interval_seconds=60)
+    calls = {"n": 0}
+
+    def boom():
+        calls["n"] += 1
+        raise RuntimeError("bad tick")
+
+    monkeypatch.setattr(loop, "tick", boom)
+    loop.start()
+    try:
+        deadline = _time.time() + 5
+        while calls["n"] == 0 and _time.time() < deadline:
+            _time.sleep(0.05)
+        assert calls["n"] >= 1 and loop.is_alive()
+    finally:
+        loop.stop()
+
+
+def test_a_disabled_coordinator_starts_no_thread(work):
+    service, _store, _queue = work
+    loop = _loop(service, enabled=False)
+    loop.start()
+    try:
+        assert loop.is_alive() is False
+    finally:
+        loop.stop()
+
+
+# -- observability and readiness -------------------------------------------------------
+
+def test_observability_counts_without_touching_a_node(work):
+    """A health view that needs the fleet to be up is useless exactly when
+    it is needed."""
+    service, _store, queue = work
+    result = service.create(title="T", goal="G", lane="mesflow-work",
+                            tasks=[{"title": "a", "prompt": "p"},
+                                   {"title": "b", "prompt": "p2"}])
+    work_id = result["work"]["work_id"]
+    service.request_approval(work_id, kind="deploy", summary="s", requested_by="agent")
+    counters = service.observability()
+    assert counters["active_runs"] == 1
+    assert counters["queued_tasks"] == 2
+    assert counters["waiting_approvals"] == 1
+    assert counters["approvals"][0]["kind"] == "deploy"
+
+
+def test_a_disabled_coordinator_is_pass_not_a_warning(work):
+    """Work is opt-in. A box that has not turned it on is in a correct state,
+    not a degraded one -- saying otherwise trains an operator to ignore this
+    section everywhere."""
+    service, _store, _queue = work
+    assert service.readiness()["checks"][0]["status"] == "PASS"
+    assert service.readiness(loop_status={"enabled": False})["checks"][0]["status"] == "PASS"
+
+
+def test_an_enabled_but_dead_coordinator_is_fail(work):
+    service, _store, _queue = work
+    check = service.readiness(loop_status={"enabled": True, "running": False})["checks"][0]
+    assert check["status"] == "FAIL"
+    assert "will not advance" in check["summary"]
+
+
+def test_a_waiting_approval_is_warn_never_fail(work):
+    """The system correctly asking a human is not a fault."""
+    service, _store, _queue = work
+    work_id = service.create(title="T", goal="G", lane="mesflow-work")["work"]["work_id"]
+    service.request_approval(work_id, kind="deploy", summary="s", requested_by="agent")
+    readiness = service.readiness(loop_status={"enabled": True, "running": True,
+                                               "interval_seconds": 20})
+    by_check = {c["check"]: c for c in readiness["checks"]}
+    assert by_check["work_waiting_approvals"]["status"] == "WARN"
+    assert readiness["status"] == "WARN"

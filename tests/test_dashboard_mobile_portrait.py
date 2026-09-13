@@ -140,7 +140,7 @@ def test_no_visible_whitelist_wording_survives():
     from terminal_mcp import dashboard
 
     for name in ("DASHBOARD_HTML", "SESSIONS_ADMIN_HTML", "NODES_ADMIN_HTML",
-                 "GLOBAL_TASKS_HTML", "BACKLOG_HTML", "WEBTERM_HTML", "AI_USAGE_HTML", "TERMINAL_WALL_HTML", "FLEET_HTML", "AUDIT_HTML"):
+                 "GLOBAL_TASKS_HTML", "BACKLOG_HTML", "WEBTERM_HTML", "AI_USAGE_HTML", "TERMINAL_WALL_HTML", "FLEET_HTML", "AUDIT_HTML", "WORK_HTML"):
         html = getattr(dashboard, name)
         # Only user-visible text: strip comments and script bodies, where
         # the word legitimately survives in explanatory prose.

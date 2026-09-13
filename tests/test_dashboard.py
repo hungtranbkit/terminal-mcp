@@ -1542,6 +1542,15 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/audit/export": {"GET", "HEAD"},
         "/dashboard/api/auth-status": {"GET", "HEAD"},
         "/dashboard/api/access-policy": {"GET", "HEAD"},
+        # Work Runtime V1. One read, four writes -- and the writes are the
+        # only way the dashboard can create or steer work, deliberately
+        # separate routes so a read can never be mistaken for an action.
+        "/dashboard/work": {"GET", "HEAD"},
+        "/dashboard/api/work": {"GET", "HEAD"},
+        "/dashboard/api/work/create": {"POST"},
+        "/dashboard/api/work/continue": {"POST"},
+        "/dashboard/api/work/control": {"POST"},
+        "/dashboard/api/work/approve": {"POST"},
         # Fleet Metadata Registry -- a later, separate feature. Three reads
         # and exactly one write, and the write only touches METADATA: there is
         # no path from any of these to starting, stopping or typing into a

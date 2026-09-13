@@ -546,6 +546,50 @@ def main() -> None:
         fleet_loop.start()
         atexit.register(fleet_loop.stop)
 
+    # Work Runtime coordinator. OFF unless config.work.enabled -- unlike the
+    # fleet loop, this one can cause an agent to be handed work on a real
+    # session, and a capability that acts on its own starts disabled.
+    if config.work.enabled:
+        try:
+            from .work_loop import WorkCoordinatorLoop, WorkLoopConfig
+            from .work_service import WorkService
+            from .work_store import WorkStore
+
+            work_service = WorkService(WorkStore(), queue=queue, controller=controller,
+                                       fleet=fleet)
+
+            def _work_evidence() -> dict:
+                """Sessions/nodes the eligibility gate needs. Failure-tolerant:
+                with no evidence the gate refuses, which is the safe
+                direction."""
+                try:
+                    listing = controller.terminal_list_sessions()
+                except Exception:  # noqa: BLE001
+                    _log.exception("work: session listing unavailable")
+                    return {"sessions": [], "nodes": {}, "statuses": {}}
+                nodes = {}
+                if fleet is not None:
+                    try:
+                        nodes = {n["node_id"]: n for n in fleet.offline_view()["nodes"]
+                                 if n.get("node_id")}
+                    except Exception:  # noqa: BLE001
+                        nodes = {}
+                return {"sessions": listing.get("sessions") or [], "nodes": nodes,
+                        "statuses": {}}
+
+            work_loop = WorkCoordinatorLoop(
+                service=work_service,
+                config=WorkLoopConfig(
+                    enabled=True, interval_seconds=config.work.interval_seconds,
+                    max_runs_per_tick=config.work.max_runs_per_tick,
+                    auto_enable_dispatch=config.work.auto_enable_dispatch),
+                evidence=_work_evidence)
+            work_loop.start()
+            atexit.register(work_loop.stop)
+            _log.info("work coordinator started (interval=%ss)", config.work.interval_seconds)
+        except Exception:  # noqa: BLE001 -- never block startup on an opt-in feature
+            _log.exception("work coordinator failed to start")
+
     # Durable Codex submissions are reconciled independently of request
     # workers.  This is deliberately local to the already-built TerminalService
     # (and therefore also covers dashboard/MCP/queue/supervisor sends) and

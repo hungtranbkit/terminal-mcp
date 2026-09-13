@@ -464,6 +464,24 @@ class AskChatGptConfig:
 
 
 @dataclass(frozen=True)
+class WorkConfig:
+    # OFF by default, and that differs from FleetSyncConfig on purpose: the
+    # fleet loop only re-projects local data, while this one can cause an
+    # agent to be handed work on a real session. A capability that acts on
+    # its own starts disabled. See work_loop.py.
+    enabled: bool = False
+    interval_seconds: int = 20
+    max_runs_per_tick: int = 25
+    # The privileged action: turning a `-work` lane's auto-dispatch on. A
+    # deployment can keep the coordinator's bookkeeping and still leave the
+    # actual enabling to a human.
+    auto_enable_dispatch: bool = True
+    lease_seconds: int = 900
+    max_revisions: int = 3
+    no_progress_limit: int = 3
+
+
+@dataclass(frozen=True)
 class FleetSyncConfig:
     # ON by default, like MaintenanceConfig and for the same reason: this is
     # not an optional feature, it is what keeps an already-shipped one
@@ -622,6 +640,7 @@ class AppConfig:
     dashboard: DashboardConfig = DashboardConfig()
     maintenance: MaintenanceConfig = MaintenanceConfig()
     fleet_sync: FleetSyncConfig = FleetSyncConfig()
+    work: WorkConfig = WorkConfig()
     session_lifecycle: SessionLifecycleConfig = SessionLifecycleConfig()
     session_knowledge: SessionKnowledgeConfig = SessionKnowledgeConfig()
     session_access: SessionAccessConfig = SessionAccessConfig()
@@ -945,6 +964,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         dashboard=_load_dashboard_config(raw.get("dashboard", {})),
         maintenance=_load_maintenance_config(raw.get("maintenance", {})),
         fleet_sync=_load_fleet_sync_config(raw.get("fleet_sync", {})),
+        work=_load_work_config(raw.get("work", {})),
         session_lifecycle=_load_session_lifecycle_config(raw.get("session_lifecycle", {})),
         session_knowledge=_load_session_knowledge_config(raw.get("session_knowledge", {})),
         session_access=_load_session_access_config(raw.get("session_access", {})),
@@ -1033,6 +1053,28 @@ def _load_session_access_config(raw: object) -> SessionAccessConfig:
         migrate_whitelist_on_start=bool(raw.get("migrate_whitelist_on_start",
                                                 defaults.migrate_whitelist_on_start)),
     )
+
+
+def _load_work_config(raw: object) -> WorkConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    interval = int(raw.get("interval_seconds", WorkConfig.interval_seconds))
+    if interval < 5:
+        raise ValueError("work.interval_seconds must be at least 5")
+    max_runs = int(raw.get("max_runs_per_tick", WorkConfig.max_runs_per_tick))
+    if max_runs < 1:
+        raise ValueError("work.max_runs_per_tick must be at least 1")
+    revisions = int(raw.get("max_revisions", WorkConfig.max_revisions))
+    if revisions < 0:
+        raise ValueError("work.max_revisions must not be negative")
+    return WorkConfig(
+        enabled=bool(raw.get("enabled", WorkConfig.enabled)),
+        interval_seconds=interval, max_runs_per_tick=max_runs,
+        auto_enable_dispatch=bool(raw.get("auto_enable_dispatch",
+                                          WorkConfig.auto_enable_dispatch)),
+        lease_seconds=int(raw.get("lease_seconds", WorkConfig.lease_seconds)),
+        max_revisions=revisions,
+        no_progress_limit=int(raw.get("no_progress_limit", WorkConfig.no_progress_limit)))
 
 
 def _load_fleet_sync_config(raw: object) -> FleetSyncConfig:
