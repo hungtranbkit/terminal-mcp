@@ -1787,6 +1787,118 @@ def build_mcp(service: TerminalService | None = None,
         finally:
             store.close()
 
+    # -- rapid capture inbox and the planner pool ----------------------------
+
+    _inbox_holder: dict[str, Any] = {}
+
+    def _inbox():
+        if "service" not in _inbox_holder:
+            from .work_inbox import InboxService, InboxStore
+
+            _inbox_holder["service"] = InboxService(InboxStore())
+        return _inbox_holder["service"]
+
+    @server.tool()
+    def work_inbox_capture(text: str, project: str = "", priority: int = 0,
+                           source: str = "capture") -> dict:
+        """Capture a batch of free-form issues as persisted records, fast.
+
+        A developer can describe twenty problems faster than any planner can
+        analyse one, so this does NOT plan: it splits the batch, gives each
+        item an id, a short title and a rough type, flags likely duplicates,
+        and returns a count. Analysis happens afterwards in the planner pool.
+
+        Bullets are one issue each; a bulleted item's continuation lines stay
+        with it. A duplicate is linked and kept, never dropped -- a second
+        report of one defect is still a fact about the world.
+        """
+        try:
+            return _inbox().capture(text, project=project or None,
+                                    priority=int(priority), source=source or "capture")
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "CAPTURE_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_inbox_list(state: str = "", project: str = "", limit: int = 50) -> dict:
+        """Issues in the inbox, newest priority first, with the state counts."""
+        try:
+            service = _inbox()
+            issues = service.store.list_issues(state=state or None,
+                                               project=project or None,
+                                               limit=max(1, min(int(limit), 200)))
+            return {"summary": service.summary(),
+                    "issues": [{"issue_id": i.issue_id, "title": i.short_title,
+                                "state": i.state, "type": i.rough_type,
+                                "difficulty": i.rough_difficulty, "priority": i.priority,
+                                "project": i.project, "duplicate_of": i.duplicate_of,
+                                "claimed_by": i.claimed_by, "updated_at": i.updated_at}
+                               for i in issues]}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "INBOX_READ_FAILED", "detail": str(exc), "issues": []}
+
+    @server.tool()
+    def work_inbox_claim(planner_id: str, project: str = "") -> dict:
+        """Claim ONE issue for planning, within the pool's concurrency cap.
+
+        Claims carry a lease so a planner that dies does not hold an issue
+        forever; an expired lease is reclaimed automatically, which is what
+        makes this recoverable across a restart. Two planners can never hold
+        the same issue.
+        """
+        try:
+            return _inbox().claim_for_planning(planner_id, project=project or None)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "CLAIM_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_inbox_transition(issue_id: str, state: str, actor: str = "",
+                              detail: str = "") -> dict:
+        """Move one issue to another state, recording the transition."""
+        try:
+            return _inbox().transition(issue_id, state, actor=actor or None,
+                                       detail=detail or None)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "TRANSITION_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_inbox_request_hint(issue_id: str, questions: list[str],
+                                findings: list[str] | None = None) -> dict:
+        """Park a hard issue on the developer with at most 3 precise questions.
+
+        The analysis already done is preserved, and other issues keep moving --
+        this blocks one issue, never the pool.
+        """
+        try:
+            return _inbox().request_user_hint(issue_id, questions or [],
+                                              findings=findings or [])
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "HINT_REQUEST_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_inbox_answer_hint(issue_id: str, hint: str, actor: str = "developer") -> dict:
+        """Record a developer's answer and resume the SAME issue.
+
+        The hint is stored as guidance with its provenance, not as truth: a
+        planner weighs it against the current code. A secret in the text is
+        refused outright.
+        """
+        try:
+            return _inbox().attach_human_hint(issue_id, hint, actor=actor or "developer")
+        except Exception as exc:  # noqa: BLE001
+            return {"error": type(exc).__name__, "detail": str(exc)}
+
+    @server.tool()
+    def work_inbox_history(issue_id: str) -> dict:
+        """Every recorded transition for one issue, oldest first."""
+        try:
+            service = _inbox()
+            issue = service.store.get(issue_id)
+            if issue is None:
+                return {"error": "ISSUE_NOT_FOUND", "issue_id": issue_id}
+            return {"issue": issue.as_dict(), "history": service.store.history(issue_id)}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "HISTORY_READ_FAILED", "detail": str(exc)}
+
     @server.tool()
     def terminal_fleet_environment(roles: str = "node") -> dict:
         """Audit every node's ENVIRONMENT in one call: tools, services and

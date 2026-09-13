@@ -95,6 +95,18 @@ async def test_server_registers_v1_and_binding_tools():
         "work_policy",
         "work_telemetry",
         "work_telemetry_report",
+        # Rapid Capture Inbox + planner pool. Capture is deliberately shallow
+        # (split, title, rough type, duplicate flag) so a developer can dump a
+        # batch faster than any planner can analyse one; the pool then claims
+        # them under a concurrency cap with leases, so a dead planner does not
+        # hold an issue forever.
+        "work_inbox_capture",
+        "work_inbox_list",
+        "work_inbox_claim",
+        "work_inbox_transition",
+        "work_inbox_request_hint",
+        "work_inbox_answer_hint",
+        "work_inbox_history",
         # Session permission management: ChatGPT could rename a session but
         # had no way to grant or revoke access to one -- that took an SSH
         # session and a config edit.
