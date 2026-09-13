@@ -700,10 +700,9 @@ def test_an_echoed_prompt_is_never_accepted_as_a_completion():
     the engine read its own prompt back and called it evidence: a worker
     running `sleep` forever, printing nothing, had its task marked COMPLETED.
     """
-    from terminal_mcp.queue_engine import (build_dispatch_text,
-                                           completion_after_instruction,
-                                           instruction_marker_line)
-    from terminal_mcp.status import parse_completion_marker, verify_completion_marker
+    from terminal_mcp.queue_engine import build_dispatch_text, worker_output_after_prompt
+    from terminal_mcp.status import (COMPLETION_MARKER_RE, parse_completion_marker,
+                                     verify_completion_marker)
 
     class _Task:
         id = "task-abc"
@@ -711,15 +710,16 @@ def test_an_echoed_prompt_is_never_accepted_as_a_completion():
         attempt_count = 0
         verification_nonce = "NONCE"
 
-    dispatched = _Task()
-    prompt = build_dispatch_text(dispatched, nonce="NONCE")
-    marker_line = instruction_marker_line(dispatched, nonce="NONCE")
-    assert marker_line in prompt, "the instruction really does contain a valid marker"
+    prompt = build_dispatch_text(_Task(), nonce="NONCE")
+    marker_line = COMPLETION_MARKER_RE.search(prompt).group(0)
+    assert marker_line, "the instruction really does contain a valid marker"
 
     def completed(pane: str) -> bool:
-        worker_output = completion_after_instruction(pane, instruction=marker_line)
+        # attempt=1 is what the task carries by VERIFICATION time -- the
+        # counter is incremented at dispatch. Getting this wrong is exactly
+        # what made the first version of the fix silently do nothing.
         return verify_completion_marker(
-            parse_completion_marker(worker_output),
+            parse_completion_marker(worker_output_after_prompt(pane)),
             task_id="task-abc", attempt=1, nonce="NONCE", nonce_consumed=False)
 
     assert completed(prompt) is False, "a worker that did nothing is not done"
@@ -732,15 +732,17 @@ def test_an_echoed_prompt_is_never_accepted_as_a_completion():
 def test_a_scrolled_away_instruction_does_not_hide_a_real_completion():
     """The tail is bounded. If our prompt has scrolled out, everything left
     is the worker's -- including the marker it printed."""
-    from terminal_mcp.queue_engine import completion_after_instruction, instruction_marker_line
+    from terminal_mcp.queue_engine import build_dispatch_text, worker_output_after_prompt
+    from terminal_mcp.status import COMPLETION_MARKER_RE
 
     class _Task:
         id = "task-abc"
+        prompt = "p"
         attempt_count = 0
 
-    marker_line = instruction_marker_line(_Task(), nonce="NONCE")
-    remaining = completion_after_instruction("...earlier output\n" + marker_line + "\n",
-                                             instruction=marker_line)
+    marker_line = COMPLETION_MARKER_RE.search(
+        build_dispatch_text(_Task(), nonce="NONCE")).group(0)
+    remaining = worker_output_after_prompt("...earlier output\n" + marker_line + "\n")
     assert marker_line in remaining
 
 
@@ -755,3 +757,56 @@ def test_the_anchor_sentence_is_the_one_we_actually_send():
         attempt_count = 0
 
     assert COMPLETION_INSTRUCTION_SENTENCE in build_dispatch_text(_Task(), nonce="N")
+
+
+def test_the_guard_works_at_verification_time_not_just_dispatch_time():
+    """The first version of this fix was silently inert in production and
+    passed its unit tests anyway.
+
+    It rebuilt the expected marker from `attempt_count + 1` -- correct when
+    the prompt is BUILT, wrong when it is VERIFIED, because the counter has
+    been incremented in between. The reconstructed string matched nothing, so
+    the echoed marker sailed through and a do-nothing worker still completed
+    on the live controller.
+
+    This drives the real pane text at the real verification-time counter.
+    """
+    from terminal_mcp.queue_engine import build_dispatch_text, worker_output_after_prompt
+    from terminal_mcp.status import parse_completion_marker, verify_completion_marker
+
+    class _AtDispatch:
+        id = "t1"
+        prompt = "echo hi"
+        attempt_count = 0          # what the prompt was built from
+
+    pane = build_dispatch_text(_AtDispatch(), nonce="N1")
+    # Verification happens with attempt_count already incremented to 1.
+    marker = parse_completion_marker(worker_output_after_prompt(pane))
+    assert verify_completion_marker(marker, task_id="t1", attempt=1, nonce="N1",
+                                    nonce_consumed=False) is False, (
+        "the echoed prompt must not verify at the counter verification uses")
+
+
+def test_a_second_dispatch_in_the_same_pane_still_only_trusts_the_last_prompt():
+    """A lane runs many tasks into one session, so the pane accumulates
+    prompts. Only output after the MOST RECENT one can be this task's
+    evidence."""
+    from terminal_mcp.queue_engine import build_dispatch_text, worker_output_after_prompt
+    from terminal_mcp.status import COMPLETION_MARKER_RE
+
+    class _First:
+        id = "old"
+        prompt = "first task"
+        attempt_count = 0
+
+    class _Second:
+        id = "new"
+        prompt = "second task"
+        attempt_count = 0
+
+    old_prompt = build_dispatch_text(_First(), nonce="OLD")
+    old_marker = COMPLETION_MARKER_RE.search(old_prompt).group(0)
+    pane = old_prompt + "\n" + old_marker + "\n" + build_dispatch_text(_Second(), nonce="NEW")
+    remaining = worker_output_after_prompt(pane)
+    assert "old" not in remaining, "a finished task's marker is not this task's evidence"
+    assert COMPLETION_MARKER_RE.search(remaining) is None
