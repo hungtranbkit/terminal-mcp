@@ -58,6 +58,27 @@ the contract routes that through the Coordinator's `expected_cwd` gate with a
 `WORKTREE_REMOVED` reason instead.
 """
 
+# The Coordinator's refusal reason when a task's worktree has already been
+# reclaimed. Declared here, beside CANCELLABLE_STATES, because the two encode
+# one decision: CLEANUP_DONE is not cancellable, so a retry must be refused
+# rather than silently sent to a directory that no longer exists (contract
+# failure mode F12).
+WORKTREE_REMOVED = "WORKTREE_REMOVED"
+
+
+def is_removed(metadata: Mapping[str, Any] | None) -> bool:
+    """True when this task's worktree has already been reclaimed.
+
+    Only CLEANUP_DONE counts. A PENDING/REVIEW/ELIGIBLE record means the
+    worktree is still there -- marking is not removing -- and treating those as
+    removed would refuse dispatch for work that is perfectly runnable, which is
+    the dangerous false direction in the other direction."""
+    record = (metadata or {}).get(METADATA_KEY)
+    if not isinstance(record, Mapping):
+        return False
+    return record.get("state") == CLEANUP_DONE
+
+
 # Event types recorded on the task's own queue_events trail.
 EVENT_MARKED = "WORKTREE_CLEANUP_PENDING"
 EVENT_CLEARED = "WORKTREE_CLEANUP_CLEARED"

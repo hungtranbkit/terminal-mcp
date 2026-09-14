@@ -31,6 +31,7 @@ from .queue_store import (
     BLOCKED, COMPLETED, FAILED, PRECHECK, READY, RUNNING, VERIFYING,
     WAITING_SESSION,
 )
+from . import worktree_cleanup as wc
 
 # queue transition -> bus vocabulary. Keyed on the DESTINATION status where
 # one exists, because that is what a consumer reacts to; a few queue event
@@ -47,6 +48,14 @@ _EVENT_TYPE_BY_QUEUE_EVENT: dict[str, str] = {
     # needs to route it -- mapping both to VERIFY_PENDING published the same
     # signal twice, once without the information that makes it actionable.
     "VERIFY_REQUESTED": "WORKER_DONE",
+    # Worktree Janitor P1. These rows carry no to_status -- they record a
+    # metadata change, not a status change -- so the _EVENT_TYPE_BY_STATUS
+    # fallback below can never match them and they would be dropped silently
+    # without an entry here. The name is identical on both sides because the
+    # queue trail and the bus mean exactly the same thing by it; the mapping
+    # exists to make forwarding DELIBERATE rather than incidental.
+    wc.EVENT_MARKED: "WORKTREE_CLEANUP_PENDING",
+    wc.EVENT_CLEARED: "WORKTREE_CLEANUP_CLEARED",
 }
 
 _EVENT_TYPE_BY_STATUS: dict[str, str] = {

@@ -9,6 +9,9 @@ asserts that structurally rather than trusting the review.
 """
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import pytest
 
 from terminal_mcp import queue_store as qs
@@ -292,3 +295,169 @@ def test_apply_never_mutates_its_input():
     original = {**ISOLATION}
     wj.apply(original, wj.Decision("mark", state=wj.CLEANUP_PENDING), now="now")
     assert wj.METADATA_KEY not in original
+
+
+# == AC4: the cleanup events actually reach the bus ==========================
+
+def test_ac4_cleanup_event_types_are_in_the_bus_vocabulary():
+    """KNOWN_EVENT_TYPES is the bus's documented vocabulary. A type absent from
+    it is not a publishable signal, whatever the producer intends."""
+    from terminal_mcp.event_bus import KNOWN_EVENT_TYPES
+
+    assert wj.EVENT_MARKED in KNOWN_EVENT_TYPES
+    assert wj.EVENT_CLEARED in KNOWN_EVENT_TYPES
+
+
+@pytest.mark.parametrize("event_type,expected", [
+    ("WORKTREE_CLEANUP_PENDING", "WORKTREE_CLEANUP_PENDING"),
+    ("WORKTREE_CLEANUP_CLEARED", "WORKTREE_CLEANUP_CLEARED"),
+])
+def test_ac4_queue_event_translates_to_a_bus_publish(event_type, expected):
+    from terminal_mcp.event_wiring import queue_event_to_bus
+
+    publish = queue_event_to_bus({"queue_event_id": 7, "event_type": event_type,
+                                  "task_id": "T1", "session": "demo", "project_id": "proj"})
+    assert publish is not None, "the mapping is what stops these being dropped"
+    assert publish["type"] == expected
+    assert publish["entity_type"] == "task"
+    assert publish["entity_id"] == "T1"
+
+
+def test_ac4_the_publish_carries_an_idempotency_key():
+    """The AC's own words. The queue_events row id is the natural key: a sink
+    that re-delivers the same row must not create a second event."""
+    from terminal_mcp.event_wiring import queue_event_to_bus
+
+    publish = queue_event_to_bus({"queue_event_id": 99, "event_type": wj.EVENT_MARKED,
+                                  "task_id": "T1"})
+    assert publish["idempotency_key"] == "queue_event:99"
+
+
+def test_ac4_the_mapping_is_what_carries_them_not_the_status_fallback():
+    """The root gap, pinned. A cleanup row records a metadata change and has NO
+    to_status, so the _EVENT_TYPE_BY_STATUS fallback can never match it -- the
+    explicit entry is the only thing keeping it off the floor. Deleting that
+    entry must fail this test, not silently stop publishing."""
+    from terminal_mcp import event_wiring
+
+    assert wj.EVENT_MARKED in event_wiring._EVENT_TYPE_BY_QUEUE_EVENT
+    assert wj.EVENT_CLEARED in event_wiring._EVENT_TYPE_BY_QUEUE_EVENT
+    # No to_status at all, exactly as the store records these rows.
+    publish = event_wiring.queue_event_to_bus(
+        {"queue_event_id": 1, "event_type": wj.EVENT_MARKED, "task_id": "T1",
+         "to_status": None, "from_status": None})
+    assert publish is not None and publish["type"] == wj.EVENT_MARKED
+
+
+def test_ac4_marking_a_real_task_publishes_through_the_real_sink(tmp_path):
+    """End to end on the production path: a real transition, the real
+    QueueStore event sink, the real wiring, a real EventBus."""
+    from terminal_mcp.event_bus import EventBus
+    from terminal_mcp.event_wiring import build_queue_event_sink
+    from terminal_mcp.queue_store import QueueStore
+
+    bus = EventBus(tmp_path / "events.db")
+    store = QueueStore(tmp_path / "queue.db", event_sink=build_queue_event_sink(bus))
+    task_id = _task(store)
+    _walk(store, task_id, "PRECHECK", "READY", "DISPATCHING", "RUNNING", "VERIFYING", "COMPLETED")
+
+    published = [e for e in bus.list_events(limit=200)
+                 if e["type"] in (wj.EVENT_MARKED, wj.EVENT_CLEARED)]
+    assert [e["type"] for e in published] == [wj.EVENT_MARKED]
+    assert published[0]["entity_id"] == task_id
+    assert published[0]["idempotency_key"].startswith("queue_event:")
+
+
+def test_ac4_a_non_isolated_task_publishes_no_cleanup_event(tmp_path):
+    """The dangerous false direction for AC4: broadcasting cleanup signals for
+    tasks that own no worktree would have every consumer acting on noise."""
+    from terminal_mcp.event_bus import EventBus
+    from terminal_mcp.event_wiring import build_queue_event_sink
+    from terminal_mcp.queue_store import QueueStore
+
+    bus = EventBus(tmp_path / "events.db")
+    store = QueueStore(tmp_path / "queue.db", event_sink=build_queue_event_sink(bus))
+    task_id = _task(store, isolated=False)
+    _walk(store, task_id, "PRECHECK", "READY", "DISPATCHING", "RUNNING", "VERIFYING", "COMPLETED")
+    assert not [e for e in bus.list_events(limit=200)
+                if e["type"] in (wj.EVENT_MARKED, wj.EVENT_CLEARED)]
+
+
+# == AC5b: dispatch after CLEANUP_DONE is refused ============================
+
+def _gate_decision(metadata, *, cwd):
+    """Run the REAL CoordinatorGate against a task carrying `metadata`.
+
+    Built the same way tests/test_coordinator.py builds one, so this exercises
+    the production gate rather than a stand-in."""
+    from terminal_mcp.coordinator import CoordinatorGate, RepoEvidence, SessionSnapshot
+
+    store = qs.QueueStore(Path(tempfile.mkdtemp()) / "queue.db")
+    task_id, = store.append_tasks("demo", [{
+        "title": "rebuild the widget index",
+        # Long enough to clear the gate's own prompt-vagueness check, so these
+        # tests genuinely reach the worktree branch instead of short-circuiting
+        # earlier and passing for the wrong reason.
+        "prompt": "Rebuild the widget index from the canonical source and "
+                  "update the affected tests so the suite stays green.",
+        "metadata": metadata}])
+    store.transition_task(task_id, "PRECHECK", event_type="CLAIMED")
+    task = store.get_task(task_id)
+    session = SessionSnapshot(node_id="local", cwd=cwd, current_command="claude", state="IDLE")
+    gate = CoordinatorGate(evidence_collector=lambda *a, **k: RepoEvidence(
+        branch="main", head="abc123", clean=True, status_lines=()))
+    return gate.review(task, store=store, session=session, other_active=())
+
+
+def test_ac5b_dispatch_after_cleanup_done_is_refused_with_worktree_removed():
+    """F12. The worktree is gone; a retry must fail loudly rather than be sent
+    to a directory that no longer exists."""
+    metadata = {**ISOLATION, "expected_cwd": "/repo/.worktrees/task-x",
+                wj.METADATA_KEY: {"state": wj.CLEANUP_DONE, "removed_at": "2026-01-01"}}
+    decision = _gate_decision(metadata, cwd="/repo/.worktrees/task-x")
+    assert decision.status == "NEEDS_HUMAN"
+    assert wj.WORKTREE_REMOVED in decision.reason
+    assert decision.evidence["expected_cwd"] == "/repo/.worktrees/task-x"
+
+
+def test_ac5b_the_refusal_names_the_real_cause_not_a_cwd_mismatch():
+    """Checked BEFORE the generic cwd comparison on purpose: once the worktree
+    is reclaimed the session's cwd cannot match, so the generic branch would
+    fire and blame the session for being in the wrong directory."""
+    metadata = {**ISOLATION, "expected_cwd": "/repo/.worktrees/task-x",
+                wj.METADATA_KEY: {"state": wj.CLEANUP_DONE}}
+    decision = _gate_decision(metadata, cwd="/somewhere/else")
+    assert wj.WORKTREE_REMOVED in decision.reason
+    assert "does not match" not in decision.reason
+
+
+@pytest.mark.parametrize("state", ["CLEANUP_PENDING", "CLEANUP_REVIEW", "CLEANUP_ELIGIBLE"])
+def test_ac5b_a_merely_marked_task_still_dispatches(state):
+    """The dangerous false direction for AC5b. Marking is not removing -- the
+    worktree is still there. Refusing here would stall every task that reached
+    a terminal state once and was legitimately reopened."""
+    metadata = {**ISOLATION, "expected_cwd": "/repo/.worktrees/task-x",
+                wj.METADATA_KEY: {"state": state}}
+    decision = _gate_decision(metadata, cwd="/repo/.worktrees/task-x")
+    assert wj.WORKTREE_REMOVED not in (decision.reason or "")
+    # Asserted positively: "not refused for this reason" would also be true if
+    # the gate had bailed out earlier for an unrelated one.
+    assert decision.status == "READY", decision.reason
+
+
+def test_ac5b_a_task_with_no_cleanup_record_is_unaffected():
+    """Backward compatibility: every task that predates P1."""
+    metadata = {**ISOLATION, "expected_cwd": "/repo/.worktrees/task-x"}
+    decision = _gate_decision(metadata, cwd="/repo/.worktrees/task-x")
+    assert wj.WORKTREE_REMOVED not in (decision.reason or "")
+    assert decision.status == "READY", decision.reason
+
+
+def test_ac5b_is_removed_only_counts_cleanup_done():
+    for state in ("CLEANUP_PENDING", "CLEANUP_REVIEW", "CLEANUP_ELIGIBLE",
+                  "CLEANUP_BLOCKED", "CLEANUP_ABANDONED"):
+        assert wj.is_removed({wj.METADATA_KEY: {"state": state}}) is False
+    assert wj.is_removed({wj.METADATA_KEY: {"state": wj.CLEANUP_DONE}}) is True
+    assert wj.is_removed({}) is False
+    assert wj.is_removed(None) is False
+    assert wj.is_removed({wj.METADATA_KEY: "not-a-mapping"}) is False
