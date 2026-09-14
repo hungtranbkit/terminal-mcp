@@ -583,3 +583,28 @@ def test_the_scan_bound_is_separate_from_the_return_cap():
     """max_bytes bounds what is RETURNED; MAX_LINE_SCAN_BYTES bounds what is
     LOOKED THROUGH. Conflating them is what caused the bug above."""
     assert repo_read.MAX_LINE_SCAN_BYTES > RepoReadPolicy().max_bytes * 10
+
+
+def test_truncated_means_you_did_not_get_what_you_asked_for_not_that_the_file_continues(repo, policy):
+    """A caller pages on `has_more`; `truncated` means a cap interfered.
+
+    Conflating them is a real trap: with one flag, a window of lines 2-2 in
+    a 500-line file reports truncated=True, so a caller that pages while
+    truncated is set never stops -- it re-asks for the same satisfied
+    window forever."""
+    exact = repo_read.repo_read(str(repo), policy, file="big.txt", start_line=2, end_line=2)
+    assert exact["lines_returned"] == 1
+    assert exact["truncated"] is False   # the window WAS fully satisfied
+    assert exact["has_more"] is True     # ...and the file continues
+
+    tail = repo_read.repo_read(str(repo), policy, file="src/app.py", start_line=5, end_line=99)
+    assert tail["truncated"] is False    # nothing capped it; the file just ended
+    assert tail["has_more"] is False
+
+
+def test_a_window_narrowed_by_the_line_limit_reports_truncated(repo):
+    tight = RepoReadPolicy(allowed_roots=(str(repo.parent),), max_lines=5)
+    result = repo_read.repo_read(str(repo), tight, file="big.txt", start_line=1, end_line=100)
+    assert result["lines_returned"] == 5
+    assert result["truncated"] is True   # the caller's own window was narrowed
+    assert result["has_more"] is True

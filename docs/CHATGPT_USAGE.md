@@ -166,11 +166,16 @@ Two of these matter especially:
   value comes back as `<REDACTED>`; the `redaction` field says how many
   rules hit (by rule name, never the value). That is not corruption —
   don't ask for the file a second way to try to get the raw value.
-- **Output is capped and truncation is reported.** `truncated: true` means
-  there is more; page with `start_line`/`end_line` rather than raising
-  `max_bytes` (a caller cannot exceed the server's configured cap anyway).
-  `start_line`/`end_line`/`lines_returned` describe exactly what you got,
-  so line numbers you quote back are trustworthy.
+- **Output is capped, and two different flags say so.** On `repo_read`,
+  **`has_more: true`** means the file continues past what you got — that is
+  the field to page on, with `start_line`/`end_line`. **`truncated: true`**
+  means a cap interfered: your window was narrowed by the line limit, or
+  cut short by the byte cap. A window you asked for and fully received
+  reports `truncated: false` even when `has_more` is true — so page on
+  `has_more`, never on `truncated`, or you will re-request a satisfied
+  window forever. Raising `max_bytes` past the server's configured cap does
+  nothing. `start_line`/`end_line`/`lines_returned` describe exactly what
+  you got, so line numbers you quote back are trustworthy.
 - **Local reads never need GitHub auth.** Nothing in the read path touches
   the network. `repo_remotes` only probes the network if you pass
   `check_auth=true`, and even then a failure lands in `auth`, not as a

@@ -716,8 +716,11 @@ def _read_head(resolved: ResolvedRepo, policy: RepoReadPolicy, cap: int,
     lines = text.splitlines()
     line_truncated = len(lines) > policy.max_lines
     selected = lines[: policy.max_lines]
+    # No window was asked for, so "capped" and "there is more" are the same
+    # event here: the caller implicitly asked for the whole file.
+    incomplete = byte_truncated or line_truncated or size > len(raw)
     return _read_payload(resolved, policy, cap, size, selected, first=1,
-                         truncated=byte_truncated or line_truncated or size > len(raw))
+                         truncated=incomplete, has_more=incomplete)
 
 
 def _read_window(resolved: ResolvedRepo, policy: RepoReadPolicy, cap: int, size: int,
@@ -741,7 +744,10 @@ def _read_window(resolved: ResolvedRepo, policy: RepoReadPolicy, cap: int, size:
         last = max(first, int(end_line))
     else:
         last = first + policy.max_lines - 1
-    if last - first + 1 > policy.max_lines:
+    # Whether the caller's own window had to be narrowed by the line limit --
+    # distinct from the file merely continuing past it (see below).
+    clamped = last - first + 1 > policy.max_lines
+    if clamped:
         last = first + policy.max_lines - 1
 
     selected: list[str] = []
@@ -749,6 +755,7 @@ def _read_window(resolved: ResolvedRepo, policy: RepoReadPolicy, cap: int, size:
     returned_bytes = 0
     line_number = 0
     more_after = False
+    cut_by_cap = False
     try:
         with resolved.target.open("rb") as handle:
             for raw_line in handle:
@@ -763,12 +770,14 @@ def _read_window(resolved: ResolvedRepo, policy: RepoReadPolicy, cap: int, size:
                                     bytes_total=size, scan_limit=MAX_LINE_SCAN_BYTES)
                     continue
                 if line_number > last:
+                    # The window was fully satisfied; the file just continues.
                     more_after = True
                     break
                 if returned_bytes + len(raw_line) > cap:
                     # The window itself exceeds the byte cap: return the
                     # whole lines that fit and say so.
                     more_after = True
+                    cut_by_cap = True
                     break
                 returned_bytes += len(raw_line)
                 selected.append(raw_line.decode("utf-8", errors="replace").rstrip("\n").rstrip("\r"))
@@ -780,18 +789,25 @@ def _read_window(resolved: ResolvedRepo, policy: RepoReadPolicy, cap: int, size:
                     detail=f"start_line {first} is past the end of this file "
                            f"({line_number} lines)",
                     lines_total=line_number, bytes_total=size)
+    # `truncated` means "you did NOT get what you asked for" -- the byte cap
+    # cut the window short, or the line limit narrowed it. It deliberately
+    # does NOT mean "the file continues past your window": a caller that asked
+    # for lines 2-2 and got exactly that has not been truncated, and a caller
+    # paging on `truncated` would otherwise never stop. "The file continues"
+    # is `has_more`, which is the field to page on.
     return _read_payload(resolved, policy, cap, size, selected, first=first,
-                         truncated=more_after)
+                         truncated=cut_by_cap or clamped, has_more=more_after)
 
 
 def _read_payload(resolved: ResolvedRepo, policy: RepoReadPolicy, cap: int, size: int,
-                  selected: list[str], *, first: int, truncated: bool) -> dict[str, Any]:
+                  selected: list[str], *, first: int, truncated: bool,
+                  has_more: bool) -> dict[str, Any]:
     redacted, report = _redact("\n".join(selected))
     return {
         "repo_root": str(resolved.repo_root), "path": resolved.relative_path,
         "content": redacted, "start_line": first, "end_line": first + len(selected) - 1,
         "lines_returned": len(selected), "bytes_total": size,
-        "truncated": bool(truncated),
+        "truncated": bool(truncated), "has_more": bool(has_more),
         "byte_limit": cap, "line_limit": policy.max_lines,
         "redaction": _redaction_summary(report),
     }

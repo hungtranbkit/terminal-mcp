@@ -1921,9 +1921,15 @@ scan/audit view over the SAME facts.)*
   7. Caps on every axis (bytes/lines/results/tree entries/log entries/diff
      bytes/timeout), and **a caller cannot argue past a configured cap** —
      `max_bytes=10_000_000` against a 2 KB policy still yields 2 KB.
-     Truncation is always REPORTED (`truncated: true`), never silent, and a
-     byte-truncated read is cut back to the last whole line so quoted line
-     numbers stay trustworthy.
+     Truncation is always REPORTED, never silent, and a byte-truncated read
+     is cut back to the last whole line so quoted line numbers stay
+     trustworthy. `repo_read` reports it as TWO distinct fields, which is a
+     correctness matter and not cosmetic: `has_more` means the file
+     continues past the returned window (the field to page on), while
+     `truncated` means a cap interfered — the line limit narrowed the
+     caller's own window, or the byte cap cut it short. With one flag, a
+     fully-satisfied window of lines 2-2 in a 500-line file reports
+     truncated=True and a caller paging on it never terminates.
   8. Argument safety: refs match a strict pattern and may not begin with
      `-`; pathspecs may not begin with `-` or contain `..`; pathspecs are
      always passed after `--`. So `--upload-pack=...` or
