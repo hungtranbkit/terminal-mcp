@@ -58,7 +58,7 @@ from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
 from .webterm import WebTerminalProcess, pump_websocket
 from .webterm_assets import ASSETS
-from .ephemeral_state import ephemeral_db_path
+from .ephemeral_state import ephemeral_db_path, ephemeral_state_dir
 
 _log = logging.getLogger(__name__)
 
@@ -11214,8 +11214,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # into the real ~/.local/state/terminal-mcp databases.
         # server_http.py's real main() always passes an explicit,
         # persistent OnboardingService.
-        import tempfile
-        _onboard_dir = Path(tempfile.mkdtemp(prefix="terminal-mcp-onboard-"))
+        _onboard_dir = ephemeral_state_dir("onboard")
         onboarding = OnboardingService(
             terminal.config, controller=controller, connection_store=connection_store,
             enrollment_store=EnrollmentStore(_onboard_dir / "enrollment.db"),
