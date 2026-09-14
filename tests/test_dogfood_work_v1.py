@@ -62,9 +62,26 @@ def knowledge():
         from terminal_mcp.project_knowledge import ProjectKnowledge, canonical_root
 
         root = canonical_root(str(REPO_ROOT))
-        return ProjectKnowledge(root) if root else None
+        knowledge = ProjectKnowledge(root) if root else None
     except Exception:  # noqa: BLE001 -- absence is a valid state to test
-        return None
+        knowledge = None
+    if knowledge is None:
+        yield None
+        return
+    # Planning RE-VERIFIES the map, and re-verification writes: a module whose
+    # paths no commit has touched gets its verified commit advanced. That is
+    # the feature, and running it against the real map is the point of a
+    # dogfood -- but a test suite must not leave a diff in the repository it
+    # planned against, so the file is put back exactly as it was.
+    path = knowledge.state_path
+    before = path.read_bytes() if path.exists() else None
+    try:
+        yield knowledge
+    finally:
+        if before is None:
+            path.unlink(missing_ok=True)
+        elif path.read_bytes() != before:
+            path.write_bytes(before)
 
 
 def _package_file_count() -> int:
@@ -264,3 +281,46 @@ def test_dogfood_uses_the_real_knowledge_map_when_one_exists(store, knowledge):
     assert knowledge is not None, "strict dogfood requires an indexed knowledge map"
     result = wp.plan(BUG_REPORT, store=store, knowledge=knowledge, cwd=str(REPO_ROOT))
     assert result.counters["knowledge_hits"] > 0
+
+
+# -- the map is loaded, against THIS repo's own map ---------------------------
+
+def test_dogfood_hands_the_worker_the_modules_its_own_map_already_knows(store, knowledge):
+    """The saving, measured where it is claimed: on this repository.
+
+    A worker sent at this bug is told which modules own it, which files they
+    are, and which of those entries have aged -- before it opens anything.
+    Without a map the pipeline is supposed to degrade rather than fail, and
+    this asserts that too rather than skipping.
+    """
+    result = wp.plan(BUG_REPORT, store=store, knowledge=knowledge, cwd=str(REPO_ROOT))
+    # A fresh worker reads the spec back from the store and starts there.
+    handoff = store.get(result.spec.spec_id).handoff()
+
+    if not result.spec.knowledge_modules:
+        # No map, or nothing in it overlapped: the honest empty case.
+        assert "KNOWLEDGE" not in handoff
+        assert result.counters["knowledge_modules_loaded"] == 0
+        return
+
+    brief = handoff["KNOWLEDGE"]
+    assert brief["MODULES"] == list(result.spec.knowledge_modules)
+    assert brief["CONFIDENCE"] in ("HIGH", "MEDIUM", "LOW")
+    # Files to open, rather than a repository to search.
+    assert "terminal_mcp/" in brief["BRIEF"]
+    # And the rule it is subordinate to, where the worker acts on it.
+    assert "current code is the truth" in brief["BRIEF"]
+    assert result.counters["knowledge_modules_loaded"] == len(brief["MODULES"])
+
+
+def test_dogfood_re_verification_never_claims_a_module_that_moved(store, knowledge):
+    """A module whose files changed since it was indexed must reach the worker
+    as a lead, not as settled truth -- however convenient the opposite is."""
+    result = wp.plan(BUG_REPORT, store=store, knowledge=knowledge, cwd=str(REPO_ROOT))
+    if not result.spec.knowledge_modules or knowledge is None:
+        return
+    stale = [m.name for m in knowledge.module_states()
+             if m.name in result.spec.knowledge_modules and m.confidence == "LOW"]
+    for name in stale:
+        section = result.spec.knowledge_brief.split(f"MODULE {name} ", 1)[1]
+        assert section.startswith("(knowledge confidence LOW, STALE)")

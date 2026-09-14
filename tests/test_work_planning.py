@@ -200,3 +200,152 @@ def test_counters_are_counts_and_carry_no_token_estimate(store):
     assert all(isinstance(v, int) for v in payload["counters"].values())
     assert not any("token" in key for key in payload["counters"]), \
         "token counts belong to the provider, reported with their provenance"
+
+
+# -- the map is LOADED, not merely present -----------------------------------
+#
+# The properties below are what separate "this project has a knowledge map"
+# from "this project's workers benefit from one". A map nobody loads at the
+# moment a task starts is a file that costs storage and saves nothing.
+
+@pytest.fixture()
+def indexed_repo(tmp_path):
+    """A real repository whose `export` module is already in the map."""
+    import subprocess
+
+    from terminal_mcp.project_knowledge import ProjectKnowledge
+
+    root = tmp_path / "repo"
+    (root / "app").mkdir(parents=True)
+    (root / "app" / "export.py").write_text(
+        "def render_csv(rows):\n    return '\\n'.join(rows)\n")
+    (root / "app" / "billing.py").write_text("def invoice(): pass\n")
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(root), "-c", "user.email=t@e",
+                        "-c", "user.name=t", *args], check=True, capture_output=True)
+
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    git("add", "-A")
+    git("commit", "-qm", "init")
+    knowledge = ProjectKnowledge(root)
+    knowledge.record_module(
+        "export", paths=["app/export.py"],
+        summary="writes report rows to CSV; the header comes from render_csv()")
+    knowledge.record_module("billing", paths=["app/billing.py"],
+                            summary="invoices and their line items")
+    knowledge.write_document(
+        "KNOWN_ISSUES.md",
+        "- export: the header row is dropped when the query returns no rows\n")
+    return knowledge
+
+
+def test_the_planner_loads_the_module_it_named(store, indexed_repo):
+    result = wp.plan("CSV export is missing its header row", store=store,
+                     knowledge=indexed_repo, cwd=str(indexed_repo.root))
+
+    assert result.knowledge["loaded"] == 1
+    assert result.spec.knowledge_modules == ("export",)
+    # What a worker would otherwise have had to find by searching the code.
+    assert "render_csv" in result.spec.knowledge_brief
+    assert "app/export.py" in result.spec.knowledge_brief
+
+
+def test_a_fresh_worker_is_briefed_without_reading_the_module_source(store,
+                                                                     indexed_repo,
+                                                                     monkeypatch):
+    """The claim this whole path exists to make.
+
+    A worker that has never seen this repository is handed where the code
+    lives, what it does and what is known to be wrong with it -- and not one
+    line of the module's own source was opened to produce that.
+    """
+    from pathlib import Path
+
+    opened: list[str] = []
+    original = Path.read_text
+
+    def watched(self, *args, **kwargs):
+        opened.append(str(self))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", watched)
+
+    result = wp.plan("CSV export is missing its header row", store=store,
+                     knowledge=indexed_repo, cwd=str(indexed_repo.root))
+
+    # A fresh worker: it reads the spec back out of the store, having been
+    # told nothing else.
+    handoff = store.get(result.spec.spec_id).handoff()
+    brief = handoff["KNOWLEDGE"]["BRIEF"]
+    assert "app/export.py" in brief                    # where it lives
+    assert "render_csv" in brief                       # what to look at
+    assert "header row is dropped" in brief            # what is known to be wrong
+    assert handoff["KNOWLEDGE"]["VERIFIED_AT_COMMIT"] == indexed_repo.head()
+
+    # The probe recorded reads at all -- otherwise the assertion below would
+    # pass simply because nothing was being watched.
+    assert any("knowledge" in path for path in opened), opened
+    source = str(indexed_repo.root / "app")
+    assert not [path for path in opened if path.startswith(source)], opened
+
+
+def test_the_briefing_covers_the_named_module_and_not_the_whole_map(store,
+                                                                    indexed_repo):
+    result = wp.plan("CSV export is missing its header row", store=store,
+                     knowledge=indexed_repo, cwd=str(indexed_repo.root))
+    # A briefing that grows with the project is the repository again.
+    assert "invoices" not in result.spec.knowledge_brief
+
+
+def test_the_map_is_re_verified_before_it_is_asked_anything(store, indexed_repo):
+    import subprocess
+
+    (indexed_repo.root / "app" / "billing.py").write_text("def invoice(): return 1\n")
+    subprocess.run(["git", "-C", str(indexed_repo.root), "-c", "user.email=t@e",
+                    "-c", "user.name=t", "commit", "-aqm", "touch billing"],
+                   check=True, capture_output=True)
+
+    result = wp.plan("CSV export is missing its header row", store=store,
+                     knowledge=indexed_repo, cwd=str(indexed_repo.root))
+
+    # `export` did not move, so the worker is not sent to re-read it just
+    # because somebody else's commit landed.
+    assert result.counters["knowledge_refreshed"] >= 1
+    assert result.spec.knowledge_confidence == "HIGH"
+
+
+def test_a_module_that_really_moved_is_named_rather_than_trusted(store, indexed_repo):
+    import subprocess
+
+    (indexed_repo.root / "app" / "export.py").write_text("def render_csv(rows):\n    ...\n")
+    subprocess.run(["git", "-C", str(indexed_repo.root), "-c", "user.email=t@e",
+                    "-c", "user.name=t", "commit", "-aqm", "rewrite export"],
+                   check=True, capture_output=True)
+
+    result = wp.plan("CSV export is missing its header row", store=store,
+                     knowledge=indexed_repo, cwd=str(indexed_repo.root))
+    stage = next(s for s in result.stages if s.name == wp.KNOWLEDGE)
+
+    assert any("needs re-indexing" in gap for gap in stage.gaps)
+    # Still briefed -- with the fact that it is a lead, not a settled truth.
+    assert result.spec.knowledge_confidence == "LOW"
+    assert "STALE" in result.spec.knowledge_brief
+
+
+def test_matching_a_module_and_briefing_on_it_are_counted_separately(store,
+                                                                     indexed_repo):
+    result = wp.plan("CSV export is missing its header row", store=store,
+                     knowledge=indexed_repo, cwd=str(indexed_repo.root))
+    # Collapsing these would let a match that briefed nobody look like a saving.
+    assert result.counters["knowledge_hits"] >= 1
+    assert result.counters["knowledge_modules_loaded"] == 1
+
+
+def test_a_knowledge_object_that_cannot_refresh_still_plans(store):
+    # The planner takes whatever knowledge-shaped object it is given; a stub
+    # without `rebuild` must degrade, not raise.
+    result = wp.plan("Add CSV export", store=store,
+                     knowledge=_FakeKnowledge(_FakeModule("export", "CSV export")))
+    assert result.spec.relevant_modules == ("export",)
+    assert result.counters["knowledge_refreshed"] == 0
