@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import yaml
 
 from terminal_mcp import doctor
@@ -123,7 +125,20 @@ def test_human_output_shows_os_and_backend(tmp_path, monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_connection_reports_loopback_only_when_lan_bind_unset(monkeypatch, capsys):
+@pytest.fixture
+def no_runtime_listeners(monkeypatch):
+    """These tests are about CONFIG plumbing, so the host's real sockets must
+    not leak in -- the machine running them is itself LAN-bound on this port,
+    which is exactly the situation the fix is about."""
+    from terminal_mcp import listen_evidence
+
+    monkeypatch.setattr(listen_evidence, "_from_proc", lambda port: [])
+    monkeypatch.setattr(listen_evidence, "_from_command",
+                        lambda argv, port, source: [])
+
+
+def test_connection_reports_loopback_only_when_lan_bind_unset(
+        monkeypatch, capsys, no_runtime_listeners):
     monkeypatch.delenv("TERMINAL_MCP_LAN_BIND", raising=False)
     monkeypatch.delenv("TERMINAL_MCP_ALLOWED_NODE_CIDRS", raising=False)
     doctor.main(["connection", "--json"])
@@ -132,7 +147,8 @@ def test_connection_reports_loopback_only_when_lan_bind_unset(monkeypatch, capsy
     assert result["endpoints"]["lan"] is None
 
 
-def test_connection_reports_lan_endpoint_and_cidrs_when_configured(monkeypatch, capsys):
+def test_connection_reports_lan_endpoint_and_cidrs_when_configured(
+        monkeypatch, capsys, no_runtime_listeners):
     monkeypatch.setenv("TERMINAL_MCP_LAN_BIND", "192.168.1.132")
     monkeypatch.setenv("TERMINAL_MCP_ALLOWED_NODE_CIDRS", "192.168.1.0/24")
     doctor.main(["connection", "--json"])
@@ -142,7 +158,8 @@ def test_connection_reports_lan_endpoint_and_cidrs_when_configured(monkeypatch, 
     assert result["endpoints"]["firewall_verified"] is False
 
 
-def test_connection_human_output_shows_endpoints_section(monkeypatch, capsys):
+def test_connection_human_output_shows_endpoints_section(
+        monkeypatch, capsys, no_runtime_listeners):
     monkeypatch.setenv("TERMINAL_MCP_LAN_BIND", "192.168.1.132")
     monkeypatch.setenv("TERMINAL_MCP_ALLOWED_NODE_CIDRS", "192.168.1.0/24")
     doctor.main(["connection"])
@@ -150,3 +167,28 @@ def test_connection_human_output_shows_endpoints_section(monkeypatch, capsys):
     assert "controller endpoints:" in out
     assert "192.168.1.132:8766" in out
     assert "loopback:" in out
+
+
+def test_connection_prefers_the_running_process_over_its_own_environment(monkeypatch, capsys):
+    """The regression this whole change exists for.
+
+    The doctor is a separate CLI process; a systemd-started server's
+    TERMINAL_MCP_LAN_BIND is in the UNIT, not in the doctor's environment. It
+    used to read its own env, find nothing, and report "not configured" about
+    a controller that was listening on two LAN addresses.
+    """
+    from terminal_mcp import listen_evidence
+
+    monkeypatch.delenv("TERMINAL_MCP_LAN_BIND", raising=False)
+    monkeypatch.setattr(
+        listen_evidence, "_from_proc",
+        lambda port: [listen_evidence.Listener("192.168.1.50", port, "ipv4",
+                                               listen_evidence.SOURCE_PROC)])
+
+    monkeypatch.delenv("TERMINAL_MCP_ALLOWED_NODE_CIDRS", raising=False)
+    doctor.main(["connection", "--json"])
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["endpoints"]["lan"] == "http://192.168.1.50:8766"
+    assert result["endpoints"]["lan_source"] == listen_evidence.SOURCE_PROC
+    assert result["lan_state"]["state"] == listen_evidence.LAN_BOUND

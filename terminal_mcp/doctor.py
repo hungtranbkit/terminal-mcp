@@ -36,10 +36,21 @@ def cmd_connection(args: argparse.Namespace) -> int:
     # same env vars server_http.py's own startup resolves, so this always
     # reflects the RUNNING process's real binding, never a guess.
     from . import network_bind
+    from .listen_evidence import lan_state
     from .server_http import HTTP_PORT
+    # The env vars below belong to THIS process, not the server's. The doctor
+    # is a separate CLI; a systemd-started server's unit variables are not in
+    # its environment, which is how this used to report "not configured" about
+    # a controller listening on two LAN addresses. Runtime evidence first,
+    # env only as the labelled fallback.
+    configured = network_bind.resolve_lan_binds(os.environ.get("TERMINAL_MCP_LAN_BIND")) \
+        if os.environ.get("TERMINAL_MCP_LAN_BIND") else ()
+    runtime = lan_state(HTTP_PORT, configured_binds=configured)
+    result["lan_state"] = runtime
     result["endpoints"] = network_bind.describe_endpoints(
         port=HTTP_PORT, lan_bind_env=os.environ.get("TERMINAL_MCP_LAN_BIND"),
         cidrs_env=os.environ.get("TERMINAL_MCP_ALLOWED_NODE_CIDRS"),
+        runtime=runtime,
     )
     if args.json:
         print(json.dumps(result, sort_keys=True))
@@ -76,13 +87,33 @@ def _print_human(result: dict) -> None:
     print("  controller endpoints:")
     print(f"    loopback: {endpoints.get('loopback')}")
     if endpoints.get("lan"):
+        how = endpoints.get("lan_source") or "config"
         for url in endpoints.get("lans") or [endpoints["lan"]]:
-            print(f"    lan:      {url}  (allowed_cidrs={endpoints.get('allowed_cidrs')})")
+            print(f"    lan:      {url}  (allowed_cidrs={endpoints.get('allowed_cidrs')}, "
+                 f"source={how})")
+        drift = endpoints.get("config_drift")
+        if drift:
+            print(f"    ⚠ config drift: {', '.join(drift['configured_not_listening'])} "
+                 f"configured but not listening -- {drift['detail']}")
         print(f"    ⚠ {endpoints.get('firewall_reminder')}")
     elif endpoints.get("lan_error"):
         print(f"    lan:      DISABLED -- {endpoints['lan_error']}")
     else:
-        print("    lan:      not configured (loopback-only -- set TERMINAL_MCP_LAN_BIND to enable)")
+        # Three different facts used to print as one sentence. They call for
+        # opposite actions, so they are now said apart.
+        state = endpoints.get("lan_state")
+        detail = endpoints.get("lan_detail")
+        if state == "loopback_only":
+            print(f"    lan:      loopback-only (observed via {endpoints.get('lan_source')})"
+                 f" -- set TERMINAL_MCP_LAN_BIND to enable")
+        elif state == "unknown":
+            print(f"    lan:      UNKNOWN -- {detail or 'could not inspect the running process'}")
+        else:
+            suffix = f" (observed via {endpoints.get('lan_source')})" if endpoints.get("lan_source") else ""
+            print(f"    lan:      not configured{suffix}"
+                 f" -- set TERMINAL_MCP_LAN_BIND to enable")
+            if detail:
+                print(f"              {detail}")
     print(f"    tunnel:   {endpoints.get('tunnel')}")
 
 
