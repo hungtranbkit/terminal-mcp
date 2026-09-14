@@ -49,6 +49,7 @@ from starlette.websockets import WebSocket
 from . import __version__, host_metrics
 from .agent_availability import available_agent_types
 from .capability_probe import probe_capabilities
+from .auth_throttle import AuthThrottle, client_key
 from .contract import describe as contract_describe
 from . import node_profile
 from .launcher_resolution import resolve_launcher
@@ -104,8 +105,18 @@ def _auth_ok(request: Request, expected_token: str) -> bool:
 
 def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
                      workspace_root: str = "/",
-                     fleet: "FleetService | None" = None) -> Starlette:
+                     fleet: "FleetService | None" = None,
+                     throttle: "AuthThrottle | None" = None,
+                     trust_forwarded_for: bool = False) -> Starlette:
     client = LocalNodeClient(terminal)
+    # Brute-force protection for the shared bearer secret. Default-on: an
+    # opt-in guard protects only the deployments that already thought about
+    # it, which are not the ones that need it.
+    #
+    # `trust_forwarded_for` stays OFF unless a deployment declares a trusted
+    # proxy. Honouring the header by default would let any caller choose their
+    # own throttle bucket and never be limited at all.
+    throttle = throttle if throttle is not None else AuthThrottle()
 
     # Built lazily and cached: a node agent must still start and serve
     # sessions on a box where the fleet cache cannot be opened (read-only
@@ -129,8 +140,29 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         return _fleet["service"]
 
     def require_auth(request: Request) -> JSONResponse | None:
+        """Throttled bearer check.
+
+        The throttle is consulted BEFORE the comparison, so a locked-out
+        source never reaches it. The 401 body is byte-identical whether the
+        token was wrong, malformed or absent: a response that differs by cause
+        tells an attacker which of those they achieved.
+        """
+        key = client_key(
+            request.client.host if request.client else None,
+            forwarded_for=request.headers.get("x-forwarded-for"),
+            trust_forwarded=trust_forwarded_for)
+        decision = throttle.check(key)
+        if not decision.allowed:
+            # 429, not 401. The source is being rate limited, which is true
+            # regardless of whether the token it is about to present is
+            # correct -- and saying 401 here would let an attacker use the
+            # status code to distinguish "locked" from "wrong token".
+            return JSONResponse({"error": "TOO_MANY_ATTEMPTS"}, status_code=429,
+                                headers=decision.headers())
         if not _auth_ok(request, token):
+            throttle.record_failure(key)
             return JSONResponse({"error": "UNAUTHORIZED"}, status_code=401)
+        throttle.record_success(key)
         return None
 
     async def health(request: Request) -> JSONResponse:
@@ -657,9 +689,22 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         # module docstring for that established trust model).
         header = websocket.headers.get("authorization", "")
         presented = header[len("Bearer "):] if header.startswith("Bearer ") else websocket.query_params.get("token", "")
+        # The websocket carries the same shared secret and is reachable by the
+        # same attacker, so it is throttled by the same counter. Leaving it out
+        # would have left an unthrottled door beside a locked one -- and this
+        # one also accepts the token in a query parameter.
+        ws_key = client_key(
+            websocket.client.host if websocket.client else None,
+            forwarded_for=websocket.headers.get("x-forwarded-for"),
+            trust_forwarded=trust_forwarded_for)
+        if not throttle.check(ws_key).allowed:
+            await websocket.close(code=4429)
+            return
         if not hmac.compare_digest(presented, token):
+            throttle.record_failure(ws_key)
             await websocket.close(code=4401)
             return
+        throttle.record_success(ws_key)
         session = websocket.query_params.get("session", "")
         readonly = websocket.query_params.get("readonly") == "1"
         if not session:
