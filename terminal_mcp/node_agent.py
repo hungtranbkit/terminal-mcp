@@ -53,9 +53,34 @@ from .launcher_resolution import resolve_launcher
 from .config import load_config
 from .core import TerminalService
 from .node_client import LocalNodeClient
+from .node_models import PLATFORM_LINUX, canonical_platform
 from .webterm import WebTerminalProcess, pump_websocket
 
 _log = logging.getLogger(__name__)
+
+
+def detect_platform() -> str:
+    """This node's real platform, from `sys.platform` and nothing else.
+
+    THE BUG THIS FIXES (blg_20dc778df7ac): `_heartbeat_loop` took
+    `platform="linux"` as a parameter default and the POSIX `main()`
+    below never passed one. windows_agent.py passes PLATFORM_WINDOWS
+    explicitly, so Windows was right by construction -- but macOS runs
+    THIS agent (real tmux, real POSIX), so it inherited the default and
+    the whole fleet saw a MacBook as a Linux box.
+
+    `sys.platform` is the only input, on purpose. It is what the running
+    interpreter reports about the OS it is executing on -- a fact, not an
+    inference. The tempting alternatives are all guesses: the hostname is
+    the operator's naming habit (`macbook` proves nothing, and a Linux
+    box called `macbook-builder` would be actively wrong), and probing
+    for `/System/Library` or `sw_vers` infers the OS from an artefact
+    when the interpreter will simply tell you.
+
+    Anything `sys.platform` reports that this fleet has no name for is
+    passed through by canonical_platform rather than flattened to Linux
+    -- which is exactly the mistake that produced this bug."""
+    return canonical_platform(sys.platform, default=PLATFORM_LINUX)
 
 # Process generation id (Phase 0 node-agent restart-safety audit,
 # 2026-09-06, task item 2: "process generation" as part of the explicit,
@@ -532,7 +557,7 @@ async def watch_for_shutdown(app: Starlette, server: "uvicorn.Server", *,
 
 
 async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller_url: str, token: str,
-                          workspace_root: str, interval_seconds: float, platform: str = "linux",
+                          workspace_root: str, interval_seconds: float, platform: str | None = None,
                           session_backend: str = "tmux", shell_capabilities: tuple[str, ...] = (),
                           wsl_available: bool = False) -> None:
     """Runs forever (until the process exits) -- a single failed push is
@@ -544,7 +569,14 @@ async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller
     (multi-node Windows support): shared with windows_agent.py's own
     main(), which calls this SAME function with those set to the real,
     Windows-appropriate values -- not a separate, duplicated heartbeat
-    loop implementation per platform."""
+    loop implementation per platform.
+
+    `platform=None` now means "detect it" rather than "assume Linux"
+    (blg_20dc778df7ac). The old default was a literal "linux", which is
+    a correct-looking value and therefore a silent wrong answer on every
+    non-Windows box that was not actually Linux; a caller that forgets
+    the argument now gets the truth instead of a plausible lie."""
+    platform = detect_platform() if platform is None else canonical_platform(platform)
     url = f"{controller_url.rstrip('/')}/dashboard/api/nodes/{node_id}/heartbeat"
     while True:
         try:
@@ -607,9 +639,12 @@ def main(argv: list[str] | None = None) -> int:
         # start_soon only supports positional args -- this closure is
         # just that adapter, keeping _heartbeat_loop's own signature
         # keyword-only (clearer at every OTHER call site, e.g. tests).
+        # Explicit, never the parameter default: the default is what
+        # made every macOS node report itself as Linux.
         await _heartbeat_loop(node_id=args.node_id, terminal=terminal, controller_url=args.controller_url,
                               token=token, workspace_root=workspace_root,
-                              interval_seconds=args.heartbeat_interval_seconds)
+                              interval_seconds=args.heartbeat_interval_seconds,
+                              platform=detect_platform())
 
     async def run() -> None:
         async with anyio.create_task_group() as tg:

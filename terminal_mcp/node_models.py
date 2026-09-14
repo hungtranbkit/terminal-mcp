@@ -74,9 +74,85 @@ class NodeHeartbeatThresholds:
 
 
 # Node platform -- reported by the node agent itself (never guessed
-# centrally, same posture as agent_types below), one of these two.
+# centrally, same posture as agent_types below).
 PLATFORM_LINUX = "linux"
 PLATFORM_WINDOWS = "windows"
+PLATFORM_MACOS = "macos"
+"""macOS. Spelled `macos`, not `darwin`, because `macos` was ALREADY this
+project's word for it everywhere it was discussed before a node could
+report it -- verify_queue.py's routing docstring, docs/REQUIREMENTS.md,
+docs/ORCHESTRATION_ARCHITECTURE.md and the roadmap all say `macos`, and
+backlog item blg_20dc778df7ac's own acceptance criterion says
+"platform='macos' (or darwin)". Introducing `darwin` as the stored value
+would have meant a second word for one thing, which is how a vocabulary
+starts drifting. `darwin` is what the OS calls itself and is accepted as
+an INPUT alias below; `macos` is what this fleet stores."""
+
+KNOWN_PLATFORMS = (PLATFORM_LINUX, PLATFORM_WINDOWS, PLATFORM_MACOS)
+
+_PLATFORM_ALIASES: dict[str, str] = {
+    # sys.platform values, current and historical, plus the spellings a
+    # human or a foreign agent might send. Everything here is an exact
+    # match on an already-lowercased, already-stripped string -- there is
+    # deliberately no prefix/substring/fuzzy matching and no inference
+    # from hostname, since "the box is called macbook" is a guess about
+    # the operator's naming habits, not a fact about the OS.
+    "darwin": PLATFORM_MACOS,
+    "macos": PLATFORM_MACOS,
+    "mac": PLATFORM_MACOS,
+    "osx": PLATFORM_MACOS,
+    "mac os x": PLATFORM_MACOS,
+    "linux": PLATFORM_LINUX,
+    "linux2": PLATFORM_LINUX,   # sys.platform on Python 2-era/older builds
+    "win32": PLATFORM_WINDOWS,  # sys.platform on 64-bit Windows too
+    "win64": PLATFORM_WINDOWS,
+    "windows": PLATFORM_WINDOWS,
+    "cygwin": PLATFORM_WINDOWS,
+    "msys": PLATFORM_WINDOWS,
+}
+
+
+def canonical_platform(raw: str | None, *, default: str = PLATFORM_LINUX) -> str:
+    """Maps a reported platform string to this fleet's canonical value.
+
+    WHY THIS EXISTS: `node_agent._heartbeat_loop` had `platform="linux"`
+    as a parameter DEFAULT and the POSIX `main()` never passed one, so
+    every node that is not Windows reported itself as Linux -- including
+    macOS, which runs that same POSIX agent (blg_20dc778df7ac). The bug
+    was a missing detection, so the fix is a real detection plus one
+    place that decides what the detected value is called.
+
+    THREE RULES, in priority order:
+
+    1. An empty/None report means "this agent does not report a
+       platform" -- an agent older than the multi-node Windows work --
+       and yields `default` (PLATFORM_LINUX at every current call site).
+       That is exactly the behaviour those call sites already had, kept
+       deliberately: an old agent's heartbeat must not start meaning
+       something new the day this function lands.
+
+    2. A recognised alias maps to its canonical value. `darwin` ->
+       `macos` is the whole point; `linux`/`win32`/... are listed so
+       this function is the ONE answer to "what platform is that
+       string", not a macOS special case bolted onto the side.
+
+    3. An UNRECOGNISED non-empty value is lowercased, stripped, and
+       RETURNED AS-IS -- never mapped to `default`, never to "unknown".
+       If some future node reports `freebsd`, that is a fact worth
+       keeping: it will simply not match linux/windows/macos routing
+       (exact match, so it fails closed) and it will display as
+       `freebsd`. Folding it into `linux` would recreate this very bug
+       for the next platform; folding it into `unknown` would throw away
+       the only information anyone had.
+
+    Pure and total: never raises, never touches the network, the
+    filesystem, or the hostname."""
+    if raw is None:
+        return default
+    text = str(raw).strip().casefold()
+    if not text:
+        return default
+    return _PLATFORM_ALIASES.get(text, text)
 
 # session_backend -- which SessionBackend (session_backend.py) a node's
 # own TerminalService was actually constructed with. Distinct from

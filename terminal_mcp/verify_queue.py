@@ -65,16 +65,25 @@ heard of (`webview2`, `browser`) becomes routable the moment a node
 probes for it via TERMINAL_MCP_CAPABILITY_PROBES -- which is why there
 is no per-application special case anywhere in this file.
 
-KNOWN FLEET LIMITATION, STATED RATHER THAN PAPERED OVER: `macos` is not
-a routable key today. The node agent has no Darwin branch -- only
-windows_agent.py sets a platform explicitly -- so the MacBook node
-reports platform="linux" (verified against the live registry, not
-assumed). Adding real Darwin reporting would change what
-choose_node(required_platform=...) matches for existing callers, which
-is a production behaviour change and therefore not P0.5's to make. What
-DOES work today, without redeploying anything: `windows` routes to
-dell-5530 even though that node still reports an empty probed-capability
-list, because `platform` is a reported fact of its own.
+`macos` IS a routable key as of blg_20dc778df7ac. It was not, and the
+reason is worth keeping: node_agent.py had no Darwin branch -- only
+windows_agent.py set a platform explicitly -- so a MacBook running that
+same POSIX agent inherited the parameter default and reported
+platform="linux". The fix detects the platform from sys.platform and
+normalises it through node_models.canonical_platform.
+
+THE BEHAVIOUR CHANGE THAT COMES WITH IT, stated rather than papered
+over: a node that used to match choose_node(required_platform="linux")
+by accident now reports "macos" and no longer does. That is the point --
+matching was never correct, it was a wrong answer that happened to route
+somewhere -- but a caller that genuinely wants "any POSIX box" must now
+ask for each platform it accepts rather than relying on macOS being
+mislabelled. Routing is exact-match and therefore fails closed: an
+unrecognised platform matches nothing rather than falling back to Linux.
+
+`windows` still routes to dell-5530 even though that node reports an
+empty probed-capability list, because `platform` is a reported fact of
+its own.
 """
 from __future__ import annotations
 
