@@ -1906,6 +1906,156 @@ def build_mcp(service: TerminalService | None = None,
         except Exception as exc:  # noqa: BLE001
             return {"error": "HISTORY_READ_FAILED", "detail": str(exc)}
 
+    # -- work execution specs, for every kind of task ------------------------
+    # `bug_spec` shipped the spec->worker handoff but only for bugs, and an
+    # audit found it had no production caller at all: 800 lines reachable only
+    # from its own tests. These tools are that wiring, over the generic
+    # contract -- so a FEATURE_NEW/REFACTOR/INTEGRATION/RESEARCH/DEPLOY task is
+    # asked for the fields it actually needs instead of for a root cause.
+
+    def _spec_store():
+        from .work_spec import WorkSpecStore
+
+        return WorkSpecStore()
+
+    def _gate_report(spec) -> dict:
+        from .work_spec import gate
+
+        return gate(spec)
+
+    @server.tool()
+    def work_spec_create(title: str, task_type: str = "", requirement: str = "",
+                         symptom: str = "", research_question: str = "",
+                         project_id: str = "", created_by: str = "",
+                         changed_paths: str = "") -> dict:
+        """Start a work spec -- the analysis done ONCE, handed to the worker.
+
+        The worker receives the spec instead of the conversation, which is the
+        whole token saving: without it the executing agent repeats the
+        planner's analysis from an empty repository.
+
+        `task_type` is one of FEATURE_NEW, BUG, REFACTOR, INTEGRATION,
+        RESEARCH, DEPLOY. Leave it empty to have it inferred from the text and
+        then confirm it -- the type decides which fields the gate requires.
+
+        The returned spec is deliberately INCOMPLETE. Fill it with
+        `work_spec_update`, then check it with `work_spec_gate` before
+        dispatching anything.
+        """
+        from .work_spec import plan_from_request
+
+        try:
+            paths = tuple(p.strip() for p in changed_paths.split(",") if p.strip())
+            spec = plan_from_request(
+                title=title, requirement=requirement, symptom=symptom,
+                research_question=research_question,
+                task_type=task_type.strip().upper() or None,
+                changed_paths=paths, project_id=project_id or None,
+                created_by=created_by or None)
+            _spec_store().save(spec)
+            return {"spec": spec.as_dict(), "gate": _gate_report(spec)}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "SPEC_CREATE_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_spec_update(spec_id: str, fields: dict) -> dict:
+        """Fill in spec fields. Returns the spec with its gate re-evaluated.
+
+        List-valued fields (scope, out_of_scope, reuse_candidates,
+        acceptance_criteria, likely_files, ...) accept a list of strings. A
+        secret is REFUSED rather than stripped: a spec is long-lived and
+        rarely re-read, the worst place for a quiet strip to fail open.
+        """
+        try:
+            store = _spec_store()
+            spec = store.get(spec_id)
+            if spec is None:
+                return {"error": "SPEC_NOT_FOUND", "spec_id": spec_id}
+            for key, value in (fields or {}).items():
+                if not hasattr(spec, key):
+                    return {"error": "UNKNOWN_FIELD", "field": key}
+                current = getattr(spec, key)
+                setattr(spec, key, tuple(value)
+                        if isinstance(current, tuple) and isinstance(value, list) else value)
+            store.save(spec)
+            return {"spec": spec.as_dict(), "gate": _gate_report(spec)}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "SPEC_UPDATE_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_spec_gate(spec_id: str) -> dict:
+        """Is this spec executable, and if not, what exactly is missing?
+
+        SPEC_READY returns the compact handoff a worker starts from.
+        NEEDS_REDEFINE returns the short questions for the planner plus a
+        BLOCKING list -- fields no amount of detail elsewhere substitutes for.
+        A worker that gets NEEDS_REDEFINE hands back rather than investigating:
+        earning that detail in the worker is the re-analysis the spec exists
+        to avoid.
+        """
+        try:
+            spec = _spec_store().get(spec_id)
+            if spec is None:
+                return {"error": "SPEC_NOT_FOUND", "spec_id": spec_id}
+            return _gate_report(spec)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "SPEC_GATE_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_spec_get(spec_id: str) -> dict:
+        """One spec in full, with its derived level and gate verdict."""
+        try:
+            store = _spec_store()
+            spec = store.get(spec_id)
+            if spec is None:
+                return {"error": "SPEC_NOT_FOUND", "spec_id": spec_id}
+            return {"spec": spec.as_dict(), "gate": _gate_report(spec),
+                    "children": [s.spec_id for s in store.children(spec_id)]}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "SPEC_READ_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_spec_list(task_type: str = "", project_id: str = "",
+                       work_id: str = "", limit: int = 50) -> dict:
+        """Specs, most recently updated first, with their gate status."""
+        try:
+            specs = _spec_store().list(task_type=task_type.strip().upper() or None,
+                                       project_id=project_id or None,
+                                       work_id=work_id or None, limit=limit)
+            return {"specs": [{"spec_id": s.spec_id, "title": s.title,
+                               "task_type": s.task_type, "level": s.level(),
+                               "plan_status": s.plan_status,
+                               "ready": _gate_report(s)["ready"]} for s in specs]}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "SPEC_LIST_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_test_selection(changed_paths: str, project_path: str = "") -> dict:
+        """Which tests this change has to run, and when the full suite does.
+
+        Two stages: a fast lane of the tests that import what changed, then
+        FULL_VERIFY before the change is called done. The fast lane never
+        replaces FULL_VERIFY -- it shortens the author's loop.
+
+        Fails CLOSED. A path no test imports, a path outside the package, a
+        high-fan-in module, or an empty change list all answer FULL_VERIFY
+        with the reason. "Selected nothing" is never an answer, because a
+        narrow pass that missed the one test that mattered reads exactly like
+        a real one.
+
+        `changed_paths` is comma-separated and repo-relative.
+        """
+        from . import test_selection as ts
+
+        try:
+            import os as _os
+
+            root = project_path.strip() or _os.getcwd()
+            paths = [p.strip() for p in changed_paths.split(",") if p.strip()]
+            return ts.plan(paths, tests_dir=_os.path.join(root, "tests"))
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "TEST_SELECTION_FAILED", "detail": str(exc)}
+
     @server.tool()
     def terminal_fleet_environment(roles: str = "node") -> dict:
         """Audit every node's ENVIRONMENT in one call: tools, services and
