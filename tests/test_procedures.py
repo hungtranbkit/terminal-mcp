@@ -276,3 +276,169 @@ def test_corrupt_local_evidence_means_nothing_has_run_here(registry):
     # Regenerable, so it degrades rather than taking the registry down.
     assert registry.get("test_gate").last_success_at is None
     assert registry.list()[0]["script_exists"] is True
+
+
+# -- the registry as the DEFAULT path ----------------------------------------
+#
+# The registry already knew how to hold a runbook. What decides whether it is
+# used is whether calling it is easier than re-deriving the command, so these
+# tests are about the cheap path existing at all: an operation name resolves,
+# registration happens on the way through, a pass costs one line, and the
+# script is handed back only when something is actually wrong with it.
+
+@pytest.fixture()
+def agent_repo(tmp_path):
+    """A repo whose runbooks live where this project's convention puts them."""
+    root = tmp_path / "agentrepo"
+    (root / "scripts" / "agent").mkdir(parents=True)
+    (root / "terminal_mcp").mkdir()
+    (root / "terminal_mcp" / "__init__.py").write_text("")
+    (root / "tests").mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _git(root, "config", "user.email", "t@e.com")
+    _git(root, "config", "user.name", "T")
+    for name, body in (("test-gate.sh", "echo 'PASS stage=pytest 12 passed'\n"),
+                       ("smoke.sh", "echo 'PASS stage=routes'\n"),
+                       ("deploy-restart.sh", "echo 'PASS stage=restart'\n")):
+        (root / "scripts" / "agent" / name).write_text(f"#!/usr/bin/env bash\n{body}")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "init")
+    return pr.ProcedureRegistry(ProjectKnowledge(root), log_dir=tmp_path / "logs")
+
+
+def test_the_conventional_scripts_register_themselves(agent_repo):
+    report = agent_repo.ensure_operations()
+    assert report["operations"]["test"]["procedure_id"] == "test_gate"
+    assert agent_repo.get("test_gate").command == ["bash", "scripts/agent/test-gate.sh"]
+    # Nothing is invented for an operation this repository cannot perform.
+    assert "build" in report["absent"]
+    assert agent_repo.get("build") is None
+
+
+def test_what_the_repository_already_runs_wins_over_the_agent_script(agent_repo):
+    (agent_repo.root / "Makefile").write_text("test:\n\tpytest -q\n")
+    agent_repo.ensure_operations()
+    # A second way to run the tests is a way for the two to disagree.
+    assert agent_repo.get("test_gate").command == ["make", "test"]
+
+
+def test_a_declared_procedure_is_never_overwritten_by_discovery(agent_repo):
+    agent_repo.register(pr.Procedure(id="test_gate", name="hand written",
+                                     command=["bash", "scripts/agent/test-gate.sh"],
+                                     depends_on=["terminal_mcp"], risk=pr.RISK_READ_ONLY))
+    agent_repo.ensure_operations()
+    kept = agent_repo.get("test_gate")
+    # The author knew a risk level and a dependency set discovery cannot infer.
+    assert kept.name == "hand written" and kept.depends_on == ("terminal_mcp",)
+
+
+def test_ensuring_twice_keeps_the_green_result_of_the_first(agent_repo):
+    agent_repo.ensure_operations()
+    agent_repo.run_operation("test")
+    before = agent_repo.get("test_gate").last_success_at
+    assert agent_repo.ensure_operations()["registered"] == []
+    assert agent_repo.get("test_gate").last_success_at == before
+
+
+def test_the_word_test_runs_the_registered_gate(agent_repo):
+    result = agent_repo.run_operation("test")
+    assert result.ok is True and result.operation == "test"
+    assert result.procedure_id == "test_gate"
+    # Nothing had to be registered first: asking is what registers it.
+    assert agent_repo.get("test_gate") is not None
+
+
+@pytest.mark.parametrize("spelling", ["test", "tests", "pytest", "TEST-GATE", "regression"])
+def test_the_spelling_a_caller_would_use_resolves(agent_repo, spelling):
+    # A caller who gets "unknown" back composes the command by hand, which is
+    # the cost this whole module exists to remove.
+    assert agent_repo.run_operation(spelling).procedure_id == "test_gate"
+
+
+def test_an_unknown_operation_names_the_ones_that_exist(agent_repo):
+    result = agent_repo.run_operation("deploy-to-mars")
+    assert result.ok is False and result.status == pr.UNREGISTERED
+    for operation in ("test", "build", "deploy", "smoke", "health"):
+        assert operation in result.summary
+
+
+def test_a_passing_operation_hands_back_one_line_and_no_script(agent_repo):
+    payload = agent_repo.run_operation("test").as_context()
+    assert payload["line"].startswith("PASS test_gate")
+    assert "\n" not in payload["line"]
+    # The rule expressed as data: on a pass there is nothing to read.
+    assert "inspect" not in payload and "error_excerpt" not in payload
+    assert payload["log_path"]
+
+
+def test_a_failing_operation_points_at_the_failing_region_and_the_script(agent_repo):
+    (agent_repo.root / "scripts" / "agent" / "test-gate.sh").write_text(
+        "#!/usr/bin/env bash\necho 'FAILED tests/test_x.py::test_y'\nexit 1\n")
+    payload = agent_repo.run_operation("test").as_context()
+    assert payload["line"].startswith("FAIL test_gate")
+    assert "test_x" in payload["error_excerpt"]
+    assert payload["inspect"]["script"] == "scripts/agent/test-gate.sh"
+    assert payload["inspect"]["log_path"] == payload["log_path"]
+
+
+def test_a_stale_operation_is_re_run_rather_than_read(agent_repo):
+    agent_repo.run_operation("test")
+    (agent_repo.root / "terminal_mcp" / "core.py").write_text("x = 1\n")
+    result = agent_repo.run_operation("test")
+    # Its dependencies moved, so the cached PASS is not reused -- but nobody
+    # needs the script to find that out.
+    assert result.status == pr.STALE
+    assert result.from_cache is False and result.ok is True
+    assert result.inspect is None
+
+
+def test_a_verified_operation_is_reused_not_re_run(agent_repo):
+    agent_repo.run_operation("test")
+    second = agent_repo.run_operation("test")
+    assert second.status == pr.VERIFIED and second.from_cache is True
+    assert second.one_line().startswith("PASS test_gate")
+
+
+def test_a_broken_operation_says_which_script_vanished(agent_repo):
+    agent_repo.ensure_operations()
+    (agent_repo.root / "scripts" / "agent" / "test-gate.sh").unlink()
+    result = agent_repo.run_operation("test")
+    assert result.ok is False and result.stage == "lookup"
+    assert result.status == pr.BROKEN
+    assert "scripts/agent/test-gate.sh" in result.summary
+
+
+def test_deploy_goes_through_the_registry_but_is_still_not_automatic(agent_repo):
+    result = agent_repo.run_operation("deploy")
+    # Routed and resolved -- then refused, because a deploy is a decision.
+    assert result.procedure_id == "deploy_restart"
+    assert result.ok is False and result.stage == "policy"
+    assert agent_repo.run_operation("deploy", allow_risky=True).ok is True
+
+
+def test_a_registered_id_outside_the_operation_table_still_runs(agent_repo):
+    agent_repo.register(_gate(id="tunnel_check",
+                              command=["bash", "scripts/agent/smoke.sh"],
+                              depends_on=[]))
+    result = agent_repo.run_operation("tunnel_check")
+    assert result.ok is True and result.operation is None
+
+
+def test_an_undeclared_dependency_set_does_not_cache_across_an_edit(agent_repo):
+    # `smoke` is about a running system, so it declares no paths. That must
+    # mean "cannot claim freshness", never "always fresh".
+    assert agent_repo.run_operation("smoke").ok is True
+    assert agent_repo.run_operation("smoke").from_cache is True
+    (agent_repo.root / "terminal_mcp" / "routes.py").write_text("ROUTES = []\n")
+    assert agent_repo.run_operation("smoke").from_cache is False
+
+
+def test_a_script_is_looked_for_in_the_REPOSITORY_not_the_callers_directory(registry):
+    # This path exists in the repo the test process happens to run from, and
+    # nowhere in the repo under test. Resolving it against the caller's own
+    # working directory would report a vanished script as present -- the one
+    # mistake a BROKEN status exists to catch.
+    registry.register(_gate(id="elsewhere",
+                            command=["bash", "scripts/agent/test-gate.sh"]))
+    assert registry.list()[0]["script_exists"] is False
+    assert registry.status_of(registry.get("elsewhere")) == pr.BROKEN

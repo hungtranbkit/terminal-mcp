@@ -1638,17 +1638,22 @@ def build_mcp(service: TerminalService | None = None,
         return state.as_dict()
 
     @server.tool()
-    def work_procedures(action: str = "list", procedure_id: str = "",
+    def work_procedures(action: str = "", procedure_id: str = "",
                         project_path: str = "", allow_risky: bool = False) -> dict:
-        """Registered runbooks: list / run / discover.
+        """Run test / build / deploy / smoke / health THROUGH the registry.
 
-        Look here before doing a repeated operation by hand. A green result is
-        reused rather than re-run when nothing it depends on has changed, and
-        a passing run returns ONE line -- the log stays on disk and only a
-        failure brings back its failing region.
+        The default way to perform any of them: pass the operation name (or a
+        registered procedure id) as `procedure_id` -- naming one implies
+        `action="run"`, naming nothing lists. Do not compose the command
+        yourself, and do not read the script first. The registry populates
+        itself from what this repo already has, so nothing needs registering
+        by hand.
 
-        Anything above preview risk is never invoked automatically; it needs
-        `allow_risky`, which is a deliberate human decision, not a default.
+        A pass returns ONE line; only a FAILURE returns the failing region and
+        names the script. A green result is reused while nothing it depends on
+        changed; a STALE one is re-run, not read. Above preview risk nothing is
+        auto-invoked -- `allow_risky` is a human decision, not a default.
+        Other actions: `ensure` (register, run nothing), `discover`, `list`.
         """
         from . import procedures as _procedures
 
@@ -1656,21 +1661,33 @@ def build_mcp(service: TerminalService | None = None,
         if knowledge is None:
             return {"error": "NOT_A_GIT_REPOSITORY"}
         registry = _procedures.ProcedureRegistry(knowledge)
+        # Naming a target IS the request to run it. Requiring `action="run"`
+        # as well is one more thing to know, and anything a caller has to know
+        # before using the registry is a reason not to use the registry.
+        wanted = action.strip() or ("run" if procedure_id.strip() else "list")
         try:
-            if action == "list":
-                return {"procedures": registry.list()}
-            if action == "discover":
+            if wanted == "run":                 # the common path, listed first
+                if not procedure_id.strip():
+                    return {"error": "PROCEDURE_ID_REQUIRED",
+                            "operations": list(_procedures.OPERATION_NAMES)}
+                result = registry.run_operation(procedure_id.strip(),
+                                                allow_risky=allow_risky)
+                # as_context(), not as_dict(): a pass must not carry a log
+                # excerpt or a script path back into the caller's context.
+                return result.as_context()
+            if wanted == "list":
+                return {"procedures": registry.list(),
+                        "operations": list(_procedures.OPERATION_NAMES),
+                        "note": "call an operation by name; read a script only on FAIL"}
+            if wanted == "discover":
                 return {"found": _procedures.discover_existing(knowledge.root),
                         "note": "reuse what a project already has before adding a script"}
-            if action == "run":
-                if not procedure_id.strip():
-                    return {"error": "PROCEDURE_ID_REQUIRED"}
-                result = registry.run(procedure_id.strip(), allow_risky=allow_risky)
-                return {**result.as_dict(), "line": result.one_line()}
+            if wanted == "ensure":
+                return registry.ensure_operations()
         except Exception as exc:  # noqa: BLE001
             return {"error": "PROCEDURE_FAILED", "detail": str(exc)}
         return {"error": "UNKNOWN_ACTION", "action": action,
-                "allowed": ["list", "run", "discover"]}
+                "allowed": ["list", "run", "discover", "ensure"]}
 
     @server.tool()
     def work_policy(action: str = "status", sections: str = "",
