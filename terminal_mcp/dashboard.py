@@ -6818,6 +6818,13 @@ NODES_ADMIN_HTML = """<!doctype html>
         helperBox.hidden = false;
         connectBtn.hidden = true;
         downloadBtn.hidden = false;
+        // Pair the download with THIS pending session so a double-click on
+        // a fresh machine continues it -- no code to copy, no handle to
+        // type, no second trip back to this page. The handle lives ~2
+        // minutes and is single-use; if the browser renames the file on the
+        // way down, the helper installs normally and the Connect button
+        // below still works.
+        downloadBtn.onclick = anDownloadPairedHelper;
         // Unsigned is stated plainly rather than coaching anyone past
         // SmartScreen.
         why.textContent = build.signed
@@ -6925,6 +6932,56 @@ NODES_ADMIN_HTML = """<!doctype html>
         anSetMsg('anDoneMsg', 'Trình duyệt chặn clipboard — lệnh đã được bôi đen, nhấn Ctrl + C để copy.', '');
       }
     });
+
+    // Fetch the helper with the handle in the BODY, then save it under the
+    // paired name the controller chose. A query string would put a live
+    // credential into access logs and browser history; a POST plus a blob
+    // keeps it out of both. Same mechanism the .ps1 download already uses.
+    async function anDownloadPairedHelper(event) {
+      event.preventDefault();
+      if (!anGenerated) return;
+      const button = event.currentTarget;
+      button.classList.add('busy');
+      let handle = '';
+      try {
+        const issued = await api(
+          `/dashboard/api/nodes/onboard/enrollments/${encodeURIComponent(anGenerated.enrollment.id)}/handle`,
+          {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+        if (issued.ok && issued.data.handle) handle = issued.data.handle;
+      } catch (error) {
+        // Generic download is a supported outcome, not a failure: the
+        // operator installs it and presses Connect again.
+      }
+      try {
+        const response = await fetch('/dashboard/api/nodes/onboard/helper/windows-x64', {
+          method: 'POST', cache: 'no-store',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(handle ? {session: handle} : {}),
+        });
+        if (!response.ok) {
+          anSetMsg('anHelperMsg', 'Không tải được helper.', 'error');
+          return;
+        }
+        // The controller names the file; honour that name exactly, because
+        // it is what the helper reads on a double-click.
+        const disposition = response.headers.get('Content-Disposition') || '';
+        const match = /filename="([^"]+)"/.exec(disposition);
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = match ? match[1] : 'terminal-mcp-bootstrap.exe';
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        anSetMsg('anHelperMsg', handle
+          ? 'Đã tải. Mở file vừa tải và bấm Yes — phần còn lại tự chạy.'
+          : 'Đã tải. Cài xong thì bấm "Kết nối máy này" lần nữa.', 'ok');
+      } finally {
+        button.classList.remove('busy');
+      }
+    }
 
     document.getElementById('anHelperBtn').addEventListener('click', async (event) => {
       if (!anGenerated) return;
@@ -15156,8 +15213,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         payload = await anyio.to_thread.run_sync(helper_artifact.available)
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
-    @server.custom_route("/dashboard/api/nodes/onboard/helper/{target}", methods=["GET"],
-                        include_in_schema=False)
+    @server.custom_route("/dashboard/api/nodes/onboard/helper/{target}",
+                        methods=["GET", "POST"], include_in_schema=False)
     async def onboard_helper_download(request: Request) -> Response:
         """Stream one verified helper binary.
 
@@ -15194,12 +15251,37 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                                  "detail": str(exc)}, status_code=404,
                                 headers={"Cache-Control": "no-store"})
 
-        _log.info("helper artifact served target=%s version=%s signed=%s",
-                 artifact.target, artifact.version, artifact.signed)
+        # A fresh machine has no helper, so no terminalmcp:// handler for
+        # the page to hand the session to -- the operator just runs what
+        # they downloaded. So the download is NAMED after the pending
+        # session, and the helper reads its own file name on a double-click.
+        # The bytes are untouched: the manifest hash (and one day the
+        # Authenticode signature) must survive the download unchanged.
+        # POST carries the handle in the BODY, never the query string: a
+        # query string lands in access logs, proxy logs and browser history,
+        # and outlives the handle's two minutes by months. GET stays the
+        # plain, unpaired download.
+        session = ""
+        if request.method == "POST":
+            try:
+                body_json = await request.json()
+            except ValueError:
+                body_json = {}
+            if isinstance(body_json, dict):
+                session = str(body_json.get("session") or "")
+        download_name = helper_artifact.paired_filename(
+            artifact.filename, _request_base_url(request), session)
+
+        # The handle is a credential for its 120 seconds. It is used to
+        # build a file name and is never logged, never echoed in a header,
+        # and never included in an error.
+        _log.info("helper artifact served target=%s version=%s signed=%s paired=%s",
+                 artifact.target, artifact.version, artifact.signed,
+                 download_name != artifact.filename)
         return Response(
             body, media_type="application/octet-stream",
             headers={
-                "Content-Disposition": f'attachment; filename="{artifact.filename}"',
+                "Content-Disposition": f'attachment; filename="{download_name}"',
                 # An executable must never be cached by a shared proxy, and
                 # a stale copy of a binary is worse than a slow download.
                 "Cache-Control": "no-store",

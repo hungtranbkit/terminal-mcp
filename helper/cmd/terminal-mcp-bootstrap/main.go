@@ -123,8 +123,19 @@ func currentStatus() statusReport {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, usage)
-		os.Exit(2)
+		// Double-clicked. On a fresh machine this is the ONLY thing that
+		// happens -- there is no helper yet, so no terminalmcp:// handler
+		// for the page to hand a session to, and the operator just runs
+		// what they downloaded. This used to print usage to stderr and
+		// exit 2, which on a double-click is a console window that flashes
+		// and vanishes, losing the enrollment they had just created.
+		//
+		// The controller names the download after that session, so the
+		// file itself carries it. Nothing here trusts the name: the
+		// pairing is validated, the handle stays opaque, and a name with
+		// no pairing falls through to an ordinary interactive install
+		// rather than an error.
+		os.Exit(runLaunchedDirectly())
 	}
 
 	// Windows invokes a protocol handler as `exe "terminalmcp://..."` --
@@ -177,6 +188,41 @@ const usage = `Terminal MCP Bootstrap
   terminal-mcp-bootstrap uninstall
   terminal-mcp-bootstrap service          (started by the service manager)
   terminal-mcp-bootstrap "terminalmcp://enroll?handle=...&controller=..."`
+
+// runLaunchedDirectly handles a double-click: recover the pending session
+// from this executable's own file name, or fall back to explaining what to
+// do next. It never fails loudly for a missing pairing -- a generic
+// download is a supported way to arrive here.
+func runLaunchedDirectly() int {
+	path, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, usage)
+		return 2
+	}
+	pairing, err := proto.ParseFilename(path)
+	if err != nil {
+		// No pairing, or a name we will not act on. Say what to do rather
+		// than printing a flag reference nobody asked for.
+		fmt.Println(noPairingMessage)
+		return 2
+	}
+	fmt.Printf("Terminal MCP Bootstrap %s\n", Version)
+	fmt.Printf("Controller: %s\n", pairing.Controller)
+	// The handle is never printed: it is a credential for its two minutes,
+	// and a console window is a screenshot away from a chat message.
+	fmt.Println("Continuing the setup session this installer was downloaded for...")
+	return runInstall(pairing.Controller, pairing.Handle)
+}
+
+const noPairingMessage = `Terminal MCP Bootstrap
+
+This installer was not downloaded for a specific setup session -- or the
+browser renamed it on the way down.
+
+Nothing is wrong. Install it, then press "Kết nối máy này" on the Nodes page
+again and it will continue from there:
+
+    terminal-mcp-bootstrap install -controller https://<your-controller>`
 
 // runProtocol is the ONLY entry point a web page can reach. It validates
 // and forwards; it never executes. A failure here is a refusal, printed

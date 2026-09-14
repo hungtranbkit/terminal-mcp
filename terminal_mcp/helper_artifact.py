@@ -42,9 +42,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 # Error codes, stable: they reach the route, the page and the tests.
 NO_MANIFEST = "HELPER_ARTIFACT_NOT_PUBLISHED"
@@ -200,6 +202,51 @@ def resolve(target: str, *, root: Path | None = None, verify: bool = True) -> Ar
         # Absent means unsigned. A missing field can never read as signed.
         signed=bool(entry.get("signed", manifest.get("signed", False))),
     )
+
+
+# Mirrors helper/internal/proto/pairing.go. Two implementations of one
+# format is a thing to keep in step, so the shape is stated once here and
+# the Go side has the round-trip tests that prove they agree.
+PAIR_SEPARATOR = "__"
+_HANDLE_RE = re.compile(r"^[0-9a-f]{32}$")
+_HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$")
+
+
+def paired_filename(filename: str, controller: str | None, handle: str | None) -> str:
+    """Name the download after the session it belongs to.
+
+    The BYTES are untouched -- that is the whole reason this lives in the
+    name. The artifact is hashed against its manifest on every request and
+    will one day be Authenticode-signed; neither survives rewriting the file
+    per download.
+
+    Returns the plain name whenever anything is missing or malformed. A
+    generic download is a supported outcome, not an error: the operator
+    installs it and presses Connect again.
+    """
+    if not controller or not handle:
+        return filename
+    handle = str(handle).strip().lower()
+    if not _HANDLE_RE.match(handle):
+        return filename
+    parsed = urlsplit(str(controller).strip())
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    if scheme not in ("http", "https") or not _HOSTNAME_RE.match(host):
+        return filename
+
+    encoded = host
+    if parsed.port:
+        # ':' is illegal in a Windows file name.
+        encoded += f"-p{parsed.port}"
+    if scheme == "http":
+        # Recorded, never guessed: the parser must not have to invent a
+        # scheme, and a wrong guess either fails to connect or downgrades.
+        encoded = "http-" + encoded
+    stem, _, ext = filename.rpartition(".")
+    if not stem:
+        stem, ext = filename, "exe"
+    return f"{stem}{PAIR_SEPARATOR}{encoded}{PAIR_SEPARATOR}{handle}.{ext}"
 
 
 def available(root: Path | None = None) -> dict[str, Any]:
