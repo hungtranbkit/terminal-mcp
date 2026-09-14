@@ -28,6 +28,7 @@ from .node_client import LocalNodeClient, NodeClient, NodeClientError, RemoteNod
 from .node_models import NODE_ONLINE, Node
 from .node_registry import NodeRegistry
 from .scheduler import PlacementResult, choose_node
+from .ephemeral_state import ephemeral_state_dir
 
 if TYPE_CHECKING:
     from .core import TerminalService
@@ -1166,6 +1167,6 @@ def build_default_controller(terminal: "TerminalService") -> ControllerService:
     location."""
     workspace_root = (terminal.config.session_lifecycle.allowed_cwd_roots[0]
                       if terminal.config.session_lifecycle.allowed_cwd_roots else "/")
-    temp_dir = tempfile.mkdtemp(prefix="terminal-mcp-nodes-")
+    temp_dir = str(ephemeral_state_dir("nodes"))
     registry = NodeRegistry(Path(temp_dir) / "nodes.db")
     return ControllerService(registry, local_client=LocalNodeClient(terminal), local_workspace_root=workspace_root)
