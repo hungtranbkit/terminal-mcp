@@ -352,3 +352,82 @@ def test_helper_box_is_hidden_until_detection_succeeds():
     page = _page()
     helper_box = page[page.index('id="anHelperBox"'):page.index('id="anQuickBox"')]
     assert "hidden" in helper_box.split(">")[0], "the CTA must not show before the helper is found"
+
+
+# ---------------------------------------------------------------------------
+# Two implementations, one grammar
+# ---------------------------------------------------------------------------
+
+def test_go_and_python_parsers_agree(tmp_path):
+    """The helper validates terminalmcp:// in Go; the controller builds and
+    validates it in Python. Two implementations of one security-critical
+    grammar is a real drift risk, so they are run against the same table
+    and must agree on every verdict.
+
+    Skips where Go is absent -- this is a guard, not a build dependency.
+    """
+    import shutil as _shutil
+    import subprocess
+    from pathlib import Path
+
+    go = _shutil.which("go") or ("/home/mesflow/opt/go/bin/go"
+                                 if Path("/home/mesflow/opt/go/bin/go").exists() else None)
+    helper = Path(__file__).resolve().parents[1] / "helper"
+    if not go or not helper.exists():
+        pytest.skip("Go toolchain or helper/ not available")
+
+    ctl = "https://terminal-dashboard.example.net"
+    good = "a" * 32
+    cases = [
+        (proto.build_enroll_url(controller=ctl, handle=good), True),
+        (f"terminalmcp://enroll?handle={good}&controller={ctl}&cmd=calc.exe", False),
+        (f"terminalmcp://enroll?handle={good}&controller={ctl}&script=x.ps1", False),
+        (f"terminalmcp://install?handle={good}&controller={ctl}", False),
+        (f"terminalmcp://enroll?handle=short&controller={ctl}", False),
+        (f"terminalmcp://enroll?handle={good}&controller=https://evil.example", False),
+        (f"terminalmcp://enroll?handle={good}&handle={'b'*32}&controller={ctl}", False),
+        (f"terminalmcp://enroll?handle={good}&controller={ctl}#frag", False),
+        (f"https://enroll?handle={good}&controller={ctl}", False),
+        (f"terminalmcp://status?controller={ctl}", True),
+    ]
+
+    probe = tmp_path / "differ_test.go"
+    probe.write_text('''package proto
+
+import "testing"
+
+func TestDifferential(t *testing.T) {
+    allowed := []string{"https://terminal-dashboard.example.net"}
+    cases := []struct {
+        url string
+        ok  bool
+    }{
+''' + "".join(f'        {{{url!r}, {str(ok).lower()}}},\n'.replace("'", '"') for url, ok in cases) + '''    }
+    for _, c := range cases {
+        _, err := Parse(c.url, allowed)
+        if (err == nil) != c.ok {
+            t.Errorf("url=%s want ok=%v got err=%v", c.url, c.ok, err)
+        }
+    }
+}
+''', encoding="utf-8")
+    target = helper / "internal" / "proto" / "differ_test.go"
+    target.write_text(probe.read_text(encoding="utf-8"), encoding="utf-8")
+    try:
+        result = subprocess.run([go, "test", "-run", "TestDifferential", "./internal/proto/"],
+                                cwd=str(helper), capture_output=True, text=True, timeout=300,
+                                env={**__import__("os").environ,
+                                     "PATH": f"{Path(go).parent}:{__import__('os').environ.get('PATH','')}",
+                                     "GOPATH": "/home/mesflow/opt/gopath", "GOFLAGS": "-mod=mod"})
+    finally:
+        target.unlink(missing_ok=True)
+
+    # Python's own verdict on the same table.
+    for url, expected_ok in cases:
+        try:
+            proto.parse(url, allowed_controllers=[ctl])
+            actual_ok = True
+        except proto.ProtocolError:
+            actual_ok = False
+        assert actual_ok == expected_ok, f"python disagreed on {url}"
+    assert result.returncode == 0, f"go disagreed:\n{result.stdout}\n{result.stderr}"

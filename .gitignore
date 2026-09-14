@@ -56,3 +56,4 @@ state/
 # The knowledge LOCK is per-process and the log directory is per-machine.
 .projectflow/knowledge/.knowledge.lock
 .projectflow/**/*.tmp
+helper/dist/
