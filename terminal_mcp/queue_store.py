@@ -53,6 +53,7 @@ from typing import Any, Sequence
 
 from . import requirement_contract as rc
 
+from . import worktree_cleanup as wj
 from .schema import Migration, apply_migrations
 
 # -- Task status state machine ------------------------------------------
@@ -1486,7 +1487,32 @@ class QueueStore:
         row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
         self._record_event_locked(connection, session=row["session"], task_id=task_id, event_type=event_type,
                                   reason=reason, from_status=from_status, to_status=to_status)
+        # Worktree Janitor P1 (docs/WORKTREE_JANITOR.md §2 "The lifecycle
+        # chokepoint"): this is the ONLY place a task's status changes, so it
+        # is the only correct hook site -- on_completed has two call sites and
+        # would leave the other path silently unmarked. Written inside the SAME
+        # transaction as the status update, so a crash cannot leave the status
+        # and the cleanup record disagreeing. MARKING ONLY: nothing deletes.
+        row = self._apply_worktree_cleanup_locked(
+            connection, row, from_status=from_status, to_status=to_status, now=now)
         return QueueTask.from_row(row)
+
+    def _apply_worktree_cleanup_locked(self, connection: sqlite3.Connection, row: sqlite3.Row, *,
+                                       from_status: str, to_status: str, now: str) -> sqlite3.Row:
+        """Mark or clear this task's worktree-cleanup record. Never deletes."""
+        metadata = _parse_json_object(row["metadata"])
+        decision = wj.decide(
+            from_status=from_status, to_status=to_status, metadata=metadata,
+            attempt_count=row["attempt_count"], max_attempts=row["max_attempts"],
+            terminal_statuses=TERMINAL_STATUSES)
+        if not decision.changes_record:
+            return row
+        updated = wj.apply(metadata, decision, now=now)
+        connection.execute("UPDATE queue_tasks SET metadata = ? WHERE id = ?",
+                           (json.dumps(updated), row["id"]))
+        self._record_event_locked(connection, session=row["session"], task_id=row["id"],
+                                  event_type=decision.event_type, reason=decision.reason)
+        return connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (row["id"],)).fetchone()
 
     # -- Phase 2: atomic claim + Coordinator Agent gate + reconciliation ---
 
