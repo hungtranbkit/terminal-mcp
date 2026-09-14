@@ -251,3 +251,36 @@ repo_read:
   extra_secret_globs: []
     # - "*.backup.sql"
     # - "deploy/production-*.yaml"
+
+# Worktree Janitor (docs/WORKTREE_JANITOR.md). P0 ships the CLASSIFIER ONLY --
+# there is no executor in this build, so nothing here can cause a deletion.
+worktree_janitor:
+  # observe_only (default) | suggest_only | auto_execute
+  # Invariant I8: nothing is ever removed until an operator opts in. An unknown
+  # value is a load-time ValueError, never silently downgraded.
+  mode: observe_only
+
+  # EMPTY MEANS NOTHING IS COLLECTABLE -- deliberately the opposite of
+  # repo_read's fallback-to-home. A reclaim deletes; its allowlist must be
+  # stated explicitly, never inherited. "/" is refused outright.
+  allowed_roots: []
+    # - /home/mesflow/workspace
+
+  # A worktree branch is "merged" when its HEAD is an ancestor of this ref.
+  integration_ref: main
+
+  # Pushed-but-not-merged is classified REVIEW by default (the work is not lost
+  # but was never integrated). true promotes it to AUTO_SAFE.
+  allow_preserved_unmerged: false
+
+  grace_seconds: 86400        # after the task's terminal transition
+  grace_floor_seconds: 3600   # disk pressure may never shorten below this
+  max_evidence_age_seconds: 120
+  max_candidates_per_run: 50
+  timeout_seconds: 20
+
+  # ADDITIVE ONLY. Credential/database/env globs are built in (and inherited
+  # from redaction.CREDENTIAL_FILE_NAMES); there is no key that REMOVES one, so
+  # no config edit can make a secret or a sqlite db collectable.
+  extra_valuable_globs: []
+    # - "*.backup.sql"

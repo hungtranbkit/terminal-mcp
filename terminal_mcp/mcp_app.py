@@ -2778,6 +2778,45 @@ def build_mcp(service: TerminalService | None = None,
         return git_isolation.worktree_status_for_task(task_id)
 
     @server.tool()
+    def terminal_worktree_janitor_scan(repo_path: str = "", include_safe: bool = True) -> dict:
+        """AUDIT-ONLY classification of every git worktree a repo knows about
+        (docs/WORKTREE_JANITOR.md). READS ONLY -- it cannot remove, prune or
+        change anything, and there is no executor in this build at all.
+
+        Each candidate comes back with a `policy_class`:
+          AUTO_SAFE -- clean, merged (or preserved), no live reference, no
+                       valuable ignored data, grace elapsed, evidence fresh.
+                       Reported only; nothing acts on it.
+          REVIEW    -- a human should decide (detached HEAD, pushed-but-unmerged,
+                       orphan, stale admin entry, grace not yet elapsed).
+          BLOCKED   -- dangerous to remove (dirty, unmerged AND unpushed, a
+                       process/tmux pane/session/service using it, a credential
+                       or database in ignored files, the main worktree, a path
+                       outside the allowlist, a symlink/mount).
+          UNKNOWN   -- the facts could not be established at all. Fail-closed:
+                       never treated as safe.
+
+        `reasons` carries stable machine-readable codes and `predicates` shows
+        each individual check's True/False/None outcome, so a verdict is always
+        explainable. Only paths are reported for sensitive ignored files, never
+        their contents.
+
+        Requires worktree_janitor.allowed_roots to be configured -- with none
+        set, nothing is collectable by design."""
+        from . import worktree_janitor
+
+        config = terminal.config.worktree_janitor
+        target = repo_path.strip() or None
+        if not target:
+            return {"error": "REPO_PATH_REQUIRED",
+                    "detail": "pass repo_path -- the janitor never guesses which repo to scan"}
+        report = worktree_janitor.scan(target, config.to_policy())
+        if not include_safe:
+            report["candidates"] = [c for c in report.get("candidates", [])
+                                    if c.get("policy_class") != worktree_janitor.AUTO_SAFE]
+        return report
+
+    @server.tool()
     def terminal_worktree_cleanup(task_id: str, force: bool = False) -> dict:
         """Explicit, manual removal of `task_id`'s own isolated
         worktree (`git worktree remove`) -- never automatic (a worktree
