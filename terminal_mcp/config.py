@@ -483,6 +483,43 @@ class WorkConfig:
 
 
 @dataclass(frozen=True)
+class PromptDeliveryConfig:
+    """Prompt delivery / acceptance gate (see delivery_gate.py).
+
+    ADVISORY BY DEFAULT, and that default is the whole reason this can ship
+    at all: in "advisory" the gate is computed, recorded to audit/events and
+    returned as additive fields, while every existing transition happens
+    exactly as it does today. Zero behaviour change until an operator sets
+    "enforce". The escalation shape mirrors supervisor2.POLICY_MODES -- the
+    project's audited precedent for exactly this kind of rollout.
+
+    In "enforce", a send that does not reach DELIVERED cannot advance a
+    queue task to RUNNING or a supervisor action to observing. That IS a
+    real behaviour change (a task that today goes RUNNING on a confirmed
+    submit with no acceptance evidence would instead hold), which is why it
+    is opt-in and per-deployment.
+
+    `require_acceptance=False` keeps gate 1 (the positive delivery_state
+    allowlist, which is pure hardening and cannot fail open) while skipping
+    gate 2 -- for a deployment that wants the denylist fixed without the
+    extra post-submit observation.
+    """
+
+    mode: str = "advisory"  # advisory | enforce
+    require_acceptance: bool = True
+    # How long to wait after a confirmed submit before deciding acceptance
+    # was not observed. Short: this is one extra observation, not a poll
+    # loop -- the completion watcher already owns long-running observation.
+    acceptance_timeout_seconds: float = 3.0
+    acceptance_poll_interval_seconds: float = 0.4
+    acceptance_capture_lines: int = 40
+
+    @property
+    def enforcing(self) -> bool:
+        return self.mode == "enforce"
+
+
+@dataclass(frozen=True)
 class RepoReadConfig:
     """Read-only repository access for the `repo_*` MCP tools (see
     repo_read.py, repo_service.py).
@@ -771,6 +808,7 @@ class AppConfig:
     maintenance: MaintenanceConfig = MaintenanceConfig()
     fleet_sync: FleetSyncConfig = FleetSyncConfig()
     repo_read: RepoReadConfig = RepoReadConfig()
+    prompt_delivery: PromptDeliveryConfig = PromptDeliveryConfig()
     work: WorkConfig = WorkConfig()
     session_lifecycle: SessionLifecycleConfig = SessionLifecycleConfig()
     session_knowledge: SessionKnowledgeConfig = SessionKnowledgeConfig()
@@ -1098,6 +1136,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         maintenance=_load_maintenance_config(raw.get("maintenance", {})),
         fleet_sync=_load_fleet_sync_config(raw.get("fleet_sync", {})),
         repo_read=_load_repo_read_config(raw.get("repo_read", {})),
+        prompt_delivery=_load_prompt_delivery_config(raw.get("prompt_delivery", {})),
         work=_load_work_config(raw.get("work", {})),
         session_lifecycle=_load_session_lifecycle_config(raw.get("session_lifecycle", {})),
         session_knowledge=_load_session_knowledge_config(raw.get("session_knowledge", {})),
@@ -1322,6 +1361,39 @@ def _load_work_config(raw: object) -> WorkConfig:
         lease_seconds=int(raw.get("lease_seconds", WorkConfig.lease_seconds)),
         max_revisions=revisions,
         no_progress_limit=int(raw.get("no_progress_limit", WorkConfig.no_progress_limit)))
+
+
+def _load_prompt_delivery_config(raw: object) -> PromptDeliveryConfig:
+    """Fail-closed validation: an unknown mode is a config ERROR, never
+    silently downgraded to advisory. An operator who typed "enforced" must
+    be told, not quietly left unprotected."""
+    if not isinstance(raw, dict):
+        raw = {}
+    mode = raw.get("mode", PromptDeliveryConfig.mode)
+    if mode not in ("advisory", "enforce"):
+        raise ValueError("prompt_delivery.mode must be one of: advisory, enforce")
+    require = raw.get("require_acceptance", PromptDeliveryConfig.require_acceptance)
+    if not isinstance(require, bool):
+        raise ValueError("prompt_delivery.require_acceptance must be a boolean")
+    timeout = raw.get("acceptance_timeout_seconds", PromptDeliveryConfig.acceptance_timeout_seconds)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("prompt_delivery.acceptance_timeout_seconds must be a number")
+    if not 0.2 <= float(timeout) <= 60.0:
+        raise ValueError("prompt_delivery.acceptance_timeout_seconds must be between 0.2 and 60")
+    poll = raw.get("acceptance_poll_interval_seconds",
+                   PromptDeliveryConfig.acceptance_poll_interval_seconds)
+    if isinstance(poll, bool) or not isinstance(poll, (int, float)):
+        raise ValueError("prompt_delivery.acceptance_poll_interval_seconds must be a number")
+    if not 0.05 <= float(poll) <= float(timeout):
+        raise ValueError("prompt_delivery.acceptance_poll_interval_seconds must be between "
+                         "0.05 and acceptance_timeout_seconds")
+    lines = raw.get("acceptance_capture_lines", PromptDeliveryConfig.acceptance_capture_lines)
+    if isinstance(lines, bool) or not isinstance(lines, int) or not 5 <= lines <= 500:
+        raise ValueError("prompt_delivery.acceptance_capture_lines must be an integer 5..500")
+    return PromptDeliveryConfig(mode=mode, require_acceptance=require,
+                                acceptance_timeout_seconds=float(timeout),
+                                acceptance_poll_interval_seconds=float(poll),
+                                acceptance_capture_lines=lines)
 
 
 def _load_repo_read_config(raw: object) -> RepoReadConfig:

@@ -42,6 +42,7 @@ from __future__ import annotations
 import calendar
 import contextlib
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -50,6 +51,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
+
+_LOGGER = logging.getLogger(__name__)
 
 from .schema import Migration, apply_migrations
 
@@ -1476,6 +1479,45 @@ class QueueStore:
             raise
         finally:
             connection.close()
+
+    def record_delivery_verdict(self, task_id: str, verdict: dict[str, Any]) -> None:
+        """Record one prompt-delivery verdict on the task (delivery_gate.py).
+
+        Written into the EXISTING metadata JSON column under
+        `delivery_verdict`, deliberately without a migration: this is
+        diagnostic evidence, not something dispatch queries or indexes, and
+        adding a column to advance an advisory-by-default feature would be a
+        schema change nobody needs yet. If a future phase needs to QUERY
+        verdicts, that is the point to add a tracked Migration.
+
+        Only the LAST verdict is kept, plus a bounded history of the last
+        few, so a task retried many times cannot grow its metadata without
+        limit. Never raises: an unrecordable verdict must not fail a
+        dispatch -- the verdict's own effect on the transition is decided by
+        the caller and does not depend on this write succeeding."""
+        try:
+            with self._connection() as connection:
+                row = connection.execute("SELECT metadata FROM queue_tasks WHERE id = ?",
+                                         (task_id,)).fetchone()
+                if row is None:
+                    return
+                try:
+                    metadata = json.loads(row["metadata"] or "{}")
+                except (TypeError, ValueError):
+                    metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                entry = {**verdict, "at": iso_now()}
+                metadata["delivery_verdict"] = entry
+                history = metadata.get("delivery_verdict_history")
+                if not isinstance(history, list):
+                    history = []
+                history.append(entry)
+                metadata["delivery_verdict_history"] = history[-5:]
+                connection.execute("UPDATE queue_tasks SET metadata = ? WHERE id = ?",
+                                   (json.dumps(metadata), task_id))
+        except Exception:  # noqa: BLE001 -- diagnostics must never break dispatch
+            _LOGGER.warning("could not record delivery verdict for %s", task_id, exc_info=True)
 
     def record_coordinator_decision(self, task_id: str, *, status: str, reason: str,
                                     blockers: list[str] | None = None, required_actions: list[str] | None = None,
