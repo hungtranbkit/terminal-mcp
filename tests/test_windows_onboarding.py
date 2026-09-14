@@ -1268,7 +1268,7 @@ def test_three_steps_never_ask_the_user_to_type_a_command():
     assert "Win + R" in done and "Ctrl + V" in done and "Enter" in done
     assert "Yes" in done and "Administrator" in done
     # None of the old manual instructions survive in the primary path.
-    quick = done[done.index('<div class="an-quick">'):done.index('<details class="an-manual">')]
+    quick = done[done.index('id="anQuickBox"'):done.index('<details class="an-manual">')]
     for banned in ("Set-ExecutionPolicy", "cd ", "Run with PowerShell", "Chuột phải"):
         assert banned not in quick, f"{banned!r} must not be in the no-typing path"
 

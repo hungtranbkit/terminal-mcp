@@ -52,11 +52,34 @@ def _add_progress_columns(connection) -> None:
         connection.execute(f"ALTER TABLE enrollments ADD COLUMN {column} {declaration}")
 
 
+def _add_handles(connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS enrollment_handles (
+            handle_hash TEXT PRIMARY KEY,
+            enrollment_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            redeemed_at TEXT,
+            created_by TEXT
+        )
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_handles_enrollment "
+                       "ON enrollment_handles(enrollment_id)")
+
+
 ENROLLMENT_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: one-time node enrollment codes", lambda connection: None),
     Migration(2, "installer progress: which stage a machine is on, and for how long",
               _add_progress_columns),
+    Migration(3, "bootstrap handles: a one-time id the web can hand a local helper",
+              _add_handles),
 ]
+
+# A handle is what travels in a terminalmcp:// URL, so it is sized for the
+# gap between a click and a helper launching -- not for a human to type.
+HANDLE_TTL_SECONDS = 120
 
 # What the installer reports while it runs. A closed set: the progress
 # route accepts nothing else, so a node cannot write arbitrary text into
@@ -443,6 +466,99 @@ class EnrollmentStore:
                 return None
             row = connection.execute("SELECT * FROM enrollments WHERE code_hash = ?", (digest,)).fetchone()
         return _row_to_record(row, now=moment)
+
+    # -- bootstrap handles ---------------------------------------------
+    # A custom-protocol URL is not a private channel: it can reach the
+    # registry's MRU, browser history, a crash report. So the URL carries
+    # one of these instead of the enrollment code -- 128 bits, hashed at
+    # rest, single-use, and alive for two minutes.
+
+    def create_handle(self, enrollment_id: str, *, created_by: str | None = None,
+                      ttl_seconds: int = HANDLE_TTL_SECONDS,
+                      now: datetime | None = None) -> tuple[str, str] | None:
+        """Returns (handle, expires_at) once, or None if the enrollment is
+        not in a state worth handing to a helper."""
+        moment = now or _now()
+        record = self.get(enrollment_id, now=moment)
+        if record is None or record.status != STATUS_PENDING:
+            return None
+        handle = secrets.token_hex(16)
+        expires = _iso(moment + timedelta(seconds=max(30, min(int(ttl_seconds), 600))))
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO enrollment_handles (handle_hash, enrollment_id, created_at, expires_at, created_by) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (hash_code(handle), enrollment_id, _iso(moment), expires, created_by))
+        return handle, expires
+
+    def redeem_handle(self, handle: str, *, now: datetime | None = None) -> Enrollment | None:
+        """Single-use, atomic, same discipline as consume(): the UPDATE
+        that marks it redeemed is the guard, so two helpers racing the
+        same handle produce exactly one winner. Returns the enrollment the
+        handle points at -- the CALLER decides what to hand over."""
+        moment = now or _now()
+        candidate = str(handle or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", candidate):
+            return None
+        digest = hash_code(candidate)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    "UPDATE enrollment_handles SET redeemed_at = ? "
+                    "WHERE handle_hash = ? AND redeemed_at IS NULL AND expires_at > ?",
+                    (_iso(moment), digest, _iso(moment)))
+                if cursor.rowcount != 1:
+                    connection.execute("COMMIT")
+                    return None
+                row = connection.execute(
+                    "SELECT enrollment_id FROM enrollment_handles WHERE handle_hash = ?", (digest,)).fetchone()
+                connection.execute("COMMIT")
+            except Exception:
+                with contextlib.suppress(sqlite3.Error):
+                    connection.execute("ROLLBACK")
+                raise
+        return self.get(row["enrollment_id"], now=moment) if row else None
+
+    def consume_by_id(self, enrollment_id: str, *, hostname: str | None = None,
+                      source_ip: str | None = None,
+                      now: datetime | None = None) -> tuple[Enrollment | None, str | None]:
+        """consume(), keyed on the record instead of the code.
+
+        This is what the helper path uses, and it is the reason the
+        enrollment code never leaves the server for that path at all: the
+        store keeps only sha256(code) and genuinely cannot reproduce one,
+        so redeeming a handle performs the consume here rather than
+        handing a credential back to the machine to replay.
+
+        Same atomic single-UPDATE guard as consume(): two helpers racing
+        one handle already resolve to one winner, and this closes the
+        second door behind them."""
+        moment = now or _now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """UPDATE enrollments
+                          SET status = ?, consumed_at = ?, consumed_from = ?, consumed_hostname = ?
+                        WHERE id = ? AND status = ? AND expires_at > ?""",
+                    (STATUS_CONSUMED, _iso(moment), source_ip, (hostname or None), enrollment_id,
+                     STATUS_PENDING, _iso(moment)))
+                row = connection.execute("SELECT * FROM enrollments WHERE id = ?", (enrollment_id,)).fetchone()
+                connection.execute("COMMIT")
+            except Exception:
+                with contextlib.suppress(sqlite3.Error):
+                    connection.execute("ROLLBACK")
+                raise
+        if cursor.rowcount == 1:
+            return _row_to_record(row, now=moment), None
+        if row is None:
+            return None, ERR_NOT_FOUND
+        if row["status"] == STATUS_CONSUMED:
+            return None, ERR_ALREADY_USED
+        if row["status"] == STATUS_REVOKED:
+            return None, ERR_REVOKED
+        return None, ERR_EXPIRED
 
     def verify_code_matches(self, enrollment_id: str, code: str) -> bool:
         """Constant-time check used only by tests and by the repair path,

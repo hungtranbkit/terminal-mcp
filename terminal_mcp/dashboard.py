@@ -30,7 +30,7 @@ from .node_onboarding import (OnboardingError, OnboardingService, read_controlle
                                rescue_authorized_keys_dir)
 from .node_transport import (GENERIC_SETUP_CODE, KIND_LAN, KIND_REVERSE_SSH, KIND_TAILSCALE,
                              TransportStore, probe_reverse_tunnel, probe_ssh_banner)
-from . import rescue_gateway
+from . import bootstrap_protocol, rescue_gateway
 from .rescue_gateway import RescuePortAllocator
 from .windows_onboarding import (SCRIPT_VERSION as SETUP_SCRIPT_VERSION,
                                  SETUP_SCRIPT_SHORT_PATH, build_quick_install_command,
@@ -5982,6 +5982,8 @@ NODES_ADMIN_HTML = """<!doctype html>
     .an-cmd:focus { outline:2px solid var(--accent); outline-offset:1px }
     .an-big-btn { font-size:13px; padding:9px 18px }
     .an-note { font-size:11px; margin-top:8px }
+    .an-helper { margin-top:10px; padding:14px; border:1px solid #6ee7a0; border-radius:10px; background:#12331f }
+    .an-helper .an-big { color:#8ef0b8 }
     .an-live { margin-top:10px; padding:9px 12px; border-radius:8px; background:#12243d; border:1px solid var(--accent);
                font-size:12px; display:flex; gap:10px; align-items:center }
     .an-live .an-spin { width:9px; height:9px; border-radius:50%; background:var(--accent); animation:anPulse 1.1s infinite }
@@ -5991,6 +5993,7 @@ NODES_ADMIN_HTML = """<!doctype html>
     .an-live.failed .an-spin { background:#ff9aa8; animation:none }
     @keyframes anPulse { 0%,100% { opacity:1 } 50% { opacity:.25 } }
     .an-manual { margin-top:14px; font-size:12px }
+    .an-quick.an-demoted { border-color:var(--line); background:#0f1730; opacity:.85 }
     .an-manual summary { cursor:pointer; color:var(--muted) }
     .an-trouble-row { display:flex; gap:8px; align-items:center; margin-top:6px; flex-wrap:wrap }
     .an-trouble-row code { flex:1 1 auto; min-width:0 }
@@ -6073,9 +6076,20 @@ NODES_ADMIN_HTML = """<!doctype html>
           <div class="muted" id="anExpiry"></div>
         </div>
 
+        <!-- Web-only path, when the Bootstrap helper is already on the
+             machine the operator is sitting at. One click, one UAC. -->
+        <div class="an-helper" id="anHelperBox" hidden>
+          <div class="an-big">Kết nối máy này</div>
+          <div class="muted" style="font-size:12px;margin-top:4px" id="anHelperWhy"></div>
+          <div class="cx-row" style="margin-top:10px">
+            <button class="icon-btn an-primary an-big-btn" id="anHelperBtn" type="button">⚡ Kết nối máy này</button>
+          </div>
+          <div class="d-msg" id="anHelperMsg"></div>
+        </div>
+
         <!-- The primary path. One button, then three physical actions on
              the Windows machine. Nothing to type, no shell to open. -->
-        <div class="an-quick">
+        <div class="an-quick" id="anQuickBox">
           <ol class="an-steps">
             <li>Bấm <b>Copy lệnh cài đặt</b> bên dưới.</li>
             <li>Trên máy Windows: nhấn <b>Win + R</b>, rồi <b>Ctrl + V</b>, rồi <b>Enter</b>.</li>
@@ -6675,6 +6689,28 @@ NODES_ADMIN_HTML = """<!doctype html>
 
     let anExpiryTimer = null;
     let anProgressTimer = null;
+    let anHelper = null;   // {version} when the local Bootstrap helper answers
+
+    // Is the Terminal MCP Bootstrap helper installed on the machine the
+    // OPERATOR is sitting at? There is no way to feature-detect a custom
+    // protocol handler from a page, so the helper runs a loopback-only
+    // listener and we probe it. A failure here is the normal case (no
+    // helper yet) and must be silent, not an error.
+    async function anDetectHelper() {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 1200);
+      try {
+        const response = await fetch('http://127.0.0.1:8791/detect',
+                                     {signal: controller.signal, cache: 'no-store'});
+        if (!response.ok) return null;
+        const body = await response.json();
+        return body && body.product === 'terminal-mcp-bootstrap' ? body : null;
+      } catch (error) {
+        return null;   // not installed, or not reachable -- same outcome
+      } finally {
+        clearTimeout(timer);
+      }
+    }
 
     // While the installer runs, the enrollment row carries the stage it is
     // on. Polling it is what turns "nothing is happening" into "installing
@@ -6748,6 +6784,23 @@ NODES_ADMIN_HTML = """<!doctype html>
       copyBtn.disabled = false;
       regenBtn.hidden = true;
       document.getElementById('anLive').hidden = true;
+
+      // Helper present -> lead with the one-click path and demote the
+      // copy/paste one. Absent -> leave copy/paste as the primary, which
+      // is the honest state on a machine that has never been onboarded.
+      const helperBox = document.getElementById('anHelperBox');
+      const quickBox = document.getElementById('anQuickBox');
+      anDetectHelper().then((found) => {
+        anHelper = found;
+        helperBox.hidden = !found;
+        if (found) {
+          document.getElementById('anHelperWhy').textContent =
+            `Bootstrap helper v${found.version || '?'} đã cài trên máy này — chỉ cần một cú bấm và một lần bấm Yes.`;
+          quickBox.classList.add('an-demoted');
+        } else {
+          quickBox.classList.remove('an-demoted');
+        }
+      });
       if (anProgressTimer) clearInterval(anProgressTimer);
       anProgressTimer = setInterval(anPollProgress, 3000);
       anPollProgress();
@@ -6848,6 +6901,27 @@ NODES_ADMIN_HTML = """<!doctype html>
         anFlash(button, 'Nhấn Ctrl + C');
         anSetMsg('anDoneMsg', 'Trình duyệt chặn clipboard — lệnh đã được bôi đen, nhấn Ctrl + C để copy.', '');
       }
+    });
+
+    document.getElementById('anHelperBtn').addEventListener('click', async (event) => {
+      if (!anGenerated) return;
+      const button = event.currentTarget;
+      button.disabled = true;
+      anSetMsg('anHelperMsg', 'Đang tạo phiên cài đặt...', '');
+      // The handle is minted per click and lives ~2 minutes: it is what
+      // travels in the terminalmcp:// URL instead of the enrollment code.
+      const issued = await api(
+        `/dashboard/api/nodes/onboard/enrollments/${encodeURIComponent(anGenerated.enrollment.id)}/handle`,
+        {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+      button.disabled = false;
+      if (!issued.ok) {
+        anSetMsg('anHelperMsg', issued.data.detail || issued.data.error || 'Không tạo được phiên cài đặt.', 'error');
+        return;
+      }
+      // Hand it to the local helper. The page never sees the bootstrap
+      // payload -- the helper redeems the handle itself, over HTTPS.
+      window.location.href = issued.data.url;
+      anSetMsg('anHelperMsg', 'Đã gửi sang Bootstrap helper — bấm Yes khi Windows hỏi quyền Administrator.', 'ok');
     });
 
     document.getElementById('anRegenBtn').addEventListener('click', () => {
@@ -15248,6 +15322,86 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # the token that will ever exist outside the node -- it is never
         # written to a log.
         _log.info("dashboard enroll_consume node_id=%s hostname=%s source=%s",
+                 result["node_id"], hostname, source)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/onboard/enrollments/{enrollment_id}/handle",
+                        methods=["POST"], include_in_schema=False)
+    async def onboard_create_handle(request: Request) -> JSONResponse:
+        """Mint the one-time handle the browser hands to the local helper.
+
+        Operator-authenticated, like every other dashboard mutation: a
+        page that cannot pass _mutation_guard cannot cause a helper to
+        install anything. The handle is what travels in the
+        terminalmcp:// URL instead of the enrollment code -- see
+        docs/windows-bootstrap-helper.md for why a custom-protocol URL is
+        not treated as a private channel."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        enrollment_id = request.path_params["enrollment_id"]
+
+        def _compute():
+            issued = onboarding.enrollments.create_handle(
+                enrollment_id, created_by=(identity.email if identity else None))
+            if issued is None:
+                return None
+            handle, expires_at = issued
+            origin = _request_base_url(request) or onboarding.controller_urls()[0]
+            return {"handle": handle, "expires_at": expires_at,
+                    "url": bootstrap_protocol.build_enroll_url(controller=origin, handle=handle),
+                    "controller": bootstrap_protocol.normalize_origin(origin)}
+
+        try:
+            result = await anyio.to_thread.run_sync(_compute)
+        except ValueError as exc:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
+        if result is None:
+            return JSONResponse({"error": "ENROLLMENT_NOT_PENDING",
+                                "detail": "this enrollment is already used, revoked or expired"},
+                                status_code=409, headers={"Cache-Control": "no-store"})
+        # enrollment id only -- the handle is a credential for its 120s.
+        _log.info("dashboard onboard_create_handle enrollment=%s identity=%s",
+                 enrollment_id, identity.email if identity else None)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/enroll/redeem", methods=["POST"], include_in_schema=False)
+    async def enroll_redeem(request: Request) -> JSONResponse:
+        """The Bootstrap helper exchanges its one-time handle for the full
+        bootstrap payload.
+
+        Machine-facing, like consume. The enrollment CODE is never part of
+        this exchange in either direction: the controller resolves the
+        handle to an enrollment and consumes that itself, so nothing the
+        helper is left holding can be replayed."""
+        source = (request.client.host if request.client else "unknown")
+        if _enroll_rate_limited(source):
+            return JSONResponse({"error": "RATE_LIMITED"}, status_code=429,
+                                headers={"Cache-Control": "no-store", "Retry-After": "60"})
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        hostname = str(body.get("hostname") or "").strip()[:255]
+        if not body.get("handle") or not hostname:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "handle and hostname are required"},
+                                status_code=400, headers={"Cache-Control": "no-store"})
+        addresses = body.get("addresses") if isinstance(body.get("addresses"), dict) else {}
+
+        def _compute() -> dict:
+            return onboarding.redeem_handle(
+                str(body.get("handle")), hostname=hostname, source_ip=source,
+                platform=str(body.get("platform") or "windows")[:32], addresses=addresses,
+                rescue_public_key=body.get("rescue_public_key"),
+                request_base_url=_request_base_url(request))
+
+        try:
+            result = await anyio.to_thread.run_sync(_compute)
+        except OnboardingError as exc:
+            return _onboarding_error(exc)
+        _log.info("dashboard enroll_redeem node_id=%s hostname=%s source=%s",
                  result["node_id"], hostname, source)
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
