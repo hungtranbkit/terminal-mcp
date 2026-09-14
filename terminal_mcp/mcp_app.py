@@ -1817,9 +1817,25 @@ def build_mcp(service: TerminalService | None = None,
 
     def _inbox():
         if "service" not in _inbox_holder:
+            from .bug_spec import BugSpecStore
+            from .project_knowledge import ProjectKnowledge, worktree_root
             from .work_inbox import InboxService, InboxStore
 
-            _inbox_holder["service"] = InboxService(InboxStore())
+            # The bug history and the repository are what turn a claim into a
+            # briefing. Both are optional to the inbox and both degrade on
+            # their own, so a server outside a git checkout still hands out
+            # work -- it just says the paths could not be checked.
+            #
+            # THIS checkout, not `_knowledge()`'s canonical root: the briefing
+            # only reads, and what it reads has to be the tree the worker will
+            # edit. Resolved through the shared root, a claim made inside a
+            # worktree would report files the worker has already rewritten as
+            # untouched -- precisely the false confidence the path check
+            # exists to prevent.
+            root = worktree_root(_project_root())
+            _inbox_holder["service"] = InboxService(
+                InboxStore(), spec_store=BugSpecStore(),
+                knowledge=ProjectKnowledge(root) if root else None)
         return _inbox_holder["service"]
 
     @server.tool()
@@ -1855,19 +1871,29 @@ def build_mcp(service: TerminalService | None = None,
                                 "state": i.state, "type": i.rough_type,
                                 "difficulty": i.rough_difficulty, "priority": i.priority,
                                 "project": i.project, "duplicate_of": i.duplicate_of,
-                                "claimed_by": i.claimed_by, "updated_at": i.updated_at}
+                                "claimed_by": i.claimed_by, "updated_at": i.updated_at,
+                                "retrieval": i.retrieval_status}
                                for i in issues]}
         except Exception as exc:  # noqa: BLE001
             return {"error": "INBOX_READ_FAILED", "detail": str(exc), "issues": []}
 
     @server.tool()
     def work_inbox_claim(planner_id: str, project: str = "") -> dict:
-        """Claim ONE issue for planning, within the pool's concurrency cap.
+        """Claim ONE issue for planning, and get its briefing with it.
 
         Claims carry a lease so a planner that dies does not hold an issue
         forever; an expired lease is reclaimed automatically, which is what
         makes this recoverable across a restart. Two planners can never hold
         the same issue.
+
+        The reply also carries `retrieval` and `context_pack`, computed HERE
+        rather than left for the planner to request: read them before opening
+        a single file. `retrieval.status` is `REUSED_BUG_SPEC` (start from
+        that spec's root cause), `RELATED_BUGS_FOUND` (read them, assume
+        nothing) or `NO_SIMILAR_BUG`. When a spec is offered for reuse,
+        `retrieval.path_check` has already checked every path it names
+        against the current tree and git delta -- act on `missing` and
+        `changed` before trusting any of its fix strategy.
         """
         try:
             return _inbox().claim_for_planning(planner_id, project=project or None)

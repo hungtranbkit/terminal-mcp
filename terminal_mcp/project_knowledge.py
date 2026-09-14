@@ -164,6 +164,24 @@ def canonical_root(cwd: str, *,
     return path.parent if path.name == ".git" else None
 
 
+def worktree_root(cwd: str, *,
+                  runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+                  ) -> Path | None:
+    """THIS checkout's top level -- the tree whose files will actually run.
+
+    Deliberately NOT :func:`canonical_root`. That one resolves every worktree
+    of a repo to the single shared map, which is right for a map that gets
+    WRITTEN: two agents must not fork it. It is wrong for asking whether a
+    file still exists or has moved since, because a worker in a worktree edits
+    that worktree, and the main checkout would confidently answer about code
+    nobody is about to run.
+    """
+    code, top = _run_git(["rev-parse", "--show-toplevel"], cwd=cwd, runner=runner)
+    if code != 0 or not top:
+        return None
+    return Path(top)
+
+
 @dataclass
 class ModuleState:
     """One module's freshness. `paths` is what makes staleness computable."""
