@@ -211,6 +211,14 @@ class WorkSpec:
     parent_spec_id: str | None = None
     plan_status: str = PLAN_PENDING
     plan_note: str = ""
+    # Why the gate last refused, and what it asked for. Persisted on the spec
+    # rather than returned and forgotten, so a redefine RESUMES this task --
+    # the planner adds the missing detail to the same spec and the same queue
+    # task continues, instead of the work being re-created and the history
+    # starting over.
+    redefine_reason: str = ""
+    redefine_missing: tuple[str, ...] = ()
+    redefine_count: int = 0
     difficulty: str = "MEDIUM"
     human_hints: tuple[str, ...] = ()
     created_by: str | None = None
@@ -658,8 +666,21 @@ def escalation(spec: WorkSpec, *, why: str, known: str, missing: str,
 _TYPE_SIGNALS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (DEPLOY, ("deploy", "release", "rollout", "ship it", "publish",
               "triển khai", "phát hành")),
+    # Two kinds of signal. The first names the defect outright. The second is
+    # the CONTRAST an operator writes when they report what they observed
+    # against what they expected -- "shows X while it is actually Y",
+    # "says X instead of Y". Caught by the dogfood: the Work-UI occupancy
+    # defect, written exactly the way a real report is written, matched none of
+    # the first group and fell through to FEATURE_NEW, so the gate then asked
+    # a bug for user value and an out-of-scope list. Most real reports describe
+    # the behaviour, not its category.
     (BUG, ("bug", "broken", "fails", "failing", "error", "crash", "regression",
-           "wrong", "incorrect", "not working", "lỗi", "hỏng", "sai", "không chạy")),
+           "wrong", "incorrect", "not working", "lỗi", "hỏng", "sai", "không chạy",
+           # contrast markers -- deliberately multi-word, because bare "should"
+           # or "while" also appear in perfectly ordinary feature requests
+           "instead of", "should be", "should show", "should say",
+           "even though", "but it still", "is actually", "still shows",
+           "still says", "đáng lẽ", "nhưng lại", "vẫn hiện", "thực tế là")),
     (REFACTOR, ("refactor", "restructure", "clean up", "cleanup", "tidy",
                 "extract", "rename", "dedupe", "tái cấu trúc", "dọn dẹp")),
     (INTEGRATION, ("integrate", "integration", "connect to", "sync with",

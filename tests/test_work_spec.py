@@ -358,3 +358,35 @@ def test_a_missing_policy_leaves_the_binding_empty_rather_than_inventing_one(mon
     spec = ws.WorkSpec(spec_id="s1", title="t")
     ws.bind_policy(spec)
     assert spec.policy_version == ""
+
+
+# -- a defect described as behaviour, not as a category ---------------------------
+
+@pytest.mark.parametrize("report", [
+    "The Work page shows a -work session as IDLE while Claude is actually running in it",
+    "the export button shows 0 rows instead of the real count",
+    "it still shows the old total after a refresh",
+    "the badge says OFFLINE even though the node answered",
+    "màn hình vẫn hiện số cũ sau khi lưu",
+])
+def test_a_defect_reported_as_observed_versus_expected_classifies_as_a_bug(report):
+    """Found by the dogfood, not by review.
+
+    The real Work-UI occupancy report used none of the words "bug", "broken",
+    "error" or "fails" -- it just described what the screen showed against what
+    was true. It fell through to FEATURE_NEW, and the gate then asked a defect
+    for its user value and an out-of-scope list. Most real reports describe the
+    behaviour rather than naming its category.
+    """
+    assert ws.infer_task_type(report) == ws.BUG
+
+
+@pytest.mark.parametrize("request_text", [
+    "Should we move to Postgres?",
+    "Add a work_spec_export tool that returns one spec as markdown",
+    "refactor the queue claim helper so there is one claim path",
+])
+def test_the_contrast_markers_do_not_swallow_ordinary_requests(request_text):
+    """The markers are multi-word on purpose: a bare "should" or "while"
+    appears in perfectly ordinary feature and research requests."""
+    assert ws.infer_task_type(request_text) != ws.BUG
