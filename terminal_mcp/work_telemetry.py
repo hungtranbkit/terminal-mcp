@@ -40,6 +40,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from .bug_spec import (PLAN_ADJUSTED, PLAN_CONFIRMED, PLAN_MISMATCH,
+                       PLAN_PENDING)
 from .schema import Migration, apply_migrations
 
 SCHEMA_VERSION = 1
@@ -56,6 +58,11 @@ PARTIAL = "PARTIAL"
 # always labelled as one. It is a crude constant on purpose: a more elaborate
 # approximation would invite the reader to trust it as a measurement.
 _BYTES_PER_TOKEN = 4.0
+
+# The plan-verification vocabulary is IMPORTED, never restated. A worker
+# answers one of these on the spec and on its telemetry row, and the two can
+# only be compared if they are literally the same strings.
+PLAN_STATUSES = (PLAN_CONFIRMED, PLAN_ADJUSTED, PLAN_MISMATCH, PLAN_PENDING)
 
 OUTCOME_COMPLETED = "COMPLETED"
 
@@ -314,6 +321,16 @@ class TaskTelemetry:
     cache_hits: int = 0            # a green result reused rather than re-run
     redefine_count: int = 0
     assist_requests: int = 0
+    # The worker's plan-verification verdict. None is NOT a fourth verdict --
+    # it means nobody answered, which is a different fact from "the plan was
+    # wrong" and is counted separately wherever these are summarised.
+    plan_status: str | None = None
+    plan_note: str = ""
+    # Times this task was allowed past its file/search budget, each with a
+    # stated reason. An unrecorded overrun cannot be represented here: the
+    # counter only moves through record_budget_escalation(), which is what
+    # makes "exceeded" distinguishable from "exceeded, and here is why".
+    budget_escalations: int = 0
     tokens: TokenCount = field(default_factory=TokenCount.unavailable)
     # Provider counters, separate from `tokens` on purpose: `tokens` is one
     # summary figure whoever filled the row chose, while this is the runtime's
@@ -356,6 +373,35 @@ class TaskTelemetry:
                 self.cache_hits += 1
         else:
             self.runbook_misses += 1
+
+    def record_plan_outcome(self, status: str, *, note: str = "") -> None:
+        """PLAN_CONFIRMED / PLAN_ADJUSTED / PLAN_MISMATCH, as the worker answered.
+
+        The spec store records the same verdict on the spec. Both are kept
+        because they answer different questions: the spec says what the next
+        planner for that module should know, and this row says what this run
+        cost and how it went. A MISMATCH rate is the number that says whether
+        specs are worth trusting at all, and it is only computable if the
+        verdict lives somewhere aggregable.
+        """
+        if status not in PLAN_STATUSES:
+            raise ValueError(f"unknown plan status {status!r}")
+        self.plan_status = status
+        if note:
+            self.plan_note = note
+
+    def record_budget_escalation(self, reason: str) -> None:
+        """A worker was let past its file/search budget, and why.
+
+        Recorded rather than merely permitted. A budget nobody can audit is
+        advice, not a budget: without the reason attached, an overrun and a
+        justified overrun are the same row, and the only honest thing to do
+        with such a fleet-wide number is ignore it.
+        """
+        if not (reason or "").strip():
+            raise ValueError("a budget escalation without a reason is not one")
+        self.budget_escalations += 1
+        self.note(f"budget escalation: {reason.strip()}"[:200])
 
     def record_redefine(self, count: int = 1) -> None:
         self.redefine_count += count
@@ -619,6 +665,12 @@ def summarise(records: Sequence[TaskTelemetry | dict[str, Any]]) -> dict[str, An
         "cache_hits": total("cache_hits"),
         "redefine_count": total("redefine_count"),
         "assist_requests": total("assist_requests"),
+        # Three verdicts plus "nobody answered", kept apart on purpose: an
+        # un-answered plan check must never be counted as a confirmed one, and
+        # the MISMATCH count is the only direct evidence the fleet has about
+        # whether its specs describe the code.
+        "plan_outcomes": _summarise_plan_outcomes(rows),
+        "budget_escalations": total("budget_escalations"),
         "dispatches": total("dispatch_count"),
         "tokens": tokens,
         "provider_usage": _summarise_usage(rows),
@@ -634,6 +686,21 @@ def summarise(records: Sequence[TaskTelemetry | dict[str, Any]]) -> dict[str, An
         "tasks_without_preview": len(rows) - len(previews),
         "tasks_with_signals": sum(1 for row in rows if row.get("signal_sources")),
     }
+
+
+def _summarise_plan_outcomes(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """How the plan-verification handshake actually went across these tasks."""
+    counts = {name: sum(1 for row in rows if row.get("plan_status") == name)
+              for name in PLAN_STATUSES}
+    counts["unreported"] = sum(1 for row in rows if not row.get("plan_status"))
+    answered = sum(counts[name] for name in (PLAN_CONFIRMED, PLAN_ADJUSTED, PLAN_MISMATCH))
+    counts["answered"] = answered
+    # Left as None rather than 0 when nothing answered: a mismatch rate over
+    # zero verdicts is not a rate, and printing 0% would read as "our specs
+    # are always right" when it means "nobody checked".
+    counts["mismatch_rate"] = (round(counts[PLAN_MISMATCH] / answered, 3)
+                               if answered else None)
+    return counts
 
 
 def _summarise_usage(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
