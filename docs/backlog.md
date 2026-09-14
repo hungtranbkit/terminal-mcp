@@ -380,3 +380,43 @@ Checked against `feat/work-efficiency-telemetry` @ `473a629`. Detail in
 | `EM-C3` | P1 | fix | `telemetry_tasks.first_pass_success` is written by the reporter, not derived. Have the report recompute it from turns/reentries/evidence and flag disagreement with the stored value. |
 | `EM-C4` | P2 | feature | No `decision_budget` / task profile / risk class on `telemetry_tasks`; stratification depends on an unrecorded join to queue metadata. Stamp it per task at creation. |
 | `EM-C5` | P1 | research | **Differential measurement on FPS**: the HIGH arm is required to carry a live-verification plan, so it is more likely to be scoreable at all — the treatment changes the denominator. Report FPS coverage per arm as a first-class result; prefer turn count as headline where coverage differs. |
+
+**Status, 2026-09-14.** The benchmark lane reports all five closed on its own
+side at `bf61bcb` (per-source reason-vocabulary declaration rendering
+`UNAVAILABLE` rather than `0`; recomputed FPS taking precedence over the
+stored scalar with per-task disagreement flagged; the three-condition FPS
+caveat stated in every risk class; `profile_source` provenance in the header;
+`first_pass_coverage` as a first-class field that switches the headline to
+`worker_turn_count` past a 10-point per-arm gap). **Reported, not verified** —
+that branch is not on this host or on origin.
+
+Upstream status, verified against `feat/work-efficiency-telemetry` @ `473a629`:
+
+- `EM-C1` — **open**. `STALE_CONTEXT` is still absent from the
+  `telemetry_reentries.reason` CHECK set. Relayed to the telemetry lane with
+  the directional argument (the arm carrying more analysis carries a larger
+  cached prefix, so misfiling staleness charges a cache-coherence failure to
+  analysis quality — against the hypothesis under test).
+- `model_id` — **already done, no action.** Present since migration 2 with its
+  own index; the benchmark lane asked for it without checking. `cost_units` is
+  priceable as soon as rows exist.
+- `EM-C2`/`EM-C4` — open, unchanged; both are genuinely upstream.
+- `EM-C3`/`EM-C5` — addressed in the consuming lane, which is the right place
+  for them; no upstream change required.
+
+**`EM-C1` — landing (2026-09-14, uncommitted).** `STALE_CONTEXT` is present in
+the telemetry lane's working tree as **Migration 3**, which *rebuilds*
+`telemetry_reentries` rather than editing the v1 CHECK literal — the v1 literal
+is deliberately left alone so that replaying the migration list from scratch
+reproduces the same sequence of real schema states it did in history. That is
+the right construction: SQLite cannot ALTER a CHECK constraint, and editing the
+v1 literal in place would silently change what already-migrated databases were
+validated against while leaving `user_version` unmoved. Not yet committed, so
+this is *observed in a working tree*, not shipped. When it lands, the benchmark
+lane's `UNAVAILABLE` row flips to real counts with no change on its side.
+
+With that, every cross-lane item is closed or landing, and the measurement
+programme's remaining blockers are the ones that were always upstream of all
+three lanes: `EM-Q2` (can per-turn provider usage be captured at all for
+CLI-driven workers), `EM-C2`/`EM-LEDGER-1` (no clarification concept exists),
+and `EM-C4` (no per-task snapshot of the stratification key).

@@ -289,10 +289,15 @@ cost_units =  input_tokens
 
 Rules that make it honest:
 
-- **Never hardcode the multipliers.** Record `model_id` and a
-  `price_table_version` on every row, and resolve the coefficients from a
-  versioned table. Prices change; a re-analysis must be able to reprice history
-  rather than inherit a number baked in at collection time.
+- **Never hardcode the multipliers.** Record `model_id` on every row and
+  resolve the coefficients from a versioned table **at report time**, pinning
+  the `price_table_version` in the report header. Prices change; a re-analysis
+  must be able to reprice history rather than inherit a number baked in at
+  collection time. The measurement store therefore records what was *consumed*
+  (tokens, by model) and never prices it — a price copy inside it would be a
+  second source of truth that drifts silently and retroactively falsifies rows
+  already written. Pricing is the reader's job; the table version is a property
+  of the report, not of the measurement.
 - **Report the four raw counts alongside `cost_units`, always.** The weighted
   figure is for comparison; the raw counts are what let a later reader
   re-derive it under different assumptions.
@@ -570,7 +575,8 @@ checkable; none is satisfied by code existing.
   reconcile-and-reclaim cycles on one dispatch yield `worker_turn_count == 1`
   while `attempt_count > 1` (A4). This is the regression test for §7.5.
 - **T3 — Per-turn token usage recorded**, with all four counts, the TTL split
-  on cache writes, `model_id`, and `price_table_version` (§5.2). Acceptance: a
+  on cache writes, and `model_id` — **not** a price or a price-table version,
+  which belong to the report (§5.2). Acceptance: a
   real turn's recorded totals reconcile against the provider's own usage
   numbers — not merely that the columns are non-null.
 - **T4 — Phase attribution.** Every token row carries `ANALYSIS` /
@@ -659,10 +665,13 @@ the v2 `cache_write_5m_tokens` / `cache_write_1h_tokens` split with `model_id`
 and a `confidence` tri-state (`MEASURED`/`DERIVED`/`ESTIMATED`/`UNKNOWN`) that
 implements §6's "missing is never zero" at the schema level.
 
-On `price_table_version`: recording `model_id` plus the raw counts at
-collection, and pinning the table version in the **report header**, is
-cleaner than this document's original wording. History reprices from raw
-counts under any table version. §5.2 should be read that way.
+On `price_table_version`: the telemetry lane records **no price and no price
+table**, deliberately, and is right to. §5.2 originally asked for a
+`price_table_version` on every row; that was wrong and has been corrected at
+source rather than patched here. A price copy inside a measurement store is a
+second source of truth that drifts silently and retroactively falsifies rows
+already written. The store records what was consumed; the report prices it and
+pins the table version.
 
 **Four gaps, each blocking a specific clause:**
 
@@ -695,3 +704,104 @@ first-class result**, and to treat any material imbalance on FPS specifically
 as a finding about the metric rather than a caveat on it. Where coverage
 differs by arm, the honest headline is the turn-count comparison (§4.5), whose
 denominator does not depend on the treatment.
+
+### 13.2 The exact coverage test — why the *gap* is the wrong quantity
+
+The benchmark lane derived a correct partial-identification bound: if an arm
+scores a fraction `c` of its tasks at observed rate `r`, its true rate lies in
+
+```
+[ r·c ,  r·c + (1 − c) ]
+```
+
+because the unscored tasks are, at the extremes, all failures or all
+successes. That is right, and the interval width is `(1 − c)` — it is governed
+by **missingness level**, not by the gap between arms.
+
+It then concluded that a scoreability gap of `G` points can account for up to
+`G` points of apparent first-pass difference, and moved the headline off FPS
+when `gap ≥ difference` (requiring both to be non-zero, since either zero makes
+the test vacuously true). **`G` is an upper bound, not the governing quantity,
+and the non-zero guard inverts the result in the regime this project is
+actually in.** Checked numerically:
+
+| Case | Gap `G` | Observed diff `D` | `gap ≥ diff` fires? | Can coverage alone explain it? |
+|---|---|---|---|---|
+| One arm at full coverage (the case checked) | 10 | 10 | **yes** | **no** — conservative, errs safe |
+| **Both arms at 50% coverage, equal** | **0** | **100** | **no** | **yes** — rule misses it entirely |
+| Both arms at 70% coverage, equal | 0 | 85 | no | no — correctly not explained |
+| Small gap, large effect | 3 | 60 | no | no — correctly not moved |
+
+The second row is the one that matters. Arm A: 100 tasks, 50 scored, all 50
+succeeded (`r = 1.00`, `c = 0.50`, true rate ∈ [0.50, 1.00]). Arm B: 100 tasks,
+50 scored, none succeeded (`r = 0.00`, `c = 0.50`, true rate ∈ [0.00, 0.50]).
+The gap is **zero**, the observed difference is **100 points**, and both arms'
+true rates could be exactly 0.50. Coverage explains the entire result, and a
+gap-based rule with a non-zero guard reports it as a directional finding.
+
+That is not an exotic configuration. It is *equal, moderate coverage in both
+arms* — the expected early state of this program, since the telemetry store
+records `first_pass_success` as `UNKNOWN` by default and evidence capture is
+the last thing to come online.
+
+**Use the interval-overlap test directly:**
+
+```
+explained_by_coverage  =  intervals [r_A·c_A, r_A·c_A + (1−c_A)]
+                          and       [r_B·c_B, r_B·c_B + (1−c_B)]
+                          overlap
+```
+
+If they overlap, equal true rates are consistent with the data and **no
+directional claim is licensed**, whatever the gap and whatever the N. This is
+exact rather than a bound, needs no degenerate-case guards (both zero-gap and
+zero-difference fall out correctly), and subsumes the `gap ≥ difference` rule
+and the fixed-points backstop as special cases.
+
+The wider point for §8: **coverage is a partial-identification problem, not a
+confidence problem.** A wider sample does not shrink these intervals — only
+recording the evidence does. Reporting an interval that spans the null
+alongside a tight confidence band is not a contradiction; it means the
+uncertainty is in what was *measured*, not in how *much* was measured.
+
+#### 13.2.1 Two refinements, and why both warnings stay
+
+**The overlap test requires at least one interval to have width.** Two fully
+scored arms produce point intervals; two coinciding points mean the rates are
+genuinely equal — an *identified null*, not an identification failure. With
+`c = 1` there is no missingness for coverage to explain, so the rule must not
+fire regardless of whether the points coincide. Verified:
+
+| Case | Intervals | Fires |
+|---|---|---|
+| Both fully scored, equal rates | `0.60` / `0.60` | no — identified null |
+| Both fully scored, differing rates | `0.80` / `0.50` | no |
+| One full, one partial, overlapping | `0.55` / `0.45–0.55` | yes |
+| Equal 90% coverage, **zero** observed difference | `0.54–0.64` / `0.54–0.64` | **yes** |
+
+The fourth row is worth keeping rather than guarding away. A null observed
+under incomplete coverage is **not an identified null** — the data are equally
+consistent with a real difference. Firing there is correct and informative, so
+the zero-difference guard is rightly gone: the rule should be as willing to
+refuse a null as to refuse an effect.
+
+**The gap-based warning is not a duplicate of the overlap test and should
+stay.** They answer different questions:
+
+| | Question | What it is about |
+|---|---|---|
+| Interval overlap | Given worst-case assumptions about *which* tasks went unscored, is the direction determined at all? | **Identification** — may a claim be made? |
+| Coverage gap by arm | Is scoreability itself treatment-dependent? | **Selection** — is the point estimate inside the interval trustworthy? |
+
+The overlap test is deliberately agnostic about the missingness *mechanism*:
+it assumes the worst and is therefore always valid, but weak. The gap warning
+says when missingness is plausibly non-random with respect to the treatment —
+which is exactly the situation in which the point estimate inside the interval
+cannot be taken as "probably about right", and the worst-case bound is all you
+actually have. An effect can survive identification while the instrument that
+produced it was still corrupted by the treatment; that is §13.1's original
+concern and it does not disappear when the interval happens to be narrow.
+
+So both stay, under **distinct labels** — `IDENTIFICATION` and `SELECTION` —
+so that a reader cannot mistake one fact stated twice for two independent
+problems, or vice versa.
