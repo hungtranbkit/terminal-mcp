@@ -5,7 +5,7 @@ tmux panes) lives in test_send_reliability.py (Codex, via the reproduced
 fixture) and test_adapters_real_cli.py (both CLIs, live)."""
 from __future__ import annotations
 
-from terminal_mcp.adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STATES, DELIVERY_SUBMIT_CONFIRMED,
+from terminal_mcp.adapters import (DELIVERY_STALLED, DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STATES, DELIVERY_SUBMIT_CONFIRMED,
                                    DELIVERY_TEXT_SENT, DELIVERY_UNKNOWN, TARGET_RUNNING, TARGET_STATES,
                                    TARGET_UNKNOWN, TARGET_WAITING, ClaudeAdapter, CodexAdapter, GenericShellAdapter,
                                    select_adapter, to_legacy_submit_status)
@@ -25,8 +25,9 @@ def test_to_legacy_submit_status_maps_every_delivery_state():
     assert to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED) == "SUBMIT_CONFIRMED"
     for state in (DELIVERY_UNKNOWN, DELIVERY_BLOCKED, DELIVERY_ERROR):
         assert to_legacy_submit_status(state) == "SUBMIT_UNCONFIRMED"
+        assert to_legacy_submit_status(DELIVERY_STALLED) == "SUBMIT_UNCONFIRMED"
     assert set(DELIVERY_STATES) == {DELIVERY_TEXT_SENT, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_UNKNOWN,
-                                     DELIVERY_BLOCKED, DELIVERY_ERROR}
+                                    DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STALLED}
 
 
 def test_generic_shell_adapter_never_recovers_and_uses_bare_diff():
