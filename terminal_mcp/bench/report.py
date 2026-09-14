@@ -85,8 +85,19 @@ ASSIGNMENT_OBSERVATIONAL = "observational"
 ASSIGNMENTS = (ASSIGNMENT_RANDOMISED, ASSIGNMENT_INTERLEAVED, ASSIGNMENT_OBSERVATIONAL)
 
 MIN_USAGE_COVERAGE = 0.80
-# Gap in first-pass-success scoreability between arms above which the
-# headline moves off that metric entirely.
+# Absolute backstop: a scoreability gap this wide moves the headline off
+# first-pass success regardless of how large the observed difference is.
+#
+# The primary rule is relative and comes from the arithmetic rather than
+# from a chosen number. If an arm scores a fraction c of its tasks at
+# observed rate r, its true rate lies in [r*c, r*c + (1-c)] -- the
+# unscored tasks are, at the extremes, all failures or all successes.
+# Working that through, a scoreability gap of G percentage points can
+# account for up to exactly G points of apparent first-pass difference.
+# So the headline moves whenever the gap is at least as large as the
+# difference it would have to explain: at that point coverage alone is a
+# complete explanation for the result, and the metric is uninformative
+# no matter how clean the rest of the comparison is.
 FPS_COVERAGE_GAP = 0.10
 
 
@@ -426,20 +437,45 @@ def _build_group(
     legacy_fps_coverage = coverage[COHORT_LEGACY].first_pass_coverage
     new_fps_coverage = coverage[COHORT_NEW].first_pass_coverage
     headline_metric = "first_pass_success"
-    if (
-        legacy_fps_coverage is not None
-        and new_fps_coverage is not None
-        and abs(legacy_fps_coverage - new_fps_coverage) > FPS_COVERAGE_GAP
-    ):
-        headline_metric = "worker_turn_count"
-        warnings.append(
-            f"FPS_COVERAGE_DIFFERS_BY_ARM: first-pass success is scoreable for "
-            f"{legacy_fps_coverage:.0%} of matched legacy tasks and {new_fps_coverage:.0%} of "
-            f"new-pipeline tasks in {risk_class}. The treatment changes the probability a task "
-            "can be measured on this metric, which inflates the better-instrumented arm's "
-            "apparent rate; the headline moves to worker turns, whose denominator does not "
-            "depend on the arm"
+    if legacy_fps_coverage is not None and new_fps_coverage is not None:
+        coverage_gap = abs(legacy_fps_coverage - new_fps_coverage)
+        legacy_rate = coverage[COHORT_LEGACY].first_pass_rate
+        new_rate = coverage[COHORT_NEW].first_pass_rate
+        observed_gap = (
+            abs(new_rate - legacy_rate) / 100.0
+            if legacy_rate is not None and new_rate is not None
+            else None
         )
+        # Both sides must be real: with no coverage gap, coverage
+        # explains nothing; with no observed difference, there is
+        # nothing for it to explain. Either zero makes the rule
+        # vacuously true, which would fire it on every clean comparison.
+        explains_everything = (
+            observed_gap is not None
+            and observed_gap > 0
+            and coverage_gap > 0
+            and coverage_gap >= observed_gap
+        )
+        if explains_everything or coverage_gap > FPS_COVERAGE_GAP:
+            headline_metric = "worker_turn_count"
+            detail = (
+                f"a {coverage_gap:.0%} gap can account for up to {coverage_gap:.0%} of an "
+                f"apparent difference, and the observed difference is {observed_gap:.0%} — so "
+                "coverage alone is a complete explanation for it"
+                if explains_everything
+                else f"a {coverage_gap:.0%} gap can account for up to {coverage_gap:.0%} of the "
+                f"observed {observed_gap:.0%} difference"
+                if observed_gap is not None
+                else "the observed difference cannot be computed"
+            )
+            warnings.append(
+                f"FPS_COVERAGE_DIFFERS_BY_ARM: first-pass success is scoreable for "
+                f"{legacy_fps_coverage:.0%} of matched legacy tasks and {new_fps_coverage:.0%} "
+                f"of new-pipeline tasks in {risk_class}; {detail}. The treatment changes the "
+                "probability a task can be measured on this metric, which inflates the "
+                "better-instrumented arm's apparent rate; the headline moves to worker turns, "
+                "whose denominator does not depend on the arm"
+            )
     disagreements = sum(group.first_pass_disagreements for group in coverage.values())
     if disagreements:
         warnings.append(

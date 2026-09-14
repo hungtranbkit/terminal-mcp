@@ -625,3 +625,40 @@ def test_stale_context_is_reported_both_in_and_out_of_the_comparison() -> None:
     assert with_stale.new.median == 1.0, "staleness is a real downstream cost of the treatment"
     assert without_stale.new.median == 0.0
     assert with_stale.legacy.median == without_stale.legacy.median == 1.0
+
+
+def test_a_small_coverage_gap_still_fires_when_it_explains_the_whole_difference() -> None:
+    """The principled half of the rule. A 4-point scoreability gap is
+    under the 10-point backstop, but if the observed first-pass
+    difference is only 3 points, coverage alone accounts for all of it
+    and the metric is uninformative."""
+    # Legacy: 25 tasks, all scoreable, 12 successes -> 48%.
+    records = [task(f"L{i}", COHORT_LEGACY, first_pass=i < 12) for i in range(25)]
+    # New: 25 tasks, 24 scoreable, 12 successes -> 50%. Gap 4pts > 2pts.
+    records += [task(f"N{i}", COHORT_NEW, first_pass=i < 12) for i in range(24)]
+    records += [task("Nx", COHORT_NEW, first_pass=None)]
+    report = build_report(records, assignment=ASSIGNMENT_RANDOMISED)
+    group = report.groups[0]
+    assert group.headline_metric == "worker_turn_count"
+    warning = next(w for w in group.warnings if "FPS_COVERAGE_DIFFERS_BY_ARM" in w)
+    assert "complete explanation" in warning
+
+
+def test_a_coverage_gap_smaller_than_the_effect_does_not_move_the_headline() -> None:
+    """The mirror case: a 4-point gap against a 40-point difference
+    explains only a tenth of it, so first-pass success survives as the
+    headline and the gap is reported rather than acted on."""
+    records = [task(f"L{i}", COHORT_LEGACY, first_pass=i < 5) for i in range(25)]     # 20%
+    records += [task(f"N{i}", COHORT_NEW, first_pass=i < 15) for i in range(24)]      # 62.5%
+    records += [task("Nx", COHORT_NEW, first_pass=None)]
+    report = build_report(records, assignment=ASSIGNMENT_RANDOMISED)
+    assert report.groups[0].headline_metric == "first_pass_success"
+
+
+def test_a_wide_coverage_gap_fires_even_against_a_large_effect() -> None:
+    """The absolute backstop, for the case the relative rule misses."""
+    records = [task(f"L{i}", COHORT_LEGACY, first_pass=i < 2) for i in range(25)]
+    records += [task(f"N{i}", COHORT_NEW, first_pass=True) for i in range(15)]
+    records += [task(f"Nx{i}", COHORT_NEW, first_pass=None) for i in range(10)]
+    report = build_report(records, assignment=ASSIGNMENT_RANDOMISED)
+    assert report.groups[0].headline_metric == "worker_turn_count"

@@ -1002,6 +1002,8 @@ def _combine(base: TaskRecord, extra: TaskRecord) -> TaskRecord:
         verification_evidence=_prefer(base.verification_evidence, extra.verification_evidence),
         terminal_status=_prefer(base.terminal_status, extra.terminal_status),
         profile_source=_prefer(base.profile_source, extra.profile_source),
+        cost_units_override=_prefer(base.cost_units_override, extra.cost_units_override),
+        cost_units_unavailable=base.cost_units_unavailable or extra.cost_units_unavailable,
     )
 
 

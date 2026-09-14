@@ -191,10 +191,23 @@ denominator and inflates the treatment arm's apparent rate. So:
 
 * per-arm **scoreability is a first-class row**, printed directly under
   the rate; the rate is never rendered without it;
-* when scoreability differs between arms by more than 10 points, the
-  **headline metric moves to `worker_turn_count`**, whose denominator is
-  every matched task regardless of treatment, and the report says so in
-  bold at the top of that risk class.
+* the **headline metric moves to `worker_turn_count`**, whose
+  denominator is every matched task regardless of treatment, whenever
+  the gap is large enough to matter — and "large enough" comes from the
+  arithmetic, not from a chosen number.
+
+If an arm scores a fraction `c` of its tasks at observed rate `r`, its
+true rate lies in `[r·c, r·c + (1−c)]` — at the extremes the unscored
+tasks are all failures or all successes. Working that through, **a
+scoreability gap of G percentage points can account for up to exactly G
+points of apparent first-pass difference.** So the headline moves
+whenever the gap is at least as large as the difference it would have to
+explain: at that point coverage alone is a complete explanation for the
+result, and the metric is uninformative however clean the rest of the
+comparison is. A fixed 10-point gap remains as an absolute backstop for
+the case where the observed difference is large but the gap is wide too.
+The report states which of the two fired and how much of the observed
+difference coverage can account for.
 
 ### Re-entry reasons
 
@@ -382,9 +395,21 @@ four semantics can only be got right by name:
 
 `counter_reset` rows and partially-NULL sample sets are **flagged**, not
 excluded, and the weakest `confidence` on any sample propagates to the
-task. The store records no model id, so `cost_units` is unpriceable from
-it alone; `--price-model <id>` lets an operator state an assumption,
-which the report then prints as a caveat on every cost figure.
+task. **Cost is priced per sample, not per task.** Migration 2 of the store
+added `model_id` and the `cache_write_5m_tokens` / `cache_write_1h_tokens`
+split, so cost is computable from the store alone with no assumption.
+Each sample is priced with its *own* `model_id` and the results summed,
+because a task whose turns ran on more than one model — a worker
+delegating to a cheaper sub-agent — cannot be priced correctly from a
+single task-level model. Such a task is flagged `MIXED_MODEL` and claims
+no task-level model id. One unpriceable sample makes the whole task
+unpriceable: a partial cost is a wrong cost.
+
+The adapter does not assume migration 2. An older store without the
+split or `model_id` degrades to the collapsed cache-write total and an
+unpriceable cost rather than failing, and `--price-model <id>` lets an
+operator state an assumption that the report then prints as a caveat on
+every cost figure.
 
 ### Cohort and controls are joined, not copied
 
@@ -467,6 +492,12 @@ otherwise produce a plausible-looking number rather than an error:
 * NULL stays unmeasured while a real 0 stays 0
 * tri-state first-pass success keeps `UNKNOWN` out of the denominator
 * a stated `--price-model` assumption is surfaced as a caveat
+* the cache-write TTL split is read where present, and cost is priced
+  per sample with each sample's own model
+* a mixed-model task is priced per sample and flagged, not priced from
+  one guessed model
+* one unpriceable sample makes the whole task unpriceable, and the
+  task-level fallback cannot quietly undo that
 * a reason the store cannot record renders UNAVAILABLE, never 0
 * a flattering stored first-pass outcome is overridden by the recomputed
   one and flagged

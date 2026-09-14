@@ -384,3 +384,152 @@ def test_failed_tasks_recompute_as_not_first_pass(tmp_path: Path) -> None:
         [],
     )
     assert WorkTelemetryDbSource(path).load().records[0].first_pass_success_recomputed is False
+
+
+# --- migration 2: cache-write TTL split + model_id ------------------------
+
+SAMPLE_COLUMNS_V2 = (
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, phase TEXT, kind TEXT, "
+    "idempotency_key TEXT, input_tokens INTEGER, output_tokens INTEGER, "
+    "cache_read_tokens INTEGER, cache_write_tokens INTEGER, "
+    "cache_write_5m_tokens INTEGER, cache_write_1h_tokens INTEGER, model_id TEXT, "
+    "turn_count INTEGER, reported_input_tokens INTEGER, counter_reset INTEGER, "
+    "confidence TEXT, evidence_source TEXT"
+)
+
+
+def build_v2(path: Path, tasks: list[dict], samples: list[dict]) -> Path:
+    connection = sqlite3.connect(path)
+    connection.execute(f"CREATE TABLE telemetry_tasks ({TASK_COLUMNS})")
+    connection.execute(f"CREATE TABLE telemetry_usage_samples ({SAMPLE_COLUMNS_V2})")
+    connection.execute(f"CREATE TABLE telemetry_reentries ({REENTRY_COLUMNS})")
+    for table, rows in (("telemetry_tasks", tasks), ("telemetry_usage_samples", samples)):
+        for row in rows:
+            keys = list(row)
+            connection.execute(
+                f"INSERT INTO {table} ({', '.join(keys)}) VALUES ({', '.join('?' for _ in keys)})",
+                tuple(row[key] for key in keys),
+            )
+    connection.commit()
+    connection.close()
+    return path
+
+
+def sample_v2(task_id: str, **overrides) -> dict:
+    payload = {
+        "task_id": task_id,
+        "phase": "IMPLEMENTATION",
+        "kind": "DELTA",
+        "idempotency_key": f"{task_id}-{overrides.get('model_id', 'a')}-{overrides.get('input_tokens', 0)}",
+        "input_tokens": 100,
+        "output_tokens": 200,
+        "cache_read_tokens": 1000,
+        "cache_write_tokens": 500,
+        "cache_write_5m_tokens": 400,
+        "cache_write_1h_tokens": 100,
+        "model_id": "claude-opus-5",
+        "turn_count": 1,
+        "counter_reset": 0,
+        "confidence": "MEASURED",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_the_cache_write_ttl_split_is_read_when_present(tmp_path: Path) -> None:
+    """Reading only the collapsed total would discard the coefficient
+    that makes cost computable, and report every task as unpriceable
+    under the default split_required policy."""
+    path = build_v2(tmp_path / "work_telemetry.db", [base_task("t1")], [sample_v2("t1")])
+    usage = WorkTelemetryDbSource(path).load().records[0].usage
+    assert usage.cache_write_5m_tokens == 400
+    assert usage.cache_write_1h_tokens == 100
+    assert usage.has_ttl_split is True
+
+
+def test_cost_is_priceable_from_the_store_alone(tmp_path: Path) -> None:
+    """model_id arrived in migration 2, so no --price-model assumption
+    is needed and none is claimed."""
+    path = build_v2(tmp_path / "work_telemetry.db", [base_task("t1")], [sample_v2("t1")])
+    result = WorkTelemetryDbSource(path).load()
+    record = result.records[0]
+    assert record.model == "claude-opus-5"
+    # 100 + 400*1.25 + 100*2 + 1000*0.1 + 200*5
+    assert record.cost_units() == pytest.approx(100 + 500 + 200 + 100 + 1000)
+    assert not any("--price-model" in warning for warning in result.warnings)
+
+
+def test_a_mixed_model_task_is_priced_per_sample_not_per_task(tmp_path: Path) -> None:
+    """A worker delegating to a cheaper sub-agent cannot be priced from
+    one task-level model. Per-sample pricing is the only correct answer,
+    and the task is flagged so the reader knows why."""
+    from terminal_mcp.bench.model import FLAG_MIXED_MODEL
+
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [
+            sample_v2("t1", model_id="claude-opus-5"),
+            sample_v2("t1", model_id="claude-haiku-4-5"),
+        ],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert FLAG_MIXED_MODEL in record.flags
+    # Both models have the same multipliers, so the two samples price
+    # identically in base-input-equivalents -- but each was priced with
+    # its OWN table entry, not with one guessed for the task.
+    assert record.cost_units() == pytest.approx(2 * (100 + 500 + 200 + 100 + 1000))
+    assert record.model is None, "no single task-level model is claimed"
+
+
+def test_per_sample_pricing_respects_a_models_own_cache_read_rate(tmp_path: Path) -> None:
+    """Fable 5.1 reads cache at 0.025x base input, not the usual 0.1x."""
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample_v2("t1", model_id="claude-fable-5-1")],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.cost_units() == pytest.approx(100 + 500 + 200 + 1000 * 0.025 + 1000)
+
+
+def test_one_unpriceable_sample_makes_the_whole_task_unpriceable(tmp_path: Path) -> None:
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [
+            sample_v2("t1"),
+            sample_v2("t1", input_tokens=None),
+        ],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.cost_units() is None, "a partial cost is a wrong cost"
+
+
+def test_an_unknown_model_is_flagged_and_unpriceable(tmp_path: Path) -> None:
+    from terminal_mcp.bench.model import FLAG_UNKNOWN_MODEL_PRICE
+
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample_v2("t1", model_id="some-other-vendor-model")],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert FLAG_UNKNOWN_MODEL_PRICE in record.flags
+    assert record.cost_units() is None
+
+
+def test_the_pre_migration_schema_still_reads(tmp_path: Path) -> None:
+    """Migration 2 is not assumed. An older store without the split or
+    model_id degrades to the collapsed total and an unpriceable cost,
+    rather than failing."""
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample("t1", "IMPLEMENTATION")],
+        [],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.usage.cache_write_tokens == 400
+    assert record.usage.has_ttl_split is False
+    assert record.cost_units() is None

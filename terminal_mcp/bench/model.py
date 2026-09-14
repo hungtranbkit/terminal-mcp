@@ -113,6 +113,9 @@ FLAG_CACHE_TTL_UNSPLIT = "CACHE_TTL_UNSPLIT"
 # recomputed from its own turn/re-entry rows. Cheapest anti-gaming
 # signal available without an upstream change.
 FLAG_FPS_DISAGREEMENT = "FPS_DISAGREEMENT"
+# The task's turns did not all run on the same model, so no single
+# task-level model id can price it; cost came from per-sample pricing.
+FLAG_MIXED_MODEL = "MIXED_MODEL"
 
 
 @dataclass(frozen=True)
@@ -279,6 +282,18 @@ class TaskRecord:
     flags: tuple[str, ...] = ()
     verification_evidence: bool | None = None
     terminal_status: str | None = None
+    # Exact cost, priced PER SAMPLE by the source using each sample's
+    # own model_id, and summed. A task whose turns ran on different
+    # models (a worker delegating to a cheaper sub-agent, say) cannot be
+    # priced correctly from one task-level model, so when a source can
+    # do the per-sample arithmetic it wins over the task-level path.
+    cost_units_override: float | None = None
+    # Set when a source ATTEMPTED per-sample pricing and could not
+    # complete it. Without this, `cost_units_override=None` is
+    # ambiguous between "not attempted" and "attempted and failed", and
+    # the task-level fallback would quietly price a task the source had
+    # already determined was unpriceable.
+    cost_units_unavailable: bool = False
     # Where the stratification key came from. A key recomputed at
     # report time can be recomputed after seeing the outcome, so its
     # provenance is carried per task and printed, never assumed.
@@ -290,6 +305,10 @@ class TaskRecord:
         return risk_class(self.profile)
 
     def cost_units(self, *, ttl_policy: str = TTL_SPLIT_REQUIRED) -> float | None:
+        if self.cost_units_unavailable:
+            return None
+        if self.cost_units_override is not None:
+            return self.cost_units_override
         return self.usage.cost_units(self.model, ttl_policy=ttl_policy)
 
     # -- re-entry accounting -------------------------------------------------

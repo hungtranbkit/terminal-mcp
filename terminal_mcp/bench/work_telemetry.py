@@ -33,10 +33,20 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .model import FLAG_FPS_DISAGREEMENT, Reentry, SourceStatus, TaskRecord, TaskUsage
+from . import pricing
+from .model import (
+    FLAG_FPS_DISAGREEMENT,
+    FLAG_MIXED_MODEL,
+    FLAG_UNKNOWN_MODEL_PRICE,
+    Reentry,
+    SourceStatus,
+    TaskRecord,
+    TaskUsage,
+)
 from .sources import (
     BenchSource,
     SourceError,
@@ -81,12 +91,32 @@ STORE_REENTRY_REASONS = frozenset(
 FLAG_COUNTER_RESET = "COUNTER_RESET"
 FLAG_PARTIAL_SAMPLES = "PARTIAL_SAMPLES"
 
+# Migration 2 of the store added the cache-write TTL split and
+# model_id, so the collapsed total is no longer the only thing
+# available. Reading only `cache_write_tokens` would silently discard
+# the coefficient that makes cost computable at all (5m bills 1.25x
+# base input, 1h bills 2x) and report every task as unpriceable under
+# the default split_required policy.
 _TOKEN_COLUMNS = (
     ("input_tokens", "input_tokens"),
     ("output_tokens", "output_tokens"),
     ("cache_read_tokens", "cache_read_tokens"),
+    ("cache_write_5m_tokens", "cache_write_5m_tokens"),
+    ("cache_write_1h_tokens", "cache_write_1h_tokens"),
     ("cache_write_tokens", "cache_write_total_tokens"),
 )
+
+
+@dataclass(frozen=True)
+class SampleRollup:
+    """Everything `telemetry_usage_samples` yields, per task."""
+
+    usage: dict[str, TaskUsage]
+    turns: dict[str, int]
+    flags: dict[str, tuple[str, ...]]
+    confidence: dict[str, str]
+    models: dict[str, tuple[str, ...]]
+    costs: dict[str, float | None]
 
 
 def default_path() -> Path:
@@ -132,7 +162,7 @@ class WorkTelemetryDbSource(BenchSource):
                     self.path,
                     f"no telemetry_tasks table (found: {sorted(tables)})",
                 )
-            usage, turns, sample_flags, confidence = self._read_samples(connection, tables)
+            samples = self._read_samples(connection, tables)
             reentries = self._read_reentries(connection, tables)
             columns = column_names(connection, "telemetry_tasks")
             records: list[TaskRecord] = []
@@ -142,16 +172,7 @@ class WorkTelemetryDbSource(BenchSource):
                 if task_id is None:
                     continue
                 records.append(
-                    self._to_record(
-                        row,
-                        columns,
-                        task_id,
-                        usage.get(task_id, TaskUsage()),
-                        turns.get(task_id),
-                        tuple(reentries.get(task_id, ())),
-                        sample_flags.get(task_id, ()),
-                        confidence.get(task_id),
-                    )
+                    self._to_record(row, columns, task_id, samples, reentries)
                 )
             measured = sum(1 for record in records if not record.usage.is_empty)
             if records and measured < len(records):
@@ -191,10 +212,13 @@ class WorkTelemetryDbSource(BenchSource):
 
     def _read_samples(
         self, connection: sqlite3.Connection, tables: set[str]
-    ) -> tuple[dict[str, TaskUsage], dict[str, int], dict[str, tuple[str, ...]], dict[str, str]]:
+    ) -> "SampleRollup":
         if "telemetry_usage_samples" not in tables:
-            return ({}, {}, {}, {})
+            return SampleRollup({}, {}, {}, {}, {}, {})
         columns = column_names(connection, "telemetry_usage_samples")
+        has_split = "cache_write_5m_tokens" in columns and "cache_write_1h_tokens" in columns
+        models: dict[str, set[str]] = {}
+        costs: dict[str, float | None] = {}
         totals: dict[str, dict[str, int | None]] = {}
         nulls: dict[str, bool] = {}
         turns: dict[str, int] = {}
@@ -221,6 +245,31 @@ class WorkTelemetryDbSource(BenchSource):
                     turns[task_id] = turns.get(task_id, 0) + turn
             if as_int(cell(row, "counter_reset")):
                 flags.setdefault(task_id, set()).add(FLAG_COUNTER_RESET)
+            # Per-sample pricing, using THIS sample's model. Summing
+            # exact per-sample costs is the only correct answer for a
+            # task whose turns ran on more than one model, and it is
+            # never worse than pricing the task total once.
+            sample_model = as_text(cell(row, "model_id")) if "model_id" in columns else None
+            sample_model = sample_model or self.price_model
+            if sample_model:
+                models.setdefault(task_id, set()).add(sample_model)
+            already_unpriceable = task_id in costs and costs[task_id] is None
+            if has_split and not already_unpriceable:
+                sample_cost = pricing.cost_units(
+                    model=sample_model,
+                    input_tokens=as_int(cell(row, "input_tokens")),
+                    output_tokens=as_int(cell(row, "output_tokens")),
+                    cache_read_tokens=as_int(cell(row, "cache_read_tokens")),
+                    cache_write_5m_tokens=as_int(cell(row, "cache_write_5m_tokens")),
+                    cache_write_1h_tokens=as_int(cell(row, "cache_write_1h_tokens")),
+                )
+                if sample_cost is None:
+                    # One unpriceable sample makes the whole task
+                    # unpriceable -- a partial cost is a wrong cost.
+                    costs[task_id] = None
+                else:
+                    running = costs.get(task_id)
+                    costs[task_id] = sample_cost if running is None else running + sample_cost
             level = (as_text(cell(row, "confidence")) or "UNKNOWN").upper()
             if level not in CONFIDENCE_ORDER:
                 level = "UNKNOWN"
@@ -233,7 +282,19 @@ class WorkTelemetryDbSource(BenchSource):
             if nulls.get(task_id) and any(value is not None for value in bucket.values()):
                 flags.setdefault(task_id, set()).add(FLAG_PARTIAL_SAMPLES)
             usage[task_id] = TaskUsage(**bucket)
-        return (usage, turns, {k: tuple(sorted(v)) for k, v in flags.items()}, confidence)
+        for task_id, seen in models.items():
+            if len(seen) > 1:
+                flags.setdefault(task_id, set()).add(FLAG_MIXED_MODEL)
+            if any(pricing.lookup(model) is None for model in seen):
+                flags.setdefault(task_id, set()).add(FLAG_UNKNOWN_MODEL_PRICE)
+        return SampleRollup(
+            usage=usage,
+            turns=turns,
+            flags={k: tuple(sorted(v)) for k, v in flags.items()},
+            confidence=confidence,
+            models={k: tuple(sorted(v)) for k, v in models.items()},
+            costs=costs,
+        )
 
     def _read_reentries(
         self, connection: sqlite3.Connection, tables: set[str]
@@ -261,12 +322,15 @@ class WorkTelemetryDbSource(BenchSource):
         row: sqlite3.Row,
         columns: set[str],
         task_id: str,
-        usage: TaskUsage,
-        turn_count: int | None,
-        reentries: tuple[Reentry, ...],
-        sample_flags: tuple[str, ...],
-        confidence: str | None,
+        samples: SampleRollup,
+        all_reentries: dict[str, list[Reentry]],
     ) -> TaskRecord:
+        usage = samples.usage.get(task_id, TaskUsage())
+        turn_count = samples.turns.get(task_id)
+        reentries = tuple(all_reentries.get(task_id, ()))
+        sample_flags = samples.flags.get(task_id, ())
+        confidence = samples.confidence.get(task_id)
+        models = samples.models.get(task_id, ())
         started = parse_iso(cell(row, "started_at")) if "started_at" in columns else None
         completed = parse_iso(cell(row, "completed_at")) if "completed_at" in columns else None
         duration = None
@@ -289,7 +353,10 @@ class WorkTelemetryDbSource(BenchSource):
             task_id=task_id,
             cohort=normalise_cohort(cohort),
             project=as_text(cell(row, "project_id")) if "project_id" in columns else None,
-            model=self.price_model,
+            model=models[0] if len(models) == 1 else self.price_model,
+            cost_units_override=samples.costs.get(task_id),
+            cost_units_unavailable=task_id in samples.costs
+            and samples.costs[task_id] is None,
             usage=usage,
             worker_turn_count=turn_count,
             reentries=reentries,
