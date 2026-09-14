@@ -1420,6 +1420,37 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # Multi-node capability refresh (this batch) -- listed so this
         # inventory guard keeps catching UNINTENDED route changes.
         "/dashboard/api/nodes/{node_id}/refresh-capabilities": {"POST"},
+        # Windows node onboarding (docs/windows-node-onboarding.md). Two
+        # audiences, and the split matters more here than anywhere else on
+        # this list, so it is spelled out rather than left to the reader.
+        #
+        # OPERATOR routes -- a browser, behind the same _read_guard /
+        # _mutation_guard (Cloudflare Access + CSRF/Origin) as every other
+        # dashboard route. A page that cannot pass those cannot mint an
+        # enrollment, and therefore cannot create a node.
+        "/dashboard/api/nodes/onboard/profiles": {"GET", "HEAD"},
+        # ONE registration serving both methods on purpose -- see the route
+        # itself. Split into two, this path-keyed dict would record only
+        # whichever registered last, and silently stop guarding the other.
+        "/dashboard/api/nodes/onboard/enrollments": {"GET", "POST", "HEAD"},
+        "/dashboard/api/nodes/onboard/enrollments/{enrollment_id}/revoke": {"POST"},
+        "/dashboard/api/nodes/onboard/gateway": {"GET", "HEAD"},
+        "/dashboard/api/nodes/{node_id}/onboarding": {"GET", "HEAD"},
+        "/dashboard/api/nodes/{node_id}/test-transport": {"POST"},
+        "/dashboard/api/nodes/{node_id}/remove": {"POST"},
+        #
+        # MACHINE routes -- called by a Windows box that has no browser
+        # session and no Access cookie, exactly like the pre-existing
+        # /dashboard/api/nodes/{node_id}/heartbeat above, and authenticated
+        # the same way: by a credential in the request, never by a cookie.
+        # consume presents the one-time enrollment code; deregister
+        # presents that node's own bearer token, so a node can only ever
+        # remove itself. The .ps1 download carries no secret and needs no
+        # auth -- the code it would otherwise embed is supplied by the
+        # operator on the command line instead.
+        "/dashboard/api/enroll/consume": {"POST"},
+        "/dashboard/api/nodes/{node_id}/deregister": {"POST"},
+        "/enroll/windows-setup.ps1": {"GET", "HEAD"},
         # Project Backlog (planning layer). Read is _read_guard'ed; every
         # write is _mutation_guard'ed AND path-gated by the service.
         # The panel PAGE itself (a view, like /dashboard/tasks) plus its

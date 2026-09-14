@@ -6,6 +6,9 @@ import logging
 import os
 import re
 import secrets
+import socket
+import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -22,6 +25,15 @@ from .cf_access import verify_access_assertion
 from .agent_availability import available_agent_types
 from .access_policy import filter_record, policy_table, role_for_identity
 from .connection_store import ConnectionStore, generate_node_token
+from .enrollment import EnrollmentStore
+from .node_onboarding import (OnboardingError, OnboardingService, read_controller_ssh_public_key,
+                               rescue_authorized_keys_dir)
+from .node_transport import (GENERIC_SETUP_CODE, KIND_LAN, KIND_REVERSE_SSH, KIND_TAILSCALE,
+                             TransportStore, probe_reverse_tunnel, probe_ssh_banner)
+from . import rescue_gateway
+from .rescue_gateway import RescuePortAllocator
+from .windows_onboarding import (SCRIPT_VERSION as SETUP_SCRIPT_VERSION, list_profiles,
+                                 render_setup_script, script_fingerprint)
 from .fleet_service import ControllerFleetSync, FleetService, auth_status_for_node
 from .controller import ControllerService, build_default_controller
 from .node_client import NodeClientError, RemoteNodeClient
@@ -5929,6 +5941,48 @@ NODES_ADMIN_HTML = """<!doctype html>
     #cxScanTable tbody td { padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top }
     #cxScanTable button { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 10px; cursor:pointer; font:inherit; font-size:11px }
     #cxScanTable button:hover { background:#233252 }
+    /* + Add Node wizard. Deliberately plain: the same tokens (--panel,
+       --line, --accent, --muted) the rest of this page already uses, so
+       it reads as one dashboard rather than a bolted-on flow. */
+    .an-step { margin-top:14px }
+    .an-hint { color:var(--muted); font-size:12px; margin-bottom:10px }
+    .an-os-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px }
+    .an-os { display:flex; flex-direction:column; align-items:flex-start; gap:2px; padding:14px 16px; cursor:pointer;
+             background:#0f1730; border:1px solid var(--line); border-radius:10px; color:var(--text); font:inherit; text-align:left }
+    .an-os:hover:not(:disabled) { border-color:var(--accent); background:#16223d }
+    .an-os:disabled { opacity:.45; cursor:not-allowed }
+    .an-os-icon { font-size:22px }
+    .an-os .muted { font-size:11px }
+    .an-profiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px; margin-top:12px }
+    .an-profile { padding:12px 14px; border:1px solid var(--line); border-radius:10px; background:#0f1730; cursor:pointer }
+    .an-profile:hover { border-color:var(--accent) }
+    .an-profile.active { border-color:var(--accent); background:#16223d }
+    .an-profile b { display:block; font-size:13px; margin-bottom:4px }
+    .an-profile .an-desc { color:var(--muted); font-size:11px; line-height:1.45 }
+    .an-profile .an-warn { color:#e6b800; font-size:11px; margin-top:6px }
+    .an-advanced { margin-top:12px; font-size:12px }
+    .an-advanced summary { cursor:pointer; color:var(--muted) }
+    .an-conn { margin-top:8px; display:flex; flex-direction:column; gap:6px }
+    .an-conn label { display:flex; gap:8px; align-items:flex-start; font-size:12px }
+    .an-conn .an-why { color:var(--muted); font-size:11px }
+    .an-primary { border-color:var(--accent) !important; background:#16223d !important }
+    .an-done-head { display:flex; justify-content:space-between; align-items:baseline; gap:10px; flex-wrap:wrap }
+    .an-big { font-size:14px; font-weight:600 }
+    .an-steps { margin:10px 0 0 0; padding-left:20px; font-size:12.5px; line-height:1.8 }
+    .an-fine { margin-top:12px; font-size:11px; color:var(--muted); line-height:1.6 }
+    .an-fine code { background:#0f1730; border:1px solid var(--line); border-radius:4px; padding:1px 5px; user-select:all }
+    /* transport health table in the node detail */
+    .tr-table { width:100%; border-collapse:collapse; margin-top:8px; font-size:12px }
+    .tr-table th, .tr-table td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line) }
+    .tr-h { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px }
+    .tr-h.healthy { background:#12331f; color:#6ee7a0 }
+    .tr-h.failing { background:#3a1620; color:#ff9aa8 }
+    .tr-h.unknown { background:#22283a; color:var(--muted) }
+    .tr-h.disabled { background:#22283a; color:var(--muted); text-decoration:line-through }
+    @media (max-width:760px) {
+      .an-os-grid, .an-profiles { grid-template-columns:1fr }
+      .tr-table th:nth-child(4), .tr-table td:nth-child(4) { display:none }
+    }
     @media (max-width:760px) {
       header { padding:12px 14px } main { padding:14px } #cards { grid-template-columns:1fr }
     }
@@ -5938,6 +5992,7 @@ NODES_ADMIN_HTML = """<!doctype html>
   <header>
     <div><h1>Quản lý node</h1><div class="muted">Trạng thái, tài nguyên và session theo từng node</div></div>
     <div style="display:flex;align-items:center;gap:10px">
+      <button class="icon-btn an-primary" id="addNodeWizardBtn" type="button">+ Add Node</button>
       <button class="icon-btn" id="connectNodeBtn" type="button">+ Connect Node</button>
       <button class="icon-btn" id="addNodeBtn" type="button">+ Thêm node</button>
       <button class="icon-btn" id="refreshBtn" type="button">⟳ Refresh</button>
@@ -5947,6 +6002,68 @@ NODES_ADMIN_HTML = """<!doctype html>
     </div>
   </header>
   <main>
+    <!-- ==================================================================
+         + Add Node -> Windows. Three steps, one screen, no scrolling
+         through options nobody changes: pick the OS, name it, pick a
+         profile, download. Connectivity is decided by the server (it
+         knows whether it has a tailnet and a rescue gateway); Advanced
+         exists only to turn something OFF.
+         ================================================================== -->
+    <div id="addNodePanel" hidden style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+        <strong style="font-size:15px">Add Node</strong>
+        <button class="icon-btn" id="anCloseBtn" type="button">✕</button>
+      </div>
+
+      <!-- step 1: platform -->
+      <div id="anStepOs" class="an-step">
+        <div class="an-hint">Chọn hệ điều hành của máy bạn muốn thêm.</div>
+        <div class="an-os-grid">
+          <button class="an-os" type="button" data-os="windows"><span class="an-os-icon">🪟</span><span>Windows</span><span class="muted">10 / 11 / Server</span></button>
+          <button class="an-os" type="button" data-os="linux" disabled><span class="an-os-icon">🐧</span><span>Linux</span><span class="muted">dùng Connect Node</span></button>
+          <button class="an-os" type="button" data-os="macos" disabled><span class="an-os-icon">🍎</span><span>macOS</span><span class="muted">dùng Connect Node</span></button>
+        </div>
+      </div>
+
+      <!-- step 2: the form -->
+      <div id="anStepForm" class="an-step" hidden>
+        <div class="an-hint">Máy Windows này sẽ tự đăng ký, tự bật SSH và tự hoạt động lại sau khi khởi động lại.</div>
+        <div class="cx-row">
+          <label class="cx-field">Node name<input type="text" id="anNodeId" placeholder="win-work" autocomplete="off"></label>
+        </div>
+        <div id="anProfiles" class="an-profiles"></div>
+        <details id="anAdvanced" class="an-advanced">
+          <summary>Advanced (connectivity)</summary>
+          <div id="anConnectivity" class="an-conn"></div>
+        </details>
+        <div id="anFormMsg" class="d-msg"></div>
+        <div class="cx-row" style="margin-top:12px">
+          <button class="icon-btn an-primary" id="anGenerateBtn" type="button">Generate setup</button>
+          <button class="icon-btn" id="anBackBtn" type="button">← Đổi hệ điều hành</button>
+        </div>
+      </div>
+
+      <!-- step 3: the download + the three things to do -->
+      <div id="anStepDone" class="an-step" hidden>
+        <div class="an-done-head">
+          <div class="an-big">Xong — còn 3 bước trên máy Windows</div>
+          <div class="muted" id="anExpiry"></div>
+        </div>
+        <ol class="an-steps">
+          <li><b>Download</b> file setup bên dưới về máy Windows đó.</li>
+          <li>Chuột phải file → <b>Run with PowerShell</b> (script tự xin quyền Administrator).</li>
+          <li>Đợi vài phút — máy sẽ tự hiện <b>Ready</b> ở trang này.</li>
+        </ol>
+        <div class="cx-row" style="margin-top:6px">
+          <button class="icon-btn an-primary" id="anDownloadBtn" type="button">⬇ Download windows-setup.ps1</button>
+          <button class="icon-btn" id="anCopyCodeBtn" type="button">Copy enrollment code</button>
+          <button class="icon-btn" id="anDoneBtn" type="button">Đã xong</button>
+        </div>
+        <div class="d-msg" id="anDoneMsg"></div>
+        <div class="an-fine" id="anFine"></div>
+      </div>
+    </div>
+    <div id="enrollStrip" hidden style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin-bottom:16px"></div>
     <div id="onboardPanel" hidden style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:16px">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
         <strong>Thêm node mới</strong>
@@ -6233,7 +6350,9 @@ NODES_ADMIN_HTML = """<!doctype html>
             ${sessions.length ? sessions.map((s) => `<tr><td>${s.name}</td><td>${s.node_id || node.id}</td><td>${s.windows ?? '—'}</td><td>${s.attached ? 'có' : 'không'}</td></tr>`).join('')
                               : '<tr><td colspan="4" class="d-empty">' + (result.data.sessions_error ? 'Không lấy được danh sách session: ' + result.data.sessions_error : 'Không có session nào trên node này') + '</td></tr>'}
           </tbody>
-        </table>`;
+        </table>
+        <div id="nodeTransports"></div>`;
+      renderOnboardingSection(nodeId);
       document.getElementById('refreshDetailBtn').addEventListener('click', () => loadDetail(nodeId));
       document.getElementById('testConnBtn').addEventListener('click', async () => {
         const msg = document.getElementById('detailMsg');
@@ -6286,7 +6405,7 @@ NODES_ADMIN_HTML = """<!doctype html>
       }
     }
 
-    document.getElementById('refreshBtn').addEventListener('click', () => { loadAll(); if (selectedNodeId) loadDetail(selectedNodeId); });
+    document.getElementById('refreshBtn').addEventListener('click', () => { loadAll(); loadEnrollments(); if (selectedNodeId) loadDetail(selectedNodeId); });
 
     document.getElementById('addNodeBtn').addEventListener('click', () => {
       document.getElementById('onboardPanel').hidden = false;
@@ -6314,6 +6433,387 @@ NODES_ADMIN_HTML = """<!doctype html>
         ${pre('3) Export biến môi trường nơi terminal-mcp-http.service đọc env (rồi safe-restart):', r.data.env_var + '=' + r.data.token)}
         <div class="muted" style="font-size:11px;margin-top:6px">4) Xác minh: terminal-mcp-doctor nodes -- ${nodeId} phải chuyển status=online trong vài giây sau khi node-agent kết nối.</div>`;
     });
+
+
+    // ======================================================================
+    // + Add Node -> Windows.
+    //
+    // Everything the operator sees here comes from
+    // /dashboard/api/nodes/onboard/profiles, which reports what THIS
+    // controller can actually do today -- so the form never offers
+    // Tailscale on a controller with no tailnet, or a rescue tunnel with
+    // no gateway. The generated script and the one-time code come back in
+    // ONE response and are never fetched again: the code is single-use,
+    // and there is no endpoint that could re-serve it.
+    //
+    // DOM is built with createElement/textContent for every value that
+    // came off the wire, same discipline as the Scan LAN table below.
+    // ======================================================================
+    const anPanel = document.getElementById('addNodePanel');
+    let anCatalog = null;        // last /onboard/profiles payload
+    let anProfile = 'minimal';
+    let anGenerated = null;      // the one create-enrollment response, held only in this tab
+
+    function anShow(step) {
+      for (const id of ['anStepOs', 'anStepForm', 'anStepDone']) {
+        document.getElementById(id).hidden = (id !== step);
+      }
+    }
+
+    function anSetMsg(id, text, kind) {
+      const el = document.getElementById(id);
+      el.textContent = text || '';
+      el.className = 'd-msg' + (kind ? ' ' + kind : '');
+    }
+
+    // Why a connectivity option is unavailable, in words an operator can act on.
+    const AN_REASONS = {
+      rescue_disabled: 'chưa bật rescue gateway trong config controller',
+      gateway_host_not_configured: 'thiếu nodes.onboarding.rescue.gateway_host',
+      gateway_user_not_configured: 'thiếu nodes.onboarding.rescue.gateway_user',
+      gateway_host_key_not_configured: 'thiếu nodes.onboarding.rescue.gateway_host_key',
+      gateway_port_range_invalid: 'dải cổng rescue không hợp lệ',
+      tailscale_not_installed: 'controller chưa cài Tailscale',
+      tailscale_logged_out: 'controller đã cài Tailscale nhưng chưa đăng nhập',
+      tailscale_disabled_in_config: 'đã tắt trong config controller',
+      declined_by_operator: 'bạn đã bỏ chọn',
+    };
+    function anReason(code) { return AN_REASONS[code] || code || 'không khả dụng'; }
+
+    function anRenderProfiles() {
+      const host = document.getElementById('anProfiles');
+      host.replaceChildren();
+      for (const profile of (anCatalog?.profiles || [])) {
+        const card = document.createElement('div');
+        card.className = 'an-profile' + (profile.id === anProfile ? ' active' : '');
+        card.tabIndex = 0;
+        const title = document.createElement('b');
+        title.textContent = profile.label;
+        const desc = document.createElement('div');
+        desc.className = 'an-desc';
+        desc.textContent = profile.description;
+        card.append(title, desc);
+        if (profile.needs_signin) {
+          const warn = document.createElement('div');
+          warn.className = 'an-warn';
+          warn.textContent = 'Cần đăng nhập thủ công cho từng AI CLI trên máy đó.';
+          card.append(warn);
+        }
+        const choose = () => { anProfile = profile.id; anRenderProfiles(); };
+        card.addEventListener('click', choose);
+        card.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); choose(); } });
+        host.append(card);
+      }
+    }
+
+    function anRenderConnectivity() {
+      const host = document.getElementById('anConnectivity');
+      host.replaceChildren();
+      const plan = anCatalog?.connectivity || {};
+      const rows = [
+        ['tailscale', 'Tailscale (primary)', plan.tailscale, plan.tailscale_reason],
+        ['rescue', 'Reverse SSH rescue', plan.rescue, plan.rescue_reason],
+        ['lan', 'LAN address', plan.lan !== false, null],
+      ];
+      for (const [key, label, available, reason] of rows) {
+        const wrap = document.createElement('label');
+        const box = document.createElement('input');
+        box.type = 'checkbox';
+        box.dataset.conn = key;
+        box.checked = !!available;
+        box.disabled = !available;   // an unavailable path cannot be turned ON from here
+        const text = document.createElement('span');
+        text.textContent = label;
+        wrap.append(box, text);
+        if (!available) {
+          const why = document.createElement('span');
+          why.className = 'an-why';
+          why.textContent = '— ' + anReason(reason);
+          wrap.append(why);
+        }
+        host.append(wrap);
+      }
+    }
+
+    async function anOpen() {
+      anPanel.hidden = false;
+      anGenerated = null;
+      anShow('anStepOs');
+      const result = await api('/dashboard/api/nodes/onboard/profiles');
+      if (!result.ok) {
+        anCatalog = null;
+        anShow('anStepForm');
+        anSetMsg('anFormMsg', result.data.detail || result.data.error || 'Không tải được cấu hình onboarding.', 'error');
+        return;
+      }
+      anCatalog = result.data;
+      if (!anCatalog.enabled) {
+        anShow('anStepForm');
+        anSetMsg('anFormMsg', 'Onboarding đang tắt trên controller (nodes.onboarding.enabled: false).', 'error');
+      }
+    }
+
+    document.getElementById('addNodeWizardBtn').addEventListener('click', anOpen);
+    document.getElementById('anCloseBtn').addEventListener('click', () => { anPanel.hidden = true; });
+    document.getElementById('anBackBtn').addEventListener('click', () => anShow('anStepOs'));
+
+    for (const button of anPanel.querySelectorAll('.an-os')) {
+      button.addEventListener('click', () => {
+        if (button.dataset.os !== 'windows') return;
+        anRenderProfiles();
+        anRenderConnectivity();
+        anSetMsg('anFormMsg', '');
+        anShow('anStepForm');
+        document.getElementById('anNodeId').focus();
+      });
+    }
+
+    document.getElementById('anGenerateBtn').addEventListener('click', async () => {
+      const button = document.getElementById('anGenerateBtn');
+      const nodeId = document.getElementById('anNodeId').value.trim();
+      if (!nodeId) { anSetMsg('anFormMsg', 'Đặt tên cho node (ví dụ: win-work).', 'error'); return; }
+      const connectivity = {};
+      for (const box of document.querySelectorAll('#anConnectivity input[data-conn]')) {
+        connectivity[box.dataset.conn] = box.checked;
+      }
+      button.disabled = true;
+      anSetMsg('anFormMsg', 'Đang tạo setup...', '');
+      const result = await api('/dashboard/api/nodes/onboard/enrollments', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ node_id: nodeId, os: 'windows', profile: anProfile, connectivity }),
+      });
+      button.disabled = false;
+      if (!result.ok) {
+        const detail = result.data.detail || result.data.error || 'Lỗi';
+        anSetMsg('anFormMsg', result.data.error === 'NODE_ALREADY_EXISTS'
+          ? `Đã có node tên "${nodeId}". Chọn tên khác, hoặc xoá node cũ trước.` : detail, 'error');
+        return;
+      }
+      anGenerated = result.data;
+      anRenderDone();
+      anShow('anStepDone');
+      loadEnrollments();
+    });
+
+    function anRenderDone() {
+      const expiresAt = new Date(anGenerated.enrollment.expires_at);
+      const minutes = Math.max(0, Math.round((expiresAt.getTime() - Date.now()) / 60000));
+      document.getElementById('anExpiry').textContent =
+        `Mã dùng một lần, hết hạn sau ~${minutes} phút (${expiresAt.toLocaleTimeString()}).`;
+      anSetMsg('anDoneMsg', '');
+      const fine = document.getElementById('anFine');
+      fine.replaceChildren();
+      const lines = [
+        ['Node', anGenerated.enrollment.node_id],
+        ['Controller', anGenerated.controller_url],
+        ['Script', `windows-setup.ps1 v${anGenerated.script_version} · sha256 ${anGenerated.script_sha256.slice(0, 16)}…`],
+      ];
+      for (const [label, value] of lines) {
+        const row = document.createElement('div');
+        const strong = document.createElement('b');
+        strong.textContent = label + ': ';
+        const code = document.createElement('code');
+        code.textContent = value;
+        row.append(strong, code);
+        fine.append(row);
+      }
+      const alt = document.createElement('div');
+      alt.style.marginTop = '8px';
+      alt.textContent = 'Hoặc chạy trên máy Windows (PowerShell as Administrator):';
+      const cmd = document.createElement('div');
+      cmd.style.marginTop = '4px';
+      const cmdCode = document.createElement('code');
+      cmdCode.textContent =
+        `irm ${anGenerated.controller_url}/enroll/windows-setup.ps1 -OutFile setup.ps1; ` +
+        `.\\setup.ps1 -EnrollmentCode ${anGenerated.code}`;
+      cmd.append(cmdCode);
+      fine.append(alt, cmd);
+    }
+
+    document.getElementById('anDownloadBtn').addEventListener('click', () => {
+      if (!anGenerated) return;
+      // A Blob download, never a URL with the code in the query string --
+      // a code in a URL lands in browser history, proxy logs and the
+      // controller's own access log.
+      const blob = new Blob([anGenerated.script], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = anGenerated.filename;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      anSetMsg('anDoneMsg', 'Đã tải. Chuột phải file → Run with PowerShell trên máy Windows.', 'ok');
+    });
+
+    document.getElementById('anCopyCodeBtn').addEventListener('click', async () => {
+      if (!anGenerated) return;
+      try {
+        await navigator.clipboard.writeText(anGenerated.code);
+        anSetMsg('anDoneMsg', 'Đã copy enrollment code.', 'ok');
+      } catch (error) {
+        anSetMsg('anDoneMsg', 'Không copy được — mã: ' + anGenerated.code, '');
+      }
+    });
+
+    document.getElementById('anDoneBtn').addEventListener('click', () => {
+      anPanel.hidden = true;
+      anGenerated = null;   // the only copy in this tab, dropped on close
+      loadAll();
+    });
+
+    // -- pending enrollments strip ----------------------------------------
+    async function loadEnrollments() {
+      const host = document.getElementById('enrollStrip');
+      const result = await api('/dashboard/api/nodes/onboard/enrollments');
+      if (!result.ok) { host.hidden = true; return; }
+      const pending = (result.data.enrollments || []).filter((row) => row.status === 'pending');
+      host.replaceChildren();
+      if (!pending.length) { host.hidden = true; return; }
+      host.hidden = false;
+      const title = document.createElement('div');
+      title.className = 'muted';
+      title.style.fontSize = '12px';
+      title.textContent = `Đang chờ cài đặt (${pending.length}):`;
+      host.append(title);
+      for (const row of pending) {
+        const line = document.createElement('div');
+        line.style.cssText = 'display:flex;gap:10px;align-items:center;margin-top:6px;font-size:12px';
+        const name = document.createElement('b');
+        name.textContent = row.node_id;
+        const meta = document.createElement('span');
+        meta.className = 'muted';
+        meta.textContent = `${row.profile} · ${row.code_display} · hết hạn ${new Date(row.expires_at).toLocaleTimeString()}`;
+        const revoke = document.createElement('button');
+        revoke.className = 'icon-btn';
+        revoke.type = 'button';
+        revoke.textContent = 'Revoke';
+        revoke.addEventListener('click', async () => {
+          revoke.disabled = true;
+          await api(`/dashboard/api/nodes/onboard/enrollments/${encodeURIComponent(row.id)}/revoke`, { method: 'POST' });
+          loadEnrollments();
+        });
+        line.append(name, meta, revoke);
+        host.append(line);
+      }
+    }
+
+    // ======================================================================
+    // Node detail: transports, Test Primary / Test Rescue, Remove Node.
+    // ======================================================================
+    const TR_LABEL = { tailscale: 'Tailscale (primary)', lan: 'LAN', reverse_ssh: 'Reverse SSH (rescue)' };
+
+    async function renderOnboardingSection(nodeId) {
+      const host = document.getElementById('nodeTransports');
+      if (!host) return;
+      host.replaceChildren();
+      const result = await api(`/dashboard/api/nodes/${encodeURIComponent(nodeId)}/onboarding`);
+      if (!result.ok) return;
+      const info = result.data;
+      const transports = info.transports || [];
+
+      const heading = document.createElement('h3');
+      heading.style.cssText = 'margin:18px 0 0 0;font-size:13px';
+      heading.textContent = 'Kết nối';
+      host.append(heading);
+
+      if (!transports.length) {
+        const empty = document.createElement('div');
+        empty.className = 'muted';
+        empty.style.fontSize = '12px';
+        empty.textContent = 'Node này chưa có transport nào được ghi nhận (chỉ node onboard qua + Add Node mới có).';
+        host.append(empty);
+      } else {
+        const table = document.createElement('table');
+        table.className = 'tr-table';
+        const head = document.createElement('thead');
+        head.innerHTML = '<tr><th>Đường</th><th>Địa chỉ</th><th>Trạng thái</th><th>Lần cuối OK</th><th>Lỗi gần nhất</th></tr>';
+        const body = document.createElement('tbody');
+        for (const transport of transports) {
+          const row = document.createElement('tr');
+          const cell = (text, className) => {
+            const td = document.createElement('td');
+            if (className) { const span = document.createElement('span'); span.className = className; span.textContent = text; td.append(span); }
+            else { td.textContent = text; }
+            row.append(td);
+          };
+          cell(TR_LABEL[transport.kind] || transport.kind);
+          cell(transport.endpoint);
+          cell(transport.health, 'tr-h ' + transport.health);
+          cell(transport.last_success_at ? new Date(transport.last_success_at).toLocaleString() : '—');
+          cell(transport.last_error || '—');
+          body.append(row);
+        }
+        table.append(head, body);
+        host.append(table);
+      }
+
+      if (info.rescue) {
+        const line = document.createElement('div');
+        line.className = 'muted';
+        line.style.cssText = 'font-size:11px;margin-top:6px';
+        line.textContent = `Rescue: cổng ${info.rescue.port} trên ${info.gateway.host || 'gateway'} (chỉ bind 127.0.0.1).`;
+        host.append(line);
+      } else if (info.gateway && !info.gateway.configured) {
+        const line = document.createElement('div');
+        line.className = 'muted';
+        line.style.cssText = 'font-size:11px;margin-top:6px';
+        line.textContent = 'Rescue: ' + anReason(info.gateway.reason);
+        host.append(line);
+      }
+
+      const actions = document.createElement('div');
+      actions.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-top:10px';
+      const message = document.createElement('div');
+      message.className = 'd-msg';
+
+      const makeTest = (label, which) => {
+        const button = document.createElement('button');
+        button.className = 'icon-btn';
+        button.type = 'button';
+        button.textContent = label;
+        button.addEventListener('click', async () => {
+          button.disabled = true;
+          message.textContent = 'Đang kiểm tra...'; message.className = 'd-msg';
+          const test = await api(`/dashboard/api/nodes/${encodeURIComponent(nodeId)}/test-transport`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ transport: which }),
+          });
+          button.disabled = false;
+          if (!test.ok) { message.textContent = test.data.detail || test.data.error || 'Lỗi'; message.className = 'd-msg error'; return; }
+          if (test.data.reachable) {
+            message.textContent = `OK qua ${TR_LABEL[test.data.transport] || test.data.transport} (${test.data.endpoint}).`;
+            message.className = 'd-msg ok';
+          } else {
+            const why = (test.data.attempts || []).map((a) => `${TR_LABEL[a.kind] || a.kind}: ${a.error}`).join(' · ');
+            message.textContent = 'Không tới được. ' + (why || test.data.reason);
+            message.className = 'd-msg error';
+          }
+          renderOnboardingSection(nodeId);
+        });
+        return button;
+      };
+      actions.append(makeTest('Test Primary', 'primary'), makeTest('Test Rescue', 'rescue'));
+
+      if (info.registered) {
+        const remove = document.createElement('button');
+        remove.className = 'icon-btn';
+        remove.type = 'button';
+        remove.textContent = '🗑 Remove Node';
+        remove.addEventListener('click', async () => {
+          if (!window.confirm(`Xoá node "${nodeId}" khỏi Terminal MCP?\n\nSẽ thu hồi credential, mã enrollment đang chờ và cổng rescue. KHÔNG gỡ phần mềm nào trên máy đó.`)) return;
+          remove.disabled = true;
+          const removal = await api(`/dashboard/api/nodes/${encodeURIComponent(nodeId)}/remove`, { method: 'POST' });
+          if (!removal.ok) { message.textContent = removal.data.detail || removal.data.error || 'Lỗi'; message.className = 'd-msg error'; remove.disabled = false; return; }
+          selectedNodeId = null;
+          document.getElementById('detail').hidden = true;
+          loadAll();
+        });
+        actions.append(remove);
+      }
+      host.append(actions, message);
+    }
 
     // ======================================================================
     // Connect Node: Scan LAN / Add Remote SSH / Add via Cloudflare Tunnel /
@@ -6599,7 +7099,8 @@ NODES_ADMIN_HTML = """<!doctype html>
       });
     })();
 
-    loadAll(); setInterval(loadAll, 8000);
+    loadAll(); loadEnrollments();
+    setInterval(loadAll, 8000); setInterval(loadEnrollments, 30000);
   </script>
 </body>
 </html>"""
@@ -10370,7 +10871,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        planner: PlannerService | None = None,
                        ai_usage: AiUsageService | None = None,
                        recovery: RecoveryEngine | None = None,
-                       backlog: BacklogService | None = None) -> None:
+                       backlog: BacklogService | None = None,
+                       onboarding: "OnboardingService | None" = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -10462,6 +10964,26 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     )
     host_key_store = remote_connect.HostKeyStore()
     ssh_known_hosts_dir = connection_store.path.parent / "ssh_known_hosts"
+    if onboarding is None:
+        # SAME private-temp-file discipline as connection_store/queue/pm
+        # above: an ad-hoc caller (every test that does not pass one)
+        # must never write enrollment codes or rescue port allocations
+        # into the real ~/.local/state/terminal-mcp databases.
+        # server_http.py's real main() always passes an explicit,
+        # persistent OnboardingService.
+        import tempfile
+        _onboard_dir = Path(tempfile.mkdtemp(prefix="terminal-mcp-onboard-"))
+        onboarding = OnboardingService(
+            terminal.config, controller=controller, connection_store=connection_store,
+            enrollment_store=EnrollmentStore(_onboard_dir / "enrollment.db"),
+            transport_store=TransportStore(_onboard_dir / "transports.db"),
+            port_allocator=RescuePortAllocator(
+                _onboard_dir / "rescue.db",
+                port_range=(terminal.config.nodes.onboarding.rescue.port_range_start,
+                            terminal.config.nodes.onboarding.rescue.port_range_end)),
+            audit=terminal.audit,
+            token_env_setter=lambda node_id, token: os.environ.__setitem__(node_token_env_var(node_id), token),
+        )
 
     def _origin_allowed(request: Request) -> bool:
         # CSRF defense (P1 hardening item #3), always on, no config
@@ -14155,6 +14677,351 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 502)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
+
+
+    def _probe_transport(transport):
+        """The prober handed to TransportResolver -- see node_transport.py
+        for what each kind's probe actually measures."""
+        if transport.kind == KIND_REVERSE_SSH:
+            return probe_reverse_tunnel(onboarding.gateway(), int(transport.port or 0))
+        return probe_ssh_banner(transport.host or "", int(transport.port or 22))
+
+    # ======================================================================
+    # Windows node onboarding (Nodes -> + Add Node -> Windows).
+    #
+    # Two audiences, two auth models, deliberately not mixed:
+    #
+    #   OPERATOR routes (/dashboard/api/nodes/onboard/*, and the per-node
+    #   onboarding/test/remove routes) go through the SAME _read_guard/
+    #   _mutation_guard every other dashboard route uses -- Cloudflare
+    #   Access identity plus the CSRF/Origin check. A browser that cannot
+    #   pass those cannot create an enrollment, and therefore cannot
+    #   create a node.
+    #
+    #   MACHINE routes (/dashboard/api/enroll/consume, the node-token
+    #   deregister, and the plain setup-script download) are called by a
+    #   Windows box that has no browser session and no Access cookie --
+    #   exactly like the existing /dashboard/api/nodes/{id}/heartbeat
+    #   route, which has always been bearer-authenticated for the same
+    #   reason. consume is authenticated by the one-time enrollment code
+    #   itself; deregister by the node's own bearer token; the script
+    #   download carries no secret at all and needs none.
+    #
+    # No route below ever returns a secret except the two that exist to
+    # deliver one exactly once: create-enrollment (the code, in the same
+    # response as the script that carries it) and consume (the bootstrap
+    # payload). Nothing is logged but identifiers.
+    # ======================================================================
+
+    # Rate limit for the unauthenticated consume route: a fixed window per
+    # source address. The code itself is 75 bits, so this is not what makes
+    # guessing infeasible -- it is what keeps a broken installer in a retry
+    # loop from becoming a denial of service against the controller.
+    _enroll_attempts: dict[str, list[float]] = {}
+    _ENROLL_WINDOW_SECONDS = 60.0
+    _ENROLL_MAX_PER_WINDOW = 12
+
+    def _enroll_rate_limited(source: str) -> bool:
+        now = time.monotonic()
+        bucket = [t for t in _enroll_attempts.get(source, []) if now - t < _ENROLL_WINDOW_SECONDS]
+        bucket.append(now)
+        _enroll_attempts[source] = bucket
+        if len(_enroll_attempts) > 4096:  # bound the dict itself
+            for key in [k for k, v in _enroll_attempts.items() if not v or now - v[-1] > _ENROLL_WINDOW_SECONDS][:2048]:
+                _enroll_attempts.pop(key, None)
+        return len(bucket) > _ENROLL_MAX_PER_WINDOW
+
+    def _request_base_url(request: Request) -> str:
+        host = request.headers.get("host") or ""
+        scheme = request.url.scheme or "http"
+        return f"{scheme}://{host}" if host else ""
+
+    def _onboarding_error(exc: OnboardingError) -> JSONResponse:
+        return JSONResponse({"error": exc.code, "detail": exc.detail}, status_code=exc.status,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/onboard/profiles", methods=["GET"], include_in_schema=False)
+    async def onboard_profiles(request: Request) -> JSONResponse:
+        """Everything the Add Node form needs to render itself: the three
+        profiles, what connectivity this controller can actually offer
+        today, and a suggested node id -- so the form never offers an
+        option that would fail at enrollment time."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+
+        def _compute() -> dict:
+            plan = onboarding.plan_connectivity({})
+            gateway = onboarding.gateway()
+            return {
+                "profiles": list_profiles(),
+                "connectivity": plan.to_dict(),
+                "gateway": gateway.to_dict(),
+                "controller_url": onboarding.controller_url(request_base_url=_request_base_url(request)),
+                "script_version": SETUP_SCRIPT_VERSION,
+                "enrollment_ttl_seconds": terminal.config.nodes.onboarding.enrollment_ttl_seconds,
+                "enabled": terminal.config.nodes.onboarding.enabled,
+                "controller_ssh_key_configured": bool(
+                    read_controller_ssh_public_key(terminal.config.nodes.onboarding)[0]),
+            }
+
+        return JSONResponse(await anyio.to_thread.run_sync(_compute), headers={"Cache-Control": "no-store"})
+
+    # GET (list) and POST (create) share ONE registration rather than two
+    # for the same path. Two registrations work at runtime, but
+    # test_dashboard.py's route-inventory guard keys its expected surface
+    # by path, so the second would quietly overwrite the first and the
+    # inventory would stop describing -- and stop protecting -- the GET.
+    @server.custom_route("/dashboard/api/nodes/onboard/enrollments", methods=["GET", "POST"],
+                        include_in_schema=False)
+    async def onboard_enrollments(request: Request) -> JSONResponse:
+        if request.method == "GET":
+            blocked, _identity = _read_guard(request)
+            if blocked is not None:
+                return blocked
+            records = await anyio.to_thread.run_sync(lambda: onboarding.list_enrollments(limit=50))
+            return JSONResponse({"enrollments": records}, headers={"Cache-Control": "no-store"})
+        return await onboard_create_enrollment(request)
+
+    async def onboard_create_enrollment(request: Request) -> JSONResponse:
+        """Creates the one-time code AND renders the script that carries
+        it, in one response. The code is never persisted in plaintext and
+        never appears in a URL, a log line, or any later response -- if
+        the operator loses this response they generate a new code, which
+        is the correct outcome for a single-use credential."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        connectivity = body.get("connectivity") if isinstance(body.get("connectivity"), dict) else {}
+
+        def _compute() -> dict:
+            created = onboarding.create_enrollment(
+                node_id=body.get("node_id"), display_name=body.get("display_name"),
+                os_name=(body.get("os") or "windows"), profile=(body.get("profile") or "minimal"),
+                connectivity=connectivity, created_by=(identity.email if identity else None),
+                hostname_hint=body.get("hostname"))
+            node_id = created["enrollment"]["node_id"]
+            controller_url = onboarding.controller_url(request_base_url=_request_base_url(request))
+            script = render_setup_script(
+                enrollment_code=created["code"], controller_url=controller_url, node_id=node_id,
+                display_name=created["enrollment"]["display_name"], profile=created["enrollment"]["profile"])
+            created["script"] = script
+            created["script_sha256"] = script_fingerprint(script)
+            created["script_version"] = SETUP_SCRIPT_VERSION
+            created["filename"] = f"terminal-mcp-setup-{node_id}.ps1"
+            created["controller_url"] = controller_url
+            return created
+
+        try:
+            result = await anyio.to_thread.run_sync(_compute)
+        except OnboardingError as exc:
+            return _onboarding_error(exc)
+        except ValueError as exc:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
+        # node_id/profile only -- never the code, never the script body.
+        _log.info("dashboard onboard_create_enrollment node_id=%s profile=%s identity=%s",
+                 result["enrollment"]["node_id"], result["enrollment"]["profile"],
+                 identity.email if identity else None)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/onboard/enrollments/{enrollment_id}/revoke",
+                        methods=["POST"], include_in_schema=False)
+    async def onboard_revoke_enrollment(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        enrollment_id = request.path_params["enrollment_id"]
+        revoked = await anyio.to_thread.run_sync(
+            lambda: onboarding.revoke_enrollment(enrollment_id, by=(identity.email if identity else None)))
+        _log.info("dashboard onboard_revoke_enrollment id=%s revoked=%s identity=%s",
+                 enrollment_id, revoked, identity.email if identity else None)
+        return JSONResponse({"revoked": revoked, "enrollment_id": enrollment_id},
+                            status_code=200 if revoked else 404, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/onboard/gateway", methods=["GET"], include_in_schema=False)
+    async def onboard_gateway(request: Request) -> JSONResponse:
+        """The rescue gateway's configured state plus the ONE combined
+        authorized_keys file an admin copies to it. Public keys only --
+        there is no secret in this response."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+
+        def _compute() -> dict:
+            gateway = onboarding.gateway()
+            directory = rescue_authorized_keys_dir()
+            combined = directory / "authorized_keys"
+            try:
+                content = combined.read_text(encoding="utf-8")
+            except OSError:
+                content = ""
+            return {
+                "gateway": gateway.to_dict(include_host_key=True),
+                "allocations": [a.to_dict() for a in onboarding.ports.list()],
+                "authorized_keys_path": str(combined),
+                "authorized_keys": content,
+                "sync_command": (f"scp {combined} {gateway.user}@{gateway.host}:~/.ssh/authorized_keys"
+                                 if gateway.configured else None),
+            }
+
+        return JSONResponse(await anyio.to_thread.run_sync(_compute), headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/onboarding", methods=["GET"], include_in_schema=False)
+    async def node_onboarding_status(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        result = await anyio.to_thread.run_sync(lambda: onboarding.describe_node(node_id))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/test-transport", methods=["POST"], include_in_schema=False)
+    async def node_test_transport(request: Request) -> JSONResponse:
+        """Test Primary / Test Rescue. Runs the REAL resolver against the
+        node's REAL recorded transports and writes the result back into
+        each transport row, so the Nodes page's health column is a record
+        of what actually happened rather than a live guess."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        which = (body.get("transport") if isinstance(body, dict) else None) or "all"
+        if which not in ("all", "primary", "rescue"):
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "transport must be all, primary or rescue"},
+                                status_code=400)
+
+        def _compute() -> dict:
+            wanted = {"all": None, "primary": (KIND_TAILSCALE, KIND_LAN), "rescue": (KIND_REVERSE_SSH,)}[which]
+            resolver = onboarding.resolver
+            if wanted is None:
+                preference = resolver.preference
+            else:
+                preference = tuple(kind for kind in resolver.preference if kind in wanted)
+            from .node_transport import TransportResolver
+            scoped = TransportResolver(onboarding.transports, preference=preference)
+            resolution = scoped.resolve(node_id, probe=_probe_transport)
+            return resolution.to_dict()
+
+        result = await anyio.to_thread.run_sync(_compute)
+        _log.info("dashboard node_test_transport node_id=%s which=%s reachable=%s transport=%s identity=%s",
+                 node_id, which, result.get("reachable"), result.get("transport"),
+                 identity.email if identity else None)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/remove", methods=["POST"], include_in_schema=False)
+    async def node_remove(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        if node_id == controller.local_node_id:
+            return JSONResponse({"error": "CANNOT_REMOVE_LOCAL_NODE",
+                                "detail": "the controller's own node cannot be removed from here"},
+                                status_code=400, headers={"Cache-Control": "no-store"})
+        result = await anyio.to_thread.run_sync(
+            lambda: onboarding.remove_node(node_id, by=(identity.email if identity else None)))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    # -- machine-facing ----------------------------------------------------
+
+    @server.custom_route("/dashboard/api/enroll/consume", methods=["POST"], include_in_schema=False)
+    async def enroll_consume(request: Request) -> JSONResponse:
+        """The one unauthenticated-by-cookie route in this feature. It is
+        authenticated by the enrollment code, which is single-use and
+        short-lived; a wrong or replayed code is refused before anything
+        is created. Nothing about the request body is trusted beyond
+        being recorded: the node's claimed addresses are validated
+        (a "tailscale IP" outside 100.64.0.0/10 is filed as LAN) and its
+        claimed hostname is metadata, never an authorization input."""
+        source = (request.client.host if request.client else "unknown")
+        if _enroll_rate_limited(source):
+            return JSONResponse({"error": "RATE_LIMITED", "detail": "too many enrollment attempts"},
+                                status_code=429, headers={"Cache-Control": "no-store", "Retry-After": "60"})
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        code = str(body.get("code") or "")
+        hostname = str(body.get("hostname") or "").strip()[:255]
+        if not code or not hostname:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "code and hostname are required"},
+                                status_code=400, headers={"Cache-Control": "no-store"})
+        addresses = body.get("addresses") if isinstance(body.get("addresses"), dict) else {}
+
+        def _compute() -> dict:
+            return onboarding.consume_enrollment(
+                code, hostname=hostname, source_ip=source,
+                platform=str(body.get("platform") or "windows")[:32],
+                addresses=addresses, rescue_public_key=body.get("rescue_public_key"),
+                agent_version=str(body.get("script_version") or "")[:64] or None,
+                request_base_url=_request_base_url(request))
+
+        try:
+            result = await anyio.to_thread.run_sync(_compute)
+        except OnboardingError as exc:
+            return _onboarding_error(exc)
+        # node_id/hostname only. The response body holds the only copy of
+        # the token that will ever exist outside the node -- it is never
+        # written to a log.
+        _log.info("dashboard enroll_consume node_id=%s hostname=%s source=%s",
+                 result["node_id"], hostname, source)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/deregister", methods=["POST"], include_in_schema=False)
+    async def node_self_deregister(request: Request) -> JSONResponse:
+        """A node removing ITSELF (windows-setup.ps1 -Uninstall). Bearer-
+        authenticated with that node's own token, exactly like the
+        heartbeat route above -- a node can only ever deregister itself,
+        never another node."""
+        node_id = request.path_params["node_id"]
+        expected_token = os.environ.get(node_token_env_var(node_id))
+        header = request.headers.get("authorization", "")
+        presented = header[len("Bearer "):] if header.startswith("Bearer ") else ""
+        if not expected_token or not hmac.compare_digest(presented, expected_token):
+            return JSONResponse({"error": "UNAUTHORIZED"}, status_code=401)
+        result = await anyio.to_thread.run_sync(lambda: onboarding.remove_node(node_id, by=f"node:{node_id}"))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/enroll/windows-setup.ps1", methods=["GET"], include_in_schema=False)
+    async def enroll_setup_script(request: Request) -> Response:
+        """The GENERIC installer -- identical to the downloaded one except
+        that it has no code baked in and requires -EnrollmentCode. Served
+        without an Access cookie because the machine fetching it does not
+        have one, and safe to serve that way because it contains no
+        secret: the code, which is the only credential in this flow, is
+        supplied by the operator on the command line.
+
+        Versioned: /enroll/windows-setup.ps1?v=1.0.0 pins a version, and
+        the response always carries the version it actually served."""
+        if not terminal.config.nodes.onboarding.enabled:
+            return PlainTextResponse("Terminal MCP node onboarding is disabled on this controller.\n",
+                                     status_code=403)
+        requested = request.query_params.get("v")
+        if requested and requested != SETUP_SCRIPT_VERSION:
+            return PlainTextResponse(
+                f"Requested setup script version {requested!r} is not served by this controller "
+                f"(it has {SETUP_SCRIPT_VERSION}).\n", status_code=404)
+        controller_url = onboarding.controller_url(request_base_url=_request_base_url(request))
+        text = render_setup_script(enrollment_code=GENERIC_SETUP_CODE, controller_url=controller_url,
+                                   node_id="pending", display_name="pending", profile="minimal")
+        return PlainTextResponse(text, media_type="text/plain; charset=utf-8", headers={
+            "Cache-Control": "no-store",
+            "X-Terminal-Mcp-Setup-Version": SETUP_SCRIPT_VERSION,
+            "X-Terminal-Mcp-Setup-Sha256": script_fingerprint(text),
+            "Content-Disposition": 'attachment; filename="windows-setup.ps1"',
+        })
 
     # ---------------------------------------------------------------- Project Backlog
     # Read is gated like every other dashboard read; every WRITE goes

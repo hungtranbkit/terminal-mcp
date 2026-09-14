@@ -14,6 +14,10 @@ import uvicorn
 from .ai_usage_service import AiUsageService
 from .config import load_config
 from .connection_store import ConnectionStore
+from .enrollment import EnrollmentStore
+from .node_onboarding import OnboardingService
+from .node_transport import TransportStore
+from .rescue_gateway import RescuePortAllocator
 from .controller import LOCAL_NODE_ID, ControllerService
 from .core import TerminalService
 from .dashboard import node_token_env_var, register_dashboard
@@ -45,7 +49,33 @@ from .webauth_dashboard import register_webauth_dashboard
 _log = logging.getLogger(__name__)
 
 HTTP_HOST = "127.0.0.1"
-HTTP_PORT = 8766
+
+
+def _http_port() -> int:
+    """The loopback port this controller serves on. 8766 unless
+    TERMINAL_MCP_HTTP_PORT says otherwise.
+
+    The override exists so a SECOND controller can be brought up beside a
+    running production one -- a staging instance, or the end-to-end
+    onboarding test, which needs a real process on a real socket and must
+    never bind the port the live dashboard is on. An unparseable or
+    out-of-range value falls back to the default rather than crashing a
+    production start over a typo'd environment variable."""
+    raw = os.environ.get("TERMINAL_MCP_HTTP_PORT")
+    if not raw:
+        return 8766
+    try:
+        port = int(raw)
+    except ValueError:
+        _log.warning("TERMINAL_MCP_HTTP_PORT=%r is not a number -- using 8766", raw)
+        return 8766
+    if not (1 <= port <= 65535):
+        _log.warning("TERMINAL_MCP_HTTP_PORT=%r is out of range -- using 8766", raw)
+        return 8766
+    return port
+
+
+HTTP_PORT = _http_port()
 HTTP_PATH = "/mcp"
 
 
@@ -367,6 +397,30 @@ def main() -> None:
     # dashboard<->MCP split specifically).
     queue = QueueService()
     integration = IntegrationService()
+
+    # Self-service node onboarding (Nodes -> + Add Node -> Windows). ONE
+    # instance, real persistent default paths (~/.local/state/terminal-mcp/
+    # enrollment.db, transports.db, rescue.db) -- same "constructed once
+    # here, never the private-temp-file test default" discipline as
+    # ControllerService/NodeRegistry/ConnectionStore above. It shares this
+    # process's ConnectionStore and AuditStore on purpose: an enrolled
+    # node's bearer token lands in the SAME 0600 token store a manually
+    # connected node's does, so the re-hydration loop above brings it back
+    # after a restart with no extra code, and every enroll/revoke/remove
+    # lands in the SAME audit log as every other action.
+    onboarding = OnboardingService(
+        config, controller=controller, connection_store=connection_store,
+        enrollment_store=EnrollmentStore(), transport_store=TransportStore(),
+        port_allocator=RescuePortAllocator(
+            port_range=(config.nodes.onboarding.rescue.port_range_start,
+                        config.nodes.onboarding.rescue.port_range_end)),
+        audit=terminal.audit,
+        # The heartbeat route re-reads this env var on every inbound push;
+        # setting it here is what makes a freshly-enrolled node's very
+        # first heartbeat succeed instead of 401ing until a restart.
+        token_env_setter=lambda node_id, token: os.environ.__setitem__(node_token_env_var(node_id), token),
+    )
+
     # Same "constructed ONCE, shared by both build_mcp and register_
     # dashboard" discipline as queue/integration just above -- the
     # Kanban board's own routing_reason display and the terminal_pm_*
@@ -427,7 +481,7 @@ def main() -> None:
                        fleet=fleet)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
-                       recovery=recovery, backlog=backlog, fleet=fleet)
+                       recovery=recovery, backlog=backlog, fleet=fleet, onboarding=onboarding)
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)

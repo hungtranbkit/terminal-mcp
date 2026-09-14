@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from dataclasses import dataclass
@@ -567,6 +568,81 @@ class RemoteConnectConfig:
 
 
 @dataclass(frozen=True)
+class TailscaleOnboardConfig:
+    """Tailscale as a node's PRIMARY transport. `enabled` only expresses
+    the operator's intent -- whether a given onboarding actually uses
+    Tailscale is decided at enrollment time by whether this controller
+    itself is on a tailnet (node_onboarding.detect_controller_tailscale),
+    so a deployment with no tailnet silently falls back to LAN + rescue
+    instead of generating an installer that cannot possibly work.
+
+    auth_key_env names the ENVIRONMENT VARIABLE holding a Tailscale auth
+    key, never the key itself -- same posture as RemoteNodeConfig.
+    token_env. The key is handed to a node exactly once, inside the
+    authenticated enrollment-exchange response, and never written into
+    the downloadable script or any log line. Leave it unset and the
+    installer prints an interactive `tailscale up` instruction instead:
+    one extra manual step, zero reusable secret in flight."""
+    enabled: bool = True
+    auth_key_env: str = "TERMINAL_MCP_TAILSCALE_AUTH_KEY"
+    tags: tuple[str, ...] = ()
+    unattended: bool = True
+    login_server: str = ""  # Headscale/self-hosted coordination server, if any
+
+
+@dataclass(frozen=True)
+class RescueTunnelConfig:
+    """The reverse-SSH rescue path (rescue_gateway.py). OFF by default and
+    deliberately so: turning it on without a real gateway would produce
+    installers that fail halfway. With `enabled: false` the whole feature
+    reports `configured=false, reason=rescue_disabled` everywhere it is
+    surfaced, and onboarding still completes over the primary path.
+
+    gateway_host_key is one known_hosts line -- a PUBLIC key, safe in
+    config.yaml and safe to ship to a node. There is deliberately no
+    field here for a PRIVATE key: the node generates its own keypair
+    locally and only its public half ever reaches this controller."""
+    enabled: bool = False
+    gateway_host: str = ""
+    gateway_port: int = 22
+    gateway_user: str = ""
+    gateway_host_key: str = ""
+    port_range_start: int = 22000
+    port_range_end: int = 22999
+    keepalive_interval_seconds: int = 30
+    keepalive_count_max: int = 3
+    retry_seconds: int = 15
+
+
+@dataclass(frozen=True)
+class OnboardingConfig:
+    """Self-service node onboarding (Nodes -> + Add Node -> Windows).
+
+    controller_url is what the generated installer calls back to. Empty
+    (the default) means "derive it from the request that asked for the
+    script", which is right for every normal deployment and wrong only
+    behind a proxy that rewrites Host -- set it explicitly there.
+
+    controller_ssh_public_key(_file) is the PUBLIC key the installer
+    installs into the new node's authorized_keys so this controller can
+    SSH in. A public key: safe in config, safe in the payload, useless to
+    anyone who intercepts it."""
+    enabled: bool = True
+    enrollment_ttl_seconds: int = 900
+    controller_url: str = ""
+    controller_ssh_public_key: str = ""
+    controller_ssh_public_key_file: str = ""
+    agent_port: int = 8790
+    heartbeat_interval_seconds: int = 30
+    # Firewall: which source range the installer opens inbound TCP 22 to
+    # on the node. Default is Tailscale's CGNAT range -- NOT "any", so a
+    # laptop that later joins a cafe network is not serving sshd to it.
+    ssh_firewall_cidrs: tuple[str, ...] = ("100.64.0.0/10",)
+    tailscale: TailscaleOnboardConfig = TailscaleOnboardConfig()
+    rescue: RescueTunnelConfig = RescueTunnelConfig()
+
+
+@dataclass(frozen=True)
 class NodesConfig:
     """Multi-node session management (controller.py/node_registry.py/
     scheduler.py). overload_thresholds/heartbeat_thresholds are the exact
@@ -580,6 +656,7 @@ class NodesConfig:
     remote_nodes: tuple[RemoteNodeConfig, ...] = ()
     discovery: DiscoveryConfig = DiscoveryConfig()
     remote_connect: RemoteConnectConfig = RemoteConnectConfig()
+    onboarding: OnboardingConfig = OnboardingConfig()
 
 
 @dataclass(frozen=True)
@@ -920,9 +997,11 @@ def load_config(path: str | Path | None = None) -> AppConfig:
                                                                remote_connect_defaults.bootstrap_timeout_seconds)),
     )
 
+    onboarding_config = _load_onboarding_config(nodes_raw.get("onboarding", {}))
+
     nodes_config = NodesConfig(overload_thresholds=overload_thresholds, heartbeat_thresholds=heartbeat_thresholds,
                                remote_nodes=tuple(remote_nodes), discovery=discovery_config,
-                               remote_connect=remote_connect_config)
+                               remote_connect=remote_connect_config, onboarding=onboarding_config)
 
     return AppConfig(
         permissions=PermissionsConfig(
@@ -976,6 +1055,119 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         submit_watchdog=watchdog_config,
         ai_usage=_load_ai_usage_config(raw.get("ai_usage", {})),
         auto_recovery=_load_auto_recovery_config(raw.get("auto_recovery", {})),
+    )
+
+
+def _load_onboarding_config(raw: object) -> OnboardingConfig:
+    """nodes.onboarding -- validated hard, because every field here ends up
+    inside a script that runs as Administrator on someone else's machine.
+    An invalid value is a startup error, never a silently-corrected
+    default: a typo'd port range that quietly became 22000-22999 would be
+    discovered as a port collision months later."""
+    if not isinstance(raw, dict):
+        raise ValueError("nodes.onboarding must be a mapping")
+    defaults = OnboardingConfig()
+
+    ttl = int(raw.get("enrollment_ttl_seconds", defaults.enrollment_ttl_seconds))
+    if ttl < 60 or ttl > 86400:
+        raise ValueError("nodes.onboarding.enrollment_ttl_seconds must be between 60 and 86400")
+    agent_port = int(raw.get("agent_port", defaults.agent_port))
+    if not (1 <= agent_port <= 65535):
+        raise ValueError("nodes.onboarding.agent_port must be a valid TCP port")
+    heartbeat = int(raw.get("heartbeat_interval_seconds", defaults.heartbeat_interval_seconds))
+    if heartbeat < 5:
+        raise ValueError("nodes.onboarding.heartbeat_interval_seconds must be at least 5")
+    controller_url = str(raw.get("controller_url", defaults.controller_url) or "").strip()
+    if controller_url and not controller_url.startswith(("http://", "https://")):
+        raise ValueError("nodes.onboarding.controller_url must start with http:// or https://")
+
+    firewall_raw = raw.get("ssh_firewall_cidrs", defaults.ssh_firewall_cidrs)
+    if isinstance(firewall_raw, str):
+        firewall_raw = [firewall_raw]
+    if not isinstance(firewall_raw, (list, tuple)):
+        raise ValueError("nodes.onboarding.ssh_firewall_cidrs must be a list of CIDRs")
+    firewall_cidrs = []
+    for entry in firewall_raw:
+        text = str(entry).strip()
+        if not text:
+            continue
+        if text.lower() in ("any", "0.0.0.0/0", "*"):
+            # Allowed, but only when spelled out -- see the field comment.
+            firewall_cidrs.append("any")
+            continue
+        try:
+            ipaddress.ip_network(text, strict=False)
+        except ValueError as exc:
+            raise ValueError(f"nodes.onboarding.ssh_firewall_cidrs entry {text!r} is not a CIDR: {exc}") from exc
+        firewall_cidrs.append(text)
+
+    tailscale_raw = raw.get("tailscale", {})
+    if not isinstance(tailscale_raw, dict):
+        raise ValueError("nodes.onboarding.tailscale must be a mapping")
+    ts_defaults = TailscaleOnboardConfig()
+    tags_raw = tailscale_raw.get("tags", ts_defaults.tags)
+    if isinstance(tags_raw, str):
+        tags_raw = [tags_raw]
+    if not isinstance(tags_raw, (list, tuple)):
+        raise ValueError("nodes.onboarding.tailscale.tags must be a list")
+    tailscale = TailscaleOnboardConfig(
+        enabled=bool(tailscale_raw.get("enabled", ts_defaults.enabled)),
+        auth_key_env=str(tailscale_raw.get("auth_key_env", ts_defaults.auth_key_env) or "").strip(),
+        tags=tuple(str(tag).strip() for tag in tags_raw if str(tag).strip()),
+        unattended=bool(tailscale_raw.get("unattended", ts_defaults.unattended)),
+        login_server=str(tailscale_raw.get("login_server", ts_defaults.login_server) or "").strip(),
+    )
+    if tailscale.login_server and not tailscale.login_server.startswith(("http://", "https://")):
+        raise ValueError("nodes.onboarding.tailscale.login_server must start with http:// or https://")
+    # A key inline in config.yaml is the one thing this whole design exists
+    # to prevent -- refuse it loudly rather than accept and redact it.
+    if "auth_key" in tailscale_raw:
+        raise ValueError("nodes.onboarding.tailscale.auth_key is not accepted -- put the key in an environment "
+                         "variable and name it with auth_key_env instead")
+
+    rescue_raw = raw.get("rescue", {})
+    if not isinstance(rescue_raw, dict):
+        raise ValueError("nodes.onboarding.rescue must be a mapping")
+    for forbidden in ("gateway_private_key", "private_key", "gateway_password", "password"):
+        if forbidden in rescue_raw:
+            raise ValueError(f"nodes.onboarding.rescue.{forbidden} is not accepted -- the rescue tunnel uses a "
+                             "keypair the NODE generates locally; this controller never holds a node private key")
+    rs_defaults = RescueTunnelConfig()
+    rescue = RescueTunnelConfig(
+        enabled=bool(rescue_raw.get("enabled", rs_defaults.enabled)),
+        gateway_host=str(rescue_raw.get("gateway_host", rs_defaults.gateway_host) or "").strip(),
+        gateway_port=int(rescue_raw.get("gateway_port", rs_defaults.gateway_port)),
+        gateway_user=str(rescue_raw.get("gateway_user", rs_defaults.gateway_user) or "").strip(),
+        gateway_host_key=str(rescue_raw.get("gateway_host_key", rs_defaults.gateway_host_key) or "").strip(),
+        port_range_start=int(rescue_raw.get("port_range_start", rs_defaults.port_range_start)),
+        port_range_end=int(rescue_raw.get("port_range_end", rs_defaults.port_range_end)),
+        keepalive_interval_seconds=int(rescue_raw.get("keepalive_interval_seconds",
+                                                      rs_defaults.keepalive_interval_seconds)),
+        keepalive_count_max=int(rescue_raw.get("keepalive_count_max", rs_defaults.keepalive_count_max)),
+        retry_seconds=int(rescue_raw.get("retry_seconds", rs_defaults.retry_seconds)),
+    )
+    if not (1 <= rescue.gateway_port <= 65535):
+        raise ValueError("nodes.onboarding.rescue.gateway_port must be a valid TCP port")
+    if rescue.port_range_start < 1024 or rescue.port_range_end > 65535:
+        raise ValueError("nodes.onboarding.rescue port range must lie within 1024-65535")
+    if rescue.port_range_start > rescue.port_range_end:
+        raise ValueError("nodes.onboarding.rescue.port_range_start must be <= port_range_end")
+    if rescue.keepalive_interval_seconds < 5 or rescue.keepalive_count_max < 1 or rescue.retry_seconds < 5:
+        raise ValueError("nodes.onboarding.rescue keepalive/retry values are too small to be useful")
+
+    return OnboardingConfig(
+        enabled=bool(raw.get("enabled", defaults.enabled)),
+        enrollment_ttl_seconds=ttl,
+        controller_url=controller_url,
+        controller_ssh_public_key=str(raw.get("controller_ssh_public_key",
+                                              defaults.controller_ssh_public_key) or "").strip(),
+        controller_ssh_public_key_file=str(raw.get("controller_ssh_public_key_file",
+                                                   defaults.controller_ssh_public_key_file) or "").strip(),
+        agent_port=agent_port,
+        heartbeat_interval_seconds=heartbeat,
+        ssh_firewall_cidrs=tuple(firewall_cidrs) or defaults.ssh_firewall_cidrs,
+        tailscale=tailscale,
+        rescue=rescue,
     )
 
 

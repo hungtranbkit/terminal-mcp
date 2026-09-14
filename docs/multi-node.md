@@ -9,6 +9,15 @@ through the real production controller, not just the test suite. See
 **Windows node support** and **Bringing up the M910** below for exactly
 what was verified on each and what (if anything) still isn't.
 
+> **Adding a Windows machine?** Use **Dashboard → Nodes → `+ Add Node` →
+> Windows** and see [docs/windows-node-onboarding.md](windows-node-onboarding.md).
+> That flow (one-time enrollment code → one PowerShell script → OpenSSH +
+> optional Tailscale primary + reverse-SSH rescue + heartbeat, all
+> reboot-persistent) replaces the manual "edit config.yaml, export a token
+> env var, restart the controller" steps described further down this page
+> for the Windows case. Those manual steps remain correct and supported
+> for Linux/macOS and for installing the full `terminal-node-agent`.
+
 ## What this is
 
 Converts Terminal MCP from a single-host tmux manager into a Controller

@@ -155,3 +155,54 @@ supervisor:
 #       token_env: TERMINAL_MCP_NODE_TOKEN_M910
 #       max_sessions: 20
 #       timeout_seconds: 10.0
+#
+#   # Self-service node onboarding -- Dashboard > Nodes > "+ Add Node".
+#   # See docs/windows-node-onboarding.md. Every field below is optional:
+#   # with none of it set, a Windows machine still enrols over its LAN
+#   # address, with a manual `tailscale up` and no rescue tunnel, and the
+#   # form says so up front rather than generating an installer that
+#   # cannot work.
+#   onboarding:
+#     enabled: true
+#     enrollment_ttl_seconds: 900        # 60..86400; codes are single-use
+#     # What the generated installer calls back to. Empty (the default) =
+#     # derive it from this controller's own tailnet address, else from the
+#     # request's Host header. Set it explicitly behind a proxy that
+#     # rewrites Host.
+#     controller_url: "http://100.100.0.1:8766"
+#     # The PUBLIC key installed into the new node's
+#     # administrators_authorized_keys so this controller can SSH in.
+#     # Defaults to ~/.ssh/id_ed25519.pub. A private key here is REFUSED.
+#     controller_ssh_public_key_file: "/home/you/.ssh/id_ed25519.pub"
+#     agent_port: 8790
+#     heartbeat_interval_seconds: 30
+#     # Which sources the node opens inbound TCP 22 to. Default is
+#     # Tailscale's CGNAT range -- deliberately not "any", so a laptop that
+#     # later joins a cafe network is not serving sshd to it.
+#     ssh_firewall_cidrs: ["100.64.0.0/10"]
+#     tailscale:
+#       enabled: true
+#       # The NAME of the env var holding an auth key, never the key. An
+#       # inline `auth_key:` here is refused at startup. Unset => the
+#       # installer prints an interactive `tailscale up` step instead,
+#       # which is the posture with no reusable secret in flight.
+#       auth_key_env: TERMINAL_MCP_TAILSCALE_AUTH_KEY
+#       tags: []
+#       unattended: true
+#       login_server: ""                 # Headscale/self-hosted, if any
+#     # Reverse-SSH rescue tunnel (rescue_gateway.py). OFF until you have
+#     # actually stood a gateway up -- see the doc's "Standing up a rescue
+#     # gateway". gateway_host_key is one PUBLIC known_hosts line
+#     # (`ssh-keyscan -t ed25519 <host>`); there is no field for a private
+#     # key because the NODE generates its own and never shares it.
+#     rescue:
+#       enabled: false
+#       gateway_host: "gw.example.net"
+#       gateway_port: 22
+#       gateway_user: "tunnel"
+#       gateway_host_key: "gw.example.net ssh-ed25519 AAAA..."
+#       port_range_start: 22000
+#       port_range_end: 22999
+#       keepalive_interval_seconds: 30
+#       keepalive_count_max: 3
+#       retry_seconds: 15
