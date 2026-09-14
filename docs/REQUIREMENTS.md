@@ -3752,13 +3752,17 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
 - **API/tool/command:** no MCP tool and no route — this is an offline
   measuring instrument. `terminal_mcp/efficiency_benchmark.py` (corpus,
   baseline, assisted measurement, aggregation, pre-registered acceptance,
-  derived conclusions, markdown rendering);
-  `scripts/benchmark/mine_corpus.py`; `scripts/benchmark/run_tokeff_benchmark.py`.
+  map provenance, derived conclusions, markdown rendering);
+  `scripts/benchmark/mine_corpus.py`; `scripts/benchmark/run_tokeff_benchmark.py`;
+  `scripts/knowledge/index_modules.py`.
   Nothing is deployed and nothing outside the given output paths is written;
   a telemetry database is never CREATED by the run, because creating an
   empty one and reading zero out of it would turn "nothing was recorded"
   into a measurement.
-- **Acceptance/tests/evidence:** `tests/test_efficiency_benchmark.py` (33) —
+- **Acceptance/tests/evidence:** `tests/test_efficiency_benchmark.py` (41) —
+  including the map's own guards (every package file claimed exactly once,
+  every indexed path still exists, provenance recorded beside the
+  measurement) —
   validates every REAL case against real git, asserts synthetic cases are
   marked, and pins the anti-flattery rules (a miss earns nothing, leave-one-
   out holds, a weak module match is no match, usage is UNAVAILABLE until a
@@ -3767,7 +3771,8 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
   committed corpus).
 - **Known limitations:** (1) the locating surface is a proxy for files read,
   not a measurement of them — labelled ESTIMATE everywhere it appears;
-  (2) the mapped stratum is underpowered at 7 cases; (3) the runbook
+  (2) strata under ten cases are underpowered and flagged as such;
+  (3) the runbook
   registry's own claim (calling a procedure instead of re-deriving a
   command, and a one-line PASS instead of a log) is NOT measured here — the
   four metrics this task names do not capture it, and inventing a weak
@@ -4384,18 +4389,21 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
 
 ---
 
-27. **The knowledge map covers ~12% of this package, and that -- not the
-    retrieval code -- is what limits the briefing (found by the 2026-09-14
-    token-efficiency benchmark).** 9 modules / 19 paths are indexed against
-    ~150 source files; 11 of 18 real benchmark bugs had their fix site
-    outside the map entirely, where no briefing can help by construction.
-    The capability is built and works; what is missing is indexed coverage of
-    the modules real bugs land in (`core.py`, `adapters.py`, `lifecycle.py`,
-    `config.py`, `status.py`, `recovery_engine.py`, `server_http.py`,
-    `controller.py`, `doctor.py` among them). Re-running
-    `scripts/benchmark/run_tokeff_benchmark.py` after indexing is how to find
-    out whether the mapped-stratum direction (5 of 7 located) survives a
-    larger sample.
+27. **The knowledge map covers ~12% of this package — DONE, 2026-09-15, and
+    it did not produce the improvement it was expected to.** The package is
+    now indexed completely: 33 modules / 147 paths, every `terminal_mcp/*.py`
+    claimed exactly once, enforced by `scripts/knowledge/index_modules.py`
+    and by `tests/test_efficiency_benchmark.py`. Re-running the benchmark
+    (`docs/TOKEFF_BENCHMARK.md`, "How this has moved") measured: the briefing
+    now names the fix site in 8 of 17 comparable cases instead of 5, and
+    leaves a worker doing full re-analysis in 7 cases instead of 12 — but it
+    beats the luckiest single grep LESS often (1/8 vs 2/5), because a
+    briefing drawn from a real module is 4.67 files where the near-empty map
+    produced 0.61. The headline verdict is still FAIL. Two consequences are
+    now the open work, below (items 30 and 31). A side effect worth naming:
+    `test_dogfood_work_v1.py`'s strict test (`TERMINAL_MCP_DOGFOOD_STRICT=1`)
+    passes for the first time — the planning pipeline really does consult the
+    map now.
 
 28. **Module choice depends on the report naming the module (same
     benchmark).** The synthetic mirror pair is the evidence: one defect,
@@ -4419,6 +4427,41 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
     in the benchmark: the logs available on this host are healthcheck-sized
     (41-297 bytes) and a saving computed from them would have been a number
     that looked like evidence.
+
+30. **Module choice scores a shared identifier as strongly as a
+    discriminating one (found by the 2026-09-15 benchmark re-run).**
+    `work_reuse._score_module` awards 0.45 for any identifier overlap, so a
+    token that appears in many modules' file names counts as much as one that
+    names a single module. With 9 modules this rarely bit; with 33 it
+    dominates. Measured examples from the real corpus: `client-side CSI regex
+    leak` in `dashboard.py` matched `nodes` on the token "client"
+    (`node_client.py`); two dashboard bugs went to `webauth`, which ties with
+    `work_ui` at 0.477/0.483 because `webauth_dashboard.py` also contains the
+    token "dashboard", and the shipped ordering `(-score, name)` puts
+    `webauth` first alphabetically. `engine`, `loop`, `registry`, `service`,
+    `session`, `store` and `work` are each shared by three or more modules
+    today. Candidate direction, not attempted here (it would have been tuning
+    the scorer against the corpus that found it): weight an identifier match
+    by how few modules contain that token, and report a tie as ambiguous
+    rather than resolving it alphabetically.
+
+31. **Six modules carry no summary because their largest file has no module
+    docstring** (`config`, `http_api`, `mcp_surface`, `security`,
+    `session_ops`, `work_ui` — 2026-09-15). The indexer generates summaries
+    mechanically from the code's own docstrings, deliberately, so that no
+    summary is written to match a bug report's wording after the fact. The
+    honest consequence is that these six are found by identifier alone. The
+    fix belongs in the code: give `core.py`, `dashboard.py`, `config.py`,
+    `mcp_app.py`, `server_http.py` and `audit.py` real module docstrings, and
+    re-index. That is a change to the source, not to the map, and the
+    benchmark will measure whether it moves anything. A second, smaller
+    limitation of the same rule, recorded rather than quietly accepted: the
+    summary is the LARGEST file's first sentence, so one file speaks for the
+    whole module (`auth` is described by `enrollment.py`, `capabilities` by
+    `host_metrics.py`). Combining the top few files' sentences would describe
+    more of each module; it was not done in this pass because every further
+    rule variant chosen by its benchmark score fits the instrument a little
+    more tightly to this one corpus.
 
 ## Project Backlog (planning layer) — IMPLEMENTED
 
