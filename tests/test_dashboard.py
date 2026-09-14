@@ -1611,6 +1611,12 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # capture and bulk-priority are _mutation_guard'ed writes, because they
         # create and reprioritise durable issue records.
         "/dashboard/api/inbox": {"GET", "HEAD"},
+        # Worktree Janitor panel (docs/WORKTREE_JANITOR.md, P5). The GET is a
+        # read-only report; the POST records an approve/abandon decision and is
+        # mutation-guarded like every sibling. There is deliberately NO
+        # force/delete route -- the absence is part of the contract.
+        "/dashboard/api/worktrees": {"GET", "HEAD"},
+        "/dashboard/api/worktrees/review": {"POST"},
         "/dashboard/api/inbox/capture": {"POST"},
         "/dashboard/api/inbox/priority": {"POST"},
         # Fleet Metadata Registry -- a later, separate feature. Three reads

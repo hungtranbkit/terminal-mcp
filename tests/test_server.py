@@ -288,6 +288,9 @@ async def test_server_registers_v1_and_binding_tools():
         # the background loop disabled.
         "terminal_worktree_sweep_run_once",
         "terminal_worktree_sweep_status",
+        # P5 operator surface. READ-ONLY -- it reports, and the review
+        # decision route lives on the dashboard (auth+CSRF), not here.
+        "terminal_worktree_janitor_report",
         # Delivery discipline: Definition of Ready (§20.6 Phase A).
         "terminal_task_check_dor",
         # Incident lane (§20.6 Phase B).

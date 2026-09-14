@@ -694,11 +694,26 @@ def classify(worktree: dict[str, Any], policy: JanitorPolicy, *,
         policy_class=policy_class, reasons=reasons, predicates=tuple(predicates),
         evidence={"mode": policy.mode, "integration_ref": policy.integration_ref,
                   "classified_at": time.time() if now is None else now,
+                  # The WORKTREE's own age, not the classification's. "Oldest
+                  # candidate" means the worktree that has sat around longest;
+                  # deriving it from classified_at (as the first version of the
+                  # P5 report did) yields ~0 for everything, because we classify
+                  # everything at the same moment.
+                  "worktree_age_seconds": _age_seconds(path, now),
                   "predicates": {p.name: p.value for p in predicates}},
         worktree_path=path, branch=branch.strip() if code == 0 else None,
         head=head.strip() if head_code == 0 else None,
         task_id=(task or {}).get("id"), node_id=str(worktree.get("node_id") or "") or None,
         size_bytes=size, size_partial=partial)
+
+
+def _age_seconds(path: str, now: float | None = None) -> float | None:
+    """How long this worktree has existed, from its own mtime. None when it
+    cannot be stat'd -- never 0, which would read as "brand new"."""
+    try:
+        return max(0.0, (time.time() if now is None else now) - Path(path).stat().st_mtime)
+    except OSError:
+        return None
 
 
 def reclaimable_bytes(path: str, *, max_entries: int = 200_000) -> tuple[int, bool]:

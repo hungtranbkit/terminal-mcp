@@ -2864,6 +2864,49 @@ def build_mcp(service: TerminalService | None = None,
         return sweep.run_once()
 
     @server.tool()
+    def terminal_worktree_janitor_report(repo_path: str = "") -> dict:
+        """The Worktree Janitor report an operator reads -- the SAME data the
+        dashboard panel shows (docs/WORKTREE_JANITOR.md, P5).
+
+        READ-ONLY. Summarises classifications: reclaimable bytes by class, the
+        review queue, BLOCKED items with their reasons in plain language
+        alongside the machine codes, the oldest candidate, and whether anything
+        is enforcing (`observe_only` is true unless mode is auto_execute).
+
+        `reclaimable_bytes` counts AUTO_SAFE only -- BLOCKED and REVIEW items
+        are not going to be removed, so including them would promise space that
+        is not coming.
+
+        Sensitive ignored files are named by PATH only, never by content. There
+        is no force option here or anywhere else in this surface."""
+        from . import worktree_janitor, worktree_review
+
+        config = terminal.config.worktree_janitor
+        roots = [repo_path.strip()] if repo_path.strip() else list(config.repo_roots)
+        if not roots:
+            return {"error": "NO_REPO_ROOTS", "mode": config.mode,
+                    "observe_only": config.mode != "auto_execute",
+                    "detail": "configure worktree_janitor.repo_roots, or pass repo_path",
+                    "candidates": [], "counts": {}}
+        candidates: list[dict] = []
+        errors: list[dict] = []
+        for root in roots:
+            report = worktree_janitor.scan(root, config.to_policy())
+            if report.get("error"):
+                errors.append({"repo_path": root, "error": report["error"]})
+            candidates.extend(report.get("candidates") or [])
+        payload = worktree_review.build_report(candidates, mode=config.mode)
+        payload["repo_roots"] = roots
+        if errors:
+            # Surfaced rather than folded into the totals: a root that could not
+            # be scanned is not a root with nothing in it.
+            payload["errors"] = errors
+            payload["complete"] = False
+        else:
+            payload["complete"] = True
+        return payload
+
+    @server.tool()
     def terminal_worktree_sweep_status() -> dict:
         """Whether the sweep loop is running, its configured bounds, and the
         last pass's report. Read-only."""
