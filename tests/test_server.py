@@ -107,6 +107,18 @@ async def test_server_registers_v1_and_binding_tools():
         "work_inbox_request_hint",
         "work_inbox_answer_hint",
         "work_inbox_history",
+        # Work v1: a generic spec/plan surface -- decompose a requirement,
+        # gate the spec, select the tests it needs. Two more defs land in
+        # mcp_app alongside these (_gate_report, _spec_store) but are private
+        # helpers, not registered tools, which is why this list is 8 not 10.
+        "work_spec_create",
+        "work_spec_get",
+        "work_spec_list",
+        "work_spec_update",
+        "work_spec_gate",
+        "work_plan",
+        "work_plan_redefine",
+        "work_test_selection",
         # Session permission management: ChatGPT could rename a session but
         # had no way to grant or revoke access to one -- that took an SSH
         # session and a config edit.
