@@ -10422,6 +10422,13 @@ GLOBAL_TASKS_HTML = """<!doctype html>
     document.querySelector('#refreshBtn').onclick = load;
     sessionFilterEl.addEventListener('input', () => renderBoard(lastData));
 
+    let ntRequestKey = null;
+    function newRequestKey() {
+      // crypto.randomUUID is not available on every browser/origin this
+      // dashboard is opened from, so fall back rather than throw.
+      if (window.crypto && window.crypto.randomUUID) return 'dash-' + window.crypto.randomUUID();
+      return 'dash-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    }
     const newTaskPanelEl = document.querySelector('#newTaskPanel');
     document.querySelector('#newTaskBtn').onclick = () => { newTaskPanelEl.hidden = false; document.querySelector('#ntTitle').focus(); };
     document.querySelector('#ntCancelBtn').onclick = () => { newTaskPanelEl.hidden = true; };
@@ -10433,17 +10440,34 @@ GLOBAL_TASKS_HTML = """<!doctype html>
       const errEl = document.querySelector('#ntError');
       if (!prompt) { errEl.textContent = 'Prompt là bắt buộc.'; return; }
       errEl.textContent = '';
+      const btn = document.querySelector('#ntSubmitBtn');
+      if (btn.disabled) return;          // a second click of one submission
+      // One key per SUBMISSION, not per click and not per page load. It
+      // survives every retry of this submission -- including a reconnect --
+      // and is cleared only once the server has accepted it, so the next
+      // real submission is a new request rather than a replay of this one.
+      if (!ntRequestKey) ntRequestKey = newRequestKey();
+      btn.disabled = true;
       try {
         const result = await fetchJSON('/dashboard/api/tasks/create', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({title, prompt, session, project}),
+          body: JSON.stringify({title, prompt, session, project, request_key: ntRequestKey}),
         });
         if (result && result.error) { errEl.textContent = clean(result.error); return; }
+        if (result && result.payload_conflict) {
+          errEl.textContent = clean(result.conflict_detail || 'request_key conflict');
+          return;
+        }
+        ntRequestKey = null;             // accepted -- the next submit is new
         document.querySelector('#ntTitle').value = ''; document.querySelector('#ntPrompt').value = '';
         document.querySelector('#ntSession').value = ''; document.querySelector('#ntProject').value = '';
         newTaskPanelEl.hidden = true;
         await load();
-      } catch (error) { errEl.textContent = clean(error.message || error); }
+      } catch (error) {
+        // Keep ntRequestKey: this submission is unfinished, and the retry
+        // must be the SAME request, not a second one.
+        errEl.textContent = clean(error.message || error);
+      } finally { btn.disabled = false; }
     };
 
     load(); setInterval(load, 4000);
@@ -13468,9 +13492,18 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         project = body.get("project") if isinstance(body.get("project"), str) and body.get("project") else None
         if session is not None and not terminal._read_authorized(session):
             return JSONResponse({"error": "READ_RESTRICTED", "session": session}, status_code=403)
-        _log.info("dashboard task_create session=%s identity=%s", session, identity.email if identity else None)
+        # Idempotency. The browser mints one key per submission and reuses it
+        # across every retry of THAT submission, so a double-click, a resent
+        # request after a dropped connection, or a reconnect mid-flight all
+        # resolve to the one task the first attempt created. Absent (an older
+        # page, a non-dashboard caller) behaves exactly as before.
+        request_key = body.get("request_key") if isinstance(body.get("request_key"), str) else None
+        request_key = (request_key or "").strip()[:200] or None
+        _log.info("dashboard task_create session=%s identity=%s request_key=%s",
+                  session, identity.email if identity else None, bool(request_key))
         result = await anyio.to_thread.run_sync(
-            lambda: queue.create_task(title or "", prompt, session=session, project=project)
+            lambda: queue.create_task(title or "", prompt, session=session, project=project,
+                                      request_key=request_key)
         )
         status_code = 200 if "error" not in result else 400
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
@@ -13549,9 +13582,13 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         title = body.get("title") if isinstance(body.get("title"), str) else None
         priority = body.get("priority") if isinstance(body.get("priority"), int) else 0
-        _log.info("dashboard queue_enqueue session=%s identity=%s", name, identity.email if identity else None)
+        request_key = body.get("request_key") if isinstance(body.get("request_key"), str) else None
+        request_key = (request_key or "").strip()[:200] or None
+        _log.info("dashboard queue_enqueue session=%s identity=%s request_key=%s",
+                  name, identity.email if identity else None, bool(request_key))
         result = await anyio.to_thread.run_sync(
-            lambda: queue.enqueue(name, prompt, title=title, priority=priority)
+            lambda: queue.enqueue(name, prompt, title=title, priority=priority,
+                                  request_key=request_key)
         )
         status_code = 200 if "error" not in result else 400
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
