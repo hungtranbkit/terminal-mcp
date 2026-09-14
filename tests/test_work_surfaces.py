@@ -125,6 +125,19 @@ def test_risky_procedures_are_not_auto_invokable_from_mcp():
     assert "allow_risky=allow_risky" in body
 
 
+def test_the_procedure_tool_routes_operations_through_the_registry():
+    body = inspect.getsource(mcp_app).split("def work_procedures(", 1)[1][:3000]
+    # Naming a target is the request to run it -- requiring action="run" as
+    # well is one more thing to know before the registry can be used at all.
+    assert 'or ("run" if procedure_id.strip() else "list")' in body
+    # run_operation, not run: "test"/"build"/"deploy"/"smoke" must resolve and
+    # register on the way through, not be rejected as unknown ids.
+    assert "registry.run_operation(" in body
+    # as_context(), so a PASS cannot carry a log excerpt or a script path.
+    assert "result.as_context()" in body
+    assert "result.as_dict()" not in body
+
+
 def test_the_policy_tool_supports_subset_loading():
     body = inspect.getsource(mcp_app).split("def work_policy(", 1)[1][:2400]
     assert "sections" in body

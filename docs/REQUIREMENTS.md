@@ -1846,6 +1846,106 @@ listed in §19, plus the living-requirements convention itself. This
 section is the backfill the user asked for; §1-§19 above are the fast-
 scan/audit view over the SAME facts.)*
 
+### Runbook registry is the DEFAULT path for test/build/deploy/smoke — 2026-09-14
+
+- **Goal / user value:** `procedures.py` already held the runbooks (status
+  VERIFIED/STALE/BROKEN, dependency-fingerprint caching, one-line output),
+  but it could only be reached by a caller who already knew a procedure
+  id — so a worker that had not been *told* about the registry simply
+  re-derived the command, which is the exact cost the registry exists to
+  remove. Now the word a worker would use anyway (`test`, `build`,
+  `deploy`, `smoke`, `health`) IS the address, and the registry populates
+  itself on the way through.
+- **Status:** VERIFIED (unit + contract tests; the repo's own
+  `scripts/agent/*` runbooks resolve through it).
+- **Scope / flow:** `procedures.Operation`/`OPERATIONS` name the five
+  operations and their spellings (`tests`, `pytest`, `regression`,
+  `restart`, `healthcheck`, …; `resolve_operation` is case- and
+  hyphen-insensitive). `ProcedureRegistry.run_operation(target)` is the
+  entry point and accepts an operation name OR a registered procedure id:
+  it resolves, calls `ensure_operations()` if nothing serves that
+  operation yet, then runs. `ensure_operations()` is idempotent and
+  ordered so nothing can drift: (1) an already-registered id wins outright
+  (a declared `depends_on`/`risk` is never overwritten by discovery), (2)
+  then what the repository ALREADY runs (`make test`, `scripts/ci.sh`, …
+  via `discover_existing`), (3) only then the conventional
+  `scripts/agent/<op>.sh`. **Nothing is generated** — an operation the
+  repository cannot perform is reported `absent`, never filled with an
+  invented script. Auto-registered test/build procedures get a default
+  `depends_on` (top-level source/test trees, capped at 8); a discovered
+  `deploy_preview`/`deploy_staging` keeps its own risk level rather than
+  the operation's production default.
+- **Output contract (the token-economy half):** `ProcedureResult`
+  gained `operation`, `status` (the registry's verdict BEFORE the run) and
+  `inspect`. `as_context()` is what callers spend context on: a PASS is
+  one line plus a log path and **nothing else**; a FAIL adds stage, exit
+  code, the failing region and `inspect {script, command, log_path, why}`.
+  The script path is therefore returned only on failure — the "inspect
+  only when it fails" rule expressed as data, not as an instruction to
+  remember. A VERIFIED+fresh result is reused (`from_cache`), a STALE one
+  is re-run rather than read, and a BROKEN one names the vanished script
+  without running anything.
+- **Two correctness fixes shipped with it:** (a) a procedure with an
+  EMPTY `depends_on` was keyed on the commit alone, so an uncommitted edit
+  left the fingerprint identical and a stale PASS could be reused; it is
+  now keyed on the working tree's dirty state (`git status --porcelain`
+  plus each listed path's mtime/size, with the registry's own
+  `.projectflow/` bookkeeping excluded so a recorded run cannot invalidate
+  the next one). (b) `_script_exists` passed a relative script path to
+  `shutil.which`, which resolves against the SERVER's working directory —
+  a deleted script looked present whenever a same-named path existed under
+  wherever the process happened to run. A relative path is now only ever
+  resolved against the repository.
+- **UI route/screen:** unchanged — `/dashboard/api/procedures` still
+  lists, never runs, and shows the new registrations like any other.
+- **API/tool/command:** `work_procedures` unchanged in name and count (no
+  new MCP tool). Naming a target now implies `action="run"`
+  (`work_procedures(procedure_id="test")`), an empty call still lists, and
+  `list` also reports the operation names. New `action="ensure"` registers
+  without running anything. The run path returns `as_context()`.
+  `work_planning.plan()` calls `ensure_operations()` before its reuse
+  stage, so "is there already a way to do this?" is asked against a
+  populated registry (failure there is a recorded gap, not a planning
+  error). `task_classifier`'s gate step and `AGENT_KNOWLEDGE_POLICY` now
+  name the call instead of describing it.
+- **Config/permission:** none new. Risk policy is unchanged and still
+  binding: `deploy` resolves to `deploy_restart` (risk `production`) and
+  is REFUSED with stage `policy` unless the caller passes `allow_risky` —
+  routing a deploy through the registry made it repeatable, never
+  automatic.
+- **Data/schema/migration:** none. `PROCEDURE_STATE.json` keeps
+  `schema_version` 1; auto-registered entries are ordinary rows with
+  `source: "discovered"`, and run evidence stays machine-local as before.
+- **Acceptance/tests/evidence:** `tests/test_procedures.py` — new "the
+  registry as the DEFAULT path" section: conventional scripts register
+  themselves, a repo-native `make test` beats them, a declared procedure
+  is never overwritten, re-ensuring keeps the green result, five spellings
+  of "test" all resolve, a pass hands back one line and no script, a
+  failure names script+log+region, STALE is re-run not read, VERIFIED is
+  reused, BROKEN names the vanished script, deploy is routed but still
+  refused without approval, an undeclared dependency set does not cache
+  across an edit, and a relative script is looked for in the repository
+  rather than the caller's directory. `tests/test_work_surfaces.py` pins
+  the MCP routing (target implies run; `run_operation`; `as_context()` not
+  `as_dict()`).
+- **Known limitations:** the working-tree fallback keys on `git status`
+  output, so an untracked DIRECTORY is tracked by its own mtime rather
+  than per-file; discovery still recognises only the entry points in
+  `DISCOVERY_RULES` (make/just/`scripts/*.sh`), so a project that runs its
+  tests some other way registers nothing and is told so rather than
+  guessed at; `build` has no runbook in THIS repository and is correctly
+  reported absent.
+- **Dependencies:** Project Knowledge (the registry is stored beside the
+  knowledge map and uses its lock), Work Policy §"Procedural Memory and
+  Runbook Registry" (unchanged — it already carried the rule; this change
+  supplies the mechanism).
+- **Follow-up/backlog:** a `build` runbook for this repo if one is ever
+  wanted; teaching `discover_existing` about `npm`/`cargo`/`go` entry
+  points for non-Python projects.
+- **Trace:** `terminal_mcp/procedures.py`, `terminal_mcp/mcp_app.py`
+  (`work_procedures`), `terminal_mcp/work_planning.py`,
+  `terminal_mcp/task_classifier.py`; see this file's own commit.
+
 ### Read-only repository access for external agents (`repo_*` MCP tools) — V1, 2026-09-14
 
 - **Goal / user value:** let an external agent reaching this server over
