@@ -2385,6 +2385,14 @@ def build_mcp(service: TerminalService | None = None,
     workers = WorkerRegistry(pm_store=pm.store if pm is not None else None,
                              node_registry=getattr(controller, "registry", None),
                              queue=queue)
+    if pm is not None:
+        # Let the PM router SEE sessions that are doing real queue work with
+        # no capability profile (blg_orch_no_workers_declared). Seeing is not
+        # routing: they become candidates only when a caller passes
+        # include_undeclared=True, and even then only probed capability can
+        # satisfy a requirement. Attached after construction rather than as a
+        # constructor argument because this registry itself needs pm.store.
+        pm.workers = workers
 
     @server.tool()
     def terminal_worker_declare(node_id: str, session: str, roles: list[str] | None = None,
@@ -2436,6 +2444,30 @@ def build_mcp(service: TerminalService | None = None,
         if worker is None:
             return {"error": "WORKER_NOT_FOUND", "node_id": node_id, "session": session}
         return {"worker": worker.to_dict()}
+
+    @server.tool()
+    def terminal_worker_diagnose(required_capabilities: list[str] | None = None,
+                                 role: str | None = None, project_id: str | None = None,
+                                 trust_declared: bool = True) -> dict:
+        """WHY capability routing has no candidates -- the answer an empty
+        worker list cannot give.
+
+        Returns a machine-readable `code`, not just a sentence:
+
+          NO_WORKERS_REGISTERED   nothing is declared and nothing is running
+          NO_WORKERS_ONLINE       every known worker is offline
+          WORKERS_BUSY            a CAPABLE worker exists but is busy/at WIP
+          WORKERS_LACK_CAPABILITY declared workers, none with this capability
+          CAPABILITY_UNKNOWN      workers exist but nobody declared what they
+                                  can do -- declare them (terminal_worker_declare)
+          WORKERS_INELIGIBLE      capable and free, blocked by another constraint
+          CANDIDATES_AVAILABLE    something is eligible right now
+
+        A worker with no profile is UNKNOWN, never "capable of everything":
+        it can satisfy a requirement only from PROBED node capability."""
+        return workers.diagnose(required_capabilities=tuple(required_capabilities or ()),
+                                role=role, project_id=project_id,
+                                trust_declared=trust_declared)
 
     @server.tool()
     def terminal_worker_roles() -> dict:

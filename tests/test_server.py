@@ -122,6 +122,9 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_worker_list",
         "terminal_worker_status",
         "terminal_worker_roles",
+        # blg_orch_no_workers_declared: why capability routing has zero
+        # candidates, as a code rather than an empty list.
+        "terminal_worker_diagnose",
         "terminal_node_sessions",
         "terminal_registry_list",
         "terminal_registry_get",

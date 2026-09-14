@@ -7,8 +7,10 @@ after the fact (`reason` on the result) and reproduced in a test.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
+from .capability_profile import CandidateView, diagnose, match_capabilities
 from .node_models import CAPACITY_OVERLOADED, NODE_ONLINE, Node
 
 
@@ -18,6 +20,11 @@ class PlacementResult:
     reason: str
     candidates_considered: int
     excluded: tuple[tuple[str, str], ...] = ()  # (node_id, why-excluded), for diagnostics/doctor
+    # Machine-readable counterpart to `reason` (capability_profile.
+    # diagnose): "no node registered" / "every node is busy" / "no node has
+    # this capability" are three different operator actions, and `reason`
+    # is one sentence that a caller would have to parse to tell them apart.
+    diagnosis: dict[str, Any] = field(default_factory=dict)
 
 
 def _eligible(node: Node, *, required_agent_type: str, min_disk_free_bytes: int,
@@ -49,6 +56,42 @@ def _eligible(node: Node, *, required_agent_type: str, min_disk_free_bytes: int,
     return True, None
 
 
+def _node_capability_pool(node: Node) -> tuple[str, ...]:
+    """A node's routing keys, NAMESPACED so they cannot collide: a label
+    literally called "linux" must never satisfy a platform requirement."""
+    return (f"platform:{node.platform}",
+            *(f"agent:{agent}" for agent in node.agent_types),
+            *(str(label) for label in node.labels))
+
+
+def _node_requirements(*, required_agent_type: str, labels_required: tuple[str, ...],
+                       required_platform: str | None) -> tuple[str, ...]:
+    """The same three checks `_eligible` makes, expressed as capability
+    keys so the shared diagnosis walk can classify them. "shell" is
+    omitted deliberately -- every node that can run tmux can host a plain
+    shell session, which is exactly what `_eligible` already says."""
+    required = list(labels_required)
+    if required_agent_type != "shell":
+        required.append(f"agent:{required_agent_type}")
+    if required_platform is not None:
+        required.append(f"platform:{required_platform}")
+    return tuple(required)
+
+
+def _capacity_blocked(node: Node, *, min_disk_free_bytes: int) -> bool:
+    """Capacity, as opposed to capability: this node could do the work but
+    has no room for it right now. Kept separate so an overloaded node that
+    ALSO lacks the capability is reported as a capability gap -- the
+    blocker an operator actually has to fix."""
+    if node.draining or node.capacity_status == CAPACITY_OVERLOADED:
+        return True
+    if node.max_sessions is not None and (node.tmux_session_count or 0) >= node.max_sessions:
+        return True
+    if node.disk_free_bytes is not None and node.disk_free_bytes < min_disk_free_bytes:
+        return True
+    return False
+
+
 def _score(node: Node) -> tuple[float, float, float, str]:
     """Higher is better on every axis. Returned as a tuple so Python's own
     tuple comparison does lexicographic ranking with NO floating-point
@@ -78,22 +121,36 @@ def choose_node(nodes: list[Node], *, required_agent_type: str = "shell",
     this function's behavior before Windows nodes existed."""
     excluded: list[tuple[str, str]] = []
     eligible: list[Node] = []
+    views: list[CandidateView] = []
+    required = _node_requirements(required_agent_type=required_agent_type,
+                                  labels_required=labels_required,
+                                  required_platform=required_platform)
     for node in nodes:
         ok, reason = _eligible(node, required_agent_type=required_agent_type, min_disk_free_bytes=min_disk_free_bytes,
                                required_platform=required_platform)
+        if ok and labels_required and not set(labels_required).issubset(node.labels):
+            ok, reason = False, f"missing required labels {labels_required!r} (has {node.labels!r})"
         if not ok:
             excluded.append((node.id, reason or "ineligible"))
-            continue
-        if labels_required and not set(labels_required).issubset(node.labels):
-            excluded.append((node.id, f"missing required labels {labels_required!r} (has {node.labels!r})"))
-            continue
-        eligible.append(node)
+        else:
+            eligible.append(node)
+        # The diagnosis view is built for EVERY node, eligible or not, from
+        # the same facts -- never a second eligibility rule (the walk above
+        # stays authoritative for placement).
+        views.append(CandidateView(
+            key=node.id, online=node.status == NODE_ONLINE,
+            busy=_capacity_blocked(node, min_disk_free_bytes=min_disk_free_bytes),
+            has_profile=True,
+            capability=match_capabilities(required, detected=_node_capability_pool(node)),
+            ineligible_reason=None if ok else (reason or "ineligible")))
 
     if not eligible:
+        diagnosis = diagnose(views, required_capabilities=required)
         return PlacementResult(
             node_id=None,
-            reason="no eligible node: " + ("; ".join(f"{nid}: {why}" for nid, why in excluded) or "no nodes registered"),
-            candidates_considered=len(nodes), excluded=tuple(excluded),
+            reason=(f"no eligible node [{diagnosis['code']}]: "
+                   + ("; ".join(f"{nid}: {why}" for nid, why in excluded) or "no nodes registered")),
+            candidates_considered=len(nodes), excluded=tuple(excluded), diagnosis=diagnosis,
         )
 
     eligible.sort(key=_score, reverse=True)
@@ -103,4 +160,5 @@ def choose_node(nodes: list[Node], *, required_agent_type: str = "shell",
         reason=(f"selected {winner.id}: RAM headroom={100.0 - (winner.ram_percent_smoothed or winner.ram_percent or 0):.0f}%, "
                f"sessions={winner.tmux_session_count or 0}, capacity={winner.capacity_status}"),
         candidates_considered=len(nodes), excluded=tuple(excluded),
+        diagnosis=diagnose(views, required_capabilities=required),
     )

@@ -34,7 +34,9 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .permissions import valid_session_name
-from .pm_router import BLOCKED, NO_ELIGIBLE_WORKER, ROUTED, WorkerCandidate, route_task
+from .pm_router import (
+    BLOCKED, NO_ELIGIBLE_WORKER, ROUTED, WorkerCandidate, diagnose_candidates, route_task,
+)
 from .pm_store import PMStore
 from .queue_service import QueueService
 
@@ -45,7 +47,8 @@ VALID_MODES = (MODE_SUGGEST, MODE_AUTO)
 
 class PMService:
     def __init__(self, pm_store: PMStore, queue: QueueService, controller: Any | None = None, *,
-                permission_checker: Callable[[str, str], bool] | None = None) -> None:
+                permission_checker: Callable[[str, str], bool] | None = None,
+                workers: Any | None = None) -> None:
         self.store = pm_store
         self.queue = queue
         # `controller` is OPTIONAL and only ever consulted for a best-
@@ -69,6 +72,15 @@ class PMService:
         # this check says -- so defaulting to True when no checker is
         # wired is safe, never a permission bypass.
         self.permission_checker = permission_checker
+        # `workers` is an OPTIONAL WorkerRegistry, used only to SEE sessions
+        # that are doing real queue work without any capability profile
+        # (blg_orch_no_workers_declared). Seeing them is not the same as
+        # routing to them: they are included as candidates only when a
+        # caller passes include_undeclared=True, and even then they can
+        # satisfy a capability requirement only from PROBED node
+        # capabilities -- never from an empty pool. Unwired (every existing
+        # caller), routing behaves exactly as before.
+        self.workers = workers
 
     # -- capability profile CRUD -------------------------------------------
 
@@ -107,10 +119,23 @@ class PMService:
         except Exception:  # noqa: BLE001 -- best-effort only, never blocks routing
             return True
 
-    def _candidates(self) -> list[WorkerCandidate]:
+    def _candidates(self, *, include_undeclared: bool = False) -> list[WorkerCandidate]:
+        """Every declared Capability Profile as a live candidate.
+
+        `include_undeclared=True` additionally offers sessions that are
+        demonstrably alive (running queue work) but have no profile, marked
+        `has_profile=False`. OFF by default: turning it on would start
+        routing unconstrained tasks to sessions no operator ever nominated,
+        which is a real behaviour change and the caller's decision to
+        make. It is never a way to become capable of everything -- an
+        undeclared candidate carries only its node's PROBED capabilities,
+        and fails any requirement those do not cover with an explicit
+        CAPABILITY_UNKNOWN reason."""
         pending = self.queue.pending_counts()
         candidates = []
+        seen: set[tuple[str, str]] = set()
         for profile in self.store.list_capabilities():
+            seen.add((profile.node_id, profile.session))
             candidates.append(WorkerCandidate(
                 node_id=profile.node_id, session=profile.session, os=profile.os,
                 runtime_tools=profile.runtime_tools, project_affinity=profile.project_affinity,
@@ -118,10 +143,45 @@ class PMService:
                 online=self._node_online(profile.node_id),
                 permissions_ok=self._permissions_ok(profile.node_id, profile.session),
                 queue_depth=pending.get(profile.session, 0), max_queued=profile.max_queued,
+                has_profile=True,
             ))
+        if include_undeclared and self.workers is not None:
+            for worker in self._undeclared_workers(seen):
+                candidates.append(WorkerCandidate(
+                    node_id=worker.node_id, session=worker.session, os=worker.platform,
+                    runtime_tools=(), project_affinity=None, role=None, skills=(),
+                    online=self._node_online(worker.node_id),
+                    permissions_ok=self._permissions_ok(worker.node_id, worker.session),
+                    queue_depth=pending.get(worker.session, 0), max_queued=None,
+                    has_profile=False,
+                    detected_capabilities=tuple(worker.detected_capabilities),
+                ))
         return candidates
 
-    def eligible_workers(self, task_id: str) -> dict[str, Any]:
+    def _undeclared_workers(self, seen: set[tuple[str, str]]) -> list[Any]:
+        try:
+            live = self.workers.list_workers(online_only=False)
+        except Exception:  # noqa: BLE001 -- best-effort view, never blocks routing
+            return []
+        return [w for w in live if not w.has_profile and (w.node_id, w.session) not in seen]
+
+    def diagnose_task(self, task_id: str, *, include_undeclared: bool = True) -> dict[str, Any]:
+        """Why this task has no eligible worker, as a CODE rather than a
+        sentence: NO_WORKERS_REGISTERED / NO_WORKERS_ONLINE / WORKERS_BUSY
+        / WORKERS_LACK_CAPABILITY / CAPABILITY_UNKNOWN / WORKERS_INELIGIBLE.
+
+        Undeclared sessions are shown by DEFAULT here, because the whole
+        point of the read is to reveal that they exist and need declaring.
+        It is a pure read -- it routes, assigns and records nothing."""
+        status = self.queue.task_status(task_id)
+        if "error" in status:
+            return status
+        candidates = self._candidates(include_undeclared=include_undeclared)
+        diagnosis = diagnose_candidates(status["task"], candidates)
+        return {"task_id": task_id, "diagnosis": diagnosis,
+                "include_undeclared": include_undeclared}
+
+    def eligible_workers(self, task_id: str, *, include_undeclared: bool = False) -> dict[str, Any]:
         """Explainability tool (task's own explicit "xem eligible
         workers"): for a real task, which candidates pass the hard gate
         and which don't (and why) -- without actually routing/assigning
@@ -131,7 +191,7 @@ class PMService:
             return status
         task = status["task"]
         from .pm_router import hard_gate_failure
-        candidates = self._candidates()
+        candidates = self._candidates(include_undeclared=include_undeclared)
         eligible = []
         ineligible = []
         for candidate in candidates:
@@ -141,18 +201,20 @@ class PMService:
             else:
                 ineligible.append({"candidate": candidate.key(), "reason": failure})
         return {"task_id": task_id, "eligible": eligible, "ineligible": ineligible,
-               "total_candidates": len(candidates)}
+               "total_candidates": len(candidates),
+               "diagnosis": diagnose_candidates(task, candidates)}
 
     # -- routing -------------------------------------------------------------
 
-    def route_task(self, task_id: str, *, mode: str = MODE_SUGGEST) -> dict[str, Any]:
+    def route_task(self, task_id: str, *, mode: str = MODE_SUGGEST,
+                  include_undeclared: bool = False) -> dict[str, Any]:
         if mode not in VALID_MODES:
             return {"error": "INVALID_MODE", "mode": mode, "valid_modes": list(VALID_MODES)}
         status = self.queue.task_status(task_id)
         if "error" in status:
             return status
         task = status["task"]
-        candidates = self._candidates()
+        candidates = self._candidates(include_undeclared=include_undeclared)
         decision = route_task(task, candidates)
 
         if decision.status == ROUTED:

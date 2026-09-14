@@ -85,6 +85,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
+from .capability_profile import (
+    CandidateView, WORKERS_INELIGIBLE, diagnose, match_capabilities,
+)
 from .queue_store import (
     BLOCKED,
     COMPLETED,
@@ -287,6 +290,27 @@ def node_capability_set(node: Any) -> frozenset[str]:
         if value:
             values.add(str(value))
     return frozenset(values)
+
+
+def diagnose_nodes(nodes: Iterable[Any], *, required_capabilities: Sequence[str] = ()) -> dict:
+    """Why no node can take this work, as a code rather than a sentence.
+
+    Nodes are always `has_profile=True`: a node's capability set is PROBED,
+    so an empty one means "measured to have nothing", not "nobody said".
+    CAPABILITY_UNKNOWN is therefore a worker-level answer only -- the honest
+    distinction, not a copy of the worker walk."""
+    from .node_models import NODE_ONLINE
+    views = [
+        CandidateView(
+            key=getattr(node, "id", "?"),
+            online=getattr(node, "status", None) == NODE_ONLINE,
+            busy=bool(getattr(node, "draining", False)),
+            has_profile=True,
+            capability=match_capabilities(required_capabilities,
+                                          detected=tuple(node_capability_set(node))))
+        for node in nodes
+    ]
+    return diagnose(views, required_capabilities=required_capabilities)
 
 
 def match_nodes_by_capability(nodes: Iterable[Any], required: Sequence[str], *,
@@ -837,18 +861,27 @@ class VerifyQueue:
         registry = registry if registry is not None else self.registry
         if registry is None:
             return {"routable": None, "reason": "no node registry wired -- routability unknown",
-                    "candidates": []}
-        nodes = match_nodes_by_capability(registry.list(), job.required_capabilities)
+                    "candidates": [], "diagnosis": None}
+        all_nodes = list(registry.list())
+        nodes = match_nodes_by_capability(all_nodes, job.required_capabilities)
         candidates = [node.id for node in nodes]
+        # Same machine-readable codes the PM router and the node scheduler
+        # answer with, so "nothing to route to" means one thing across all
+        # three surfaces (capability_profile.diagnose).
+        diagnosis = diagnose_nodes(all_nodes, required_capabilities=job.required_capabilities)
         if not candidates:
-            return {"routable": False, "candidates": [],
-                    "reason": "no online node reports every required capability: "
-                              f"{', '.join(job.required_capabilities) or '(none)'}"}
+            return {"routable": False, "candidates": [], "diagnosis": diagnosis,
+                    "reason": f"[{diagnosis['code']}] no online node reports every required "
+                              f"capability: {', '.join(job.required_capabilities) or '(none)'}"}
         if job.require_independent and job.implementer and candidates == [job.implementer]:
-            return {"routable": False, "candidates": candidates,
+            diagnosis = {**diagnosis, "code": WORKERS_INELIGIBLE,
+                        "reason": "the only capable node is the implementer, and this job "
+                                  "requires an independent verifier"}
+            return {"routable": False, "candidates": candidates, "diagnosis": diagnosis,
                     "reason": "the only capable node is the implementer, and this job "
                               "requires an independent verifier"}
-        return {"routable": True, "candidates": candidates, "reason": "capable verifier available"}
+        return {"routable": True, "candidates": candidates, "diagnosis": diagnosis,
+                "reason": "capable verifier available"}
 
     def trace(self, task_id: str) -> dict[str, Any]:
         """The full traceability chain for one task, in one read:
