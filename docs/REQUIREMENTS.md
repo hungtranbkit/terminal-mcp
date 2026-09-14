@@ -741,11 +741,14 @@ summarizes it, never duplicates it verbatim (avoids drift).
 
 ## 16. Config / env / service / deploy / tunnel / startup
 
-- **Config file:** `config.yaml` (`AppConfig`, `config.py`) — 14 nested
-  config sections: `permissions`, `input_policy`, `supervisor`, `queue`
-  (new), `dashboard`, `session_lifecycle`, `session_knowledge`,
-  `ask_chatgpt`, `maintenance`, plus per-node/discovery/remote-connect
-  sections under `nodes`.
+- **Config file:** `config.yaml` (`AppConfig`, `config.py`) — nested config
+  sections: `permissions`, `input_policy`, `supervisor`, `queue`,
+  `dashboard`, `session_lifecycle`, `session_knowledge`, `session_access`,
+  `ask_chatgpt`, `maintenance`, `fleet_sync`, `work`, `repo_read`,
+  `submit`, `submit_watchdog`, `integration_loop`, `ai_usage`,
+  `auto_recovery`, plus per-node/discovery/remote-connect sections under
+  `nodes`. (The count that used to head this line had drifted and is
+  dropped rather than re-pinned; `AppConfig`'s own fields are the list.)
 - **Service:** `terminal-mcp-http.service` (systemd), HTTP port `8766`
   (`server_http.py`'s `HTTP_PORT`).
 - **Remote nodes:** `node_agent.py` (Linux/macOS) / `windows_agent.py`
