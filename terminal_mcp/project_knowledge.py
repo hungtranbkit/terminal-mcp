@@ -615,6 +615,10 @@ class ProjectKnowledge:
             entry = modules.setdefault(name, {})
             entry.update({"paths": list(paths), "summary": summary,
                           "last_verified_commit": commit, "last_verified_at": stamp})
+            # A reader has now verified this entry, which supersedes any
+            # earlier machine advance. Leaving the marker would make the
+            # stronger claim keep describing itself as the weaker one.
+            entry.pop("last_refreshed_at", None)
             if topics:
                 entry["topics"] = sorted({str(t) for t in topics})
             state["last_indexed_commit"] = state.get("last_indexed_commit") or commit

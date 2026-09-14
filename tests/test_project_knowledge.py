@@ -438,3 +438,20 @@ def test_loading_named_modules_never_lists_the_whole_map(repo, monkeypatch):
 
 def test_asking_for_a_module_the_map_does_not_have_returns_nothing_not_an_error(repo):
     assert pk.ProjectKnowledge(repo).module_state("nosuch") is None
+
+
+def test_a_reader_re_verifying_supersedes_an_earlier_machine_advance(repo):
+    knowledge = pk.ProjectKnowledge(repo)
+    knowledge.record_module("alpha", paths=["alpha.py"])
+    (repo / "beta.py").write_text("beta = 6\n")
+    _git(repo, "commit", "-aqm", "beta")
+    knowledge.rebuild()
+    assert knowledge.module_state("alpha").last_refreshed_at
+
+    knowledge.record_module("alpha", paths=["alpha.py"], summary="a reader read it")
+
+    module = knowledge.module_state("alpha")
+    assert module.last_refreshed_at is None
+    # The stronger claim must not keep describing itself as the weaker one.
+    assert "re-reading" not in module.confidence_reason
+    assert module.confidence == pk.HIGH
