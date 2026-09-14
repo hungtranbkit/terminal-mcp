@@ -143,10 +143,33 @@ def test_connection_reports_lan_endpoint_and_cidrs_when_configured(monkeypatch, 
 
 
 def test_connection_human_output_shows_endpoints_section(monkeypatch, capsys):
+    """UPDATED for blg_316183197b4c. This test used to assert that the
+    env var was printed AS the LAN endpoint ("192.168.1.132:8766") --
+    i.e. it pinned the bug: this CLI's own environment is not the
+    service's, so that line claimed an exposure it had not observed.
+    The LAN endpoint line now comes from live sockets (covered
+    host-independently in test_doctor_effective_lan.py); the declared env
+    var still appears, but labelled as config. Asserting on the declared
+    label keeps this test independent of THIS host's real sockets."""
     monkeypatch.setenv("TERMINAL_MCP_LAN_BIND", "192.168.1.132")
     monkeypatch.setenv("TERMINAL_MCP_ALLOWED_NODE_CIDRS", "192.168.1.0/24")
     doctor.main(["connection"])
     out = capsys.readouterr().out
     assert "controller endpoints:" in out
-    assert "192.168.1.132:8766" in out
     assert "loopback:" in out
+    assert "lan cfg:  192.168.1.132" in out
+    assert "declared intent" in out
+    # The old, source-free claim must not come back.
+    assert "not configured (loopback-only" not in out
+
+
+def test_connection_json_marks_endpoints_lan_as_declared_not_observed(monkeypatch, capsys):
+    """endpoints["lan"] stays for backward compatibility, so it must say
+    where it came from -- otherwise a script reading it is misled the
+    same way the human output was."""
+    monkeypatch.setenv("TERMINAL_MCP_LAN_BIND", "192.168.1.132")
+    doctor.main(["connection", "--json"])
+    result = json.loads(capsys.readouterr().out)
+    assert "declared-config" in result["endpoints"]["lan_source"]
+    assert "effective_lan" in result
+    assert result["effective_lan"]["confidence"] in ("effective", "unknown")

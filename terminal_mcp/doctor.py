@@ -30,15 +30,32 @@ def cmd_connection(args: argparse.Namespace) -> int:
     state = WatchdogState.load(default_state_path())
     result = diagnose(stale_threshold=args.stale_threshold, state=state)
     # Controller endpoints (task item 7: "Doctor/dashboard phải hiển thị
-    # rõ controller endpoints: loopback, LAN, tunnel") -- reads the exact
-    # same env vars server_http.py's own startup resolves, so this always
-    # reflects the RUNNING process's real binding, never a guess.
-    from . import network_bind
+    # rõ controller endpoints: loopback, LAN, tunnel"). These env vars are
+    # THIS CLI's own -- a separate process from the service, which does
+    # NOT inherit its systemd EnvironmentFile -- so they are declared
+    # intent, never proof of what the service bound. Real exposure is
+    # resolved from live sockets just below.
+    from . import effective_bind, network_bind
     from .server_http import HTTP_PORT
+    lan_bind_env = os.environ.get("TERMINAL_MCP_LAN_BIND")
     result["endpoints"] = network_bind.describe_endpoints(
-        port=HTTP_PORT, lan_bind_env=os.environ.get("TERMINAL_MCP_LAN_BIND"),
+        port=HTTP_PORT, lan_bind_env=lan_bind_env,
         cidrs_env=os.environ.get("TERMINAL_MCP_ALLOWED_NODE_CIDRS"),
     )
+    # ...but describe_endpoints reads THIS process's environment, and
+    # this process is the CLI, not the service (backlog blg_316183197b4c).
+    # The effective state comes from observed listening sockets instead;
+    # `endpoints` above is now only the declared intent of this shell.
+    result["effective_lan"] = effective_bind.describe_effective_lan(
+        port=HTTP_PORT, declared_lan_bind=lan_bind_env)
+    # `endpoints` is kept for every existing reader, but a script reading
+    # endpoints["lan"] would be misled exactly the way the human output
+    # used to be -- so it carries its own provenance now. The dashboard
+    # calls describe_endpoints IN-PROCESS, where its env genuinely is the
+    # server's; only this CLI needs the caveat.
+    result["endpoints"]["lan_source"] = (
+        "declared-config: TERMINAL_MCP_LAN_BIND in this CLI process's own environment. "
+        "NOT evidence of what the service bound -- read effective_lan for the observed state.")
     if args.json:
         print(json.dumps(result, sort_keys=True))
     else:
@@ -71,16 +88,41 @@ def _print_human(result: dict) -> None:
         print("  last_recovery_action: none")
     print(f"  recommended_action:   {result['recommended_action']}")
     endpoints = result.get("endpoints") or {}
+    effective = result.get("effective_lan") or {}
     print("  controller endpoints:")
     print(f"    loopback: {endpoints.get('loopback')}")
-    if endpoints.get("lan"):
-        for url in endpoints.get("lans") or [endpoints["lan"]]:
-            print(f"    lan:      {url}  (allowed_cidrs={endpoints.get('allowed_cidrs')})")
-        print(f"    ⚠ {endpoints.get('firewall_reminder')}")
-    elif endpoints.get("lan_error"):
-        print(f"    lan:      DISABLED -- {endpoints['lan_error']}")
+    # LAN is reported from EFFECTIVE runtime evidence, not from this
+    # CLI's own environment (backlog blg_316183197b4c). Every line names
+    # the source it came from, so a reader never has to guess whether a
+    # number is observed or merely configured.
+    state = effective.get("state")
+    source = effective.get("source", "unknown")
+    confidence = effective.get("confidence", "unknown")
+    if state in ("lan", "all-interfaces"):
+        scope = "ALL INTERFACES" if state == "all-interfaces" else "LAN/overlay"
+        for address in effective.get("lan_addresses") or ():
+            print(f"    lan:      http://{address}:{effective.get('port')}  [{scope}]")
+        print(f"    lan src:  {source} (confidence={confidence})")
+        if endpoints.get("allowed_cidrs"):
+            print(f"    lan cidrs: {endpoints.get('allowed_cidrs')}  [source: this CLI's own env, declared intent]")
+        if endpoints.get("firewall_reminder"):
+            print(f"    ⚠ {endpoints.get('firewall_reminder')}")
+    elif state == "loopback-only":
+        print(f"    lan:      none -- loopback-only [source: {source}, confidence={confidence}]")
+    elif state == "service-not-running":
+        print(f"    lan:      unknown -- nothing is listening on port {effective.get('port')} "
+              f"[source: {source}, confidence={confidence}]")
     else:
-        print("    lan:      not configured (loopback-only -- set TERMINAL_MCP_LAN_BIND to enable)")
+        print(f"    lan:      UNKNOWN -- {effective.get('detail')} "
+              f"[source: {source}, confidence={confidence}]")
+        print("    lan:      exposure NOT verified; config is deliberately not used to assume it")
+    if effective.get("declared_lan_bind"):
+        print(f"    lan cfg:  {', '.join(effective['declared_lan_bind'])}  "
+              f"[source: {effective.get('declared_source')}]")
+    if effective.get("mismatch"):
+        print(f"    ⚠ config/runtime mismatch: {effective['mismatch']}")
+    if endpoints.get("lan_error"):
+        print(f"    lan cfg:  INVALID -- {endpoints['lan_error']}  [source: this CLI's own env]")
     print(f"    tunnel:   {endpoints.get('tunnel')}")
 
 
