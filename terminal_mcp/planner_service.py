@@ -124,6 +124,13 @@ class PlannerService:
                 child.get("title") or "", child["prompt"], session=child.get("session"),
                 priority=child.get("priority", 0), project=child.get("project"),
                 metadata=metadata, depends_on=depends_on or None,
+                # Pass-through, so a caller that can name a child
+                # deterministically gets an IDEMPOTENT split: re-applying the
+                # same decomposition returns the existing rows instead of a
+                # second set of children. Without it, a retried or resumed
+                # decomposition silently doubles the DAG. A caller that
+                # supplies no key behaves exactly as before.
+                request_key=child.get("request_key"),
             )
             if "error" in result:
                 # Rare (children already validated above) -- stop and
