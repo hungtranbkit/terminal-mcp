@@ -18,6 +18,29 @@
       "timeout_seconds": 300.0,
       "working_dir": "."
     },
+    "dogfood": {
+      "args_hint": "",
+      "command": [
+        "bash",
+        "scripts/agent/dogfood.sh"
+      ],
+      "depends_on": [
+        "terminal_mcp/bug_spec.py",
+        "terminal_mcp/work_planning.py",
+        "terminal_mcp/work_telemetry.py",
+        "tests/dogfood_worker.py"
+      ],
+      "environment": "local",
+      "id": "dogfood",
+      "name": "budget/gate dogfood (real run against this checkout)",
+      "output_contract": "PASS/FAIL + stage + pytest summary + log path",
+      "prerequisites": [],
+      "risk": "read_only",
+      "source": "declared",
+      "success_criteria": "an L1 run is stopped at 5 files / 2 search rounds; an incomplete spec opens nothing; plan verdicts reach telemetry",
+      "timeout_seconds": 300.0,
+      "working_dir": "."
+    },
     "healthcheck": {
       "args_hint": "",
       "command": [

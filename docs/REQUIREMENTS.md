@@ -124,6 +124,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Work efficiency telemetry (per-task counters + aggregation/savings) | IMPLEMENTED_NOT_LIVE_VERIFIED (runtime-driven rows + tests; not yet attached in a live deployment — the attach call is the coordinator's central wiring) |
 | Unified Task System §20 (Kanban/PM/Planner/git isolation/Phase A-E) | VERIFIED — see §20 itself for the exact per-slice scope |
 | Work Mode: a planner claim briefs itself (similar-bug retrieval + module context pack, paths verified) | VERIFIED (V1) |
+| Work Mode: the budget and the gate constrain a REAL run (dogfood, `dogfood` runbook) | VERIFIED (dogfood; see its own "what is not claimed" note) |
 
 ---
 
@@ -1854,6 +1855,110 @@ tests/limitations/dependencies/follow-up/trace — for every checkpoint
 listed in §19, plus the living-requirements convention itself. This
 section is the backfill the user asked for; §1-§19 above are the fast-
 scan/audit view over the SAME facts.)*
+
+### The budget and the gate, proven against a real run (dogfood) — 2026-09-14
+
+- **Goal / user value:** `bug_spec.gate` and `bug_spec.budget_check` already
+  had unit tests, which prove the arithmetic: given these numbers, is the
+  verdict right. That is a different sentence from "the budget constrains a
+  run". A verdict nothing consults constrains nothing, and a soft budget that
+  is only ever computed is advice. This entry is the end-to-end evidence that
+  a worker is actually stopped.
+- **Status: VERIFIED (dogfood).** `tests/test_dogfood_budget_gate.py` (25) and
+  `tests/test_dogfood_work_v1.py` (8 + 1 opt-in skip), run together by the new
+  `dogfood` runbook. Real file reads and real `git grep` against THIS
+  checkout, a real `QueueService`, a real `InboxService`, a real
+  `BugSpecStore` and a real `TelemetryStore`. No fixture repository: a
+  dogfood over a convenient fake proves the fake.
+- **What is claimed, and what is deliberately NOT.** Claimed: a worker that
+  routes its reads and searches through the shipped contract is stopped at the
+  declared limits, hands the task back instead of widening it, and cannot pass
+  the budget without leaving a record of why. **Not claimed:** that an
+  unmediated agent obeys a budget it merely read in a prompt. No test can
+  establish that, and asserting it here would manufacture exactly the false
+  confidence the rest of this system refuses. The harness
+  (`tests/dogfood_worker.py`) is therefore the dogfood's worker, not a new
+  product surface — it re-implements no limit, and every verdict in it comes
+  from `bug_spec`.
+- **Permission is asked BEFORE the work, not after.** `budget_check` is asked
+  about the count the next operation WOULD reach, so the sixth file of a
+  five-file budget is never opened. Checking afterwards would report the
+  overrun accurately and permit it anyway.
+- **The five properties, and where each is proven:**
+  1. **L1 stays within 5 source files and 2 search rounds.**
+     `FILE_SEARCH_BUDGET[L1]` is asserted to be exactly `{max_files: 5,
+     max_search_rounds: 2}`, then five real package files are read and the
+     sixth is refused (`worker.opened` has five entries; `files_read` is 5,
+     not 6), and two real `git grep` rounds run before the third is refused.
+     The refusal's action is `NEEDS_REDEFINE` with the contract's own reason
+     ("an L1 that runs out of budget was not actually an L1"). A companion
+     test records the narrowing as a count: the run opened ≤ 5 of the 142
+     files in `terminal_mcp/`.
+  2. **Past the budget only by explicit, recorded escalation.**
+     `bug_spec.escalation` is the record; `TaskTelemetry.budget_escalations`
+     and a `budget escalation: <why>` note make it auditable, and
+     `record_budget_escalation("")` is refused outright — an unexplained
+     overrun and a justified one must not be the same row. The escalation
+     report carries `TASK_CONTINUES: True` and the same `bug_id`, so the
+     planner adds detail to the SAME task.
+  3. **An incomplete spec ⇒ `NEEDS_REDEFINE`, and the SAME task resumes.**
+     A thin spec blocks the session; the worker hands back
+     `reply_to_planner` with `MISSING` and `QUESTIONS_FOR_PLANNER` and the
+     hand-back is counted (`redefine_count`). Refinement is proven to resume
+     rather than restart in three places: the same `bug_id` re-gates READY,
+     the real queue board still holds exactly one task with the same
+     `queue_task_id`, and `work_planning.redefine()` returns the same
+     `spec_id` with `source_commit` from the first pass intact.
+  4. **HARD ⇒ `NEEDS_USER_HINT` with 1–3 precise questions, same issue
+     resumes, prior analysis preserved.** `triage` returns HARD with
+     `assist_recommended`; `developer_assist_request` yields at most
+     `MAX_ASSIST_QUESTIONS` questions, each ending in `?`, none of them a
+     vague "more detail", with the current findings and hypotheses attached
+     and `never block` in `if_unavailable`. The parked issue is **not**
+     offered to a second planner (`NOTHING_TO_CLAIM`), a hint request with no
+     question is refused, and after `attach_human_hint` the SAME `issue_id`
+     comes back claimable with `findings_before_hint`, the question asked, and
+     the hint all still on it.
+  5. **`PLAN_CONFIRMED` / `PLAN_ADJUSTED` / `PLAN_MISMATCH` recorded as
+     telemetry.** All three land on the telemetry row AND on the spec, in the
+     same imported vocabulary; an invented fourth verdict raises; the verdict
+     survives `TelemetryStore` and `TaskTelemetry.from_dict` (so a restart
+     does not lose it); `summarise()` reports `plan_outcomes` with
+     `unreported` kept apart from the three verdicts, and a `mismatch_rate`
+     over zero verdicts is `None` rather than `0` — zero would read as "our
+     specs are always right" when it means nobody checked.
+- **Worker must not start a broad repo audit on an incomplete spec.** Proven
+  as a fact rather than an instruction: on a blocked session both `read()` and
+  `search()` raise `SpecNotExecutable`, `worker.opened == []`, and
+  `files_read == search_rounds == 0`, against a package the test also counts
+  so the size of the audit that did NOT happen is on the record.
+- **New runbook:** `dogfood` (`scripts/agent/dogfood.sh`), declared in
+  `.projectflow/knowledge/PROCEDURE_STATE.json`, `risk: read_only`, same
+  PASS/FAIL + stage + summary + log-path output contract as the others. It
+  resolves its interpreter through the main checkout's venv when run from a
+  worktree (`git rev-parse --git-common-dir`) and pins `PYTHONPATH` to the
+  checkout it was invoked in, so the dogfood measures the code in front of
+  you rather than whichever checkout owns the interpreter. Verified through
+  the registry itself: `ProcedureRegistry.run("dogfood")` returns
+  `PASS dogfood :: run :: PASS stage=dogfood summary="33 passed, 1 skipped"`.
+- **Scope boundary held:** `mcp_app.py` and `dashboard.py` were not touched,
+  `bug_spec.py` was not edited at all (every property above is proven against
+  it as it already ships), and nothing was deployed.
+- **Known limitations:** (1) the harness proves enforcement for a worker that
+  routes through it — an agent using its own editor tools is invisible to
+  these counters, the same gap `work_telemetry` already records as an empty
+  `signal_sources` rather than a confident zero; (2) the escalation path
+  permits continuing after a recorded reason, which is what "unless an
+  explicit, recorded escalation" asks for, but `bug_spec.escalation`'s own
+  docstring describes the report as something sent INSTEAD of widening — both
+  readings are legitimate and the dogfood pins the permissive one, with the
+  record as the price; (3) the run is single-process, so the budget it proves
+  is per worker session, not per task across retries.
+- **Trace:** `tests/dogfood_worker.py` (new), `tests/test_dogfood_budget_gate.py`
+  (new), `scripts/agent/dogfood.sh` (new),
+  `.projectflow/knowledge/PROCEDURE_STATE.json`, `terminal_mcp/work_telemetry.py`
+  (`plan_status`, `plan_note`, `record_plan_outcome`, `budget_escalations`,
+  `record_budget_escalation`, `_summarise_plan_outcomes`).
 
 ### Runbook registry is the DEFAULT path for test/build/deploy/smoke — 2026-09-14
 
@@ -3762,7 +3867,16 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
   and `WorkService.telemetry_for_run()`, `WorkSpecStore.by_queue_task()`,
   and in `work_telemetry.py`: `ProviderUsage`, `aggregate`, `period_key`,
   `Baseline`/`measure_baseline`/`stated_baseline`/`savings`,
-  `TelemetryStore.for_task/query/aggregate/report`. The existing
+  `TelemetryStore.for_task/query/aggregate/report`, and (2026-09-14)
+  `TaskTelemetry.plan_status`/`plan_note`/`record_plan_outcome()`,
+  `TaskTelemetry.budget_escalations`/`record_budget_escalation()`, plus
+  `plan_outcomes` and `budget_escalations` in `summarise()` — and so, via
+  `summarise`, in every `aggregate()` group as well. The PLAN_* vocabulary is
+  IMPORTED from `bug_spec`, never restated, so the verdict on the spec and the
+  verdict on the row are literally the same strings and can be compared. All
+  additive: the row is a JSON payload, older rows read back with
+  `plan_status=None`, and `None` is counted as `unreported` rather than as a
+  confirmation. The existing
   `work_telemetry_report`/`work_telemetry` MCP tools are unchanged and
   still work: a worker adds what only it can see, on top of a lifecycle
   the runtime now records by itself.
@@ -3783,7 +3897,10 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
   telemetry store cannot disturb a real transition),
   `tests/test_work_telemetry.py` (50, up from 23 — provenance,
   three-valued first-pass, grouping, half-open windows, baseline
-  admissibility, derived-savings labelling).
+  admissibility, derived-savings labelling), and
+  `tests/test_dogfood_budget_gate.py` for the plan-verdict and
+  budget-escalation fields, which are asserted where they are actually
+  produced — in a real run — rather than only as setters.
 - **Known limitations:** (1) not attached in any live deployment yet (see
   the integration note); (2) the counters only see reads that go through
   THIS process — a worker reading files with its own editor/agent tools
