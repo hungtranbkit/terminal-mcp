@@ -205,7 +205,7 @@ class NodeCredentialStore:
             return existing
         return self._insert(node_id, token, status=ACTIVE, moment=moment, activated=True)
 
-    def rotate(self, node_id: str, *, grace_seconds: int = DEFAULT_GRACE_SECONDS,
+    def rotate(self, node_id: str, *, grace_seconds: int | None = DEFAULT_GRACE_SECONDS,
                now: datetime | None = None, new_token: str | None = None) -> tuple[Credential, str]:
         """Mint a new ACTIVE token and move the current one to GRACE.
 
@@ -214,9 +214,22 @@ class NodeCredentialStore:
         loses it must rotate again rather than look it up.
 
         The grace window is the whole point: the node keeps authenticating
-        with its old token until it picks up the new one. Set
-        grace_seconds=0 for an immediate cutover when the old token is
-        believed compromised.
+        with its old token until it picks up the new one. Three modes:
+
+            grace_seconds=N     old token dies N seconds from now, picked
+                                up or not -- a hard deadline
+            grace_seconds=0     immediate cutover, for a token believed
+                                compromised: the old one is REVOKED here
+            grace_seconds=None  open-ended: the old token stays valid
+                                until the rotation is CONFIRMED (see
+                                token_rotation.TokenRotationService)
+
+        None is what routine rotation wants. A fixed deadline locks out
+        any node that happened to be offline for the window -- which is
+        the failure this whole task exists to avoid -- whereas an
+        open-ended grace closed by confirmation kills the old token the
+        moment the new one is demonstrably in use, which is both safer
+        and provable.
         """
         node_id = self._validate(node_id)
         moment = now or _now()
@@ -232,7 +245,15 @@ class NodeCredentialStore:
                     "UPDATE node_credentials SET status = ?, revoked_at = ?, revoked_reason = ? "
                     "WHERE node_id = ? AND status = ?",
                     (REVOKED, _iso(moment), "superseded_by_newer_rotation", node_id, GRACE))
-                if grace_seconds > 0:
+                if grace_seconds is None:
+                    # Open-ended grace: expires_at stays NULL, so verify()
+                    # accepts it and expire_grace() (which only ever looks
+                    # at rows WITH an expires_at) leaves it alone.
+                    connection.execute(
+                        "UPDATE node_credentials SET status = ?, expires_at = NULL "
+                        "WHERE node_id = ? AND status = ?",
+                        (GRACE, node_id, ACTIVE))
+                elif grace_seconds > 0:
                     connection.execute(
                         "UPDATE node_credentials SET status = ?, expires_at = ? "
                         "WHERE node_id = ? AND status = ?",

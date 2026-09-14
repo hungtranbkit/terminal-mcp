@@ -120,7 +120,21 @@ def _config(tmp_path: Path, **kwargs) -> AppConfig:
     )
 
 
-def _service(tmp_path: Path, *, config: AppConfig | None = None, tailscale_available: bool = True):
+def _token_setter(credentials):
+    """Exactly what server_http.py's real main() passes: sets the env var
+    the node's first heartbeat verifies against, and -- once the
+    credential store exists (blg_a3cc401d8275) -- records the token so
+    the node is rotatable from the moment it enrolls rather than after a
+    separate adoption step."""
+    def _set(node_id: str, token: str) -> None:
+        os.environ[f"TERMINAL_MCP_NODE_TOKEN_{node_id.upper().replace('-', '_')}"] = token
+        if credentials is not None:
+            credentials.adopt(node_id, token)
+    return _set
+
+
+def _service(tmp_path: Path, *, config: AppConfig | None = None, tailscale_available: bool = True,
+             credentials=None):
     config = config or _config(tmp_path)
     terminal = TerminalService(config)
     registry = NodeRegistry(tmp_path / "nodes.db")
@@ -142,8 +156,7 @@ def _service(tmp_path: Path, *, config: AppConfig | None = None, tailscale_avail
         # Exactly what server_http.py's real main() passes -- without it a
         # freshly-enrolled node's first heartbeat would 401, which is a
         # production behavior the tests must exercise, not paper over.
-        token_env_setter=lambda node_id, token: os.environ.__setitem__(
-            f"TERMINAL_MCP_NODE_TOKEN_{node_id.upper().replace('-', '_')}", token),
+        token_env_setter=_token_setter(credentials),
         tailscale_detector=lambda: detected,
     )
     return terminal, controller, connection_store, onboarding
@@ -164,7 +177,8 @@ def _client(tmp_path, monkeypatch, **kwargs):
     credentials = kwargs.pop("credentials", None)
     config = kwargs.pop("config", None) or _config(tmp_path, **kwargs)
     terminal, controller, connection_store, onboarding = _service(
-        tmp_path, config=config, tailscale_available=kwargs.pop("tailscale_available", True))
+        tmp_path, config=config, tailscale_available=kwargs.pop("tailscale_available", True),
+        credentials=credentials)
     server = build_mcp(terminal)
     register_dashboard(server, terminal, controller=controller, connection_store=connection_store,
                        onboarding=onboarding, credentials=credentials)
@@ -794,6 +808,29 @@ def test_consume_route_is_single_use_and_replay_is_refused(tmp_path, monkeypatch
                          json={"code": code, "hostname": "ATTACKER"})
     assert replay.status_code == 401
     assert replay.json()["error"] == "ENROLLMENT_ALREADY_USED"
+
+
+def test_an_enrolled_node_is_rotatable_immediately(tmp_path, monkeypatch):
+    """A node enrolled today must not need a separate adoption step
+    before its token can be rotated or revoked (blg_a3cc401d8275) --
+    otherwise every new node arrives as a credential nobody can retire."""
+    from terminal_mcp.node_credentials import NodeCredentialStore
+
+    credentials = NodeCredentialStore(tmp_path / "credentials.db")
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch, credentials=credentials)
+    code = client.post("/dashboard/api/nodes/onboard/enrollments",
+                       json={"node_id": "win9", "profile": "minimal"}).json()["code"]
+    consumed = client.post("/dashboard/api/enroll/consume",
+                           json={"code": code, "hostname": "WIN9-PC", "platform": "windows",
+                                 "addresses": {"lan_ip": "192.168.1.59"}})
+    assert consumed.status_code == 200
+    assert credentials.is_managed("win9")
+
+    rotate = client.post("/dashboard/api/nodes/win9/token/rotate", json={})
+    assert rotate.status_code == 200 and rotate.json()["rotated"] is True
+    # And still no secret anywhere an operator can see.
+    assert consumed.json().get("token") is None
+    assert "token" not in rotate.json()
 
 
 def test_consume_route_is_rate_limited(tmp_path, monkeypatch):

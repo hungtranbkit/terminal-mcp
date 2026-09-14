@@ -38,7 +38,8 @@ import uvicorn
 
 from .config import load_config
 from .core import TerminalService
-from .node_agent import _heartbeat_loop, _read_token, build_node_agent, watch_for_shutdown
+from .node_agent import (AgentCredential, _heartbeat_loop, _read_token, build_node_agent,
+                         watch_for_shutdown)
 from .node_models import PLATFORM_WINDOWS, SESSION_BACKEND_WINDOWS_PTY
 from .windows_backend import WindowsSessionBackend
 
@@ -103,6 +104,10 @@ def main(argv: list[str] | None = None) -> int:
                     "(pywinpty) will fail on any actual create_session call on this platform.", sys.platform)
 
     token = _read_token(args.token, args.token_file)
+    # Same shared-credential discipline as the Linux agent: rotation
+    # must cost a Windows node no more than it costs a Linux one --
+    # no restart, since a restart here takes every session with it.
+    credential = AgentCredential(token, token_file=args.token_file)
     config = load_config(args.config)
     backend = WindowsSessionBackend(shell=args.shell, history_lines=args.history_lines)
     terminal = TerminalService(config, tmux=backend)
@@ -129,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
         _log.exception("deny-record migration failed -- grants left unchanged")
     workspace_root = (config.session_lifecycle.allowed_cwd_roots[0]
                       if config.session_lifecycle.allowed_cwd_roots else "/")
-    app = build_node_agent(node_id=args.node_id, terminal=terminal, token=token, workspace_root=workspace_root)
+    app = build_node_agent(node_id=args.node_id, terminal=terminal, token=credential, workspace_root=workspace_root)
 
     shell_capabilities = detect_shell_capabilities()
     wsl_available = detect_wsl_available()
@@ -138,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
 
     async def _heartbeat_task() -> None:
         await _heartbeat_loop(node_id=args.node_id, terminal=terminal, controller_url=args.controller_url,
-                              token=token, workspace_root=workspace_root,
+                              token=credential, workspace_root=workspace_root,
                               interval_seconds=args.heartbeat_interval_seconds,
                               platform=PLATFORM_WINDOWS, session_backend=SESSION_BACKEND_WINDOWS_PTY,
                               shell_capabilities=shell_capabilities, wsl_available=wsl_available)

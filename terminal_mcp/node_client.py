@@ -275,6 +275,16 @@ class RemoteNodeClient:
         self._token = token
         self.timeout = timeout
 
+    def set_token(self, token: str) -> None:
+        """Point this client at a rotated credential in place.
+
+        Every request reads `self._token` when it is sent, so replacing
+        it here is enough -- no client needs rebuilding and no in-flight
+        caller holds a stale one. An empty token is deliberately allowed:
+        that is how revocation stops this controller from continuing to
+        command a node with a credential it has just refused."""
+        self._token = token
+
     def fleet_exchange(self, *, objects: list[dict[str, Any]], since: str | None,
                        source_node: str) -> dict[str, Any]:
         """One fleet-metadata exchange with this node.

@@ -411,6 +411,13 @@ def main() -> None:
     # lands in the SAME audit log as every other action.
     # Persistent node credentials -- the durable half of rotation/revocation.
     credentials = NodeCredentialStore()
+
+    def _manage_enrolled_token(node_id: str, token: str) -> None:
+        os.environ[node_token_env_var(node_id)] = token
+        try:
+            credentials.adopt(node_id, token)
+        except Exception:  # noqa: BLE001 -- never fail an enrollment over bookkeeping
+            _log.exception("could not record node %s's token for rotation", node_id)
     onboarding = OnboardingService(
         config, controller=controller, connection_store=connection_store,
         enrollment_store=EnrollmentStore(), transport_store=TransportStore(),
@@ -421,7 +428,11 @@ def main() -> None:
         # The heartbeat route re-reads this env var on every inbound push;
         # setting it here is what makes a freshly-enrolled node's very
         # first heartbeat succeed instead of 401ing until a restart.
-        token_env_setter=lambda node_id, token: os.environ.__setitem__(node_token_env_var(node_id), token),
+        # Sets the env var the node's heartbeat verifies against AND
+        # records the token in the credential store, so a node enrolled
+        # today is rotatable/revocable without a later adoption step
+        # (blg_a3cc401d8275). Same helper shape as dashboard.py's own.
+        token_env_setter=_manage_enrolled_token,
     )
 
     # Same "constructed ONCE, shared by both build_mcp and register_

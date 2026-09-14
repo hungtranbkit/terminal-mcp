@@ -131,6 +131,26 @@ class ControllerService:
     def client_for(self, node_id: str) -> NodeClient | None:
         return self._clients.get(node_id)
 
+    def update_remote_token(self, node_id: str, token: str | None) -> bool:
+        """Swap the credential this controller PRESENTS to a node agent.
+
+        The outbound half of token rotation (blg_a3cc401d8275): the
+        registry row, endpoint and every other piece of that node's
+        configuration stay exactly as they are -- only the bearer token
+        changes. `None` clears it, which is what revocation needs: a
+        refused credential must stop being used in both directions, not
+        just the inbound one.
+
+        Returns False when this controller holds no client for the node
+        (nothing to update), so a caller can tell "changed" from
+        "nothing there" instead of assuming."""
+        client = self._clients.get(node_id)
+        setter = getattr(client, "set_token", None)
+        if client is None or setter is None:
+            return False
+        setter(token or "")
+        return True
+
     # -- local self-heartbeat ----------------------------------------------
     # No background thread: cheap enough (a few /proc reads + one
     # shutil.disk_usage call) to compute fresh at the top of any route/
