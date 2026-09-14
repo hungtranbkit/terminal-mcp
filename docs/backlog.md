@@ -367,3 +367,16 @@ is no history — `queue.db` holds 0 tasks and 0 events, and lacks the
 `analysis` column entirely. Before/after is also confounded by codebase
 drift and task-mix shift, so it could not support a causal claim even if
 the data existed (`EFFICIENCY_MEASUREMENT_CONTRACT.md` §7.2).
+
+### Cross-lane conformance items (2026-09-14)
+
+Checked against `feat/work-efficiency-telemetry` @ `473a629`. Detail in
+`EFFICIENCY_MEASUREMENT_CONTRACT.md` §13.
+
+| id | P | type | title |
+|---|---|---|---|
+| `EM-C1` | P1 | fix | Add `STALE_CONTEXT` to the `telemetry_reentries.reason` CHECK set. Today the store **rejects** it and the row lands in `OTHER` — the generic bucket the reason taxonomy exists to avoid. The benchmark lane already reports the category with no source behind it. |
+| `EM-C2` | P1 | feature | Clarification/Question Ledger has no representation in the telemetry store at all. Until it exists, "raised no clarification" in first-pass success cannot be evaluated. Same item as `EM-LEDGER-1`, now with a second consumer blocked on it. |
+| `EM-C3` | P1 | fix | `telemetry_tasks.first_pass_success` is written by the reporter, not derived. Have the report recompute it from turns/reentries/evidence and flag disagreement with the stored value. |
+| `EM-C4` | P2 | feature | No `decision_budget` / task profile / risk class on `telemetry_tasks`; stratification depends on an unrecorded join to queue metadata. Stamp it per task at creation. |
+| `EM-C5` | P1 | research | **Differential measurement on FPS**: the HIGH arm is required to carry a live-verification plan, so it is more likely to be scoreable at all — the treatment changes the denominator. Report FPS coverage per arm as a first-class result; prefer turn count as headline where coverage differs. |

@@ -640,3 +640,58 @@ specific.
 invalidate the largest part of this design, and — per the rule this document is
 measuring — an unresolved CRITICAL-impact assumption blocks implementation.
 Nothing in §5 should be built until Q2 is answered with evidence.
+
+---
+
+## 13. Cross-lane conformance (2026-09-14)
+
+Checked first-hand against the telemetry lane's committed schema
+(`feat/work-efficiency-telemetry` @ `473a629`: `work_telemetry_store.py`,
+`work_telemetry_service.py`). Recorded here because the contract is only
+useful if it is checked against what is actually being built.
+
+**Conformant, and better than this document specified:** the separate
+telemetry DB (not bolted onto `QUEUE_MIGRATIONS`, so lanes cannot race on a
+version number); `IF NOT EXISTS` on every v1 statement (found by a crash test,
+not by reasoning — Python's sqlite3 does not wrap DDL in a transaction);
+the v2 `cache_write_5m_tokens` / `cache_write_1h_tokens` split with `model_id`
+(§5.2 satisfied at source); `reported_*` columns held beside derived values;
+and a `confidence` tri-state (`MEASURED`/`DERIVED`/`ESTIMATED`/`UNKNOWN`) that
+implements §6's "missing is never zero" at the schema level.
+
+On `price_table_version`: recording `model_id` plus the raw counts at
+collection, and pinning the table version in the **report header**, is
+cleaner than this document's original wording. History reprices from raw
+counts under any table version. §5.2 should be read that way.
+
+**Four gaps, each blocking a specific clause:**
+
+| # | Gap | Blocks |
+|---|---|---|
+| C1 | `telemetry_reentries.reason` has no `STALE_CONTEXT`. The CHECK constraint admits only `TEST_FAILURE`, `CONTRACT_GAP`, `IMPLEMENTATION_BUG`, `ENVIRONMENT_FAILURE`, `USER_CHANGED_REQUIREMENT`, `DELIVERY_FAILURE`, `MERGE_CONFLICT`, `OTHER` — so a stale-context reentry is **rejected at the store and lands in `OTHER`**, the generic bucket. The benchmark lane names `STALE_CONTEXT` in its report; there is no source for it. | §7.3 |
+| C2 | **No clarification concept anywhere** — no table, no event, no column. The Question Ledger (`AI_ANALYSIS_GATE.md` §5, A8) is still unbuilt, so the "raised no clarification" condition of first-pass success **cannot be evaluated**, and §4.2 is unmeasurable. | T5, §4.2, §4.5 |
+| C3 | `telemetry_tasks.first_pass_success` is a **stored tri-state written by the reporter**, not derived from turns, reentries and evidence. The measured party writes its own outcome directly. §4.5 defines FPS as a *derivation*; storing it as an input is an anti-gaming hole regardless of who currently writes it. Fix: keep the column as a cache if useful, but have the report **recompute** from the underlying rows and flag disagreement. | §4.5, §10 |
+| C4 | **No `decision_budget`, task profile or risk class** on `telemetry_tasks`. Stratification (§9) and the never-pool rule (B9) therefore depend on an unstated join back to queue metadata. Whatever that join is, it must be explicit and recorded per task — a stratification whose key is recomputed at report time can be recomputed after seeing the outcome. | §2, §3, §9, B9 |
+
+### 13.1 Differential measurement on first-pass success
+
+A structural bias, not a data-quality warning, and it needs stating before any
+FPS number is produced.
+
+FPS requires real `verification_evidence` (§4.5, correctly). Tasks without it
+resolve to `UNKNOWN` and are **excluded from the FPS denominator**. But the
+`decision_budget = HIGH` arm is *required by its own contract* to carry a
+`live_verification` plan — so it is systematically **more likely to record the
+evidence that makes a task scoreable at all**.
+
+The treatment therefore changes the probability that a task can be measured on
+the very metric being compared. That is differential measurement, and its
+direction is predictable: it inflates the HIGH arm's apparent FPS by selecting
+the well-run tasks in the control arm out of the denominator.
+
+A coverage-imbalance warning catches gross cases but frames this as an
+accident. It is not. The guard is to **report FPS coverage per arm as a
+first-class result**, and to treat any material imbalance on FPS specifically
+as a finding about the metric rather than a caveat on it. Where coverage
+differs by arm, the honest headline is the turn-count comparison (§4.5), whose
+denominator does not depend on the treatment.
