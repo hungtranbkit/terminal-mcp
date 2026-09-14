@@ -290,16 +290,67 @@ flatter the arm that caused it. The comparison is rendered **both ways**
 the causal reading differs between the two and the gap between them is
 itself the part of rework attributable to carrying more context.
 
-**But the store cannot record it.** `telemetry_reentries.reason` is
-CHECK-constrained to `TEST_FAILURE`, `CONTRACT_GAP`,
-`IMPLEMENTATION_BUG`, `ENVIRONMENT_FAILURE`, `USER_CHANGED_REQUIREMENT`,
-`DELIVERY_FAILURE`, `MERGE_CONFLICT`, `OTHER` — a stale-context re-entry
-is rejected at write time and lands in the generic bucket. A zero row
-for it would read as *evidence of absence* rather than absence of
+**Migration v3 added it upstream**, and the row flipped to real counts
+with no change on this side. Before v3, `telemetry_reentries.reason` was
+CHECK-constrained to eight values that excluded it, so a stale-context
+re-entry was rejected at write time and landed in `OTHER`. A zero row
+would have read as *evidence of absence* rather than absence of
 evidence, so each source declares the vocabulary it can physically emit
-and the report renders any unrecordable reason as **UNAVAILABLE**. Until
-the reason is added upstream, no `STALE_CONTEXT` figure is trustworthy
-and the report says so instead of printing a confident zero.
+and the report renders any unrecordable reason as **UNAVAILABLE**.
+
+That mechanism stays even though a current store no longer triggers it,
+and it is load-bearing for a reason specific to this tool: **the reader
+never migrates.** A database opened through the store's own code brings
+itself to the current schema on open; this one is opened read-only, so
+it can legitimately meet a v2 file that no producer has yet opened with
+current code. For that file `STALE_CONTEXT` is genuinely unavailable.
+
+Two facts are kept apart in the report, because collapsing them would
+put a fabricated zero in the column hardest-won:
+
+* **the schema admits this reason** — a v3 store with no such rows is
+  *available, count 0*, which is a real finding;
+* **rows with this reason exist** — a v2 store is **UNAVAILABLE**.
+
+### Asking the constraint, not the prose
+
+The emittable set is **probed**, not read off the DDL. The obvious
+implementation — look for the value in the stored `CREATE` statement —
+has a hole the telemetry lane hit for real in their own migration guard:
+`sqlite_master` keeps the statement verbatim, **comments included**, so
+a comment explaining that a migration *adds* `STALE_CONTEXT` contains
+that string as literal text. Their guard concluded the constraint
+already admitted the value, skipped the rebuild, and every such write
+then failed. The prose describing the rule was mistaken for the rule.
+
+The failure direction is the dangerous one here: a false *available*
+renders a real-looking count for a category the store rejects, and a
+spurious zero reads as **data** where `UNAVAILABLE` reads as an
+**absence**.
+
+Their fix — probe inside a `SAVEPOINT` and roll back — is not available
+to this reader, and copying it would have been worse than not probing at
+all: with `mode=ro` plus `PRAGMA query_only=1`, a probe `INSERT` fails
+because *writes are forbidden*, not because the CHECK rejected the
+value, so every reason would report as not-admitted. A silent
+fail-closed. So the DDL is replayed into a fresh **in-memory** database
+and the candidates are inserted there: exact constraint semantics, no
+parsing, and not a single write to the file being measured. A test pins
+that the file's mtime, size and row count are unchanged after a probe.
+
+Three sources, most authoritative first, with the report naming which
+was used whenever it is not the first:
+
+1. **probe the constraint** — observed from the file, immune to both
+   the comment trap and to drift when the store adds a reason;
+2. **`PRAGMA user_version`** — also from the file, but a
+   version-to-vocabulary table here drifts the moment a migration adds
+   one;
+3. **this adapter's documented constant** — the *code's* idea of the
+   vocabulary rather than the *file's*.
+
+Hardcoding alone would avoid the comment trap but silently drift, which
+is what would make "adding it upstream needs no change here" false.
 
 > Open contract item, not implemented here because it is a process
 > control rather than an analysis one: adjudication of
@@ -455,7 +506,7 @@ four semantics can only be got right by name:
 
 `counter_reset` rows and partially-NULL sample sets are **flagged**, not
 excluded, and the weakest `confidence` on any sample propagates to the
-task. **Cost is priced per sample, not per task.** Migration 2 of the store
+task. **Cost is priced per sample, not per task.** Migration v2 of the store
 added `model_id` and the `cache_write_5m_tokens` / `cache_write_1h_tokens`
 split, so cost is computable from the store alone with no assumption.
 Each sample is priced with its *own* `model_id` and the results summed,
@@ -465,11 +516,34 @@ single task-level model. Such a task is flagged `MIXED_MODEL` and claims
 no task-level model id. One unpriceable sample makes the whole task
 unpriceable: a partial cost is a wrong cost.
 
-The adapter does not assume migration 2. An older store without the
-split or `model_id` degrades to the collapsed cache-write total and an
-unpriceable cost rather than failing, and `--price-model <id>` lets an
-operator state an assumption that the report then prints as a caveat on
+A sample with no `model_id` groups under `MODEL_UNKNOWN` — it is real
+usage whose price is genuinely unknown, so it never inherits the model
+of the sample next to it, never counts as a second model for the
+`MIXED_MODEL` flag, and makes the task unpriceable rather than
+caveated. `--price-model <id>` lets an operator state an explicit
+assumption in its place, which the report then prints as a caveat on
 every cost figure.
+
+**The TTL split is a breakdown, never an addition.** `cache_write_5m` +
+`cache_write_1h` *is* `cache_write_tokens`; summing all three would
+count every cache write twice. Tests mirror the store's own pinned case
+— 100 input with an 800/200 split is **1,100** prompt tokens, not 3,100.
+Both splits without a total derive the total; a total alone leaves the
+TTL mix **unknown, not zero**; and where all three are present and
+disagree, the task is flagged `CACHE_WRITE_INCONSISTENT` and left
+unpriced, because preferring one figure over the other would be picking
+a winner between two contradictory measurements. (The store refuses such
+a write, so that can only arise from an older or foreign database.)
+
+The adapter does not assume migration v2. An older store without the
+split or `model_id` degrades to the collapsed cache-write total and an
+unpriceable cost rather than failing.
+
+**The price table lives here, not in the store.** The telemetry store
+deliberately records no prices: they are per-model, they change over
+time, and a copy inside a measurement store drifts silently and
+retroactively falsifies old rows. `PRICE_TABLE_VERSION` is a property of
+this report and is printed in its header.
 
 ### Cohort and controls are joined, not copied
 

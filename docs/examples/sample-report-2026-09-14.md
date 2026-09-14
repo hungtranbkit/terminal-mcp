@@ -1,6 +1,6 @@
 # Before/After Efficiency Benchmark
 
-- Generated: `2026-09-14T09:03:37+00:00` (harness v1.1.0)
+- Generated: `2026-09-14T09:10:45+00:00` (harness v1.1.0)
 - Verdict: **INSUFFICIENT_DATA**
 - Cohort assignment: **observational**
 - Price table: `2026-06-24`, cache-TTL policy `split_required`

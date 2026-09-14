@@ -443,17 +443,34 @@ def test_the_report_round_trips_through_json() -> None:
 
 
 def test_a_reason_the_store_cannot_record_renders_unavailable_not_zero() -> None:
-    """EM-C1. `telemetry_reentries.reason` is CHECK-constrained and does
-    not admit STALE_CONTEXT, so such a re-entry is rejected at write
-    time and lands in OTHER. A zero row for it would read as evidence of
-    absence rather than absence of evidence."""
-    from terminal_mcp.bench.work_telemetry import STORE_REENTRY_REASONS
+    """EM-C1. Against a pre-v3 database, `telemetry_reentries.reason`
+    does not admit STALE_CONTEXT, so such a re-entry is rejected at
+    write time and lands in OTHER. A zero row for it would read as
+    evidence of absence rather than absence of evidence."""
+    from terminal_mcp.bench.work_telemetry import STORE_REENTRY_REASONS_V2
 
-    report = build_report(cohort_pair(12), reason_vocabulary=STORE_REENTRY_REASONS)
+    report = build_report(cohort_pair(12), reason_vocabulary=STORE_REENTRY_REASONS_V2)
     assert "STALE_CONTEXT" in report.unavailable_reasons
     text = render_markdown(report)
     assert "| `STALE_CONTEXT` | UNAVAILABLE | UNAVAILABLE" in text
     assert any("REASON_UNAVAILABLE" in warning for warning in report.warnings)
+
+
+def test_migration_v3_flips_the_unavailable_row_to_real_counts() -> None:
+    """The upstream fix landed, and it needed no change on this side."""
+    from terminal_mcp.bench.model import STALE_CONTEXT
+    from terminal_mcp.bench.work_telemetry import STORE_REENTRY_REASONS
+
+    records = [task(f"L{i}", COHORT_LEGACY, first_pass=True) for i in range(12)]
+    records += [
+        task(f"N{i}", COHORT_NEW, first_pass=False, reentries=(Reentry(reason=STALE_CONTEXT),))
+        for i in range(12)
+    ]
+    report = build_report(records, reason_vocabulary=STORE_REENTRY_REASONS)
+    assert report.unavailable_reasons == ()
+    text = render_markdown(report)
+    assert "| `STALE_CONTEXT` | 0 | 12 | yes |" in text
+    assert "UNAVAILABLE" not in text
 
 
 def test_a_recordable_reason_is_not_marked_unavailable() -> None:

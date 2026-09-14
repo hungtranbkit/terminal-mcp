@@ -1,6 +1,6 @@
 # Before/After Efficiency Benchmark
 
-- Generated: `2026-09-14T09:03:38+00:00` (harness v1.1.0)
+- Generated: `2026-09-14T09:10:46+00:00` (harness v1.1.0)
 - Verdict: **COMPARISON_AVAILABLE**
 - Cohort assignment: **randomised**
 - Price table: `2026-06-24`, cache-TTL policy `split_required`

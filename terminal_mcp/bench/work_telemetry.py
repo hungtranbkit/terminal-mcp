@@ -39,6 +39,7 @@ from typing import Any
 
 from . import pricing
 from .model import (
+    KNOWN_REENTRY_REASONS,
     FLAG_FPS_DISAGREEMENT,
     FLAG_MIXED_MODEL,
     FLAG_UNKNOWN_MODEL_PRICE,
@@ -49,6 +50,7 @@ from .model import (
 )
 from .sources import (
     BenchSource,
+    probe_check_values,
     SourceError,
     SourceResult,
     _missing,
@@ -71,10 +73,16 @@ WORKER_PHASES = ("IMPLEMENTATION", "VERIFICATION", "DELIVERY")
 # than its least confident input.
 CONFIDENCE_ORDER = ("UNKNOWN", "ESTIMATED", "DERIVED", "MEASURED")
 
-# The CHECK constraint on telemetry_reentries.reason. Anything outside
-# this set is rejected at write time and lands in OTHER -- so a reason
-# the harness knows about but this store cannot record (STALE_CONTEXT,
-# today) must render as UNAVAILABLE rather than as a zero row.
+# The CHECK constraint on telemetry_reentries.reason, as of migration
+# v3. Anything outside this set is rejected at write time and lands in
+# OTHER, so a reason the harness knows about but the store cannot record
+# renders as UNAVAILABLE rather than as a zero row.
+#
+# STALE_CONTEXT arrived in v3 and the set is now complete with respect
+# to what this harness knows, so nothing renders UNAVAILABLE against a
+# current store. The mechanism stays because the next reason will have
+# the same problem, and because this adapter may be pointed at an older
+# database whose constraint predates v3.
 STORE_REENTRY_REASONS = frozenset(
     {
         "TEST_FAILURE",
@@ -84,11 +92,47 @@ STORE_REENTRY_REASONS = frozenset(
         "USER_CHANGED_REQUIREMENT",
         "DELIVERY_FAILURE",
         "MERGE_CONFLICT",
+        "STALE_CONTEXT",
         "OTHER",
     }
 )
 
+# The same constraint before migration v3. Kept named rather than
+# deleted: this adapter can be pointed at an older database, and the
+# UNAVAILABLE path is only exercisable against a vocabulary that is
+# genuinely missing something.
+STORE_REENTRY_REASONS_V2 = STORE_REENTRY_REASONS - {"STALE_CONTEXT"}
+
+# PRAGMA user_version -> the vocabulary that schema level admits. Used
+# only when the constraint itself cannot be probed. It is a DECLARED
+# level rather than an observed constraint, so it drifts the moment a
+# migration adds a reason without this table being updated -- which is
+# precisely why it is the fallback and not the primary.
+#
+# It matters at all because this reader NEVER MIGRATES. A database
+# opened through the store's own code migrates itself on open; this one
+# is opened read-only, so it can legitimately encounter a v2 file that
+# no producer has yet opened with current code. For that file
+# STALE_CONTEXT genuinely is UNAVAILABLE rather than zero.
+REASONS_BY_USER_VERSION: tuple[tuple[int, frozenset[str]], ...] = (
+    (3, STORE_REENTRY_REASONS),
+    (1, STORE_REENTRY_REASONS_V2),
+)
+
+# Samples whose model was never recorded. They are real usage whose
+# price is genuinely unknown -- never dropped, never folded into a
+# neighbouring model, and never priced under a silent default.
+MODEL_UNKNOWN = "UNKNOWN"
+
 FLAG_COUNTER_RESET = "COUNTER_RESET"
+# At least one sample carries no model_id, so part of this task's usage
+# cannot be priced at all.
+FLAG_MODEL_UNATTRIBUTED = "MODEL_UNATTRIBUTED"
+# The collapsed cache-write total and the 5m/1h split disagree. The
+# store refuses such a write, so this can only come from an older or
+# foreign database -- but silently preferring one over the other would
+# be picking a winner between two contradictory measurements.
+FLAG_CACHE_WRITE_INCONSISTENT = "CACHE_WRITE_INCONSISTENT"
 FLAG_PARTIAL_SAMPLES = "PARTIAL_SAMPLES"
 
 # Migration 2 of the store added the cache-write TTL split and
@@ -167,6 +211,13 @@ class WorkTelemetryDbSource(BenchSource):
             columns = column_names(connection, "telemetry_tasks")
             records: list[TaskRecord] = []
             warnings: list[str] = []
+            vocabulary, vocabulary_source = self._reason_vocabulary(connection, tables)
+            if vocabulary_source != "probed":
+                warnings.append(
+                    f"{self.name}: the re-entry reason constraint could not be probed directly; "
+                    f"the emittable set was taken from {vocabulary_source}, which can drift "
+                    "behind the store"
+                )
             for row in connection.execute("SELECT * FROM telemetry_tasks"):
                 task_id = as_text(cell(row, "task_id"))
                 if task_id is None:
@@ -201,12 +252,58 @@ class WorkTelemetryDbSource(BenchSource):
                 ),
                 records=tuple(records),
                 warnings=tuple(warnings),
-                reason_vocabulary=STORE_REENTRY_REASONS,
+                reason_vocabulary=vocabulary,
             )
         finally:
             connection.close()
             if temp is not None:
                 temp.unlink(missing_ok=True)
+
+    def _reason_vocabulary(
+        self, connection: sqlite3.Connection, tables: set[str]
+    ) -> tuple[frozenset[str], str]:
+        """Which re-entry reasons this FILE can actually hold.
+
+        Three sources, most authoritative first, because they fail in
+        different ways:
+
+        1. Probe the constraint (`sources.probe_check_values`). Exact,
+           observed from the file, and immune both to the DDL-comment
+           trap -- where a comment naming a value makes a text match
+           report it as admitted -- and to drift when the store adds a
+           reason. It replays the DDL into a fresh in-memory database,
+           so it stays compatible with this package's read-only
+           guarantee; a SAVEPOINT probe against the real file would
+           fail on `query_only`, and would report EVERY reason as
+           rejected rather than erroring, which is a silent
+           fail-closed.
+        2. `PRAGMA user_version`, the declared migration level. Also
+           read from the file, but a version-to-vocabulary table here
+           drifts the moment a migration adds a reason.
+        3. The documented constant, which is this code's idea of the
+           vocabulary rather than the file's.
+
+        A `warnings` line names which one was used whenever it is not
+        the probe, so a reader is never told a vocabulary is observed
+        when it was assumed."""
+        if "telemetry_reentries" in tables:
+            probed = probe_check_values(
+                connection,
+                "telemetry_reentries",
+                "reason",
+                sorted(KNOWN_REENTRY_REASONS | STORE_REENTRY_REASONS),
+            )
+            if probed:
+                return (probed, "probed")
+        try:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        except (sqlite3.Error, TypeError, IndexError):
+            version = None
+        if isinstance(version, int) and version > 0:
+            for minimum, reasons in REASONS_BY_USER_VERSION:
+                if version >= minimum:
+                    return (reasons, f"PRAGMA user_version = {version}")
+        return (STORE_REENTRY_REASONS, "this adapter's documented constant")
 
     # -- samples ------------------------------------------------------------
 
@@ -249,10 +346,13 @@ class WorkTelemetryDbSource(BenchSource):
             # exact per-sample costs is the only correct answer for a
             # task whose turns ran on more than one model, and it is
             # never worse than pricing the task total once.
-            sample_model = as_text(cell(row, "model_id")) if "model_id" in columns else None
-            sample_model = sample_model or self.price_model
-            if sample_model:
-                models.setdefault(task_id, set()).add(sample_model)
+            recorded_model = as_text(cell(row, "model_id")) if "model_id" in columns else None
+            # An unattributed sample groups under MODEL_UNKNOWN rather
+            # than inheriting a neighbouring sample's model. Only an
+            # explicit operator assumption (--price-model) may stand in
+            # for it, and the report discloses that it did.
+            sample_model = recorded_model or self.price_model
+            models.setdefault(task_id, set()).add(recorded_model or MODEL_UNKNOWN)
             already_unpriceable = task_id in costs and costs[task_id] is None
             if has_split and not already_unpriceable:
                 sample_cost = pricing.cost_units(
@@ -281,12 +381,29 @@ class WorkTelemetryDbSource(BenchSource):
         for task_id, bucket in totals.items():
             if nulls.get(task_id) and any(value is not None for value in bucket.values()):
                 flags.setdefault(task_id, set()).add(FLAG_PARTIAL_SAMPLES)
+            # The 5m/1h columns are a BREAKDOWN of cache_write_tokens,
+            # never an addition to it -- summing all three would count
+            # every cache write twice. Where all three are present they
+            # must agree; the store refuses a write that disagrees, so a
+            # mismatch here means an older or foreign database, and
+            # preferring one over the other would be picking a winner
+            # between two contradictory measurements.
+            total = bucket["cache_write_total_tokens"]
+            five, hour = bucket["cache_write_5m_tokens"], bucket["cache_write_1h_tokens"]
+            if total is not None and five is not None and hour is not None and five + hour != total:
+                flags.setdefault(task_id, set()).add(FLAG_CACHE_WRITE_INCONSISTENT)
             usage[task_id] = TaskUsage(**bucket)
         for task_id, seen in models.items():
-            if len(seen) > 1:
+            attributed = {model for model in seen if model != MODEL_UNKNOWN}
+            if MODEL_UNKNOWN in seen:
+                flags.setdefault(task_id, set()).add(FLAG_MODEL_UNATTRIBUTED)
+            if len(attributed) > 1:
                 flags.setdefault(task_id, set()).add(FLAG_MIXED_MODEL)
-            if any(pricing.lookup(model) is None for model in seen):
+            if any(pricing.lookup(model) is None for model in attributed):
                 flags.setdefault(task_id, set()).add(FLAG_UNKNOWN_MODEL_PRICE)
+        for task_id, task_flags in flags.items():
+            if FLAG_CACHE_WRITE_INCONSISTENT in task_flags:
+                costs[task_id] = None
         return SampleRollup(
             usage=usage,
             turns=turns,
@@ -331,6 +448,7 @@ class WorkTelemetryDbSource(BenchSource):
         sample_flags = samples.flags.get(task_id, ())
         confidence = samples.confidence.get(task_id)
         models = samples.models.get(task_id, ())
+        attributed_models = tuple(model for model in models if model != MODEL_UNKNOWN)
         started = parse_iso(cell(row, "started_at")) if "started_at" in columns else None
         completed = parse_iso(cell(row, "completed_at")) if "completed_at" in columns else None
         duration = None
@@ -353,7 +471,7 @@ class WorkTelemetryDbSource(BenchSource):
             task_id=task_id,
             cohort=normalise_cohort(cohort),
             project=as_text(cell(row, "project_id")) if "project_id" in columns else None,
-            model=models[0] if len(models) == 1 else self.price_model,
+            model=attributed_models[0] if len(attributed_models) == 1 else self.price_model,
             cost_units_override=samples.costs.get(task_id),
             cost_units_unavailable=task_id in samples.costs
             and samples.costs[task_id] is None,

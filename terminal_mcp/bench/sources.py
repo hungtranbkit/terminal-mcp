@@ -1030,3 +1030,96 @@ def default_source_paths(state_dir: str | os.PathLike[str] | None = None) -> dic
         "ai_usage.db": root / "ai_usage.db",
         "work.db": root / "work.db",
     }
+
+
+# ---------------------------------------------------------------------------
+# constraint probing
+# ---------------------------------------------------------------------------
+
+
+def probe_check_values(
+    connection: sqlite3.Connection,
+    table: str,
+    column: str,
+    candidates: Sequence[str],
+) -> frozenset[str] | None:
+    """Which values a CHECK constraint on `table.column` actually admits.
+
+    ASKS THE CONSTRAINT, NEVER THE PROSE. The obvious implementation --
+    read the stored CREATE statement and look for the value in it -- has
+    a hole that the telemetry lane hit for real: `sqlite_master` keeps
+    the DDL verbatim, COMMENTS INCLUDED. A comment that merely explains
+    which values the constraint admits contains those values as literal
+    text, so a text match reports a value as admitted because someone
+    wrote about it. The prose describing the rule gets mistaken for the
+    rule.
+
+    The failure direction is the dangerous one here. This function feeds
+    the report's re-entry vocabulary, so a false "admitted" would render
+    real-looking counts for a category the store rejects -- and a
+    spuriously-available row reads as data, where an UNAVAILABLE row
+    reads as an absence. Hardcoding the values avoids that specific bug
+    but drifts silently the moment the store adds one, which is what
+    makes "adding it upstream needs no change here" false.
+
+    So: copy the table's DDL into a fresh IN-MEMORY database and try
+    inserting each candidate there. Exact constraint semantics, no
+    parsing, and -- the reason it is done this way rather than in a
+    SAVEPOINT against the real database -- NOT A SINGLE WRITE to the
+    file being measured. This package's read-only guarantee holds even
+    while probing a write constraint.
+
+    Returns None when the table or its DDL cannot be read, so a caller
+    can fall back to a declared set rather than silently treating an
+    unprobeable store as unconstrained."""
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    ddl = row[0] if row and row[0] else None
+    if not ddl:
+        return None
+    try:
+        probe = sqlite3.connect(":memory:")
+    except sqlite3.Error:
+        return None
+    try:
+        probe.execute(ddl)
+        columns = probe.execute(f'PRAGMA table_info("{table}")').fetchall()
+        if not columns:
+            return None
+        names: list[str] = []
+        values: list[Any] = []
+        for _cid, name, declared_type, not_null, _default, primary_key in columns:
+            if primary_key and "INT" in (declared_type or "").upper():
+                continue  # let the rowid alias assign itself
+            if name == column:
+                names.append(name)
+                values.append(None)  # filled per candidate below
+                continue
+            if not not_null:
+                continue
+            names.append(name)
+            values.append(0 if "INT" in (declared_type or "").upper() or "REAL" in (declared_type or "").upper() else "x")
+        if column not in names:
+            names.append(column)
+            values.append(None)
+        target = names.index(column)
+        placeholders = ", ".join("?" for _ in names)
+        quoted = ", ".join(f'"{name}"' for name in names)
+        statement = f'INSERT INTO "{table}" ({quoted}) VALUES ({placeholders})'
+        admitted: list[str] = []
+        for candidate in candidates:
+            values[target] = candidate
+            try:
+                probe.execute(statement, tuple(values))
+            except sqlite3.IntegrityError:
+                continue
+            except sqlite3.Error:
+                return None
+            admitted.append(candidate)
+            probe.execute(f'DELETE FROM "{table}"')
+        return frozenset(admitted)
+    except sqlite3.Error:
+        return None
+    finally:
+        probe.close()
