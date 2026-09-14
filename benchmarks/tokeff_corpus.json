@@ -1,0 +1,302 @@
+{
+  "corpus_version": 1,
+  "repository": "terminal-mcp",
+  "generated_by": "scripts/benchmark/mine_corpus.py",
+  "cases": [
+    {
+      "case_id": "real-a25834e",
+      "origin": "REAL",
+      "category": "ui",
+      "commit": "a25834e512d6",
+      "parent": "e89e2fb72ee0",
+      "date": "2026-09-05T22:50:28+07:00",
+      "symptom": "dashboard: fix client-side CSI regex leak, missing resize readonly guard",
+      "fix_paths": [
+        "terminal_mcp/dashboard.py",
+        "terminal_mcp/windows_webterm.py"
+      ],
+      "touched_total": 4,
+      "note": ""
+    },
+    {
+      "case_id": "real-9970f97",
+      "origin": "REAL",
+      "category": "ui",
+      "commit": "9970f970db96",
+      "parent": "c38a4fbad85a",
+      "date": "2026-09-05T15:36:53+07:00",
+      "symptom": "dashboard: fix missing glyphs for box-drawing/block characters on Windows",
+      "fix_paths": [
+        "terminal_mcp/dashboard.py"
+      ],
+      "touched_total": 1,
+      "note": ""
+    },
+    {
+      "case_id": "real-600c9d7",
+      "origin": "REAL",
+      "category": "ui",
+      "commit": "600c9d77cd81",
+      "parent": "5c5b9ffbbc19",
+      "date": "2026-09-04T21:21:20+07:00",
+      "symptom": "dashboard: fix mobile tab strip squeeze (real phone screenshot)",
+      "fix_paths": [
+        "terminal_mcp/dashboard.py"
+      ],
+      "touched_total": 3,
+      "note": ""
+    },
+    {
+      "case_id": "real-dba2d05",
+      "origin": "REAL",
+      "category": "ui",
+      "commit": "dba2d0532c2d",
+      "parent": "c8bb72a50510",
+      "date": "2026-09-04T16:04:48+07:00",
+      "symptom": "dashboard: fix cold-start auto-select race and OSC-sequence leak",
+      "fix_paths": [
+        "terminal_mcp/dashboard.py"
+      ],
+      "touched_total": 2,
+      "note": ""
+    },
+    {
+      "case_id": "real-805d644",
+      "origin": "REAL",
+      "category": "session",
+      "commit": "805d644e1097",
+      "parent": "caadfbad9038",
+      "date": "2026-09-07T13:55:55+07:00",
+      "symptom": "P0 fix: initial_prompt double-echo for brand-new shell sessions",
+      "fix_paths": [
+        "terminal_mcp/lifecycle.py"
+      ],
+      "touched_total": 2,
+      "note": ""
+    },
+    {
+      "case_id": "real-8f9d03a",
+      "origin": "REAL",
+      "category": "session",
+      "commit": "8f9d03ae83f5",
+      "parent": "c957dcd9f80f",
+      "date": "2026-09-11T08:18:20+07:00",
+      "symptom": "recovery: never auto-resurrect an intentionally killed session",
+      "fix_paths": [
+        "terminal_mcp/recovery_engine.py"
+      ],
+      "touched_total": 2,
+      "note": ""
+    },
+    {
+      "case_id": "real-4d51782",
+      "origin": "REAL",
+      "category": "session",
+      "commit": "4d51782350b2",
+      "parent": "78e5f36f5e48",
+      "date": "2026-09-05T23:40:37+07:00",
+      "symptom": "P0 audit/recovery: fix window/window2 transcript collision on dell-5530",
+      "fix_paths": [
+        "terminal_mcp/core.py",
+        "terminal_mcp/doctor.py",
+        "terminal_mcp/models.py",
+        "terminal_mcp/windows_backend.py"
+      ],
+      "touched_total": 8,
+      "note": ""
+    },
+    {
+      "case_id": "real-c6e2e63",
+      "origin": "REAL",
+      "category": "auth",
+      "commit": "c6e2e636d603",
+      "parent": "b992ac69a25b",
+      "date": "2026-09-05T12:07:25+07:00",
+      "symptom": "P0 hotfix: stale grants (openclaw-/nail/server-hub) + honest perm badge",
+      "fix_paths": [
+        "terminal_mcp/dashboard.py"
+      ],
+      "touched_total": 4,
+      "note": ""
+    },
+    {
+      "case_id": "real-5588feb",
+      "origin": "REAL",
+      "category": "auth",
+      "commit": "5588feb47bad",
+      "parent": "600c9d77cd81",
+      "date": "2026-09-05T09:23:42+07:00",
+      "symptom": "P0 hotfix: identity-aware grant listing + multi-node grant routing fix",
+      "fix_paths": [
+        "terminal_mcp/controller.py",
+        "terminal_mcp/core.py",
+        "terminal_mcp/dashboard.py",
+        "terminal_mcp/node_agent.py",
+        "terminal_mcp/node_client.py",
+        "terminal_mcp/server_http.py",
+        "terminal_mcp/webauth_dashboard.py"
+      ],
+      "touched_total": 14,
+      "note": ""
+    },
+    {
+      "case_id": "real-8fca313",
+      "origin": "REAL",
+      "category": "auth",
+      "commit": "8fca31373ba6",
+      "parent": "50c3f0db919c",
+      "date": "2026-09-05T19:32:16+07:00",
+      "symptom": "fix: doctor grants NODE_ONLINE import path, macOS LaunchAgent PATH",
+      "fix_paths": [
+        "deploy/install-node-agent-macos.sh",
+        "terminal_mcp/doctor.py"
+      ],
+      "touched_total": 3,
+      "note": ""
+    },
+    {
+      "case_id": "real-998ab63",
+      "origin": "REAL",
+      "category": "backend",
+      "commit": "998ab6353ead",
+      "parent": "5a93cc4dc616",
+      "date": "2026-09-07T02:40:41+07:00",
+      "symptom": "P0 Queue+Supervisor live test: fix real queue.db migration drift, enable queue globally",
+      "fix_paths": [
+        "config.yaml",
+        "terminal_mcp/queue_store.py"
+      ],
+      "touched_total": 3,
+      "note": ""
+    },
+    {
+      "case_id": "real-32c77ac",
+      "origin": "REAL",
+      "category": "backend",
+      "commit": "32c77ace3203",
+      "parent": "c2a688bce90d",
+      "date": "2026-09-09T16:50:09+07:00",
+      "symptom": "P0 fix: config.submit was clobbered by config.submit_watchdog",
+      "fix_paths": [
+        "terminal_mcp/config.py",
+        "terminal_mcp/core.py"
+      ],
+      "touched_total": 3,
+      "note": ""
+    },
+    {
+      "case_id": "real-d160eb0",
+      "origin": "REAL",
+      "category": "backend",
+      "commit": "d160eb0c1dc4",
+      "parent": "bfb2dbb5c017",
+      "date": "2026-09-10T11:09:56+07:00",
+      "symptom": "controller: refuse to register this host as one of its own remote nodes",
+      "fix_paths": [
+        "terminal_mcp/server_http.py"
+      ],
+      "touched_total": 2,
+      "note": ""
+    },
+    {
+      "case_id": "real-b107c94",
+      "origin": "REAL",
+      "category": "simple_logic",
+      "commit": "b107c94bf181",
+      "parent": "998ab6353ead",
+      "date": "2026-09-07T03:10:47+07:00",
+      "symptom": "P0 Queue+Supervisor live test: fix completion-marker line-wrap bug, docs",
+      "fix_paths": [
+        "terminal_mcp/status.py"
+      ],
+      "touched_total": 3,
+      "note": ""
+    },
+    {
+      "case_id": "real-fe53f97",
+      "origin": "REAL",
+      "category": "simple_logic",
+      "commit": "fe53f9767f21",
+      "parent": "c33fc41d3122",
+      "date": "2026-09-07T07:14:51+07:00",
+      "symptom": "Fix: TARGET_AWAITING_APPROVAL false positive on ordinary composer text",
+      "fix_paths": [
+        "terminal_mcp/adapters.py"
+      ],
+      "touched_total": 5,
+      "note": ""
+    },
+    {
+      "case_id": "real-12d41d4",
+      "origin": "REAL",
+      "category": "simple_logic",
+      "commit": "12d41d41e6c6",
+      "parent": "664147b3129b",
+      "date": "2026-09-06T21:15:12+07:00",
+      "symptom": "P0 fix: direct-send false-negative DELIVERY_UNKNOWN (Windows Claude)",
+      "fix_paths": [
+        "terminal_mcp/core.py"
+      ],
+      "touched_total": 4,
+      "note": ""
+    },
+    {
+      "case_id": "real-184b7e0",
+      "origin": "REAL",
+      "category": "unknown",
+      "commit": "184b7e0eb8e7",
+      "parent": "1a8ff8ff211b",
+      "date": "2026-09-04T14:16:30+07:00",
+      "symptom": "fix: dashboard tunnel outage \u2014 cloudflared stuck down after http restarts",
+      "fix_paths": [
+        "deploy/systemd/cloudflared-terminal-mcp-dashboard.service.example"
+      ],
+      "touched_total": 2,
+      "note": ""
+    },
+    {
+      "case_id": "real-4a3ca43",
+      "origin": "REAL",
+      "category": "unknown",
+      "commit": "4a3ca437e303",
+      "parent": "fb57c825dfe7",
+      "date": "2026-09-01T16:50:24+07:00",
+      "symptom": "URGENT bugfix: Codex composer-swallow recovery gap (text sits unsubmitted)",
+      "fix_paths": [
+        "terminal_mcp/adapters.py",
+        "terminal_mcp/core.py"
+      ],
+      "touched_total": 4,
+      "note": ""
+    },
+    {
+      "case_id": "synthetic-repeat-glyphs",
+      "origin": "SYNTHETIC",
+      "category": "ui",
+      "commit": "",
+      "parent": "",
+      "date": "",
+      "symptom": "box drawing characters show as empty tofu boxes in the web terminal when the session is on a Windows node",
+      "fix_paths": [
+        "terminal_mcp/dashboard.py"
+      ],
+      "touched_total": 0,
+      "mirrors": "real-9970f97",
+      "note": "SYNTHETIC. Restates real-9970f97 as a user would report it, to measure the repeat-bug case directly. Its fix paths are that commit's own, not a guess."
+    },
+    {
+      "case_id": "synthetic-unmapped-bridge",
+      "origin": "SYNTHETIC",
+      "category": "unknown",
+      "commit": "",
+      "parent": "",
+      "date": "",
+      "symptom": "the ask-ChatGPT bridge stops answering after a while and no receipt is ever written for the turn",
+      "fix_paths": [
+        "terminal_mcp/bridge.py"
+      ],
+      "touched_total": 0,
+      "note": "SYNTHETIC. No commit behind it. Written to bracket the case where the knowledge map covers nothing relevant -- the module is real and genuinely unmapped."
+    }
+  ]
+}
