@@ -20,10 +20,12 @@ from __future__ import annotations
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import host_metrics
+from .fleet_registry import NodeSource, matches_query, merge_sources, paginate
 from .node_client import LocalNodeClient, NodeClient, NodeClientError, RemoteNodeClient
 from .node_models import NODE_ONLINE, Node
 from .node_registry import NodeRegistry
@@ -318,6 +320,129 @@ class ControllerService:
             result.setdefault("node_id", node_id)
             result.setdefault("node_name", node.display_name if node else node_id)
         return result
+
+    # -- Fleet-aware registry reads (task blg_84f09bbc1798) ----------------
+    # session_registry.py is per-node-local, so "where is my session?"
+    # could only ever be answered one node at a time. These two fan out
+    # across the fleet and hand the results to fleet_registry.py, which
+    # owns every merge/dedupe/precedence/freshness rule (and is pure, so
+    # those rules are tested without a network).
+    #
+    # The LOCAL entry points are deliberately untouched: TerminalService.
+    # terminal_registry_list/_search and `/v1/registry` stay local-only.
+    # Making the local read fleet-aware would be a recursion bug, not a
+    # feature -- `/v1/registry` is served by LocalNodeClient.registry_
+    # list, so every node would fan out to every other node on every
+    # controller poll.
+
+    def _collect_registry_sources(self, *, recoverable_only: bool = False,
+                                  node_ids: tuple[str, ...] | None = None,
+                                  include_offline: bool = True) -> list[NodeSource]:
+        """One NodeSource per node: the controller's OWN direct local read
+        first, then every configured client. A node that fails to answer
+        yields `records=None` (never an empty list -- see fleet_registry's
+        rule 3) so the merge can report "could not look" distinctly from
+        "nothing there"."""
+        from .node_models import NODE_OFFLINE, NODE_ONLINE
+
+        nodes_by_id = {node.id: node for node in self.list_nodes()}
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        sources: list[NodeSource] = []
+
+        def node_status(node_id: str) -> tuple[str, str]:
+            node = nodes_by_id.get(node_id)
+            if node is None:
+                return NODE_OFFLINE, node_id
+            return node.status, node.display_name or node_id
+
+        wanted = set(node_ids) if node_ids else None
+
+        # The controller's own local read -- authoritative for this node,
+        # and one hop shorter than routing through its own client.
+        if wanted is None or self.local_node_id in wanted:
+            status, name = node_status(self.local_node_id)
+            local_client = self._clients.get(self.local_node_id)
+            try:
+                if local_client is None:
+                    raise NodeClientError("no local client configured")
+                result = local_client.registry_list(recoverable_only=recoverable_only)
+                records = tuple(result.get("records") or []) if isinstance(result, dict) else ()
+                error = result.get("error") if isinstance(result, dict) else None
+                sources.append(NodeSource(
+                    node_id=self.local_node_id, node_name=name,
+                    # The local node is read in-process; a stale heartbeat
+                    # says nothing about whether THIS read succeeded, so it
+                    # is reported ONLINE when it genuinely answered.
+                    status=NODE_ONLINE if error is None else status,
+                    records=None if error else records, error=error,
+                    fetched_at=fetched_at, is_local=True))
+            except NodeClientError as exc:
+                sources.append(NodeSource(node_id=self.local_node_id, node_name=name, status=status,
+                                          records=None, error=str(exc), fetched_at=fetched_at,
+                                          is_local=True))
+
+        for node_id, client in self._clients.items():
+            if node_id == self.local_node_id:
+                continue
+            if wanted is not None and node_id not in wanted:
+                continue
+            status, name = node_status(node_id)
+            if not include_offline and status == NODE_OFFLINE:
+                # Skipped by explicit request -- still reported, so the
+                # caller never mistakes "not asked" for "nothing there".
+                sources.append(NodeSource(node_id=node_id, node_name=name, status=status,
+                                          records=None, error="SKIPPED_OFFLINE_NODE",
+                                          fetched_at=fetched_at))
+                continue
+            try:
+                result = client.registry_list(recoverable_only=recoverable_only)
+            except NodeClientError as exc:
+                sources.append(NodeSource(node_id=node_id, node_name=name, status=status,
+                                          records=None, error=str(exc), fetched_at=fetched_at))
+                continue
+            if not isinstance(result, dict) or result.get("error"):
+                detail = result.get("error") if isinstance(result, dict) else "MALFORMED_NODE_RESPONSE"
+                sources.append(NodeSource(node_id=node_id, node_name=name, status=status,
+                                          records=None, error=str(detail), fetched_at=fetched_at))
+                continue
+            sources.append(NodeSource(node_id=node_id, node_name=name, status=status,
+                                      records=tuple(result.get("records") or []),
+                                      fetched_at=fetched_at))
+        return sources
+
+    def registry_list_fleet(self, *, recoverable_only: bool = False,
+                            node_ids: tuple[str, ...] | None = None,
+                            include_offline: bool = True,
+                            limit: int | None = None, cursor: int | None = None) -> dict[str, Any]:
+        """Every node's registry rows, merged, deduped, and annotated with
+        authoritative node identity + freshness. See fleet_registry.py for
+        every rule applied here."""
+        sources = self._collect_registry_sources(recoverable_only=recoverable_only,
+                                                 node_ids=node_ids, include_offline=include_offline)
+        merged = merge_sources(sources)
+        page = paginate(merged["records"], limit=limit, cursor=cursor)
+        return {**merged, **page, "scope": "fleet", "recoverable_only": recoverable_only}
+
+    def registry_search_fleet(self, query: str, *, node_ids: tuple[str, ...] | None = None,
+                              include_offline: bool = True,
+                              limit: int | None = None, cursor: int | None = None) -> dict[str, Any]:
+        """Fleet-wide equivalent of terminal_registry_search. The match
+        rule is fleet_registry.matches_query, which is deliberately
+        identical to session_registry.search's own -- a remote node
+        exposes only a plain `/v1/registry` listing, so there is no remote
+        search to delegate to and the semantics have to be kept in step
+        by construction (a test pins them against each other)."""
+        if not query or not query.strip():
+            return {"records": [], "nodes": [], "unavailable_nodes": [], "scope": "fleet",
+                    "query": query, "counts": {"total": 0, "local": 0, "remote": 0, "deduped": 0,
+                                               "nodes_reporting": 0, "nodes_unavailable": 0},
+                    "limit": 0, "cursor": 0, "next_cursor": None, "total": 0, "has_more": False}
+        sources = self._collect_registry_sources(node_ids=node_ids, include_offline=include_offline)
+        merged = merge_sources(sources)
+        matched = [record for record in merged["records"] if matches_query(record, query)]
+        page = paginate(matched, limit=limit, cursor=cursor)
+        return {**merged, **page, "records": page["records"], "scope": "fleet", "query": query,
+                "counts": {**merged["counts"], "matched": len(matched)}}
 
     def terminal_rename_session(self, name: str, new_name: str, *,
                                 requested_by: str | None = None) -> dict[str, Any]:

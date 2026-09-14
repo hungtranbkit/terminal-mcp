@@ -666,14 +666,39 @@ def build_mcp(service: TerminalService | None = None,
     # matches session name, cwd, repo_root, or git remote.
 
     @server.tool()
-    def terminal_registry_list(recoverable_only: bool = False) -> dict:
-        """Every session this process has ever discovered/created --
-        ACTIVE (currently running) and MISSING/KILLED/OFFLINE (gone, but
-        the record -- project path, repo, agent type -- is kept). Pass
-        recoverable_only=True to see only the ones with enough saved
-        metadata (`recoverable`) for terminal_registry_reopen to actually
-        recreate."""
-        return terminal.terminal_registry_list(recoverable_only=recoverable_only)
+    def terminal_registry_list(recoverable_only: bool = False, scope: str = "fleet",
+                               node_id: str | None = None, include_offline: bool = True,
+                               limit: int | None = None, cursor: int | None = None) -> dict:
+        """Every session ACROSS THE FLEET that has ever been discovered/
+        created -- ACTIVE (currently running) and MISSING/KILLED/OFFLINE
+        (gone, but the record -- project path, repo, agent type -- is
+        kept). Pass recoverable_only=True to see only the ones with
+        enough saved metadata (`recoverable`) for terminal_registry_
+        reopen to actually recreate.
+
+        scope="fleet" (default) merges every node's registry, deduped,
+        with AUTHORITATIVE `node_id`/`node_name` (a raw registry row
+        always records itself as "local", which collides across nodes --
+        the original is kept as `source_node_id`). Each record also
+        gains `node_status`/`node_online`/`freshness`/`stale`/
+        `effective_status`. A node that could not be reached contributes
+        NO records and is listed in `unavailable_nodes` instead -- "could
+        not look" is never silently rendered as "nothing there".
+
+        A record from a node that is not confirmed fresh NEVER reports
+        `effective_status: "ACTIVE"` -- it reports "UNKNOWN" (its raw
+        `status` is still carried verbatim).
+
+        scope="local" returns exactly what this tool returned before
+        this became fleet-aware: this node only, `{"records": [...]}`,
+        no extra keys. node_id=... restricts a fleet read to one node."""
+        if scope == "local":
+            return terminal.terminal_registry_list(recoverable_only=recoverable_only)
+        _refresh_local_heartbeat()
+        return controller.registry_list_fleet(
+            recoverable_only=recoverable_only,
+            node_ids=(node_id,) if node_id else None,
+            include_offline=include_offline, limit=limit, cursor=cursor)
 
     @server.tool()
     def terminal_registry_get(session_name: str) -> dict:
@@ -682,15 +707,33 @@ def build_mcp(service: TerminalService | None = None,
         return terminal.terminal_registry_get(session_name)
 
     @server.tool()
-    def terminal_registry_search(query: str) -> dict:
+    def terminal_registry_search(query: str, scope: str = "fleet", node_id: str | None = None,
+                                 include_offline: bool = True,
+                                 limit: int | None = None, cursor: int | None = None) -> dict:
         """Find a session/project by session name, working directory,
         repo root, or git remote URL -- for when the session name itself
         was lost/renamed/recreated but the underlying project wasn't.
         E.g. terminal_registry_search("ban hang") or
         terminal_registry_search("offline-pos") both find a session that
         was working in /home/.../offline-pos, even if that session is
-        long gone and was never named anything containing that text."""
-        return terminal.terminal_registry_search(query)
+        long gone and was never named anything containing that text.
+
+        scope="fleet" (default) searches EVERY node's registry using the
+        identical match rule as the local search (whitespace-separated
+        words, each of which must appear somewhere in the row's name/cwd/
+        repo/remote/notes, case-insensitive). Results carry the same
+        authoritative node identity and freshness fields as terminal_
+        registry_list; unreachable nodes are reported in
+        `unavailable_nodes` rather than silently contributing nothing.
+
+        scope="local" returns exactly the pre-fleet shape
+        (`{"records": [...]}`, this node only)."""
+        if scope == "local":
+            return terminal.terminal_registry_search(query)
+        _refresh_local_heartbeat()
+        return controller.registry_search_fleet(
+            query, node_ids=(node_id,) if node_id else None,
+            include_offline=include_offline, limit=limit, cursor=cursor)
 
     @server.tool()
     def terminal_registry_reopen(session_name: str, agent_type: str | None = None,
