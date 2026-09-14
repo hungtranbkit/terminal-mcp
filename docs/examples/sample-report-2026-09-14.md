@@ -1,6 +1,6 @@
 # Before/After Efficiency Benchmark
 
-- Generated: `2026-09-14T08:53:07+00:00` (harness v1.1.0)
+- Generated: `2026-09-14T08:59:51+00:00` (harness v1.1.0)
 - Verdict: **INSUFFICIENT_DATA**
 - Cohort assignment: **observational**
 - Price table: `2026-06-24`, cache-TTL policy `split_required`
@@ -35,5 +35,6 @@ No tasks were loaded, so there is nothing to stratify.
 - **worker_turn_count** is the primary statistical metric (a count has far more power than a binary at these sizes); first-pass success is the headline outcome but needs ~100 matched tasks per arm before any direction is claimed.
 - A saving is the **lesser** of the point estimate and the lower bound of a 90% seeded bootstrap interval, floored at 0%, and is only ever stated **under randomisation**. Assignment here was `observational` — so every figure is descriptive, whatever the sample size.
 - A missing measurement is counted as missing, never as zero. Each cell's `n` is the number of tasks that actually recorded that metric.
+- Missing **outcomes** are a **partial identification** problem, not a precision one. Where first-pass success is unscoreable for some tasks, each arm's true rate is only known to lie in a range, and **more tasks will not shrink those ranges — only recording the outcomes will**. So an "equal true rates are consistent" verdict sitting next to a tight confidence interval is not a contradiction: the interval describes sampling noise around a quantity that is not identified in the first place, and it is the weaker claim of the two.
 - Sources listed as unavailable are reported, not silently skipped — an empty comparison always says which telemetry was missing.
 

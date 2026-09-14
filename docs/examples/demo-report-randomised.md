@@ -1,6 +1,6 @@
 # Before/After Efficiency Benchmark
 
-- Generated: `2026-09-14T08:53:08+00:00` (harness v1.1.0)
+- Generated: `2026-09-14T08:59:52+00:00` (harness v1.1.0)
 - Verdict: **COMPARISON_AVAILABLE**
 - Cohort assignment: **randomised**
 - Price table: `2026-06-24`, cache-TTL policy `split_required`
@@ -32,9 +32,10 @@
 | Priceable (cost units computable) | 45 | 45 |
 | First-pass success (verified only) | 24% | 58% |
 | — scoreable for | 100% (45/45) | 100% (45/45) |
+| — true rate lies in | 24% (fully scored) | 58% (fully scored) |
 | Re-entries from excluded reasons only | 2 | 5 |
 
-**Headline metric for this class: `first_pass_success`.** First-pass success is scoreable at a similar rate in both arms.
+**Headline metric for this class: `first_pass_success`.** Enough first-pass outcomes were recorded for the observed difference to be a real one.
 
 First-pass success is measured on the **three-condition** definition (completed, verified, no counted re-entries). The contract's fourth condition — that the task raised no clarification — **cannot be evaluated at all today**: there is no clarification concept in the telemetry store, so the Question Ledger condition is absent rather than satisfied.
 
@@ -76,9 +77,10 @@ Tasks left out: surplus in stratum 0, unknown cohort 0, unmatched stratum 0.
 | Priceable (cost units computable) | 45 | 45 |
 | First-pass success (verified only) | 18% | 51% |
 | — scoreable for | 100% (45/45) | 100% (45/45) |
+| — true rate lies in | 18% (fully scored) | 51% (fully scored) |
 | Re-entries from excluded reasons only | 2 | 5 |
 
-**Headline metric for this class: `first_pass_success`.** First-pass success is scoreable at a similar rate in both arms.
+**Headline metric for this class: `first_pass_success`.** Enough first-pass outcomes were recorded for the observed difference to be a real one.
 
 First-pass success is measured on the **three-condition** definition (completed, verified, no counted re-entries). The contract's fourth condition — that the task raised no clarification — **cannot be evaluated at all today**: there is no clarification concept in the telemetry store, so the Question Ledger condition is absent rather than satisfied.
 
@@ -115,5 +117,6 @@ Tasks left out: surplus in stratum 0, unknown cohort 0, unmatched stratum 0.
 - **worker_turn_count** is the primary statistical metric (a count has far more power than a binary at these sizes); first-pass success is the headline outcome but needs ~100 matched tasks per arm before any direction is claimed.
 - A saving is the **lesser** of the point estimate and the lower bound of a 90% seeded bootstrap interval, floored at 0%, and is only ever stated **under randomisation**. Assignment here was `randomised`.
 - A missing measurement is counted as missing, never as zero. Each cell's `n` is the number of tasks that actually recorded that metric.
+- Missing **outcomes** are a **partial identification** problem, not a precision one. Where first-pass success is unscoreable for some tasks, each arm's true rate is only known to lie in a range, and **more tasks will not shrink those ranges — only recording the outcomes will**. So an "equal true rates are consistent" verdict sitting next to a tight confidence interval is not a contradiction: the interval describes sampling noise around a quantity that is not identified in the first place, and it is the weaker claim of the two.
 - Sources listed as unavailable are reported, not silently skipped — an empty comparison always says which telemetry was missing.
 

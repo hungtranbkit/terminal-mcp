@@ -220,3 +220,71 @@ def rate(successes: int, total: int) -> float | None:
     if total <= 0:
         return None
     return successes / total * 100.0
+
+
+# ---------------------------------------------------------------------------
+# partial identification under missing outcomes
+# ---------------------------------------------------------------------------
+
+
+def identification_interval(rate: float | None, coverage: float | None) -> tuple[float, float] | None:
+    """The range a cohort's TRUE rate could occupy, given that only some
+    of its tasks were scoreable at all.
+
+    If a fraction `c` of tasks were scored and they succeeded at rate
+    `r`, the unscored remainder is unknown -- at the extremes it is all
+    failures or all successes -- so the true rate lies in
+    `[r*c, r*c + (1-c)]`.
+
+    The thing to read off that expression is the WIDTH: `1 - c`. It is
+    governed by how much is missing, NOT by how much more is missing in
+    one arm than the other. That distinction matters because the
+    intuitive rule -- "worry when coverage differs between arms" --
+    misses the case where BOTH arms are equally and moderately covered:
+    two arms at 50% coverage, one observing 100% success and the other
+    0%, have a coverage gap of zero and an observed difference of a
+    hundred points, and yet both true rates could be exactly 0.5. Equal
+    coverage is not safety; poor coverage is the problem, and it can be
+    poor symmetrically.
+
+    Rates are fractions in [0, 1], not percentages."""
+    if rate is None or coverage is None:
+        return None
+    point = rate * coverage
+    return (point, point + (1.0 - coverage))
+
+
+def intervals_overlap(left: tuple[float, float] | None, right: tuple[float, float] | None) -> bool:
+    """Closed-interval overlap -- touching endpoints count, because a
+    single shared value is exactly the case where the two arms' true
+    rates could be equal."""
+    if left is None or right is None:
+        return False
+    return left[0] <= right[1] and right[0] <= left[1]
+
+
+def explained_by_missingness(
+    left_rate: float | None,
+    left_coverage: float | None,
+    right_rate: float | None,
+    right_coverage: float | None,
+) -> bool:
+    """True when equal true rates are consistent with what was
+    observed, i.e. the difference between the arms could be entirely an
+    artefact of which tasks were scoreable.
+
+    This is EXACT rather than a bound, and it needs no thresholds: a
+    zero coverage gap and a zero observed difference both fall out of it
+    correctly on their own. It subsumes the cruder "gap >= observed
+    difference" heuristic and any fixed gap cutoff.
+
+    Note this is a PARTIAL IDENTIFICATION question, not a precision
+    one. A larger sample does not shrink these intervals -- only
+    recording the missing outcomes does. So an overlap verdict sitting
+    next to a tight confidence interval is not a contradiction: the
+    confidence interval describes sampling noise around a quantity that
+    is not identified in the first place."""
+    return intervals_overlap(
+        identification_interval(left_rate, left_coverage),
+        identification_interval(right_rate, right_coverage),
+    )

@@ -640,8 +640,8 @@ def test_a_small_coverage_gap_still_fires_when_it_explains_the_whole_difference(
     report = build_report(records, assignment=ASSIGNMENT_RANDOMISED)
     group = report.groups[0]
     assert group.headline_metric == "worker_turn_count"
-    warning = next(w for w in group.warnings if "FPS_COVERAGE_DIFFERS_BY_ARM" in w)
-    assert "complete explanation" in warning
+    warning = next(w for w in group.warnings if "FPS_NOT_IDENTIFIED" in w)
+    assert "equal true rates are consistent with the data" in warning
 
 
 def test_a_coverage_gap_smaller_than_the_effect_does_not_move_the_headline() -> None:
@@ -655,10 +655,89 @@ def test_a_coverage_gap_smaller_than_the_effect_does_not_move_the_headline() -> 
     assert report.groups[0].headline_metric == "first_pass_success"
 
 
-def test_a_wide_coverage_gap_fires_even_against_a_large_effect() -> None:
-    """The absolute backstop, for the case the relative rule misses."""
+def test_a_wide_coverage_gap_alone_does_not_move_the_headline() -> None:
+    """A 40-point scoreability gap against an effect coverage cannot
+    possibly explain: legacy is fully scored at 8%, and the new arm's
+    true rate is at least 60% however its unscored tasks went. The
+    identification test correctly leaves first-pass success as the
+    headline -- an earlier gap-based rule fired here, wrongly. The
+    lopsided denominator is still reported and still demotes the band,
+    because differential measurement is a separate concern."""
     records = [task(f"L{i}", COHORT_LEGACY, first_pass=i < 2) for i in range(25)]
     records += [task(f"N{i}", COHORT_NEW, first_pass=True) for i in range(15)]
     records += [task(f"Nx{i}", COHORT_NEW, first_pass=None) for i in range(10)]
     report = build_report(records, assignment=ASSIGNMENT_RANDOMISED)
-    assert report.groups[0].headline_metric == "worker_turn_count"
+    group = report.groups[0]
+    assert group.headline_metric == "first_pass_success"
+    assert any("FPS_COVERAGE_DIFFERS_BY_ARM" in w for w in group.warnings)
+    assert not any("FPS_NOT_IDENTIFIED" in w for w in group.warnings)
+
+
+# --- partial identification under missing outcomes -------------------------
+
+
+def test_the_identification_interval_width_is_governed_by_missingness() -> None:
+    """The width is (1 - coverage). It does NOT depend on the other arm,
+    which is why a rule keyed on the coverage GAP is the wrong shape."""
+    assert stats.identification_interval(1.0, 1.0) == (1.0, 1.0)
+    assert stats.identification_interval(1.0, 0.5) == (0.5, 1.0)
+    assert stats.identification_interval(0.0, 0.5) == (0.0, 0.5)
+    assert stats.identification_interval(None, 0.5) is None
+    assert stats.identification_interval(0.5, None) is None
+
+
+def test_equal_but_poor_coverage_can_explain_a_hundred_point_difference() -> None:
+    """The counterexample that killed the gap rule. Both arms 50%
+    scoreable, one observing 100% success and the other 0%: the gap is
+    ZERO and the observed difference is a hundred points, yet both true
+    rates could be exactly 50%. Equal coverage is not safety."""
+    assert stats.explained_by_missingness(1.0, 0.5, 0.0, 0.5) is True
+
+    records = [task(f"L{i}", COHORT_LEGACY, first_pass=True) for i in range(12)]
+    records += [task(f"Lx{i}", COHORT_LEGACY, first_pass=None) for i in range(12)]
+    records += [task(f"N{i}", COHORT_NEW, first_pass=False) for i in range(12)]
+    records += [task(f"Nx{i}", COHORT_NEW, first_pass=None) for i in range(12)]
+    report = build_report(records, assignment=ASSIGNMENT_RANDOMISED)
+    group = report.groups[0]
+    assert group.coverage[COHORT_LEGACY].first_pass_coverage == 0.5
+    assert group.coverage[COHORT_NEW].first_pass_coverage == 0.5
+    assert group.headline_metric == "worker_turn_count"
+    warning = next(w for w in group.warnings if "FPS_NOT_IDENTIFIED" in w)
+    assert "not\na sample-size one" in warning or "not a sample-size one" in warning
+    assert not any("FPS_COVERAGE_DIFFERS_BY_ARM" in w for w in group.warnings), (
+        "the gap is zero -- the gap warning must not be what caught this"
+    )
+
+
+def test_equal_coverage_is_not_a_blanket_veto() -> None:
+    """The mirror sanity row: both arms at 70% scoreability with an
+    85-point observed difference do NOT overlap, so the finding stands."""
+    assert stats.explained_by_missingness(1.0, 0.7, 0.15, 0.7) is False
+
+
+def test_a_tiny_gap_against_a_large_effect_is_identified() -> None:
+    assert stats.explained_by_missingness(0.20, 1.0, 0.80, 0.97) is False
+
+
+def test_full_coverage_always_identifies() -> None:
+    """With nothing missing the intervals are points, so any real
+    difference survives and an equal pair is a genuine null."""
+    assert stats.explained_by_missingness(0.2, 1.0, 0.8, 1.0) is False
+    assert stats.explained_by_missingness(0.5, 1.0, 0.5, 1.0) is True
+
+
+def test_touching_intervals_count_as_overlapping() -> None:
+    """A single shared value is exactly the case where the two arms'
+    true rates could be equal."""
+    assert stats.intervals_overlap((0.5, 1.0), (0.0, 0.5)) is True
+    assert stats.intervals_overlap((0.51, 1.0), (0.0, 0.5)) is False
+
+
+def test_the_report_says_coverage_is_not_a_sample_size_problem() -> None:
+    """A larger sample does not shrink an identification interval; only
+    recording the outcomes does. A reader seeing an overlap verdict next
+    to a tight confidence band must be told they answer different
+    questions, or they will read the band as the stronger claim."""
+    text = render_markdown(build_report(cohort_pair(12)))
+    assert "partial identification" in text
+    assert "more tasks will not shrink" in text.lower()

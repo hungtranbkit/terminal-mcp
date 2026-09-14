@@ -85,8 +85,19 @@ ASSIGNMENT_OBSERVATIONAL = "observational"
 ASSIGNMENTS = (ASSIGNMENT_RANDOMISED, ASSIGNMENT_INTERLEAVED, ASSIGNMENT_OBSERVATIONAL)
 
 MIN_USAGE_COVERAGE = 0.80
-# Absolute backstop: a scoreability gap this wide moves the headline off
-# first-pass success regardless of how large the observed difference is.
+# This no longer gates the headline -- `stats.explained_by_missingness`
+# does, exactly and without any threshold. An earlier version keyed the
+# headline on the GAP in scoreability between arms, which was wrong: the
+# identification interval's width is (1 - coverage), so it is governed
+# by how much is missing, not by how much MORE is missing in one arm.
+# Two arms at equal, moderate coverage can show a hundred-point apparent
+# difference whose true rates are identical, and a gap rule scores that
+# as perfectly safe. Equal coverage is not safety.
+#
+# What this constant still decides is when a lopsided denominator is
+# worth SAYING. Differential measurement is a selection concern in its
+# own right, separate from whether coverage can explain the result, so
+# it is reported and demotes the band even when the effect survives.
 #
 # The primary rule is relative and comes from the arithmetic rather than
 # from a chosen number. If an arm scores a fraction c of its tasks at
@@ -437,45 +448,55 @@ def _build_group(
     legacy_fps_coverage = coverage[COHORT_LEGACY].first_pass_coverage
     new_fps_coverage = coverage[COHORT_NEW].first_pass_coverage
     headline_metric = "first_pass_success"
-    if legacy_fps_coverage is not None and new_fps_coverage is not None:
-        coverage_gap = abs(legacy_fps_coverage - new_fps_coverage)
-        legacy_rate = coverage[COHORT_LEGACY].first_pass_rate
-        new_rate = coverage[COHORT_NEW].first_pass_rate
-        observed_gap = (
-            abs(new_rate - legacy_rate) / 100.0
-            if legacy_rate is not None and new_rate is not None
-            else None
+    legacy_rate = coverage[COHORT_LEGACY].first_pass_rate
+    new_rate = coverage[COHORT_NEW].first_pass_rate
+    legacy_interval = stats.identification_interval(
+        None if legacy_rate is None else legacy_rate / 100.0, legacy_fps_coverage
+    )
+    new_interval = stats.identification_interval(
+        None if new_rate is None else new_rate / 100.0, new_fps_coverage
+    )
+    # Overlap only signals a problem when at least one interval has
+    # WIDTH -- i.e. something is actually missing. Two fully-covered
+    # arms produce point intervals, and two points that coincide mean
+    # the rates are genuinely equal, which is an identified finding
+    # rather than an identification failure.
+    has_missingness = any(
+        interval is not None and interval[1] > interval[0]
+        for interval in (legacy_interval, new_interval)
+    )
+    if has_missingness and stats.intervals_overlap(legacy_interval, new_interval):
+        # Equal true rates are consistent with what was observed, so no
+        # directional claim on this metric is licensed -- whatever the
+        # coverage gap, whatever the sample size.
+        headline_metric = "worker_turn_count"
+        warnings.append(
+            f"FPS_NOT_IDENTIFIED: in {risk_class}, first-pass success is scoreable for "
+            f"{legacy_fps_coverage:.0%} of matched legacy tasks and {new_fps_coverage:.0%} of "
+            f"new-pipeline tasks, so their true rates lie anywhere in "
+            f"[{legacy_interval[0]:.0%}, {legacy_interval[1]:.0%}] and "
+            f"[{new_interval[0]:.0%}, {new_interval[1]:.0%}]. Those ranges overlap: equal true "
+            "rates are consistent with the data, so the observed difference could be entirely "
+            "an artefact of which tasks were scoreable. This is a missing-outcome problem, not "
+            "a sample-size one -- more tasks will not shrink those ranges, only recording the "
+            "outcomes will. The headline moves to worker turns, whose denominator does not "
+            "depend on the arm"
         )
-        # Both sides must be real: with no coverage gap, coverage
-        # explains nothing; with no observed difference, there is
-        # nothing for it to explain. Either zero makes the rule
-        # vacuously true, which would fire it on every clean comparison.
-        explains_everything = (
-            observed_gap is not None
-            and observed_gap > 0
-            and coverage_gap > 0
-            and coverage_gap >= observed_gap
+    if (
+        legacy_fps_coverage is not None
+        and new_fps_coverage is not None
+        and abs(legacy_fps_coverage - new_fps_coverage) > FPS_COVERAGE_GAP
+    ):
+        # Reported even when the effect survives the test above: the
+        # treatment changing the probability a task can be measured at
+        # all is a selection concern on its own terms.
+        warnings.append(
+            f"FPS_COVERAGE_DIFFERS_BY_ARM: first-pass success is scoreable for "
+            f"{legacy_fps_coverage:.0%} of matched legacy tasks and {new_fps_coverage:.0%} of "
+            f"new-pipeline tasks in {risk_class}. The treatment changes the probability a task "
+            "can be measured on the very metric being compared, which selects the "
+            "worse-instrumented arm's tasks out of the denominator"
         )
-        if explains_everything or coverage_gap > FPS_COVERAGE_GAP:
-            headline_metric = "worker_turn_count"
-            detail = (
-                f"a {coverage_gap:.0%} gap can account for up to {coverage_gap:.0%} of an "
-                f"apparent difference, and the observed difference is {observed_gap:.0%} — so "
-                "coverage alone is a complete explanation for it"
-                if explains_everything
-                else f"a {coverage_gap:.0%} gap can account for up to {coverage_gap:.0%} of the "
-                f"observed {observed_gap:.0%} difference"
-                if observed_gap is not None
-                else "the observed difference cannot be computed"
-            )
-            warnings.append(
-                f"FPS_COVERAGE_DIFFERS_BY_ARM: first-pass success is scoreable for "
-                f"{legacy_fps_coverage:.0%} of matched legacy tasks and {new_fps_coverage:.0%} "
-                f"of new-pipeline tasks in {risk_class}; {detail}. The treatment changes the "
-                "probability a task can be measured on this metric, which inflates the "
-                "better-instrumented arm's apparent rate; the headline moves to worker turns, "
-                "whose denominator does not depend on the arm"
-            )
     disagreements = sum(group.first_pass_disagreements for group in coverage.values())
     if disagreements:
         warnings.append(
@@ -507,6 +528,8 @@ def _build_group(
         if any("THIN_TELEMETRY" in warning for warning in warnings):
             confidence = _demote(confidence)
         if any("COVERAGE_IMBALANCE" in warning for warning in warnings):
+            confidence = _demote(confidence)
+        if any("FPS_COVERAGE_DIFFERS_BY_ARM" in warning for warning in warnings):
             confidence = _demote(confidence)
 
     directional = enough and assignment == ASSIGNMENT_RANDOMISED and count_ok
@@ -705,6 +728,21 @@ def _percent(value: float | None) -> str:
     return "—" if value is None else f"{value:.0f}%"
 
 
+def _interval(coverage: GroupCoverage) -> str:
+    """The range the arm's true rate could occupy given what was never
+    scored. Printed next to the observed rate so the rate is never read
+    as more certain than it is."""
+    rate = coverage.first_pass_rate
+    interval = stats.identification_interval(
+        None if rate is None else rate / 100.0, coverage.first_pass_coverage
+    )
+    if interval is None:
+        return "—"
+    if interval[1] - interval[0] < 1e-9:
+        return f"{interval[0]:.0%} (fully scored)"
+    return f"{interval[0]:.0%}–{interval[1]:.0%}"
+
+
 def _share(value: float | None) -> float | None:
     return None if value is None else value * 100.0
 
@@ -807,6 +845,15 @@ def render_markdown(report: BenchmarkReport) -> str:
         "- A missing measurement is counted as missing, never as zero. Each cell's `n` is the "
         "number of tasks that actually recorded that metric."
     )
+    lines.append(
+        "- Missing **outcomes** are a **partial identification** problem, not a precision one. "
+        "Where first-pass success is unscoreable for some tasks, each arm's true rate is only "
+        "known to lie in a range, and **more tasks will not shrink those ranges — only recording "
+        "the outcomes will**. So an \"equal true rates are consistent\" verdict sitting next to a "
+        "tight confidence interval is not a contradiction: the interval describes sampling noise "
+        "around a quantity that is not identified in the first place, and it is the weaker "
+        "claim of the two."
+    )
     for note in report.notes:
         lines.append(f"- {note}")
     lines.append("")
@@ -862,6 +909,9 @@ def _render_group(group: RiskGroupReport, unavailable_reasons: Sequence[str] = (
         f"({new_cov.first_pass_known}/{new_cov.matched}) |"
     )
     lines.append(
+        f"| — true rate lies in | {_interval(legacy_cov)} | {_interval(new_cov)} |"
+    )
+    lines.append(
         f"| Re-entries from excluded reasons only | {legacy_cov.excluded_reason_only} "
         f"| {new_cov.excluded_reason_only} |"
     )
@@ -870,10 +920,13 @@ def _render_group(group: RiskGroupReport, unavailable_reasons: Sequence[str] = (
     lines.append(
         f"**Headline metric for this class: `{group.headline_metric}`.** "
         + (
-            "First-pass success is scoreable at a similar rate in both arms."
+            "Enough first-pass outcomes were recorded for the observed difference to be a real "
+            "one."
             if group.headline_metric == "first_pass_success"
-            else "First-pass success is scoreable at materially different rates in the two arms, "
-            "so its denominator depends on the treatment; worker turns are the headline instead."
+            else "Too many first-pass outcomes are unrecorded for the observed difference to be "
+            "distinguishable from an artefact of which tasks were scoreable — equal true rates "
+            "are consistent with the data. Worker turns are the headline instead: every matched "
+            "task has one, so its denominator cannot depend on the treatment."
         )
     )
     lines.append("")

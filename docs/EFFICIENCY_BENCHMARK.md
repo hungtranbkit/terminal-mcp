@@ -193,21 +193,57 @@ denominator and inflates the treatment arm's apparent rate. So:
   the rate; the rate is never rendered without it;
 * the **headline metric moves to `worker_turn_count`**, whose
   denominator is every matched task regardless of treatment, whenever
-  the gap is large enough to matter — and "large enough" comes from the
-  arithmetic, not from a chosen number.
+  the first-pass comparison is not *identified*.
+
+### Coverage is partial identification, not imprecision
 
 If an arm scores a fraction `c` of its tasks at observed rate `r`, its
 true rate lies in `[r·c, r·c + (1−c)]` — at the extremes the unscored
-tasks are all failures or all successes. Working that through, **a
-scoreability gap of G percentage points can account for up to exactly G
-points of apparent first-pass difference.** So the headline moves
-whenever the gap is at least as large as the difference it would have to
-explain: at that point coverage alone is a complete explanation for the
-result, and the metric is uninformative however clean the rest of the
-comparison is. A fixed 10-point gap remains as an absolute backstop for
-the case where the observed difference is large but the gap is wide too.
-The report states which of the two fired and how much of the observed
-difference coverage can account for.
+tasks are all failures or all successes. **The width of that interval is
+`1 − c`**: it is governed by how much is missing, *not* by how much more
+is missing in one arm than the other.
+
+That distinction is the whole rule, and getting it wrong is easy. An
+earlier version of this harness moved the headline when the scoreability
+**gap** between arms was large. That misses the case the programme will
+actually hit first — both arms equally and moderately covered:
+
+| | scored | observed rate | true rate could be |
+| --- | ---: | ---: | --- |
+| legacy | 50% | 100% | 50%–100% |
+| new pipeline | 50% | 0% | 0%–50% |
+
+The gap is **zero** and the observed difference is **a hundred points**,
+yet both true rates could be exactly 50%. Equal coverage is not safety;
+poor coverage is the problem, and it can be poor symmetrically. Since
+`first_pass_success` defaults to `UNKNOWN` and evidence capture will be
+the last thing to come online, equal-and-incomplete is the *expected*
+early state.
+
+So the test is the **interval overlap itself**, applied directly: if the
+two arms' identification intervals overlap, equal true rates are
+consistent with the data and no directional claim is licensed — whatever
+the gap, whatever the N. It is exact rather than a bound, it needs no
+thresholds, and it subsumes every gap-based heuristic as a special case.
+Overlap only counts when at least one interval has width; two
+fully-scored arms produce point intervals, and two coinciding points
+mean the rates are genuinely equal, which is a finding rather than a
+failure.
+
+A lopsided denominator (>10 points) is still **reported** and still
+demotes the band, because a treatment that changes the probability a
+task can be measured at all is a selection concern in its own right —
+but on its own it no longer moves the headline. A 40-point gap against
+an effect coverage cannot possibly explain leaves first-pass success
+standing, correctly; the old gap rule fired there and was wrong to.
+
+**A larger sample does not shrink an identification interval — only
+recording the outcomes does.** So an overlap verdict next to a tight
+confidence interval is not a contradiction: the confidence interval
+describes sampling noise around a quantity that is not identified in the
+first place, and it is the weaker claim of the two. The report says this
+explicitly, because a reader will otherwise take the band as the
+stronger one.
 
 ### Re-entry reasons
 
@@ -501,7 +537,12 @@ otherwise produce a plausible-looking number rather than an error:
 * a reason the store cannot record renders UNAVAILABLE, never 0
 * a flattering stored first-pass outcome is overridden by the recomputed
   one and flagged
-* first-pass success stops being the headline when its denominator
-  depends on the arm
+* first-pass success stops being the headline when the arms'
+  identification intervals overlap — including at equal coverage, where
+  a gap-based rule scores a hundred-point difference as safe
+* two fully-scored arms with equal rates are a genuine null, not an
+  identification failure
+* a wide coverage gap alone does not move the headline when coverage
+  cannot explain the effect
 * `primary_cost_tokens` never renders without `cost_units` in the same
   row, and a divergence between them is called out inline
