@@ -1,5 +1,12 @@
 [Unit]
 Description=OpenAI Secure MCP Tunnel for Terminal MCP
+#
+# NOTE (2026-09-13): on a host where the controller runs as
+# terminal-mcp-fed-controller.service instead of terminal-mcp-http.service
+# (the self-hosted/federated layout), change the unit named below to match.
+# An After=/Wants= pointing at a unit that never starts is not just inert
+# ordering -- a Wants= will actively TRY to start it, and a second controller
+# racing for 127.0.0.1:8766 crash-loops on EADDRINUSE. Observed live.
 After=network-online.target terminal-mcp-http.service
 Wants=network-online.target
 

@@ -257,6 +257,65 @@ class AiUsageConfig:
     critical_threshold_percent: float = 90.0
 
 
+# The image types notes_service.py can both content-sniff and serve.
+# Kept as a literal here rather than imported from notes_service so
+# config.py's import graph stays as narrow as it is today;
+# tests/test_notes_config.py asserts the two lists never drift apart.
+_NOTES_SERVABLE_MIME_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
+
+
+@dataclass(frozen=True)
+class NotesConfig:
+    """Notes / Ideas store (notes_store.py + notes_service.py) -- the
+    cross-project kho ghi chú ChatGPT writes into when the user says "lưu
+    lại". Defaults ON, same reasoning as ai_usage above: there is no
+    autonomous background ACTION to gate here, only a store that answers
+    reads and writes when something asks it to. Nothing runs, nothing is
+    captured, and no file is written until a caller explicitly creates a
+    note.
+
+    `attachments_dir` empty means "beside the notes DB under the same
+    state root" (notes_service.default_attachments_dir) -- so an
+    XDG_STATE_HOME override relocates the DB and its images together,
+    which is what makes an isolated test run or a second instance
+    actually isolated.
+
+    `attachment_source_roots` is empty BY DEFAULT and that is the whole
+    point: with no root configured, the source_path attachment transport
+    is refused outright (ATTACHMENT_SOURCE_DISABLED) and the only way to
+    attach bytes is data_base64 or the dashboard's own upload form.
+    Adding a root is an operator granting this store permission to read
+    files from exactly that subtree -- never an implicit licence to read
+    anywhere the server process happens to have access to."""
+    enabled: bool = True
+    # Application-layer authentication for the Notes HTTP surface (the
+    # page, its JSON API, and attachment serving). ON by default, and
+    # unlike every other gate in this file that default is a TIGHTENING of
+    # what the route would otherwise do, not a feature switch: notes hold
+    # whatever the operator chose to keep, so "reachable the socket is
+    # reachable" is the wrong posture for them even though it is the
+    # historical one for /dashboard/*.
+    #
+    # Satisfied by EITHER of the two identities this project already has
+    # (no third mechanism is introduced -- see dashboard._notes_auth_guard):
+    # a webauth session cookie (webauth.py, the /login path) or a verified
+    # Cloudflare Access assertion (cf_access.py, when
+    # dashboard.cloudflare_access_team_domain/audience are configured).
+    # Edge-only Access is explicitly NOT enough: cloudflared connects to
+    # this process over loopback, so tunnel traffic is indistinguishable
+    # from local traffic once it arrives -- exactly the gap cf_access.py's
+    # own docstring warns about.
+    #
+    # Set false only for a genuinely single-user loopback-only box where
+    # logging in is pure friction; it returns these routes to the same
+    # unauthenticated posture the rest of /dashboard/* still has.
+    require_auth: bool = True
+    attachments_dir: str = ""
+    max_attachment_bytes: int = 10 * 1024 * 1024
+    allowed_mime_types: tuple[str, ...] = ("image/png", "image/jpeg", "image/webp", "image/gif")
+    attachment_source_roots: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class DashboardConfig:
     # A boundary specific to the web dashboard's own mutation routes
@@ -782,6 +841,7 @@ class AppConfig:
     integration_loop: IntegrationLoopConfig = IntegrationLoopConfig()
     submit_watchdog: SubmitWatchdogConfig = SubmitWatchdogConfig()
     ai_usage: AiUsageConfig = AiUsageConfig()
+    notes: NotesConfig = NotesConfig()
     auto_recovery: AutoRecoveryConfig = AutoRecoveryConfig()
     # Loop-protection metadata schema (see docs/prompt-submission.md, P11):
     # terminal_send_text/_granted accept optional origin/trace_id/parent_
@@ -1109,6 +1169,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         integration_loop=_load_integration_loop_config(raw.get("integration_loop", {})),
         submit_watchdog=watchdog_config,
         ai_usage=_load_ai_usage_config(raw.get("ai_usage", {})),
+        notes=_load_notes_config(raw.get("notes", {})),
         auto_recovery=_load_auto_recovery_config(raw.get("auto_recovery", {})),
     )
 
@@ -1244,6 +1305,44 @@ def _load_auto_recovery_config(raw: object) -> AutoRecoveryConfig:
     return AutoRecoveryConfig(enabled=bool(raw.get("enabled", False)), max_attempts=max_attempts,
                               lock_ttl_seconds=lock_ttl, reconcile_poll_seconds=reconcile_poll,
                               max_missing_age_seconds=max_missing_age)
+
+
+def _load_notes_config(raw: object) -> NotesConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    max_bytes = int(raw.get("max_attachment_bytes", NotesConfig.max_attachment_bytes))
+    if max_bytes <= 0:
+        raise ValueError("notes.max_attachment_bytes must be positive")
+    allowed_raw = raw.get("allowed_mime_types", NotesConfig.allowed_mime_types)
+    if isinstance(allowed_raw, str):
+        allowed_raw = [allowed_raw]
+    allowed = tuple(str(item).strip().lower() for item in allowed_raw if str(item).strip())
+    if not allowed:
+        raise ValueError("notes.allowed_mime_types must list at least one type")
+    unsupported = [item for item in allowed if item not in _NOTES_SERVABLE_MIME_TYPES]
+    if unsupported:
+        # Fail LOUDLY at config load rather than accepting a type the
+        # content sniffer cannot recognise -- that combination would
+        # silently refuse every upload of that type at runtime with a
+        # confusing "not an allowed image type" error.
+        raise ValueError(
+            "notes.allowed_mime_types contains types this build cannot verify or serve: "
+            + ", ".join(unsupported) + " (supported: " + ", ".join(sorted(_NOTES_SERVABLE_MIME_TYPES)) + ")")
+    roots_raw = raw.get("attachment_source_roots", NotesConfig.attachment_source_roots)
+    if isinstance(roots_raw, str):
+        roots_raw = [roots_raw]
+    roots = tuple(str(item).strip() for item in roots_raw if str(item).strip())
+    for root in roots:
+        if not Path(root).expanduser().is_absolute():
+            raise ValueError(f"notes.attachment_source_roots entries must be absolute paths: {root}")
+    return NotesConfig(
+        enabled=bool(raw.get("enabled", NotesConfig.enabled)),
+        require_auth=bool(raw.get("require_auth", NotesConfig.require_auth)),
+        attachments_dir=str(raw.get("attachments_dir", NotesConfig.attachments_dir) or ""),
+        max_attachment_bytes=max_bytes,
+        allowed_mime_types=allowed,
+        attachment_source_roots=roots,
+    )
 
 
 def _load_ai_usage_config(raw: object) -> AiUsageConfig:

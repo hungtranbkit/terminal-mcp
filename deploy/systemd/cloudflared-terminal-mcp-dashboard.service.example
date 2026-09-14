@@ -1,7 +1,13 @@
 [Unit]
 Description=Cloudflare Tunnel for Terminal MCP read-only dashboard
 After=network-online.target terminal-mcp-http.service
-Wants=network-online.target terminal-mcp-http.service
+# WARNING: a Wants= on the controller unit will START it. Name the unit that
+# actually serves 127.0.0.1:8766 on this host -- on a fed-controller host,
+# leaving terminal-mcp-http.service here resurrects the retired controller and
+# crash-loops it on EADDRINUSE every time this tunnel starts (observed live
+# 2026-09-13). Note that an empty `Wants=` in a drop-in does NOT reliably reset
+# an inherited list (systemd 259); fix it here, in the unit itself.
+Wants=network-online.target terminal-mcp-fed-controller.service
 
 [Service]
 Type=simple
