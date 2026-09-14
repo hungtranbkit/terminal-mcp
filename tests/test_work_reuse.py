@@ -202,3 +202,50 @@ def test_applying_twice_does_not_duplicate_the_decision(store):
     wr.apply_to_spec(target, analysis)
 
     assert len(target.reuse_decisions) == 1
+
+
+# -- module scoring has to be on the same scale as spec scoring --------------------
+
+def test_a_module_named_by_the_request_is_found_even_with_little_prose_overlap():
+    """The defect this covers, measured on this repo's real map.
+
+    Module matching used a raw Jaccard similarity against MENTION_THRESHOLD,
+    which was calibrated for the COMPOSITE spec score. Different units:
+    Jaccard divides by the union, so a fifteen-word request against a
+    twenty-word module description cannot reach 0.25 even when it is
+    unmistakably about that module. The correct module for a real bug report
+    scored 0.065 and was discarded, so the knowledge stage returned nothing on
+    real input while appearing to work.
+    """
+    knowledge = _FakeKnowledge([
+        _FakeModule("work_runtime", "runs and supervises tasks"),
+        _FakeModule("tunnel", "keeps the cloudflared tunnel healthy")])
+    target = _spec("the work page shows a session as idle while it is running")
+
+    found = wr.knowledge_candidates(target, knowledge=knowledge)
+
+    assert [c.ref for c in found] == ["work_runtime"]
+    assert found[0].score >= wr.MENTION_THRESHOLD
+    assert any("names" in r for r in found[0].reasons)
+
+
+def test_a_path_stem_counts_as_naming_the_module():
+    """`work_runtime` owning `work_service.py` should be found by a request
+    that says "service" -- the files a module owns name it too."""
+    module = _FakeModule("runtime", "supervises things")
+    module.paths = ("terminal_mcp/work_service.py",)
+    target = _spec("the work service reports the wrong state")
+
+    found = wr.knowledge_candidates(target, knowledge=_FakeKnowledge([module]))
+
+    assert [c.ref for c in found] == ["runtime"]
+
+
+def test_shared_path_noise_alone_does_not_make_a_match():
+    """Every module in this project lives under terminal_mcp/ and ends in .py.
+    Matching on those would score every module equally and distinguish none."""
+    module = _FakeModule("tunnel", "keeps the cloudflared tunnel healthy")
+    module.paths = ("terminal_mcp/tunnel_watchdog.py",)
+    target = _spec("add a terminal mcp py thing")
+
+    assert wr.knowledge_candidates(target, knowledge=_FakeKnowledge([module])) == []

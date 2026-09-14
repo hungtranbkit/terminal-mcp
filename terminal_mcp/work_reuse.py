@@ -37,6 +37,7 @@ it is an omission, so the searched-and-found-nothing case says so explicitly.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -144,6 +145,90 @@ def similar_work(store: WorkSpecStore, target: WorkSpec, *,
     return candidates[:limit]
 
 
+# Path fragments every module in a Python project shares. Left in, they match
+# everything equally and so distinguish nothing while inflating every score.
+_PATH_NOISE = frozenset({
+    "terminal", "mcp", "py", "src", "lib", "app", "scripts", "agent",
+    "projectflow", "policies", "tests", "test", "init",
+})
+
+
+def _identifier_tokens(module: Any) -> set[str]:
+    """The STRONG signal: a module's name and the stems of its own paths.
+
+    `work_runtime` owning `work_service.py` and `work_loop.py` contributes
+    work/runtime/service/loop -- words that name the thing rather than
+    describe it. A request sharing one of these is talking about this module;
+    a request sharing only prose from its summary may just be using English.
+    """
+    words: set[str] = set()
+    for part in re.split(r"[^0-9a-zA-Z]+", str(module.name or "")):
+        if part:
+            words.add(part.lower())
+    for path in (getattr(module, "paths", ()) or ()):
+        for part in re.split(r"[^0-9a-zA-Z]+", str(path)):
+            token = part.lower()
+            if token and not token.isdigit():
+                words.add(token)
+    for topic in (getattr(module, "topics", ()) or ()):
+        for part in re.split(r"[^0-9a-zA-Z]+", str(topic)):
+            if part:
+                words.add(part.lower())
+    return words - _PATH_NOISE
+
+
+def _score_module(module: Any, target_tokens: set[str]) -> tuple[float, list[str]]:
+    """Composite, on the SAME scale as `_score_spec`.
+
+    The bug this fixes: module matching used a raw Jaccard similarity and
+    compared it against MENTION_THRESHOLD, which was calibrated for the
+    COMPOSITE spec score (0.30 same-module + 0.25 shared-files + 0.30x text).
+    Those are different units. Jaccard divides by the union of both bags, so a
+    fifteen-word request against a twenty-word module description cannot reach
+    0.25 even when it is unmistakably about that module -- measured on this
+    repo's real map, the correct module for a real bug report scored 0.065 and
+    was discarded. The knowledge stage therefore contributed nothing on real
+    input while appearing to work.
+
+    So the score is built the same way the spec score is: an identifier match
+    carries most of the weight, prose overlap refines it.
+    """
+    identifiers = _identifier_tokens(module)
+    prose = _tokens(module.name, module.summary)
+    shared_ids = sorted(identifiers & target_tokens)
+
+    score = 0.0
+    reasons: list[str] = []
+    if shared_ids:
+        # Naming the module (or one of its files) is the strongest evidence a
+        # free-text request can carry.
+        score += 0.45
+        reasons.append("names " + ", ".join(shared_ids[:3]))
+        if len(shared_ids) > 1:
+            score += 0.25
+            reasons.append(f"{len(shared_ids)} identifier matches")
+
+    # Prose is scored by OVERLAP COEFFICIENT, not Jaccard. Jaccard divides by
+    # the union, so a short focused summary that genuinely describes the
+    # request is punished simply for being short -- "serialises report rows to
+    # CSV" against "add CSV download of report rows" shares most of what there
+    # is to share and still scores near zero. The overlap coefficient asks the
+    # question that actually matters: how much of the SMALLER bag matched.
+    combined = prose | identifiers
+    shared_prose = combined & target_tokens
+    coefficient = (len(shared_prose) / min(len(combined), len(target_tokens))
+                   if combined and target_tokens else 0.0)
+    if coefficient >= 0.5:
+        # Most of the shorter description is present in the request. That is
+        # evidence in its own right, even with no identifier in common.
+        score += 0.35
+        reasons.append(f"description closely matches ({coefficient:.0%})")
+    elif coefficient:
+        score += 0.30 * coefficient
+        reasons.append(f"description overlaps ({coefficient:.0%})")
+    return min(score, 1.0), reasons
+
+
 def knowledge_candidates(target: WorkSpec, *, knowledge: Any = None,
                          limit: int = MAX_CANDIDATES) -> list[Candidate]:
     """Modules whose recorded purpose overlaps this work.
@@ -162,13 +247,13 @@ def knowledge_candidates(target: WorkSpec, *, knowledge: Any = None,
     target_tokens = _spec_tokens(target)
     out: list[Candidate] = []
     for module in modules:
-        overlap = _jaccard(_tokens(module.name, module.summary), target_tokens)
-        if overlap < MENTION_THRESHOLD:
+        score, reasons = _score_module(module, target_tokens)
+        if score < MENTION_THRESHOLD:
             continue
         out.append(Candidate(
             kind="module", ref=module.name, title=module.summary or module.name,
-            score=overlap,
-            reasons=(f"knowledge summary overlaps ({overlap:.0%})",
+            score=score,
+            reasons=(*reasons,
                      f"confidence {module.confidence}: {module.confidence_reason}"),
             detail={"paths": list(getattr(module, "paths", ()) or ()),
                     "confidence": module.confidence,
