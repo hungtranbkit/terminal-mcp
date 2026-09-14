@@ -27,6 +27,7 @@ never blocks any session operation on the heartbeat loop's own success).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import logging
@@ -34,6 +35,7 @@ import os
 import secrets
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -91,7 +93,95 @@ def _read_token(token: str | None, token_file: str | None) -> str:
     raise SystemExit("no node token configured -- set TERMINAL_MCP_NODE_TOKEN, or pass --token/--token-file")
 
 
-def _auth_ok(request: Request, expected_token: str) -> bool:
+class AgentCredential:
+    """This agent's own bearer token, swappable while the process runs.
+
+    blg_a3cc401d8275. The token used to be a closure variable captured at
+    startup, which is why rotating one meant editing a file and
+    restarting the agent -- and why rotating dell-5530 was deferred on
+    2026-09-09 rather than cost six live sessions.
+
+    Holding it here instead makes two things possible. The controller can
+    hand this agent a replacement over the already-authenticated
+    heartbeat channel and it takes effect on the next request, no
+    restart. And during the handoff the agent keeps accepting the
+    PREVIOUS token for a short window -- the controller only moves its
+    own outbound copy once it has seen a heartbeat signed with the new
+    one, so there is an unavoidable moment where it is still calling in
+    with the old token. Accepting both is what makes that moment
+    invisible instead of a burst of 401s.
+    """
+
+    PREVIOUS_GRACE_SECONDS = 900
+
+    def __init__(self, token: str, *, token_file: str | None = None,
+                 previous_grace_seconds: float | None = None) -> None:
+        self._token = token
+        self._previous: str | None = None
+        self._previous_until = 0.0
+        self.token_file = token_file
+        self._grace = (self.PREVIOUS_GRACE_SECONDS if previous_grace_seconds is None
+                       else previous_grace_seconds)
+
+    @classmethod
+    def of(cls, value: "str | AgentCredential") -> "AgentCredential":
+        return value if isinstance(value, cls) else cls(value)
+
+    @property
+    def current(self) -> str:
+        return self._token
+
+    @property
+    def token_id(self) -> str:
+        """The same 12-hex fingerprint the controller uses, so a log line
+        on either machine names the same credential without either of
+        them writing it down."""
+        return hashlib.sha256(self._token.encode("utf-8")).hexdigest()[:12]
+
+    def accepts(self, presented: str) -> bool:
+        if hmac.compare_digest(presented, self._token):
+            return True
+        if self._previous and time.time() < self._previous_until:
+            return hmac.compare_digest(presented, self._previous)
+        return False
+
+    def adopt(self, token: str) -> bool:
+        """Take a replacement token. Idempotent -- adopting the token we
+        already hold is a no-op, so a duplicated controller hint cannot
+        push the real previous token out of its grace window."""
+        if not token or token == self._token:
+            return False
+        self._previous = self._token
+        self._previous_until = time.time() + self._grace
+        self._token = token
+        self._persist(token)
+        return True
+
+    def _persist(self, token: str) -> None:
+        """Survive a restart. Best-effort on purpose: an agent that
+        cannot write its token file has still rotated successfully in
+        memory, and failing the rotation over it would be worse than the
+        next restart falling back to the old token (which the controller
+        still accepts in grace)."""
+        if not self.token_file:
+            return
+        try:
+            target = Path(self.token_file).expanduser()
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(descriptor, token.encode())
+            finally:
+                os.close(descriptor)
+            # O_CREAT's mode applies only to a file it CREATES -- the
+            # common case here is overwriting one the installer wrote,
+            # whose mode is whatever that installer chose.
+            os.chmod(target, 0o600)
+        except OSError:
+            _log.exception("could not persist the rotated node token to %s -- "
+                           "it is live in memory but a restart will fall back", self.token_file)
+
+
+def _auth_ok(request: Request, expected_token: "str | AgentCredential") -> bool:
     header = request.headers.get("authorization", "")
     if not header.startswith("Bearer "):
         return False
@@ -100,12 +190,17 @@ def _auth_ok(request: Request, expected_token: str) -> bool:
     # check would leak the shared secret one byte at a time to a network
     # attacker; every other auth comparison in this project (webauth.py)
     # already uses the same discipline for the same reason.
-    return hmac.compare_digest(presented, expected_token)
+    return AgentCredential.of(expected_token).accepts(presented)
 
 
-def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
+def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | AgentCredential",
                      workspace_root: str = "/",
                      fleet: "FleetService | None" = None) -> Starlette:
+    # A plain string still works (every existing caller and test passes
+    # one); it is wrapped so that THIS process has exactly one credential
+    # object, and a rotation adopted by the heartbeat loop is immediately
+    # true for every route below.
+    credential = AgentCredential.of(token)
     client = LocalNodeClient(terminal)
 
     # Built lazily and cached: a node agent must still start and serve
@@ -130,7 +225,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         return _fleet["service"]
 
     def require_auth(request: Request) -> JSONResponse | None:
-        if not _auth_ok(request, token):
+        if not _auth_ok(request, credential):
             return JSONResponse({"error": "UNAUTHORIZED"}, status_code=401)
         return None
 
@@ -695,7 +790,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         # module docstring for that established trust model).
         header = websocket.headers.get("authorization", "")
         presented = header[len("Bearer "):] if header.startswith("Bearer ") else websocket.query_params.get("token", "")
-        if not hmac.compare_digest(presented, token):
+        if not credential.accepts(presented):
             await websocket.close(code=4401)
             return
         session = websocket.query_params.get("session", "")
@@ -792,7 +887,46 @@ async def watch_for_shutdown(app: Starlette, server: "uvicorn.Server", *,
     server.should_exit = True
 
 
-async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller_url: str, token: str,
+def _collect_rotated_token(*, controller_url: str, node_id: str, credential: AgentCredential,
+                           hint: dict, timeout: float = 10.0) -> bool:
+    """Fetch the replacement token the controller says is waiting.
+
+    Authenticated with the token this agent is ALREADY holding -- that is
+    the whole authorization, and it is why this can be a plain HTTP call
+    rather than a second enrollment: only the holder of the current (or
+    still-in-grace) credential can collect its successor.
+
+    Nothing here is logged but fingerprints. `hint["token_id"]` is
+    checked against what actually arrives, so a truncated or mismatched
+    response is discarded rather than adopted -- adopting the wrong
+    string would lock this agent out until someone drove to the machine.
+    """
+    path = str(hint.get("collect_path") or f"/dashboard/api/nodes/{node_id}/token/refresh")
+    url = f"{controller_url.rstrip('/')}{path}"
+    request = urllib.request.Request(url, data=b"{}", method="POST")
+    request.add_header("Authorization", f"Bearer {credential.current}")
+    request.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode() or "{}")
+    fresh = str(payload.get("token") or "")
+    if not fresh:
+        _log.warning("controller offered a token rotation but returned no token (token_id=%s)",
+                     hint.get("token_id"))
+        return False
+    expected = hint.get("token_id")
+    actual = hashlib.sha256(fresh.encode("utf-8")).hexdigest()[:12]
+    if expected and actual != expected:
+        _log.warning("refusing a rotated token: controller announced token_id=%s but delivered %s",
+                     expected, actual)
+        return False
+    adopted = credential.adopt(fresh)
+    if adopted:
+        _log.info("adopted rotated node token token_id=%s (no restart)", actual)
+    return adopted
+
+
+async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller_url: str,
+                          token: "str | AgentCredential",
                           workspace_root: str, interval_seconds: float, platform: str = "linux",
                           session_backend: str = "tmux", shell_capabilities: tuple[str, ...] = (),
                           wsl_available: bool = False) -> None:
@@ -807,6 +941,7 @@ async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller
     Windows-appropriate values -- not a separate, duplicated heartbeat
     loop implementation per platform."""
     url = f"{controller_url.rstrip('/')}/dashboard/api/nodes/{node_id}/heartbeat"
+    credential = AgentCredential.of(token)
     while True:
         try:
             metrics = host_metrics.collect(workspace_path=workspace_root)
@@ -833,9 +968,24 @@ async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller
                 "shell_capabilities": list(shell_capabilities), "wsl_available": wsl_available,
             }).encode()
             request = urllib.request.Request(url, data=body, method="POST")
-            request.add_header("Authorization", f"Bearer {token}")
+            request.add_header("Authorization", f"Bearer {credential.current}")
             request.add_header("Content-Type", "application/json")
-            await anyio.to_thread.run_sync(lambda: urllib.request.urlopen(request, timeout=10))
+
+            def _push() -> dict:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return json.loads(response.read().decode() or "{}")
+
+            answer = await anyio.to_thread.run_sync(_push)
+            # The controller answers a heartbeat with a rotation hint when
+            # it has a replacement token staged for this node. Collecting
+            # it here -- on the node's own schedule, over the channel it
+            # has already authenticated -- is what makes rotation cost
+            # zero restarts and zero hand-edited files.
+            hint = (answer or {}).get("token_refresh") or {}
+            if hint.get("available") and hint.get("token_id") != credential.token_id:
+                await anyio.to_thread.run_sync(
+                    lambda: _collect_rotated_token(controller_url=controller_url, node_id=node_id,
+                                                   credential=credential, hint=hint))
         except (urllib.error.URLError, OSError, ValueError) as exc:
             _log.warning("heartbeat push to controller failed (will retry): %s: %s", type(exc).__name__, exc)
         except Exception:  # noqa: BLE001 -- this loop must never die
@@ -858,6 +1008,9 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     token = _read_token(args.token, args.token_file)
+    # ONE credential object shared by the HTTP app and the heartbeat loop:
+    # a token the loop adopts is instantly the token every route accepts.
+    credential = AgentCredential(token, token_file=args.token_file)
     config = load_config(args.config)
     terminal = TerminalService(config)
     # Retired session-name whitelist -> real grants, same as the controller
@@ -881,7 +1034,7 @@ def main(argv: list[str] | None = None) -> int:
                       _deny_migration.get("errors"))
     except Exception:  # noqa: BLE001 -- never block startup on a migration
         _log.exception("deny-record migration failed -- grants left unchanged")
-    app = build_node_agent(node_id=args.node_id, terminal=terminal, token=token,
+    app = build_node_agent(node_id=args.node_id, terminal=terminal, token=credential,
                            workspace_root=(config.session_lifecycle.allowed_cwd_roots[0]
                                           if config.session_lifecycle.allowed_cwd_roots else "/"))
 
@@ -893,7 +1046,7 @@ def main(argv: list[str] | None = None) -> int:
         # just that adapter, keeping _heartbeat_loop's own signature
         # keyword-only (clearer at every OTHER call site, e.g. tests).
         await _heartbeat_loop(node_id=args.node_id, terminal=terminal, controller_url=args.controller_url,
-                              token=token, workspace_root=workspace_root,
+                              token=credential, workspace_root=workspace_root,
                               interval_seconds=args.heartbeat_interval_seconds)
 
     async def run() -> None:

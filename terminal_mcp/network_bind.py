@@ -227,6 +227,7 @@ def build_listen_sockets(port: int, lan_bind_ip: str | None | Sequence[str]) -> 
 
 
 def describe_endpoints(*, port: int, lan_bind_env: str | None, cidrs_env: str | None,
+                       runtime: dict | None = None,
                        tunnel_note: str = "OpenAI Secure MCP Tunnel + Cloudflare Access dashboard tunnel "
                                           "(see terminal-mcp-doctor connection)") -> dict:
     """One place both `terminal-mcp-doctor connection` and the dashboard's
@@ -243,8 +244,21 @@ def describe_endpoints(*, port: int, lan_bind_env: str | None, cidrs_env: str | 
         lan_binds = resolve_lan_binds(lan_bind_env)
     except NetworkBindError as exc:
         return {"loopback": f"http://{LOOPBACK}:{port}", "lan": None, "lan_error": str(exc), "tunnel": tunnel_note}
+    observed = list((runtime or {}).get("lan_addresses") or [])
+    if observed:
+        # Runtime wins outright, including when the env said nothing.
+        lan_binds = tuple(observed)
+    elif runtime is not None and runtime.get("confident") and not lan_binds:
+        # Looked, and there genuinely is no LAN listener. Carry WHY, so the
+        # caller can tell loopback-only from "the service is down" from
+        # "unconfigured" -- three states one string used to flatten.
+        return {"loopback": f"http://{LOOPBACK}:{port}", "lan": None, "tunnel": tunnel_note,
+                "lan_state": runtime.get("state"), "lan_source": runtime.get("source"),
+                "lan_detail": runtime.get("detail")}
     if not lan_binds:
-        return {"loopback": f"http://{LOOPBACK}:{port}", "lan": None, "tunnel": tunnel_note}
+        return {"loopback": f"http://{LOOPBACK}:{port}", "lan": None, "tunnel": tunnel_note,
+                **({"lan_state": runtime.get("state"), "lan_source": runtime.get("source"),
+                    "lan_detail": runtime.get("detail")} if runtime else {})}
     lan_urls = [f"http://{ip}:{port}" for ip in lan_binds]
     try:
         allowed = resolve_allowed_cidrs(cidrs_env, lan_binds)
@@ -255,6 +269,10 @@ def describe_endpoints(*, port: int, lan_bind_env: str | None, cidrs_env: str | 
         # "lan" stays a single string for every existing reader; "lans"
         # is the full list once more than one address is bound.
         "loopback": f"http://{LOOPBACK}:{port}", "lan": lan_urls[0], "lans": lan_urls,
+        "lan_state": (runtime or {}).get("state"),
+        "lan_source": (runtime or {}).get("source") or "config",
+        **({"config_drift": runtime["config_drift"]}
+           if runtime and runtime.get("config_drift") else {}),
         "allowed_cidrs": [str(c) for c in allowed], "firewall_verified": False,
         "firewall_reminder": "This process enforces the allowed_cidrs list itself (LanCidrGuardMiddleware), "
                              "but has no way to confirm an OS firewall rule also restricts this port -- run "

@@ -15,6 +15,7 @@ from .ai_usage_service import AiUsageService
 from .config import load_config
 from .connection_store import ConnectionStore
 from .enrollment import EnrollmentStore
+from .node_credentials import NodeCredentialStore
 from .node_onboarding import OnboardingService
 from .node_transport import TransportStore
 from .rescue_gateway import RescuePortAllocator
@@ -34,6 +35,7 @@ from .planner_store import PlannerStore
 from .pm_service import PMService
 from .pm_store import PMStore
 from .backlog_service import BacklogService
+from .notes_service import NotesService
 from .event_bus import EventBus
 from .queue_service import QueueService
 from .recovery_engine import RecoveryEngine
@@ -408,6 +410,15 @@ def main() -> None:
     # connected node's does, so the re-hydration loop above brings it back
     # after a restart with no extra code, and every enroll/revoke/remove
     # lands in the SAME audit log as every other action.
+    # Persistent node credentials -- the durable half of rotation/revocation.
+    credentials = NodeCredentialStore()
+
+    def _manage_enrolled_token(node_id: str, token: str) -> None:
+        os.environ[node_token_env_var(node_id)] = token
+        try:
+            credentials.adopt(node_id, token)
+        except Exception:  # noqa: BLE001 -- never fail an enrollment over bookkeeping
+            _log.exception("could not record node %s's token for rotation", node_id)
     onboarding = OnboardingService(
         config, controller=controller, connection_store=connection_store,
         enrollment_store=EnrollmentStore(), transport_store=TransportStore(),
@@ -418,7 +429,11 @@ def main() -> None:
         # The heartbeat route re-reads this env var on every inbound push;
         # setting it here is what makes a freshly-enrolled node's very
         # first heartbeat succeed instead of 401ing until a restart.
-        token_env_setter=lambda node_id, token: os.environ.__setitem__(node_token_env_var(node_id), token),
+        # Sets the env var the node's heartbeat verifies against AND
+        # records the token in the credential store, so a node enrolled
+        # today is rotatable/revocable without a later adoption step
+        # (blg_a3cc401d8275). Same helper shape as dashboard.py's own.
+        token_env_setter=_manage_enrolled_token,
     )
 
     # Same "constructed ONCE, shared by both build_mcp and register_
@@ -458,6 +473,13 @@ def main() -> None:
     # allowed_cwd_roots path gate, its audit trail, and its dispatch path
     # are the existing ones rather than parallel copies.
     backlog = BacklogService(config, audit=terminal.audit, queue=queue, controller=controller)
+    # Notes / Ideas: ONE shared instance, same "constructed once, passed to
+    # both build_mcp and register_dashboard" discipline as queue/integration/
+    # pm/ai_usage above -- so the note_* MCP tools ChatGPT calls and the
+    # /dashboard/notes page a human browses read and write the SAME notes.db
+    # and the SAME attachment directory, never two drifting copies (each
+    # surface's own fallback default would otherwise build a private one).
+    notes = NotesService.from_config(config) if config.notes.enabled else None
     # P0.2: the bus is CONSTRUCTED (so publish/claim tools exist) but no
     # consumer loop is started here -- autonomous coordination stays off.
     events = EventBus()
@@ -476,14 +498,21 @@ def main() -> None:
                              local_node_id=controller.local_node_id)
     except Exception:  # noqa: BLE001 -- never block startup on the fleet cache
         _log.exception("fleet registry unavailable -- fleet views will report it")
-    server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
-                       planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog, events=events,
-                       fleet=fleet)
-    register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
-                       queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
-                       recovery=recovery, backlog=backlog, fleet=fleet, onboarding=onboarding)
+    # ONE WebAuthStore for the whole process. Constructed HERE, before
+    # register_dashboard, rather than a few lines below where it used to be:
+    # the Notes routes authenticate against this exact store (see
+    # dashboard._notes_authenticated), so the /login session a human already
+    # holds is the same session those routes accept -- never a second store
+    # with its own users and its own sessions.
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
+    server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
+                       planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog, notes=notes,
+                       events=events, fleet=fleet)
+    register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
+                       queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
+                       recovery=recovery, backlog=backlog, fleet=fleet, onboarding=onboarding,
+                       credentials=credentials, notes=notes, webauth=webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)
     register_health(server, terminal, supervisor)
 
