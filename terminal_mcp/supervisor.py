@@ -680,7 +680,12 @@ class SupervisorService:
     # -- watch management (supervisor_watch / _unwatch / _list_watches) ---
 
     def watch(self, binding: str | None = None, session: str | None = None,
-             required_verifiers: list[str] | None = None) -> dict[str, Any]:
+             required_verifiers: list[str] | None = None,
+             source: str = "manual") -> dict[str, Any]:
+        """`source` records who asked for this watch ("manual", or
+        "auto-discovery" from worker_discovery.py). It is stored on creation
+        and is provenance only -- it changes no behaviour here, and callers
+        that omit it keep the original "manual" value exactly as before."""
         if (binding is None) == (session is None):
             return {"error": "EXACTLY_ONE_TARGET_REQUIRED"}
         if required_verifiers is not None:
@@ -720,7 +725,7 @@ class SupervisorService:
                 pin = {"pinned_session_id": info.session_id, "pinned_pane_id": info.pane_id,
                       "pinned_created_epoch": info.created_epoch}
         verifiers = tuple(required_verifiers) if required_verifiers is not None else None
-        row, created = self.store.upsert_watch(kind, target, source="manual",
+        row, created = self.store.upsert_watch(kind, target, source=source,
                                                 required_verifiers=verifiers, **pin)
         return {**self._watch_view(row), "created": created}
 

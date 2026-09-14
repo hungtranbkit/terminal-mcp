@@ -1868,13 +1868,13 @@
     {
       "id": "blg_orch_no_workers_declared",
       "title": "No worker has a capability profile, so capability routing has zero candidates",
-      "description": "pm_store.capability_profiles has 0 production rows, so terminal_worker_roles reports 0 for every role and pm_router.route_task always returns NO_ELIGIBLE_WORKER. The fleet cannot verify or route anything until real sessions are declared with roles and skills. Needs a decision on which live sessions should be declared as WORKER/VERIFIER and with what skills.",
-      "status": "BACKLOG",
+      "description": "pm_service._candidates() reads ONLY pm_store.capability_profiles, which has 0 production rows, so pm_router.route_task returns NO_ELIGIBLE_WORKER for every task. Measured on HP 2026-09-14: session_records holds 5 ACTIVE sessions, 4 of them agent_type=claude with input_granted=1, against 0 capability_profiles -- four usable workers idle and invisible. Phase 1 reconciliation cannot help, because reconciliation repairs a worker that is represented; these were never represented at all. Phase 2 adds bounded, idempotent auto-discovery (declare + watch) before dispatch, plus work-conserving coverage reporting.",
+      "status": "IN_PROGRESS",
       "priority": "P1",
       "type": "chore",
       "order": 41,
       "created_at": "2026-09-10T01:41:16.114137+00:00",
-      "updated_at": "2026-09-10T01:41:16.114137+00:00",
+      "updated_at": "2026-09-14T10:58:08.739076+00:00",
       "source": "orchestration-v1",
       "dependencies": [],
       "acceptance_criteria": [
@@ -1890,20 +1890,34 @@
       "session": null,
       "node_id": null,
       "queue_task_id": null,
-      "branch": null,
-      "worktree": null,
+      "branch": "feat/worker-discovery-dispatch",
+      "worktree": "/home/kimex/workspace/terminal-mcp-scheduler-lane",
       "blocked_reason": null,
       "evidence": {
-        "commits": [],
-        "tests": [],
+        "commits": [
+          "feat/worker-discovery-dispatch"
+        ],
+        "tests": [
+          "47 new tests: tests/test_worker_discovery.py (30), tests/test_worker_discovery_dispatch.py (17)",
+          "full suite 2816 passed / 3 failed / 23 skipped -- all 3 failures environmental, traced to a real live tmux session named 'test-http-secure' on this host which conftest correctly refuses to touch; test_transports reproduces identically on unmodified origin/main, and test_kill_reopen passes 23/23 in isolation against this branch"
+        ],
         "deploys": [],
-        "notes": []
+        "notes": [
+          "NOT deployed and NOT merged. Discovery is OFF by default (WorkerDiscoveryPolicy.enabled=False).",
+          "Acceptance criteria 1 and 2 are met by this branch. Criterion 3 (a non-zero VERIFIER count) is deliberately NOT met: auto-discovery declares role=WORKER only and will never auto-declare VERIFIER/INTEGRATOR/DEPLOYER, which are trust positions -- a live, input-granted tmux session is not evidence that it may verify or deploy anything. That criterion still needs an explicit human declaration or a separate probe.",
+          "Watch creation is CREATE-ONLY. SupervisorStore.upsert_watch on an EXISTING row re-enables it, re-pins session/pane identity and mints a fresh completion nonce while bumping completion_attempt. Re-watching on every reconcile tick would therefore silently re-enable operator- or phase-1-disabled watches, destroy the P0-2 identity pin, and invalidate the outstanding completion nonce -- breaking the submission/completion-confirmation semantics this work is required to preserve."
+        ]
       },
       "history": [
         {
           "at": "2026-09-10T01:41:16.114137+00:00",
           "event": "created",
           "by": "orchestration-v1"
+        },
+        {
+          "at": "2026-09-14T10:58:08.739076+00:00",
+          "event": "phase-2 implementation on feat/worker-discovery-dispatch",
+          "by": "mcp"
         }
       ]
     },
