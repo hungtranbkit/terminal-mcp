@@ -36,6 +36,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 import anyio
@@ -210,19 +211,56 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         # test for this exact route.
         resolved, error = resolve_cwd(cwd, terminal.config)
         if error is not None:
+            # "Not here" is not "not allowed". resolve_cwd reports both, and
+            # mapping them both to 403 told a caller its path was forbidden
+            # when the node simply did not have it -- sending whoever read
+            # that off to fix a permission that was never the problem.
+            if error.get("error") == "CWD_NOT_FOUND":
+                return JSONResponse({
+                    "cwd": cwd, "repo_valid": False, "exists": False, "readable": False,
+                    "collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "error": "PATH_NOT_FOUND",
+                    "detail": f"{cwd} does not exist on this node",
+                    **contract_describe(),
+                }, status_code=200)
             return JSONResponse({"error": "PATH_NOT_ALLOWED", "detail": error},
                                 status_code=403)
+        # Say WHICH precondition failed. "the path is not here", "it is here
+        # but unreadable" and "it is a broken repo" call for different actions
+        # from whoever is looking; collapsing them made a healthy repo on an
+        # unreachable path indistinguishable from a corrupt one.
+        path = Path(str(resolved))
+        exists = path.is_dir()
+        readable = bool(exists and os.access(str(path), os.R_OK | os.X_OK))
+        # When the evidence was READ, so a caller can tell fresh from stale
+        # rather than trusting that a reply is about the present moment.
+        collected_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        base = {"cwd": str(resolved), "exists": exists, "readable": readable,
+                "collected_at": collected_at, **contract_describe()}
+        if not exists or not readable:
+            return JSONResponse({
+                **base, "repo_valid": False,
+                "error": "PATH_NOT_READABLE" if exists else "PATH_NOT_FOUND",
+                "detail": (f"{resolved} exists but this agent cannot read it"
+                           if exists else f"{resolved} does not exist on this node"),
+            }, status_code=200)
         try:
             evidence = git_repo_evidence(str(resolved))
         except RepoEvidenceError as exc:
             # A real repo problem on this node -- reported as such, and
             # distinct from "this node cannot answer", which is a transport
             # failure the caller sees as a non-200 instead.
-            return JSONResponse({"error": "REPO_EVIDENCE_FAILED", "detail": str(exc)},
+            return JSONResponse({**base, "repo_valid": False,
+                                 "error": "REPO_EVIDENCE_FAILED", "detail": str(exc)},
                                 status_code=200)
         return JSONResponse({
-            "cwd": str(resolved), "branch": evidence.branch, "head": evidence.head,
-            "clean": evidence.clean, "status_lines": list(evidence.status_lines),
+            **base, "repo_valid": True,
+            "branch": evidence.branch, "head": evidence.head,
+            # `dirty` next to `clean`: callers phrase this both ways, and
+            # inverting a boolean by hand is where such a check gets quietly
+            # reversed.
+            "dirty": not evidence.clean, "clean": evidence.clean,
+            "status_lines": list(evidence.status_lines),
             "has_upstream": evidence.has_upstream,
             "ahead": evidence.ahead, "behind": evidence.behind,
         })

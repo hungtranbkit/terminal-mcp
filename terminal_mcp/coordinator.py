@@ -45,10 +45,12 @@ import re
 import inspect
 import os
 import subprocess
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .core import RECOVERY_STATE_RESUMED_OK
+from .contract import CAP_REPO_EVIDENCE
 from .queue_store import COMPLETED, QueueStore, QueueTask
 
 READY = "READY"
@@ -226,8 +228,39 @@ def git_repo_evidence(cwd: str, node_id: str | None = None, *,
 RepoEvidenceCollector = Callable[..., RepoEvidence]
 
 
+# How old a node's evidence may be before the gate refuses to rely on it. A
+# node answers from its own clock, so this is deliberately generous -- it is a
+# guard against a cached or replayed reply, not a clock-sync mechanism.
+DEFAULT_EVIDENCE_MAX_AGE_SECONDS = 300.0
+
+
+def _evidence_staleness(collected_at: Any, max_age_seconds: float) -> str | None:
+    """Describe why this evidence is unusable, or None when it is fine.
+
+    A payload with no timestamp is NOT assumed fresh: an agent that cannot say
+    when it looked cannot support a claim about the repo's state now.
+    """
+    if collected_at is None:
+        return "undated (the agent did not say when it was collected)"
+    try:
+        when = datetime.fromisoformat(str(collected_at))
+    except (TypeError, ValueError):
+        return f"timestamped unusably ({collected_at!r})"
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - when).total_seconds()
+    if age > max_age_seconds:
+        return f"{int(age)}s old (limit {int(max_age_seconds)}s)"
+    if age < -max_age_seconds:
+        # A future timestamp means the clocks disagree badly enough that the
+        # age is meaningless; treating it as fresh would trust that skew.
+        return f"dated {int(-age)}s in the future (clock skew)"
+    return None
+
+
 def node_aware_repo_evidence(local_node_id: str | None = None,
                              node_client_factory: Callable[[str], Any] | None = None,
+                             max_age_seconds: float = DEFAULT_EVIDENCE_MAX_AGE_SECONDS,
                              ) -> RepoEvidenceCollector:
     """Collect evidence where the session actually lives.
 
@@ -260,6 +293,17 @@ def node_aware_repo_evidence(local_node_id: str | None = None,
         if not isinstance(payload, dict):
             raise RepoEvidenceUnavailable(
                 f"node {node_id!r} returned no usable repo evidence for {cwd!r}: {payload!r}")
+        # An agent that predates the endpoint is identified by its DECLARED
+        # capability, not by a 404. A 404 is also what a misrouted request, a
+        # stale proxy or a half-deployed agent returns, and none of those may
+        # be mistaken for "this node genuinely speaks an older protocol".
+        capabilities = payload.get("contract_capabilities")
+        if capabilities is not None and CAP_REPO_EVIDENCE not in capabilities:
+            raise RepoEvidenceUnavailable(
+                f"node {node_id!r} answered but does not declare the "
+                f"{CAP_REPO_EVIDENCE!r} capability (contract v"
+                f"{payload.get('contract_version', 0)}) -- treating as OLD AGENT "
+                f"rather than as verified")
         if payload.get("error"):
             # The node ANSWERED and says the repo is bad. That is real evidence
             # about its own filesystem, not a failure to look -- so it fails
@@ -268,6 +312,18 @@ def node_aware_repo_evidence(local_node_id: str | None = None,
             raise RepoEvidenceError(
                 f"node {node_id!r} could not read the repo at {cwd!r}: "
                 f"{payload.get('detail') or payload.get('error')}")
+        # An answer that never says the repo was valid is not an answer. An
+        # older or partial payload omits repo_valid entirely, and defaulting
+        # that to True would turn a silence into a verification.
+        if payload.get("repo_valid") is not True:
+            raise RepoEvidenceUnavailable(
+                f"node {node_id!r} did not confirm repo_valid for {cwd!r} "
+                f"(got {payload.get('repo_valid')!r}) -- not treating as verified")
+        stale = _evidence_staleness(payload.get("collected_at"), max_age_seconds)
+        if stale is not None:
+            raise RepoEvidenceUnavailable(
+                f"node {node_id!r} returned evidence for {cwd!r} that is {stale} -- "
+                f"refusing to gate on evidence that may no longer describe the repo")
         status_lines = tuple(payload.get("status_lines") or ())
         return RepoEvidence(
             branch=str(payload.get("branch") or ""), head=str(payload.get("head") or ""),

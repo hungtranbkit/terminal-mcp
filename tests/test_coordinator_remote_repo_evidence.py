@@ -56,6 +56,25 @@ def _evidence(**overrides):
     return RepoEvidence(**base)
 
 
+def _contract_payload(**overrides):
+    """A payload shaped like a CURRENT agent.
+
+    These fixtures predate repo_valid/collected_at/contract_capabilities. The
+    collector now refuses a payload that omits them -- an agent that cannot
+    say the repo was valid, or when it looked, has not verified anything --
+    so the fixtures move to the real shape rather than the guarantees moving.
+    """
+    from datetime import datetime, timezone
+
+    from terminal_mcp.contract import describe
+
+    payload = {"repo_valid": True, "exists": True, "readable": True,
+               "collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+               **describe()}
+    payload.update(overrides)
+    return payload
+
+
 class _FakeClient:
     """A node agent that can answer repo questions."""
 
@@ -96,8 +115,9 @@ def test_unavailable_is_a_repo_evidence_error_so_old_handlers_still_catch_it():
 
 
 def test_remote_session_asks_that_node(repo):
-    client = _FakeClient({"branch": "feature/x", "head": "deadbeef", "clean": True,
-                          "status_lines": [], "has_upstream": True, "ahead": 2, "behind": 0})
+    client = _FakeClient(_contract_payload(
+        branch="feature/x", head="deadbeef", clean=True, status_lines=[],
+        has_upstream=True, ahead=2, behind=0))
     collect = node_aware_repo_evidence(local_node_id="local",
                                        node_client_factory=lambda node: client)
     evidence = collect("/home/dell/workspace/thing", "dell-linux")
@@ -108,8 +128,8 @@ def test_remote_session_asks_that_node(repo):
 
 
 def test_remote_dirty_repo_is_reported_as_dirty_not_unavailable():
-    client = _FakeClient({"branch": "main", "head": "abc", "clean": False,
-                          "status_lines": [" M app.py"]})
+    client = _FakeClient(_contract_payload(
+        branch="main", head="abc", clean=False, status_lines=[" M app.py"]))
     collect = node_aware_repo_evidence(local_node_id="local",
                                        node_client_factory=lambda node: client)
     evidence = collect("/remote/path", "dell-linux")
@@ -190,7 +210,8 @@ def _remote_session(cwd="/home/dell/workspace/thing"):
 
 def test_gate_dispatches_a_remote_session_when_its_node_answers(store):
     task = _task(store)
-    client = _FakeClient({"branch": "main", "head": "abc", "clean": True, "status_lines": []})
+    client = _FakeClient(_contract_payload(branch="main", head="abc", clean=True,
+                                           status_lines=[]))
     gate = CoordinatorGate(evidence_collector=node_aware_repo_evidence(
         local_node_id="local", node_client_factory=lambda node: client))
     decision = gate.review(task, store=store, session=_remote_session())
@@ -234,8 +255,8 @@ def test_a_genuine_repo_failure_is_still_reported_as_one(store):
 
 def test_a_dirty_remote_repo_still_blocks(store):
     task = _task(store)
-    client = _FakeClient({"branch": "main", "head": "abc", "clean": False,
-                          "status_lines": [" M app.py"]})
+    client = _FakeClient(_contract_payload(branch="main", head="abc", clean=False,
+                                           status_lines=[" M app.py"]))
     gate = CoordinatorGate(evidence_collector=node_aware_repo_evidence(
         local_node_id="local", node_client_factory=lambda node: client))
     decision = gate.review(task, store=store, session=_remote_session())
@@ -258,3 +279,17 @@ def test_legacy_single_argument_collectors_still_work(store):
     task = _task(store)
     gate = CoordinatorGate(evidence_collector=lambda cwd: _evidence())
     assert gate.review(task, store=store, session=_remote_session()).status == READY
+
+
+def test_a_pre_contract_payload_is_not_treated_as_verified():
+    """The shape these fixtures used to carry must now be refused.
+
+    Kept as its own test so the fixture modernisation above cannot quietly
+    become a weakening: an agent that answers without repo_valid has not
+    verified anything, and must read as UNAVAILABLE rather than as a pass.
+    """
+    legacy = {"branch": "main", "head": "abc", "clean": True, "status_lines": []}
+    collect = node_aware_repo_evidence(
+        local_node_id="local", node_client_factory=lambda node: _FakeClient(legacy))
+    with pytest.raises(RepoEvidenceUnavailable):
+        collect("/remote/path", "dell-linux")
