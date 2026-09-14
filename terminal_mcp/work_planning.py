@@ -116,7 +116,11 @@ def _git(args: Sequence[str], *, cwd: str) -> str | None:
                               text=True, timeout=15, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
-    return done.stdout.strip() if done.returncode == 0 else None
+    # rstrip, never strip -- `git status --porcelain` encodes the status in the
+    # first two COLUMNS, so an unstaged modification's line starts with a
+    # space. Stripping the whole output eats it on the first line only, and the
+    # column parse below then truncates that one path by a character.
+    return done.stdout.rstrip() if done.returncode == 0 else None
 
 
 def plan(request: str, *, store: WorkSpecStore, task_type: str | None = None,
@@ -197,7 +201,7 @@ def plan(request: str, *, store: WorkSpecStore, task_type: str | None = None,
         delta.findings.append(f"HEAD {head[:12]}")
         dirty = _git(["status", "--porcelain"], cwd=cwd)
         if dirty:
-            changed = [line[3:] for line in dirty.splitlines() if len(line) > 3]
+            changed = [line[2:].strip() for line in dirty.splitlines() if len(line) > 2]
             counters["changed_paths_seen"] = len(changed)
             delta.findings.append(f"{len(changed)} uncommitted path(s) in the working tree")
             # The working tree outranks the commit graph: an edited file is
