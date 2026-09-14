@@ -252,8 +252,11 @@ $bootstrap | Select-Object * -ExcludeProperty node_token |
     _status, onboarding = _get(base, "/dashboard/api/nodes/e2e-win/onboarding")
     assert onboarding["registered"] is True and onboarding["has_credentials"] is True
     assert {t["kind"] for t in onboarding["transports"]} == {"lan"}
-    assert onboarding["transports"][0]["endpoint"] == "ssh://192.168.44.7:22" or \
-           onboarding["transports"][0]["host"] == "192.168.44.7"
+    # Exact, with no `or` fallback: an alternative spelling accepted here
+    # is how the agent-port-vs-ssh-port bug reached staging unnoticed.
+    lan = onboarding["transports"][0]
+    assert lan["endpoint"] == "ssh://192.168.44.7:22"
+    assert (lan["host"], lan["port"]) == ("192.168.44.7", 22)
 
     # 5. What the node wrote to disk carries no token, and does carry the
     #    controller's PUBLIC key.

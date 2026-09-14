@@ -1114,3 +1114,53 @@ if ($errors) { $errors | ForEach-Object { "{0}:{1} {2}" -f $_.Extent.StartLineNu
             assert "while ($true)" in expanded
             assert "/dashboard/api/nodes/$nodeId/heartbeat" in expanded
             assert "Bearer" in expanded and "$token" in expanded
+
+
+def test_consume_records_the_SSH_port_not_the_agent_port(tmp_path):
+    """Regression, found on staging: transports were recorded at the
+    node-agent's HTTP port (8790) while Test Primary probes them with an
+    SSH banner read. On a Minimal-profile node nothing listens on 8790, so
+    Test Primary failed on every healthy node.
+
+    The unit tests missed it because they seeded transports by hand with
+    the right port; only a run through consume_enrollment could catch it.
+    So this asserts the REAL path, and asserts the two fields that answer
+    two different questions stay different: the transport is where we
+    probe (sshd), the registry endpoint is where a node-agent would be."""
+    _t, controller, _cs, onboarding = _service(tmp_path)
+    created = onboarding.create_enrollment(node_id="ports", profile="minimal")
+    onboarding.consume_enrollment(created["code"], hostname="PORTS",
+                                  addresses={"tailscale_ip": "100.90.1.2", "lan_ip": "192.168.44.9"})
+
+    by_kind = {t.kind: t for t in onboarding.transports.list_for("ports")}
+    assert set(by_kind) == {KIND_TAILSCALE, KIND_LAN}
+    for kind, host in ((KIND_TAILSCALE, "100.90.1.2"), (KIND_LAN, "192.168.44.9")):
+        assert by_kind[kind].port == 22, f"{kind} must be probed at sshd, not the agent port"
+        assert by_kind[kind].endpoint == f"ssh://{host}:22"
+        assert "8790" not in by_kind[kind].endpoint
+
+    # ...while the registry still points at the agent, for the day one is
+    # installed. Losing this distinction is the other half of the bug.
+    node = controller.node_status("ports")
+    assert node.endpoint == "http://100.90.1.2:8790"
+
+
+def test_test_primary_probes_the_port_the_installer_actually_opens(tmp_path, monkeypatch):
+    """The end the operator sees: Test Primary must dial 22, because that
+    is the port windows-setup.ps1 starts sshd on and firewalls."""
+    client, _controller, onboarding = _client(tmp_path, monkeypatch)
+    code = client.post("/dashboard/api/nodes/onboard/enrollments",
+                       json={"node_id": "probed", "profile": "minimal"}).json()["code"]
+    client.post("/dashboard/api/enroll/consume",
+                json={"code": code, "hostname": "PROBED", "addresses": {"lan_ip": "192.168.44.9"}})
+
+    dialled: list[tuple[str, int]] = []
+
+    def _fake_connection(address, timeout=None):
+        dialled.append((address[0], address[1]))
+        raise OSError("refused")
+
+    monkeypatch.setattr("terminal_mcp.node_transport.socket.create_connection", _fake_connection)
+    result = client.post("/dashboard/api/nodes/probed/test-transport", json={"transport": "primary"})
+    assert result.status_code == 200 and result.json()["reachable"] is False
+    assert dialled == [("192.168.44.9", 22)], dialled

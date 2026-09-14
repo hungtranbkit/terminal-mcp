@@ -66,6 +66,12 @@ _log = logging.getLogger(__name__)
 
 _TAILNET_RE = re.compile(r"^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.")
 
+# The port windows-setup.ps1 configures sshd on, and therefore the port a
+# primary transport is probed at. Windows' OpenSSH has no supported way to
+# move it during unattended setup, so this is a constant rather than a
+# config knob -- a knob here would only ever disagree with the installer.
+NODE_SSH_PORT = 22
+
 
 class OnboardingError(Exception):
     """Carries a machine-readable code so routes can map it to a status
@@ -332,18 +338,30 @@ class OnboardingService:
         #    100.64.0.0/10 -- a node claiming "my tailscale IP is
         #    10.0.0.5" gets it recorded as LAN, not as the trusted
         #    overlay path.
-        primary_endpoint = None
+        #
+        #    A transport records the node's SSH port, NOT the node-agent's
+        #    HTTP port, and the difference is not cosmetic: sshd is what
+        #    windows-setup.ps1 actually configures and what every profile
+        #    has, while the agent is optional and absent on Minimal. These
+        #    rows are what Test Primary probes (probe_ssh_banner), so
+        #    recording :8790 here made Test Primary fail on every healthy
+        #    Minimal node -- caught on staging, after unit tests missed it
+        #    by seeding transports by hand instead of going through this
+        #    function. The registry's own `endpoint` below stays the agent
+        #    URL, because that is what RemoteNodeClient is built from if an
+        #    agent is ever installed. Two different questions, two fields.
+        primary_agent_endpoint = None
         tailnet_ip = str(addresses.get("tailscale_ip") or "").strip()
         lan_ip = str(addresses.get("lan_ip") or "").strip()
         if tailnet_ip and is_tailnet_address(tailnet_ip):
-            primary_endpoint = f"http://{tailnet_ip}:{agent_port}"
-            self.transports.upsert(node_id, KIND_TAILSCALE, endpoint=primary_endpoint,
-                                   host=tailnet_ip, port=agent_port)
+            primary_agent_endpoint = f"http://{tailnet_ip}:{agent_port}"
+            self.transports.upsert(node_id, KIND_TAILSCALE, endpoint=f"ssh://{tailnet_ip}:{NODE_SSH_PORT}",
+                                   host=tailnet_ip, port=NODE_SSH_PORT)
         if lan_ip and not is_tailnet_address(lan_ip):
-            lan_endpoint = f"http://{lan_ip}:{agent_port}"
-            primary_endpoint = primary_endpoint or lan_endpoint
-            self.transports.upsert(node_id, KIND_LAN, endpoint=lan_endpoint, host=lan_ip, port=agent_port)
-        endpoint = primary_endpoint or f"http://{hostname}:{agent_port}"
+            primary_agent_endpoint = primary_agent_endpoint or f"http://{lan_ip}:{agent_port}"
+            self.transports.upsert(node_id, KIND_LAN, endpoint=f"ssh://{lan_ip}:{NODE_SSH_PORT}",
+                                   host=lan_ip, port=NODE_SSH_PORT)
+        endpoint = primary_agent_endpoint or f"http://{hostname}:{agent_port}"
 
         # 3. Rescue port + the gateway authorized_keys line an admin (or a
         #    sync job) installs. Never fatal.
