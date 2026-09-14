@@ -193,6 +193,121 @@ def test_a_stale_legacy_artifact_does_not_affect_a_run(real_owned_session):
 
 
 def test_owned_regex_shape_is_what_the_janitor_documents():
+    """Ownership is the full STRUCTURAL marker, never a prefix match.
+
+    The prefix is deliberately open (suites need `claude-lc-`,
+    `codex-lc-`, and the intentionally-unwhitelisted `unwhitelisted-`),
+    so what authorises a kill is the `-own<pid>x<6 hex>-<slug>` segment,
+    not the leading text."""
     assert OWNED_RE.match(f"lifecycle-own{os.getpid()}xabc123-slug")
-    assert not OWNED_RE.match("lifecycle-ownXxabc123-slug")
-    assert not OWNED_RE.match("other-own123xabc123-slug")
+    assert OWNED_RE.match("other-own123xabc123-slug"), "any prefix, strict marker"
+    assert not OWNED_RE.match("lifecycle-ownXxabc123-slug"), "pid must be digits"
+    assert not OWNED_RE.match("lifecycle-own123xABC123-slug"), "tag must be lowercase hex"
+    assert not OWNED_RE.match("lifecycle-own123xabc12-slug"), "tag must be exactly 6"
+    assert not OWNED_RE.match("lifecycle-own123xabc1234-slug"), "tag must be exactly 6"
+    assert not OWNED_RE.match(f"lifecycle-own{os.getpid()}xabc123-"), "slug must be non-empty"
+
+
+# -- prefixes: uniqueness must not change a name's whitelist status -----
+
+@pytest.mark.parametrize("prefix", ["lifecycle", "claude-lc", "codex-lc", "unwhitelisted", "granted"])
+def test_every_prefix_round_trips_and_is_owned(prefix):
+    name = owned_name("slug-1", prefix=prefix)
+    assert name.startswith(f"{prefix}-own")
+    assert is_owned(name) and is_mine(name)
+    assert OWNED_RE.match(name).group("prefix") == prefix, "a hyphenated prefix must split correctly"
+
+
+def test_unwhitelisted_names_stay_outside_the_allowed_patterns():
+    """test_session_lifecycle has tests whose whole point is a name that
+    matches NO allowed pattern. Making names unique must not smuggle them
+    into the whitelist."""
+    allowed = ("lifecycle-", "claude-lc-", "codex-lc-")
+    name = owned_name("prompt-1", prefix="unwhitelisted")
+    assert not any(name.startswith(p) for p in allowed)
+
+
+# -- ambiguity: names that merely LOOK like ours -------------------------
+
+@pytest.mark.parametrize("name", [
+    "lifecycle-victim", "lifecycle-bystander", "lifecycle-protected-sim",
+    "lifecycle-own", "lifecycle-own-", "lifecycle-own-thing",
+    "own123xabc123-slug",          # no prefix at all
+    "lifecycle-own123xabc123",     # no slug
+])
+def test_lookalike_names_are_not_owned(name):
+    assert is_owned(name) is False
+    with pytest.raises(AssertionError):
+        tmux_isolation.kill_session(name)
+
+
+# -- the exact real sessions on this host --------------------------------
+
+REAL_HOST_SESSIONS = ["hp-work", "hp1", "hp2", "hp3-work", "test-http-secure"]
+
+
+@pytest.mark.parametrize("name", REAL_HOST_SESSIONS)
+def test_named_real_sessions_on_this_host_are_never_touchable(name):
+    """These are this machine's actual attended/lane sessions. Pinned by
+    name so a future change to the matching rule fails loudly here rather
+    than silently killing one of them."""
+    assert is_owned(name) is False
+    assert owning_pid(name) is None
+    with pytest.raises(AssertionError, match="not an owned test session"):
+        tmux_isolation.kill_session(name)
+
+
+def test_sweep_leaves_every_real_host_session_alone():
+    killed = []
+    swept = sweep_orphans(sessions=list(REAL_HOST_SESSIONS), pid_is_alive=lambda pid: False,
+                          killer=killed.append)
+    assert swept == [] and killed == []
+
+
+# -- crash cleanup is best-effort, never fatal ---------------------------
+
+def test_sweep_survives_tmux_being_unavailable(monkeypatch):
+    """No tmux server at all is a normal state, not an error -- the
+    janitor must not break collection for every suite that imports it."""
+    monkeypatch.setattr(tmux_isolation, "list_tmux_sessions", lambda: [])
+    assert sweep_orphans() == []
+
+
+def test_sweep_continues_past_a_kill_that_fails():
+    """A crashed run's session may vanish between listing and killing.
+    Best-effort means the next orphan is still swept."""
+    first = _other_run_name("a", pid=DEAD_PID)
+    second = _other_run_name("b", pid=DEAD_PID)
+
+    def flaky(name):
+        if name == first:
+            raise subprocess.SubprocessError("session disappeared")
+
+    with pytest.raises(subprocess.SubprocessError):
+        sweep_orphans(sessions=[first, second], pid_is_alive=lambda pid: False, killer=flaky)
+    # kill_session itself never raises on a missing session (check=False),
+    # which is what makes the real sweep best-effort.
+    tmux_isolation.kill_session(_other_run_name("never-existed", pid=DEAD_PID))
+
+
+# -- concurrency ---------------------------------------------------------
+
+def test_many_concurrent_runs_produce_disjoint_names(monkeypatch):
+    """Simulates N lanes running this suite at once: for one shared slug
+    every run must get a distinct name."""
+    names = set()
+    for pid in range(1000, 1010):
+        monkeypatch.setattr(tmux_isolation, "RUN_ID", f"{pid}xaabbcc")
+        names.add(tmux_isolation.owned_name("lifecycle-victim"))
+    assert len(names) == 10
+
+
+def test_a_concurrent_runs_sessions_are_never_swept():
+    """Live-pid skip across a whole fleet of sibling runs."""
+    live = [_other_run_name(f"s{i}", pid=LIVE_PID) for i in range(5)]
+    dead = [_other_run_name(f"d{i}", pid=DEAD_PID) for i in range(5)]
+    killed = []
+    swept = sweep_orphans(sessions=live + dead,
+                          pid_is_alive=lambda pid: pid == LIVE_PID, killer=killed.append)
+    assert set(swept) == set(dead)
+    assert not any(name in killed for name in live)

@@ -58,7 +58,12 @@ import re
 import subprocess
 import uuid
 
-#: Required by the suites' own `allowed_session_patterns=("lifecycle-*",)`.
+#: Default prefix -- the suites configure
+#: `allowed_session_patterns=("lifecycle-*", ...)`, so a disposable
+#: session normally has to start with it. Callers pass `prefix=` when a
+#: test deliberately needs a name OUTSIDE the whitelist (e.g.
+#: test_session_lifecycle's "unwhitelisted-*" cases, whose whole point is
+#: that the name does not match any allowed pattern).
 NAME_PREFIX = "lifecycle"
 
 #: Identifies THIS pytest process's sessions. The pid is part of the
@@ -66,19 +71,31 @@ NAME_PREFIX = "lifecycle"
 #: makes cleanup safe: "is the run that created this still alive?"
 RUN_ID = f"{os.getpid()}x{uuid.uuid4().hex[:6]}"
 
-OWNED_RE = re.compile(rf"^{NAME_PREFIX}-own(?P<pid>\d+)x[0-9a-f]{{6}}-")
+#: The ownership marker is a STRUCTURAL segment, not a prefix match:
+#: literal "-own", a decimal pid, "x", exactly six lowercase hex digits,
+#: then "-" and a non-empty slug. Ownership is decided by that whole
+#: shape, so no amount of prefix coincidence can make a real session
+#: look like ours -- "lifecycle-victim" and "lifecycle-own-thing" are
+#: both correctly NOT owned. The prefix is captured (non-greedy, so a
+#: hyphenated one like "claude-lc" splits correctly) but is never what
+#: authorises a kill.
+OWNED_RE = re.compile(r"^(?P<prefix>.+?)-own(?P<pid>\d+)x(?P<tag>[0-9a-f]{6})-(?P<slug>.+)$")
+
+#: This run's own marker segment, matched verbatim by `is_mine`.
+MY_MARKER = f"-own{RUN_ID}-"
 
 
-def owned_name(slug: str) -> str:
+def owned_name(slug: str, *, prefix: str = NAME_PREFIX) -> str:
     """A session name unique to this run. Same `slug` in two concurrent
     runs yields two different names, so they cannot collide."""
-    return f"{NAME_PREFIX}-own{RUN_ID}-{slug}"
+    return f"{prefix}-own{RUN_ID}-{slug}"
 
 
 def is_owned(name: str) -> bool:
-    """True only for a name minted by `owned_name` (any run). Anything
-    else -- a user session, another suite's leftover, a legacy fixed
-    name -- is not ours and must never be killed."""
+    """True only for a name carrying the full ownership marker (from any
+    run). Anything else -- a user session, another suite's leftover, a
+    legacy fixed name, or a name that merely shares a prefix -- is not
+    ours and must never be killed."""
     return bool(OWNED_RE.match(name or ""))
 
 
@@ -88,7 +105,9 @@ def owning_pid(name: str) -> int | None:
 
 
 def is_mine(name: str) -> bool:
-    return name.startswith(f"{NAME_PREFIX}-own{RUN_ID}-")
+    """Created by THIS pytest process. Matched on the marker segment, so
+    it holds for every prefix this run mints."""
+    return MY_MARKER in (name or "") and is_owned(name)
 
 
 def pid_alive(pid: int) -> bool:
@@ -128,7 +147,7 @@ def kill_session(name: str) -> None:
     if not is_owned(name):
         raise AssertionError(
             f"refusing to kill tmux session {name!r}: not an owned test session "
-            f"(expected {NAME_PREFIX}-own<pid>x<hex>-<slug>)")
+            f"(expected <prefix>-own<pid>x<6 hex>-<slug>)")
     subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
 
 
