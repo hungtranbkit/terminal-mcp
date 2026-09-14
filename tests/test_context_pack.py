@@ -304,3 +304,152 @@ def test_reuse_without_a_repository_admits_the_paths_are_unchecked(store):
     assert result["status"] == cp.REUSED
     assert result["path_check"]["verified"] is False
     assert "not every path could be checked" in result["guidance"]
+
+
+# -- what a task is handed at its start --------------------------------------
+#
+# A map that merely exists on disk saves nothing: reading it was one more
+# thing to remember, and searching the code was always the path of least
+# resistance. These tests are about the load happening automatically, being
+# limited to what the spec named, and being honest when it found nothing.
+
+class _Spec:
+    """A spec-shaped object -- the loader is duck-typed across Work and Bug."""
+
+    def __init__(self, likely_module=None, relevant_modules=()):
+        self.likely_module = likely_module
+        self.relevant_modules = tuple(relevant_modules)
+
+
+@pytest.fixture()
+def mapped(tmp_path):
+    """A small repository with three modules actually indexed."""
+    import subprocess
+
+    from terminal_mcp.project_knowledge import ProjectKnowledge
+
+    root = tmp_path / "repo"
+    (root / "app").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    for name in ("export", "billing", "auth"):
+        (root / "app" / f"{name}.py").write_text(f"def {name}(): pass\n")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(root), "-c", "user.email=t@e", "-c", "user.name=t",
+                    "commit", "-qm", "init"], check=True, capture_output=True)
+    knowledge = ProjectKnowledge(root)
+    knowledge.record_module("export", paths=["app/export.py"],
+                            summary="writes report rows to CSV")
+    knowledge.record_module("billing", paths=["app/billing.py"],
+                            summary="invoices and their line items")
+    knowledge.record_module("auth", paths=["app/auth.py"], summary="sessions and grants")
+    return knowledge
+
+
+def test_only_the_modules_the_spec_names_are_loaded(mapped, store):
+    brief = cp.load_task_knowledge(_Spec(likely_module="export"),
+                                   knowledge=mapped, store=store)
+    assert [p.module for p in brief.packs] == ["export"]
+    rendered = brief.render()
+    assert "writes report rows to CSV" in rendered
+    # The rest of the map is not the task's business -- a briefing that grows
+    # with the project is the repository again under another name.
+    assert "invoices" not in rendered and "grants" not in rendered
+
+
+def test_the_spec_ordering_is_kept_and_duplicates_collapse(mapped, store):
+    brief = cp.load_task_knowledge(
+        _Spec(likely_module="billing", relevant_modules=("billing", "export")),
+        knowledge=mapped, store=store)
+    assert [p.module for p in brief.packs] == ["billing", "export"]
+
+
+def test_a_module_the_map_does_not_have_is_reported_not_dropped(mapped, store):
+    brief = cp.load_task_knowledge(
+        _Spec(likely_module="export", relevant_modules=("reporting",)),
+        knowledge=mapped, store=store)
+    assert brief.unknown == ("reporting",)
+    # An unindexed module is exactly where a worker DOES have to read code.
+    assert "NOT IN THE MAP" in brief.render()
+    assert any("reporting" in gap for gap in brief.gaps)
+
+
+def test_a_spec_that_names_no_module_says_so(mapped, store):
+    brief = cp.load_task_knowledge(_Spec(), knowledge=mapped, store=store)
+    assert brief.loaded == 0 and brief.usable is False
+    assert cp.MODULES_NOT_NAMED in brief.gaps
+
+
+def test_without_a_map_the_briefing_says_so_rather_than_looking_thin(store):
+    brief = cp.load_task_knowledge(_Spec(likely_module="export"), knowledge=None,
+                                   store=store)
+    assert brief.asked_for == ("export",)
+    assert cp.NO_MAP in brief.gaps
+    assert "nothing loaded" in brief.render()
+
+
+def test_the_briefing_is_no_stronger_than_its_weakest_module(mapped, store):
+    import subprocess
+
+    root = mapped.root
+    (root / "app" / "billing.py").write_text("def billing(): return 2\n")
+    subprocess.run(["git", "-C", str(root), "-c", "user.email=t@e", "-c", "user.name=t",
+                    "commit", "-aqm", "change billing"], check=True, capture_output=True)
+    brief = cp.load_task_knowledge(
+        _Spec(likely_module="export", relevant_modules=("billing",)),
+        knowledge=mapped, store=store)
+    assert {p.module: p.confidence for p in brief.packs}["billing"] == "LOW"
+    # A briefing is never more trustworthy than the least trustworthy thing in it.
+    assert brief.confidence == "LOW"
+
+
+def test_the_briefing_is_capped_and_says_what_it_left_out(mapped, store):
+    brief = cp.load_task_knowledge(
+        _Spec(likely_module="export",
+              relevant_modules=("billing", "auth", "export", "reporting", "ledger")),
+        knowledge=mapped, store=store, limit=2)
+    assert brief.loaded == 2
+    assert any("further module" in gap for gap in brief.gaps)
+
+
+def test_the_handoff_form_carries_the_brief_and_the_commit_it_was_verified_at(mapped,
+                                                                              store):
+    payload = cp.load_task_knowledge(_Spec(likely_module="export"),
+                                     knowledge=mapped, store=store).as_handoff()
+    assert payload["MODULES"] == ["export"]
+    assert payload["VERIFIED_COMMIT"] == mapped.head()
+    assert "app/export.py" in payload["BRIEF"]
+    # The rule the map is subordinate to, restated where it is acted on.
+    assert "current code is the truth" in payload["BRIEF"]
+
+
+def test_a_map_that_raises_becomes_a_gap_not_an_exception(mapped, store, monkeypatch):
+    def _boom():
+        raise RuntimeError("state file is a directory")
+
+    monkeypatch.setattr(mapped, "exists", _boom)
+    brief = cp.load_task_knowledge(_Spec(likely_module="export"), knowledge=mapped,
+                                   store=store)
+    # Retrieval that fails must never take the task down with it.
+    assert brief.loaded == 0
+    assert any("could not be read" in gap for gap in brief.gaps)
+
+
+def test_loading_records_a_knowledge_hit_where_the_retrieval_happened(mapped, store):
+    from terminal_mcp import work_telemetry_runtime as wtr
+
+    seen: list[tuple[str, int]] = []
+
+    class _Recorder:
+        def note(self, task_id, kind, count=1, *, source=""):
+            seen.append((kind, count))
+            return True
+
+    with wtr.observing(_Recorder(), "task-1"):
+        brief = cp.load_task_knowledge(_Spec(likely_module="export"),
+                                       knowledge=mapped, store=store)
+
+    assert brief.usable is True
+    # Counted at the call site, so the number is what happened rather than
+    # what a worker remembers happening.
+    assert ("knowledge_hits", 1) in seen
+    assert ("context_pack_hits", 1) in seen

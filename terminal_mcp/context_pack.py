@@ -40,6 +40,17 @@ MAX_PACK_FILES = 12
 MAX_PACK_BUGS = 5
 MAX_PACK_CHARS = 4000
 
+# How many modules one task's briefing may load, and how long the whole thing
+# may get. A task that names six modules has not been narrowed enough for a
+# briefing to help; loading all six would hand a worker the repository again
+# under a different name.
+MAX_TASK_MODULES = 3
+MAX_BRIEF_CHARS = 6000
+
+# Weakest-link order. A briefing is never more trustworthy than the least
+# trustworthy thing in it.
+_CONFIDENCE_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+
 # Similarity thresholds. STRONG means "start from this spec"; RELATED means
 # "read this first, it is probably informative"; below WEAK we say nothing,
 # because a bad suggestion costs more attention than no suggestion.
@@ -407,10 +418,15 @@ def build_context_pack(module: str, *,
 
     if knowledge is not None and knowledge.exists():
         head = knowledge.head()
-        state = next((m for m in knowledge.module_states() if m.name == module), None)
+        # Ask about the one module, when the map can answer that. Listing every
+        # module to answer about one costs a `git diff` per module nobody asked
+        # about -- the exact cost a bounded briefing exists to avoid.
+        state = (knowledge.module_state(module) if hasattr(knowledge, "module_state")
+                 else next((m for m in knowledge.module_states() if m.name == module), None))
         if state is not None:
             pack.summary = state.summary
-            pack.confidence = knowledge._confidence(state, head)
+            pack.confidence = (getattr(state, "confidence", "")
+                               or knowledge._confidence(state, head))
             pack.files = tuple(state.paths[:MAX_PACK_FILES])
             pack.entry_points = tuple(getattr(state, "entry_points", ())[:MAX_PACK_FILES])
             pack.test_runbook = getattr(state, "test_runbook", None)
@@ -451,3 +467,173 @@ def build_context_pack(module: str, *,
         _note_signal("context_pack_hits", source="context_pack.build_context_pack")
         _note_signal("knowledge_hits", source="context_pack.build_context_pack")
     return pack
+
+
+# -- the briefing a task starts with -----------------------------------------
+#
+# A map that merely exists on disk saves nothing. Every worker still opens the
+# repository and re-derives the shape of the module it was sent to, because
+# reading the map was one more thing to remember and searching the code was
+# the path of least resistance.
+#
+# So the map is LOADED at the moment the task starts, for the modules the spec
+# already names -- and only those. Not the whole map: a briefing that grows
+# with the project is the repository again, and would cost more than the
+# search it replaced.
+
+MODULES_NOT_NAMED = "the spec names no module, so there was nothing specific to load"
+NO_MAP = "this project has no knowledge map yet -- nothing could be loaded"
+
+
+@dataclass
+class TaskKnowledge:
+    """What a worker is handed INSTEAD of re-reading the repository."""
+
+    asked_for: tuple[str, ...] = ()
+    packs: tuple[ContextPack, ...] = ()
+    # Named by the spec and absent from the map. Reported, never silently
+    # dropped: an unindexed module is precisely where a worker DOES have to
+    # read the code, and it must be able to tell that case from a thin map.
+    unknown: tuple[str, ...] = ()
+    verified_commit: str | None = None
+    gaps: tuple[str, ...] = ()
+
+    @property
+    def loaded(self) -> int:
+        return len(self.packs)
+
+    @property
+    def usable(self) -> bool:
+        """Did anything arrive that a worker can actually start from?
+
+        A pack with neither a summary nor a file list is a name and nothing
+        else, and calling that a hit would let a map full of empty entries
+        report the saving it never produced.
+        """
+        return any(pack.summary or pack.files for pack in self.packs)
+
+    @property
+    def confidence(self) -> str:
+        """The weakest loaded pack's confidence, never the best one's."""
+        if not self.packs:
+            return "LOW"
+        return min((p.confidence or "LOW" for p in self.packs),
+                   key=lambda level: _CONFIDENCE_ORDER.get(level, 0))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"asked_for": list(self.asked_for), "loaded": self.loaded,
+                "usable": self.usable, "confidence": self.confidence,
+                "unknown": list(self.unknown),
+                "verified_commit": self.verified_commit,
+                "modules": [p.as_dict() for p in self.packs],
+                "gaps": list(self.gaps)}
+
+    def render(self) -> str:
+        """The briefing as the worker reads it, bounded and honest about gaps."""
+        if not self.packs:
+            return "KNOWLEDGE: nothing loaded -- " + (
+                self.gaps[0] if self.gaps else "no module was named")
+        parts = [pack.render() for pack in self.packs]
+        if self.unknown:
+            parts.append("NOT IN THE MAP: " + ", ".join(self.unknown)
+                         + " -- read the code for these; nothing is recorded about them")
+        if self.gaps:
+            parts.append("BRIEFING GAPS: " + "; ".join(self.gaps))
+        # The rule the map is subordinate to, restated where it is acted on.
+        parts.append("The map says WHERE to look. The current code is the truth: "
+                     "confirm the named paths and symbols before editing them.")
+        text = "\n\n".join(parts)
+        if len(text) > MAX_BRIEF_CHARS:
+            text = text[:MAX_BRIEF_CHARS].rsplit("\n", 1)[0] + "\n[briefing truncated]"
+        return text
+
+    def as_handoff(self) -> dict[str, Any]:
+        """The compact form that travels in a worker's task-start payload."""
+        return {"MODULES": [p.module for p in self.packs],
+                "CONFIDENCE": self.confidence,
+                "VERIFIED_COMMIT": self.verified_commit,
+                "NOT_INDEXED": list(self.unknown),
+                "BRIEF": self.render()}
+
+
+def spec_modules(spec: Any, *, limit: int = MAX_TASK_MODULES) -> list[str]:
+    """The modules a spec NAMES, best first, deduplicated and capped.
+
+    Duck-typed across `WorkSpec` and `BugSpec` on purpose: both name where
+    the work lives, and a briefing that only worked for one of them would be
+    absent exactly half the time.
+    """
+    names: list[str] = []
+    for value in (getattr(spec, "likely_module", None),
+                  *(getattr(spec, "relevant_modules", ()) or ())):
+        name = str(value).strip() if value else ""
+        if name and name not in names:
+            names.append(name)
+    return names[:limit]
+
+
+def load_task_knowledge(spec: Any, *, knowledge: "ProjectKnowledge | None" = None,
+                        store: BugSpecStore | None = None,
+                        limit: int = MAX_TASK_MODULES) -> TaskKnowledge:
+    """Load the knowledge this task needs, and nothing else.
+
+    Called at task start, which is the only moment it can save anything: a
+    briefing assembled after a worker has read the module has already let the
+    cost it exists to avoid be paid in full.
+
+    Degrades rather than raises, like every other retrieval on this path. A
+    project with no map, a spec that names no module, and a module that was
+    never indexed are three different situations, and each is reported as
+    itself rather than as an empty result.
+    """
+    asked = spec_modules(spec, limit=limit)
+    gaps: list[str] = []
+    named_total = len(spec_modules(spec, limit=10_000))
+    if named_total > len(asked):
+        gaps.append(f"{named_total - len(asked)} further module(s) the spec names "
+                    f"were not loaded (briefing capped at {limit})")
+    if not asked:
+        return TaskKnowledge(gaps=(MODULES_NOT_NAMED,))
+    if knowledge is None:
+        return TaskKnowledge(asked_for=tuple(asked), gaps=(NO_MAP, *gaps))
+
+    try:
+        if not knowledge.exists():
+            return TaskKnowledge(asked_for=tuple(asked), gaps=(NO_MAP, *gaps))
+    except Exception as exc:  # noqa: BLE001 -- a map that cannot be read is a gap
+        return TaskKnowledge(asked_for=tuple(asked),
+                             gaps=(f"the knowledge map could not be read: {exc}", *gaps))
+
+    known, unknown = _resolve_modules(knowledge, asked)
+    packs: list[ContextPack] = []
+    for module in known:
+        try:
+            packs.append(build_context_pack(module, knowledge=knowledge, store=store))
+        except Exception as exc:  # noqa: BLE001
+            gaps.append(f"{module}: briefing failed ({type(exc).__name__}: {exc})")
+    if unknown:
+        gaps.append(f"not in the knowledge map: {', '.join(unknown)}")
+
+    verified = next((p.last_verified_commit for p in packs if p.last_verified_commit), None)
+    return TaskKnowledge(asked_for=tuple(asked), packs=tuple(packs),
+                         unknown=tuple(unknown), verified_commit=verified,
+                         gaps=tuple(gaps))
+
+
+def _resolve_modules(knowledge: Any, asked: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Which of the named modules the map actually has.
+
+    Uses `load_modules` when the map offers it -- that asks about exactly
+    these modules -- and falls back to listing for any other knowledge-shaped
+    object, because a briefing that only worked against one implementation
+    would be absent wherever it was most needed.
+    """
+    try:
+        if hasattr(knowledge, "load_modules"):
+            found, unknown = knowledge.load_modules(list(asked))
+            return [m.name for m in found], list(unknown)
+        recorded = {m.name for m in knowledge.module_states()}
+    except Exception:  # noqa: BLE001 -- treated as "the map could not answer"
+        return list(asked), []
+    return ([name for name in asked if name in recorded],
+            [name for name in asked if name not in recorded])
