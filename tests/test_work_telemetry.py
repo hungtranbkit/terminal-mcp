@@ -207,3 +207,271 @@ def test_the_store_summary_carries_targets(store):
     summary = store.summary(project_id="p1")
     assert summary["tasks"] == 1
     assert "targets" in summary
+
+
+# -- provider usage: the counters a runtime reported, and only those ----------
+
+def test_usage_records_only_the_counters_that_were_reported():
+    usage = wt.ProviderUsage.from_report({"input_tokens": 100, "output_tokens": 20},
+                                         provider="runtime")
+    assert usage.available() is True
+    assert usage.get("input_tokens").value == 100
+    # Nothing was said about the cache, so nothing is claimed about it.
+    missing = usage.get("cache_read_tokens")
+    assert missing.value is None and missing.source == wt.UNAVAILABLE
+    assert "cache_read_tokens" in usage.unreported()
+
+
+def test_usage_from_nothing_is_unavailable_not_empty_success():
+    assert wt.ProviderUsage.from_report({}).available() is False
+    assert wt.ProviderUsage.from_report(None).available() is False
+    assert wt.ProviderUsage.from_report("18000 tokens").available() is False
+
+
+def test_a_booleans_worth_of_tokens_is_not_a_token_count():
+    """`True` is an int in Python. It is not a measurement."""
+    usage = wt.ProviderUsage.from_report({"input_tokens": True, "output_tokens": 4})
+    assert "input_tokens" not in usage.counters
+    assert "input_tokens" in usage.ignored
+
+
+def test_provider_synonyms_map_to_one_counter_but_unknown_names_never_do():
+    usage = wt.ProviderUsage.from_report({"prompt_tokens": 9, "completion_tokens": 3,
+                                          "thinking_tokens": 5}, provider="other")
+    assert usage.get("input_tokens").value == 9
+    assert usage.get("output_tokens").value == 3
+    # An unmapped name is kept visible rather than folded into a counter it
+    # might not belong to.
+    assert usage.ignored == ("thinking_tokens",)
+
+
+def test_a_partial_usage_total_across_tasks_says_how_many_reported():
+    rows = [wt.TaskTelemetry(task_id="a"), wt.TaskTelemetry(task_id="b")]
+    rows[0].record_provider_usage({"input_tokens": 10}, provider="runtime")
+    summary = wt.summarise(rows)
+    counters = summary["provider_usage"]["counters"]
+    assert summary["provider_usage"]["reporting_tasks"] == 1
+    assert counters["input_tokens"]["source"] == wt.PARTIAL
+    assert counters["input_tokens"]["missing_tasks"] == 1
+    assert counters["output_tokens"]["source"] == wt.UNAVAILABLE
+
+
+def test_no_task_reporting_usage_is_reported_as_exactly_that():
+    summary = wt.summarise([wt.TaskTelemetry(task_id="a")])
+    assert summary["provider_usage"]["available"] is False
+    assert "none of 1 task(s)" in summary["provider_usage"]["note"]
+
+
+# -- first-pass success is three-valued --------------------------------------
+
+def test_an_unfinished_task_has_no_first_pass_verdict():
+    record = wt.TaskTelemetry(task_id="t")
+    record.mark_dispatched()
+    assert record.first_pass_success is None
+
+
+def test_a_row_with_no_observed_dispatch_cannot_claim_a_first_pass():
+    """A worker-reported row says nothing about how many dispatches it took,
+    and a gap in instrumentation must not become a success statistic."""
+    record = wt.TaskTelemetry(task_id="t")
+    record.finish("COMPLETED")
+    assert record.first_pass_success is None
+    assert "not knowable" in record.first_pass_basis
+
+
+def test_unknown_first_pass_rows_are_excluded_from_the_rate_not_counted_as_failures():
+    good = wt.TaskTelemetry(task_id="a")
+    good.mark_dispatched()
+    good.finish("COMPLETED")
+    summary = wt.summarise([good, wt.TaskTelemetry(task_id="b")])
+    assert summary["first_pass_rate"] == 1.0
+    assert (summary["first_pass_judged"], summary["first_pass_unknown"]) == (1, 1)
+
+
+# -- aggregation: per task, per module, per period ---------------------------
+
+def _row(**kwargs):
+    record = wt.TaskTelemetry(**kwargs)
+    return record
+
+
+def test_aggregation_groups_by_module():
+    rows = [_row(task_id="a", module="ui", started_at="2026-09-01T10:00:00+00:00"),
+            _row(task_id="b", module="ui", started_at="2026-09-01T11:00:00+00:00"),
+            _row(task_id="c", module="queue", started_at="2026-09-02T10:00:00+00:00")]
+    for row in rows:
+        row.record_files(2)
+    result = wt.aggregate(rows, by="module")
+    keys = {group["key"]: group["summary"]["tasks"] for group in result["groups"]}
+    assert keys == {"ui": 2, "queue": 1}
+    assert result["overall"]["files_read"] == 6
+
+
+def test_a_row_with_no_module_is_named_not_bucketed_as_other():
+    rows = [_row(task_id="a", module="ui"), _row(task_id="b")]
+    result = wt.aggregate(rows, by="module")
+    assert result["ungrouped_tasks"] == 1
+    assert result["ungrouped_ids"] == ["b"]
+    assert [g["key"] for g in result["groups"]] == ["ui"]
+
+
+def test_aggregation_by_time_period():
+    rows = [_row(task_id="a", started_at="2026-09-01T10:00:00+00:00"),
+            _row(task_id="b", started_at="2026-09-01T23:00:00+00:00"),
+            _row(task_id="c", started_at="2026-09-08T10:00:00+00:00")]
+    days = wt.aggregate(rows, by=wt.PERIOD_DAY)
+    assert [g["key"] for g in days["groups"]] == ["2026-09-01", "2026-09-08"]
+    weeks = wt.aggregate(rows, by=wt.PERIOD_WEEK)
+    assert [g["key"] for g in weeks["groups"]] == ["2026-W36", "2026-W37"]
+    months = wt.aggregate(rows, by=wt.PERIOD_MONTH)
+    assert [g["key"] for g in months["groups"]] == ["2026-09"]
+
+
+def test_an_unreadable_timestamp_belongs_to_no_period():
+    """Putting it in today's would quietly move work between windows."""
+    assert wt.period_key("last tuesday", wt.PERIOD_DAY) is None
+    result = wt.aggregate([_row(task_id="a", started_at="whenever")], by=wt.PERIOD_DAY)
+    assert result["ungrouped_tasks"] == 1 and result["groups"] == []
+
+
+def test_an_unknown_grouping_is_refused():
+    assert wt.aggregate([], by="mood")["error"] == "UNKNOWN_GROUPING"
+
+
+def test_aggregation_per_task_is_available_too():
+    rows = [_row(task_id="a"), _row(task_id="b")]
+    assert {g["key"] for g in wt.aggregate(rows, by="task")["groups"]} == {"a", "b"}
+
+
+# -- baseline and savings ----------------------------------------------------
+
+def test_without_a_baseline_no_saving_is_shown_at_all():
+    summary = wt.summarise([_row(task_id="a")])
+    result = wt.savings(summary, wt.Baseline.unavailable("nothing measured yet"))
+    assert result["available"] is False
+    assert "nothing measured yet" in result["reason"]
+    assert "metrics" not in result
+
+
+def test_a_measured_baseline_carries_its_window_and_task_count():
+    rows = [_row(task_id="a"), _row(task_id="b"), _row(task_id="c")]
+    for row in rows:
+        row.record_files(10)
+    baseline = wt.measure_baseline(rows, definition="the three tasks before the change",
+                                   window=("2026-08-01", "2026-09-01"), min_tasks=3)
+    assert baseline.source == wt.BASELINE_MEASURED
+    assert baseline.metrics["files_read_per_task"] == 10.0
+    payload = baseline.as_dict()
+    assert payload["tasks"] == 3 and payload["window"]["since"] == "2026-08-01"
+
+
+def test_too_few_rows_is_not_a_baseline():
+    baseline = wt.measure_baseline([_row(task_id="a")], definition="one task",
+                                   min_tasks=3)
+    assert baseline.available() is False
+    assert "at least 3" in baseline.note
+
+
+def test_a_supplied_baseline_without_a_stated_definition_is_refused():
+    baseline = wt.stated_baseline({"files_read_per_task": 20}, definition="  ")
+    assert baseline.available() is False
+    assert "how it was arrived at" in baseline.note
+
+
+def test_a_supplied_baseline_with_a_definition_is_admissible():
+    baseline = wt.stated_baseline(
+        {"files_read_per_task": 20, "made_up_metric": 3},
+        definition="hand-counted over 12 tasks in August, recorded in the handoff")
+    assert baseline.source == wt.BASELINE_STATED
+    assert baseline.metrics == {"files_read_per_task": 20}      # unknown metric dropped
+
+
+def test_every_saving_is_labelled_derived_and_points_the_right_way():
+    before = [_row(task_id=f"b{i}") for i in range(3)]
+    for row in before:
+        row.record_files(10)
+        row.record_runbook(hit=False)
+    baseline = wt.measure_baseline(before, definition="before the change", min_tasks=3)
+
+    after = [_row(task_id="a")]
+    after[0].record_files(4)
+    after[0].record_runbook(hit=True)
+    result = wt.savings(wt.summarise(after), baseline)
+
+    files = result["metrics"]["files_read_per_task"]
+    assert files["status"] == "IMPROVED"        # fewer files is better
+    assert files["change"] == -6.0 and files["percent_change"] == -60.0
+    assert files["source"] == wt.ESTIMATED      # derived, never presented as measured
+    assert "derived" in files["method"]
+    # ...and for a rate, MORE is the improvement.
+    assert result["metrics"]["runbook_hit_rate"]["status"] == "IMPROVED"
+
+
+def test_a_metric_missing_on_either_side_is_unknown_rather_than_zero():
+    baseline = wt.stated_baseline({"files_read_per_task": 5},
+                                  definition="stated in the handoff")
+    result = wt.savings(wt.summarise([_row(task_id="a")]), baseline)
+    assert result["metrics"]["first_pass_rate"]["status"] == "UNKNOWN"
+
+
+# -- store: querying the three axes savings are read along -------------------
+
+def test_the_store_queries_a_half_open_time_window(store):
+    for task_id, started in (("a", "2026-09-01T00:00:00+00:00"),
+                             ("b", "2026-09-02T00:00:00+00:00"),
+                             ("c", "2026-09-03T00:00:00+00:00")):
+        store.save(wt.TaskTelemetry(task_id=task_id, module="ui", started_at=started))
+    window = store.query(since="2026-09-02T00:00:00+00:00",
+                         until="2026-09-03T00:00:00+00:00")
+    # Half-open, so two adjacent windows can never both contain task b.
+    assert [row["task_id"] for row in window] == ["b"]
+
+
+def test_the_store_aggregates_per_module(store):
+    store.save(wt.TaskTelemetry(task_id="a", module="ui"))
+    store.save(wt.TaskTelemetry(task_id="b", module="queue"))
+    grouped = store.aggregate(by="module")
+    assert {g["key"] for g in grouped["groups"]} == {"ui", "queue"}
+
+
+def test_a_report_with_no_baseline_still_reports_the_window_and_says_why(store):
+    store.save(wt.TaskTelemetry(task_id="a", module="ui"))
+    report = store.report(by="module")
+    assert report["tasks"] == 1
+    assert report["savings"]["available"] is False
+    assert "no baseline" in report["savings"]["reason"]
+
+
+def test_a_report_measures_its_baseline_from_an_earlier_window(store):
+    for index in range(3):
+        row = wt.TaskTelemetry(task_id=f"old{index}", module="ui",
+                               started_at=f"2026-08-0{index + 1}T00:00:00+00:00")
+        row.record_files(10)
+        store.save(row)
+    recent = wt.TaskTelemetry(task_id="new", module="ui",
+                              started_at="2026-09-01T00:00:00+00:00")
+    recent.record_files(4)
+    store.save(recent)
+
+    report = store.report(module="ui", since="2026-09-01T00:00:00+00:00",
+                          baseline_window=("2026-08-01T00:00:00+00:00",
+                                           "2026-09-01T00:00:00+00:00"),
+                          baseline_min_tasks=3)
+    assert report["savings"]["available"] is True
+    assert report["savings"]["baseline"]["source"] == wt.BASELINE_MEASURED
+    assert report["savings"]["metrics"]["files_read_per_task"]["change"] == -6.0
+
+
+def test_a_stored_row_can_be_reopened_and_continued(store):
+    record = wt.TaskTelemetry(task_id="t1", module="ui")
+    record.mark_dispatched(lane="demo-work")
+    record.record_provider_usage({"total_tokens": 50}, provider="runtime")
+    store.save(record)
+
+    reloaded = wt.TaskTelemetry.from_dict(store.for_task("t1"))
+    assert reloaded.telemetry_id == record.telemetry_id
+    assert reloaded.dispatch_count == 1 and reloaded.lane == "demo-work"
+    assert reloaded.usage.get("total_tokens").value == 50
+    reloaded.finish("COMPLETED")
+    store.save(reloaded)
+    assert len(store.query(task_id="t1")) == 1

@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Sequence
 
 from .bug_spec import BugSpec, BugSpecStore
+from .work_telemetry_runtime import note as _note_signal
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .project_knowledge import ProjectKnowledge
@@ -149,7 +150,11 @@ def similar_bugs(store: BugSpecStore, target: BugSpec, *,
         if score >= RELATED_MATCH:
             found.append(SimilarBug(candidate, score, tuple(reasons)))
     found.sort(key=lambda item: item.score, reverse=True)
-    return found[:limit]
+    served = found[:limit]
+    # Efficiency telemetry: how often history answered instead of a search.
+    # A no-op unless a recorder is active for the task being worked.
+    _note_signal("similar_bug_hits", len(served), source="context_pack.similar_bugs")
+    return served
 
 
 def retrieval_result(store: BugSpecStore, target: BugSpec, *,
@@ -300,4 +305,10 @@ def build_context_pack(module: str, *,
             gaps.append("no previous bugs recorded in this module")
 
     pack.gaps = tuple(gaps)
+    # Counted where the retrieval actually happened, not inferred later: a
+    # pack with a summary or files in it is a briefing the worker did not
+    # have to reconstruct by reading the module.
+    if pack.summary or pack.files:
+        _note_signal("context_pack_hits", source="context_pack.build_context_pack")
+        _note_signal("knowledge_hits", source="context_pack.build_context_pack")
     return pack
