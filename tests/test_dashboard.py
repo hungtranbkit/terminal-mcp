@@ -1519,6 +1519,20 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/node/test-connection": {"POST"},
         "/dashboard/api/node/generate-onboarding": {"POST"},
         "/dashboard/api/nodes/{node_id}/heartbeat": {"POST"},
+        # Node token rotation/revocation (blg_a3cc401d8275, token_rotation.py).
+        # Declared deliberately, not to quiet this guard: /token is a
+        # read (fingerprints and statuses, never a secret), /adopt,
+        # /rotate and /revoke are operator mutations behind the same
+        # guard as every other node action, and /refresh is the ONE
+        # machine-facing one -- authenticated by the node token being
+        # replaced, the same way /heartbeat above is, and the only route
+        # in this whole inventory whose response body carries a token.
+        # No dashboard UI: this feature is API-only by design.
+        "/dashboard/api/nodes/{node_id}/token": {"GET", "HEAD"},
+        "/dashboard/api/nodes/{node_id}/token/adopt": {"POST"},
+        "/dashboard/api/nodes/{node_id}/token/rotate": {"POST"},
+        "/dashboard/api/nodes/{node_id}/token/revoke": {"POST"},
+        "/dashboard/api/nodes/{node_id}/token/refresh": {"POST"},
         # LAN discovery + remote connect/bootstrap (Scan LAN / Add Remote
         # SSH / Add via Cloudflare Tunnel / Add by Agent Token) -- another
         # later, separate feature, same as the nodes routes above.

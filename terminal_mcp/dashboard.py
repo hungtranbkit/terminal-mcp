@@ -28,6 +28,8 @@ from .connection_store import ConnectionStore, generate_node_token
 from .enrollment import STAGES as ENROLL_STAGES, EnrollmentStore
 from .node_onboarding import (OnboardingError, OnboardingService, read_controller_ssh_public_key,
                                rescue_authorized_keys_dir)
+from . import node_credentials
+from .token_rotation import TokenRotationService
 from .node_transport import (GENERIC_SETUP_CODE, KIND_LAN, KIND_REVERSE_SSH, KIND_TAILSCALE,
                              TransportStore, probe_reverse_tunnel, probe_ssh_banner)
 from . import bootstrap_protocol, rescue_gateway
@@ -11271,7 +11273,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        ai_usage: AiUsageService | None = None,
                        recovery: RecoveryEngine | None = None,
                        backlog: BacklogService | None = None,
-                       onboarding: "OnboardingService | None" = None) -> None:
+                       onboarding: "OnboardingService | None" = None,
+                       credentials: "node_credentials.NodeCredentialStore | None" = None,
+                       rotation: "TokenRotationService | None" = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -11360,6 +11364,58 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     )
     host_key_store = remote_connect.HostKeyStore()
     ssh_known_hosts_dir = connection_store.path.parent / "ssh_known_hosts"
+    # Versioned/revocable node credentials (blg_a3cc401d8275). Same
+    # private-temp-file discipline as every other store default here:
+    # server_http.py's real main() passes a persistent one.
+    if credentials is None:
+        import tempfile
+        credentials = node_credentials.NodeCredentialStore(
+            Path(tempfile.mkdtemp(prefix="terminal-mcp-credentials-")) / "node-credentials.db")
+    if rotation is None:
+        def _apply_outbound_token(node_id: str, token: str | None) -> None:
+            """The controller's outbound half of a rotation, in one place.
+
+            A controller presents a node token from three places -- the
+            0600 token file, the per-node env var and the live
+            RemoteNodeClient -- and all three must move together or the
+            next call out picks up whichever one lagged. `None` clears
+            all three, which is what revocation means in this direction.
+            """
+            if token:
+                connection = connection_store.get(node_id)
+                if connection is not None:
+                    token_file = connection_store.write_token(node_id, token)
+                    connection_store.save(node_id, transport_type=connection.transport_type,
+                                          endpoint=connection.endpoint, hostname=connection.hostname,
+                                          username=connection.username, port=connection.port,
+                                          host_key_fingerprint=connection.host_key_fingerprint,
+                                          token_file=token_file)
+                os.environ[node_token_env_var(node_id)] = token
+            else:
+                os.environ.pop(node_token_env_var(node_id), None)
+            if controller is not None:
+                controller.update_remote_token(node_id, token)
+
+        rotation = TokenRotationService(credentials, connection_store=connection_store,
+                                        audit=terminal.audit, apply_outbound=_apply_outbound_token)
+
+    def _manage_node_token(node_id: str, token: str) -> None:
+        """Every place a node GETS its token routes through here.
+
+        Setting the env var is what makes the node's next heartbeat
+        verify (see node_token_env_var); adopting it is what makes that
+        credential rotatable and revocable from day one, instead of
+        leaving each new node to be adopted by hand later. Adoption is
+        best-effort on purpose: a node that enrolled successfully must
+        not be turned away because the credential ledger was
+        unwritable -- it stays on the legacy path, which still works.
+        """
+        os.environ[node_token_env_var(node_id)] = token
+        try:
+            credentials.adopt(node_id, token)
+        except Exception:  # noqa: BLE001
+            _log.exception("could not record node %s's token for rotation -- "
+                           "it will authenticate via the legacy env var", node_id)
     if onboarding is None:
         # SAME private-temp-file discipline as connection_store/queue/pm
         # above: an ad-hoc caller (every test that does not pass one)
@@ -11377,7 +11433,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 port_range=(terminal.config.nodes.onboarding.rescue.port_range_start,
                             terminal.config.nodes.onboarding.rescue.port_range_end)),
             audit=terminal.audit,
-            token_env_setter=lambda node_id, token: os.environ.__setitem__(node_token_env_var(node_id), token),
+            token_env_setter=_manage_node_token,
         )
 
     def _origin_allowed(request: Request) -> bool:
@@ -14944,7 +15000,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # controller's own os.environ, not the shell's) so the very next
         # heartbeat push already verifies correctly, no separate manual
         # export step needed for a discovery/SSH-connected node.
-        os.environ[node_token_env_var(node_id)] = token
+        _manage_node_token(node_id, token)
         node = controller.node_status(node_id)
         return JSONResponse({"ok": True, "node_id": node_id, "endpoint": endpoint,
                             "node": _node_to_dict(node) if node else None}, headers={"Cache-Control": "no-store"})
@@ -15026,10 +15082,39 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # See node_token_env_var's own docstring -- makes the node's
         # (already-running) heartbeat loop verify successfully against
         # THIS controller the moment its next push arrives.
-        os.environ[node_token_env_var(node_id)] = token
+        _manage_node_token(node_id, token)
         node = controller.node_status(node_id)
         return JSONResponse({"ok": True, "node_id": node_id, "endpoint": endpoint,
                             "node": _node_to_dict(node) if node else None}, headers={"Cache-Control": "no-store"})
+
+    def _verify_node_token(node_id: str, request: Request):
+        """The ONE inbound node-token check, shared by every machine-facing
+        route (blg_a3cc401d8275).
+
+        Backward compatible by construction: a node that has a credential
+        record is checked against it -- so rotation and revocation take
+        effect immediately -- and a node that predates the store falls back
+        to the legacy env var it has always used. No flag day, and no node
+        stops working because this landed.
+
+        Fail-closed on ambiguity: a token matching a REVOKED record is
+        refused with its own reason rather than folded into "unknown",
+        because a revoked credential still in use is an incident. The
+        token_id is safe to log; the token never is.
+        """
+        header = request.headers.get("authorization", "")
+        presented = header[len("Bearer "):] if header.startswith("Bearer ") else ""
+        if credentials.is_managed(node_id):
+            result = credentials.verify(node_id, presented)
+            if not result.accepted:
+                _log.warning("dashboard node auth refused node_id=%s verdict=%s token_id=%s",
+                             node_id, result.verdict, result.token_id)
+            return result.accepted, result
+        expected = os.environ.get(node_token_env_var(node_id))
+        legacy_ok = bool(expected) and hmac.compare_digest(presented, expected)
+        return legacy_ok, node_credentials.VerifyResult(
+            node_credentials.OK if legacy_ok else node_credentials.UNKNOWN,
+            None, "legacy env-var credential (not yet under rotation management)")
 
     @server.custom_route("/dashboard/api/nodes/{node_id}/heartbeat", methods=["POST"], include_in_schema=False)
     async def node_heartbeat(request: Request) -> JSONResponse:
@@ -15041,11 +15126,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # before touching the registry at all -- never silently accepted
         # as "must be the local node" or similarly guessed.
         node_id = request.path_params["node_id"]
-        expected_token = os.environ.get(node_token_env_var(node_id))
-        header = request.headers.get("authorization", "")
-        presented = header[len("Bearer "):] if header.startswith("Bearer ") else ""
-        if not expected_token or not hmac.compare_digest(presented, expected_token):
-            return JSONResponse({"error": "UNAUTHORIZED"}, status_code=401)
+        accepted, verdict = _verify_node_token(node_id, request)
+        if not accepted:
+            return JSONResponse({"error": "UNAUTHORIZED", "verdict": verdict.verdict},
+                                status_code=401, headers={"Cache-Control": "no-store"})
         try:
             body = await request.json()
         except ValueError:
@@ -15076,8 +15160,121 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return {"ok": True, "node_id": node_id}
 
         result = await anyio.to_thread.run_sync(_compute)
+        # A heartbeat signed with the staged token is the PROOF that the
+        # node has adopted it -- the only moment at which this controller
+        # can safely move its own outbound copy over and revoke the old
+        # credential. Doing it here, on the node's own traffic, is what
+        # removes the restart from rotation (blg_a3cc401d8275 AC2).
+        await anyio.to_thread.run_sync(lambda: rotation.confirm(node_id, verdict.token_id))
+        hint = await anyio.to_thread.run_sync(lambda: rotation.refresh_hint(node_id, verdict.token_id))
+        if hint:
+            result = {**result, "token_refresh": hint}
         status_code = 200 if "error" not in result else 404
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/token/refresh", methods=["POST"], include_in_schema=False)
+    async def node_token_refresh(request: Request) -> JSONResponse:
+        """The node collects the replacement token staged for it.
+
+        Machine-facing, and authenticated by exactly the credential being
+        replaced: only something already holding this node's current (or
+        still-in-grace) token can collect its successor, which is why no
+        second enrollment step is needed. This is the ONE response in the
+        system that carries a token in its body -- it is never logged,
+        never audited (the audit row records the fingerprint), and the
+        staged copy is deleted once the node proves it took it.
+        """
+        node_id = request.path_params["node_id"]
+        accepted, verdict = _verify_node_token(node_id, request)
+        if not accepted:
+            return JSONResponse({"error": "UNAUTHORIZED", "verdict": verdict.verdict},
+                                status_code=401, headers={"Cache-Control": "no-store"})
+        result = await anyio.to_thread.run_sync(lambda: rotation.collect(node_id))
+        status_code = 200 if result.get("ok") else 404
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/token", methods=["GET"], include_in_schema=False)
+    async def node_token_status(request: Request) -> JSONResponse:
+        """What credentials this node has, by fingerprint. No secret can
+        appear here: the store holds only hashes."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        return JSONResponse(await anyio.to_thread.run_sync(lambda: rotation.status(node_id)),
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/token/adopt", methods=["POST"], include_in_schema=False)
+    async def node_token_adopt(request: Request) -> JSONResponse:
+        """Bring a node enrolled before this feature under management,
+        without changing its token -- so nothing about that node stops
+        working at the moment it becomes rotatable. Idempotent."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        actor = identity.email if identity else None
+        result = await anyio.to_thread.run_sync(lambda: rotation.adopt_existing(node_id, actor=actor))
+        return JSONResponse(result, status_code=200 if result.get("ok") else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/token/rotate", methods=["POST"], include_in_schema=False)
+    async def node_token_rotate(request: Request) -> JSONResponse:
+        """Stage a replacement token for the node to collect.
+
+        Returns fingerprints and state only -- the new token goes to the
+        NODE, over the channel it authenticates itself on, and never back
+        to the operator who pressed the button. An operator who never
+        sees a token cannot leak one, and nothing downstream needs them
+        to: `grace_seconds` omitted means the old token stays valid until
+        the new one is confirmed in use, rather than until a clock runs
+        out on a node that happened to be offline.
+        """
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        raw_grace = body.get("grace_seconds")
+        try:
+            grace = None if raw_grace is None else max(0, int(raw_grace))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "grace_seconds must be an integer"},
+                                status_code=400, headers={"Cache-Control": "no-store"})
+        force = bool(body.get("force"))
+        actor = identity.email if identity else None
+        result = await anyio.to_thread.run_sync(
+            lambda: rotation.rotate(node_id, grace_seconds=grace, force=force, actor=actor))
+        return JSONResponse(result, status_code=200 if result.get("ok") else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/token/revoke", methods=["POST"], include_in_schema=False)
+    async def node_token_revoke(request: Request) -> JSONResponse:
+        """Refuse a credential from now on. With no token_id, refuses
+        every credential this node has -- which is what "revoke this
+        node" means and is the safe default. Idempotent."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        token_id = str(body.get("token_id") or "").strip() or None
+        reason = str(body.get("reason") or "manual_revoke")[:200]
+        actor = identity.email if identity else None
+        result = await anyio.to_thread.run_sync(
+            lambda: rotation.revoke(node_id, token_id=token_id, reason=reason, actor=actor))
+        return JSONResponse(result, status_code=200 if result.get("ok") else 400,
+                            headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/nodes/{node_id}/refresh-capabilities", methods=["POST"], include_in_schema=False)
     async def node_refresh_capabilities(request: Request) -> JSONResponse:
@@ -15643,11 +15840,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         heartbeat route above -- a node can only ever deregister itself,
         never another node."""
         node_id = request.path_params["node_id"]
-        expected_token = os.environ.get(node_token_env_var(node_id))
-        header = request.headers.get("authorization", "")
-        presented = header[len("Bearer "):] if header.startswith("Bearer ") else ""
-        if not expected_token or not hmac.compare_digest(presented, expected_token):
-            return JSONResponse({"error": "UNAUTHORIZED"}, status_code=401)
+        accepted, verdict = _verify_node_token(node_id, request)
+        if not accepted:
+            return JSONResponse({"error": "UNAUTHORIZED", "verdict": verdict.verdict},
+                                status_code=401, headers={"Cache-Control": "no-store"})
         result = await anyio.to_thread.run_sync(lambda: onboarding.remove_node(node_id, by=f"node:{node_id}"))
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
