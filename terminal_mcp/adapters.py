@@ -396,5 +396,40 @@ _ADAPTERS_BY_COMMAND = {
 _GENERIC = GenericShellAdapter()
 
 
+# Executable suffixes a Windows foreground process reports and a POSIX one
+# never does. windows_backend.py derives pane_current_command as the Win32
+# foreground process's basename, to match tmux's own #{pane_current_command}
+# semantic ("always a bare process name, e.g. bash") -- but on Windows the
+# bare name KEEPS its extension, so Claude Code arrives as "claude.EXE"
+# where the same agent on Linux arrives as "claude".
+_EXECUTABLE_SUFFIXES = (".exe", ".com", ".bat", ".cmd")
+
+
+def normalize_command(pane_current_command: str) -> str:
+    """The adapter-lookup key for a foreground command name.
+
+    P0 2026-09-15: `select_adapter` looked the raw casefolded command up in
+    `_ADAPTERS_BY_COMMAND`, whose keys are "codex"/"claude". On every Windows
+    node that meant `"claude.exe"`, which is not a key, so a real Claude Code
+    session silently selected `GenericShellAdapter`. Two consequences, both
+    observed live on dell-5530 (win1/win2/wtest/win-work): the send result
+    reported `agent_type: "generic"`, and -- because
+    `submit_flow.ACTIVATION_ADAPTERS` is keyed on the adapter NAME -- the
+    Claude activation nudge was never sent, so a bare Enter on an already-
+    visible prompt did nothing at all. Upgrading the node agent alone could
+    never have fixed those sessions.
+
+    Basename first (defensive only: both backends already report a bare
+    name), then at most one executable suffix, then casefold. Deliberately
+    NOT a general "strip any extension" rule -- a command genuinely named
+    with a dot keeps it, and only the Windows executable family is stripped.
+    """
+    name = (pane_current_command or "").strip().replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    for suffix in _EXECUTABLE_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
 def select_adapter(pane_current_command: str) -> AgentAdapter:
-    return _ADAPTERS_BY_COMMAND.get((pane_current_command or "").casefold(), _GENERIC)
+    return _ADAPTERS_BY_COMMAND.get(normalize_command(pane_current_command), _GENERIC)
