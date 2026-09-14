@@ -244,15 +244,56 @@ class OnboardingService:
         THIS process serves on -- a staging controller started with
         TERMINAL_MCP_HTTP_PORT would otherwise hand every node a URL
         pointing at the production instance."""
-        configured = (self.onboarding_config.controller_url or "").strip()
-        if configured:
-            return configured.rstrip("/")
+        candidates = self.controller_urls(request_base_url=request_base_url)
+        return candidates[0]
+
+    def controller_urls(self, *, request_base_url: str | None = None) -> list[str]:
+        """Every address a NOT-YET-ONBOARDED node might reach this
+        controller on, best first.
+
+        Ordering is the whole point, and it is ordered by what a brand-new
+        machine can actually reach RIGHT NOW:
+
+          1. the operator's explicit setting, if any
+          2. the address the operator's own browser just used -- if they
+             are on the LAN, so is the machine they are about to onboard
+          3. this controller's LAN address
+          4. this controller's TAILNET address -- LAST, deliberately
+
+        Tailscale being last is the fix for a real outage: a node enrols
+        BEFORE it joins the tailnet (it joins as part of onboarding), so a
+        100.64.0.0/10 address is unreachable at exactly the moment the
+        installer needs it. Putting it first -- which is what this
+        function used to do -- produced "unable to connect to the remote
+        server" at the enrollment stage on a machine that was otherwise
+        perfectly able to reach the controller over the LAN. It stays in
+        the list because once Tailscale IS up it is the best path for
+        heartbeats, and the installer re-resolves after joining.
+        """
+        seen: list[str] = []
+
+        def add(url: str | None) -> None:
+            if not url:
+                return
+            cleaned = str(url).rstrip("/")
+            if cleaned and cleaned not in seen:
+                seen.append(cleaned)
+
+        add((self.onboarding_config.controller_url or "").strip())
+        add(request_base_url)
+        port = _controller_port()
+        lan_candidates, tailnet_candidates = [], []
+        for address in _controller_bind_addresses():
+            (tailnet_candidates if is_tailnet_address(address) else lan_candidates).append(address)
+        for address in lan_candidates:
+            add(f"http://{address}:{port}")
+        for address in tailnet_candidates:
+            add(f"http://{address}:{port}")
         detected = self._detect_tailscale()
         if detected.get("available") and detected.get("ip"):
-            return f"http://{detected['ip']}:{_controller_port()}"
-        if request_base_url:
-            return str(request_base_url).rstrip("/")
-        return f"http://{socket.gethostname()}:{_controller_port()}"
+            add(f"http://{detected['ip']}:{port}")
+        add(f"http://{socket.gethostname()}:{port}")
+        return seen
 
     # -- create ------------------------------------------------------------
 
@@ -565,6 +606,14 @@ class OnboardingService:
 
 def _token_env_var(node_id: str) -> str:
     return f"TERMINAL_MCP_NODE_TOKEN_{node_id.upper().replace('-', '_')}"
+
+
+def _controller_bind_addresses() -> list[str]:
+    """The addresses this controller actually listens on, from the same
+    TERMINAL_MCP_LAN_BIND the service is configured with -- so the list a
+    node is handed matches the sockets that exist, rather than a guess."""
+    raw = os.environ.get("TERMINAL_MCP_LAN_BIND") or ""
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
 
 def _controller_port() -> int:

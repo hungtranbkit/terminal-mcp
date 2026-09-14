@@ -15069,10 +15069,12 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 connectivity=connectivity, created_by=(identity.email if identity else None),
                 hostname_hint=body.get("hostname"))
             node_id = created["enrollment"]["node_id"]
-            controller_url = onboarding.controller_url(request_base_url=_request_base_url(request))
+            controller_urls = onboarding.controller_urls(request_base_url=_request_base_url(request))
+            controller_url = controller_urls[0]
             script = render_setup_script(
                 enrollment_code=created["code"], controller_url=controller_url, node_id=node_id,
-                display_name=created["enrollment"]["display_name"], profile=created["enrollment"]["profile"])
+                display_name=created["enrollment"]["display_name"], profile=created["enrollment"]["profile"],
+                controller_urls=controller_urls)
             created["script"] = script
             created["script_sha256"] = script_fingerprint(script)
             # The one-liner the wizard shows as its PRIMARY action. Built
@@ -15085,6 +15087,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             created["script_version"] = SETUP_SCRIPT_VERSION
             created["filename"] = f"terminal-mcp-setup-{node_id}.ps1"
             created["controller_url"] = controller_url
+            created["controller_urls"] = controller_urls
             return created
 
         try:

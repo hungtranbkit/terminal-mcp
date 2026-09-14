@@ -1449,3 +1449,79 @@ def test_wizard_shows_live_install_progress():
     assert "progress_label" in page and "progress_elapsed_seconds" in page
     # Terminal states stop the poll rather than spinning forever.
     assert "clearInterval(anProgressTimer)" in page
+
+
+# ---------------------------------------------------------------------------
+# Hotfix regression: the controller address a not-yet-onboarded node can reach
+# ---------------------------------------------------------------------------
+
+def test_tailnet_address_is_never_the_first_controller_candidate(tmp_path):
+    """The outage this guards: the baked controller_url was the tailnet IP,
+    but a machine being onboarded has not joined the tailnet yet -- it
+    joins later, in this same script. Enrollment therefore died with
+    "unable to connect to the remote server" on a machine that could reach
+    the controller fine over the LAN, and every later stage failed with
+    it."""
+    _t, _c, _cs, onboarding = _service(tmp_path)
+    urls = onboarding.controller_urls(request_base_url="http://192.168.1.109:8766")
+    assert urls, "there must always be at least one candidate"
+    assert not urls[0].startswith("http://100."), f"tailnet first again: {urls}"
+    tailnet = [u for u in urls if u.startswith("http://100.1")]
+    if tailnet:
+        assert urls.index(tailnet[0]) > 0, "tailnet must be a fallback, never the first choice"
+
+
+def test_controller_candidates_prefer_lan_then_tailnet(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_LAN_BIND", "192.168.1.109,100.117.214.87")
+    _t, _c, _cs, onboarding = _service(tmp_path)
+    urls = onboarding.controller_urls()
+    lan = next(i for i, u in enumerate(urls) if "192.168.1.109" in u)
+    tail = next(i for i, u in enumerate(urls) if "100.117.214.87" in u)
+    assert lan < tail, f"LAN must come before tailnet: {urls}"
+    assert len(urls) == len(set(urls)), "candidates must be de-duplicated"
+
+
+def test_explicit_config_url_still_wins(tmp_path):
+    config = _config(tmp_path)
+    _t, _c, _cs, onboarding = _service(tmp_path, config=config)
+    urls = onboarding.controller_urls(request_base_url="http://somewhere.else:8766")
+    assert urls[0] == "http://controller.test:8766"
+
+
+def test_script_bakes_every_candidate_and_probes_before_enrolling():
+    urls = ["http://192.168.1.109:8766", "http://100.117.214.87:8766"]
+    script = render_setup_script(enrollment_code="TMCP-4KQ7M-2ZXWP-9BCDE",
+                                 controller_url=urls[0], node_id="win1", profile="minimal",
+                                 controller_urls=urls)
+    for url in urls:
+        assert url in script
+    assert "function Resolve-Controller" in script
+    assert "/health/live" in script
+    # The probe must happen BEFORE the code is spent.
+    assert script.index("Resolve-Controller -Candidates") < script.index("/dashboard/api/enroll/consume")
+
+
+def test_enrollment_failure_skips_dependents_instead_of_cascading():
+    """One root error, not a screen of red. The reported symptom was a
+    7/7 FAIL 'no node token on disk' that was purely a consequence of the
+    3/7 enrollment failure -- and it read like a second, separate bug."""
+    script = render_setup_script(enrollment_code="TMCP-4KQ7M-2ZXWP-9BCDE",
+                                 controller_url="http://192.168.1.109:8766",
+                                 node_id="win1", profile="minimal")
+    assert "$script:EnrollmentOk" in script
+    assert "bo qua vi dang ky that bai" in script
+    # The old unconditional FAIL is gone.
+    assert "'Heartbeat task' 'FAIL' 'no node token on disk" not in script
+    heartbeat = script[script.index("Start-Stage 'Heartbeat"):]
+    assert "if (-not $script:EnrollmentOk) {" in heartbeat[:400]
+    assert "'SKIP'" in heartbeat[:600]
+
+
+def test_create_route_returns_the_candidate_list(tmp_path, monkeypatch):
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch)
+    body = client.post("/dashboard/api/nodes/onboard/enrollments",
+                       json={"node_id": "cand", "profile": "minimal"}).json()
+    assert isinstance(body["controller_urls"], list) and body["controller_urls"]
+    assert body["controller_url"] == body["controller_urls"][0]
+    for url in body["controller_urls"]:
+        assert url in body["script"], "every candidate must reach the machine"

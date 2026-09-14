@@ -148,7 +148,8 @@ def _ps_string_array(values) -> str:
 
 
 def render_setup_script(*, enrollment_code: str, controller_url: str, node_id: str,
-                        display_name: str | None = None, profile: str = PROFILE_MINIMAL) -> str:
+                        display_name: str | None = None, profile: str = PROFILE_MINIMAL,
+                        controller_urls: "list[str] | None" = None) -> str:
     """The full windows-setup.ps1 text. Raises ValueError on anything that
     would not be safe to embed -- a caller cannot opt out of that check."""
     if not _SAFE_CODE_RE.match(str(enrollment_code or "")):
@@ -173,6 +174,8 @@ def render_setup_script(*, enrollment_code: str, controller_url: str, node_id: s
     body = body.replace("@@SCRIPT_VERSION@@", SCRIPT_VERSION)
     body = body.replace("@@ENROLLMENT_CODE@@", _ps_string(enrollment_code))
     body = body.replace("@@CONTROLLER_URL@@", _ps_string(controller_url.rstrip("/")))
+    body = body.replace("@@CONTROLLER_URLS@@", _ps_string_array(
+        [u.rstrip("/") for u in (controller_urls or [controller_url])]))
     body = body.replace("@@NODE_ID@@", _ps_string(node_id))
     body = body.replace("@@DISPLAY_NAME@@", _ps_string(display_name or node_id))
     body = body.replace("@@PROFILE@@", _ps_string(profile))
@@ -336,8 +339,34 @@ $ProfileName     = @@PROFILE@@
 $WingetPackages = @(@@WINGET_PACKAGES@@)
 $NpmTools = @(@@NPM_TOOLS@@)
 
+$ControllerUrlCandidates = @@CONTROLLER_URLS@@
+
 if (-not $EnrollmentCode) { $EnrollmentCode = $BakedCode }
 if (-not $ControllerUrl)  { $ControllerUrl  = $BakedController }
+
+# Which controller address can THIS machine actually reach, right now?
+#
+# This exists because of a real failure: the address baked in used to be
+# the controller's Tailscale IP, and a machine being onboarded has not
+# joined the tailnet yet -- it joins later, as part of this very script.
+# So enrollment died with "unable to connect to the remote server" on a
+# machine that could reach the controller perfectly well over the LAN,
+# and every later step failed as a consequence. Candidates are now tried
+# in order (LAN before tailnet) and the first one that answers wins.
+function Resolve-Controller {
+    param([string[]] $Candidates)
+    foreach ($candidate in $Candidates) {
+        if (-not $candidate) { continue }
+        try {
+            Invoke-RestMethod -Method Get -Uri "$candidate/health/live" -TimeoutSec 6 -UseBasicParsing | Out-Null
+            Write-Host ("      controller: {0}" -f $candidate) -ForegroundColor DarkGray
+            return $candidate
+        } catch {
+            Write-Host ("      khong ket noi duoc {0}" -f $candidate) -ForegroundColor DarkGray
+        }
+    }
+    return $null
+}
 
 # The generic build (downloaded from /enroll/windows-setup.ps1) has no real
 # code baked in. Refuse loudly rather than fail four steps later with an
@@ -753,6 +782,12 @@ if ($Repair) {
             'Generate a fresh setup script from the Dashboard and run it without -Repair'
     }
 } else {
+    $resolved = Resolve-Controller -Candidates (@($ControllerUrl) + $ControllerUrlCandidates)
+    if (-not $resolved) {
+        Add-Step 'Enrollment' 'FAIL' ("Khong ket noi duoc controller qua bat ky dia chi nao: " + (($ControllerUrlCandidates) -join ', ')) `
+            'May nay phai cung mang LAN voi controller (hoac da vao Tailscale). Kiem tra mang roi chay lai.'
+    } else {
+    $ControllerUrl = $resolved
     $addresses = Get-LocalAddresses
     $body = @{
         code             = $EnrollmentCode
@@ -799,8 +834,20 @@ if ($Repair) {
             $detail = (New-Object IO.StreamReader($stream)).ReadToEnd()
         } catch { }
         Add-Step 'Enrollment' 'FAIL' $detail `
-            'The code is single-use and expires in ~15 minutes -- generate a new setup script from the Dashboard'
+            'Ma dung mot lan va het han sau ~15 phut -- tao lenh cai dat moi tu Dashboard.'
     }
+    }
+}
+
+# Enrollment is the root dependency: without a node token there is nothing
+# to configure, register or heartbeat. Everything downstream now SKIPs with
+# one honest reason instead of each inventing its own FAIL -- a cascade of
+# red that buries the single line that actually matters.
+$script:EnrollmentOk = [bool]($bootstrap -and (Test-Path $TokenFile))
+if (-not $script:EnrollmentOk) {
+    Write-Host ""
+    Write-Host "  Dang ky that bai -- bo qua cac buoc phu thuoc (SSH key, firewall, rescue, heartbeat)." -ForegroundColor Yellow
+    Write-Host "  Loi goc nam o buoc 'Dang ky node voi controller' o tren." -ForegroundColor Yellow
 }
 
 # ===========================================================================
@@ -808,7 +855,10 @@ if ($Repair) {
 # ===========================================================================
 End-Stage
 Start-Stage 'Cau hinh authorized_keys va firewall'
-if ($bootstrap -and $bootstrap.ssh -and $bootstrap.ssh.authorized_key) {
+if (-not $script:EnrollmentOk) {
+    Add-Step 'Controller authorized_key' 'SKIP' 'bo qua vi dang ky that bai'
+    Add-Step 'Firewall (inbound 22)' 'SKIP' 'bo qua vi dang ky that bai'
+} elseif ($bootstrap -and $bootstrap.ssh -and $bootstrap.ssh.authorized_key) {
     try {
         $adminKeys = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
         $key = ([string]$bootstrap.ssh.authorized_key).Trim()
@@ -1032,8 +1082,11 @@ while (`$true) {
 # ===========================================================================
 End-Stage
 Start-Stage 'Heartbeat (de node hien tren Dashboard)'
-if (-not (Test-Path $TokenFile)) {
-    Add-Step 'Heartbeat task' 'FAIL' 'no node token on disk (enrollment did not complete)'
+if (-not $script:EnrollmentOk) {
+    # NOT a FAIL: nothing is broken here, the node simply never got a
+    # token because enrollment did not complete. Reporting this as its own
+    # failure is what turned one root cause into a screen of red.
+    Add-Step 'Heartbeat task' 'SKIP' 'bo qua vi dang ky that bai (chua co node token)'
 } else {
     try {
         $interval = 30
@@ -1250,7 +1303,9 @@ foreach ($pair in @(@($TaskBeat, 'Verify: heartbeat task'), @($TaskRescue, 'Veri
     }
 }
 
-if ($bootstrap -and (Test-Path $TokenFile)) {
+if (-not $script:EnrollmentOk) {
+    Add-Step 'Verify: controller sees this node' 'SKIP' 'bo qua vi dang ky that bai'
+} elseif ($bootstrap -and (Test-Path $TokenFile)) {
     try {
         $tok = (Get-Content $TokenFile -Raw).Trim()
         $probe = @{
