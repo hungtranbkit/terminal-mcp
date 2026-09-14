@@ -11969,8 +11969,6 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # instance) and passes it here so the Kanban board's own
         # routing_reason display and the MCP terminal_pm_* tool surface
         # read/write the exact same store.
-        import tempfile
-
         def _local_permission_checker(node_id: str, session: str) -> bool:
             if node_id != controller.local_node_id:
                 return True
@@ -12006,9 +12004,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     # private-temp-file discipline as every other store default here:
     # server_http.py's real main() passes a persistent one.
     if credentials is None:
-        import tempfile
         credentials = node_credentials.NodeCredentialStore(
-            Path(tempfile.mkdtemp(prefix="terminal-mcp-credentials-")) / "node-credentials.db")
+            ephemeral_db_path("credentials", "node-credentials.db"))
     if rotation is None:
         def _apply_outbound_token(node_id: str, token: str | None) -> None:
             """The controller's outbound half of a rotation, in one place.
@@ -12234,8 +12231,6 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     # write into the real ~/.local/state/terminal-mcp/fleet_registry.db.
     # server_http.py's main() passes the persistent one.
     if fleet is None:
-        import tempfile as _tempfile
-
         from .fleet_registry import FleetRegistryStore as _FleetStore
         from .fleet_service import FleetService as _FleetService
 
