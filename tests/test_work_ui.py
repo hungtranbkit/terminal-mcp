@@ -395,7 +395,20 @@ def test_live_polling_can_be_paused(page):
 
 
 def test_an_unknown_agent_is_shown_as_unknown_not_guessed():
-    """The session listing carries no agent field. Defaulting to 'shell'
-    labelled a Claude worker wrong, which is worse than saying nothing."""
-    assert "worker.agent_type || 'agent ?'" in WORK_HTML
+    """Never guess the agent; prefer real evidence, else say unknown.
+
+    The session listing still carries no agent field, so the worker route now
+    probes the session and the label falls back to the OBSERVED command
+    before giving up. That is evidence, not a guess. Defaulting to 'shell'
+    labelled a Claude worker wrong and remains forbidden.
+    """
+    assert "worker.agent_type || evidence.current_command || 'agent ?'" in WORK_HTML
     assert "|| 'shell'" not in WORK_HTML
+
+
+def test_a_worker_busy_outside_the_queue_is_not_labelled_idle():
+    """IDLE invited dispatch into a session a human was already using."""
+    assert "RUNNING_MANUAL" in WORK_HTML
+    assert "worker.busy_untracked" in WORK_HTML
+    # The label has to say WHY it is busy; the state name alone cannot.
+    assert "không do queue giao" in WORK_HTML

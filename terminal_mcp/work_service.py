@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
@@ -80,6 +81,44 @@ class Progress:
         return {"percent": self.percent, "total_weight": round(self.total_weight, 2),
                 "done_weight": round(self.done_weight, 2), "total_tasks": self.total_tasks,
                 "done_tasks": self.done_tasks, "blocked_tasks": self.blocked_tasks}
+
+
+# A session sitting at one of these is running a shell prompt, not an agent.
+# Anything else in `current_command` is a program someone started.
+_SHELL_COMMANDS = frozenset({
+    "bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh", "csh",
+    "pwsh", "powershell", "cmd", "cmd.exe", "powershell.exe", "pwsh.exe",
+})
+# Session states that mean work is happening right now. WAITING_INPUT counts:
+# a session holding a prompt open is mid-task, and sending into it would land
+# on whatever question it is asking.
+_ACTIVE_SESSION_STATES = frozenset({"RUNNING", "WAITING_INPUT"})
+
+
+def _occupancy(row: dict[str, Any],
+               status: dict[str, Any] | None) -> tuple[bool, dict[str, Any]]:
+    """Is something actually running in this session, queue or no queue?
+
+    Two independent signals, either of which is sufficient: a foreground
+    command that is not a plain shell, or a session state that means work is
+    in flight. Returns the evidence alongside the verdict so a caller never
+    has to take the boolean on trust.
+    """
+    status = status or {}
+    # The command can arrive on the session row or on the status payload,
+    # depending on which listing the caller had. Neither listing carries it
+    # today, which is why occupancy has to be fetched deliberately -- reading
+    # only the row is what made every worker look free.
+    command = str(row.get("current_command") or status.get("current_command") or "").strip()
+    base = command.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+    agent_running = bool(base) and base not in _SHELL_COMMANDS
+    # terminal_status calls it `state`; terminal_input_context calls it
+    # `status`. Accept both rather than depending on which one a caller used.
+    state = str(status.get("state") or status.get("status") or "")
+    active_state = state in _ACTIVE_SESSION_STATES
+    return (agent_running or active_state,
+            {"current_command": command or None, "session_state": state or None,
+             "agent_running": agent_running, "active_state": active_state})
 
 
 class WorkService:
@@ -217,8 +256,54 @@ class WorkService:
         for task in self.store.tasks_for(work_id):
             queue_task = by_queue_id.get(task.get("queue_task_id"))
             if queue_task:
-                out[task["work_task_id"]] = queue_task
+                out[task["work_task_id"]] = self._with_waiting_age(dict(queue_task))
         return out
+
+    # A task holding one of these is waiting on something external. The queue
+    # is right to keep waiting -- completing without evidence is exactly what
+    # it must never do -- but a screen that shows only the status name cannot
+    # tell "verifying" from "stuck since yesterday", so both look identical
+    # and the page appears frozen.
+    WAITING_STATUSES = ("VERIFYING", "DISPATCH_UNCERTAIN", "WAITING_SESSION", "PRECHECK")
+    # Past this, a wait has stopped being normal and wants a human.
+    WAITING_STALE_SECONDS = 900.0
+
+    def _with_waiting_age(self, queue_task: dict[str, Any]) -> dict[str, Any]:
+        """Attach how long this task has been waiting, and whether that is odd.
+
+        Derived from the queue's own transition event, so it cannot disagree
+        with the status it describes. This is also what makes the payload
+        change between polls: without it two reads are byte-identical and the
+        UI has nothing to re-render, however correctly it polls.
+        """
+        status = str(queue_task.get("status") or "")
+        if status not in self.WAITING_STATUSES or self.queue is None:
+            return queue_task
+        task_id = queue_task.get("id") or queue_task.get("task_id")
+        try:
+            since = self.queue.store.waiting_since(task_id, status)
+        except Exception:  # noqa: BLE001 -- an age is a nicety, never a failure
+            return queue_task
+        if not since:
+            return queue_task
+        try:
+            started = datetime.fromisoformat(since)
+        except ValueError:
+            return queue_task
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        seconds = max(0.0, (datetime.now(timezone.utc) - started).total_seconds())
+        queue_task["waiting_since"] = since
+        queue_task["waiting_seconds"] = int(seconds)
+        queue_task["waiting_stale"] = seconds >= self.WAITING_STALE_SECONDS
+        if status == "VERIFYING" and seconds >= self.WAITING_STALE_SECONDS:
+            queue_task["waiting_reason"] = (
+                "no verified completion marker seen yet -- the worker never printed one, "
+                "or it scrolled out of the capture window. Needs a marker or an explicit "
+                "terminal_queue_verify; the queue will not complete a task without evidence.")
+        elif seconds >= self.WAITING_STALE_SECONDS:
+            queue_task["waiting_reason"] = f"waiting in {status} longer than expected"
+        return queue_task
 
     def progress(self, work_id: str) -> Progress:
         tasks = self.store.tasks_for(work_id)
@@ -306,6 +391,15 @@ class WorkService:
                           "claimed_by": queue_task.get("claimed_by"),
                           "node_id": queue_task.get("node_id"),
                           "last_error": queue_task.get("last_error"),
+                          # How long this task has been waiting, and why. This
+                          # is the only field on the row that advances between
+                          # polls while a task is parked, so without it the UI
+                          # re-renders an identical DOM however correctly it
+                          # polls -- which is what made the page look frozen.
+                          "waiting_since": queue_task.get("waiting_since"),
+                          "waiting_seconds": queue_task.get("waiting_seconds"),
+                          "waiting_stale": queue_task.get("waiting_stale"),
+                          "waiting_reason": queue_task.get("waiting_reason"),
                           "coordinator_reason": queue_task.get("coordinator_reason"),
                           "started_at": queue_task.get("started_at"),
                           "completed_at": queue_task.get("completed_at")})
@@ -380,18 +474,41 @@ class WorkService:
                                    "status": task.get("status")}
                 except Exception:  # noqa: BLE001 -- a worker list never 5xxs
                     lane = {}
-            state = ("OFFLINE" if not verdict.eligible and verdict.reason in
-                     ("SESSION_MISSING", "SESSION_DEAD", "NODE_UNREACHABLE")
-                     else "BUSY" if current else "IDLE" if verdict.eligible else "UNAVAILABLE")
+            # Occupancy is NOT eligibility, and it is not the queue's opinion
+            # either. A `-work` session running Claude that nobody queued a
+            # task on is busy: dispatching into it would type over a live
+            # conversation. Deriving "idle" from "the queue has no task here"
+            # reported exactly that session as free.
+            occupied, evidence = _occupancy(row, (statuses or {}).get(name))
+            offline = (not verdict.eligible and verdict.reason in
+                       ("SESSION_MISSING", "SESSION_DEAD", "NODE_UNREACHABLE"))
+            if offline:
+                state = "OFFLINE"
+            elif current:
+                state = "BUSY"                    # the queue owns this one
+            elif occupied:
+                # Something real is running that the queue did not start.
+                state = "RUNNING_MANUAL"
+            elif verdict.eligible:
+                state = "IDLE"                    # eligible AND demonstrably free
+            else:
+                state = "UNAVAILABLE"
             out.append({
                 "session": name, "node_id": node_id,
                 "agent_type": row.get("agent_type") or row.get("current_command"),
                 "state": state, "eligible": verdict.eligible,
                 "reason": verdict.reason, "detail": verdict.detail,
                 "current_task": current,
+                # Busy, but not because of anything this runtime scheduled.
+                # Kept as its own field so a caller can tell "the queue is
+                # working here" from "a human is", which the state name alone
+                # cannot carry without overloading it.
+                "busy_untracked": bool(occupied and not current and not offline),
+                "occupancy": ("queue" if current else "manual" if occupied else "free"),
+                "occupancy_evidence": evidence,
                 "is_work_session": True})
-        out.sort(key=lambda w: (0 if w["state"] == "BUSY" else 1 if w["state"] == "IDLE" else 2,
-                                w["session"]))
+        _ORDER = {"BUSY": 0, "RUNNING_MANUAL": 1, "IDLE": 2}
+        out.sort(key=lambda w: (_ORDER.get(w["state"], 3), w["session"]))
         return {"workers": out}
 
     # -- control -------------------------------------------------------------
