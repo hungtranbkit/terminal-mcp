@@ -158,12 +158,16 @@ def rescue_keys_dir(tmp_path, monkeypatch):
 
 def _client(tmp_path, monkeypatch, **kwargs):
     monkeypatch.setenv("TERMINAL_MCP_RESCUE_KEYS_DIR", str(tmp_path / "rescue-keys"))
+    # Optional explicit stores, popped BEFORE the rest reach _config -- a
+    # store is not a config field and would otherwise be forwarded into
+    # _onboarding_config and raise.
+    credentials = kwargs.pop("credentials", None)
     config = kwargs.pop("config", None) or _config(tmp_path, **kwargs)
     terminal, controller, connection_store, onboarding = _service(
         tmp_path, config=config, tailscale_available=kwargs.pop("tailscale_available", True))
     server = build_mcp(terminal)
     register_dashboard(server, terminal, controller=controller, connection_store=connection_store,
-                       onboarding=onboarding)
+                       onboarding=onboarding, credentials=credentials)
     client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})
     return client, controller, onboarding
 

@@ -28,6 +28,7 @@ from .connection_store import ConnectionStore, generate_node_token
 from .enrollment import STAGES as ENROLL_STAGES, EnrollmentStore
 from .node_onboarding import (OnboardingError, OnboardingService, read_controller_ssh_public_key,
                                rescue_authorized_keys_dir)
+from . import node_credentials
 from .node_transport import (GENERIC_SETUP_CODE, KIND_LAN, KIND_REVERSE_SSH, KIND_TAILSCALE,
                              TransportStore, probe_reverse_tunnel, probe_ssh_banner)
 from . import bootstrap_protocol, rescue_gateway
@@ -11192,7 +11193,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        ai_usage: AiUsageService | None = None,
                        recovery: RecoveryEngine | None = None,
                        backlog: BacklogService | None = None,
-                       onboarding: "OnboardingService | None" = None) -> None:
+                       onboarding: "OnboardingService | None" = None,
+                       credentials: "node_credentials.NodeCredentialStore | None" = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -11281,6 +11283,13 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     )
     host_key_store = remote_connect.HostKeyStore()
     ssh_known_hosts_dir = connection_store.path.parent / "ssh_known_hosts"
+    # Versioned/revocable node credentials (blg_a3cc401d8275). Same
+    # private-temp-file discipline as every other store default here:
+    # server_http.py's real main() passes a persistent one.
+    if credentials is None:
+        import tempfile
+        credentials = node_credentials.NodeCredentialStore(
+            Path(tempfile.mkdtemp(prefix="terminal-mcp-credentials-")) / "node-credentials.db")
     if onboarding is None:
         # SAME private-temp-file discipline as connection_store/queue/pm
         # above: an ad-hoc caller (every test that does not pass one)
@@ -14952,6 +14961,35 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         return JSONResponse({"ok": True, "node_id": node_id, "endpoint": endpoint,
                             "node": _node_to_dict(node) if node else None}, headers={"Cache-Control": "no-store"})
 
+    def _verify_node_token(node_id: str, request: Request):
+        """The ONE inbound node-token check, shared by every machine-facing
+        route (blg_a3cc401d8275).
+
+        Backward compatible by construction: a node that has a credential
+        record is checked against it -- so rotation and revocation take
+        effect immediately -- and a node that predates the store falls back
+        to the legacy env var it has always used. No flag day, and no node
+        stops working because this landed.
+
+        Fail-closed on ambiguity: a token matching a REVOKED record is
+        refused with its own reason rather than folded into "unknown",
+        because a revoked credential still in use is an incident. The
+        token_id is safe to log; the token never is.
+        """
+        header = request.headers.get("authorization", "")
+        presented = header[len("Bearer "):] if header.startswith("Bearer ") else ""
+        if credentials.is_managed(node_id):
+            result = credentials.verify(node_id, presented)
+            if not result.accepted:
+                _log.warning("dashboard node auth refused node_id=%s verdict=%s token_id=%s",
+                             node_id, result.verdict, result.token_id)
+            return result.accepted, result
+        expected = os.environ.get(node_token_env_var(node_id))
+        legacy_ok = bool(expected) and hmac.compare_digest(presented, expected)
+        return legacy_ok, node_credentials.VerifyResult(
+            node_credentials.OK if legacy_ok else node_credentials.UNKNOWN,
+            None, "legacy env-var credential (not yet under rotation management)")
+
     @server.custom_route("/dashboard/api/nodes/{node_id}/heartbeat", methods=["POST"], include_in_schema=False)
     async def node_heartbeat(request: Request) -> JSONResponse:
         # Machine-to-machine (a remote node's own terminal-node-agent
@@ -14962,11 +15000,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # before touching the registry at all -- never silently accepted
         # as "must be the local node" or similarly guessed.
         node_id = request.path_params["node_id"]
-        expected_token = os.environ.get(node_token_env_var(node_id))
-        header = request.headers.get("authorization", "")
-        presented = header[len("Bearer "):] if header.startswith("Bearer ") else ""
-        if not expected_token or not hmac.compare_digest(presented, expected_token):
-            return JSONResponse({"error": "UNAUTHORIZED"}, status_code=401)
+        accepted, verdict = _verify_node_token(node_id, request)
+        if not accepted:
+            return JSONResponse({"error": "UNAUTHORIZED", "verdict": verdict.verdict},
+                                status_code=401, headers={"Cache-Control": "no-store"})
         try:
             body = await request.json()
         except ValueError:
@@ -15453,11 +15490,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         heartbeat route above -- a node can only ever deregister itself,
         never another node."""
         node_id = request.path_params["node_id"]
-        expected_token = os.environ.get(node_token_env_var(node_id))
-        header = request.headers.get("authorization", "")
-        presented = header[len("Bearer "):] if header.startswith("Bearer ") else ""
-        if not expected_token or not hmac.compare_digest(presented, expected_token):
-            return JSONResponse({"error": "UNAUTHORIZED"}, status_code=401)
+        accepted, verdict = _verify_node_token(node_id, request)
+        if not accepted:
+            return JSONResponse({"error": "UNAUTHORIZED", "verdict": verdict.verdict},
+                                status_code=401, headers={"Cache-Control": "no-store"})
         result = await anyio.to_thread.run_sync(lambda: onboarding.remove_node(node_id, by=f"node:{node_id}"))
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
 

@@ -15,6 +15,7 @@ from .ai_usage_service import AiUsageService
 from .config import load_config
 from .connection_store import ConnectionStore
 from .enrollment import EnrollmentStore
+from .node_credentials import NodeCredentialStore
 from .node_onboarding import OnboardingService
 from .node_transport import TransportStore
 from .rescue_gateway import RescuePortAllocator
@@ -408,6 +409,8 @@ def main() -> None:
     # connected node's does, so the re-hydration loop above brings it back
     # after a restart with no extra code, and every enroll/revoke/remove
     # lands in the SAME audit log as every other action.
+    # Persistent node credentials -- the durable half of rotation/revocation.
+    credentials = NodeCredentialStore()
     onboarding = OnboardingService(
         config, controller=controller, connection_store=connection_store,
         enrollment_store=EnrollmentStore(), transport_store=TransportStore(),
@@ -481,7 +484,8 @@ def main() -> None:
                        fleet=fleet)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
-                       recovery=recovery, backlog=backlog, fleet=fleet, onboarding=onboarding)
+                       recovery=recovery, backlog=backlog, fleet=fleet, onboarding=onboarding,
+                       credentials=credentials)
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)
