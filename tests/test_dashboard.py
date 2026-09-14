@@ -1454,6 +1454,12 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # deliberately NOT consuming it -- progress arrives both before the
         # exchange (OpenSSH install) and after it (winget).
         "/dashboard/api/enroll/progress": {"POST"},
+        # Web-first onboarding (docs/windows-bootstrap-helper.md). Minting
+        # a handle is what causes a local helper to install software, so it
+        # sits behind _mutation_guard like every other mutation; redeeming
+        # one is machine-facing, like consume, and is what the helper calls.
+        "/dashboard/api/nodes/onboard/enrollments/{enrollment_id}/handle": {"POST"},
+        "/dashboard/api/enroll/redeem": {"POST"},
         "/dashboard/api/nodes/{node_id}/deregister": {"POST"},
         "/enroll/windows-setup.ps1": {"GET", "HEAD"},
         # Same handler, same bytes, shorter path. Exists only because the
