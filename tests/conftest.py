@@ -242,3 +242,36 @@ def tmux_session_factory():
     for name in created:
         tmux("kill-session", "-t", name, check=False)
 
+
+
+# ---------------------------------------------------------------------------
+# The suite must not leave a diff in the repository it planned against.
+#
+# Planning RE-VERIFIES the knowledge map, and re-verification writes: a module
+# whose paths no commit has touched gets its verified commit advanced. That is
+# the feature. But several tests drive the real pipeline with no project path,
+# which resolves to the CANONICAL map -- the main worktree's, shared by every
+# worktree on this machine. A test run must not advance another lane's file,
+# so the canonical state is snapshotted here and put back at the end.
+#
+# Session-scoped rather than per-test: the file is shared, not per-test state,
+# and paying a read on every one of several thousand tests to catch a write
+# that only a handful can make is the wrong trade.
+
+@pytest.fixture(scope="session", autouse=True)
+def _canonical_knowledge_map_is_left_as_it_was():
+    try:
+        from terminal_mcp.project_knowledge import ProjectKnowledge, canonical_root
+
+        root = canonical_root(str(Path(__file__).resolve().parent.parent))
+        path = ProjectKnowledge(root).state_path if root else None
+    except Exception:  # noqa: BLE001 -- no repo, no map, nothing to protect
+        path = None
+    before = path.read_bytes() if path and path.exists() else None
+    yield
+    if path is None:
+        return
+    if before is None:
+        path.unlink(missing_ok=True)
+    elif path.exists() and path.read_bytes() != before:
+        path.write_bytes(before)
