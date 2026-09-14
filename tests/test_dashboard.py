@@ -1449,8 +1449,17 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # auth -- the code it would otherwise embed is supplied by the
         # operator on the command line instead.
         "/dashboard/api/enroll/consume": {"POST"},
+        # Installer telemetry: which stage the machine is on, and for how
+        # long. Authenticated by the same enrollment code as consume and
+        # deliberately NOT consuming it -- progress arrives both before the
+        # exchange (OpenSSH install) and after it (winget).
+        "/dashboard/api/enroll/progress": {"POST"},
         "/dashboard/api/nodes/{node_id}/deregister": {"POST"},
         "/enroll/windows-setup.ps1": {"GET", "HEAD"},
+        # Same handler, same bytes, shorter path. Exists only because the
+        # Windows Run dialog truncates at ~259 characters and the
+        # quick-install one-liner does not fit with the long path.
+        "/w": {"GET", "HEAD"},
         # Project Backlog (planning layer). Read is _read_guard'ed; every
         # write is _mutation_guard'ed AND path-gated by the service.
         # The panel PAGE itself (a view, like /dashboard/tasks) plus its

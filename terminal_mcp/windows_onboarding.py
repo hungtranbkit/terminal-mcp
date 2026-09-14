@@ -181,6 +181,80 @@ def render_setup_script(*, enrollment_code: str, controller_url: str, node_id: s
     return body
 
 
+# Short alias for the setup-script download, served alongside the long
+# descriptive path. It exists for ONE reason: the Windows Run dialog
+# (Win+R) truncates at ~259 characters, and the quick-install one-liner
+# does not fit with the long path on a hostname of realistic length.
+# See build_quick_install_command.
+SETUP_SCRIPT_SHORT_PATH = "/w"
+SETUP_SCRIPT_PATH = "/enroll/windows-setup.ps1"
+
+# The Run dialog's own limit. Measured against it in build_quick_install_
+# command so a too-long command is reported rather than silently handed to
+# a user who would paste it and watch it get cut in half.
+RUN_DIALOG_MAX_CHARS = 259
+
+
+def build_quick_install_command(*, controller_url: str, enrollment_code: str) -> str:
+    """The single line a user pastes into Win+R. Nothing else to type.
+
+    What it does, and why each piece is the way it is:
+
+      powershell -NoP -Command "..."
+          No -ExecutionPolicy on the OUTER call on purpose: execution
+          policy governs script FILES, never -Command, so adding it here
+          would cost 11 characters of a 259-character budget and buy
+          nothing.
+
+      $f=$env:TEMP+'\tmcp.ps1'; iwr <url> -UseB -OutFile $f
+          Download to a FILE, then run the file. Deliberately not
+          `iex (irm ...)`: a file on disk can be read, kept and diffed
+          after the fact, and an interrupted download fails at the
+          download instead of executing half a script. -UseB
+          (-UseBasicParsing) is required on Windows PowerShell 5.1, where
+          Invoke-WebRequest otherwise needs Internet Explorer's engine to
+          be initialised and fails on a fresh machine.
+
+      saps powershell -Verb RunAs -Arg (...)
+          -Verb RunAs is what raises the UAC prompt, so the user never
+          opens an admin shell by hand. The elevated process gets
+          -Ex Bypass, PROCESS scope only -- the machine policy is never
+          touched.
+
+      ('-NoP -Ex Bypass -File '+[char]34+$f+[char]34+' -EnrollmentCode ...')
+          [char]34 is a double quote built without writing one. A literal
+          quote here would terminate the outer -Command string, and the
+          path MUST be quoted: %TEMP% for a user called "John Doe"
+          contains a space, and Start-Process joins an argument ARRAY with
+          spaces without quoting any element -- so the unquoted form
+          breaks on exactly the machines most likely to be someone's
+          personal laptop.
+
+    The enrollment code travels as a command-line ARGUMENT, never as a URL
+    query parameter: a code in a URL lands in the controller's access log,
+    any proxy in between, and the user's own shell history. It is
+    single-use and expires in minutes either way, but that is a reason to
+    keep it short-lived, not a reason to spray it around.
+    """
+    if not _SAFE_CODE_RE.match(str(enrollment_code or "")):
+        raise ValueError("enrollment_code is not a canonical enrollment code")
+    base = str(controller_url or "").rstrip("/")
+    if not _SAFE_URL_RE.match(base):
+        raise ValueError("controller_url must be a plain http(s) URL")
+    inner = (
+        "$f=$env:TEMP+'\\tmcp.ps1';"
+        f"iwr '{base}{SETUP_SCRIPT_SHORT_PATH}' -UseB -OutFile $f;"
+        "saps powershell -Verb RunAs -Arg "
+        "('-NoP -Ex Bypass -File '+[char]34+$f+[char]34+"
+        f"' -EnrollmentCode {enrollment_code}')"
+    )
+    return f'powershell -NoP -Command "{inner}"'
+
+
+def quick_install_fits_run_dialog(command: str) -> bool:
+    return len(command) <= RUN_DIALOG_MAX_CHARS
+
+
 def script_fingerprint(text: str) -> str:
     """sha256 of the generated script, printed next to the download so an
     operator can verify the file they are about to run as Administrator is
@@ -293,6 +367,106 @@ $TaskBeat     = "TerminalMCP-Heartbeat-$NodeId"
 # is derived from these rows -- there is no separate "did it work"
 # bookkeeping that could disagree with what gets printed.
 $script:Checklist = New-Object System.Collections.ArrayList
+$script:TotalSw = [System.Diagnostics.Stopwatch]::StartNew()
+$script:StageNo = 0
+$script:StageTotal = 11
+$script:StageSw = $null
+
+# -- stage banner + elapsed ---------------------------------------------
+# The console is the only thing the user can see while this runs, and the
+# slowest step (Add-WindowsCapability for OpenSSH) can sit for minutes
+# with no output of its own. Silence there is indistinguishable from a
+# hang, so every stage announces itself with a wall-clock time and closes
+# with its own elapsed seconds plus the running total.
+function Start-Stage {
+    param([Parameter(Mandatory)] [string] $Name)
+    $script:StageNo++
+    $script:StageSw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-Host ""
+    Write-Host ("[{0}/{1}] {2}" -f $script:StageNo, $script:StageTotal, $Name) -ForegroundColor Cyan -NoNewline
+    Write-Host ("   {0}" -f (Get-Date -Format 'HH:mm:ss')) -ForegroundColor DarkGray
+}
+function End-Stage {
+    param([string] $State = 'OK')
+    $each = if ($script:StageSw) { [int]$script:StageSw.Elapsed.TotalSeconds } else { 0 }
+    $all = [int]$script:TotalSw.Elapsed.TotalSeconds
+    $color = switch ($State) { 'OK' { 'DarkGray' } 'WARN' { 'Yellow' } 'FAIL' { 'Red' } default { 'DarkGray' } }
+    Write-Host ("      -> {0} ({1}s, tong cong {2}s)" -f $State, $each, $all) -ForegroundColor $color
+}
+
+# -- progress reported to the Dashboard ---------------------------------
+# Best effort, always. A controller that cannot be reached yet (the node
+# may still be joining Tailscale) must never fail an install -- the whole
+# point of this call is to make a slow install legible, not to gate it.
+# The enrollment code authenticates it; it is never written to the log.
+function Report-Stage {
+    param([Parameter(Mandatory)] [string] $Stage)
+    if (-not $ControllerUrl -or -not $EnrollmentCode) { return }
+    try {
+        $payload = @{ code = $EnrollmentCode; stage = $Stage
+                      elapsed_seconds = [int]$script:TotalSw.Elapsed.TotalSeconds } | ConvertTo-Json
+        Invoke-RestMethod -Method Post -Uri "$ControllerUrl/dashboard/api/enroll/progress" `
+            -ContentType 'application/json' -Body $payload -TimeoutSec 8 -UseBasicParsing | Out-Null
+    } catch { }
+}
+
+# -- run something slow without going silent ----------------------------
+function Invoke-Tracked {
+    param(
+        [Parameter(Mandatory)] [scriptblock] $Work,
+        [Parameter(Mandatory)] [string] $What,
+        [int] $SlowAfterSeconds = 120,
+        [int] $TimeoutSeconds = 900,
+        [string] $Stage = ''
+    )
+    # A background job, polled -- rather than calling $Work inline, which
+    # would block with no way to print anything until it returned.
+    $job = Start-Job -ScriptBlock $Work
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastBeat = 0
+    $warned = $false
+    try {
+        while ($job.State -eq 'Running') {
+            Start-Sleep -Seconds 2
+            $secs = [int]$sw.Elapsed.TotalSeconds
+            # Stream whatever the job has produced so far, instead of
+            # holding it all until the job ends.
+            foreach ($line in @(Receive-Job -Job $job -ErrorAction SilentlyContinue)) {
+                $text = [string]$line
+                if ($text.Trim()) { Write-Host ("      | " + $text.Trim()) -ForegroundColor DarkGray }
+            }
+            if (($secs - $lastBeat) -ge 12) {
+                $lastBeat = $secs
+                if ($secs -ge $SlowAfterSeconds) {
+                    if (-not $warned) {
+                        $warned = $true
+                        Write-Host ("      ! Dang cho lau hon binh thuong ({0}s). {1} van dang chay --" -f $secs, $What) -ForegroundColor Yellow
+                        Write-Host  "        dung tat cua so nay. Windows Update/winget co the mat vai phut." -ForegroundColor Yellow
+                    } else {
+                        Write-Host ("      ! Van dang chay... {0}s (qua nguong {1}s)" -f $secs, $SlowAfterSeconds) -ForegroundColor Yellow
+                    }
+                } else {
+                    Write-Host ("      ... Van dang chay... {0}s" -f $secs) -ForegroundColor DarkGray
+                }
+                if ($Stage) { Report-Stage $Stage }
+            }
+            if ($secs -ge $TimeoutSeconds) {
+                Stop-Job -Job $job -ErrorAction SilentlyContinue
+                throw ("{0}: qua {1}s ma chua xong -- da dung buoc nay." -f $What, $TimeoutSeconds)
+            }
+        }
+        foreach ($line in @(Receive-Job -Job $job -ErrorAction SilentlyContinue)) {
+            $text = [string]$line
+            if ($text.Trim()) { Write-Host ("      | " + $text.Trim()) -ForegroundColor DarkGray }
+        }
+        if ($job.State -eq 'Failed') {
+            $reason = ($job.ChildJobs | ForEach-Object { $_.JobStateInfo.Reason.Message }) -join '; '
+            throw ("{0} that bai: {1}" -f $What, $reason)
+        }
+    } finally {
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
+}
 function Add-Step {
     param(
         [Parameter(Mandatory)] [string] $Name,
@@ -428,7 +602,17 @@ if ($Uninstall) {
 # ===========================================================================
 #  1. OpenSSH Server + Client
 # ===========================================================================
-Write-Section '1/7  OpenSSH'
+Start-Stage 'Kiem tra quyen Administrator va phien ban Windows'
+Report-Stage 'starting'
+try {
+    $os = Get-CimInstance Win32_OperatingSystem
+    Add-Step 'Administrator' 'OK' 'da elevated'
+    Add-Step 'Windows' 'OK' ("{0} (build {1})" -f $os.Caption, $os.BuildNumber)
+} catch { Add-Step 'Windows' 'WARN' $_.Exception.Message }
+End-Stage
+
+Start-Stage 'Cai OpenSSH Server (buoc nay co the mat vai phut)'
+Report-Stage 'installing_openssh'
 $sshdReady = $false
 try {
     $caps = Get-WindowsCapability -Online -Name 'OpenSSH*' -ErrorAction Stop
@@ -439,21 +623,30 @@ try {
             continue
         }
         if ($cap.State -ne 'Installed') {
-            Write-Host "  installing $want ..."
-            Add-WindowsCapability -Online -Name $cap.Name | Out-Null
+            Write-Host "      dang cai $want ..." -ForegroundColor DarkGray
+            # The single slowest thing this script does. Tracked so the
+            # console keeps talking while DISM works.
+            $capName = $cap.Name
+            Invoke-Tracked -What "Cai $want" -Stage 'installing_openssh' `
+                -SlowAfterSeconds 150 -TimeoutSeconds 1800 `
+                -Work ([scriptblock]::Create("Add-WindowsCapability -Online -Name '$capName' | Out-Null"))
             Add-Step "$want" 'OK' 'installed'
         } else {
             Add-Step "$want" 'OK' 'already installed'
         }
     }
+    End-Stage
+    Start-Stage 'Khoi dong dich vu sshd'
     Set-Service -Name sshd -StartupType Automatic
     Set-Service -Name ssh-agent -StartupType Automatic -ErrorAction SilentlyContinue
     if ((Get-Service sshd).Status -ne 'Running') { Start-Service sshd }
     Add-Step 'sshd service' 'OK' 'Automatic + running'
     $sshdReady = $true
+    End-Stage
 } catch {
     Add-Step 'OpenSSH Server' 'FAIL' $_.Exception.Message `
         'Install manually: Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0'
+    End-Stage 'FAIL'
 }
 
 # Key-only auth, written as a drop-in we own rather than by editing the
@@ -496,7 +689,8 @@ if ($sshdReady) {
 #     in the enrollment request so the controller can allocate a port and
 #     stage the gateway authorized_keys line in one round trip)
 # ===========================================================================
-Write-Section '2/7  Rescue keypair'
+Start-Stage 'Cau hinh SSH (khoa rescue + chinh sach dang nhap)'
+Report-Stage 'configuring_ssh'
 $rescuePublicKey = ''
 try {
     if (-not (Test-Path "$RescueKey.pub")) {
@@ -519,7 +713,9 @@ try {
 # ===========================================================================
 #  3. Enrollment exchange  (or reuse existing credentials under -Repair)
 # ===========================================================================
-Write-Section '3/7  Registering with the controller'
+End-Stage
+Start-Stage 'Dang ky node voi controller'
+Report-Stage 'registering'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11
 
 function Get-LocalAddresses {
@@ -610,7 +806,8 @@ if ($Repair) {
 # ===========================================================================
 #  4. Controller SSH key + firewall
 # ===========================================================================
-Write-Section '4/7  SSH access for the controller'
+End-Stage
+Start-Stage 'Cau hinh authorized_keys va firewall'
 if ($bootstrap -and $bootstrap.ssh -and $bootstrap.ssh.authorized_key) {
     try {
         $adminKeys = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
@@ -657,7 +854,8 @@ try {
 # ===========================================================================
 #  5. Primary transport -- Tailscale
 # ===========================================================================
-Write-Section '5/7  Primary transport'
+End-Stage
+Start-Stage 'Tailscale / duong ket noi chinh'
 $tailscaleWanted = $false
 if ($bootstrap -and $bootstrap.tailscale) { $tailscaleWanted = [bool]$bootstrap.tailscale.enabled }
 
@@ -731,7 +929,8 @@ if (-not $tailscaleWanted) {
 # ===========================================================================
 #  6. Rescue transport -- persistent reverse SSH
 # ===========================================================================
-Write-Section '6/7  Rescue transport (reverse SSH)'
+End-Stage
+Start-Stage 'Duong rescue (reverse SSH)'
 $rescueConfigured = $false
 if ($bootstrap -and $bootstrap.rescue) { $rescueConfigured = [bool]$bootstrap.rescue.configured }
 
@@ -831,7 +1030,8 @@ while (`$true) {
 # ===========================================================================
 #  7. Heartbeat -- what makes the node show Ready on the Dashboard
 # ===========================================================================
-Write-Section '7/7  Heartbeat'
+End-Stage
+Start-Stage 'Heartbeat (de node hien tren Dashboard)'
 if (-not (Test-Path $TokenFile)) {
     Add-Step 'Heartbeat task' 'FAIL' 'no node token on disk (enrollment did not complete)'
 } else {
@@ -948,8 +1148,10 @@ while (`$true) {
 # ===========================================================================
 #  Profile packages
 # ===========================================================================
+End-Stage
+Start-Stage ("Cai cong cu theo profile: {0}" -f $ProfileName)
 if ($WingetPackages.Count -gt 0 -or $NpmTools.Count -gt 0) {
-    Write-Section "Profile: $ProfileName"
+    Report-Stage 'installing_tools'
     if ($SkipProfilePackages) {
         Add-Step 'Profile packages' 'SKIP' '-SkipProfilePackages given'
     } elseif (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -962,8 +1164,11 @@ if ($WingetPackages.Count -gt 0 -or $NpmTools.Count -gt 0) {
                 continue
             }
             try {
-                & winget install --id $pkg.Id --silent --accept-package-agreements `
-                    --accept-source-agreements --disable-interactivity 2>&1 | Out-Null
+                Write-Host ("      dang cai {0} ..." -f $pkg.Name) -ForegroundColor DarkGray
+                $id = $pkg.Id
+                Invoke-Tracked -What ("Cai " + $pkg.Name) -Stage 'installing_tools' `
+                    -SlowAfterSeconds 300 -TimeoutSeconds 1800 `
+                    -Work ([scriptblock]::Create("& winget install --id $id --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1"))
                 # winget puts new binaries on the machine PATH; this process
                 # still has the old one, so re-read it before probing.
                 $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
@@ -988,7 +1193,11 @@ if ($WingetPackages.Count -gt 0 -or $NpmTools.Count -gt 0) {
                 continue
             }
             try {
-                & npm install -g $tool.Id 2>&1 | Out-Null
+                Write-Host ("      dang cai {0} ..." -f $tool.Name) -ForegroundColor DarkGray
+                $tid = $tool.Id
+                Invoke-Tracked -What ("Cai " + $tool.Name) -Stage 'installing_tools' `
+                    -SlowAfterSeconds 240 -TimeoutSeconds 1200 `
+                    -Work ([scriptblock]::Create("& npm install -g $tid 2>&1"))
                 $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
                             [Environment]::GetEnvironmentVariable('Path', 'User')
                 if (Get-Command $tool.Probe -ErrorAction SilentlyContinue) {
@@ -1001,12 +1210,15 @@ if ($WingetPackages.Count -gt 0 -or $NpmTools.Count -gt 0) {
             }
         }
     }
+} else {
+    Add-Step 'Profile packages' 'SKIP' 'profile Minimal -- khong cai them gi'
 }
+End-Stage
 
 # ===========================================================================
 #  Verification + summary
 # ===========================================================================
-Write-Section 'Verifying'
+Start-Stage 'Kiem tra cuoi'
 try {
     $sshd = Get-Service sshd -ErrorAction Stop
     if ($sshd.Status -eq 'Running' -and $sshd.StartType -eq 'Automatic') {
@@ -1059,7 +1271,7 @@ if ($bootstrap -and (Test-Path $TokenFile)) {
 
 Write-Host ''
 Write-Host '=====================================================' -ForegroundColor Cyan
-Write-Host ' SUMMARY' -ForegroundColor Cyan
+Write-Host ' TONG KET  (PASS / WARN / FAIL theo tung buoc)' -ForegroundColor Cyan
 Write-Host '=====================================================' -ForegroundColor Cyan
 $fails = @($script:Checklist | Where-Object { $_.State -eq 'FAIL' })
 $warns = @($script:Checklist | Where-Object { $_.State -eq 'WARN' })
@@ -1076,17 +1288,42 @@ if ($fails.Count -gt 0 -or $warns.Count -gt 0) {
     }
 }
 Write-Host ''
+Write-Host (' Tong thoi gian: {0}s' -f [int]$script:TotalSw.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+
+# The window was opened by UAC from Win+R, so when this script returns the
+# window vanishes with it. Anything the user still needs to read has to be
+# held on screen deliberately.
+function Wait-BeforeClosing {
+    param([int] $Seconds = 0, [string] $Prompt = 'Nhan Enter de dong cua so nay')
+    if ($Seconds -gt 0) {
+        Write-Host ''
+        Write-Host (" Cua so se dong sau {0} giay..." -f $Seconds) -ForegroundColor DarkGray
+        Start-Sleep -Seconds $Seconds
+        return
+    }
+    Write-Host ''
+    try { Read-Host $Prompt | Out-Null } catch { Start-Sleep -Seconds 60 }
+}
+
 if ($fails.Count -gt 0) {
-    Write-Host " NOT READY -- $($fails.Count) required step(s) failed." -ForegroundColor Red
-    Write-Host " Fix the items above and re-run this file with -Repair." -ForegroundColor Red
+    Report-Stage 'failed'
+    Write-Host " CHUA XONG -- $($fails.Count) buoc bat buoc that bai." -ForegroundColor Red
+    Write-Host " Sua cac muc o tren roi chay lai file nay voi -Repair." -ForegroundColor Red
+    # FAIL: never auto-close. The user must be able to read why.
+    Wait-BeforeClosing
     exit 1
 }
 if ($warns.Count -gt 0) {
-    Write-Host " READY (degraded) -- the node is registered and reachable, with $($warns.Count) optional item(s) to look at." -ForegroundColor Yellow
-    Write-Host " It should appear on the Dashboard Nodes page within a minute." -ForegroundColor Yellow
+    Report-Stage 'ready'
+    Write-Host " SAN SANG (con canh bao) -- node da dang ky va ket noi duoc, con $($warns.Count) muc tuy chon." -ForegroundColor Yellow
+    Write-Host " May se hien tren trang Nodes cua Dashboard trong khoang mot phut." -ForegroundColor Yellow
+    # WARN: also hold, the warnings are the whole reason to look.
+    Wait-BeforeClosing
     exit 2
 }
-Write-Host ' READY -- this machine is a Terminal MCP node.' -ForegroundColor Green
-Write-Host ' It should appear on the Dashboard Nodes page within a minute.' -ForegroundColor Green
+Report-Stage 'ready'
+Write-Host ' SAN SANG -- may nay da la mot Terminal MCP node.' -ForegroundColor Green
+Write-Host ' May se hien tren trang Nodes cua Dashboard trong khoang mot phut.' -ForegroundColor Green
+Wait-BeforeClosing -Seconds 20
 exit 0
 """

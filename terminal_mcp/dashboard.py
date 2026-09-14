@@ -25,14 +25,16 @@ from .cf_access import verify_access_assertion
 from .agent_availability import available_agent_types
 from .access_policy import filter_record, policy_table, role_for_identity
 from .connection_store import ConnectionStore, generate_node_token
-from .enrollment import EnrollmentStore
+from .enrollment import STAGES as ENROLL_STAGES, EnrollmentStore
 from .node_onboarding import (OnboardingError, OnboardingService, read_controller_ssh_public_key,
                                rescue_authorized_keys_dir)
 from .node_transport import (GENERIC_SETUP_CODE, KIND_LAN, KIND_REVERSE_SSH, KIND_TAILSCALE,
                              TransportStore, probe_reverse_tunnel, probe_ssh_banner)
 from . import rescue_gateway
 from .rescue_gateway import RescuePortAllocator
-from .windows_onboarding import (SCRIPT_VERSION as SETUP_SCRIPT_VERSION, list_profiles,
+from .windows_onboarding import (SCRIPT_VERSION as SETUP_SCRIPT_VERSION,
+                                 SETUP_SCRIPT_SHORT_PATH, build_quick_install_command,
+                                 list_profiles, quick_install_fits_run_dialog,
                                  render_setup_script, script_fingerprint)
 from .fleet_service import ControllerFleetSync, FleetService, auth_status_for_node
 from .controller import ControllerService, build_default_controller
@@ -5971,6 +5973,27 @@ NODES_ADMIN_HTML = """<!doctype html>
     .an-steps { margin:10px 0 0 0; padding-left:20px; font-size:12.5px; line-height:1.8 }
     .an-fine { margin-top:12px; font-size:11px; color:var(--muted); line-height:1.6 }
     .an-fine code { background:#0f1730; border:1px solid var(--line); border-radius:4px; padding:1px 5px; user-select:all }
+    /* Quick install: the primary path, and it should look like it. */
+    .an-quick { margin-top:10px; padding:14px; border:1px solid var(--accent); border-radius:10px; background:#111c33 }
+    .an-cmd { width:100%; box-sizing:border-box; margin-top:10px; padding:10px; resize:vertical;
+              font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11.5px; line-height:1.5;
+              color:var(--text); background:#0b1324; border:1px solid var(--line);
+              border-radius:6px; white-space:pre-wrap; word-break:break-all }
+    .an-cmd:focus { outline:2px solid var(--accent); outline-offset:1px }
+    .an-big-btn { font-size:13px; padding:9px 18px }
+    .an-note { font-size:11px; margin-top:8px }
+    .an-live { margin-top:10px; padding:9px 12px; border-radius:8px; background:#12243d; border:1px solid var(--accent);
+               font-size:12px; display:flex; gap:10px; align-items:center }
+    .an-live .an-spin { width:9px; height:9px; border-radius:50%; background:var(--accent); animation:anPulse 1.1s infinite }
+    .an-live.done { border-color:#2c6e49; background:#12331f }
+    .an-live.done .an-spin { background:#6ee7a0; animation:none }
+    .an-live.failed { border-color:#7a2333; background:#3a1620 }
+    .an-live.failed .an-spin { background:#ff9aa8; animation:none }
+    @keyframes anPulse { 0%,100% { opacity:1 } 50% { opacity:.25 } }
+    .an-manual { margin-top:14px; font-size:12px }
+    .an-manual summary { cursor:pointer; color:var(--muted) }
+    .an-trouble-row { display:flex; gap:8px; align-items:center; margin-top:6px; flex-wrap:wrap }
+    .an-trouble-row code { flex:1 1 auto; min-width:0 }
     /* transport health table in the node detail */
     .tr-table { width:100%; border-collapse:collapse; margin-top:8px; font-size:12px }
     .tr-table th, .tr-table td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line) }
@@ -6046,21 +6069,38 @@ NODES_ADMIN_HTML = """<!doctype html>
       <!-- step 3: the download + the three things to do -->
       <div id="anStepDone" class="an-step" hidden>
         <div class="an-done-head">
-          <div class="an-big">Xong — còn 3 bước trên máy Windows</div>
+          <div class="an-big">Cài đặt nhanh — không cần gõ lệnh nào</div>
           <div class="muted" id="anExpiry"></div>
         </div>
-        <ol class="an-steps">
-          <li><b>Download</b> file setup bên dưới về máy Windows đó.</li>
-          <li>Chuột phải file → <b>Run with PowerShell</b> (script tự xin quyền Administrator).</li>
-          <li>Đợi vài phút — máy sẽ tự hiện <b>Ready</b> ở trang này.</li>
-        </ol>
-        <div class="cx-row" style="margin-top:6px">
-          <button class="icon-btn an-primary" id="anDownloadBtn" type="button">⬇ Download windows-setup.ps1</button>
-          <button class="icon-btn" id="anCopyCodeBtn" type="button">Copy enrollment code</button>
-          <button class="icon-btn" id="anDoneBtn" type="button">Đã xong</button>
+
+        <!-- The primary path. One button, then three physical actions on
+             the Windows machine. Nothing to type, no shell to open. -->
+        <div class="an-quick">
+          <ol class="an-steps">
+            <li>Bấm <b>Copy lệnh cài đặt</b> bên dưới.</li>
+            <li>Trên máy Windows: nhấn <b>Win + R</b>, rồi <b>Ctrl + V</b>, rồi <b>Enter</b>.</li>
+            <li>Chọn <b>Yes</b> khi Windows hỏi quyền Administrator, rồi chờ màn hình báo hoàn tất.</li>
+          </ol>
+          <textarea id="anQuickCmd" class="an-cmd" readonly rows="3" spellcheck="false" wrap="soft"></textarea>
+          <div class="cx-row" style="margin-top:8px">
+            <button class="icon-btn an-primary an-big-btn" id="anCopyCmdBtn" type="button">📋 Copy lệnh cài đặt</button>
+            <button class="icon-btn" id="anRegenBtn" type="button" hidden>Tạo lại</button>
+            <button class="icon-btn" id="anDoneBtn" type="button">Đã xong</button>
+          </div>
+          <div class="d-msg" id="anDoneMsg"></div>
+          <div class="an-live" id="anLive" hidden></div>
+          <div class="muted an-note" id="anPlatformNote" hidden></div>
         </div>
-        <div class="d-msg" id="anDoneMsg"></div>
-        <div class="an-fine" id="anFine"></div>
+
+        <details class="an-manual">
+          <summary>Cách khác / thủ công</summary>
+          <div class="cx-row" style="margin-top:10px">
+            <button class="icon-btn" id="anDownloadBtn" type="button">⬇ Download windows-setup.ps1</button>
+            <button class="icon-btn" id="anCopyCodeBtn" type="button">Copy enrollment code</button>
+          </div>
+          <div class="an-fine" id="anFine"></div>
+          <div class="an-fine" id="anTrouble"></div>
+        </details>
       </div>
     </div>
     <div id="enrollStrip" hidden style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin-bottom:16px"></div>
@@ -6595,11 +6635,126 @@ NODES_ADMIN_HTML = """<!doctype html>
       loadEnrollments();
     });
 
+    // One clipboard helper for every copy button on this page. The
+    // fallback matters: navigator.clipboard is undefined on a page served
+    // over plain http:// to anything but localhost, which is exactly how
+    // this dashboard is reached over the LAN -- so the primary action
+    // would silently do nothing without it.
+    async function anCopy(text) {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch (error) { /* fall through to the textarea path */ }
+      try {
+        const scratch = document.createElement('textarea');
+        scratch.value = text;
+        scratch.setAttribute('readonly', '');
+        scratch.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+        document.body.append(scratch);
+        scratch.select();
+        scratch.setSelectionRange(0, text.length);
+        const ok = document.execCommand('copy');
+        scratch.remove();
+        return ok;
+      } catch (error) { return false; }
+    }
+
+    // Flash "Đã copy ✓" then restore. Guards against double-clicks
+    // stacking timers and leaving the button stuck on the flashed label.
+    function anFlash(button, okLabel) {
+      if (button.dataset.restoreTo === undefined) button.dataset.restoreTo = button.textContent;
+      if (button.dataset.timer) clearTimeout(Number(button.dataset.timer));
+      button.textContent = okLabel;
+      button.dataset.timer = String(setTimeout(() => {
+        button.textContent = button.dataset.restoreTo;
+        delete button.dataset.timer;
+      }, 2500));
+    }
+
+    let anExpiryTimer = null;
+    let anProgressTimer = null;
+
+    // While the installer runs, the enrollment row carries the stage it is
+    // on. Polling it is what turns "nothing is happening" into "installing
+    // OpenSSH, 1m32s" -- the single most useful thing to show someone
+    // staring at a machine that looks stuck.
+    async function anPollProgress() {
+      if (!anGenerated) return;
+      const live = document.getElementById('anLive');
+      const result = await api('/dashboard/api/nodes/onboard/enrollments');
+      if (!result.ok) return;
+      const row = (result.data.enrollments || []).find((e) => e.id === anGenerated.enrollment.id);
+      if (!row || !row.progress_stage) return;
+      live.hidden = false;
+      live.className = 'an-live' + (row.progress_stage === 'ready' ? ' done'
+                                  : row.progress_stage === 'failed' ? ' failed' : '');
+      live.replaceChildren();
+      const dot = document.createElement('span'); dot.className = 'an-spin';
+      const text = document.createElement('span');
+      const secs = Number(row.progress_elapsed_seconds || 0);
+      const elapsed = secs >= 60 ? `${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, '0')}s` : `${secs}s`;
+      const label = row.progress_label || row.progress_stage;
+      text.textContent = row.progress_stage === 'ready'
+        ? `${label} — máy đã cài xong sau ${elapsed}.`
+        : row.progress_stage === 'failed'
+          ? `${label} — xem cửa sổ PowerShell trên máy đó để biết bước nào lỗi.`
+          : `${label}… đã ${elapsed}`;
+      live.append(dot, text);
+      if (row.progress_stage === 'ready' || row.progress_stage === 'failed') {
+        if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
+        loadAll();
+      }
+    }
+
     function anRenderDone() {
       const expiresAt = new Date(anGenerated.enrollment.expires_at);
-      const minutes = Math.max(0, Math.round((expiresAt.getTime() - Date.now()) / 60000));
-      document.getElementById('anExpiry').textContent =
-        `Mã dùng một lần, hết hạn sau ~${minutes} phút (${expiresAt.toLocaleTimeString()}).`;
+      const cmdEl = document.getElementById('anQuickCmd');
+      const regenBtn = document.getElementById('anRegenBtn');
+      const copyBtn = document.getElementById('anCopyCmdBtn');
+      cmdEl.value = anGenerated.quick_install_command || '';
+
+      // A command longer than the Run dialog accepts would be silently
+      // truncated on paste -- say so rather than let them find out.
+      const note = document.getElementById('anPlatformNote');
+      const notes = [];
+      if (anGenerated.quick_install_fits_run_dialog === false) {
+        notes.push('Lệnh dài hơn giới hạn của hộp Win + R — dùng cách thủ công bên dưới.');
+      }
+      if (!/Win/i.test(navigator.platform || '')) {
+        notes.push('Chạy lệnh này trên máy Windows cần thêm.');
+      }
+      note.textContent = notes.join(' ');
+      note.hidden = notes.length === 0;
+
+      // Live countdown: the code is the whole credential, so "still valid?"
+      // must never be a guess.
+      function tick() {
+        const left = Math.round((expiresAt.getTime() - Date.now()) / 1000);
+        const expiryEl = document.getElementById('anExpiry');
+        if (left <= 0) {
+          expiryEl.textContent = 'Lệnh đã hết hạn — bấm Tạo lại.';
+          cmdEl.disabled = true;
+          copyBtn.disabled = true;
+          regenBtn.hidden = false;
+          if (anExpiryTimer) { clearInterval(anExpiryTimer); anExpiryTimer = null; }
+          return;
+        }
+        const mins = Math.floor(left / 60), secs = left % 60;
+        expiryEl.textContent = `Lệnh có hiệu lực khoảng 15 phút — còn ${mins}:${String(secs).padStart(2, '0')}. Dùng một lần.`;
+      }
+      cmdEl.disabled = false;
+      copyBtn.disabled = false;
+      regenBtn.hidden = true;
+      document.getElementById('anLive').hidden = true;
+      if (anProgressTimer) clearInterval(anProgressTimer);
+      anProgressTimer = setInterval(anPollProgress, 3000);
+      anPollProgress();
+      if (anExpiryTimer) clearInterval(anExpiryTimer);
+      tick();
+      anExpiryTimer = setInterval(tick, 1000);
+
       anSetMsg('anDoneMsg', '');
       const fine = document.getElementById('anFine');
       fine.replaceChildren();
@@ -6619,15 +6774,47 @@ NODES_ADMIN_HTML = """<!doctype html>
       }
       const alt = document.createElement('div');
       alt.style.marginTop = '8px';
-      alt.textContent = 'Hoặc chạy trên máy Windows (PowerShell as Administrator):';
+      alt.textContent = 'Hoặc tự chạy trong PowerShell (Administrator), sau khi đã tải file:';
       const cmd = document.createElement('div');
       cmd.style.marginTop = '4px';
       const cmdCode = document.createElement('code');
-      cmdCode.textContent =
-        `irm ${anGenerated.controller_url}/enroll/windows-setup.ps1 -OutFile setup.ps1; ` +
-        `.\\setup.ps1 -EnrollmentCode ${anGenerated.code}`;
+      cmdCode.textContent = `.\\${anGenerated.filename} `;
       cmd.append(cmdCode);
       fine.append(alt, cmd);
+
+      // Troubleshooting: a short, fixed list, each with its own copy
+      // button. Deliberately three lines, not a manual -- the primary
+      // action stays the one button above.
+      const trouble = document.getElementById('anTrouble');
+      trouble.replaceChildren();
+      const heading = document.createElement('div');
+      heading.style.marginTop = '10px';
+      heading.textContent = 'Nếu máy không hiện Ready, chạy trên máy đó để kiểm tra:';
+      trouble.append(heading);
+      for (const [label, command] of [
+        ['OpenSSH', 'Get-Service sshd'],
+        ['Tailscale', 'tailscale status'],
+        ['Tác vụ nền', "Get-ScheduledTask -TaskName 'TerminalMCP-*' | Get-ScheduledTaskInfo"],
+        ['Chạy lại/sửa', `.\\${anGenerated.filename} -Repair`],
+      ]) {
+        const row = document.createElement('div');
+        row.className = 'an-trouble-row';
+        const name = document.createElement('span');
+        name.className = 'muted';
+        name.style.minWidth = '86px';
+        name.textContent = label;
+        const code = document.createElement('code');
+        code.textContent = command;
+        const copy = document.createElement('button');
+        copy.className = 'icon-btn';
+        copy.type = 'button';
+        copy.textContent = 'Copy';
+        copy.addEventListener('click', async () => {
+          anFlash(copy, await anCopy(command) ? '✓' : '✕');
+        });
+        row.append(name, code, copy);
+        trouble.append(row);
+      }
     }
 
     document.getElementById('anDownloadBtn').addEventListener('click', () => {
@@ -6647,18 +6834,42 @@ NODES_ADMIN_HTML = """<!doctype html>
       anSetMsg('anDoneMsg', 'Đã tải. Chuột phải file → Run with PowerShell trên máy Windows.', 'ok');
     });
 
-    document.getElementById('anCopyCodeBtn').addEventListener('click', async () => {
+    document.getElementById('anCopyCmdBtn').addEventListener('click', async (event) => {
       if (!anGenerated) return;
-      try {
-        await navigator.clipboard.writeText(anGenerated.code);
-        anSetMsg('anDoneMsg', 'Đã copy enrollment code.', 'ok');
-      } catch (error) {
-        anSetMsg('anDoneMsg', 'Không copy được — mã: ' + anGenerated.code, '');
+      const button = event.currentTarget;
+      const ok = await anCopy(anGenerated.quick_install_command || '');
+      if (ok) {
+        anFlash(button, 'Đã copy ✓');
+        anSetMsg('anDoneMsg', 'Trên máy Windows: Win + R → Ctrl + V → Enter → Yes.', 'ok');
+      } else {
+        // Never leave them stuck: select the box so Ctrl+C still works.
+        const box = document.getElementById('anQuickCmd');
+        box.focus(); box.select();
+        anFlash(button, 'Nhấn Ctrl + C');
+        anSetMsg('anDoneMsg', 'Trình duyệt chặn clipboard — lệnh đã được bôi đen, nhấn Ctrl + C để copy.', '');
       }
+    });
+
+    document.getElementById('anRegenBtn').addEventListener('click', () => {
+      // Same node name and profile, a fresh code. Straight back to the
+      // form's submit path so there is one code-minting path, not two.
+      if (anExpiryTimer) { clearInterval(anExpiryTimer); anExpiryTimer = null; }
+      anShow('anStepForm');
+      anSetMsg('anFormMsg', 'Mã cũ đã hết hạn — bấm Generate setup để tạo lệnh mới.', '');
+    });
+
+    document.getElementById('anCopyCodeBtn').addEventListener('click', async (event) => {
+      if (!anGenerated) return;
+      const button = event.currentTarget;
+      const ok = await anCopy(anGenerated.code);
+      anFlash(button, ok ? 'Đã copy ✓' : '✕');
+      if (!ok) anSetMsg('anDoneMsg', 'Không copy được enrollment code.', '');
     });
 
     document.getElementById('anDoneBtn').addEventListener('click', () => {
       anPanel.hidden = true;
+      if (anExpiryTimer) { clearInterval(anExpiryTimer); anExpiryTimer = null; }
+      if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
       anGenerated = null;   // the only copy in this tab, dropped on close
       loadAll();
     });
@@ -14864,6 +15075,13 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 display_name=created["enrollment"]["display_name"], profile=created["enrollment"]["profile"])
             created["script"] = script
             created["script_sha256"] = script_fingerprint(script)
+            # The one-liner the wizard shows as its PRIMARY action. Built
+            # server-side, where the PowerShell quoting is unit-tested,
+            # rather than assembled in the browser.
+            command = build_quick_install_command(controller_url=controller_url,
+                                                  enrollment_code=created["code"])
+            created["quick_install_command"] = command
+            created["quick_install_fits_run_dialog"] = quick_install_fits_run_dialog(command)
             created["script_version"] = SETUP_SCRIPT_VERSION
             created["filename"] = f"terminal-mcp-setup-{node_id}.ps1"
             created["controller_url"] = controller_url
@@ -15030,6 +15248,50 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                  result["node_id"], hostname, source)
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
+    @server.custom_route("/dashboard/api/enroll/progress", methods=["POST"], include_in_schema=False)
+    async def enroll_progress(request: Request) -> JSONResponse:
+        """Where the installer says which stage it is on.
+
+        Machine-facing, like consume, and authenticated the same way: by
+        the enrollment code the installer already holds. It does NOT
+        consume the code -- progress arrives both before the exchange
+        (OpenSSH can take minutes) and after it (winget can take longer),
+        and one mechanism for both beats two.
+
+        Answers 202 whether or not the code is known. A distinct 404 would
+        turn this into an oracle for "is this code real", which is exactly
+        the question an attacker holding a guess wants answered."""
+        source = (request.client.host if request.client else "unknown")
+        if _enroll_rate_limited(source):
+            return JSONResponse({"error": "RATE_LIMITED"}, status_code=429,
+                                headers={"Cache-Control": "no-store", "Retry-After": "60"})
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        stage = str(body.get("stage") or "")
+        if stage not in ENROLL_STAGES:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "unknown stage"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        elapsed = body.get("elapsed_seconds")
+        try:
+            elapsed = int(elapsed) if elapsed is not None else None
+        except (TypeError, ValueError):
+            elapsed = None
+
+        def _compute() -> str | None:
+            record = onboarding.enrollments.record_progress(
+                str(body.get("code") or ""), stage=stage, elapsed_seconds=elapsed)
+            return record.node_id if record else None
+
+        node_id = await anyio.to_thread.run_sync(_compute)
+        # node_id (not the code) is the only identifier that reaches a log.
+        if node_id:
+            _log.info("dashboard enroll_progress node_id=%s stage=%s elapsed=%s", node_id, stage, elapsed)
+        return JSONResponse({"accepted": True}, status_code=202, headers={"Cache-Control": "no-store"})
+
     @server.custom_route("/dashboard/api/nodes/{node_id}/deregister", methods=["POST"], include_in_schema=False)
     async def node_self_deregister(request: Request) -> JSONResponse:
         """A node removing ITSELF (windows-setup.ps1 -Uninstall). Bearer-
@@ -15045,6 +15307,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         result = await anyio.to_thread.run_sync(lambda: onboarding.remove_node(node_id, by=f"node:{node_id}"))
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
+    # Two paths, ONE handler. The short alias exists only so the
+    # quick-install one-liner fits the Win+R dialog's ~259-character
+    # limit; it serves byte-identical content.
+    @server.custom_route(SETUP_SCRIPT_SHORT_PATH, methods=["GET"], include_in_schema=False)
     @server.custom_route("/enroll/windows-setup.ps1", methods=["GET"], include_in_schema=False)
     async def enroll_setup_script(request: Request) -> Response:
         """The GENERIC installer -- identical to the downloaded one except

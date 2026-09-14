@@ -45,9 +45,45 @@ from typing import Any
 
 from .schema import Migration, apply_migrations
 
+def _add_progress_columns(connection) -> None:
+    for column, declaration in (("progress_stage", "TEXT"),
+                                ("progress_at", "TEXT"),
+                                ("progress_elapsed_seconds", "INTEGER")):
+        connection.execute(f"ALTER TABLE enrollments ADD COLUMN {column} {declaration}")
+
+
 ENROLLMENT_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: one-time node enrollment codes", lambda connection: None),
+    Migration(2, "installer progress: which stage a machine is on, and for how long",
+              _add_progress_columns),
 ]
+
+# What the installer reports while it runs. A closed set: the progress
+# route accepts nothing else, so a node cannot write arbitrary text into
+# a field the dashboard renders.
+STAGE_STARTING = "starting"
+STAGE_DOWNLOADING = "downloading"
+STAGE_INSTALLING_OPENSSH = "installing_openssh"
+STAGE_CONFIGURING_SSH = "configuring_ssh"
+STAGE_REGISTERING = "registering"
+STAGE_INSTALLING_TOOLS = "installing_tools"
+STAGE_READY = "ready"
+STAGE_FAILED = "failed"
+STAGES = (STAGE_STARTING, STAGE_DOWNLOADING, STAGE_INSTALLING_OPENSSH, STAGE_CONFIGURING_SSH,
+          STAGE_REGISTERING, STAGE_INSTALLING_TOOLS, STAGE_READY, STAGE_FAILED)
+
+# Human labels, kept next to the vocabulary so the dashboard and the
+# installer cannot drift apart on what a stage is called.
+STAGE_LABELS = {
+    STAGE_STARTING: "Đang bắt đầu",
+    STAGE_DOWNLOADING: "Đang tải bộ cài",
+    STAGE_INSTALLING_OPENSSH: "Đang cài OpenSSH",
+    STAGE_CONFIGURING_SSH: "Đang cấu hình SSH",
+    STAGE_REGISTERING: "Đang đăng ký node",
+    STAGE_INSTALLING_TOOLS: "Đang cài công cụ theo profile",
+    STAGE_READY: "Hoàn tất",
+    STAGE_FAILED: "Thất bại",
+}
 
 STATUS_PENDING = "pending"
 STATUS_CONSUMED = "consumed"
@@ -172,6 +208,9 @@ class Enrollment:
     consumed_hostname: str | None
     revoked_at: str | None
     revoked_by: str | None
+    progress_stage: str | None = None
+    progress_at: str | None = None
+    progress_elapsed_seconds: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -182,6 +221,10 @@ class Enrollment:
             "created_by": self.created_by, "consumed_at": self.consumed_at,
             "consumed_from": self.consumed_from, "consumed_hostname": self.consumed_hostname,
             "revoked_at": self.revoked_at, "revoked_by": self.revoked_by,
+            "progress_stage": self.progress_stage,
+            "progress_label": STAGE_LABELS.get(self.progress_stage or "", None),
+            "progress_at": self.progress_at,
+            "progress_elapsed_seconds": self.progress_elapsed_seconds,
         }
 
 
@@ -368,6 +411,39 @@ class EnrollmentStore:
             cursor = connection.execute("DELETE FROM enrollments WHERE created_at < ?", (_iso(cutoff),))
         return cursor.rowcount
 
+    def record_progress(self, code: str, *, stage: str, elapsed_seconds: int | None = None,
+                        now: datetime | None = None) -> Enrollment | None:
+        """Best-effort telemetry from a machine that is mid-install.
+
+        Authenticated by the enrollment code, which the installer already
+        holds -- and deliberately does NOT consume it: progress arrives
+        both before the exchange (while OpenSSH installs) and after it
+        (while winget runs), and a single mechanism for both beats two.
+
+        `stage` must be one of STAGES; anything else is refused rather
+        than stored, because this value is rendered on the dashboard.
+        Returns None when the code is unknown, so the caller can answer
+        identically to a wrong code and leak nothing."""
+        if stage not in STAGES:
+            raise ValueError(f"unknown stage {stage!r}")
+        canonical = normalize_code(code)
+        if not canonical:
+            return None
+        moment = now or _now()
+        # Clamp: this number is reported by the machine and only ever
+        # displayed, but an unbounded value has no business in the store.
+        elapsed = None if elapsed_seconds is None else max(0, min(int(elapsed_seconds), 86_400))
+        digest = hash_code(canonical)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE enrollments SET progress_stage = ?, progress_at = ?, progress_elapsed_seconds = ? "
+                "WHERE code_hash = ?",
+                (stage, _iso(moment), elapsed, digest))
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute("SELECT * FROM enrollments WHERE code_hash = ?", (digest,)).fetchone()
+        return _row_to_record(row, now=moment)
+
     def verify_code_matches(self, enrollment_id: str, code: str) -> bool:
         """Constant-time check used only by tests and by the repair path,
         where the caller already holds a record id."""
@@ -403,4 +479,16 @@ def _row_to_record(row: sqlite3.Row | None, *, now: datetime) -> Enrollment | No
         created_at=row["created_at"], expires_at=row["expires_at"], created_by=row["created_by"],
         consumed_at=row["consumed_at"], consumed_from=row["consumed_from"],
         consumed_hostname=row["consumed_hostname"], revoked_at=row["revoked_at"], revoked_by=row["revoked_by"],
+        progress_stage=_column(row, "progress_stage"),
+        progress_at=_column(row, "progress_at"),
+        progress_elapsed_seconds=_column(row, "progress_elapsed_seconds"),
     )
+
+
+def _column(row: sqlite3.Row, name: str):
+    """Reads a column that may predate this store's migration 2 -- a row
+    fetched before the ALTER has no such key at all."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None

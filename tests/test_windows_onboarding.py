@@ -965,14 +965,6 @@ def test_wizard_asks_for_the_minimum_and_nothing_more():
     assert form.index('id="anProfiles"') < form.index('id="anAdvanced"')
 
 
-def test_wizard_tells_the_user_exactly_three_things_to_do():
-    page = _nodes_page()
-    done = page[page.index('id="anStepDone"'):page.index('id="enrollStrip"')]
-    assert "Download" in done and "Run with PowerShell" in done and "Ready" in done
-    assert 'id="anDownloadBtn"' in done
-    assert done.count("<li>") == 3
-
-
 def test_wizard_downloads_via_blob_never_a_url_carrying_the_code():
     """A code in a query string lands in browser history, proxy logs and
     the controller's own access log. The download is a Blob built from the
@@ -1164,3 +1156,296 @@ def test_test_primary_probes_the_port_the_installer_actually_opens(tmp_path, mon
     result = client.post("/dashboard/api/nodes/probed/test-transport", json={"transport": "primary"})
     assert result.status_code == 200 and result.json()["reachable"] is False
     assert dialled == [("192.168.44.9", 22)], dialled
+
+
+# ---------------------------------------------------------------------------
+# Quick install: the one-liner a user pastes into Win+R
+# ---------------------------------------------------------------------------
+
+def test_quick_install_command_shape_and_safety():
+    from terminal_mcp.windows_onboarding import build_quick_install_command
+    code = generate_code()
+    cmd = build_quick_install_command(controller_url="http://100.100.0.1:8766", enrollment_code=code)
+
+    # Runs via the Windows Run dialog: must start with the interpreter
+    # every Windows has, and must not require a shell to be open already.
+    assert cmd.startswith("powershell -NoP -Command ")
+    # Download to a FILE then execute it -- never iex/irm straight into the
+    # pipeline (task requirement, and it keeps the artefact on disk).
+    assert "-OutFile" in cmd
+    assert "iex" not in cmd and "Invoke-Expression" not in cmd
+    # UAC, and process-scope policy ONLY -- never the machine policy.
+    assert "-Verb RunAs" in cmd
+    assert "-Ex Bypass" in cmd
+    assert "Set-ExecutionPolicy" not in cmd
+    # 5.1 needs -UseBasicParsing or IWR wants the IE engine.
+    assert "-UseB" in cmd
+    # The code travels as an ARGUMENT, never a URL query parameter.
+    assert f"-EnrollmentCode {code}" in cmd
+    assert "?code=" not in cmd and "&code=" not in cmd
+    assert f"={code}" not in cmd.split("-EnrollmentCode")[0]
+
+
+def test_quick_install_quotes_paths_for_usernames_with_spaces():
+    """%TEMP% for "John Doe" contains a space, and Start-Process joins an
+    argument array WITHOUT quoting. The command must build the quote
+    itself -- via [char]34, because a literal quote would terminate the
+    outer -Command string."""
+    from terminal_mcp.windows_onboarding import build_quick_install_command
+    cmd = build_quick_install_command(controller_url="http://100.100.0.1:8766",
+                                      enrollment_code=generate_code())
+    assert "[char]34+$f+[char]34" in cmd
+    # Exactly two double quotes in the whole line: the pair delimiting
+    # -Command. Any other would end the string early.
+    assert cmd.count('"') == 2
+
+
+def test_quick_install_fits_the_run_dialog():
+    """Win+R truncates at ~259 characters. A command that does not fit is
+    worse than useless -- it pastes as a half-command that may still
+    execute."""
+    from terminal_mcp.windows_onboarding import (RUN_DIALOG_MAX_CHARS, build_quick_install_command,
+                                                 quick_install_fits_run_dialog)
+    for base in ("http://100.100.0.1:8766", "https://terminal-dashboard.example.net"):
+        cmd = build_quick_install_command(controller_url=base, enrollment_code=generate_code())
+        assert len(cmd) <= RUN_DIALOG_MAX_CHARS, f"{base}: {len(cmd)} chars"
+        assert quick_install_fits_run_dialog(cmd) is True
+    assert quick_install_fits_run_dialog("x" * (RUN_DIALOG_MAX_CHARS + 1)) is False
+
+
+def test_quick_install_rejects_unsafe_inputs():
+    from terminal_mcp.windows_onboarding import build_quick_install_command
+    ok = dict(controller_url="http://100.100.0.1:8766", enrollment_code="TMCP-4KQ7M-2ZXWP-9BCDE")
+    for bad in ({"enrollment_code": "'; Stop-Computer; #"}, {"enrollment_code": "TMCP-SHORT"},
+                {"controller_url": "file:///etc/passwd"}, {"controller_url": "http://h/\n$(evil)"}):
+        with pytest.raises(ValueError):
+            build_quick_install_command(**{**ok, **bad})
+
+
+def test_quick_install_command_is_returned_by_the_create_route(tmp_path, monkeypatch):
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch)
+    body = client.post("/dashboard/api/nodes/onboard/enrollments",
+                       json={"node_id": "quick", "profile": "minimal"}).json()
+    cmd = body["quick_install_command"]
+    assert body["quick_install_fits_run_dialog"] is True
+    assert body["code"] in cmd
+    assert cmd.startswith("powershell -NoP -Command ")
+    # It points at the SHORT alias, which is the only reason it fits.
+    assert "/w'" in cmd
+
+
+def test_short_alias_serves_the_same_script_as_the_long_path(tmp_path, monkeypatch):
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch)
+    short = client.get("/w")
+    long = client.get("/enroll/windows-setup.ps1")
+    assert short.status_code == 200 and long.status_code == 200
+    assert short.text == long.text, "the alias must serve byte-identical content"
+    assert short.headers["X-Terminal-Mcp-Setup-Sha256"] == long.headers["X-Terminal-Mcp-Setup-Sha256"]
+    assert not re.search(r"\b[0-9a-f]{64}\b", short.text)
+
+
+# ---------------------------------------------------------------------------
+# UI acceptance for the quick-install flow
+# ---------------------------------------------------------------------------
+
+def test_quick_install_is_the_primary_action_and_download_is_secondary():
+    page = _nodes_page()
+    done = page[page.index('id="anStepDone"'):page.index('id="enrollStrip"')]
+    assert 'id="anCopyCmdBtn"' in done and 'Copy lệnh cài đặt' in done
+    assert 'an-primary an-big-btn' in done, "the copy button must be styled as the primary action"
+    # Download still exists, but demoted behind "Cách khác / thủ công".
+    assert 'id="anDownloadBtn"' in done
+    assert done.index('id="anCopyCmdBtn"') < done.index('id="anDownloadBtn"')
+    assert 'Cách khác / thủ công' in done
+    manual = done[done.index('<details class="an-manual">'):]
+    assert 'id="anDownloadBtn"' in manual, "Download belongs inside the manual section"
+
+
+def test_three_steps_never_ask_the_user_to_type_a_command():
+    page = _nodes_page()
+    done = page[page.index('id="anStepDone"'):page.index('id="enrollStrip"')]
+    assert done.count("<li>") == 3
+    assert "Win + R" in done and "Ctrl + V" in done and "Enter" in done
+    assert "Yes" in done and "Administrator" in done
+    # None of the old manual instructions survive in the primary path.
+    quick = done[done.index('<div class="an-quick">'):done.index('<details class="an-manual">')]
+    for banned in ("Set-ExecutionPolicy", "cd ", "Run with PowerShell", "Chuột phải"):
+        assert banned not in quick, f"{banned!r} must not be in the no-typing path"
+
+
+def test_command_box_is_readonly_and_copy_has_a_fallback():
+    page = _nodes_page()
+    assert 'id="anQuickCmd"' in page and "readonly" in page
+    # navigator.clipboard is undefined on plain http:// over the LAN, which
+    # is how this dashboard is actually reached -- the fallback is what
+    # keeps the primary button working there.
+    assert "navigator.clipboard" in page and "window.isSecureContext" in page
+    assert "document.execCommand('copy')" in page
+    assert "Đã copy ✓" in page
+    assert "anFlash(" in page
+
+
+def test_expiry_countdown_and_regenerate_exist():
+    page = _nodes_page()
+    assert "Lệnh có hiệu lực khoảng 15 phút" in page
+    assert 'id="anRegenBtn"' in page and "Tạo lại" in page
+    assert "Lệnh đã hết hạn" in page
+    assert "anExpiryTimer" in page and "clearInterval" in page
+
+
+def test_non_windows_browser_gets_a_note_but_can_still_copy():
+    page = _nodes_page()
+    assert "Chạy lệnh này trên máy Windows cần thêm." in page
+    assert "navigator.platform" in page
+    # The note must not disable the copy button.
+    assert "copyBtn.disabled = true" not in page.split("navigator.platform")[1][:400]
+
+
+def test_troubleshooting_commands_each_have_a_copy_button():
+    page = _nodes_page()
+    for command in ("Get-Service sshd", "tailscale status", "TerminalMCP-*"):
+        assert command in page
+    assert "an-trouble-row" in page
+    assert 'id="anTrouble"' in page
+
+
+# ---------------------------------------------------------------------------
+# Installer progress: stage reporting, stall visibility, no secret leakage
+# ---------------------------------------------------------------------------
+
+def test_progress_route_records_a_stage_without_consuming_the_code(tmp_path, monkeypatch):
+    """Progress arrives BEFORE the exchange (OpenSSH can take minutes) and
+    after it (winget can take longer). Reporting it must not burn the
+    single-use code."""
+    client, _controller, onboarding = _client(tmp_path, monkeypatch)
+    created = client.post("/dashboard/api/nodes/onboard/enrollments",
+                          json={"node_id": "prog", "profile": "minimal"}).json()
+    code = created["code"]
+
+    response = client.post("/dashboard/api/enroll/progress",
+                           json={"code": code, "stage": "installing_openssh", "elapsed_seconds": 92})
+    assert response.status_code == 202 and response.json()["accepted"] is True
+
+    row = client.get("/dashboard/api/nodes/onboard/enrollments").json()["enrollments"][0]
+    assert row["progress_stage"] == "installing_openssh"
+    assert row["progress_elapsed_seconds"] == 92
+    assert row["progress_label"] == "Đang cài OpenSSH"
+    assert row["status"] == "pending", "reporting progress must not consume the code"
+
+    # ...and the code still works afterwards.
+    assert client.post("/dashboard/api/enroll/consume",
+                       json={"code": code, "hostname": "PROG-PC",
+                             "addresses": {"lan_ip": "192.168.1.9"}}).status_code == 200
+    # Post-consume stages keep landing on the same row.
+    client.post("/dashboard/api/enroll/progress", json={"code": code, "stage": "ready", "elapsed_seconds": 240})
+    row = client.get("/dashboard/api/nodes/onboard/enrollments").json()["enrollments"][0]
+    assert row["progress_stage"] == "ready" and row["status"] == "consumed"
+
+
+def test_progress_route_refuses_unknown_stages_and_never_leaks_the_code(tmp_path, monkeypatch, caplog):
+    import logging
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch)
+    code = client.post("/dashboard/api/nodes/onboard/enrollments",
+                       json={"node_id": "prog2", "profile": "minimal"}).json()["code"]
+
+    bad = client.post("/dashboard/api/enroll/progress",
+                      json={"code": code, "stage": "<img src=x onerror=1>"})
+    assert bad.status_code == 400 and bad.json()["error"] == "INVALID_REQUEST"
+
+    with caplog.at_level(logging.INFO):
+        client.post("/dashboard/api/enroll/progress",
+                    json={"code": code, "stage": "installing_openssh", "elapsed_seconds": 10})
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert code not in logged, "the enrollment code must never reach a log line"
+    assert "prog2" in logged, "the node id is the identifier that may be logged"
+
+
+def test_progress_for_an_unknown_code_is_indistinguishable_from_success(tmp_path, monkeypatch):
+    """A distinct 404 here would answer 'is this code real?' for anyone
+    holding a guess."""
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch)
+    response = client.post("/dashboard/api/enroll/progress",
+                           json={"code": generate_code(), "stage": "installing_openssh"})
+    assert response.status_code == 202
+
+
+def test_progress_elapsed_is_clamped(tmp_path):
+    from terminal_mcp.enrollment import EnrollmentStore, STAGE_INSTALLING_TOOLS
+    store = EnrollmentStore(tmp_path / "e.db")
+    _rec, code = store.create(node_id="clamp")
+    assert store.record_progress(code, stage=STAGE_INSTALLING_TOOLS, elapsed_seconds=10**9).progress_elapsed_seconds == 86_400
+    assert store.record_progress(code, stage=STAGE_INSTALLING_TOOLS, elapsed_seconds=-5).progress_elapsed_seconds == 0
+
+
+def test_installer_prints_staged_progress_with_elapsed_time():
+    script = render_setup_script(enrollment_code="TMCP-4KQ7M-2ZXWP-9BCDE",
+                                 controller_url="http://c.test:8766", node_id="win1", profile="minimal")
+    # Stage banner carries position, wall clock and per-stage elapsed.
+    assert 'Write-Host ("[{0}/{1}] {2}"' in script
+    assert "Get-Date -Format 'HH:mm:ss'" in script
+    assert 'tong cong {2}s' in script
+    # Every stage opened is closed.
+    assert script.count("\nStart-Stage ") + script.count("\n    Start-Stage ") == \
+           script.count("\nEnd-Stage") + script.count("\n    End-Stage")
+    # The numerator must match the number of stages actually run.
+    import re as _re
+    declared = int(_re.search(r"\$script:StageTotal = (\d+)", script).group(1))
+    actual = len(_re.findall(r"^\s*Start-Stage ", script, _re.M))
+    assert declared == actual, f"prints [n/{declared}] but runs {actual} stages"
+
+
+def test_installer_never_goes_silent_on_a_slow_stage():
+    script = render_setup_script(enrollment_code="TMCP-4KQ7M-2ZXWP-9BCDE",
+                                 controller_url="http://c.test:8766", node_id="ai", profile="ai_coding")
+    # Heartbeat at most every ~12s, and a distinct "longer than usual".
+    assert "-ge 12" in script
+    assert "Dang cho lau hon binh thuong" in script
+    assert "Van dang chay" in script
+    # Output is streamed while the job runs, not collected at the end.
+    assert "Receive-Job" in script and "while ($job.State -eq 'Running')" in script
+    # The three genuinely slow things are all tracked.
+    assert "Invoke-Tracked" in script
+    for slow in ("Add-WindowsCapability", "winget install", "npm install -g"):
+        assert slow in script
+    # Controlled timeout rather than an unbounded wait.
+    assert "-TimeoutSeconds" in script and "Stop-Job" in script
+
+
+def test_installer_reports_stages_to_the_controller_without_logging_the_code():
+    script = render_setup_script(enrollment_code="TMCP-4KQ7M-2ZXWP-9BCDE",
+                                 controller_url="http://c.test:8766", node_id="win1", profile="minimal")
+    assert "/dashboard/api/enroll/progress" in script
+    for stage in ("starting", "installing_openssh", "configuring_ssh", "registering",
+                  "installing_tools", "ready", "failed"):
+        assert f"Report-Stage '{stage}'" in script, stage
+    # Best-effort: a controller it cannot reach must never fail the install.
+    reporter = script[script.index("function Report-Stage"):]
+    reporter = reporter[:reporter.index("\n}")]
+    assert "try {" in reporter and "catch { }" in reporter
+
+
+def test_installer_holds_the_window_open_when_there_is_something_to_read():
+    script = render_setup_script(enrollment_code="TMCP-4KQ7M-2ZXWP-9BCDE",
+                                 controller_url="http://c.test:8766", node_id="win1", profile="minimal")
+    assert "function Wait-BeforeClosing" in script
+    assert "Read-Host" in script
+    # FAIL and WARN wait for the user; only the all-clear auto-closes.
+    # Slice from the summary onward: "exit 1" also appears far earlier, in
+    # the generic-code guard, so indexing from the start of the file finds
+    # the wrong one and silently yields an empty block.
+    summary = script[script.index("if ($fails.Count -gt 0) {"):]
+    fail_block = summary[:summary.index("exit 1")]
+    assert "Wait-BeforeClosing" in fail_block and "-Seconds" not in fail_block
+    warn_block = summary[summary.index("if ($warns.Count -gt 0) {"):summary.index("exit 2")]
+    assert "Wait-BeforeClosing" in warn_block and "-Seconds" not in warn_block
+    assert "Wait-BeforeClosing -Seconds 20" in script
+    assert "TONG KET" in script
+
+
+def test_wizard_shows_live_install_progress():
+    page = _nodes_page()
+    assert "anPollProgress" in page and 'id="anLive"' in page
+    assert "setInterval(anPollProgress, 3000)" in page, "poll every 3s while the Done screen is open"
+    assert "progress_label" in page and "progress_elapsed_seconds" in page
+    # Terminal states stop the poll rather than spinning forever.
+    assert "clearInterval(anProgressTimer)" in page
