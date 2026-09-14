@@ -336,3 +336,34 @@ Design points worth keeping:
   for session creation — never a second, looser policy. It is lazily
   constructed rather than a constructor argument, so no other caller (or
   test) has to know the backlog exists.
+
+---
+
+## Efficiency Measurement program — filed items (2026-09-14)
+
+Design of record: **`docs/EFFICIENCY_MEASUREMENT_CONTRACT.md`**. These are
+filed, not started. Q2 below is a **CRITICAL-impact open assumption and
+blocks the whole token-accounting slice** — per the Analysis Gate's own
+rule, nothing in the `EM-TOKEN-*` group may start until it is resolved
+with evidence.
+
+| id | P | type | title | blocked by |
+|---|---|---|---|---|
+| `EM-Q2` | P0 | research | **Can per-turn provider token usage be captured for CLI-driven workers?** No API response object exists for a Claude Code / Codex process in tmux. If no, §5 is infeasible as specified and the program falls back to turn-count + wall-clock outcomes. | — |
+| `EM-Q1` | P0 | research | Decide which host owns the measurement store. HP is a **node**; the real queue lives on the fed-controller (`100.117.214.87`). Building the instrument on HP would instrument an empty queue. | — |
+| `EM-TURN-1` | P1 | feature | Populate `trace_id`/`parent_turn_id`/`depth` on the **real dispatch path**. Columns and plumbing already exist (`audit.py` migration 3, `core.py` → `node_client.py` → `node_agent.py`); only `bridge.py` writes them today. | EM-Q1 |
+| `EM-TURN-2` | P1 | fix | Turn counting must collapse on `dispatch_idempotency_key`, never use `attempt_count` (which bumps on reconcile-and-reclaim). Ship with the regression test that proves N reclaim cycles ⇒ 1 turn. | EM-TURN-1 |
+| `EM-LEDGER-1` | P1 | feature | **Question Ledger** — `CLARIFICATION_RAISED`/`CLARIFICATION_ANSWERED` events with question, impact, resolution. Closes a real gap between `AI_ANALYSIS_GATE.md` §5 (which describes it as existing) and the code (where it does not). Worth doing on its own merits. | — |
+| `EM-GATE-1` | P1 | feature | Make `ANALYSIS_UPDATED` carry **what changed** and **the resulting gate verdict**, and append gate verdicts instead of overwriting `coordinator_decision`. Anti-gaming prerequisite. | — |
+| `EM-REENTRY-1` | P2 | feature | Typed reentry reasons (`CONTRACT_GAP`, `IMPLEMENTATION_DEFECT`, `VERIFICATION_FAILED`, `USER_CHANGED_REQUIREMENT`, `ENVIRONMENT_FAILURE`, `STALE_CONTEXT`); untyped ⇒ `UNCLASSIFIED_REENTRY`, never dropped. | — |
+| `EM-TOKEN-1` | P2 | feature | Per-turn token rows: four raw counts + cache-write TTL split + `model_id` + `price_table_version`. Cost-weighted, never `input + cache_write`. | **EM-Q2** |
+| `EM-TOKEN-2` | P2 | feature | Phase attribution (`ANALYSIS`/`IMPLEMENTATION`/`VERIFICATION`) on every token row — without it the central question cannot be computed. | **EM-Q2** |
+| `EM-PROFILE-1` | P2 | feature | Stamp task profile (FAST_FIX/STANDARD/HIGH_RISK, from existing `risk_level` + categories) and `decision_budget` (HIGH/MEDIUM/LOW) **before first dispatch**, immutable thereafter. | — |
+| `EM-CTX-1` | P3 | feature | Record `cache_read` volume and repo `HEAD` per turn, so stale-context rework is not misattributed to contract quality. | EM-TOKEN-1 |
+| `EM-CONC-1` | P3 | feature | Record lease/lock holders per turn; exclude concurrency-contaminated tasks from primary analysis and report the contamination rate. | — |
+
+**Deliberately not filed:** a before/after comparison against history. There
+is no history — `queue.db` holds 0 tasks and 0 events, and lacks the
+`analysis` column entirely. Before/after is also confounded by codebase
+drift and task-mix shift, so it could not support a causal claim even if
+the data existed (`EFFICIENCY_MEASUREMENT_CONTRACT.md` §7.2).
