@@ -246,6 +246,44 @@ cost no extra round trip, which is what this flag measures.
 Completing twice keeps the first verdict and timestamp. Use
 `reopen_task()` to clear it explicitly if delivery reopens a task.
 
+## Read-only readers: detect the vocabulary with `PRAGMA user_version`
+
+A reader that needs to know **which re-entry reasons a given database
+can hold** must not answer it by reading the CHECK set out of the DDL
+text. `sqlite_master` stores the `CREATE` statement verbatim *including
+comments*, so a comment that merely mentions a value matches a substring
+search. That is not hypothetical -- it is how the v3 migration guard in
+this very file was wrong, and it failed in the worst direction: it
+reported a constraint as already admitting a value it rejected.
+
+This store answers it by probing the constraint inside a `SAVEPOINT` and
+rolling back. **That technique does not work in a read-only reader**: on
+a connection opened `mode=ro` / `PRAGMA query_only=1`, the probe insert
+fails because writes are forbidden, not because the CHECK refused — so
+every reason would report as unavailable.
+
+Read-only readers should use `PRAGMA user_version`:
+
+| `user_version` | re-entry vocabulary |
+|---|---|
+| 1, 2 | `TEST_FAILURE`, `CONTRACT_GAP`, `IMPLEMENTATION_BUG`, `ENVIRONMENT_FAILURE`, `USER_CHANGED_REQUIREMENT`, `DELIVERY_FAILURE`, `MERGE_CONFLICT`, `OTHER` |
+| 3 | the above plus `STALE_CONTEXT` |
+
+This matters because opening the database through `WorkTelemetryStore`
+migrates it to the current version, and a read-only reader never does
+— so it can legitimately meet a file that is behind.
+
+Keep two different facts apart in any report: **the schema admits this
+reason** (`user_version`) versus **rows with this reason exist** (a
+`COUNT`). A v3 store with no `STALE_CONTEXT` rows is available-with-
+count-0, a real finding. A v2 store is UNAVAILABLE. Collapsing them puts
+a fabricated zero in the column.
+
+`work_telemetry_store.REENTRY_REASONS` is the tuple the CHECK set is
+generated from, so importing it avoids parsing anything — but it
+describes the *code's* vocabulary, not the *file's*. Pair it with
+`user_version` when the file may be behind.
+
 ## Do not use input + cache_write as a cost figure
 
 Flagged by the benchmark-harness lane and worth repeating here, because
