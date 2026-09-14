@@ -289,6 +289,11 @@ class QueueTask:
     # Orchestration V1: which user-visible deliverable this task rolls up
     # into. Nullable -- a task with no outcome behaves exactly as before.
     outcome_id: str | None = None
+    # Analysis Gate (§20.6 Phase F): the structured analysis / Feature
+    # Contract object. Empty dict = never declared, which is what every
+    # pre-Analysis-Gate row reads back as, and is NOT an error -- see
+    # analysis_gate.py's own backward-compatibility docstring.
+    analysis: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "QueueTask":
@@ -316,6 +321,7 @@ class QueueTask:
             at_risk=bool(row["at_risk"]),
             project_id=(row["project_id"] if "project_id" in row.keys() else None),
             outcome_id=(row["outcome_id"] if "outcome_id" in row.keys() else None),
+            analysis=(_parse_json_object(row["analysis"]) if "analysis" in row.keys() else {}),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -341,6 +347,7 @@ class QueueTask:
             "at_risk": self.at_risk,
             "project_id": self.project_id,
             "outcome_id": self.outcome_id,
+            "analysis": self.analysis,
         }
 
 
@@ -692,6 +699,30 @@ def _add_v8_outcomes(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_queue_tasks_outcome ON queue_tasks(outcome_id, status)")
 
 
+def _add_v9_analysis(connection: sqlite3.Connection) -> None:
+    """Analysis Gate (docs/AI_ANALYSIS_GATE.md, §20.6 Phase F): one
+    nullable JSON column holding the task's structured analysis /Feature
+    Contract object.
+
+    ONE column, not a dozen: the contract is a nested document with a
+    versioned shape (analysis_gate.GATE_VERSION), and spreading its
+    fields across real columns would mean a migration every time the
+    doc gains a question -- exactly the "phá schema" this was asked not
+    to do. It is a real column rather than another key inside `metadata`
+    so the Work/task APIs can expose and query the contract without
+    reaching into an unrelated blob; `analysis_gate.extract_analysis`
+    still falls back to `metadata.analysis`, so callers that already
+    wrote it there keep working.
+
+    Additive and nullable: every existing row reads back `analysis = {}`
+    and, carrying no task_class either, resolves to PROFILE_NONE -- so
+    no pre-existing task in a real queue changes behaviour, and nothing
+    needs backfilling."""
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(queue_tasks)")}
+    if "analysis" not in columns:
+        connection.execute("ALTER TABLE queue_tasks ADD COLUMN analysis TEXT")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
@@ -711,6 +742,9 @@ QUEUE_MIGRATIONS = [
     Migration(8, "Orchestration V1: outcomes table + queue_tasks.outcome_id (nullable, additive) -- "
                  "the user-visible deliverable one backlog item may need N tasks to reach",
               _add_v8_outcomes),
+    Migration(9, "Analysis Gate: queue_tasks.analysis (nullable JSON Feature Contract) -- additive, "
+                 "no backfill, legacy rows keep reading back as unclassified/ungated",
+              _add_v9_analysis),
 ]
 
 
@@ -982,6 +1016,34 @@ class QueueStore:
                 (project_id, iso_now(), task_id))
         return cursor.rowcount > 0
 
+    def set_task_analysis(self, task_id: str, analysis: dict[str, Any] | None,
+                          *, merge: bool = True) -> QueueTask | None:
+        """Analysis Gate (§20.6 Phase F): write/patch a task's structured
+        analysis object. Returns the updated task, or None if no such task.
+
+        `merge=True` (the default) shallow-merges into whatever is already
+        there, so the normal workflow -- answer one open question, record
+        the evidence, come back -- never requires resending the whole
+        contract and can never silently drop a field someone else just
+        added. `merge=False` replaces it outright; `analysis=None` with
+        merge=False clears it back to "never analysed"."""
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                return None
+            current = _parse_json_object(row["analysis"]) if "analysis" in row.keys() else {}
+            if merge:
+                updated: dict[str, Any] | None = {**current, **(analysis or {})}
+            else:
+                updated = dict(analysis) if analysis else None
+            connection.execute(
+                "UPDATE queue_tasks SET analysis = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(updated) if updated else None, iso_now(), task_id))
+            self._record_event_locked(connection, session=row["session"], task_id=task_id,
+                                      event_type="ANALYSIS_UPDATED", reason=None)
+            refreshed = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+        return QueueTask.from_row(refreshed)
+
     def backfill_project_ids(self, resolver: Any, *, dry_run: bool = True) -> dict[str, Any]:
         """P0.1 backfill. `resolver(session) -> project_id | None` is
         supplied by the caller, so this store never learns how a project
@@ -1077,13 +1139,17 @@ class QueueStore:
                 connection.execute(
                     "INSERT INTO queue_tasks (id, session, position, title, prompt, status, created_at, "
                     "attempt_count, max_attempts, completion_policy, metadata, updated_at, priority, depends_on, "
-                    "original_owner, project_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "original_owner, project_id, analysis) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (task_id, session, next_position + offset, task.get("title") or "", task["prompt"], QUEUED, now,
                      int(task.get("max_attempts") or 3), json.dumps(task.get("completion_policy") or {}),
                      json.dumps(task.get("metadata") or {}), now, int(task.get("priority") or 0),
                      json.dumps(list(task.get("depends_on") or [])), session,
-                     task.get("project_id")),
+                     task.get("project_id"),
+                     # Analysis Gate: NULL (not "{}") when the caller
+                     # declared nothing, so "never analysed" stays
+                     # distinguishable from "analysed as empty" in the raw row.
+                     json.dumps(task["analysis"]) if task.get("analysis") else None),
                 )
                 self._record_event_locked(connection, session=session, task_id=task_id, event_type="ENQUEUED",
                                           reason=None)

@@ -1372,8 +1372,7 @@ deferred behind explicit action-based moves first (task's own
 reorder-within-queue as ordinary button/API actions before any drag/
 drop is attempted.
 
-### 20.6 Startup Software Operating Model (Phases A–E, PLANNED, docs-
-only — no code yet, per explicit instruction)
+### 20.6 Startup Software Operating Model (Phases A–F)
 
 All phases below build on §20.0–20.5 above, never a separate system.
 Each phase gets its own real live-verification pass before being marked
@@ -1776,6 +1775,107 @@ gate + Emergency Stop; least-privilege documented, no new code needed)
   task run to a real `COMPLETED` with real verification evidence. Both
   green. Updated MCP tool-count assertions (126 -> 128). Full suite
   green (see Backlog item 25).
+
+**Phase F — Analysis discipline ("Understand First, Code Second"):**
+- **Analysis Gate**: an implementation/feature/fix task may not reach
+  `READY` until it carries a real Feature Contract — problem statement,
+  user-observable goal, source of truth, the evidence actually gathered,
+  invariants, declared assumptions, acceptance tests, and a live
+  verification plan. Missing any of these is `NEEDS_CLARIFICATION`,
+  never guessed.
+- **Assumptions block on impact, not confidence**: a HIGH/CRITICAL-impact
+  assumption with no recorded resolution blocks implementation outright.
+  An assumption with no declared impact counts as blocking — "I didn't
+  say how bad this could be" is itself an unresolved high-impact unknown.
+- **Critic review** is mandatory for state-machine, workflow, auth,
+  security, deploy, data-model, multi-agent, automation and destructive
+  work — the categories where a plausible-looking change does damage the
+  happy path never reveals.
+- **Fast Fix** has a lighter profile but never an absent one: reproduce,
+  root cause, expected behaviour, invariant, regression test, verify fix.
+- **UNKNOWN > guess**, and an agent never silently reinterprets a
+  requirement: missing/ambiguous/high-impact contract means it returns
+  ANALYSIS/NEEDS_CLARIFICATION instead of proceeding.
+
+Full rule: **`docs/AI_ANALYSIS_GATE.md`** (the versioned source of truth).
+The MCP server's own `instructions` field carries only a short bootstrap
+pointing at it — never a copy, because duplicated rules drift.
+
+#### Phase F implementation note (2026-09-14, branch `feat/analysis-gate`)
+
+**Status: VERIFIED** (2026-09-14, branch `feat/analysis-gate`).
+**NOT deployed to production** — built on an isolated clone per
+instruction; no running node agent or controller was restarted.
+
+This note was briefly written as "unit + dogfood verified" BEFORE any
+test had been run, and was corrected mid-task. That is exactly the
+defect this feature exists to prevent, so the rule it broke is now
+written down (docs/AI_ANALYSIS_GATE.md §10a) and enforced by
+`tests/test_docs_status_claims.py`.
+
+**Evidence (recorded with the claim, per §10a):**
+- **New tests: 108 passed, 2 skipped** across 4 files —
+  `test_analysis_gate.py` (65: rule, profiles, assumptions, critic,
+  policy), `test_analysis_gate_queue.py` (24: coordinator wiring,
+  backward compatibility, migration, service),
+  `test_analysis_gate_mcp_tools.py` (9: MCP surface + the agent
+  bootstrap), `test_docs_status_claims.py` (10 passed / 2 skipped: the
+  §10a guardrail; the 2 skips are the correct behaviour while a doc
+  claims UNVERIFIED, and the guardrail's own accept/reject logic is
+  proven directly).
+- **Dogfood, real runtime, `pytest -m queue_smoke`: 2 passed.**
+  `test_analysis_gate_blocks_a_real_task_then_lets_it_through_once_the_
+  contract_is_complete` — a real disposable tmux worker in a real git
+  repo, driven by the real `engine.tick()` loop with the real
+  `CoordinatorGate`: a `feature` task missing `invariants`/`evidence`
+  settled at `BLOCKED` with `dispatch_idempotency_key is None` and
+  `started_at is None` (i.e. never sent), carrying
+  `missing_fields == {"invariants", "evidence"}`; the SAME task, after
+  `set_task_analysis` completed the contract and `retry_task`, reached
+  `COORDINATOR_READY` and really dispatched.
+  `test_analysis_gate_never_blocks_a_real_legacy_task` — a task shaped
+  like every pre-existing row (no `task_class`, no `analysis`) ran
+  through the real gate to `READY`/completion.
+- **Migration backward compatibility, proven against a real pre-v9
+  database:** a row is written, `analysis` is dropped, `user_version` is
+  reset to 8, and the current code migrates it — the old row survives,
+  reads back `analysis == {}`, and still dispatches.
+- **Full regression: 2878 passed, 25 skipped, 2 failed.** Both failures
+  are PRE-EXISTING on `origin/main` @ `695b31c` and unrelated to this
+  work — confirmed by running them on a clean `origin/main` worktree:
+  `test_transports.py::test_http_real_handshake_tools_and_security`
+  already asserts a stale tool count there (`214 != 202` on main; this
+  branch makes it 216 by adding 2 tools), and
+  `test_transports.py::test_stdio_real_handshake_and_tools` already
+  fails with `FileNotFoundError`. `tests/test_server.py`'s own tool-name
+  registry WAS updated by this branch (the two new tool names) and
+  passes.
+
+- `terminal_mcp/analysis_gate.py` — pure, deterministic, no LLM, never
+  raises. Same posture and result shape as `dor_gate.py`
+  (`READY`/`NEEDS_CLARIFICATION` + machine-readable detail).
+- **One enforcement point**: check `2b` in `CoordinatorGate.review()`,
+  the PRECHECK → READY transition. A failing task becomes `BLOCKED`
+  (not `NEEDS_REWORK`, whose PRECHECK → QUEUED edge would spin the task
+  around the lane until the attempt budget killed it). The verdict is
+  machine-readable in `coordinator_decision.evidence.analysis_gate` and
+  human-readable in `reason`.
+- **No new queue status and no new transition edge.** `NEEDS_
+  CLARIFICATION` travels inside the evidence payload; the
+  CoordinatorDecision vocabulary stays at its existing four, so no
+  consumer that switches on it needs changing.
+- **Not enforced at create/assign** (unlike DoR): a task *is* the
+  request, and the analysis is produced after it exists. Requiring a
+  finished contract to file work would invert the pipeline.
+- **Schema**: migration v9 adds one nullable JSON column
+  `queue_tasks.analysis`. Additive, no backfill. Every pre-existing row
+  reads back `{}`, carries no `task_class`, and therefore resolves to
+  `profile: "none"` — ungated, exactly as before.
+- **Rollout controls**: `AnalysisGatePolicy(enforcement=
+  "advisory"|"enforce"|"off", require_classification=bool)`.
+  `require_classification=True` (unclassified → treated as full) is the
+  intended end state and a deliberate flip, never the default.
+- **Tools**: `terminal_task_check_analysis`, `terminal_task_set_analysis`.
 
 ### 20.7 New API/tools (PLANNED names, for future implementation —
 none of these exist yet)
