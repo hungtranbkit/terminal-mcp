@@ -40,6 +40,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from . import integration_worktree as iw
 from .integration_reviewer import IntegrationReviewGate
 from .integration_reviewer import BLOCKED as REVIEW_BLOCKED
 from .integration_reviewer import REWORK_REQUIRED as REVIEW_REWORK_REQUIRED
@@ -112,13 +113,28 @@ class IntegrationEngine:
     def __init__(self, store: IntegrationStore, queue_store: QueueStore, *,
                 claimed_by: str = DEFAULT_CLAIMED_BY, lease_seconds: float = DEFAULT_LEASE_SECONDS,
                 test_timeout_seconds: float = DEFAULT_TEST_TIMEOUT_SECONDS,
-                reviewer: IntegrationReviewGate | None = None) -> None:
+                reviewer: IntegrationReviewGate | None = None,
+                locks: Any = None) -> None:
         self.store = store
         self.queue_store = queue_store
         self.claimed_by = claimed_by
         self.lease_seconds = lease_seconds
         self.test_timeout_seconds = test_timeout_seconds
         self.reviewer = reviewer or IntegrationReviewGate()
+        # Injected so a test can use a temp lock database; the default is the
+        # shared one every other resource lock in this system uses.
+        self._locks = locks
+
+    def _integration_tree(self, project: str, pipeline: dict[str, Any]) -> dict[str, Any]:
+        """The worktree this project's merges happen in -- never the shared one.
+
+        Every mutating git operation in this engine goes through here. See
+        integration_worktree for why a merge needs a tree of its own and why a
+        failed one is left in place.
+        """
+        return iw.acquire(pipeline["repo_path"], project,
+                          integration_branch=pipeline["integration_branch"],
+                          owner_id=self.claimed_by, locks=self._locks)
 
     def tick(self, project: str) -> EngineResult:
         self.store.reconcile_stale_handoff_claims(project)
@@ -182,8 +198,18 @@ class IntegrationEngine:
         return self._merge(project, handoff, pipeline)
 
     def _merge(self, project: str, handoff: Handoff, pipeline: dict[str, Any]) -> EngineResult:
-        repo_path = pipeline["repo_path"]
         integration_branch = pipeline["integration_branch"]
+        tree = self._integration_tree(project, pipeline)
+        if "error" in tree:
+            # No isolated tree, no merge. Merging in the shared working tree
+            # instead is precisely the defect this path exists to prevent, so
+            # the handoff waits rather than falling back to it.
+            self.store.transition_handoff(
+                handoff.id, BLOCKED, event_type="MERGE_WORKTREE_UNAVAILABLE",
+                reason=f"{tree['error']}: {tree.get('detail') or ''}"[:500])
+            return EngineResult(project, "BLOCKED", handoff_id=handoff.id,
+                                detail=tree["error"])
+        repo_path = tree["worktree_path"]
         try:
             _run_git(["checkout", integration_branch], repo_path)
             merge_result = _run_git(
@@ -268,7 +294,16 @@ class IntegrationEngine:
     # -- targeted test ---------------------------------------------------------
 
     def _run_targeted_test(self, project: str, handoff: Handoff, pipeline: dict[str, Any]) -> EngineResult:
-        repo_path = pipeline["repo_path"]
+        # Runs in the integration worktree, not the shared one -- not only for
+        # isolation but for CORRECTNESS: the point is to test the merge result,
+        # and the shared tree is on whatever branch its owner left it on.
+        tree = self._integration_tree(project, pipeline)
+        if "error" in tree:
+            self.store.transition_handoff(
+                handoff.id, BLOCKED, event_type="TEST_WORKTREE_UNAVAILABLE",
+                reason=f"{tree['error']}: {tree.get('detail') or ''}"[:500])
+            return EngineResult(project, "BLOCKED", handoff_id=handoff.id, detail=tree["error"])
+        repo_path = tree["worktree_path"]
         command = pipeline["targeted_test_command"] or pipeline["full_regression_command"]
         if not command:
             # No test command configured at all -- fail-closed rather
@@ -308,7 +343,7 @@ class IntegrationEngine:
         # handoff bookkeeping). `git revert` (never reset/clean/force)
         # is the safe, mechanical, fully-reversible way to undo exactly
         # this one merge commit while keeping full history.
-        revert_ok = self._revert_merge(handoff, pipeline)
+        revert_ok = self._revert_merge(project, handoff, pipeline)
         if not revert_ok:
             self.store.transition_handoff(
                 handoff.id, BLOCKED, event_type="REVERT_FAILED",
@@ -330,7 +365,7 @@ class IntegrationEngine:
         )
         return EngineResult(project, "REWORK_REQUIRED", handoff_id=handoff.id, detail=f"exit {result.returncode}")
 
-    def _revert_merge(self, handoff: Handoff, pipeline: dict[str, Any]) -> bool:
+    def _revert_merge(self, project: str, handoff: Handoff, pipeline: dict[str, Any]) -> bool:
         """Reverts exactly ONE merge commit (handoff.merge_commit_sha)
         on the integration branch -- `git revert -m 1` (mainline parent
         1, the integration branch's own prior history) so the branch's
@@ -340,7 +375,12 @@ class IntegrationEngine:
         to BLOCKED rather than leaving an ambiguous state."""
         if not handoff.merge_commit_sha:
             return True  # nothing was ever merged -- nothing to revert
-        repo_path = pipeline["repo_path"]
+        tree = self._integration_tree(project, pipeline)
+        if "error" in tree:
+            # Fail-closed, same as any other revert failure: the caller
+            # blocks rather than reverting in the shared working tree.
+            return False
+        repo_path = tree["worktree_path"]
         try:
             _run_git(["checkout", pipeline["integration_branch"]], repo_path)
             result = _run_git(["revert", "--no-edit", "-m", "1", handoff.merge_commit_sha], repo_path, check=False)
@@ -415,7 +455,14 @@ class IntegrationEngine:
         return EngineResult(project, "WAITING_FOR_HANDOFF", detail=f"{len(pending)} integrated, awaiting batch threshold")
 
     def _run_full_regression(self, project: str, batch_id: str, pipeline: dict[str, Any]) -> EngineResult:
-        repo_path = pipeline["repo_path"]
+        tree = self._integration_tree(project, pipeline)
+        if "error" in tree:
+            self.store.transition_batch(
+                batch_id, REGRESSION_FAILED, event_type="REGRESSION_WORKTREE_UNAVAILABLE",
+                reason=f"{tree['error']}: {tree.get('detail') or ''}"[:500])
+            return EngineResult(project, "REGRESSION_FAILED", batch_id=batch_id,
+                                detail=tree["error"])
+        repo_path = tree["worktree_path"]
         command = pipeline["full_regression_command"]
         if not command:
             self.store.transition_batch(batch_id, REGRESSION_FAILED, event_type="REGRESSION_FAILED",
@@ -471,7 +518,18 @@ class IntegrationEngine:
             return {"error": "BATCH_NOT_FOUND"}
         if batch.status != MERGE_READY:
             return {"error": "NOT_MERGE_READY", "status": batch.status}
-        repo_path = pipeline["repo_path"]
+        # Promotion is the one step that lands on main -- and the one that
+        # used to drag the SHARED tree onto main to do it. It gets its own
+        # worktree too. If the shared tree is itself sitting on main, git
+        # refuses the second checkout and this fails closed with that reason,
+        # which is strictly better than moving somebody else's HEAD.
+        tree = iw.acquire_promote_tree(pipeline["repo_path"], project,
+                                       main_branch=pipeline["main_branch"],
+                                       owner_id=self.claimed_by, locks=self._locks)
+        if "error" in tree:
+            return {"action": "PROMOTE_FAILED", "detail": tree["error"],
+                    "reason": tree.get("detail")}
+        repo_path = tree["worktree_path"]
         _run_git(["checkout", pipeline["main_branch"]], repo_path)
         result = _run_git(["merge", "--ff-only", pipeline["integration_branch"]], repo_path, check=False)
         if result.returncode != 0:
