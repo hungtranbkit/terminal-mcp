@@ -30,7 +30,7 @@ from .node_onboarding import (OnboardingError, OnboardingService, read_controlle
                                rescue_authorized_keys_dir)
 from .node_transport import (GENERIC_SETUP_CODE, KIND_LAN, KIND_REVERSE_SSH, KIND_TAILSCALE,
                              TransportStore, probe_reverse_tunnel, probe_ssh_banner)
-from . import bootstrap_protocol, rescue_gateway
+from . import bootstrap_protocol, endpoint_policy, rescue_gateway
 from .rescue_gateway import RescuePortAllocator
 from .windows_onboarding import (SCRIPT_VERSION as SETUP_SCRIPT_VERSION,
                                  SETUP_SCRIPT_SHORT_PATH, build_quick_install_command,
@@ -14917,9 +14917,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
         endpoint = (body.get("endpoint") or "").strip()
         token = body.get("token") or ""
-        if not endpoint.startswith(("http://", "https://")) or not token:
+        if not token:
             return JSONResponse({"error": "INVALID_REQUEST", "detail": "endpoint (http(s)://host:port) and token are required"},
                                 status_code=400)
+
         if controller.node_status(node_id) is not None:
             return JSONResponse({"error": "NODE_ALREADY_EXISTS", "node_id": node_id}, status_code=409)
         host_part = re.sub(r"^https?://", "", endpoint).split("/", 1)[0].split(":", 1)[0]
@@ -14927,6 +14928,18 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             remote_connect.validate_hostname_or_ip(host_part, allow_public=_remote_connect_config().allow_public_manual_add)
         except remote_connect.ValidationError as exc:
             return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
+        # Scheme gate, on top of the host gate just above. That one asks
+        # "is this host public"; this one asks "would the bearer token
+        # travel in plaintext". They are different questions -- an https
+        # endpoint to a public host is fine, a http one is not -- and the
+        # same documented opt-in (allow_public_manual_add) governs both.
+        try:
+            endpoint_policy.validate_node_endpoint(
+                endpoint, context=f"node {node_id!r} endpoint",
+                allow_public_http=_remote_connect_config().allow_public_manual_add)
+        except endpoint_policy.EndpointPolicyError as exc:
+            return JSONResponse({"error": exc.reason, "detail": str(exc)}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
 
         def _probe() -> tuple[bool, str | None]:
             client = RemoteNodeClient(endpoint, token, timeout=8.0)
@@ -14943,7 +14956,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         connection_store.save(node_id, transport_type="agent_token", endpoint=endpoint, hostname=host_part,
                               token_file=token_file)
         controller.register_remote_node(node_id, display_name=body.get("display_name") or node_id,
-                                        hostname=host_part, endpoint=endpoint, token=token)
+                                        hostname=host_part, endpoint=endpoint, token=token,
+                                        allow_public_http=_remote_connect_config().allow_public_manual_add)
         # See node_token_env_var's own docstring -- makes the node's
         # (already-running) heartbeat loop verify successfully against
         # THIS controller the moment its next push arrives.

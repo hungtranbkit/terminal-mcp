@@ -13,6 +13,7 @@ import uvicorn
 
 from .ai_usage_service import AiUsageService
 from .config import load_config
+from . import endpoint_policy
 from .connection_store import ConnectionStore
 from .enrollment import EnrollmentStore
 from .node_onboarding import OnboardingService
@@ -373,9 +374,22 @@ def main() -> None:
             _log.warning("nodes: skipping saved connection %r -- token file missing/unreadable "
                         "(re-connect it from the Nodes page)", saved.node_id)
             continue
-        controller.register_remote_node(saved.node_id, display_name=saved.node_id,
-                                        hostname=saved.hostname or saved.node_id, endpoint=saved.endpoint,
-                                        token=token)
+        try:
+            controller.register_remote_node(
+                saved.node_id, display_name=saved.node_id,
+                hostname=saved.hostname or saved.node_id, endpoint=saved.endpoint, token=token,
+                # A node the operator added under the documented opt-in
+                # must survive a restart; re-reading the same flag here is
+                # what keeps re-hydration consistent with how it was added.
+                allow_public_http=config.nodes.remote_connect.allow_public_manual_add)
+        except endpoint_policy.EndpointPolicyError as exc:
+            # A previously-saved endpoint that today's policy refuses:
+            # skip THAT node loudly rather than refusing to start at all.
+            # Failing the whole controller would take every other node
+            # down with it, which is a worse outcome than one node being
+            # visibly absent with the reason in the log.
+            _log.error("nodes: refusing to re-register %r -- %s", saved.node_id, exc)
+            continue
         # Same env var dashboard.py's node_heartbeat route re-reads on
         # every inbound push from this node -- see its own
         # node_token_env_var docstring. Without this, the node would

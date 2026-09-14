@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import contract, host_metrics
+from . import contract, endpoint_policy, host_metrics
 from .node_client import LocalNodeClient, NodeClient, NodeClientError, RemoteNodeClient
 from .node_models import NODE_ONLINE, Node
 from .node_registry import NodeRegistry
@@ -123,7 +123,21 @@ class ControllerService:
 
     def register_remote_node(self, node_id: str, *, display_name: str, hostname: str, endpoint: str,
                              token: str, max_sessions: int | None = None,
-                             timeout: float = 10.0) -> None:
+                             timeout: float = 10.0, allow_public_http: bool = False) -> None:
+        """Raises EndpointPolicyError for an endpoint this controller must
+        not send a bearer token to.
+
+        This is the chokepoint on purpose: config, the dashboard connect
+        routes, onboarding and the startup re-hydration all arrive here,
+        and this is the line where a RemoteNodeClient -- the thing that
+        actually puts `Authorization: Bearer ...` on a wire -- is built.
+        Validating in the callers alone would leave whichever caller is
+        added next unguarded."""
+        # allow_public_http is the ONE existing, documented escape hatch:
+        # nodes.remote_connect.allow_public_manual_add. It is passed in by
+        # the callers that honour it, never defaulted on here.
+        endpoint_policy.validate_node_endpoint(endpoint, context=f"node {node_id!r} endpoint",
+                                               allow_public_http=allow_public_http)
         self.registry.register(node_id, display_name=display_name, hostname=hostname, endpoint=endpoint,
                                auth_token_ref=f"node:{node_id}", max_sessions=max_sessions)
         self._clients[node_id] = RemoteNodeClient(endpoint, token, timeout=timeout)

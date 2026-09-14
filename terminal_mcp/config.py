@@ -8,6 +8,7 @@ from pathlib import Path
 
 import yaml
 
+from . import endpoint_policy
 from .node_models import NodeHeartbeatThresholds, OverloadThresholds
 
 
@@ -1020,6 +1021,23 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             max_sessions=max_sessions,
             timeout_seconds=float(entry.get("timeout_seconds", 10.0)),
         ))
+    # Scheme/host gate, as a SECOND pass over the parsed entries.
+    #
+    # A plaintext endpoint pointed at a public host would put that node's
+    # bearer token on the wire in the clear on every request -- see
+    # endpoint_policy for the rule. It runs after the loop above rather
+    # than inside it so that every structural and cross-entry problem
+    # (missing token_env, a duplicate node_id, a bad max_sessions) still
+    # reports itself first: those are cheap and local, this one costs a
+    # DNS lookup and would otherwise pre-empt them on an entry that is
+    # invalid for a much more obvious reason.
+    for index, remote in enumerate(remote_nodes):
+        try:
+            endpoint_policy.validate_node_endpoint(
+                remote.endpoint, context=f"nodes.remote[{index}].endpoint")
+        except endpoint_policy.EndpointPolicyError as exc:
+            raise ValueError(str(exc)) from None
+
     discovery_raw = nodes_raw.get("discovery", {})
     if not isinstance(discovery_raw, dict):
         raise ValueError("nodes.discovery must be a mapping")

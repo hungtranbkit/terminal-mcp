@@ -238,7 +238,8 @@ def test_connect_ssh_bootstrap_success_registers_node_and_saves_connection(tmp_p
 
 def test_connect_ssh_bootstrap_duplicate_node_id_rejected(tmp_path, monkeypatch):
     client, controller, store = _client(tmp_path)
-    controller.register_remote_node("pi01", display_name="pi01", hostname="pi01", endpoint="http://1.2.3.4:8790", token="t")
+    controller.register_remote_node("pi01", display_name="pi01", hostname="pi01",
+                                   endpoint="http://192.168.9.9:8790", token="t")
     body = {"transport_type": "lan_ssh", "host": "192.168.1.50", "username": "pi", "node_id": "pi01",
            "controller_url": "http://10.0.0.1:8766", "credential": {"password": "x"}}
     r = client.post("/dashboard/api/nodes/connect/ssh/bootstrap", json=body)
