@@ -143,11 +143,24 @@ REENTRY_ENVIRONMENT_FAILURE = "ENVIRONMENT_FAILURE"
 REENTRY_USER_CHANGED_REQUIREMENT = "USER_CHANGED_REQUIREMENT"
 REENTRY_DELIVERY_FAILURE = "DELIVERY_FAILURE"
 REENTRY_MERGE_CONFLICT = "MERGE_CONFLICT"
+REENTRY_STALE_CONTEXT = "STALE_CONTEXT"
+"""The agent reasoned from a warm cached prefix over a repo state that
+had since moved. It looks exactly like a CONTRACT_GAP from the outside --
+rework, extra turns, a failed first pass -- but it is a cache-coherence
+failure, not a contract failure, and the difference has a DIRECTION: the
+arm carrying more up-front analysis carries a larger cached prefix and is
+therefore more exposed to staleness. Folded into CONTRACT_GAP or buried
+in OTHER, that cost is charged to analysis quality -- i.e. against the
+exact hypothesis this telemetry exists to test. It is its own value so
+the bias can be measured instead of absorbed. (Raised by the
+measurement-contract lane; §13 of docs/EFFICIENCY_MEASUREMENT_CONTRACT.md
+on branch docs/measurement-contract.)"""
 REENTRY_OTHER = "OTHER"
 
 REENTRY_REASONS = (REENTRY_TEST_FAILURE, REENTRY_CONTRACT_GAP, REENTRY_IMPLEMENTATION_BUG,
                    REENTRY_ENVIRONMENT_FAILURE, REENTRY_USER_CHANGED_REQUIREMENT,
-                   REENTRY_DELIVERY_FAILURE, REENTRY_MERGE_CONFLICT, REENTRY_OTHER)
+                   REENTRY_DELIVERY_FAILURE, REENTRY_MERGE_CONFLICT, REENTRY_STALE_CONTEXT,
+                   REENTRY_OTHER)
 
 # -- Sample kinds -------------------------------------------------------
 
@@ -183,7 +196,22 @@ CONFIDENCE_ESTIMATED = "ESTIMATED"  # approximated (e.g. token count from text l
 CONFIDENCE_UNKNOWN = "UNKNOWN"      # provenance not stated
 CONFIDENCE_ORDER = (CONFIDENCE_MEASURED, CONFIDENCE_DERIVED, CONFIDENCE_ESTIMATED, CONFIDENCE_UNKNOWN)
 
-_TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+MODEL_UNKNOWN = "UNKNOWN"
+"""The key usage with no recorded model_id is grouped under. A real
+string rather than a None key so the grouping survives JSON, and a
+loud one so nobody mistakes it for a model name."""
+
+_TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+                 "cache_write_5m_tokens", "cache_write_1h_tokens")
+"""Every field that is delta-tracked against a cumulative counter.
+
+The two TTL splits are tracked INDEPENDENTLY of `cache_write_tokens`
+rather than derived from it. Differencing is linear, so if a producer's
+snapshots satisfy total == 5m + 1h then so do the deltas -- but a
+producer that reports only the collapsed total (the common case) must
+still get correct totals, and one that reports only the splits must too.
+Independent counters give both; deriving one from the others would force
+every producer to report all three."""
 
 
 class TelemetryValidationError(ValueError):
@@ -322,6 +350,10 @@ def _create_v1_schema(connection: sqlite3.Connection) -> None:
             detail TEXT,
             evidence_source TEXT,
             confidence TEXT NOT NULL DEFAULT 'UNKNOWN',
+            -- v1's historical set. Migration 3 rebuilds this table to add
+            -- STALE_CONTEXT; this literal is deliberately NOT edited, so
+            -- that replaying the migration list from scratch reproduces
+            -- the same sequence of real schema states it did in history.
             CHECK (reason IN ('TEST_FAILURE','CONTRACT_GAP','IMPLEMENTATION_BUG','ENVIRONMENT_FAILURE',
                               'USER_CHANGED_REQUIREMENT','DELIVERY_FAILURE','MERGE_CONFLICT','OTHER')),
             CHECK (confidence IN ('MEASURED','DERIVED','ESTIMATED','UNKNOWN'))
@@ -360,10 +392,161 @@ def _create_v1_schema(connection: sqlite3.Connection) -> None:
     """)
 
 
+_REENTRY_REASON_SQL_LIST = ",".join(f"'{reason}'" for reason in REENTRY_REASONS)
+
+
+def _reentry_check_admits(connection: sqlite3.Connection, reason: str) -> bool:
+    """Does telemetry_reentries.reason's CHECK currently accept `reason`?
+
+    Answered by trying it inside a SAVEPOINT and rolling back, because
+    the only thing that reliably reports what a constraint does is the
+    constraint. Text-matching the stored DDL is what this replaced, and
+    it was wrong in the ordinary case of a comment naming the value."""
+    if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='telemetry_reentries'"
+    ).fetchone() is None:
+        return False
+    connection.execute("SAVEPOINT probe_reentry_reason")
+    try:
+        connection.execute(
+            "INSERT INTO telemetry_reentries (idempotency_key, task_id, reason, occurred_at, "
+            "recorded_at) VALUES ('__probe__','__probe__',?,'__probe__','__probe__')", (reason,))
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        connection.execute("ROLLBACK TO probe_reentry_reason")
+        connection.execute("RELEASE probe_reentry_reason")
+    return True
+
+
+def _add_v3_stale_context_reason(connection: sqlite3.Connection) -> None:
+    """Adds STALE_CONTEXT to telemetry_reentries.reason's CHECK set.
+
+    SQLite cannot ALTER a CHECK constraint, so this is the standard
+    rebuild: create the new table, copy, drop, rename. That is normally
+    routine -- here it is the single most dangerous thing in this file,
+    because DDL is not transactional (see _create_v1_schema's docstring),
+    so a crash lands mid-rebuild with `user_version` still at 2 and the
+    whole function re-running over whatever state it left. Each step is
+    therefore written to be safe on re-entry, and the ordering is chosen
+    so that no crash point can lose a row:
+
+      crash after CREATE   -> retry re-creates nothing, re-copies
+      crash after COPY     -> INSERT OR IGNORE dedupes on idempotency_key
+      crash after DROP     -> the copy guard sees no source and skips;
+                              the rename completes the job
+      crash after RENAME   -> the table is already correct; the retry
+                              rebuilds it from itself, same rows
+
+    INSERT OR IGNORE rather than a plain INSERT is what makes the re-copy
+    safe: idempotency_key is UNIQUE, so a row already carried over is
+    skipped instead of aborting the migration.
+
+    Idempotent: if the live CHECK already admits STALE_CONTEXT there is
+    nothing to do, so an already-migrated database never pays for a
+    rebuild. That question is answered by PROBING the constraint, not by
+    searching the stored CREATE text for the value -- sqlite_master keeps
+    the statement verbatim, comments included, so a substring search
+    matches a mere MENTION of the value in a comment and skips the
+    rebuild that was still needed. (That is not hypothetical: it is
+    exactly what the comment in _create_v1_schema's own CHECK did, and
+    the tests below caught it.)"""
+    if _reentry_check_admits(connection, REENTRY_STALE_CONTEXT):
+        return
+
+    connection.execute(f"""
+        CREATE TABLE IF NOT EXISTS telemetry_reentries_v3 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            task_id TEXT NOT NULL,
+            work_id TEXT,
+            reason TEXT NOT NULL,
+            phase TEXT,
+            occurred_at TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            detail TEXT,
+            evidence_source TEXT,
+            confidence TEXT NOT NULL DEFAULT 'UNKNOWN',
+            CHECK (reason IN ({_REENTRY_REASON_SQL_LIST})),
+            CHECK (confidence IN ('MEASURED','DERIVED','ESTIMATED','UNKNOWN'))
+        )
+    """)
+    if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='telemetry_reentries'"
+    ).fetchone() is not None:
+        connection.execute(
+            "INSERT OR IGNORE INTO telemetry_reentries_v3 "
+            "(id, idempotency_key, task_id, work_id, reason, phase, occurred_at, recorded_at, "
+            " detail, evidence_source, confidence) "
+            "SELECT id, idempotency_key, task_id, work_id, reason, phase, occurred_at, "
+            "       recorded_at, detail, evidence_source, confidence FROM telemetry_reentries")
+        connection.execute("DROP TABLE telemetry_reentries")
+    connection.execute("ALTER TABLE telemetry_reentries_v3 RENAME TO telemetry_reentries")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_telemetry_reentries_task ON telemetry_reentries(task_id)")
+
+
+def _add_v2_model_and_cache_ttl(connection: sqlite3.Connection) -> None:
+    """Additive, nullable, no backfill: `model_id` on usage samples, plus
+    the 5m/1h split of cache-write tokens.
+
+    WHY model_id: token counts cannot be turned into cost without it.
+    Price ratios are per-model and not close to each other -- output
+    bills 5x input, a cache read ~0.1x input (and ~0.025x on
+    `claude-fable-5-1`), a cache write 1.25x at the 5-minute TTL and 2x
+    at the one-hour TTL. A cohort whose arms used different models can
+    therefore show a token "saving" that is a cost increase, or the
+    reverse. Without this column a reader can only price by assuming a
+    model, and every figure it produces has to carry that caveat.
+    (Requested by the benchmark-harness lane, which hit exactly this.)
+
+    WHY the TTL split: `cache_write_tokens` collapses two different
+    prices into one number, so even with a known model the collapsed
+    total can only be priced to a range. `cache_write_5m_tokens` and
+    `cache_write_1h_tokens` are the producer-side
+    `usage.cache_creation.ephemeral_5m_input_tokens` /
+    `ephemeral_1h_input_tokens` breakdown. Both stay nullable: a producer
+    that only has the collapsed total keeps working exactly as before and
+    reports NULL for the split, which reads as "TTL mix unknown" rather
+    than as zero.
+
+    `cache_write_tokens` is KEPT as the total rather than replaced by the
+    two parts -- readers written against v1 keep working unchanged, which
+    is the whole backward-compatibility requirement.
+
+    The counter table gains matching baselines so cumulative snapshots of
+    the new fields are differenced like every other field instead of
+    being summed as snapshots."""
+    sample_columns = {row[1] for row in connection.execute(
+        "PRAGMA table_info(telemetry_usage_samples)")}
+    for column in ("model_id TEXT",
+                   "cache_write_5m_tokens INTEGER",
+                   "cache_write_1h_tokens INTEGER",
+                   "reported_cache_write_5m_tokens INTEGER",
+                   "reported_cache_write_1h_tokens INTEGER"):
+        if column.split()[0] not in sample_columns:
+            connection.execute(f"ALTER TABLE telemetry_usage_samples ADD COLUMN {column}")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_telemetry_samples_model "
+        "ON telemetry_usage_samples(model_id)")
+
+    counter_columns = {row[1] for row in connection.execute(
+        "PRAGMA table_info(telemetry_counters)")}
+    for column in ("last_cache_write_5m_tokens INTEGER", "last_cache_write_1h_tokens INTEGER"):
+        if column.split()[0] not in counter_columns:
+            connection.execute(f"ALTER TABLE telemetry_counters ADD COLUMN {column}")
+
+
 TELEMETRY_MIGRATIONS = [
     Migration(1, "Work Efficiency Telemetry v1: telemetry_tasks/telemetry_usage_samples/"
                  "telemetry_reentries/telemetry_contract_gaps/telemetry_counters",
               _create_v1_schema),
+    Migration(2, "model_id on usage samples (token counts cannot be priced without it) + the "
+                 "5m/1h cache-write TTL split; additive, nullable, no backfill",
+              _add_v2_model_and_cache_ttl),
+    Migration(3, "STALE_CONTEXT re-entry reason (a cache-coherence failure that is NOT a contract "
+                 "failure, and is biased toward the analysis-heavy arm) -- CHECK-set rebuild",
+              _add_v3_stale_context_reason),
 ]
 
 
@@ -534,6 +717,9 @@ class WorkTelemetryStore:
                      counter_id: str | None = None, idempotency_key: str | None = None,
                      input_tokens: int | None = None, output_tokens: int | None = None,
                      cache_read_tokens: int | None = None, cache_write_tokens: int | None = None,
+                     cache_write_5m_tokens: int | None = None,
+                     cache_write_1h_tokens: int | None = None,
+                     model_id: str | None = None,
                      turn_count: int | None = None, work_id: str | None = None,
                      session_id: str | None = None, project_id: str | None = None,
                      observed_at: str | None = None, evidence_source: str | None = None,
@@ -555,7 +741,22 @@ class WorkTelemetryStore:
         retries on restart re-sends the same key and adds nothing.
 
         Unmeasured fields must be passed as None and are stored as NULL.
-        Passing 0 asserts a real measurement of zero and is kept as 0."""
+        Passing 0 asserts a real measurement of zero and is kept as 0.
+
+        `model_id` is the exact API model string (`claude-opus-5`,
+        `claude-fable-5-1`, ...), never a date-suffixed or friendly name
+        -- a reader prices tokens by looking it up, so a value it cannot
+        match is no better than NULL. It is nullable: a producer that
+        does not know which model ran records NULL, which reads as
+        unknown rather than as a default model.
+
+        `cache_write_5m_tokens` / `cache_write_1h_tokens` are the
+        producer-side `usage.cache_creation.ephemeral_5m_input_tokens` /
+        `ephemeral_1h_input_tokens` breakdown of `cache_write_tokens`
+        (the two TTLs bill differently, so a collapsed total can only be
+        priced to a range). Report whichever you have: if both splits are
+        given and the total is omitted, the total is derived from them;
+        if all three are given they must agree."""
         _validate_choice(phase, ALL_PHASES, "phase")
         _validate_choice(kind, SAMPLE_KINDS, "kind")
         _validate_choice(confidence, CONFIDENCE_ORDER, "confidence")
@@ -564,17 +765,33 @@ class WorkTelemetryStore:
                 "kind=CUMULATIVE requires counter_id -- without the identity of the counter being "
                 "snapshotted there is no way to tell a rise from a repeat, which is precisely the "
                 "double-counting this store exists to prevent")
+        split_5m = _validate_count(cache_write_5m_tokens, "cache_write_5m_tokens")
+        split_1h = _validate_count(cache_write_1h_tokens, "cache_write_1h_tokens")
+        total_write = _validate_count(cache_write_tokens, "cache_write_tokens")
+        if split_5m is not None and split_1h is not None:
+            if total_write is None:
+                # Derived, not assumed: both parts are present, so their
+                # sum IS the total and a producer should not have to send
+                # the same number twice.
+                total_write = split_5m + split_1h
+            elif total_write != split_5m + split_1h:
+                raise TelemetryValidationError(
+                    f"cache_write_tokens={total_write} disagrees with its own TTL split "
+                    f"({split_5m} + {split_1h} = {split_5m + split_1h}). One of them is wrong and "
+                    f"this store will not pick a winner -- send the two that agree, or only the total")
         reported = {
             "input_tokens": _validate_count(input_tokens, "input_tokens"),
             "output_tokens": _validate_count(output_tokens, "output_tokens"),
             "cache_read_tokens": _validate_count(cache_read_tokens, "cache_read_tokens"),
-            "cache_write_tokens": _validate_count(cache_write_tokens, "cache_write_tokens"),
+            "cache_write_tokens": total_write,
+            "cache_write_5m_tokens": split_5m,
+            "cache_write_1h_tokens": split_1h,
         }
         reported_turn = _validate_count(turn_count, "turn_count")
         observed = observed_at or _iso_now()
         key = idempotency_key or _derive_idempotency_key({
             "task_id": task_id, "phase": phase, "kind": kind, "counter_id": counter_id,
-            "observed_at": observed, "turn_count": reported_turn, **reported,
+            "observed_at": observed, "turn_count": reported_turn, "model_id": model_id, **reported,
         })
 
         with self._connection() as connection:
@@ -600,15 +817,19 @@ class WorkTelemetryStore:
                 "INSERT INTO telemetry_usage_samples ("
                 "idempotency_key, task_id, work_id, session_id, phase, kind, counter_id, "
                 "observed_at, recorded_at, input_tokens, output_tokens, cache_read_tokens, "
-                "cache_write_tokens, turn_count, reported_input_tokens, reported_output_tokens, "
-                "reported_cache_read_tokens, reported_cache_write_tokens, reported_turn_count, "
-                "counter_reset, evidence_source, confidence, metadata) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "cache_write_tokens, cache_write_5m_tokens, cache_write_1h_tokens, model_id, "
+                "turn_count, reported_input_tokens, reported_output_tokens, "
+                "reported_cache_read_tokens, reported_cache_write_tokens, "
+                "reported_cache_write_5m_tokens, reported_cache_write_1h_tokens, "
+                "reported_turn_count, counter_reset, evidence_source, confidence, metadata) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (key, task_id, work_id, session_id, phase, kind, counter_id, observed, _iso_now(),
                  deltas["input_tokens"], deltas["output_tokens"], deltas["cache_read_tokens"],
-                 deltas["cache_write_tokens"], delta_turn,
+                 deltas["cache_write_tokens"], deltas["cache_write_5m_tokens"],
+                 deltas["cache_write_1h_tokens"], model_id, delta_turn,
                  reported["input_tokens"], reported["output_tokens"], reported["cache_read_tokens"],
-                 reported["cache_write_tokens"], reported_turn, int(counter_reset),
+                 reported["cache_write_tokens"], reported["cache_write_5m_tokens"],
+                 reported["cache_write_1h_tokens"], reported_turn, int(counter_reset),
                  evidence_source, confidence,
                  json.dumps(metadata, sort_keys=True) if metadata else None))
             sample = connection.execute(
@@ -662,25 +883,25 @@ class WorkTelemetryStore:
             else:
                 delta_turn = reported_turn - previous_turn
 
+        # Column lists are built from _TOKEN_FIELDS rather than spelled
+        # out, so a field added to that tuple cannot be silently left out
+        # of the baseline and start double-counting.
         if row is None:
+            columns = ", ".join(f"last_{field}" for field in _TOKEN_FIELDS)
+            placeholders = ", ".join("?" for _ in _TOKEN_FIELDS)
             connection.execute(
-                "INSERT INTO telemetry_counters (counter_id, last_task_id, last_input_tokens, "
-                "last_output_tokens, last_cache_read_tokens, last_cache_write_tokens, "
-                "last_turn_count, updated_at) VALUES (?,?,?,?,?,?,?,?)",
-                (counter_id, task_id, reported["input_tokens"], reported["output_tokens"],
-                 reported["cache_read_tokens"], reported["cache_write_tokens"], reported_turn,
-                 observed_at))
+                f"INSERT INTO telemetry_counters (counter_id, last_task_id, {columns}, "
+                f"last_turn_count, updated_at) VALUES (?,?,{placeholders},?,?)",
+                (counter_id, task_id, *(reported[field] for field in _TOKEN_FIELDS),
+                 reported_turn, observed_at))
         else:
+            assignments = ", ".join(
+                f"last_{field} = COALESCE(?, last_{field})" for field in _TOKEN_FIELDS)
             connection.execute(
-                "UPDATE telemetry_counters SET last_task_id = ?, "
-                "last_input_tokens = COALESCE(?, last_input_tokens), "
-                "last_output_tokens = COALESCE(?, last_output_tokens), "
-                "last_cache_read_tokens = COALESCE(?, last_cache_read_tokens), "
-                "last_cache_write_tokens = COALESCE(?, last_cache_write_tokens), "
-                "last_turn_count = COALESCE(?, last_turn_count), updated_at = ? "
-                "WHERE counter_id = ?",
-                (task_id, reported["input_tokens"], reported["output_tokens"],
-                 reported["cache_read_tokens"], reported["cache_write_tokens"], reported_turn,
+                f"UPDATE telemetry_counters SET last_task_id = ?, {assignments}, "
+                f"last_turn_count = COALESCE(?, last_turn_count), updated_at = ? "
+                f"WHERE counter_id = ?",
+                (task_id, *(reported[field] for field in _TOKEN_FIELDS), reported_turn,
                  observed_at, counter_id))
         return deltas, delta_turn, counter_reset
 
@@ -886,12 +1107,39 @@ class WorkTelemetryStore:
             rows = connection.execute(
                 "SELECT phase, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, "
                 "SUM(cache_read_tokens) AS cache_read_tokens, SUM(cache_write_tokens) AS cache_write_tokens, "
+                "SUM(cache_write_5m_tokens) AS cache_write_5m_tokens, "
+                "SUM(cache_write_1h_tokens) AS cache_write_1h_tokens, "
                 "SUM(turn_count) AS turn_count, COUNT(*) AS sample_count, "
+                "GROUP_CONCAT(DISTINCT model_id) AS model_ids, "
                 "MAX(counter_reset) AS counter_reset, "
                 "GROUP_CONCAT(DISTINCT evidence_source) AS evidence_sources, "
                 "GROUP_CONCAT(DISTINCT confidence) AS confidences "
                 "FROM telemetry_usage_samples WHERE task_id = ? GROUP BY phase", (task_id,)).fetchall()
         return {row["phase"]: dict(row) for row in rows}
+
+    def model_totals(self, task_id: str) -> dict[str, dict[str, Any]]:
+        """Per-MODEL SUM()s for one task, keyed by model_id.
+
+        This is what makes a token total priceable. One task routinely
+        spans several models (analysis on one, implementation on
+        another), and the price ratios between them are large enough that
+        pricing a mixed total against any single model is not an
+        approximation, it is a wrong answer. Samples that recorded no
+        model_id are grouped under MODEL_UNKNOWN rather than dropped or
+        silently attributed to a neighbouring model -- they are real
+        usage whose price is genuinely unknown."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT COALESCE(model_id, ?) AS model_id, "
+                "SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, "
+                "SUM(cache_read_tokens) AS cache_read_tokens, "
+                "SUM(cache_write_tokens) AS cache_write_tokens, "
+                "SUM(cache_write_5m_tokens) AS cache_write_5m_tokens, "
+                "SUM(cache_write_1h_tokens) AS cache_write_1h_tokens, "
+                "SUM(turn_count) AS turn_count, COUNT(*) AS sample_count "
+                "FROM telemetry_usage_samples WHERE task_id = ? GROUP BY COALESCE(model_id, ?)",
+                (MODEL_UNKNOWN, task_id, MODEL_UNKNOWN)).fetchall()
+        return {row["model_id"]: dict(row) for row in rows}
 
     def list_tasks(self, *, project_id: str | None = None, work_id: str | None = None,
                    terminal_status: str | None = None, since: str | None = None,

@@ -4,6 +4,13 @@
 Branch `feat/work-efficiency-telemetry`. Nothing here has been deployed
 and no real worker has written a row yet.
 
+Schema version 3 (`PRAGMA user_version`). v3 adds the `STALE_CONTEXT`
+re-entry reason, which needs a table rebuild since SQLite cannot ALTER a
+CHECK constraint; rows, ids and idempotency keys are preserved, and the
+rebuild is re-entrant at every crash point. v2 is additive and nullable:
+a v1 database keeps every row, every idempotency key still dedupes, and
+the new columns read back NULL. No backfill.
+
 ## What this is
 
 Additive, measurement-only telemetry that exists to answer ONE empirical
@@ -61,8 +68,10 @@ store.start_task(task_id, work_id=..., session_id=..., project_id=...,
 store.record_usage(task_id, phase="IMPLEMENTATION",
                    kind="CUMULATIVE", counter_id="claude:window2:pid1234",
                    idempotency_key="<your stable event id>",
+                   model_id="claude-opus-5",
                    input_tokens=..., output_tokens=...,
                    cache_read_tokens=..., cache_write_tokens=...,
+                   cache_write_5m_tokens=..., cache_write_1h_tokens=...,
                    turn_count=..., evidence_source="claude_usage_json",
                    confidence="MEASURED")
 
@@ -89,7 +98,17 @@ into `worker_*` -- doing so would inflate the very number under test.
 
 `TEST_FAILURE`, `CONTRACT_GAP`, `IMPLEMENTATION_BUG`,
 `ENVIRONMENT_FAILURE`, `USER_CHANGED_REQUIREMENT`, `DELIVERY_FAILURE`,
-`MERGE_CONFLICT`, `OTHER`.
+`MERGE_CONFLICT`, `STALE_CONTEXT`, `OTHER`.
+
+`STALE_CONTEXT` (added in v3) is the agent reasoning from a warm cached
+prefix over a repo state that has since moved. From the outside it looks
+exactly like a `CONTRACT_GAP` -- rework, extra turns, a failed first pass
+-- but it is a cache-coherence failure, and the difference has a
+**direction**: the arm carrying more up-front analysis carries a larger
+cached prefix and is more exposed to staleness. Folded into
+`CONTRACT_GAP` or buried in `OTHER`, that cost is charged to analysis
+quality, i.e. against the exact hypothesis this telemetry tests. It does
+**not** increment `contract_gap_count`.
 
 An unrecognised reason raises `TelemetryValidationError` -- it is **not**
 coerced to `OTHER`. Silently remapping would destroy the one field the
@@ -98,6 +117,36 @@ experiment reads. Use `OTHER` explicitly, or ask for an enum value.
 A `CONTRACT_GAP` re-entry increments both `reentry_count` and
 `contract_gap_count`. A gap that did not force a re-entry goes through
 `record_contract_gap` and increments only the latter.
+
+### Model attribution and cost (migration v2)
+
+**Record `model_id` whenever you know it.** Token counts cannot be
+turned into cost without it, and the ratios are not close: output bills
+5x input, a cache read ~0.1x input (~0.025x on `claude-fable-5-1`), and
+a cache write 1.25x at the 5-minute TTL against 2x at the one-hour one
+-- all per-model. A cohort whose arms used different models can show a
+token "saving" that is a cost increase.
+
+Use the exact API model string (`claude-opus-5`, `claude-sonnet-5`,
+`claude-fable-5-1`), never a date-suffixed or friendly name -- a reader
+prices by looking it up, so a value it cannot match is no better than
+NULL. The column is nullable; usage with no model groups under
+`MODEL_UNKNOWN` and stays visible rather than being dropped or
+attributed to a neighbour.
+
+One task routinely spans several models, so **price from
+`model_totals` / `tokens_by_model`, not from the scope-wide total** --
+pricing a mixed total against any single model is not an approximation,
+it is a wrong answer.
+
+`cache_write_5m_tokens` / `cache_write_1h_tokens` are the producer-side
+`usage.cache_creation.ephemeral_5m_input_tokens` /
+`ephemeral_1h_input_tokens` breakdown. They are a breakdown **of**
+`cache_write_tokens` and are never added into a total -- doing so would
+count every cache write three times. Report whichever you have: both
+splits with no total derives the total; all three must agree or the call
+is refused. A producer with only the collapsed total keeps working
+unchanged and reports the TTL mix as NULL (unknown), not zero.
 
 ## The two anti-double-counting primitives
 
@@ -145,7 +194,9 @@ service.work_summary(work_id)
 `task_summary` returns: `task_id`, `work_id`, `session_id`,
 `project_id`, `phase`, `analysis_tokens`, `contract_tokens`,
 `worker_input_tokens`, `worker_output_tokens`, `cache_read_tokens`,
-`cache_write_tokens`, `worker_turn_count`, `unattributed_tokens`,
+`cache_write_tokens`, `worker_turn_count`, `cache_write_5m_tokens`,
+`cache_write_1h_tokens`, `model_ids`, `model_totals`,
+`has_model_attribution`, `unattributed_tokens`,
 `total_tokens`, `reentry_count`, `reentry_reasons`,
 `contract_gap_count`, `first_pass_success`, `started_at`,
 `completed_at`, `duration_seconds`, `terminal_status`,
@@ -194,6 +245,21 @@ cost no extra round trip, which is what this flag measures.
 
 Completing twice keeps the first verdict and timestamp. Use
 `reopen_task()` to clear it explicitly if delivery reopens a task.
+
+## Do not use input + cache_write as a cost figure
+
+Flagged by the benchmark-harness lane and worth repeating here, because
+anything reading this store could make the same mistake: a "primary
+cost" metric of `input_tokens + cache_write_tokens` **omits output**,
+which bills 5x input. It therefore charges an up-front-analysis pipeline
+nothing for its own largest per-token cost, and it moves in the opposite
+direction to real cost -- that lane's demo shows a 4.5% "saving" on that
+metric against cost per completed task being 1.27x HIGHER on the same
+cohort.
+
+Nothing in this store defines or exposes such a metric: `total_tokens`
+and every per-phase total sum all four billing kinds, output included.
+Keep it that way.
 
 ## Cohort labelling (legacy vs new pipeline)
 

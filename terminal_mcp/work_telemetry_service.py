@@ -25,12 +25,21 @@ from __future__ import annotations
 from typing import Any
 
 from .work_telemetry_store import (
-    CONFIDENCE_UNKNOWN, FIRST_PASS_FALSE, FIRST_PASS_TRUE, FIRST_PASS_UNKNOWN,
+    CONFIDENCE_UNKNOWN, FIRST_PASS_FALSE, FIRST_PASS_TRUE, FIRST_PASS_UNKNOWN, MODEL_UNKNOWN,
     PHASE_ANALYSIS, PHASE_CONTRACT, PHASE_UNKNOWN, STATUS_COMPLETED, WORKER_PHASES,
     WorkTelemetryStore, _weakest_confidence,
 )
 
 _TOKEN_KEYS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+"""The four NON-OVERLAPPING billing kinds -- what a total is summed from.
+
+`cache_write_5m_tokens` / `cache_write_1h_tokens` are deliberately NOT
+here: they are a breakdown OF `cache_write_tokens`, so including them
+would count every cache write up to three times. They are carried
+alongside as their own fields for pricing (the two TTLs bill at
+different multiples of input) and never added into a total."""
+
+_CACHE_TTL_KEYS = ("cache_write_5m_tokens", "cache_write_1h_tokens")
 
 
 def _add(left: int | None, right: int | None) -> int | None:
@@ -105,17 +114,18 @@ class WorkTelemetryService:
         if task is None:
             return None
         totals = self.store.phase_totals(task_id)
-        worker = {key: None for key in _TOKEN_KEYS}
+        worker = {key: None for key in _TOKEN_KEYS + _CACHE_TTL_KEYS}
         worker_turns: int | None = None
         for phase in WORKER_PHASES:
             row = totals.get(phase)
             if row is None:
                 continue
-            for key in _TOKEN_KEYS:
+            for key in _TOKEN_KEYS + _CACHE_TTL_KEYS:
                 worker[key] = _add(worker[key], row.get(key))
             worker_turns = _add(worker_turns, row.get("turn_count"))
 
         all_phases = tuple(totals.keys())
+        model_totals = self.store.model_totals(task_id)
         reentries = self.store.list_reentries(task_id)
         # GROUP_CONCAT returns ONE comma-joined string per phase, not a
         # list -- splitting it is what makes `evidence_sources` a real set
@@ -140,6 +150,11 @@ class WorkTelemetryService:
             "worker_output_tokens": worker["output_tokens"],
             "cache_read_tokens": worker["cache_read_tokens"],
             "cache_write_tokens": worker["cache_write_tokens"],
+            # Nullable breakdown OF cache_write_tokens, never added to it:
+            # a 5-minute cache write and a one-hour one bill differently,
+            # so a collapsed total can only be priced to a range.
+            "cache_write_5m_tokens": worker["cache_write_5m_tokens"],
+            "cache_write_1h_tokens": worker["cache_write_1h_tokens"],
             "worker_turn_count": worker_turns,
             "unattributed_tokens": _sum_phase_tokens(totals, (PHASE_UNKNOWN,)),
             "total_tokens": _sum_phase_tokens(totals, all_phases),
@@ -165,6 +180,15 @@ class WorkTelemetryService:
             "lifecycle_confidence": task["confidence"],
             "counter_reset_observed": counter_reset,
             "sample_count": sum(int(row.get("sample_count") or 0) for row in totals.values()),
+            # Pricing inputs. `model_totals` is the one a cost model
+            # should actually read: a task routinely spans several
+            # models, and the per-token prices between them differ enough
+            # that pricing a mixed total against any single model is not
+            # an approximation but a wrong answer. Usage with no recorded
+            # model lands under MODEL_UNKNOWN and stays visible.
+            "model_ids": sorted(model_totals),
+            "model_totals": model_totals,
+            "has_model_attribution": bool(model_totals) and MODEL_UNKNOWN not in model_totals,
         }
         summary["has_token_telemetry"] = summary["total_tokens"] is not None
         summary["duration_seconds"] = _duration_seconds(task["started_at"], task["completed_at"])
@@ -213,6 +237,7 @@ class WorkTelemetryService:
         first_pass_resolved = 0
         confidences: list[str] = []
         counter_reset = False
+        by_model: dict[str, dict[str, Any]] = {}
 
         for task in tasks:
             summary = self.task_summary(task["task_id"])
@@ -232,6 +257,14 @@ class WorkTelemetryService:
                 if summary["first_pass_success"] == FIRST_PASS_TRUE:
                     first_pass_true += 1
             counter_reset = counter_reset or summary["counter_reset_observed"]
+            for model_id, model_row in summary["model_totals"].items():
+                bucket = by_model.setdefault(
+                    model_id, {key: None for key in _TOKEN_KEYS + _CACHE_TTL_KEYS
+                               + ("turn_count",)} | {"sample_count": 0, "task_count": 0})
+                for key in _TOKEN_KEYS + _CACHE_TTL_KEYS + ("turn_count",):
+                    bucket[key] = _add(bucket[key], model_row.get(key))
+                bucket["sample_count"] += int(model_row.get("sample_count") or 0)
+                bucket["task_count"] += 1
 
         def per_measured(value: int | None) -> float | None:
             if value is None or measured == 0:
@@ -264,6 +297,13 @@ class WorkTelemetryService:
             "unresolved_first_pass_tasks": completed - first_pass_resolved,
             "confidence": _weakest_confidence(*confidences) if confidences else CONFIDENCE_UNKNOWN,
             "counter_reset_observed": counter_reset,
+            # Price from this, not from the scope-wide totals: a cohort
+            # whose arms ran different models can show a token "saving"
+            # that is a cost increase, and only a per-model split can
+            # tell the two apart.
+            "tokens_by_model": by_model,
+            "model_ids": sorted(by_model),
+            "unattributed_model_tasks": by_model.get(MODEL_UNKNOWN, {}).get("task_count", 0),
         }
 
     def work_summary(self, work_id: str) -> dict[str, Any]:

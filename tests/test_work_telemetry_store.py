@@ -21,7 +21,8 @@ from terminal_mcp.schema import Migration, apply_migrations, get_schema_version
 from terminal_mcp.work_telemetry_store import (
     CONFIDENCE_ESTIMATED, CONFIDENCE_MEASURED, FIRST_PASS_FALSE, FIRST_PASS_TRUE,
     FIRST_PASS_UNKNOWN, KIND_CUMULATIVE, KIND_DELTA, PHASE_ANALYSIS, PHASE_CONTRACT,
-    PHASE_IMPLEMENTATION, REENTRY_CONTRACT_GAP, REENTRY_TEST_FAILURE, STATUS_CANCELLED,
+    MODEL_UNKNOWN, PHASE_IMPLEMENTATION, REENTRY_CONTRACT_GAP, REENTRY_STALE_CONTEXT,
+    REENTRY_TEST_FAILURE, STATUS_CANCELLED,
     STATUS_COMPLETED, STATUS_FAILED, TELEMETRY_MIGRATIONS, TelemetryValidationError,
     WorkTelemetryStore, default_telemetry_db_path,
 )
@@ -416,3 +417,271 @@ class TestCrashRetryRestart:
         store.record_usage("task-1", phase=PHASE_ANALYSIS, input_tokens=1,
                            confidence=CONFIDENCE_ESTIMATED)
         assert store.get_task("task-1")["confidence"] == CONFIDENCE_ESTIMATED
+
+
+class TestModelIdAndCacheTtl:
+    """Migration v2: the fields that make a token count priceable.
+
+    Requested by the benchmark-harness lane, which could not turn any
+    total into cost without them -- output bills 5x input, a cache read
+    ~0.1x, and a cache write 1.25x at the 5-minute TTL against 2x at the
+    one-hour one, all per-model.
+    """
+
+    def test_migrating_a_v1_database_keeps_its_rows_and_adds_the_columns(self, tmp_path):
+        """The acceptance case: an existing database with real rows in it
+        gains the new columns without losing or rewriting anything."""
+        path = tmp_path / "work_telemetry.db"
+        v1_only = [m for m in TELEMETRY_MIGRATIONS if m.version == 1]
+        with sqlite3.connect(path) as connection:
+            apply_migrations(connection, v1_only)
+            assert get_schema_version(connection) == 1
+        # A v1-era producer's rows, written as v1 SQL -- today's code
+        # cannot stand in for one, since it writes the v2 columns.
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "INSERT INTO telemetry_tasks (task_id, phase, started_at, reentry_count, "
+                "created_at, updated_at) VALUES ('task-1','ANALYSIS','2026-09-01T00:00:00+00:00',"
+                "1,'2026-09-01T00:00:00+00:00','2026-09-01T00:00:00+00:00')")
+            connection.execute(
+                "INSERT INTO telemetry_usage_samples (idempotency_key, task_id, phase, kind, "
+                "observed_at, recorded_at, input_tokens, cache_write_tokens) "
+                "VALUES ('old-1','task-1','ANALYSIS','DELTA','2026-09-01T00:00:00+00:00',"
+                "'2026-09-01T00:00:00+00:00',100,500)")
+
+        upgraded = WorkTelemetryStore(path)  # real open -> applies v2
+
+        with sqlite3.connect(path) as connection:
+            assert get_schema_version(connection) == max(m.version for m in TELEMETRY_MIGRATIONS)
+        sample = upgraded.list_samples("task-1")[0]
+        assert sample["input_tokens"] == 100
+        assert sample["cache_write_tokens"] == 500
+        # New columns exist and read back as UNKNOWN for the old row.
+        assert sample["model_id"] is None
+        assert sample["cache_write_5m_tokens"] is None
+        assert sample["cache_write_1h_tokens"] is None
+        assert upgraded.get_task("task-1")["reentry_count"] == 1
+        # And the old row's idempotency key still dedupes after the upgrade.
+        assert upgraded.record_usage("task-1", phase=PHASE_ANALYSIS, idempotency_key="old-1",
+                                     input_tokens=100)["duplicate"] is True
+
+    def test_model_id_is_stored_verbatim(self, store):
+        store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, input_tokens=10,
+                           model_id="claude-opus-5")
+        assert store.list_samples("task-1")[0]["model_id"] == "claude-opus-5"
+
+    def test_model_totals_split_a_task_that_spans_models(self, store):
+        store.record_usage("task-1", phase=PHASE_ANALYSIS, idempotency_key="a",
+                           input_tokens=300, output_tokens=40, model_id="claude-opus-5")
+        store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, idempotency_key="b",
+                           input_tokens=4000, output_tokens=900, model_id="claude-sonnet-5")
+        totals = store.model_totals("task-1")
+        assert totals["claude-opus-5"]["input_tokens"] == 300
+        assert totals["claude-sonnet-5"]["output_tokens"] == 900
+
+    def test_usage_with_no_model_is_grouped_under_unknown_not_dropped(self, store):
+        store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, idempotency_key="a",
+                           input_tokens=10, model_id="claude-opus-5")
+        store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, idempotency_key="b",
+                           input_tokens=7)
+        totals = store.model_totals("task-1")
+        assert totals[MODEL_UNKNOWN]["input_tokens"] == 7
+        assert sum(row["input_tokens"] for row in totals.values()) == 17
+
+    def test_the_ttl_split_is_stored_and_the_total_derived_from_it(self, store):
+        store.record_usage("task-1", phase=PHASE_IMPLEMENTATION,
+                           cache_write_5m_tokens=800, cache_write_1h_tokens=200)
+        sample = store.list_samples("task-1")[0]
+        assert (sample["cache_write_5m_tokens"], sample["cache_write_1h_tokens"]) == (800, 200)
+        assert sample["cache_write_tokens"] == 1000
+
+    def test_a_collapsed_total_with_no_split_still_works(self, store):
+        """Backward compatibility: a producer that only has the collapsed
+        number keeps working and reports the TTL mix as unknown."""
+        store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, cache_write_tokens=1000)
+        sample = store.list_samples("task-1")[0]
+        assert sample["cache_write_tokens"] == 1000
+        assert sample["cache_write_5m_tokens"] is None
+        assert sample["cache_write_1h_tokens"] is None
+
+    def test_a_split_that_disagrees_with_its_total_is_refused(self, store):
+        with pytest.raises(TelemetryValidationError, match="disagrees"):
+            store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, cache_write_tokens=999,
+                               cache_write_5m_tokens=800, cache_write_1h_tokens=200)
+
+    def test_a_split_that_agrees_with_its_total_is_accepted(self, store):
+        store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, cache_write_tokens=1000,
+                           cache_write_5m_tokens=800, cache_write_1h_tokens=200)
+        assert store.list_samples("task-1")[0]["cache_write_tokens"] == 1000
+
+    def test_cumulative_snapshots_of_the_ttl_split_are_differenced_too(self, store):
+        """The new columns go through the same counter machinery -- if
+        they did not, they would be the one place snapshots still summed
+        as snapshots."""
+        for index, (five_m, one_h) in enumerate(((800, 200), (1500, 500), (2000, 900)), start=1):
+            store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, kind=KIND_CUMULATIVE,
+                               counter_id="session-7", idempotency_key=f"snap-{index}",
+                               cache_write_5m_tokens=five_m, cache_write_1h_tokens=one_h)
+        totals = store.phase_totals("task-1")[PHASE_IMPLEMENTATION]
+        assert totals["cache_write_5m_tokens"] == 2000   # not 4300
+        assert totals["cache_write_1h_tokens"] == 900    # not 1600
+        counter = store.get_counter("session-7")
+        assert counter["last_cache_write_5m_tokens"] == 2000
+        assert counter["last_cache_write_1h_tokens"] == 900
+
+    def test_a_negative_split_is_refused(self, store):
+        with pytest.raises(TelemetryValidationError, match="cache_write_5m_tokens"):
+            store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, cache_write_5m_tokens=-1)
+
+
+class TestStaleContextReason:
+    """Migration v3: a CHECK-set rebuild, which is the one genuinely
+    dangerous migration in this store (DDL is not transactional, so a
+    crash re-runs the rebuild over whatever state it left behind)."""
+
+    def test_stale_context_is_accepted(self, store):
+        result = store.record_reentry("task-1", reason=REENTRY_STALE_CONTEXT,
+                                      idempotency_key="re-1", detail="cached prefix predates HEAD")
+        assert result["task"]["reentry_count"] == 1
+        assert store.list_reentries("task-1")[0]["reason"] == "STALE_CONTEXT"
+
+    def test_stale_context_does_not_count_as_a_contract_gap(self, store):
+        """The whole point of the value existing: a cache-coherence
+        failure must not be charged to contract quality, because the
+        analysis-heavy arm carries the larger cached prefix and would
+        absorb the bias."""
+        result = store.record_reentry("task-1", reason=REENTRY_STALE_CONTEXT,
+                                      idempotency_key="re-1")
+        assert result["task"]["contract_gap_count"] == 0
+        assert result["task"]["reentry_count"] == 1
+
+    def test_an_unknown_reason_is_still_refused_after_the_rebuild(self, store):
+        """The rebuilt CHECK must still be a real constraint, not a
+        table that silently accepts anything."""
+        with pytest.raises(TelemetryValidationError, match="reason"):
+            store.record_reentry("task-1", reason="STALE_VIBES", idempotency_key="re-1")
+        with sqlite3.connect(store.path) as connection:
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO telemetry_reentries (idempotency_key, task_id, reason, "
+                    "occurred_at, recorded_at) VALUES ('x','t','STALE_VIBES','now','now')")
+
+    def test_migrating_a_v2_database_keeps_its_reentry_rows(self, tmp_path):
+        path = tmp_path / "work_telemetry.db"
+        upto_v2 = [m for m in TELEMETRY_MIGRATIONS if m.version <= 2]
+        with sqlite3.connect(path) as connection:
+            apply_migrations(connection, upto_v2)
+            for index in range(3):
+                connection.execute(
+                    "INSERT INTO telemetry_reentries (idempotency_key, task_id, reason, "
+                    "occurred_at, recorded_at) VALUES (?,?,?,?,?)",
+                    (f"re-{index}", "task-1", "TEST_FAILURE", "2026-09-01T00:00:00+00:00",
+                     "2026-09-01T00:00:00+00:00"))
+
+        upgraded = WorkTelemetryStore(path)
+
+        rows = upgraded.list_reentries("task-1")
+        assert [row["idempotency_key"] for row in rows] == ["re-0", "re-1", "re-2"]
+        assert [row["id"] for row in rows] == [1, 2, 3]  # ids preserved, not renumbered
+        # The pre-existing keys still dedupe across the rebuild.
+        assert upgraded.record_reentry("task-1", reason=REENTRY_TEST_FAILURE,
+                                       idempotency_key="re-0")["duplicate"] is True
+        # And the new value now works on the upgraded database.
+        upgraded.record_reentry("task-1", reason=REENTRY_STALE_CONTEXT, idempotency_key="re-new")
+        assert len(upgraded.list_reentries("task-1")) == 4
+
+    @pytest.mark.parametrize("crash_after", ["create", "copy", "drop", "rename"])
+    def test_the_rebuild_survives_a_crash_at_every_step(self, tmp_path, crash_after):
+        """Each crash point is re-entered by the retry with user_version
+        still at 2. No row may be lost or duplicated at any of them."""
+        path = tmp_path / "work_telemetry.db"
+        upto_v2 = [m for m in TELEMETRY_MIGRATIONS if m.version <= 2]
+        with sqlite3.connect(path) as connection:
+            apply_migrations(connection, upto_v2)
+            for index in range(3):
+                connection.execute(
+                    "INSERT INTO telemetry_reentries (idempotency_key, task_id, reason, "
+                    "occurred_at, recorded_at) VALUES (?,?,?,?,?)",
+                    (f"re-{index}", "task-1", "TEST_FAILURE", "2026-09-01T00:00:00+00:00",
+                     "2026-09-01T00:00:00+00:00"))
+
+        # Reproduce the partial state a crash at this step would leave.
+        with sqlite3.connect(path) as connection:
+            statements = {
+                "create": 1, "copy": 2, "drop": 3, "rename": 4,
+            }[crash_after]
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS telemetry_reentries_v3 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    idempotency_key TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL, work_id TEXT,
+                    reason TEXT NOT NULL, phase TEXT, occurred_at TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL, detail TEXT, evidence_source TEXT,
+                    confidence TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    CHECK (reason IN ('TEST_FAILURE','CONTRACT_GAP','IMPLEMENTATION_BUG',
+                                      'ENVIRONMENT_FAILURE','USER_CHANGED_REQUIREMENT',
+                                      'DELIVERY_FAILURE','MERGE_CONFLICT','STALE_CONTEXT','OTHER'))
+                )""")
+            if statements >= 2:
+                connection.execute(
+                    "INSERT OR IGNORE INTO telemetry_reentries_v3 (id, idempotency_key, task_id, "
+                    "work_id, reason, phase, occurred_at, recorded_at, detail, evidence_source, "
+                    "confidence) SELECT id, idempotency_key, task_id, work_id, reason, phase, "
+                    "occurred_at, recorded_at, detail, evidence_source, confidence "
+                    "FROM telemetry_reentries")
+            if statements >= 3:
+                connection.execute("DROP TABLE telemetry_reentries")
+            if statements >= 4:
+                connection.execute(
+                    "ALTER TABLE telemetry_reentries_v3 RENAME TO telemetry_reentries")
+            assert get_schema_version(connection) == 2  # the crash never stamped v3
+
+        recovered = WorkTelemetryStore(path)  # the retry
+
+        rows = recovered.list_reentries("task-1")
+        assert [row["idempotency_key"] for row in rows] == ["re-0", "re-1", "re-2"], crash_after
+        recovered.record_reentry("task-1", reason=REENTRY_STALE_CONTEXT, idempotency_key="re-new")
+        assert len(recovered.list_reentries("task-1")) == 4
+        with sqlite3.connect(path) as connection:
+            assert get_schema_version(connection) == max(m.version for m in TELEMETRY_MIGRATIONS)
+            leftovers = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            assert "telemetry_reentries_v3" not in leftovers
+
+    def test_an_already_migrated_database_skips_the_rebuild(self, store):
+        """The inspection guard: re-running v3 against a table that
+        already admits STALE_CONTEXT must not rebuild it again."""
+        from terminal_mcp.work_telemetry_store import _add_v3_stale_context_reason
+        store.record_reentry("task-1", reason=REENTRY_STALE_CONTEXT, idempotency_key="re-1")
+        with sqlite3.connect(store.path) as connection:
+            before = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name='telemetry_reentries'").fetchone()[0]
+            _add_v3_stale_context_reason(connection)
+            after = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name='telemetry_reentries'").fetchone()[0]
+        assert before == after
+        assert len(store.list_reentries("task-1")) == 1
+
+    def test_the_rebuild_guard_is_not_fooled_by_a_comment(self):
+        """Regression: the guard used to text-match the stored CREATE
+        statement, which sqlite_master keeps verbatim -- comments and
+        all. A comment merely NAMING the value made the guard believe the
+        constraint already admitted it, so the rebuild was skipped and
+        every STALE_CONTEXT write failed on a fresh database."""
+        from terminal_mcp.work_telemetry_store import _reentry_check_admits
+
+        connection = sqlite3.connect(":memory:")
+        connection.execute("""
+            CREATE TABLE telemetry_reentries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                task_id TEXT NOT NULL, reason TEXT NOT NULL,
+                occurred_at TEXT NOT NULL, recorded_at TEXT NOT NULL,
+                -- a comment that mentions STALE_CONTEXT but does not admit it
+                CHECK (reason IN ('TEST_FAILURE','OTHER'))
+            )""")
+        assert "STALE_CONTEXT" in connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='telemetry_reentries'").fetchone()[0]
+        assert _reentry_check_admits(connection, "STALE_CONTEXT") is False
+        assert _reentry_check_admits(connection, "TEST_FAILURE") is True
+        # The probe leaves nothing behind.
+        assert connection.execute("SELECT COUNT(*) FROM telemetry_reentries").fetchone()[0] == 0

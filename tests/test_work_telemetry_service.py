@@ -272,3 +272,82 @@ class TestWorkSummary:
         summary = service.work_summary("outcome-never-seen")
         assert summary["task_count"] == 0
         assert summary["aggregate"]["tokens_per_completed_task"] is None
+
+
+class TestModelAttributionAndCacheTtl:
+    """What a cost model needs from a summary (migration v2)."""
+
+    def test_the_ttl_split_is_never_added_into_a_total(self, store, service):
+        """cache_write_5m/1h are a breakdown OF cache_write_tokens. If
+        they were summed as separate kinds, every cache write would be
+        counted three times."""
+        store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, input_tokens=100,
+                           cache_write_5m_tokens=800, cache_write_1h_tokens=200)
+        summary = service.task_summary("task-1")
+        assert summary["cache_write_tokens"] == 1000
+        assert summary["cache_write_5m_tokens"] == 800
+        assert summary["cache_write_1h_tokens"] == 200
+        assert summary["total_tokens"] == 1100  # 100 input + 1000 cache write, not 3100
+
+    def test_a_task_spanning_models_reports_each_one_separately(self, store, service):
+        store.record_usage("task-1", phase=PHASE_ANALYSIS, idempotency_key="a",
+                           input_tokens=300, output_tokens=40, model_id="claude-opus-5")
+        store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, idempotency_key="b",
+                           input_tokens=4000, output_tokens=900, model_id="claude-sonnet-5")
+        summary = service.task_summary("task-1")
+        assert summary["model_ids"] == ["claude-opus-5", "claude-sonnet-5"]
+        assert summary["model_totals"]["claude-opus-5"]["input_tokens"] == 300
+        assert summary["model_totals"]["claude-sonnet-5"]["output_tokens"] == 900
+        assert summary["has_model_attribution"] is True
+
+    def test_unattributed_usage_makes_the_summary_say_so(self, store, service):
+        store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, input_tokens=10)
+        summary = service.task_summary("task-1")
+        assert summary["model_ids"] == ["UNKNOWN"]
+        assert summary["has_model_attribution"] is False
+
+    def test_a_task_with_no_usage_has_no_models_and_claims_no_attribution(self, store, service):
+        store.start_task("task-1")
+        summary = service.task_summary("task-1")
+        assert summary["model_ids"] == []
+        assert summary["has_model_attribution"] is False
+
+    def test_the_aggregate_splits_tokens_by_model(self, store, service):
+        for task_id in ("task-1", "task-2"):
+            store.start_task(task_id, project_id="p")
+            store.record_usage(task_id, phase=PHASE_ANALYSIS, idempotency_key=f"{task_id}-a",
+                               input_tokens=300, model_id="claude-opus-5")
+            store.record_usage(task_id, phase=PHASE_IMPLEMENTATION, idempotency_key=f"{task_id}-i",
+                               input_tokens=4000, output_tokens=900, model_id="claude-sonnet-5")
+            store.complete_task(task_id)
+        result = service.tokens_per_completed_task(project_id="p")
+        assert result["model_ids"] == ["claude-opus-5", "claude-sonnet-5"]
+        assert result["tokens_by_model"]["claude-opus-5"]["input_tokens"] == 600
+        assert result["tokens_by_model"]["claude-sonnet-5"]["output_tokens"] == 1800
+        assert result["tokens_by_model"]["claude-sonnet-5"]["task_count"] == 2
+        assert result["unattributed_model_tasks"] == 0
+
+    def test_the_aggregate_counts_tasks_whose_model_is_unknown(self, store, service):
+        store.start_task("task-1", project_id="p")
+        store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, input_tokens=10)
+        store.complete_task("task-1")
+        result = service.tokens_per_completed_task(project_id="p")
+        assert result["unattributed_model_tasks"] == 1
+
+    def test_per_model_totals_sum_to_the_scope_total(self, store, service):
+        """A cost model prices per model and then adds up; that sum must
+        not silently disagree with the headline token total."""
+        store.start_task("task-1", project_id="p")
+        store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, idempotency_key="a",
+                           input_tokens=100, output_tokens=20, model_id="claude-opus-5")
+        store.record_usage("task-1", phase=PHASE_IMPLEMENTATION, idempotency_key="b",
+                           input_tokens=7, model_id="claude-sonnet-5")
+        store.complete_task("task-1")
+        result = service.tokens_per_completed_task(project_id="p")
+        per_model = sum(
+            value
+            for row in result["tokens_by_model"].values()
+            for key, value in row.items()
+            if key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+            and value is not None)
+        assert per_model == result["total_tokens"] == 127
