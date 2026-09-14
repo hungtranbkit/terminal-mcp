@@ -134,8 +134,17 @@ def pytest_configure(config: pytest.Config) -> None:
     tmux session ends) -- clean up periodically with the same read-only-
     diff-then-DELETE approach used to discover this, never treat it as
     a regression to chase further."""
+    # Isolation unchanged; what is added is the other half of it. This used to
+    # be a bare mkdtemp that nothing removed, so every pytest run left one more
+    # directory in /tmp forever -- the same shape of leak as the six in
+    # register_dashboard, one per run instead of six per call. See
+    # terminal_mcp/ephemeral_state.py for the measurement that found both.
+    import atexit
+    import shutil
     import tempfile
-    os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="terminal-mcp-test-state-")
+    state_home = tempfile.mkdtemp(prefix="terminal-mcp-test-state-")
+    os.environ["XDG_STATE_HOME"] = state_home
+    atexit.register(lambda: shutil.rmtree(state_home, ignore_errors=True))
     config.addinivalue_line(
         "markers",
         "closed_access: run with session_access defaults CLOSED (the production posture) -- "
