@@ -9,6 +9,7 @@ is a REAL non-zero subprocess exit."""
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -33,6 +34,16 @@ def _init_repo(path):
     _git(["commit", "-q", "-m", "initial"], path)
     _git(["branch", "integration"], path)
     return path
+
+
+def _integration_tree(repo, project="proj-a"):
+    """The integrator's OWN worktree. These assertions used to check the
+    integration branch out in the shared tree -- the very mutation this engine
+    must never make -- so they now read the tree the integrator actually
+    works in."""
+    from terminal_mcp.integration_worktree import worktree_path_for
+
+    return Path(worktree_path_for(str(repo), project))
 
 
 def _commit_on_branch(repo, branch, filename, content, *, base="main", message="feature commit"):
@@ -106,9 +117,9 @@ def test_clean_merge_and_passing_targeted_test_reaches_integrated(stores, repo):
     assert final.status == INTEGRATED
     assert final.merge_commit_sha is not None
 
-    # The file really is on the integration branch now.
-    _git(["checkout", "-q", "integration"], repo)
-    assert (repo / "a.txt").read_text() == "hello from A\n"
+    # The file really is on the integration branch now -- read from the
+    # integrator's worktree, never by moving the shared tree's HEAD.
+    assert (_integration_tree(repo) / "a.txt").read_text() == "hello from A\n"
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +168,7 @@ def test_real_merge_conflict_routes_rework_to_owning_session(stores, repo):
 
     # The integration branch itself was never left in a conflicted state
     # -- the merge was cleanly aborted.
-    _git(["checkout", "-q", "integration"], repo)
-    status = _git(["status", "--porcelain"], repo).stdout
+    status = _git(["status", "--porcelain"], _integration_tree(repo)).stdout
     assert status.strip() == ""  # clean, no leftover conflict markers
 
 
@@ -249,7 +259,6 @@ def test_restart_mid_merge_never_creates_a_duplicate_merge_commit(stores, repo, 
 
     # And the integration branch's own history has exactly ONE merge
     # commit for this branch, not two.
-    _git(["checkout", "-q", "integration"], repo)
     log = _git(["log", "--oneline", "--all"], repo).stdout
     assert log.count("integrate feature/a") == 1
 
@@ -277,13 +286,22 @@ def test_batch_regression_pass_and_promote_to_main(stores, repo):
     passed = engine.tick("proj-a")
     assert passed.action == "MERGE_READY"
 
+    # Promotion lands on main, so it needs main in a worktree of its own.
+    # Git refuses the same branch in two worktrees, so the shared tree must
+    # not be parked on main -- which is the honest consequence of never
+    # moving somebody else's HEAD. Refused first, then allowed once the
+    # shared tree steps aside.
+    refused = engine.promote_to_main("proj-a", batch_id)
+    assert refused["action"] == "PROMOTE_FAILED"
+    assert stores["integration"].get_batch(batch_id).promoted_to_main is False
+
+    _git(["checkout", "-q", "-b", "scratch"], repo)
     promotion = engine.promote_to_main("proj-a", batch_id)
-    assert promotion["action"] == "PROMOTED"
+    assert promotion["action"] == "PROMOTED", promotion
     batch = stores["integration"].get_batch(batch_id)
     assert batch.promoted_to_main is True
 
-    _git(["checkout", "-q", "main"], repo)
-    assert (repo / "a.txt").read_text() == "content\n"
+    assert _git(["show", "main:a.txt"], repo).stdout == "content\n"
 
 
 def test_batch_regression_failure_pauses_the_whole_pipeline(stores, repo):
@@ -370,10 +388,10 @@ def test_whitespace_only_conflict_auto_resolved_when_opted_in(stores, repo):
     assert "shared.txt" in handoff_b_final.artifacts["mechanical_conflict_original_paths"]
 
     # The integration branch is clean, no leftover conflict markers.
-    _git(["checkout", "-q", "integration"], repo)
-    status = _git(["status", "--porcelain"], repo).stdout
+    tree = _integration_tree(repo)
+    status = _git(["status", "--porcelain"], tree).stdout
     assert status.strip() == ""
-    assert "<<<<<<<" not in (repo / "shared.txt").read_text()
+    assert "<<<<<<<" not in (tree / "shared.txt").read_text()
 
 
 def test_real_content_conflict_still_routes_rework_even_when_opted_in(stores, repo):
@@ -407,8 +425,7 @@ def test_real_content_conflict_still_routes_rework_even_when_opted_in(stores, re
     assert handoff_b_final.conflict_detected is True
     assert "mechanical_conflict_auto_resolved" not in handoff_b_final.artifacts
 
-    _git(["checkout", "-q", "integration"], repo)
-    assert _git(["status", "--porcelain"], repo).stdout.strip() == ""
+    assert _git(["status", "--porcelain"], _integration_tree(repo)).stdout.strip() == ""
 
 
 def test_mechanical_conflict_resolution_disabled_by_default(stores, repo):
@@ -434,3 +451,49 @@ def test_mechanical_conflict_resolution_disabled_by_default(stores, repo):
     merge_result = engine.tick("proj-a")
     assert merge_result.action == "REWORK_REQUIRED"
     assert stores["integration"].get_handoff(handoff_b.id).status == REWORK_REQUIRED
+
+
+# -- the shared tree is never the integrator's workspace ---------------------------
+
+def test_a_full_engine_merge_leaves_the_shared_tree_byte_identical(stores, repo):
+    """End to end, through tick(): the defect was that _merge ran
+    `git checkout` + `git merge` in `pipeline["repo_path"]` -- the tree a
+    human or a coding session is using. Branch, HEAD and porcelain status must
+    all come back unchanged."""
+    from terminal_mcp.integration_worktree import shared_tree_state
+
+    sha, base_sha = _commit_on_branch(repo, "feature/a", "a.txt", "hello from A\n")
+    _configure(stores["integration"], repo)
+    _publish_handoff(stores["integration"], project="proj-a", task_id="iso1",
+                     origin_session="lane-a", branch="feature/a", commit_sha=sha,
+                     base_sha=base_sha, changed_paths=["a.txt"])
+    engine = _engine(stores)
+
+    before = shared_tree_state(str(repo))
+    assert engine.tick("proj-a").action == "CLAIMED"
+    assert engine.tick("proj-a").action == "MERGED"
+    assert engine.tick("proj-a").action == "INTEGRATED"
+
+    assert shared_tree_state(str(repo)) == before
+
+
+def test_a_conflicting_engine_merge_leaves_the_shared_tree_byte_identical(stores, repo):
+    """The worse half: a failed merge used to leave conflict markers in
+    somebody else's working tree."""
+    from terminal_mcp.integration_worktree import shared_tree_state
+
+    _commit_on_branch(repo, "integration", "shared.txt", "integration side\n",
+                      base="main", message="integration edits shared")
+    sha, base_sha = _commit_on_branch(repo, "feature/b", "shared.txt", "feature side\n")
+    _configure(stores["integration"], repo)
+    _publish_handoff(stores["integration"], project="proj-a", task_id="iso2",
+                     origin_session="lane-b", branch="feature/b", commit_sha=sha,
+                     base_sha=base_sha, changed_paths=["shared.txt"])
+    engine = _engine(stores)
+
+    before = shared_tree_state(str(repo))
+    engine.tick("proj-a")
+    result = engine.tick("proj-a")
+
+    assert result.action == "REWORK_REQUIRED"
+    assert shared_tree_state(str(repo)) == before
