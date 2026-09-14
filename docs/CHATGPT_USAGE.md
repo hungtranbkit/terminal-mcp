@@ -22,13 +22,39 @@ only, nothing to call yet. Never treat a PLANNED item as available.
 
 ## 1. Quick start
 
-- The production control plane is `terminal-mcp-http.service` (a
-  user-scoped systemd unit — `systemctl --user status
-  terminal-mcp-http.service`, not a system-wide one), serving the MCP
-  endpoint at `http://127.0.0.1:8766/mcp` and the dashboard at
+- The production control plane serves the MCP endpoint at
+  `http://127.0.0.1:8766/mcp` and the dashboard at
   `http://127.0.0.1:8766/dashboard` (both loopback-only; a real
   deployment fronts this with an authenticated tunnel/Cloudflare Access
-  — see `docs/REQUIREMENTS.md` §16 for exact config keys).
+  — see `docs/REQUIREMENTS.md` §16 for exact config keys). **Which unit
+  serves it depends on the host**, and getting this wrong sends you
+  debugging a process that is not running:
+    - `terminal-mcp-fed-controller.service` — the self-hosted/federated
+      layout (dell-linux today). Its code authority is a worktree pinned
+      by `PYTHONPATH=`, and its state lives under a separate
+      `XDG_STATE_HOME`, so `/version` is the only reliable way to tell
+      which commit is actually answering.
+    - `terminal-mcp-http.service` — the original layout. On a
+      fed-controller host this unit is **retired**: it is kept as a
+      rollback point but must never start, because it would race the
+      real controller for `127.0.0.1:8766` and crash-loop on
+      `EADDRINUSE`.
+  `systemctl --user list-units 'terminal-mcp*'` tells you which one is
+  live; `curl -s localhost:8766/version` proves what it is running.
+
+- **If your MCP client shows no tools at all (or a stale list missing
+  recently-added ones), the server is almost certainly fine and the
+  TUNNEL is down.** The endpoint above is loopback-only; ChatGPT reaches
+  it through `terminal-mcp-tunnel.service` (the OpenAI Secure MCP
+  Tunnel, profile `terminal-mcp`, targeting `http://127.0.0.1:8766/mcp`).
+  If that unit is dead, `tools/list` never reaches this server and the
+  client falls back to whatever it cached — which is exactly how a newly
+  added tool family appears to "not exist". Diagnose with
+  `terminal-mcp-doctor connection`: it distinguishes `mcp_local`
+  (the server itself) from `tunnel_process`/`tunnel_ready` (the path to
+  ChatGPT) and prints the exact remediation. `tunnel_ready: unknown` in
+  the first ~30s after a restart is normal — it means "no successful
+  control-plane poll yet", not a fault.
 - `config.yaml` gates most of what you can do: `permissions.
   terminal_read`/`terminal_input` (read/send at all), `session_
   lifecycle.enabled` (create/kill/reopen/rename), `supervisor.enabled`/
@@ -671,6 +697,55 @@ see REQUIREMENTS.md Backlog item 7).
   with this recovery mechanism built and tested, this remains a real,
   disruptive, outward-facing action on a live machine with real
   attended sessions.
+
+## 7b. Saving an idea ("lưu lại") — the notes/ideas store
+
+When the user says **"lưu lại"**, **"ghi chú cái này"**, **"lưu ý tưởng
+này"**, **"đưa vào kho ý tưởng"** — that is `note_create`, not a task and
+not a session operation. Full reference: [`notes.md`](notes.md).
+
+What to put where, because this is the part that decides whether the note
+is still useful in six weeks:
+
+- `original_content` — what the USER wanted kept, verbatim (the pasted
+  text, the link, their own words about why).
+- `analysis` — YOUR reading of it. Keep it separate: the note must stand
+  on its own after the source URL dies.
+- `source_url` — if there is one.
+- `tags` + `type` — real labels; call `note_facets` first if you want to
+  reuse the user's existing tag spellings rather than inventing near-
+  duplicates.
+- `project_id`/`project_name` — only if the user actually said which
+  project. Leave them empty otherwise and attach later with
+  `note_link_to_project`; a guessed project is worse than none.
+- `title` — optional; one is derived from the content if you omit it.
+
+An image the user just shared goes in the same call:
+`attachments_base64: [{"filename": "shot.png", "data_base64": "..."}]`.
+If the file is already on this host, `attachment_paths` takes absolute
+paths — but that transport is refused (`ATTACHMENT_SOURCE_DISABLED`)
+unless the operator configured `notes.attachment_source_roots`, so fall
+back to base64 rather than reporting failure to the user. A failed
+attachment never loses the note: check `attachment_results` in the
+response and tell the user which image did not make it.
+
+Confirm back with the note id and title, and mention the page
+(`/dashboard/notes`) where they can see it.
+
+Recall — **"trước đây tôi có lưu gì về X không?"** — is `note_search`.
+It is local and deterministic (SQLite FTS5 bm25, diacritics-insensitive:
+`y tuong` finds `ý tưởng`). Order results by `rank_position` (1 = best),
+not by `score`, and summarise from the `excerpt` + metadata each hit
+carries. Use `note_list` when the user is browsing by filter rather than
+searching by words.
+
+When an idea actually gets used, `note_mark_applied` with an
+`applied_ref` (commit / PR / task id) — that is what keeps the kho from
+turning into an undifferentiated pile.
+
+Deleting is soft by default and reversible with `note_restore`. Only pass
+`hard=true` on an explicit "xóa hẳn": it unlinks the image files and
+cannot be undone.
 
 ## 8. What NOT to do (anti-patterns, repeated for emphasis)
 
