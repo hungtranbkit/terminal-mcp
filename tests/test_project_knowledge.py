@@ -284,3 +284,157 @@ def test_an_unreadable_working_tree_is_medium_not_high(repo, monkeypatch):
     module = next(m for m in knowledge.module_states() if m.name == "alpha")
     assert module.confidence == pk.MEDIUM
     assert "could not be read" in module.confidence_reason
+
+
+# -- incremental re-verification ---------------------------------------------
+#
+# The map ages whether or not anybody re-reads it, and MEDIUM is what sends a
+# worker off to re-derive a module that did not change. `rebuild` is the cheap
+# half of that problem: what git can prove, it advances; what only a reader
+# can judge, it refuses to touch and names instead.
+
+def test_rebuild_advances_a_module_whose_paths_never_moved(repo):
+    knowledge = pk.ProjectKnowledge(repo)
+    knowledge.record_module("alpha", paths=["alpha.py"], summary="alpha module")
+    (repo / "beta.py").write_text("beta = 2\n")
+    _git(repo, "commit", "-aqm", "touch beta only")
+    # Verified against an ancestor now, which is what makes a worker re-read it.
+    assert knowledge.module_state("alpha").confidence == pk.MEDIUM
+
+    report = knowledge.rebuild()
+
+    assert report["advanced"] == ["alpha"]
+    assert knowledge.module_state("alpha").confidence == pk.HIGH
+    assert knowledge.module_state("alpha").last_verified_commit == knowledge.head()
+
+
+def test_an_advanced_module_says_it_was_advanced_rather_than_re_read(repo):
+    knowledge = pk.ProjectKnowledge(repo)
+    knowledge.record_module("alpha", paths=["alpha.py"])
+    (repo / "beta.py").write_text("beta = 3\n")
+    _git(repo, "commit", "-aqm", "beta")
+    knowledge.rebuild()
+    reason = knowledge.module_state("alpha").confidence_reason
+    # "A reader checked this" and "git proved nothing moved" are different
+    # claims, and the weaker one must not wear the stronger one's name.
+    assert "re-reading" in reason
+    assert knowledge.module_state("alpha").last_refreshed_at
+
+
+def test_rebuild_never_advances_a_module_whose_paths_changed(repo):
+    knowledge = pk.ProjectKnowledge(repo)
+    before = knowledge.record_module("alpha", paths=["alpha.py"]).last_verified_commit
+    (repo / "alpha.py").write_text("alpha = 9\n")
+    _git(repo, "commit", "-aqm", "touch alpha")
+
+    report = knowledge.rebuild()
+
+    assert report["advanced"] == []
+    review = next(r for r in report["needs_review"] if r["module"] == "alpha")
+    assert "alpha.py" in review["paths"]
+    assert knowledge.module_state("alpha").last_verified_commit == before
+    assert knowledge.module_state("alpha").confidence == pk.LOW
+
+
+def test_rebuild_re_verifies_but_never_rewrites_what_only_a_reader_can_judge(repo):
+    knowledge = pk.ProjectKnowledge(repo)
+    knowledge.record_module("alpha", paths=["alpha.py"], summary="serialises rows to CSV")
+    (repo / "beta.py").write_text("beta = 4\n")
+    _git(repo, "commit", "-aqm", "beta")
+    knowledge.rebuild()
+    # A machine that rewrote the prose would be inventing the one thing this
+    # map is not allowed to invent.
+    assert knowledge.module_state("alpha").summary == "serialises rows to CSV"
+    assert knowledge.module_state("alpha").last_verified_at == \
+        knowledge.load_state()["modules"]["alpha"]["last_verified_at"]
+
+
+def test_an_uncommitted_edit_blocks_an_advance(repo):
+    knowledge = pk.ProjectKnowledge(repo)
+    knowledge.record_module("alpha", paths=["alpha.py"])
+    (repo / "beta.py").write_text("beta = 5\n")
+    _git(repo, "commit", "-aqm", "beta")
+    (repo / "alpha.py").write_text("alpha = 99\n")      # on disk, not committed
+
+    report = knowledge.rebuild()
+
+    assert report["advanced"] == []
+    assert "uncommitted" in next(r for r in report["needs_review"]
+                                 if r["module"] == "alpha")["why"]
+
+
+def test_rebuild_names_a_path_that_no_longer_exists_instead_of_stamping_head(repo):
+    knowledge = pk.ProjectKnowledge(repo)
+    knowledge.record_module("alpha", paths=["alpha.py", "gone.py"])
+    report = knowledge.rebuild()
+    assert {m["path"] for m in report["missing_paths"]} == {"gone.py"}
+    assert report["advanced"] == []
+
+
+def test_the_map_is_only_indexed_at_head_when_every_module_is(repo):
+    knowledge = pk.ProjectKnowledge(repo)
+    knowledge.record_module("alpha", paths=["alpha.py"])
+    knowledge.record_module("beta", paths=["beta.py"])
+    (repo / "alpha.py").write_text("alpha = 7\n")
+    _git(repo, "commit", "-aqm", "touch alpha")
+
+    stale = knowledge.rebuild()
+    assert stale["indexed_advanced"] is False       # alpha still needs a reader
+
+    knowledge.record_module("alpha", paths=["alpha.py"])   # a reader re-verified it
+    clean = knowledge.rebuild()
+    assert clean["indexed_advanced"] is True
+    assert clean["last_indexed_commit"] == knowledge.head()
+
+
+def test_rebuilding_named_modules_leaves_the_rest_alone(repo):
+    knowledge = pk.ProjectKnowledge(repo)
+    knowledge.record_module("alpha", paths=["alpha.py"])
+    knowledge.record_module("beta", paths=["beta.py"])
+    (repo / "gamma.md").write_text("notes\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "unrelated")
+
+    report = knowledge.rebuild(modules=["alpha", "nosuch"])
+
+    assert report["advanced"] == ["alpha"]
+    assert report["unknown"] == ["nosuch"]
+    assert knowledge.module_state("beta").confidence == pk.MEDIUM   # untouched
+
+
+def test_rebuild_outside_a_repository_reports_why_rather_than_raising(tmp_path):
+    knowledge = pk.ProjectKnowledge(tmp_path / "nowhere")
+    report = knowledge.rebuild()
+    # This runs on the planning path: a refresh that failed must not take a
+    # plan down with it.
+    assert report["ok"] is False and report["head"] is None
+    assert "HEAD" in report["why"]
+
+
+def test_rebuild_of_an_empty_map_says_there_is_nothing_to_verify(repo):
+    report = pk.ProjectKnowledge(repo).rebuild()
+    assert report["checked"] == 0 and "no modules" in report["why"]
+
+
+# -- loading only what was asked for -----------------------------------------
+
+def test_loading_named_modules_never_lists_the_whole_map(repo, monkeypatch):
+    knowledge = pk.ProjectKnowledge(repo)
+    knowledge.record_module("alpha", paths=["alpha.py"], summary="alpha")
+    knowledge.record_module("beta", paths=["beta.py"], summary="beta")
+
+    def _refuse():
+        raise AssertionError("the whole map was listed to answer about one module")
+
+    monkeypatch.setattr(knowledge, "module_states", _refuse)
+    found, unknown = knowledge.load_modules(["alpha", "alpha", "nosuch"])
+
+    assert [m.name for m in found] == ["alpha"]
+    assert found[0].confidence == pk.HIGH
+    # "We loaded nothing" and "that module is not in the map" send a worker in
+    # opposite directions.
+    assert unknown == ["nosuch"]
+
+
+def test_asking_for_a_module_the_map_does_not_have_returns_nothing_not_an_error(repo):
+    assert pk.ProjectKnowledge(repo).module_state("nosuch") is None

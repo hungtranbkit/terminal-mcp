@@ -190,6 +190,12 @@ class ModuleState:
     paths: tuple[str, ...] = ()
     last_verified_commit: str | None = None
     last_verified_at: str | None = None
+    # When `rebuild` last advanced this entry's commit without anybody
+    # re-reading it. Kept separate from `last_verified_at` on purpose: "a
+    # reader checked this prose" and "git proved nothing under it moved" are
+    # different claims, and collapsing them would let the weaker one wear the
+    # stronger one's name.
+    last_refreshed_at: str | None = None
     summary: str = ""
     confidence: str = LOW
     # Why the confidence is what it is. A bare label tells a worker what to
@@ -200,6 +206,7 @@ class ModuleState:
         return {"name": self.name, "paths": list(self.paths),
                 "last_verified_commit": self.last_verified_commit,
                 "last_verified_at": self.last_verified_at,
+                "last_refreshed_at": self.last_refreshed_at,
                 "summary": self.summary, "confidence": self.confidence,
                 "confidence_reason": self.confidence_reason}
 
@@ -336,6 +343,15 @@ class ProjectKnowledge:
 
     # -- freshness ---------------------------------------------------------
 
+    @staticmethod
+    def _module_from_raw(name: str, raw: dict[str, Any]) -> ModuleState:
+        return ModuleState(
+            name=name, paths=tuple(raw.get("paths") or ()),
+            last_verified_commit=raw.get("last_verified_commit"),
+            last_verified_at=raw.get("last_verified_at"),
+            last_refreshed_at=raw.get("last_refreshed_at"),
+            summary=raw.get("summary") or "")
+
     def module_states(self, *, now: str | None = None) -> list[ModuleState]:
         """Every module with its CURRENT confidence, recomputed from git.
 
@@ -350,14 +366,56 @@ class ProjectKnowledge:
         dirty = self.uncommitted_paths()
         modules: list[ModuleState] = []
         for name, raw in sorted((state.get("modules") or {}).items()):
-            module = ModuleState(
-                name=name, paths=tuple(raw.get("paths") or ()),
-                last_verified_commit=raw.get("last_verified_commit"),
-                last_verified_at=raw.get("last_verified_at"),
-                summary=raw.get("summary") or "")
+            module = self._module_from_raw(name, raw)
             module.confidence = self._confidence(module, head, dirty)
             modules.append(module)
         return modules
+
+    def module_state(self, name: str) -> ModuleState | None:
+        """ONE module, without paying for the rest of the map.
+
+        `module_states` runs a `git diff` per module, so answering "what do we
+        know about the two modules this task names" by listing every module in
+        the project costs a diff for each one nobody asked about. A task that
+        names two modules should pay for two.
+        """
+        raw = (self.load_state().get("modules") or {}).get(name)
+        if raw is None:
+            return None
+        module = self._module_from_raw(name, raw)
+        module.confidence = self._confidence(module, self.head())
+        return module
+
+    def load_modules(self, names: Sequence[str]) -> tuple[list[ModuleState], list[str]]:
+        """Exactly the modules asked for, plus the names the map does not have.
+
+        The second half of the pair is the point. "We loaded nothing" and
+        "this module is not in the map" send a worker in opposite directions,
+        and a loader that returned only what it found would make them look
+        identical.
+        """
+        state = self.load_state()
+        recorded = state.get("modules") or {}
+        head = self.head()
+        # One `git status` shared across the requested modules -- the per-module
+        # `git diff` is unavoidable, this is not.
+        dirty = self.uncommitted_paths()
+        found: list[ModuleState] = []
+        unknown: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            name = str(name)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            raw = recorded.get(name)
+            if raw is None:
+                unknown.append(name)
+                continue
+            module = self._module_from_raw(name, raw)
+            module.confidence = self._confidence(module, head, dirty)
+            found.append(module)
+        return found, unknown
 
     def _confidence(self, module: ModuleState, head: str | None,
                     dirty: Sequence[str] | None = _UNSET) -> str:
@@ -387,6 +445,10 @@ class ProjectKnowledge:
                 # Not LOW: the edit may be exactly what was just indexed. Not
                 # HIGH either: we cannot tell. That is what MEDIUM is for.
                 return MEDIUM, f"verified at HEAD, but {working_tree} has uncommitted changes"
+            if module.last_refreshed_at:
+                return HIGH, ("no commit has touched its paths since it was written, "
+                              "so its verified commit was advanced to HEAD without "
+                              "anybody re-reading it")
             return HIGH, "verified against the current HEAD, working tree clean"
 
         changed = self.changed_paths(module.last_verified_commit)
@@ -562,6 +624,120 @@ class ProjectKnowledge:
                              last_verified_at=stamp, summary=summary)
         module.confidence = self._confidence(module, self.head())
         return module
+
+    def rebuild(self, *, modules: Sequence[str] | None = None,
+                owner: str = "worker") -> dict[str, Any]:
+        """Re-verify the map against the current commit, incrementally.
+
+        A rebuild here is a RE-VERIFICATION, never a re-derivation. Nothing
+        rewrites a summary: only a reader can say whether prose is still true,
+        and a machine that rewrote it would be inventing the one thing this
+        map is not allowed to invent.
+
+        What GIT can prove, this advances for free. A module whose paths no
+        commit has touched between its verified commit and HEAD is exactly as
+        true now as when it was written -- but today it reports MEDIUM
+        ("verified against an ancestor"), and MEDIUM is what sends a worker
+        off to re-read code that did not change. Advancing its verified commit
+        removes that cost without claiming anything git did not establish.
+
+        A module whose paths DID move is never advanced. It is named, with the
+        path that moved, because that is the only thing a re-index has to
+        look at -- which is the whole reason to do this incrementally instead
+        of re-indexing a project because one file changed.
+
+        Degrades rather than raises: a repository with no HEAD, or a map with
+        no modules, is reported as such. This runs on the planning path, and a
+        refresh that failed must not take a plan down with it.
+        """
+        head = self.head()
+        report: dict[str, Any] = {
+            "ok": bool(head), "head": head, "checked": 0, "advanced": [],
+            "already_at_head": [], "needs_review": [], "missing_paths": [],
+            "indexed_advanced": False}
+        if not head:
+            report["why"] = ("no HEAD to verify against -- not a git repository, or "
+                             "nothing committed yet")
+            return report
+        # Read once, outside the lock: the working tree outranks the commit
+        # graph, so an edited file blocks an advance however clean history is.
+        dirty = self.uncommitted_paths()
+        stamp = datetime.now(timezone.utc).isoformat()
+
+        def review(name: str, why: str, paths: Sequence[str] = ()) -> None:
+            report["needs_review"].append(
+                {"module": name, "why": why, "paths": list(paths)})
+
+        with self.lock(owner=owner):
+            state = self.load_state()
+            recorded = state.get("modules") or {}
+            wanted = [n for n in (list(modules) if modules is not None
+                                  else sorted(recorded)) if n in recorded]
+            if modules is not None:
+                report["unknown"] = [n for n in modules if n not in recorded]
+            changed_any = False
+            for name in wanted:
+                raw = recorded[name]
+                module = self._module_from_raw(name, raw)
+                report["checked"] += 1
+
+                gone = [p for p in module.paths if not (self.root / str(p)).exists()]
+                if gone:
+                    # A path that no longer exists is a claim that has already
+                    # failed. Advancing it would stamp HEAD on a lie.
+                    report["missing_paths"].extend(
+                        {"module": name, "path": p} for p in gone)
+                    review(name, "names a path that no longer exists", gone)
+                    continue
+
+                touched_dirty = ([p for p in dirty if self._touches(p, module.paths)]
+                                 if dirty is not None else None)
+                if touched_dirty is None:
+                    review(name, "the working tree could not be read, so freshness "
+                                 "cannot be established")
+                    continue
+                if touched_dirty:
+                    review(name, "uncommitted edits under its paths", touched_dirty[:4])
+                    continue
+
+                if module.last_verified_commit == head:
+                    report["already_at_head"].append(name)
+                    continue
+
+                if not module.last_verified_commit:
+                    review(name, "never verified against a commit")
+                    continue
+
+                changed = self.changed_paths(module.last_verified_commit)
+                if changed is None:
+                    review(name, "cannot compare against the commit it was verified at")
+                    continue
+                committed = [p for p in changed if self._touches(p, module.paths)]
+                if committed:
+                    review(name, "its paths changed since it was verified", committed[:4])
+                    continue
+
+                # Nothing moved under it, in history or on disk. Advance.
+                raw["last_verified_commit"] = head
+                raw["last_refreshed_at"] = stamp
+                report["advanced"].append(name)
+                changed_any = True
+
+            # The map as a whole is only "indexed at HEAD" when every module
+            # is. Claiming it while one still needs review would hide the one
+            # thing this report exists to surface.
+            if (wanted and not report["needs_review"]
+                    and modules is None and state.get("last_indexed_commit") != head):
+                state["last_indexed_commit"] = head
+                state["last_indexed_at"] = stamp
+                report["indexed_advanced"] = True
+                changed_any = True
+            if changed_any:
+                self.save_state(state)
+            report["last_indexed_commit"] = state.get("last_indexed_commit")
+        if not wanted:
+            report["why"] = "no modules recorded in this map yet"
+        return report
 
     def mark_indexed(self, *, commit: str | None = None, owner: str = "worker") -> dict[str, Any]:
         commit = commit or self.head()
