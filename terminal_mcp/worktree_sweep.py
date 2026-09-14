@@ -121,9 +121,12 @@ class WorktreeSweep:
                  orphan_min_age_seconds: float = DEFAULT_ORPHAN_MIN_AGE_SECONDS,
                  max_candidates_per_run: int = 50,
                  budget_seconds: float = DEFAULT_BUDGET_SECONDS,
-                 dry_run: bool = True) -> None:
+                 dry_run: bool = True, session_registry: Any = None) -> None:
         self.executor = executor
         self.store = store
+        # Per-host, passed in: a controller must never answer session liveness
+        # about another node's filesystem.
+        self.session_registry = session_registry
         self.repo_roots = tuple(repo_roots)
         self.interval_seconds = max(5.0, float(interval_seconds))
         self.orphan_confirm_runs = max(1, int(orphan_confirm_runs))
@@ -204,12 +207,18 @@ class WorktreeSweep:
         # then thrown away. It also matters for correctness on a node answering
         # about its own filesystem -- its probes must win, not merely be kept.
         probes = dict(probe_overrides)
-        if "process_cwds" not in probes:
-            probes["process_cwds"] = wj.collect_process_cwds()
-        if "tmux_paths" not in probes:
-            probes["tmux_paths"] = wj.collect_tmux_paths()
-        if "service_roots" not in probes:
-            probes["service_roots"] = wj.collect_service_roots()
+        if not probes:
+            # The shared collector, so the sweep cannot drift from the node-side
+            # callers -- and so session_paths is actually populated. Leaving it
+            # out (as this did originally) meant one permanently-UNKNOWN
+            # predicate and therefore nothing ever actionable in production.
+            probes = wj.collect_local_probes(self.session_registry)
+        else:
+            for key, collector in (("process_cwds", wj.collect_process_cwds),
+                                   ("tmux_paths", wj.collect_tmux_paths),
+                                   ("service_roots", wj.collect_service_roots)):
+                if key not in probes:
+                    probes[key] = collector()
         try:
             self._converge_stale_records(report, deadline, probes)
             self._sweep_repos(report, now, deadline, probes)

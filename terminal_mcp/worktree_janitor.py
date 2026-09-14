@@ -28,6 +28,7 @@ its output.
 from __future__ import annotations
 
 import fnmatch
+import logging
 import os
 import re
 import subprocess
@@ -497,6 +498,48 @@ def collect_service_roots() -> list[str] | None:
                 if value and value != "/":
                     roots.append(value)
     return roots
+
+
+def collect_local_probes(session_registry: Any = None) -> dict[str, Any]:
+    """All four liveness probes for THIS host, in one call.
+
+    Exists because three separate callers -- the sweep, the node-agent handler
+    and LocalNodeClient -- each need the same set, and each of them originally
+    forgot some or all of them. The consequence was not a crash: `classify`
+    fail-closed on the missing probe, returned UNKNOWN, and the caller was
+    silently inert in production while its tests passed by injecting probes the
+    real caller never supplied. One function means one place to forget.
+
+    A probe that cannot look returns None, which classifies UNKNOWN -- that is
+    the point, and callers must not paper over it with an empty list.
+
+    `session_paths` comes from the session registry, which is per-host: a
+    controller must never answer this about another node's filesystem, which is
+    why the registry is passed in rather than opened here."""
+    probes: dict[str, Any] = {
+        "process_cwds": collect_process_cwds(),
+        "tmux_paths": collect_tmux_paths(),
+        "service_roots": collect_service_roots(),
+        "session_paths": None,
+    }
+    if session_registry is not None:
+        try:
+            records = session_registry.list()
+            paths: list[str] = []
+            for record in records:
+                # A DELETED session no longer holds anything; every other status
+                # (ACTIVE/MISSING/OFFLINE/KILLED) might still be resumed into
+                # its own directory, so its cwd still counts as in use.
+                if getattr(record, "status", None) == "DELETED":
+                    continue
+                for value in (getattr(record, "cwd", None), getattr(record, "repo_root", None)):
+                    if value:
+                        paths.append(value)
+            probes["session_paths"] = paths
+        except Exception:  # noqa: BLE001 -- unreadable registry => UNKNOWN, never []
+            _LOGGER.warning("could not read the session registry for worktree probes",
+                            exc_info=True)
+    return probes
 
 
 def classify_ignored_entries(entries: list[str], policy: JanitorPolicy) -> tuple[list[str], list[str]]:

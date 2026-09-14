@@ -73,6 +73,11 @@ class NodeClient(Protocol):
     def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]: ...
     def repo_evidence(self, cwd: str) -> dict[str, Any]: ...
     def repo_op(self, op: str, path: str, params: dict[str, Any]) -> dict[str, Any]: ...
+    def worktree_candidates(self, repo_path: str) -> dict[str, Any]: ...
+    def worktree_cleanup(self, worktree_path: str, *, repo_path: str | None = None,
+                         expected_head: str | None = None, expected_branch: str | None = None,
+                         task: dict[str, Any] | None = None,
+                         dry_run: bool = True) -> dict[str, Any]: ...
     def describe_permissions(self, session: str) -> dict[str, Any]: ...
     def set_permissions(self, session: str, *, read: bool | None, input: bool | None,
                         expected_revision: int | None, actor: str | None) -> dict[str, Any]: ...
@@ -220,6 +225,59 @@ class LocalNodeClient:
         config = self._terminal.config
         policy = config.repo_read.to_policy(config.session_lifecycle.allowed_cwd_roots)
         return repo_read.run_operation(op, path, params or {}, policy)
+
+    def worktree_candidates(self, repo_path: str) -> dict[str, Any]:
+        """Classify this host's worktrees (controller == node here).
+
+        Goes through the SAME worktree_janitor.scan the remote node's HTTP
+        handler calls, with the policy built from this process's own config --
+        so local and remote are decided by identical code under identical
+        rules, and any difference between them would be a transport bug rather
+        than a policy one."""
+        from . import worktree_janitor
+
+        config = self._terminal.config.worktree_janitor
+        result = worktree_janitor.scan(repo_path, config.to_policy())
+        result["node_id"] = "local"
+        return result
+
+    def worktree_cleanup(self, worktree_path: str, *, repo_path: str | None = None,
+                         expected_head: str | None = None, expected_branch: str | None = None,
+                         task: dict[str, Any] | None = None,
+                         dry_run: bool = True) -> dict[str, Any]:
+        """Remove one worktree on this host. Same executor, same identity
+        pre-check and same force=False guarantee the remote handler applies."""
+        from . import git_worktree
+        from .lease import ResourceLockStore
+        from .worktree_executor import WorktreeExecutor
+
+        config = self._terminal.config.worktree_janitor
+        if expected_head or expected_branch:
+            observed = git_worktree.worktree_status(repo_path or worktree_path, worktree_path)
+            if not observed.get("exists"):
+                return {"outcome": "SKIPPED", "error": "WORKTREE_ABSENT",
+                        "worktree_path": worktree_path, "node_id": "local"}
+            if expected_head and observed.get("head_sha") != expected_head:
+                return {"outcome": "ABORTED", "error": "IDENTITY_MISMATCH",
+                        "worktree_path": worktree_path, "node_id": "local",
+                        "expected_head": expected_head, "observed_head": observed.get("head_sha")}
+            if expected_branch and observed.get("branch") != expected_branch:
+                return {"outcome": "ABORTED", "error": "IDENTITY_MISMATCH",
+                        "worktree_path": worktree_path, "node_id": "local",
+                        "expected_branch": expected_branch,
+                        "observed_branch": observed.get("branch")}
+        executor = WorktreeExecutor(
+            config.to_policy(), audit=getattr(self._terminal, "audit", None),
+            locks=ResourceLockStore(self._terminal.leases.path), node_id="local")
+        from . import worktree_janitor
+
+        probes = worktree_janitor.collect_local_probes(
+            getattr(self._terminal, "session_registry", None))
+        result = executor.execute({"worktree_path": worktree_path, "node_id": "local"},
+                                  task=task, repo_path=repo_path, dry_run=dry_run, **probes)
+        payload = result.to_dict()
+        payload["node_id"] = "local"
+        return payload
 
     def describe_permissions(self, session: str) -> dict[str, Any]:
         return self._terminal.describe_session_permissions(session)
@@ -458,6 +516,33 @@ class RemoteNodeClient:
         return self._request(
             "GET", f"/v1/repo/{_urlparse.quote(str(op), safe='')}?"
                    + _urlparse.urlencode(query))
+
+    def worktree_candidates(self, repo_path: str) -> dict[str, Any]:
+        """Ask THIS node to classify its own worktrees.
+
+        A node whose agent predates these routes answers 404, which _request
+        raises as NodeClientError -- reported by the caller as
+        NODE_LACKS_WORKTREE_JANITOR, kept distinct from NODE_UNREACHABLE. An old
+        agent and a dead one need different operator action."""
+        import urllib.parse as _urlparse
+
+        return self._request("GET", "/v1/worktree/candidates?repo_path="
+                            + _urlparse.quote(str(repo_path), safe=""))
+
+    def worktree_cleanup(self, worktree_path: str, *, repo_path: str | None = None,
+                         expected_head: str | None = None, expected_branch: str | None = None,
+                         task: dict[str, Any] | None = None,
+                         dry_run: bool = True) -> dict[str, Any]:
+        """Ask THIS node to remove one of its own worktrees.
+
+        The controller never removes a remote path itself -- it cannot see that
+        filesystem, and a same-named directory here is exactly what it would
+        delete instead. expected_head/expected_branch travel so the node can
+        refuse a stale view rather than act on it."""
+        return self._request("POST", "/v1/worktree/cleanup", body={
+            "worktree_path": worktree_path, "repo_path": repo_path,
+            "expected_head": expected_head, "expected_branch": expected_branch,
+            "task": task, "dry_run": dry_run})
 
     def describe_permissions(self, session: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/sessions/{session}/permissions")

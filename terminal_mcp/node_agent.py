@@ -55,6 +55,7 @@ from .launcher_resolution import resolve_launcher
 from .config import load_config
 from .coordinator import RepoEvidenceError, git_repo_evidence
 from . import repo_read
+from . import git_worktree, worktree_janitor
 from .lifecycle import resolve_cwd
 from .core import TerminalService
 from .node_client import LocalNodeClient
@@ -282,6 +283,112 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         # could not be reached", and a non-2xx status means the latter to
         # every layer above.
         return JSONResponse(result)
+
+    async def worktree_candidates(request: Request) -> JSONResponse:
+        """Classify the worktrees of a repo ON THIS NODE (audit-only).
+
+        Exists for the same reason /v1/repo/{op} does: the controller cannot see
+        this node's filesystem. A worktree at C:\\Users\\tranv\\project or
+        /home/dell/workspace/x does not exist there, and a controller that ran
+        the classifier locally against that path would be answering about
+        whatever it happens to have at the same name -- contract failure mode F4.
+
+        READ-ONLY. This route cannot remove anything; the classifier it calls
+        has no deletion primitive at all.
+        """
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        repo_path = (request.query_params.get("repo_path") or "").strip()
+        if not repo_path:
+            return JSONResponse({"error": "INVALID_ARGUMENT", "node_id": node_id,
+                                 "detail": "repo_path is required"})
+        config = terminal.config.worktree_janitor
+        result = await anyio.to_thread.run_sync(
+            lambda: worktree_janitor.scan(repo_path, config.to_policy()))
+        result["node_id"] = node_id
+        return JSONResponse(result)
+
+    async def worktree_cleanup(request: Request) -> JSONResponse:
+        """Remove ONE worktree on this node, if this node's own policy agrees.
+
+        The controller never removes a remote path -- it asks here, and this
+        handler decides using THIS node's config, THIS node's filesystem and
+        evidence it gathers itself. A controller's verdict is not accepted as
+        authorisation; it is at most a nomination.
+
+        `expected_head`/`expected_branch` are optimistic concurrency: the
+        controller says what it believed it was asking about, and a mismatch
+        means its view is stale -- refused rather than acted on. That is the
+        multi-node analogue of the executor's own EVIDENCE_CHANGED abort.
+
+        POST because it mutates. Application-level refusals return HTTP 200 with
+        an error code, this agent's documented convention (node_client._request
+        reads any non-200 as a transport failure, so a 4xx here would be
+        reported upstream as "the node is unreachable" -- which is a different
+        and much worse thing to tell an operator than "the node said no").
+        """
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        worktree_path = str(body.get("worktree_path") or "").strip()
+        repo_path = str(body.get("repo_path") or "").strip()
+        if not worktree_path:
+            return JSONResponse({"error": "INVALID_ARGUMENT", "node_id": node_id,
+                                 "detail": "worktree_path is required"})
+
+        config = terminal.config.worktree_janitor
+        expected_head = body.get("expected_head")
+        expected_branch = body.get("expected_branch")
+
+        def _run() -> dict:
+            from .lease import ResourceLockStore
+            from .worktree_executor import WorktreeExecutor
+
+            # Identity check FIRST, against what this node observes right now.
+            if expected_head or expected_branch:
+                observed = git_worktree.worktree_status(repo_path or worktree_path, worktree_path)
+                if not observed.get("exists"):
+                    return {"outcome": "SKIPPED", "error": "WORKTREE_ABSENT",
+                            "worktree_path": worktree_path,
+                            "detail": "this node has no such worktree"}
+                if expected_head and observed.get("head_sha") != expected_head:
+                    return {"outcome": "ABORTED", "error": "IDENTITY_MISMATCH",
+                            "worktree_path": worktree_path,
+                            "detail": "head moved since the controller looked",
+                            "expected_head": expected_head, "observed_head": observed.get("head_sha")}
+                if expected_branch and observed.get("branch") != expected_branch:
+                    return {"outcome": "ABORTED", "error": "IDENTITY_MISMATCH",
+                            "worktree_path": worktree_path,
+                            "detail": "branch changed since the controller looked",
+                            "expected_branch": expected_branch,
+                            "observed_branch": observed.get("branch")}
+
+            executor = WorktreeExecutor(
+                config.to_policy(), audit=terminal.audit,
+                locks=ResourceLockStore(terminal.leases.path),
+                node_id=node_id)
+            # THIS node's own liveness probes. Collected here rather than
+            # accepted from the request: the controller cannot see this
+            # filesystem, so anything it sent would be a guess about someone
+            # else's machine. Without them every candidate classifies UNKNOWN
+            # and the endpoint is silently inert.
+            probes = worktree_janitor.collect_local_probes(
+                getattr(terminal, "session_registry", None))
+            result = executor.execute(
+                {"worktree_path": worktree_path, "node_id": node_id},
+                task=body.get("task") if isinstance(body.get("task"), dict) else None,
+                repo_path=repo_path or None,
+                dry_run=bool(body.get("dry_run", True)), **probes)
+            return result.to_dict()
+
+        payload = await anyio.to_thread.run_sync(_run)
+        payload["node_id"] = node_id
+        return JSONResponse(payload)
 
     async def environment(request: Request) -> JSONResponse:
         """This node's audit against deploy/node-profile.yaml.
@@ -700,6 +807,8 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         Route("/v1/environment", environment, methods=["GET"]),
         Route("/v1/repo-evidence", repo_evidence, methods=["GET"]),
         Route("/v1/repo/{op}", repo_op, methods=["GET"]),
+        Route("/v1/worktree/candidates", worktree_candidates, methods=["GET"]),
+        Route("/v1/worktree/cleanup", worktree_cleanup, methods=["POST"]),
         Route("/v1/capabilities/refresh", refresh_capabilities, methods=["POST"]),
         Route("/v1/sessions", list_sessions, methods=["GET"]),
         Route("/v1/sessions", create_session, methods=["POST"]),
