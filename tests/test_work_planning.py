@@ -349,3 +349,23 @@ def test_a_knowledge_object_that_cannot_refresh_still_plans(store):
                      knowledge=_FakeKnowledge(_FakeModule("export", "CSV export")))
     assert result.spec.relevant_modules == ("export",)
     assert result.counters["knowledge_refreshed"] == 0
+
+
+def test_a_hand_edited_map_cannot_smuggle_a_credential_into_a_spec(store, indexed_repo):
+    """The briefing now travels in the spec payload, which is long-lived and
+    rarely re-read -- the worst place for a leak to sit quietly.
+
+    `record_module` refuses a secret at write time, so this simulates the only
+    way one gets in: somebody editing the state file by hand.
+    """
+    from terminal_mcp.project_knowledge import SecretInKnowledge
+
+    state = indexed_repo.load_state()
+    state["modules"]["export"]["summary"] = "csv export; API_TOKEN=ghp_" + "a" * 36
+    indexed_repo.save_state(state)
+
+    with pytest.raises(SecretInKnowledge):
+        wp.plan("CSV export is missing its header row", store=store,
+                knowledge=indexed_repo, cwd=str(indexed_repo.root))
+    # Refused at the store boundary, so nothing was persisted to read back.
+    assert store.list() == []

@@ -2038,6 +2038,12 @@ scan/audit view over the SAME facts.)*
   the module's own directory was opened**. It also asserts the watcher
   recorded reads at all, so the negative is a finding rather than a broken
   probe. The dogfood repeats the claim against this repository's own map.
+- **No secrets, even from a hand-edited map.** The briefing now rides in the
+  spec payload, which is long-lived and rarely re-read. `record_module`
+  already refuses a credential at write time; if one is put into the state
+  file by hand, `WorkSpecStore.save`'s own scrub refuses the spec and
+  planning raises `SecretInKnowledge` rather than persisting it — refused,
+  never silently stripped, and nothing reaches the store to be read back.
 - **Known limitations.** Re-verification is path-level, not symbol-level: a
   commit that touches a module's file advances nothing even when the change
   cannot affect what the summary says — the conservative direction, since the
