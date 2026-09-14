@@ -2030,6 +2030,72 @@ def build_mcp(service: TerminalService | None = None,
             return {"error": "SPEC_LIST_FAILED", "detail": str(exc)}
 
     @server.tool()
+    def work_plan(request: str, task_type: str = "", project_path: str = "",
+                  project_id: str = "", created_by: str = "") -> dict:
+        """Run the whole planning pipeline once: request in, spec + verdict out.
+
+        capture -> classify -> knowledge -> similar prior work -> git delta ->
+        reuse -> spec -> gate. The order is the saving: cheapest evidence
+        first, each stage narrowing the next, and the git delta AFTER the
+        knowledge map so a stale claim is caught before it reaches the spec.
+
+        Every stage reports what it could NOT do as well as what it found, so
+        "this module has no known issues" stays distinguishable from "there is
+        no knowledge map". A project with nothing indexed still gets a spec.
+
+        The spec is saved whatever the verdict. A NEEDS_REDEFINE is resumed
+        with `work_plan_redefine` on the same spec id -- the work already done
+        is not thrown away.
+        """
+        try:
+            import os as _os
+
+            from . import work_planning as wplan
+            from .procedures import ProcedureRegistry
+            from .work_spec import WorkSpecStore
+
+            root = project_path.strip() or _os.getcwd()
+            knowledge = _knowledge(root)
+            # The registry is scoped to a project's knowledge map, so without
+            # one there is nothing to look procedures up in -- a gap the
+            # pipeline reports, not an error it raises.
+            registry = None
+            if knowledge is not None:
+                try:
+                    registry = ProcedureRegistry(knowledge)
+                except Exception:  # noqa: BLE001
+                    registry = None
+            result = wplan.plan(request, store=WorkSpecStore(),
+                                task_type=task_type.strip().upper() or None,
+                                knowledge=knowledge, registry=registry, cwd=root,
+                                project_id=project_id or None,
+                                created_by=created_by or None)
+            return result.as_dict()
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "PLANNING_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_plan_redefine(spec_id: str, fields: dict) -> dict:
+        """Add the missing detail the gate asked for, and re-gate the SAME spec.
+
+        This is a resume, not a restart: same spec id, same queue task, and the
+        redefine count is kept rather than cleared, because how many rounds a
+        spec took is what says whether planning is learning the shape of this
+        project.
+        """
+        try:
+            from . import work_planning as wplan
+            from .work_spec import WorkSpecStore
+
+            return wplan.redefine(WorkSpecStore(), spec_id, fields or {}).as_dict()
+        except KeyError:
+            return {"error": "SPEC_NOT_FOUND", "spec_id": spec_id}
+        except ValueError as exc:
+            return {"error": "UNKNOWN_FIELD", "detail": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "REDEFINE_FAILED", "detail": str(exc)}
+
+    @server.tool()
     def work_test_selection(changed_paths: str, project_path: str = "") -> dict:
         """Which tests this change has to run, and when the full suite does.
 

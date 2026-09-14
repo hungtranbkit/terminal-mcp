@@ -149,3 +149,54 @@ async def test_test_selection_fails_closed_on_an_uncovered_path(server):
                          changed_paths="terminal_mcp/work_spec.py,scripts/whatever.sh")
     assert result["selection"]["lane"] == "FULL_VERIFY"
     assert result["selection"]["full_verify_because"]
+
+
+# -- the pipeline over MCP ------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_work_plan_runs_every_stage_and_saves_the_spec(server):
+    result = await _call(server, "work_plan",
+                         request="Add CSV export to the reports page")
+
+    assert [s["stage"] for s in result["stages"]] == [
+        "capture", "classify", "knowledge", "similar", "delta", "reuse", "spec", "gate"]
+    assert result["status"] == "NEEDS_REDEFINE"
+    assert result["spec"]["spec_id"]
+
+    stored = await _call(server, "work_spec_get", spec_id=result["spec"]["spec_id"])
+    assert stored["spec"]["redefine_reason"], "the refusal reason has to survive"
+
+
+@pytest.mark.anyio
+async def test_work_plan_redefine_resumes_the_same_spec(server):
+    planned = await _call(server, "work_plan", request="Add CSV export to reports")
+    spec_id = planned["spec"]["spec_id"]
+
+    resumed = await _call(server, "work_plan_redefine", spec_id=spec_id, fields={
+        "problem": "Finance exports by hand",
+        "user_value": "Finance stops retyping numbers",
+        "expected_outcome": "an Export button downloads a CSV",
+        "scope": ["the button", "a serialiser"],
+        "out_of_scope": ["XLSX"],
+        "arch_impact": "one route",
+        "reuse_candidates": ["redaction.redact_output"],
+        "existing_patterns": ["register_dashboard()"],
+        "implementation_plan": ["serialiser", "route", "button"],
+        "likely_files": ["terminal_mcp/dashboard.py"],
+        "api_contract": "GET /export.csv -> text/csv",
+        "test_plan": ["unit: quoting"],
+        "test_runbook": "test_gate",
+        "acceptance_criteria": ["clicking Export downloads a CSV"],
+        "risks": ["large reports"],
+    })
+
+    assert resumed["spec"]["spec_id"] == spec_id
+    assert resumed["status"] == "SPEC_READY", resumed["gate"]["missing"]
+    listed = await _call(server, "work_spec_list")
+    assert len(listed["specs"]) == 1, "a resume must not leave a second spec behind"
+
+
+@pytest.mark.anyio
+async def test_work_plan_redefine_reports_a_missing_spec(server):
+    result = await _call(server, "work_plan_redefine", spec_id="nope", fields={})
+    assert result["error"] == "SPEC_NOT_FOUND"
