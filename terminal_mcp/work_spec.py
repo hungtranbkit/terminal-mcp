@@ -119,7 +119,9 @@ class WorkSpec:
 
     # -- what the work is -----------------------------------------------------
     requirement: str = ""          # what must be true when this is done
+    problem: str = ""              # what is wrong or missing today
     user_value: str = ""           # who is better off, and how
+    expected_outcome: str = ""     # what an observer sees afterwards
     symptom: str = ""              # BUG: what the user sees
     expected_behavior: str = ""    # BUG: what should happen instead
     hypothesis: str = ""           # BUG/REFACTOR: suspected cause or risk
@@ -135,9 +137,17 @@ class WorkSpec:
     # or template. Required for FEATURE_NEW and INTEGRATION; see the module
     # docstring for why an empty list fails the gate rather than defaulting.
     reuse_candidates: tuple[str, ...] = ()
+    # The decision the planner reached about each candidate, as REUSE / EXTEND
+    # / NEW lines with their evidence. Recorded rather than implied, so a
+    # reviewer can see that "NEW" was a choice and not an oversight.
+    reuse_decisions: tuple[str, ...] = ()
+    # Conventions this repository already follows for work of this shape --
+    # the thing a worker should imitate instead of inventing a second style.
+    existing_patterns: tuple[str, ...] = ()
 
     # -- where it lives -------------------------------------------------------
     likely_module: str | None = None
+    relevant_modules: tuple[str, ...] = ()
     likely_files: tuple[str, ...] = ()
     entry_points: tuple[str, ...] = ()
     search_terms: tuple[str, ...] = ()
@@ -150,6 +160,11 @@ class WorkSpec:
     migration: str = ""
 
     # -- how it is executed ---------------------------------------------------
+    implementation_plan: tuple[str, ...] = ()
+    # Subtasks as a DAG: each entry is {"id", "title", "depends_on": [...]}.
+    # Carried on the spec so a decomposition survives a restart even before
+    # the queue tasks exist; `work_planning` is what turns it into queue rows.
+    subtask_dag: tuple[dict[str, Any], ...] = ()
     fix_strategy: tuple[str, ...] = ()
     do_not_touch: tuple[str, ...] = ()
     regression_areas: tuple[str, ...] = ()
@@ -166,12 +181,25 @@ class WorkSpec:
 
     # -- how it ships ---------------------------------------------------------
     deploy_level: str = "PREVIEW"
+    rollout: str = ""
     rollback_plan: str = ""
 
     # -- classification, never re-derived here --------------------------------
     execution_mode: str = NORMAL
     risk: str = "MEDIUM"
     knowledge_confidence: str = "LOW"
+    # The soft allowance this spec was planned under, persisted alongside it.
+    # Derived by `budget_for`, but recorded so "what was this worker allowed to
+    # read" stays answerable after the fact, when the level may have moved.
+    file_budget: int = 0
+    search_budget: int = 0
+
+    # -- which rules this ran under -------------------------------------------
+    # A task records the policy version and hash it actually loaded, so "which
+    # rules was this run under" is answerable later rather than inferred from
+    # whatever the file says today.
+    policy_version: str = ""
+    policy_hash: str = ""
 
     # -- provenance and lifecycle ---------------------------------------------
     source_commit: str | None = None
@@ -246,7 +274,13 @@ class WorkSpec:
                       "entry_points": list(self.entry_points),
                       "search_terms": list(self.search_terms)},
             "REUSE_FIRST": list(self.reuse_candidates),
+            "REUSE_DECISIONS": list(self.reuse_decisions),
+            "FOLLOW_EXISTING_PATTERN": list(self.existing_patterns),
+            "IMPLEMENTATION_PLAN": list(self.implementation_plan),
             "DO_NOT_TOUCH": list(self.do_not_touch),
+            "BUDGET": {"files": self.file_budget, "search_rounds": self.search_budget,
+                       "on_exceed": "return NEEDS_REDEFINE with a reason; do not keep reading"},
+            "POLICY": {"version": self.policy_version, "hash": self.policy_hash},
             "ACCEPTANCE": list(self.acceptance_criteria),
             "TEST": {"plan": list(self.test_plan), "runbook": self.test_runbook,
                      "smoke": self.smoke_runbook},
@@ -287,14 +321,19 @@ _COMMON_TAIL: tuple[tuple[str, float, str], ...] = (
 REQUIRED_FIELDS_BY_TYPE: dict[str, tuple[tuple[str, float, str], ...]] = {
     FEATURE_NEW: (
         ("requirement", 1.5, "What exactly must be true when this is done?"),
+        ("problem", 1.0, "What is wrong or missing today that this addresses?"),
         ("user_value", 1.0, "Who is better off, and how would they notice?"),
+        ("expected_outcome", 1.0, "What does an observer see once this ships?"),
         ("scope", 1.0, "What is in scope?"),
         ("out_of_scope", 1.5, "What is explicitly OUT of scope for this task?"),
         ("arch_impact", 1.0, "What does this change architecturally, if anything?"),
         ("reuse_candidates", 1.5,
          "What already exists that this should reuse rather than rebuild?"),
+        ("existing_patterns", 0.5,
+         "Which convention in this repo should the implementation follow?"),
         ("locator", 1.0, "Which modules/files will this touch?"),
         ("contract", 1.5, "What is the data/API/UI contract?"),
+        ("implementation_plan", 1.0, "What are the ordered steps to build it?"),
         ("dependencies", 0.5, "What must land first?"),
         ("risks", 0.5, "What could this break?"),
         ("deploy_level", 0.5, "Preview, staging, or no deploy?"),
@@ -368,8 +407,15 @@ COMPLETENESS_THRESHOLDS = {L1: 0.90, L2: 0.75, L3: 0.40}
 # it lowers the level, lowers the threshold, and lets the thinner spec through.
 # `scope` and `out_of_scope` are both read by the FEATURE_NEW/INTEGRATION
 # branch, so both are listed there.
+#
+# A second edge, found the same way: ADDING required fields raises the total
+# weight, so a field that used to be decisive stops being decisive. Weight is
+# a statement about how much a gap costs, not about whether the task is
+# executable without it -- which is why the floor is enumerated rather than
+# inferred from weight.
 MANDATORY_BY_TYPE: dict[str, tuple[str, ...]] = {
-    FEATURE_NEW: ("requirement", "scope", "out_of_scope", "acceptance_criteria"),
+    FEATURE_NEW: ("requirement", "problem", "user_value", "expected_outcome",
+                  "scope", "out_of_scope", "reuse_candidates", "acceptance_criteria"),
     BUG: ("symptom", "acceptance_criteria"),
     REFACTOR: ("out_of_scope", "regression_areas"),
     INTEGRATION: ("requirement", "scope", "out_of_scope", "contract"),
@@ -495,8 +541,31 @@ def budget_for(spec: WorkSpec) -> dict[str, Any]:
         profile = LARGE
     else:
         profile = MEDIUM
+    # Recorded on the spec as well as returned, so "what was this worker
+    # allowed to read" survives a later change of level.
+    spec.file_budget = limits["max_files"]
+    spec.search_budget = limits["max_search_rounds"]
     return {"profile": profile, "limits": limits,
             "rules": list(_BUDGET_PROFILE_RULES[profile])}
+
+
+def bind_policy(spec: WorkSpec, *, cwd: str | None = None) -> WorkSpec:
+    """Record which WORK_POLICY version and hash this spec was planned under.
+
+    Bound at plan time rather than read at execution time: a policy that
+    changes mid-flight must not silently redefine what a running task agreed
+    to. A project without a policy file binds nothing and says so by leaving
+    the fields empty, rather than inventing a version.
+    """
+    try:
+        from .work_policy import load_policy
+
+        policy = load_policy(cwd or os.getcwd())
+    except Exception:  # noqa: BLE001 -- a missing policy is not a spec failure
+        return spec
+    spec.policy_version = policy.version or ""
+    spec.policy_hash = policy.policy_hash or ""
+    return spec
 
 
 def budget_check(spec: WorkSpec, *, files_read: int,
@@ -665,6 +734,10 @@ def plan_from_request(*, title: str, requirement: str = "",
             raise ValueError(f"unknown spec field {key!r}")
         current = getattr(spec, key)
         setattr(spec, key, tuple(value) if isinstance(current, tuple) else value)
+    # Bound at plan time, not read at execution time: a policy that changes
+    # mid-flight must not silently redefine what a running task agreed to.
+    bind_policy(spec)
+    budget_for(spec)  # records file_budget/search_budget on the spec
     _scrub(spec)
     return spec
 
@@ -681,6 +754,12 @@ def _scrub(spec: WorkSpec) -> None:
             for item in value:
                 if isinstance(item, str):
                     scrub_knowledge(item, where=f"work_spec:{name}")
+                elif isinstance(item, dict):
+                    # subtask_dag entries. Scanned too: a subtask title is
+                    # written by the same planner as everything else here.
+                    for sub in item.values():
+                        if isinstance(sub, str):
+                            scrub_knowledge(sub, where=f"work_spec:{name}")
 
 
 # -- persistence ----------------------------------------------------------------

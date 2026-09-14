@@ -59,13 +59,17 @@ async def test_a_feature_spec_is_refused_then_released_once_it_is_complete(serve
     assert created["gate"]["reply_to_planner"]["QUESTIONS_FOR_PLANNER"]
 
     filled = await _call(server, "work_spec_update", spec_id=spec_id, fields={
+        "problem": "Finance exports by hand and the numbers drift",
         "user_value": "Finance stops retyping numbers into a spreadsheet",
+        "expected_outcome": "An Export button downloads a CSV of the current report",
         "scope": ["the export button", "a CSV serialiser"],
         "out_of_scope": ["XLSX", "scheduled exports"],
         "arch_impact": "one route on the existing dashboard app",
         "reuse_candidates": ["redaction.redact_output", "report_service.rows()"],
         "likely_files": ["terminal_mcp/dashboard.py"],
         "api_contract": "GET /dashboard/api/reports/export.csv -> text/csv",
+        "existing_patterns": ["dashboard routes register via register_dashboard()"],
+        "implementation_plan": ["add the serialiser", "add the route", "wire the button"],
         "test_plan": ["unit: the serialiser quotes embedded commas"],
         "test_runbook": "test_gate",
         "acceptance_criteria": ["clicking Export downloads a CSV matching the table"],

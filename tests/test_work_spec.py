@@ -31,7 +31,9 @@ def _complete_feature(**overrides) -> ws.WorkSpec:
         title="CSV export for the reports page",
         requirement="An operator can download the current report as CSV",
         task_type=ws.FEATURE_NEW,
+        problem="Finance exports by hand and the numbers drift",
         user_value="Finance stops retyping the numbers into a spreadsheet",
+        expected_outcome="An Export button on the reports page downloads a CSV",
         scope=("the reports page export button", "a CSV serialiser for report rows"),
         out_of_scope=("XLSX", "scheduled/emailed exports", "a settings screen"),
         arch_impact="no new service; one route on the existing dashboard app",
@@ -39,6 +41,8 @@ def _complete_feature(**overrides) -> ws.WorkSpec:
                           "the existing report query in report_service.rows()"),
         likely_files=("terminal_mcp/dashboard.py",),
         api_contract="GET /dashboard/api/reports/export.csv -> text/csv, same auth guard",
+        existing_patterns=("dashboard routes register via register_dashboard()",),
+        implementation_plan=("add the serialiser", "add the route", "wire the button"),
         test_plan=("unit: serialiser quotes embedded commas",),
         test_runbook="test_gate",
         acceptance_criteria=("clicking Export downloads a CSV whose rows match the table",),
@@ -78,9 +82,9 @@ def test_scope_without_out_of_scope_still_fails_the_gate():
     assert "out_of_scope" in report["missing"]
 
 
-@pytest.mark.parametrize("dropped", ["requirement", "out_of_scope",
-                                     "acceptance_criteria", "reuse_candidates",
-                                     "scope", "user_value"])
+@pytest.mark.parametrize("dropped", ["requirement", "problem", "user_value",
+                                     "expected_outcome", "scope", "out_of_scope",
+                                     "reuse_candidates", "acceptance_criteria"])
 def test_removing_a_required_field_never_makes_a_spec_readier(dropped):
     """The perverse edge a weighted threshold has on its own.
 
@@ -88,6 +92,10 @@ def test_removing_a_required_field_never_makes_a_spec_readier(dropped):
     drop the spec to a lower level, which lowers the threshold, which lets the
     THINNER spec pass. Caught for real: removing `out_of_scope` from a complete
     feature spec turned NEEDS_REDEFINE into SPEC_READY.
+
+    A second edge, caught the same way: ADDING required fields raised the total
+    weight, so dropping `user_value` stopped being decisive. Weight says how
+    much a gap costs, not whether the task can be executed without it.
     """
     complete = _complete_feature()
     assert ws.gate(complete)["status"] == SPEC_READY
@@ -310,3 +318,43 @@ def test_a_secret_is_refused_rather_than_stripped(store):
         ws.plan_from_request(
             title="Add export",
             requirement="use api_key=sk-live-abcdef0123456789abcdef0123456789")
+
+
+# -- what a spec records about the run it was planned for -------------------------
+
+def test_the_budget_is_recorded_on_the_spec_not_only_returned():
+    """"What was this worker allowed to read" has to stay answerable later,
+    when the level may have moved."""
+    spec = _complete_feature()
+    assert spec.file_budget == ws.FILE_SEARCH_BUDGET[ws.FEATURE_NEW][L1]["max_files"]
+    assert spec.search_budget > 0
+
+
+def test_the_handoff_carries_the_budget_and_what_to_do_when_it_is_spent():
+    handoff = ws.gate(_complete_feature())["handoff"]
+    assert handoff["BUDGET"]["files"] > 0
+    assert "NEEDS_REDEFINE" in handoff["BUDGET"]["on_exceed"], \
+        "a worker over budget hands back rather than wandering"
+
+
+def test_the_policy_version_is_bound_at_plan_time(tmp_path, monkeypatch):
+    """Bound when the spec is planned, not read at execution time: a policy
+    that changes mid-flight must not silently redefine what a running task
+    agreed to."""
+    spec = _complete_feature()
+    # The repo ships a canonical policy, so a version is always bindable; the
+    # property under test is that it is RECORDED, whatever it says.
+    assert spec.policy_version, "a spec must record which rules it ran under"
+    assert spec.policy_hash
+
+
+def test_a_missing_policy_leaves_the_binding_empty_rather_than_inventing_one(monkeypatch):
+    import terminal_mcp.work_policy as wp
+
+    def _boom(_cwd):
+        raise RuntimeError("no policy here")
+
+    monkeypatch.setattr(wp, "load_policy", _boom)
+    spec = ws.WorkSpec(spec_id="s1", title="t")
+    ws.bind_policy(spec)
+    assert spec.policy_version == ""
