@@ -58,6 +58,7 @@ from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
 from .webterm import WebTerminalProcess, pump_websocket
 from .webterm_assets import ASSETS
+from .ephemeral_state import ephemeral_db_path, ephemeral_state_dir
 
 _log = logging.getLogger(__name__)
 
@@ -11217,8 +11218,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # write into the real ~/.local/state/terminal-mcp/connections.db).
         # server_http.py's real main() always passes an explicit,
         # persistent ConnectionStore instead of relying on this fallback.
-        import tempfile
-        connection_store = ConnectionStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-connections-")) / "connections.db")
+        connection_store = ConnectionStore(ephemeral_db_path("connections", "connections.db"))
     if queue is None:
         # SAME private-temp-file discipline as connection_store's own
         # default just above: every EXISTING caller of register_dashboard
@@ -11230,12 +11230,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # Dashboard Task Manager's rename/task routes and the MCP
         # terminal_queue_*/terminal_task_* tool surface share one real,
         # persistent store -- never two independently-drifting ones.
-        import tempfile
-        queue = QueueService(QueueStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-queue-")) / "queue.db"))
+        queue = QueueService(QueueStore(ephemeral_db_path("queue", "queue.db")))
     if integration is None:
-        import tempfile
         integration = IntegrationService(IntegrationStore(
-            Path(tempfile.mkdtemp(prefix="terminal-mcp-integration-")) / "integration.db"))
+            ephemeral_db_path("integration", "integration.db")))
     if ai_usage is None:
         # No persistent store at all (in-memory cache only) -- no
         # private-temp-file discipline needed, unlike queue/integration
@@ -11269,12 +11267,12 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             authorized, _reason = terminal._input_authorized(session)
             return authorized
 
-        pm = PMService(PMStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-pm-")) / "pm.db"), queue, controller,
+        pm = PMService(PMStore(ephemeral_db_path("pm", "pm.db")), queue, controller,
                        permission_checker=_local_permission_checker)
     if planner is None:
         import tempfile
         planner = PlannerService(
-            PlannerStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-planner-")) / "planner.db"), queue)
+            PlannerStore(ephemeral_db_path("planner", "planner.db")), queue)
     discovery_config = terminal.config.nodes.discovery
     discovery = lan_discovery.DiscoveryService(
         agent_port=discovery_config.agent_port, concurrency=discovery_config.concurrency,
@@ -11290,8 +11288,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # into the real ~/.local/state/terminal-mcp databases.
         # server_http.py's real main() always passes an explicit,
         # persistent OnboardingService.
-        import tempfile
-        _onboard_dir = Path(tempfile.mkdtemp(prefix="terminal-mcp-onboard-"))
+        _onboard_dir = ephemeral_state_dir("onboard")
         onboarding = OnboardingService(
             terminal.config, controller=controller, connection_store=connection_store,
             enrollment_store=EnrollmentStore(_onboard_dir / "enrollment.db"),
@@ -11470,7 +11467,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         from .fleet_service import FleetService as _FleetService
 
         fleet = _FleetService(
-            _FleetStore(Path(_tempfile.mkdtemp(prefix="terminal-mcp-fleet-")) / "fleet.db",
+            _FleetStore(ephemeral_db_path("fleet", "fleet.db"),
                         local_node_id=controller.local_node_id),
             local_node_id=controller.local_node_id)
     _fleet_sync = ControllerFleetSync(fleet, controller)

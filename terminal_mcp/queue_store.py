@@ -51,6 +51,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
+from . import requirement_contract as rc
+
 from .schema import Migration, apply_migrations
 
 # -- Task status state machine ------------------------------------------
@@ -230,6 +232,22 @@ class InvalidTransitionError(ValueError):
     fail loudly in a test, not quietly corrupt a task's history."""
 
 
+class RequirementsNotCoveredError(ValueError):
+    """Raised by mark_completed_with_evidence when the task carries a
+    requirement contract whose required criteria are not all covered (or
+    explicitly waived with an actor and a reason), or whose evidence was
+    reconciled against a stale contract version.
+
+    Carries the full `GateDecision` so a caller can report WHICH requirement
+    ids are missing rather than only that something was refused -- the
+    reported MESFlow failure was exactly a missing id nobody could name.
+    """
+
+    def __init__(self, decision: "rc.GateDecision") -> None:
+        super().__init__(f"{decision.reason}: {decision.detail}")
+        self.decision = decision
+
+
 class TaskAlreadyClaimedError(ValueError):
     """Raised by reassign_task (Task Migration/Load Balancing, item 12's
     own race-safety requirement) when the task is no longer in a
@@ -293,6 +311,13 @@ class QueueTask:
     # retry returns this task instead of making a second one. Nullable:
     # a task created without one behaves exactly as before.
     request_key: str | None = None
+    # Requirement Contract (migration v10). All nullable: a task without a
+    # contract reconciles to NO_CONTRACT and completes exactly as before.
+    requirement_contract: dict[str, Any] = field(default_factory=dict)
+    evidence_matrix: dict[str, Any] = field(default_factory=dict)
+    # Deployment is a fact about an artifact, NOT a task status -- see
+    # _add_v10_requirement_contract. Deploying never changes `status`.
+    deploy_state: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "QueueTask":
@@ -304,6 +329,11 @@ class QueueTask:
             completion_policy=_parse_json_object(row["completion_policy"]),
             last_error=row["last_error"], correlation_id=row["correlation_id"],
             request_key=(row["request_key"] if "request_key" in row.keys() else None),
+            requirement_contract=(_parse_json_object(row["requirement_contract"])
+                                  if "requirement_contract" in row.keys() else {}),
+            evidence_matrix=(_parse_json_object(row["evidence_matrix"])
+                             if "evidence_matrix" in row.keys() else {}),
+            deploy_state=(row["deploy_state"] if "deploy_state" in row.keys() else None),
             metadata=_parse_json_object(row["metadata"]), updated_at=row["updated_at"],
             paused_from_status=row["paused_from_status"],
             priority=row["priority"], depends_on=tuple(_parse_json_list(row["depends_on"])),
@@ -723,6 +753,31 @@ def _add_v9_request_key(connection: sqlite3.Connection) -> None:
         "ON queue_tasks(request_key) WHERE request_key IS NOT NULL")
 
 
+def _add_v10_requirement_contract(connection: sqlite3.Connection) -> None:
+    """What the task was asked for, what proved it, and where it was deployed.
+
+    See docs/MISS_TASK_ROOT_CAUSE.md. RC3: a missing acceptance criterion was
+    not a representable fact, so no gate could enforce it. RC6: there was no
+    DEPLOYED concept at all, so "I got it onto TEST" had only one word
+    available -- COMPLETED -- and the conflation was structural.
+
+    All three columns are nullable and additive. A task created before this
+    migration reads NULL, takes the no-contract path, and behaves exactly as it
+    did. `deploy_state` is deliberately NOT a task status: deployment is a fact
+    about an artifact, not a stage of a task's lifecycle, and modelling it as a
+    status would have meant editing VALID_TRANSITIONS and re-deciding every
+    edge. A task can be DEPLOYED_TEST while still RUNNING.
+    """
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(queue_tasks)")}
+    for column, declaration in (
+        ("requirement_contract", "TEXT"),   # JSON RequirementContract, append-only versions
+        ("evidence_matrix", "TEXT"),        # JSON EvidenceMatrix, requirement_id -> status
+        ("deploy_state", "TEXT"),           # NOT_DEPLOYED/DEPLOYED_TEST/DEPLOYED_PROD, never a status
+    ):
+        if column not in columns:
+            connection.execute(f"ALTER TABLE queue_tasks ADD COLUMN {column} {declaration}")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
@@ -745,6 +800,10 @@ QUEUE_MIGRATIONS = [
     Migration(9, "idempotent creation: queue_tasks.request_key (nullable) + a PARTIAL unique "
                  "index, so a retried create returns the SAME task instead of a second one",
               _add_v9_request_key),
+    Migration(10, "Requirement Contract: queue_tasks.requirement_contract/evidence_matrix "
+                  "(nullable) so a missing acceptance criterion is a representable fact, "
+                  "plus deploy_state kept OFF the status enum so deploying never reads as done",
+              _add_v10_requirement_contract),
 ]
 
 
@@ -1889,8 +1948,148 @@ class QueueStore:
         if not evidence:
             raise ValueError("mark_completed_with_evidence requires non-empty evidence -- "
                             "use transition_task directly only for a test/legacy no-evidence path")
+        # Requirement Contract gate. Non-emptiness was never the question:
+        # queue_engine passes {"completion_marker": marker}, a string the agent
+        # emitted about itself, and it satisfied this check for free (RC2). The
+        # question is whether the evidence covers what was ASKED, which needs
+        # the contract -- so ask it here, where COMPLETED is actually reached.
+        decision = self.completion_decision(task_id)
+        if not decision.verified_done:
+            self.record_event(
+                session=self.get_task(task_id).session, task_id=task_id,
+                event_type="COMPLETION_REFUSED_REQUIREMENTS",
+                reason=f"{decision.reason}: {', '.join(decision.blocking_ids()) or decision.detail}")
+            raise RequirementsNotCoveredError(decision)
         return self.transition_task(task_id, COMPLETED, event_type="VERIFIED",
                                     extra_fields={"verification_evidence": json.dumps(evidence)})
+
+    # -- Requirement Contract ------------------------------------------------
+
+    def get_requirement_contract(self, task_id: str) -> "rc.RequirementContract | None":
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        return rc.RequirementContract.from_dict(task.requirement_contract)
+
+    def get_evidence_matrix(self, task_id: str) -> "rc.EvidenceMatrix":
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        return rc.EvidenceMatrix.from_dict(task.evidence_matrix)
+
+    def set_requirement_contract(self, task_id: str, *,
+                                 requirements: Sequence[dict[str, Any]] = (),
+                                 prompt: str | None = None,
+                                 actor: str | None = None) -> "rc.RequirementContract":
+        """Create v1 of the contract for a task that has none.
+
+        `prompt` defaults to the task's own prompt, so the original wording is
+        preserved without the caller having to restate it -- v1 does not need
+        perfect parsing, it needs to not lose the source.
+        """
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        if task.requirement_contract:
+            raise rc.ContractError(
+                f"{task_id} already has a contract (v"
+                f"{task.requirement_contract.get('contract_version')}); "
+                f"use amend_requirement_contract -- a contract is never overwritten")
+        contract = rc.create_contract(
+            prompt=prompt if prompt is not None else task.prompt,
+            requirements=requirements, created_at=iso_now(), actor=actor)
+        self._write_contract(task_id, contract)
+        self.record_event(session=task.session, task_id=task_id,
+                          event_type="REQUIREMENT_CONTRACT_SET",
+                          reason=f"v1 with {len(contract.required_ids())} required criteria")
+        return contract
+
+    def amend_requirement_contract(self, task_id: str, *, prompt: str,
+                                   requirements: Sequence[dict[str, Any]] = (),
+                                   actor: str | None = None) -> "rc.RequirementContract":
+        """Append a version. The prior version is never touched.
+
+        This is the operation the reported failure had no way to express: a
+        follow-up instruction became either a second task that knew nothing of
+        the first contract, or a raw send that left the task row unchanged.
+        """
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        existing = rc.RequirementContract.from_dict(task.requirement_contract)
+        if existing is None:
+            # An amendment to a task that never had a contract creates v1 from
+            # the task's own prompt first, so the original is not lost by the
+            # act of amending it.
+            existing = rc.create_contract(prompt=task.prompt, created_at=iso_now(),
+                                          actor=actor)
+        amended = rc.amend_contract(existing, prompt=prompt, requirements=requirements,
+                                    created_at=iso_now(), actor=actor)
+        self._write_contract(task_id, amended)
+        self.record_event(
+            session=task.session, task_id=task_id, event_type="REQUIREMENT_CONTRACT_AMENDED",
+            reason=f"v{amended.contract_version}: +{len(requirements)} requirement(s)")
+        return amended
+
+    def set_evidence_matrix(self, task_id: str, matrix: "rc.EvidenceMatrix") -> None:
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE queue_tasks SET evidence_matrix = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(matrix.to_dict()), iso_now(), task_id))
+
+    def _write_contract(self, task_id: str, contract: "rc.RequirementContract") -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE queue_tasks SET requirement_contract = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(contract.to_dict()), iso_now(), task_id))
+
+    def completion_decision(self, task_id: str, *,
+                            detectors: Sequence["rc.Detector"] = ()) -> "rc.GateDecision":
+        """Reconcile this task's evidence against its LATEST contract version.
+
+        Exposed separately from the gate so a caller (a tool, the dashboard)
+        can show the Requirement | Status | Evidence checklist WITHOUT
+        attempting completion -- `GateDecision.to_dict()` is that payload.
+        """
+        return rc.reconcile(self.get_requirement_contract(task_id),
+                            self.get_evidence_matrix(task_id),
+                            detectors=detectors or (
+                                rc.detector_evidence_must_not_be_self_reported,))
+
+    # -- deployment is not completion ---------------------------------------
+
+    NOT_DEPLOYED = "NOT_DEPLOYED"
+    DEPLOYED_TEST = "DEPLOYED_TEST"
+    DEPLOYED_PROD = "DEPLOYED_PROD"
+    DEPLOY_STATES = (NOT_DEPLOYED, DEPLOYED_TEST, DEPLOYED_PROD)
+
+    def record_deploy(self, task_id: str, *, deploy_state: str, reference: str | None = None,
+                      actor: str | None = None) -> QueueTask:
+        """Record WHERE this task's work was deployed. Never changes `status`.
+
+        RC6: there was no deployment concept at all, so "it is on TEST" had
+        only `COMPLETED` available to say it with. Keeping this off the status
+        enum is the whole point -- a deployed task is still un-verified until
+        its requirements reconcile, and a reader can now see both facts at
+        once instead of one standing in for the other.
+        """
+        if deploy_state not in self.DEPLOY_STATES:
+            raise ValueError(f"unknown deploy_state {deploy_state!r}; "
+                             f"expected one of {list(self.DEPLOY_STATES)}")
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE queue_tasks SET deploy_state = ?, updated_at = ? WHERE id = ?",
+                (deploy_state, iso_now(), task_id))
+        self.record_event(session=task.session, task_id=task_id, event_type="DEPLOY_RECORDED",
+                          reason=f"{deploy_state}{f' ({reference})' if reference else ''}"
+                                 f"{f' by {actor}' if actor else ''}")
+        return self.get_task(task_id)
 
     # -- Task Migration / Load Balancing -----------------------------------
 
