@@ -297,6 +297,23 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_checkpoint_session",
         "terminal_recovery_loop_status",
         "terminal_recovery_loop_run_once",
+        # Read-only repository access (repo_read.py / repo_service.py) --
+        # the surface an external agent uses to read Git and source
+        # directly. These ten are READS ONLY: the absence of any
+        # repo_write/repo_checkout/repo_commit/repo_push name from this
+        # set is itself part of the V1 contract, and this assertion is
+        # what keeps a write primitive from being added without anyone
+        # noticing.
+        "repo_status",
+        "repo_head",
+        "repo_branches",
+        "repo_remotes",
+        "repo_tree",
+        "repo_read",
+        "repo_search",
+        "repo_diff",
+        "repo_log",
+        "repo_show_commit",
     }
 
 

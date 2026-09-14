@@ -482,6 +482,59 @@ class WorkConfig:
 
 
 @dataclass(frozen=True)
+class RepoReadConfig:
+    """Read-only repository access for the `repo_*` MCP tools (see
+    repo_read.py, repo_service.py).
+
+    ON by default, unlike `session_lifecycle`/`work` -- and the difference
+    is the point rather than an oversight. Those gates guard capabilities
+    that CREATE something (a real process, an auto-dispatched prompt);
+    this one only reads, has no write primitive to lose control of, and
+    would be useless to an operator who had to edit config before an
+    agent could look at a file. The real boundary here is
+    `allowed_roots`, not the on/off flag.
+
+    `allowed_roots` empty (the default) reuses
+    `session_lifecycle.allowed_cwd_roots` -- the allowlist this
+    deployment has ALREADY curated for "paths a session may live in",
+    which is very nearly the set of repos worth reading -- and falls back
+    to the server's own home directory when that is unset too. Never to
+    "/" and never to an unbounded root; see repo_read.RepoReadPolicy.
+
+    `extra_secret_globs` is additive only. There is deliberately no
+    config key that REMOVES a built-in secret glob, so no config edit can
+    reopen a path repo_read.py closed."""
+
+    enabled: bool = True
+    allowed_roots: tuple[str, ...] = ()
+    max_bytes: int = 256_000
+    max_lines: int = 2_000
+    max_results: int = 200
+    max_tree_entries: int = 2_000
+    max_tree_depth: int = 6
+    max_log_entries: int = 200
+    max_diff_bytes: int = 400_000
+    timeout_seconds: float = 15.0
+    extra_secret_globs: tuple[str, ...] = ()
+
+    def to_policy(self, fallback_roots: tuple[str, ...] = ()) -> Any:
+        """Build the immutable RepoReadPolicy the engine actually
+        enforces. Imported lazily so config.py keeps no import-time
+        dependency on a feature module -- the same layering every other
+        section here holds to."""
+        from .repo_read import RepoReadPolicy
+
+        return RepoReadPolicy(
+            enabled=self.enabled,
+            allowed_roots=tuple(self.allowed_roots or fallback_roots),
+            max_bytes=self.max_bytes, max_lines=self.max_lines,
+            max_results=self.max_results, max_tree_entries=self.max_tree_entries,
+            max_tree_depth=self.max_tree_depth, max_log_entries=self.max_log_entries,
+            max_diff_bytes=self.max_diff_bytes, timeout_seconds=self.timeout_seconds,
+            extra_secret_globs=tuple(self.extra_secret_globs))
+
+
+@dataclass(frozen=True)
 class FleetSyncConfig:
     # ON by default, like MaintenanceConfig and for the same reason: this is
     # not an optional feature, it is what keeps an already-shipped one
@@ -640,6 +693,7 @@ class AppConfig:
     dashboard: DashboardConfig = DashboardConfig()
     maintenance: MaintenanceConfig = MaintenanceConfig()
     fleet_sync: FleetSyncConfig = FleetSyncConfig()
+    repo_read: RepoReadConfig = RepoReadConfig()
     work: WorkConfig = WorkConfig()
     session_lifecycle: SessionLifecycleConfig = SessionLifecycleConfig()
     session_knowledge: SessionKnowledgeConfig = SessionKnowledgeConfig()
@@ -964,6 +1018,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         dashboard=_load_dashboard_config(raw.get("dashboard", {})),
         maintenance=_load_maintenance_config(raw.get("maintenance", {})),
         fleet_sync=_load_fleet_sync_config(raw.get("fleet_sync", {})),
+        repo_read=_load_repo_read_config(raw.get("repo_read", {})),
         work=_load_work_config(raw.get("work", {})),
         session_lifecycle=_load_session_lifecycle_config(raw.get("session_lifecycle", {})),
         session_knowledge=_load_session_knowledge_config(raw.get("session_knowledge", {})),
@@ -1075,6 +1130,57 @@ def _load_work_config(raw: object) -> WorkConfig:
         lease_seconds=int(raw.get("lease_seconds", WorkConfig.lease_seconds)),
         max_revisions=revisions,
         no_progress_limit=int(raw.get("no_progress_limit", WorkConfig.no_progress_limit)))
+
+
+def _load_repo_read_config(raw: object) -> RepoReadConfig:
+    """Validation is strict and fail-closed: a config that asks for an
+    unbounded limit is a CONFIG ERROR, not something to silently clamp,
+    because a caps section nobody can trust is worse than no caps at
+    all. Each ceiling below is a sanity bound on operator intent, not the
+    limit itself."""
+    if not isinstance(raw, dict):
+        raw = {}
+    enabled = raw.get("enabled", RepoReadConfig.enabled)
+    if not isinstance(enabled, bool):
+        raise ValueError("repo_read.enabled must be a boolean")
+    roots = raw.get("allowed_roots", [])
+    if not isinstance(roots, list) or not all(isinstance(r, str) and r for r in roots):
+        raise ValueError("repo_read.allowed_roots must be a list of strings")
+    for root in roots:
+        # A relative root cannot be reasoned about (it would resolve
+        # against whatever cwd the server happens to have) and "/" would
+        # make the allowlist meaningless -- both are refused outright.
+        if not root.startswith("/") and not root.startswith("~"):
+            raise ValueError(f"repo_read.allowed_roots entry {root!r} must be an absolute path")
+        if root.strip() == "/":
+            raise ValueError("repo_read.allowed_roots may not contain '/'")
+    globs = raw.get("extra_secret_globs", [])
+    if not isinstance(globs, list) or not all(isinstance(g, str) and g for g in globs):
+        raise ValueError("repo_read.extra_secret_globs must be a list of strings")
+
+    def bounded(key: str, default: int, low: int, high: int) -> int:
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"repo_read.{key} must be an integer")
+        if not low <= value <= high:
+            raise ValueError(f"repo_read.{key} must be between {low} and {high}")
+        return value
+
+    timeout = raw.get("timeout_seconds", RepoReadConfig.timeout_seconds)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("repo_read.timeout_seconds must be a number")
+    if not 1.0 <= float(timeout) <= 120.0:
+        raise ValueError("repo_read.timeout_seconds must be between 1 and 120")
+    return RepoReadConfig(
+        enabled=enabled, allowed_roots=tuple(roots),
+        max_bytes=bounded("max_bytes", RepoReadConfig.max_bytes, 1_024, 8_000_000),
+        max_lines=bounded("max_lines", RepoReadConfig.max_lines, 10, 100_000),
+        max_results=bounded("max_results", RepoReadConfig.max_results, 1, 5_000),
+        max_tree_entries=bounded("max_tree_entries", RepoReadConfig.max_tree_entries, 1, 50_000),
+        max_tree_depth=bounded("max_tree_depth", RepoReadConfig.max_tree_depth, 1, 32),
+        max_log_entries=bounded("max_log_entries", RepoReadConfig.max_log_entries, 1, 5_000),
+        max_diff_bytes=bounded("max_diff_bytes", RepoReadConfig.max_diff_bytes, 1_024, 16_000_000),
+        timeout_seconds=float(timeout), extra_secret_globs=tuple(globs))
 
 
 def _load_fleet_sync_config(raw: object) -> FleetSyncConfig:

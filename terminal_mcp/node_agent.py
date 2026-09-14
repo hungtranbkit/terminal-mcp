@@ -54,6 +54,7 @@ from . import node_profile
 from .launcher_resolution import resolve_launcher
 from .config import load_config
 from .coordinator import RepoEvidenceError, git_repo_evidence
+from . import repo_read
 from .lifecycle import resolve_cwd
 from .core import TerminalService
 from .node_client import LocalNodeClient
@@ -204,7 +205,9 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         # node_aware_repo_evidence reports a non-200 as
         # RepoEvidenceUnavailable ("we could not look") and fails closed, so
         # the breakage was safe but silent -- remote repo evidence had never
-        # once actually been collected.
+        # once actually been collected. Found 2026-09-14 while adding
+        # /v1/repo/{op}; see tests/test_repo_read_node.py's own regression
+        # test for this exact route.
         resolved, error = resolve_cwd(cwd, terminal.config)
         if error is not None:
             return JSONResponse({"error": "PATH_NOT_ALLOWED", "detail": error},
@@ -223,6 +226,62 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
             "has_upstream": evidence.has_upstream,
             "ahead": evidence.ahead, "behind": evidence.behind,
         })
+
+    async def repo_op(request: Request) -> JSONResponse:
+        """Read-only repository introspection for a path ON THIS NODE --
+        the content-bearing sibling of /v1/repo-evidence.
+
+        Exists for the same reason that endpoint does: the controller
+        cannot see this node's filesystem, so a repo that lives on
+        dell-linux/hp/windows can only be read by asking the agent that
+        runs there. /v1/repo-evidence deliberately returns metadata only;
+        an external agent that wants to READ the code needs this.
+
+        GET-only, and the operation is looked up in
+        repo_read.OPERATIONS -- a fixed table of ten read functions. There
+        is no path by which a request can name a git subcommand, a shell
+        string or an argv list, so this endpoint cannot write, check out,
+        reset or fetch anything no matter what it is sent. The allowlist,
+        the secret-path denial, the redaction and the output caps are all
+        applied inside repo_read against THIS node's own config.
+        """
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        op = (request.path_params.get("op") or "").strip()
+        # 200 with an error CODE, not a 4xx: this agent never answers an
+        # application-level refusal with a non-200 status (see
+        # node_client._request's own comment -- every non-200 is read as a
+        # transport failure by every layer above, so a bad argument sent as
+        # 400 would be reported to the caller as "the node is unreachable").
+        # A 404 from this route still means what it should: an agent old
+        # enough not to have the endpoint at all.
+        if op not in repo_read.OPERATIONS:
+            return JSONResponse({"error": "INVALID_ARGUMENT", "op": op, "node_id": node_id,
+                                 "detail": f"unknown repo operation; known: "
+                                           f"{', '.join(repo_read.OPERATION_NAMES)}"})
+        path = (request.query_params.get("path") or "").strip()
+        if not path:
+            return JSONResponse({"error": "INVALID_ARGUMENT", "op": op, "node_id": node_id,
+                                 "detail": "path is required"})
+        # `paths` is genuinely multi-valued (a pathspec list), so it is read
+        # with getlist rather than collapsed to whichever copy came last.
+        raw: dict[str, object] = {}
+        for key in request.query_params.keys():
+            if key in ("path", "op"):
+                continue
+            values = request.query_params.getlist(key)
+            raw[key] = values if len(values) > 1 else values[0]
+        config = terminal.config
+        policy = config.repo_read.to_policy(config.session_lifecycle.allowed_cwd_roots)
+        result = await anyio.to_thread.run_sync(
+            lambda: repo_read.run_operation(op, path, raw, policy))
+        result["node_id"] = node_id
+        # A refusal is a 200 carrying an error CODE, exactly like
+        # /v1/repo-evidence's REPO_EVIDENCE_FAILED: the caller has to be
+        # able to tell "this node answered and said no" from "this node
+        # could not be reached", and a non-2xx status means the latter to
+        # every layer above.
+        return JSONResponse(result)
 
     async def environment(request: Request) -> JSONResponse:
         """This node's audit against deploy/node-profile.yaml.
@@ -640,6 +699,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         Route("/v1/metrics", metrics, methods=["GET"]),
         Route("/v1/environment", environment, methods=["GET"]),
         Route("/v1/repo-evidence", repo_evidence, methods=["GET"]),
+        Route("/v1/repo/{op}", repo_op, methods=["GET"]),
         Route("/v1/capabilities/refresh", refresh_capabilities, methods=["POST"]),
         Route("/v1/sessions", list_sessions, methods=["GET"]),
         Route("/v1/sessions", create_session, methods=["POST"]),

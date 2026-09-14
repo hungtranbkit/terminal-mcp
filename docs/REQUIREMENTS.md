@@ -88,6 +88,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Dashboard: Integration lane view (in Supervisor panel) | VERIFIED |
 | Dashboard: AI Usage panel (read-only, local AI Usage Monitor) | VERIFIED |
 | Dashboard: Requirements/Feature Matrix link | VERIFIED |
+| Read-only repo access for external agents (`repo_*` MCP tools) | VERIFIED (V1, read-only) |
 | Permissions: read/input grants + effective permissions | VERIFIED |
 | Reliable prompt submission (press-enter, DELIVERY_UNKNOWN, idempotency) | VERIFIED |
 | Supervisor v1 (watch/poll/state machine) | VERIFIED |
@@ -614,6 +615,16 @@ not placeholders).
 - **SSH bootstrap node connect:** real dashboard flow, `remote_connect.py`
   (host-key trust, connection test, bootstrap), covered by `real_ssh`-
   marked tests against a real local sshd.
+- **Reading a repo that lives on another node:** `GET /v1/repo/{op}` on
+  the node agent (read-only, GET-only, dispatched through
+  `repo_read.OPERATIONS` — a fixed table of ten read functions, so the
+  endpoint cannot be asked to write/checkout/fetch regardless of input),
+  reached through `NodeClient.repo_op` and routed by
+  `repo_service.RepoService`. Each node enforces its OWN
+  `repo_read`/`session_lifecycle` allowlist over its own paths, which is
+  the correct owner of that decision. `/v1/repo-evidence` (metadata only,
+  for the Coordinator gate) is its older sibling — **and had never once
+  worked before 2026-09-14**: see the Feature Details entry below.
 
 ## 13. Watchdog / recovery / registry / knowledge
 
@@ -651,7 +662,12 @@ not placeholders).
   (`windows_webterm.py`, xterm.js) is UNAFFECTED — it gets the true raw
   byte stream directly from the reader loop, full color fidelity.
 
-## 15. API / MCP tool inventory (96 tools, from `tests/test_server.py`'s own exact set)
+## 15. API / MCP tool inventory (from `tests/test_server.py`'s own exact set)
+
+The count in this heading used to be pinned at 96 and had drifted; the
+authoritative set is and always was `tests/test_server.py`'s own
+assertion, which fails the moment a tool is added or removed. This
+section names the GROUPS, never a total.
 
 Session ops: `terminal_list_sessions`, `terminal_tail`, `terminal_capture`,
 `terminal_status`, `terminal_send_text`, `terminal_send_keys`,
@@ -703,6 +719,15 @@ Auto-dispatch loop: `terminal_queue_loop_status`,
 `terminal_queue_loop_run_once`.
 Supervisor/Coordinator panel: `terminal_queue_global_inbox`,
 `terminal_queue_recent_events`, `terminal_integration_fleet_overview`.
+Read-only repo access (V1, READ-ONLY — `repo_read.py`/`repo_service.py`):
+`repo_status`, `repo_head`, `repo_branches`, `repo_remotes`, `repo_tree`,
+`repo_read`, `repo_search`, `repo_diff`, `repo_log`, `repo_show_commit`.
+There is deliberately NO write counterpart (no `repo_write`/
+`repo_checkout`/`repo_commit`/`repo_push`/`repo_reset`/`repo_clean`), and
+`tests/test_repo_read_mcp_tools.py` asserts that absence at the MCP
+surface — the read-only guarantee is pinned by a test, not by convention.
+See the "Read-only repository access for external agents" Feature Details
+entry for the full contract.
 
 **Dashboard HTTP routes** (58, from `tests/test_dashboard.py`'s own exact
 dict) — session CRUD/grant/rename/kill/reopen, supervisor v1/v2, nodes
@@ -1817,6 +1842,217 @@ tests/limitations/dependencies/follow-up/trace — for every checkpoint
 listed in §19, plus the living-requirements convention itself. This
 section is the backfill the user asked for; §1-§19 above are the fast-
 scan/audit view over the SAME facts.)*
+
+### Read-only repository access for external agents (`repo_*` MCP tools) — V1, 2026-09-14
+
+- **Goal / user value:** let an external agent reaching this server over
+  MCP (ChatGPT, specifically) read Git and source **directly**. Before
+  this, it could not: reading a file meant asking a Claude session to open
+  it and paste the content back, which is slow, lossy, and puts a second
+  agent's paraphrase between the reader and the code. Nothing in the
+  previous 240-tool surface returned file content or a diff at all.
+- **Status: VERIFIED (V1, READ-ONLY).** 97 tests across
+  `tests/test_repo_read.py` (66), `tests/test_repo_read_node.py` (26) and
+  `tests/test_repo_read_mcp_tools.py` (7)*, all against real `git init`
+  repositories, a real node-agent ASGI app and a real built MCPServer —
+  no mocked `git`, because the containment/secret/truncation rules ARE the
+  product and a mock of `git` proves nothing about what `git grep`'s
+  pathspec handling or `Path.resolve()`'s symlink following actually do.
+  (*counts as of this commit; the pinned sets, not the totals, are what
+  the tests assert.)
+- **Scope — the ten operations:** `repo_status` (branch/HEAD/dirty/
+  ahead-behind/project identity), `repo_head`, `repo_branches`,
+  `repo_remotes`, `repo_tree`, `repo_read`, `repo_search`, `repo_diff`,
+  `repo_log`, `repo_show_commit`. Declared ONCE in
+  `repo_read.OPERATIONS`, which the MCP tools, the node endpoint and
+  `LocalNodeClient` all dispatch through — so local and remote cannot
+  drift, and an operation absent from that table does not exist anywhere.
+- **Read-only, structurally rather than by convention.** Three
+  independent locks, each pinned by a test:
+  1. `repo_read.READ_ONLY_GIT_SUBCOMMANDS` — `_run_git` RAISES on any
+     subcommand outside it. `checkout`/`switch`/`reset`/`clean`/`commit`/
+     `push`/`fetch`/`pull`/`merge`/`rebase`/`stash`/`apply`/`add`/`rm`/
+     `config`/`worktree`/`update-ref` are all absent, so a later careless
+     edit inside this module fails loudly instead of shipping a write.
+  2. No tool, endpoint or client method accepts a git subcommand, a shell
+     string or an argv list. There is no arbitrary-exec path to widen.
+  3. The node endpoint is **GET-only** (`POST` → 405) and dispatches only
+     through the operation table.
+  `tests/test_repo_read_mcp_tools.py` additionally asserts that no
+  `repo_*` name beyond the ten reads is registered — adding a write
+  capability later requires editing that assertion on purpose.
+- **Security boundary, in the order a request meets it:**
+  1. `repo_read.enabled` (config gate).
+  2. `allowed_roots` — absolute-path allowlist; symlinks resolved BEFORE
+     containment is checked (`lifecycle.resolve_cwd`'s own rule), so a
+     symlink inside an allowed root pointing outside it is refused.
+  3. **The repo ROOT is checked too, not just the requested path.** Without
+     this, allowing only `<repo>/src` would expose the whole repository
+     through relative paths — a real hole, covered by its own test.
+  4. Every in-repo path is re-resolved and re-contained (PATH_OUTSIDE_REPO),
+     which is what stops `../..` and an absolute path outside the repo.
+  5. Secret paths denied by name/glob BEFORE any byte is read
+     (SECRET_PATH_DENIED), seeded from the list this project already
+     maintains (`redaction.CREDENTIAL_FILE_NAMES`) and extended with
+     `.env*`/`*.pem`/`*.key`/`id_*`/`.git-credentials`/`.npmrc`/
+     `*credentials*`/`node-agent.env`/... plus never-descended directories
+     (`.git`, `.ssh`, `.gnupg`, `.aws`, `.terminal-mcp`). `.git` is denied
+     for a concrete reason: `.git/config` can hold a tokened remote URL,
+     and `.git/objects` would let a caller reconstruct any file the path
+     rules just denied.
+     - The denial covers every route a secret could take out: `repo_read`
+       refuses it, `repo_search` DROPS hits inside it (and names the file
+       in `secret_paths_skipped`, so the omission is visible rather than
+       silent — otherwise a secret is readable one grep line at a time),
+       `repo_diff`/`repo_show_commit` EXCLUDE its hunks
+       (`secret_paths_excluded`), and `repo_log --file` refuses it.
+     - A denied path answers the same whether or not it exists — otherwise
+       the error itself is an oracle for "does this box have an
+       `id_ed25519`".
+     - A denied path is still LISTED by `repo_tree`, flagged
+       `"denied": true`: hiding it would make an agent conclude the file is
+       absent. Same posture `redaction.CREDENTIAL_FILE_NAMES` already
+       documents ("the PATH stays visible").
+  6. Everything that survives is run through `redaction.redact_output`
+     anyway — a token pasted into a README or a password in a
+     `config.sample.yaml` is caught by no path rule. The returned
+     `redaction` report carries counts and rule NAMES only, never a matched
+     value, so it is safe to return and to log.
+  7. Caps on every axis (bytes/lines/results/tree entries/log entries/diff
+     bytes/timeout), and **a caller cannot argue past a configured cap** —
+     `max_bytes=10_000_000` against a 2 KB policy still yields 2 KB.
+     Truncation is always REPORTED (`truncated: true`), never silent, and a
+     byte-truncated read is cut back to the last whole line so quoted line
+     numbers stay trustworthy.
+  8. Argument safety: refs match a strict pattern and may not begin with
+     `-`; pathspecs may not begin with `-` or contain `..`; pathspecs are
+     always passed after `--`. So `--upload-pack=...` or
+     `--output=/etc/passwd` is a rejected value, never a flag.
+  9. Every git call runs with `GIT_TERMINAL_PROMPT=0`/`GIT_ASKPASS=`/
+     `SSH_ASKPASS=` (a read can never block on a credential prompt — which
+     is what makes GIT_AUTH_REQUIRED a fast clean answer instead of a
+     stall) and `GIT_OPTIONAL_LOCKS=0` (a read never takes the index lock,
+     so it cannot interfere with a session actually working in the repo).
+- **Node-aware — reads happen where the repo lives.** The same lesson
+  `coordinator.node_aware_repo_evidence` learned for metadata, applied to
+  content: a repo at `C:\Users\tranv\project` or `/home/dell/workspace/x`
+  does not exist on the controller, and running git against that path
+  locally produces an answer about a path that means nothing here.
+  `repo_service.RepoService` LOCATES first and executes second:
+  `node`+`path` (explicit), `session` (via the controller's own
+  session→node resolution plus that node's registry record — works for a
+  remote session whose cwd the controller cannot stat), `project` (a
+  `project_identity` id, via the checkouts the fleet already reports), or
+  `path` alone (local). Every response carries `node_id` and `located_by`,
+  so an answer that came from the wrong machine is impossible to mistake
+  for the right one.
+  - A project with checkouts on two nodes returns **AMBIGUOUS_REPO with the
+    candidates listed, never a guess** — seven checkouts of this very repo
+    across three nodes is the real state of this fleet.
+  - "Could not look" is never conflated with "the repo said no":
+    NODE_UNREACHABLE (transport/timeout/404) and NODE_LACKS_REPO_READ (an
+    agent predating the endpoint) are distinct from every path/secret
+    refusal, which arrive as a 200 carrying an error code.
+  - Each node enforces its OWN allowlist over its own paths. That is the
+    correct owner of the decision, and it means a controller cannot talk a
+    node into reading something the node's operator did not allow.
+- **Git auth (V1): a local repo never needs it.** No read path touches the
+  network — `repo_remotes(check_auth=False)`, the default, is pure local
+  config. `check_auth=True` opt-in probes read access with `ls-remote` and
+  reports GIT_AUTH_REQUIRED **inside `auth`**, not as a top-level error,
+  because the remotes themselves were read fine and a caller that only
+  wanted the URL must not be failed because the network was down. Remote
+  URLs are normalised through `project_identity.normalise_git_remote`
+  (which already strips credentials) and redacted; a failed probe's stderr
+  is redacted too, since it can echo a tokened URL.
+  **Audited on the controller host, 2026-09-14:** `origin` is
+  `https://github.com/hungtranbkit/terminal-mcp.git`, anonymous HTTPS read
+  works (`ls-remote` exit 0, no credential helper configured), so **no SSH
+  key and no GitHub Deploy Key was needed or created.** Nothing was written
+  to `~/.ssh`, no key material exists in this repo or its config.
+- **Audit:** every invocation records `repo_<op>` + node + outcome +
+  latency through the EXISTING `AuditStore` (never a second database).
+  It deliberately records **no content** — no file text, no patch, no
+  matched search line, no redaction sample, and `text` is left unset so
+  `AuditStore` does not fingerprint/preview it. This log is the one an
+  operator greps freely; a read-audit that stored the secret would defeat
+  the denial it is recording. Pinned by a test that asserts the secret
+  value is absent from the serialized rows.
+- **Config:** new `repo_read` section (`config.RepoReadConfig`) — `enabled`
+  (default **true**), `allowed_roots`, the six caps, `timeout_seconds`,
+  `extra_secret_globs`. `enabled` defaults ON, unlike
+  `session_lifecycle`/`work`, and the difference is deliberate: those gates
+  guard capabilities that CREATE something (a real process, an
+  auto-dispatched prompt), while this one only reads and has no write
+  primitive to lose control of. The real boundary is `allowed_roots`, not
+  the flag. `allowed_roots` empty (the default) reuses
+  `session_lifecycle.allowed_cwd_roots` — the allowlist this deployment has
+  already curated — falling back to the server's home directory, never to
+  `/`. `extra_secret_globs` is **additive only**: there is no config key
+  that removes a built-in secret glob, so no config edit can reopen a path
+  the code closed. An out-of-range limit is a load-time ValueError, not a
+  silent clamp — a caps section nobody can trust is worse than no caps.
+- **Limitations / explicitly NOT in V1:**
+  - No write capability of any kind (that is the point, not a gap).
+  - No `fetch`/`clone`/`pull`, so a private remote this host cannot already
+    read is out of scope; an already-cloned repo is fully readable.
+  - `repo_search` uses `git grep`, so it searches tracked + untracked files
+    in a work tree, not arbitrary history. Searching history would need
+    `log -S`/`grep <rev>` and is not exposed.
+  - Binary files are refused (BINARY_FILE), never returned.
+  - `session`-based location depends on the owning node's registry record
+    having `repo_root`/`cwd`; a record predating project-info backfill
+    falls back to `cwd`, and a session in no repo answers
+    SESSION_NOT_IN_A_REPO.
+  - Reading a repo on a remote node requires that node's agent to be
+    running THIS version (`/v1/repo/{op}`); an older agent answers
+    NODE_LACKS_REPO_READ. Rolling the new agent out to dell-5530/hp is a
+    separate, explicitly-approved deployment step — see §Backlog.
+- **Trace:** `terminal_mcp/repo_read.py` (engine + operation table),
+  `terminal_mcp/repo_service.py` (node-aware routing + audit),
+  `terminal_mcp/node_agent.py` (`GET /v1/repo/{op}`),
+  `terminal_mcp/node_client.py` (`repo_op` on the protocol,
+  `LocalNodeClient`, `RemoteNodeClient`), `terminal_mcp/config.py`
+  (`RepoReadConfig`, `_load_repo_read_config`), `terminal_mcp/mcp_app.py`
+  (the ten tools), `tests/test_repo_read*.py`, `tests/test_server.py` (the
+  pinned tool set).
+
+### `/v1/repo-evidence` had never worked — NameError on every request (fixed 2026-09-14)
+
+- **Found while** adding the content-bearing `/v1/repo/{op}` sibling
+  endpoint next to it.
+- **The bug:** the handler called `resolve_cwd(cwd, config)`, but `config`
+  is not defined anywhere in `build_node_agent`'s scope (`node_agent.py`
+  imports `load_config`, the FUNCTION, and the only `config` binding in the
+  module is a local inside `main()`). So **every single request to
+  `/v1/repo-evidence` raised NameError and answered HTTP 500**, from the
+  day the endpoint was written (commit `10d2566`, "Collect pre-dispatch
+  repo evidence where the session actually lives").
+- **Blast radius:** the Coordinator's pre-dispatch gate reads repo evidence
+  for a session through `node_aware_repo_evidence`, which reports any
+  non-200 as `RepoEvidenceUnavailable` — "we could not look" — and fails
+  closed. So **nothing was ever wrong-but-believed**: no dispatch decision
+  was made on bad evidence. The capability was simply never working, and
+  silently: every remote-node dispatch fell back to the
+  unavailable/NEEDS_HUMAN path (or an `allow_unverified_repo` waiver)
+  instead of getting real evidence. The fail-closed design is exactly what
+  kept this from becoming an incident, and is also what hid it.
+- **Why it survived:** `tests/test_coordinator_remote_repo_evidence.py`
+  covers the collector and the client protocol thoroughly, but with a stub
+  client — nothing ever exercised the ROUTE end-to-end through a real ASGI
+  app. The unit tests were green the whole time.
+- **Fix:** use `terminal.config` (the node's own config, genuinely in
+  scope). One-line change; the endpoint's logic was otherwise correct.
+- **Regression cover:** `tests/test_repo_read_node.py` —
+  `test_repo_evidence_endpoint_actually_answers` (real request, real repo,
+  asserts branch/HEAD/clean), `test_repo_evidence_endpoint_enforces_the_
+  cwd_allowlist` (403 PATH_NOT_ALLOWED), and
+  `test_repo_evidence_reaches_the_controller_gate_through_the_node_client`
+  (the full collector → client → HTTP → node → git chain the gate really
+  uses).
+- **Deployment note:** the fix only takes effect on a node once THAT node's
+  agent is restarted on this version. Until then, remote repo evidence
+  keeps behaving as it has: unavailable, fail-closed.
 
 ### Supervisor Queue v2 — Phase 1 (persistence + state machine + CRUD)
 
@@ -3097,6 +3333,29 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
 ---
 
 ## Backlog (explicitly not done yet — tracked here so it isn't re-discovered)
+
+0. **Repo Read V1 — the two things it deliberately does not do yet
+   (2026-09-14).**
+   a) **Rolling the new node agent out to dell-5530 / hp / any other
+      remote node.** `repo_service` routing, `NodeClient.repo_op` and the
+      `/v1/repo/{op}` endpoint are all implemented and tested, but a
+      remote node can only serve repo reads once ITS agent runs this
+      version; an older one correctly answers NODE_LACKS_REPO_READ. The
+      same restart is what activates the `/v1/repo-evidence` NameError fix
+      on that node. Not done autonomously: restarting the dell-5530 agent
+      is the exact disruptive action item 7 below documents at length (a
+      real `taskkill /F` with no known ConPTY reattach), and it needs the
+      same explicit per-instance go-ahead. **Local/controller-side reads
+      work today with no restart of anything remote.**
+   b) **Write capability (checkout/commit/branch/push/apply).** Out of
+      scope for V1 by design, not by omission — see the read-only locks in
+      the Feature Details entry. Any future write surface is a new,
+      separately-audited capability with its own gate; it must not be
+      added by widening `repo_read.READ_ONLY_GIT_SUBCOMMANDS`.
+   Also not done, and smaller: searching git HISTORY (`log -S`,
+   `grep <rev>`) rather than a work tree; `fetch`/`clone` of a private
+   remote this host cannot already read (no key was needed or created —
+   anonymous HTTPS read against `origin` works today).
 
 1. **Live remote-node auto-dispatch smoke test (dell-5530,
    `RemoteNodeClient`)** — this task batch's own required next step
