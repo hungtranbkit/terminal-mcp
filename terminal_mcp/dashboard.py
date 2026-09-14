@@ -8401,6 +8401,14 @@ WORK_HTML = r"""<!doctype html>
       return node;
     }
 
+    function duration(seconds) {
+      if (seconds === null || seconds === undefined) return '—';
+      if (seconds < 90) return Math.round(seconds) + 's';
+      if (seconds < 5400) return Math.round(seconds / 60) + 'm';
+      if (seconds < 172800) return Math.round(seconds / 3600) + 'h';
+      return Math.round(seconds / 86400) + 'd';
+    }
+
     function ago(stamp) {
       if (!stamp) return '—';
       const seconds = (Date.now() - Date.parse(stamp)) / 1000;
@@ -8488,16 +8496,29 @@ WORK_HTML = r"""<!doctype html>
       for (const worker of state.workers) {
         const card = el('div', {className: 'card'});
         const head = el('div', {className: 'card-head'});
+        // A state name alone cannot say WHY a worker is busy. "BUSY" means the
+        // queue put work here; "đang chạy (ngoài queue)" means a human did,
+        // and dispatching into it would type over their conversation. The old
+        // label called that second case IDLE, which invited exactly that.
+        const WORKER_LABEL = {
+          BUSY: 'BUSY · queue', RUNNING_MANUAL: 'đang chạy (ngoài queue)',
+          IDLE: 'IDLE · sẵn sàng', OFFLINE: 'OFFLINE', UNAVAILABLE: 'không dùng được',
+        };
         head.append(el('span', {className: 'title', text: worker.session}),
                     el('span', {className: 'pill WORK', text: 'WORK'}),
-                    el('span', {className: 'pill ' + worker.state, text: worker.state}));
+                    el('span', {className: 'pill ' + worker.state,
+                                text: WORKER_LABEL[worker.state] || worker.state}));
         card.appendChild(head);
-        // The session listing carries no agent field, so an unknown agent is
-        // shown as unknown. Defaulting to 'shell' labelled a Claude worker
-        // wrong, which is worse than saying nothing -- and adding a status
-        // round-trip per worker to a 6s poll is not worth a cosmetic label.
+        // The agent now comes from the occupancy probe when the listing has
+        // none; an unknown agent is still shown as unknown rather than
+        // defaulted to 'shell', which labelled a Claude worker wrong.
+        const evidence = worker.occupancy_evidence || {};
         card.appendChild(el('div', {className: 'muted',
-          text: [worker.node_id || 'local', worker.agent_type || 'agent ?'].join(' · ')}));
+          text: [worker.node_id || 'local',
+                 worker.agent_type || evidence.current_command || 'agent ?'].join(' · ')}));
+        if (worker.busy_untracked)
+          card.appendChild(el('div', {className: 'muted',
+            text: 'đang bận nhưng không do queue giao — không tự gửi task vào đây'}));
         if (worker.current_task)
           card.appendChild(el('div', {className: 'muted ellip',
             text: '▶ ' + worker.current_task.title + ' (' + worker.current_task.status + ')'}));
@@ -8636,6 +8657,19 @@ WORK_HTML = r"""<!doctype html>
           left.appendChild(el('div', {className: 'dep',
             text: '↳ sau: ' + task.depends_on.map((d) => byId[d] || d).join(', ')}));
         left.appendChild(flowStrip(task.queue_status));
+        // How long this task has been waiting, and why. Without it a task
+        // parked in VERIFYING renders exactly like one that just got there,
+        // so the page looks frozen when it is in fact faithfully showing a
+        // stall. This is also the value that changes between polls.
+        if (task.waiting_seconds !== undefined && task.waiting_seconds !== null) {
+          const waited = el('div', {className: task.waiting_stale ? 'err' : 'muted',
+                                    text: 'đang chờ ' + duration(task.waiting_seconds)
+                                          + ' ở ' + task.queue_status});
+          left.appendChild(waited);
+          if (task.waiting_reason) {
+            left.appendChild(el('div', {className: 'muted', text: task.waiting_reason}));
+          }
+        }
         if (task.last_error) left.appendChild(el('div', {className: 'err', text: task.last_error}));
         if (task.coordinator_reason && /NEEDS|BLOCK|loop/i.test(task.coordinator_reason))
           left.appendChild(el('div', {className: 'err', text: task.coordinator_reason}));
@@ -11483,8 +11517,25 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                              if n.get("node_id")}
                 except Exception:  # noqa: BLE001 -- freshness is a bonus here
                     nodes = {}
-            return _work_service().workers(sessions=listing.get("sessions") or [],
-                                           nodes=nodes)
+            from .work_eligibility import is_work_session
+
+            rows = listing.get("sessions") or []
+            # Occupancy has to be fetched, not inferred: neither session
+            # listing carries current_command, so without this every worker
+            # running an agent looked IDLE and the queue would happily
+            # dispatch on top of a live conversation. Only `-work` sessions
+            # are probed -- there are few of them, and an ordinary session is
+            # none of this list's business.
+            statuses: dict[str, Any] = {}
+            for row in rows:
+                name = row.get("name")
+                if not name or not is_work_session(name):
+                    continue
+                try:
+                    statuses[name] = controller.terminal_input_context(name)
+                except Exception:  # noqa: BLE001 -- occupancy is best-effort
+                    continue
+            return _work_service().workers(sessions=rows, nodes=nodes, statuses=statuses)
 
         try:
             payload = await anyio.to_thread.run_sync(_build)

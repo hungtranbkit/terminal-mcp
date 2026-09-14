@@ -1126,6 +1126,18 @@ class QueueStore:
     def append_tasks(self, session: str, tasks: list[dict[str, Any]]) -> list[str]:
         return self.set_tasks(session, tasks, replace_pending=False)
 
+    def waiting_since(self, task_id: str, status: str) -> str | None:
+        """When this task most recently ENTERED `status`, from its own events.
+
+        Derived rather than stored: the transition is already written to
+        queue_events, and a second copy on the row could disagree with it.
+        """
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT timestamp FROM queue_events WHERE task_id = ? AND event_type = ? "
+                "ORDER BY id DESC LIMIT 1", (task_id, status)).fetchone()
+        return row["timestamp"] if row else None
+
     def record_manual_dispatch(self, task_id: str, *, detail: dict[str, Any]) -> dict[str, Any] | None:
         """Reconcile a send that went round the queue onto the task itself.
 

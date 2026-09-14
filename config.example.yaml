@@ -206,3 +206,48 @@ supervisor:
 #       keepalive_interval_seconds: 30
 #       keepalive_count_max: 3
 #       retry_seconds: 15
+
+# Read-only repository access for the repo_* MCP tools (repo_read.py /
+# repo_service.py) -- what lets an external agent (ChatGPT over MCP) read
+# Git and source directly instead of asking a Claude session to paste
+# file contents back.
+#
+# ON by default, unlike session_lifecycle/work: those gate capabilities
+# that CREATE something (a real process, an auto-dispatched prompt), while
+# this one only reads and has no write primitive -- there is deliberately
+# no repo_write/repo_checkout/repo_commit tool, and every mutating git
+# subcommand is refused by repo_read.READ_ONLY_GIT_SUBCOMMANDS. The real
+# boundary is allowed_roots, not the flag.
+repo_read:
+  enabled: true
+
+  # Absolute paths a repository must resolve (symlinks followed) inside
+  # of. LEAVE EMPTY to reuse session_lifecycle.allowed_cwd_roots -- the
+  # allowlist you have already curated for "where a session may live",
+  # which is very nearly the set of repos worth reading. With both empty
+  # the effective root is this server's own home directory; never "/",
+  # which the loader refuses outright.
+  allowed_roots: []
+    # - /home/dell/workspace
+
+  # Output caps. A caller cannot argue past these (asking for
+  # max_bytes=10000000 against a 256000 policy still yields 256000), and
+  # truncation is always reported as `truncated: true`, never silent.
+  # An out-of-range value here is a load-time error, not a silent clamp.
+  max_bytes: 256000          # per repo_read call
+  max_lines: 2000            # per repo_read call
+  max_results: 200           # per repo_search call
+  max_tree_entries: 2000     # per repo_tree call
+  max_tree_depth: 6          # per repo_tree call
+  max_log_entries: 200       # per repo_log call
+  max_diff_bytes: 400000     # per repo_diff / repo_show_commit patch
+  timeout_seconds: 15        # per git invocation
+
+  # ADDITIVE ONLY. Credential files are already denied by a built-in list
+  # (.env*, *.pem, *.key, id_*, .git-credentials, .npmrc, *credentials*,
+  # .git/, .ssh/, ... -- see repo_read.SECRET_PATH_GLOBS), and there is
+  # deliberately NO key that removes one, so nothing configured here can
+  # reopen a path the code closed. Use it to deny MORE for your own repo.
+  extra_secret_globs: []
+    # - "*.backup.sql"
+    # - "deploy/production-*.yaml"

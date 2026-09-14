@@ -72,6 +72,7 @@ class NodeClient(Protocol):
     def metrics(self) -> dict[str, Any]: ...
     def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]: ...
     def repo_evidence(self, cwd: str) -> dict[str, Any]: ...
+    def repo_op(self, op: str, path: str, params: dict[str, Any]) -> dict[str, Any]: ...
     def describe_permissions(self, session: str) -> dict[str, Any]: ...
     def set_permissions(self, session: str, *, read: bool | None, input: bool | None,
                         expected_revision: int | None, actor: str | None) -> dict[str, Any]: ...
@@ -205,6 +206,20 @@ class LocalNodeClient:
                 "clean": evidence.clean, "status_lines": list(evidence.status_lines),
                 "has_upstream": evidence.has_upstream,
                 "ahead": evidence.ahead, "behind": evidence.behind}
+
+    def repo_op(self, op: str, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Read-only repo introspection on THIS host (controller == node).
+
+        Goes through the SAME repo_read.run_operation the remote node's
+        HTTP endpoint calls, with the policy built from this process's own
+        config -- so a local repo and a remote one are read by identical
+        code under identical limits, and a behaviour difference between
+        them would be a bug in the transport, never in the engine."""
+        from . import repo_read
+
+        config = self._terminal.config
+        policy = config.repo_read.to_policy(config.session_lifecycle.allowed_cwd_roots)
+        return repo_read.run_operation(op, path, params or {}, policy)
 
     def describe_permissions(self, session: str) -> dict[str, Any]:
         return self._terminal.describe_session_permissions(session)
@@ -414,6 +429,35 @@ class RemoteNodeClient:
 
         return self._request(
             "GET", "/v1/repo-evidence?cwd=" + _urlparse.quote(str(cwd), safe=""))
+
+    def repo_op(self, op: str, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Ask THIS node to read one of its own repositories.
+
+        A node whose agent predates /v1/repo/{op} answers 404, which
+        surfaces as a NodeClientError from `_request` and is reported by
+        the caller as NODE_UNREACHABLE/unsupported -- never as "the repo
+        said no". That is the same distinction /v1/repo-evidence had to
+        draw, and confusing the two here would be worse: a caller would
+        conclude a file does not exist when the truth is that nobody
+        looked.
+        """
+        import urllib.parse as _urlparse
+
+        query: list[tuple[str, str]] = [("path", str(path))]
+        for key, value in (params or {}).items():
+            if value is None or value == "":
+                continue
+            if isinstance(value, bool):
+                query.append((key, "true" if value else "false"))
+            elif isinstance(value, (list, tuple)):
+                # Repeated key, not a joined string: a pathspec may legally
+                # contain a comma.
+                query.extend((key, str(item)) for item in value)
+            else:
+                query.append((key, str(value)))
+        return self._request(
+            "GET", f"/v1/repo/{_urlparse.quote(str(op), safe='')}?"
+                   + _urlparse.urlencode(query))
 
     def describe_permissions(self, session: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/sessions/{session}/permissions")

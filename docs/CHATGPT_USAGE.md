@@ -72,6 +72,128 @@ only, nothing to call yet. Never treat a PLANNED item as available.
    if false, you have no access; ask a human to grant it (dashboard) or
    use a session already in `allowed_session_patterns`.
 
+## 2b. Reading a repository directly (`repo_*` — READ-ONLY)
+
+**Use these instead of asking a session to read a file for you.** Before
+these existed, the only way to see code through this server was to send a
+prompt like "cat the file and paste it back" into a Claude/Codex session
+and read the pane output. Don't do that any more: it is slow, it burns
+another agent's context, and what comes back is that agent's paraphrase
+rather than the file.
+
+The ten tools, all reads:
+
+| Tool | Answers |
+|---|---|
+| `repo_status` | branch, HEAD, dirty state, ahead/behind, project identity |
+| `repo_head` | just the checked-out commit (cheapest) |
+| `repo_branches` | local branches, tips, upstreams |
+| `repo_remotes` | remote URLs (credentials stripped); optional auth probe |
+| `repo_tree` | file/directory listing, bounded by depth + limit |
+| `repo_read` | one text file's content, by line window or byte cap |
+| `repo_search` | content search -> path + line number + line |
+| `repo_diff` | working-tree diff, or `base..head` |
+| `repo_log` | commit history, optionally for one path |
+| `repo_show_commit` | one commit's metadata, message and patch |
+
+### Saying WHICH repo you mean
+
+Pass exactly one of these on any `repo_*` call:
+
+- `path` — a repo root, or any path inside one, **on the controller host**.
+- `session` — "the repo this session is working in". Resolved on the node
+  that session actually runs on, so this is the right choice when you are
+  already watching a session and want to see its code.
+- `project` — a `project_identity` project_id or name (e.g.
+  `git:github.com/hungtranbkit/terminal-mcp`).
+- `node` + `path` — explicit, no discovery.
+
+Every response carries `node_id` and `located_by`, so you can always see
+which machine answered and how it was chosen. **Check them**: if you asked
+by `session` and got a different node than you expected, the answer is
+about a different working tree than you thought.
+
+### The normal workflow
+
+```
+repo_tree(project="…", depth=2)              # orient
+repo_search(project="…", query="some_symbol") # find it
+repo_read(project="…", file="pkg/mod.py",     # read around the hit
+          start_line=1, end_line=120)
+repo_diff(project="…")                        # what is uncommitted right now
+repo_log(project="…", limit=10)               # recent history
+repo_show_commit(project="…", commit="<sha>") # one commit in full
+```
+
+`repo_search` is FIXED-STRING by default — searching `find_me()` finds
+that literal text. Pass `regex=true` only if you actually want a regex.
+
+### What you will be refused, and what it means
+
+Refusals come back as an error CODE in a normal result (never an
+exception, never prose), so branch on them:
+
+| Code | Meaning |
+|---|---|
+| `REPO_NOT_ALLOWED` | that path is outside the server's configured repo allowlist |
+| `PATH_OUTSIDE_REPO` | the path (after resolving `..` and symlinks) leaves the repo |
+| `SECRET_PATH_DENIED` | a credential file (`.env`, `*.pem`, `id_*`, …) — never readable |
+| `PATH_NOT_FOUND` / `NOT_A_FILE` / `BINARY_FILE` | ordinary "that isn't a readable text file" |
+| `NOT_A_GIT_REPO` | the path exists but is not inside a repository |
+| `INVALID_REF` | your `commit`/`base`/`head` isn't a valid revision |
+| `INVALID_ARGUMENT` | a bad/misspelled parameter, or no locator given |
+| `AMBIGUOUS_REPO` | the project has checkouts on >1 node — re-ask with `node` + `path` |
+| `NODE_UNREACHABLE` | that node could not be asked (this is **not** "the file is missing") |
+| `NODE_LACKS_REPO_READ` | that node's agent predates this feature |
+| `GIT_AUTH_REQUIRED` | only from `repo_remotes(check_auth=true)`; local reads never need auth |
+| `REPO_READ_DISABLED` | the operator turned `repo_read` off in config |
+
+Two of these matter especially:
+
+- **`SECRET_PATH_DENIED` is final.** Don't try to route around it — the
+  same denial applies to `repo_search` hits (dropped, and listed in
+  `secret_paths_skipped`), to diff hunks (excluded, listed in
+  `secret_paths_excluded`) and to `repo_log --file`. There is no
+  combination of these tools that returns a credential file's content.
+  A denied file is still *listed* by `repo_tree` with `"denied": true`, so
+  you can tell "refused" from "absent".
+- **`NODE_UNREACHABLE` means nobody looked.** Never report it as "the file
+  does not exist" or "the repo is broken".
+
+### Things to expect
+
+- **Content is redacted.** Even in an ordinary file, a token/password-shaped
+  value comes back as `<REDACTED>`; the `redaction` field says how many
+  rules hit (by rule name, never the value). That is not corruption —
+  don't ask for the file a second way to try to get the raw value.
+- **Output is capped, and two different flags say so.** On `repo_read`,
+  **`has_more: true`** means the file continues past what you got — that is
+  the field to page on, with `start_line`/`end_line`. **`truncated: true`**
+  means a cap interfered: your window was narrowed by the line limit, or
+  cut short by the byte cap. A window you asked for and fully received
+  reports `truncated: false` even when `has_more` is true — so page on
+  `has_more`, never on `truncated`, or you will re-request a satisfied
+  window forever. Raising `max_bytes` past the server's configured cap does
+  nothing. `start_line`/`end_line`/`lines_returned` describe exactly what
+  you got, so line numbers you quote back are trustworthy.
+- **Local reads never need GitHub auth.** Nothing in the read path touches
+  the network. `repo_remotes` only probes the network if you pass
+  `check_auth=true`, and even then a failure lands in `auth`, not as a
+  top-level error.
+
+### What these tools CANNOT do (V1)
+
+There is **no write capability at all** — no checkout, commit, branch,
+reset, clean, apply, push, fetch or pull, and no arbitrary git/shell
+command. This is structural, not a policy you can ask to have relaxed at
+call time: every mutating git subcommand is refused by the engine, and no
+tool accepts a git subcommand or shell string. If a task needs the
+repository *changed*, that is still a real task for a coding session —
+use the queue flow (§4) and the git-isolation worktree flow (§4d).
+
+Also not available: searching git *history* (these search a work tree),
+and fetching/cloning a private remote this host cannot already read.
+
 ## 3. Direct-send flow (canonical for a single, immediate prompt)
 
 **`terminal_send_text(session, text, press_enter=True)`** is the
