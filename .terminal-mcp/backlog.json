@@ -9,8 +9,8 @@
     "git_branch": "main",
     "is_portable": true
   },
-  "revision": 8,
-  "updated_at": "2026-09-11T17:09:43.483188+00:00",
+  "revision": 47,
+  "updated_at": "2026-09-14T19:44:23.231913+00:00",
   "items": [
     {
       "id": "blg_f52a999971d9",
@@ -68,7 +68,7 @@
       "type": "feature",
       "order": 2,
       "created_at": "2026-09-09T08:02:29.711872+00:00",
-      "updated_at": "2026-09-09T08:02:29.711873+00:00",
+      "updated_at": "2026-09-14T15:20:59.989198+00:00",
       "source": "session-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -86,7 +86,7 @@
       "queue_task_id": null,
       "branch": null,
       "worktree": null,
-      "blocked_reason": null,
+      "blocked_reason": "Not evidenced by the 2026-09-14 staging run. That run proved rate limiting on the ENROLMENT routes (/dashboard/api/enroll/consume: 4 attempts then HTTP 429), which is a different surface from node-agent bearer auth. AC2 (heartbeat never throttled) and AC3 (lockout cannot wedge a node) remain entirely untested. Recorded so the adjacent evidence is not mistaken for this item's.",
       "evidence": {
         "commits": [],
         "tests": [],
@@ -98,6 +98,14 @@
           "at": "2026-09-09T08:02:29.711883+00:00",
           "event": "created",
           "by": "session-audit-2026-09-09"
+        },
+        {
+          "at": "2026-09-14T15:20:59.989198+00:00",
+          "event": "updated",
+          "by": "m910-reconcile",
+          "changed": [
+            "blocked_reason"
+          ]
         }
       ]
     },
@@ -105,12 +113,12 @@
       "id": "blg_a3cc401d8275",
       "title": "Node token rotation and revocation mechanism",
       "description": "There is no rotation/revocation path today - rotating a token is a manual, per-node, restart-requiring edit of two files (proven twice on 2026-09-09: macbook rotated, dell-5530 deferred because its restart costs 6 sessions). Roadmap Phase 5 names this.",
-      "status": "BACKLOG",
+      "status": "IN_PROGRESS",
       "priority": "P1",
       "type": "feature",
       "order": 3,
       "created_at": "2026-09-09T08:02:29.711889+00:00",
-      "updated_at": "2026-09-09T08:02:29.711890+00:00",
+      "updated_at": "2026-09-14T15:10:13.320335+00:00",
       "source": "session-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -126,20 +134,73 @@
       "session": null,
       "node_id": null,
       "queue_task_id": null,
-      "branch": null,
-      "worktree": null,
+      "branch": "feat/node-token-rotation",
+      "worktree": "/home/mesflow/wt-token-rotation",
       "blocked_reason": null,
       "evidence": {
-        "commits": [],
-        "tests": [],
-        "deploys": [],
-        "notes": []
+        "commits": [
+          "a6e4999 Give a node token an identity, so it can be rotated and revoked -- terminal_mcp/node_credentials.py (store: ACTIVE/GRACE/REVOKED, sha256 only, fail-closed verify), dashboard.py shared _verify_node_token",
+          "3e5f21c Make rotating a node token an operation, not a procedure -- terminal_mcp/token_rotation.py (stage/collect/confirm/revoke), node_agent.AgentCredential (in-place token swap, no restart), controller.update_remote_token, 5 API routes, docs/node-token-rotation.md",
+          "5d3bc6b Merge: rotate a node token without touching either machine -- feat/node-token-rotation merged into main (after 4a51368 merged main's 16 intervening commits back in; no conflicts)"
+        ],
+        "tests": [
+          "tests/test_node_credentials.py -- 22 passed (store semantics, concurrency, no plaintext at rest)",
+          "tests/test_token_rotation.py -- 32 passed (full handoff over real routes, idempotence, revocation fail-closed both directions, no plaintext in audit/status/responses, agent-side credential swap)",
+          "adjacent auth/node regressions -- 473 passed total across test_dashboard, test_dashboard_nodes, test_dashboard_nodes_connect, test_dashboard_grants, test_webauth, test_node_agent, test_node_agent_webterm, test_windows_onboarding, test_windows_onboarding_e2e, test_connection_store, test_controller, test_server, test_node_profile",
+          "post-merge on the merged branch -- 402 passed (rotation + auth/node adjacents) and 236 passed (the suites main added in between); on main after the merge -- 176 passed (test_token_rotation, test_node_credentials, test_dashboard)"
+        ],
+        "deploys": [
+          "staging 8777 (loopback-only, ~/terminal-mcp-staging) redeployed onto merged main 5d3bc6b on 2026-09-14; rotation flow verified end to end against a REAL node agent (~/terminal-mcp-staging/run-staging-node.sh, node stg-rot on 127.0.0.1:8792): enrollment auto-adopted the token; two rotations picked up by the agent with NO restart ('adopted rotated node token ... (no restart)' in agent.log); each confirmation revoked the superseded token (reason=rotation_confirmed); the real old plaintext was then refused 401 verdict=REVOKED; a second rotate while one was in flight returned rotated=false with the same staged token_id; revoke-all made the node fail closed in BOTH directions (inbound heartbeat 401 REVOKED, outbound /v1/capabilities/refresh 401 because the controller cleared its own copy); 8 audit rows written, all token_id fingerprints, zero plaintext in staging audit.db. Production 8766 untouched."
+        ],
+        "notes": [
+          "AC1 (rotate without hand-editing both sides) MET: POST /dashboard/api/nodes/{id}/token/rotate stages a replacement; the node collects it on its next heartbeat via /token/refresh and adopts it in memory; the controller moves its own outbound copy (token file + env var + live RemoteNodeClient) only once a heartbeat arrives signed with the new token. Operator never sees a token.",
+          "AC2 (revocation without a full node restart) MET: enforced controller-side at the one shared _verify_node_token site, so it takes effect on the node's next request on every platform with zero node-side action; outbound is cleared at the same time. Per-platform cost table in docs/node-token-rotation.md.",
+          "AC3 (old token provably rejected) MET: confirmation REVOKES the superseded token rather than letting it expire; asserted at the route (401 + verdict=REVOKED) and in the store.",
+          "Grace is open-ended by default (closed by confirmation, not a clock) so a node offline during rotation is never locked out; grace_seconds=0 gives an immediate cutover for a compromised token.",
+          "Backward compatible: nodes with no credential record keep using the legacy env-var path; newly enrolled nodes are adopted automatically, so they are rotatable from their first heartbeat.",
+          "BLOCKER (why this is not DONE): merged into main at 5d3bc6b but NOT deployed. Production 8766 still runs the pinned worktree at d5ea332, which predates the merge. Remaining: (1) production deploy of the controller half, (2) node-agent upgrade on dell-5530/hp/Windows nodes -- until (2) rotation on those stages safely but only completes after an agent restart; revocation needs only (1). Both require rollout approval that has not been given.",
+          "Staging measurement note: POST /dashboard/api/node/test-connection cannot verify an outbound TOKEN -- the agent's /v1/health is an unauthenticated liveness probe by design. Use /dashboard/api/nodes/{id}/refresh-capabilities for that. Documented in the staging README."
+        ]
       },
       "history": [
         {
           "at": "2026-09-09T08:02:29.711897+00:00",
           "event": "created",
           "by": "session-audit-2026-09-09"
+        },
+        {
+          "at": "2026-09-14T10:49:02.360532+00:00",
+          "event": "claimed",
+          "by": null,
+          "session": null,
+          "node_id": null
+        },
+        {
+          "at": "2026-09-14T13:35:32.178798+00:00",
+          "event": "updated",
+          "by": "claude-code",
+          "changed": [
+            "branch",
+            "evidence",
+            "status",
+            "worktree"
+          ]
+        },
+        {
+          "at": "2026-09-14T14:37:58.956414+00:00",
+          "event": "updated",
+          "by": "claude-code",
+          "changed": [
+            "evidence"
+          ]
+        },
+        {
+          "at": "2026-09-14T15:10:13.320335+00:00",
+          "event": "updated",
+          "by": "claude-code",
+          "changed": [
+            "evidence"
+          ]
         }
       ]
     },
@@ -147,12 +208,12 @@
       "id": "blg_0393ee9bd3d2",
       "title": "Validate node endpoint scheme: refuse plaintext http:// to a non-private host",
       "description": "config.py accepts any non-empty string as nodes.remote[].endpoint. A plaintext http:// endpoint pointed at a public host would send the bearer token in the clear on every request. RemoteNodeClient already verifies TLS correctly for https:// - only the scheme check is missing.",
-      "status": "BACKLOG",
+      "status": "IN_PROGRESS",
       "priority": "P1",
       "type": "bug",
       "order": 4,
       "created_at": "2026-09-09T08:02:29.711902+00:00",
-      "updated_at": "2026-09-09T08:02:29.711904+00:00",
+      "updated_at": "2026-09-14T08:41:33.933223+00:00",
       "source": "session-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -182,6 +243,20 @@
           "at": "2026-09-09T08:02:29.711910+00:00",
           "event": "created",
           "by": "session-audit-2026-09-09"
+        },
+        {
+          "at": "2026-09-14T08:41:25.473655+00:00",
+          "event": "claimed",
+          "by": null,
+          "session": null,
+          "node_id": null
+        },
+        {
+          "at": "2026-09-14T08:41:33.933223+00:00",
+          "event": "claimed",
+          "by": null,
+          "session": null,
+          "node_id": null
         }
       ]
     },
@@ -189,12 +264,12 @@
       "id": "blg_316183197b4c",
       "title": "terminal-mcp-doctor reports 'lan: not configured' while the service IS LAN-bound",
       "description": "The CLI reads its OWN environment, not the running service's, so describe_endpoints reports loopback-only even though the service is bound to 192.168.1.132 and 100.81.85.120. The dashboard route is correct because it runs in-process. describe_endpoints' docstring claims it 'always reflects what the RUNNING process actually resolved' - true for the dashboard, false for the CLI.",
-      "status": "BACKLOG",
+      "status": "IN_PROGRESS",
       "priority": "P1",
       "type": "bug",
       "order": 5,
       "created_at": "2026-09-09T08:02:29.711914+00:00",
-      "updated_at": "2026-09-09T08:02:29.711916+00:00",
+      "updated_at": "2026-09-14T10:54:03.587564+00:00",
       "source": "session-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -206,9 +281,9 @@
         "observability",
         "doctor"
       ],
-      "assignee": null,
-      "session": null,
-      "node_id": null,
+      "assignee": "m2",
+      "session": "m2",
+      "node_id": "local",
       "queue_task_id": null,
       "branch": null,
       "worktree": null,
@@ -224,6 +299,13 @@
           "at": "2026-09-09T08:02:29.711921+00:00",
           "event": "created",
           "by": "session-audit-2026-09-09"
+        },
+        {
+          "at": "2026-09-14T10:54:03.587564+00:00",
+          "event": "claimed",
+          "by": "m2",
+          "session": "m2",
+          "node_id": "local"
         }
       ]
     },
@@ -278,7 +360,7 @@
       "type": "bug",
       "order": 7,
       "created_at": "2026-09-09T08:02:29.711936+00:00",
-      "updated_at": "2026-09-09T08:02:29.711937+00:00",
+      "updated_at": "2026-09-14T15:20:59.869302+00:00",
       "source": "session-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -296,7 +378,7 @@
       "queue_task_id": null,
       "branch": null,
       "worktree": null,
-      "blocked_reason": null,
+      "blocked_reason": "AC2 (verify live on a real Windows session) is blocked by the same risk as every other dell-5530 item: it is the only Windows node, win1/win2/wtest are attached and active, and a node-agent restart previously lost 3 of 6 ConPTY sessions (blg_dell5530_lost_sessions). Do this inside the maintenance window described by blg_f52a999971d9, not ad hoc. NOTE: the 2026-09-14 submit-deadlock fix (SUBMIT_STALLED, commit d5ea332) is a DIFFERENT surface -- send_keys Enter on the controller -- and does NOT satisfy either AC here.",
       "evidence": {
         "commits": [],
         "tests": [],
@@ -308,6 +390,14 @@
           "at": "2026-09-09T08:02:29.711942+00:00",
           "event": "created",
           "by": "session-audit-2026-09-09"
+        },
+        {
+          "at": "2026-09-14T15:20:59.869302+00:00",
+          "event": "updated",
+          "by": "m910-reconcile",
+          "changed": [
+            "blocked_reason"
+          ]
         }
       ]
     },
@@ -358,12 +448,12 @@
       "id": "blg_2f6ac3f0ab9a",
       "title": "Node self-registration with an enrollment token",
       "description": "An unknown node_id heartbeat is refused NODE_NOT_FOUND, and dashboard onboarding health-probes the node, so onboarding needs controller->node reachability AND a manual controller-side action. The goal 'install agent, paste token, it appears' is not achievable today.",
-      "status": "BACKLOG",
+      "status": "IN_PROGRESS",
       "priority": "P2",
       "type": "feature",
       "order": 9,
       "created_at": "2026-09-09T08:02:29.711956+00:00",
-      "updated_at": "2026-09-09T08:02:29.711958+00:00",
+      "updated_at": "2026-09-14T15:20:40.780041+00:00",
       "source": "session-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -381,18 +471,30 @@
       "queue_task_id": null,
       "branch": null,
       "worktree": null,
-      "blocked_reason": null,
+      "blocked_reason": "AC1 needs a real fresh machine: enrolment must be driven end to end from a machine that has never enrolled. dell-5530 cannot be used -- it is already enrolled and re-enrolling mints a new bearer token over its live one, and a node-agent restart previously lost 3 of 6 ConPTY sessions (see blg_dell5530_lost_sessions); win1/win2/wtest are currently attached and active.",
       "evidence": {
         "commits": [],
         "tests": [],
         "deploys": [],
-        "notes": []
+        "notes": [
+          "2026-09-14 staging E2E on 8777 (own state dir, production untouched). AC3 MET: replay of a consumed code -> HTTP 401 ENROLLMENT_ALREADY_USED, unknown code -> ENROLLMENT_NOT_FOUND, both with an identical `detail` string so the two are indistinguishable to a caller; audit rows node_enrolled (node_id set) and node_enrollment_rejected (node_id None) written per attempt. AC2 evidenced at protocol level: consume is a single outbound POST from the machine; nothing calls back to the node during enrolment. AC1 NOT met: the controller half was driven from m910 with a synthetic hostname (node_id e2e-probe-01), NOT from a real fresh machine. Also measured: consume returns the full bootstrap config (controller_url, heartbeat_path+interval, agent_port, profile, ssh firewall CIDR, node_token); progress accepts starting/downloading/registering with HTTP 202 and rejects an unknown stage with 400; consume is rate-limited to 4 attempts then 429."
+        ]
       },
       "history": [
         {
           "at": "2026-09-09T08:02:29.711963+00:00",
           "event": "created",
           "by": "session-audit-2026-09-09"
+        },
+        {
+          "at": "2026-09-14T15:20:40.780041+00:00",
+          "event": "updated",
+          "by": "m910-reconcile",
+          "changed": [
+            "blocked_reason",
+            "evidence",
+            "status"
+          ]
         }
       ]
     },
@@ -1826,12 +1928,12 @@
       "id": "blg_orch_integrator_worktree",
       "title": "Integration engine merges in the SHARED repo path -- must use its own worktree first",
       "description": "integration_engine._merge runs `git checkout <integration_branch>` in pipeline.repo_path. Activating the merge queue as-is would switch branches under a live human working tree. Also: _merge catches only (OSError, TimeoutExpired) while _run_git defaults check=True, so CalledProcessError escapes tick(); pre-merge target SHA is never recorded; and integrator identity is the constant 'integration-engine'. BLOCKS activating the merge queue.",
-      "status": "BACKLOG",
+      "status": "IN_PROGRESS",
       "priority": "P1",
       "type": "bug",
       "order": 40,
       "created_at": "2026-09-10T01:41:16.114137+00:00",
-      "updated_at": "2026-09-10T01:41:16.114137+00:00",
+      "updated_at": "2026-09-14T08:51:25.753942+00:00",
       "source": "orchestration-v1",
       "dependencies": [],
       "acceptance_criteria": [
@@ -1844,9 +1946,9 @@
         "integration",
         "safety"
       ],
-      "assignee": null,
-      "session": null,
-      "node_id": null,
+      "assignee": "m2",
+      "session": "m2",
+      "node_id": "local",
       "queue_task_id": null,
       "branch": null,
       "worktree": null,
@@ -1862,6 +1964,13 @@
           "at": "2026-09-10T01:41:16.114137+00:00",
           "event": "created",
           "by": "orchestration-v1"
+        },
+        {
+          "at": "2026-09-14T08:51:25.753942+00:00",
+          "event": "claimed",
+          "by": "m2",
+          "session": "m2",
+          "node_id": "local"
         }
       ]
     },
@@ -1869,12 +1978,12 @@
       "id": "blg_orch_no_workers_declared",
       "title": "No worker has a capability profile, so capability routing has zero candidates",
       "description": "pm_store.capability_profiles has 0 production rows, so terminal_worker_roles reports 0 for every role and pm_router.route_task always returns NO_ELIGIBLE_WORKER. The fleet cannot verify or route anything until real sessions are declared with roles and skills. Needs a decision on which live sessions should be declared as WORKER/VERIFIER and with what skills.",
-      "status": "BACKLOG",
+      "status": "IN_PROGRESS",
       "priority": "P1",
       "type": "chore",
       "order": 41,
       "created_at": "2026-09-10T01:41:16.114137+00:00",
-      "updated_at": "2026-09-10T01:41:16.114137+00:00",
+      "updated_at": "2026-09-14T08:57:05.608814+00:00",
       "source": "orchestration-v1",
       "dependencies": [],
       "acceptance_criteria": [
@@ -1886,24 +1995,59 @@
         "orchestration",
         "worker"
       ],
-      "assignee": null,
+      "assignee": "dell-linux/feat-orch-worker-capability-profiles",
       "session": null,
-      "node_id": null,
+      "node_id": "dell-linux",
       "queue_task_id": null,
-      "branch": null,
-      "worktree": null,
+      "branch": "feat/orch-worker-capability-profiles",
+      "worktree": "/home/dell/workspace/terminal-mcp-capprofiles",
       "blocked_reason": null,
       "evidence": {
-        "commits": [],
-        "tests": [],
+        "commits": [
+          "4a68a5f"
+        ],
+        "tests": [
+          "68 new (tests/test_capability_profile.py 25, tests/test_capability_routing.py 43)",
+          "577 passed across every suite importing the changed modules; 0 failed"
+        ],
         "deploys": [],
-        "notes": []
+        "notes": [
+          "Branch feat/orch-worker-capability-profiles (unpushed, worktree /home/dell/workspace/terminal-mcp-capprofiles on dell-linux). NOT deployed anywhere.",
+          "Delivers the MODEL and DIAGNOSTICS only. The item's own acceptance criteria (live sessions declared, non-zero VERIFIER count, a verify job finding a real candidate) still need real production declarations and are NOT met.",
+          "Quiet bug fixed on the way: pm_router matched capability_profiles.skills only, so a profile declaring runtime_tools=['playwright'] was ineligible for playwright work.",
+          "Routing now answers with a code: NO_WORKERS_REGISTERED / NO_WORKERS_ONLINE / WORKERS_BUSY / WORKERS_LACK_CAPABILITY / CAPABILITY_UNKNOWN / WORKERS_INELIGIBLE / CANDIDATES_AVAILABLE, on pm_router, worker_registry, scheduler and verify_queue alike.",
+          "Undeclared workers stay ADVISORY and opt-in (PMService include_undeclared, default False); an undeclared worker can never satisfy a requirement from an empty pool."
+        ]
       },
       "history": [
         {
           "at": "2026-09-10T01:41:16.114137+00:00",
           "event": "created",
           "by": "orchestration-v1"
+        },
+        {
+          "at": "2026-09-14T08:55:47.209431+00:00",
+          "event": "claimed",
+          "by": "dell-linux/feat-orch-worker-capability-profiles",
+          "session": null,
+          "node_id": "dell-linux"
+        },
+        {
+          "at": "2026-09-14T08:55:47.263049+00:00",
+          "event": "updated",
+          "by": "dell-linux",
+          "changed": [
+            "branch",
+            "worktree"
+          ]
+        },
+        {
+          "at": "2026-09-14T08:57:05.608814+00:00",
+          "event": "updated",
+          "by": "dell-linux",
+          "changed": [
+            "evidence"
+          ]
         }
       ]
     },
@@ -1958,6 +2102,774 @@
           "at": "2026-09-11T17:09:23.026797+00:00",
           "event": "created",
           "by": "user"
+        }
+      ]
+    },
+    {
+      "id": "blg_be6227619053",
+      "title": "Rapid Capture Inbox + Parallel Planner Pool for Work mode",
+      "description": "FEATURE: Rapid Capture Inbox + Parallel Planner Pool for Work mode.\n(Requirement preserved VERBATIM from the user, 2026-09-13. Do NOT duplicate the\nexisting Knowledge Map / Runbook registry / Bug Planner / token policy /\nWORK_POLICY work -- build on those.)\n\nGoal: the human developer can dump issues/ideas much faster than one planner can\ndeeply analyze them. Capture must stay fast, while planning/execution happen\nindependently and in parallel.\n\n1) RAPID CAPTURE INBOX\n- Accept one issue or a batch of many issues in one message.\n- Split batch into atomic work items without requiring deep analysis first.\n- Capture only lightweight metadata initially: issue_id, project, raw_text,\n  short_title, rough_type, likely_module(optional), rough_difficulty(optional),\n  created_at, source, priority, duplicate_candidate.\n- Capture must never block on root-cause analysis.\n- Return concise acknowledgement/count/state rather than a long analysis.\n\n2) PER-ISSUE STATE MACHINE (durable across restart)\nNEW -> TRIAGED -> PLANNING -> READY -> EXECUTING -> PREVIEW_READY -> VERIFYING -> DONE\nSide states: NEEDS_USER_HINT, NEEDS_REDEFINE, BLOCKED, DUPLICATE, CANCELLED, FAILED\n\n3) PARALLEL PLANNER POOL\n- N planning jobs concurrently instead of a single global planner bottleneck.\n- Each planner gets only one issue + relevant project policy + targeted\n  Knowledge Map context.\n- Planner produces the existing Bug Execution Spec contract.\n- Must respect difficulty triage / token policy / spec completeness rules.\n- Concurrency configurable globally and per project.\n- Avoid double-planning the same issue: claim/lease/lock semantics.\n\n4) NEEDS_USER_HINT\n- For genuinely difficult/ambiguous bugs, planner first performs bounded\n  analysis and formulates at most 1-3 precise high-value questions.\n- Do not block other issues while waiting.\n- Preserve all prior analysis/spec draft.\n- When the developer answers, attach HUMAN_HINTS and resume the SAME issue,\n  not a new task.\n- User hint is guidance; current code remains source of truth.\n\n5) BATCH SPLITTING\n- A 20-bullet input becomes multiple atomic work items.\n- Detect obvious dependencies/duplicates.\n- Preserve original batch/source linkage.\n- Do not over-split one coherent bug into meaningless microtasks.\n- Allow later merge/split correction.\n\n6) EXECUTION SESSION CREATION\n- Do NOT create a tmux/agent session per captured issue immediately.\n- Capture and planning are lightweight state/jobs.\n- Create a worker/session only when an issue reaches READY/EXECUTING and\n  capacity is available.\n- Suggested naming: <project>-work-<issue_id> when a real session is needed.\n\n7) QUEUE/DASHBOARD UX\n- Work-mode view with counts and compact cards/rows for: Inbox / Planning /\n  Needs User Hint / Ready / Executing / Preview Ready / Done / Failed.\n- Each issue shows: issue id, title, project/module, difficulty, state,\n  planner/worker, age, dependencies, last update.\n- Filtering and bulk priority change.\n- A Rapid Capture box accepting many pasted bullets at once.\n\n8) BACKPRESSURE / FAIRNESS\n- Configurable planner concurrency and worker concurrency.\n- Priority + FIFO within the same priority.\n- Prevent one project or one huge bug from starving all others.\n- Planning may continue while worker capacity is full.\n- Never spawn unbounded sessions.\n\n9) DUPLICATE/SIMILAR ISSUE HANDLING\n- Before expensive planning, use the existing similar-bug retrieval /\n  fingerprint (terminal_mcp/context_pack.py).\n- Mark possible duplicates and reuse history/spec where safe.\n- Never silently drop distinct issues.\n\n10) API/CLI\n- Stable backend primitives: capture_issue(s), list/filter issues, claim\n  planning job, attach_user_hint, resume issue, update priority/state,\n  concise queue summary. CLI desirable; backend contract first.\n\n11) POLICY INTEGRATION\n- Auto-load canonical WORK_POLICY; record policy_version/policy_hash per\n  issue and per planning attempt (terminal_mcp/work_policy.py).\n- Reuse Knowledge Map, Bug Planner, Runbooks, token telemetry -- no parallel\n  duplicate systems.\n- Normal non-work terminal sessions remain backward compatible.\n\n12) OBSERVABILITY\n- Track: capture latency, planning wait time, planning duration,\n  NEEDS_USER_HINT count, READY wait time, execution duration, duplicate reuse,\n  planner concurrency, worker concurrency.\n- Concise logs on success; detailed logs only on failure.\n\nACCEPTANCE TESTS\nA. Paste 10 distinct bullet issues -> 10 persistent items captured quickly;\n   capture does not wait for deep analysis.\nB. planner concurrency=3 -> three different items PLANNING simultaneously with\n   no duplicate claim.\nC. One hard issue moves to NEEDS_USER_HINT with <=3 precise questions while\n   other issues keep planning/executing.\nD. Answering the hint resumes the SAME issue with the prior draft preserved.\nE. Worker capacity=2 never creates more than two execution workers even with\n   20 READY items.\nF. Restart terminal-mcp: inbox/state/claims recover; stale claims reclaimable.\nG. A batch containing a duplicate flags/reuses it instead of blindly re-planning.\nH. Normal terminal sessions unaffected.\nI. No secrets persisted in issue metadata/spec/history.\n\nIMPLEMENTATION PRIORITY\npersistent issue/state model + capture API + planner claims/concurrency +\nuser-hint resume  ->  execution spawning/backpressure  ->  UI polish/telemetry.\n\nBUILD ON (do not duplicate):\n- terminal_mcp/bug_spec.py        (spec contract, triage, budgets, assist)\n- terminal_mcp/context_pack.py    (similar-bug retrieval, fingerprint buckets)\n- terminal_mcp/project_knowledge.py (knowledge map + confidence)\n- terminal_mcp/procedures.py      (runbook registry)\n- terminal_mcp/work_policy.py     (canonical policy + bindings)\n- terminal_mcp/work_telemetry.py  (honest token provenance)\n- terminal_mcp/work_store.py / work_service.py / queue_engine.py (existing queue)\n\nSTANDING CONSTRAINTS: never restart node-agents; no reboot; never kill live\ntmux/ConPTY sessions; never bypass Cloudflare Access/Tailscale; never read or\nprint secrets; announce before restarting the controller (cách 1).\n",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "feature",
+      "order": 43,
+      "created_at": "2026-09-13T12:20:14.514815+00:00",
+      "updated_at": "2026-09-13T12:20:14.514826+00:00",
+      "source": "user",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "A. 10 pasted bullets -> 10 persistent items, capture does not wait for analysis",
+        "B. planner concurrency=3 -> 3 items PLANNING at once, no duplicate claim",
+        "C. hard issue -> NEEDS_USER_HINT with <=3 precise questions, others continue",
+        "D. answering a hint resumes the SAME issue with prior draft preserved",
+        "E. worker capacity=2 never creates more than 2 execution workers",
+        "F. restart: inbox/state/claims recover; stale claims reclaimable",
+        "G. duplicate in a batch is flagged/reused, not blindly re-planned",
+        "H. normal terminal sessions unaffected",
+        "I. no secrets persisted in issue metadata/spec/history"
+      ],
+      "tags": [
+        "work-mode",
+        "inbox",
+        "planner-pool",
+        "queued-requirement"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-13T12:20:14.514857+00:00",
+          "event": "created",
+          "by": "user"
+        }
+      ]
+    },
+    {
+      "id": "blg_349fb9e08b4f",
+      "title": "Worktree Janitor: feature contract, state model and invariants (design of record)",
+      "description": "DESIGN OF RECORD for the Worktree Janitor. Write this into docs/REQUIREMENTS.md\nusing the project's own living-requirements convention (a Feature Details entry + a Feature\nmatrix row + a Backlog entry). Do NOT invent a new doc file. No executable code in this task.\n\nPROBLEM: isolated task worktrees (git_isolation_service.create_isolated_task) are created\nautomatically but are ONLY ever removed by an explicit human MCP call\n(terminal_worktree_cleanup -> git_isolation_service.cleanup_worktree_for_task). Nothing\nreclaims them on task completion, and nothing notices orphans after a crash/reboot. They\naccumulate forever. Verified on m910 2026-09-14: 4 linked worktrees + main, /dev/sda3 at\n26% (83G free) so this is a hygiene/debt problem today, not an outage.\n\nSOURCE OF TRUTH (audited, do not invent alternatives):\n- Worktree admin entries: `git worktree list --porcelain` in the OWNING repo, via\n  git_worktree.list_worktrees(repo_path). This is authoritative for \"which worktrees does\n  git know about\", including stale admin entries whose directory is gone.\n- Task<->worktree link: queue_tasks.metadata JSON -> metadata.git_isolation\n  {repo_path, branch, base_sha, worktree_path} and metadata.expected_cwd. Written by\n  git_isolation_service.create_isolated_task. A worktree with no such task is an ORPHAN.\n- Task state: queue_tasks.status. The ONLY mutation path is\n  queue_store._transition_locked (called by transition_task); it already writes a\n  queue_events row in the same transaction. This is the minimal chokepoint for any\n  lifecycle hook.\n- Session -> path usage: session_registry SessionRecord(node_id, session_name, cwd,\n  repo_root, status). Node-scoped; the controller cannot stat a remote node's paths.\n- Node reachability/execution: node_client NodeClient protocol (LocalNodeClient /\n  RemoteNodeClient) + node_agent HTTP routes.\n- Repo state evidence: coordinator.git_repo_evidence / node_aware_repo_evidence (fails\n  closed: RepoEvidenceError for a real repo problem, RepoEvidenceUnavailable for \"could\n  not look\").\n- Audit: audit.AuditStore.record(action=, session=, result=, reason=, actor=, node_id=,\n  latency_ms=, policy_source=). Never put file content in it.\n- Events: event_bus.EventBus.publish(type=, entity_type=, entity_id=, payload=,\n  idempotency_key=). New types MUST be added to KNOWN_EVENT_TYPES.\n- Config: config.AppConfig + a new frozen dataclass section and a _load_*_config validator\n  that raises ValueError on out-of-range input (never silently clamps).\n\nSTATE MODEL (new, on the task's own metadata -- see P1):\nmetadata.worktree_cleanup = {state, classified_at, eligible_at, policy, reasons[],\nattempts, last_error, removed_at, reclaimed_bytes, evidence{...}}\nstates: NONE -> CLEANUP_PENDING -> CLEANUP_ELIGIBLE -> CLEANUP_DONE\n                              \\-> CLEANUP_REVIEW -> (human) -> CLEANUP_ELIGIBLE | CLEANUP_ABANDONED\n                              \\-> CLEANUP_BLOCKED (terminal until re-classified)\nCLEANUP_PENDING is entered when the task reaches a cleanup-eligible lifecycle state.\nCLEANUP_ELIGIBLE only after grace elapsed AND classification == AUTO_SAFE.\n\nCRITICAL CORRECTION FOUND IN AUDIT: there is NO 'FAILED_FINAL' status anywhere.\nqueue_store.TERMINAL_STATUSES == (COMPLETED, SKIPPED, CANCELLED); FAILED and BLOCKED are\nexplicitly NOT terminal (terminal_queue_retry/skip/cancel still apply). work_store\nTERMINAL_WORK_STATES == (COMPLETE, CANCELLED). Therefore the cleanup trigger predicate is:\n  status in (COMPLETED, SKIPPED, CANCELLED)\n  OR (status == FAILED AND attempt_count >= max_attempts)\nA bare FAILED must NEVER trigger cleanup -- it is retryable and the worktree is the retry's\nworking directory.\n\nPOLICY CLASSES (fail-closed):\n- AUTO_SAFE: every predicate below proven true. Only this class may be auto-removed.\n- REVIEW: safe to keep, needs a human. Any predicate that could not be EVALUATED\n  (node offline, evidence stale, git error, permission denied, detached HEAD) lands here.\n- BLOCKED: actively dangerous to remove (dirty, unmerged-and-unpushed, valuable ignored\n  data, process/session/service using it, main worktree, path outside allowlist).\nUnknown ALWAYS degrades toward REVIEW/BLOCKED, never toward AUTO_SAFE.\n\nAUTO_SAFE PREDICATE (all must hold, each with recorded evidence):\n1. NOT the main worktree: `git rev-parse --git-dir` != `--git-common-dir` inside the\n   candidate (verified primitive). Refuse if equal. Also refuse if worktree_path equals\n   any configured repo root.\n2. Path allowlisted: worktree_path resolves (symlinks followed BEFORE the check) inside\n   config allowed roots, and is not a symlink itself, not a mount point, not a bind mount.\n3. CLEAN: `git status --porcelain` empty.\n4. MERGED or PRESERVED:\n   merged  = `git merge-base --is-ancestor <worktree_head> <integration_ref>` (default main)\n   preserved = the branch tip exists on a remote AND <worktree_head> is an ancestor of that\n   remote ref. Pushed-but-not-merged counts as PRESERVED (work is not lost) but is\n   classified REVIEW by default, promoted to AUTO_SAFE only when\n   config.allow_preserved_unmerged is true.\n   Detached HEAD => no branch identity => REVIEW, never AUTO_SAFE.\n5. NO LIVE REFERENCES (evaluated ON the owning node):\n   - no process with cwd inside the path (Linux: readlink /proc/*/cwd)\n   - no tmux pane with pane_current_path inside the path\n   - no session_registry record (any non-DELETED status) whose cwd/repo_root is inside it\n   - no systemd unit WorkingDirectory inside it\n   - no container/bind mount referencing it (/proc/mounts scan)\n   Any positive match => BLOCKED. Inability to check => REVIEW.\n6. NO VALUABLE IGNORED DATA: `git status --porcelain --ignored=matching` -> '!!' entries.\n   Classify each: SAFE_CACHE (__pycache__, .pytest_cache, .mypy_cache, .ruff_cache, node_modules,\n   dist, build, .venv, *.pyc) vs VALUABLE (*.db, *.sqlite*, .env*, *.pem, *.key, *credentials*,\n   node-agent.env, evidence/, *.log above config threshold, anything matching\n   repo_read.SECRET_PATH_GLOBS). Any VALUABLE entry => BLOCKED with the paths listed\n   (paths only -- NEVER contents).\n7. REPO EVIDENCE FRESH: evidence collected at decision time on the owning node, age <=\n   config.max_evidence_age_seconds. Stale/unavailable => REVIEW.\n8. GRACE ELAPSED: now >= terminal_transition_at + grace_seconds.\n9. LOCK HELD: a ResourceLockStore lock namespaced 'worktree_janitor:<node_id>:<worktree_path>'\n   is held for the whole classify+remove sequence.\n\nHARD INVARIANTS (must be expressed as tests, not comments):\nI1. The janitor NEVER passes force=True / --force to git worktree remove. Not under disk\n    pressure, not on retry, not ever. git_worktree.remove_worktree(force=...) must be called\n    with force=False from every janitor path.\nI2. The main worktree and any configured repo root can never be selected.\nI3. A dirty or unmerged-and-unpushed worktree is never removed, regardless of disk pressure.\nI4. The controller never removes a path on another node (no os/shutil/subprocess rm against\n    a remote path). Remote removal happens only via the owning node-agent endpoint.\nI5. Classification is pure/read-only and has no side effects other than audit+events.\nI6. Every removal writes an audit row with reclaimed bytes and the full evidence set BEFORE\n    the removal is attempted and a result row after.\nI7. Disk pressure may only shorten grace (down to a configured floor) and reorder\n    candidates. It may never downgrade a predicate, promote REVIEW/BLOCKED, or enable force.\nI8. Feature flag default is observe_only; nothing is ever removed until an operator opts in.\n\nDANGEROUS FAILURE MODES (each needs a named test):\nF1. Deleting a worktree a retry still needs (bare FAILED treated as final).\nF2. Deleting unmerged work that exists nowhere else (branch only local, not merged).\nF3. Deleting an ignored-but-valuable file (a task's sqlite db, .env, collected evidence).\nF4. Controller running rm against a path that only exists on another node -- deleting the\n    CONTROLLER's like-named directory.\nF5. Two janitors racing on one worktree (double remove, or remove during another's classify).\nF6. Crash between `git worktree remove` and the metadata write -> state says PENDING while\n    the directory is gone. Recovery must be idempotent and converge to CLEANUP_DONE.\nF7. Stale admin entry (directory gone, git still lists it) treated as a live worktree, or\n    `git worktree prune` run while another worktree is mid-creation.\nF8. Root-owned or permission-denied artifacts inside the tree -> partial removal leaving a\n    half-deleted worktree. Must be detected and left BLOCKED, never retried with force.\nF9. Windows locked directory -> remove fails; must not retry-loop or force.\nF10. Symlink/mount/bind-mount escape: worktree_path containing a symlink to a real repo.\nF11. Evidence staleness: classifying AUTO_SAFE on evidence collected minutes ago after a\n     human started working in the tree.\nF12. Task reopen/retry after CLEANUP_DONE -> must fail loudly (worktree gone) rather than\n     silently recreating and losing the link.\nF13. Parent/child (planner split) -- a parent's worktree removed while a child still works\n     in it, or a child's removal attributed to the parent.\n\nACCEPTANCE (this task): docs/REQUIREMENTS.md contains the contract above (state model,\nsource-of-truth table, AUTO_SAFE predicate, I1-I8, F1-F13), a Feature matrix row, and a\nBacklog entry. No behaviour change, no new module.",
+      "status": "DONE",
+      "priority": "P1",
+      "type": "docs",
+      "order": 44,
+      "created_at": "2026-09-14T04:28:09.474240+00:00",
+      "updated_at": "2026-09-14T08:43:44.927425+00:00",
+      "source": "analysis-gate",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "docs/REQUIREMENTS.md carries a Feature Details entry with the state model, source-of-truth table, AUTO_SAFE predicate (1-9), invariants I1-I8 and failure modes F1-F13",
+        "A Feature matrix row and a Backlog entry are added using the project's existing living-requirements convention",
+        "The FAILED_FINAL correction is recorded explicitly: cleanup triggers on COMPLETED/SKIPPED/CANCELLED, or FAILED with attempt_count >= max_attempts, never bare FAILED",
+        "No code change and no new doc file"
+      ],
+      "tags": [
+        "worktree-janitor",
+        "design",
+        "analysis-gate"
+      ],
+      "assignee": "claude-opus5-session-01FH4tRd",
+      "session": "claude-contract-wj",
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [
+          "ec0ca05a42071a54544089c0092e97c267657fba (branch feat/worktree-janitor-contract, NOT merged to main)"
+        ],
+        "tests": [
+          "docs-only change; 12/12 factual claims verified against code; tests/test_git_worktree.py + test_git_isolation_service.py 20 passed"
+        ],
+        "deploys": [],
+        "notes": [
+          "Contract only: docs/WORKTREE_JANITOR.md + REQUIREMENTS.md matrix row and backlog entry. No executor, no scanner, no service, nothing deletes. Branch not merged, not deployed."
+        ]
+      },
+      "history": [
+        {
+          "at": "2026-09-14T04:28:09.474288+00:00",
+          "event": "created",
+          "by": "analysis-gate"
+        },
+        {
+          "at": "2026-09-14T08:40:15.080667+00:00",
+          "event": "claimed",
+          "by": "claude-opus5-session-01FH4tRd",
+          "session": "claude-contract-wj",
+          "node_id": null
+        },
+        {
+          "at": "2026-09-14T08:43:44.927425+00:00",
+          "event": "completed",
+          "by": "claude-opus5-session-01FH4tRd",
+          "verified_by": "evidence",
+          "queue_task_id": null
+        }
+      ]
+    },
+    {
+      "id": "blg_cb4c52480ce6",
+      "title": "Worktree Janitor P0: audit-only classification engine (structurally cannot delete)",
+      "description": "Build the classification engine. AUDIT-ONLY: it must be structurally incapable of\ndeleting anything (no os.remove/shutil.rmtree/git worktree remove call anywhere in the new\nmodule; assert this with a source-level test like tests/test_repo_read.py's\nREAD_ONLY_GIT_SUBCOMMANDS test).\n\nNew module terminal_mcp/worktree_janitor.py exposing pure functions:\n- candidates(repo_path) -> list of candidate dicts, from git_worktree.list_worktrees()\n  joined against queue_store tasks by metadata.git_isolation.worktree_path.\n  Mark each: linked|main, has_task|orphan, admin_stale (git lists it, directory absent).\n- classify(candidate, policy, evidence, refs) -> {policy_class, reasons[], evidence{},\n  predicates{p1..p9: true|false|UNKNOWN}, size_bytes}\n  policy_class in (AUTO_SAFE, REVIEW, BLOCKED) per the contract. Every false/UNKNOWN\n  predicate appends a machine-readable reason code, e.g. DIRTY, UNMERGED_UNPUSHED,\n  DETACHED_HEAD, VALUABLE_IGNORED_DATA, PROCESS_IN_USE, TMUX_IN_USE, SESSION_IN_USE,\n  SERVICE_ROOT, MAIN_WORKTREE, PATH_NOT_ALLOWED, SYMLINK_OR_MOUNT, EVIDENCE_STALE,\n  NODE_UNREACHABLE, GRACE_NOT_ELAPSED, ADMIN_ENTRY_STALE, PERMISSION_DENIED,\n  TASK_NOT_FINAL, LOCK_UNAVAILABLE.\n- reclaimable_bytes(path) -> int, bounded walk, never follows symlinks or crosses\n  filesystems, returns a best-effort number plus a 'partial' flag.\n\nReuse, do not reimplement: git_worktree._run_git for git calls; the /proc + tmux + mount\nprobes belong in this module but must be pure read-only; session_registry for session\nusage; coordinator.git_repo_evidence for evidence.\n\nConfig: add WorktreeJanitorConfig to config.py (frozen dataclass + _load_worktree_janitor_config\nvalidator, wired into AppConfig and load_config) with: mode (observe_only|suggest_only|\nauto_execute, default observe_only), grace_seconds (default 86400, min 300),\ngrace_floor_seconds (default 3600), integration_ref (default 'main'),\nallow_preserved_unmerged (default False), max_evidence_age_seconds (default 120),\nallowed_roots (empty -> falls back to session_lifecycle.allowed_cwd_roots, never '/'),\nvaluable_ignored_globs (additive only), safe_cache_globs, max_candidates_per_run (default 50),\ntimeout_seconds. Out-of-range => ValueError at load time.\n\nMCP tool: terminal_worktree_janitor_scan(repo_path='', node='', include_blocked=True) ->\nthe full classification report. Read-only, safe to expose immediately.\n\nDoD: unit tests with REAL git repos + real worktrees in tmp_path (follow\ntests/test_repo_read.py's posture -- never mock git) covering: main worktree refused,\nclean+merged => AUTO_SAFE, dirty => BLOCKED/DIRTY, unmerged local-only =>\nBLOCKED/UNMERGED_UNPUSHED, pushed-not-merged => REVIEW (and AUTO_SAFE when\nallow_preserved_unmerged=True), detached HEAD => REVIEW/DETACHED_HEAD, valuable ignored\nfile (.env, *.db) => BLOCKED, cache-only ignored => not blocking, stale admin entry =>\nADMIN_ENTRY_STALE, orphan (no task) => REVIEW, symlinked worktree_path => BLOCKED,\npath outside allowed_roots => PATH_NOT_ALLOWED. Plus the source-level 'no delete primitive'\ntest and a config-validation test per bad field. Feature flag defaults to observe_only.\nNo behaviour change to any existing path.",
+      "status": "DONE",
+      "priority": "P1",
+      "type": "feature",
+      "order": 45,
+      "created_at": "2026-09-14T04:28:09.474308+00:00",
+      "updated_at": "2026-09-14T11:08:09.675653+00:00",
+      "source": "analysis-gate",
+      "dependencies": [
+        "blg_349fb9e08b4f"
+      ],
+      "acceptance_criteria": [
+        "terminal_mcp/worktree_janitor.py provides candidates(), classify(), reclaimable_bytes() and is read-only",
+        "A source-level test proves the module contains no deletion primitive (no shutil.rmtree/os.remove/worktree remove)",
+        "WorktreeJanitorConfig added to config.py with a validating loader that raises ValueError on every out-of-range field; mode defaults to observe_only",
+        "terminal_worktree_janitor_scan MCP tool returns the classification report and is registered in the pinned tool-set test",
+        "Real-git tests (no mocks) cover: main worktree refused, clean+merged AUTO_SAFE, dirty BLOCKED, unmerged-local-only BLOCKED, pushed-not-merged REVIEW, detached HEAD REVIEW, valuable ignored data BLOCKED, cache-only ignored not blocking, stale admin entry, orphan, symlinked path, path outside allowed_roots",
+        "Zero behaviour change to any existing code path"
+      ],
+      "tags": [
+        "worktree-janitor",
+        "engine"
+      ],
+      "assignee": "claude-opus5-session-01FH4tRd",
+      "session": "claude-wj-p0",
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [
+          "45c6dbb064d4335ea3ad3279cca81b134891620d (branch feat/worktree-janitor-p0, NOT merged)"
+        ],
+        "tests": [
+          "tests/test_worktree_janitor.py 54 passed; full suite 4556 passed / 0 failed / 2 skipped"
+        ],
+        "deploys": [],
+        "notes": [
+          "Classifier only. AUTO_SAFE/REVIEW/BLOCKED/UNKNOWN, fail-closed. No executor: AST test asserts no removal call, no shutil import; git helper raises on non-read-only subcommands and on --force. Observe_only default. Live scan of 21 real worktrees: 18 BLOCKED, 3 REVIEW, 0 actionable. Branch unmerged, not deployed."
+        ]
+      },
+      "history": [
+        {
+          "at": "2026-09-14T04:28:09.474332+00:00",
+          "event": "created",
+          "by": "analysis-gate"
+        },
+        {
+          "at": "2026-09-14T04:28:18.986595+00:00",
+          "event": "updated",
+          "by": "chatgpt",
+          "changed": [
+            "dependencies"
+          ]
+        },
+        {
+          "at": "2026-09-14T10:42:24.281820+00:00",
+          "event": "claimed",
+          "by": "claude-opus5-session-01FH4tRd",
+          "session": "claude-wj-p0",
+          "node_id": null
+        },
+        {
+          "at": "2026-09-14T11:08:09.675653+00:00",
+          "event": "completed",
+          "by": "claude-opus5-session-01FH4tRd",
+          "verified_by": "evidence",
+          "queue_task_id": null
+        }
+      ]
+    },
+    {
+      "id": "blg_819492490d0b",
+      "title": "Worktree Janitor P1: cleanup lifecycle state set from queue_store's single chokepoint",
+      "description": "Record cleanup lifecycle state on the task, and set it from the ONE chokepoint.\n\nHook site: queue_store._transition_locked (the only place a task's status ever changes;\nit already writes a queue_events row in the same transaction). Do NOT hook\nQueueService.on_completed or QueueEngine.on_completed -- audited: there are TWO call sites\n(queue_service.py:658 and queue_engine.py:515), so neither is a chokepoint and a task\ncompleted via the other path would silently never be marked.\n\nTrigger predicate (exactly this, per the contract -- FAILED_FINAL does not exist):\n  to_status in (COMPLETED, SKIPPED, CANCELLED)\n  OR (to_status == FAILED AND attempt_count >= max_attempts)\nAND the task has metadata.git_isolation.worktree_path.\nEffect: set metadata.worktree_cleanup = {state: CLEANUP_PENDING, classified_at: null,\neligible_at: <now + grace_seconds>, policy: null, reasons: [], attempts: 0}. Idempotent:\nre-entering a terminal state never resets an existing record or bumps attempts.\n\nSchema: metadata is already a JSON TEXT column -- prefer writing inside it (no migration).\nIf a queryable index is needed for the periodic sweep, add it as a tracked\nMigration(N, ...) appended to QUEUE_MIGRATIONS (schema.py/apply_migrations), never a bare\nALTER TABLE.\n\nEvents: add WORKTREE_CLEANUP_PENDING, WORKTREE_CLEANUP_ELIGIBLE, WORKTREE_CLEANUP_REVIEW,\nWORKTREE_CLEANUP_BLOCKED, WORKTREE_CLEANUP_DONE, WORKTREE_CLEANUP_FAILED to\nevent_bus.KNOWN_EVENT_TYPES and publish with entity_type='worktree',\nentity_id=worktree_path, idempotency_key=<task_id>:<state> so a retried producer cannot\nduplicate.\n\nReopen/retry (F12): if a task leaves a terminal state (retry/reopen) while\nworktree_cleanup.state is PENDING/REVIEW, clear the record. If state is DONE, the worktree\nis gone -- the existing Coordinator expected_cwd gate must refuse dispatch with a clear\nreason (WORKTREE_REMOVED) rather than silently proceeding; add that reason, do not weaken\nthe gate.\n\nDoD: tests that a COMPLETED/SKIPPED/CANCELLED isolated task gets CLEANUP_PENDING with the\nright eligible_at; a bare FAILED does NOT; FAILED at max_attempts DOES; a non-isolated task\nnever gets the record; the hook is idempotent across repeated transitions; a retry clears\nPENDING; a retry after DONE is refused by the gate with WORKTREE_REMOVED. Backward\ncompatible: an existing task with no worktree_cleanup key behaves exactly as today.",
+      "status": "DONE",
+      "priority": "P1",
+      "type": "feature",
+      "order": 46,
+      "created_at": "2026-09-14T04:28:09.474344+00:00",
+      "updated_at": "2026-09-14T13:14:48.706005+00:00",
+      "source": "analysis-gate",
+      "dependencies": [
+        "blg_349fb9e08b4f"
+      ],
+      "acceptance_criteria": [
+        "The hook lives in queue_store._transition_locked, NOT on QueueService/QueueEngine.on_completed (two call sites, not a chokepoint)",
+        "CLEANUP_PENDING is set for COMPLETED/SKIPPED/CANCELLED and for FAILED at max_attempts; never for bare FAILED; never for a non-isolated task",
+        "The hook is idempotent and never resets an existing record or bumps attempts",
+        "New WORKTREE_CLEANUP_* types added to event_bus.KNOWN_EVENT_TYPES and published with an idempotency_key",
+        "A retry/reopen clears a PENDING/REVIEW record; a dispatch after CLEANUP_DONE is refused by the existing expected_cwd gate with reason WORKTREE_REMOVED",
+        "Any schema change is a tracked Migration appended to QUEUE_MIGRATIONS, never a bare ALTER TABLE",
+        "A task with no worktree_cleanup key behaves exactly as before (backward compatible)"
+      ],
+      "tags": [
+        "worktree-janitor",
+        "lifecycle"
+      ],
+      "assignee": "claude-opus5-session-01FH4tRd",
+      "session": "claude-wj-p1-gaps",
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [
+          "d0c57a5 (P1 base, by m1) + 662f1f8f25307a11ad7c5569361fb11318d64ba6 (AC4/AC5b gaps) on feat/worktree-janitor-p1, NOT merged"
+        ],
+        "tests": [
+          "targeted tests/test_worktree_cleanup_p1.py 42 passed; regressions 328 passed across queue_store/phase2/engine/persist, coordinator + remote_repo_evidence, git_worktree/isolation, event_bus/wiring/mcp"
+        ],
+        "deploys": [],
+        "notes": [
+          "All 7 AC verified independently. AC4 root gap was vocabulary not plumbing: sink+idempotency_key already existed, the two types were missing from KNOWN_EVENT_TYPES and _EVENT_TYPE_BY_QUEUE_EVENT so every mark was dropped silently. AC5b checked BEFORE the cwd comparison so the refusal names the real cause. is_removed() counts only CLEANUP_DONE. Marking only - no classifier, no grace expiry, no executor, no delete, no --force."
+        ]
+      },
+      "history": [
+        {
+          "at": "2026-09-14T04:28:09.474363+00:00",
+          "event": "created",
+          "by": "analysis-gate"
+        },
+        {
+          "at": "2026-09-14T04:28:19.101018+00:00",
+          "event": "updated",
+          "by": "chatgpt",
+          "changed": [
+            "dependencies"
+          ]
+        },
+        {
+          "at": "2026-09-14T13:10:22.721354+00:00",
+          "event": "claimed",
+          "by": "claude-opus5-session-01FH4tRd",
+          "session": "claude-wj-p1-gaps",
+          "node_id": null
+        },
+        {
+          "at": "2026-09-14T13:14:48.706005+00:00",
+          "event": "completed",
+          "by": "claude-opus5-session-01FH4tRd",
+          "verified_by": "evidence",
+          "queue_task_id": null
+        }
+      ]
+    },
+    {
+      "id": "blg_e0c7eabeaf72",
+      "title": "Worktree Janitor P2: local safe executor (never --force, lock + audit + fresh evidence)",
+      "description": "Local safe executor. The first task that may delete anything.\n\nNew: worktree_janitor.execute(candidate, policy_result, *, dry_run) in the same module,\nplus WorktreeJanitorService (terminal_mcp/worktree_janitor_service.py) wiring engine ->\nlock -> audit -> events -> git_worktree.remove_worktree.\n\nRules (non-negotiable, each a test):\n- Only acts on policy_class == AUTO_SAFE, and RE-CLASSIFIES immediately before removal with\n  FRESH evidence while holding the lock. A candidate that was AUTO_SAFE at scan time and is\n  no longer must abort with EVIDENCE_CHANGED and no removal.\n- Calls git_worktree.remove_worktree(repo_path, worktree_path, force=False) ALWAYS. Never\n  force=True. Never shutil.rmtree. If git refuses (WORKTREE_DIRTY /\n  WORKTREE_REMOVE_FAILED), record BLOCKED with the git stderr and stop -- no fallback,\n  no retry with force.\n- Lock: ResourceLockStore key 'worktree_janitor:<node_id>:<worktree_path>' held across\n  classify+remove; LOCK_UNAVAILABLE => skip this candidate this run (never wait long).\n- Audit: one row BEFORE (action='worktree_cleanup_attempt', full evidence + predicted\n  reclaimed_bytes) and one AFTER (action='worktree_cleanup_result', result=OK/DENIED/FAILED,\n  reclaimed_bytes actually observed, latency_ms). Paths and sizes only -- never file content.\n- Metadata: on success set state=CLEANUP_DONE, removed_at, reclaimed_bytes. On refusal set\n  CLEANUP_BLOCKED + reasons. On transient failure increment attempts and keep PENDING, with\n  a configured max_attempts after which it becomes REVIEW (never an infinite retry loop).\n- Crash recovery (F6): the sequence must be idempotent. If the directory is already gone but\n  metadata says PENDING, converge to CLEANUP_DONE and run `git worktree prune` for that repo.\n  Run prune ONLY after a successful removal or when a stale admin entry was positively\n  identified -- never speculatively while another worktree may be mid-creation (F7).\n- dry_run=True is the default for the MCP tool.\n\nMCP tools: terminal_worktree_janitor_run_once(repo_path='', node='', dry_run=True,\nlimit=10) and terminal_worktree_janitor_review(worktree_path, decision=approve|abandon,\nactor) for REVIEW items. run_once refuses to remove anything unless\nconfig mode == auto_execute AND dry_run=False.\n\nDoD: real-git tests -- AUTO_SAFE clean+merged worktree is removed and reclaimed_bytes > 0;\ndirty tree is never removed even with disk pressure simulated; force is never passed\n(assert on the git_worktree call args); a candidate that turns dirty between scan and\nexecute aborts; concurrent janitors (two threads) result in exactly one removal;\nalready-removed directory converges to DONE idempotently; a permission-denied subtree\nleaves BLOCKED with no partial state; audit rows contain no file content.",
+      "status": "DONE",
+      "priority": "P1",
+      "type": "feature",
+      "order": 47,
+      "created_at": "2026-09-14T04:28:09.474372+00:00",
+      "updated_at": "2026-09-14T15:00:00.385709+00:00",
+      "source": "analysis-gate",
+      "dependencies": [
+        "blg_cb4c52480ce6",
+        "blg_819492490d0b"
+      ],
+      "acceptance_criteria": [
+        "Removal only for AUTO_SAFE, and only after re-classifying with fresh evidence while holding the lock; EVIDENCE_CHANGED aborts with no removal",
+        "git_worktree.remove_worktree is always called with force=False; a test asserts the call arguments and that no force path exists",
+        "A dirty worktree is not removed even with disk pressure simulated at 99% full",
+        "ResourceLockStore lock namespaced worktree_janitor:<node_id>:<worktree_path>; two concurrent janitors produce exactly one removal",
+        "An audit row is written before the attempt and after the result, with reclaimed bytes and evidence, and contains no file content",
+        "An already-removed directory converges idempotently to CLEANUP_DONE; git worktree prune runs only after a real removal or a positively-identified stale admin entry",
+        "Transient failures are bounded by max_attempts then become REVIEW; a permission-denied subtree leaves BLOCKED with no partial state",
+        "dry_run defaults to True and nothing is removed unless mode == auto_execute and dry_run=False"
+      ],
+      "tags": [
+        "worktree-janitor",
+        "executor"
+      ],
+      "assignee": "claude-opus5-session-01FH4tRd",
+      "session": "claude-wj-p2",
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [
+          "7151df262cdf9ab49a45964331b2c9b84ded240c on feat/worktree-janitor-p2 (merges P0 45c6dbb + P1 662f1f8), NOT merged to main"
+        ],
+        "tests": [
+          "targeted tests/test_worktree_executor_p2.py 33 passed; regressions 436 passed; full suite 4631 passed / 0 failed / 2 skipped"
+        ],
+        "deploys": [],
+        "notes": [
+          "All 8 AC verified. Executor: gate->lock->re-classify fresh->audit attempt->remove(force=False)->audit result->record->prune. Two independent gates (mode==auto_execute AND dry_run=False), dry_run defaults True. Fixed a real fail-open in _lock_granted caught by the concurrency test. Real directories really removed in tests. Branch unmerged, not deployed."
+        ]
+      },
+      "history": [
+        {
+          "at": "2026-09-14T04:28:09.474388+00:00",
+          "event": "created",
+          "by": "analysis-gate"
+        },
+        {
+          "at": "2026-09-14T04:28:19.215376+00:00",
+          "event": "updated",
+          "by": "chatgpt",
+          "changed": [
+            "dependencies"
+          ]
+        },
+        {
+          "at": "2026-09-14T14:33:56.444242+00:00",
+          "event": "claimed",
+          "by": "claude-opus5-session-01FH4tRd",
+          "session": "claude-wj-p2",
+          "node_id": null
+        },
+        {
+          "at": "2026-09-14T15:00:00.385709+00:00",
+          "event": "completed",
+          "by": "claude-opus5-session-01FH4tRd",
+          "verified_by": "evidence",
+          "queue_task_id": null
+        }
+      ]
+    },
+    {
+      "id": "blg_ab2a3b46730a",
+      "title": "Worktree Janitor P3: periodic sweep for orphans and post-crash stale state",
+      "description": "Periodic janitor service: catch orphans and stale state after crash/reboot.\n\nFollow the established loop shape EXACTLY (maintenance.py / queue_loop.py / fleet_loop.py):\ndaemon thread + threading.Event stop + run_once() + start()/stop()/is_alive(), constructed\nin server_http.py and started ONLY if its config flag is enabled. run_once() must remain\ncallable via MCP even when the loop is off (the project's standing 'manual always\navailable, only the automatic trigger is gated' posture).\n\nSweep responsibilities:\n- Enumerate every known repo root (from session_registry repo_root values + configured\n  roots), list worktrees, classify all.\n- ORPHANS: a worktree whose worktree_path matches no task metadata (registry lost, task\n  pruned, created outside the isolation service). Never AUTO_SAFE on the first sighting:\n  require it to be seen orphaned in >= orphan_confirm_runs consecutive runs\n  (default 2) AND older than orphan_min_age_seconds, then classify normally. A brand-new\n  worktree mid-creation must never be swept (F7).\n- STALE CLEANUP STATE: tasks with worktree_cleanup.state == PENDING whose eligible_at has\n  passed -> classify and (if mode allows) execute. Tasks whose directory is gone -> converge\n  to DONE.\n- STALE ADMIN ENTRIES: worktrees git lists whose directory is absent -> prune, per P2 rules.\n- Bounded: max_candidates_per_run, per-run wall-clock budget, and it must never block\n  startup or hold a lock across the whole sweep.\n\nConfig: add interval_seconds (default 900), orphan_confirm_runs, orphan_min_age_seconds to\nWorktreeJanitorConfig. Loop enabled flag separate from mode so an operator can run the\nsweep in observe_only.\n\nDoD: tests that the loop is not started when disabled; run_once works with the loop off;\nan orphan is not actioned on first sighting but is on the Nth; a worktree created 10s ago is\nnever swept; the sweep is bounded by max_candidates_per_run; a crash-simulated PENDING task\nwhose directory is gone converges to DONE; the sweep never raises out of run_once (one bad\nrepo must not kill the loop).",
+      "status": "DONE",
+      "priority": "P2",
+      "type": "feature",
+      "order": 48,
+      "created_at": "2026-09-14T04:28:09.474398+00:00",
+      "updated_at": "2026-09-14T16:00:57.116089+00:00",
+      "source": "analysis-gate",
+      "dependencies": [
+        "blg_e0c7eabeaf72"
+      ],
+      "acceptance_criteria": [
+        "Loop follows the maintenance.py/queue_loop.py shape (daemon thread, stop Event, run_once, start/stop/is_alive) and is started in server_http.py only when its config flag is enabled",
+        "run_once() is callable via MCP with the loop disabled",
+        "An orphan is not actioned on first sighting; it requires orphan_confirm_runs consecutive sightings and orphan_min_age_seconds",
+        "A worktree created seconds ago is never swept",
+        "The sweep is bounded by max_candidates_per_run and a wall-clock budget, and never holds a lock across the whole sweep",
+        "A PENDING task whose directory vanished converges to CLEANUP_DONE",
+        "run_once never raises: one unreadable repo does not kill the loop"
+      ],
+      "tags": [
+        "worktree-janitor",
+        "scheduler"
+      ],
+      "assignee": "claude-opus5-session-01FH4tRd",
+      "session": "claude-wj-p3",
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [
+          "f2127a32d660ed870316581f59a71067b7e31b84 on feat/worktree-janitor-p3, NOT merged"
+        ],
+        "tests": [
+          "targeted tests/test_worktree_sweep_p3.py 33 passed; regressions 403 passed; full suite SERIAL 4664 passed / 0 failed / 2 skipped (an earlier concurrent run showed 2 failures, both proven environmental: literal tmux session name collision and an ephemeral-port TOCTOU race between two simultaneous suites)"
+        ],
+        "deploys": [],
+        "notes": [
+          "Periodic sweep: daemon thread + stop Event + run_once + start/stop/is_alive/status, started in server_http only behind sweep_enabled (default off); run_once callable via MCP with the loop off. Orphans need N consecutive sightings AND a min age. Bounded by candidate count and wall clock. No sweep-wide lock. Fixed two real bugs found by their own tests: the claimed-set missed still-RUNNING tasks, and the converge half passed no probes so it was inert in production."
+        ]
+      },
+      "history": [
+        {
+          "at": "2026-09-14T04:28:09.474413+00:00",
+          "event": "created",
+          "by": "analysis-gate"
+        },
+        {
+          "at": "2026-09-14T04:28:19.336555+00:00",
+          "event": "updated",
+          "by": "chatgpt",
+          "changed": [
+            "dependencies"
+          ]
+        },
+        {
+          "at": "2026-09-14T15:03:38.411626+00:00",
+          "event": "claimed",
+          "by": "claude-opus5-session-01FH4tRd",
+          "session": "claude-wj-p3",
+          "node_id": null
+        },
+        {
+          "at": "2026-09-14T16:00:57.116089+00:00",
+          "event": "completed",
+          "by": "claude-opus5-session-01FH4tRd",
+          "verified_by": "evidence",
+          "queue_task_id": null
+        }
+      ]
+    },
+    {
+      "id": "blg_5fd5d2c98956",
+      "title": "Worktree Janitor P4: multi-node execution at the owning node-agent",
+      "description": "Multi-node: execution happens at the owning node-agent. The controller never removes\na remote path.\n\nThis mirrors exactly what /v1/repo/{op} and /v1/repo-evidence already do for reads: the\ncontroller cannot see another node's filesystem, so it must ask the node that owns it.\n\nNode-agent (node_agent.py): add authenticated routes\n  GET  /v1/worktree/candidates?repo_path=...   -> classification report for THIS node\n  POST /v1/worktree/cleanup                    -> body {repo_path, worktree_path,\n                                                   expected_head, expected_branch}\nThe POST re-classifies locally with fresh evidence and its OWN config before acting, and\nrefuses if expected_head/expected_branch do not match what it observes (optimistic\nconcurrency -- prevents acting on a controller's stale view). Application-level refusals\nreturn HTTP 200 with {\"error\": CODE} (this agent's documented convention -- a 4xx is read as\n'unreachable' by node_client._request); a genuinely missing route stays 404.\n\nnode_client: add worktree_candidates(...) and worktree_cleanup(...) to the NodeClient\nprotocol, LocalNodeClient (delegating to the same in-process service, so local and remote\nrun identical code) and RemoteNodeClient.\n\nController routing (mirror repo_service.RepoService): locate the owning node from the task's\nnode_id / session_registry, then dispatch. A node with no worktree routes =>\nNODE_LACKS_WORKTREE_JANITOR (distinct from NODE_UNREACHABLE). Node offline => REVIEW, never\nAUTO_SAFE, and never a local fallback.\n\nI4 must be enforced structurally: a test asserting the controller-side code path contains no\nfilesystem-removal primitive and that a remote candidate never reaches the local executor.\n\nDoD: tests using a real node-agent ASGI app via starlette TestClient and the REAL\nRemoteNodeClient with its transport swapped (see tests/test_repo_read_node.py) --\nremote classify works; remote cleanup works; expected_head mismatch refuses; auth required;\nPOST-only for cleanup; node offline => REVIEW; old agent => NODE_LACKS_WORKTREE_JANITOR;\nand the structural test that the controller never removes a remote path. Windows node:\na locked directory must surface as BLOCKED/PERMISSION_DENIED with no retry-with-force (F9).",
+      "status": "IN_PROGRESS",
+      "priority": "P2",
+      "type": "feature",
+      "order": 49,
+      "created_at": "2026-09-14T04:28:09.474422+00:00",
+      "updated_at": "2026-09-14T15:16:04.638557+00:00",
+      "source": "analysis-gate",
+      "dependencies": [
+        "blg_e0c7eabeaf72"
+      ],
+      "acceptance_criteria": [
+        "node_agent exposes GET /v1/worktree/candidates and POST /v1/worktree/cleanup, authenticated, application refusals as HTTP 200 with an error code",
+        "The node re-classifies with its own config and fresh evidence and refuses on expected_head/expected_branch mismatch",
+        "worktree_candidates/worktree_cleanup added to the NodeClient protocol, LocalNodeClient and RemoteNodeClient; local and remote execute identical engine code",
+        "A structural test proves the controller-side path contains no filesystem-removal primitive and a remote candidate never reaches the local executor",
+        "Node offline => REVIEW (never AUTO_SAFE, never a local fallback); an agent without the routes => NODE_LACKS_WORKTREE_JANITOR, distinct from NODE_UNREACHABLE",
+        "Tests use a real node-agent ASGI app plus the real RemoteNodeClient with a swapped transport",
+        "A Windows locked directory surfaces as BLOCKED/PERMISSION_DENIED with no retry and no force"
+      ],
+      "tags": [
+        "worktree-janitor",
+        "multi-node"
+      ],
+      "assignee": "claude-opus5-session-01FH4tRd",
+      "session": "claude-wj-p4",
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-14T04:28:09.474437+00:00",
+          "event": "created",
+          "by": "analysis-gate"
+        },
+        {
+          "at": "2026-09-14T04:28:19.453710+00:00",
+          "event": "updated",
+          "by": "chatgpt",
+          "changed": [
+            "dependencies"
+          ]
+        },
+        {
+          "at": "2026-09-14T15:16:04.638557+00:00",
+          "event": "claimed",
+          "by": "claude-opus5-session-01FH4tRd",
+          "session": "claude-wj-p4",
+          "node_id": null
+        }
+      ]
+    },
+    {
+      "id": "blg_068815a02285",
+      "title": "Worktree Janitor P5: review queue, dashboard panel and report API",
+      "description": "Operator surface: review queue, alerts, and API. Nothing is auto-removed by this task.\n\nDashboard (dashboard.py, following its existing route + test-pinned-inventory convention --\ntests/test_dashboard.py's route dict is authoritative, update it):\n- GET /dashboard/api/worktrees -> per-node candidate list with policy_class, reasons,\n  size, age, owning task, and the evidence summary.\n- POST /dashboard/api/worktrees/review -> approve|abandon a REVIEW item (CSRF + auth like\n  every other mutating dashboard route), recorded with the acting identity in audit.actor.\n- A panel showing totals: reclaimable bytes by class, count BLOCKED with reasons, oldest\n  candidate, and a clear 'observe_only' badge when the feature is not enforcing.\n\nRules: the UI must make BLOCKED reasons legible (an operator has to understand WHY, e.g.\n'unmerged and not pushed', 'holds a .env'), must never offer a force option, and must show\npaths only -- never contents of a valuable ignored file.\n\nMCP: terminal_worktree_janitor_report(node='') for the same data.\n\nDoD: dashboard route tests (the pinned route inventory updated deliberately); a REVIEW item\ncan be approved and then becomes eligible; abandon marks CLEANUP_ABANDONED and stops\nre-proposing it; no force affordance exists anywhere in the UI or API; unauthenticated and\nCSRF-less requests are refused exactly like sibling routes.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "feature",
+      "order": 50,
+      "created_at": "2026-09-14T04:28:09.474462+00:00",
+      "updated_at": "2026-09-14T04:28:19.572475+00:00",
+      "source": "analysis-gate",
+      "dependencies": [
+        "blg_cb4c52480ce6"
+      ],
+      "acceptance_criteria": [
+        "GET /dashboard/api/worktrees and POST /dashboard/api/worktrees/review exist with the same auth+CSRF posture as sibling mutating routes, and tests/test_dashboard.py's pinned route inventory is updated deliberately",
+        "The panel shows reclaimable bytes by class, BLOCKED reasons in plain language, oldest candidate, and an observe_only badge when not enforcing",
+        "approve makes a REVIEW item eligible; abandon sets CLEANUP_ABANDONED and stops it being re-proposed",
+        "No force affordance exists in any UI or API surface",
+        "Only paths are shown for valuable ignored data, never contents",
+        "terminal_worktree_janitor_report exposes the same data over MCP"
+      ],
+      "tags": [
+        "worktree-janitor",
+        "ui",
+        "api"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-14T04:28:09.474478+00:00",
+          "event": "created",
+          "by": "analysis-gate"
+        },
+        {
+          "at": "2026-09-14T04:28:19.572475+00:00",
+          "event": "updated",
+          "by": "chatgpt",
+          "changed": [
+            "dependencies"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "blg_a6d4b57ba491",
+      "title": "Worktree Janitor P6: disk-pressure escalation (per-mount) + scratch/cache policy",
+      "description": "Disk-pressure escalation, and a durable policy for scratch/cache locations.\n\nEscalation (must obey I7): when free space on the filesystem holding the candidates crosses\nconfigured thresholds, the janitor may ONLY:\n  (a) shorten grace_seconds toward grace_floor_seconds (never below),\n  (b) reorder AUTO_SAFE candidates largest-first,\n  (c) raise log/alert severity and emit a WORKTREE_CLEANUP_PRESSURE event.\nIt may NEVER: downgrade or skip a predicate, promote REVIEW/BLOCKED to AUTO_SAFE, pass\nforce, or touch a dirty/unmerged tree. A test must assert that at 99% full a dirty worktree\nis still not removed.\n\nMeasurement: reuse host_metrics (already collects disk usage) rather than a second\nimplementation. Thresholds are per-mount, because the audited reality on m910 is that the\npressure is NOT where the worktrees are: /dev/sda3 (worktrees, /home) was 26% used with 83G\nfree while tmpfs /tmp was 74% used and had already hit an EDQUOT that broke tooling. So:\n- Evaluate pressure on the filesystem of each candidate path, never a global number.\n- Removing worktrees frees the worktree filesystem only; state that explicitly in the\n  report so an operator is not misled into thinking it relieves /tmp.\n\nScratch/cache policy (the second half of the audited problem): /tmp is a 7.6G RAM-backed\ntmpfs with usrquota, and per-user quota exhaustion there breaks unrelated tooling. Propose\nand document (in docs/REQUIREMENTS.md) a policy for where agent scratch/logs/caches live,\nwith a recommendation to place durable scratch on the ext4 root rather than tmpfs, plus a\nbounded retention sweep for whatever location is chosen. Implement only the retention sweep\nfor directories the project itself owns; do NOT touch another tool's directories.\n\nDoD: tests for threshold behaviour including the 99%-full dirty-worktree refusal; per-mount\nevaluation (a candidate on a roomy mount is not escalated because another mount is full);\nthe report explicitly names which filesystem the reclaim affects; retention sweep is bounded\nand dry-run by default.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "feature",
+      "order": 51,
+      "created_at": "2026-09-14T04:28:09.474487+00:00",
+      "updated_at": "2026-09-14T04:28:19.681323+00:00",
+      "source": "analysis-gate",
+      "dependencies": [
+        "blg_ab2a3b46730a"
+      ],
+      "acceptance_criteria": [
+        "Escalation may only shorten grace toward grace_floor_seconds, reorder largest-first, and raise alert severity",
+        "A test asserts that at 99% full a dirty or unmerged worktree is still refused, and that force is never enabled",
+        "Pressure is evaluated per-mount on the candidate's own filesystem, reusing host_metrics; a candidate on a roomy mount is not escalated because another mount is full",
+        "The report states explicitly which filesystem a reclaim affects, so removing worktrees is not mistaken for relieving tmpfs /tmp",
+        "docs/REQUIREMENTS.md records the scratch/cache location policy including the tmpfs-quota finding and the recommendation to keep durable scratch off RAM-backed tmpfs",
+        "Any retention sweep is bounded, dry-run by default, and touches only directories this project owns"
+      ],
+      "tags": [
+        "worktree-janitor",
+        "disk-pressure"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-14T04:28:09.474501+00:00",
+          "event": "created",
+          "by": "analysis-gate"
+        },
+        {
+          "at": "2026-09-14T04:28:19.681323+00:00",
+          "event": "updated",
+          "by": "chatgpt",
+          "changed": [
+            "dependencies"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "blg_2a916d4a1505",
+      "title": "Worktree Janitor P7: rollout ladder observe->suggest->auto, telemetry, debt reconciliation",
+      "description": "Rollout, telemetry and debt cleanup. Ships the feature to enforcing, safely.\n\nRollout ladder (reuse supervisor2.py's audited precedent POLICY_MODES =\nobserve_only|suggest_only|approved_auto_continue -- same escalation shape, same default):\n1. observe_only (default everywhere): classify + report + audit only. Run for a defined\n   observation window and export the report.\n2. suggest_only: additionally emit events/alerts and populate the review queue; still zero\n   removals.\n3. auto_execute: AUTO_SAFE candidates removed automatically. Enable per-repo/per-node first,\n   never globally in one step, and only after the observation window shows zero\n   misclassifications.\nDocument the exact promotion criteria (N days observed, zero AUTO_SAFE items that a human\njudged wrong, zero BLOCKED-for-the-wrong-reason) as the gate to each step, and require an\nexplicit human go-ahead for step 3 -- consistent with this project's standing rule for\noutward-facing behaviour changes (see the auto-dispatch per-lane decision in the Backlog).\n\nTelemetry: counters for candidates by class, removals, reclaimed bytes, refusals by reason\ncode, classification latency, and evidence-staleness rate. Surface via the existing metrics\npath; no new metrics system.\n\nDebt cleanup within this feature's own scope only:\n- Reconcile terminal_worktree_cleanup (the existing manual tool) with the janitor so there\n  is ONE removal implementation; the manual tool keeps its force=True escape hatch for a\n  human but must route through the same audit/lock/evidence recording.\n- Audited side-effect worth fixing here: repo_read.DENIED_DIR_NAMES includes '.terminal-mcp',\n  which means the repo_* read tools cannot read .terminal-mcp/backlog.json -- the project's\n  own backlog source of truth. Decide deliberately: keep the denial (and document that the\n  backlog is only reachable via terminal_backlog_*) or narrow the rule to the specific\n  secret-bearing paths. Do not change it silently.\n\nDoD: the ladder and promotion criteria are in docs/REQUIREMENTS.md; mode transitions are\nconfig-only and tested at each level (observe_only provably removes nothing); telemetry\ncounters asserted; the two removal paths share one implementation with one audit shape; the\nrepo_read/.terminal-mcp decision is recorded with its rationale.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "chore",
+      "order": 52,
+      "created_at": "2026-09-14T04:28:09.474509+00:00",
+      "updated_at": "2026-09-14T04:28:19.823262+00:00",
+      "source": "analysis-gate",
+      "dependencies": [
+        "blg_e0c7eabeaf72",
+        "blg_ab2a3b46730a",
+        "blg_5fd5d2c98956",
+        "blg_068815a02285",
+        "blg_a6d4b57ba491"
+      ],
+      "acceptance_criteria": [
+        "Mode ladder mirrors supervisor2 POLICY_MODES with observe_only as the default; each level is config-only and tested, and observe_only provably removes nothing",
+        "Promotion criteria to auto_execute are documented (observation window, zero misclassifications) and step 3 requires an explicit human go-ahead, per-repo/per-node first",
+        "Telemetry counters exist for candidates by class, removals, reclaimed bytes, refusals by reason code, classification latency and evidence-staleness rate, via the existing metrics path",
+        "terminal_worktree_cleanup and the janitor share ONE removal implementation with one audit shape; the manual tool keeps force=True for a human but routes through the same lock/audit/evidence recording",
+        "The repo_read.DENIED_DIR_NAMES '.terminal-mcp' decision is made deliberately and documented with rationale (it currently blocks reading the project's own backlog.json)"
+      ],
+      "tags": [
+        "worktree-janitor",
+        "rollout",
+        "telemetry"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-14T04:28:09.474524+00:00",
+          "event": "created",
+          "by": "analysis-gate"
+        },
+        {
+          "at": "2026-09-14T04:28:19.823262+00:00",
+          "event": "updated",
+          "by": "chatgpt",
+          "changed": [
+            "dependencies"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "blg_39f82cd2fe3a",
+      "title": "Prompt delivery/acceptance gate: enforce across supervisor2 + MCP send tools, then promote advisory->enforce",
+      "description": "Finish wiring the PROMPT DELIVERY / ACCEPTANCE GATE into the two send paths that still decide\nfor themselves, and promote the gate from advisory to enforce.\n\nAlready shipped on branch feat/prompt-delivery-gate (advisory default, zero behaviour change):\nterminal_mcp/delivery_gate.py (the pure decision point), config.PromptDeliveryConfig +\n_load_prompt_delivery_config, queue_engine._dispatch wired through it,\nqueue_store.record_delivery_verdict, the contract in docs/prompt-submission.md (\"The acceptance\ngate\") and a pointer in docs/REQUIREMENTS.md section 5, plus tests/test_delivery_gate.py.\nThis item is the REMAINDER, deliberately not guessed at.\n\nTHE RULE (source of truth: docs/prompt-submission.md \"The acceptance gate\"): a prompt is\nDELIVERED only when BOTH (1) the send receipt's delivery_state is SUBMIT_CONFIRMED, AND (2) a\nseparate post-submit observation shows the target actually took it. SUBMIT_CONFIRMED alone\nproves Enter was processed, not that the agent read the prompt and started.\n\n1. supervisor2.execute_send. It currently does: if submit_status == \"SUBMIT_UNCONFIRMED\" ->\n   cas_update(state=blocked, stop_reason=submit_unconfirmed) + block_policy; else ->\n   cas_update(state=observing). That is the same denylist shape queue_engine had -- a TEXT_SENT\n   receipt, or any delivery_state added to adapters.py later, falls through to observing.\n   Replace with delivery_gate.evaluate. The care needed:\n   - The action state machine is a CAS chain (approved -> sent -> observing|blocked|failed) and\n     the row is CAS'd to sent BEFORE the send. Do NOT change that ordering: it is what makes a\n     duplicate execute_send a no-op.\n   - A NOT_ACCEPTED verdict needs its OWN stop_reason (proposed: acceptance_not_observed) and\n     must not be conflated with submit_unconfirmed. They call for different operator action:\n     submit_unconfirmed means the submit itself is unproven, acceptance_not_observed means the\n     submit is confirmed but the agent has not visibly started. Conflating them would tell an\n     operator to retry something that must never be retried.\n   - DECIDE and document: should NOT_ACCEPTED call block_policy (pausing the whole watch) or\n     only block the single action? Blocking the whole policy because one agent was slow to start\n     is probably too aggressive; blocking only the action risks the chain advancing. Pick one\n     with a stated rationale.\n\n2. Direct MCP send tools (terminal_send_text, terminal_send_bound and the _bound variants).\n   These return a receipt and the CALLER decides, so in-process enforcement is impossible --\n   for an external caller the docs section IS the rule. What is possible and additive: return\n   the verdict as a receipt field (proposed name: delivery_verdict) alongside the existing\n   submission_id / evidence / stage that core.py's _enrich_receipt already adds, so a caller\n   branches on one field instead of re-deriving the rule.\n   - DECIDE: compute it inline on every send (costs one extra status read of latency per send)\n     or only when the caller opts in via a parameter. Measure before choosing.\n   - _enrich_receipt already emits stage=ACCEPTANCE for the enter-sent-but-unconfirmed case.\n     Reconcile the two vocabularies rather than introducing a third overlapping one.\n\n3. Promotion advisory -> enforce. Run advisory in production for a defined window, export the\n   recorded metadata.delivery_verdict distribution, and confirm there are no false negatives\n   (NOT_ACCEPTED returned for a task that had genuinely started) -- a false negative stalls real\n   work, which is worse than the fail-open it replaces. Only then flip prompt_delivery.mode to\n   enforce, per-deployment, with an explicit human go-ahead, the same discipline the per-lane\n   auto_dispatch_enabled decision documents. Record the observed false-negative rate in\n   docs/REQUIREMENTS.md BEFORE flipping.\n\n4. Dashboard surface: show the verdict (kind, activation, acceptance, evidence) on a held task\n   so an operator can see WHY it is held rather than just that it is. tests/test_dashboard.py's\n   pinned route inventory is authoritative -- update it deliberately if a route is added.\n\nEXPLICIT NON-GOALS: no new queue status (DISPATCH_UNCERTAIN already carries the\nheld-after-confirmed-submit case); no schema migration (the verdict lives in the existing\nmetadata JSON column, bounded to 5 history entries); no change to the bounded Escape+Enter\nactivation retry, which stays owned by core.py under its own evidence gate; no automatic resend\non NOT_ACCEPTED, ever -- the submit is confirmed, so a resend duplicates it.\n\nCLAUDE-SPECIFIC RULE that must survive any refactor here: never raw/repeated Enter. If a prompt\nis still in the input box, inspect via terminal_input_context, clear it, then exactly one\nterminal_send_text(..., press_enter=True). No bare terminal_send_keys([\"Enter\"]) to help it\nalong, no second Enter because the first looked slow.\n",
+      "status": "BACKLOG",
+      "priority": "P1",
+      "type": "feature",
+      "order": 53,
+      "created_at": "2026-09-14T06:22:48.024073+00:00",
+      "updated_at": "2026-09-14T06:23:38.864524+00:00",
+      "source": "analysis-gate",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "supervisor2.execute_send routes through delivery_gate.evaluate with a positive allowlist; a TEXT_SENT or unrecognised delivery_state no longer reaches state=observing",
+        "NOT_ACCEPTED has its own stop_reason distinct from submit_unconfirmed, and the decision on whether it blocks the policy or only the action is documented with rationale",
+        "The CAS ordering (approved -> sent before the send) is unchanged, and a duplicate execute_send is still refused",
+        "terminal_send_text/_bound expose the verdict as an additive receipt field reconciled with the existing stage=ACCEPTANCE vocabulary; no existing field changes meaning",
+        "Advisory-mode verdict distribution from a real production window is recorded in docs/REQUIREMENTS.md, including the observed false-negative rate, BEFORE any enforce flip",
+        "prompt_delivery.mode=enforce is flipped only per-deployment with an explicit human go-ahead",
+        "Dashboard shows kind/activation/acceptance/evidence for a held task; the pinned route inventory is updated deliberately if a route is added",
+        "Regression tests for supervisor2: TEXT_SENT does not reach observing, NOT_ACCEPTED blocks with its own reason, duplicate send still refused",
+        "No new queue status and no schema migration introduced"
+      ],
+      "tags": [
+        "prompt-delivery",
+        "acceptance-gate",
+        "reliability"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-14T06:22:48.024139+00:00",
+          "event": "created",
+          "by": "analysis-gate"
+        },
+        {
+          "at": "2026-09-14T06:23:38.864524+00:00",
+          "event": "updated",
+          "by": "chatgpt",
+          "changed": [
+            "description"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "blg_8d65afc1b38b",
+      "title": "Scheduler: auto-refill idle workers and reclaim stalled sessions",
+      "description": "Scheduling is not work-conserving: READY backlog work coexists with genuinely idle compatible workers and nothing dispatches, so capacity is wasted and stale sessions hold worker slots indefinitely.\n\nOBSERVED (production, 2026-09-14):\n- supervisor loop running every 20s, but supervisor_status: watch_count=4, enabled_watch_count=0, stalled_count=2 -- i.e. zero enabled watches despite live workers.\n- watches stop silently via max_iterations_exceeded / manual_unwatch / target_missing, removing scheduling visibility from workers that are still alive.\n- linux1 finished implementation+tests and sits at an empty prompt.\n- hp3-work reported done and sits at an empty prompt.\n- hp1 stale ~35h, never reclaimed, still occupying a worker slot.\n- linux2/hp2 had ~1h-old activity while the UI still rendered composing/imagining.\n\nSCOPE:\n1. Worker state model distinguishing RUNNING, IDLE_READY, WAITING_INPUT, STALLED, BLOCKED, UNAVAILABLE/OFFLINE, RESERVED, UNKNOWN. Empty prompt after completion becomes IDLE_READY after a configurable 30-60s debounce. UNKNOWN must be re-probed, never permanent.\n2. Refill invariant: ready_compatible_tasks>0 && idle_compatible_workers>0 must not persist beyond a configurable refill SLA (default <=60s) without a persisted reason code (DEPENDENCY_BLOCKED, CAPABILITY_MISMATCH, RESERVED_FOR_HOTFIX, NODE_OFFLINE, CONCURRENCY_LIMIT, WORKTREE_CONFLICT, PERMISSION_DENIED).\n3. Watch lifecycle robustness: max_iterations_exceeded must not permanently remove worker coverage; target_missing must trigger rediscovery/reconciliation; manual unwatch stays respected but is recorded as intentional exclusion; supervisor restart rebuilds observation idempotently from persisted sessions.\n4. Stalled reclaim on MULTIPLE signals (tmux activity age, prompt state, output hash/no-progress, running child process, pending shell command, submit/activation state). Probe before reclaim; never reclaim on one weak signal; preserve a genuinely running child command; release lease exactly once with audit trail.\n5. Dispatch safety: capability matching preserved; no two tasks into one tmux session; delivery incomplete until SUBMIT_CONFIRMED/activation evidence; unconfirmed send returns task to READY without leaking a worker reservation; compare-and-swap/lease prevents double-claim.\n6. Observability: usable worker count, RUNNING/IDLE_READY/STALLED/BLOCKED/OFFLINE counts, READY task count, compatible-ready per worker, utilization %, idle-with-ready-work duration, last dispatch timestamp, non-dispatch reason, reclaimed count. The dashboard must make it obvious WHY a worker is idle.\n\nDEPENDENCIES:\n- blg_orch_no_workers_declared (IN_PROGRESS): capability_profiles has 0 rows, so pm_router returns NO_ELIGIBLE_WORKER for everything. Capability-routed refill cannot find candidates until profiles exist; refill must still work for non-capability-routed dispatch and must report CAPABILITY_MISMATCH as an explicit reason rather than failing silently.\n- Composes with blg_orch_scheduler (P1 cross-project portfolio scheduling) and blg_967d4e3aa293 (P3 deterministic portfolio scheduler); this item is single-project work-conservation and must not pre-empt their allocation model.\n- Interacts with blg_39f82cd2fe3a (prompt delivery/acceptance gate) for SUBMIT_CONFIRMED.",
+      "status": "IN_PROGRESS",
+      "priority": "P1",
+      "type": "bug",
+      "order": 54,
+      "created_at": "2026-09-14T09:01:27.558658+00:00",
+      "updated_at": "2026-09-14T09:14:03.041503+00:00",
+      "source": "claude-code",
+      "dependencies": [
+        "blg_orch_no_workers_declared"
+      ],
+      "acceptance_criteria": [
+        "With >=3 idle compatible workers and >=3 independent READY tasks, every eligible worker is filled automatically in one refill pass with no manual sends",
+        "READY-compatible-work + IDLE-compatible-worker never persists >60s without an explicit persisted reason code",
+        "max_iterations_exceeded does not permanently remove scheduling visibility from a live worker",
+        "target_missing then reappearing reconciles the worker back into coverage",
+        "A stale-looking session with a genuinely running child process is NOT reclaimed",
+        "A confidently stalled session is marked STALLED and its lease released exactly once, with audit trail",
+        "Concurrent scheduler passes cannot double-claim the same task or worker",
+        "Unconfirmed/rejected prompt delivery returns the task to READY and leaks no worker reservation",
+        "Restart/recovery of observation is idempotent",
+        "Existing supervisor v1/v2 and dashboard tests remain green; changes are additive",
+        "Before/after utilization evidence reported"
+      ],
+      "tags": [
+        "scheduler",
+        "orchestration",
+        "reliability",
+        "utilization"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": "ROOT CAUSE CONFIRMED: supervisor.py disables watches for 7 reasons and called set_enabled(...,True) from NOWHERE in the codebase -- every disable was permanent. A watch that hit max_iterations while its worker kept working never came back, so live workers lost scheduling visibility forever. That is exactly watch_count=4/enabled=0.\n\nPHASE 1 COMMITTED: branch fix/scheduler-refill @ 02efdf5 (NOT merged, NOT deployed).\n  terminal_mcp/scheduler_health.py (new): worker state model (RUNNING/IDLE_READY/WAITING_INPUT/STALLED/BLOCKED/OFFLINE/RESERVED/UNKNOWN), multi-signal classify_worker with configurable idle debounce, may_reclaim requiring STALLED+high confidence, watch_recovery_action, evaluate_refill with reason codes, utilization_snapshot.\n  terminal_mcp/supervisor.py: reconcile_watches() + _target_alive() + store.reenable_watch/reset_iterations/note_reconcile_attempt, reconcile_attempts column, watch_reconciled event, enriched status (disabled/recoverable/intentional counts + per-watch reasons).\n  tests: test_scheduler_health.py (35), test_supervisor_reconcile.py (9). Regression 227 passed.\n\nBEFORE/AFTER on a COPY of the real supervisor.db (production not mutated):\n  BEFORE enabled=0/4 (recoverable=3, intentional=1)\n  AFTER  enabled=2/4 -- restored mcp-work + terminal-mcp-main (max_iterations_exceeded); left mesflow-dell (manual_unwatch, deliberate) and wtest (target still missing).\n\nSTILL OPEN (phase 2): the dispatch side. evaluate_refill decides and explains but nothing yet claims a lease, sends a prompt under the SUBMIT_CONFIRMED contract, or reclaims a STALLED session. Needs wiring into queue_engine's dispatch path; deserves its own review.",
+      "history": [
+        {
+          "at": "2026-09-14T09:01:27.558721+00:00",
+          "event": "created",
+          "by": "claude-code"
+        },
+        {
+          "at": "2026-09-14T09:14:03.041503+00:00",
+          "event": "updated",
+          "by": "claude-code",
+          "changed": [
+            "dependencies",
+            "evidence",
+            "status"
+          ]
         }
       ]
     }
