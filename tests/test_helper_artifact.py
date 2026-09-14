@@ -378,3 +378,140 @@ def test_the_manual_powershell_fallback_is_untouched():
 def test_the_one_click_connect_button_still_exists_for_an_installed_helper():
     assert 'id="anHelperBtn"' in NODES_ADMIN_HTML
     assert "terminalmcp" in NODES_ADMIN_HTML or "issued.data.url" in NODES_ADMIN_HTML
+
+
+# -- pairing the download with a pending session ------------------------------------
+
+HANDLE = "0123456789abcdef0123456789abcdef"
+
+
+def test_a_paired_filename_carries_origin_and_handle():
+    name = ha.paired_filename("terminal-mcp-bootstrap.exe", "https://ctl.example", HANDLE)
+    assert name == f"terminal-mcp-bootstrap__ctl.example__{HANDLE}.exe"
+
+
+def test_a_port_is_encoded_because_colon_is_illegal_in_a_windows_filename():
+    name = ha.paired_filename("terminal-mcp-bootstrap.exe", "https://ctl.example:8443", HANDLE)
+    assert name == f"terminal-mcp-bootstrap__ctl.example-p8443__{HANDLE}.exe"
+
+
+def test_a_dev_http_controller_records_its_scheme_rather_than_being_guessed():
+    name = ha.paired_filename("terminal-mcp-bootstrap.exe", "http://127.0.0.1:8766", HANDLE)
+    assert name == f"terminal-mcp-bootstrap__http-127.0.0.1-p8766__{HANDLE}.exe"
+
+
+@pytest.mark.parametrize("controller,handle", [
+    (None, HANDLE),
+    ("https://ctl.example", None),
+    ("https://ctl.example", "not-a-handle"),
+    ("https://ctl.example", HANDLE + "extra"),
+    ("ftp://ctl.example", HANDLE),
+    ("https://ctl.example;calc.exe", HANDLE),
+])
+def test_anything_malformed_degrades_to_the_plain_name(controller, handle):
+    """A generic download is a supported outcome, never an error -- the
+    operator installs it and presses Connect again."""
+    assert ha.paired_filename("terminal-mcp-bootstrap.exe", controller, handle) == \
+        "terminal-mcp-bootstrap.exe"
+
+
+def test_a_path_on_the_controller_url_does_not_affect_the_origin(client, store):
+    """An origin is scheme + host + port. A path is not part of it, and
+    pairing on the correct origin is right rather than a degradation."""
+    name = ha.paired_filename("terminal-mcp-bootstrap.exe",
+                              "https://ctl.example/../../etc", HANDLE)
+    assert name == f"terminal-mcp-bootstrap__ctl.example__{HANDLE}.exe"
+
+
+def test_the_paired_download_names_the_file_after_the_session(client, store):
+    _publish(store)
+
+    response = client.post(DOWNLOAD, json={"session": HANDLE})
+
+    assert response.status_code == 200
+    disposition = response.headers["content-disposition"]
+    assert HANDLE in disposition
+    assert disposition.startswith('attachment; filename="terminal-mcp-bootstrap__')
+    assert disposition.endswith('.exe"')
+
+
+def test_the_bytes_are_identical_whether_or_not_it_is_paired(client, store):
+    """The whole reason pairing lives in the name: the manifest hash is
+    re-checked per request, and an Authenticode signature would not survive
+    rewriting the file per download."""
+    published = _publish(store)
+
+    plain = client.get(DOWNLOAD)
+    paired = client.post(DOWNLOAD, json={"session": HANDLE})
+
+    assert plain.content == paired.content == published.path.read_bytes()
+    assert paired.headers["x-artifact-sha256"] == published.sha256
+
+
+def test_a_malformed_session_still_serves_a_generic_download(client, store):
+    _publish(store)
+
+    response = client.post(DOWNLOAD, json={"session": "../../etc/passwd"})
+
+    assert response.status_code == 200
+    assert response.headers["content-disposition"] == \
+        'attachment; filename="terminal-mcp-bootstrap.exe"'
+
+
+def test_the_handle_never_reaches_a_log(client, store, caplog):
+    """It is a credential for its 120 seconds. A log line outlives that by
+    months and travels to places the handle never should."""
+    import logging
+
+    _publish(store)
+    with caplog.at_level(logging.INFO, logger="terminal_mcp"):
+        response = client.post(DOWNLOAD, json={"session": HANDLE})
+
+    assert response.status_code == 200
+    for record in caplog.records:
+        assert HANDLE not in record.getMessage()
+        assert HANDLE not in str(record.args or "")
+
+
+def test_the_handle_never_travels_in_a_url(client, store):
+    """A query string outlives the handle's two minutes in access logs,
+    proxy logs and browser history. The handle goes in the POST body."""
+    _publish(store)
+
+    response = client.post(DOWNLOAD, json={"session": HANDLE})
+
+    assert response.status_code == 200
+    assert HANDLE not in str(response.request.url)
+    assert "?" not in str(response.request.url)
+
+
+def test_the_handle_is_not_echoed_back_in_any_header(client, store):
+    _publish(store)
+    response = client.post(DOWNLOAD, json={"session": HANDLE})
+
+    for name, value in response.headers.items():
+        if name.lower() == "content-disposition":
+            continue          # the file name is the delivery mechanism
+        assert HANDLE not in value, name
+
+
+def test_the_cta_asks_for_a_paired_download():
+    assert "anDownloadPairedHelper" in NODES_ADMIN_HTML
+    assert "JSON.stringify(handle ? {session: handle} : {})" in NODES_ADMIN_HTML
+
+
+def test_the_cta_never_puts_the_handle_in_a_url():
+    assert "helper/windows-x64?session=" not in NODES_ADMIN_HTML
+
+
+def test_the_cta_honours_the_filename_the_controller_chose():
+    """It is what the helper reads on a double-click, so the browser must
+    not be left to invent one."""
+    assert "Content-Disposition" in NODES_ADMIN_HTML
+    assert "link.download = match ? match[1]" in NODES_ADMIN_HTML
+
+
+def test_the_cta_still_works_when_pairing_fails():
+    """A generic download is the documented fallback, so the CTA must not
+    break when the handle mint fails."""
+    assert "Generic download is a supported outcome" in NODES_ADMIN_HTML

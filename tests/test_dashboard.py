@@ -1437,7 +1437,7 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/nodes/onboard/gateway": {"GET", "HEAD"},
         # Bootstrap helper artifact: operator-facing reads, _read_guard only.
         "/dashboard/api/nodes/onboard/helper": {"GET", "HEAD"},
-        "/dashboard/api/nodes/onboard/helper/{target}": {"GET", "HEAD"},
+        "/dashboard/api/nodes/onboard/helper/{target}": {"GET", "POST", "HEAD"},
         "/dashboard/api/nodes/{node_id}/onboarding": {"GET", "HEAD"},
         "/dashboard/api/nodes/{node_id}/test-transport": {"POST"},
         "/dashboard/api/nodes/{node_id}/remove": {"POST"},
