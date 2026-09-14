@@ -369,3 +369,57 @@ def _config_for_loop_test() -> AppConfig:
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+def test_repo_evidence_endpoint_answers_for_a_real_repo_on_this_node(agent_client, tmp_path):
+    """Regression, found 2026-09-14.
+
+    This endpoint called `resolve_cwd(cwd, config)`, but `config` is not
+    defined anywhere in `build_node_agent`'s scope -- the module imports
+    `load_config` (the function), and the only `config` binding is a local
+    inside `main()`. So EVERY request to /v1/repo-evidence raised NameError
+    and answered 500, from the commit that added it.
+
+    It failed closed (the Coordinator's collector reports any non-200 as
+    RepoEvidenceUnavailable -- "we could not look"), so no dispatch decision
+    was ever made on bad evidence; the capability was simply never working,
+    and silently. Nothing exercised the ROUTE end-to-end -- the collector
+    and client protocol are well covered, but with a stub client -- which is
+    why a NameError survived with a green suite. This test is that exercise.
+    """
+    repo = tmp_path / "evidence-repo"
+    repo.mkdir()
+    env = {"HOME": str(tmp_path), "PATH": "/usr/bin:/bin",
+           "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@x",
+           "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@x"}
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True, env=env)
+    (repo / "tracked.txt").write_text("committed\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "c"], cwd=repo, check=True, env=env)
+
+    response = agent_client.get("/v1/repo-evidence", params={"cwd": str(repo)}, headers=_auth())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["branch"] == "main"
+    assert len(body["head"]) == 40
+    assert body["clean"] is True
+    # No upstream configured is NOT a failure -- it must be reported, not guessed.
+    assert body["has_upstream"] is False
+    assert (body["ahead"], body["behind"]) == (0, 0)
+
+    (repo / "dirty.txt").write_text("uncommitted\n")
+    dirty = agent_client.get("/v1/repo-evidence", params={"cwd": str(repo)}, headers=_auth()).json()
+    assert dirty["clean"] is False
+    assert any("dirty.txt" in line for line in dirty["status_lines"])
+
+
+def test_repo_evidence_endpoint_enforces_the_cwd_allowlist(agent_client):
+    response = agent_client.get("/v1/repo-evidence", params={"cwd": "/etc"}, headers=_auth())
+    assert response.status_code == 403
+    assert response.json()["error"] == "PATH_NOT_ALLOWED"
+
+
+def test_repo_evidence_endpoint_requires_a_cwd(agent_client):
+    response = agent_client.get("/v1/repo-evidence", headers=_auth())
+    assert response.status_code == 400
+    assert response.json()["error"] == "CWD_REQUIRED"

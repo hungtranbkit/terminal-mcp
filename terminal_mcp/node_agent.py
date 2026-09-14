@@ -198,7 +198,14 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: str,
         cwd = (request.query_params.get("cwd") or "").strip()
         if not cwd:
             return JSONResponse({"error": "CWD_REQUIRED"}, status_code=400)
-        resolved, error = resolve_cwd(cwd, config)
+        # `terminal.config`, not a bare `config`: this endpoint referred to
+        # an undefined name from the day it was written, so EVERY request to
+        # it raised NameError and answered 500. The controller's own
+        # node_aware_repo_evidence reports a non-200 as
+        # RepoEvidenceUnavailable ("we could not look") and fails closed, so
+        # the breakage was safe but silent -- remote repo evidence had never
+        # once actually been collected.
+        resolved, error = resolve_cwd(cwd, terminal.config)
         if error is not None:
             return JSONResponse({"error": "PATH_NOT_ALLOWED", "detail": error},
                                 status_code=403)
