@@ -12,6 +12,7 @@ the guarantee is lost:
 """
 from __future__ import annotations
 
+import pathlib
 import sqlite3
 
 import pytest
@@ -21,7 +22,7 @@ from terminal_mcp.schema import Migration, apply_migrations, get_schema_version
 from terminal_mcp.work_telemetry_store import (
     CONFIDENCE_ESTIMATED, CONFIDENCE_MEASURED, FIRST_PASS_FALSE, FIRST_PASS_TRUE,
     FIRST_PASS_UNKNOWN, KIND_CUMULATIVE, KIND_DELTA, PHASE_ANALYSIS, PHASE_CONTRACT,
-    MODEL_UNKNOWN, PHASE_IMPLEMENTATION, REENTRY_CONTRACT_GAP, REENTRY_STALE_CONTEXT,
+    MODEL_UNKNOWN, PHASE_IMPLEMENTATION, REENTRY_CONTRACT_GAP, REENTRY_REASONS, REENTRY_STALE_CONTEXT,
     REENTRY_TEST_FAILURE, STATUS_CANCELLED,
     STATUS_COMPLETED, STATUS_FAILED, TELEMETRY_MIGRATIONS, TelemetryValidationError,
     WorkTelemetryStore, default_telemetry_db_path,
@@ -685,3 +686,42 @@ class TestStaleContextReason:
         assert _reentry_check_admits(connection, "TEST_FAILURE") is True
         # The probe leaves nothing behind.
         assert connection.execute("SELECT COUNT(*) FROM telemetry_reentries").fetchone()[0] == 0
+
+
+class TestDocumentedContract:
+    """The integration contract is what other lanes build against, so
+    the parts of it that can drift silently are pinned here.
+
+    Prompted by the benchmark lane's observation that a
+    version-to-vocabulary table in a READER goes stale the moment a
+    migration adds a reason. The same is true of the one in this
+    project's own doc -- the difference is that this can be made to fail
+    the build instead of quietly misinforming someone."""
+
+    @staticmethod
+    def _doc() -> str:
+        path = pathlib.Path(__file__).resolve().parents[1] / "docs" / "WORK_EFFICIENCY_TELEMETRY.md"
+        return path.read_text(encoding="utf-8")
+
+    def test_every_reentry_reason_is_documented(self):
+        doc = self._doc()
+        missing = [reason for reason in REENTRY_REASONS if f"`{reason}`" not in doc]
+        assert not missing, (
+            f"re-entry reasons missing from the integration contract: {missing}. "
+            f"Producers read that doc to decide what they may emit.")
+
+    def test_the_version_vocabulary_table_covers_the_current_schema(self):
+        """If a migration is added, the documented table must gain its
+        row -- otherwise a read-only reader using the fallback silently
+        reports an out-of-date vocabulary."""
+        doc = self._doc()
+        current = max(m.version for m in TELEMETRY_MIGRATIONS)
+        assert f"| {current} |" in doc, (
+            f"schema is at v{current} but the version-to-vocabulary table in "
+            f"docs/WORK_EFFICIENCY_TELEMETRY.md does not have a row for it")
+
+    def test_the_documented_schema_version_matches_the_code(self):
+        doc = self._doc()
+        current = max(m.version for m in TELEMETRY_MIGRATIONS)
+        assert f"Schema version {current}" in doc, (
+            f"doc does not state the current schema version (v{current})")

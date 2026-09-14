@@ -260,9 +260,19 @@ This store answers it by probing the constraint inside a `SAVEPOINT` and
 rolling back. **That technique does not work in a read-only reader**: on
 a connection opened `mode=ro` / `PRAGMA query_only=1`, the probe insert
 fails because writes are forbidden, not because the CHECK refused — so
-every reason would report as unavailable.
+every reason would report as unavailable. Worse, it fails *closed* and
+looks like a store that rejects everything rather than like an error.
 
-Read-only readers should use `PRAGMA user_version`:
+**The best answer for a read-only reader** (found by the benchmark lane,
+better than either option above): read the table's DDL — a read-only
+query — replay it into a fresh **in-memory** database, and probe the
+candidate values there. That gives exact constraint semantics with no
+text parsing and not a single write to the file being measured. It also
+cannot go stale: unlike a version table, it reports what the constraint
+actually does.
+
+`PRAGMA user_version` remains the fallback for when no constraint can be
+probed:
 
 | `user_version` | re-entry vocabulary |
 |---|---|
@@ -281,8 +291,16 @@ a fabricated zero in the column.
 
 `work_telemetry_store.REENTRY_REASONS` is the tuple the CHECK set is
 generated from, so importing it avoids parsing anything — but it
-describes the *code's* vocabulary, not the *file's*. Pair it with
-`user_version` when the file may be behind.
+describes the *code's* vocabulary, not the *file's*, and it is the last
+resort rather than the first. Pair it with `user_version` when the file
+may be behind.
+
+Prefer the order: **replay-probe → `user_version` → documented
+constant**, and say in the report which one was used whenever it was not
+the probe. The table above is a convenience that goes stale the moment a
+migration adds a reason — `tests/test_work_telemetry_store.py::
+TestDocumentedContract` fails the build if it does, but a reader that
+depends on the constraint itself never has to care.
 
 ## Do not use input + cache_write as a cost figure
 
