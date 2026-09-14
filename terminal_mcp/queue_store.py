@@ -42,6 +42,7 @@ from __future__ import annotations
 import calendar
 import contextlib
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -50,6 +51,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
+
+_LOGGER = logging.getLogger(__name__)
 
 from . import requirement_contract as rc
 
@@ -1561,6 +1564,35 @@ class QueueStore:
             raise
         finally:
             connection.close()
+
+    def patch_worktree_cleanup(self, task_id: str, patch: dict[str, Any]) -> None:
+        """Merge fields into a task's worktree-cleanup record (P2's executor).
+
+        Kept here rather than in the executor because the metadata column is
+        this store's own, and a read-modify-write of it belongs inside the
+        store's connection. Merges rather than replaces: the executor updates
+        state/attempts/reclaimed_bytes without having to know, or preserve,
+        every field P1 wrote.
+
+        Never raises: the directory's real state is the truth, and a failed
+        metadata write is reconciled by the next sweep. Turning a completed
+        removal into a reported failure because a bookkeeping UPDATE lost a
+        race would be strictly worse."""
+        try:
+            with self._connection() as connection:
+                row = connection.execute("SELECT metadata FROM queue_tasks WHERE id = ?",
+                                         (task_id,)).fetchone()
+                if row is None:
+                    return
+                metadata = _parse_json_object(row["metadata"])
+                record = metadata.get(wj.METADATA_KEY)
+                record = dict(record) if isinstance(record, dict) else {}
+                record.update(patch)
+                metadata[wj.METADATA_KEY] = record
+                connection.execute("UPDATE queue_tasks SET metadata = ? WHERE id = ?",
+                                   (json.dumps(metadata), task_id))
+        except Exception:  # noqa: BLE001 -- bookkeeping must not mask the real outcome
+            _LOGGER.warning("could not patch worktree cleanup for %s", task_id, exc_info=True)
 
     def record_coordinator_decision(self, task_id: str, *, status: str, reason: str,
                                     blockers: list[str] | None = None, required_actions: list[str] | None = None,
