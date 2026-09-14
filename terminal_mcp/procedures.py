@@ -62,6 +62,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 from .project_knowledge import (KNOWLEDGE_DIRNAME, KnowledgeError,
                                 ProjectKnowledge, _run_git, scrub_knowledge)
+from .work_telemetry_runtime import note as _note_signal
 
 PROCEDURE_STATE_FILE = "PROCEDURE_STATE.json"
 # Run EVIDENCE is per machine and never travels with the repository. A cached
@@ -592,9 +593,13 @@ class ProcedureRegistry:
         """
         procedure = self.get(procedure_id)
         if procedure is None:
+            # A miss in the efficiency sense: the caller wanted a registered
+            # procedure and will now do the work by hand instead.
+            _note_signal("runbook_misses", source="procedures.run")
             return ProcedureResult(procedure_id, False, "lookup",
                                    f"no procedure registered as {procedure_id!r}")
         if not self._script_exists(procedure):
+            _note_signal("runbook_misses", source="procedures.run")
             return ProcedureResult(procedure_id, False, "lookup",
                                    f"the script it names is missing: "
                                    f"{' '.join(procedure.command)}")
@@ -610,6 +615,10 @@ class ProcedureRegistry:
         if use_cache and not extra_args:
             cached = self.load()["cache"].get(procedure_id) or {}
             if cached.get("fingerprint") == fingerprint and cached.get("ok"):
+                # Reused twice over: the procedure existed AND its green
+                # result stood, so nothing was re-run at all.
+                _note_signal("runbook_hits", source="procedures.run")
+                _note_signal("cache_hits", source="procedures.run")
                 return ProcedureResult(
                     procedure_id, True, "cached", cached.get("summary") or "passed earlier",
                     log_path=cached.get("log_path"), exit_code=0, from_cache=True)
@@ -641,6 +650,10 @@ class ProcedureRegistry:
                                  exit_code=code, duration_seconds=duration,
                                  error_excerpt=excerpt)
         self._record(procedure, result, fingerprint, owner=owner)
+        # A registered procedure was called rather than an ad-hoc command
+        # being written beside it -- which is what the hit rate measures,
+        # whether or not the procedure itself passed.
+        _note_signal("runbook_hits", source="procedures.run")
         return result
 
     def _record(self, procedure: Procedure, result: ProcedureResult,

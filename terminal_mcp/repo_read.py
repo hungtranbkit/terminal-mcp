@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from .redaction import CREDENTIAL_FILE_NAMES, redact_output
+from .work_telemetry_runtime import note as _note_signal
 
 # -- error codes ---------------------------------------------------------
 # Named constants rather than inline strings: these are part of the MCP
@@ -690,9 +691,15 @@ def repo_read(path: str, policy: RepoReadPolicy, *, file: str | None = None,
     if b"\x00" in head:
         return _err(BINARY_FILE, path=resolved.relative_path, bytes=size)
 
-    if start_line is not None or end_line is not None:
-        return _read_window(resolved, policy, cap, size, start_line, end_line)
-    return _read_head(resolved, policy, cap, size)
+    payload = (_read_window(resolved, policy, cap, size, start_line, end_line)
+               if start_line is not None or end_line is not None
+               else _read_head(resolved, policy, cap, size))
+    # Efficiency telemetry, counted where the file was actually read. A
+    # refused read is not a read, and this is a no-op unless a recorder is
+    # active for the task being worked.
+    if not payload.get("error"):
+        _note_signal("files_read", source="repo_read.repo_read")
+    return payload
 
 
 def _read_head(resolved: ResolvedRepo, policy: RepoReadPolicy, cap: int,
@@ -894,6 +901,9 @@ def repo_search(path: str, policy: RepoReadPolicy, *, query: str,
             continue
         redacted, _ = _redact(body[:1000])
         results.append({"path": file_part, "line": int(line_no), "text": redacted})
+    # One search CALL, whatever it found: the cost being measured is the
+    # round trip, not the number of lines that came back.
+    _note_signal("search_calls", source="repo_read.repo_search")
     return {"repo_root": str(root), "query": needle, "regex": bool(regex),
             "results": results, "count": len(results), "truncated": truncated,
             "limit": limit, "secret_paths_skipped": sorted(denied_files)}

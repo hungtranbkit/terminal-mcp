@@ -119,6 +119,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Direct-send verification: continued-polling ack evidence (P0 fix) | VERIFIED locally; NOT YET DEPLOYED to dell-5530 |
 | `terminal_create_session(initial_prompt)` double-echo (shell sessions) | FIXED, 2026-09-07 (`lifecycle.py`'s own real readiness signal) |
 | AI Usage (read-only, local AI Usage Monitor integration) | VERIFIED_LIVE (real browser smoke, real live data) |
+| Work efficiency telemetry (per-task counters + aggregation/savings) | IMPLEMENTED_NOT_LIVE_VERIFIED (runtime-driven rows + tests; not yet attached in a live deployment — the attach call is the coordinator's central wiring) |
 | Unified Task System §20 (Kanban/PM/Planner/git isolation/Phase A-E) | VERIFIED — see §20 itself for the exact per-slice scope |
 | Work Mode: a planner claim briefs itself (similar-bug retrieval + module context pack, paths verified) | VERIFIED (V1) |
 
@@ -3525,6 +3526,144 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
 - **Trace:** see this file's own commit.
 
 ---
+
+### Work efficiency telemetry — runtime-driven, provenance-preserving
+
+- **Goal / user value:** answer "what did this task actually cost, and is
+  the fleet getting cheaper" from the runtime's own record, per task, per
+  module and per time period — without any number in the answer having
+  been invented.
+- **Status:** IMPLEMENTED_NOT_LIVE_VERIFIED (2026-09-14). Code + unit/
+  integration tests against a REAL `QueueStore` (real transitions, real
+  event hook) are green; no live deployment has attached it yet, because
+  the attach call belongs to the central MCP/dashboard wiring which this
+  lane deliberately did not touch.
+- **What changed (the contract):** telemetry rows used to exist ONLY when
+  a worker called `work_telemetry_report` about its own finished task —
+  a self-selected, retrospective sample. Rows are now opened and closed
+  by the runtime itself:
+  - `work_telemetry_runtime.py` (new) subscribes to `QueueStore`'s own
+    post-commit event hook (`event_sink`, the same one `event_wiring.py`
+    uses for the event bus — `attach()` composes with whatever sink is
+    already installed and never displaces it).
+  - `DISPATCHING` opens the row (or REOPENS the task's existing row —
+    one row per task, so a retry stays one task rather than becoming two
+    cheap-looking ones); `RUNNING` records that the agent started;
+    `VERIFYING` is first preview; `COMPLETED`/`FAILED`/`BLOCKED`/
+    `SKIPPED`/`CANCELLED` finish it.
+  - A transition for a task this recorder never saw dispatched opens
+    NOTHING: a row whose `started_at` is "whenever the process attached"
+    would make every duration in the table wrong.
+- **First preview is a stated DEFINITION, not a guess:** this runtime has
+  no separate preview state, so the row records `preview_basis` — by
+  default the transition into `VERIFYING`, the first moment a reviewable
+  result exists. A caller with a truer signal (deploy preview URL,
+  screenshot artifact) calls `RuntimeTelemetry.mark_preview(basis=...)`,
+  and the basis is REQUIRED: a preview time nobody can trace to an event
+  is a number nobody can check.
+- **Per-task record:** `files_read`, `search_calls` (stored under the
+  original field name `search_rounds`; both names are the same number in
+  every payload), `runbook_hits`/`runbook_misses`, `knowledge_hits`,
+  `context_pack_hits`, `similar_bug_hits`, `redefine_count` (read from
+  the planner's own `WorkSpec.redefine_count`, never re-counted here),
+  `time_to_preview_seconds`, `first_pass_success`, plus the dispatch
+  bookkeeping (`dispatch_count`, `reopened`, `failed_excursions`).
+  Attributes carried at open: task id, work id, module, execution mode,
+  spec level, difficulty, lane — resolved from the `WorkSpec` bound to
+  the queue task and the queue row's own metadata; a task with no spec
+  gets NULLs, never a classified guess.
+- **`first_pass_success` is three-valued** — True / False / unknown. A row
+  whose dispatches were never observed (a worker-reported row) reports
+  `None` with a stated basis, and aggregates exclude it from the rate
+  rather than counting a gap in instrumentation as a failure.
+- **Counters come from the real call sites:** `repo_read.repo_read` (one
+  `files_read` per file actually read — a refused read is not a read),
+  `repo_read.repo_search` (one `search_calls` per search CALL, whatever
+  it found), `context_pack.py` (`context_pack_hits`/`knowledge_hits`
+  when a pack was actually served, `similar_bug_hits` per past spec
+  offered), `work_reuse.analyse` (knowledge/prior-spec candidates) and
+  `procedures.run` (`runbook_hits` when a registered procedure was
+  called, `+cache_hits` when its green result was reused instead of
+  re-run, `runbook_misses` when there was no usable procedure to call).
+  All report through `work_telemetry_runtime.note()`, which does nothing
+  at all unless a recorder has been made active for a task
+  (`observing(recorder, task_id)`). So an un-instrumented process
+  behaves exactly as before, and a zero counter on a row with an empty
+  `signal_sources` means "nobody reported", not "it never happened".
+  Attaching the same recorder to a queue store twice is a no-op, so a
+  double-wire cannot count two dispatches where there was one.
+- **Provider usage counters — recorded only when reported:**
+  `ProviderUsage` holds `input_tokens`/`output_tokens`/
+  `cache_read_tokens`/`cache_write_tokens`/`total_tokens`, each present
+  only because a runtime reported it, each carrying who reported it.
+  Anything unreported is `UNAVAILABLE`, never `0` (zero is itself a
+  measurement, and a false one). A value that is not a plain
+  non-negative integer — including `True` — is IGNORED and named in
+  `ignored`. A total nobody reported is `input + output` labelled
+  `ESTIMATED` (the estimate label) with its derivation in `method`;
+  exact arithmetic is still a derived figure. Usage is NOT back-filled
+  from the local AI Usage Monitor: those figures are per-MACHINE daily
+  quota and cannot be attributed to one task without inventing the
+  attribution. This telemetry reads and writes no credential material of
+  any kind.
+- **Aggregation API:** `summarise(rows)`, `aggregate(rows, by=...)` over
+  `task` / `module` / `work` / `project` / `lane` / `execution_mode` /
+  `difficulty` / `spec_level` / `day` / `week` / `month`; rows that
+  cannot be placed on the chosen axis are counted and named as
+  `ungrouped`, never dropped into an "other" bucket that reads as a real
+  group. `TelemetryStore.query()` filters by task/work/project/module and
+  a HALF-OPEN `[since, until)` time window, so two adjacent windows can
+  never double-count a task. `TelemetryStore.aggregate()`/`report()` are
+  the read surfaces; `WorkService.telemetry_for_run(work_id)` gives one
+  run's own rows.
+- **Baseline and savings — shown only when admissible:** a `Baseline` is
+  `MEASURED` (computed from real recorded rows, carrying its window and
+  task count, with a `min_tasks` floor) or `STATED` (supplied WITH its
+  definition — a definition-less one is refused outright), otherwise
+  `UNAVAILABLE`. With no admissible baseline, `savings()` returns
+  availability `False` and a reason and NO numbers at all. Every saving
+  figure is labelled `ESTIMATED` with its derivation, because it is
+  derived from two windows rather than measured.
+- **API/tool/command:** no new MCP tool or route in this lane (see
+  "Integration note" below). New Python surfaces:
+  `work_telemetry_runtime.install(queue_store=..., telemetry_store=...,
+  spec_store=...)` (the one call that wires it to a running queue),
+  `attach`/`fan_out`/`observing`/`note`, `RuntimeTelemetry.note/
+  record_provider_usage/mark_preview/row`, `WorkService.enable_telemetry()`
+  and `WorkService.telemetry_for_run()`, `WorkSpecStore.by_queue_task()`,
+  and in `work_telemetry.py`: `ProviderUsage`, `aggregate`, `period_key`,
+  `Baseline`/`measure_baseline`/`stated_baseline`/`savings`,
+  `TelemetryStore.for_task/query/aggregate/report`. The existing
+  `work_telemetry_report`/`work_telemetry` MCP tools are unchanged and
+  still work: a worker adds what only it can see, on top of a lifecycle
+  the runtime now records by itself.
+- **Integration note (deliberate scope boundary):** `mcp_app.py` and
+  `dashboard.py` were NOT touched — the coordinator integrates those
+  surfaces centrally. Until that wiring calls `install(...)`, nothing is
+  attached and behaviour is byte-identical to before; this is why the
+  status above is not VERIFIED.
+- **Storage:** same `work_telemetry.db` (SQLite/WAL/0700 state dir).
+  Migration v2 is additive: indexes on `module` and `started_at` for the
+  two aggregation axes. Older builds read the same rows.
+- **Acceptance/tests/evidence:** `tests/test_work_telemetry_runtime.py`
+  (34 — real `QueueStore`/`QueueService`, real transitions incl. the
+  retry path `DISPATCHING→FAILED→QUEUED→DISPATCHING→…→COMPLETED`, real
+  `ProjectKnowledge`/`ProcedureRegistry`/`WorkSpecStore`/`repo_read` over
+  a real git repo; asserts the
+  existing sink still receives every event, and that an exploding
+  telemetry store cannot disturb a real transition),
+  `tests/test_work_telemetry.py` (50, up from 23 — provenance,
+  three-valued first-pass, grouping, half-open windows, baseline
+  admissibility, derived-savings labelling).
+- **Known limitations:** (1) not attached in any live deployment yet (see
+  the integration note); (2) the counters only see reads that go through
+  THIS process — a worker reading files with its own editor/agent tools
+  is invisible here, which is why an empty `signal_sources` is recorded
+  rather than a confident zero, and why the worker-reported path stays;
+  (3) first preview means "a reviewable result exists", not "a human
+  looked at it"; (4) provider usage depends entirely on a runtime that
+  reports counters — with none, every token figure in every aggregate
+  stays `UNAVAILABLE`, by design.
 
 ## Backlog (explicitly not done yet — tracked here so it isn't re-discovered)
 

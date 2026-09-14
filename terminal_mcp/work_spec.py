@@ -876,6 +876,22 @@ class WorkSpecStore:
                 (*params, limit)).fetchall()
         return [_from_payload(row["payload"]) for row in rows]
 
+    def by_queue_task(self, queue_task_id: str) -> WorkSpec | None:
+        """The spec that was planned for a given queue task, if there is one.
+
+        Looked up on the column the spec already stores rather than by
+        scanning payloads, and returning None is a real answer: plenty of
+        queue tasks were never planned through a spec, and telemetry records
+        them with no module or difficulty rather than with a guessed one.
+        """
+        if not queue_task_id:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM work_specs WHERE queue_task_id = ? "
+                "ORDER BY updated_at DESC LIMIT 1", (queue_task_id,)).fetchone()
+        return _from_payload(row["payload"]) if row else None
+
     def children(self, parent_spec_id: str) -> list[WorkSpec]:
         """Subtask specs of a decomposed feature, oldest first -- the order a
         DAG was planned in is the order it reads best."""
