@@ -6086,6 +6086,9 @@ NODES_ADMIN_HTML = """<!doctype html>
           <div class="muted" style="font-size:12px;margin-top:4px" id="anHelperWhy"></div>
           <div class="cx-row" style="margin-top:10px">
             <button class="icon-btn an-primary an-big-btn" id="anHelperBtn" type="button">⚡ Kết nối máy này</button>
+            <a class="icon-btn an-big-btn" id="anHelperDlBtn" hidden
+               href="/dashboard/api/nodes/onboard/helper/windows-x64"
+               download="terminal-mcp-bootstrap.exe">⬇ Tải Bootstrap helper</a>
           </div>
           <div class="d-msg" id="anHelperMsg"></div>
         </div>
@@ -6793,16 +6796,42 @@ NODES_ADMIN_HTML = """<!doctype html>
       // is the honest state on a machine that has never been onboarded.
       const helperBox = document.getElementById('anHelperBox');
       const quickBox = document.getElementById('anQuickBox');
-      anDetectHelper().then((found) => {
+      anDetectHelper().then(async (found) => {
         anHelper = found;
-        helperBox.hidden = !found;
+        const connectBtn = document.getElementById('anHelperBtn');
+        const downloadBtn = document.getElementById('anHelperDlBtn');
+        const why = document.getElementById('anHelperWhy');
         if (found) {
-          document.getElementById('anHelperWhy').textContent =
+          helperBox.hidden = false;
+          connectBtn.hidden = false;
+          downloadBtn.hidden = true;
+          why.textContent =
             `Bootstrap helper v${found.version || '?'} đã cài trên máy này — chỉ cần một cú bấm và một lần bấm Yes.`;
           quickBox.classList.add('an-demoted');
-        } else {
-          quickBox.classList.remove('an-demoted');
+          return;
         }
+        // Not installed. Offer the download only if this controller has
+        // actually published one; otherwise say nothing and leave the
+        // copy/paste path primary, which is the honest state.
+        quickBox.classList.remove('an-demoted');
+        const published = await api('/dashboard/api/nodes/onboard/helper');
+        const build = published.ok && published.data.published ? published.data : null;
+        if (!build) { helperBox.hidden = true; return; }
+        helperBox.hidden = false;
+        connectBtn.hidden = true;
+        downloadBtn.hidden = false;
+        // Pair the download with THIS pending session so a double-click on
+        // a fresh machine continues it -- no code to copy, no handle to
+        // type, no second trip back to this page. The handle lives ~2
+        // minutes and is single-use; if the browser renames the file on the
+        // way down, the helper installs normally and the Connect button
+        // below still works.
+        downloadBtn.onclick = anDownloadPairedHelper;
+        // Unsigned is stated plainly rather than coaching anyone past
+        // SmartScreen.
+        why.textContent = build.signed
+          ? `Chưa có helper trên máy này. Tải v${build.version} rồi chạy — sau đó nút Kết nối sẽ hoạt động.`
+          : `Chưa có helper trên máy này. Tải v${build.version} (bản DEV chưa ký — Windows SmartScreen sẽ cảnh báo) rồi chạy.`;
       });
       if (anProgressTimer) clearInterval(anProgressTimer);
       anProgressTimer = setInterval(anPollProgress, 3000);
@@ -6905,6 +6934,56 @@ NODES_ADMIN_HTML = """<!doctype html>
         anSetMsg('anDoneMsg', 'Trình duyệt chặn clipboard — lệnh đã được bôi đen, nhấn Ctrl + C để copy.', '');
       }
     });
+
+    // Fetch the helper with the handle in the BODY, then save it under the
+    // paired name the controller chose. A query string would put a live
+    // credential into access logs and browser history; a POST plus a blob
+    // keeps it out of both. Same mechanism the .ps1 download already uses.
+    async function anDownloadPairedHelper(event) {
+      event.preventDefault();
+      if (!anGenerated) return;
+      const button = event.currentTarget;
+      button.classList.add('busy');
+      let handle = '';
+      try {
+        const issued = await api(
+          `/dashboard/api/nodes/onboard/enrollments/${encodeURIComponent(anGenerated.enrollment.id)}/handle`,
+          {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+        if (issued.ok && issued.data.handle) handle = issued.data.handle;
+      } catch (error) {
+        // Generic download is a supported outcome, not a failure: the
+        // operator installs it and presses Connect again.
+      }
+      try {
+        const response = await fetch('/dashboard/api/nodes/onboard/helper/windows-x64', {
+          method: 'POST', cache: 'no-store',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(handle ? {session: handle} : {}),
+        });
+        if (!response.ok) {
+          anSetMsg('anHelperMsg', 'Không tải được helper.', 'error');
+          return;
+        }
+        // The controller names the file; honour that name exactly, because
+        // it is what the helper reads on a double-click.
+        const disposition = response.headers.get('Content-Disposition') || '';
+        const match = /filename="([^"]+)"/.exec(disposition);
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = match ? match[1] : 'terminal-mcp-bootstrap.exe';
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        anSetMsg('anHelperMsg', handle
+          ? 'Đã tải. Mở file vừa tải và bấm Yes — phần còn lại tự chạy.'
+          : 'Đã tải. Cài xong thì bấm "Kết nối máy này" lần nữa.', 'ok');
+      } finally {
+        button.classList.remove('busy');
+      }
+    }
 
     document.getElementById('anHelperBtn').addEventListener('click', async (event) => {
       if (!anGenerated) return;
@@ -15302,6 +15381,117 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     # test_dashboard.py's route-inventory guard keys its expected surface
     # by path, so the second would quietly overwrite the first and the
     # inventory would stop describing -- and stop protecting -- the GET.
+    # -- Bootstrap helper artifact -------------------------------------
+    # Operator-facing, _read_guard like every other fleet read route: the
+    # same Cloudflare-Access-protected hostname the Dashboard itself is
+    # behind, and nothing wider. This deliberately does NOT get its own
+    # public path -- the binary is for the operator standing in front of
+    # the Dashboard, not for the open Internet.
+    #
+    # No credential ever rides along: no enrollment code, no handle, no
+    # node token, nothing in the URL and nothing in the body. The helper
+    # gets its credential later, from the terminalmcp:// handle it
+    # redeems itself.
+
+    @server.custom_route("/dashboard/api/nodes/onboard/helper", methods=["GET"],
+                        include_in_schema=False)
+    async def onboard_helper_manifest(request: Request) -> JSONResponse:
+        """What helper builds this controller can hand out.
+
+        Never an error for "nothing published" -- the CTA reads this to
+        decide whether to offer the one-click path at all, and an empty
+        list is the honest answer that keeps it on the manual fallback.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        from . import helper_artifact
+
+        payload = await anyio.to_thread.run_sync(helper_artifact.available)
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/onboard/helper/{target}",
+                        methods=["GET", "POST"], include_in_schema=False)
+    async def onboard_helper_download(request: Request) -> Response:
+        """Stream one verified helper binary.
+
+        The bytes are hashed against the manifest on every request rather
+        than trusted from publish time. A truncated copy or a half-written
+        replacement is REFUSED, not served with a warning: the reason to
+        check at all is that the operator about to run it elevated cannot
+        check for themselves.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        from . import helper_artifact
+
+        target = str(request.path_params.get("target") or "")
+
+        def _resolve():
+            return helper_artifact.resolve(target)
+
+        try:
+            artifact = await anyio.to_thread.run_sync(_resolve)
+        except helper_artifact.ArtifactError as exc:
+            status = 404 if exc.code in (helper_artifact.NO_MANIFEST,
+                                         helper_artifact.UNKNOWN_TARGET,
+                                         helper_artifact.MISSING_FILE) else 500
+            _log.warning("helper artifact refused target=%s code=%s", target, exc.code)
+            return JSONResponse(exc.as_dict(), status_code=status,
+                                headers={"Cache-Control": "no-store"})
+
+        try:
+            body = await anyio.to_thread.run_sync(artifact.path.read_bytes)
+        except OSError as exc:
+            return JSONResponse({"error": helper_artifact.MISSING_FILE,
+                                 "detail": str(exc)}, status_code=404,
+                                headers={"Cache-Control": "no-store"})
+
+        # A fresh machine has no helper, so no terminalmcp:// handler for
+        # the page to hand the session to -- the operator just runs what
+        # they downloaded. So the download is NAMED after the pending
+        # session, and the helper reads its own file name on a double-click.
+        # The bytes are untouched: the manifest hash (and one day the
+        # Authenticode signature) must survive the download unchanged.
+        # POST carries the handle in the BODY, never the query string: a
+        # query string lands in access logs, proxy logs and browser history,
+        # and outlives the handle's two minutes by months. GET stays the
+        # plain, unpaired download.
+        session = ""
+        if request.method == "POST":
+            try:
+                body_json = await request.json()
+            except ValueError:
+                body_json = {}
+            if isinstance(body_json, dict):
+                session = str(body_json.get("session") or "")
+        download_name = helper_artifact.paired_filename(
+            artifact.filename, _request_base_url(request), session)
+
+        # The handle is a credential for its 120 seconds. It is used to
+        # build a file name and is never logged, never echoed in a header,
+        # and never included in an error.
+        _log.info("helper artifact served target=%s version=%s signed=%s paired=%s",
+                 artifact.target, artifact.version, artifact.signed,
+                 download_name != artifact.filename)
+        return Response(
+            body, media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{download_name}"',
+                # An executable must never be cached by a shared proxy, and
+                # a stale copy of a binary is worse than a slow download.
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                # So a careful operator can verify the download themselves
+                # without a second round trip.
+                "X-Artifact-Sha256": artifact.sha256,
+                "X-Artifact-Version": artifact.version,
+                "X-Artifact-Build-Sha": artifact.build_sha,
+                # Reported, never inferred. Absent evidence is unsigned.
+                "X-Artifact-Signed": "true" if artifact.signed else "false",
+            })
+
     @server.custom_route("/dashboard/api/nodes/onboard/enrollments", methods=["GET", "POST"],
                         include_in_schema=False)
     async def onboard_enrollments(request: Request) -> JSONResponse:

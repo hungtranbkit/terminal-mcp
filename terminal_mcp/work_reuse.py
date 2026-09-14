@@ -43,6 +43,7 @@ from typing import Any, Sequence
 
 from .context_pack import _jaccard, _tokens
 from .work_spec import TASK_TYPES, WorkSpec, WorkSpecStore
+from .work_telemetry_runtime import note as _note_signal
 
 REUSE = "REUSE"
 EXTEND = "EXTEND"
@@ -314,6 +315,14 @@ def analyse(target: WorkSpec, *, store: WorkSpecStore | None = None,
     specs = similar_work(store, target) if store is not None else []
     modules = knowledge_candidates(target, knowledge=knowledge)
     runbooks = runbook_candidates(target, registry=registry)
+
+    # Efficiency telemetry, counted at the point the reuse search actually
+    # returned something. Candidates only -- a runbook that was OFFERED is
+    # not a runbook that was USED, and only `procedures.run` can say that.
+    if modules:
+        _note_signal("knowledge_hits", len(modules), source="work_reuse.analyse")
+    if specs:
+        _note_signal("similar_bug_hits", len(specs), source="work_reuse.analyse")
 
     searched = [f"{len(specs)} prior spec(s) above the mention threshold",
                 f"{len(modules)} knowledge module(s)",

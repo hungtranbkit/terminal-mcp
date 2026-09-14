@@ -119,7 +119,9 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Direct-send verification: continued-polling ack evidence (P0 fix) | VERIFIED locally; NOT YET DEPLOYED to dell-5530 |
 | `terminal_create_session(initial_prompt)` double-echo (shell sessions) | FIXED, 2026-09-07 (`lifecycle.py`'s own real readiness signal) |
 | AI Usage (read-only, local AI Usage Monitor integration) | VERIFIED_LIVE (real browser smoke, real live data) |
+| Work efficiency telemetry (per-task counters + aggregation/savings) | IMPLEMENTED_NOT_LIVE_VERIFIED (runtime-driven rows + tests; not yet attached in a live deployment — the attach call is the coordinator's central wiring) |
 | Unified Task System §20 (Kanban/PM/Planner/git isolation/Phase A-E) | VERIFIED — see §20 itself for the exact per-slice scope |
+| Work Mode: a planner claim briefs itself (similar-bug retrieval + module context pack, paths verified) | VERIFIED (V1) |
 
 ---
 
@@ -1846,6 +1848,190 @@ listed in §19, plus the living-requirements convention itself. This
 section is the backfill the user asked for; §1-§19 above are the fast-
 scan/audit view over the SAME facts.)*
 
+### Runbook registry is the DEFAULT path for test/build/deploy/smoke — 2026-09-14
+
+- **Goal / user value:** `procedures.py` already held the runbooks (status
+  VERIFIED/STALE/BROKEN, dependency-fingerprint caching, one-line output),
+  but it could only be reached by a caller who already knew a procedure
+  id — so a worker that had not been *told* about the registry simply
+  re-derived the command, which is the exact cost the registry exists to
+  remove. Now the word a worker would use anyway (`test`, `build`,
+  `deploy`, `smoke`, `health`) IS the address, and the registry populates
+  itself on the way through.
+- **Status:** VERIFIED (unit + contract tests; the repo's own
+  `scripts/agent/*` runbooks resolve through it).
+- **Scope / flow:** `procedures.Operation`/`OPERATIONS` name the five
+  operations and their spellings (`tests`, `pytest`, `regression`,
+  `restart`, `healthcheck`, …; `resolve_operation` is case- and
+  hyphen-insensitive). `ProcedureRegistry.run_operation(target)` is the
+  entry point and accepts an operation name OR a registered procedure id:
+  it resolves, calls `ensure_operations()` if nothing serves that
+  operation yet, then runs. `ensure_operations()` is idempotent and
+  ordered so nothing can drift: (1) an already-registered id wins outright
+  (a declared `depends_on`/`risk` is never overwritten by discovery), (2)
+  then what the repository ALREADY runs (`make test`, `scripts/ci.sh`, …
+  via `discover_existing`), (3) only then the conventional
+  `scripts/agent/<op>.sh`. **Nothing is generated** — an operation the
+  repository cannot perform is reported `absent`, never filled with an
+  invented script. Auto-registered test/build procedures get a default
+  `depends_on` (top-level source/test trees, capped at 8); a discovered
+  `deploy_preview`/`deploy_staging` keeps its own risk level rather than
+  the operation's production default.
+- **Output contract (the token-economy half):** `ProcedureResult`
+  gained `operation`, `status` (the registry's verdict BEFORE the run) and
+  `inspect`. `as_context()` is what callers spend context on: a PASS is
+  one line plus a log path and **nothing else**; a FAIL adds stage, exit
+  code, the failing region and `inspect {script, command, log_path, why}`.
+  The script path is therefore returned only on failure — the "inspect
+  only when it fails" rule expressed as data, not as an instruction to
+  remember. A VERIFIED+fresh result is reused (`from_cache`), a STALE one
+  is re-run rather than read, and a BROKEN one names the vanished script
+  without running anything.
+- **Two correctness fixes shipped with it:** (a) a procedure with an
+  EMPTY `depends_on` was keyed on the commit alone, so an uncommitted edit
+  left the fingerprint identical and a stale PASS could be reused; it is
+  now keyed on the working tree's dirty state (`git status --porcelain`
+  plus each listed path's mtime/size, with the registry's own
+  `.projectflow/` bookkeeping excluded so a recorded run cannot invalidate
+  the next one). (b) `_script_exists` passed a relative script path to
+  `shutil.which`, which resolves against the SERVER's working directory —
+  a deleted script looked present whenever a same-named path existed under
+  wherever the process happened to run. A relative path is now only ever
+  resolved against the repository.
+- **UI route/screen:** unchanged — `/dashboard/api/procedures` still
+  lists, never runs, and shows the new registrations like any other.
+- **API/tool/command:** `work_procedures` unchanged in name and count (no
+  new MCP tool). Naming a target now implies `action="run"`
+  (`work_procedures(procedure_id="test")`), an empty call still lists, and
+  `list` also reports the operation names. New `action="ensure"` registers
+  without running anything. The run path returns `as_context()`.
+  `work_planning.plan()` calls `ensure_operations()` before its reuse
+  stage, so "is there already a way to do this?" is asked against a
+  populated registry (failure there is a recorded gap, not a planning
+  error). `task_classifier`'s gate step and `AGENT_KNOWLEDGE_POLICY` now
+  name the call instead of describing it.
+- **Config/permission:** none new. Risk policy is unchanged and still
+  binding: `deploy` resolves to `deploy_restart` (risk `production`) and
+  is REFUSED with stage `policy` unless the caller passes `allow_risky` —
+  routing a deploy through the registry made it repeatable, never
+  automatic.
+- **Data/schema/migration:** none. `PROCEDURE_STATE.json` keeps
+  `schema_version` 1; auto-registered entries are ordinary rows with
+  `source: "discovered"`, and run evidence stays machine-local as before.
+- **Acceptance/tests/evidence:** `tests/test_procedures.py` — new "the
+  registry as the DEFAULT path" section: conventional scripts register
+  themselves, a repo-native `make test` beats them, a declared procedure
+  is never overwritten, re-ensuring keeps the green result, five spellings
+  of "test" all resolve, a pass hands back one line and no script, a
+  failure names script+log+region, STALE is re-run not read, VERIFIED is
+  reused, BROKEN names the vanished script, deploy is routed but still
+  refused without approval, an undeclared dependency set does not cache
+  across an edit, and a relative script is looked for in the repository
+  rather than the caller's directory. `tests/test_work_surfaces.py` pins
+  the MCP routing (target implies run; `run_operation`; `as_context()` not
+  `as_dict()`).
+- **Known limitations:** the working-tree fallback keys on `git status`
+  output, so an untracked DIRECTORY is tracked by its own mtime rather
+  than per-file; discovery still recognises only the entry points in
+  `DISCOVERY_RULES` (make/just/`scripts/*.sh`), so a project that runs its
+  tests some other way registers nothing and is told so rather than
+  guessed at; `build` has no runbook in THIS repository and is correctly
+  reported absent.
+- **Dependencies:** Project Knowledge (the registry is stored beside the
+  knowledge map and uses its lock), Work Policy §"Procedural Memory and
+  Runbook Registry" (unchanged — it already carried the rule; this change
+  supplies the mechanism).
+- **Follow-up/backlog:** a `build` runbook for this repo if one is ever
+  wanted; teaching `discover_existing` about `npm`/`cargo`/`go` entry
+  points for non-Python projects.
+- **Trace:** `terminal_mcp/procedures.py`, `terminal_mcp/mcp_app.py`
+  (`work_procedures`), `terminal_mcp/work_planning.py`,
+  `terminal_mcp/task_classifier.py`; see this file's own commit.
+
+### Retrieval before investigation — a planner claim now briefs itself (2026-09-14)
+
+- **Goal / user value:** make the SECOND bug in a module cost less than the
+  first. `context_pack.retrieval_result` (has this been seen before?) and
+  `context_pack.build_context_pack` (the bounded briefing for one module)
+  were implemented and tested, and **nothing called either of them**. Built
+  but unwired is worse than absent: the capability reads as done while every
+  planner still starts from an empty repository, and the audit that finds it
+  has to be run twice — once to notice the code exists, once to notice it is
+  unreachable.
+- **Status: VERIFIED.** `tests/test_context_pack.py` (24),
+  `tests/test_work_inbox.py` (43) and `tests/test_project_knowledge.py` (34),
+  all against real `git init` repositories, a real `git worktree`, a real
+  `BugSpecStore` and a real built MCP server. No mocked `git`: what a path
+  check is worth depends entirely on what `git diff --name-only` and
+  `git status --porcelain` actually report, and a mock of them proves nothing.
+- **Where it runs, and why there:** inside
+  `work_inbox.InboxService.claim_for_planning` — the last moment before a
+  planner starts looking. Retrieval that runs afterwards has already let the
+  cost it exists to avoid be paid in full, so it cannot be left to a planner
+  to remember to ask for. The claim reply gains two keys beside `issue`:
+  - `retrieval` — `REUSED_BUG_SPEC` (start from that spec's root cause and
+    fix strategy), `RELATED_BUGS_FOUND` (read them, assume nothing),
+    `NO_SIMILAR_BUG`, or one of `RETRIEVAL_UNAVAILABLE` / `RETRIEVAL_FAILED`.
+  - `context_pack` — the bounded module briefing (purpose, files, entry
+    points, runbooks, known issues, past bugs, and what it does **not**
+    cover), built for `issue.likely_module` or, failing that, for the module
+    the best match names.
+- **Every path a reused spec names is verified BEFORE it is offered.**
+  `context_pack.verify_reused_paths` gives each path its own verdict against
+  the working tree and the git delta from the spec's `source_commit`:
+  `UNCHANGED`, `CHANGED` (rewritten since — including an uncommitted edit,
+  because the working tree outranks the commit graph), `MISSING` (gone), or
+  `UNVERIFIED`. A path that cannot be checked is **never** reported
+  `UNCHANGED`: "I checked and nothing moved" and "I could not check" demand
+  opposite next steps. The paths that moved are named in the guidance text a
+  worker actually reads, not only in a structure it might.
+- **The downgrade rule.** A strong match whose *every* named path is gone is
+  returned as `RELATED_BUGS_FOUND` with `downgraded_from: REUSED_BUG_SPEC`,
+  and without a `reused_bug_id`. The symptom really did match, so the root
+  cause is worth reading — but a fix strategy for code that no longer exists
+  points at nothing, and offering it as a starting point would spend the
+  saving reuse exists to produce.
+- **Which repository gets asked.** `project_knowledge.worktree_root()` (new,
+  `git rev-parse --show-toplevel`), deliberately not `canonical_root()`.
+  Canonical root resolves every worktree to the one shared map, which is
+  right for a map that gets *written*; it is wrong here, because a worker in
+  a worktree edits that worktree, and the main checkout would report files
+  the worker has already rewritten as untouched — exactly the false
+  confidence this check exists to prevent. Found by a real smoke run against
+  this repo's own worktree, where it reported precisely that.
+- **Stored vs returned.** The issue row keeps `retrieval_status` plus a
+  compact record (statuses, match ids and scores, per-path verdicts, gaps);
+  the root causes, fix strategies and file lists travel to the claiming
+  planner once. Writing them into the row as well would move the same
+  paragraphs twice in a feature whose whole purpose is to move fewer of them.
+  The status is kept on the issue, not only in the reply, so an expired lease
+  does not lose what the last planner was told.
+- **Degrades, never fails.** `spec_store` and `knowledge` are both optional on
+  `InboxService`. Without a spec store the claim still succeeds and says
+  `RETRIEVAL_UNAVAILABLE` — "nobody searched" is not "nothing was found".
+  Without a repository the paths come back `UNVERIFIED` with the reason. A
+  raised lookup is caught and reported as `RETRIEVAL_FAILED`: a claim that
+  failed because the history could not be read would block real work over a
+  lookup.
+- **Two things it deliberately does not do.** (a) The throwaway spec built to
+  *ask* the question is never saved — persisting it would put an unanswered
+  query into the very history the next query reads. (b) The matched spec's
+  module is **not** written back onto the issue: a module inferred from a
+  fuzzy match would score the next retrieval higher for no new evidence, and
+  the system would grow confident by talking to itself.
+- **Known limitation (by design, not omission).** A captured issue carries no
+  module until something triages it, and without a module no past bug can
+  score above `STRONG_MATCH` — so a raw `NEW` issue gets `RELATED_BUGS_FOUND`
+  at best. That is the threshold refusing to claim more than the evidence
+  supports. Set `likely_module` on the issue (a `work_inbox_transition` field)
+  and the same claim reaches `REUSED_BUG_SPEC`.
+- **Trace:** `terminal_mcp/context_pack.py` (`named_paths`,
+  `verify_reused_paths`, `retrieval_result`), `terminal_mcp/work_inbox.py`
+  (`InboxService.brief_for_planning`, `_attach_briefing`,
+  `claim_for_planning`, `Issue.retrieval_status`),
+  `terminal_mcp/project_knowledge.py` (`worktree_root`),
+  `terminal_mcp/mcp_app.py` (`work_inbox_claim`, `work_inbox_list`).
+
 ### Read-only repository access for external agents (`repo_*` MCP tools) — V1, 2026-09-14
 
 - **Goal / user value:** let an external agent reaching this server over
@@ -3340,6 +3526,144 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
 - **Trace:** see this file's own commit.
 
 ---
+
+### Work efficiency telemetry — runtime-driven, provenance-preserving
+
+- **Goal / user value:** answer "what did this task actually cost, and is
+  the fleet getting cheaper" from the runtime's own record, per task, per
+  module and per time period — without any number in the answer having
+  been invented.
+- **Status:** IMPLEMENTED_NOT_LIVE_VERIFIED (2026-09-14). Code + unit/
+  integration tests against a REAL `QueueStore` (real transitions, real
+  event hook) are green; no live deployment has attached it yet, because
+  the attach call belongs to the central MCP/dashboard wiring which this
+  lane deliberately did not touch.
+- **What changed (the contract):** telemetry rows used to exist ONLY when
+  a worker called `work_telemetry_report` about its own finished task —
+  a self-selected, retrospective sample. Rows are now opened and closed
+  by the runtime itself:
+  - `work_telemetry_runtime.py` (new) subscribes to `QueueStore`'s own
+    post-commit event hook (`event_sink`, the same one `event_wiring.py`
+    uses for the event bus — `attach()` composes with whatever sink is
+    already installed and never displaces it).
+  - `DISPATCHING` opens the row (or REOPENS the task's existing row —
+    one row per task, so a retry stays one task rather than becoming two
+    cheap-looking ones); `RUNNING` records that the agent started;
+    `VERIFYING` is first preview; `COMPLETED`/`FAILED`/`BLOCKED`/
+    `SKIPPED`/`CANCELLED` finish it.
+  - A transition for a task this recorder never saw dispatched opens
+    NOTHING: a row whose `started_at` is "whenever the process attached"
+    would make every duration in the table wrong.
+- **First preview is a stated DEFINITION, not a guess:** this runtime has
+  no separate preview state, so the row records `preview_basis` — by
+  default the transition into `VERIFYING`, the first moment a reviewable
+  result exists. A caller with a truer signal (deploy preview URL,
+  screenshot artifact) calls `RuntimeTelemetry.mark_preview(basis=...)`,
+  and the basis is REQUIRED: a preview time nobody can trace to an event
+  is a number nobody can check.
+- **Per-task record:** `files_read`, `search_calls` (stored under the
+  original field name `search_rounds`; both names are the same number in
+  every payload), `runbook_hits`/`runbook_misses`, `knowledge_hits`,
+  `context_pack_hits`, `similar_bug_hits`, `redefine_count` (read from
+  the planner's own `WorkSpec.redefine_count`, never re-counted here),
+  `time_to_preview_seconds`, `first_pass_success`, plus the dispatch
+  bookkeeping (`dispatch_count`, `reopened`, `failed_excursions`).
+  Attributes carried at open: task id, work id, module, execution mode,
+  spec level, difficulty, lane — resolved from the `WorkSpec` bound to
+  the queue task and the queue row's own metadata; a task with no spec
+  gets NULLs, never a classified guess.
+- **`first_pass_success` is three-valued** — True / False / unknown. A row
+  whose dispatches were never observed (a worker-reported row) reports
+  `None` with a stated basis, and aggregates exclude it from the rate
+  rather than counting a gap in instrumentation as a failure.
+- **Counters come from the real call sites:** `repo_read.repo_read` (one
+  `files_read` per file actually read — a refused read is not a read),
+  `repo_read.repo_search` (one `search_calls` per search CALL, whatever
+  it found), `context_pack.py` (`context_pack_hits`/`knowledge_hits`
+  when a pack was actually served, `similar_bug_hits` per past spec
+  offered), `work_reuse.analyse` (knowledge/prior-spec candidates) and
+  `procedures.run` (`runbook_hits` when a registered procedure was
+  called, `+cache_hits` when its green result was reused instead of
+  re-run, `runbook_misses` when there was no usable procedure to call).
+  All report through `work_telemetry_runtime.note()`, which does nothing
+  at all unless a recorder has been made active for a task
+  (`observing(recorder, task_id)`). So an un-instrumented process
+  behaves exactly as before, and a zero counter on a row with an empty
+  `signal_sources` means "nobody reported", not "it never happened".
+  Attaching the same recorder to a queue store twice is a no-op, so a
+  double-wire cannot count two dispatches where there was one.
+- **Provider usage counters — recorded only when reported:**
+  `ProviderUsage` holds `input_tokens`/`output_tokens`/
+  `cache_read_tokens`/`cache_write_tokens`/`total_tokens`, each present
+  only because a runtime reported it, each carrying who reported it.
+  Anything unreported is `UNAVAILABLE`, never `0` (zero is itself a
+  measurement, and a false one). A value that is not a plain
+  non-negative integer — including `True` — is IGNORED and named in
+  `ignored`. A total nobody reported is `input + output` labelled
+  `ESTIMATED` (the estimate label) with its derivation in `method`;
+  exact arithmetic is still a derived figure. Usage is NOT back-filled
+  from the local AI Usage Monitor: those figures are per-MACHINE daily
+  quota and cannot be attributed to one task without inventing the
+  attribution. This telemetry reads and writes no credential material of
+  any kind.
+- **Aggregation API:** `summarise(rows)`, `aggregate(rows, by=...)` over
+  `task` / `module` / `work` / `project` / `lane` / `execution_mode` /
+  `difficulty` / `spec_level` / `day` / `week` / `month`; rows that
+  cannot be placed on the chosen axis are counted and named as
+  `ungrouped`, never dropped into an "other" bucket that reads as a real
+  group. `TelemetryStore.query()` filters by task/work/project/module and
+  a HALF-OPEN `[since, until)` time window, so two adjacent windows can
+  never double-count a task. `TelemetryStore.aggregate()`/`report()` are
+  the read surfaces; `WorkService.telemetry_for_run(work_id)` gives one
+  run's own rows.
+- **Baseline and savings — shown only when admissible:** a `Baseline` is
+  `MEASURED` (computed from real recorded rows, carrying its window and
+  task count, with a `min_tasks` floor) or `STATED` (supplied WITH its
+  definition — a definition-less one is refused outright), otherwise
+  `UNAVAILABLE`. With no admissible baseline, `savings()` returns
+  availability `False` and a reason and NO numbers at all. Every saving
+  figure is labelled `ESTIMATED` with its derivation, because it is
+  derived from two windows rather than measured.
+- **API/tool/command:** no new MCP tool or route in this lane (see
+  "Integration note" below). New Python surfaces:
+  `work_telemetry_runtime.install(queue_store=..., telemetry_store=...,
+  spec_store=...)` (the one call that wires it to a running queue),
+  `attach`/`fan_out`/`observing`/`note`, `RuntimeTelemetry.note/
+  record_provider_usage/mark_preview/row`, `WorkService.enable_telemetry()`
+  and `WorkService.telemetry_for_run()`, `WorkSpecStore.by_queue_task()`,
+  and in `work_telemetry.py`: `ProviderUsage`, `aggregate`, `period_key`,
+  `Baseline`/`measure_baseline`/`stated_baseline`/`savings`,
+  `TelemetryStore.for_task/query/aggregate/report`. The existing
+  `work_telemetry_report`/`work_telemetry` MCP tools are unchanged and
+  still work: a worker adds what only it can see, on top of a lifecycle
+  the runtime now records by itself.
+- **Integration note (deliberate scope boundary):** `mcp_app.py` and
+  `dashboard.py` were NOT touched — the coordinator integrates those
+  surfaces centrally. Until that wiring calls `install(...)`, nothing is
+  attached and behaviour is byte-identical to before; this is why the
+  status above is not VERIFIED.
+- **Storage:** same `work_telemetry.db` (SQLite/WAL/0700 state dir).
+  Migration v2 is additive: indexes on `module` and `started_at` for the
+  two aggregation axes. Older builds read the same rows.
+- **Acceptance/tests/evidence:** `tests/test_work_telemetry_runtime.py`
+  (34 — real `QueueStore`/`QueueService`, real transitions incl. the
+  retry path `DISPATCHING→FAILED→QUEUED→DISPATCHING→…→COMPLETED`, real
+  `ProjectKnowledge`/`ProcedureRegistry`/`WorkSpecStore`/`repo_read` over
+  a real git repo; asserts the
+  existing sink still receives every event, and that an exploding
+  telemetry store cannot disturb a real transition),
+  `tests/test_work_telemetry.py` (50, up from 23 — provenance,
+  three-valued first-pass, grouping, half-open windows, baseline
+  admissibility, derived-savings labelling).
+- **Known limitations:** (1) not attached in any live deployment yet (see
+  the integration note); (2) the counters only see reads that go through
+  THIS process — a worker reading files with its own editor/agent tools
+  is invisible here, which is why an empty `signal_sources` is recorded
+  rather than a confident zero, and why the worker-reported path stays;
+  (3) first preview means "a reviewable result exists", not "a human
+  looked at it"; (4) provider usage depends entirely on a runtime that
+  reports counters — with none, every token figure in every aggregate
+  stays `UNAVAILABLE`, by design.
 
 ## Backlog (explicitly not done yet — tracked here so it isn't re-discovered)
 

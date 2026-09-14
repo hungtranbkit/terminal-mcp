@@ -215,6 +215,16 @@ def plan(request: str, *, store: WorkSpecStore, task_type: str | None = None,
 
     # -- reuse -----------------------------------------------------------------
     reuse_stage = Stage(REUSE)
+    if registry is not None and hasattr(registry, "ensure_operations"):
+        # Register what this repository already has BEFORE asking what can be
+        # reused. A runbook nobody registered can never be offered, so an empty
+        # registry would make every plan conclude "write a new script" -- which
+        # is how a project ends up with three ways to run its own tests.
+        try:
+            registry.ensure_operations()
+        except Exception:  # noqa: BLE001 -- a registry that cannot write is not a planning failure
+            reuse_stage.gaps.append("the procedure registry could not be populated; "
+                                    "runbook candidates may be incomplete")
     analysis = work_reuse.analyse(spec, store=store, knowledge=knowledge, registry=registry)
     counters["runbook_hits"] = len(analysis["candidates"]["runbooks"])
     work_reuse.apply_to_spec(spec, analysis)

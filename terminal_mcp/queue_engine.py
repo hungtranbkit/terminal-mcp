@@ -47,6 +47,8 @@ that automatic loop would start.
 """
 from __future__ import annotations
 
+import re
+
 import hashlib
 import time
 from dataclasses import dataclass
@@ -118,6 +120,8 @@ the worker-facing half of the mechanism."""
 # The one sentence that is unmistakably OUR prompt rather than a worker's
 # output. `completion_after_instruction` anchors on it, so it must stay
 # byte-identical between the text we send and the text we look for.
+_WHITESPACE = re.compile(r"\s+")
+
 COMPLETION_INSTRUCTION_SENTENCE = (
     "When (and only when) the above task is FULLY complete, print exactly one "
     "line in this exact format (once), then stop:")
@@ -142,6 +146,35 @@ def build_dispatch_text(task: QueueTask, *, nonce: str) -> str:
         f"attempt={task.attempt_count + 1} nonce={nonce} status=completion_candidate "
         f"summary_sha256={hashlib.sha256(task.id.encode()).hexdigest()[:16]}###\n"
     )
+
+
+def _flatten(text: str) -> str:
+    """Whitespace-collapsed text, for matching against a wrapped pane."""
+    return _WHITESPACE.sub(" ", text).strip()
+
+
+_FLAT_INSTRUCTION = None
+
+
+def _is_our_own_template(output: str, marker_start: int) -> bool:
+    """Is the marker at this position the one WE dispatched?
+
+    Our template is always written immediately after the instruction
+    sentence. A worker's marker is printed later, after its own work. So the
+    text directly preceding a marker decides whose it is.
+
+    Compared on whitespace-collapsed text because a pane wraps at its width:
+    the sentence arrives split across lines, and a literal match finds none of
+    it. That exact miss let three tasks be marked COMPLETED against untouched
+    worktrees while their workers were still running.
+    """
+    global _FLAT_INSTRUCTION
+    if _FLAT_INSTRUCTION is None:
+        _FLAT_INSTRUCTION = _flatten(COMPLETION_INSTRUCTION_SENTENCE)
+    # A generous look-back: enough to hold the sentence however it wrapped,
+    # short enough that unrelated earlier text cannot reach into it.
+    window = _flatten(output[max(0, marker_start - 400):marker_start])
+    return window.endswith(_FLAT_INSTRUCTION)
 
 
 def worker_output_after_prompt(output: str) -> str:
@@ -174,12 +207,21 @@ def worker_output_after_prompt(output: str) -> str:
     """
     if not output:
         return ""
-    anchor = output.rfind(COMPLETION_INSTRUCTION_SENTENCE)
-    if anchor == -1:
+    # Walk every marker in the window and keep only what follows one that is
+    # NOT our own template. Anchoring on the sentence alone was too brittle in
+    # both directions: a wrapped sentence let our template through, and
+    # demanding the sentence be visible stranded genuine completions once a
+    # long run scrolled it away.
+    last_ours_end = None
+    for match in COMPLETION_MARKER_RE.finditer(output):
+        if _is_our_own_template(output, match.start()):
+            last_ours_end = match.end()
+        elif last_ours_end is None:
+            # A marker that nothing of ours precedes: the worker's own.
+            return output
+    if last_ours_end is None:
         return output
-    after = output[anchor + len(COMPLETION_INSTRUCTION_SENTENCE):]
-    ours = COMPLETION_MARKER_RE.search(after)
-    return after[ours.end():] if ours else after
+    return output[last_ours_end:]
 
 
 @dataclass(frozen=True)

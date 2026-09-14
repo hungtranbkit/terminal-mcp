@@ -195,8 +195,11 @@ def investigation_plan(classification: Classification) -> list[dict[str, str]]:
         plan.append({"step": "expand", "action": "widen only where evidence demands it",
                      "why": "guessing to save tokens costs more than the tokens saved"})
     plan.append({"step": "gate",
-                 "action": f"run the {classification.gate_procedure} procedure",
-                 "why": "a registered procedure is called, not re-derived"})
+                 "action": f"work_procedures(procedure_id=\"{classification.gate_procedure}\") "
+                           f"-- or just \"test\"; do not compose the command",
+                 "why": "a registered procedure is called, not re-derived: it reuses a "
+                        "green result, returns one line, and costs a reading of the "
+                        "script only if it fails"})
     plan.append({"step": "deploy",
                  "action": f"{classification.deploy_level.lower()} deploy"
                            + (" after explicit approval" if classification.requires_approval else ""),
@@ -213,10 +216,12 @@ The knowledge map is a map. The current code and git history are the
 source of truth and override anything stored there: verify the git delta
 for the paths you are about to touch before changing them. Explore
 progressively -- knowledge, then delta, then an exact search, then only the
-functions involved -- and widen only when the evidence requires it. Use a
-registered procedure for tests, builds and deploys instead of composing your
-own; inspect a procedure's script only if it fails or its dependencies
-changed. After the task, update reusable knowledge only if you learned
+functions involved -- and widen only when the evidence requires it. Run tests,
+builds, deploys and smokes THROUGH the registry -- `work_procedures` with the
+operation name ("test", "build", "deploy", "smoke", "health") -- instead of
+composing the command yourself; it registers what this repository already has
+on first use, reuses a still-valid green result, and answers in one line.
+Inspect a procedure's script only if it fails. After the task, update reusable knowledge only if you learned
 something a future task would need. Never write a secret into knowledge: name
 the environment variable, never its value.\
 """

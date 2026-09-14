@@ -22,6 +22,16 @@ docs, no re-deriving the flow. The implementation is inspected only when it
 FAILS, when its dependencies changed, when the command vanished, or when a
 human asks for the process itself to change.
 
+THE DEFAULT PATH, NOT AN OPTIONAL ONE
+
+A lookup rule only works if the lookup is easier than the alternative. So the
+five things a worker repeatedly asks for -- test, build, deploy, smoke, health
+-- are addressable by NAME (`run_operation("test")`), the registry populates
+itself from what the repository already has on first use, and the answer comes
+back as one line. Composing the command by hand is then strictly more work
+than calling the runbook, which is the only reliable way to make the registry
+the default rather than a thing to be reminded of.
+
 OUTPUT IS A CONTRACT, NOT A TRANSCRIPT
 
 A successful run returns one line and a log path. A long successful log has
@@ -50,8 +60,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-from .project_knowledge import (KnowledgeError, ProjectKnowledge, _run_git,
-                                scrub_knowledge)
+from .project_knowledge import (KNOWLEDGE_DIRNAME, KnowledgeError,
+                                ProjectKnowledge, _run_git, scrub_knowledge)
+from .work_telemetry_runtime import note as _note_signal
 
 PROCEDURE_STATE_FILE = "PROCEDURE_STATE.json"
 # Run EVIDENCE is per machine and never travels with the repository. A cached
@@ -73,6 +84,7 @@ VERIFIED = "VERIFIED"   # ran green at a commit whose dependencies are unchanged
 STALE = "STALE"         # its dependencies moved since it last passed
 BROKEN = "BROKEN"       # the script it names is gone or not executable
 UNVERIFIED = "UNVERIFIED"  # registered, never run green
+UNREGISTERED = "UNREGISTERED"  # nothing in this repository serves it at all
 
 # Risk decides what may be called automatically. A procedure that changes
 # production is never auto-invoked by a classifier, however fresh it is.
@@ -160,18 +172,52 @@ class ProcedureResult:
     duration_seconds: float | None = None
     from_cache: bool = False
     error_excerpt: str = ""
+    # Which of test/build/deploy/smoke/health this answered, when the caller
+    # asked by operation rather than by procedure id.
+    operation: str | None = None
+    # The registry's verdict BEFORE the run -- VERIFIED/STALE/UNVERIFIED/
+    # BROKEN. A caller that sees STALE knows the gate was re-verified rather
+    # than reused; it still has no reason to read the script.
+    status: str = ""
+    # Where to look, and ONLY when there is a reason to look. Populated on a
+    # failure; None on success, so "inspect the script" cannot become a habit
+    # that a green run pays for.
+    inspect: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {"procedure_id": self.procedure_id, "ok": self.ok, "stage": self.stage,
                 "summary": self.summary, "log_path": self.log_path,
                 "exit_code": self.exit_code, "duration_seconds": self.duration_seconds,
-                "from_cache": self.from_cache, "error_excerpt": self.error_excerpt}
+                "from_cache": self.from_cache, "error_excerpt": self.error_excerpt,
+                "operation": self.operation, "status": self.status,
+                "inspect": self.inspect}
 
     def one_line(self) -> str:
         """What goes into an agent's context on success: this, and nothing else."""
         mark = "PASS" if self.ok else "FAIL"
         cached = " (cached)" if self.from_cache else ""
         return f"{mark} {self.procedure_id} :: {self.stage}{cached} :: {self.summary}"
+
+    def as_context(self) -> dict[str, Any]:
+        """The payload a caller actually spends context on.
+
+        A pass is the one line plus where the log is, and nothing more -- the
+        log holds no information a green run needs read back. A failure adds
+        the failing region and the two paths worth opening. The shape itself
+        carries the rule: on success there is no excerpt and no script to
+        inspect, so neither can be read out of habit.
+        """
+        payload: dict[str, Any] = {
+            "line": self.one_line(), "ok": self.ok,
+            "procedure_id": self.procedure_id, "operation": self.operation,
+            "status": self.status, "from_cache": self.from_cache,
+            "log_path": self.log_path}
+        if not self.ok:
+            payload.update({"stage": self.stage, "summary": self.summary,
+                            "exit_code": self.exit_code,
+                            "error_excerpt": self.error_excerpt,
+                            "inspect": self.inspect})
+        return payload
 
 
 # -- discovery ---------------------------------------------------------------
@@ -217,6 +263,91 @@ def discover_existing(root: Path) -> list[dict[str, Any]]:
                 continue
         found.append({"id": procedure_id, "via": relative, "command": list(command)})
     return found
+
+
+# -- operations: what a caller actually asks for -----------------------------
+#
+# Nobody thinks "invoke procedure test_gate". They think "run the tests". That
+# gap is the whole reason the registry used to be optional: it could only be
+# reached by a caller who already knew the id, so a worker that had not been
+# told about it simply re-derived the command instead.
+#
+# An OPERATION closes it. The word a caller would use anyway -- test, build,
+# deploy, smoke, health -- resolves to the registered runbook, and the
+# registration happens on the way through, so the registry is the default path
+# rather than a thing to remember.
+
+OPERATION_TEST = "test"
+OPERATION_BUILD = "build"
+OPERATION_DEPLOY = "deploy"
+OPERATION_SMOKE = "smoke"
+OPERATION_HEALTH = "health"
+
+
+@dataclass(frozen=True)
+class Operation:
+    """One named operation and the runbooks that may serve it."""
+
+    name: str
+    aliases: tuple[str, ...]
+    # Registered ids that serve it, best first. Also what a discovery result
+    # is matched against, since DISCOVERY_RULES already speaks these ids.
+    procedure_ids: tuple[str, ...]
+    # The conventional script, used only when the repository offers nothing of
+    # its own -- see the ordering note on `ensure_operations`.
+    agent_script: str
+    risk: str
+    title: str
+    timeout_seconds: float = 1800.0
+
+
+OPERATIONS: tuple[Operation, ...] = (
+    Operation(OPERATION_TEST,
+              ("tests", "regression", "pytest", "unit", "gate", "test_gate"),
+              ("test_gate", "test_ui_fast"),
+              f"{AGENT_SCRIPT_DIR}/test-gate.sh", RISK_READ_ONLY, "full regression"),
+    Operation(OPERATION_BUILD, ("compile", "package", "bundle"), ("build",),
+              f"{AGENT_SCRIPT_DIR}/build.sh", RISK_LOCAL, "build", 1800.0),
+    Operation(OPERATION_DEPLOY, ("release", "restart", "deploy_restart"),
+              ("deploy_restart", "deploy_staging", "deploy_preview"),
+              f"{AGENT_SCRIPT_DIR}/deploy-restart.sh", RISK_PRODUCTION,
+              "deploy / restart", 600.0),
+    Operation(OPERATION_SMOKE, ("post_deploy", "postdeploy", "smoketest"), ("smoke",),
+              f"{AGENT_SCRIPT_DIR}/smoke.sh", RISK_READ_ONLY, "post-deploy smoke", 600.0),
+    Operation(OPERATION_HEALTH, ("healthcheck", "health_check"), ("healthcheck",),
+              f"{AGENT_SCRIPT_DIR}/healthcheck.sh", RISK_READ_ONLY, "health check", 300.0),
+)
+
+OPERATION_NAMES = tuple(operation.name for operation in OPERATIONS)
+
+# A discovered deploy script says which environment it touches in its own name,
+# and that is a safer signal than the operation's blanket default: a preview
+# deploy should not need the approval a production restart does, and a
+# production restart must never inherit a preview's freedom.
+DISCOVERED_RISK = {"deploy_preview": RISK_PREVIEW, "deploy_staging": RISK_STAGING}
+
+# Top-level trees that decide whether a test or build result is still true.
+# Used only when a procedure is registered automatically; a declared one keeps
+# whatever its author wrote.
+SOURCE_TREE_HINTS = ("src", "lib", "app", "tests", "test")
+
+
+def resolve_operation(name: str) -> Operation | None:
+    """Map whatever the caller typed onto one operation, or None.
+
+    Deliberately generous about spelling -- `test-gate`, `test_gate`, `tests`
+    and `pytest` are the same request -- because a caller who gets "unknown"
+    back goes and composes the command by hand, which is the exact cost this
+    module exists to remove.
+    """
+    wanted = (name or "").strip().lower().replace("-", "_")
+    if not wanted:
+        return None
+    for operation in OPERATIONS:
+        if wanted == operation.name or wanted in operation.aliases \
+                or wanted in operation.procedure_ids:
+            return operation
+    return None
 
 
 class ProcedureRegistry:
@@ -336,21 +467,39 @@ class ProcedureRegistry:
 
     # -- freshness -----------------------------------------------------------
 
-    def _script_exists(self, procedure: Procedure) -> bool:
+    def _script_reference(self, procedure: Procedure) -> str:
+        """The file a caller would open if it had to read this procedure.
+
+        `bash scripts/x.sh` -- the script is what matters, not the shell. One
+        implementation, so "does it exist" and "where do I look when it fails"
+        can never name two different things.
+        """
         if not procedure.command:
-            return False
+            return ""
         head = procedure.command[0]
-        # `bash scripts/x.sh` -- the script is what matters, not the shell.
-        candidate = procedure.command[1] if head in ("bash", "sh", "python", "python3") \
+        return procedure.command[1] if head in ("bash", "sh", "python", "python3") \
             and len(procedure.command) > 1 else head
+
+    def _script_exists(self, procedure: Procedure) -> bool:
+        candidate = self._script_reference(procedure)
+        if not candidate:
+            return False
         path = self.root / candidate
         if path.exists():
             return True
-        # An absolute path or a command on PATH is legitimate too.
+        if Path(candidate).is_absolute():
+            return Path(candidate).exists()
+        if os.sep in candidate or "/" in candidate:
+            # A relative path is relative to the REPOSITORY, and it was just
+            # checked. Handing it to shutil.which here would resolve it
+            # against this process's own working directory instead, so a
+            # deleted script could look present because a same-named file
+            # exists under wherever the server happens to be running.
+            return False
+        # A bare command name on PATH is legitimate too.
         import shutil as _shutil
 
-        return Path(candidate).is_absolute() and Path(candidate).exists() \
-            or _shutil.which(candidate) is not None
+        return _shutil.which(candidate) is not None
 
     def dependency_fingerprint(self, procedure: Procedure) -> str:
         """What this procedure's result depends on, right now.
@@ -362,6 +511,15 @@ class ProcedureRegistry:
         """
         digest = hashlib.sha256()
         digest.update((self.knowledge.head() or "no-head").encode())
+        if not procedure.depends_on:
+            # Declaring nothing is not the same as depending on nothing. With
+            # only the commit in the key, an UNCOMMITTED edit would leave the
+            # fingerprint identical and hand back a PASS produced before it --
+            # exactly the stale-green this cache exists to prevent. So a
+            # procedure with no declared dependencies is keyed on the whole
+            # working tree's dirty state instead: conservative, which is the
+            # right direction to be wrong in for a gate.
+            digest.update(("worktree:" + self._worktree_signature()).encode())
         for relative in sorted(procedure.depends_on):
             path = self.root / relative
             if path.is_dir():
@@ -379,6 +537,37 @@ class ProcedureRegistry:
             else:
                 digest.update(f"{relative}:missing".encode())
         return digest.hexdigest()[:20]
+
+    def _worktree_signature(self) -> str:
+        """The uncommitted state of this repository, cheaply.
+
+        `git status --porcelain` names every path that differs from HEAD; the
+        mtime and size of each is what distinguishes one edit of a file from
+        the next, which the porcelain line alone does not.
+        """
+        code, out = _run_git(["status", "--porcelain"], cwd=str(self.root))
+        if code != 0:
+            # Cannot tell -> do not claim freshness. A unique marker makes the
+            # fingerprint differ every time, so nothing is reused on a guess.
+            return f"unknown:{time.time_ns()}"
+        parts = []
+        own = KNOWLEDGE_DIRNAME.split("/", 1)[0] + "/"
+        for line in out.splitlines():
+            path = line[3:].strip().strip('"') if len(line) > 3 else ""
+            if " -> " in path:            # a rename: the destination is the file now
+                path = path.split(" -> ", 1)[1]
+            if not path or path.startswith(own):
+                # The registry's own bookkeeping changes on every run it
+                # records. Counting it would make each result invalidate the
+                # next, so nothing with undeclared dependencies could ever be
+                # reused -- an invalidation caused by the cache itself.
+                continue
+            try:
+                stat = (self.root / path).stat()
+                parts.append(f"{line[:2]}{path}:{stat.st_mtime_ns}:{stat.st_size}")
+            except OSError:
+                parts.append(f"{line[:2]}{path}:gone")
+        return "|".join(parts)
 
     def status_of(self, procedure: Procedure) -> str:
         if not self._script_exists(procedure):
@@ -404,9 +593,13 @@ class ProcedureRegistry:
         """
         procedure = self.get(procedure_id)
         if procedure is None:
+            # A miss in the efficiency sense: the caller wanted a registered
+            # procedure and will now do the work by hand instead.
+            _note_signal("runbook_misses", source="procedures.run")
             return ProcedureResult(procedure_id, False, "lookup",
                                    f"no procedure registered as {procedure_id!r}")
         if not self._script_exists(procedure):
+            _note_signal("runbook_misses", source="procedures.run")
             return ProcedureResult(procedure_id, False, "lookup",
                                    f"the script it names is missing: "
                                    f"{' '.join(procedure.command)}")
@@ -422,6 +615,10 @@ class ProcedureRegistry:
         if use_cache and not extra_args:
             cached = self.load()["cache"].get(procedure_id) or {}
             if cached.get("fingerprint") == fingerprint and cached.get("ok"):
+                # Reused twice over: the procedure existed AND its green
+                # result stood, so nothing was re-run at all.
+                _note_signal("runbook_hits", source="procedures.run")
+                _note_signal("cache_hits", source="procedures.run")
                 return ProcedureResult(
                     procedure_id, True, "cached", cached.get("summary") or "passed earlier",
                     log_path=cached.get("log_path"), exit_code=0, from_cache=True)
@@ -453,6 +650,10 @@ class ProcedureRegistry:
                                  exit_code=code, duration_seconds=duration,
                                  error_excerpt=excerpt)
         self._record(procedure, result, fingerprint, owner=owner)
+        # A registered procedure was called rather than an ad-hoc command
+        # being written beside it -- which is what the hit rate measures,
+        # whether or not the procedure itself passed.
+        _note_signal("runbook_hits", source="procedures.run")
         return result
 
     def _record(self, procedure: Procedure, result: ProcedureResult,
@@ -473,6 +674,158 @@ class ProcedureRegistry:
                 # that would let the next caller skip the gate entirely.
                 state["cache"].pop(procedure.id, None)
             self.save(state)
+
+    # -- the default path ----------------------------------------------------
+
+    def _default_dependencies(self, operation: Operation) -> tuple[str, ...]:
+        """What an AUTO-registered procedure's result depends on.
+
+        Only ever applied to a procedure this registry registers itself; a
+        declared one keeps whatever its author wrote, who knows more about the
+        project than any rule here can.
+        """
+        if operation.name not in (OPERATION_TEST, OPERATION_BUILD):
+            # A smoke, health or deploy runbook is about a RUNNING system, not
+            # about a tree of files, so naming source paths would suggest a
+            # freshness it does not have. Leaving it empty routes it through
+            # the working-tree fallback in `dependency_fingerprint` instead.
+            return ()
+        found = [name for name in SOURCE_TREE_HINTS if (self.root / name).is_dir()]
+        try:
+            for child in sorted(self.root.iterdir()):
+                if child.is_dir() and not child.name.startswith((".", "_")) \
+                        and (child / "__init__.py").exists():
+                    found.append(child.name)
+        except OSError:
+            pass
+        # Deduplicated, ordered, and capped -- a fingerprint over half the disk
+        # would cost more to compute than the gate it guards.
+        return tuple(sorted(set(found))[:8])
+
+    def _procedure_for(self, operation: Operation) -> Procedure | None:
+        """The registered runbook that serves this operation, best first."""
+        state = self.load()
+        for procedure_id in operation.procedure_ids:
+            raw = state["procedures"].get(procedure_id)
+            if raw:
+                return Procedure.from_dict(raw)
+        return None
+
+    def ensure_operations(self, *, owner: str = "worker") -> dict[str, Any]:
+        """Populate the registry so that CALLING it is the path of least effort.
+
+        Idempotent. The ordering is the whole design:
+
+        1. an id already registered wins outright -- a human who wrote a risk
+           level and a `depends_on` knows things discovery cannot, and
+           re-registering would overwrite them;
+        2. then whatever the repository ALREADY runs (`make test`,
+           `scripts/ci.sh`) -- reusing the humans' own entry point is what
+           stops a second way to run the tests from existing at all;
+        3. only then the conventional `scripts/agent/` script.
+
+        Nothing is generated here. An operation this repository has no way to
+        perform is reported as absent, which is a fact a caller can act on --
+        unlike a script invented to fill the hole.
+        """
+        registered = self.load()["procedures"]
+        discovered = {item["id"]: item for item in discover_existing(self.root)}
+        report: dict[str, Any] = {"operations": {}, "registered": [], "absent": []}
+        for operation in OPERATIONS:
+            existing = next((pid for pid in operation.procedure_ids if pid in registered), None)
+            if existing is not None:
+                report["operations"][operation.name] = {
+                    "procedure_id": existing, "action": "kept",
+                    "source": registered[existing].get("source") or "declared"}
+                continue
+
+            native = next((discovered[pid] for pid in operation.procedure_ids
+                           if pid in discovered), None)
+            if native is not None:
+                procedure = Procedure(
+                    id=native["id"], name=f"{operation.title} (via {native['via']})",
+                    command=list(native["command"]),
+                    risk=DISCOVERED_RISK.get(native["id"], operation.risk),
+                    timeout_seconds=operation.timeout_seconds,
+                    depends_on=self._default_dependencies(operation),
+                    success_criteria="exit code 0", source="discovered")
+                via = native["via"]
+            elif (self.root / operation.agent_script).is_file():
+                procedure = Procedure(
+                    id=operation.procedure_ids[0], name=operation.title,
+                    command=["bash", operation.agent_script], risk=operation.risk,
+                    timeout_seconds=operation.timeout_seconds,
+                    depends_on=self._default_dependencies(operation),
+                    success_criteria="exit code 0", source="discovered")
+                via = operation.agent_script
+            else:
+                report["operations"][operation.name] = {
+                    "procedure_id": None, "action": "absent",
+                    "why": f"this repository has no {operation.name} entry point: "
+                           f"nothing registered as {'/'.join(operation.procedure_ids)}, "
+                           f"nothing found by discovery, no {operation.agent_script}"}
+                report["absent"].append(operation.name)
+                continue
+
+            self.register(procedure, owner=owner)
+            report["registered"].append(procedure.id)
+            report["operations"][operation.name] = {
+                "procedure_id": procedure.id, "action": "registered",
+                "source": "discovered", "via": via}
+        return report
+
+    def run_operation(self, target: str, *, extra_args: Sequence[str] = (),
+                      use_cache: bool = True, owner: str = "worker",
+                      allow_risky: bool = False) -> ProcedureResult:
+        """Run test / build / deploy / smoke / health THROUGH the registry.
+
+        This is the default entry point, and `target` is whatever the caller
+        would have typed anyway: an operation name, one of its spellings, or a
+        registered procedure id. Resolution, registration and caching all
+        happen on the way through, so the cheap path needs no prior knowledge
+        of the registry and the expensive one -- composing the command by hand,
+        reading the script to find out what it does -- never has to be taken.
+
+        A pass costs one line. The script is named back to the caller only
+        when the run actually failed.
+        """
+        name = (target or "").strip()
+        procedure = self.get(name) if name else None
+        operation = resolve_operation(name)
+        if procedure is None:
+            if operation is None:
+                return ProcedureResult(
+                    name or "(unnamed)", False, "lookup",
+                    f"unknown operation {name!r}; registered ids aside, the operations "
+                    f"are: {', '.join(OPERATION_NAMES)}", status=UNREGISTERED)
+            # Registering on first use is what makes the registry the default
+            # rather than a setup step somebody has to have done first.
+            self.ensure_operations(owner=owner)
+            procedure = self._procedure_for(operation)
+            if procedure is None:
+                return ProcedureResult(
+                    operation.name, False, "lookup",
+                    f"nothing in this repository performs {operation.name}: no runbook "
+                    f"registered as {'/'.join(operation.procedure_ids)}, none discovered, "
+                    f"and no {operation.agent_script}",
+                    operation=operation.name, status=UNREGISTERED)
+
+        status = self.status_of(procedure)
+        result = self.run(procedure.id, extra_args=extra_args, use_cache=use_cache,
+                          owner=owner, allow_risky=allow_risky)
+        result.operation = operation.name if operation else None
+        result.status = status
+        if not result.ok:
+            # The ONE place a script path is handed back. A green run leaves
+            # this None, which is the rule -- inspect on failure only --
+            # expressed as data rather than as an instruction to remember.
+            result.inspect = {
+                "script": self._script_reference(procedure),
+                "command": list(procedure.command),
+                "log_path": result.log_path,
+                "why": "read the failing region above first; open the script only if "
+                       "the failure is in the procedure rather than in the code"}
+        return result
 
 
 # How much of a failing log is worth carrying. Enough to see the failure and

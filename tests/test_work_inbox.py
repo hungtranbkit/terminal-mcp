@@ -371,3 +371,190 @@ def test_a_still_running_task_does_not_move_the_issue(service):
                                queue=queue)["task_id"]
     assert sync_from_queue(service, queue_store=_FakeQueueStore({task_id: "RUNNING"})) == []
     assert service.store.get(issue_id).state == wi.EXECUTING
+
+
+# -- a claim is also a briefing (items 8/9) -----------------------------------
+#
+# `context_pack.retrieval_result` and `build_context_pack` were implemented
+# and tested long before anything called them. Built-but-unwired is worse than
+# absent: the capability reads as done while every planner still starts from
+# an empty repository. These tests pin the wiring, not the retrieval logic --
+# that has its own file.
+
+@pytest.fixture()
+def repo(tmp_path):
+    import subprocess
+
+    from terminal_mcp.project_knowledge import ProjectKnowledge
+
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(root), "-c", "user.email=t@e",
+                        "-c", "user.name=t", *args], check=True, capture_output=True)
+
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    (root / "steady.py").write_text("steady = 1\n")
+    (root / "deleted.py").write_text("gone = 1\n")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+    head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    return ProjectKnowledge(root), head
+
+
+@pytest.fixture()
+def specs(tmp_path):
+    from terminal_mcp.bug_spec import BugSpecStore
+
+    store = BugSpecStore(tmp_path / "specs.db")
+    yield store
+    store.close()
+
+
+def _briefed(tmp_path, specs, knowledge=None):
+    store = InboxStore(tmp_path / "briefed-inbox.db")
+    return InboxService(store, spec_store=specs, knowledge=knowledge)
+
+
+def _prior_badge_bug(specs, *, files, commit=None):
+    from terminal_mcp.bug_spec import plan_from_report
+
+    spec = plan_from_report(
+        title="Badge overlaps the session name",
+        symptom="the work badge overlaps the session name on a narrow screen",
+        module="work_ui", files=files, suspected_cause="missing flex gap",
+        cause_confidence="HIGH", fix_strategy=["add a 6px gap"],
+        acceptance=["no overlap"])
+    spec.source_commit = commit
+    return specs.save(spec)
+
+
+def _triaged_badge_issue(service):
+    issue_id = service.capture("- Badge overlaps the session name on mobile"
+                               )["issues"][0]["issue_id"]
+    # A module is what lifts a match from "worth reading" to "worth starting
+    # from": without one, retrieval cannot score a past bug high enough to be
+    # offered for reuse, and should not pretend otherwise.
+    service.transition(issue_id, wi.TRIAGED, likely_module="work_ui")
+    return issue_id
+
+
+def test_claiming_an_issue_hands_over_the_retrieval_with_it(tmp_path, specs, repo):
+    knowledge, head = repo
+    prior = _prior_badge_bug(specs, files=["steady.py"], commit=head)
+    service = _briefed(tmp_path, specs, knowledge)
+    _triaged_badge_issue(service)
+
+    claimed = service.claim_for_planning("planner-1")
+    assert claimed["status"] == "CLAIMED"
+    # Before a single file is opened, not after the investigation reports.
+    assert claimed["retrieval"]["status"] == "REUSED_BUG_SPEC"
+    assert claimed["retrieval"]["reused_bug_id"] == prior.bug_id
+
+
+def test_a_reused_spec_arrives_with_its_paths_already_checked(tmp_path, specs, repo):
+    knowledge, head = repo
+    _prior_badge_bug(specs, files=["steady.py", "deleted.py"], commit=head)
+    (knowledge.root / "deleted.py").unlink()
+    service = _briefed(tmp_path, specs, knowledge)
+    _triaged_badge_issue(service)
+
+    check = service.claim_for_planning("planner-1")["retrieval"]["path_check"]
+    assert check["missing"] == ["deleted.py"]
+    assert check["verified"] is True
+
+
+def test_the_context_pack_is_built_for_the_module_the_match_names(tmp_path, specs, repo):
+    knowledge, head = repo
+    knowledge.record_module("work_ui", paths=["steady.py"], summary="the work panel")
+    _prior_badge_bug(specs, files=["steady.py"], commit=head)
+    service = _briefed(tmp_path, specs, knowledge)
+    _triaged_badge_issue(service)
+
+    pack = service.claim_for_planning("planner-1")["context_pack"]
+    assert pack["module"] == "work_ui"
+    assert pack["summary"] == "the work panel"
+    assert "MODULE work_ui" in pack["render"]
+
+
+def test_the_verdict_outlives_the_planner_that_received_it(tmp_path, specs, repo):
+    knowledge, head = repo
+    _prior_badge_bug(specs, files=["steady.py"], commit=head)
+    service = _briefed(tmp_path, specs, knowledge)
+    issue_id = _triaged_badge_issue(service)
+    service.claim_for_planning("planner-1")
+
+    # A lease can expire; the next planner must see what the last one was told.
+    assert service.store.get(issue_id).retrieval_status == "REUSED_BUG_SPEC"
+    kinds = [event["kind"] for event in service.store.history(issue_id)]
+    assert "retrieval" in kinds
+
+
+def test_the_issue_row_keeps_a_summary_not_the_whole_briefing(tmp_path, specs, repo):
+    knowledge, head = repo
+    _prior_badge_bug(specs, files=["steady.py"], commit=head)
+    service = _briefed(tmp_path, specs, knowledge)
+    issue_id = _triaged_badge_issue(service)
+    service.claim_for_planning("planner-1")
+
+    record = service.store.get(issue_id).metadata["retrieval"]
+    assert record["status"] == "REUSED_BUG_SPEC"
+    assert record["path_check"]["checked"] == 1
+    # The root causes and fix strategies travel to the planner, once. Storing
+    # them here too would move the same paragraphs twice in a feature whose
+    # whole purpose is to move fewer of them.
+    assert set(record["matches"][0]) == {"bug_id", "score", "title"}
+
+
+def test_a_match_is_not_written_back_as_the_issue_module(tmp_path, specs, repo):
+    knowledge, head = repo
+    _prior_badge_bug(specs, files=["steady.py"], commit=head)
+    service = _briefed(tmp_path, specs, knowledge)
+    issue_id = service.capture("- Badge overlaps the session name on mobile"
+                               )["issues"][0]["issue_id"]
+    service.claim_for_planning("planner-1")
+
+    # A module inferred from a fuzzy match would score the NEXT retrieval
+    # higher for no new evidence -- the system growing confident by talking
+    # to itself.
+    assert service.store.get(issue_id).likely_module is None
+
+
+def test_an_inbox_with_no_history_wired_says_so_rather_than_staying_silent(service):
+    service.capture("- Badge overlaps the session name on mobile")
+    claimed = service.claim_for_planning("planner-1")
+    assert claimed["status"] == "CLAIMED"
+    # "Nobody searched" and "nothing was found" demand opposite next steps.
+    assert claimed["retrieval"]["status"] == wi.RETRIEVAL_UNAVAILABLE
+
+
+def test_a_failing_lookup_never_costs_the_claim(tmp_path):
+    class _Exploding:
+        def iter_recent(self, **_kwargs):
+            raise RuntimeError("spec database is locked")
+
+        def recent_for_module(self, *_args, **_kwargs):
+            raise RuntimeError("spec database is locked")
+
+    store = InboxStore(tmp_path / "inbox.db")
+    service = InboxService(store, spec_store=_Exploding())
+    service.capture("- Badge overlaps the session name on mobile")
+
+    claimed = service.claim_for_planning("planner-1")
+    assert claimed["status"] == "CLAIMED"
+    assert claimed["retrieval"]["status"] == wi.RETRIEVAL_FAILED
+    assert "spec database is locked" in claimed["retrieval"]["detail"]
+
+
+def test_retrieval_does_not_persist_the_query_it_asked_with(tmp_path, specs, repo):
+    knowledge, head = repo
+    _prior_badge_bug(specs, files=["steady.py"], commit=head)
+    service = _briefed(tmp_path, specs, knowledge)
+    _triaged_badge_issue(service)
+    service.claim_for_planning("planner-1")
+
+    # The throwaway spec built to ASK must not join the history the next
+    # question reads, or the inbox slowly answers itself.
+    assert len(list(specs.iter_recent(limit=50))) == 1

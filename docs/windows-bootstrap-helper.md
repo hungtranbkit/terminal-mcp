@@ -103,6 +103,40 @@ probes it:
 - exposes **no** enroll endpoint over loopback: enrollment arrives only
   via the protocol handler, so a page cannot start an install by fetch
 
+## Getting the binary to the machine
+
+The Dashboard serves the built helper itself. Two routes, both behind
+`_read_guard` — the same Cloudflare Access check every other fleet read
+route uses, on the Dashboard's own hostname:
+
+    GET /dashboard/api/nodes/onboard/helper            what is published
+    GET /dashboard/api/nodes/onboard/helper/{target}   the bytes
+
+`target` is an allowlist (`windows-x64`, `windows-arm64`), never a path the
+caller shapes. **No credential travels with the download** — no enrollment
+code, no handle, no node token, not in the URL and not in a header. The
+helper earns its credential afterwards by redeeming a `terminalmcp://`
+handle itself.
+
+Artifacts live under the state directory, versioned, never a temp path:
+
+    <XDG_STATE_HOME>/terminal-mcp/helper/<version>/terminal-mcp-bootstrap.exe
+    <XDG_STATE_HOME>/terminal-mcp/helper/<version>/manifest.json
+
+The manifest records version, build SHA, size, SHA256 and `signed`. The hash
+is re-checked against the bytes on disk on **every** request rather than
+trusted from publish time, and a mismatch is refused rather than served with
+a warning: the reason to check at all is that the operator about to run it
+elevated cannot check for themselves.
+
+The CTA offers the download only when this controller has actually published
+a build. Otherwise it stays hidden and the copy/paste path remains primary —
+a button that 404s in front of an operator is worse than no button.
+
+This route is deliberately NOT public. A first install on a machine that
+cannot reach the Dashboard hostname still needs a public bootstrap hostname,
+which does not exist yet.
+
 ## Signing
 
 **Unsigned artifacts are marked dev-only, in the UI, in plain words.**

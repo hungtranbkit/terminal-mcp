@@ -1638,17 +1638,22 @@ def build_mcp(service: TerminalService | None = None,
         return state.as_dict()
 
     @server.tool()
-    def work_procedures(action: str = "list", procedure_id: str = "",
+    def work_procedures(action: str = "", procedure_id: str = "",
                         project_path: str = "", allow_risky: bool = False) -> dict:
-        """Registered runbooks: list / run / discover.
+        """Run test / build / deploy / smoke / health THROUGH the registry.
 
-        Look here before doing a repeated operation by hand. A green result is
-        reused rather than re-run when nothing it depends on has changed, and
-        a passing run returns ONE line -- the log stays on disk and only a
-        failure brings back its failing region.
+        The default way to perform any of them: pass the operation name (or a
+        registered procedure id) as `procedure_id` -- naming one implies
+        `action="run"`, naming nothing lists. Do not compose the command
+        yourself, and do not read the script first. The registry populates
+        itself from what this repo already has, so nothing needs registering
+        by hand.
 
-        Anything above preview risk is never invoked automatically; it needs
-        `allow_risky`, which is a deliberate human decision, not a default.
+        A pass returns ONE line; only a FAILURE returns the failing region and
+        names the script. A green result is reused while nothing it depends on
+        changed; a STALE one is re-run, not read. Above preview risk nothing is
+        auto-invoked -- `allow_risky` is a human decision, not a default.
+        Other actions: `ensure` (register, run nothing), `discover`, `list`.
         """
         from . import procedures as _procedures
 
@@ -1656,21 +1661,33 @@ def build_mcp(service: TerminalService | None = None,
         if knowledge is None:
             return {"error": "NOT_A_GIT_REPOSITORY"}
         registry = _procedures.ProcedureRegistry(knowledge)
+        # Naming a target IS the request to run it. Requiring `action="run"`
+        # as well is one more thing to know, and anything a caller has to know
+        # before using the registry is a reason not to use the registry.
+        wanted = action.strip() or ("run" if procedure_id.strip() else "list")
         try:
-            if action == "list":
-                return {"procedures": registry.list()}
-            if action == "discover":
+            if wanted == "run":                 # the common path, listed first
+                if not procedure_id.strip():
+                    return {"error": "PROCEDURE_ID_REQUIRED",
+                            "operations": list(_procedures.OPERATION_NAMES)}
+                result = registry.run_operation(procedure_id.strip(),
+                                                allow_risky=allow_risky)
+                # as_context(), not as_dict(): a pass must not carry a log
+                # excerpt or a script path back into the caller's context.
+                return result.as_context()
+            if wanted == "list":
+                return {"procedures": registry.list(),
+                        "operations": list(_procedures.OPERATION_NAMES),
+                        "note": "call an operation by name; read a script only on FAIL"}
+            if wanted == "discover":
                 return {"found": _procedures.discover_existing(knowledge.root),
                         "note": "reuse what a project already has before adding a script"}
-            if action == "run":
-                if not procedure_id.strip():
-                    return {"error": "PROCEDURE_ID_REQUIRED"}
-                result = registry.run(procedure_id.strip(), allow_risky=allow_risky)
-                return {**result.as_dict(), "line": result.one_line()}
+            if wanted == "ensure":
+                return registry.ensure_operations()
         except Exception as exc:  # noqa: BLE001
             return {"error": "PROCEDURE_FAILED", "detail": str(exc)}
         return {"error": "UNKNOWN_ACTION", "action": action,
-                "allowed": ["list", "run", "discover"]}
+                "allowed": ["list", "run", "discover", "ensure"]}
 
     @server.tool()
     def work_policy(action: str = "status", sections: str = "",
@@ -1800,9 +1817,25 @@ def build_mcp(service: TerminalService | None = None,
 
     def _inbox():
         if "service" not in _inbox_holder:
+            from .bug_spec import BugSpecStore
+            from .project_knowledge import ProjectKnowledge, worktree_root
             from .work_inbox import InboxService, InboxStore
 
-            _inbox_holder["service"] = InboxService(InboxStore())
+            # The bug history and the repository are what turn a claim into a
+            # briefing. Both are optional to the inbox and both degrade on
+            # their own, so a server outside a git checkout still hands out
+            # work -- it just says the paths could not be checked.
+            #
+            # THIS checkout, not `_knowledge()`'s canonical root: the briefing
+            # only reads, and what it reads has to be the tree the worker will
+            # edit. Resolved through the shared root, a claim made inside a
+            # worktree would report files the worker has already rewritten as
+            # untouched -- precisely the false confidence the path check
+            # exists to prevent.
+            root = worktree_root(_project_root())
+            _inbox_holder["service"] = InboxService(
+                InboxStore(), spec_store=BugSpecStore(),
+                knowledge=ProjectKnowledge(root) if root else None)
         return _inbox_holder["service"]
 
     @server.tool()
@@ -1838,19 +1871,29 @@ def build_mcp(service: TerminalService | None = None,
                                 "state": i.state, "type": i.rough_type,
                                 "difficulty": i.rough_difficulty, "priority": i.priority,
                                 "project": i.project, "duplicate_of": i.duplicate_of,
-                                "claimed_by": i.claimed_by, "updated_at": i.updated_at}
+                                "claimed_by": i.claimed_by, "updated_at": i.updated_at,
+                                "retrieval": i.retrieval_status}
                                for i in issues]}
         except Exception as exc:  # noqa: BLE001
             return {"error": "INBOX_READ_FAILED", "detail": str(exc), "issues": []}
 
     @server.tool()
     def work_inbox_claim(planner_id: str, project: str = "") -> dict:
-        """Claim ONE issue for planning, within the pool's concurrency cap.
+        """Claim ONE issue for planning, and get its briefing with it.
 
         Claims carry a lease so a planner that dies does not hold an issue
         forever; an expired lease is reclaimed automatically, which is what
         makes this recoverable across a restart. Two planners can never hold
         the same issue.
+
+        The reply also carries `retrieval` and `context_pack`, computed HERE
+        rather than left for the planner to request: read them before opening
+        a single file. `retrieval.status` is `REUSED_BUG_SPEC` (start from
+        that spec's root cause), `RELATED_BUGS_FOUND` (read them, assume
+        nothing) or `NO_SIMILAR_BUG`. When a spec is offered for reuse,
+        `retrieval.path_check` has already checked every path it names
+        against the current tree and git delta -- act on `missing` and
+        `changed` before trusting any of its fix strategy.
         """
         try:
             return _inbox().claim_for_planning(planner_id, project=project or None)

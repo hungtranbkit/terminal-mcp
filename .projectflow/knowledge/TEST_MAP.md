@@ -16,5 +16,9 @@ Playwright on this host needs `--no-sandbox --no-zygote --single-process
 One test is skipped by design: `tests/test_session_lifecycle.py` skips when
 `codex` is not installed on the host.
 
-Prefer the registered runbook over composing a command: `work_procedures`
-lists them, and a green result is reused when nothing it depends on changed.
+Call the runbook by OPERATION rather than composing a command:
+`work_procedures(procedure_id="test")` -- also `build`, `deploy`, `smoke`,
+`health`. It resolves and registers from the scripts above on first use,
+reuses a green result while nothing it depends on changed, and answers in one
+line. The `bash scripts/agent/...` forms above are what it runs; read one only
+when a run FAILS.

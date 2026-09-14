@@ -123,11 +123,71 @@ def _occupancy(row: dict[str, Any],
 
 class WorkService:
     def __init__(self, store: ws.WorkStore, *, queue: Any = None, controller: Any = None,
-                 fleet: Any = None) -> None:
+                 fleet: Any = None, telemetry: Any = None) -> None:
         self.store = store
         self.queue = queue
         self.controller = controller
         self.fleet = fleet
+        # Efficiency telemetry recorder, or None. Held, never auto-created:
+        # constructing one opens a database, and a service built for a read
+        # should not acquire a writer as a side effect. `enable_telemetry`
+        # is the deliberate step.
+        self.telemetry = telemetry
+
+    # -- efficiency telemetry ------------------------------------------------
+
+    def enable_telemetry(self, *, telemetry_store: Any = None, spec_store: Any = None,
+                         clock: Any = None) -> dict[str, Any]:
+        """Wire telemetry to the queue this run actually dispatches through.
+
+        After this, a row is opened when the QUEUE dispatches a task and
+        closed on the queue's own terminal transition -- no worker has to
+        remember to report anything for the lifecycle numbers to exist. It
+        composes with whatever sink the store already has (the event bus,
+        normally) rather than displacing it.
+        """
+        from .work_telemetry_runtime import install
+
+        queue_store = getattr(self.queue, "store", None)
+        if queue_store is None:
+            return {"error": "QUEUE_UNAVAILABLE",
+                    "detail": "telemetry follows the queue's own transitions; "
+                              "there is no queue store to listen to"}
+        if self.telemetry is not None:
+            return {"enabled": True, "already": True}
+        self.telemetry = install(queue_store=queue_store,
+                                 telemetry_store=telemetry_store,
+                                 spec_store=spec_store, clock=clock)
+        return {"enabled": True, "already": False}
+
+    def telemetry_for_run(self, work_id: str, *, by: str = "module") -> dict[str, Any]:
+        """What this run's tasks actually cost, per task and in aggregate.
+
+        Reads the telemetry rows for the run's OWN queue tasks, so a run with
+        no recorded rows reports that honestly instead of borrowing the
+        fleet's numbers. Needs a telemetry store to read: with none attached
+        the answer is that telemetry is not enabled, not an empty report that
+        reads like a cheap run.
+        """
+        from .work_telemetry import aggregate, summarise
+
+        run = self.store.get_run(work_id)
+        if run is None:
+            return {"error": "UNKNOWN_WORK", "work_id": work_id}
+        telemetry_store = getattr(self.telemetry, "store", None)
+        if telemetry_store is None:
+            return {"error": "TELEMETRY_NOT_ENABLED", "work_id": work_id,
+                    "detail": "no telemetry recorder is attached to this service"}
+        rows: list[dict[str, Any]] = []
+        for task in self.store.tasks_for(work_id):
+            queue_task_id = task.get("queue_task_id")
+            row = telemetry_store.for_task(queue_task_id) if queue_task_id else None
+            if row:
+                rows.append(row)
+        return {"work_id": work_id, "tasks": rows, "summary": summarise(rows),
+                "grouped": aggregate(rows, by=by),
+                "tasks_without_telemetry":
+                    len(self.store.tasks_for(work_id)) - len(rows)}
 
     # -- creation and planning ----------------------------------------------
 

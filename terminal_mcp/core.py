@@ -7,7 +7,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
+from . import submit_flow
+from .adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STALLED, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
                        DELIVERY_UNKNOWN, TARGET_WAITING, _sent_text_echoed, select_adapter,
                        to_legacy_submit_status)
 from .audit import AuditStore
@@ -2270,9 +2271,51 @@ class TerminalService:
         except TmuxError:
             typed_snapshot = None
 
+        # P0 2026-09-14 (fix/submit-enter-deadlock): a bare Enter on an
+        # ALREADY-VISIBLE Claude prompt reaches the pty and Claude Code does
+        # nothing with it -- observed on wtest/win1 and local m1, while
+        # terminal_send_text with fresh text + Enter confirmed every time. So
+        # for an adapter that needs it, wake the composer with a CURSOR MOVE
+        # (which cannot change what is about to be submitted, unlike retyping
+        # the prompt) before the single Enter. Never a second Enter: two
+        # Enters submit twice. Codex is deliberately untouched.
+        submit_plan = None
+        if typed_snapshot is not None:
+            second = None
+            try:
+                second = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
+            except TmuxError:
+                second = None
+            if second is not None:
+                submit_plan = submit_flow.plan_submit(
+                    snapshot_a=typed_snapshot, snapshot_b=second, adapter=adapter,
+                    pane_identity=f"{session}")
+                if submit_plan.is_terminal:
+                    return {"session": session, "sent": False, "keys": keys,
+                            "correlation_id": correlation_id, "agent_type": adapter.name,
+                            "delivery_state": DELIVERY_BLOCKED,
+                            "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED),
+                            "submit_outcome": submit_plan.outcome,
+                            "submission_id": submit_plan.submission_id,
+                            "submit_reason": submit_plan.reason}
+                if submit_plan.send_activation:
+                    try:
+                        self.tmux.send_keys(session, [submit_flow.ACTIVATION_KEY])
+                        # Re-baseline AFTER the nudge. The nudge itself redraws
+                        # the pane, and _shows_genuine_progress cannot tell that
+                        # redraw from the one a real submit causes -- verified:
+                        # with the pre-nudge baseline, the `never_echoes`
+                        # fixture (built to never acknowledge anything) came
+                        # back SUBMIT_CONFIRMED. Only what changes AFTER the
+                        # nudge may count as evidence that the Enter landed.
+                        typed_snapshot = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
+                    except TmuxError:
+                        pass    # the nudge is best-effort; the Enter still goes
         self.tmux.send_keys(session, keys)
         result: dict[str, Any] = {"session": session, "sent": True, "keys": keys,
                                   "correlation_id": correlation_id, "agent_type": adapter.name}
+        if submit_plan is not None:
+            result["submission_id"] = submit_plan.submission_id
         if typed_snapshot is None:
             result["delivery_state"] = DELIVERY_UNKNOWN
             result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
@@ -2304,11 +2347,39 @@ class TerminalService:
             result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
             result["submit_reason"] = "confirmed via adapter ack evidence"
         else:
-            result["delivery_state"] = DELIVERY_UNKNOWN
-            result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
-            result["submit_reason"] = ("pane changed but no adapter ack evidence found in time" if after != typed_snapshot
-                                       else "the pane looked identical to its pre-send state throughout the "
-                                            "verification window")
+            # PROVE_ACCEPTED: require real evidence -- composer cleared, busy/
+            # thinking, a permission dialog, or adapter ack. Absent all four,
+            # answer SUBMIT_STALLED, which says the prompt is still there and
+            # nothing started, rather than UNKNOWN, which does not.
+            # Deliberately a NEGATIVE classifier only. The adapter's own
+            # acceptance rule is unchanged and still the only thing that can
+            # produce SUBMIT_CONFIRMED: Claude requires the echo whenever the
+            # target is busy, established by live testing (see ClaudeAdapter's
+            # docstring), and the `never_echoes` fixture proves why -- it DOES
+            # clear its composer and DOES show a busy footer while never
+            # echoing, so "cleared" and "busy" are both present on a send that
+            # genuinely failed. Treating either as acceptance would have turned
+            # that real failure into a false SUBMIT_CONFIRMED.
+            #
+            # What this adds is a better answer in the NEGATIVE case: when the
+            # pane never moved and the prompt is still sitting in the composer,
+            # say SUBMIT_STALLED -- a specific, retryable fact -- instead of
+            # DELIVERY_UNKNOWN, which cannot be acted on.
+            still_typed = (submit_flow.extract_composer_text(after) == expected_text
+                           and bool(expected_text))
+            stalled = after == typed_snapshot and still_typed
+            state = DELIVERY_STALLED if stalled else DELIVERY_UNKNOWN
+            result["delivery_state"] = state
+            result["submit_status"] = to_legacy_submit_status(state)
+            result["submit_outcome"] = submit_flow.STALLED if stalled else None
+            result["submit_reason"] = (
+                "the prompt is still in the composer and the pane never moved: "
+                "nothing started, so this submission may be retried"
+                if stalled else
+                ("pane changed but no adapter ack evidence found in time"
+                 if after != typed_snapshot else
+                 "the pane looked identical to its pre-send state throughout the "
+                 "verification window"))
         return result
 
     def terminal_exit_copy_mode(self, *, session: str | None = None,

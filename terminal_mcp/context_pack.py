@@ -10,9 +10,12 @@ unbounded pack is just the repository again.
 
 *Similar-bug retrieval* asks whether this bug has been seen before. When it
 has, the previous spec is offered as a starting point with its provenance
-attached. It is never applied silently: the code is still the source of
-truth, and a reused spec that no longer matches the code must be adjusted,
-which is exactly what the worker's plan-verification step is for.
+attached, and with every path it names already checked against the current
+working tree and git delta -- because a match is decided on wording, and
+wording matching says nothing about whether those files still exist. It is
+never applied silently: the code is still the source of truth, and a reused
+spec that no longer matches it must be adjusted, which is exactly what the
+worker's plan-verification step is for.
 
 Nothing here stores secrets -- it only ever reads material that
 project_knowledge and bug_spec have already scrubbed.
@@ -23,9 +26,11 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
 from .bug_spec import BugSpec, BugSpecStore
+from .work_telemetry_runtime import note as _note_signal
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .project_knowledge import ProjectKnowledge
@@ -44,6 +49,14 @@ RELATED_MATCH = 0.38
 REUSED = "REUSED_BUG_SPEC"
 RELATED_ONLY = "RELATED_BUGS_FOUND"
 NO_MATCH = "NO_SIMILAR_BUG"
+
+# Per-path verdicts for a spec offered for reuse. A match is decided on the
+# wording of a symptom, and wording matching says nothing about whether the
+# files that fixed it last time are still the files to edit.
+PATH_UNCHANGED = "UNCHANGED"
+PATH_CHANGED = "CHANGED"
+PATH_MISSING = "MISSING"
+PATH_UNVERIFIED = "UNVERIFIED"
 
 _WORD = re.compile(r"[a-z0-9_]{3,}")
 # Words that appear in nearly every bug report and therefore separate nothing.
@@ -149,33 +162,161 @@ def similar_bugs(store: BugSpecStore, target: BugSpec, *,
         if score >= RELATED_MATCH:
             found.append(SimilarBug(candidate, score, tuple(reasons)))
     found.sort(key=lambda item: item.score, reverse=True)
-    return found[:limit]
+    served = found[:limit]
+    # Efficiency telemetry: how often history answered instead of a search.
+    # A no-op unless a recorder is active for the task being worked.
+    _note_signal("similar_bug_hits", len(served), source="context_pack.similar_bugs")
+    return served
+
+
+_PATHLIKE = re.compile(r"\.[A-Za-z0-9]{1,6}$")
+
+
+def named_paths(spec: BugSpec) -> list[str]:
+    """Every repository path this spec points a worker at, in order, once each.
+
+    An entry point may be written ``path/to/file.py:symbol``; the half before
+    the colon is the part a tree can be asked about. A bare symbol name is not
+    a path, and checking one would only ever report it missing -- a fabricated
+    failure, which is worse than the gap it pretends to close.
+    """
+    out: list[str] = []
+    for raw in spec.likely_files:
+        value = str(raw).strip()
+        if value and value not in out:
+            out.append(value)
+    for raw in spec.entry_points:
+        head = str(raw).split(":", 1)[0].strip()
+        if head and head not in out and ("/" in head or _PATHLIKE.search(head)):
+            out.append(head)
+    return out
+
+
+def verify_reused_paths(spec: BugSpec, *,
+                        knowledge: "ProjectKnowledge | None" = None) -> dict[str, Any]:
+    """Check every path a reused spec names against the code as it is NOW.
+
+    This is the half of reuse that makes reuse safe. The match was made on
+    wording; the fix was written against a commit that has since moved. A path
+    that is gone, or that was rewritten after the spec was written, is exactly
+    what a worker would otherwise discover only after trusting it -- and the
+    whole saving reuse exists to produce would be spent there instead.
+
+    Every verdict is derived from the working tree and the git delta. Where it
+    cannot be derived the path is reported UNVERIFIED, never UNCHANGED: "I
+    checked and nothing moved" and "I could not check" demand opposite next
+    steps, and collapsing them is how a stale plan gets acted on.
+    """
+    paths = named_paths(spec)
+    report: dict[str, Any] = {
+        "verified": False, "checked": len(paths), "paths": [],
+        "missing": [], "changed": [], "unverified": [], "gaps": [],
+    }
+    if not paths:
+        # Nothing named is nothing to get wrong -- but say so, because a
+        # silent empty check reads exactly like a passing one.
+        report["verified"] = True
+        report["gaps"].append("the matched spec names no path, so there is none to verify")
+        return report
+
+    root: Path | None = None
+    delta: list[str] | None = None
+    dirty: list[str] | None = None
+    if knowledge is None:
+        report["gaps"].append("no repository to check against -- verify each path "
+                              "by hand before editing")
+    else:
+        root = Path(knowledge.root)
+        # The working tree outranks the commit graph here for the same reason
+        # it does everywhere else: an edited file is what will actually run.
+        dirty = knowledge.uncommitted_paths()
+        if spec.source_commit:
+            delta = knowledge.changed_paths(spec.source_commit)
+            if delta is None:
+                report["gaps"].append(
+                    f"cannot diff against {spec.source_commit[:12]} -- it is not in "
+                    "this repository's history, so drift cannot be measured")
+        else:
+            report["gaps"].append("the matched spec records no commit, so what moved "
+                                  "under it since cannot be computed")
+    moved = set(delta or ()) | set(dirty or ())
+
+    for path in paths:
+        status, why = PATH_UNVERIFIED, "no repository to check against"
+        if root is not None:
+            relative = Path(path)
+            if relative.is_absolute() or ".." in relative.parts:
+                why = "not a repository-relative path"
+            elif not (root / relative).exists():
+                status, why = PATH_MISSING, "no longer in the working tree"
+            elif path in moved:
+                status, why = PATH_CHANGED, "rewritten since the spec was written"
+            elif delta is None:
+                why = "present, but there is no commit to measure drift from"
+            else:
+                status, why = PATH_UNCHANGED, "present and untouched since the spec"
+        report["paths"].append({"path": path, "status": status, "why": why})
+        if status == PATH_MISSING:
+            report["missing"].append(path)
+        elif status == PATH_CHANGED:
+            report["changed"].append(path)
+        elif status == PATH_UNVERIFIED:
+            report["unverified"].append(path)
+
+    report["verified"] = not report["unverified"]
+    return report
 
 
 def retrieval_result(store: BugSpecStore, target: BugSpec, *,
-                     current_commit: str | None = None) -> dict[str, Any]:
-    """Should the worker start from a previous spec, or merely read it?
+                     current_commit: str | None = None,
+                     knowledge: "ProjectKnowledge | None" = None) -> dict[str, Any]:
+    """Should the worker start from a previous spec, merely read it, or neither?
+
+    Asked BEFORE investigation, never after. Retrieval that runs afterwards
+    has already let the cost it exists to avoid be paid in full.
 
     A strong match is offered as a starting point together with the reason it
-    matched and the commit it was written against -- a fix that was correct
-    three months ago may name a file that has since moved, and the worker has
-    to be able to see that for itself.
+    matched, the commit it was written against, and -- when a repository is
+    given -- a verdict per path from the current git delta. A fix that was
+    correct three months ago may name a file that has since moved, and the
+    worker has to be able to see that before editing rather than after.
+
+    A match whose every named path has since vanished is handed back as
+    reading instead of as a plan: the symptom really did match, so the root
+    cause is worth knowing, but a fix strategy for code that no longer exists
+    points at nothing.
     """
+    if knowledge is not None and not current_commit:
+        current_commit = knowledge.head()
     matches = similar_bugs(store, target)
     if not matches:
         return {"status": NO_MATCH, "matches": [],
                 "guidance": "no comparable bug on record; investigate from the spec"}
 
     best = matches[0]
-    payload = {"matches": [m.as_dict() for m in matches]}
+    payload: dict[str, Any] = {"matches": [m.as_dict() for m in matches]}
     if best.score < STRONG_MATCH:
         payload["status"] = RELATED_ONLY
         payload["guidance"] = ("related bugs exist -- read their root causes before "
                                "searching, but do not assume the same cause")
         return payload
 
+    # Verified BEFORE the spec is offered for reuse, not alongside it: a
+    # caller that receives REUSED_BUG_SPEC has already been told what moved.
+    check = verify_reused_paths(best.spec, knowledge=knowledge)
+    payload["path_check"] = check
+    if check["checked"] and len(check["missing"]) == check["checked"]:
+        payload["status"] = RELATED_ONLY
+        payload["downgraded_from"] = REUSED
+        payload["guidance"] = (
+            "a strong match exists, but every path it names is gone from this "
+            "repository -- read its root cause, then investigate from the current "
+            "code instead of from its fix strategy")
+        return payload
+
     stale = bool(current_commit and best.spec.source_commit
                  and best.spec.source_commit != current_commit)
+    drifted = check["missing"] + check["changed"]
     payload["status"] = REUSED
     payload["reused_bug_id"] = best.spec.bug_id
     payload["reused_from_commit"] = best.spec.source_commit
@@ -183,7 +324,10 @@ def retrieval_result(store: BugSpecStore, target: BugSpec, *,
     payload["guidance"] = (
         "start from this spec's root cause and fix strategy, then VERIFY each "
         "referenced path against the current code before editing"
-        + (" -- it was written against a different commit, so expect drift" if stale else ""))
+        + (" -- it was written against a different commit, so expect drift" if stale else "")
+        + (" -- these have already moved: " + ", ".join(drifted[:4]) if drifted else "")
+        + ("" if check["verified"]
+           else " -- not every path could be checked here: " + "; ".join(check["gaps"])))
     return payload
 
 
@@ -300,4 +444,10 @@ def build_context_pack(module: str, *,
             gaps.append("no previous bugs recorded in this module")
 
     pack.gaps = tuple(gaps)
+    # Counted where the retrieval actually happened, not inferred later: a
+    # pack with a summary or files in it is a briefing the worker did not
+    # have to reconstruct by reading the module.
+    if pack.summary or pack.files:
+        _note_signal("context_pack_hits", source="context_pack.build_context_pack")
+        _note_signal("knowledge_hits", source="context_pack.build_context_pack")
     return pack
