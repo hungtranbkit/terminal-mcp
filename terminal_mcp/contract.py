@@ -46,11 +46,23 @@ CAP_KEY_SENDS = "key_sends"
 """Raw key sends (arrows/Tab/Escape) over /v1/sessions/{name}/send-keys,
 policy-gated by permissions.allow_send_keys + input_policy.allow_keys."""
 
+CAP_REPO_EVIDENCE = "repo_evidence"
+"""GET /v1/repo-evidence answers with git metadata for a path on this node:
+repo_valid, readable, branch, head, dirty, ahead/behind and collected_at.
+
+The controller's pre-dispatch gate needs this because it cannot see another
+node's filesystem. Declaring it as a capability is what lets an older agent be
+identified as OLD rather than inferred from a 404 -- a 404 is also what a
+misrouted request, a stale proxy or a half-deployed agent returns, and those
+must not be indistinguishable from "this node genuinely predates the
+endpoint"."""
+
 CAPABILITIES: frozenset[str] = frozenset({
     CAP_GRANT_ONLY_ACCESS,
     CAP_SOFT_RECONNECT,
     CAP_RECOVERY_TOMBSTONE,
     CAP_KEY_SENDS,
+    CAP_REPO_EVIDENCE,
 })
 
 LEGACY_CONTRACT_VERSION = 0
