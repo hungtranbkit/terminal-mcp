@@ -510,6 +510,15 @@ class WorktreeJanitorConfig:
     max_candidates_per_run: int = 50
     timeout_seconds: float = 20.0
     extra_valuable_globs: tuple[str, ...] = ()
+    # P3 sweep. `sweep_enabled` gates only the BACKGROUND THREAD -- run_once()
+    # stays callable via MCP with it off, this project's standing "the manual
+    # path always works, only the automatic trigger is gated" posture.
+    sweep_enabled: bool = False
+    sweep_interval_seconds: float = 900.0
+    sweep_budget_seconds: float = 60.0
+    orphan_confirm_runs: int = 2
+    orphan_min_age_seconds: float = 3600.0
+    repo_roots: tuple[str, ...] = ()
 
     def to_policy(self) -> Any:
         from .worktree_janitor import JanitorPolicy
@@ -1410,7 +1419,26 @@ def _load_worktree_janitor_config(raw: object) -> WorktreeJanitorConfig:
                         60, 2_592_000))
     if floor > grace:
         raise ValueError("worktree_janitor.grace_floor_seconds must not exceed grace_seconds")
+    sweep_enabled = raw.get("sweep_enabled", WorktreeJanitorConfig.sweep_enabled)
+    if not isinstance(sweep_enabled, bool):
+        raise ValueError("worktree_janitor.sweep_enabled must be a boolean")
+    sweep_roots = raw.get("repo_roots", [])
+    if not isinstance(sweep_roots, list) or not all(isinstance(r, str) and r for r in sweep_roots):
+        raise ValueError("worktree_janitor.repo_roots must be a list of strings")
+    for root in sweep_roots:
+        if not root.startswith("/") and not root.startswith("~"):
+            raise ValueError(f"worktree_janitor.repo_roots entry {root!r} must be absolute")
     return WorktreeJanitorConfig(
+        sweep_enabled=sweep_enabled,
+        sweep_interval_seconds=float(bounded(
+            "sweep_interval_seconds", WorktreeJanitorConfig.sweep_interval_seconds, 30, 86_400)),
+        sweep_budget_seconds=float(bounded(
+            "sweep_budget_seconds", WorktreeJanitorConfig.sweep_budget_seconds, 1, 3_600)),
+        orphan_confirm_runs=int(bounded(
+            "orphan_confirm_runs", WorktreeJanitorConfig.orphan_confirm_runs, 1, 100)),
+        orphan_min_age_seconds=float(bounded(
+            "orphan_min_age_seconds", WorktreeJanitorConfig.orphan_min_age_seconds, 0, 2_592_000)),
+        repo_roots=tuple(sweep_roots),
         mode=mode, allowed_roots=tuple(roots), integration_ref=ref.strip(),
         allow_preserved_unmerged=allow_preserved, grace_seconds=grace,
         grace_floor_seconds=floor,

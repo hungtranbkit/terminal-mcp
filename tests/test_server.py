@@ -284,6 +284,10 @@ async def test_server_registers_v1_and_binding_tools():
         # terminal_worktree_janitor_run/remove/prune name is part of the P0
         # contract: the classifier ships with no executor.
         "terminal_worktree_janitor_scan",
+        # P3 periodic sweep. run_once is exposed so the manual path works with
+        # the background loop disabled.
+        "terminal_worktree_sweep_run_once",
+        "terminal_worktree_sweep_status",
         # Delivery discipline: Definition of Ready (§20.6 Phase A).
         "terminal_task_check_dor",
         # Incident lane (§20.6 Phase B).

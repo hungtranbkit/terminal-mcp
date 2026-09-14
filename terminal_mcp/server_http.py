@@ -557,6 +557,35 @@ def main() -> None:
     # regardless of whether Supervisor Loop v1 is enabled, so its
     # retention/WAL maintenance is baseline hygiene, not gated behind that
     # unrelated opt-in.
+    # Worktree Janitor sweep (docs/WORKTREE_JANITOR.md, P3). The BACKGROUND
+    # THREAD is gated on its own flag, default off; terminal_worktree_sweep_
+    # run_once stays callable regardless, the same "manual always available,
+    # only the automatic trigger is gated" posture as queue/integration/
+    # auto_recovery above. Even with the loop running, nothing is removed
+    # unless worktree_janitor.mode is auto_execute -- so a deployment that
+    # enables the sweep without changing mode gets a periodic REPORT.
+    worktree_sweep = None
+    if config.worktree_janitor.sweep_enabled:
+        from .lease import ResourceLockStore
+        from .worktree_executor import WorktreeExecutor
+        from .worktree_sweep import WorktreeSweep
+
+        worktree_sweep = WorktreeSweep(
+            WorktreeExecutor(config.worktree_janitor.to_policy(), audit=terminal.audit,
+                             locks=ResourceLockStore(terminal.leases.path),
+                             store=queue.store,
+                             node_id=getattr(controller, "local_node_id", "local")),
+            store=queue.store, repo_roots=config.worktree_janitor.repo_roots,
+            interval_seconds=config.worktree_janitor.sweep_interval_seconds,
+            orphan_confirm_runs=config.worktree_janitor.orphan_confirm_runs,
+            orphan_min_age_seconds=config.worktree_janitor.orphan_min_age_seconds,
+            max_candidates_per_run=config.worktree_janitor.max_candidates_per_run,
+            budget_seconds=config.worktree_janitor.sweep_budget_seconds)
+        worktree_sweep.start()
+        _log.info("worktree janitor sweep started (mode=%s, interval=%ss)",
+                     config.worktree_janitor.mode,
+                     config.worktree_janitor.sweep_interval_seconds)
+
     maintenance_loop = MaintenanceLoop(
         audit=terminal.audit, supervisor2_store=supervisor_v2.store,
         bindings_path=terminal.bindings.path, config=config.maintenance,

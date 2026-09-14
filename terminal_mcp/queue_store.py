@@ -811,6 +811,20 @@ QUEUE_MIGRATIONS = [
 ]
 
 
+def _epoch_or_none(value: Any) -> float | None:
+    """An ISO timestamp -> epoch seconds, or None. Never raises: a sweep must
+    not die on one unparseable row."""
+    if not value:
+        return None
+    try:
+        from datetime import datetime
+
+        text = str(value).replace("Z", "+00:00")
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
 class QueueStore:
     """SQLite persistence for the whole Supervisor Queue v2 feature --
     same pattern as supervisor.py's SupervisorStore (0700 state dir,
@@ -1564,6 +1578,83 @@ class QueueStore:
             raise
         finally:
             connection.close()
+
+    def list_isolated_worktree_paths(self, *, limit: int = 10_000) -> set[str]:
+        """Every worktree path ANY task claims, in ANY status.
+
+        Deliberately NOT derived from list_worktree_cleanup_tasks: that one only
+        returns tasks which already carry a cleanup record, so a task that is
+        still RUNNING -- the most important one to protect -- would be absent and
+        its worktree would look unclaimed to the orphan sweep. Keyed on
+        git_isolation.worktree_path, which every isolated task has from the
+        moment it is created.
+
+        Read-only and bounded. Returns a set because the only question asked of
+        it is membership."""
+        try:
+            with self._connection() as connection:
+                rows = connection.execute(
+                    "SELECT json_extract(metadata, '$.git_isolation.worktree_path') AS path "
+                    "FROM queue_tasks "
+                    "WHERE json_extract(metadata, '$.git_isolation.worktree_path') IS NOT NULL "
+                    "LIMIT ?", (int(limit),)).fetchall()
+        except sqlite3.Error:
+            _LOGGER.warning("could not list isolated worktree paths", exc_info=True)
+            raise
+        return {row["path"] for row in rows if row["path"]}
+
+    def list_worktree_cleanup_tasks(self, *, states: tuple[str, ...] = (),
+                                    limit: int = 200) -> list[dict[str, Any]]:
+        """Tasks carrying a worktree-cleanup record, optionally filtered by
+        state. READ-ONLY, bounded, and the janitor sweep's only way in.
+
+        Filtered in SQL with json_extract rather than by loading every task and
+        sifting in Python: the sweep runs on a timer against a store that grows
+        forever, and "read everything then discard most of it" is how a
+        background loop quietly becomes the most expensive thing on the box.
+
+        Returns plain dicts (not QueueTask) carrying exactly what the sweep
+        needs -- id, status, attempt_count, max_attempts, metadata and the
+        derived terminal_at -- so the executor's `task` contract is satisfied
+        without the caller re-reading each row."""
+        if limit <= 0:
+            return []
+        sql = ["SELECT id, session, status, attempt_count, max_attempts, metadata, "
+               "completed_at, updated_at FROM queue_tasks "
+               "WHERE json_extract(metadata, '$.worktree_cleanup.state') IS NOT NULL"]
+        params: list[Any] = []
+        if states:
+            placeholders = ",".join("?" for _ in states)
+            sql.append(f"AND json_extract(metadata, '$.worktree_cleanup.state') IN ({placeholders})")
+            params.extend(states)
+        sql.append("ORDER BY updated_at ASC LIMIT ?")
+        params.append(int(limit))
+        try:
+            with self._connection() as connection:
+                rows = connection.execute(" ".join(sql), params).fetchall()
+        except sqlite3.Error:
+            # A malformed metadata blob makes json_extract raise for the whole
+            # query. A sweep that cannot read is a sweep that does nothing --
+            # never one that crashes the loop.
+            _LOGGER.warning("could not list worktree cleanup tasks", exc_info=True)
+            return []
+        tasks = []
+        for row in rows:
+            metadata = _parse_json_object(row["metadata"])
+            record = metadata.get(wj.METADATA_KEY) or {}
+            tasks.append({
+                "id": row["id"], "session": row["session"], "status": row["status"],
+                "attempt_count": row["attempt_count"], "max_attempts": row["max_attempts"],
+                "metadata": metadata,
+                # The executor's grace check wants a timestamp. completed_at is
+                # the real terminal moment when there is one; updated_at is the
+                # honest fallback for SKIPPED/CANCELLED, which do not set it.
+                "terminal_at": _epoch_or_none(row["completed_at"] or row["updated_at"]),
+                "cleanup_state": record.get("state"),
+                "worktree_path": (metadata.get(wj.ISOLATION_KEY) or {}).get("worktree_path"),
+                "repo_path": (metadata.get(wj.ISOLATION_KEY) or {}).get("repo_path"),
+            })
+        return tasks
 
     def patch_worktree_cleanup(self, task_id: str, patch: dict[str, Any]) -> None:
         """Merge fields into a task's worktree-cleanup record (P2's executor).

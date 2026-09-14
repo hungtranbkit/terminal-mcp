@@ -125,7 +125,7 @@ async def test_stdio_real_handshake_and_tools(tmp_path):
     assert initialized.server_info.name == "terminal-mcp"
     assert initialized.server_info.version == __version__
     names = {tool.name for tool in tools.tools}
-    assert len(names) == 259  # +8 Work v1 spec/plan tools; ONE surface (stdio == HTTP)
+    assert len(names) == 261  # +8 Work v1 spec/plan tools; ONE surface (stdio == HTTP)
     assert {"terminal_tail", "terminal_send_keys", "terminal_exit_copy_mode",
             "terminal_bind", "terminal_tail_bound"} <= names
 
@@ -178,7 +178,7 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
     # global INPUT_DISABLED gate; INPUT_DISABLED itself stays covered in test_permissions.py.
     assert text_disabled["error"] == "ACCESS_DENIED"
     assert keys_disabled["error"] == "ACCESS_DENIED"
-    assert len(tools.tools) == 259  # +8 Work v1 spec/plan tools; ONE surface (stdio == HTTP)
+    assert len(tools.tools) == 261  # +8 Work v1 spec/plan tools; ONE surface (stdio == HTTP)
 
 
 @pytest.mark.anyio

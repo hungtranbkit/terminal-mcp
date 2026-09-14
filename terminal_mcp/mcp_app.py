@@ -193,6 +193,7 @@ def build_mcp(service: TerminalService | None = None,
     # rule, applied to content instead of metadata. Uses terminal's own
     # AuditStore; never a second audit database.
     repo = build_repo_service(terminal, controller)
+    _worktree_sweep_holder: dict[str, Any] = {}
     queue_engine = QueueEngine(queue.store, controller, coordinator=_gate,
                               on_completed=_on_task_completed, verify_queue=queue.verify_queue)
     queue.engine = queue.engine or queue_engine
@@ -2815,6 +2816,58 @@ def build_mcp(service: TerminalService | None = None,
             report["candidates"] = [c for c in report.get("candidates", [])
                                     if c.get("policy_class") != worktree_janitor.AUTO_SAFE]
         return report
+
+    def _worktree_sweep():
+        """Built lazily and cached on the closure, the same shape mcp_app uses
+        for other optional services. Constructed even when the background
+        thread is disabled -- run_once must stay callable with the loop off."""
+        if "sweep" not in _worktree_sweep_holder:
+            from .worktree_executor import WorktreeExecutor
+            from .worktree_sweep import WorktreeSweep
+
+            config = terminal.config.worktree_janitor
+            executor = WorktreeExecutor(
+                config.to_policy(), audit=terminal.audit,
+                locks=ResourceLockStore(terminal.leases.path),
+                store=queue.store,
+                node_id=getattr(controller, "local_node_id", "local"))
+            _worktree_sweep_holder["sweep"] = WorktreeSweep(
+                executor, store=queue.store, repo_roots=config.repo_roots,
+                interval_seconds=config.sweep_interval_seconds,
+                orphan_confirm_runs=config.orphan_confirm_runs,
+                orphan_min_age_seconds=config.orphan_min_age_seconds,
+                max_candidates_per_run=config.max_candidates_per_run,
+                budget_seconds=config.sweep_budget_seconds)
+        return _worktree_sweep_holder["sweep"]
+
+    @server.tool()
+    def terminal_worktree_sweep_run_once(dry_run: bool = True) -> dict:
+        """Run ONE worktree-janitor sweep pass now (docs/WORKTREE_JANITOR.md).
+
+        Callable whether or not the background loop is enabled -- the loop gates
+        the AUTOMATIC trigger only. Converges cleanup records whose directory
+        already vanished, then looks for orphaned worktrees no task claims.
+
+        `dry_run=True` (the default) reports what it would do and removes
+        nothing. Even with dry_run=False, nothing is removed unless
+        worktree_janitor.mode is auto_execute -- two independent gates.
+
+        An orphan is never actioned on first sighting: it must be seen unclaimed
+        in `orphan_confirm_runs` consecutive passes AND be older than
+        `orphan_min_age_seconds`, because a worktree can legitimately exist for
+        a moment before the task that references it does.
+
+        Returns the full report: per-candidate outcomes, what was skipped and
+        why, errors per repo, and reclaimed bytes. Never raises."""
+        sweep = _worktree_sweep()
+        sweep.dry_run = bool(dry_run)
+        return sweep.run_once()
+
+    @server.tool()
+    def terminal_worktree_sweep_status() -> dict:
+        """Whether the sweep loop is running, its configured bounds, and the
+        last pass's report. Read-only."""
+        return _worktree_sweep().status()
 
     @server.tool()
     def terminal_worktree_cleanup(task_id: str, force: bool = False) -> dict:

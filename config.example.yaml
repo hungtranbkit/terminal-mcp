@@ -284,3 +284,24 @@ worktree_janitor:
   # no config edit can make a secret or a sqlite db collectable.
   extra_valuable_globs: []
     # - "*.backup.sql"
+
+  # --- P3 periodic sweep -------------------------------------------------
+  # `sweep_enabled` gates ONLY the background thread. terminal_worktree_sweep_
+  # run_once stays callable with it off -- the project's standing "manual path
+  # always works, only the automatic trigger is gated" posture. And even with
+  # the loop running, nothing is removed unless `mode` is auto_execute, so
+  # enabling the sweep alone gets you a periodic REPORT.
+  sweep_enabled: false
+  sweep_interval_seconds: 900
+  sweep_budget_seconds: 60      # wall-clock budget for one pass
+
+  # An orphan (a worktree no task claims) is never actioned on first sight: a
+  # worktree legitimately exists for a moment before the task referencing it
+  # does, because git_isolation_service must create it first. So it must be
+  # seen unclaimed this many CONSECUTIVE passes AND be older than the min age.
+  orphan_confirm_runs: 2
+  orphan_min_age_seconds: 3600
+
+  # Repos the sweep walks. Empty = the sweep has nothing to do.
+  repo_roots: []
+    # - /home/mesflow/terminal-mcp
