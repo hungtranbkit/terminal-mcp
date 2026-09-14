@@ -2027,8 +2027,11 @@ scan/audit view over the SAME facts.)*
   advance a module (and only then — nothing to advance means no write). The
   map is the shared canonical one (`canonical_root`), so a planner running in
   a worktree advances the main checkout's map under the existing knowledge
-  lock. The dogfood tests snapshot and restore that file: a suite must not
-  leave a diff in the repository it planned against.
+  lock. The test suite must not leave a diff in the repository it planned
+  against, so `tests/conftest.py` snapshots the canonical state file once per
+  session and restores it at the end (the dogfood fixture does the same per
+  test) — several tests drive the real pipeline with no project path, and
+  without this a plain `pytest` run left another lane's committed file dirty.
 - **Proof that a fresh worker does not re-read the repo.**
   `test_a_fresh_worker_is_briefed_without_reading_the_module_source` watches
   every `Path.read_text` for the duration of a real plan against a real git
