@@ -188,6 +188,14 @@ class WorkSpec:
     execution_mode: str = NORMAL
     risk: str = "MEDIUM"
     knowledge_confidence: str = "LOW"
+    # What the knowledge map said about this task's modules when it was
+    # planned, already loaded. Persisted on the spec rather than fetched by
+    # the worker: a briefing that has to be asked for is a briefing that gets
+    # skipped, and the whole point is that the map is read BEFORE the code.
+    # It is a snapshot with its commit recorded beside it, never a claim about
+    # the repository as it stands now.
+    knowledge_brief: str = ""
+    knowledge_modules: tuple[str, ...] = ()
     # The soft allowance this spec was planned under, persisted alongside it.
     # Derived by `budget_for`, but recorded so "what was this worker allowed to
     # read" stays answerable after the fact, when the level may have moved.
@@ -309,6 +317,18 @@ class WorkSpec:
             payload["CONTRACTS"] = contracts
         if self.dependencies:
             payload["DEPENDS_ON"] = list(self.dependencies)
+        if self.knowledge_brief:
+            # Inside the handoff, because the handoff IS the worker's task
+            # start. Anywhere else and reading the map is opt-in again, which
+            # is the state this costs a worker a repository read to leave.
+            payload["KNOWLEDGE"] = {
+                "MODULES": list(self.knowledge_modules),
+                "CONFIDENCE": self.knowledge_confidence,
+                "VERIFIED_AT_COMMIT": self.knowledge_last_verified_commit,
+                "BRIEF": self.knowledge_brief,
+                "NOTE": ("loaded from the knowledge map when this was planned -- "
+                         "start here instead of searching, then confirm the named "
+                         "paths against the current code before editing")}
         if self.human_hints:
             payload["HUMAN_HINTS"] = {
                 "hints": list(self.human_hints),

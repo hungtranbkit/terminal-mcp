@@ -47,7 +47,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-from . import work_reuse
+from . import context_pack, work_reuse
 from .work_spec import (NEEDS_REDEFINE, SPEC_READY, WorkSpec, WorkSpecStore,
                         bind_policy, gate, infer_task_type, plan_from_request)
 
@@ -94,6 +94,10 @@ class PlanningResult:
     stages: list[Stage] = field(default_factory=list)
     gate_report: dict[str, Any] = field(default_factory=dict)
     counters: dict[str, int] = field(default_factory=dict)
+    # The modules this task's worker was handed, already loaded. Carried on
+    # the result rather than left for the worker to fetch: a briefing that
+    # has to be asked for is a briefing that gets skipped.
+    knowledge: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ready(self) -> bool:
@@ -103,6 +107,7 @@ class PlanningResult:
         return {"status": self.status, "ready": self.ready,
                 "spec": self.spec.as_dict(), "gate": self.gate_report,
                 "stages": [s.as_dict() for s in self.stages],
+                "knowledge": dict(self.knowledge),
                 # Counted, never estimated. Token counts belong to the provider
                 # and are reported by work_telemetry with their provenance; a
                 # number invented here would be indistinguishable from a real
@@ -136,7 +141,12 @@ def plan(request: str, *, store: WorkSpecStore, task_type: str | None = None,
     cwd = cwd or os.getcwd()
     stages: list[Stage] = []
     counters = {"knowledge_hits": 0, "similar_hits": 0, "runbook_hits": 0,
-                "changed_paths_seen": 0, "redefine_count": 0}
+                "changed_paths_seen": 0, "redefine_count": 0,
+                # Distinct from `knowledge_hits` on purpose: how many modules
+                # MATCHED and how many were actually loaded for the worker are
+                # different numbers, and collapsing them would let a match that
+                # briefed nobody be counted as a saving.
+                "knowledge_modules_loaded": 0, "knowledge_refreshed": 0}
 
     # -- capture ---------------------------------------------------------------
     capture = Stage(CAPTURE, findings=[f"request captured ({len(request)} chars)"])
@@ -162,6 +172,28 @@ def plan(request: str, *, store: WorkSpecStore, task_type: str | None = None,
 
     # -- knowledge -------------------------------------------------------------
     know = Stage(KNOWLEDGE)
+    # Re-verify the map against this commit BEFORE asking it anything. The
+    # question the next line asks is "which modules match, and how much can
+    # they be trusted", and a module that reports MEDIUM only because five
+    # unrelated commits landed since it was written is a module this pipeline
+    # would tell a worker to go and re-read for nothing.
+    if knowledge is not None and hasattr(knowledge, "rebuild"):
+        try:
+            refresh = knowledge.rebuild()
+        except Exception as exc:  # noqa: BLE001 -- a refresh is not a plan
+            know.gaps.append(f"the map could not be re-verified "
+                             f"({type(exc).__name__}); module confidence may be "
+                             f"older than this commit")
+        else:
+            counters["knowledge_refreshed"] = len(refresh.get("advanced") or ())
+            if counters["knowledge_refreshed"]:
+                know.findings.append(
+                    f"{counters['knowledge_refreshed']} module(s) re-verified against "
+                    f"HEAD from the git delta, without re-reading them")
+            for item in (refresh.get("needs_review") or ())[:3]:
+                # Named, not silently trusted: these are the modules where the
+                # map is a lead and the code is the only answer.
+                know.gaps.append(f"{item['module']} needs re-indexing ({item['why']})")
     modules = work_reuse.knowledge_candidates(spec, knowledge=knowledge)
     if knowledge is None:
         know.ok = False
@@ -177,6 +209,40 @@ def plan(request: str, *, store: WorkSpecStore, task_type: str | None = None,
         paths = [p for c in modules for p in (c.detail.get("paths") or ())]
         spec.likely_files = spec.likely_files or tuple(paths[:8])
         spec.knowledge_confidence = modules[0].detail.get("confidence", "LOW")
+
+    # -- and now LOAD it, for the modules the spec names and nothing else ------
+    # This is the step that makes the map worth having. Everything above finds
+    # out WHICH modules are relevant; without this the worker is handed their
+    # names and goes to read the code anyway, which is what the map was written
+    # to prevent.
+    brief = context_pack.TaskKnowledge()
+    if knowledge is not None and context_pack.spec_modules(spec):
+        # Guarded on the spec naming something: when nothing matched, the stage
+        # has already said so, and a loader repeating it in its own words would
+        # make one finding look like two.
+        brief = context_pack.load_task_knowledge(spec, knowledge=knowledge)
+        counters["knowledge_modules_loaded"] = brief.loaded
+        if brief.usable:
+            know.findings.append(
+                "briefing loaded for " + ", ".join(p.module for p in brief.packs)
+                + f" (confidence {brief.confidence})")
+            # The weakest loaded module decides, not the best-scoring match:
+            # a worker acts on the whole briefing, not on its strongest part.
+            spec.knowledge_confidence = brief.confidence
+            spec.knowledge_last_verified_commit = brief.verified_commit
+            # Onto the SPEC, so every handoff built from it carries the
+            # briefing -- including the one a redefine produces later, which a
+            # result-only attachment would silently leave empty.
+            spec.knowledge_brief = brief.render()
+            spec.knowledge_modules = tuple(p.module for p in brief.packs)
+            if not spec.entry_points:
+                spec.entry_points = tuple(
+                    point for pack in brief.packs for point in pack.entry_points)[:8]
+        know.gaps.extend(g for g in brief.gaps if g not in know.gaps)
+        know.detail = {"loaded": [p.module for p in brief.packs],
+                       "confidence": brief.confidence,
+                       "not_indexed": list(brief.unknown),
+                       "verified_commit": brief.verified_commit}
     stages.append(know)
 
     # -- similar prior work ----------------------------------------------------
@@ -263,7 +329,11 @@ def plan(request: str, *, store: WorkSpecStore, task_type: str | None = None,
 
     return PlanningResult(spec=spec,
                           status=SPEC_READY if report["ready"] else NEEDS_REDEFINE,
-                          stages=stages, gate_report=report, counters=counters)
+                          stages=stages, gate_report=report, counters=counters,
+                          # Carried even when the gate refuses: a NEEDS_REDEFINE
+                          # is answered by a planner who needs the same context
+                          # as the worker would have.
+                          knowledge=brief.as_dict())
 
 
 def redefine(store: WorkSpecStore, spec_id: str, fields: dict[str, Any]) -> PlanningResult:

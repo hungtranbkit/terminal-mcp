@@ -1955,6 +1955,128 @@ scan/audit view over the SAME facts.)*
   (`work_procedures`), `terminal_mcp/work_planning.py`,
   `terminal_mcp/task_classifier.py`; see this file's own commit.
 
+### The knowledge map is LOADED at task start, not merely present — 2026-09-14
+
+- **Goal / user value:** `project_knowledge.py` (the map), its per-module
+  confidence and its freshness rules all existed and were tested, and the
+  planning path used them only to pick module NAMES. A name is not a
+  briefing: the worker still opened the repository and re-derived what the
+  map already said. This is the wiring that makes the map pay for itself —
+  the modules a spec names are loaded at the moment the task starts and
+  travel inside the worker's own handoff.
+- **Status: VERIFIED.** `tests/test_project_knowledge.py` (46),
+  `tests/test_context_pack.py` (34), `tests/test_work_planning.py` (22) and
+  `tests/test_dogfood_work_v1.py` (11, including the opt-in strict pass with
+  `TERMINAL_MCP_DOGFOOD_STRICT=1`) — all against real `git init`
+  repositories and this repo's own map. No mocked git: what a freshness
+  claim is worth depends entirely on what `git diff --name-only` and
+  `git status --porcelain` actually report.
+- **`ProjectKnowledge.rebuild()` — incremental re-verification, driven by
+  the git delta.** For each module it asks git one question: has anything
+  under this module's paths moved between the commit it was verified at and
+  HEAD? If nothing has, and the working tree is clean under it, the entry is
+  as true now as when it was written, so its `last_verified_commit` is
+  advanced and it stops reporting MEDIUM — which is precisely the value that
+  sends a worker off to re-read code that did not change. If something did
+  move, it is **never** advanced: it is returned in `needs_review` with the
+  path that moved, which is the only thing a re-index has to look at.
+  - It **re-verifies; it never re-derives.** No summary is rewritten. Only a
+    reader can say whether prose is still true, and a machine that rewrote it
+    would be inventing the one thing this map may not invent.
+  - An advanced entry records `last_refreshed_at` and says so in its own
+    confidence reason, so "a reader checked this" and "git proved nothing
+    moved" cannot wear each other's name.
+  - A module naming a path that no longer exists, or with uncommitted edits
+    under it, is never advanced — the working tree outranks the commit graph.
+  - The map as a whole is marked indexed at HEAD only when **every** module
+    is. `rebuild(modules=[...])` re-verifies a named subset and reports any
+    name the map does not have.
+  - Degrades rather than raises: no HEAD, no map, or an unreadable working
+    tree are each reported as themselves. It runs on the planning path, and
+    a refresh that failed must not take a plan down with it.
+- **Loading only what the spec names.** `ProjectKnowledge.module_state()`
+  and `load_modules()` answer about named modules without listing the map —
+  `module_states()` runs a `git diff` per module, so answering "what do we
+  know about the two modules this task names" by walking every module pays
+  for each one nobody asked about. `context_pack.load_task_knowledge(spec)`
+  builds the briefing from `likely_module` + `relevant_modules`, best first,
+  deduplicated and **capped at 3** (`MAX_TASK_MODULES`): a briefing that
+  grows with the project is the repository again under another name. It is
+  duck-typed across `WorkSpec` and `BugSpec` — a briefing that worked for
+  only one of them would be absent exactly half the time.
+- **Honest about what it did not load.** A module the spec names and the map
+  has never indexed is reported in `unknown` and named in the rendered
+  briefing, because that is exactly where a worker DOES have to read code.
+  No map, no module named, and a map that raised are three different
+  situations and each is reported as itself. The briefing takes the
+  **weakest** loaded module's confidence, never the best one's: a worker acts
+  on the whole briefing, not on its strongest part.
+- **Where it reaches the worker.** The rendered briefing is persisted on the
+  spec (`knowledge_brief`, `knowledge_modules`, alongside the existing
+  `knowledge_confidence`/`knowledge_last_verified_commit`) and
+  `WorkSpec.handoff()` emits it as `KNOWLEDGE` with the commit it was
+  verified at. On the SPEC rather than on the planning result, because the
+  spec is what is read back later: a redefine, a restart or a second worker
+  each build a handoff from it, and a result-only attachment would leave all
+  of those empty. It is a snapshot with its commit recorded beside it, never
+  a claim about the repository as it stands now — and the payload repeats the
+  rule the map is subordinate to: the map says where to look, the current
+  code is the truth.
+- **Counters.** `knowledge_hits` (modules that MATCHED, unchanged meaning)
+  is now joined by `knowledge_modules_loaded` and `knowledge_refreshed`.
+  Collapsing the first two would let a match that briefed nobody be counted
+  as a saving. The telemetry `knowledge_hits`/`context_pack_hits` signals
+  stay where they were — at the retrieval call site, one per pack that
+  actually carried a summary or files, so an empty entry is never counted as
+  a hit.
+- **Behaviour change worth knowing:** planning now WRITES to
+  `.projectflow/knowledge/KNOWLEDGE_STATE.json` when re-verification can
+  advance a module (and only then — nothing to advance means no write). The
+  map is the shared canonical one (`canonical_root`), so a planner running in
+  a worktree advances the main checkout's map under the existing knowledge
+  lock. The test suite must not leave a diff in the repository it planned
+  against, so `tests/conftest.py` snapshots the canonical state file once per
+  session and restores it at the end (the dogfood fixture does the same per
+  test) — several tests drive the real pipeline with no project path, and
+  without this a plain `pytest` run left another lane's committed file dirty.
+- **Proof that a fresh worker does not re-read the repo.**
+  `test_a_fresh_worker_is_briefed_without_reading_the_module_source` watches
+  every `Path.read_text` for the duration of a real plan against a real git
+  repository, then reads the spec back out of the store as a worker would:
+  the handoff carries where the code lives (`app/export.py`), what to look at
+  (`render_csv`) and what is known to be wrong with it, and **no file under
+  the module's own directory was opened**. It also asserts the watcher
+  recorded reads at all, so the negative is a finding rather than a broken
+  probe. The dogfood repeats the claim against this repository's own map.
+- **No secrets, even from a hand-edited map.** The briefing now rides in the
+  spec payload, which is long-lived and rarely re-read. `record_module`
+  already refuses a credential at write time; if one is put into the state
+  file by hand, `WorkSpecStore.save`'s own scrub refuses the spec and
+  planning raises `SecretInKnowledge` rather than persisting it — refused,
+  never silently stripped, and nothing reaches the store to be read back.
+- **Known limitations.** Re-verification is path-level, not symbol-level: a
+  commit that touches a module's file advances nothing even when the change
+  cannot affect what the summary says — the conservative direction, since the
+  cost of a needless re-read is smaller than the cost of a confident wrong
+  map. Entry points and runbooks come from the pack only when the map records
+  them. And the briefing rides in the spec payload, so a very large map entry
+  is capped (`MAX_BRIEF_CHARS`) rather than paged.
+- **Not touched, deliberately:** `mcp_app.py` and `dashboard.py`. The surface
+  integration is the coordinator's to make centrally; everything here reaches
+  a worker through data that already flows — `work_plan`'s result and the
+  spec's own handoff — so no MCP or route change was needed.
+- **Dependencies:** Project Knowledge, `context_pack` (the pack this briefing
+  is assembled from), Work Spec (the handoff), `work_telemetry_runtime` (the
+  hit counters).
+- **Follow-up/backlog:** entry points and past-bug history in the briefing
+  need a `BugSpecStore` on the planning path, which `work_planning.plan()`
+  does not take yet; symbol-level re-verification.
+- **Trace:** `terminal_mcp/project_knowledge.py` (`rebuild`, `module_state`,
+  `load_modules`, `ModuleState.last_refreshed_at`),
+  `terminal_mcp/context_pack.py` (`TaskKnowledge`, `load_task_knowledge`,
+  `spec_modules`), `terminal_mcp/work_planning.py` (the knowledge stage),
+  `terminal_mcp/work_spec.py` (`knowledge_brief`, `handoff`).
+
 ### Retrieval before investigation — a planner claim now briefs itself (2026-09-14)
 
 - **Goal / user value:** make the SECOND bug in a module cost less than the
