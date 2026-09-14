@@ -36,8 +36,14 @@ DELIVERY_SUBMIT_CONFIRMED = "SUBMIT_CONFIRMED"
 DELIVERY_UNKNOWN = "DELIVERY_UNKNOWN"
 DELIVERY_BLOCKED = "BLOCKED"
 DELIVERY_ERROR = "ERROR"
+# P0 2026-09-14: a bare Enter on an ALREADY-VISIBLE Claude prompt leaves the
+# pane byte-identical and nothing starts. That is not DELIVERY_UNKNOWN ("bytes
+# went out, outcome unproven") -- it is a specific, stable fact: the prompt is
+# still sitting there and no execution began, so a retry is safe. Conflating
+# the two is what left callers unable to decide whether to retry.
+DELIVERY_STALLED = "SUBMIT_STALLED"
 DELIVERY_STATES = (DELIVERY_TEXT_SENT, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_UNKNOWN,
-                    DELIVERY_BLOCKED, DELIVERY_ERROR)
+                    DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STALLED)
 
 # Legacy submit_status vocabulary (pre-dates this module) -- kept as the
 # public field every existing caller/test already reads, now *derived* from
