@@ -720,10 +720,31 @@ def test_a_tiny_gap_against_a_large_effect_is_identified() -> None:
 
 
 def test_full_coverage_always_identifies() -> None:
-    """With nothing missing the intervals are points, so any real
-    difference survives and an equal pair is a genuine null."""
+    """With nothing missing the intervals are points, so a real
+    difference survives AND an equal pair is a genuine null -- neither
+    is an identification failure, because there is no missingness for
+    coverage to explain."""
     assert stats.explained_by_missingness(0.2, 1.0, 0.8, 1.0) is False
-    assert stats.explained_by_missingness(0.5, 1.0, 0.5, 1.0) is True
+    assert stats.explained_by_missingness(0.5, 1.0, 0.5, 1.0) is False
+
+
+def test_an_observed_null_under_incomplete_coverage_is_not_identified() -> None:
+    """The case that must NOT be guarded away. Equal 90% coverage with
+    no observed difference still fires: the data are equally consistent
+    with a real difference hiding in the unscored tenth. The rule has to
+    be as willing to refuse a null as to refuse an effect -- more so
+    here, since a null is the most likely true outcome of this
+    comparison."""
+    assert stats.explained_by_missingness(0.5, 0.9, 0.5, 0.9) is True
+
+    records = [task(f"L{i}", COHORT_LEGACY, first_pass=i < 5) for i in range(9)]
+    records += [task("Lx", COHORT_LEGACY, first_pass=None)]
+    records += [task(f"N{i}", COHORT_NEW, first_pass=i < 5) for i in range(9)]
+    records += [task("Nx", COHORT_NEW, first_pass=None)]
+    report = build_report(records, assignment=ASSIGNMENT_RANDOMISED, min_matched_per_group=10)
+    group = report.groups[0]
+    assert group.coverage[COHORT_LEGACY].first_pass_rate == group.coverage[COHORT_NEW].first_pass_rate
+    assert group.headline_metric == "worker_turn_count"
 
 
 def test_touching_intervals_count_as_overlapping() -> None:
@@ -741,3 +762,35 @@ def test_the_report_says_coverage_is_not_a_sample_size_problem() -> None:
     text = render_markdown(build_report(cohort_pair(12)))
     assert "partial identification" in text
     assert "more tasks will not shrink" in text.lower()
+
+
+def test_identification_and_selection_are_labelled_as_distinct_classes() -> None:
+    """They answer different questions and must not read as one fact
+    stated twice, nor as two independent problems when only one fired."""
+    # Selection only: a wide coverage gap against an effect coverage
+    # cannot explain. Identification survives, so the headline stands.
+    records = [task(f"L{i}", COHORT_LEGACY, first_pass=i < 2) for i in range(25)]
+    records += [task(f"N{i}", COHORT_NEW, first_pass=True) for i in range(15)]
+    records += [task(f"Nx{i}", COHORT_NEW, first_pass=None) for i in range(10)]
+    group = build_report(records, assignment=ASSIGNMENT_RANDOMISED).groups[0]
+    assert any(w.startswith("SELECTION / ") for w in group.warnings)
+    assert not any(w.startswith("IDENTIFICATION / ") for w in group.warnings)
+    assert group.headline_metric == "first_pass_success"
+
+    # Identification only: equal coverage, so no selection concern, but
+    # the ranges overlap and no claim is licensed.
+    records = [task(f"L{i}", COHORT_LEGACY, first_pass=True) for i in range(12)]
+    records += [task(f"Lx{i}", COHORT_LEGACY, first_pass=None) for i in range(12)]
+    records += [task(f"N{i}", COHORT_NEW, first_pass=False) for i in range(12)]
+    records += [task(f"Nx{i}", COHORT_NEW, first_pass=None) for i in range(12)]
+    group = build_report(records, assignment=ASSIGNMENT_RANDOMISED).groups[0]
+    assert any(w.startswith("IDENTIFICATION / ") for w in group.warnings)
+    assert not any(w.startswith("SELECTION / ") for w in group.warnings)
+    assert group.headline_metric == "worker_turn_count"
+
+
+def test_the_report_explains_what_each_class_answers() -> None:
+    text = render_markdown(build_report(cohort_pair(12)))
+    assert "**IDENTIFICATION** asks whether a claim may be made at all" in text
+    assert "**SELECTION** asks whether the number inside the interval" in text
+    assert "only IDENTIFICATION moves the headline" in text

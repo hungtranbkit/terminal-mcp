@@ -278,13 +278,37 @@ def explained_by_missingness(
     correctly on their own. It subsumes the cruder "gap >= observed
     difference" heuristic and any fixed gap cutoff.
 
+    Requires that something actually be missing. Two fully-scored arms
+    produce point intervals, and coinciding points mean the rates are
+    genuinely EQUAL -- an identified null, which is a different thing
+    from an identification failure and must not be reported as one.
+
+    An observed NULL is not exempt. Equal coverage of 90% in both arms
+    with no observed difference still returns True, and correctly: the
+    data are equally consistent with a real difference hiding in the
+    unscored tenth. A rule that refuses unidentified nulls is doing more
+    work here than one that only refuses unidentified effects, since a
+    null is the most likely true outcome of the comparison this harness
+    exists to make.
+
     Note this is a PARTIAL IDENTIFICATION question, not a precision
     one. A larger sample does not shrink these intervals -- only
     recording the missing outcomes does. So an overlap verdict sitting
     next to a tight confidence interval is not a contradiction: the
     confidence interval describes sampling noise around a quantity that
-    is not identified in the first place."""
-    return intervals_overlap(
-        identification_interval(left_rate, left_coverage),
-        identification_interval(right_rate, right_coverage),
-    )
+    is not identified in the first place.
+
+    It is also deliberately agnostic about the missingness MECHANISM: it
+    assumes the worst about which tasks went unscored, which makes it
+    always valid and therefore weak. Whether the number INSIDE the
+    interval can be read as an estimate at all is a separate, selection
+    question -- see the report's SELECTION warning."""
+    left = identification_interval(left_rate, left_coverage)
+    right = identification_interval(right_rate, right_coverage)
+    if not _has_width(left) and not _has_width(right):
+        return False
+    return intervals_overlap(left, right)
+
+
+def _has_width(interval: tuple[float, float] | None) -> bool:
+    return interval is not None and interval[1] > interval[0]

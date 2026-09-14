@@ -456,22 +456,19 @@ def _build_group(
     new_interval = stats.identification_interval(
         None if new_rate is None else new_rate / 100.0, new_fps_coverage
     )
-    # Overlap only signals a problem when at least one interval has
-    # WIDTH -- i.e. something is actually missing. Two fully-covered
-    # arms produce point intervals, and two points that coincide mean
-    # the rates are genuinely equal, which is an identified finding
-    # rather than an identification failure.
-    has_missingness = any(
-        interval is not None and interval[1] > interval[0]
-        for interval in (legacy_interval, new_interval)
-    )
-    if has_missingness and stats.intervals_overlap(legacy_interval, new_interval):
+    if stats.explained_by_missingness(
+        None if legacy_rate is None else legacy_rate / 100.0,
+        legacy_fps_coverage,
+        None if new_rate is None else new_rate / 100.0,
+        new_fps_coverage,
+    ):
         # Equal true rates are consistent with what was observed, so no
         # directional claim on this metric is licensed -- whatever the
         # coverage gap, whatever the sample size.
         headline_metric = "worker_turn_count"
         warnings.append(
-            f"FPS_NOT_IDENTIFIED: in {risk_class}, first-pass success is scoreable for "
+            f"IDENTIFICATION / FPS_NOT_IDENTIFIED: in {risk_class}, first-pass success is "
+            f"scoreable for "
             f"{legacy_fps_coverage:.0%} of matched legacy tasks and {new_fps_coverage:.0%} of "
             f"new-pipeline tasks, so their true rates lie anywhere in "
             f"[{legacy_interval[0]:.0%}, {legacy_interval[1]:.0%}] and "
@@ -491,11 +488,14 @@ def _build_group(
         # treatment changing the probability a task can be measured at
         # all is a selection concern on its own terms.
         warnings.append(
-            f"FPS_COVERAGE_DIFFERS_BY_ARM: first-pass success is scoreable for "
+            f"SELECTION / FPS_COVERAGE_DIFFERS_BY_ARM: first-pass success is scoreable for "
             f"{legacy_fps_coverage:.0%} of matched legacy tasks and {new_fps_coverage:.0%} of "
             f"new-pipeline tasks in {risk_class}. The treatment changes the probability a task "
-            "can be measured on the very metric being compared, which selects the "
-            "worse-instrumented arm's tasks out of the denominator"
+            "can be measured on the very metric being compared, so the missingness is plausibly "
+            "non-random with respect to the arm. This is a separate problem from identification: "
+            "even where the ranges above do NOT overlap, the point estimate inside an interval "
+            "stops being readable as an estimate once the instrument itself was shaped by the "
+            "treatment"
         )
     disagreements = sum(group.first_pass_disagreements for group in coverage.values())
     if disagreements:
@@ -844,6 +844,16 @@ def render_markdown(report: BenchmarkReport) -> str:
     lines.append(
         "- A missing measurement is counted as missing, never as zero. Each cell's `n` is the "
         "number of tasks that actually recorded that metric."
+    )
+    lines.append(
+        "- Warnings about coverage come in two classes and are labelled as such. "
+        "**IDENTIFICATION** asks whether a claim may be made at all: it assumes the worst about "
+        "which tasks went unscored, which makes it always valid and therefore weak. "
+        "**SELECTION** asks whether the number inside the interval can be read as an estimate: "
+        "it fires when missingness is plausibly non-random with respect to the arm. An effect "
+        "can survive identification while the instrument that produced it was shaped by the "
+        "treatment, so the two are neither the same fact stated twice nor interchangeable — "
+        "only IDENTIFICATION moves the headline."
     )
     lines.append(
         "- Missing **outcomes** are a **partial identification** problem, not a precision one. "

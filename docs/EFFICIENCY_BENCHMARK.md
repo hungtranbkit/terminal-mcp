@@ -230,12 +230,36 @@ fully-scored arms produce point intervals, and two coinciding points
 mean the rates are genuinely equal, which is a finding rather than a
 failure.
 
-A lopsided denominator (>10 points) is still **reported** and still
-demotes the band, because a treatment that changes the probability a
-task can be measured at all is a selection concern in its own right —
-but on its own it no longer moves the headline. A 40-point gap against
-an effect coverage cannot possibly explain leaves first-pass success
-standing, correctly; the old gap rule fired there and was wrong to.
+An observed **null** is not exempt. Equal 90% coverage with no observed
+difference still fires the rule, and correctly: the data are equally
+consistent with a real difference hiding in the unscored tenth. The rule
+has to be as willing to refuse an unidentified null as an unidentified
+effect — more so here, since a null is the most likely true outcome of
+the comparison this harness exists to make.
+
+### Two classes of coverage warning: IDENTIFICATION and SELECTION
+
+They answer different questions and are labelled distinctly so a reader
+cannot take one fact stated twice for two problems, or two problems for
+one.
+
+| | asks | fires when | moves the headline |
+| --- | --- | --- | --- |
+| `IDENTIFICATION` | may a claim be made at all? | the arms' intervals overlap | **yes** |
+| `SELECTION` | can the number *inside* the interval be read as an estimate? | scoreability differs by arm by >10 points | no — warns and demotes |
+
+The overlap test is deliberately agnostic about the missingness
+*mechanism*: it assumes the worst about which tasks went unscored, which
+makes it always valid and therefore **weak**. The selection warning says
+when missingness is plausibly non-random with respect to the treatment —
+precisely the situation where the point estimate inside the interval
+stops being "probably about right" and the worst-case bound is genuinely
+all you have. An effect can survive identification while the instrument
+that produced it was corrupted by the treatment, so a lopsided
+denominator is still **reported** and still demotes the band even when
+the interval is narrow. A 40-point gap against an effect coverage cannot
+possibly explain leaves first-pass success standing, correctly; the old
+gap rule fired there and was wrong to.
 
 **A larger sample does not shrink an identification interval — only
 recording the outcomes does.** So an overlap verdict next to a tight
@@ -467,6 +491,28 @@ Telemetry that does not label its own cohort can be labelled explicitly
 with `--cohort-map cohorts.json` (`{"task-id": "legacy"}`), which is
 auditable, rather than by a heuristic buried in an adapter.
 
+## One class of bug, three times
+
+Worth recording, because the same mistake appeared in three unrelated
+places in this programme and will appear again:
+
+1. **UNKNOWN means zero** — a missing measurement silently entering a
+   median as `0`.
+2. **`first_pass_success` stored rather than derived** — a party writing
+   its own outcome, trusted because the column existed.
+3. **`cost_units_override=None`** — one value meaning both "not
+   attempted" and "attempted and failed", so a task already known to be
+   unpriceable got priced from its partial totals.
+
+All three are the same shape: *a value that cannot represent the state
+it is in*. The third is the instructive one, because this document had
+already written the rule it broke ("a partial cost is a wrong cost")
+three commits before it broke it. **Writing the rule down is not the
+same as enforcing it in the type.** That is why `cost_units_unavailable`
+is a field rather than a convention, why every numeric field here is
+`| None` rather than defaulting to `0`, and why first-pass success is
+recomputed rather than read.
+
 ## Example reports
 
 * `docs/examples/sample-report-2026-09-14.md` / `.json` — this host,
@@ -540,6 +586,10 @@ otherwise produce a plausible-looking number rather than an error:
 * first-pass success stops being the headline when the arms'
   identification intervals overlap — including at equal coverage, where
   a gap-based rule scores a hundred-point difference as safe
+* an observed null under incomplete coverage is refused too, not just an
+  observed effect
+* IDENTIFICATION and SELECTION fire independently and are labelled
+  distinctly
 * two fully-scored arms with equal rates are a genuine null, not an
   identification failure
 * a wide coverage gap alone does not move the headline when coverage
