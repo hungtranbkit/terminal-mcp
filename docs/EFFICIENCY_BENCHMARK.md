@@ -104,6 +104,10 @@ expensive per completed task** — the brief's metric and the real one
 point in opposite directions, and only one of them is denominated in
 anything that gets billed.
 
+`primary_cost_tokens` therefore never renders on its own: its cells
+carry the `cost_units` median inline, and where the two disagree about
+which arm is better the row says so. The two cannot be quoted apart.
+
 The decision metric is therefore **`cost_units`**, in base-input-equivalents:
 
     cost_units = input
@@ -149,13 +153,48 @@ far more power than a binary at these sample sizes). First-pass success
 is the **headline outcome**, but needs a much larger sample before a
 direction is claimed.
 
-### First-pass success requires evidence
+### First-pass success: recomputed, three-condition, and never quoted without its coverage
 
-Derived only where the runtime left real `verification_evidence`.
-Without it, "no recorded rework" is indistinguishable from "nobody
-checked", and scoring the latter as a success rewards a vague
-contract — the less a task promises, the easier it is to satisfy.
-Unverified stays `None`, and `None` stays out of the denominator.
+Three separate constraints, each from a gap found by the critic lane
+against the committed telemetry schema.
+
+**Recomputed, not read.** `telemetry_tasks.first_pass_success` is a
+*stored* tri-state written by the reporter — the party being measured
+writes its own outcome. The harness recomputes it from that task's own
+terminal status and re-entry rows, uses the recomputed value, and
+flags disagreement (`FPS_DISAGREEMENT`) with a per-arm count in the
+report. This is the cheapest anti-gaming fix available with no upstream
+change.
+
+**Three conditions, not four.** The harness measures *completed,
+verified, no counted re-entries*. The contract's fourth condition — that
+the task raised no clarification — **cannot be evaluated at all today**:
+there is no clarification concept anywhere in the telemetry store (no
+table, no event, no column; the Question Ledger is unbuilt). The report
+states that the condition is **absent rather than satisfied**, so the
+definition cannot drift silently.
+
+**Evidence is still required**, and where it is absent the task stays
+`None` and leaves the denominator. "No recorded rework" is
+indistinguishable from "nobody checked", and scoring the latter as a
+success rewards a vague contract — the less a task promises, the easier
+it is to satisfy.
+
+**The denominator itself is a treatment effect.** This is the structural
+problem, not an accident of instrumentation: the HIGH decision-budget
+arm is required *by its own contract* to carry a live verification plan,
+so it is systematically more likely to record the evidence that makes a
+task scoreable at all. The treatment changes the probability a task can
+be measured **on the very metric being compared**, and the direction is
+predictable — it selects well-run control-arm tasks out of the
+denominator and inflates the treatment arm's apparent rate. So:
+
+* per-arm **scoreability is a first-class row**, printed directly under
+  the rate; the rate is never rendered without it;
+* when scoreability differs between arms by more than 10 points, the
+  **headline metric moves to `worker_turn_count`**, whose denominator is
+  every matched task regardless of treatment, and the report says so in
+  bold at the top of that risk class.
 
 ### Re-entry reasons
 
@@ -167,11 +206,27 @@ carry those reasons is **flagged** (`EXCLUDED_REASON_ONLY`), never
 dropped — dropping it would bias the sample toward whichever cohort
 happens to run in a more stable environment.
 
-`STALE_CONTEXT` is recognised as its own reason and **is** counted: a
+`STALE_CONTEXT` is recognised as its own reason and **is** counted. A
 warm cache can make an agent reason about a repo state that no longer
-holds, and that rework looks exactly like `CONTRACT_GAP` from outside —
-so it would otherwise be charged to whichever arm carries more context,
-which is the arm under test.
+holds, and that rework looks exactly like `CONTRACT_GAP` from outside.
+It is counted rather than excluded because if a bigger analysis prefix
+*causes* more staleness, that is a genuine downstream cost of the
+treatment — a mediator, not a confounder — and excluding it would
+flatter the arm that caused it. The comparison is rendered **both ways**
+(`Re-entries` and `Re-entries, also excluding STALE_CONTEXT`), because
+the causal reading differs between the two and the gap between them is
+itself the part of rework attributable to carrying more context.
+
+**But the store cannot record it.** `telemetry_reentries.reason` is
+CHECK-constrained to `TEST_FAILURE`, `CONTRACT_GAP`,
+`IMPLEMENTATION_BUG`, `ENVIRONMENT_FAILURE`, `USER_CHANGED_REQUIREMENT`,
+`DELIVERY_FAILURE`, `MERGE_CONFLICT`, `OTHER` — a stale-context re-entry
+is rejected at write time and lands in the generic bucket. A zero row
+for it would read as *evidence of absence* rather than absence of
+evidence, so each source declares the vocabulary it can physically emit
+and the report renders any unrecordable reason as **UNAVAILABLE**. Until
+the reason is added upstream, no `STALE_CONTEXT` figure is trustworthy
+and the report says so instead of printing a confident zero.
 
 > Open contract item, not implemented here because it is a process
 > control rather than an analysis one: adjudication of
@@ -209,6 +264,15 @@ counts in both arms — so the two arms have an identical workload mix by
 construction. An **unknown** control value is its own stratum, never
 folded in with a known one. `MatchResult.dropped` reports exactly how
 many tasks fell out and why.
+
+The stratification key is **joined at report time**, not snapshotted:
+the telemetry store records no `decision_budget`, profile or risk class
+per task, so the key is recomputed from queue metadata rather than read.
+A recomputed key can in principle be recomputed *after* seeing the
+outcome, so the report header names exactly where each key came from
+(`queue_tasks.analysis`, `queue_tasks.metadata`, or a column) and says
+plainly when no per-task snapshot exists. Snapshotting the key per task
+is an upstream ask, not something this tool can fix.
 
 **Risk classes are never pooled.** `HIGH_RISK`, `STANDARD`, `FAST_FIX`
 and `UNKNOWN_RISK` each get their own comparison. There is deliberately
@@ -403,3 +467,10 @@ otherwise produce a plausible-looking number rather than an error:
 * NULL stays unmeasured while a real 0 stays 0
 * tri-state first-pass success keeps `UNKNOWN` out of the denominator
 * a stated `--price-model` assumption is surfaced as a caveat
+* a reason the store cannot record renders UNAVAILABLE, never 0
+* a flattering stored first-pass outcome is overridden by the recomputed
+  one and flagged
+* first-pass success stops being the headline when its denominator
+  depends on the arm
+* `primary_cost_tokens` never renders without `cost_units` in the same
+  row, and a divergence between them is called out inline

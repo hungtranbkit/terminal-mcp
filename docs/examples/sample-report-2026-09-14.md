@@ -1,11 +1,12 @@
 # Before/After Efficiency Benchmark
 
-- Generated: `2026-09-14T08:36:38+00:00` (harness v1.1.0)
+- Generated: `2026-09-14T08:46:43+00:00` (harness v1.1.0)
 - Verdict: **INSUFFICIENT_DATA**
 - Cohort assignment: **observational**
 - Price table: `2026-06-24`, cache-TTL policy `split_required`
 - Tasks loaded from all sources: 0
-- Reporting floor: 10 matched tasks per arm, per risk class
+- Reporting floor: 10 matched, measured tasks per arm, per risk class
+- Stratification key: **joined at report time** — no per-task snapshot of the key exists. The telemetry store records no decision_budget, profile or risk class per task, so the key is recomputed rather than read, and a recomputed key can in principle be recomputed after seeing the outcome.
 
 > **INSUFFICIENT_DATA — no efficiency claim is made anywhere in this report.** No risk class reached 10 matched tasks in both arms. Whatever distributions exist are shown below so the shape of the data is visible; none of them is a result. This report becomes a comparison automatically once the threshold is met — nothing needs to be re-enabled.
 

@@ -109,6 +109,10 @@ FLAG_NO_USAGE = "NO_USAGE"
 FLAG_OUTLIER = "OUTLIER"
 FLAG_UNKNOWN_MODEL_PRICE = "UNKNOWN_MODEL_PRICE"
 FLAG_CACHE_TTL_UNSPLIT = "CACHE_TTL_UNSPLIT"
+# The measured party wrote an outcome that disagrees with the one
+# recomputed from its own turn/re-entry rows. Cheapest anti-gaming
+# signal available without an upstream change.
+FLAG_FPS_DISAGREEMENT = "FPS_DISAGREEMENT"
 
 
 @dataclass(frozen=True)
@@ -273,6 +277,12 @@ class TaskRecord:
     retries: int | None = None
     source: str = "unknown"
     flags: tuple[str, ...] = ()
+    verification_evidence: bool | None = None
+    terminal_status: str | None = None
+    # Where the stratification key came from. A key recomputed at
+    # report time can be recomputed after seeing the outcome, so its
+    # provenance is carried per task and printed, never assumed.
+    profile_source: str | None = None
 
     @property
     def risk_class(self) -> str:
@@ -302,17 +312,73 @@ class TaskRecord:
             counts[key] = counts.get(key, 0) + 1
         return counts
 
+    def counted_reentry_count_excluding(self, reasons: frozenset[str]) -> int:
+        """Counted re-entries with a further set of reasons removed.
+
+        Used to render the comparison both with and WITHOUT
+        `STALE_CONTEXT`: staleness caused by a longer analysis prefix is
+        a genuine downstream cost of the treatment (a mediator), so it
+        belongs in the headline -- but the causal reading differs
+        between the two views and the gap between them is itself
+        informative, so both are shown."""
+        return sum(1 for r in self.counted_reentries if r.reason not in reasons)
+
+    @property
+    def first_pass_success_recomputed(self) -> bool | None:
+        """First-pass success derived HERE from the task's own turn and
+        re-entry rows, rather than read from whatever scalar the
+        measured party wrote about itself.
+
+        `telemetry_tasks.first_pass_success` is a STORED tri-state
+        written by the reporter, not derived -- so the party being
+        measured writes its own outcome. Recomputing it from the
+        underlying rows and flagging disagreement is the cheapest
+        anti-gaming fix available without an upstream change.
+
+        NOTE: this is the THREE-condition definition. The fourth
+        condition of the full contract -- that the task raised no
+        clarification -- cannot be evaluated at all today, because
+        there is no clarification concept anywhere in the telemetry
+        store (no table, no event, no column; the Question Ledger is
+        unbuilt). The report states that rather than letting the
+        definition drift silently."""
+        if self.verification_evidence is False:
+            return None
+        status = (self.terminal_status or "").upper()
+        if not status:
+            return None
+        if status == "CANCELLED":
+            return None
+        if status == "COMPLETED":
+            return self.counted_reentry_count == 0
+        if status == "FAILED":
+            return False
+        return None
+
+    @property
+    def first_pass_success_disagrees(self) -> bool:
+        """The stored outcome and the recomputed one differ."""
+        recomputed = self.first_pass_success_recomputed
+        if recomputed is None or self.first_pass_success is None:
+            return False
+        return recomputed != self.first_pass_success
+
     @property
     def first_pass_success_adjusted(self) -> bool | None:
-        """First-pass success after removing the excluded reasons.
+        """The value the report actually uses.
 
-        A task the runtime marked as NOT first-pass, whose every
-        re-entry carries an excluded reason, counts as a first-pass
-        success here AND gets the `EXCLUDED_REASON_ONLY` flag, so the
-        adjustment is visible in the report rather than assumed.
+        Prefers the recomputed outcome over the stored one. Falls back
+        to the stored value adjusted for excluded reasons: a task the
+        runtime marked NOT first-pass whose every re-entry carries an
+        excluded reason counts as a success AND gets the
+        `EXCLUDED_REASON_ONLY` flag, so the adjustment is visible
+        rather than assumed.
 
-        Stays None when the runtime never recorded first-pass success
-        at all -- a missing flag is not a failure."""
+        Stays None when nothing recorded first-pass success at all --
+        a missing flag is not a failure."""
+        recomputed = self.first_pass_success_recomputed
+        if recomputed is not None:
+            return recomputed
         if self.first_pass_success is None:
             return None
         if self.first_pass_success:
@@ -346,7 +412,12 @@ class TaskRecord:
             "reentries_excluded": len(self.excluded_reentries),
             "reentries_by_reason": self.reentry_counts_by_reason(),
             "first_pass_success": self.first_pass_success,
+            "first_pass_success_recomputed": self.first_pass_success_recomputed,
             "first_pass_success_adjusted": self.first_pass_success_adjusted,
+            "first_pass_success_disagrees": self.first_pass_success_disagrees,
+            "verification_evidence": self.verification_evidence,
+            "terminal_status": self.terminal_status,
+            "profile_source": self.profile_source,
             "duration_seconds": self.duration_seconds,
             "retries": self.retries,
             "source": self.source,

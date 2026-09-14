@@ -48,6 +48,8 @@ def task(
     first_pass: bool | None = True,
     duration: float | None = 600.0,
     retries: int | None = 0,
+    terminal_status: str | None = None,
+    verification_evidence: bool | None = None,
 ) -> TaskRecord:
     return TaskRecord(
         task_id=task_id,
@@ -69,6 +71,8 @@ def task(
         duration_seconds=duration,
         retries=retries,
         source="fixture",
+        terminal_status=terminal_status,
+        verification_evidence=verification_evidence,
     )
 
 
@@ -432,3 +436,192 @@ def test_the_report_round_trips_through_json() -> None:
     payload = json.loads(json.dumps(report.as_dict()))
     assert payload["price_table_version"] == pricing.PRICE_TABLE_VERSION
     assert payload["risk_groups"][0]["risk_class"] == "STANDARD"
+
+
+# --- cross-lane conformance: gaps found by the critic lane against the
+# --- committed telemetry schema (EM-C1..C5)
+
+
+def test_a_reason_the_store_cannot_record_renders_unavailable_not_zero() -> None:
+    """EM-C1. `telemetry_reentries.reason` is CHECK-constrained and does
+    not admit STALE_CONTEXT, so such a re-entry is rejected at write
+    time and lands in OTHER. A zero row for it would read as evidence of
+    absence rather than absence of evidence."""
+    from terminal_mcp.bench.work_telemetry import STORE_REENTRY_REASONS
+
+    report = build_report(cohort_pair(12), reason_vocabulary=STORE_REENTRY_REASONS)
+    assert "STALE_CONTEXT" in report.unavailable_reasons
+    text = render_markdown(report)
+    assert "| `STALE_CONTEXT` | UNAVAILABLE | UNAVAILABLE" in text
+    assert any("REASON_UNAVAILABLE" in warning for warning in report.warnings)
+
+
+def test_a_recordable_reason_is_not_marked_unavailable() -> None:
+    from terminal_mcp.bench.work_telemetry import STORE_REENTRY_REASONS
+
+    report = build_report(cohort_pair(12), reason_vocabulary=STORE_REENTRY_REASONS)
+    assert "CONTRACT_GAP" not in report.unavailable_reasons
+    assert "ENVIRONMENT_FAILURE" not in report.unavailable_reasons
+
+
+def test_without_a_declared_vocabulary_nothing_is_marked_unavailable() -> None:
+    report = build_report(cohort_pair(12))
+    assert report.unavailable_reasons == ()
+
+
+def test_the_three_condition_fps_definition_is_stated(  ) -> None:
+    """EM-C2. There is no clarification concept anywhere in the store,
+    so the contract's fourth condition cannot be evaluated. The report
+    must say the condition is absent rather than let the definition
+    drift silently."""
+    text = render_markdown(build_report(cohort_pair(12)))
+    assert "three-condition" in text
+    assert "cannot be evaluated at all today" in text
+
+
+def test_first_pass_success_is_recomputed_not_read() -> None:
+    """EM-C3. The stored tri-state is written by the party being
+    measured. Recomputing it from that task's own re-entry rows and
+    flagging disagreement is the anti-gaming fix."""
+    honest = task("t1", COHORT_LEGACY, first_pass=True, terminal_status="COMPLETED")
+    assert honest.first_pass_success_recomputed is True
+    assert honest.first_pass_success_disagrees is False
+
+    flattering = TaskRecord(
+        task_id="t2",
+        cohort=COHORT_LEGACY,
+        first_pass_success=True,           # what the reporter claimed
+        terminal_status="COMPLETED",
+        reentries=(Reentry(reason="CONTRACT_GAP"),),  # what actually happened
+    )
+    assert flattering.first_pass_success_recomputed is False
+    assert flattering.first_pass_success_disagrees is True
+    assert flattering.first_pass_success_adjusted is False, "the recomputed value wins"
+
+
+def test_cancelled_tasks_leave_the_denominator() -> None:
+    record = TaskRecord(task_id="t1", cohort=COHORT_LEGACY, terminal_status="CANCELLED")
+    assert record.first_pass_success_recomputed is None
+    assert record.first_pass_success_adjusted is None
+
+
+def test_unverified_tasks_are_unscoreable_even_with_a_terminal_status() -> None:
+    record = TaskRecord(
+        task_id="t1",
+        cohort=COHORT_LEGACY,
+        terminal_status="COMPLETED",
+        verification_evidence=False,
+    )
+    assert record.first_pass_success_recomputed is None
+
+
+def test_disagreement_is_counted_and_warned_per_group() -> None:
+    records = [
+        TaskRecord(
+            task_id=f"L{i}",
+            cohort=COHORT_LEGACY,
+            profile="STANDARD",
+            complexity="medium",
+            project="p1",
+            first_pass_success=True,
+            terminal_status="COMPLETED",
+            reentries=(Reentry(reason="CONTRACT_GAP"),),
+            worker_turn_count=4,
+        )
+        for i in range(12)
+    ]
+    records += [task(f"N{i}", COHORT_NEW, terminal_status="COMPLETED") for i in range(12)]
+    report = build_report(records, assignment=ASSIGNMENT_RANDOMISED)
+    group = report.groups[0]
+    assert group.coverage[COHORT_LEGACY].first_pass_disagreements == 12
+    assert any("FPS_DISAGREEMENT" in warning for warning in group.warnings)
+    assert "disagrees with the value recomputed" in render_markdown(report)
+
+
+def test_the_stratification_key_join_is_named_in_the_header() -> None:
+    """EM-C4. The key is recomputed at report time, and a recomputed key
+    can be recomputed after seeing the outcome. Say where it came from."""
+    records = [
+        TaskRecord(task_id=f"L{i}", cohort=COHORT_LEGACY, profile="STANDARD",
+                   profile_source="queue_tasks.analysis")
+        for i in range(12)
+    ]
+    text = render_markdown(build_report(records))
+    assert "joined at report time" in text
+    assert "queue_tasks.analysis" in text
+    assert "no per-task snapshot of the key exists" in render_markdown(build_report(cohort_pair(4)))
+
+
+def test_fps_stops_being_the_headline_when_its_denominator_depends_on_the_arm() -> None:
+    """EM-C5, the structural one. The HIGH decision-budget arm is
+    required by its own contract to carry a verification plan, so it is
+    systematically more likely to record the evidence that makes a task
+    scoreable at all — which inflates its apparent first-pass success by
+    selecting well-run control tasks out of the denominator."""
+    records = [task(f"L{i}", COHORT_LEGACY, first_pass=None) for i in range(20)]
+    records += [task(f"L{i}s", COHORT_LEGACY, first_pass=True) for i in range(5)]
+    records += [task(f"N{i}", COHORT_NEW, first_pass=True) for i in range(25)]
+    report = build_report(records, assignment=ASSIGNMENT_RANDOMISED)
+    group = report.groups[0]
+    assert group.headline_metric == "worker_turn_count"
+    assert any("FPS_COVERAGE_DIFFERS_BY_ARM" in warning for warning in group.warnings)
+    text = render_markdown(report)
+    assert "Headline metric for this class: `worker_turn_count`" in text
+    assert "scoreable for" in text
+
+
+def test_fps_stays_the_headline_when_coverage_matches() -> None:
+    report = build_report(cohort_pair(25), assignment=ASSIGNMENT_RANDOMISED)
+    assert report.groups[0].headline_metric == "first_pass_success"
+
+
+def test_fps_rate_is_never_rendered_without_its_coverage() -> None:
+    text = render_markdown(build_report(cohort_pair(12)))
+    assert "| — scoreable for |" in text
+
+
+def test_primary_cost_tokens_never_renders_without_cost_units_beside_it() -> None:
+    """The critic lane's one condition for keeping the brief's metric."""
+    text = render_markdown(build_report(cohort_pair(12), assignment=ASSIGNMENT_RANDOMISED))
+    row = next(line for line in text.splitlines() if "primary_cost_tokens (input" in line)
+    assert "vs cost_units:" in row
+
+
+def test_a_divergence_between_the_paired_metrics_is_called_out() -> None:
+    """The demo case: the new arm shifts spend into output, so
+    primary_cost_tokens shows a saving while real cost rises."""
+    records = [
+        task(f"L{i}", COHORT_LEGACY, input_tokens=6000, output_tokens=8000, cache_write_5m=4000)
+        for i in range(20)
+    ]
+    records += [
+        task(f"N{i}", COHORT_NEW, input_tokens=3000, output_tokens=20000, cache_write_5m=3000)
+        for i in range(20)
+    ]
+    report = build_report(records, assignment=ASSIGNMENT_RANDOMISED)
+    group = report.groups[0]
+    primary = next(c for c in group.comparisons if c.metric.key == "primary_cost_tokens")
+    cost = next(c for c in group.comparisons if c.metric.key == "cost_units")
+    assert primary.legacy.median > primary.new.median, "brief metric says the new arm is cheaper"
+    assert cost.legacy.median < cost.new.median, "real cost says it is more expensive"
+    assert "disagrees with cost_units" in render_markdown(report)
+
+
+def test_stale_context_is_reported_both_in_and_out_of_the_comparison() -> None:
+    from terminal_mcp.bench.model import STALE_CONTEXT
+
+    records = [
+        task(f"L{i}", COHORT_LEGACY, first_pass=False, reentries=(Reentry(reason="CONTRACT_GAP"),))
+        for i in range(12)
+    ]
+    records += [
+        task(f"N{i}", COHORT_NEW, first_pass=False, reentries=(Reentry(reason=STALE_CONTEXT),))
+        for i in range(12)
+    ]
+    report = build_report(records, assignment=ASSIGNMENT_RANDOMISED)
+    group = report.groups[0]
+    with_stale = next(c for c in group.comparisons if c.metric.key == "reentries")
+    without_stale = next(c for c in group.comparisons if c.metric.key == "reentries_excl_stale")
+    assert with_stale.new.median == 1.0, "staleness is a real downstream cost of the treatment"
+    assert without_stale.new.median == 0.0
+    assert with_stale.legacy.median == without_stale.legacy.median == 1.0

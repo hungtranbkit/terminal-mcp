@@ -177,13 +177,20 @@ def run(argv: Sequence[str] | None = None) -> int:
     groups: list[tuple] = []
     statuses = []
     warnings: list[str] = []
+    vocabularies: list[frozenset[str]] = []
     for source in _collect_sources(args, cohort_map):
         result = source.load()
         statuses.append(result.status)
         warnings.extend(result.warnings)
+        if result.reason_vocabulary is not None and result.status.available:
+            vocabularies.append(result.reason_vocabulary)
         if result.records:
             groups.append(result.records)
     records = sources_module.merge_records(groups)
+    # A reason is recordable if ANY contributing source admits it; it is
+    # unavailable only when every source that declares a vocabulary
+    # rejects it.
+    reason_vocabulary = frozenset().union(*vocabularies) if vocabularies else None
 
     notes = [
         "Sources listed as unavailable are reported, not silently skipped — an empty comparison "
@@ -198,6 +205,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             assignment=args.assignment,
             ttl_policy=args.cache_ttl_policy,
             min_matched_per_group=args.min_matched,
+            reason_vocabulary=reason_vocabulary,
             notes=notes,
         )
     except ValueError as exc:

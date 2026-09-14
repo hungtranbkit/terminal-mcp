@@ -1,11 +1,12 @@
 # Before/After Efficiency Benchmark
 
-- Generated: `2026-09-14T08:36:54+00:00` (harness v1.1.0)
+- Generated: `2026-09-14T08:46:43+00:00` (harness v1.1.0)
 - Verdict: **COMPARISON_AVAILABLE**
 - Cohort assignment: **randomised**
 - Price table: `2026-06-24`, cache-TTL policy `split_required`
 - Tasks loaded from all sources: 180
-- Reporting floor: 10 matched tasks per arm, per risk class
+- Reporting floor: 10 matched, measured tasks per arm, per risk class
+- Stratification key: **joined at report time** — no per-task snapshot of the key exists. The telemetry store records no decision_budget, profile or risk class per task, so the key is recomputed rather than read, and a recomputed key can in principle be recomputed after seeing the outcome.
 
 ## Sources
 
@@ -29,8 +30,13 @@
 | Matched tasks | 45 | 45 |
 | Complete token telemetry | 45 | 45 |
 | Priceable (cost units computable) | 45 | 45 |
-| First-pass success (verified only) | 24% (45 known) | 58% (45 known) |
+| First-pass success (verified only) | 24% | 58% |
+| — scoreable for | 100% (45/45) | 100% (45/45) |
 | Re-entries from excluded reasons only | 2 | 5 |
+
+**Headline metric for this class: `first_pass_success`.** First-pass success is scoreable at a similar rate in both arms.
+
+First-pass success is measured on the **three-condition** definition (completed, verified, no counted re-entries). The contract's fourth condition — that the task raised no clarification — **cannot be evaluated at all today**: there is no clarification concept in the telemetry store, so the Question Ledger condition is absent rather than satisfied.
 
 First-pass success above is **descriptive only** — a 40%→60% shift needs roughly 100 matched tasks per arm under randomisation before a direction can be claimed.
 
@@ -41,7 +47,8 @@ Tasks left out: surplus in stratum 0, unknown cohort 0, unmatched stratum 0.
 | Cost (base-input-equivalents) ⭐ decision metric | 76,182.50 [65,363.75–88,870.10] (n=45) | 105,457.15 [93,290.20–117,292.70] (n=45) | no measurable difference |
 | Worker turns ◆ primary statistical metric | 7 [5–8] (n=45) | 3 [2–4] (n=45) | **28.6%** |
 | Re-entries (excluded reasons removed) | 1 [0–1] (n=45) | 0 [0–0] (n=45) | no measurable difference |
-| primary_cost_tokens (input + cache write) | 13,778 [11,717–15,842] (n=45) | 11,547 [9,358–13,577] (n=45) | **3.5%** |
+| Re-entries, also excluding STALE_CONTEXT | 1 [0–1] (n=45) | 0 [0–0] (n=45) | no measurable difference |
+| primary_cost_tokens (input + cache write) | 13,778 [11,717–15,842] (n=45)<br>vs cost_units: 76,182.50 | 11,547 [9,358–13,577] (n=45)<br>vs cost_units: 105,457.15 | **3.5%**<br>⚠ disagrees with cost_units, which is the metric decisions use |
 | Input tokens (uncached remainder) | 6,259 [4,333–7,551] (n=45) | 3,260 [2,549–4,117] (n=45) | **31.3%** |
 | Output tokens | 9,374 [8,009–11,762] (n=45) | 15,695 [13,173–17,677] (n=45) | no measurable difference |
 | Cache read tokens | 141,503 [108,714–161,414] (n=45) | 131,848 [110,145–170,551] (n=45) | no measurable difference |
@@ -67,8 +74,13 @@ Tasks left out: surplus in stratum 0, unknown cohort 0, unmatched stratum 0.
 | Matched tasks | 45 | 45 |
 | Complete token telemetry | 45 | 45 |
 | Priceable (cost units computable) | 45 | 45 |
-| First-pass success (verified only) | 18% (45 known) | 51% (45 known) |
+| First-pass success (verified only) | 18% | 51% |
+| — scoreable for | 100% (45/45) | 100% (45/45) |
 | Re-entries from excluded reasons only | 2 | 5 |
+
+**Headline metric for this class: `first_pass_success`.** First-pass success is scoreable at a similar rate in both arms.
+
+First-pass success is measured on the **three-condition** definition (completed, verified, no counted re-entries). The contract's fourth condition — that the task raised no clarification — **cannot be evaluated at all today**: there is no clarification concept in the telemetry store, so the Question Ledger condition is absent rather than satisfied.
 
 First-pass success above is **descriptive only** — a 40%→60% shift needs roughly 100 matched tasks per arm under randomisation before a direction can be claimed.
 
@@ -79,7 +91,8 @@ Tasks left out: surplus in stratum 0, unknown cohort 0, unmatched stratum 0.
 | Cost (base-input-equivalents) ⭐ decision metric | 77,476.10 [71,688.35–87,780.20] (n=45) | 98,082.05 [91,150.10–113,377.40] (n=45) | no measurable difference |
 | Worker turns ◆ primary statistical metric | 6 [5–8] (n=45) | 4 [3–5] (n=45) | **33.3%** |
 | Re-entries (excluded reasons removed) | 0 [0–1] (n=45) | 0 [0–0] (n=45) | — |
-| primary_cost_tokens (input + cache write) | 13,580 [11,716–15,307] (n=45) | 11,383 [10,071–13,292] (n=45) | **4.5%** |
+| Re-entries, also excluding STALE_CONTEXT | 0 [0–1] (n=45) | 0 [0–0] (n=45) | — |
+| primary_cost_tokens (input + cache write) | 13,580 [11,716–15,307] (n=45)<br>vs cost_units: 77,476.10 | 11,383 [10,071–13,292] (n=45)<br>vs cost_units: 98,082.05 | **4.5%**<br>⚠ disagrees with cost_units, which is the metric decisions use |
 | Input tokens (uncached remainder) | 5,350 [4,130–6,526] (n=45) | 3,182 [2,826–4,206] (n=45) | **21.3%** |
 | Output tokens | 9,978 [7,931–11,756] (n=45) | 13,986 [12,361–17,463] (n=45) | no measurable difference |
 | Cache read tokens | 137,019 [110,691–160,817] (n=45) | 143,326 [132,160–168,629] (n=45) | no measurable difference |

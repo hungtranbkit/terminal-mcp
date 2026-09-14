@@ -306,3 +306,81 @@ def test_empty_store_says_empty_not_absent(tmp_path: Path) -> None:
     result = WorkTelemetryDbSource(path).load()
     assert result.status.available is True
     assert "no worker has written a row yet" in result.status.detail
+
+
+def test_the_store_declares_the_reason_vocabulary_it_can_record(tmp_path: Path) -> None:
+    """EM-C1 at the source: the adapter publishes the CHECK-constrained
+    enum so the report can mark what the store physically cannot say."""
+    from terminal_mcp.bench.model import STALE_CONTEXT
+    from terminal_mcp.bench.work_telemetry import STORE_REENTRY_REASONS
+
+    path = build(tmp_path / "work_telemetry.db", [base_task("t1")], [], [])
+    result = WorkTelemetryDbSource(path).load()
+    assert result.reason_vocabulary == STORE_REENTRY_REASONS
+    assert STALE_CONTEXT not in result.reason_vocabulary
+    assert "CONTRACT_GAP" in result.reason_vocabulary
+
+
+def test_a_missing_store_declares_no_vocabulary(tmp_path: Path) -> None:
+    assert WorkTelemetryDbSource(tmp_path / "absent.db").load().reason_vocabulary is None
+
+
+def test_a_flattering_stored_outcome_is_overridden_and_flagged(tmp_path: Path) -> None:
+    """EM-C3: the reporter writes its own outcome, so it is recomputed
+    from that task's own re-entry rows and disagreement is flagged."""
+    from terminal_mcp.bench.model import FLAG_FPS_DISAGREEMENT
+
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1", first_pass_success="TRUE", reentry_count=1)],
+        [],
+        [{"task_id": "t1", "reason": "CONTRACT_GAP", "phase": "IMPLEMENTATION",
+          "occurred_at": "2026-09-14T00:05:00+00:00", "detail": ""}],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.first_pass_success is True, "what the reporter claimed"
+    assert record.first_pass_success_recomputed is False, "what its own rows say"
+    assert record.first_pass_success_adjusted is False
+    assert FLAG_FPS_DISAGREEMENT in record.flags
+
+
+def test_an_honest_stored_outcome_is_not_flagged(tmp_path: Path) -> None:
+    from terminal_mcp.bench.model import FLAG_FPS_DISAGREEMENT
+
+    path = build(tmp_path / "work_telemetry.db", [base_task("t1")], [], [])
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.first_pass_success_recomputed is True
+    assert FLAG_FPS_DISAGREEMENT not in record.flags
+
+
+def test_excluded_reasons_do_not_make_a_task_fail_on_recompute(tmp_path: Path) -> None:
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1", first_pass_success="FALSE", reentry_count=1)],
+        [],
+        [{"task_id": "t1", "reason": "ENVIRONMENT_FAILURE", "phase": "IMPLEMENTATION",
+          "occurred_at": "2026-09-14T00:05:00+00:00", "detail": ""}],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.first_pass_success_recomputed is True
+    assert record.has_excluded_reason_only is True
+
+
+def test_cancelled_leaves_the_denominator_on_recompute(tmp_path: Path) -> None:
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1", first_pass_success="UNKNOWN", terminal_status="CANCELLED")],
+        [],
+        [],
+    )
+    assert WorkTelemetryDbSource(path).load().records[0].first_pass_success_adjusted is None
+
+
+def test_failed_tasks_recompute_as_not_first_pass(tmp_path: Path) -> None:
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1", first_pass_success="FALSE", terminal_status="FAILED")],
+        [],
+        [],
+    )
+    assert WorkTelemetryDbSource(path).load().records[0].first_pass_success_recomputed is False

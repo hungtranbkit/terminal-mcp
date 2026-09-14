@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-14T08:36:38+00:00",
+  "generated_at": "2026-09-14T08:46:43+00:00",
   "harness_version": "1.1.0",
   "price_table_version": "2026-06-24",
   "assignment": "observational",
@@ -7,6 +7,8 @@
   "verdict": "INSUFFICIENT_DATA",
   "min_matched_per_group": 10,
   "loaded_tasks": 0,
+  "unavailable_reentry_reasons": [],
+  "stratification_key_sources": [],
   "sources": [
     {
       "name": "queue.db",

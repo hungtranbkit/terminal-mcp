@@ -48,12 +48,15 @@ from .model import (
     COHORT_LEGACY,
     COHORT_NEW,
     EXCLUDED_REENTRY_REASONS,
+    KNOWN_REENTRY_REASONS,
     FLAG_CACHE_TTL_UNSPLIT,
     FLAG_EXCLUDED_REASON_ONLY,
+    FLAG_FPS_DISAGREEMENT,
     FLAG_INCOMPLETE_USAGE,
     FLAG_NO_USAGE,
     FLAG_UNKNOWN_MODEL_PRICE,
     RISK_CLASSES,
+    STALE_CONTEXT,
     TTL_SPLIT_REQUIRED,
     SourceStatus,
     TaskRecord,
@@ -82,6 +85,9 @@ ASSIGNMENT_OBSERVATIONAL = "observational"
 ASSIGNMENTS = (ASSIGNMENT_RANDOMISED, ASSIGNMENT_INTERLEAVED, ASSIGNMENT_OBSERVATIONAL)
 
 MIN_USAGE_COVERAGE = 0.80
+# Gap in first-pass-success scoreability between arms above which the
+# headline moves off that metric entirely.
+FPS_COVERAGE_GAP = 0.10
 
 
 @dataclass(frozen=True)
@@ -94,6 +100,12 @@ class Metric:
     headline: bool = False
     primary: bool = False
     note: str = ""
+    # Render this metric's cells alongside another metric's, so the two
+    # can never be quoted apart. primary_cost_tokens is paired with
+    # cost_units for exactly that reason: on the same cohort they can
+    # point in opposite directions, and seeing one without the other is
+    # how the refuted metric comes back.
+    paired_with: str | None = None
 
 
 def _cost_units(ttl_policy: str) -> Callable[[TaskRecord], float | None]:
@@ -126,11 +138,23 @@ def build_metrics(ttl_policy: str = TTL_SPLIT_REQUIRED) -> tuple[Metric, ...]:
             unit="re-entries",
         ),
         Metric(
+            "reentries_excl_stale",
+            "Re-entries, also excluding STALE_CONTEXT",
+            lambda r: float(r.counted_reentry_count_excluding(frozenset({STALE_CONTEXT})))
+            if r.reentries or r.worker_turn_count is not None
+            else None,
+            unit="re-entries",
+            note="staleness caused by a longer analysis prefix is a downstream cost of the "
+            "treatment (a mediator), not a confounder -- so the row above keeps it. The gap "
+            "between the two rows is the part of rework attributable to carrying more context",
+        ),
+        Metric(
             "primary_cost_tokens",
             "primary_cost_tokens (input + cache write)",
             lambda r: _f(r.usage.primary_cost_tokens),
             note="raw diagnostic from the original brief; NOT decided on -- it sums tokens of "
             "different unit cost and omits output, which biases it toward the up-front arm",
+            paired_with="cost_units",
         ),
         Metric("input_tokens", "Input tokens (uncached remainder)", lambda r: _f(r.usage.input_tokens)),
         Metric("output_tokens", "Output tokens", lambda r: _f(r.usage.output_tokens)),
@@ -200,6 +224,22 @@ class GroupCoverage:
     excluded_reason_only: int
     first_pass_known: int
     first_pass_successes: int
+    first_pass_disagreements: int
+
+    @property
+    def first_pass_coverage(self) -> float | None:
+        """Share of matched tasks whose first-pass outcome is scoreable
+        at all. A first-class result, not a footnote: the HIGH
+        decision-budget arm is required by its own contract to carry a
+        live verification plan, so it is systematically MORE likely to
+        record the evidence that makes a task scoreable. The treatment
+        therefore changes the probability a task can be measured on the
+        very metric being compared, and the direction is predictable --
+        it selects well-run control-arm tasks out of the denominator and
+        inflates the treatment arm's apparent first-pass success. That
+        is structural, not an accident, so the rate is never printed
+        without this number beside it."""
+        return None if self.matched == 0 else self.first_pass_known / self.matched
 
     @property
     def usage_coverage(self) -> float | None:
@@ -218,6 +258,8 @@ class GroupCoverage:
             "excluded_reason_only": self.excluded_reason_only,
             "first_pass_known": self.first_pass_known,
             "first_pass_successes": self.first_pass_successes,
+            "first_pass_disagreements": self.first_pass_disagreements,
+            "first_pass_coverage": self.first_pass_coverage,
             "usage_coverage": self.usage_coverage,
             "first_pass_success_rate_percent": self.first_pass_rate,
         }
@@ -236,11 +278,13 @@ class RiskGroupReport:
     comparisons: tuple[MetricComparison, ...]
     cost_ratio: float | None
     reentry_reasons: dict[str, dict[str, int]]
+    headline_metric: str
     warnings: tuple[str, ...]
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "risk_class": self.risk_class,
+            "headline_metric": self.headline_metric,
             "verdict": self.verdict,
             "confidence": self.confidence,
             "directional_claim_allowed": self.directional_claim_allowed,
@@ -265,6 +309,8 @@ class BenchmarkReport:
     sources: tuple[SourceStatus, ...]
     groups: tuple[RiskGroupReport, ...]
     loaded_tasks: int
+    unavailable_reasons: tuple[str, ...]
+    profile_sources: tuple[str, ...]
     warnings: tuple[str, ...]
     notes: tuple[str, ...] = ()
 
@@ -278,6 +324,8 @@ class BenchmarkReport:
             "verdict": self.verdict,
             "min_matched_per_group": self.min_matched_per_group,
             "loaded_tasks": self.loaded_tasks,
+            "unavailable_reentry_reasons": list(self.unavailable_reasons),
+            "stratification_key_sources": list(self.profile_sources),
             "sources": [status.as_dict() for status in self.sources],
             "risk_groups": [group.as_dict() for group in self.groups],
             "warnings": list(self.warnings),
@@ -295,6 +343,7 @@ def _coverage(records: Sequence[TaskRecord], ttl_policy: str) -> GroupCoverage:
         excluded_reason_only=sum(1 for r in records if r.has_excluded_reason_only),
         first_pass_known=len(known),
         first_pass_successes=sum(1 for value in known if value),
+        first_pass_disagreements=sum(1 for r in records if r.first_pass_success_disagrees),
     )
 
 
@@ -370,6 +419,35 @@ def _build_group(
             f"{measured_per_group} carry telemetry; the floor counts measured tasks, so no "
             "comparison is stated"
         )
+    # First-pass success is the headline outcome only while its
+    # denominator does not depend on the arm. Where scoreability
+    # differs between arms, the headline moves to worker turns, whose
+    # denominator is every matched task regardless of treatment.
+    legacy_fps_coverage = coverage[COHORT_LEGACY].first_pass_coverage
+    new_fps_coverage = coverage[COHORT_NEW].first_pass_coverage
+    headline_metric = "first_pass_success"
+    if (
+        legacy_fps_coverage is not None
+        and new_fps_coverage is not None
+        and abs(legacy_fps_coverage - new_fps_coverage) > FPS_COVERAGE_GAP
+    ):
+        headline_metric = "worker_turn_count"
+        warnings.append(
+            f"FPS_COVERAGE_DIFFERS_BY_ARM: first-pass success is scoreable for "
+            f"{legacy_fps_coverage:.0%} of matched legacy tasks and {new_fps_coverage:.0%} of "
+            f"new-pipeline tasks in {risk_class}. The treatment changes the probability a task "
+            "can be measured on this metric, which inflates the better-instrumented arm's "
+            "apparent rate; the headline moves to worker turns, whose denominator does not "
+            "depend on the arm"
+        )
+    disagreements = sum(group.first_pass_disagreements for group in coverage.values())
+    if disagreements:
+        warnings.append(
+            f"FPS_DISAGREEMENT: the stored first-pass outcome disagrees with the one recomputed "
+            f"from the task's own re-entry rows on {disagreements} matched task(s) in "
+            f"{risk_class}; the recomputed value is the one used"
+        )
+
     legacy_share = coverage[COHORT_LEGACY].usage_coverage
     new_share = coverage[COHORT_NEW].usage_coverage
     if legacy_share is not None and new_share is not None and abs(legacy_share - new_share) > 0.20:
@@ -454,6 +532,7 @@ def _build_group(
             COHORT_LEGACY: _reason_totals(legacy),
             COHORT_NEW: _reason_totals(new),
         },
+        headline_metric=headline_metric,
         warnings=tuple(dict.fromkeys(warnings)),
     )
 
@@ -484,6 +563,7 @@ def build_report(
     ttl_policy: str = TTL_SPLIT_REQUIRED,
     min_matched_per_group: int = MIN_MATCHED_PER_GROUP,
     bootstrap_seed: int = stats.DEFAULT_BOOTSTRAP_SEED,
+    reason_vocabulary: frozenset[str] | None = None,
     notes: Sequence[str] = (),
 ) -> BenchmarkReport:
     if assignment not in ASSIGNMENTS:
@@ -521,6 +601,25 @@ def build_report(
         if any(group.verdict == "COMPARISON_AVAILABLE" for group in groups)
         else INSUFFICIENT
     )
+    # Reasons this harness knows about that no contributing source can
+    # physically record. They must render as UNAVAILABLE, never as a
+    # zero row -- a structurally-always-zero row reads as evidence of
+    # absence rather than absence of evidence.
+    unavailable = (
+        tuple(sorted(KNOWN_REENTRY_REASONS - reason_vocabulary))
+        if reason_vocabulary is not None
+        else ()
+    )
+    collected_warnings = list(warnings)
+    if unavailable:
+        collected_warnings.append(
+            "REASON_UNAVAILABLE: the telemetry store's reason column is CHECK-constrained and "
+            f"cannot record {', '.join(unavailable)}; such a re-entry is rejected at write time "
+            "and lands in OTHER. Those rows are shown as UNAVAILABLE, not as zero"
+        )
+    profile_sources = tuple(
+        sorted({record.profile_source for record in all_records if record.profile_source})
+    )
     return BenchmarkReport(
         generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         harness_version=HARNESS_VERSION,
@@ -532,7 +631,9 @@ def build_report(
         sources=tuple(sources),
         groups=groups,
         loaded_tasks=len(all_records),
-        warnings=tuple(dict.fromkeys(warnings)),
+        unavailable_reasons=unavailable,
+        profile_sources=profile_sources,
+        warnings=tuple(dict.fromkeys(collected_warnings)),
         notes=tuple(notes),
     )
 
@@ -568,6 +669,10 @@ def _percent(value: float | None) -> str:
     return "—" if value is None else f"{value:.0f}%"
 
 
+def _share(value: float | None) -> float | None:
+    return None if value is None else value * 100.0
+
+
 def render_markdown(report: BenchmarkReport) -> str:
     lines: list[str] = []
     lines.append("# Before/After Efficiency Benchmark")
@@ -578,7 +683,19 @@ def render_markdown(report: BenchmarkReport) -> str:
     lines.append(f"- Price table: `{report.price_table_version}`, cache-TTL policy `{report.ttl_policy}`")
     lines.append(f"- Tasks loaded from all sources: {report.loaded_tasks}")
     lines.append(
-        f"- Reporting floor: {report.min_matched_per_group} matched tasks per arm, per risk class"
+        f"- Reporting floor: {report.min_matched_per_group} matched, measured tasks per arm, "
+        "per risk class"
+    )
+    lines.append(
+        "- Stratification key: **joined at report time**"
+        + (
+            f" from {', '.join(report.profile_sources)}"
+            if report.profile_sources
+            else " — no per-task snapshot of the key exists"
+        )
+        + ". The telemetry store records no decision_budget, profile or risk class per task, so "
+        "the key is recomputed rather than read, and a recomputed key can in principle be "
+        "recomputed after seeing the outcome."
     )
     lines.append("")
 
@@ -609,7 +726,7 @@ def render_markdown(report: BenchmarkReport) -> str:
         lines.append("No tasks were loaded, so there is nothing to stratify.")
         lines.append("")
     for group in report.groups:
-        lines.extend(_render_group(group))
+        lines.extend(_render_group(group, report.unavailable_reasons))
 
     if report.warnings:
         lines.append("## Warnings")
@@ -660,7 +777,18 @@ def render_markdown(report: BenchmarkReport) -> str:
     return "\n".join(lines)
 
 
-def _render_group(group: RiskGroupReport) -> list[str]:
+def _points_opposite(left: MetricComparison, right: MetricComparison) -> bool:
+    """True when two paired metrics disagree about which arm is better
+    -- the exact failure mode that got primary_cost_tokens demoted."""
+    for pair in ((left.legacy, left.new), (right.legacy, right.new)):
+        if pair[0].median is None or pair[1].median is None:
+            return False
+    left_delta = left.legacy.median - left.new.median
+    right_delta = right.legacy.median - right.new.median
+    return (left_delta > 0) != (right_delta > 0)
+
+
+def _render_group(group: RiskGroupReport, unavailable_reasons: Sequence[str] = ()) -> list[str]:
     lines: list[str] = []
     lines.append(f"## Risk class: {group.risk_class}")
     lines.append("")
@@ -689,21 +817,46 @@ def _render_group(group: RiskGroupReport) -> list[str]:
     lines.append(f"| Priceable (cost units computable) | {legacy_cov.priceable} | {new_cov.priceable} |")
     lines.append(
         f"| First-pass success (verified only) | {_percent(legacy_cov.first_pass_rate)} "
-        f"({legacy_cov.first_pass_known} known) | {_percent(new_cov.first_pass_rate)} "
-        f"({new_cov.first_pass_known} known) |"
+        f"| {_percent(new_cov.first_pass_rate)} |"
+    )
+    lines.append(
+        f"| — scoreable for | {_percent(_share(legacy_cov.first_pass_coverage))} "
+        f"({legacy_cov.first_pass_known}/{legacy_cov.matched}) "
+        f"| {_percent(_share(new_cov.first_pass_coverage))} "
+        f"({new_cov.first_pass_known}/{new_cov.matched}) |"
     )
     lines.append(
         f"| Re-entries from excluded reasons only | {legacy_cov.excluded_reason_only} "
         f"| {new_cov.excluded_reason_only} |"
     )
     binary_ok = _band(min(len(group.match.legacy), len(group.match.new)))[2]
-    if group.directional_claim_allowed and binary_ok:
+    lines.append("")
+    lines.append(
+        f"**Headline metric for this class: `{group.headline_metric}`.** "
+        + (
+            "First-pass success is scoreable at a similar rate in both arms."
+            if group.headline_metric == "first_pass_success"
+            else "First-pass success is scoreable at materially different rates in the two arms, "
+            "so its denominator depends on the treatment; worker turns are the headline instead."
+        )
+    )
+    lines.append("")
+    lines.append(
+        "First-pass success is measured on the **three-condition** definition (completed, "
+        "verified, no counted re-entries). The contract's fourth condition — that the task "
+        "raised no clarification — **cannot be evaluated at all today**: there is no "
+        "clarification concept in the telemetry store, so the Question Ledger condition is "
+        "absent rather than satisfied."
+    )
+    if legacy_cov.first_pass_disagreements or new_cov.first_pass_disagreements:
         lines.append("")
         lines.append(
-            "First-pass success is powered for a directional claim in this class "
-            f"({min(len(group.match.legacy), len(group.match.new))} matched tasks per arm)."
+            f"The stored first-pass outcome disagrees with the value recomputed from the task's "
+            f"own re-entry rows on {legacy_cov.first_pass_disagreements} legacy and "
+            f"{new_cov.first_pass_disagreements} new-pipeline task(s). The recomputed value is "
+            "used; the stored one is written by the party being measured."
         )
-    else:
+    if not (group.directional_claim_allowed and binary_ok):
         lines.append("")
         lines.append(
             "First-pass success above is **descriptive only** — a 40%→60% shift needs roughly "
@@ -716,10 +869,12 @@ def _render_group(group: RiskGroupReport) -> list[str]:
         + "."
     )
     lines.append("")
+    by_key = {comparison.metric.key: comparison for comparison in group.comparisons}
     lines.append("| Metric | Legacy | New pipeline | Conservative saving |")
     lines.append("| --- | --- | --- | --- |")
     for comparison in group.comparisons:
         unit = comparison.metric.unit
+        pair = by_key.get(comparison.metric.paired_with or "")
         if comparison.reported:
             estimate = comparison.savings
             if estimate.reported_percent is None:
@@ -735,17 +890,32 @@ def _render_group(group: RiskGroupReport) -> list[str]:
             label += " ⭐ decision metric"
         elif comparison.metric.primary:
             label += " ◆ primary statistical metric"
-        lines.append(
-            f"| {label} | {_summary_cell(comparison.legacy, unit)} "
-            f"| {_summary_cell(comparison.new, unit)} | {saving} |"
-        )
+        legacy_cell = _summary_cell(comparison.legacy, unit)
+        new_cell = _summary_cell(comparison.new, unit)
+        if pair is not None:
+            # Never let the paired metrics be quoted apart.
+            legacy_cell += f"<br>vs {pair.metric.key}: {_number(pair.legacy.median, pair.metric.unit)}"
+            new_cell += f"<br>vs {pair.metric.key}: {_number(pair.new.median, pair.metric.unit)}"
+            if _points_opposite(comparison, pair):
+                saving += (
+                    f"<br>⚠ disagrees with {pair.metric.key}, which is the metric decisions "
+                    "use"
+                )
+        lines.append(f"| {label} | {legacy_cell} | {new_cell} | {saving} |")
     lines.append("")
-    reasons = sorted(set(group.reentry_reasons[COHORT_LEGACY]) | set(group.reentry_reasons[COHORT_NEW]))
+    observed = set(group.reentry_reasons[COHORT_LEGACY]) | set(group.reentry_reasons[COHORT_NEW])
+    reasons = sorted(observed | set(unavailable_reasons))
     if reasons:
         lines.append("| Re-entry reason | Legacy | New pipeline | Counted |")
         lines.append("| --- | ---: | ---: | --- |")
         for reason in reasons:
             counted = "no — reported separately" if reason in EXCLUDED_REENTRY_REASONS else "yes"
+            if reason in unavailable_reasons:
+                lines.append(
+                    f"| `{reason}` | UNAVAILABLE | UNAVAILABLE | the store cannot record this "
+                    "reason; such a re-entry lands in `OTHER` |"
+                )
+                continue
             lines.append(
                 f"| `{reason}` | {group.reentry_reasons[COHORT_LEGACY].get(reason, 0)} "
                 f"| {group.reentry_reasons[COHORT_NEW].get(reason, 0)} | {counted} |"

@@ -410,6 +410,11 @@ class SourceResult:
     records: tuple[TaskRecord, ...] = ()
     usage_by_task: dict[str, TaskUsage] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    # The closed set of re-entry reasons this source can physically
+    # emit, where it has one. It matters because a reason the store
+    # cannot record renders as a zero row, and a zero row reads as
+    # evidence of absence rather than absence of evidence.
+    reason_vocabulary: frozenset[str] | None = None
 
 
 class BenchSource:
@@ -591,6 +596,14 @@ class QueueDbSource(BenchSource):
         if worker_turn_count is None and dispatch_keys is not None:
             worker_turn_count = len(dispatch_keys)
         retries = None if worker_turn_count is None else max(0, worker_turn_count - 1)
+        profile = as_text(_dig(analysis, PROFILE_COLUMNS))
+        profile_source = "queue_tasks.analysis" if profile else None
+        if profile is None:
+            profile = as_text(_dig(metadata, PROFILE_COLUMNS))
+            profile_source = "queue_tasks.metadata" if profile else None
+        if profile is None:
+            profile = as_text(cell(row, pick(columns, PROFILE_COLUMNS)))
+            profile_source = "queue_tasks column" if profile else None
         task_reentries = tuple(reentries.get(task_id, ()))
         first_pass = as_bool(_dig(metadata, FIRST_PASS_COLUMNS))
         if first_pass is None:
@@ -609,14 +622,18 @@ class QueueDbSource(BenchSource):
             if evidence and worker_turn_count is not None:
                 counted = [entry for entry in task_reentries if not entry.is_excluded]
                 first_pass = worker_turn_count == 1 and not counted
+        has_evidence = (
+            as_text(cell(row, "verification_evidence")) is not None
+            if "verification_evidence" in columns
+            else None
+        )
         return TaskRecord(
             task_id=task_id,
             cohort=cohort,
             project=as_text(cell(row, pick(columns, PROJECT_COLUMNS)))
             or as_text(_dig(metadata, PROJECT_COLUMNS)),
-            profile=as_text(_dig(analysis, PROFILE_COLUMNS))
-            or as_text(_dig(metadata, PROFILE_COLUMNS))
-            or as_text(cell(row, pick(columns, PROFILE_COLUMNS))),
+            profile=profile,
+            profile_source=profile_source,
             complexity=as_text(_dig(analysis, COMPLEXITY_COLUMNS))
             or as_text(_dig(metadata, COMPLEXITY_COLUMNS))
             or as_text(cell(row, pick(columns, COMPLEXITY_COLUMNS))),
@@ -630,6 +647,8 @@ class QueueDbSource(BenchSource):
             duration_seconds=duration,
             retries=retries,
             source=self.name,
+            verification_evidence=has_evidence,
+            terminal_status=as_text(cell(row, "status")) if "status" in columns else None,
         )
 
 
@@ -980,6 +999,9 @@ def _combine(base: TaskRecord, extra: TaskRecord) -> TaskRecord:
         retries=_prefer(base.retries, extra.retries),
         source=sources,
         flags=tuple(dict.fromkeys(base.flags + extra.flags)),
+        verification_evidence=_prefer(base.verification_evidence, extra.verification_evidence),
+        terminal_status=_prefer(base.terminal_status, extra.terminal_status),
+        profile_source=_prefer(base.profile_source, extra.profile_source),
     )
 
 

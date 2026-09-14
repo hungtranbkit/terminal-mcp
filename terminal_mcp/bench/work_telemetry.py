@@ -36,7 +36,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .model import Reentry, SourceStatus, TaskRecord, TaskUsage
+from .model import FLAG_FPS_DISAGREEMENT, Reentry, SourceStatus, TaskRecord, TaskUsage
 from .sources import (
     BenchSource,
     SourceError,
@@ -60,6 +60,23 @@ WORKER_PHASES = ("IMPLEMENTATION", "VERIFICATION", "DELIVERY")
 # Weakest-wins ordering, so an aggregate never claims more confidence
 # than its least confident input.
 CONFIDENCE_ORDER = ("UNKNOWN", "ESTIMATED", "DERIVED", "MEASURED")
+
+# The CHECK constraint on telemetry_reentries.reason. Anything outside
+# this set is rejected at write time and lands in OTHER -- so a reason
+# the harness knows about but this store cannot record (STALE_CONTEXT,
+# today) must render as UNAVAILABLE rather than as a zero row.
+STORE_REENTRY_REASONS = frozenset(
+    {
+        "TEST_FAILURE",
+        "CONTRACT_GAP",
+        "IMPLEMENTATION_BUG",
+        "ENVIRONMENT_FAILURE",
+        "USER_CHANGED_REQUIREMENT",
+        "DELIVERY_FAILURE",
+        "MERGE_CONFLICT",
+        "OTHER",
+    }
+)
 
 FLAG_COUNTER_RESET = "COUNTER_RESET"
 FLAG_PARTIAL_SAMPLES = "PARTIAL_SAMPLES"
@@ -163,6 +180,7 @@ class WorkTelemetryDbSource(BenchSource):
                 ),
                 records=tuple(records),
                 warnings=tuple(warnings),
+                reason_vocabulary=STORE_REENTRY_REASONS,
             )
         finally:
             connection.close()
@@ -261,7 +279,13 @@ class WorkTelemetryDbSource(BenchSource):
         flags = list(sample_flags)
         if confidence and confidence != "MEASURED":
             flags.append(f"CONFIDENCE_{confidence}")
-        return TaskRecord(
+        stored_first_pass = (
+            _tri_state(cell(row, "first_pass_success")) if "first_pass_success" in columns else None
+        )
+        terminal_status = (
+            as_text(cell(row, "terminal_status")) if "terminal_status" in columns else None
+        )
+        record = TaskRecord(
             task_id=task_id,
             cohort=normalise_cohort(cohort),
             project=as_text(cell(row, "project_id")) if "project_id" in columns else None,
@@ -269,9 +293,8 @@ class WorkTelemetryDbSource(BenchSource):
             usage=usage,
             worker_turn_count=turn_count,
             reentries=reentries,
-            first_pass_success=_tri_state(cell(row, "first_pass_success"))
-            if "first_pass_success" in columns
-            else None,
+            first_pass_success=stored_first_pass,
+            terminal_status=terminal_status,
             duration_seconds=duration,
             # There is no separate retry concept in this store: a retry
             # that costs a worker round trip IS a re-entry, so inventing
@@ -280,6 +303,11 @@ class WorkTelemetryDbSource(BenchSource):
             source=self.name,
             flags=tuple(dict.fromkeys(flags)),
         )
+        # Recomputed from this task's own re-entry rows, then compared
+        # with the scalar the reporter wrote about itself.
+        if record.first_pass_success_disagrees:
+            record = record.with_flags(FLAG_FPS_DISAGREEMENT)
+        return record
 
 
 def _tri_state(value: Any) -> bool | None:
