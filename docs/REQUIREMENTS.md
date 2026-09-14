@@ -120,6 +120,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | `terminal_create_session(initial_prompt)` double-echo (shell sessions) | FIXED, 2026-09-07 (`lifecycle.py`'s own real readiness signal) |
 | AI Usage (read-only, local AI Usage Monitor integration) | VERIFIED_LIVE (real browser smoke, real live data) |
 | Unified Task System §20 (Kanban/PM/Planner/git isolation/Phase A-E) | VERIFIED — see §20 itself for the exact per-slice scope |
+| Work Mode: a planner claim briefs itself (similar-bug retrieval + module context pack, paths verified) | VERIFIED (V1) |
 
 ---
 
@@ -1845,6 +1846,90 @@ tests/limitations/dependencies/follow-up/trace — for every checkpoint
 listed in §19, plus the living-requirements convention itself. This
 section is the backfill the user asked for; §1-§19 above are the fast-
 scan/audit view over the SAME facts.)*
+
+### Retrieval before investigation — a planner claim now briefs itself (2026-09-14)
+
+- **Goal / user value:** make the SECOND bug in a module cost less than the
+  first. `context_pack.retrieval_result` (has this been seen before?) and
+  `context_pack.build_context_pack` (the bounded briefing for one module)
+  were implemented and tested, and **nothing called either of them**. Built
+  but unwired is worse than absent: the capability reads as done while every
+  planner still starts from an empty repository, and the audit that finds it
+  has to be run twice — once to notice the code exists, once to notice it is
+  unreachable.
+- **Status: VERIFIED.** `tests/test_context_pack.py` (24),
+  `tests/test_work_inbox.py` (43) and `tests/test_project_knowledge.py` (34),
+  all against real `git init` repositories, a real `git worktree`, a real
+  `BugSpecStore` and a real built MCP server. No mocked `git`: what a path
+  check is worth depends entirely on what `git diff --name-only` and
+  `git status --porcelain` actually report, and a mock of them proves nothing.
+- **Where it runs, and why there:** inside
+  `work_inbox.InboxService.claim_for_planning` — the last moment before a
+  planner starts looking. Retrieval that runs afterwards has already let the
+  cost it exists to avoid be paid in full, so it cannot be left to a planner
+  to remember to ask for. The claim reply gains two keys beside `issue`:
+  - `retrieval` — `REUSED_BUG_SPEC` (start from that spec's root cause and
+    fix strategy), `RELATED_BUGS_FOUND` (read them, assume nothing),
+    `NO_SIMILAR_BUG`, or one of `RETRIEVAL_UNAVAILABLE` / `RETRIEVAL_FAILED`.
+  - `context_pack` — the bounded module briefing (purpose, files, entry
+    points, runbooks, known issues, past bugs, and what it does **not**
+    cover), built for `issue.likely_module` or, failing that, for the module
+    the best match names.
+- **Every path a reused spec names is verified BEFORE it is offered.**
+  `context_pack.verify_reused_paths` gives each path its own verdict against
+  the working tree and the git delta from the spec's `source_commit`:
+  `UNCHANGED`, `CHANGED` (rewritten since — including an uncommitted edit,
+  because the working tree outranks the commit graph), `MISSING` (gone), or
+  `UNVERIFIED`. A path that cannot be checked is **never** reported
+  `UNCHANGED`: "I checked and nothing moved" and "I could not check" demand
+  opposite next steps. The paths that moved are named in the guidance text a
+  worker actually reads, not only in a structure it might.
+- **The downgrade rule.** A strong match whose *every* named path is gone is
+  returned as `RELATED_BUGS_FOUND` with `downgraded_from: REUSED_BUG_SPEC`,
+  and without a `reused_bug_id`. The symptom really did match, so the root
+  cause is worth reading — but a fix strategy for code that no longer exists
+  points at nothing, and offering it as a starting point would spend the
+  saving reuse exists to produce.
+- **Which repository gets asked.** `project_knowledge.worktree_root()` (new,
+  `git rev-parse --show-toplevel`), deliberately not `canonical_root()`.
+  Canonical root resolves every worktree to the one shared map, which is
+  right for a map that gets *written*; it is wrong here, because a worker in
+  a worktree edits that worktree, and the main checkout would report files
+  the worker has already rewritten as untouched — exactly the false
+  confidence this check exists to prevent. Found by a real smoke run against
+  this repo's own worktree, where it reported precisely that.
+- **Stored vs returned.** The issue row keeps `retrieval_status` plus a
+  compact record (statuses, match ids and scores, per-path verdicts, gaps);
+  the root causes, fix strategies and file lists travel to the claiming
+  planner once. Writing them into the row as well would move the same
+  paragraphs twice in a feature whose whole purpose is to move fewer of them.
+  The status is kept on the issue, not only in the reply, so an expired lease
+  does not lose what the last planner was told.
+- **Degrades, never fails.** `spec_store` and `knowledge` are both optional on
+  `InboxService`. Without a spec store the claim still succeeds and says
+  `RETRIEVAL_UNAVAILABLE` — "nobody searched" is not "nothing was found".
+  Without a repository the paths come back `UNVERIFIED` with the reason. A
+  raised lookup is caught and reported as `RETRIEVAL_FAILED`: a claim that
+  failed because the history could not be read would block real work over a
+  lookup.
+- **Two things it deliberately does not do.** (a) The throwaway spec built to
+  *ask* the question is never saved — persisting it would put an unanswered
+  query into the very history the next query reads. (b) The matched spec's
+  module is **not** written back onto the issue: a module inferred from a
+  fuzzy match would score the next retrieval higher for no new evidence, and
+  the system would grow confident by talking to itself.
+- **Known limitation (by design, not omission).** A captured issue carries no
+  module until something triages it, and without a module no past bug can
+  score above `STRONG_MATCH` — so a raw `NEW` issue gets `RELATED_BUGS_FOUND`
+  at best. That is the threshold refusing to claim more than the evidence
+  supports. Set `likely_module` on the issue (a `work_inbox_transition` field)
+  and the same claim reaches `REUSED_BUG_SPEC`.
+- **Trace:** `terminal_mcp/context_pack.py` (`named_paths`,
+  `verify_reused_paths`, `retrieval_result`), `terminal_mcp/work_inbox.py`
+  (`InboxService.brief_for_planning`, `_attach_briefing`,
+  `claim_for_planning`, `Issue.retrieval_status`),
+  `terminal_mcp/project_knowledge.py` (`worktree_root`),
+  `terminal_mcp/mcp_app.py` (`work_inbox_claim`, `work_inbox_list`).
 
 ### Read-only repository access for external agents (`repo_*` MCP tools) — V1, 2026-09-14
 

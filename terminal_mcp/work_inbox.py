@@ -15,7 +15,10 @@ Three things live here:
   to tell what was already in flight.
 * **A planner pool.** Bounded concurrent claims with leases, so two planners
   cannot take one issue and a crashed planner's issue does not stay claimed
-  forever.
+  forever. A claim also BRIEFS: similar-bug retrieval and the module context
+  pack run at the moment the issue is taken, and their answers are attached
+  to it. Retrieval that runs after the investigation has already let the cost
+  it exists to avoid be paid, so it cannot be left to a planner to remember.
 
 It deliberately reuses what already exists: `context_pack.fingerprint` for
 duplicate detection, `bug_spec` for the spec a planner produces, and
@@ -76,6 +79,13 @@ DUPLICATE_SIMILARITY = 0.6
 
 DEFAULT_PLANNER_CONCURRENCY = 3
 DEFAULT_CLAIM_LEASE_SECONDS = 900.0
+
+# What a claim's briefing says when it could not be produced. Both are states
+# of the WORLD, not errors of the claim: a planner must be able to tell "there
+# is no comparable bug" from "nobody asked", because only the second one means
+# the history is still worth searching by hand.
+RETRIEVAL_UNAVAILABLE = "RETRIEVAL_UNAVAILABLE"
+RETRIEVAL_FAILED = "RETRIEVAL_FAILED"
 
 
 class InboxError(RuntimeError):
@@ -204,6 +214,11 @@ class Issue:
     questions: tuple[str, ...] = ()
     claimed_by: str | None = None
     claim_expires_at: str | None = None
+    # REUSED_BUG_SPEC / RELATED_BUGS_FOUND / NO_SIMILAR_BUG, as of the last
+    # claim. Kept on the issue itself, not only in the claim's reply, so it
+    # survives the planner that received it -- a lease can expire and the next
+    # planner has to see what the last one was told.
+    retrieval_status: str | None = None
     policy_version: str | None = None
     policy_hash: str | None = None
     created_at: str = field(default_factory=_iso)
@@ -350,19 +365,83 @@ def _issue_from_payload(payload: str) -> Issue:
 
 # -- the service --------------------------------------------------------------
 
+def _best_match_module(retrieval: dict[str, Any]) -> str | None:
+    """The module the best-scoring past bug lived in, if retrieval found one.
+
+    A hypothesis, and used only to decide which pack to build. It is
+    deliberately NOT written back onto the issue: a module inferred from a
+    fuzzy match would then score the NEXT retrieval higher for no new
+    evidence, and the system would grow confident by talking to itself.
+    """
+    for match in retrieval.get("matches") or ():
+        module = match.get("module")
+        if module:
+            return module
+    return None
+
+
+def _retrieval_record(retrieval: dict[str, Any]) -> dict[str, Any]:
+    """The durable, compact half of a retrieval answer."""
+    record: dict[str, Any] = {
+        "status": retrieval.get("status"),
+        "checked_at": _iso(),
+        "matches": [{"bug_id": m.get("bug_id"), "score": m.get("score"),
+                     "title": m.get("title")}
+                    for m in (retrieval.get("matches") or ())],
+    }
+    for key in ("reused_bug_id", "reused_from_commit", "reused_is_stale",
+                "downgraded_from", "guidance", "detail"):
+        if retrieval.get(key) is not None:
+            record[key] = retrieval[key]
+    check = retrieval.get("path_check")
+    if check:
+        # The per-path verdicts, minus the prose explaining each one: which
+        # paths moved is what a later reader acts on.
+        record["path_check"] = {k: check[k] for k in
+                                ("verified", "checked", "missing", "changed",
+                                 "unverified", "gaps")}
+    return record
+
+
+def _briefing_detail(briefing: dict[str, Any]) -> str:
+    """One history line: what was found, and what it means for the paths."""
+    retrieval = briefing.get("retrieval") or {}
+    parts = [str(retrieval.get("status"))]
+    if retrieval.get("reused_bug_id"):
+        parts.append(f"from {retrieval['reused_bug_id']}")
+    check = retrieval.get("path_check") or {}
+    if check.get("checked"):
+        parts.append(f"{len(check.get('missing') or [])} missing / "
+                     f"{len(check.get('changed') or [])} changed "
+                     f"of {check['checked']} paths")
+    pack = briefing.get("context_pack") or {}
+    if pack.get("module"):
+        parts.append(f"pack {pack['module']} ({pack.get('confidence', '?')})")
+    return "; ".join(parts)[:200]
+
+
 class InboxService:
     """Capture, state transitions and planner claims over one InboxStore."""
 
     def __init__(self, store: InboxStore, *,
                  planner_concurrency: int = DEFAULT_PLANNER_CONCURRENCY,
                  claim_lease_seconds: float = DEFAULT_CLAIM_LEASE_SECONDS,
-                 project_concurrency: dict[str, int] | None = None) -> None:
+                 project_concurrency: dict[str, int] | None = None,
+                 spec_store: Any = None, knowledge: Any = None) -> None:
         self.store = store
         self.planner_concurrency = max(1, int(planner_concurrency))
         self.claim_lease_seconds = float(claim_lease_seconds)
         # Per-project caps exist so one noisy project cannot occupy every
         # planner slot while another waits behind it.
         self.project_concurrency = dict(project_concurrency or {})
+        # Both optional, and both degrade rather than fail. Without a spec
+        # store there is no bug history to retrieve from; without a repository
+        # a reused spec's paths cannot be checked. Either way a claim still
+        # succeeds and says what it could not do -- an inbox that refused to
+        # hand out work because nothing was indexed yet would be useless in
+        # exactly the projects that need it most.
+        self.spec_store = spec_store
+        self.knowledge = knowledge
 
     # -- capture -------------------------------------------------------------
 
@@ -556,13 +635,96 @@ class InboxService:
             self.store.record_event(fresh.issue_id, kind="claimed", from_state=candidate.state,
                                     to_state=PLANNING, actor=planner_id,
                                     detail=f"lease {self.claim_lease_seconds:.0f}s")
-            return {"status": "CLAIMED", "issue": fresh.as_dict()}
+            # The briefing runs here, inside the claim, because this is the
+            # last moment before the planner starts looking. Anywhere later
+            # and it is a report on work already done.
+            briefing = self._attach_briefing(fresh, actor=planner_id)
+            return {"status": "CLAIMED", "issue": fresh.as_dict(), **briefing}
         return {"status": "NOTHING_TO_CLAIM", "active": len(active)}
 
     def release(self, issue_id: str, *, to_state: str, actor: str,
                 detail: str | None = None, **fields: Any) -> dict[str, Any]:
         """Finish planning an issue and free the planner slot."""
         return self.transition(issue_id, to_state, actor=actor, detail=detail, **fields)
+
+    # -- the briefing a claim hands over -------------------------------------
+
+    def brief_for_planning(self, issue: Issue) -> dict[str, Any]:
+        """What is already known about this issue, asked BEFORE investigating.
+
+        Two questions, in this order: has this been seen before, and what is
+        already recorded about the module it probably lives in. Both were
+        implemented and tested long before anything called them, which is the
+        worst state for a capability to be in -- it reads as done on a roadmap
+        while every planner still starts from an empty repository.
+
+        The order matters. Retrieval runs first because its best match is also
+        the cheapest evidence of WHICH module this is, and without it a
+        captured issue usually names none, so there would be no pack to build.
+        """
+        retrieval = self._retrieval_for(issue)
+        module = issue.likely_module or _best_match_module(retrieval)
+        return {"retrieval": retrieval, "context_pack": self._pack_for(module)}
+
+    def _retrieval_for(self, issue: Issue) -> dict[str, Any]:
+        if self.spec_store is None:
+            return {"status": RETRIEVAL_UNAVAILABLE, "matches": [],
+                    "guidance": "no bug-spec history is wired to this inbox; the "
+                                "history was not searched, which is not the same as "
+                                "it being empty"}
+        from . import context_pack
+        from .bug_spec import plan_from_report
+
+        try:
+            # A throwaway spec built from the captured text, used only as the
+            # query. It is never saved: persisting it would put a planner's
+            # unanswered question into the very history the next query reads.
+            target = plan_from_report(title=issue.short_title, symptom=issue.raw_text,
+                                      module=issue.likely_module,
+                                      project_id=issue.project)
+            return context_pack.retrieval_result(self.spec_store, target,
+                                                 knowledge=self.knowledge)
+        except Exception as exc:  # noqa: BLE001 -- a failed lookup is data
+            # Reported, never raised: a claim that fails because the history
+            # could not be read would block real work over a lookup.
+            return {"status": RETRIEVAL_FAILED, "matches": [],
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "guidance": "retrieval failed; investigate from the issue text"}
+
+    def _pack_for(self, module: str | None) -> dict[str, Any] | None:
+        if not module:
+            return None
+        from . import context_pack
+
+        try:
+            pack = context_pack.build_context_pack(
+                module, knowledge=self.knowledge, store=self.spec_store)
+        except Exception as exc:  # noqa: BLE001
+            return {"module": module, "error": f"{type(exc).__name__}: {exc}"}
+        return {**pack.as_dict(), "render": pack.render()}
+
+    def _attach_briefing(self, issue: Issue, *, actor: str) -> dict[str, Any]:
+        """Persist what the briefing found, and hand the full thing back.
+
+        Only a compact record is stored. The matches carry root causes, fix
+        strategies and file lists, and writing all of that into the issue row
+        as well as the reply would mean the same paragraphs travelling twice
+        in a feature whose entire purpose is to move fewer of them.
+        """
+        briefing = self.brief_for_planning(issue)
+        retrieval = briefing["retrieval"]
+        issue.retrieval_status = retrieval.get("status")
+        issue.metadata["retrieval"] = _retrieval_record(retrieval)
+        pack = briefing["context_pack"]
+        if pack is not None:
+            issue.metadata["context_pack"] = {
+                key: pack.get(key) for key in
+                ("module", "confidence", "files", "stale", "gaps", "error")
+                if pack.get(key) is not None}
+        self.store._write(issue)
+        self.store.record_event(issue.issue_id, kind="retrieval", to_state=issue.state,
+                                actor=actor, detail=_briefing_detail(briefing))
+        return briefing
 
     # -- developer assist ----------------------------------------------------
 

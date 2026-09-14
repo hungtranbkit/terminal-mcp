@@ -88,6 +88,27 @@ def test_outside_a_repository_there_is_no_canonical_root(tmp_path):
     assert pk.canonical_root(str(tmp_path)) is None
 
 
+def test_a_worktree_root_is_the_checkout_not_the_shared_one(repo, tmp_path):
+    worktree = tmp_path / "wt"
+    _git(repo, "worktree", "add", "-q", "-b", "side", str(worktree))
+    # The opposite question to the one above, and it must get the opposite
+    # answer: asking whether a file still exists, or has moved, has to be
+    # answered about the tree that will actually run -- the main checkout
+    # would report confidently about code nobody is about to execute.
+    assert pk.worktree_root(str(worktree)) == worktree.resolve()
+    assert pk.worktree_root(str(worktree)) != pk.canonical_root(str(worktree))
+
+
+def test_a_subdirectory_still_resolves_to_the_checkout_top(repo):
+    nested = repo / "pkg" / "deep"
+    nested.mkdir(parents=True)
+    assert pk.worktree_root(str(nested)) == repo.resolve()
+
+
+def test_outside_a_repository_there_is_no_worktree_root(tmp_path):
+    assert pk.worktree_root(str(tmp_path)) is None
+
+
 # -- confidence is derived ---------------------------------------------------
 
 def test_a_module_verified_at_head_is_high_confidence(repo):
