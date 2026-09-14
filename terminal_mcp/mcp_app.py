@@ -114,6 +114,14 @@ def build_mcp(service: TerminalService | None = None,
     supervisor = supervisor or SupervisorService(terminal, SupervisorStore())
     supervisor_v2 = supervisor_v2 or build_supervisor_v2(supervisor)
     controller = controller or build_default_controller(terminal)
+    # P1 node-aware watch routing: hand the Supervisor the SAME controller
+    # every other remote-aware read already goes through, so a watch on a
+    # session that lives on another node resolves and polls through it
+    # instead of this host's local tmux (which is what made such a watch
+    # report target_missing immediately). Set post-construction and
+    # duck-typed -- see SupervisorService.controller's own comment.
+    supervisor.controller = supervisor.controller or controller
+
     # 3-role model (task: "Coding A/B + Integration Agent"): constructed
     # BEFORE queue/queue_engine below so its store exists for their own
     # on_completed hook to reference -- integration.engine itself is

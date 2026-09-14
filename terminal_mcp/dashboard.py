@@ -7053,6 +7053,14 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # build_default_controller's own docstring for why this is a
         # PRIVATE temp registry, never the real production nodes.db path.
         controller = build_default_controller(terminal)
+    # P1 node-aware watch routing: hand the Supervisor the SAME controller
+    # every other remote-aware read already goes through, so a watch on a
+    # session that lives on another node resolves and polls through it
+    # instead of this host's local tmux (which is what made such a watch
+    # report target_missing immediately). Set post-construction and
+    # duck-typed -- see SupervisorService.controller's own comment.
+    supervisor.controller = supervisor.controller or controller
+
     if connection_store is None:
         # Same private-temp-file discipline as build_default_controller's
         # own registry default just above (see that docstring for the
