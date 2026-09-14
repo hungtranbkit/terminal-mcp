@@ -447,6 +447,33 @@ def build_mcp(service: TerminalService | None = None,
         return terminal.terminal_list_input_audit(limit, binding, session)
 
     @server.tool()
+    def terminal_list_input_audit_fleet(limit: int = 50, binding: str | None = None,
+                                        session: str | None = None, cursor: str | None = None) -> dict:
+        """FLEET-WIDE input audit -- "who sent what, where" in one call,
+        instead of reading every node's own audit.db (backlog
+        blg_178d7b6506b7).
+
+        Reads only: every node's audit.db stays its own source of truth
+        and nothing is replicated. Each row carries `node_id` (this
+        controller's id for the serving node), `node_row_id` (that node's
+        own local row id) and `audit_uid` ("node:rowid") -- per-node ids
+        collide across nodes, so `audit_uid` is the one safe key to dedupe
+        or reference a row by.
+
+        Ordered (timestamp DESC, node_id ASC, node_row_id DESC) -- a total
+        order, so the same fleet state always returns the same page. Page
+        with `cursor` (pass back `next_cursor`); a full page always returns
+        a cursor, so loop until `next_cursor` is null.
+
+        An offline/unreachable node contributes nothing, is named in
+        `nodes`/`node_errors`, and sets `complete: false` -- it never fails
+        the read. `complete: false` means rows are MISSING, not merely
+        that a node is down. Same sanitized payload as the local tool:
+        redacted previews and fingerprints, never raw prompt text."""
+        _refresh_local_heartbeat()
+        return controller.terminal_audit_fleet(limit=limit, binding=binding, session=session, cursor=cursor)
+
+    @server.tool()
     def terminal_input_context(session: str | None = None,
                                binding: str | None = None) -> dict:
         """Inspect the last 20 lines and effective permission before sending input."""

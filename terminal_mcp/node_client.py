@@ -78,6 +78,8 @@ class NodeClient(Protocol):
     def knowledge_recover(self, session_name: str) -> dict[str, Any]: ...
     def knowledge_checkpoint(self, session_name: str, summary: str) -> dict[str, Any]: ...
     def watchdog_session_events(self, *, unacknowledged_only: bool = False, limit: int = 50) -> dict[str, Any]: ...
+    def audit_list(self, *, limit: int = 50, binding: str | None = None, session: str | None = None,
+                   at_or_before: str | None = None) -> dict[str, Any]: ...
     def watchdog_acknowledge_session_event(self, event_id: int, *, by: str | None = None) -> dict[str, Any]: ...
 
 
@@ -210,6 +212,14 @@ class LocalNodeClient:
 
     def watchdog_session_events(self, *, unacknowledged_only: bool = False, limit: int = 50) -> dict[str, Any]:
         return self._terminal.terminal_watchdog_events(unacknowledged_only=unacknowledged_only, limit=limit)
+
+    def audit_list(self, *, limit: int = 50, binding: str | None = None, session: str | None = None,
+                   at_or_before: str | None = None) -> dict[str, Any]:
+        # Goes through TerminalService exactly like every other local
+        # read, so a local node is answered by the SAME code path (and
+        # the same limit validation) a remote node answers over HTTP --
+        # there is no "local shortcut" that could drift from it.
+        return self._terminal.terminal_list_input_audit(limit, binding, session, at_or_before=at_or_before)
 
     def watchdog_acknowledge_session_event(self, event_id: int, *, by: str | None = None) -> dict[str, Any]:
         return self._terminal.terminal_watchdog_acknowledge(event_id, by=by)
@@ -382,6 +392,17 @@ class RemoteNodeClient:
     def watchdog_session_events(self, *, unacknowledged_only: bool = False, limit: int = 50) -> dict[str, Any]:
         return self._request("GET", "/v1/watchdog/events",
                              params={"unacknowledged_only": int(unacknowledged_only), "limit": limit})
+
+    def audit_list(self, *, limit: int = 50, binding: str | None = None, session: str | None = None,
+                   at_or_before: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        if binding is not None:
+            params["binding"] = binding
+        if session is not None:
+            params["session"] = session
+        if at_or_before is not None:
+            params["at_or_before"] = at_or_before
+        return self._request("GET", "/v1/audit", params=params)
 
     def watchdog_acknowledge_session_event(self, event_id: int, *, by: str | None = None) -> dict[str, Any]:
         return self._request("POST", f"/v1/watchdog/acknowledge/{event_id}", body={"by": by})

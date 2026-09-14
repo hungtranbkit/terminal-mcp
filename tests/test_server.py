@@ -22,6 +22,7 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_status_bound",
         "terminal_send_bound",
         "terminal_list_input_audit",
+        "terminal_list_input_audit_fleet",
         "terminal_input_context",
         "terminal_create_session",
         "terminal_detach_session",

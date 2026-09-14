@@ -2436,10 +2436,16 @@ class TerminalService:
                                   text=text, press_enter=press_enter)
 
     def terminal_list_input_audit(self, limit: int = 50, binding: str | None = None,
-                                  session: str | None = None) -> dict[str, Any]:
+                                  session: str | None = None, *,
+                                  at_or_before: str | None = None) -> dict[str, Any]:
+        """Unchanged for every existing caller. `at_or_before` is the
+        paging filter fleet_audit.py needs (see AuditStore.list) and is
+        passed straight through -- this method stays the ONE place limit
+        validation happens, so the fleet read inherits it rather than
+        re-implementing a second, drifting copy."""
         if not 1 <= limit <= 500:
             return {"error": "INVALID_LIMIT", "events": []}
-        return {"events": self.audit.list(limit, binding, session)}
+        return {"events": self.audit.list(limit, binding, session, at_or_before=at_or_before)}
 
     def terminal_input_context(self, session: str | None = None,
                                binding: str | None = None) -> dict[str, Any]:

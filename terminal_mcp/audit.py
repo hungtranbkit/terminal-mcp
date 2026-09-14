@@ -250,7 +250,25 @@ class AuditStore:
         return json.loads(row["result_json"])
 
     def list(self, limit: int = 50, binding: str | None = None,
-             session: str | None = None) -> list[dict[str, Any]]:
+             session: str | None = None, *, at_or_before: str | None = None) -> list[dict[str, Any]]:
+        """Local audit read. UNCHANGED for every existing caller: with
+        `at_or_before` omitted this is byte-for-byte the query it always
+        was, including its `ORDER BY id DESC`.
+
+        `at_or_before` exists for fleet_audit.py's scatter-gather paging
+        (see that module's docstring). It is INCLUSIVE on the timestamp
+        rather than a strict cursor, because the real cursor is a
+        (timestamp, node_id, row_id) triple that only the merge step can
+        evaluate -- this node cannot know how its own rows order against
+        another node's at the same timestamp. Over-fetching one timestamp's
+        worth of rows and letting the merge trim is correct; filtering
+        strictly here would silently drop a tied row on a different node.
+
+        When paging, order by (timestamp, id) rather than id alone: the
+        merge assumes each node hands back its newest rows BY THE FLEET
+        SORT KEY, and id order only coincides with timestamp order while a
+        node's clock moves forward. Existing non-paging callers keep the
+        original ordering untouched."""
         limit = max(1, min(limit, 500))
         clauses, params = [], []
         if binding is not None:
@@ -259,8 +277,12 @@ class AuditStore:
         if session is not None:
             clauses.append("session = ?")
             params.append(session)
+        if at_or_before is not None:
+            clauses.append("timestamp <= ?")
+            params.append(at_or_before)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        query = "SELECT * FROM input_audit" + where + " ORDER BY id DESC LIMIT ?"
+        order = " ORDER BY timestamp DESC, id DESC" if at_or_before is not None else " ORDER BY id DESC"
+        query = "SELECT * FROM input_audit" + where + order + " LIMIT ?"
         with self._connection() as connection:
             rows = connection.execute(query, (*params, limit)).fetchall()
         results = []

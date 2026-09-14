@@ -139,7 +139,7 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
     # global INPUT_DISABLED gate; INPUT_DISABLED itself stays covered in test_permissions.py.
     assert text_disabled["error"] == "ACCESS_DENIED"
     assert keys_disabled["error"] == "ACCESS_DENIED"
-    assert len(tools.tools) == 202  # Orchestration V1: +8 outcome layer, +4 worker view; ONE surface (stdio == HTTP)
+    assert len(tools.tools) == 203  # +1 terminal_list_input_audit_fleet (blg_178d7b6506b7); ONE surface (stdio == HTTP)
 
 
 @pytest.mark.anyio

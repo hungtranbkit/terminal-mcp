@@ -20,10 +20,11 @@ from __future__ import annotations
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import host_metrics
+from . import fleet_audit, host_metrics
 from .node_client import LocalNodeClient, NodeClient, NodeClientError, RemoteNodeClient
 from .node_models import NODE_ONLINE, Node
 from .node_registry import NodeRegistry
@@ -432,6 +433,63 @@ class ControllerService:
         results.sort(key=lambda r: r.get("captured_at", ""), reverse=True)
         return {"query": query, "results": results[:limit], "node_errors": errors,
                 "untrusted_output": True, "untrusted_fields": ["results"]}
+
+    def terminal_audit_fleet(self, *, limit: int = fleet_audit.DEFAULT_LIMIT, binding: str | None = None,
+                             session: str | None = None, cursor: str | None = None) -> dict[str, Any]:
+        """Fleet-wide input audit (backlog blg_178d7b6506b7).
+
+        Scatter-gather over the SAME transport/registry loop every other
+        fleet read uses (see terminal_knowledge_search_fleet above) -- no
+        replication, no aggregation store, nothing written anywhere. Each
+        node's audit.db stays its own source of truth; this only reads.
+
+        The LOCAL node needs no special case: ControllerService.__init__
+        registers it like any other node with a LocalNodeClient, so a
+        single-node deployment takes this exact path and gets its own rows
+        back, provenance and all.
+
+        Per-node failure is tolerated the way the backlog item asks: an
+        offline or erroring node contributes zero rows, is reported by id
+        in `nodes`/`node_errors`, and flips `complete` to False -- it never
+        fails the read. Each node is asked for a FULL `limit` (not limit/N)
+        because the merge cannot know in advance which node holds the
+        newest rows; under-asking would silently truncate a busy node."""
+        position = fleet_audit.decode_cursor(cursor)
+        at_or_before = position[0] if position is not None else None
+
+        per_node: dict[str, list[dict[str, Any]]] = {}
+        reports: list[fleet_audit.NodeReport] = []
+        for node in self.registry.list():
+            fetched_at = datetime.now(timezone.utc).isoformat()
+            if node.status != NODE_ONLINE:
+                reports.append(fleet_audit.NodeReport(node_id=node.id, ok=False, status=node.status,
+                                                      error=f"node is {node.status}", fetched_at=fetched_at))
+                continue
+            client = self._clients.get(node.id)
+            if client is None:
+                reports.append(fleet_audit.NodeReport(node_id=node.id, ok=False, status=node.status,
+                                                      error="no_client", fetched_at=fetched_at))
+                continue
+            try:
+                response = client.audit_list(limit=limit, binding=binding, session=session,
+                                             at_or_before=at_or_before)
+            except NodeClientError as exc:
+                reports.append(fleet_audit.NodeReport(node_id=node.id, ok=False, status=node.status,
+                                                      error=str(exc), fetched_at=fetched_at))
+                continue
+            if isinstance(response, dict) and "error" in response:
+                reports.append(fleet_audit.NodeReport(node_id=node.id, ok=False, status=node.status,
+                                                      error=str(response["error"]), fetched_at=fetched_at))
+                continue
+            rows = (response or {}).get("events") or []
+            per_node[node.id] = rows
+            reports.append(fleet_audit.NodeReport(node_id=node.id, ok=True, status=node.status,
+                                                  rows=len(rows), fetched_at=fetched_at))
+
+        merged, next_cursor = fleet_audit.merge_pages(per_node, limit=limit, cursor=cursor)
+        page = fleet_audit.FleetAuditPage(rows=merged, nodes=reports, next_cursor=next_cursor,
+                                          complete=all(report.ok for report in reports))
+        return page.to_dict()
 
     def discover_projects(self) -> dict[str, Any]:
         """Auto-detect the GIT PROJECTS this fleet is actually working on,
