@@ -26,7 +26,15 @@ import (
 // being granted a back door here.
 const pipeSDDL = "D:(A;;GA;;;SY)(A;;GA;;;BA)"
 
-func serveePipe(config Config) int {
+// serveePipe keeps the old signature for the non-service paths; the
+// service now uses servePipeUntil so SCM can actually stop it.
+func serveePipe(config Config) int { return servePipeUntil(config, nil) }
+
+// servePipeUntil is the same loop, with one addition: closing `stop` closes
+// the listener, which unblocks Accept and ends the loop. Without it a
+// service that reported Running had no way to reach Stopped, and Windows
+// shutdown would have to kill it.
+func servePipeUntil(config Config, stop <-chan struct{}) int {
 	listener, err := winio.ListenPipe(PipeName, &winio.PipeConfig{
 		SecurityDescriptor: pipeSDDL,
 		MessageMode:        true,
@@ -39,6 +47,15 @@ func serveePipe(config Config) int {
 	}
 	defer listener.Close()
 	fmt.Printf("service: listening on %s\n", PipeName)
+
+	if stop != nil {
+		go func() {
+			<-stop
+			// Closing the listener is what unblocks Accept below; there is
+			// no other way to interrupt it.
+			_ = listener.Close()
+		}()
+	}
 
 	for {
 		connection, err := listener.Accept()

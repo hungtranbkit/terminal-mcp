@@ -131,6 +131,17 @@ func currentStatus() statusReport {
 }
 
 func main() {
+	// SCM FIRST, before argument parsing, before the paired-filename
+	// lookup, before anything that could touch a pairing. A Win32
+	// own-process service that does not complete the handshake makes
+	// `sc.exe start` block until SCM's own timeout -- which is exactly the
+	// stall that stopped the installer dead at "[3/3]" with no error
+	// anywhere. Reaching the dispatcher quickly IS the fix.
+	underSCM, detectErr := isWindowsService()
+	if decideServiceMode(underSCM, detectErr, os.Args[1:]) == modeSCM {
+		os.Exit(runServiceSCM())
+	}
+
 	if len(os.Args) < 2 {
 		// Double-clicked. On a fresh machine this is the ONLY thing that
 		// happens -- there is no helper yet, so no terminalmcp:// handler
@@ -172,6 +183,9 @@ func main() {
 		_ = set.Parse(args)
 		os.Exit(runInstall(*controller, *session))
 	case "service":
+		// Reached only when SCM detection said no and the operator ran
+		// `service` by hand -- decideServiceMode sends the real SCM case
+		// to runServiceSCM above.
 		os.Exit(runService())
 	case "uninstall":
 		os.Exit(runUninstall())
