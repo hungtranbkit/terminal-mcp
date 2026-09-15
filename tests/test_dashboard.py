@@ -1536,6 +1536,10 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/node/drain": {"POST"},
         "/dashboard/api/node/test-connection": {"POST"},
         "/dashboard/api/node/generate-onboarding": {"POST"},
+        # Machine-facing, authenticated by the node's own bearer token --
+        # GET fetches the node-agent bundle, HEAD just its metadata so an
+        # installer can skip a download it already has.
+        "/dashboard/api/nodes/{node_id}/agent-bundle": {"GET", "HEAD"},
         "/dashboard/api/nodes/{node_id}/heartbeat": {"POST"},
         # Node token rotation/revocation (blg_a3cc401d8275, token_rotation.py).
         # Declared deliberately, not to quiet this guard: /token is a

@@ -424,7 +424,7 @@ $TaskBeat     = "TerminalMCP-Heartbeat-$NodeId"
 $script:Checklist = New-Object System.Collections.ArrayList
 $script:TotalSw = [System.Diagnostics.Stopwatch]::StartNew()
 $script:StageNo = 0
-$script:StageTotal = 11
+$script:StageTotal = 12
 $script:StageSw = $null
 
 # -- stage banner + elapsed ---------------------------------------------
@@ -1266,6 +1266,16 @@ function Get-Capabilities {
     if (`$rescue) {
         if (`$rescue.State -eq 'Running') { `$found += 'rescue_tunnel_running' } else { `$found += 'rescue_tunnel_stopped' }
     }
+    # session_transport is advertised ONLY when the node agent is both
+    # listening AND accepting this node's own credential. A service that is
+    # up but rejects the controller cannot host a session, and claiming it
+    # can is how Create Session offers a node that then fails.
+    try {
+        Invoke-RestMethod -Uri "http://127.0.0.1:8790/v1/health" -TimeoutSec 3 -UseBasicParsing | Out-Null
+        Invoke-RestMethod -Uri "http://127.0.0.1:8790/v1/sessions" ``
+            -Headers @{ Authorization = "Bearer `$token" } -TimeoutSec 3 -UseBasicParsing | Out-Null
+        `$found += 'session_transport'
+    } catch { }
     `$sshd = Get-Service sshd -ErrorAction SilentlyContinue
     if (`$sshd -and `$sshd.Status -eq 'Running') { `$found += 'sshd_running' }
     return `$found
@@ -1412,6 +1422,164 @@ if ($WingetPackages.Count -gt 0 -or $NpmTools.Count -gt 0) {
     }
 } else {
     Add-Step 'Profile packages' 'SKIP' 'profile Minimal -- khong cai them gi'
+}
+End-Stage
+
+# ===========================================================================
+#  9. Node agent -- the session transport the controller actually dials
+# ===========================================================================
+#
+# Without this a node reaches "registered and heartbeating" and stops: port
+# 8790 closed, no transport row, and Create Session offering a node the
+# controller can never reach. deploy/install-node-agent.ps1 has always been
+# able to install the agent, but it needs a terminal-mcp source tree, and a
+# machine that arrived through Add Node has no way to obtain one. The
+# controller now serves that tree as one pinned bundle over a route
+# authenticated by THIS node's own bearer token.
+Start-Stage 'Node agent (transport de tao session)'
+$script:AgentReady = $false
+if (-not $script:EnrollmentOk) {
+    Add-Step 'Node agent' 'SKIP' 'bo qua vi dang ky that bai (chua co node token)'
+} elseif ($ProfileName -ne 'ai_coding') {
+    # Minimal/Developer deliberately stay SSH-only: the agent needs Python
+    # and a service, and those profiles do not promise either.
+    Add-Step 'Node agent' 'SKIP' ("profile '{0}' -- node agent chi cai cho ai_coding" -f $ProfileName)
+} else {
+    $agentBase = Join-Path $StateDir 'agent'
+    $installedFile = Join-Path $agentBase 'installed.json'
+    $previous = $null
+    if (Test-Path $installedFile) {
+        try { $previous = Get-Content $installedFile -Raw | ConvertFrom-Json } catch { $previous = $null }
+    }
+    try {
+        New-Item -ItemType Directory -Force -Path $agentBase | Out-Null
+        $tok = (Get-Content $TokenFile -Raw).Trim()
+        $auth = @{ Authorization = "Bearer $tok" }
+        $bundleUri = "$ControllerUrl/dashboard/api/nodes/$NodeId/agent-bundle"
+
+        # 1. Metadata first. HEAD is what makes this idempotent -- a node
+        #    that already has this exact bundle never downloads it again.
+        $head = Invoke-WebRequest -Method Head -Uri $bundleUri -Headers $auth -TimeoutSec 30 -UseBasicParsing
+        $wantVersion = [string]$head.Headers['X-Terminal-Mcp-Agent-Version']
+        $wantSha = ([string]$head.Headers['X-Terminal-Mcp-Agent-Sha256']).ToLowerInvariant()
+        if (-not $wantSha) { throw "controller did not report a bundle hash" }
+        $targetDir = Join-Path $agentBase $wantVersion
+
+        $upToDate = ($previous -and $previous.sha256 -eq $wantSha -and (Test-Path (Join-Path $targetDir 'pyproject.toml')))
+        if ($upToDate) {
+            Add-Step 'Node agent bundle' 'OK' ("da co ban {0} (bo qua tai lai)" -f $wantVersion)
+        } else {
+            # 2. Download, then VERIFY before anything is extracted. A
+            #    bundle that does not match the hash the controller
+            #    published is never unpacked, let alone installed.
+            $tmpZip = Join-Path $agentBase ("bundle-" + [guid]::NewGuid().ToString('N') + ".zip")
+            Invoke-WebRequest -Uri $bundleUri -Headers $auth -OutFile $tmpZip -TimeoutSec 300 -UseBasicParsing
+            $gotSha = (Get-FileHash -Path $tmpZip -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($gotSha -ne $wantSha) {
+                Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
+                throw "bundle hash mismatch -- refusing to install"
+            }
+            # 3. Extract member by member, refusing anything that would
+            #    write outside the target directory.
+            $staging = Join-Path $agentBase ("stage-" + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Force -Path $staging | Out-Null
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($tmpZip)
+            try {
+                $root = [System.IO.Path]::GetFullPath($staging)
+                foreach ($entry in $zip.Entries) {
+                    if (-not $entry.Name) { continue }   # directory entry
+                    $dest = [System.IO.Path]::GetFullPath((Join-Path $staging $entry.FullName))
+                    if (-not $dest.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+                        throw "bundle contains a path outside the extraction directory"
+                    }
+                    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
+                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
+                }
+            } finally {
+                $zip.Dispose()
+                Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
+            }
+            if (Test-Path $targetDir) { Remove-Item $targetDir -Recurse -Force -ErrorAction SilentlyContinue }
+            Move-Item -Path $staging -Destination $targetDir -Force
+            Add-Step 'Node agent bundle' 'OK' ("ban {0} da tai va xac thuc SHA256" -f $wantVersion)
+        }
+
+        # 4. Bind address: the interface the controller actually reaches
+        #    this node on. Tailnet first, LAN second -- never 0.0.0.0.
+        $addr = Get-LocalAddresses
+        $bindHost = if ($addr.tailscale_ip) { $addr.tailscale_ip } elseif ($addr.lan_ip) { $addr.lan_ip } else { '127.0.0.1' }
+
+        # 5. Install/refresh the service with the SAME script this release
+        #    was tested against, shipped inside the bundle.
+        $installer = Join-Path $targetDir 'deploy\install-node-agent.ps1'
+        if (-not (Test-Path $installer)) { throw "bundle has no deploy\install-node-agent.ps1" }
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer `
+            -ControllerUrl $ControllerUrl -NodeId $NodeId -Token $tok `
+            -RepoDir $targetDir -Port 8790 -BindHost $bindHost 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "install-node-agent.ps1 exited $LASTEXITCODE" }
+
+        # 6. Firewall: 8790 reachable only from the overlay, never the open
+        #    internet. Same CIDR discipline the SSH rule already uses.
+        try {
+            Remove-NetFirewallRule -DisplayName 'Terminal MCP node agent' -ErrorAction SilentlyContinue
+            New-NetFirewallRule -DisplayName 'Terminal MCP node agent' -Direction Inbound `
+                -Action Allow -Protocol TCP -LocalPort 8790 -RemoteAddress @('100.64.0.0/10') | Out-Null
+            Add-Step 'Node agent firewall' 'OK' 'TCP 8790 chi mo cho 100.64.0.0/10'
+        } catch {
+            Add-Step 'Node agent firewall' 'WARN' $_.Exception.Message
+        }
+
+        # 7. Readiness, and it is TWO checks. /v1/health proves the process
+        #    is listening; /v1/sessions with this node's bearer proves the
+        #    credential the controller will use actually works. A service
+        #    that is up but rejects the controller is not ready.
+        $healthy = $false
+        $authed = $false
+        foreach ($attempt in 1..20) {
+            Start-Sleep -Seconds 3
+            try {
+                Invoke-RestMethod -Uri "http://${bindHost}:8790/v1/health" -TimeoutSec 5 -UseBasicParsing | Out-Null
+                $healthy = $true
+            } catch { continue }
+            try {
+                Invoke-RestMethod -Uri "http://${bindHost}:8790/v1/sessions" -Headers $auth `
+                    -TimeoutSec 5 -UseBasicParsing | Out-Null
+                $authed = $true
+                break
+            } catch { }
+        }
+        if (-not $healthy) { throw "node agent did not answer /v1/health on ${bindHost}:8790" }
+        if (-not $authed) { throw "node agent is up but refused this node's own token on /v1/sessions" }
+
+        # 8. Only NOW is the transport real.
+        $script:AgentReady = $true
+        @{ version = $wantVersion; sha256 = $wantSha; dir = $targetDir; bind = $bindHost } |
+            ConvertTo-Json | Set-Content -Path $installedFile -Encoding utf8
+        Add-Step 'Node agent' 'OK' ("dang chay tren {0}:8790, xac thuc OK" -f $bindHost)
+    } catch {
+        $detail = $_.Exception.Message
+        # ROLLBACK: put the previously working version back rather than
+        # leaving the node with a half-installed agent. A node with no
+        # agent is honest; a node with a broken one is not.
+        if ($previous -and $previous.dir -and (Test-Path (Join-Path $previous.dir 'deploy\install-node-agent.ps1'))) {
+            try {
+                & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+                    -File (Join-Path $previous.dir 'deploy\install-node-agent.ps1') `
+                    -ControllerUrl $ControllerUrl -NodeId $NodeId -Token (Get-Content $TokenFile -Raw).Trim() `
+                    -RepoDir $previous.dir -Port 8790 -BindHost ([string]$previous.bind) 2>&1 | Out-Null
+                Add-Step 'Node agent rollback' 'WARN' ("da quay ve ban {0}" -f $previous.version)
+            } catch {
+                Add-Step 'Node agent rollback' 'FAIL' $_.Exception.Message
+            }
+        } else {
+            # Nothing to roll back to: stop the service rather than leave a
+            # half-installed one claiming the port.
+            Stop-Service -Name 'TerminalMCPNodeAgent' -Force -ErrorAction SilentlyContinue
+        }
+        Add-Step 'Node agent' 'FAIL' $detail `
+            'Chay lai file nay voi -Repair; node van dung duoc qua SSH trong luc do.'
+    }
 }
 End-Stage
 

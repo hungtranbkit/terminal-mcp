@@ -39,7 +39,7 @@ from . import node_credentials
 from .token_rotation import TokenRotationService
 from .node_transport import (GENERIC_SETUP_CODE, KIND_LAN, KIND_REVERSE_SSH, KIND_TAILSCALE,
                              TransportStore, probe_reverse_tunnel, probe_ssh_banner)
-from . import bootstrap_protocol, endpoint_policy, rescue_gateway
+from . import agent_bundle, bootstrap_protocol, endpoint_policy, rescue_gateway
 from .rescue_gateway import RescuePortAllocator
 from .windows_onboarding import (SCRIPT_VERSION as SETUP_SCRIPT_VERSION,
                                  SETUP_SCRIPT_SHORT_PATH, build_quick_install_command,
@@ -5286,6 +5286,27 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     function nodeCapable(node, agentType) {
       return agentType === 'shell' || (node.agent_types || []).includes(agentType);
     }
+    // Can the controller actually REACH a session on this node?
+    //
+    // agent_types says what could be launched; it says nothing about
+    // whether anything is listening. A Windows node onboarded by
+    // windows-setup.ps1 heartbeats from a scheduled task -- it is online
+    // and healthy and has no node agent at all, so port 8790 is closed and
+    // every session create against it fails at the transport. Offering it
+    // was worse than hiding it: the operator picked a node the scheduler
+    // could not use.
+    //
+    // Two positive signals, either of which means a real agent is there:
+    // the node explicitly reports session_transport (verified health AND
+    // auth on 8790), or its heartbeat comes from the node agent itself
+    // rather than the setup script. The second keeps every node that
+    // enrolled before session_transport existed working unchanged.
+    function nodeHasTransport(node) {
+      if (!node || node.id === 'local') return true;   // in-process, no transport to dial
+      if ((node.capabilities || []).includes('session_transport')) return true;
+      const version = String(node.agent_version || '');
+      return version !== '' && !version.startsWith('windows-setup/');
+    }
     function nodeSummaryLabel(node) {
       const os = node.platform === 'windows' ? 'Windows' : 'Linux';
       const health = node.status !== 'online' ? 'Offline'
@@ -5306,12 +5327,19 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         opt.textContent = (node.id === 'local' ? 'Local/Dell' : node.display_name || node.id) + ' — ' + nodeSummaryLabel(node);
         const capable = nodeCapable(node, csSelectedAgent);
         const online = node.status === 'online';
+        const reachable = nodeHasTransport(node);
         if (!capable) {
           opt.disabled = true;
           opt.textContent += `  (thiếu agent_type=${csSelectedAgent})`;
         } else if (!online) {
           opt.disabled = true;
           opt.textContent += '  (offline)';
+        } else if (!reachable) {
+          // Online, and still unusable: the heartbeat arrives from the
+          // setup script's scheduled task, but nothing is listening on
+          // 8790 for the controller to dial.
+          opt.disabled = true;
+          opt.textContent += '  (chưa có node agent — chạy lại setup)';
         }
         csNodeEl.append(opt);
       }
@@ -16689,6 +16717,55 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             result = {**result, "token_refresh": hint}
         status_code = 200 if "error" not in result else 404
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/agent-bundle", methods=["GET", "HEAD"],
+                         include_in_schema=False)
+    async def node_agent_bundle(request: Request) -> Response:
+        """The node-agent source bundle, for a node that already has a
+        credential.
+
+        MACHINE-FACING and authenticated by exactly the same per-node
+        bearer token as the heartbeat route -- never a cookie, never
+        anonymous. A node can only ever fetch with its OWN credential, and
+        a missing or wrong token is refused before the store is touched.
+        Deliberately not a public download: the bundle is this project's
+        own source tree, and serving that anonymously would be a very
+        different decision from serving an enrollment code.
+
+        HEAD answers with the metadata alone, which is what makes the
+        installer idempotent -- it compares version and sha256 against what
+        is already on disk and skips the download when they match. GET adds
+        the bytes. One path, one ingress entry, two verbs.
+        """
+        node_id = request.path_params["node_id"]
+        accepted, verdict = _verify_node_token(node_id, request)
+        if not accepted:
+            return JSONResponse({"error": "UNAUTHORIZED", "verdict": verdict.verdict},
+                                status_code=401, headers={"Cache-Control": "no-store"})
+        try:
+            found = await anyio.to_thread.run_sync(agent_bundle.resolve)
+        except agent_bundle.BundleError as exc:
+            # 404 for "nothing published" -- an honest state on a
+            # controller that has not built one yet, not a server error.
+            status = 404 if exc.code == "NOT_PUBLISHED" else 500
+            return JSONResponse({"error": exc.code, "detail": exc.detail}, status_code=status,
+                                headers={"Cache-Control": "no-store"})
+
+        headers = {
+            "Cache-Control": "no-store",
+            "X-Terminal-Mcp-Agent-Version": found["version"],
+            "X-Terminal-Mcp-Agent-Build-Sha": found["build_sha"],
+            "X-Terminal-Mcp-Agent-Sha256": found["sha256"],
+            "X-Terminal-Mcp-Agent-Size": str(found["size"]),
+            "Content-Disposition": 'attachment; filename="%s"' % found["name"],
+        }
+        _log.info("dashboard agent_bundle node_id=%s version=%s size=%s method=%s",
+                 node_id, found["version"], found["size"], request.method)
+        if request.method == "HEAD":
+            headers["Content-Length"] = str(found["size"])
+            return Response(b"", media_type="application/zip", headers=headers)
+        body = await anyio.to_thread.run_sync(found["path"].read_bytes)
+        return Response(body, media_type="application/zip", headers=headers)
 
     @server.custom_route("/dashboard/api/nodes/{node_id}/token/refresh", methods=["POST"], include_in_schema=False)
     async def node_token_refresh(request: Request) -> JSONResponse:
