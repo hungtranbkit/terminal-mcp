@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from .adapters import is_submission_confirmed
 from .audit import sanitized_preview, text_fingerprint
 from .metrics import increment
 from .models import SessionIdentity
@@ -757,12 +758,27 @@ class SupervisorV2Service:
                                   stop_reason=result["error"], send_result=json.dumps(result))
             return {"sent": False, **result}
         watch = self.v1.store.get_watch(action["watch_key"])
-        if result.get("submit_status") == "SUBMIT_UNCONFIRMED":
-            # P0-6: the text really was sent (sent=True stays accurate),
-            # but Enter's submission could not be confirmed -- never count
-            # this as a successful auto-action or let reconciliation
-            # advance the chain as if it had progressed. Hold for review,
-            # exactly like a content-screening block.
+        if not is_submission_confirmed(result):
+            # P0-6: the text really was sent (sent=True stays accurate), but
+            # submission was not PROVED -- never count this as a successful
+            # auto-action or let reconciliation advance the chain as if it had
+            # progressed. Hold for review, exactly like a content-screening
+            # block.
+            #
+            # This asks adapters.is_submission_confirmed (a positive allowlist)
+            # rather than checking for the literal "SUBMIT_UNCONFIRMED" it used
+            # to. A denylist here silently advanced autonomous work on two
+            # results that prove nothing: `TEXT_SENT`, which legacy
+            # to_legacy_submit_status deliberately preserves rather than folding
+            # into the unconfirmed bucket, and a result carrying no delivery
+            # field at all. The failure mode is the one that matters least
+            # visibly and costs most -- a chain marching on after a prompt that
+            # was typed and never submitted.
+            # The stop_reason keeps its exact existing spelling: dashboards,
+            # operator runbooks and tests already key on it, and the specific
+            # delivery_state that failed to confirm is already durable in
+            # send_result below. What changed is WHICH results land here, not
+            # what they are called.
             self.store.cas_update(action_id, expected_state="sent", state="blocked",
                                   stop_reason="submit_unconfirmed", send_result=json.dumps(result))
             self.store.block_policy(action["watch_key"], "submit_unconfirmed")

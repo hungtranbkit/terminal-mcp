@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from typing import Any
 from abc import ABC, abstractmethod
 
 # ---------------------------------------------------------------------------
@@ -57,6 +59,36 @@ def to_legacy_submit_status(delivery_state: str) -> str:
     if delivery_state in (DELIVERY_TEXT_SENT, DELIVERY_SUBMIT_CONFIRMED):
         return delivery_state
     return "SUBMIT_UNCONFIRMED"
+
+
+def is_submission_confirmed(result: Mapping[str, Any]) -> bool:
+    """Did this send result PROVE the prompt was submitted?
+
+    A positive allowlist over the vocabulary above, and the distinction matters
+    because a caller acting autonomously has to decide whether to advance a
+    chain of work on the answer. Only SUBMIT_CONFIRMED carries adapter evidence
+    that submission actually happened.
+
+    Everything else is not-proven, including the two cases a denylist misses:
+
+      TEXT_SENT -- the text reached the composer and Enter's effect was never
+        established. Legacy `to_legacy_submit_status` deliberately preserves this
+        spelling rather than folding it into SUBMIT_UNCONFIRMED, so a consumer
+        checking `!= "SUBMIT_UNCONFIRMED"` reads it as success.
+
+      a missing field -- a result shape this function has not met. Treating
+        absence as success is how a new transport, a short-circuit path or a
+        refactor silently starts advancing autonomous work on no evidence at
+        all.
+
+    Named here, beside DELIVERY_STATES, so there is ONE definition of
+    "confirmed" for every consumer instead of each one re-deriving it from the
+    string constants and getting a slightly different answer."""
+    state = result.get("delivery_state")
+    if state is not None:
+        return state == DELIVERY_SUBMIT_CONFIRMED
+    # Older/synthesised results may carry only the legacy field.
+    return result.get("submit_status") == DELIVERY_SUBMIT_CONFIRMED
 
 
 # Target states an adapter reports the pane as currently showing.

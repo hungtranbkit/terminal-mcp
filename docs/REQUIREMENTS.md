@@ -3298,6 +3298,115 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
   action.
 - **Trace:** see this file's own commit.
 
+### Supervisor / watch / queue reliability integration
+
+- **Goal / user value:** one coherent Supervisor/Queue lifecycle with no second
+  scheduler and no watch that is silently disabled because of an implementation
+  defect rather than a decision.
+- **Status:** IMPLEMENTED and TESTED locally; runtime effect on the live
+  controller is NOT yet proved (that needs a controller restart, out of scope
+  here). Every new behaviour is opt-in or default-off.
+- **Design of record:** `docs/supervisor-queue-lifecycle.md`.
+- **Symptom this started from (live `supervisor.db`):** `watch_count=10,
+  enabled_watch_count=0, stalled_count=3`. Six rows (`wtest`, `win2`, `hp1`,
+  `hp2`, `hp3-work`, `hp-work`) were `target_missing` at `iteration_count=1`
+  while those sessions were alive on the hp and Windows nodes; three were
+  `max_iterations_exceeded` (223/121/20 iterations); one was a person's
+  `manual_unwatch`.
+- **Root causes:**
+  1. Every status call in `supervisor.py` went to the LOCAL `TerminalService`, so
+     a watch on another node's session resolved against local tmux, came back
+     MISSING, and was disabled on its first poll.
+  2. `watch(session="hp/hp1")` returned ACCESS_DENIED: `_read_authorized` was
+     asked about the node-QUALIFIED name while grants are keyed by session name.
+     The fleet-correct way to name a watch was the one way that could not be
+     used, which is why the production rows are all bare names.
+  3. `_sync_config_watches` listed local tmux only, so `watched_session_patterns`
+     could never match a remote session, with no error to explain it; and
+     `rename_target` matched only the exact key, so a bare rename from the node
+     that performed it missed the qualified watch.
+  4. `supervisor_status` counted only two disable reasons as stalled, so six
+     disabled watches were invisible and the surface said 3 while 9 were down.
+  5. The EventBus was write-only: `event_wiring.py` published every transition
+     and nothing ever claimed one, so dependents were never woken by the
+     completion that unblocked them and the dead-letter table could not engage.
+  6. `supervisor2.execute_send` read the transport's answer with a denylist
+     (`== "SUBMIT_UNCONFIRMED"`), so `TEXT_SENT` and a result with no delivery
+     field advanced an autonomous chain and counted as a successful auto-action.
+  7. `build_mcp()` defaulted `controller` AFTER constructing `RecoveryEngine`/
+     `RecoveryLoop` with it, so the stdio surface (`build_mcp()` bare, as
+     `server.py` calls it) built both with `controller=None` -- auto-recovery and
+     `reconcile_node` silently non-functional there.
+- **Fix:**
+  - `supervisor.py`: one `_status_for` used by BOTH polling and reconciliation
+    (when they disagreed, a watch could be disabled by a poll that asked the
+    fleet and never revived by a probe that asked local); optional
+    `fleet_status`/`fleet_sessions` callbacks wired post-construction, same
+    duck-typed posture as `autonomous_check`, so `None` means today's local-only
+    behaviour; `bare_session_name` for the read gate; fleet-aware config seeding;
+    `rename_target` matching a qualified row for a bare rename, refusing when two
+    nodes hold the same bare name.
+  - Routing is LOCAL FIRST, then fleet. Not a preference: routing bare names
+    through the controller unconditionally makes every local watch depend on the
+    local node being ONLINE, and a stale heartbeat then answers
+    SESSION_NOT_FOUND for a session running right here. That regression broke
+    `test_supervisor_tools_registered_and_functional` and would have disabled the
+    three working local watches to fix the six remote ones.
+  - `scheduler_health.py`: `disable_reason_for_status_error` mapping fleet errors
+    to distinct recoverable reasons (`node_unreachable`, `node_not_found`,
+    `ambiguous_target`), with an UNRECOGNISED error mapping to a recoverable
+    reason so a new fleet error code can never permanently blind a watch.
+  - Absorbs `fix/scheduler-refill` (blg_8d65afc1b38b): `reconcile_attempts`,
+    backoff, `reenable_watch`, iteration reset, and the
+    recoverable/intentional/disabled split in `supervisor_status`.
+  - `queue_event_drain.py` (new): bus consumption as a STEP of the existing
+    `QueueLoop` cycle -- never a second thread, because two schedulers on the
+    same lanes would leave the lane claim lease arbitrating races every cycle.
+    Three stacked gates (`queue.enabled`, new `queue.drain_enabled` default
+    False, per-lane `auto_dispatch_enabled` re-checked because an event names its
+    lane directly), one tick per lane per pass, bounded batch, `fail()` not
+    `ack()` on error so attempts/dead-lettering engage, unreadable bus never
+    stops dispatch.
+  - `adapters.is_submission_confirmed` (new): positive allowlist beside
+    DELIVERY_STATES, consumed by `execute_send`. `stop_reason` keeps its exact
+    spelling; the specific failing state is already durable in `send_result`.
+  - `mcp_app.py`: controller defaulted before the services that take it.
+- **Scope / flow:** local/integration only. No production deploy, no credential
+  creation, no Windows rollout. `feat/windows-detached-sessions` (4ff5f5c) was
+  not touched and is dependency-compatible (disjoint files).
+- **API/tool/command:** no new MCP tools. New config: `queue.drain_enabled`
+  (default False), `queue.drain_batch_size` (25). New `supervisor_status` fields
+  (additive): `disabled_watch_count`, `recoverable_disabled_count`,
+  `intentionally_excluded_count`, `disabled_reasons`.
+- **Data/schema/migration:** one additive, defaulted column
+  (`watches.reconcile_attempts`, ALTER-if-absent) from the absorbed branch. No
+  re-keying of the ten live watch rows -- bare names resolve through the
+  controller as they are.
+- **Acceptance/tests/evidence:** `tests/test_supervisor_fleet_watches.py` (24:
+  the six production rows restoring only once their nodes return, the
+  `manual_unwatch` that must never be resurrected, the full ten-row production
+  mix restoring by policy rather than all-or-nothing, per-error disable reasons,
+  remote timeout isolation, fleet rename including the ambiguous refusal, and the
+  local-first regression itself); `tests/test_queue_event_drain.py` (39: every
+  actionable type, the three gates, at-least-once redelivery, poison-event
+  dead-lettering, batch bounds, re-entrancy, two concurrent drains partitioning
+  rather than duplicating, and loop start/stop lifecycle);
+  `tests/test_supervisor_v2_acceptance.py` (20); `tests/test_mcp_app_wiring.py`
+  (3). Absorbed: `tests/test_supervisor_reconcile.py`,
+  `tests/test_scheduler_health.py`, `tests/test_scheduler_integration.py`.
+- **Known limitations:** the fleet is SIMULATED in tests -- a fake resolver, not
+  real remote nodes, because the defect is entirely in which resolver gets asked
+  and a simulated node can be made unreachable on demand. The six watches
+  actually recovering, the drain under real multi-node load, and whether the
+  backoff/max_iterations constants suit real workers all still need a real node.
+  `test_scheduler_integration.py` keeps 4 declared phase-2 skips (worker
+  discovery/dispatch not landed).
+- **Follow-up/backlog:** blg_39f82cd2fe3a stays IN_PROGRESS -- its AC1 is
+  satisfied in substance but via `adapters.is_submission_confirmed` rather than
+  `delivery_gate.evaluate`, and its AC2 (a distinct stop_reason for NOT_ACCEPTED)
+  was deliberately NOT done to keep the existing label; the MCP-send-tools half
+  and the advisory->enforce promotion remain with the owning lane.
+- **Trace:** branch `integration/supervisor-queue-reliability`.
 ### Windows detached session hosts (survive node-agent restart)
 
 - **Goal / user value:** a Windows node-agent update or restart must stop
