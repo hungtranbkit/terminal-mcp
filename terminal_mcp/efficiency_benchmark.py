@@ -543,6 +543,22 @@ class CaseResult:
         return bool(self.assisted.owning_modules)
 
     @property
+    def smaller_than_union(self) -> bool | None:
+        """Against the baseline a worker actually pays, not its luckiest case.
+
+        SECONDARY, and deliberately not part of the verdict: the headline was
+        pre-registered against the single most selective term and stays
+        there. But the luckiest grep is not what a worker triages -- it tries
+        its several terms and triages what they all return -- so the union is
+        the comparison that describes the real cost, and leaving it out
+        because the headline was registered differently would be hiding half
+        the measurement.
+        """
+        if not self.assisted.contains_fix_path:
+            return None
+        return (self.assisted.surface.value or 0) < (self.baseline.union_surface.value or 0)
+
+    @property
     def verdict(self) -> str:
         """What this case actually shows. A miss is a miss, whatever it cost.
 
@@ -562,6 +578,7 @@ class CaseResult:
 
     def as_dict(self) -> dict[str, Any]:
         return {"case_id": self.case.case_id, "origin": self.case.origin,
+                "smaller_than_union_baseline": self.smaller_than_union,
                 "category": self.case.category, "commit": self.case.commit,
                 "symptom": self.case.symptom, "fix_paths": list(self.case.fix_paths),
                 "baseline": self.baseline.as_dict(), "assisted": self.assisted.as_dict(),
@@ -659,6 +676,17 @@ def summarise(results: Sequence[CaseResult]) -> dict[str, Any]:
         },
         "fix_site_mapped": sum(1 for r in results if r.fix_site_mapped),
         "fix_site_unmapped": sum(1 for r in results if not r.fix_site_mapped),
+        # SECONDARY (see CaseResult.smaller_than_union): never feeds the verdict.
+        "secondary_vs_union_baseline": {
+            "smaller": sum(1 for r in results if r.smaller_than_union is True),
+            "denominator": sum(1 for r in results if r.smaller_than_union is not None),
+            "mean_union_surface": Figure.estimate(
+                mean([r.baseline.union_surface.value or 0 for r in results]) or 0,
+                method="mean files matching ANY derived term -- what a worker "
+                       "triages when no single term happens to be selective").as_dict(),
+            "note": "reported because the headline's baseline is the luckiest "
+                    "single grep, which is the hardest case and not the usual one",
+        },
         "mean_seconds": {
             "baseline": Figure.real(
                 mean([r.baseline.seconds.value or 0.0 for r in results]) or 0.0,
@@ -722,6 +750,39 @@ def acceptance(summary: dict[str, Any], *, usage: dict[str, Any],
                         "when a provider actually reported counters"}}
 
 
+def map_provenance(knowledge: Any, *, repo_root: str | Path) -> dict[str, Any]:
+    """What the knowledge map actually contained when this ran.
+
+    A retrieval result is only meaningful beside the map it was drawn from,
+    and "the map" is a thing that changes. Recording its size, its coverage
+    of the package and the commit it was indexed at makes two runs of this
+    benchmark comparable instead of merely adjacent.
+    """
+    try:
+        modules = knowledge.module_states()
+        state = knowledge.load_state()
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "detail": f"{type(exc).__name__}: {exc}"}
+    indexed_files: set[str] = set()
+    for module in modules:
+        for path in getattr(module, "paths", ()) or ():
+            indexed_files.add(str(path))
+    package = {f"terminal_mcp/{p.name}"
+               for p in (Path(repo_root) / "terminal_mcp").glob("*.py")
+               if p.name != "__init__.py"}
+    covered = package & indexed_files
+    return {
+        "available": True,
+        "modules": len(modules),
+        "indexed_paths": len(indexed_files),
+        "package_files": len(package),
+        "package_files_indexed": len(covered),
+        "package_coverage": (round(len(covered) / len(package), 3) if package else None),
+        "indexed_at_commit": (state.get("last_indexed_commit") or "")[:12],
+        "modules_without_summary": sorted(m.name for m in modules if not m.summary),
+    }
+
+
 def run_benchmark(cases: Sequence[BenchmarkCase], *, repo_root: str | Path,
                   knowledge: Any, store_path: str | Path,
                   telemetry_store: Any = None,
@@ -746,6 +807,7 @@ def run_benchmark(cases: Sequence[BenchmarkCase], *, repo_root: str | Path,
     unmapped = [r for r in real if not r.fix_site_mapped]
     report: dict[str, Any] = {
         "corpus": {"cases": len(results), "real": len(real), "synthetic": len(synthetic)},
+        "knowledge_map": map_provenance(knowledge, repo_root=repo_root),
         "methodology": METHODOLOGY,
         "results": [r.as_dict() for r in results],
         "summary": summary,
@@ -846,6 +908,19 @@ METHODOLOGY = [
     "A briefing that does not contain a real fix path is a MISS, however small.",
     "Every figure is labelled REAL, ESTIMATE or UNAVAILABLE; nothing unmeasured "
     "is filled in.",
+    "MAP PROVENANCE, disclosed: the first run measured a map of 9 modules / 19 "
+    "paths, and its finding was that coverage -- not retrieval -- was the "
+    "constraint. The package was then indexed COMPLETELY (every file assigned to "
+    "exactly one module, enforced by the indexer), which is a change made after "
+    "seeing the result. It was done by a uniform rule rather than by indexing the "
+    "modules the corpus needed, because the second would have been tuning the "
+    "system to its own test.",
+    "TWO SUMMARY STYLES were measured and the numbers for both are recorded here: "
+    "prose (the module's own first docstring sentence) and names (that plus every "
+    "public name its files define). Prose was kept -- it locates the fix site more "
+    "often AND is the more defensible artifact -- but choosing between them by "
+    "benchmark result is fitting to this corpus, so the kept variant's number is "
+    "optimistic by an unknown amount.",
     "The instrument was corrected twice while it was being built, and neither "
     "correction improved the result. (1) It chose a module by argmax with no "
     "confidence floor, 'choosing' modules on scores of 0.03; applying the shipped "
@@ -953,6 +1028,39 @@ def conclusions(report: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+# Every run of this benchmark that has been performed, with the MAP it was
+# run against. Recorded because the question "did indexing help?" cannot be
+# answered by a single run, and because the honest answer turned out to be
+# more complicated than yes or no. Each row is a real run; the current run's
+# own numbers are computed, never copied from here.
+PRIOR_RUNS: list[dict[str, Any]] = [
+    {
+        "date": "2026-09-14",
+        "map": "9 modules / 19 paths (the map as it had grown on its own)",
+        "located": "5/17 (0.294)",
+        "beat_luckiest_grep": "2/5 (0.400)",
+        "module_choice": "5 right / 2 wrong / 11 fix sites unmapped",
+        "analysis_depth": "3 reuse / 3 read-related / 12 full",
+        "mean_assisted_surface": 0.61,
+        "note": "coverage was the binding constraint: in 11 of 18 cases the map "
+                "contained none of the files the fix touched",
+    },
+    {
+        "date": "2026-09-15",
+        "map": "33 modules / 147 paths, summaries = docstring sentence + every "
+               "public name the module's files define",
+        "located": "5/17 (0.294)",
+        "beat_luckiest_grep": "1/5 (0.200)",
+        "module_choice": "6 right / 12 wrong / 0 unmapped",
+        "analysis_depth": "1 reuse / 6 read-related / 11 full",
+        "mean_assisted_surface": 4.67,
+        "note": "complete coverage, no improvement: the bottleneck moved from "
+                "coverage to module CHOICE, and a summary full of symbol names "
+                "made choosing worse",
+    },
+]
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     """The report a person reads, with the unflattering parts kept in."""
     summary = report["summary"]
@@ -976,6 +1084,50 @@ def render_markdown(report: dict[str, Any]) -> str:
             add(f"  - **{item['caveat']}**")
         add(f"  - _supports: {item['supports']}_")
     add("")
+    if PRIOR_RUNS:
+        add("## How this has moved")
+        add("")
+        add("| Run | Map | Named the fix site | Beat the luckiest grep | Module choice "
+            "| Re-analysis | Mean briefing |")
+        add("|---|---|---|---|---|---|---|")
+        for run in PRIOR_RUNS:
+            add(f"| {run['date']} | {run['map']} | {run['located']} "
+                f"| {run['beat_luckiest_grep']} | {run['module_choice']} "
+                f"| {run['analysis_depth']} | {run['mean_assisted_surface']} files |")
+        current = report["summary"]
+        module_choice = current["module_choice"]
+        analysis = current["analysis_depth"]["assisted"]
+        located_hits = (current["verdicts"]["SHRUNK"] + current["verdicts"]["NO_SHRINK"])
+        add(f"| **this run** | {(report.get('knowledge_map') or {}).get('modules', '?')} "
+            f"modules / {(report.get('knowledge_map') or {}).get('indexed_paths', '?')} "
+            f"paths, prose summaries "
+            f"| {located_hits}/{current['located_denominator']} "
+            f"({current['located_rate']}) "
+            f"| {current['verdicts']['SHRUNK']}/{current['shrunk_denominator']} "
+            f"({current['shrunk_rate']}) "
+            f"| {module_choice['right']} right / {module_choice['wrong']} wrong / "
+            f"{module_choice['unmapped']} unmapped "
+            f"| {analysis.get(REUSE_PRIOR, 0)} reuse / "
+            f"{analysis.get(READ_RELATED, 0)} read-related / "
+            f"{analysis.get(FULL_ANALYSIS, 0)} full "
+            f"| {current['mean_assisted_surface']['value']} files |")
+        add("")
+        for run in PRIOR_RUNS:
+            add(f"- {run['date']}: {run['note']}")
+        add("")
+    provenance = report.get("knowledge_map") or {}
+    if provenance.get("available"):
+        add("## The map the briefing was built from")
+        add("")
+        add(f"- {provenance['modules']} modules, {provenance['indexed_paths']} indexed "
+            f"paths, at commit `{provenance['indexed_at_commit']}`")
+        add(f"- package coverage: {provenance['package_files_indexed']}"
+            f"/{provenance['package_files']} files "
+            f"({provenance['package_coverage']})")
+        if provenance.get("modules_without_summary"):
+            add(f"- modules with NO summary (their largest file has no module "
+                f"docstring): {', '.join(provenance['modules_without_summary'])}")
+        add("")
     add("## Methodology, stated before measuring")
     add("")
     for item in report["methodology"]:
@@ -1006,6 +1158,14 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"{summary['verdicts']['SHRUNK']}/{summary['shrunk_denominator']} "
         f"(rate {summary['shrunk_rate']})")
     add(f"- module choice: {summary['module_choice']}")
+    secondary = summary.get("secondary_vs_union_baseline") or {}
+    if secondary:
+        add(f"- **secondary, not part of the verdict**: against the baseline a "
+            f"worker actually pays -- everything its {summary['mean_baseline_searches']['value']} "
+            f"derived terms return, {secondary['mean_union_surface']['value']} files "
+            f"on average -- the briefing was smaller in "
+            f"{secondary['smaller']}/{secondary['denominator']} located cases. "
+            f"{secondary['note']}.")
     add(f"- re-analysis depth (assisted): {summary['analysis_depth']['assisted']}")
     add("")
     stratified = report.get("stratified") or {}

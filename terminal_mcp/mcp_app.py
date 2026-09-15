@@ -204,6 +204,7 @@ def build_mcp(service: TerminalService | None = None,
     # rule, applied to content instead of metadata. Uses terminal's own
     # AuditStore; never a second audit database.
     repo = build_repo_service(terminal, controller)
+    _worktree_sweep_holder: dict[str, Any] = {}
     queue_engine = QueueEngine(queue.store, controller, coordinator=_gate,
                               on_completed=_on_task_completed, verify_queue=queue.verify_queue)
     queue.engine = queue.engine or queue_engine
@@ -2830,6 +2831,140 @@ def build_mcp(service: TerminalService | None = None,
         `task_id` was created with. Refuses (TASK_NOT_ISOLATED) for a
         task that was never created via terminal_task_create_isolated."""
         return git_isolation.worktree_status_for_task(task_id)
+
+    @server.tool()
+    def terminal_worktree_janitor_scan(repo_path: str = "", include_safe: bool = True) -> dict:
+        """AUDIT-ONLY classification of every git worktree a repo knows about
+        (docs/WORKTREE_JANITOR.md). READS ONLY -- it cannot remove, prune or
+        change anything, and there is no executor in this build at all.
+
+        Each candidate comes back with a `policy_class`:
+          AUTO_SAFE -- clean, merged (or preserved), no live reference, no
+                       valuable ignored data, grace elapsed, evidence fresh.
+                       Reported only; nothing acts on it.
+          REVIEW    -- a human should decide (detached HEAD, pushed-but-unmerged,
+                       orphan, stale admin entry, grace not yet elapsed).
+          BLOCKED   -- dangerous to remove (dirty, unmerged AND unpushed, a
+                       process/tmux pane/session/service using it, a credential
+                       or database in ignored files, the main worktree, a path
+                       outside the allowlist, a symlink/mount).
+          UNKNOWN   -- the facts could not be established at all. Fail-closed:
+                       never treated as safe.
+
+        `reasons` carries stable machine-readable codes and `predicates` shows
+        each individual check's True/False/None outcome, so a verdict is always
+        explainable. Only paths are reported for sensitive ignored files, never
+        their contents.
+
+        Requires worktree_janitor.allowed_roots to be configured -- with none
+        set, nothing is collectable by design."""
+        from . import worktree_janitor
+
+        config = terminal.config.worktree_janitor
+        target = repo_path.strip() or None
+        if not target:
+            return {"error": "REPO_PATH_REQUIRED",
+                    "detail": "pass repo_path -- the janitor never guesses which repo to scan"}
+        report = worktree_janitor.scan(target, config.to_policy())
+        if not include_safe:
+            report["candidates"] = [c for c in report.get("candidates", [])
+                                    if c.get("policy_class") != worktree_janitor.AUTO_SAFE]
+        return report
+
+    def _worktree_sweep():
+        """Built lazily and cached on the closure, the same shape mcp_app uses
+        for other optional services. Constructed even when the background
+        thread is disabled -- run_once must stay callable with the loop off."""
+        if "sweep" not in _worktree_sweep_holder:
+            from .worktree_executor import WorktreeExecutor
+            from .worktree_sweep import WorktreeSweep
+
+            config = terminal.config.worktree_janitor
+            executor = WorktreeExecutor(
+                config.to_policy(), audit=terminal.audit,
+                locks=ResourceLockStore(terminal.leases.path),
+                store=queue.store,
+                node_id=getattr(controller, "local_node_id", "local"))
+            _worktree_sweep_holder["sweep"] = WorktreeSweep(
+                executor, store=queue.store, repo_roots=config.repo_roots,
+                interval_seconds=config.sweep_interval_seconds,
+                orphan_confirm_runs=config.orphan_confirm_runs,
+                orphan_min_age_seconds=config.orphan_min_age_seconds,
+                max_candidates_per_run=config.max_candidates_per_run,
+                budget_seconds=config.sweep_budget_seconds)
+        return _worktree_sweep_holder["sweep"]
+
+    @server.tool()
+    def terminal_worktree_sweep_run_once(dry_run: bool = True) -> dict:
+        """Run ONE worktree-janitor sweep pass now (docs/WORKTREE_JANITOR.md).
+
+        Callable whether or not the background loop is enabled -- the loop gates
+        the AUTOMATIC trigger only. Converges cleanup records whose directory
+        already vanished, then looks for orphaned worktrees no task claims.
+
+        `dry_run=True` (the default) reports what it would do and removes
+        nothing. Even with dry_run=False, nothing is removed unless
+        worktree_janitor.mode is auto_execute -- two independent gates.
+
+        An orphan is never actioned on first sighting: it must be seen unclaimed
+        in `orphan_confirm_runs` consecutive passes AND be older than
+        `orphan_min_age_seconds`, because a worktree can legitimately exist for
+        a moment before the task that references it does.
+
+        Returns the full report: per-candidate outcomes, what was skipped and
+        why, errors per repo, and reclaimed bytes. Never raises."""
+        sweep = _worktree_sweep()
+        sweep.dry_run = bool(dry_run)
+        return sweep.run_once()
+
+    @server.tool()
+    def terminal_worktree_janitor_report(repo_path: str = "") -> dict:
+        """The Worktree Janitor report an operator reads -- the SAME data the
+        dashboard panel shows (docs/WORKTREE_JANITOR.md, P5).
+
+        READ-ONLY. Summarises classifications: reclaimable bytes by class, the
+        review queue, BLOCKED items with their reasons in plain language
+        alongside the machine codes, the oldest candidate, and whether anything
+        is enforcing (`observe_only` is true unless mode is auto_execute).
+
+        `reclaimable_bytes` counts AUTO_SAFE only -- BLOCKED and REVIEW items
+        are not going to be removed, so including them would promise space that
+        is not coming.
+
+        Sensitive ignored files are named by PATH only, never by content. There
+        is no force option here or anywhere else in this surface."""
+        from . import worktree_janitor, worktree_review
+
+        config = terminal.config.worktree_janitor
+        roots = [repo_path.strip()] if repo_path.strip() else list(config.repo_roots)
+        if not roots:
+            return {"error": "NO_REPO_ROOTS", "mode": config.mode,
+                    "observe_only": config.mode != "auto_execute",
+                    "detail": "configure worktree_janitor.repo_roots, or pass repo_path",
+                    "candidates": [], "counts": {}}
+        candidates: list[dict] = []
+        errors: list[dict] = []
+        for root in roots:
+            report = worktree_janitor.scan(root, config.to_policy())
+            if report.get("error"):
+                errors.append({"repo_path": root, "error": report["error"]})
+            candidates.extend(report.get("candidates") or [])
+        payload = worktree_review.build_report(candidates, mode=config.mode)
+        payload["repo_roots"] = roots
+        if errors:
+            # Surfaced rather than folded into the totals: a root that could not
+            # be scanned is not a root with nothing in it.
+            payload["errors"] = errors
+            payload["complete"] = False
+        else:
+            payload["complete"] = True
+        return payload
+
+    @server.tool()
+    def terminal_worktree_sweep_status() -> dict:
+        """Whether the sweep loop is running, its configured bounds, and the
+        last pass's report. Read-only."""
+        return _worktree_sweep().status()
 
     @server.tool()
     def terminal_worktree_cleanup(task_id: str, force: bool = False) -> dict:

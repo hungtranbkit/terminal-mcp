@@ -34,7 +34,7 @@ from . import node_credentials
 from .token_rotation import TokenRotationService
 from .node_transport import (GENERIC_SETUP_CODE, KIND_LAN, KIND_REVERSE_SSH, KIND_TAILSCALE,
                              TransportStore, probe_reverse_tunnel, probe_ssh_banner)
-from . import bootstrap_protocol, rescue_gateway
+from . import bootstrap_protocol, endpoint_policy, rescue_gateway
 from .rescue_gateway import RescuePortAllocator
 from .windows_onboarding import (SCRIPT_VERSION as SETUP_SCRIPT_VERSION,
                                  SETUP_SCRIPT_SHORT_PATH, build_quick_install_command,
@@ -9916,6 +9916,29 @@ AI_USAGE_HTML = """<!doctype html>
       return box;
     }
 
+    // How full the model's context is. This is NOT the subscription quota --
+    // that lives in quotaPill and is `unavailable` because no local artefact
+    // reports it. Context fullness is computed from provider-reported token
+    // counts against a window resolved from the model id, so it is shown only
+    // when that window is known; every other case is N/A with the reason on
+    // hover, never a number.
+    function contextPill(context) {
+      if (!context) return el('span', {className: 'pill na', text: '—'});
+      if (context.used_percent == null) {
+        const pill = el('span', {className: 'pill na',
+          text: context.used ? 'N/A · ' + short(context.used) : 'N/A'});
+        if (context.detail) pill.title = context.detail;
+        return pill;
+      }
+      const pct = Math.round(context.used_percent);
+      // Only classes this page actually defines: `warn` is the red one here.
+      const cls = pct >= 80 ? 'pill warn' : 'pill rep';
+      const pill = el('span', {className: cls,
+        text: pct + '% · ' + short(context.used) + '/' + short(context.window)});
+      pill.title = context.detail || '';
+      return pill;
+    }
+
     function quotaPill(window) {
       const state_ = window.state || (window.observed ? 'provider_reported' : 'unavailable');
       if (state_ === 'provider_reported') {
@@ -10002,6 +10025,7 @@ AI_USAGE_HTML = """<!doctype html>
           {title: '7d', key: 'tokens_7d', render: (r) => short(r.tokens_7d)},
           {title: 'Requests', key: 'requests', render: (r) => fmt(r.requests)},
           {title: 'TB/req', key: 'avg_tokens_per_request', render: (r) => fmt(r.avg_tokens_per_request)},
+          {title: 'Context', left: true, render: (r) => contextPill(r.context)},
           {title: 'Chi phí', key: 'estimated_cost_usd', render: (r) => usd(r.estimated_cost_usd)},
           {title: 'Quota 5h', left: true, render: () => quotaPill(quotaFor('5h') || {})},
           {title: 'Quota 1w', left: true, render: () => quotaPill(quotaFor('1w') || {})},
@@ -10535,6 +10559,13 @@ GLOBAL_TASKS_HTML = """<!doctype html>
     document.querySelector('#refreshBtn').onclick = load;
     sessionFilterEl.addEventListener('input', () => renderBoard(lastData));
 
+    let ntRequestKey = null;
+    function newRequestKey() {
+      // crypto.randomUUID is not available on every browser/origin this
+      // dashboard is opened from, so fall back rather than throw.
+      if (window.crypto && window.crypto.randomUUID) return 'dash-' + window.crypto.randomUUID();
+      return 'dash-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    }
     const newTaskPanelEl = document.querySelector('#newTaskPanel');
     document.querySelector('#newTaskBtn').onclick = () => { newTaskPanelEl.hidden = false; document.querySelector('#ntTitle').focus(); };
     document.querySelector('#ntCancelBtn').onclick = () => { newTaskPanelEl.hidden = true; };
@@ -10546,17 +10577,34 @@ GLOBAL_TASKS_HTML = """<!doctype html>
       const errEl = document.querySelector('#ntError');
       if (!prompt) { errEl.textContent = 'Prompt là bắt buộc.'; return; }
       errEl.textContent = '';
+      const btn = document.querySelector('#ntSubmitBtn');
+      if (btn.disabled) return;          // a second click of one submission
+      // One key per SUBMISSION, not per click and not per page load. It
+      // survives every retry of this submission -- including a reconnect --
+      // and is cleared only once the server has accepted it, so the next
+      // real submission is a new request rather than a replay of this one.
+      if (!ntRequestKey) ntRequestKey = newRequestKey();
+      btn.disabled = true;
       try {
         const result = await fetchJSON('/dashboard/api/tasks/create', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({title, prompt, session, project}),
+          body: JSON.stringify({title, prompt, session, project, request_key: ntRequestKey}),
         });
         if (result && result.error) { errEl.textContent = clean(result.error); return; }
+        if (result && result.payload_conflict) {
+          errEl.textContent = clean(result.conflict_detail || 'request_key conflict');
+          return;
+        }
+        ntRequestKey = null;             // accepted -- the next submit is new
         document.querySelector('#ntTitle').value = ''; document.querySelector('#ntPrompt').value = '';
         document.querySelector('#ntSession').value = ''; document.querySelector('#ntProject').value = '';
         newTaskPanelEl.hidden = true;
         await load();
-      } catch (error) { errEl.textContent = clean(error.message || error); }
+      } catch (error) {
+        // Keep ntRequestKey: this submission is unfinished, and the retry
+        // must be the SAME request, not a second one.
+        errEl.textContent = clean(error.message || error);
+      } finally { btn.disabled = false; }
     };
 
     load(); setInterval(load, 4000);
@@ -12115,6 +12163,16 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                                 headers={"Cache-Control": "no-store"}), None
         return None, identity
 
+    def _queue_store_for_worktrees():
+        """The SAME QueueStore the queue uses -- the cleanup record lives on the
+        task's own metadata, so a second store would write to a different file
+        and the review would appear to do nothing."""
+        from .queue_store import QueueStore
+
+        if queue is not None and getattr(queue, "store", None) is not None:
+            return queue.store
+        return QueueStore()
+
     def _mutation_guard(request: Request):
         """Independent boundary in front of every dashboard POST route
         (session input, supervisor ack, supervisor2 pause) -- checked
@@ -12641,6 +12699,72 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             payload = {"error": "INBOX_READ_FAILED", "detail": str(exc),
                        "issues": [], "summary": {}}
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/worktrees", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_worktrees(request: Request) -> JSONResponse:
+        """The Worktree Janitor panel's data (docs/WORKTREE_JANITOR.md, P5).
+
+        READ-ONLY. Classifies with the same engine the executor uses and
+        summarises it for a human: reclaimable bytes by class, BLOCKED reasons
+        in plain language, the oldest candidate, and whether anything is
+        actually enforcing.
+
+        Only PATHS are ever reported for sensitive ignored files -- naming the
+        file is what makes a refusal actionable, and printing a line of it would
+        put the secret on a dashboard."""
+        from . import worktree_janitor, worktree_review
+
+        config = terminal.config.worktree_janitor
+        repo_path = (request.query_params.get("repo_path") or "").strip()
+        roots = [repo_path] if repo_path else list(config.repo_roots)
+        if not roots:
+            return JSONResponse(
+                {"error": "NO_REPO_ROOTS",
+                 "detail": "configure worktree_janitor.repo_roots, or pass repo_path",
+                 "mode": config.mode, "observe_only": config.mode != "auto_execute",
+                 "candidates": [], "counts": {}},
+                headers={"Cache-Control": "no-store"})
+
+        def _collect() -> list[dict]:
+            found: list[dict] = []
+            for root in roots:
+                report = worktree_janitor.scan(root, config.to_policy())
+                found.extend(report.get("candidates") or [])
+            return found
+
+        candidates = await anyio.to_thread.run_sync(_collect)
+        payload = worktree_review.build_report(candidates, mode=config.mode)
+        payload["repo_roots"] = roots
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/worktrees/review", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_worktrees_review(request: Request) -> JSONResponse:
+        """Record an operator decision on one review-queue item.
+
+        `decision` is approve or abandon, and NOTHING else -- there is
+        deliberately no force/delete-now option on this route, so no UI can
+        offer one. Approve moves the item to CLEANUP_ELIGIBLE, which the
+        executor re-checks with fresh evidence before removing anything; a human
+        cannot approve past a predicate. Abandon stops it being re-proposed.
+
+        Mutation-guarded exactly like every sibling POST route (auth + CSRF)."""
+        from . import worktree_review
+
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        task_id = str(body.get("task_id") or "").strip()
+        decision = str(body.get("decision") or "").strip()
+        service = worktree_review.WorktreeReviewService(
+            store=_queue_store_for_worktrees(), audit=terminal.audit)
+        result = await anyio.to_thread.run_sync(lambda: service.decide(
+            task_id, decision, actor=(identity.email if identity else None),
+            worktree_path=body.get("worktree_path") or None))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/inbox/capture", methods=["POST"],
                          include_in_schema=False)
@@ -14612,9 +14736,18 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         project = body.get("project") if isinstance(body.get("project"), str) and body.get("project") else None
         if session is not None and not terminal._read_authorized(session):
             return JSONResponse({"error": "READ_RESTRICTED", "session": session}, status_code=403)
-        _log.info("dashboard task_create session=%s identity=%s", session, identity.email if identity else None)
+        # Idempotency. The browser mints one key per submission and reuses it
+        # across every retry of THAT submission, so a double-click, a resent
+        # request after a dropped connection, or a reconnect mid-flight all
+        # resolve to the one task the first attempt created. Absent (an older
+        # page, a non-dashboard caller) behaves exactly as before.
+        request_key = body.get("request_key") if isinstance(body.get("request_key"), str) else None
+        request_key = (request_key or "").strip()[:200] or None
+        _log.info("dashboard task_create session=%s identity=%s request_key=%s",
+                  session, identity.email if identity else None, bool(request_key))
         result = await anyio.to_thread.run_sync(
-            lambda: queue.create_task(title or "", prompt, session=session, project=project)
+            lambda: queue.create_task(title or "", prompt, session=session, project=project,
+                                      request_key=request_key)
         )
         status_code = 200 if "error" not in result else 400
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
@@ -14693,9 +14826,13 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         title = body.get("title") if isinstance(body.get("title"), str) else None
         priority = body.get("priority") if isinstance(body.get("priority"), int) else 0
-        _log.info("dashboard queue_enqueue session=%s identity=%s", name, identity.email if identity else None)
+        request_key = body.get("request_key") if isinstance(body.get("request_key"), str) else None
+        request_key = (request_key or "").strip()[:200] or None
+        _log.info("dashboard queue_enqueue session=%s identity=%s request_key=%s",
+                  name, identity.email if identity else None, bool(request_key))
         result = await anyio.to_thread.run_sync(
-            lambda: queue.enqueue(name, prompt, title=title, priority=priority)
+            lambda: queue.enqueue(name, prompt, title=title, priority=priority,
+                                  request_key=request_key)
         )
         status_code = 200 if "error" not in result else 400
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
@@ -16061,9 +16198,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
         endpoint = (body.get("endpoint") or "").strip()
         token = body.get("token") or ""
-        if not endpoint.startswith(("http://", "https://")) or not token:
+        if not token:
             return JSONResponse({"error": "INVALID_REQUEST", "detail": "endpoint (http(s)://host:port) and token are required"},
                                 status_code=400)
+
         if controller.node_status(node_id) is not None:
             return JSONResponse({"error": "NODE_ALREADY_EXISTS", "node_id": node_id}, status_code=409)
         host_part = re.sub(r"^https?://", "", endpoint).split("/", 1)[0].split(":", 1)[0]
@@ -16071,6 +16209,18 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             remote_connect.validate_hostname_or_ip(host_part, allow_public=_remote_connect_config().allow_public_manual_add)
         except remote_connect.ValidationError as exc:
             return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
+        # Scheme gate, on top of the host gate just above. That one asks
+        # "is this host public"; this one asks "would the bearer token
+        # travel in plaintext". They are different questions -- an https
+        # endpoint to a public host is fine, a http one is not -- and the
+        # same documented opt-in (allow_public_manual_add) governs both.
+        try:
+            endpoint_policy.validate_node_endpoint(
+                endpoint, context=f"node {node_id!r} endpoint",
+                allow_public_http=_remote_connect_config().allow_public_manual_add)
+        except endpoint_policy.EndpointPolicyError as exc:
+            return JSONResponse({"error": exc.reason, "detail": str(exc)}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
 
         def _probe() -> tuple[bool, str | None]:
             client = RemoteNodeClient(endpoint, token, timeout=8.0)
@@ -16087,7 +16237,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         connection_store.save(node_id, transport_type="agent_token", endpoint=endpoint, hostname=host_part,
                               token_file=token_file)
         controller.register_remote_node(node_id, display_name=body.get("display_name") or node_id,
-                                        hostname=host_part, endpoint=endpoint, token=token)
+                                        hostname=host_part, endpoint=endpoint, token=token,
+                                        allow_public_http=_remote_connect_config().allow_public_manual_add)
         # See node_token_env_var's own docstring -- makes the node's
         # (already-running) heartbeat loop verify successfully against
         # THIS controller the moment its next push arrives.

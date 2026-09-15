@@ -296,7 +296,7 @@
         "terminal_mcp/bridge.py"
       ],
       "touched_total": 0,
-      "note": "SYNTHETIC. No commit behind it. Written to bracket the case where the knowledge map covers nothing relevant -- the module is real and genuinely unmapped."
+      "note": "SYNTHETIC. No commit behind it. Written on 2026-09-14 to bracket the case where the knowledge map covers nothing relevant -- `bridge.py` was genuinely unmapped then. The 2026-09-15 complete indexing covers it, so from that run on this case measures the OPPOSITE bracket: a small, single-file module that the map describes exactly. The id is kept so the two runs stay comparable; the name no longer describes what it measures."
     }
   ]
 }

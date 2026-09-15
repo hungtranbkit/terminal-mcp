@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .core import RECOVERY_STATE_RESUMED_OK
+from . import worktree_cleanup
 from .contract import CAP_REPO_EVIDENCE
 from .queue_store import COMPLETED, QueueStore, QueueTask
 
@@ -701,6 +702,21 @@ class CoordinatorGate:
         #    from the real window/window2 transcript-collision incident
         #    this same feature's earlier phase fixed live.
         expected_cwd = task.metadata.get("expected_cwd")
+        # Checked BEFORE the cwd comparison below, deliberately. Once a task's
+        # worktree has been reclaimed, the session's cwd will of course not
+        # match `expected_cwd` -- so the generic mismatch branch would fire and
+        # tell an operator the session is in the wrong directory, when the truth
+        # is that the directory is gone and is never coming back. Same refusal
+        # either way; this one names the actual cause (contract F12).
+        if expected_cwd and worktree_cleanup.is_removed(task.metadata):
+            return CoordinatorDecision(
+                NEEDS_HUMAN,
+                evidence={"expected_cwd": expected_cwd,
+                          "worktree_cleanup": task.metadata.get(worktree_cleanup.METADATA_KEY)},
+                reason=f"{worktree_cleanup.WORKTREE_REMOVED}: this task's worktree "
+                       f"({expected_cwd}) was reclaimed by the worktree janitor -- it must be "
+                       f"recreated before this task can be dispatched again",
+            )
         if expected_cwd and session.cwd and session.cwd.rstrip("/\\") != str(expected_cwd).rstrip("/\\"):
             return CoordinatorDecision(
                 NEEDS_HUMAN, evidence={"expected_cwd": expected_cwd, "observed_cwd": session.cwd},

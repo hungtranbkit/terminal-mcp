@@ -4,6 +4,23 @@
     "real": 18,
     "synthetic": 2
   },
+  "knowledge_map": {
+    "available": true,
+    "modules": 33,
+    "indexed_paths": 147,
+    "package_files": 142,
+    "package_files_indexed": 142,
+    "package_coverage": 1.0,
+    "indexed_at_commit": "63903c1e39bc",
+    "modules_without_summary": [
+      "config",
+      "http_api",
+      "mcp_surface",
+      "security",
+      "session_ops",
+      "work_ui"
+    ]
+  },
   "methodology": [
     "No old model is re-run; git's record of each fix is the evidence.",
     "Baseline = the unassisted locating surface: source files matching terms derived mechanically from the bug's own words, measured by really running git grep at the fix's parent commit.",
@@ -14,12 +31,15 @@
     "Prior bugs are seeded leave-one-out: no case ever sees itself.",
     "A briefing that does not contain a real fix path is a MISS, however small.",
     "Every figure is labelled REAL, ESTIMATE or UNAVAILABLE; nothing unmeasured is filled in.",
+    "MAP PROVENANCE, disclosed: the first run measured a map of 9 modules / 19 paths, and its finding was that coverage -- not retrieval -- was the constraint. The package was then indexed COMPLETELY (every file assigned to exactly one module, enforced by the indexer), which is a change made after seeing the result. It was done by a uniform rule rather than by indexing the modules the corpus needed, because the second would have been tuning the system to its own test.",
+    "TWO SUMMARY STYLES were measured and the numbers for both are recorded here: prose (the module's own first docstring sentence) and names (that plus every public name its files define). Prose was kept -- it locates the fix site more often AND is the more defensible artifact -- but choosing between them by benchmark result is fitting to this corpus, so the kept variant's number is optimistic by an unknown amount.",
     "The instrument was corrected twice while it was being built, and neither correction improved the result. (1) It chose a module by argmax with no confidence floor, 'choosing' modules on scores of 0.03; applying the shipped threshold turned several of those into no-module-chosen, which cost the assisted side cases it had been credited with. (2) It reused one spec database across cases, so a case could meet its own spec; each case now gets its own. That one changed no number, because the shipped matcher already refuses to match a spec against itself by id -- verified by re-running both ways and diffing, not assumed."
   ],
   "results": [
     {
       "case_id": "real-a25834e",
       "origin": "REAL",
+      "smaller_than_union_baseline": true,
       "category": "ui",
       "commit": "a25834e512d6",
       "symptom": "dashboard: fix client-side CSI regex leak, missing resize readonly guard",
@@ -57,7 +77,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.042,
+          "value": 0.044,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -66,17 +86,20 @@
       },
       "assisted": {
         "chosen_module": "work_ui",
-        "module_score": 0.477,
+        "module_score": 0.493,
         "module_is_right": true,
         "owning_modules": [
           "work_ui"
         ],
         "fix_site_mapped": true,
         "files": [
-          "terminal_mcp/dashboard.py"
+          "terminal_mcp/dashboard.py",
+          "terminal_mcp/webterm.py",
+          "terminal_mcp/webterm_assets.py",
+          "terminal_mcp/windows_webterm.py"
         ],
         "surface": {
-          "value": 1,
+          "value": 4,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -86,7 +109,7 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.12,
+          "value": 0.046,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
@@ -96,11 +119,12 @@
         "reused_bug_id": "bench_real-9970f97",
         "pack_gaps": []
       },
-      "verdict": "SHRUNK"
+      "verdict": "NO_SHRINK"
     },
     {
       "case_id": "real-9970f97",
       "origin": "REAL",
+      "smaller_than_union_baseline": true,
       "category": "ui",
       "commit": "9970f970db96",
       "symptom": "dashboard: fix missing glyphs for box-drawing/block characters on Windows",
@@ -137,7 +161,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.042,
+          "value": 0.047,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -146,7 +170,7 @@
       },
       "assisted": {
         "chosen_module": "work_ui",
-        "module_score": 0.483,
+        "module_score": 0.786,
         "module_is_right": true,
         "owning_modules": [
           "work_ui"
@@ -154,10 +178,12 @@
         "fix_site_mapped": true,
         "files": [
           "terminal_mcp/dashboard.py",
+          "terminal_mcp/webterm.py",
+          "terminal_mcp/webterm_assets.py",
           "terminal_mcp/windows_webterm.py"
         ],
         "surface": {
-          "value": 2,
+          "value": 4,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -167,7 +193,7 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.122,
+          "value": 0.042,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
@@ -182,6 +208,7 @@
     {
       "case_id": "real-600c9d7",
       "origin": "REAL",
+      "smaller_than_union_baseline": true,
       "category": "ui",
       "commit": "600c9d77cd81",
       "symptom": "dashboard: fix mobile tab strip squeeze (real phone screenshot)",
@@ -218,7 +245,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.052,
+          "value": 0.051,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -227,17 +254,20 @@
       },
       "assisted": {
         "chosen_module": "work_ui",
-        "module_score": 0.483,
+        "module_score": 0.493,
         "module_is_right": true,
         "owning_modules": [
           "work_ui"
         ],
         "fix_site_mapped": true,
         "files": [
-          "terminal_mcp/dashboard.py"
+          "terminal_mcp/dashboard.py",
+          "terminal_mcp/webterm.py",
+          "terminal_mcp/webterm_assets.py",
+          "terminal_mcp/windows_webterm.py"
         ],
         "surface": {
-          "value": 1,
+          "value": 4,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -247,7 +277,7 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.115,
+          "value": 0.034,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
@@ -262,6 +292,7 @@
     {
       "case_id": "real-dba2d05",
       "origin": "REAL",
+      "smaller_than_union_baseline": true,
       "category": "ui",
       "commit": "dba2d0532c2d",
       "symptom": "dashboard: fix cold-start auto-select race and OSC-sequence leak",
@@ -307,17 +338,20 @@
       },
       "assisted": {
         "chosen_module": "work_ui",
-        "module_score": 0.48,
+        "module_score": 0.493,
         "module_is_right": true,
         "owning_modules": [
           "work_ui"
         ],
         "fix_site_mapped": true,
         "files": [
-          "terminal_mcp/dashboard.py"
+          "terminal_mcp/dashboard.py",
+          "terminal_mcp/webterm.py",
+          "terminal_mcp/webterm_assets.py",
+          "terminal_mcp/windows_webterm.py"
         ],
         "surface": {
-          "value": 1,
+          "value": 4,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -327,7 +361,7 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.107,
+          "value": 0.034,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
@@ -342,6 +376,7 @@
     {
       "case_id": "real-805d644",
       "origin": "REAL",
+      "smaller_than_union_baseline": true,
       "category": "session",
       "commit": "805d644e1097",
       "symptom": "P0 fix: initial_prompt double-echo for brand-new shell sessions",
@@ -378,7 +413,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.046,
+          "value": 0.051,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -386,14 +421,24 @@
         "analysis": "FULL_ANALYSIS"
       },
       "assisted": {
-        "chosen_module": null,
-        "module_score": 0.0,
-        "module_is_right": null,
-        "owning_modules": [],
-        "fix_site_mapped": false,
-        "files": [],
+        "chosen_module": "session_ops",
+        "module_score": 0.487,
+        "module_is_right": true,
+        "owning_modules": [
+          "session_ops"
+        ],
+        "fix_site_mapped": true,
+        "files": [
+          "terminal_mcp/core.py",
+          "terminal_mcp/tmux.py",
+          "terminal_mcp/lifecycle.py",
+          "terminal_mcp/session_backend.py",
+          "terminal_mcp/models.py",
+          "terminal_mcp/bindings.py",
+          "terminal_mcp/killed_sessions.py"
+        ],
         "surface": {
-          "value": 0,
+          "value": 7,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -403,21 +448,22 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.047,
+          "value": 0.032,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
-        "retrieval_status": "NO_SIMILAR_BUG",
-        "analysis": "FULL_ANALYSIS",
-        "contains_fix_path": false,
+        "retrieval_status": "RELATED_BUGS_FOUND",
+        "analysis": "READ_RELATED",
+        "contains_fix_path": true,
         "reused_bug_id": "",
         "pack_gaps": []
       },
-      "verdict": "MISSED"
+      "verdict": "NO_SHRINK"
     },
     {
       "case_id": "real-8f9d03a",
       "origin": "REAL",
+      "smaller_than_union_baseline": null,
       "category": "session",
       "commit": "8f9d03ae83f5",
       "symptom": "recovery: never auto-resurrect an intentionally killed session",
@@ -454,7 +500,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.057,
+          "value": 0.064,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -462,14 +508,24 @@
         "analysis": "FULL_ANALYSIS"
       },
       "assisted": {
-        "chosen_module": null,
-        "module_score": 0.043,
-        "module_is_right": null,
-        "owning_modules": [],
-        "fix_site_mapped": false,
-        "files": [],
+        "chosen_module": "session_ops",
+        "module_score": 0.786,
+        "module_is_right": false,
+        "owning_modules": [
+          "supervisor"
+        ],
+        "fix_site_mapped": true,
+        "files": [
+          "terminal_mcp/core.py",
+          "terminal_mcp/tmux.py",
+          "terminal_mcp/lifecycle.py",
+          "terminal_mcp/session_backend.py",
+          "terminal_mcp/models.py",
+          "terminal_mcp/bindings.py",
+          "terminal_mcp/killed_sessions.py"
+        ],
         "surface": {
-          "value": 0,
+          "value": 7,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -479,12 +535,12 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.052,
+          "value": 0.037,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
-        "retrieval_status": "NO_SIMILAR_BUG",
-        "analysis": "FULL_ANALYSIS",
+        "retrieval_status": "RELATED_BUGS_FOUND",
+        "analysis": "READ_RELATED",
         "contains_fix_path": false,
         "reused_bug_id": "",
         "pack_gaps": []
@@ -494,6 +550,7 @@
     {
       "case_id": "real-4d51782",
       "origin": "REAL",
+      "smaller_than_union_baseline": null,
       "category": "session",
       "commit": "4d51782350b2",
       "symptom": "P0 audit/recovery: fix window/window2 transcript collision on dell-5530",
@@ -533,7 +590,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.045,
+          "value": 0.043,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -541,14 +598,24 @@
         "analysis": "FULL_ANALYSIS"
       },
       "assisted": {
-        "chosen_module": null,
-        "module_score": 0.033,
-        "module_is_right": null,
-        "owning_modules": [],
-        "fix_site_mapped": false,
-        "files": [],
+        "chosen_module": "security",
+        "module_score": 0.487,
+        "module_is_right": false,
+        "owning_modules": [
+          "deployment",
+          "session_ops",
+          "windows"
+        ],
+        "fix_site_mapped": true,
+        "files": [
+          "terminal_mcp/access_policy.py",
+          "terminal_mcp/redaction.py",
+          "terminal_mcp/audit.py",
+          "terminal_mcp/network_bind.py",
+          "terminal_mcp/network_middleware.py"
+        ],
         "surface": {
-          "value": 0,
+          "value": 5,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -558,7 +625,7 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.054,
+          "value": 0.035,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
@@ -566,13 +633,16 @@
         "analysis": "FULL_ANALYSIS",
         "contains_fix_path": false,
         "reused_bug_id": "",
-        "pack_gaps": []
+        "pack_gaps": [
+          "no previous bugs recorded in this module"
+        ]
       },
       "verdict": "MISSED"
     },
     {
       "case_id": "real-c6e2e63",
       "origin": "REAL",
+      "smaller_than_union_baseline": null,
       "category": "auth",
       "commit": "c6e2e636d603",
       "symptom": "P0 hotfix: stale grants (openclaw-/nail/server-hub) + honest perm badge",
@@ -609,7 +679,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.047,
+          "value": 0.046,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -617,16 +687,21 @@
         "analysis": "FULL_ANALYSIS"
       },
       "assisted": {
-        "chosen_module": null,
-        "module_score": 0.03,
+        "chosen_module": "auth",
+        "module_score": 0.48,
         "module_is_right": false,
         "owning_modules": [
           "work_ui"
         ],
         "fix_site_mapped": true,
-        "files": [],
+        "files": [
+          "terminal_mcp/permissions.py",
+          "terminal_mcp/grants.py",
+          "terminal_mcp/cf_access.py",
+          "terminal_mcp/enrollment.py"
+        ],
         "surface": {
-          "value": 0,
+          "value": 4,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -636,7 +711,7 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.053,
+          "value": 0.04,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
@@ -644,13 +719,16 @@
         "analysis": "FULL_ANALYSIS",
         "contains_fix_path": false,
         "reused_bug_id": "",
-        "pack_gaps": []
+        "pack_gaps": [
+          "no previous bugs recorded in this module"
+        ]
       },
       "verdict": "MISSED"
     },
     {
       "case_id": "real-5588feb",
       "origin": "REAL",
+      "smaller_than_union_baseline": true,
       "category": "auth",
       "commit": "5588feb47bad",
       "symptom": "P0 hotfix: identity-aware grant listing + multi-node grant routing fix",
@@ -693,7 +771,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.048,
+          "value": 0.05,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -701,16 +779,28 @@
         "analysis": "FULL_ANALYSIS"
       },
       "assisted": {
-        "chosen_module": null,
-        "module_score": 0.0,
-        "module_is_right": false,
+        "chosen_module": "nodes",
+        "module_score": 0.517,
+        "module_is_right": true,
         "owning_modules": [
+          "http_api",
+          "node_onboarding",
+          "nodes",
+          "session_ops",
+          "webauth",
           "work_ui"
         ],
         "fix_site_mapped": true,
-        "files": [],
+        "files": [
+          "terminal_mcp/node_registry.py",
+          "terminal_mcp/node_models.py",
+          "terminal_mcp/node_client.py",
+          "terminal_mcp/node_transport.py",
+          "terminal_mcp/controller.py",
+          "terminal_mcp/connection_store.py"
+        ],
         "surface": {
-          "value": 0,
+          "value": 6,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -720,21 +810,24 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.047,
+          "value": 0.041,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
         "retrieval_status": "NO_SIMILAR_BUG",
         "analysis": "FULL_ANALYSIS",
-        "contains_fix_path": false,
+        "contains_fix_path": true,
         "reused_bug_id": "",
-        "pack_gaps": []
+        "pack_gaps": [
+          "no previous bugs recorded in this module"
+        ]
       },
-      "verdict": "MISSED"
+      "verdict": "NO_SHRINK"
     },
     {
       "case_id": "real-8fca313",
       "origin": "REAL",
+      "smaller_than_union_baseline": null,
       "category": "auth",
       "commit": "8fca31373ba6",
       "symptom": "fix: doctor grants NODE_ONLINE import path, macOS LaunchAgent PATH",
@@ -772,7 +865,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.042,
+          "value": 0.043,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -780,14 +873,21 @@
         "analysis": "FULL_ANALYSIS"
       },
       "assisted": {
-        "chosen_module": null,
-        "module_score": 0.0,
-        "module_is_right": null,
-        "owning_modules": [],
-        "fix_site_mapped": false,
-        "files": [],
+        "chosen_module": "auth",
+        "module_score": 0.487,
+        "module_is_right": false,
+        "owning_modules": [
+          "deployment"
+        ],
+        "fix_site_mapped": true,
+        "files": [
+          "terminal_mcp/permissions.py",
+          "terminal_mcp/grants.py",
+          "terminal_mcp/cf_access.py",
+          "terminal_mcp/enrollment.py"
+        ],
         "surface": {
-          "value": 0,
+          "value": 4,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -797,7 +897,7 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.051,
+          "value": 0.032,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
@@ -805,13 +905,16 @@
         "analysis": "FULL_ANALYSIS",
         "contains_fix_path": false,
         "reused_bug_id": "",
-        "pack_gaps": []
+        "pack_gaps": [
+          "no previous bugs recorded in this module"
+        ]
       },
       "verdict": "MISSED"
     },
     {
       "case_id": "real-998ab63",
       "origin": "REAL",
+      "smaller_than_union_baseline": true,
       "category": "backend",
       "commit": "998ab6353ead",
       "symptom": "P0 Queue+Supervisor live test: fix real queue.db migration drift, enable queue globally",
@@ -858,18 +961,24 @@
       },
       "assisted": {
         "chosen_module": "queue",
-        "module_score": 0.48,
+        "module_score": 0.79,
         "module_is_right": true,
         "owning_modules": [
+          "config",
           "queue"
         ],
         "fix_site_mapped": true,
         "files": [
           "terminal_mcp/queue_engine.py",
-          "terminal_mcp/queue_store.py"
+          "terminal_mcp/queue_store.py",
+          "terminal_mcp/queue_service.py",
+          "terminal_mcp/queue_loop.py",
+          "terminal_mcp/coordinator.py",
+          "terminal_mcp/task_migration.py",
+          "terminal_mcp/dor_gate.py"
         ],
         "surface": {
-          "value": 2,
+          "value": 7,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -879,7 +988,7 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.122,
+          "value": 0.032,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
@@ -896,6 +1005,7 @@
     {
       "case_id": "real-32c77ac",
       "origin": "REAL",
+      "smaller_than_union_baseline": false,
       "category": "backend",
       "commit": "32c77ace3203",
       "symptom": "P0 fix: config.submit was clobbered by config.submit_watchdog",
@@ -931,7 +1041,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.036,
+          "value": 0.035,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -939,14 +1049,21 @@
         "analysis": "FULL_ANALYSIS"
       },
       "assisted": {
-        "chosen_module": null,
-        "module_score": 0.0,
-        "module_is_right": null,
-        "owning_modules": [],
-        "fix_site_mapped": false,
-        "files": [],
+        "chosen_module": "config",
+        "module_score": 0.55,
+        "module_is_right": true,
+        "owning_modules": [
+          "config",
+          "session_ops"
+        ],
+        "fix_site_mapped": true,
+        "files": [
+          "terminal_mcp/config.py",
+          "config.yaml",
+          "config.example.yaml"
+        ],
         "surface": {
-          "value": 0,
+          "value": 3,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -956,21 +1073,22 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.054,
+          "value": 0.032,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
-        "retrieval_status": "NO_SIMILAR_BUG",
-        "analysis": "FULL_ANALYSIS",
-        "contains_fix_path": false,
+        "retrieval_status": "RELATED_BUGS_FOUND",
+        "analysis": "READ_RELATED",
+        "contains_fix_path": true,
         "reused_bug_id": "",
         "pack_gaps": []
       },
-      "verdict": "MISSED"
+      "verdict": "NO_SHRINK"
     },
     {
       "case_id": "real-d160eb0",
       "origin": "REAL",
+      "smaller_than_union_baseline": null,
       "category": "backend",
       "commit": "d160eb0c1dc4",
       "symptom": "controller: refuse to register this host as one of its own remote nodes",
@@ -1007,7 +1125,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.054,
+          "value": 0.055,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -1015,14 +1133,23 @@
         "analysis": "FULL_ANALYSIS"
       },
       "assisted": {
-        "chosen_module": null,
-        "module_score": 0.037,
-        "module_is_right": null,
-        "owning_modules": [],
-        "fix_site_mapped": false,
-        "files": [],
+        "chosen_module": "nodes",
+        "module_score": 0.812,
+        "module_is_right": false,
+        "owning_modules": [
+          "http_api"
+        ],
+        "fix_site_mapped": true,
+        "files": [
+          "terminal_mcp/node_registry.py",
+          "terminal_mcp/node_models.py",
+          "terminal_mcp/node_client.py",
+          "terminal_mcp/node_transport.py",
+          "terminal_mcp/controller.py",
+          "terminal_mcp/connection_store.py"
+        ],
         "surface": {
-          "value": 0,
+          "value": 6,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -1032,12 +1159,12 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.048,
+          "value": 0.035,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
-        "retrieval_status": "NO_SIMILAR_BUG",
-        "analysis": "FULL_ANALYSIS",
+        "retrieval_status": "RELATED_BUGS_FOUND",
+        "analysis": "READ_RELATED",
         "contains_fix_path": false,
         "reused_bug_id": "",
         "pack_gaps": []
@@ -1047,6 +1174,7 @@
     {
       "case_id": "real-b107c94",
       "origin": "REAL",
+      "smaller_than_union_baseline": null,
       "category": "simple_logic",
       "commit": "b107c94bf181",
       "symptom": "P0 Queue+Supervisor live test: fix completion-marker line-wrap bug, docs",
@@ -1083,7 +1211,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.058,
+          "value": 0.06,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -1093,16 +1221,22 @@
       "assisted": {
         "chosen_module": "queue",
         "module_score": 0.51,
-        "module_is_right": null,
-        "owning_modules": [],
-        "fix_site_mapped": false,
+        "module_is_right": false,
+        "owning_modules": [
+          "session_state"
+        ],
+        "fix_site_mapped": true,
         "files": [
           "terminal_mcp/queue_engine.py",
           "terminal_mcp/queue_store.py",
-          "config.yaml"
+          "terminal_mcp/queue_service.py",
+          "terminal_mcp/queue_loop.py",
+          "terminal_mcp/coordinator.py",
+          "terminal_mcp/task_migration.py",
+          "terminal_mcp/dor_gate.py"
         ],
         "surface": {
-          "value": 3,
+          "value": 7,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -1112,21 +1246,24 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.124,
+          "value": 0.039,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
-        "retrieval_status": "REUSED_BUG_SPEC",
-        "analysis": "REUSE_PRIOR_ROOT_CAUSE",
+        "retrieval_status": "NO_SIMILAR_BUG",
+        "analysis": "FULL_ANALYSIS",
         "contains_fix_path": false,
-        "reused_bug_id": "bench_real-998ab63",
-        "pack_gaps": []
+        "reused_bug_id": "",
+        "pack_gaps": [
+          "no previous bugs recorded in this module"
+        ]
       },
       "verdict": "MISSED"
     },
     {
       "case_id": "real-fe53f97",
       "origin": "REAL",
+      "smaller_than_union_baseline": null,
       "category": "simple_logic",
       "commit": "fe53f9767f21",
       "symptom": "Fix: TARGET_AWAITING_APPROVAL false positive on ordinary composer text",
@@ -1163,7 +1300,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.054,
+          "value": 0.047,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -1173,9 +1310,11 @@
       "assisted": {
         "chosen_module": null,
         "module_score": 0.0,
-        "module_is_right": null,
-        "owning_modules": [],
-        "fix_site_mapped": false,
+        "module_is_right": false,
+        "owning_modules": [
+          "session_state"
+        ],
+        "fix_site_mapped": true,
         "files": [],
         "surface": {
           "value": 0,
@@ -1188,7 +1327,7 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.06,
+          "value": 0.012,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
@@ -1203,6 +1342,7 @@
     {
       "case_id": "real-12d41d4",
       "origin": "REAL",
+      "smaller_than_union_baseline": null,
       "category": "simple_logic",
       "commit": "12d41d41e6c6",
       "symptom": "P0 fix: direct-send false-negative DELIVERY_UNKNOWN (Windows Claude)",
@@ -1239,7 +1379,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.052,
+          "value": 0.056,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -1247,14 +1387,21 @@
         "analysis": "FULL_ANALYSIS"
       },
       "assisted": {
-        "chosen_module": null,
-        "module_score": 0.0,
-        "module_is_right": null,
-        "owning_modules": [],
-        "fix_site_mapped": false,
-        "files": [],
+        "chosen_module": "work_ui",
+        "module_score": 0.493,
+        "module_is_right": false,
+        "owning_modules": [
+          "session_ops"
+        ],
+        "fix_site_mapped": true,
+        "files": [
+          "terminal_mcp/dashboard.py",
+          "terminal_mcp/webterm.py",
+          "terminal_mcp/webterm_assets.py",
+          "terminal_mcp/windows_webterm.py"
+        ],
         "surface": {
-          "value": 0,
+          "value": 4,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -1264,12 +1411,12 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.046,
+          "value": 0.038,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
-        "retrieval_status": "NO_SIMILAR_BUG",
-        "analysis": "FULL_ANALYSIS",
+        "retrieval_status": "RELATED_BUGS_FOUND",
+        "analysis": "READ_RELATED",
         "contains_fix_path": false,
         "reused_bug_id": "",
         "pack_gaps": []
@@ -1279,6 +1426,7 @@
     {
       "case_id": "real-184b7e0",
       "origin": "REAL",
+      "smaller_than_union_baseline": null,
       "category": "unknown",
       "commit": "184b7e0eb8e7",
       "symptom": "fix: dashboard tunnel outage \u2014 cloudflared stuck down after http restarts",
@@ -1324,15 +1472,20 @@
       },
       "assisted": {
         "chosen_module": "work_ui",
-        "module_score": 0.483,
-        "module_is_right": null,
-        "owning_modules": [],
-        "fix_site_mapped": false,
+        "module_score": 0.493,
+        "module_is_right": false,
+        "owning_modules": [
+          "deployment"
+        ],
+        "fix_site_mapped": true,
         "files": [
-          "terminal_mcp/dashboard.py"
+          "terminal_mcp/dashboard.py",
+          "terminal_mcp/webterm.py",
+          "terminal_mcp/webterm_assets.py",
+          "terminal_mcp/windows_webterm.py"
         ],
         "surface": {
-          "value": 1,
+          "value": 4,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -1342,7 +1495,7 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.135,
+          "value": 0.032,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
@@ -1357,6 +1510,7 @@
     {
       "case_id": "real-4a3ca43",
       "origin": "REAL",
+      "smaller_than_union_baseline": null,
       "category": "unknown",
       "commit": "4a3ca437e303",
       "symptom": "URGENT bugfix: Codex composer-swallow recovery gap (text sits unsubmitted)",
@@ -1402,14 +1556,22 @@
         "analysis": "FULL_ANALYSIS"
       },
       "assisted": {
-        "chosen_module": null,
-        "module_score": 0.0,
-        "module_is_right": null,
-        "owning_modules": [],
-        "fix_site_mapped": false,
-        "files": [],
+        "chosen_module": "supervisor",
+        "module_score": 0.48,
+        "module_is_right": false,
+        "owning_modules": [
+          "session_ops",
+          "session_state"
+        ],
+        "fix_site_mapped": true,
+        "files": [
+          "terminal_mcp/supervisor.py",
+          "terminal_mcp/supervisor2.py",
+          "terminal_mcp/recovery_engine.py",
+          "terminal_mcp/recovery_loop.py"
+        ],
         "surface": {
-          "value": 0,
+          "value": 4,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -1419,12 +1581,12 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.047,
+          "value": 0.031,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
-        "retrieval_status": "NO_SIMILAR_BUG",
-        "analysis": "FULL_ANALYSIS",
+        "retrieval_status": "RELATED_BUGS_FOUND",
+        "analysis": "READ_RELATED",
         "contains_fix_path": false,
         "reused_bug_id": "",
         "pack_gaps": []
@@ -1434,6 +1596,7 @@
     {
       "case_id": "synthetic-repeat-glyphs",
       "origin": "SYNTHETIC",
+      "smaller_than_union_baseline": null,
       "category": "ui",
       "commit": "",
       "symptom": "box drawing characters show as empty tofu boxes in the web terminal when the session is on a Windows node",
@@ -1448,19 +1611,19 @@
           "session"
         ],
         "per_term": {
-          "characters": 17,
-          "terminal": 157,
-          "drawing": 2,
-          "session": 133
+          "characters": 20,
+          "terminal": 161,
+          "drawing": 5,
+          "session": 136
         },
         "best_term": "drawing",
         "best_surface": {
-          "value": 2,
+          "value": 5,
           "label": "ESTIMATE",
           "method": "files matching the most selective term 'drawing' at HEAD -- a proxy for what a worker would triage, not a count of files anyone read"
         },
         "union_surface": {
-          "value": 176,
+          "value": 180,
           "label": "ESTIMATE",
           "method": "files matching any of 4 derived term(s) at HEAD"
         },
@@ -1470,7 +1633,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.084,
+          "value": 0.086,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -1478,16 +1641,21 @@
         "analysis": "FULL_ANALYSIS"
       },
       "assisted": {
-        "chosen_module": null,
-        "module_score": 0.025,
+        "chosen_module": "windows",
+        "module_score": 0.525,
         "module_is_right": false,
         "owning_modules": [
           "work_ui"
         ],
         "fix_site_mapped": true,
-        "files": [],
+        "files": [
+          "terminal_mcp/windows_backend.py",
+          "terminal_mcp/windows_agent.py",
+          "terminal_mcp/windows_onboarding.py",
+          "terminal_mcp/windows_visible_console.py"
+        ],
         "surface": {
-          "value": 0,
+          "value": 4,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -1497,7 +1665,7 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.049,
+          "value": 0.034,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
@@ -1505,13 +1673,16 @@
         "analysis": "FULL_ANALYSIS",
         "contains_fix_path": false,
         "reused_bug_id": "",
-        "pack_gaps": []
+        "pack_gaps": [
+          "no previous bugs recorded in this module"
+        ]
       },
       "verdict": "MISSED"
     },
     {
       "case_id": "synthetic-unmapped-bridge",
       "origin": "SYNTHETIC",
+      "smaller_than_union_baseline": true,
       "category": "unknown",
       "commit": "",
       "symptom": "the ask-ChatGPT bridge stops answering after a while and no receipt is ever written for the turn",
@@ -1526,19 +1697,19 @@
           "written"
         ],
         "per_term": {
-          "ask-ChatGPT": 3,
-          "answering": 12,
-          "receipt": 5,
-          "written": 69
+          "ask-ChatGPT": 6,
+          "answering": 16,
+          "receipt": 8,
+          "written": 74
         },
         "best_term": "ask-ChatGPT",
         "best_surface": {
-          "value": 3,
+          "value": 6,
           "label": "ESTIMATE",
           "method": "files matching the most selective term 'ask-ChatGPT' at HEAD -- a proxy for what a worker would triage, not a count of files anyone read"
         },
         "union_surface": {
-          "value": 70,
+          "value": 75,
           "label": "ESTIMATE",
           "method": "files matching any of 4 derived term(s) at HEAD"
         },
@@ -1548,7 +1719,7 @@
           "method": "searches this benchmark actually ran"
         },
         "seconds": {
-          "value": 0.093,
+          "value": 0.082,
           "label": "REAL",
           "method": "wall clock of the real git grep calls"
         },
@@ -1556,14 +1727,18 @@
         "analysis": "FULL_ANALYSIS"
       },
       "assisted": {
-        "chosen_module": null,
-        "module_score": 0.0,
-        "module_is_right": null,
-        "owning_modules": [],
-        "fix_site_mapped": false,
-        "files": [],
+        "chosen_module": "bridge",
+        "module_score": 0.8,
+        "module_is_right": true,
+        "owning_modules": [
+          "bridge"
+        ],
+        "fix_site_mapped": true,
+        "files": [
+          "terminal_mcp/bridge.py"
+        ],
         "surface": {
-          "value": 0,
+          "value": 1,
           "label": "REAL",
           "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
         },
@@ -1573,38 +1748,40 @@
           "method": "the briefing runs no repository search"
         },
         "seconds": {
-          "value": 0.052,
+          "value": 0.035,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         },
         "retrieval_status": "NO_SIMILAR_BUG",
         "analysis": "FULL_ANALYSIS",
-        "contains_fix_path": false,
+        "contains_fix_path": true,
         "reused_bug_id": "",
-        "pack_gaps": []
+        "pack_gaps": [
+          "no previous bugs recorded in this module"
+        ]
       },
-      "verdict": "MISSED"
+      "verdict": "SHRUNK"
     }
   ],
   "summary": {
     "cases": 18,
     "verdicts": {
-      "SHRUNK": 2,
-      "NO_SHRINK": 3,
-      "MISSED": 12,
+      "SHRUNK": 1,
+      "NO_SHRINK": 7,
+      "MISSED": 9,
       "UNLOCATABLE": 1
     },
-    "located_rate": 0.294,
+    "located_rate": 0.471,
     "located_denominator": 17,
-    "shrunk_rate": 0.4,
-    "shrunk_denominator": 5,
+    "shrunk_rate": 0.125,
+    "shrunk_denominator": 8,
     "mean_baseline_best_surface": {
       "value": 5.17,
       "label": "ESTIMATE",
       "method": "mean over cases of the most selective term's match count"
     },
     "mean_assisted_surface": {
-      "value": 0.61,
+      "value": 4.67,
       "label": "REAL",
       "method": "mean over cases of the files the briefing named"
     },
@@ -1620,9 +1797,9 @@
     },
     "analysis_depth": {
       "assisted": {
-        "REUSE_PRIOR_ROOT_CAUSE": 3,
-        "READ_RELATED": 3,
-        "FULL_ANALYSIS": 12
+        "REUSE_PRIOR_ROOT_CAUSE": 2,
+        "READ_RELATED": 9,
+        "FULL_ANALYSIS": 7
       },
       "baseline": {
         "FULL_ANALYSIS": 18,
@@ -1630,12 +1807,22 @@
       }
     },
     "module_choice": {
-      "right": 5,
-      "wrong": 2,
-      "unmapped": 11
+      "right": 8,
+      "wrong": 10,
+      "unmapped": 0
     },
-    "fix_site_mapped": 7,
-    "fix_site_unmapped": 11,
+    "fix_site_mapped": 18,
+    "fix_site_unmapped": 0,
+    "secondary_vs_union_baseline": {
+      "smaller": 7,
+      "denominator": 8,
+      "mean_union_surface": {
+        "value": 37.94,
+        "label": "ESTIMATE",
+        "method": "mean files matching ANY derived term -- what a worker triages when no single term happens to be selective"
+      },
+      "note": "reported because the headline's baseline is the luckiest single grep, which is the hardest case and not the usual one"
+    },
     "mean_seconds": {
       "baseline": {
         "value": 0.05,
@@ -1643,7 +1830,7 @@
         "method": "wall clock of the real greps; NOT a worker's own time, which nothing recorded"
       },
       "assisted": {
-        "value": 0.08,
+        "value": 0.03,
         "label": "REAL",
         "method": "wall clock of the real retrieval + pack build"
       }
@@ -1651,69 +1838,6 @@
   },
   "by_category": {
     "auth": {
-      "cases": 3,
-      "verdicts": {
-        "SHRUNK": 0,
-        "NO_SHRINK": 0,
-        "MISSED": 3,
-        "UNLOCATABLE": 0
-      },
-      "located_rate": 0.0,
-      "located_denominator": 3,
-      "shrunk_rate": null,
-      "shrunk_denominator": 0,
-      "mean_baseline_best_surface": {
-        "value": 2.33,
-        "label": "ESTIMATE",
-        "method": "mean over cases of the most selective term's match count"
-      },
-      "mean_assisted_surface": {
-        "value": 0,
-        "label": "REAL",
-        "method": "mean over cases of the files the briefing named"
-      },
-      "mean_baseline_searches": {
-        "value": 4.0,
-        "label": "REAL",
-        "method": "searches this benchmark really ran per case"
-      },
-      "mean_assisted_searches": {
-        "value": 0,
-        "label": "REAL",
-        "method": "the briefing runs no repository search"
-      },
-      "analysis_depth": {
-        "assisted": {
-          "REUSE_PRIOR_ROOT_CAUSE": 0,
-          "READ_RELATED": 0,
-          "FULL_ANALYSIS": 3
-        },
-        "baseline": {
-          "FULL_ANALYSIS": 3,
-          "note": "by definition: an unassisted worker is offered no prior root cause"
-        }
-      },
-      "module_choice": {
-        "right": 0,
-        "wrong": 2,
-        "unmapped": 1
-      },
-      "fix_site_mapped": 2,
-      "fix_site_unmapped": 1,
-      "mean_seconds": {
-        "baseline": {
-          "value": 0.05,
-          "label": "REAL",
-          "method": "wall clock of the real greps; NOT a worker's own time, which nothing recorded"
-        },
-        "assisted": {
-          "value": 0.05,
-          "label": "REAL",
-          "method": "wall clock of the real retrieval + pack build"
-        }
-      }
-    },
-    "backend": {
       "cases": 3,
       "verdicts": {
         "SHRUNK": 0,
@@ -1726,17 +1850,17 @@
       "shrunk_rate": 0.0,
       "shrunk_denominator": 1,
       "mean_baseline_best_surface": {
-        "value": 10.67,
+        "value": 2.33,
         "label": "ESTIMATE",
         "method": "mean over cases of the most selective term's match count"
       },
       "mean_assisted_surface": {
-        "value": 0.67,
+        "value": 4.67,
         "label": "REAL",
         "method": "mean over cases of the files the briefing named"
       },
       "mean_baseline_searches": {
-        "value": 3.67,
+        "value": 4.0,
         "label": "REAL",
         "method": "searches this benchmark really ran per case"
       },
@@ -1758,11 +1882,21 @@
       },
       "module_choice": {
         "right": 1,
-        "wrong": 0,
-        "unmapped": 2
+        "wrong": 2,
+        "unmapped": 0
       },
-      "fix_site_mapped": 1,
-      "fix_site_unmapped": 2,
+      "fix_site_mapped": 3,
+      "fix_site_unmapped": 0,
+      "secondary_vs_union_baseline": {
+        "smaller": 1,
+        "denominator": 1,
+        "mean_union_surface": {
+          "value": 25.67,
+          "label": "ESTIMATE",
+          "method": "mean files matching ANY derived term -- what a worker triages when no single term happens to be selective"
+        },
+        "note": "reported because the headline's baseline is the luckiest single grep, which is the hardest case and not the usual one"
+      },
       "mean_seconds": {
         "baseline": {
           "value": 0.05,
@@ -1770,7 +1904,80 @@
           "method": "wall clock of the real greps; NOT a worker's own time, which nothing recorded"
         },
         "assisted": {
-          "value": 0.07,
+          "value": 0.04,
+          "label": "REAL",
+          "method": "wall clock of the real retrieval + pack build"
+        }
+      }
+    },
+    "backend": {
+      "cases": 3,
+      "verdicts": {
+        "SHRUNK": 0,
+        "NO_SHRINK": 2,
+        "MISSED": 1,
+        "UNLOCATABLE": 0
+      },
+      "located_rate": 0.667,
+      "located_denominator": 3,
+      "shrunk_rate": 0.0,
+      "shrunk_denominator": 2,
+      "mean_baseline_best_surface": {
+        "value": 10.67,
+        "label": "ESTIMATE",
+        "method": "mean over cases of the most selective term's match count"
+      },
+      "mean_assisted_surface": {
+        "value": 5.33,
+        "label": "REAL",
+        "method": "mean over cases of the files the briefing named"
+      },
+      "mean_baseline_searches": {
+        "value": 3.67,
+        "label": "REAL",
+        "method": "searches this benchmark really ran per case"
+      },
+      "mean_assisted_searches": {
+        "value": 0,
+        "label": "REAL",
+        "method": "the briefing runs no repository search"
+      },
+      "analysis_depth": {
+        "assisted": {
+          "REUSE_PRIOR_ROOT_CAUSE": 0,
+          "READ_RELATED": 2,
+          "FULL_ANALYSIS": 1
+        },
+        "baseline": {
+          "FULL_ANALYSIS": 3,
+          "note": "by definition: an unassisted worker is offered no prior root cause"
+        }
+      },
+      "module_choice": {
+        "right": 2,
+        "wrong": 1,
+        "unmapped": 0
+      },
+      "fix_site_mapped": 3,
+      "fix_site_unmapped": 0,
+      "secondary_vs_union_baseline": {
+        "smaller": 1,
+        "denominator": 2,
+        "mean_union_surface": {
+          "value": 40.67,
+          "label": "ESTIMATE",
+          "method": "mean files matching ANY derived term -- what a worker triages when no single term happens to be selective"
+        },
+        "note": "reported because the headline's baseline is the luckiest single grep, which is the hardest case and not the usual one"
+      },
+      "mean_seconds": {
+        "baseline": {
+          "value": 0.05,
+          "label": "REAL",
+          "method": "wall clock of the real greps; NOT a worker's own time, which nothing recorded"
+        },
+        "assisted": {
+          "value": 0.03,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         }
@@ -1780,21 +1987,21 @@
       "cases": 3,
       "verdicts": {
         "SHRUNK": 0,
-        "NO_SHRINK": 0,
-        "MISSED": 3,
+        "NO_SHRINK": 1,
+        "MISSED": 2,
         "UNLOCATABLE": 0
       },
-      "located_rate": 0.0,
+      "located_rate": 0.333,
       "located_denominator": 3,
-      "shrunk_rate": null,
-      "shrunk_denominator": 0,
+      "shrunk_rate": 0.0,
+      "shrunk_denominator": 1,
       "mean_baseline_best_surface": {
         "value": 5.33,
         "label": "ESTIMATE",
         "method": "mean over cases of the most selective term's match count"
       },
       "mean_assisted_surface": {
-        "value": 0,
+        "value": 6.33,
         "label": "REAL",
         "method": "mean over cases of the files the briefing named"
       },
@@ -1811,8 +2018,8 @@
       "analysis_depth": {
         "assisted": {
           "REUSE_PRIOR_ROOT_CAUSE": 0,
-          "READ_RELATED": 0,
-          "FULL_ANALYSIS": 3
+          "READ_RELATED": 2,
+          "FULL_ANALYSIS": 1
         },
         "baseline": {
           "FULL_ANALYSIS": 3,
@@ -1820,12 +2027,22 @@
         }
       },
       "module_choice": {
-        "right": 0,
-        "wrong": 0,
-        "unmapped": 3
+        "right": 1,
+        "wrong": 2,
+        "unmapped": 0
       },
-      "fix_site_mapped": 0,
-      "fix_site_unmapped": 3,
+      "fix_site_mapped": 3,
+      "fix_site_unmapped": 0,
+      "secondary_vs_union_baseline": {
+        "smaller": 1,
+        "denominator": 1,
+        "mean_union_surface": {
+          "value": 53.33,
+          "label": "ESTIMATE",
+          "method": "mean files matching ANY derived term -- what a worker triages when no single term happens to be selective"
+        },
+        "note": "reported because the headline's baseline is the luckiest single grep, which is the hardest case and not the usual one"
+      },
       "mean_seconds": {
         "baseline": {
           "value": 0.05,
@@ -1833,7 +2050,7 @@
           "method": "wall clock of the real greps; NOT a worker's own time, which nothing recorded"
         },
         "assisted": {
-          "value": 0.05,
+          "value": 0.03,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         }
@@ -1857,7 +2074,7 @@
         "method": "mean over cases of the most selective term's match count"
       },
       "mean_assisted_surface": {
-        "value": 1.0,
+        "value": 3.67,
         "label": "REAL",
         "method": "mean over cases of the files the briefing named"
       },
@@ -1873,8 +2090,8 @@
       },
       "analysis_depth": {
         "assisted": {
-          "REUSE_PRIOR_ROOT_CAUSE": 1,
-          "READ_RELATED": 0,
+          "REUSE_PRIOR_ROOT_CAUSE": 0,
+          "READ_RELATED": 1,
           "FULL_ANALYSIS": 2
         },
         "baseline": {
@@ -1884,11 +2101,21 @@
       },
       "module_choice": {
         "right": 0,
-        "wrong": 0,
-        "unmapped": 3
+        "wrong": 3,
+        "unmapped": 0
       },
-      "fix_site_mapped": 0,
-      "fix_site_unmapped": 3,
+      "fix_site_mapped": 3,
+      "fix_site_unmapped": 0,
+      "secondary_vs_union_baseline": {
+        "smaller": 0,
+        "denominator": 0,
+        "mean_union_surface": {
+          "value": 34.0,
+          "label": "ESTIMATE",
+          "method": "mean files matching ANY derived term -- what a worker triages when no single term happens to be selective"
+        },
+        "note": "reported because the headline's baseline is the luckiest single grep, which is the hardest case and not the usual one"
+      },
       "mean_seconds": {
         "baseline": {
           "value": 0.05,
@@ -1896,7 +2123,7 @@
           "method": "wall clock of the real greps; NOT a worker's own time, which nothing recorded"
         },
         "assisted": {
-          "value": 0.08,
+          "value": 0.03,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         }
@@ -1905,14 +2132,14 @@
     "ui": {
       "cases": 4,
       "verdicts": {
-        "SHRUNK": 2,
-        "NO_SHRINK": 2,
+        "SHRUNK": 1,
+        "NO_SHRINK": 3,
         "MISSED": 0,
         "UNLOCATABLE": 0
       },
       "located_rate": 1.0,
       "located_denominator": 4,
-      "shrunk_rate": 0.5,
+      "shrunk_rate": 0.25,
       "shrunk_denominator": 4,
       "mean_baseline_best_surface": {
         "value": 3.25,
@@ -1920,7 +2147,7 @@
         "method": "mean over cases of the most selective term's match count"
       },
       "mean_assisted_surface": {
-        "value": 1.25,
+        "value": 4.0,
         "label": "REAL",
         "method": "mean over cases of the files the briefing named"
       },
@@ -1952,6 +2179,16 @@
       },
       "fix_site_mapped": 4,
       "fix_site_unmapped": 0,
+      "secondary_vs_union_baseline": {
+        "smaller": 4,
+        "denominator": 4,
+        "mean_union_surface": {
+          "value": 44.25,
+          "label": "ESTIMATE",
+          "method": "mean files matching ANY derived term -- what a worker triages when no single term happens to be selective"
+        },
+        "note": "reported because the headline's baseline is the luckiest single grep, which is the hardest case and not the usual one"
+      },
       "mean_seconds": {
         "baseline": {
           "value": 0.05,
@@ -1959,7 +2196,7 @@
           "method": "wall clock of the real greps; NOT a worker's own time, which nothing recorded"
         },
         "assisted": {
-          "value": 0.12,
+          "value": 0.04,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         }
@@ -1983,7 +2220,7 @@
         "method": "mean over cases of the most selective term's match count"
       },
       "mean_assisted_surface": {
-        "value": 0.5,
+        "value": 4.0,
         "label": "REAL",
         "method": "mean over cases of the files the briefing named"
       },
@@ -2000,8 +2237,8 @@
       "analysis_depth": {
         "assisted": {
           "REUSE_PRIOR_ROOT_CAUSE": 0,
-          "READ_RELATED": 1,
-          "FULL_ANALYSIS": 1
+          "READ_RELATED": 2,
+          "FULL_ANALYSIS": 0
         },
         "baseline": {
           "FULL_ANALYSIS": 2,
@@ -2010,11 +2247,21 @@
       },
       "module_choice": {
         "right": 0,
-        "wrong": 0,
-        "unmapped": 2
+        "wrong": 2,
+        "unmapped": 0
       },
-      "fix_site_mapped": 0,
-      "fix_site_unmapped": 2,
+      "fix_site_mapped": 2,
+      "fix_site_unmapped": 0,
+      "secondary_vs_union_baseline": {
+        "smaller": 0,
+        "denominator": 0,
+        "mean_union_surface": {
+          "value": 22.5,
+          "label": "ESTIMATE",
+          "method": "mean files matching ANY derived term -- what a worker triages when no single term happens to be selective"
+        },
+        "note": "reported because the headline's baseline is the luckiest single grep, which is the hardest case and not the usual one"
+      },
       "mean_seconds": {
         "baseline": {
           "value": 0.04,
@@ -2022,7 +2269,7 @@
           "method": "wall clock of the real greps; NOT a worker's own time, which nothing recorded"
         },
         "assisted": {
-          "value": 0.09,
+          "value": 0.03,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         }
@@ -2034,29 +2281,29 @@
     "fix_site_mapped": {
       "meaning": "the knowledge map covers a file the fix touched, so a briefing could in principle have named it",
       "summary": {
-        "cases": 7,
+        "cases": 18,
         "verdicts": {
-          "SHRUNK": 2,
-          "NO_SHRINK": 3,
-          "MISSED": 2,
-          "UNLOCATABLE": 0
+          "SHRUNK": 1,
+          "NO_SHRINK": 7,
+          "MISSED": 9,
+          "UNLOCATABLE": 1
         },
-        "located_rate": 0.714,
-        "located_denominator": 7,
-        "shrunk_rate": 0.4,
-        "shrunk_denominator": 5,
+        "located_rate": 0.471,
+        "located_denominator": 17,
+        "shrunk_rate": 0.125,
+        "shrunk_denominator": 8,
         "mean_baseline_best_surface": {
-          "value": 2.86,
+          "value": 5.17,
           "label": "ESTIMATE",
           "method": "mean over cases of the most selective term's match count"
         },
         "mean_assisted_surface": {
-          "value": 1.0,
+          "value": 4.67,
           "label": "REAL",
           "method": "mean over cases of the files the briefing named"
         },
         "mean_baseline_searches": {
-          "value": 4.0,
+          "value": 3.94,
           "label": "REAL",
           "method": "searches this benchmark really ran per case"
         },
@@ -2068,21 +2315,31 @@
         "analysis_depth": {
           "assisted": {
             "REUSE_PRIOR_ROOT_CAUSE": 2,
-            "READ_RELATED": 2,
-            "FULL_ANALYSIS": 3
+            "READ_RELATED": 9,
+            "FULL_ANALYSIS": 7
           },
           "baseline": {
-            "FULL_ANALYSIS": 7,
+            "FULL_ANALYSIS": 18,
             "note": "by definition: an unassisted worker is offered no prior root cause"
           }
         },
         "module_choice": {
-          "right": 5,
-          "wrong": 2,
+          "right": 8,
+          "wrong": 10,
           "unmapped": 0
         },
-        "fix_site_mapped": 7,
+        "fix_site_mapped": 18,
         "fix_site_unmapped": 0,
+        "secondary_vs_union_baseline": {
+          "smaller": 7,
+          "denominator": 8,
+          "mean_union_surface": {
+            "value": 37.94,
+            "label": "ESTIMATE",
+            "method": "mean files matching ANY derived term -- what a worker triages when no single term happens to be selective"
+          },
+          "note": "reported because the headline's baseline is the luckiest single grep, which is the hardest case and not the usual one"
+        },
         "mean_seconds": {
           "baseline": {
             "value": 0.05,
@@ -2090,7 +2347,7 @@
             "method": "wall clock of the real greps; NOT a worker's own time, which nothing recorded"
           },
           "assisted": {
-            "value": 0.1,
+            "value": 0.03,
             "label": "REAL",
             "method": "wall clock of the real retrieval + pack build"
           }
@@ -2100,67 +2357,8 @@
     "fix_site_unmapped": {
       "meaning": "the map covers none of the files the fix touched; this measures coverage, not retrieval",
       "summary": {
-        "cases": 11,
-        "verdicts": {
-          "SHRUNK": 0,
-          "NO_SHRINK": 0,
-          "MISSED": 10,
-          "UNLOCATABLE": 1
-        },
-        "located_rate": 0.0,
-        "located_denominator": 10,
-        "shrunk_rate": null,
-        "shrunk_denominator": 0,
-        "mean_baseline_best_surface": {
-          "value": 6.64,
-          "label": "ESTIMATE",
-          "method": "mean over cases of the most selective term's match count"
-        },
-        "mean_assisted_surface": {
-          "value": 0.36,
-          "label": "REAL",
-          "method": "mean over cases of the files the briefing named"
-        },
-        "mean_baseline_searches": {
-          "value": 3.91,
-          "label": "REAL",
-          "method": "searches this benchmark really ran per case"
-        },
-        "mean_assisted_searches": {
-          "value": 0,
-          "label": "REAL",
-          "method": "the briefing runs no repository search"
-        },
-        "analysis_depth": {
-          "assisted": {
-            "REUSE_PRIOR_ROOT_CAUSE": 1,
-            "READ_RELATED": 1,
-            "FULL_ANALYSIS": 9
-          },
-          "baseline": {
-            "FULL_ANALYSIS": 11,
-            "note": "by definition: an unassisted worker is offered no prior root cause"
-          }
-        },
-        "module_choice": {
-          "right": 0,
-          "wrong": 0,
-          "unmapped": 11
-        },
-        "fix_site_mapped": 0,
-        "fix_site_unmapped": 11,
-        "mean_seconds": {
-          "baseline": {
-            "value": 0.05,
-            "label": "REAL",
-            "method": "wall clock of the real greps; NOT a worker's own time, which nothing recorded"
-          },
-          "assisted": {
-            "value": 0.07,
-            "label": "REAL",
-            "method": "wall clock of the real retrieval + pack build"
-          }
-        }
+        "cases": 0,
+        "note": "nothing measured"
       }
     }
   },
@@ -2170,6 +2368,7 @@
       {
         "case_id": "synthetic-repeat-glyphs",
         "origin": "SYNTHETIC",
+        "smaller_than_union_baseline": null,
         "category": "ui",
         "commit": "",
         "symptom": "box drawing characters show as empty tofu boxes in the web terminal when the session is on a Windows node",
@@ -2184,19 +2383,19 @@
             "session"
           ],
           "per_term": {
-            "characters": 17,
-            "terminal": 157,
-            "drawing": 2,
-            "session": 133
+            "characters": 20,
+            "terminal": 161,
+            "drawing": 5,
+            "session": 136
           },
           "best_term": "drawing",
           "best_surface": {
-            "value": 2,
+            "value": 5,
             "label": "ESTIMATE",
             "method": "files matching the most selective term 'drawing' at HEAD -- a proxy for what a worker would triage, not a count of files anyone read"
           },
           "union_surface": {
-            "value": 176,
+            "value": 180,
             "label": "ESTIMATE",
             "method": "files matching any of 4 derived term(s) at HEAD"
           },
@@ -2206,7 +2405,7 @@
             "method": "searches this benchmark actually ran"
           },
           "seconds": {
-            "value": 0.084,
+            "value": 0.086,
             "label": "REAL",
             "method": "wall clock of the real git grep calls"
           },
@@ -2214,16 +2413,21 @@
           "analysis": "FULL_ANALYSIS"
         },
         "assisted": {
-          "chosen_module": null,
-          "module_score": 0.025,
+          "chosen_module": "windows",
+          "module_score": 0.525,
           "module_is_right": false,
           "owning_modules": [
             "work_ui"
           ],
           "fix_site_mapped": true,
-          "files": [],
+          "files": [
+            "terminal_mcp/windows_backend.py",
+            "terminal_mcp/windows_agent.py",
+            "terminal_mcp/windows_onboarding.py",
+            "terminal_mcp/windows_visible_console.py"
+          ],
           "surface": {
-            "value": 0,
+            "value": 4,
             "label": "REAL",
             "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
           },
@@ -2233,7 +2437,7 @@
             "method": "the briefing runs no repository search"
           },
           "seconds": {
-            "value": 0.049,
+            "value": 0.034,
             "label": "REAL",
             "method": "wall clock of the real retrieval + pack build"
           },
@@ -2241,13 +2445,16 @@
           "analysis": "FULL_ANALYSIS",
           "contains_fix_path": false,
           "reused_bug_id": "",
-          "pack_gaps": []
+          "pack_gaps": [
+            "no previous bugs recorded in this module"
+          ]
         },
         "verdict": "MISSED"
       },
       {
         "case_id": "synthetic-unmapped-bridge",
         "origin": "SYNTHETIC",
+        "smaller_than_union_baseline": true,
         "category": "unknown",
         "commit": "",
         "symptom": "the ask-ChatGPT bridge stops answering after a while and no receipt is ever written for the turn",
@@ -2262,19 +2469,19 @@
             "written"
           ],
           "per_term": {
-            "ask-ChatGPT": 3,
-            "answering": 12,
-            "receipt": 5,
-            "written": 69
+            "ask-ChatGPT": 6,
+            "answering": 16,
+            "receipt": 8,
+            "written": 74
           },
           "best_term": "ask-ChatGPT",
           "best_surface": {
-            "value": 3,
+            "value": 6,
             "label": "ESTIMATE",
             "method": "files matching the most selective term 'ask-ChatGPT' at HEAD -- a proxy for what a worker would triage, not a count of files anyone read"
           },
           "union_surface": {
-            "value": 70,
+            "value": 75,
             "label": "ESTIMATE",
             "method": "files matching any of 4 derived term(s) at HEAD"
           },
@@ -2284,7 +2491,7 @@
             "method": "searches this benchmark actually ran"
           },
           "seconds": {
-            "value": 0.093,
+            "value": 0.082,
             "label": "REAL",
             "method": "wall clock of the real git grep calls"
           },
@@ -2292,14 +2499,18 @@
           "analysis": "FULL_ANALYSIS"
         },
         "assisted": {
-          "chosen_module": null,
-          "module_score": 0.0,
-          "module_is_right": null,
-          "owning_modules": [],
-          "fix_site_mapped": false,
-          "files": [],
+          "chosen_module": "bridge",
+          "module_score": 0.8,
+          "module_is_right": true,
+          "owning_modules": [
+            "bridge"
+          ],
+          "fix_site_mapped": true,
+          "files": [
+            "terminal_mcp/bridge.py"
+          ],
           "surface": {
-            "value": 0,
+            "value": 1,
             "label": "REAL",
             "method": "files the shipped briefing actually named (bounded at 12 by the pack)"
           },
@@ -2309,38 +2520,40 @@
             "method": "the briefing runs no repository search"
           },
           "seconds": {
-            "value": 0.052,
+            "value": 0.035,
             "label": "REAL",
             "method": "wall clock of the real retrieval + pack build"
           },
           "retrieval_status": "NO_SIMILAR_BUG",
           "analysis": "FULL_ANALYSIS",
-          "contains_fix_path": false,
+          "contains_fix_path": true,
           "reused_bug_id": "",
-          "pack_gaps": []
+          "pack_gaps": [
+            "no previous bugs recorded in this module"
+          ]
         },
-        "verdict": "MISSED"
+        "verdict": "SHRUNK"
       }
     ],
     "summary": {
       "cases": 2,
       "verdicts": {
-        "SHRUNK": 0,
+        "SHRUNK": 1,
         "NO_SHRINK": 0,
-        "MISSED": 2,
+        "MISSED": 1,
         "UNLOCATABLE": 0
       },
-      "located_rate": 0.0,
+      "located_rate": 0.5,
       "located_denominator": 2,
-      "shrunk_rate": null,
-      "shrunk_denominator": 0,
+      "shrunk_rate": 1.0,
+      "shrunk_denominator": 1,
       "mean_baseline_best_surface": {
-        "value": 2.5,
+        "value": 5.5,
         "label": "ESTIMATE",
         "method": "mean over cases of the most selective term's match count"
       },
       "mean_assisted_surface": {
-        "value": 0,
+        "value": 2.5,
         "label": "REAL",
         "method": "mean over cases of the files the briefing named"
       },
@@ -2366,20 +2579,30 @@
         }
       },
       "module_choice": {
-        "right": 0,
+        "right": 1,
         "wrong": 1,
-        "unmapped": 1
+        "unmapped": 0
       },
-      "fix_site_mapped": 1,
-      "fix_site_unmapped": 1,
+      "fix_site_mapped": 2,
+      "fix_site_unmapped": 0,
+      "secondary_vs_union_baseline": {
+        "smaller": 1,
+        "denominator": 1,
+        "mean_union_surface": {
+          "value": 127.5,
+          "label": "ESTIMATE",
+          "method": "mean files matching ANY derived term -- what a worker triages when no single term happens to be selective"
+        },
+        "note": "reported because the headline's baseline is the luckiest single grep, which is the hardest case and not the usual one"
+      },
       "mean_seconds": {
         "baseline": {
-          "value": 0.09,
+          "value": 0.08,
           "label": "REAL",
           "method": "wall clock of the real greps; NOT a worker's own time, which nothing recorded"
         },
         "assisted": {
-          "value": 0.05,
+          "value": 0.03,
           "label": "REAL",
           "method": "wall clock of the real retrieval + pack build"
         }
@@ -2393,15 +2616,15 @@
         "as_reported": {
           "case_id": "synthetic-repeat-glyphs",
           "symptom": "box drawing characters show as empty tofu boxes in the web terminal when the session is on a Windows node",
-          "module": null,
-          "module_score": 0.025,
+          "module": "windows",
+          "module_score": 0.525,
           "verdict": "MISSED"
         },
         "as_committed": {
           "case_id": "real-9970f97",
           "symptom": "dashboard: fix missing glyphs for box-drawing/block characters on Windows",
           "module": "work_ui",
-          "module_score": 0.483,
+          "module_score": 0.786,
           "verdict": "SHRUNK"
         },
         "diverges": true
@@ -2435,15 +2658,15 @@
       },
       "located_rate": {
         "status": "NOT_MET",
-        "actual": 0.294,
+        "actual": 0.471,
         "required": 0.5,
         "denominator": 17
       },
       "shrunk_rate": {
         "status": "NOT_MET",
-        "actual": 0.4,
+        "actual": 0.125,
         "required": 0.5,
-        "denominator": 5
+        "denominator": 8
       }
     },
     "token_claim": {
@@ -2454,23 +2677,13 @@
   },
   "conclusions": [
     {
-      "statement": "The binding constraint is knowledge-map COVERAGE, not the retrieval mechanism: in 11 of 18 real cases the map covers none of the files the fix touched, so no briefing built from it could have named the site.",
+      "statement": "Where the map does cover the fix site, the briefing named it in 8 of 17 comparable cases (rate 0.471), and was smaller than the luckiest single grep in 1 of 8 (rate 0.125).",
       "evidence": {
-        "unmapped_cases": 11,
-        "real_cases": 18,
-        "unmapped_located_rate": 0.0
+        "cases": 18,
+        "located_rate": 0.471,
+        "shrunk_rate": 0.125
       },
-      "supports": "a coverage finding"
-    },
-    {
-      "statement": "Where the map does cover the fix site, the briefing named it in 5 of 7 comparable cases (rate 0.714), and was smaller than the luckiest single grep in 2 of 5 (rate 0.4).",
-      "evidence": {
-        "cases": 7,
-        "located_rate": 0.714,
-        "shrunk_rate": 0.4
-      },
-      "supports": "a narrow, conditional claim",
-      "caveat": "UNDERPOWERED: 7 cases. This is not a result, it is a direction worth measuring again on a larger indexed map."
+      "supports": "a narrow, conditional claim"
     },
     {
       "statement": "The assisted path's success depends on the REPORT naming the module. The same defect, reworded as a user would report it, dropped below the module-choice floor and returned nothing -- so every rate here, measured from commit subjects, is optimistic about real bug reports.",
@@ -2481,15 +2694,15 @@
             "as_reported": {
               "case_id": "synthetic-repeat-glyphs",
               "symptom": "box drawing characters show as empty tofu boxes in the web terminal when the session is on a Windows node",
-              "module": null,
-              "module_score": 0.025,
+              "module": "windows",
+              "module_score": 0.525,
               "verdict": "MISSED"
             },
             "as_committed": {
               "case_id": "real-9970f97",
               "symptom": "dashboard: fix missing glyphs for box-drawing/block characters on Windows",
               "module": "work_ui",
-              "module_score": 0.483,
+              "module_score": 0.786,
               "verdict": "SHRUNK"
             },
             "diverges": true

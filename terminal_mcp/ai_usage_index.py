@@ -29,6 +29,7 @@ identifiers, timestamps, model names.
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
@@ -36,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from .ai_context_window import context_usage
 from .ai_usage_local import (AGENT_CLAUDE, AGENT_CODEX, CLAUDE_QUOTA_UNOBSERVED,
                              parse_claude_transcript,
                              SOURCE_CLI_STATE, SOURCE_TRANSCRIPT, SOURCE_UNAVAILABLE,
@@ -528,6 +530,41 @@ class AiUsageIndex:
                 record["remaining_percent"] = (None if record["used_percent"] is None
                                                else 100 - record["used_percent"])
                 quota.append(record)
+
+            # The prompt size of each session's MOST RECENT request. Summing a
+            # session would answer a different question (total spend) and would
+            # pass any window within a few turns; what the model actually held
+            # is the last request's input + cache-read + cache-write.
+            latest_context: dict[tuple[str, int], int] = {}
+            for row in connection.execute(
+                    """SELECT u.agent_session_id, u.is_subagent,
+                              u.input_tokens + u.cache_read_tokens
+                              + u.cache_write_tokens AS ctx
+                       FROM usage_events u
+                       WHERE u.ts = (SELECT MAX(ts) FROM usage_events x
+                                     WHERE x.agent_session_id = u.agent_session_id
+                                       AND x.is_subagent = u.is_subagent)"""):
+                latest_context[(row["agent_session_id"],
+                                int(row["is_subagent"] or 0))] = int(row["ctx"] or 0)
+
+            # `message.model` drops the variant suffix that states the window,
+            # but the cost block's per-model breakdown keeps it. Read the
+            # provider's own structured record rather than inferring one.
+            variant_ids: dict[str, list[str]] = {}
+            try:
+                for row in connection.execute(
+                        "SELECT agent_session_id, per_model FROM session_costs"):
+                    try:
+                        variant_ids[row["agent_session_id"]] = list(
+                            json.loads(row["per_model"] or "{}").keys())
+                    except (TypeError, ValueError):
+                        continue
+            except sqlite3.Error:
+                # An older database without session_costs still reports usage;
+                # it simply cannot resolve a window, which the page renders as
+                # unavailable rather than as a failure.
+                variant_ids = {}
+
             totals = connection.execute(
                 """SELECT COUNT(*) AS events,
                           SUM(input_tokens) AS input_tokens,
@@ -571,6 +608,14 @@ class AiUsageIndex:
                 },
                 "first_seen": row["first_ts"], "last_activity": row["last_ts"],
                 "source": SOURCE_TRANSCRIPT,
+                # How full the model's context is -- the one percentage that is
+                # computable locally. Provider quota % stays in quota_windows,
+                # where it is honestly `unavailable`.
+                "context": context_usage(
+                    latest_context.get((row["agent_session_id"],
+                                        int(row["is_subagent"] or 0))),
+                    model=row["model"],
+                    variant_ids=variant_ids.get(row["agent_session_id"], ())),
             })
 
         def _sum(key: str, bucket: str) -> int:
@@ -845,8 +890,28 @@ class AiUsageIndex:
                     GROUP BY agent, agent_session_id, is_subagent
                     ORDER BY tokens_24h DESC, total_tokens DESC LIMIT ?""",
                 params + [limit]).fetchall()
-            costs = {r["agent_session_id"]: r["total_cost_usd"]
-                     for r in connection.execute("SELECT * FROM session_costs")}
+            costs: dict[str, Any] = {}
+            variant_ids: dict[str, list[str]] = {}
+            for r in connection.execute("SELECT * FROM session_costs"):
+                costs[r["agent_session_id"]] = r["total_cost_usd"]
+                try:
+                    variant_ids[r["agent_session_id"]] = list(
+                        json.loads(r["per_model"] or "{}").keys())
+                except (TypeError, ValueError, IndexError):
+                    continue
+            # Context fullness is a property of the LATEST request, not of the
+            # session total -- see ai_context_window for why summing answers a
+            # different question.
+            latest_context = {
+                (r["agent_session_id"], int(r["is_subagent"] or 0)): int(r["ctx"] or 0)
+                for r in connection.execute(
+                    """SELECT u.agent_session_id, u.is_subagent,
+                              u.input_tokens + u.cache_read_tokens
+                              + u.cache_write_tokens AS ctx
+                       FROM usage_events u
+                       WHERE u.ts = (SELECT MAX(ts) FROM usage_events x
+                                     WHERE x.agent_session_id = u.agent_session_id
+                                       AND x.is_subagent = u.is_subagent)""")}
         items = []
         for row in rows:
             record = {k: row[k] for k in row.keys()}
@@ -854,6 +919,15 @@ class AiUsageIndex:
             record["estimated_cost_usd"] = costs.get(record["agent_session_id"])
             record["avg_tokens_per_request"] = (
                 round(record["total_tokens"] / record["requests"]) if record["requests"] else 0)
+            # `models` here is a GROUP_CONCAT of every model the session used;
+            # the window belongs to the one it is running now, which is the
+            # last id in that list.
+            newest_model = (record.get("models") or "").split(",")[-1].strip() or None
+            record["context"] = context_usage(
+                latest_context.get((record["agent_session_id"],
+                                    int(row["is_subagent"] or 0))),
+                model=newest_model,
+                variant_ids=variant_ids.get(record["agent_session_id"], ()))
             items.append(record)
         return {"items": items, "limit": limit}
 

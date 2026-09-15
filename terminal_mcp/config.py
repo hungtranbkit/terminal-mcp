@@ -8,6 +8,7 @@ from pathlib import Path
 
 import yaml
 
+from . import endpoint_policy
 from .node_models import NodeHeartbeatThresholds, OverloadThresholds
 
 
@@ -542,6 +543,57 @@ class WorkConfig:
 
 
 @dataclass(frozen=True)
+class WorktreeJanitorConfig:
+    """Worktree Janitor (docs/WORKTREE_JANITOR.md). P0 ships the CLASSIFIER
+    ONLY -- there is no executor, so no setting here can cause a deletion.
+
+    `mode` defaults to observe_only (invariant I8) and mirrors
+    supervisor2.POLICY_MODES' escalation shape. It is recorded in every report
+    so an operator can see which mode produced a verdict; the classifier never
+    acts in any mode.
+
+    `allowed_roots` empty means NOTHING is collectable -- deliberately the
+    opposite of repo_read's fallback-to-home behaviour. A reclaim deletes; its
+    allowlist must be stated explicitly by an operator, never inherited.
+
+    `extra_valuable_globs` is additive only. There is no key that removes a
+    built-in valuable glob, so no config edit can make a credential file or a
+    sqlite db collectable."""
+
+    mode: str = "observe_only"  # observe_only | suggest_only | auto_execute
+    allowed_roots: tuple[str, ...] = ()
+    integration_ref: str = "main"
+    allow_preserved_unmerged: bool = False
+    grace_seconds: int = 86_400
+    grace_floor_seconds: int = 3_600
+    max_evidence_age_seconds: float = 120.0
+    max_candidates_per_run: int = 50
+    timeout_seconds: float = 20.0
+    extra_valuable_globs: tuple[str, ...] = ()
+    # P3 sweep. `sweep_enabled` gates only the BACKGROUND THREAD -- run_once()
+    # stays callable via MCP with it off, this project's standing "the manual
+    # path always works, only the automatic trigger is gated" posture.
+    sweep_enabled: bool = False
+    sweep_interval_seconds: float = 900.0
+    sweep_budget_seconds: float = 60.0
+    orphan_confirm_runs: int = 2
+    orphan_min_age_seconds: float = 3600.0
+    repo_roots: tuple[str, ...] = ()
+
+    def to_policy(self) -> Any:
+        from .worktree_janitor import JanitorPolicy
+
+        return JanitorPolicy(
+            mode=self.mode, allowed_roots=tuple(self.allowed_roots),
+            integration_ref=self.integration_ref,
+            allow_preserved_unmerged=self.allow_preserved_unmerged,
+            grace_seconds=self.grace_seconds,
+            max_evidence_age_seconds=self.max_evidence_age_seconds,
+            timeout_seconds=self.timeout_seconds,
+            extra_valuable_globs=tuple(self.extra_valuable_globs))
+
+
+@dataclass(frozen=True)
 class RepoReadConfig:
     """Read-only repository access for the `repo_*` MCP tools (see
     repo_read.py, repo_service.py).
@@ -830,6 +882,7 @@ class AppConfig:
     maintenance: MaintenanceConfig = MaintenanceConfig()
     fleet_sync: FleetSyncConfig = FleetSyncConfig()
     repo_read: RepoReadConfig = RepoReadConfig()
+    worktree_janitor: WorktreeJanitorConfig = WorktreeJanitorConfig()
     work: WorkConfig = WorkConfig()
     session_lifecycle: SessionLifecycleConfig = SessionLifecycleConfig()
     session_knowledge: SessionKnowledgeConfig = SessionKnowledgeConfig()
@@ -1080,6 +1133,23 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             max_sessions=max_sessions,
             timeout_seconds=float(entry.get("timeout_seconds", 10.0)),
         ))
+    # Scheme/host gate, as a SECOND pass over the parsed entries.
+    #
+    # A plaintext endpoint pointed at a public host would put that node's
+    # bearer token on the wire in the clear on every request -- see
+    # endpoint_policy for the rule. It runs after the loop above rather
+    # than inside it so that every structural and cross-entry problem
+    # (missing token_env, a duplicate node_id, a bad max_sessions) still
+    # reports itself first: those are cheap and local, this one costs a
+    # DNS lookup and would otherwise pre-empt them on an entry that is
+    # invalid for a much more obvious reason.
+    for index, remote in enumerate(remote_nodes):
+        try:
+            endpoint_policy.validate_node_endpoint(
+                remote.endpoint, context=f"nodes.remote[{index}].endpoint")
+        except endpoint_policy.EndpointPolicyError as exc:
+            raise ValueError(str(exc)) from None
+
     discovery_raw = nodes_raw.get("discovery", {})
     if not isinstance(discovery_raw, dict):
         raise ValueError("nodes.discovery must be a mapping")
@@ -1158,6 +1228,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         maintenance=_load_maintenance_config(raw.get("maintenance", {})),
         fleet_sync=_load_fleet_sync_config(raw.get("fleet_sync", {})),
         repo_read=_load_repo_read_config(raw.get("repo_read", {})),
+        worktree_janitor=_load_worktree_janitor_config(raw.get("worktree_janitor", {})),
         work=_load_work_config(raw.get("work", {})),
         session_lifecycle=_load_session_lifecycle_config(raw.get("session_lifecycle", {})),
         session_knowledge=_load_session_knowledge_config(raw.get("session_knowledge", {})),
@@ -1421,6 +1492,80 @@ def _load_work_config(raw: object) -> WorkConfig:
         lease_seconds=int(raw.get("lease_seconds", WorkConfig.lease_seconds)),
         max_revisions=revisions,
         no_progress_limit=int(raw.get("no_progress_limit", WorkConfig.no_progress_limit)))
+
+
+def _load_worktree_janitor_config(raw: object) -> WorktreeJanitorConfig:
+    """Fail-closed: an unknown mode is a config ERROR, never silently
+    downgraded. An operator who typed "auto" instead of "auto_execute" must be
+    told, not left believing the janitor is enforcing (or that it is safe)."""
+    if not isinstance(raw, dict):
+        raw = {}
+    mode = raw.get("mode", WorktreeJanitorConfig.mode)
+    if mode not in ("observe_only", "suggest_only", "auto_execute"):
+        raise ValueError("worktree_janitor.mode must be one of: observe_only, "
+                         "suggest_only, auto_execute")
+    roots = raw.get("allowed_roots", [])
+    if not isinstance(roots, list) or not all(isinstance(r, str) and r for r in roots):
+        raise ValueError("worktree_janitor.allowed_roots must be a list of strings")
+    for root in roots:
+        if not root.startswith("/") and not root.startswith("~"):
+            raise ValueError(f"worktree_janitor.allowed_roots entry {root!r} must be absolute")
+        if root.strip() == "/":
+            raise ValueError("worktree_janitor.allowed_roots may not contain '/'")
+    ref = raw.get("integration_ref", WorktreeJanitorConfig.integration_ref)
+    if not isinstance(ref, str) or not ref.strip() or ref.startswith("-"):
+        raise ValueError("worktree_janitor.integration_ref must be a non-empty ref name")
+    allow_preserved = raw.get("allow_preserved_unmerged",
+                              WorktreeJanitorConfig.allow_preserved_unmerged)
+    if not isinstance(allow_preserved, bool):
+        raise ValueError("worktree_janitor.allow_preserved_unmerged must be a boolean")
+    globs = raw.get("extra_valuable_globs", [])
+    if not isinstance(globs, list) or not all(isinstance(g, str) and g for g in globs):
+        raise ValueError("worktree_janitor.extra_valuable_globs must be a list of strings")
+
+    def bounded(key: str, default: Any, low: float, high: float) -> Any:
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"worktree_janitor.{key} must be a number")
+        if not low <= value <= high:
+            raise ValueError(f"worktree_janitor.{key} must be between {low} and {high}")
+        return value
+
+    grace = int(bounded("grace_seconds", WorktreeJanitorConfig.grace_seconds, 300, 2_592_000))
+    floor = int(bounded("grace_floor_seconds", WorktreeJanitorConfig.grace_floor_seconds,
+                        60, 2_592_000))
+    if floor > grace:
+        raise ValueError("worktree_janitor.grace_floor_seconds must not exceed grace_seconds")
+    sweep_enabled = raw.get("sweep_enabled", WorktreeJanitorConfig.sweep_enabled)
+    if not isinstance(sweep_enabled, bool):
+        raise ValueError("worktree_janitor.sweep_enabled must be a boolean")
+    sweep_roots = raw.get("repo_roots", [])
+    if not isinstance(sweep_roots, list) or not all(isinstance(r, str) and r for r in sweep_roots):
+        raise ValueError("worktree_janitor.repo_roots must be a list of strings")
+    for root in sweep_roots:
+        if not root.startswith("/") and not root.startswith("~"):
+            raise ValueError(f"worktree_janitor.repo_roots entry {root!r} must be absolute")
+    return WorktreeJanitorConfig(
+        sweep_enabled=sweep_enabled,
+        sweep_interval_seconds=float(bounded(
+            "sweep_interval_seconds", WorktreeJanitorConfig.sweep_interval_seconds, 30, 86_400)),
+        sweep_budget_seconds=float(bounded(
+            "sweep_budget_seconds", WorktreeJanitorConfig.sweep_budget_seconds, 1, 3_600)),
+        orphan_confirm_runs=int(bounded(
+            "orphan_confirm_runs", WorktreeJanitorConfig.orphan_confirm_runs, 1, 100)),
+        orphan_min_age_seconds=float(bounded(
+            "orphan_min_age_seconds", WorktreeJanitorConfig.orphan_min_age_seconds, 0, 2_592_000)),
+        repo_roots=tuple(sweep_roots),
+        mode=mode, allowed_roots=tuple(roots), integration_ref=ref.strip(),
+        allow_preserved_unmerged=allow_preserved, grace_seconds=grace,
+        grace_floor_seconds=floor,
+        max_evidence_age_seconds=float(bounded(
+            "max_evidence_age_seconds", WorktreeJanitorConfig.max_evidence_age_seconds, 5, 3_600)),
+        max_candidates_per_run=int(bounded(
+            "max_candidates_per_run", WorktreeJanitorConfig.max_candidates_per_run, 1, 5_000)),
+        timeout_seconds=float(bounded(
+            "timeout_seconds", WorktreeJanitorConfig.timeout_seconds, 1, 300)),
+        extra_valuable_globs=tuple(globs))
 
 
 def _load_repo_read_config(raw: object) -> RepoReadConfig:
