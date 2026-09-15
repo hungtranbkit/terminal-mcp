@@ -27,7 +27,12 @@ from .cf_access import verify_access_assertion
 from .agent_availability import available_agent_types
 from .access_policy import filter_record, policy_table, role_for_identity
 from .connection_store import ConnectionStore, generate_node_token
-from .enrollment import STAGES as ENROLL_STAGES, EnrollmentStore
+from .enrollment import (
+    STAGES as ENROLL_STAGES,
+    EnrollmentStore,
+    normalize_exit_code,
+    normalize_failure_code,
+)
 from .node_onboarding import (OnboardingError, OnboardingService, read_controller_ssh_public_key,
                                rescue_authorized_keys_dir)
 from . import node_credentials
@@ -17377,8 +17382,24 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
         node_id = await anyio.to_thread.run_sync(_compute)
         # node_id (not the code) is the only identifier that reaches a log.
+        #
+        # The helper also sends WHY it failed. Both values are normalised
+        # against a closed set before they are written down, so nothing the
+        # machine sends can put free text into this log: an unrecognised
+        # code or an out-of-range exit status becomes None and is simply
+        # not logged. Deliberately log-only -- no column, no migration --
+        # because the reason is a diagnostic, not state the Dashboard
+        # renders today.
+        failure_code = normalize_failure_code(body.get("code"))
+        exit_code = normalize_exit_code(body.get("exit_code"))
         if node_id:
-            _log.info("dashboard enroll_progress node_id=%s stage=%s elapsed=%s", node_id, stage, elapsed)
+            detail = ""
+            if failure_code:
+                detail += " code=%s" % failure_code
+            if exit_code is not None:
+                detail += " exit_code=%d" % exit_code
+            _log.info("dashboard enroll_progress node_id=%s stage=%s elapsed=%s%s",
+                     node_id, stage, elapsed, detail)
         return JSONResponse({"accepted": True}, status_code=202, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/nodes/{node_id}/deregister", methods=["POST"], include_in_schema=False)

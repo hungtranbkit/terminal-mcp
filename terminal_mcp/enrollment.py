@@ -143,6 +143,46 @@ STAGE_LABELS = {
     STAGE_FAILED: "Thất bại",
 }
 
+# The Bootstrap helper's own failure vocabulary, mirroring the closed set in
+# helper/cmd/terminal-mcp-bootstrap/progress.go. A failed stage says only
+# THAT it failed; these say which step, so "Cài đặt thất bại" stops being
+# the end of the diagnosis. Closed on purpose: the helper must not be able
+# to write arbitrary text into anything this controller logs or renders.
+FAILURE_CODES = (
+    "pairing_rejected",
+    "controller_unreachable",
+    "script_download_failed",
+    "service_install_failed",
+    "setup_launch_failed",
+)
+
+# Installer exit codes windows-setup.ps1 actually uses: 1 required steps
+# failed, 2 ready-with-warnings, 3 elevation trouble, -1 the helper's own
+# "no exit code" (timeout or could not start).
+EXIT_CODE_MIN = -1
+EXIT_CODE_MAX = 255
+
+
+def normalize_failure_code(value: object) -> str | None:
+    """A code from the closed set, or None. Never the caller's string."""
+    candidate = str(value or "").strip()
+    return candidate if candidate in FAILURE_CODES else None
+
+
+def normalize_exit_code(value: object) -> int | None:
+    """A bounded integer, or None. The machine reports this and it is only
+    ever displayed or logged, so an unbounded value has no business here."""
+    if value is None:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if number < EXIT_CODE_MIN or number > EXIT_CODE_MAX:
+        return None
+    return number
+
+
 STATUS_PENDING = "pending"
 STATUS_CONSUMED = "consumed"
 STATUS_REVOKED = "revoked"
