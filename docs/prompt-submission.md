@@ -356,6 +356,16 @@ A remote failure is classified rather than collapsed into one error string:
 `node_id` and `session` travel with the verdict, so a caller never has to guess
 which target a failure belongs to. Prompt content never reaches this path.
 
+### One pipeline, one vocabulary
+
+`prompt_transport.py`'s `PromptTransport` Protocol names the same stages this
+contract does, and nothing calls through it — `TmuxPromptTransport.activate()`
+and `.prove_accepted()` raise `NotImplementedError`. The live path is `core.py`
+alone, and the stage names in this document are the ones it emits. The dead
+Protocol is tracked for retirement or implementation; until that is settled,
+treat any state it declares that does not appear in the tables above as not
+real.
+
 ### Troubleshooting
 
 | Symptom | Read this |
