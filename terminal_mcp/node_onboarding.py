@@ -233,12 +233,25 @@ class OnboardingService:
         return ConnectivityPlan(tailscale=tailscale_ok, tailscale_reason=tailscale_reason,
                                 rescue=rescue_ok, rescue_reason=rescue_reason, lan=want_lan)
 
+    @property
+    def bootstrap_origin(self) -> str:
+        """The pinned public, machine-facing origin, or "" when this
+        controller derives one per request.
+
+        Machines get this; the operator's browser keeps whatever hostname
+        it arrived on. The two are deliberately allowed to differ -- the
+        Dashboard hostname is Access-gated and a machine mid-enrollment
+        cannot pass Access.
+        """
+        return (self.onboarding_config.bootstrap_origin or "").strip().rstrip("/")
+
     def controller_url(self, *, request_base_url: str | None = None) -> str:
-        """What the generated installer will call back to, in priority
-        order: the operator's explicit setting, then this controller's own
-        tailnet address (the address a node can actually reach, and the
-        one that bypasses a Cloudflare-Access-gated dashboard hostname),
-        then the Host the browser used, then the bare hostname.
+        """What the generated installer will call back to: the first of
+        controller_urls(), which is the pinned public bootstrap_origin if
+        there is one, then the operator's explicit controller_url, then the
+        Host the browser used (only when nothing is pinned), then this
+        controller's LAN addresses, then its tailnet address, then the bare
+        hostname. See controller_urls() for why that order is what it is.
 
         The tailnet fallback has to name a port, and it must be the port
         THIS process serves on -- a staging controller started with
@@ -269,6 +282,15 @@ class OnboardingService:
         perfectly able to reach the controller over the LAN. It stays in
         the list because once Tailscale IS up it is the best path for
         heartbeats, and the installer re-resolves after joining.
+
+        When nodes.onboarding.bootstrap_origin is set, it leads AND the
+        browser's Host is dropped from the list entirely. On a public
+        deployment that Host is the operator's Access-gated Dashboard
+        hostname: a machine that tries it does not get a connection error
+        it can fall through, it gets a 302 to an Access login page, which
+        is a perfectly successful HTTP response carrying no bootstrap
+        config. Leaving it in the candidate list is how a machine picks
+        the one origin guaranteed not to work.
         """
         seen: list[str] = []
 
@@ -279,8 +301,11 @@ class OnboardingService:
             if cleaned and cleaned not in seen:
                 seen.append(cleaned)
 
+        pinned = self.bootstrap_origin
+        add(pinned)
         add((self.onboarding_config.controller_url or "").strip())
-        add(request_base_url)
+        if not pinned:
+            add(request_base_url)
         port = _controller_port()
         lan_candidates, tailnet_candidates = [], []
         for address in _controller_bind_addresses():
