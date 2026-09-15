@@ -113,13 +113,36 @@ if (-not (Test-Path $venvDir)) {
 $venvPython = Join-Path $venvDir "Scripts\python.exe"
 $venvPip = Join-Path $venvDir "Scripts\pip.exe"
 Write-Host "-> Installing terminal-mcp (pip install -e .[windows])"
-& $venvPip install --quiet --upgrade pip
-& $venvPip install --quiet -e "$RepoDir[windows]"
-if ($LASTEXITCODE -ne 0) {
+# pip writes to stderr for warnings as well as errors, and this script runs
+# under $ErrorActionPreference = "Stop". On PowerShell 5.1 that turns the
+# FIRST stderr line from a native command into a terminating
+# NativeCommandError -- which killed the script here and made the fallback
+# below unreachable, so a node whose [windows] extra could not resolve got
+# no agent and no explanation. The preference is relaxed around the pip
+# calls only, and the exit code is what decides instead.
+function Invoke-Pip {
+    param([Parameter(Mandatory)] [string[]] $PipArgs)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $venvPip @PipArgs 2>&1 | ForEach-Object { Write-Host "   $_" }
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
+Invoke-Pip @('install', '--quiet', '--upgrade', 'pip') | Out-Null
+$pipExit = Invoke-Pip @('install', '--quiet', '-e', "$RepoDir[windows]")
+if ($pipExit -ne 0) {
     $warnMsg = "pip install -e .[windows] failed (pywinpty needs a C++ build toolchain on some Python versions) -- " `
         + "retrying without the [windows] extra; you will need to 'pip install pywinpty' yourself before this agent can actually spawn sessions."
     Write-Warning $warnMsg
-    & $venvPip install --quiet -e "$RepoDir"
+    $pipExit = Invoke-Pip @('install', '--quiet', '-e', $RepoDir)
+    if ($pipExit -ne 0) {
+        Write-Error "pip install failed with and without the [windows] extra (exit $pipExit) -- see the lines above"
+        exit 1
+    }
 }
 
 # -- 4. Token -------------------------------------------------------------------

@@ -112,7 +112,7 @@ def test_a_missing_312_is_installed_through_the_existing_winget_mechanism():
 
 def test_a_verified_interpreter_is_handed_to_the_installer_explicitly():
     section = _agent_section(_script())
-    assert "-PythonExe $py" in section
+    assert "'-PythonExe', $py" in section
     assert "'Node agent python' 'OK'" in section
 
 
@@ -140,8 +140,9 @@ def test_paths_with_spaces_are_quoted_everywhere_they_are_used():
     source = _installer_source()
     assert '& "$pythonPath" -m venv' in source, "Program Files contains a space"
     section = _agent_section(_script())
-    # The interpreter path is passed as its own argument, never concatenated.
-    assert "-PythonExe $py" in section
+    # The interpreter path is its own -ArgumentList entry, never
+    # concatenated into a command string that a space could split.
+    assert "'-PythonExe', $py" in section
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +153,7 @@ def test_the_installer_output_is_written_to_a_log_not_discarded():
     section = _agent_section(_script())
     assert "Out-Null" not in section.split("winget install")[-1].split("$transcript")[0] or True
     assert "node-agent-install.log" in section
-    assert "*>> $rawLog" in section, "streams captured to a file"
+    assert "-RedirectStandardOutput $rawLog" in section, "streams captured to files"
     assert "Add-Content -Path $agentLog" in section
 
 
@@ -251,7 +252,13 @@ def test_the_installer_streams_go_to_a_file_not_the_pipeline():
     remove."""
     section = _agent_section(_script())
     invoke = section[section.index("$rawLog ="):section.index("$scrubbed = ''")]
-    assert "*>> $rawLog" in invoke, "streams must be file-redirected"
+    # Start-Process: a real process, streams straight to files, exit code
+    # read from the object. `&` still trips ErrorActionPreference='Stop'
+    # the moment the child writes to stderr, redirection or not.
+    assert "Start-Process -FilePath 'powershell.exe'" in invoke
+    assert "-RedirectStandardOutput $rawLog" in invoke
+    assert "-RedirectStandardError $rawErr" in invoke
+    assert "$proc.ExitCode" in invoke
     assert "2>&1" not in invoke, "the pipeline-merging form must not come back"
 
 
@@ -278,3 +285,31 @@ def test_the_log_is_written_even_when_the_installer_fails():
     # Add-Content comes after the try/catch, so both paths reach it.
     assert section.index("} catch {") < section.index("Add-Content -Path $agentLog")
     assert section.index("$installerExit = -1") < section.index("Add-Content -Path $agentLog")
+
+
+def test_the_installers_pip_calls_survive_stderr():
+    """install-node-agent.ps1 runs under $ErrorActionPreference = "Stop",
+    so `& $venvPip ...` died on pip's first stderr line -- which made its
+    own `if ($LASTEXITCODE -ne 0)` fallback unreachable. A node whose
+    [windows] extra could not resolve therefore got no agent and no
+    explanation. Pre-existing; found by node 54202."""
+    source = _installer_source()
+    assert "function Invoke-Pip" in source
+    pipfn = source[source.index("function Invoke-Pip"):source.index("Invoke-Pip @('install', '--quiet', '--upgrade'")]
+    assert "$ErrorActionPreference = 'Continue'" in pipfn
+    assert "finally {" in pipfn and "$ErrorActionPreference = $previous" in pipfn
+    assert "return $LASTEXITCODE" in pipfn
+
+
+def test_the_fallback_without_the_windows_extra_is_now_reachable():
+    source = _installer_source()
+    assert "$pipExit = Invoke-Pip @('install', '--quiet', '-e', \"$RepoDir[windows]\")" in source
+    assert "if ($pipExit -ne 0) {" in source
+    # And a total failure is a real, explained non-zero exit.
+    assert "pip install failed with and without the [windows] extra" in source
+    assert "exit 1" in source
+
+
+def test_pip_output_is_visible_rather_than_swallowed():
+    source = _installer_source()
+    assert 'ForEach-Object { Write-Host "   $_" }' in source
