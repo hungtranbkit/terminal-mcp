@@ -6030,6 +6030,16 @@ NODES_ADMIN_HTML = """<!doctype html>
     .an-live.done .an-spin { background:#6ee7a0; animation:none }
     .an-live.failed { border-color:#7a2333; background:#3a1620 }
     .an-live.failed .an-spin { background:#ff9aa8; animation:none }
+    /* Stalled is NOT failed: the installer may still be grinding through a
+       slow OpenSSH install. Amber says "nothing has reported for a while",
+       which is the honest claim, rather than red's "this is over". */
+    .an-live.stalled { border-color:var(--amber); background:#2e2410 }
+    .an-live.stalled .an-spin { background:var(--amber) }
+    .an-live-body { flex:1; min-width:0 }
+    .an-live-stage { font-weight:600 }
+    .an-live-meta { font-size:11px; color:var(--muted); margin-top:2px }
+    .an-live-hint { font-size:11px; margin-top:4px; color:var(--amber) }
+    .an-live .cx-row { margin-top:6px }
     @keyframes anPulse { 0%,100% { opacity:1 } 50% { opacity:.25 } }
     .an-manual { margin-top:14px; font-size:12px }
     .an-quick.an-demoted { border-color:var(--line); background:#0f1730; opacity:.85 }
@@ -6132,7 +6142,23 @@ NODES_ADMIN_HTML = """<!doctype html>
             <button class="icon-btn" id="anDoneBtn" type="button">Đã xong</button>
           </div>
           <div class="d-msg" id="anHelperMsg" role="status" aria-live="polite"></div>
-          <div class="an-live" id="anLive" hidden></div>
+          <!-- Installation status. Shown from the moment the CTA is used
+               and never hidden again while an enrollment is pending: the
+               previous version only appeared once the machine reported a
+               stage, so an operator whose helper never started saw an
+               empty panel and no way to tell waiting from broken. -->
+          <div class="an-live" id="anLive" hidden role="status" aria-live="polite">
+            <span class="an-spin" id="anLiveSpin"></span>
+            <div class="an-live-body">
+              <div class="an-live-stage" id="anLiveStage"></div>
+              <div class="an-live-meta" id="anLiveMeta"></div>
+              <div class="an-live-hint" id="anLiveHint" hidden></div>
+              <div class="cx-row" id="anLiveActions" hidden>
+                <button class="icon-btn" id="anLiveRetryBtn" type="button">Thử lại</button>
+                <button class="icon-btn" id="anLiveRepairBtn" type="button">Cách thủ công</button>
+              </div>
+            </div>
+          </div>
         </div>
 
         <!-- Everything below is the fallback: the copy/paste Win + R path
@@ -6880,30 +6906,152 @@ NODES_ADMIN_HTML = """<!doctype html>
     // on. Polling it is what turns "nothing is happening" into "installing
     // OpenSSH, 1m32s" -- the single most useful thing to show someone
     // staring at a machine that looks stuck.
-    async function anPollProgress() {
-      if (!anGenerated) return;
+    // -- installation status -------------------------------------------------
+    //
+    // This panel is shown the moment the CTA is used and is NOT hidden again
+    // while the enrollment is pending. The version this replaces returned
+    // early whenever the row carried no progress_stage, which is precisely
+    // the state a machine is in before its helper has called back -- so the
+    // operator whose helper never started (SmartScreen, no double-click, an
+    // expired pairing) saw an empty box and had no way to tell "waiting"
+    // from "broken". Waiting is a state and it gets rendered like one.
+    const AN_STALL_AFTER_MS = 30000;
+    let anWatch = null;   // {id, nodeId, startedAt, lastStage, lastChangeAt}
+
+    function anFmtDuration(ms) {
+      const secs = Math.max(0, Math.round(ms / 1000));
+      return secs >= 60 ? `${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, '0')}s` : `${secs}s`;
+    }
+
+    // Survives a reload: the enrollment ID is not a credential (the code
+    // and the handle are, and neither is stored). Without this, refreshing
+    // the page during a ten-minute OpenSSH install left the operator with
+    // no way back to the status of the thing they had just started.
+    const AN_WATCH_KEY = 'tmcp.addnode.watch';
+
+    function anSaveWatch() {
+      try {
+        if (anWatch) localStorage.setItem(AN_WATCH_KEY, JSON.stringify(anWatch));
+        else localStorage.removeItem(AN_WATCH_KEY);
+      } catch (error) { /* private window / blocked storage: in-memory only */ }
+    }
+
+    function anLoadWatch() {
+      try {
+        const raw = localStorage.getItem(AN_WATCH_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        return (parsed && parsed.id) ? parsed : null;
+      } catch (error) { return null; }
+    }
+
+    function anBeginWatch(enrollmentId, nodeId) {
+      const now = Date.now();
+      anWatch = {id: enrollmentId, nodeId: nodeId || '', startedAt: now,
+                 lastStage: '', lastChangeAt: now};
+      anSaveWatch();
+      anRenderLive(null);
+      if (anProgressTimer) clearInterval(anProgressTimer);
+      anProgressTimer = setInterval(anPollProgress, 3000);
+      anPollProgress();
+    }
+
+    function anEndWatch() {
+      anWatch = null;
+      anSaveWatch();
+      if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
+      if (anLiveTicker) { clearInterval(anLiveTicker); anLiveTicker = null; }
+    }
+
+    let anLiveTicker = null;
+    let anLiveRow = null;
+
+    // Redrawn once a second off a cached row, so "đã 41s" counts up between
+    // the 3-second polls instead of freezing -- a frozen timer is the single
+    // clearest way to make a working install look hung.
+    function anRenderLive(row) {
+      if (row !== undefined) anLiveRow = row;
       const live = document.getElementById('anLive');
-      const result = await api('/dashboard/api/nodes/onboard/enrollments');
-      if (!result.ok) return;
-      const row = (result.data.enrollments || []).find((e) => e.id === anGenerated.enrollment.id);
-      if (!row || !row.progress_stage) return;
+      if (!live || !anWatch) return;
+      const stageEl = document.getElementById('anLiveStage');
+      const metaEl = document.getElementById('anLiveMeta');
+      const hintEl = document.getElementById('anLiveHint');
+      const actions = document.getElementById('anLiveActions');
+      const current = anLiveRow;
+      const stage = (current && current.progress_stage) || '';
+      const now = Date.now();
+      const sinceChange = now - anWatch.lastChangeAt;
+      // Prefer the elapsed the MACHINE reports: it measures the install
+      // itself, and it stays right across a reload and across a clock that
+      // disagrees with the controller's. The browser-side measure is the
+      // fallback, and is all there is during the wait before any stage.
+      const serverSecs = Number((current && current.progress_elapsed_seconds) || 0);
+      const sinceStart = serverSecs > 0 ? serverSecs * 1000 : (now - anWatch.startedAt);
       live.hidden = false;
-      live.className = 'an-live' + (row.progress_stage === 'ready' ? ' done'
-                                  : row.progress_stage === 'failed' ? ' failed' : '');
-      live.replaceChildren();
-      const dot = document.createElement('span'); dot.className = 'an-spin';
-      const text = document.createElement('span');
-      const secs = Number(row.progress_elapsed_seconds || 0);
-      const elapsed = secs >= 60 ? `${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, '0')}s` : `${secs}s`;
-      const label = row.progress_label || row.progress_stage;
-      text.textContent = row.progress_stage === 'ready'
-        ? `${label} — máy đã cài xong sau ${elapsed}.`
-        : row.progress_stage === 'failed'
-          ? `${label} — xem cửa sổ PowerShell trên máy đó để biết bước nào lỗi.`
-          : `${label}… đã ${elapsed}`;
-      live.append(dot, text);
-      if (row.progress_stage === 'ready' || row.progress_stage === 'failed') {
+
+      if (stage === 'ready') {
+        live.className = 'an-live done';
+        stageEl.textContent = `${(current && current.progress_label) || 'Hoàn tất'} — máy đã cài xong.`;
+        metaEl.textContent = `Tổng thời gian ${anFmtDuration(sinceStart)}.`;
+        hintEl.hidden = true;
+        actions.hidden = true;
+        return;
+      }
+      if (stage === 'failed') {
+        live.className = 'an-live failed';
+        stageEl.textContent = `${(current && current.progress_label) || 'Cài đặt thất bại'}`;
+        metaEl.textContent = `Dừng sau ${anFmtDuration(sinceStart)}. Xem cửa sổ PowerShell trên máy đó để biết bước nào lỗi.`;
+        hintEl.hidden = true;
+        actions.hidden = false;
+        return;
+      }
+
+      const stalled = !stage && sinceChange > AN_STALL_AFTER_MS;
+      live.className = 'an-live' + (stalled ? ' stalled' : '');
+      stageEl.textContent = stage
+        ? `${(current && current.progress_label) || stage}…`
+        : 'Đang chờ máy Windows bắt đầu cài đặt…';
+      const bits = [`đã ${anFmtDuration(sinceStart)}`];
+      bits.push(stage
+        ? `cập nhật lần cuối ${anFmtDuration(sinceChange)} trước`
+        : 'máy chưa báo về bước nào');
+      if (anWatch.nodeId) bits.push(`node ${anWatch.nodeId}`);
+      metaEl.textContent = bits.join(' · ');
+      // The warning is the whole point of this panel: it names the two
+      // physical things the operator has to do, which is what nobody can
+      // guess from a silent screen.
+      hintEl.hidden = !stalled;
+      if (stalled) {
+        hintEl.textContent = 'Chưa thấy máy Windows phản hồi. Mở file vừa tải trên máy đó và bấm Yes khi '
+                           + 'Windows hỏi quyền Administrator. Nếu SmartScreen chặn: More info → Run anyway.';
+      }
+      actions.hidden = !stalled;
+    }
+
+    async function anPollProgress() {
+      if (!anWatch) return;
+      const result = await api('/dashboard/api/nodes/onboard/enrollments');
+      if (!result.ok) return;   // keep the panel and its timer; transient
+      const row = (result.data.enrollments || []).find((e) => e.id === anWatch.id);
+      if (!row) {
+        // Gone from the list entirely: expired and swept, or revoked. Say
+        // so rather than spinning forever against nothing.
+        anLiveRow = {progress_stage: 'failed',
+                     progress_label: 'Mã cài đặt đã hết hạn hoặc bị thu hồi'};
+        anRenderLive(anLiveRow);
         if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
+        return;
+      }
+      const stage = row.progress_stage || '';
+      if (stage !== anWatch.lastStage) {
+        anWatch.lastStage = stage;
+        anWatch.lastChangeAt = Date.now();
+        anSaveWatch();
+      }
+      anRenderLive(row);
+      if (stage === 'ready' || stage === 'failed') {
+        if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
+        try { localStorage.removeItem(AN_WATCH_KEY); } catch (error) { /* ignore */ }
         loadAll();
       }
     }
@@ -6953,6 +7101,7 @@ NODES_ADMIN_HTML = """<!doctype html>
       copyBtn.disabled = false;
       regenBtn.hidden = true;
       document.getElementById('anLive').hidden = true;
+      anLiveRow = null;
       anCtaExpired = false;
       anSetMsg('anHelperMsg', '');
 
@@ -6962,9 +7111,8 @@ NODES_ADMIN_HTML = """<!doctype html>
       if (anDetectTimer) { clearInterval(anDetectTimer); anDetectTimer = null; }
       anSetCtaMode('checking');
       anDecideCta();
-      if (anProgressTimer) clearInterval(anProgressTimer);
-      anProgressTimer = setInterval(anPollProgress, 3000);
-      anPollProgress();
+      // The status panel stays dark until the operator actually uses the
+      // CTA -- generating a code is not yet an install to watch.
       if (anExpiryTimer) clearInterval(anExpiryTimer);
       tick();
       anExpiryTimer = setInterval(tick, 1000);
@@ -7136,6 +7284,10 @@ NODES_ADMIN_HTML = """<!doctype html>
         anCtaSetState(button, false, true);
         await anDownloadPairedHelper(event);
         anApplyCta();
+        // The installer is now in the operator's hands, so the wait starts
+        // here -- including the case where they never run it, which is the
+        // one the old silent panel could not express.
+        anBeginWatch(anGenerated.enrollment.id, anGenerated.enrollment.node_id);
         return;
       }
       if (anCtaMode !== 'connect') return;
@@ -7156,11 +7308,47 @@ NODES_ADMIN_HTML = """<!doctype html>
         // payload -- the helper redeems the handle itself, over HTTPS.
         window.location.href = issued.data.url;
         anSetMsg('anHelperMsg', 'Đã gửi sang Bootstrap helper — bấm Yes khi Windows hỏi quyền Administrator.', 'ok');
+        anBeginWatch(anGenerated.enrollment.id, anGenerated.enrollment.node_id);
       } finally {
         anHandleInFlight = false;
         anApplyCta();   // back to whatever the current state allows
       }
     });
+
+    // Retry re-runs whatever the CTA currently means; Repair opens the
+    // manual path, which is the one that works when the helper will not.
+    document.getElementById('anLiveRetryBtn').addEventListener('click', () => {
+      if (anWatch) { anWatch.lastChangeAt = Date.now(); anSaveWatch(); }
+      anRenderLive(anLiveRow);
+      const cta = document.getElementById('anHelperBtn');
+      if (cta && !cta.disabled) cta.click();
+    });
+
+    document.getElementById('anLiveRepairBtn').addEventListener('click', () => {
+      const manual = document.querySelector('details.an-manual');
+      if (manual) { manual.open = true; manual.scrollIntoView({block: 'nearest'}); }
+    });
+
+    // One tick a second so elapsed/last-update count up between polls.
+    anLiveTicker = setInterval(() => { if (anWatch) anRenderLive(undefined); }, 1000);
+
+    // Resume across a reload: a pending enrollment this browser started is
+    // still worth watching even though anGenerated (which holds the code)
+    // is deliberately gone.
+    (function anResumeWatch() {
+      const saved = anLoadWatch();
+      if (!saved) return;
+      // Anything older than an enrollment can possibly live is stale.
+      if (Date.now() - Number(saved.startedAt || 0) > 3600000) { anWatch = null; anSaveWatch(); return; }
+      anWatch = saved;
+      anPanel.hidden = false;
+      anShow('anStepDone');
+      document.getElementById('anExpiry').textContent = 'Đang theo dõi lần cài đặt trước đó.';
+      anRenderLive(null);
+      if (anProgressTimer) clearInterval(anProgressTimer);
+      anProgressTimer = setInterval(anPollProgress, 3000);
+      anPollProgress();
+    })();
 
     document.getElementById('anRegenBtn').addEventListener('click', () => {
       // Same node name and profile, a fresh code. Straight back to the
@@ -7182,8 +7370,8 @@ NODES_ADMIN_HTML = """<!doctype html>
     document.getElementById('anDoneBtn').addEventListener('click', () => {
       anPanel.hidden = true;
       if (anExpiryTimer) { clearInterval(anExpiryTimer); anExpiryTimer = null; }
-      if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
       if (anDetectTimer) { clearInterval(anDetectTimer); anDetectTimer = null; }
+      anEndWatch();         // stops polling AND forgets the resume marker
       anGenerated = null;   // the only copy in this tab, dropped on close
       loadAll();
     });
