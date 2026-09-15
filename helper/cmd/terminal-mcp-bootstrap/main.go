@@ -75,6 +75,15 @@ func programDataDir() string {
 	return filepath.Join(base, "TerminalMCP")
 }
 
+// nodeConfigPath is where windows-setup.ps1 keeps its own node.json
+// ($StateDir\node.json). The helper writes the redeemed bootstrap payload
+// there so the installer's -Repair path finds credentials already on disk
+// instead of trying to enrol a second time with a pairing that has just
+// been spent.
+func nodeConfigPath() string {
+	return filepath.Join(programDataDir(), "node.json")
+}
+
 // Config is the helper's install-time binding to ONE controller. The
 // allowlist here is what makes the protocol handler safe: a page can ask
 // for any controller it likes and be refused.

@@ -174,9 +174,14 @@ def test_handle_is_single_use_short_lived_and_hashed(tmp_path):
 
     assert len(handle) == 32
     assert handle.encode() not in (tmp_path / "e.db").read_bytes(), "handle must be hashed at rest"
-    # ~2 minutes, not ~15: it covers a click, not a coffee break.
+    # ~15 minutes, not ~2. The original comment here read "it covers a
+    # click, not a coffee break" -- but the handle is minted when the
+    # DOWNLOAD starts, so the clock has to cover the operator finding the
+    # file, clearing SmartScreen on an unsigned binary and accepting UAC.
+    # A live run expired every time before the helper ever ran. Single-use
+    # is what bounds the risk here; the TTL only bounds the wait.
     delta = datetime.fromisoformat(expires_at) - datetime.now(timezone.utc)
-    assert timedelta(seconds=60) < delta <= timedelta(seconds=180)
+    assert timedelta(seconds=880) < delta <= timedelta(seconds=900)
 
     assert store.redeem_handle(handle).node_id == "hnode"
     assert store.redeem_handle(handle) is None, "a handle must not be redeemable twice"
@@ -186,7 +191,8 @@ def test_expired_handle_is_refused(tmp_path):
     store = EnrollmentStore(tmp_path / "e.db")
     record, _code = store.create(node_id="hnode")
     handle, _ = store.create_handle(record.id)
-    future = datetime.now(timezone.utc) + timedelta(minutes=10)
+    # Past the 15-minute window, not merely past the old 2-minute one.
+    future = datetime.now(timezone.utc) + timedelta(seconds=901)
     assert store.redeem_handle(handle, now=future) is None
 
 
@@ -593,8 +599,8 @@ def test_the_status_panel_is_not_gated_on_a_reported_stage():
     assert "if (!row || !row.progress_stage) return;" not in page
     js = _status_js()
     # The no-stage branch renders words rather than returning.
-    assert "Đang chờ máy Windows bắt đầu cài đặt…" in js
-    assert "máy chưa báo về bước nào" in js
+    assert "Đang chờ helper trên máy Windows…" in js
+    assert "helper chưa báo về bước nào" in js
 
 
 def test_the_panel_opens_when_the_cta_acts_not_when_progress_arrives():
@@ -685,3 +691,58 @@ def test_a_transient_poll_failure_keeps_the_panel_and_the_timer():
     ten-minute install."""
     js = _status_js()
     assert "if (!result.ok) return;   // keep the panel and its timer; transient" in js
+
+
+# ---------------------------------------------------------------------------
+# Two stall thresholds, the pairing countdown, and the expired dead-end
+# ---------------------------------------------------------------------------
+
+
+def test_thirty_seconds_says_the_helper_has_not_connected():
+    page = _page()
+    assert "const AN_STALL_AFTER_MS = 30000;" in page
+    js = _status_js()
+    assert "Chưa thấy helper kết nối" in js
+
+
+def test_ninety_seconds_says_plainly_that_it_never_reached_the_server():
+    """The second threshold exists because 'quiet for 30s' and 'quiet for
+    90s' deserve different words -- the latter is a blocked or never-opened
+    binary, which the operator can act on."""
+    page = _page()
+    assert "const AN_STALL_HARD_AFTER_MS = 90000;" in page
+    js = _status_js()
+    assert "Helper chưa liên hệ máy chủ — kiểm tra SmartScreen/UAC hoặc chạy lại" in js
+    assert "veryQuiet" in js
+
+
+def test_an_expired_enrollment_is_a_dead_end_with_one_action():
+    """Waiting cannot rescue a dead code, so the panel stops nudging."""
+    js = _status_js()
+    assert "current.status === 'expired'" in js
+    assert "Mã cài đặt đã hết hạn — Tạo lại" in js
+    # And it stops polling rather than spinning against something finished.
+    assert "clearInterval(anProgressTimer); anProgressTimer = null;" in js
+
+
+def test_the_panel_counts_down_the_pairing_itself():
+    """The pairing dies before the enrollment does, and the operator cannot
+    see it anywhere else."""
+    page = _page()
+    js = _status_js()
+    assert "pairingExpiresAt" in js
+    assert "mã còn" in js
+    # The expiry timestamp is kept, never the handle.
+    assert "anPairingExpiresAt = Date.parse(issued.data.expires_at" in page
+    watch = page[page.index("function anBeginWatch("):page.index("function anEndWatch(")]
+    assert "handle" not in watch
+
+
+def test_the_helper_stages_reach_the_panel_as_vietnamese_labels():
+    """The panel renders progress_label, which the store supplies, so the
+    six helper stages must all have one -- checked against the store rather
+    than duplicated here."""
+    from terminal_mcp.enrollment import HELPER_STAGES, STAGE_LABELS
+    for stage in HELPER_STAGES:
+        assert STAGE_LABELS.get(stage), stage
+    assert "progress_label" in _page()
