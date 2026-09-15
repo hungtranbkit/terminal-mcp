@@ -58,7 +58,14 @@ param(
     [string] $BindHost = "127.0.0.1",
     [string] $ShellBinary = "powershell.exe",
     [double] $HeartbeatIntervalSeconds = 20,
-    [switch] $NoScheduledTask
+    [switch] $NoScheduledTask,
+    # The EXACT interpreter to build the venv from. Passed by
+    # windows-setup.ps1, which resolves 3.12 deliberately. Left empty this
+    # falls back to whatever `python` resolves to first, which is how a
+    # node ended up with a Store-alias Python 3.14: pywinpty publishes no
+    # 2.x wheel for cp314, so `pip install .[windows]` could not resolve
+    # and the venv was left with nothing but pip in it.
+    [string] $PythonExe
 )
 
 $ErrorActionPreference = "Stop"
@@ -76,19 +83,32 @@ if (-not (Test-Path (Join-Path $RepoDir "pyproject.toml"))) {
 }
 
 # -- 2. Python -----------------------------------------------------------------
-$pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-if (-not $pythonCmd) { $pythonCmd = Get-Command py -ErrorAction SilentlyContinue }
-if (-not $pythonCmd) {
-    Write-Error "No 'python' or 'py' found on PATH -- install Python 3.11+ from python.org first (check 'Add to PATH' during setup)."
-    exit 1
+# An explicitly supplied interpreter wins over anything on PATH. The caller
+# has already verified its version; re-deriving it here would defeat the
+# point of passing it.
+$pythonPath = $null
+if ($PythonExe) {
+    if (-not (Test-Path -LiteralPath $PythonExe)) {
+        Write-Error "-PythonExe '$PythonExe' does not exist"
+        exit 1
+    }
+    $pythonPath = $PythonExe
+} else {
+    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $pythonCmd) { $pythonCmd = Get-Command py -ErrorAction SilentlyContinue }
+    if (-not $pythonCmd) {
+        Write-Error "No 'python' or 'py' found on PATH -- install Python 3.11+ from python.org first (check 'Add to PATH' during setup)."
+        exit 1
+    }
+    $pythonPath = $pythonCmd.Source
 }
-Write-Host "-> Using $($pythonCmd.Source)"
+Write-Host "-> Using $pythonPath"
 
 # -- 3. Venv + install -----------------------------------------------------------
 $venvDir = Join-Path $RepoDir ".venv"
 if (-not (Test-Path $venvDir)) {
     Write-Host "-> Creating .venv"
-    & $pythonCmd.Source -m venv $venvDir
+    & "$pythonPath" -m venv $venvDir
 }
 $venvPython = Join-Path $venvDir "Scripts\python.exe"
 $venvPip = Join-Path $venvDir "Scripts\pip.exe"

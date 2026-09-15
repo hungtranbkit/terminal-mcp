@@ -1436,6 +1436,46 @@ End-Stage
 # machine that arrived through Add Node has no way to obtain one. The
 # controller now serves that tree as one pinned bundle over a route
 # authenticated by THIS node's own bearer token.
+# Which interpreter the agent venv is built from, and why it is pinned.
+#
+# A node ended up with a Store-alias Python 3.14 because install-node-agent
+# .ps1 took whatever `python` resolved to first. pywinpty publishes no 2.x
+# wheel for cp314 -- only 3.0.x -- so the pinned `pywinpty>=2,<3` could not
+# resolve, pip installed nothing, and the venv was left holding pip alone.
+# 3.12 is what the ai_coding profile already installs and what the existing
+# wheels are published for, so it is chosen explicitly rather than hoped for.
+function Resolve-Python312 {
+    # 1. The launcher is the authoritative way to ask for a specific
+    #    version, and it ignores PATH order entirely.
+    try {
+        $probe = & py -3.12 -c "import sys;print(sys.executable)" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $probe) {
+            $candidate = ([string]$probe).Trim()
+            if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+        }
+    } catch { }
+    # 2. The locations winget's Python.Python.3.12 actually installs to.
+    $roots = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'),
+        (Join-Path $env:ProgramFiles 'Python312\python.exe'),
+        'C:\Python312\python.exe'
+    )
+    foreach ($candidate in $roots) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+    }
+    return $null
+}
+
+# Verified, never assumed: an interpreter that reports anything other than
+# 3.12 is refused rather than used, because using it is the bug.
+function Test-Python312 {
+    param([Parameter(Mandatory)] [string] $Exe)
+    try {
+        $out = & "$Exe" -c "import sys;print('%d.%d' % sys.version_info[:2])" 2>$null
+        return ($LASTEXITCODE -eq 0 -and ([string]$out).Trim() -eq '3.12')
+    } catch { return $false }
+}
+
 Start-Stage 'Node agent (transport de tao session)'
 $script:AgentReady = $false
 if (-not $script:EnrollmentOk) {
@@ -1510,14 +1550,59 @@ if (-not $script:EnrollmentOk) {
         $addr = Get-LocalAddresses
         $bindHost = if ($addr.tailscale_ip) { $addr.tailscale_ip } elseif ($addr.lan_ip) { $addr.lan_ip } else { '127.0.0.1' }
 
-        # 5. Install/refresh the service with the SAME script this release
+        # 5. Pin the interpreter BEFORE building anything. 3.12 is what the
+        #    ai_coding profile installs and what the existing wheels are
+        #    published for; anything else is refused rather than used.
+        $py = Resolve-Python312
+        if ($py -and -not (Test-Python312 $py)) { $py = $null }
+        if (-not $py) {
+            # Absent on an ai_coding node is a repairable state, not a dead
+            # end: install it through the same winget mechanism the profile
+            # already uses, then look again.
+            Add-Step 'Node agent python' 'WARN' 'khong thay Python 3.12 -- dang cai qua winget'
+            if (Get-Command winget -ErrorAction SilentlyContinue) {
+                & winget install --id Python.Python.3.12 --silent --accept-package-agreements `
+                    --accept-source-agreements --disable-interactivity 2>&1 | Out-Null
+                # winget updates the machine PATH for NEW processes only, so
+                # the explicit install paths above are what finds it now.
+                $py = Resolve-Python312
+                if ($py -and -not (Test-Python312 $py)) { $py = $null }
+            }
+        }
+        if (-not $py) {
+            throw "no verified Python 3.12 available (refusing to build the agent venv on another version)"
+        }
+        Add-Step 'Node agent python' 'OK' ("dung {0}" -f $py)
+
+        # 6. Install/refresh the service with the SAME script this release
         #    was tested against, shipped inside the bundle.
         $installer = Join-Path $targetDir 'deploy\install-node-agent.ps1'
         if (-not (Test-Path $installer)) { throw "bundle has no deploy\install-node-agent.ps1" }
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer `
+        # Output is KEPT. Discarding it is why a pip resolution failure --
+        # the actual cause of a dead agent -- left an empty logs directory
+        # and had to be chased over SSH. Tokens never reach this file: the
+        # only secret in play is passed as an argument, and the transcript
+        # is scrubbed of anything token-shaped before it is written.
+        New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+        $agentLog = Join-Path $LogDir 'node-agent-install.log'
+        $transcript = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer `
             -ControllerUrl $ControllerUrl -NodeId $NodeId -Token $tok `
-            -RepoDir $targetDir -Port 8790 -BindHost $bindHost 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "install-node-agent.ps1 exited $LASTEXITCODE" }
+            -RepoDir $targetDir -Port 8790 -BindHost $bindHost -PythonExe $py 2>&1
+        $installerExit = $LASTEXITCODE
+        $scrubbed = ($transcript | Out-String)
+        foreach ($secret in @($tok)) {
+            if ($secret) { $scrubbed = $scrubbed.Replace($secret, '<redacted>') }
+        }
+        # Belt and braces: anything else token-shaped goes too.
+        $scrubbed = [regex]::Replace($scrubbed, '[0-9a-fA-F]{32,}', '<redacted>')
+        ("=== {0} exit={1} python={2} ===" -f (Get-Date -Format 'u'), $installerExit, $py) |
+            Add-Content -Path $agentLog -Encoding utf8
+        $scrubbed | Add-Content -Path $agentLog -Encoding utf8
+        if ($installerExit -ne 0) {
+            # The last non-empty line is usually pip's actual complaint.
+            $tail = ($scrubbed -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
+            throw ("install-node-agent.ps1 exited {0}: {1}" -f $installerExit, $tail)
+        }
 
         # 6. Firewall: 8790 reachable only from the overlay, never the open
         #    internet. Same CIDR discipline the SSH rule already uses.
