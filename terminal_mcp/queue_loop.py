@@ -47,6 +47,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from .queue_engine import QueueEngine
+from .queue_event_drain import QueueEventDrain
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,8 +56,15 @@ DEFAULT_POLL_INTERVAL_SECONDS = 3.0
 
 class QueueLoop:
     def __init__(self, engine: QueueEngine, *, poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
-                heartbeat_refresher: Callable[[], None] | None = None) -> None:
+                heartbeat_refresher: Callable[[], None] | None = None,
+                event_drain: "QueueEventDrain | None" = None) -> None:
         self.engine = engine
+        # The event-bus drain, run as a STEP of this cycle. Injected and
+        # optional: None means exactly today's behaviour, and there is still
+        # only ever one background thread driving the queue (see
+        # queue_event_drain.py's own docstring on why a second loop was the
+        # wrong shape).
+        self.event_drain = event_drain
         self.poll_interval_seconds = max(0.5, poll_interval_seconds)
         # Injected, not imported -- this module has no business knowing
         # HOW to compute a fresh local heartbeat (that's mcp_app.py's/
@@ -72,6 +80,7 @@ class QueueLoop:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_cycle_at: str | None = None
+        self._last_drain: dict | None = None
         self._last_error: dict[str, str] | None = None
         self._lock = threading.Lock()
 
@@ -93,7 +102,9 @@ class QueueLoop:
     def status(self) -> dict:
         with self._lock:
             return {"running": self.is_alive(), "poll_interval_seconds": self.poll_interval_seconds,
-                    "last_cycle_at": self._last_cycle_at, "last_error": self._last_error}
+                    "last_cycle_at": self._last_cycle_at, "last_error": self._last_error,
+                    "drain_enabled": self.event_drain is not None,
+                    "last_drain": self._last_drain}
 
     def run_one_cycle(self) -> list[dict]:
         """One full pass over every auto-dispatch-enabled lane -- the
@@ -102,6 +113,11 @@ class QueueLoop:
         tool call) can drive exactly one cycle deterministically without
         starting a real thread."""
         results = []
+        # Drain BEFORE the lane sweep. An event that makes a task dispatchable
+        # should be acted on in this cycle rather than waiting for the next one,
+        # and the sweep below is what picks up anything the drain's single tick
+        # per lane did not finish.
+        self._drain_events()
         if self.heartbeat_refresher is not None:
             try:
                 self.heartbeat_refresher()
@@ -121,6 +137,20 @@ class QueueLoop:
         with self._lock:
             self._last_cycle_at = datetime.now(timezone.utc).isoformat()
         return results
+
+    def _drain_events(self) -> dict | None:
+        """One bounded drain pass. Never raises: an unreadable bus must not stop
+        the lane dispatch that is this loop's primary job."""
+        if self.event_drain is None:
+            return None
+        try:
+            result = self.event_drain.drain_once()
+        except Exception:  # noqa: BLE001 -- drain_once already catches; belt and braces
+            _LOGGER.exception("queue-loop: event drain failed, continuing with lane dispatch")
+            return None
+        with self._lock:
+            self._last_drain = result
+        return result
 
     def _run(self) -> None:
         while not self._stop_event.is_set():

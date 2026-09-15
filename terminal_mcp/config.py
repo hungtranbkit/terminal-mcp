@@ -107,6 +107,13 @@ class QueueConfig:
     docstring for the full two-gate safety reasoning."""
     enabled: bool = False
     poll_interval_seconds: float = 3.0
+    # Bus-driven reaction (queue_event_drain.py), inside the SAME loop -- never
+    # a second scheduler. Its own flag rather than riding on `enabled` above:
+    # turning on auto-dispatch is a decision about lanes, while turning on the
+    # drain is a decision about consuming the event bus, and an operator should
+    # be able to make the first without silently also making the second.
+    drain_enabled: bool = False
+    drain_batch_size: int = 25
 
 
 @dataclass(frozen=True)

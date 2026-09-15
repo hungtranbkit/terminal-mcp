@@ -34,6 +34,7 @@ from .pm_summary import (
     emergency_resume_all_lanes, emergency_stop_all_lanes, generate_summary,
 )
 from .queue_engine import QueueEngine
+from .queue_event_drain import QueueEventDrain
 from .queue_loop import QueueLoop
 from .backlog_service import BacklogService
 from .event_bus import KNOWN_EVENT_TYPES, EventBus
@@ -50,6 +51,31 @@ from .release_service import ReleaseService
 from .release_store import ReleaseStore
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
+
+
+def _fleet_session_names(controller: "ControllerService") -> list[str]:
+    """Every session the fleet can see, qualified as "node/session".
+
+    Qualified on purpose: a bare name is ambiguous the moment two nodes hold the
+    same one, and the supervisor stores whatever it is given as the watch
+    target. Qualifying at the source means a config-pattern watch routes to one
+    specific node forever, instead of resolving differently as the fleet
+    changes. One unreachable node is skipped, never fatal -- the alternative is
+    that a single node being down stops the supervisor seeing any session at
+    all.
+    """
+    names: list[str] = []
+    try:
+        listing = controller.terminal_list_sessions()
+    except Exception:  # noqa: BLE001 -- seeding is best-effort by design
+        _LOGGER.warning("supervisor: fleet session listing failed; local sessions only", exc_info=True)
+        return names
+    for row in listing.get("sessions", []) or []:
+        node_id, name = row.get("node_id"), row.get("name")
+        if not name:
+            continue
+        names.append(f"{node_id}/{name}" if node_id else name)
+    return names
 
 
 def build_mcp(service: TerminalService | None = None,
@@ -123,6 +149,18 @@ def build_mcp(service: TerminalService | None = None,
     supervisor = supervisor or SupervisorService(terminal, SupervisorStore())
     supervisor_v2 = supervisor_v2 or build_supervisor_v2(supervisor)
     controller = controller or build_default_controller(terminal)
+    # Give the supervisor the fleet's view. Wired HERE rather than at
+    # construction because this is the first point where both objects exist,
+    # and as a callback rather than a controller reference because supervisor.py
+    # importing controller.py would invert the layering (see its own
+    # fleet_status docstring).
+    #
+    # Without this, every watch on a remote node's session resolved against
+    # local tmux and was disabled target_missing on its first poll -- six of the
+    # ten watches in production, all of them sessions that were alive on their
+    # own nodes the entire time.
+    supervisor.fleet_status = controller.terminal_status
+    supervisor.fleet_sessions = lambda: _fleet_session_names(controller)
     # 3-role model (task: "Coding A/B + Integration Agent"): constructed
     # BEFORE queue/queue_engine below so its store exists for their own
     # on_completed hook to reference -- integration.engine itself is
@@ -296,9 +334,19 @@ def build_mcp(service: TerminalService | None = None,
     # _refresh_local_heartbeat closure rather than a second, duplicated
     # copy. Exposed as queue.loop so server_http.py can start/stop it and
     # a status tool below can report on it.
+    # Bus-driven reaction, as a STEP of the loop above rather than a second
+    # thread (queue_event_drain.py explains why at length). Built only when
+    # config.queue.drain_enabled is on, so the default deployment keeps exactly
+    # today's behaviour and `events` staying None cannot produce a half-wired
+    # drain that claims events and then cannot act on them.
+    _event_drain = None
+    if terminal.config.queue.drain_enabled and events is not None:
+        _event_drain = QueueEventDrain(
+            events, queue_engine, batch_size=terminal.config.queue.drain_batch_size)
     queue.loop = queue.loop or QueueLoop(
         queue_engine, poll_interval_seconds=terminal.config.queue.poll_interval_seconds,
         heartbeat_refresher=_refresh_local_heartbeat,
+        event_drain=_event_drain,
     )
 
     def _active_queue_task_for(session: str) -> dict | None:
