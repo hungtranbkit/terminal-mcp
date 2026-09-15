@@ -270,3 +270,75 @@ def may_retry(previous: Mapping[str, Any] | None, *, current_composer_text: str,
     if adapter.identify_target_state(list(snapshot)) == TARGET_RUNNING:
         return False, "the target started working after all; retrying would submit twice"
     return True, "the prompt is unchanged and nothing started"
+
+
+# -- remote failure classes (P1 item 6) --------------------------------------
+# A remote send can fail in ways that mean very different things to a caller,
+# and today they all arrive as one NodeClientError carrying a string. A caller
+# deciding whether to retry needs them apart: a transport fault is retryable
+# and says nothing about the prompt, a refused input is a policy decision that
+# retrying cannot change, and a vanished session means the target itself is
+# gone. Naming them here keeps ONE state vocabulary rather than adding a
+# second one beside adapters.DELIVERY_STATES.
+REMOTE_TRANSPORT_FAILED = "REMOTE_TRANSPORT_FAILED"   # could not reach/complete the call
+REMOTE_TIMEOUT = "REMOTE_TIMEOUT"                     # reached, no answer in time
+REMOTE_SESSION_GONE = "REMOTE_SESSION_GONE"           # node answered: no such session
+REMOTE_INPUT_DENIED = "REMOTE_INPUT_DENIED"           # node answered: not permitted
+REMOTE_NODE_UNREACHABLE = "REMOTE_NODE_UNREACHABLE"   # node itself is not answering
+REMOTE_UNKNOWN = "REMOTE_UNKNOWN"                     # answered, but unrecognised
+
+RETRYABLE_REMOTE = frozenset({REMOTE_TRANSPORT_FAILED, REMOTE_TIMEOUT, REMOTE_NODE_UNREACHABLE})
+"""Retrying these may work. REMOTE_SESSION_GONE and REMOTE_INPUT_DENIED are
+deliberately absent: the first needs a different target and the second needs a
+policy change, and retrying either just produces the same answer more often."""
+
+_SESSION_GONE_MARKERS = ("session_not_found", "no such session", "unknown session")
+_DENIED_MARKERS = ("access_denied", "input_not_permitted", "not permitted",
+                   "read_restricted", "send_keys_disabled")
+_UNREACHABLE_MARKERS = ("node_unreachable", "connection refused", "no route to host",
+                        "name or service not known", "urlerror")
+_TIMEOUT_MARKERS = ("timeout", "timed out")
+
+
+def classify_remote_failure(detail: Any, *, node_id: str | None = None,
+                            session: str | None = None) -> dict[str, Any]:
+    """Name what went wrong on a remote send, and whether retrying can help.
+
+    `detail` is whatever the caller has: an exception, a response dict, or a
+    message. Deliberately tolerant of shape -- the point is to stop losing the
+    distinction, not to demand one caller's format.
+
+    Never raises, and never guesses a specific cause it cannot see: an
+    unrecognised failure is REMOTE_UNKNOWN and is NOT marked retryable, because
+    "we do not know what happened" is not evidence that trying again is safe.
+    """
+    if isinstance(detail, Mapping):
+        text = " ".join(str(detail.get(k) or "") for k in ("error", "reason", "detail"))
+    else:
+        text = f"{type(detail).__name__} {detail}" if isinstance(detail, BaseException) else str(detail or "")
+    lowered = text.casefold()
+
+    if any(m in lowered for m in _SESSION_GONE_MARKERS):
+        state = REMOTE_SESSION_GONE
+    elif any(m in lowered for m in _DENIED_MARKERS):
+        state = REMOTE_INPUT_DENIED
+    elif any(m in lowered for m in _TIMEOUT_MARKERS):
+        state = REMOTE_TIMEOUT
+    elif any(m in lowered for m in _UNREACHABLE_MARKERS):
+        state = REMOTE_NODE_UNREACHABLE
+    elif text.strip():
+        state = REMOTE_TRANSPORT_FAILED
+    else:
+        state = REMOTE_UNKNOWN
+
+    return {
+        "remote_state": state,
+        "retryable": state in RETRYABLE_REMOTE,
+        # node/session travel with the verdict so a caller never has to guess
+        # WHICH target this failure belongs to (P1 item 6).
+        "node_id": node_id,
+        "session": session,
+        # The raw text is kept as a short, already-redacted-by-caller detail.
+        # Prompt content never reaches this function.
+        "detail": text[:200] or None,
+    }
