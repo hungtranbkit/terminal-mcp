@@ -138,6 +138,9 @@ def test_a_machine_needs_no_access_cookie_for_it(tmp_path):
 ALLOWED = (
     r"^/dashboard/api/enroll/(consume|redeem|progress)$",
     r"^/(w|enroll/windows-setup\.ps1)$",
+    # The node-agent bundle: machine-facing, but authenticated by the
+    # node's own bearer token rather than anonymous like the others.
+    r"^/dashboard/api/nodes/[A-Za-z0-9_-]{1,64}/agent-bundle$",
     r"^/dashboard/api/nodes/[A-Za-z0-9_-]{1,64}/heartbeat$",
     r"^/health/(live|ready)$",
 )
@@ -163,11 +166,11 @@ def test_the_template_and_this_suite_agree_on_the_allowlist():
     assert set(declared) == set(ALLOWED), declared
 
 
-def test_the_deploy_delta_is_exactly_one_new_rule():
-    """The whole change, stated as a number so a wider edit fails here."""
+def test_the_allowlist_size_is_pinned():
+    """Stated as a number so a wider edit fails here rather than shipping."""
     body = TEMPLATE.read_text(encoding="utf-8").split("ingress:", 1)[1]
     rules = [line for line in body.splitlines() if line.strip().startswith("- hostname:")]
-    assert len(rules) == 5, "4 routed rules + 1 catch-all 404"
+    assert len(rules) == 6, "5 routed rules + 1 catch-all 404"
     assert body.count("http_status:404") == 1
     assert body.rindex("http_status:404") > body.rindex("path:")
 

@@ -104,6 +104,22 @@ ingress:
     path: ^/(w|enroll/windows-setup\.ps1)$
     service: ${CONTROLLER_ORIGIN}
 
+  # The node-agent bundle, so an onboarded node can install the agent that
+  # makes it able to host sessions at all. Added 2026-09-15: without it a
+  # node could reach "registered and heartbeating" and no further -- 8790
+  # closed, no transport, Create Session offering a node it could never
+  # reach -- because deploy/install-node-agent.ps1 needs a source tree the
+  # machine has no way to obtain (private repo, Access-gated Dashboard).
+  #
+  # NOT an anonymous download. Authenticated by the SAME per-node bearer
+  # token as the heartbeat below, verified before the store is touched, so
+  # only a node that already holds its own credential can fetch it. GET and
+  # HEAD on one exact path -- HEAD is what lets the installer skip a
+  # download it already has.
+  - hostname: ${BOOTSTRAP_HOSTNAME}
+    path: ^/dashboard/api/nodes/[A-Za-z0-9_-]{1,64}/agent-bundle$
+    service: ${CONTROLLER_ORIGIN}
+
   # Post-enrollment liveness of the NODE, not of the controller. Bearer
   # token per node, issued at enrollment and verified before the registry is
   # touched, so this is not an unauthenticated write.

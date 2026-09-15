@@ -25,6 +25,7 @@ TEMPLATE = Path(__file__).resolve().parent.parent / "deploy" / "cloudflare" / \
 ALLOWED_PATTERNS = (
     r"^/dashboard/api/enroll/(consume|redeem|progress)$",
     r"^/(w|enroll/windows-setup\.ps1)$",
+    r"^/dashboard/api/nodes/[A-Za-z0-9_-]{1,64}/agent-bundle$",
     r"^/dashboard/api/nodes/[A-Za-z0-9_-]{1,64}/heartbeat$",
     r"^/health/(live|ready)$",
 )
@@ -57,6 +58,8 @@ MUST_NOT_MATCH = (
     "/dashboard/api/nodes/",
     "/dashboard/api/nodes/win-work",
     "/dashboard/api/nodes/win-work/token/refresh",
+    "/dashboard/api/nodes/win-work/agent-bundle/../token/refresh",
+    "/dashboard/api/nodes/win-work/agent-bundlex",
     "/dashboard/api/nodes/win-work/deregister",
     "/dashboard/api/nodes/win-work/sessions",
     "/dashboard/api/nodes/onboard/enrollments",
@@ -102,6 +105,7 @@ def test_the_template_activates_nothing_by_itself(template):
     "/dashboard/api/enroll/redeem",
     "/dashboard/api/enroll/progress",
     "/dashboard/api/nodes/win-work/heartbeat",
+    "/dashboard/api/nodes/win-work/agent-bundle",
     "/dashboard/api/nodes/w/heartbeat",
     "/dashboard/api/nodes/WIN_work-01/heartbeat",
     "/health/live",
@@ -172,7 +176,7 @@ def test_the_template_ends_in_a_catch_all_404(template):
     that matches nothing is refused at the edge, not forwarded."""
     body = template.split("ingress:", 1)[1]
     entries = [line for line in body.splitlines() if line.strip().startswith("- hostname:")]
-    assert len(entries) == 5
+    assert len(entries) == 6
     assert "http_status:404" in body
     # And the 404 is LAST -- a catch-all above a real rule swallows it.
     assert body.rindex("http_status:404") > body.rindex("path:")
