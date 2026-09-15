@@ -341,3 +341,33 @@ worktree_janitor:
   # Repos the sweep walks. Empty = the sweep has nothing to do.
   repo_roots: []
     # - /home/mesflow/terminal-mcp
+
+# Prompt delivery / acceptance gate (delivery_gate.py; the contract lives in
+# docs/prompt-submission.md under "The acceptance gate").
+#
+# A prompt counts as DELIVERED only when BOTH hold:
+#   1. the send receipt's delivery_state is SUBMIT_CONFIRMED, and
+#   2. a separate post-submit observation shows the target actually took it
+#      (running/working, adapter ack, or output genuinely advanced).
+# SUBMIT_CONFIRMED alone proves Enter was processed -- NOT that the agent
+# read the prompt and started.
+prompt_delivery:
+  # advisory (default): the verdict is computed and recorded to the task's
+  #   metadata.delivery_verdict, and every existing transition behaves
+  #   exactly as before. Zero behaviour change -- safe to leave on.
+  # enforce: a confirmed submit with no acceptance evidence holds the task
+  #   as DISPATCH_UNCERTAIN instead of marking it RUNNING.
+  # NOTE: gate 1 (the positive delivery_state allowlist, which replaces a
+  # fail-open denylist) is enforced in BOTH modes -- it can only refuse a
+  # dispatch the old code would have wrongly advanced.
+  mode: advisory
+
+  # false keeps gate 1 and skips the extra post-submit observation.
+  require_acceptance: true
+
+  # ONE extra observation, not a poll loop: long-running observation belongs
+  # to the completion watcher, and the rule is that polling for completion
+  # stops once delivery is established.
+  acceptance_timeout_seconds: 3.0
+  acceptance_poll_interval_seconds: 0.4
+  acceptance_capture_lines: 40

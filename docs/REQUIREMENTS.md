@@ -92,6 +92,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Dashboard: Requirements/Feature Matrix link | VERIFIED |
 | Worktree Janitor (reclaim isolated task worktrees) | CONTRACT ONLY — no executor, nothing deletes yet |
 | Read-only repo access for external agents (`repo_*` MCP tools) | VERIFIED (V1, read-only) |
+| Prompt delivery / acceptance gate (`delivery_gate.py`) | VERIFIED (advisory default; enforce opt-in) |
 | Permissions: read/input grants + effective permissions | VERIFIED |
 | Reliable prompt submission (press-enter, DELIVERY_UNKNOWN, idempotency) | VERIFIED |
 | Supervisor v1 (watch/poll/state machine) | VERIFIED |
@@ -335,6 +336,21 @@ sessions bringing up dell-5530/m910/macbook — see `docs/multi-node.md`).
   "legacy" migration path currently pending — this IS the live model.
 
 ## 5. Reliable prompt submission
+
+**MANDATORY RULE (2026-09-14): a prompt is DELIVERED only when BOTH (1) the
+send receipt's `delivery_state` is `SUBMIT_CONFIRMED` AND (2) a separate
+post-submit observation shows the target actually took it.** Anything short
+of both must not be reported as delivered and must not advance a queue task
+to DISPATCHED/RUNNING. `SUBMIT_CONFIRMED` proves Enter was processed, NOT
+that the agent read the prompt and started — those are different claims.
+The full contract (verdict table, acceptance evidence, the "never spam
+Enter for Claude" rule, advisory→enforce rollout, and the audit of the two
+denylist call sites this replaces) lives in `docs/prompt-submission.md`
+under "The acceptance gate", which is the source of truth for prompt
+delivery. Decision point: `terminal_mcp/delivery_gate.py` (pure; cannot
+send or retry). Config: `prompt_delivery.mode`, default `advisory` (no
+behaviour change; gate 1's positive allowlist is enforced in both modes as
+pure hardening). Tests: `tests/test_delivery_gate.py`.
 
 **Status: VERIFIED.**
 
