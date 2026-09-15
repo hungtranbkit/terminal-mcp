@@ -142,13 +142,20 @@ def build_mcp(service: TerminalService | None = None,
     # already-real PaneLeaseStore instance send/verify locking already
     # uses) for the recovery lock -- never a second lock table; keys are
     # namespaced ("recovery:...") so there is no collision risk.
+    # The controller is defaulted FIRST, because everything below takes it as a
+    # collaborator. It used to be defaulted after RecoveryEngine/RecoveryLoop
+    # were constructed with it, so `build_mcp()` called bare -- which is exactly
+    # how server.py builds the stdio surface -- handed both of them
+    # controller=None. Auto-recovery and reconcile_node on that surface were
+    # therefore silently non-functional: constructed, exposed as tools, and
+    # holding nothing to route with.
+    controller = controller or build_default_controller(terminal)
     recovery = recovery or RecoveryEngine(terminal.session_registry, controller, terminal.leases,
                                           terminal.config.auto_recovery)
     recovery.loop = recovery.loop or RecoveryLoop(
         recovery, controller, poll_interval_seconds=terminal.config.auto_recovery.reconcile_poll_seconds)
     supervisor = supervisor or SupervisorService(terminal, SupervisorStore())
     supervisor_v2 = supervisor_v2 or build_supervisor_v2(supervisor)
-    controller = controller or build_default_controller(terminal)
     # Give the supervisor the fleet's view. Wired HERE rather than at
     # construction because this is the first point where both objects exist,
     # and as a callback rather than a controller reference because supervisor.py
