@@ -163,12 +163,24 @@ def render_setup_script(*, enrollment_code: str, controller_url: str, node_id: s
 
     winget_packages = _PACKAGES.get(profile, ())
     npm_tools = _NPM_TOOLS.get(profile, ())
-    winget_literal = ",\n    ".join(
-        f"@{{ Id = {_ps_string(pid)}; Name = {_ps_string(name)}; Probe = {_ps_string(probe)} }}"
-        for pid, name, probe in winget_packages) or ""
-    npm_literal = ",\n    ".join(
-        f"@{{ Id = {_ps_string(pid)}; Name = {_ps_string(name)}; Probe = {_ps_string(probe)} }}"
-        for pid, name, probe in npm_tools) or ""
+    winget_literal = _ps_entry_array(winget_packages)
+    npm_literal = _ps_entry_array(npm_tools)
+
+    # EVERY profile's catalogue is baked in, not just the one selected at
+    # generation time. -Repair needs it: the helper downloads the GENERIC
+    # script, which is rendered with profile="minimal", so without a
+    # catalogue to look up an ai_coding node would silently reinstall as
+    # Minimal -- no Claude/Codex CLI, and therefore agent_types that can
+    # never be anything but shell. The profile id IS on disk in node.json;
+    # only the table to resolve it against was missing.
+    catalog_entries = []
+    for name in (PROFILE_MINIMAL, PROFILE_DEVELOPER, PROFILE_AI_CODING):
+        catalog_entries.append(
+            "    {key} = @{{ Winget = @({winget}); Npm = @({npm}) }}".format(
+                key=name,
+                winget=_ps_entry_array(_PACKAGES.get(name, ())),
+                npm=_ps_entry_array(_NPM_TOOLS.get(name, ()))))
+    catalog_literal = "\n" + "\n".join(catalog_entries) + "\n"
 
     body = _SCRIPT_TEMPLATE
     body = body.replace("@@SCRIPT_VERSION@@", SCRIPT_VERSION)
@@ -181,7 +193,15 @@ def render_setup_script(*, enrollment_code: str, controller_url: str, node_id: s
     body = body.replace("@@PROFILE@@", _ps_string(profile))
     body = body.replace("@@WINGET_PACKAGES@@", ("\n    " + winget_literal + "\n") if winget_literal else "")
     body = body.replace("@@NPM_TOOLS@@", ("\n    " + npm_literal + "\n") if npm_literal else "")
+    body = body.replace("@@PROFILE_CATALOG@@", catalog_literal)
     return body
+
+
+def _ps_entry_array(entries) -> str:
+    """One (id, name, probe) table rendered as PowerShell hashtables."""
+    return ",\n    ".join(
+        f"@{{ Id = {_ps_string(pid)}; Name = {_ps_string(name)}; Probe = {_ps_string(probe)} }}"
+        for pid, name, probe in entries) or ""
 
 
 # Short alias for the setup-script download, served alongside the long
@@ -338,6 +358,12 @@ $ProfileName     = @@PROFILE@@
 
 $WingetPackages = @(@@WINGET_PACKAGES@@)
 $NpmTools = @(@@NPM_TOOLS@@)
+
+# Every profile's package table, so -Repair can restore the profile this
+# node was actually enrolled with. The generic script downloaded by the
+# Bootstrap helper is rendered as Minimal; without this it would quietly
+# reinstall an ai_coding node as Minimal every time.
+$ProfileCatalog = @{@@PROFILE_CATALOG@@}
 
 $ControllerUrlCandidates = @@CONTROLLER_URLS@@
 
@@ -776,6 +802,23 @@ if ($Repair) {
             $TaskBeat = "TerminalMCP-Heartbeat-$NodeId"
         }
         if ($bootstrap.controller_url) { $ControllerUrl = [string]$bootstrap.controller_url }
+        # Restore the profile this node was ENROLLED with, not whatever the
+        # script file happens to have baked in. The helper hands us the
+        # generic (Minimal) script, so without this an ai_coding node
+        # reinstalls as Minimal and never gets the Claude/Codex CLIs that
+        # make agent_types anything but shell.
+        if ($bootstrap.profile) {
+            $savedProfile = [string]$bootstrap.profile
+            if ($ProfileCatalog.ContainsKey($savedProfile)) {
+                $ProfileName = $savedProfile
+                $WingetPackages = @($ProfileCatalog[$savedProfile].Winget)
+                $NpmTools = @($ProfileCatalog[$savedProfile].Npm)
+                Add-Step 'Profile restore' 'OK' ("-Repair: profile '{0}' ({1} winget, {2} npm)" -f $ProfileName, $WingetPackages.Count, $NpmTools.Count)
+            } else {
+                # Unknown id: keep the baked-in values rather than guessing.
+                Add-Step 'Profile restore' 'WARN' ("unknown profile '{0}' in node.json -- keeping '{1}'" -f $savedProfile, $ProfileName)
+            }
+        }
         Add-Step 'Enrollment' 'SKIP' '-Repair: reusing the credentials already on disk'
     } else {
         Add-Step 'Enrollment' 'FAIL' 'no saved configuration to repair' `
@@ -1183,18 +1226,46 @@ while (`$true) {
         Set-Content -Path $BeatRunner -Value $beat -Encoding utf8
         $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
             -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$BeatRunner`""
-        $trigger = New-ScheduledTaskTrigger -AtStartup
+        # TWO triggers, and the second one is the fix. -AtStartup alone
+        # meant the task did nothing until the machine rebooted: the only
+        # thing that started it now was a Start-ScheduledTask whose errors
+        # were swallowed, so a task that never ran still reported OK and
+        # the node was invisible on the Dashboard until someone rebooted.
+        # The repeating trigger also recovers the loop if its process dies,
+        # and MultipleInstances IgnoreNew makes a redundant start a no-op.
+        $triggers = @(
+            (New-ScheduledTaskTrigger -AtStartup),
+            (New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(30) `
+                -RepetitionInterval (New-TimeSpan -Minutes 5))
+        )
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
             -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
             -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-        Register-ScheduledTask -TaskName $TaskBeat -Action $action -Trigger $trigger -Principal $principal `
+        # -Force replaces an existing registration, so a re-run or a
+        # -Repair is idempotent rather than a second task.
+        Register-ScheduledTask -TaskName $TaskBeat -Action $action -Trigger $triggers -Principal $principal `
             -Settings $settings -Description "Terminal MCP heartbeat for $NodeId" -Force | Out-Null
-        Restart-ScheduledTask -TaskName $TaskBeat -ErrorAction SilentlyContinue
-        Start-ScheduledTask -TaskName $TaskBeat -ErrorAction SilentlyContinue
-        Add-Step 'Heartbeat task' 'OK' "every ${interval}s, at startup as SYSTEM"
+        # Start it NOW and VERIFY. The previous version silenced every
+        # error here and then claimed success regardless.
+        Start-ScheduledTask -TaskName $TaskBeat
+        $beatState = 'Unknown'
+        foreach ($wait in 1..10) {
+            Start-Sleep -Milliseconds 500
+            $beatState = [string](Get-ScheduledTask -TaskName $TaskBeat -ErrorAction SilentlyContinue).State
+            if ($beatState -eq 'Running') { break }
+        }
+        if ($beatState -eq 'Running') {
+            Add-Step 'Heartbeat task' 'OK' "every ${interval}s, running now + at startup as SYSTEM"
+        } else {
+            # Registered but not running is a real failure: the node will
+            # not appear on the Dashboard. Say so instead of reporting OK.
+            Add-Step 'Heartbeat task' 'FAIL' ("registered but did not start (state: {0})" -f $beatState) `
+                ("Kiem tra: Get-ScheduledTask -TaskName '{0}' | Get-ScheduledTaskInfo" -f $TaskBeat)
+        }
     } catch {
-        Add-Step 'Heartbeat task' 'FAIL' $_.Exception.Message
+        Add-Step 'Heartbeat task' 'FAIL' $_.Exception.Message `
+            ("Kiem tra: Get-ScheduledTask -TaskName '{0}' | Get-ScheduledTaskInfo" -f $TaskBeat)
     }
 }
 

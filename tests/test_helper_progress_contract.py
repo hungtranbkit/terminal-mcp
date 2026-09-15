@@ -342,3 +342,58 @@ def test_the_progress_route_is_the_only_path_the_helper_needs(client):
     assert "enroll/(consume|redeem|progress)" in template
     assert "bootstrap-status" not in template
     assert "helper/progress" not in template
+
+
+# ---------------------------------------------------------------------------
+# The failure reason, end to end through the live route
+# ---------------------------------------------------------------------------
+
+def test_a_failure_code_reaches_the_log_with_the_node_id(client, caplog):
+    """Before this, the helper sent `code` and `exit_code` and the route
+    dropped both -- so a dead install said "failed" and nothing else."""
+    import logging
+    enrollment_id = _make_enrollment(client)
+    handle = _mint_handle(client, enrollment_id)
+
+    with caplog.at_level(logging.INFO):
+        posted = client.post(PROGRESS, json={
+            "handle": handle, "stage": "failed",
+            "code": "setup_launch_failed", "exit_code": 1})
+
+    assert posted.status_code == 202
+    assert "code=setup_launch_failed" in caplog.text
+    assert "exit_code=1" in caplog.text
+    assert "win-work" in caplog.text
+    assert handle not in caplog.text
+
+
+def test_an_unknown_code_is_dropped_rather_than_logged(client, caplog):
+    """A closed set, so nothing the machine sends becomes free text in a
+    log line."""
+    import logging
+    enrollment_id = _make_enrollment(client)
+    handle = _mint_handle(client, enrollment_id)
+
+    with caplog.at_level(logging.INFO):
+        posted = client.post(PROGRESS, json={
+            "handle": handle, "stage": "failed",
+            "code": "rm -rf / ; node_token=leaked", "exit_code": 999999})
+
+    assert posted.status_code == 202
+    assert "rm -rf" not in caplog.text
+    assert "leaked" not in caplog.text
+    assert "999999" not in caplog.text
+    # The stage itself still lands.
+    assert "stage=failed" in caplog.text
+
+
+def test_a_normal_stage_logs_no_failure_detail(client, caplog):
+    import logging
+    enrollment_id = _make_enrollment(client)
+    handle = _mint_handle(client, enrollment_id)
+
+    with caplog.at_level(logging.INFO):
+        client.post(PROGRESS, json={"handle": handle, "stage": "redeeming"})
+
+    assert "code=" not in caplog.text
+    assert "exit_code=" not in caplog.text
