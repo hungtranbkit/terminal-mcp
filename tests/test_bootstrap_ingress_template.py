@@ -7,8 +7,9 @@ never be public fails this suite loudly rather than quietly appearing on a
 hostname nobody re-read.
 
 The rule these encode: a machine being onboarded has no Cloudflare Access
-session and cannot get one, so the three enrollment routes -- and only those,
-plus liveness -- are what a public hostname may carry.
+session and cannot get one, so the three enrollment routes, the one
+node-authenticated heartbeat it needs afterwards -- and only those, plus
+liveness -- are what a public hostname may carry.
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ TEMPLATE = Path(__file__).resolve().parent.parent / "deploy" / "cloudflare" / \
 # Every path the template allows, as a regex the tunnel would apply.
 ALLOWED_PATTERNS = (
     r"^/dashboard/api/enroll/(consume|redeem|progress)$",
+    r"^/dashboard/api/nodes/[A-Za-z0-9_-]{1,64}/heartbeat$",
     r"^/health/(live|ready)$",
 )
 
@@ -47,6 +49,19 @@ MUST_NOT_MATCH = (
     "/app",
     "/health/metrics",
     "/version",
+    # Admitting ONE route under /dashboard/api/nodes/ is what makes the
+    # rest of that namespace worth spelling out. Every one of these is a
+    # sibling of the heartbeat path and none may come along with it.
+    "/dashboard/api/nodes",
+    "/dashboard/api/nodes/",
+    "/dashboard/api/nodes/win-work",
+    "/dashboard/api/nodes/win-work/token/refresh",
+    "/dashboard/api/nodes/win-work/deregister",
+    "/dashboard/api/nodes/win-work/sessions",
+    "/dashboard/api/nodes/onboard/enrollments",
+    # The operator's own enrollment-minting surface, as opposed to the
+    # machine's enrollment-redeeming one.
+    "/dashboard/api/nodes/onboard/enrollments/abc/handle",
 )
 
 
@@ -73,11 +88,37 @@ def test_the_template_activates_nothing_by_itself(template):
     "/dashboard/api/enroll/consume",
     "/dashboard/api/enroll/redeem",
     "/dashboard/api/enroll/progress",
+    "/dashboard/api/nodes/win-work/heartbeat",
+    "/dashboard/api/nodes/w/heartbeat",
+    "/dashboard/api/nodes/WIN_work-01/heartbeat",
     "/health/live",
     "/health/ready",
 ])
 def test_the_machine_routes_are_allowed(path):
     assert any(re.match(pattern, path) for pattern in ALLOWED_PATTERNS), path
+
+
+def test_the_heartbeat_route_is_in_the_template_by_its_exact_path(template):
+    """The path and verb are the ones the controller already serves. A
+    pattern that merely looks right is how an ingress silently forwards
+    nothing."""
+    assert "^/dashboard/api/nodes/[A-Za-z0-9_-]{1,64}/heartbeat$" in template
+
+
+def test_the_heartbeat_pattern_cannot_reach_a_sibling_node_route():
+    """The node id class carries no '/' and no '.', so it cannot be used to
+    spell a deeper path or a traversal out of the one route admitted."""
+    pattern = r"^/dashboard/api/nodes/[A-Za-z0-9_-]{1,64}/heartbeat$"
+    for path in ("/dashboard/api/nodes/a/token/refresh",
+                 "/dashboard/api/nodes/a/heartbeat/../token/refresh",
+                 "/dashboard/api/nodes/../session/input/heartbeat",
+                 "/dashboard/api/nodes/a/b/heartbeat",
+                 "/dashboard/api/nodes/a/heartbeatx",
+                 "/dashboard/api/nodes//heartbeat",
+                 "/dashboard/api/nodes/%2e%2e/heartbeat"):
+        assert not re.match(pattern, path), path
+    # And an id longer than the registry accepts is not admitted either.
+    assert not re.match(pattern, "/dashboard/api/nodes/%s/heartbeat" % ("a" * 65))
 
 
 @pytest.mark.parametrize("path", MUST_NOT_MATCH)
@@ -118,7 +159,7 @@ def test_the_template_ends_in_a_catch_all_404(template):
     that matches nothing is refused at the edge, not forwarded."""
     body = template.split("ingress:", 1)[1]
     entries = [line for line in body.splitlines() if line.strip().startswith("- hostname:")]
-    assert len(entries) == 3
+    assert len(entries) == 4
     assert "http_status:404" in body
     # And the 404 is LAST -- a catch-all above a real rule swallows it.
     assert body.rindex("http_status:404") > body.rindex("path:")

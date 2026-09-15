@@ -170,6 +170,17 @@ supervisor:
 #     # request's Host header. Set it explicitly behind a proxy that
 #     # rewrites Host.
 #     controller_url: "http://100.100.0.1:8766"
+#     # PUBLIC deployments: the machine-facing origin, pinned rather than
+#     # inferred. A machine being onboarded has no Cloudflare Access session
+#     # and cannot get one, so it must never be handed the Access-gated
+#     # Dashboard hostname -- Access answers its enrollment POST with a
+#     # login page, which is a successful HTTP response carrying no
+#     # bootstrap config. Setting this makes it the first callback
+#     # candidate AND removes the browser's Host from the list entirely.
+#     # The operator's Dashboard is unaffected and keeps its own hostname.
+#     # An origin only: scheme://host[:port], never a path.
+#     # Pair it with deploy/cloudflare/bootstrap-ingress.template.yml.
+#     bootstrap_origin: "https://terminal-bootstrap.example.net"
 #     # The PUBLIC key installed into the new node's
 #     # administrators_authorized_keys so this controller can SSH in.
 #     # Defaults to ~/.ssh/id_ed25519.pub. A private key here is REFUSED.

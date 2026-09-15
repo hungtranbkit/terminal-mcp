@@ -23,6 +23,22 @@
 #   /supervisor         fleet control
 #   /login, /app        the operator's own auth flow
 #
+# WHY HEARTBEAT IS HERE TOO
+#
+# Enrollment is not the end of the machine's need for this hostname. A node
+# that finishes enrolling and then cannot heartbeat is registered and
+# permanently unhealthy -- the Dashboard shows it, the scheduler will not
+# place work on it, and the operator is left with a node that onboarded
+# "successfully" and never came up. The heartbeat route is machine-facing
+# for the same reason the enrollment routes are, and authenticates the same
+# way the rest of the machine surface does: a per-node bearer token, issued
+# at enrollment, verified before the registry is touched.
+#
+# It is ONE path and ONE verb. The node's other machine-facing routes are
+# deliberately NOT here -- notably token/refresh, which means a node whose
+# token rotates while it can only reach this hostname will need that route
+# added in a separate, deliberate edit, exactly like this one.
+#
 # The catch-all 404 at the bottom is what makes that list enforceable: a
 # path that does not match is refused at the edge, so a route added later
 # is NOT exposed here by default. Adding one is an edit to this file.
@@ -56,6 +72,18 @@ ingress:
   #   progress  report an install stage back, so the page can show it
   - hostname: ${BOOTSTRAP_HOSTNAME}
     path: ^/dashboard/api/enroll/(consume|redeem|progress)$
+    service: ${CONTROLLER_ORIGIN}
+
+  # Post-enrollment liveness of the NODE, not of the controller. Bearer
+  # token per node, issued at enrollment and verified before the registry is
+  # touched, so this is not an unauthenticated write.
+  #
+  # The node id is bounded to the charset the registry accepts, which is
+  # what stops this pattern reaching any other route under /nodes/: there is
+  # no '/' and no '.' in the class, so neither a deeper path nor a traversal
+  # can be spelled through it.
+  - hostname: ${BOOTSTRAP_HOSTNAME}
+    path: ^/dashboard/api/nodes/[A-Za-z0-9_-]{1,64}/heartbeat$
     service: ${CONTROLLER_ORIGIN}
 
   # Liveness only. No readiness detail, no metrics, no version: enough for a
