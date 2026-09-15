@@ -1585,11 +1585,33 @@ if (-not $script:EnrollmentOk) {
         # is scrubbed of anything token-shaped before it is written.
         New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
         $agentLog = Join-Path $LogDir 'node-agent-install.log'
-        $transcript = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer `
-            -ControllerUrl $ControllerUrl -NodeId $NodeId -Token $tok `
-            -RepoDir $targetDir -Port 8790 -BindHost $bindHost -PythonExe $py 2>&1
-        $installerExit = $LASTEXITCODE
-        $scrubbed = ($transcript | Out-String)
+        # Streams go STRAIGHT to a file, never through the pipeline.
+        #
+        # The obvious `$out = & powershell.exe ... 2>&1` is a trap on
+        # PowerShell 5.1: with $ErrorActionPreference = 'Stop', merging a
+        # native command's stderr into the output stream turns the very
+        # first stderr line into a terminating NativeCommandError. It threw
+        # at the call itself -- before the log could be written -- so the
+        # step failed with an EMPTY detail and no log, which is exactly the
+        # blindness this logging was added to remove.
+        #
+        # `*>>` is a file redirection, so no stream is converted to an
+        # object and nothing can throw on the way. A raw temp file is used
+        # first so the transcript can be scrubbed before it reaches the log
+        # an operator reads.
+        $rawLog = Join-Path $LogDir ('node-agent-install.raw-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        try {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer `
+                -ControllerUrl $ControllerUrl -NodeId $NodeId -Token $tok `
+                -RepoDir $targetDir -Port 8790 -BindHost $bindHost -PythonExe $py *>> $rawLog
+            $installerExit = $LASTEXITCODE
+        } catch {
+            $installerExit = -1
+            $_.Exception.Message | Add-Content -Path $rawLog -Encoding utf8
+        }
+        $scrubbed = ''
+        if (Test-Path $rawLog) { $scrubbed = (Get-Content $rawLog -Raw -ErrorAction SilentlyContinue) }
+        if ($null -eq $scrubbed) { $scrubbed = '' }
         foreach ($secret in @($tok)) {
             if ($secret) { $scrubbed = $scrubbed.Replace($secret, '<redacted>') }
         }
@@ -1598,6 +1620,7 @@ if (-not $script:EnrollmentOk) {
         ("=== {0} exit={1} python={2} ===" -f (Get-Date -Format 'u'), $installerExit, $py) |
             Add-Content -Path $agentLog -Encoding utf8
         $scrubbed | Add-Content -Path $agentLog -Encoding utf8
+        Remove-Item $rawLog -Force -ErrorAction SilentlyContinue
         if ($installerExit -ne 0) {
             # The last non-empty line is usually pip's actual complaint.
             $tail = ($scrubbed -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
