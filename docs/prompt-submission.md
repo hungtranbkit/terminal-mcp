@@ -276,3 +276,96 @@ safe against an accidental double-submit by the existing
   current tmux-pane-content adapters have no way to distinguish those
   cases today, and inventing evidence codes that don't correspond to a
   real, checked signal would be worse than not having them.
+
+---
+
+## The acceptance contract (P1, 2026-09-15)
+
+### Text delivered is not a submission
+
+Three states, and they are not interchangeable:
+
+| State | Means |
+|---|---|
+| `TEXT_SENT` | the bytes reached the composer. Nothing was submitted, and nothing is claimed. |
+| `SUBMIT_CONFIRMED` | positive evidence ties **this** attempt to a real change of state in the target. |
+| `DELIVERY_UNKNOWN` | Enter went out, the outcome is unproven. Never silently upgraded. |
+| `SUBMIT_STALLED` | the prompt is still in the composer and the pane never moved. Specific, and retryable. |
+
+**A pane diff is not evidence.** A Claude Code redraw, a spinner tick, or an
+elapsed-timer update changes the pane without anything having been submitted.
+Confirmation requires the adapter's own ack rule to pass.
+
+### The pipeline, and the ordering that matters
+
+```
+PREPARE -> WRITE -> VERIFY_TEXT -> ACTIVATE -> PROVE_ACCEPTED -> TRACK
+```
+
+`VERIFY_TEXT` runs **before** `ACTIVATE`, not after. An activate-only send
+(`terminal_send_text("", press_enter=True)`) into an empty composer has nothing
+to submit, so the Enter is **withheld** — the call returns `DELIVERY_UNKNOWN`
+with `submit_outcome: NOTHING_TO_SUBMIT`, `stage: VERIFY_TEXT` and
+`activation_attempts: 0`.
+
+Getting that ordering wrong is not theoretical. Measured live on `hp-linux`
+(2026-09-15), before this change:
+
+```
+composer empty, agent idle
+terminal_send_text("", press_enter=True)
+  -> {"delivery_state": "SUBMIT_CONFIRMED", "submit_reason": null}
+pane afterwards: byte-identical
+```
+
+and three consecutive activate-only calls during a running turn each returned
+`SUBMIT_CONFIRMED` while the pane only ever showed
+`Press up to edit queued messages`.
+
+**Root cause.** `_sent_text_echoed` treats an empty `sent_text` as trivially
+satisfied — correct, for a caller with genuinely nothing to attribute. An
+activate-only send *does* have something to attribute: the composer's own
+content. Passing `""` removed the busy-window guard entirely, and a spinner
+tick was then sufficient to confirm. An activate-only send now attributes the
+composer, the same rule the bare-Enter path already used.
+
+### Claude vs Codex
+
+Separated by adapter capability, never by a shared default:
+
+- **Claude** — exactly one Enter. `ACTIVATION_ADAPTERS == {"claude"}` adds a
+  cursor-move nudge before it, chosen because it cannot alter what is about to
+  be submitted. Never a second Enter: two Enters submit twice.
+- **Codex** — its multi-enter/debounce retry profile is gated on
+  `adapter.name == "codex"` and is never applied to Claude. A test pins this so
+  a later edit cannot widen it silently.
+
+### Remote sends
+
+A remote failure is classified rather than collapsed into one error string:
+
+| State | Retryable | Means |
+|---|---|---|
+| `REMOTE_TIMEOUT` | yes | reached the node, no answer in time |
+| `REMOTE_TRANSPORT_FAILED` | yes | the call itself did not complete |
+| `REMOTE_NODE_UNREACHABLE` | yes | the node is not answering at all |
+| `REMOTE_SESSION_GONE` | **no** | the node answered: no such session |
+| `REMOTE_INPUT_DENIED` | **no** | the node answered: not permitted |
+| `REMOTE_UNKNOWN` | **no** | answered, unrecognised — not knowing what happened is not evidence that retrying is safe |
+
+`node_id` and `session` travel with the verdict, so a caller never has to guess
+which target a failure belongs to. Prompt content never reaches this path.
+
+### Troubleshooting
+
+| Symptom | Read this |
+|---|---|
+| `SUBMIT_STALLED` | the prompt is still in the composer and nothing started. Safe to retry **while** the prompt is unchanged and the target has not begun working. |
+| `DELIVERY_UNKNOWN` | bytes went out, outcome unproven. Inspect the pane before retrying — a retry may submit twice. |
+| `NOTHING_TO_SUBMIT` | the composer was empty. No Enter was sent. Write the text first. |
+| `SUBMIT_CONFIRMED` with `submit_reason` naming the composer | an activate-only send; the echo was attributed to the composer's content, not to an empty sent text. |
+| `REMOTE_*` | see the table above; only the three transport classes are worth retrying. |
+
+Audit metadata carried on every send: `submission_id`, `activation_attempts`,
+`enter_count`, `evidence`, `stage`, `submit_latency_ms`, `submit_reason`.
+None of them contain prompt text.
