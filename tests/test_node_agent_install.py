@@ -9,7 +9,16 @@ only asked about agent_types.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _installer() -> str:
+    return (REPO_ROOT / "deploy" / "install-node-agent.ps1").read_text(encoding="utf-8")
+
 
 from terminal_mcp.dashboard import SESSIONS_ADMIN_HTML as SESSIONS_PAGE
 from terminal_mcp.windows_onboarding import (
@@ -243,3 +252,80 @@ def test_nodes_that_predate_session_transport_keep_working():
     assert "version !== ''" in gate
     # Positive signals only -- no list of known-bad nodes.
     assert "dell" not in gate and "5420" not in gate
+
+
+# --- the config an onboarded node actually gets --------------------------
+#
+# 54202 reached "agent healthy, credential accepted, session_transport
+# advertised" and still could not host a session: the installer had copied
+# config.example.yaml, where session_lifecycle is commented out, so the
+# controller's first Create Session came back SESSION_LIFECYCLE_DISABLED.
+# Every check in the chain passed while the one capability the node was
+# enrolled for was off.
+
+def _template_text() -> str:
+    return (REPO_ROOT / "deploy" / "node-agent-config.yaml").read_text(encoding="utf-8")
+
+
+def test_the_node_agent_config_template_enables_session_lifecycle():
+    import yaml
+
+    parsed = yaml.safe_load(_template_text())
+    assert parsed["session_lifecycle"]["enabled"] is True
+    # The capability is opted into, but the blast radius is not: a session's
+    # cwd still has to resolve inside one named root.
+    roots = parsed["session_lifecycle"]["allowed_cwd_roots"]
+    assert roots == ["__SESSION_ROOT__"], roots
+    assert parsed["session_lifecycle"]["protected_sessions"] == ["terminal-mcp"]
+    # Launchers stay literal binaries -- never a caller-supplied string.
+    assert parsed["session_lifecycle"]["launch_commands"] == {"claude": "claude", "codex": "codex"}
+
+
+def test_the_installer_writes_that_template_and_not_the_example():
+    script = _installer()
+    assert "deploy\\node-agent-config.yaml" in script
+    # The example config remains the fallback for a bundle without the
+    # template, never the first choice.
+    template_at = script.index("node-agent-config.yaml")
+    example_at = script.index("config.example.yaml", template_at)
+    assert template_at < example_at, "the example must not be preferred over the template"
+    assert "__SESSION_ROOT__" in script
+    # A config with no session root is refused rather than written empty.
+    assert "-SessionRoot is empty" in script
+
+
+def test_the_session_root_is_escaped_for_yaml():
+    """C:\\Users\\Admin inside a double-quoted YAML scalar is an escape
+    sequence, not a path."""
+    script = _installer()
+    assert "$yamlRoot = $root.Replace('\\', '\\\\')" in script
+    assert "'__SESSION_ROOT__', $yamlRoot" in script
+
+
+def test_the_template_is_shipped_in_the_bundle():
+    from terminal_mcp import agent_bundle
+
+    assert "deploy/node-agent-config.yaml" in agent_bundle.BUNDLE_FILES
+
+
+def test_an_existing_config_is_never_overwritten():
+    script = _installer()
+    block = script[script.index('$configPath = Join-Path $RepoDir "config.yaml"'):]
+    assert block.startswith('$configPath = Join-Path $RepoDir "config.yaml"\nif (-not (Test-Path $configPath))')
+
+
+def test_the_upgrade_stops_the_running_agent_before_starting_the_new_one():
+    """Register -Force rewrote the task definition and left the running
+    instance holding the port, so the replacement died on bind and the node
+    kept serving the old version -- installed.json said 0.13.5-dev while the
+    live process was still 0.13.3-dev."""
+    script = _installer()
+    stop_at = script.index("Stop-ScheduledTask -TaskName $taskName")
+    register_at = script.index("Register-ScheduledTask -TaskName $taskName")
+    start_at = script.index("Start-ScheduledTask -TaskName $taskName")
+    assert stop_at < register_at < start_at
+    # Bounded, and it says so when the port never frees -- rather than
+    # starting a replacement that cannot bind and reporting success.
+    waited = script[stop_at:register_at]
+    assert "foreach ($wait in 1..20)" in waited
+    assert "still held after stopping" in script
