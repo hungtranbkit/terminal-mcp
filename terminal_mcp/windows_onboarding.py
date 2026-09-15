@@ -1162,6 +1162,16 @@ function Get-LauncherDirs {
 }
 
 $LauncherDirs = @(Get-LauncherDirs)
+
+# The interface the node agent binds -- resolved HERE, before the heartbeat
+# script is generated, because the beat needs it baked in to probe the
+# agent. Resolving it later (in the node-agent step) left the beat with an
+# empty host, so it fell back to loopback, which the agent does not listen
+# on, and session_transport stayed absent on a node whose agent was up.
+$AgentAddresses = Get-LocalAddresses
+$AgentBindHost = if ($AgentAddresses.tailscale_ip) { $AgentAddresses.tailscale_ip }
+                 elseif ($AgentAddresses.lan_ip) { $AgentAddresses.lan_ip }
+                 else { '127.0.0.1' }
 if ($LauncherDirs.Count -gt 0) {
     Add-Step 'Launcher path' 'OK' ("{0} user launcher dir(s) recorded for the heartbeat" -f $LauncherDirs.Count)
 } else {
@@ -1270,12 +1280,22 @@ function Get-Capabilities {
     # listening AND accepting this node's own credential. A service that is
     # up but rejects the controller cannot host a session, and claiming it
     # can is how Create Session offers a node that then fails.
-    try {
-        Invoke-RestMethod -Uri "http://127.0.0.1:8790/v1/health" -TimeoutSec 3 -UseBasicParsing | Out-Null
-        Invoke-RestMethod -Uri "http://127.0.0.1:8790/v1/sessions" ``
-            -Headers @{ Authorization = "Bearer `$token" } -TimeoutSec 3 -UseBasicParsing | Out-Null
-        `$found += 'session_transport'
-    } catch { }
+    # Probe the address the agent ACTUALLY binds, not loopback. The agent
+    # listens on the interface the controller reaches this node on -- the
+    # tailnet address -- so a hardcoded 127.0.0.1 probe never connects and
+    # session_transport stayed absent on a node whose agent was up and
+    # serving. The bound host is baked in at install time, alongside the
+    # launcher dirs, for exactly this reason.
+    foreach (`$agentHost in @('$AgentBindHost', '127.0.0.1')) {
+        if (-not `$agentHost) { continue }
+        try {
+            Invoke-RestMethod -Uri "http://`$($agentHost):8790/v1/health" -TimeoutSec 3 -UseBasicParsing | Out-Null
+            Invoke-RestMethod -Uri "http://`$($agentHost):8790/v1/sessions" ``
+                -Headers @{ Authorization = "Bearer `$token" } -TimeoutSec 3 -UseBasicParsing | Out-Null
+            `$found += 'session_transport'
+            break
+        } catch { }
+    }
     `$sshd = Get-Service sshd -ErrorAction SilentlyContinue
     if (`$sshd -and `$sshd.Status -eq 'Running') { `$found += 'sshd_running' }
     return `$found
@@ -1547,8 +1567,8 @@ if (-not $script:EnrollmentOk) {
 
         # 4. Bind address: the interface the controller actually reaches
         #    this node on. Tailnet first, LAN second -- never 0.0.0.0.
-        $addr = Get-LocalAddresses
-        $bindHost = if ($addr.tailscale_ip) { $addr.tailscale_ip } elseif ($addr.lan_ip) { $addr.lan_ip } else { '127.0.0.1' }
+        # Same address the heartbeat was told to probe, resolved once above.
+        $bindHost = $AgentBindHost
 
         # 5. Pin the interpreter BEFORE building anything. 3.12 is what the
         #    ai_coding profile installs and what the existing wheels are

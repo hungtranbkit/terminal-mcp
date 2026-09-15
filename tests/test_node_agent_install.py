@@ -111,9 +111,14 @@ def test_it_runs_the_install_script_shipped_inside_the_bundle():
 
 
 def test_it_binds_the_interface_the_controller_reaches_not_everything():
-    section = _agent_section(_script())
-    assert "Get-LocalAddresses" in section
-    assert "$addr.tailscale_ip" in section and "$addr.lan_ip" in section
+    script = _script()
+    # Resolved ONCE, before the heartbeat script is generated, so the beat
+    # and the agent cannot disagree about the address.
+    resolve = script[script.index("$AgentBindHost = if"):script.index("Start-Stage 'Node agent")]
+    assert "$AgentAddresses.tailscale_ip" in resolve
+    assert "$AgentAddresses.lan_ip" in resolve
+    section = _agent_section(script)
+    assert "$bindHost = $AgentBindHost" in section
     assert "'-BindHost', $bindHost" in section
     # Checked against CODE, not the comment that says "never 0.0.0.0".
     assert "0.0.0.0" not in _without_comments(section)
