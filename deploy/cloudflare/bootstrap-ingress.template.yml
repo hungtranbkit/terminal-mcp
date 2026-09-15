@@ -23,6 +23,30 @@
 #   /supervisor         fleet control
 #   /login, /app        the operator's own auth flow
 #
+# WHY THE SETUP SCRIPT IS HERE TOO
+#
+# Both machine-facing install paths fetch it from this hostname, and until
+# now neither could: the edge 404'd the request and the install died with
+# no error anywhere the operator could see.
+#
+#   the helper   downloadSetupScript() GETs /enroll/windows-setup.ps1 from
+#                the origin it was paired with -- which, on a public
+#                deployment, is this hostname. A live run on 2026-09-15
+#                redeemed successfully, reported installing_service, then
+#                failed here: 404 at the edge, 200 on loopback.
+#   Win + R      build_quick_install_command() builds
+#                `iwr '<origin>/w'`, the same script under its short path.
+#
+# It is safe to serve unauthenticated -- and was always designed to be. The
+# route's own contract is that the machine fetching it has no Access
+# session and cannot get one, so the GENERIC script carries no credential:
+# the enrollment code is baked as TMCP-00000-00000-00000 and the real one
+# is supplied by the operator or by the redeemed payload. A test asserts no
+# 64-hex secret appears in what is served.
+#
+# GET only, two exact paths, both anchored. Not a prefix: /enroll/... must
+# not become a door to anything else added under /enroll later.
+#
 # WHY HEARTBEAT IS HERE TOO
 #
 # Enrollment is not the end of the machine's need for this hostname. A node
@@ -72,6 +96,12 @@ ingress:
   #   progress  report an install stage back, so the page can show it
   - hostname: ${BOOTSTRAP_HOSTNAME}
     path: ^/dashboard/api/enroll/(consume|redeem|progress)$
+    service: ${CONTROLLER_ORIGIN}
+
+  # The generic setup script, under both paths that serve it. Byte
+  # identical on either, GET only, and carrying no secret -- see the header.
+  - hostname: ${BOOTSTRAP_HOSTNAME}
+    path: ^/(w|enroll/windows-setup\.ps1)$
     service: ${CONTROLLER_ORIGIN}
 
   # Post-enrollment liveness of the NODE, not of the controller. Bearer
