@@ -434,3 +434,95 @@ def test_the_published_report_states_its_verdict_and_its_methodology():
     assert "Verdict:" in text
     assert "Methodology, stated before measuring" in text
     assert "UNAVAILABLE" in text, "the unmeasured figures must stay visible"
+
+
+# -- the knowledge map this repository actually ships -------------------------
+
+def test_every_package_file_is_claimed_by_exactly_one_indexed_module():
+    """The indexing rule is completeness, and a rule nobody checks is a wish.
+
+    This is also what keeps the map honest against the benchmark it was
+    grown for: a map that covered only the modules the corpus asks about
+    would score well and mean nothing.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "index_modules", REPO_ROOT / "scripts" / "knowledge" / "index_modules.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    missing, duplicated = module.check_completeness(REPO_ROOT)
+    assert missing == [], f"package files claimed by no module: {missing}"
+    assert duplicated == [], f"package files claimed twice: {duplicated}"
+
+
+def test_every_indexed_path_still_exists():
+    """A map that names files that are gone is worse than a smaller one: it
+    sends a worker to read something that is not there."""
+    knowledge = ProjectKnowledge(REPO_ROOT)
+    missing = [path for m in knowledge.module_states()
+               for path in (m.paths or ()) if not (REPO_ROOT / path).exists()]
+    assert missing == [], f"indexed paths that no longer exist: {missing}"
+
+
+def test_the_map_covers_the_package_it_claims_to():
+    knowledge = ProjectKnowledge(REPO_ROOT)
+    indexed = {p for m in knowledge.module_states() for p in (m.paths or ())}
+    package = {f"terminal_mcp/{p.name}"
+               for p in (REPO_ROOT / "terminal_mcp").glob("*.py")
+               if p.name != "__init__.py"}
+    assert package - indexed == set()
+
+
+def test_map_provenance_is_recorded_with_the_measurement():
+    """A retrieval result only means something beside the map it came from."""
+    knowledge = ProjectKnowledge(REPO_ROOT)
+    provenance = eb.map_provenance(knowledge, repo_root=REPO_ROOT)
+    assert provenance["available"] is True
+    assert provenance["package_coverage"] == 1.0
+    assert provenance["modules"] >= 30
+    # Modules whose largest file carries no docstring have no summary, and the
+    # report says which rather than inventing one.
+    assert isinstance(provenance["modules_without_summary"], list)
+
+
+def test_a_missing_map_is_reported_not_raised(tmp_path):
+    class Broken:
+        def module_states(self):
+            raise RuntimeError("no map here")
+
+    provenance = eb.map_provenance(Broken(), repo_root=tmp_path)
+    assert provenance["available"] is False
+    assert "no map here" in provenance["detail"]
+
+
+# -- the secondary comparison is reported, and never decides anything --------
+
+def test_the_union_comparison_is_secondary_and_absent_when_the_site_was_missed():
+    located = _case_result(baseline_surface=1, baseline_hit=True,
+                           assisted_files=["pkg/widget.py"], assisted_hit=True)
+    # A miss has nothing to compare: None, not False.
+    missed = _case_result(baseline_surface=1, baseline_hit=True,
+                          assisted_files=[], assisted_hit=False)
+    assert missed.smaller_than_union is None
+    # The union in the fixture equals the best surface, so 1 file is not smaller.
+    assert located.smaller_than_union is False
+
+
+def test_the_secondary_figure_does_not_enter_the_verdict():
+    summary = _summary(0.29, 0.40)
+    summary["secondary_vs_union_baseline"] = {"smaller": 8, "denominator": 8}
+    assert eb.acceptance(summary, usage={"available": False})["verdict"] == "FAIL"
+
+
+def test_the_report_records_which_map_each_prior_run_measured():
+    """'Did indexing help?' cannot be answered by one run, so the runs that
+    came before are published beside the current one."""
+    assert eb.PRIOR_RUNS, "the earlier runs are evidence, not scratch work"
+    for run in eb.PRIOR_RUNS:
+        assert run["map"] and run["located"] and run["note"]
+    text = (REPO_ROOT / "docs" / "TOKEFF_BENCHMARK.md").read_text(encoding="utf-8")
+    assert "How this has moved" in text
+    for run in eb.PRIOR_RUNS:
+        assert run["date"] in text

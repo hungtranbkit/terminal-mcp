@@ -58,13 +58,19 @@ SESSIONS = {"limit": 50, "items": [
      "total_tokens": 830500000, "requests": 1653, "tokens_5h": 50700000,
      "tokens_24h": 830500000, "tokens_7d": 830500000, "tokens_30d": 830500000,
      "last_activity": 1788999990, "first_seen": 1788900000,
-     "estimated_cost_usd": 1.77, "avg_tokens_per_request": 502},
+     "estimated_cost_usd": 1.77, "avg_tokens_per_request": 502,
+     "context": {"used": 400000, "window": 1000000, "used_percent": 40.0,
+                 "source": "model_variant_suffix",
+                 "detail": "claude-opus-5[1m] states its window"}},
     {"agent": "codex", "agent_session_id": "cx1", "node_id": "local", "project": None,
      "is_subagent": True, "models": None, "input_tokens": 0, "output_tokens": 0,
      "cache_read_tokens": 0, "cache_write_tokens": 0, "total_tokens": 10, "requests": 1,
      "tokens_5h": 0, "tokens_24h": 10, "tokens_7d": 10, "tokens_30d": 10,
      "last_activity": 1788990000, "first_seen": 1788990000,
-     "estimated_cost_usd": None, "avg_tokens_per_request": 10}]}
+     "estimated_cost_usd": None, "avg_tokens_per_request": 10,
+     "context": {"used": 795496, "window": None, "used_percent": None,
+                 "source": "window_contradicted",
+                 "detail": "measured context 795,496 exceeds the 200,000 window"}}]}
 PROJECTS = {"limit": 50, "items": [
     {"project": "/home/me/workspace", "sessions": 2, "models": "claude-opus-5",
      "input_tokens": 1, "output_tokens": 2, "cache_read_tokens": 3, "cache_write_tokens": 4,
@@ -468,3 +474,43 @@ def test_the_quota_bars_are_readable_at_both_sizes(screen, width, height):
     assert screen.evaluate("() => document.querySelectorAll('.qcard').length") == 2
     assert not screen.evaluate(
         "() => document.documentElement.scrollWidth > window.innerWidth + 1")
+
+
+# -- context fullness: the one percentage that IS computable ------------------------
+
+def test_a_known_context_window_shows_a_real_percentage(screen):
+    """The gap this closes: the page offered only subscription quota, which no
+    local artefact reports, so it was permanently N/A and the screen looked
+    broken. Context fullness comes from provider-reported token counts."""
+    _open(screen, "sessions")
+    text = screen.evaluate("() => document.querySelector('#view').textContent")
+    assert "40%" in text
+    assert "1.0M" in text or "1000000" in text or "1M" in text
+
+
+def test_an_unresolvable_context_window_reads_na_and_never_a_number(screen):
+    """795k measured against a 200k window is 397%. A number above 100% is a
+    bug wearing the costume of a measurement, so the cell says N/A."""
+    _open(screen, "sessions")
+    text = screen.evaluate("() => document.querySelector('#view').textContent")
+    assert "N/A" in text
+    assert "397" not in text
+    assert "%" not in text.split("N/A")[1][:12], "no percentage beside the N/A"
+
+
+def test_the_context_cell_explains_itself_on_hover(screen):
+    """A bare N/A is indistinguishable from a value nobody looked up."""
+    _open(screen, "sessions")
+    titles = screen.evaluate(
+        "() => [...document.querySelectorAll('#view .pill')].map((p) => p.title)")
+    assert any("exceeds" in (t or "") for t in titles)
+
+
+def test_context_is_not_presented_as_subscription_quota(screen):
+    """Two different questions. The quota columns stay N/A; the context column
+    is separate and labelled."""
+    _open(screen, "sessions")
+    headers = screen.evaluate(
+        "() => [...document.querySelectorAll('#view thead th')].map((h) => h.textContent)")
+    assert "Context" in headers
+    assert any("Quota" in h for h in headers)

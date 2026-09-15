@@ -184,10 +184,108 @@ def tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
 # the guard below refused it on every subsequent run.
 OWNER_OPTION = "@terminal_mcp_test_session"
 
+# The tag now carries WHICH run owns the session, not just "a test does".
+# Two full suites on one host is this project's normal state (one per
+# worktree lane), and they collide on these literal names. With the old
+# "1" marker the second run read "test-owned" and KILLED a session the
+# first run was actively using, which surfaces as a storm of unrelated
+# failures in the other run rather than as anything pointing here.
+
+# Names this suite has actually CREATED on this host, remembered across
+# runs. Needed because the tag lives on the session, and a session can be
+# recreated during a test by the code under test (the recovery engine
+# rebuilds a session by name; so does terminal_create_session). That
+# replacement carries no tag, so an interrupted run leaves an UNTAGGED
+# session under a name only this suite ever uses -- which is exactly what
+# poisoned `webterm-smoke-readonly` and `test-tail-order` here. A name
+# only lands in this ledger when the fixture created it from nothing, so
+# a real session's name can never enter it by being refused.
+def _name_ledger() -> Path:
+    """Deliberately NOT under XDG_STATE_HOME, and deliberately resolved on
+    each call rather than at import.
+
+    pytest_configure above points XDG_STATE_HOME at a fresh temp directory
+    per run and deletes it on exit -- correct for everything the suite
+    writes, and fatal for this one file, whose entire job is to be read by
+    the NEXT run. Resolving at import would also make the path depend on
+    whether this module was imported before or after that hook ran, which
+    is the kind of difference that shows up as one baffling failure and
+    nothing else."""
+    return Path.home() / ".local" / "state" / "terminal-mcp" / "test-session-names"
+
+
+def _process_start_time(pid: int) -> str | None:
+    """Field 22 of /proc/<pid>/stat: the tick the process started at.
+
+    Paired with the pid so a recycled pid cannot make a dead owner look
+    alive. Returns None off Linux or when the process is gone, and every
+    caller treats None as "cannot prove it is alive".
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "r") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    # The comm field can contain spaces and parentheses; everything after
+    # the LAST ')' is positional.
+    tail = data[data.rfind(")") + 1:].split()
+    return tail[19] if len(tail) > 19 else None
+
+
+_RUN_OWNER = f"{os.getpid()}:{_process_start_time(os.getpid()) or 0}"
+
+
+def _owner_alive(owner: str) -> bool:
+    """True only when the run that tagged this session is provably still
+    running. Anything unparseable is treated as not alive: the sessions
+    this is asked about carry test-only names, and refusing to reap a
+    genuine leftover forever is the failure mode that sent a human to a
+    terminal to run kill-session by hand."""
+    if owner == _RUN_OWNER:
+        return True
+    pid_text, _, start = owner.partition(":")
+    if not pid_text.isdigit():
+        return False
+    return _process_start_time(int(pid_text)) == start
+
+
+def _session_owner(name: str) -> str | None:
+    """The run that owns this session, "" for the legacy untargeted marker,
+    or None when the session carries no marker at all."""
+    got = tmux("show-options", "-t", name, "-v", OWNER_OPTION, check=False)
+    if got.returncode != 0:
+        return None
+    value = got.stdout.strip()
+    if not value:
+        return None
+    # "1" is what runs from before this change write. Treat it as owned by
+    # a run we cannot identify -- reapable, since that is what it meant.
+    return "" if value == "1" else value
+
+
+def _remember_created(name: str) -> None:
+    try:
+        _name_ledger().parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if name in _known_created_names():
+            return
+        with open(_name_ledger(), "a") as handle:
+            handle.write(name + "\n")
+    except OSError:
+        # A ledger that cannot be written costs us the untagged-orphan
+        # cleanup and nothing else; it must never fail a test run.
+        pass
+
+
+def _known_created_names() -> set[str]:
+    try:
+        with open(_name_ledger(), "r") as handle:
+            return {line.strip() for line in handle if line.strip()}
+    except OSError:
+        return set()
+
 
 def _is_test_owned(name: str) -> bool:
-    got = tmux("show-options", "-t", name, "-v", OWNER_OPTION, check=False)
-    return got.returncode == 0 and got.stdout.strip() == "1"
+    return _session_owner(name) is not None
 
 
 @pytest.fixture
@@ -211,12 +309,38 @@ def tmux_session_factory():
 
     def create(name: str, command: str = "bash") -> str:
         exists = tmux("has-session", "-t", name, check=False).returncode == 0
-        if exists and name not in created and _is_test_owned(name):
-            # Provably a leftover from an earlier test run of this suite
-            # (see OWNER_OPTION). A real, attended session can never carry
-            # that tag, so reaping this one cannot touch anyone's work.
-            tmux("kill-session", "-t", name, check=False)
-            exists = False
+        if exists and name not in created:
+            owner = _session_owner(name)
+            if owner is not None and _owner_alive(owner):
+                # Tagged, and the run that tagged it is STILL RUNNING --
+                # another suite on this host (one per worktree lane is
+                # normal here) is using this session right now. Killing it
+                # would break that run in ways that point nowhere near
+                # this line, so refuse loudly instead.
+                raise RuntimeError(
+                    f"tmux session {name!r} belongs to another test run that is still "
+                    f"alive (owner {owner}). Two suites on one host collide on these "
+                    "literal names -- run them one at a time, or give this test a "
+                    "unique disposable name."
+                )
+            if owner is not None:
+                # Tagged by a run that is gone: a leftover from a suite
+                # interrupted before teardown. Reaping it cannot touch
+                # anyone's work.
+                tmux("kill-session", "-t", name, check=False)
+                exists = False
+            elif name in _known_created_names():
+                # UNTAGGED, but this suite has created this exact name on
+                # this host before. That is the recreated-by-the-code-under
+                # -test case: the recovery engine (and terminal_create_
+                # session) rebuild a session by name, and the replacement
+                # carries no tag, so an interrupted run leaves a nameless
+                # squatter that refused this test on every later run until
+                # a human killed it by hand. The name reached the ledger
+                # only by being created from nothing here, so a real
+                # session's name cannot arrive this way.
+                tmux("kill-session", "-t", name, check=False)
+                exists = False
         if exists and name not in created:
             # A session by this name already exists and this fixture
             # instance did not make it -- refuse rather than kill it. Once
@@ -233,7 +357,8 @@ def tmux_session_factory():
         if exists:
             tmux("kill-session", "-t", name, check=False)
         tmux("new-session", "-d", "-s", name, command)
-        tmux("set-option", "-t", name, OWNER_OPTION, "1", check=False)
+        tmux("set-option", "-t", name, OWNER_OPTION, _RUN_OWNER, check=False)
+        _remember_created(name)
         created.add(name)
         time.sleep(0.15)
         return name

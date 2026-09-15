@@ -13,6 +13,7 @@ import uvicorn
 
 from .ai_usage_service import AiUsageService
 from .config import load_config
+from . import endpoint_policy
 from .connection_store import ConnectionStore
 from .enrollment import EnrollmentStore
 from .node_credentials import NodeCredentialStore
@@ -375,9 +376,22 @@ def main() -> None:
             _log.warning("nodes: skipping saved connection %r -- token file missing/unreadable "
                         "(re-connect it from the Nodes page)", saved.node_id)
             continue
-        controller.register_remote_node(saved.node_id, display_name=saved.node_id,
-                                        hostname=saved.hostname or saved.node_id, endpoint=saved.endpoint,
-                                        token=token)
+        try:
+            controller.register_remote_node(
+                saved.node_id, display_name=saved.node_id,
+                hostname=saved.hostname or saved.node_id, endpoint=saved.endpoint, token=token,
+                # A node the operator added under the documented opt-in
+                # must survive a restart; re-reading the same flag here is
+                # what keeps re-hydration consistent with how it was added.
+                allow_public_http=config.nodes.remote_connect.allow_public_manual_add)
+        except endpoint_policy.EndpointPolicyError as exc:
+            # A previously-saved endpoint that today's policy refuses:
+            # skip THAT node loudly rather than refusing to start at all.
+            # Failing the whole controller would take every other node
+            # down with it, which is a worse outcome than one node being
+            # visibly absent with the reason in the log.
+            _log.error("nodes: refusing to re-register %r -- %s", saved.node_id, exc)
+            continue
         # Same env var dashboard.py's node_heartbeat route re-reads on
         # every inbound push from this node -- see its own
         # node_token_env_var docstring. Without this, the node would
@@ -586,6 +600,35 @@ def main() -> None:
     # regardless of whether Supervisor Loop v1 is enabled, so its
     # retention/WAL maintenance is baseline hygiene, not gated behind that
     # unrelated opt-in.
+    # Worktree Janitor sweep (docs/WORKTREE_JANITOR.md, P3). The BACKGROUND
+    # THREAD is gated on its own flag, default off; terminal_worktree_sweep_
+    # run_once stays callable regardless, the same "manual always available,
+    # only the automatic trigger is gated" posture as queue/integration/
+    # auto_recovery above. Even with the loop running, nothing is removed
+    # unless worktree_janitor.mode is auto_execute -- so a deployment that
+    # enables the sweep without changing mode gets a periodic REPORT.
+    worktree_sweep = None
+    if config.worktree_janitor.sweep_enabled:
+        from .lease import ResourceLockStore
+        from .worktree_executor import WorktreeExecutor
+        from .worktree_sweep import WorktreeSweep
+
+        worktree_sweep = WorktreeSweep(
+            WorktreeExecutor(config.worktree_janitor.to_policy(), audit=terminal.audit,
+                             locks=ResourceLockStore(terminal.leases.path),
+                             store=queue.store,
+                             node_id=getattr(controller, "local_node_id", "local")),
+            store=queue.store, repo_roots=config.worktree_janitor.repo_roots,
+            interval_seconds=config.worktree_janitor.sweep_interval_seconds,
+            orphan_confirm_runs=config.worktree_janitor.orphan_confirm_runs,
+            orphan_min_age_seconds=config.worktree_janitor.orphan_min_age_seconds,
+            max_candidates_per_run=config.worktree_janitor.max_candidates_per_run,
+            budget_seconds=config.worktree_janitor.sweep_budget_seconds)
+        worktree_sweep.start()
+        _log.info("worktree janitor sweep started (mode=%s, interval=%ss)",
+                     config.worktree_janitor.mode,
+                     config.worktree_janitor.sweep_interval_seconds)
+
     maintenance_loop = MaintenanceLoop(
         audit=terminal.audit, supervisor2_store=supervisor_v2.store,
         bindings_path=terminal.bindings.path, config=config.maintenance,

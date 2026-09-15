@@ -288,3 +288,56 @@ repo_read:
 #   attachment_source_roots:
 #     - "~/Pictures/Screenshots"
 #     - "/tmp/chatgpt-drops"
+# Worktree Janitor (docs/WORKTREE_JANITOR.md). P0 ships the CLASSIFIER ONLY --
+# there is no executor in this build, so nothing here can cause a deletion.
+worktree_janitor:
+  # observe_only (default) | suggest_only | auto_execute
+  # Invariant I8: nothing is ever removed until an operator opts in. An unknown
+  # value is a load-time ValueError, never silently downgraded.
+  mode: observe_only
+
+  # EMPTY MEANS NOTHING IS COLLECTABLE -- deliberately the opposite of
+  # repo_read's fallback-to-home. A reclaim deletes; its allowlist must be
+  # stated explicitly, never inherited. "/" is refused outright.
+  allowed_roots: []
+    # - /home/mesflow/workspace
+
+  # A worktree branch is "merged" when its HEAD is an ancestor of this ref.
+  integration_ref: main
+
+  # Pushed-but-not-merged is classified REVIEW by default (the work is not lost
+  # but was never integrated). true promotes it to AUTO_SAFE.
+  allow_preserved_unmerged: false
+
+  grace_seconds: 86400        # after the task's terminal transition
+  grace_floor_seconds: 3600   # disk pressure may never shorten below this
+  max_evidence_age_seconds: 120
+  max_candidates_per_run: 50
+  timeout_seconds: 20
+
+  # ADDITIVE ONLY. Credential/database/env globs are built in (and inherited
+  # from redaction.CREDENTIAL_FILE_NAMES); there is no key that REMOVES one, so
+  # no config edit can make a secret or a sqlite db collectable.
+  extra_valuable_globs: []
+    # - "*.backup.sql"
+
+  # --- P3 periodic sweep -------------------------------------------------
+  # `sweep_enabled` gates ONLY the background thread. terminal_worktree_sweep_
+  # run_once stays callable with it off -- the project's standing "manual path
+  # always works, only the automatic trigger is gated" posture. And even with
+  # the loop running, nothing is removed unless `mode` is auto_execute, so
+  # enabling the sweep alone gets you a periodic REPORT.
+  sweep_enabled: false
+  sweep_interval_seconds: 900
+  sweep_budget_seconds: 60      # wall-clock budget for one pass
+
+  # An orphan (a worktree no task claims) is never actioned on first sight: a
+  # worktree legitimately exists for a moment before the task referencing it
+  # does, because git_isolation_service must create it first. So it must be
+  # seen unclaimed this many CONSECUTIVE passes AND be older than the min age.
+  orphan_confirm_runs: 2
+  orphan_min_age_seconds: 3600
+
+  # Repos the sweep walks. Empty = the sweep has nothing to do.
+  repo_roots: []
+    # - /home/mesflow/terminal-mcp

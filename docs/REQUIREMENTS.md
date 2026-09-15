@@ -90,6 +90,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Notes / Ideas store (kho ghi chú: MCP `note_*` + `/dashboard/notes`) | VERIFIED |
 | Notes surface application-layer auth (webauth session or verified CF Access) | VERIFIED |
 | Dashboard: Requirements/Feature Matrix link | VERIFIED |
+| Worktree Janitor (reclaim isolated task worktrees) | CONTRACT ONLY — no executor, nothing deletes yet |
 | Read-only repo access for external agents (`repo_*` MCP tools) | VERIFIED (V1, read-only) |
 | Permissions: read/input grants + effective permissions | VERIFIED |
 | Reliable prompt submission (press-enter, DELIVERY_UNKNOWN, idempotency) | VERIFIED |
@@ -3406,6 +3407,116 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
   was deliberately NOT done to keep the existing label; the MCP-send-tools half
   and the advisory->enforce promotion remain with the owning lane.
 - **Trace:** branch `integration/supervisor-queue-reliability`.
+### Windows detached session hosts (survive node-agent restart)
+
+- **Goal / user value:** a Windows node-agent update or restart must stop
+  being an outage for that node's Claude/Codex/PowerShell sessions. The
+  node-agent becomes control plane only; a session's process is no longer
+  a child whose lifetime depends on it.
+- **Status:** IMPLEMENTED and TESTED on Linux against real processes; NOT
+  YET PROVEN on real Windows, and NOT deployed. `--detached-sessions` is
+  OFF by default so shipping the code cannot change a running node's
+  behaviour. The live dell-5530 agent has not been restarted or touched.
+- **Design of record:** `docs/WINDOWS_SESSION_HOST.md` (architecture,
+  crash/reboot matrix, the adoption-impossibility proof, and the
+  zero-loss rollout).
+- **Root cause this fixes (from "Windows node-agent restart safety
+  (Phase 0)" above):** a session's ConPTY child was spawned inside the
+  node-agent process and the only registry was an in-memory dict, so the
+  child died with the agent (measured live, both via `taskkill /F` and
+  via the graceful `/v1/internal/shutdown`) and no on-disk state existed
+  to reconnect with. Phase 0's "NOT achievable" conclusion was scoped to
+  that architecture; this entry replaces the architecture.
+- **Fix:**
+  - `windows_session_host.py` (new): a detached per-session HOST process
+    that owns the PTY. Atomic `meta.json` (temp + fsync + `os.replace`,
+    its mtime doubling as the heartbeat), append-only `out.log`/`in.log`
+    offset spools, `ctl.json` control requests consumed exactly once,
+    `host.log`. Liveness is `ALIVE`/`GONE`/`PID_REUSED` — a live PID with
+    a stale heartbeat is treated as reuse, never as a session, because
+    Windows recycles PIDs and the cost of a false ALIVE is writing an
+    operator's keystrokes into a void while reporting health. POSIX
+    liveness additionally rejects zombies, since `kill(pid, 0)` succeeds
+    on an unreaped process and Windows has no such state.
+  - Spawned with `DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB |
+    CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`; breakaway denial raises
+    `BreakawayDenied` rather than silently retrying without the flag (a
+    host spawned without it looks identical and then dies with the agent
+    — the exact bug being fixed).
+  - `windows_detached.py` (new): `HostProcessProxy`, a `PtyProcessLike`
+    over the spool, so the existing reader thread, pyte VT parser,
+    history buffer, resize and kill paths are untouched. `pid` is the
+    CHILD's pid (the backend feeds it to `_win32_foreground_command`;
+    the host's pid there would make every session report the wrapper);
+    `read()` sleeps briefly on an empty spool so `_reader_loop` does not
+    spin. `adopt_sessions()` is a pure read returning a verdict per
+    session.
+  - `windows_backend.py`: new optional `session_process_factory`
+    (`(name, argv, cwd) -> PtyProcessLike`) alongside the unchanged
+    2-arg `ProcessFactory`, and `adopt_detached_sessions()` /
+    `_register_adopted()`. The duplicate-name check is re-done inside the
+    registry lock, so a create racing an adoption cannot produce two
+    hosts behind one id.
+  - `windows_agent.py`: `--detached-sessions` (default OFF) and
+    `--session-state-root`; adoption runs BEFORE serving, so a request
+    arriving early cannot be told a live session does not exist and then
+    have a create spawn a second host for it.
+- **Scope / flow:** Windows nodes only, opt-in. Linux/tmux is untouched
+  (asserted by test). Sessions created before the flag is enabled are
+  NOT migratable — see the impossibility proof below.
+- **Adoption impossibility (proved, as the task required):** a 0.12.0
+  session's `HPCON` and pipe handles live in the running agent's handle
+  table; Windows exposes no way to enumerate or re-open a pseudoconsole
+  from another process, and `DuplicateHandle` needs a cooperating source
+  that 0.12.0 does not contain. Even a duplicated handle would not help:
+  when the owning process exits, ConPTY signals the client and
+  `conhost.exe` tears the console down (measured in Phase 0). And the old
+  agent must exit to be replaced (the code, and port 8790's single
+  listener). Therefore every path that ends with the 0.12.0 agent gone
+  ends with its sessions gone; no bridge exists.
+- **Rollout (zero-loss, not yet executed):** Option A = deploy files
+  only, capture each live session's scrollback + cwd + `--session-id`,
+  quiesce, prove survival on a disposable second agent first, restart
+  once with the flag, recreate with `--resume`, then restart again to
+  demonstrate the property. Option B (recommended, loses nothing and
+  waits for nothing) = run a second agent side by side on another port
+  with its own state root and node id, prove it there, put new work on
+  it, and retire the old agent only when its sessions are finished.
+- **API/tool/command:** no new MCP tools. New agent CLI flags
+  `--detached-sessions`, `--session-state-root`; new host entry point
+  `python -m terminal_mcp.windows_session_host`.
+- **Config/permission:** none new. `TERMINAL_MCP_SESSION_PTY_FACTORY`
+  exists so the host entry point itself can be exercised on Linux CI; it
+  is unset in production, which selects the real pywinpty path.
+- **Data/schema/migration:** no DB change. New on-disk per-session state
+  directory; no migration, since existing sessions cannot be adopted.
+- **Acceptance/tests/evidence:** `tests/test_windows_session_host.py`
+  (52 tests: atomic metadata, corrupt-metadata-as-absent, zombie and
+  PID-reuse protection, spool rotation keeping the recent tail on a line
+  boundary, control requests consumed once, the exact creation flags, and
+  a spawner-death survival test verified by negative control — the same
+  scenario without detachment freezes, with it keeps running);
+  `tests/test_windows_detached_sessions.py` (19 tests: a real agent
+  process SIGKILLed with its whole process group, both host and child
+  confirmed still alive afterwards, pre-restart history readable and
+  post-restart input answered, four concurrent sessions adopted with no
+  crossed spools, host crash reported as an orphan and never adopted,
+  stale-record-with-live-pid refused, claude.exe-style argv round-tripped
+  verbatim including `--session-id`, backend create→restart→adopt→kill,
+  double adoption producing no duplicate, and the plain Linux factory
+  path unchanged). Existing `tests/test_windows_backend.py` (86) passes
+  unchanged.
+- **Known limitations:** ConPTY and the Win32 creation flags are NOT
+  measured on Windows — asserted structurally and reviewed against the
+  Win32 contract; rollout step 4 is what measures them, on a disposable
+  session. A machine reboot loses every session (only `out.log` survives)
+  and this is documented rather than papered over. Orphans are never
+  auto-deleted, because a `PID_REUSED` verdict can also be a live host
+  that was briefly slow to heartbeat.
+- **Follow-up/backlog:** execute the rollout (Option B) on dell-5530;
+  package `--detached-sessions` into `run-node-agent.ps1`'s Scheduled
+  Task definition; surface adoption verdicts/orphans in the dashboard.
+- **Trace:** branch `feat/windows-detached-sessions`.
 
 ### Conversation-continuity recovery (`--resume` wiring)
 
@@ -4108,13 +4219,17 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
 - **API/tool/command:** no MCP tool and no route — this is an offline
   measuring instrument. `terminal_mcp/efficiency_benchmark.py` (corpus,
   baseline, assisted measurement, aggregation, pre-registered acceptance,
-  derived conclusions, markdown rendering);
-  `scripts/benchmark/mine_corpus.py`; `scripts/benchmark/run_tokeff_benchmark.py`.
+  map provenance, derived conclusions, markdown rendering);
+  `scripts/benchmark/mine_corpus.py`; `scripts/benchmark/run_tokeff_benchmark.py`;
+  `scripts/knowledge/index_modules.py`.
   Nothing is deployed and nothing outside the given output paths is written;
   a telemetry database is never CREATED by the run, because creating an
   empty one and reading zero out of it would turn "nothing was recorded"
   into a measurement.
-- **Acceptance/tests/evidence:** `tests/test_efficiency_benchmark.py` (33) —
+- **Acceptance/tests/evidence:** `tests/test_efficiency_benchmark.py` (41) —
+  including the map's own guards (every package file claimed exactly once,
+  every indexed path still exists, provenance recorded beside the
+  measurement) —
   validates every REAL case against real git, asserts synthetic cases are
   marked, and pins the anti-flattery rules (a miss earns nothing, leave-one-
   out holds, a weak module match is no match, usage is UNAVAILABLE until a
@@ -4123,7 +4238,8 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
   committed corpus).
 - **Known limitations:** (1) the locating surface is a proxy for files read,
   not a measurement of them — labelled ESTIMATE everywhere it appears;
-  (2) the mapped stratum is underpowered at 7 cases; (3) the runbook
+  (2) strata under ten cases are underpowered and flagged as such;
+  (3) the runbook
   registry's own claim (calling a procedure instead of re-deriving a
   command, and a one-line PASS instead of a log) is NOT measured here — the
   four metrics this task names do not capture it, and inventing a weak
@@ -4132,6 +4248,31 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
   beyond it.
 
 ## Backlog (explicitly not done yet — tracked here so it isn't re-discovered)
+
+0a. **Worktree Janitor — CONTRACT ONLY as of 2026-09-14. No executor exists;
+   nothing deletes anything.** The specification is
+   `docs/WORKTREE_JANITOR.md` (state model, the nine AUTO_SAFE predicates,
+   invariants I1-I8, failure modes F1-F13, multi-node ownership, audit shape,
+   rollout ladder, and the P0/P1/P2 acceptance tests). What exists in code
+   today is ONLY the pre-existing manual path: `terminal_worktree_cleanup` ->
+   `GitIsolationService.cleanup_worktree_for_task`, which is human-invoked,
+   accepts `force=True`, takes no lock, and writes NO audit row (verified:
+   `audit.db` has zero rows for any worktree action, and neither
+   `git_worktree.py` nor `git_isolation_service.py` contains an audit call).
+   Implementation is tracked as the P0-P7 backlog items tagged
+   `worktree-janitor`; the contract item is `blg_349fb9e08b4f`.
+   Two findings from the audit that the contract encodes and that must not be
+   re-litigated by an implementer:
+   - There is no `FAILED_FINAL` status. `TERMINAL_STATUSES` is
+     `(COMPLETED, SKIPPED, CANCELLED)`; `FAILED`/`BLOCKED` are retryable. The
+     trigger is those three, or `FAILED` with `attempt_count >= max_attempts`.
+     Cleaning up on a bare `FAILED` deletes the retry's own working directory.
+   - The lifecycle hook belongs in `queue_store._transition_locked`, NOT on
+     `QueueService.on_completed`/`QueueEngine.on_completed` -- those have TWO
+     call sites, so neither is a chokepoint.
+   Not urgent: measured 2026-09-14, the worktree filesystem (`/dev/sda3`) was
+   26% used with 83G free. The disk pressure that actually broke tooling was on
+   tmpfs `/tmp`, which worktree removal cannot relieve (different filesystem).
 
 0. **Repo Read V1 — the two things it deliberately does not do yet
    (2026-09-14).**
@@ -4740,18 +4881,21 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
 
 ---
 
-27. **The knowledge map covers ~12% of this package, and that -- not the
-    retrieval code -- is what limits the briefing (found by the 2026-09-14
-    token-efficiency benchmark).** 9 modules / 19 paths are indexed against
-    ~150 source files; 11 of 18 real benchmark bugs had their fix site
-    outside the map entirely, where no briefing can help by construction.
-    The capability is built and works; what is missing is indexed coverage of
-    the modules real bugs land in (`core.py`, `adapters.py`, `lifecycle.py`,
-    `config.py`, `status.py`, `recovery_engine.py`, `server_http.py`,
-    `controller.py`, `doctor.py` among them). Re-running
-    `scripts/benchmark/run_tokeff_benchmark.py` after indexing is how to find
-    out whether the mapped-stratum direction (5 of 7 located) survives a
-    larger sample.
+27. **The knowledge map covers ~12% of this package — DONE, 2026-09-15, and
+    it did not produce the improvement it was expected to.** The package is
+    now indexed completely: 33 modules / 147 paths, every `terminal_mcp/*.py`
+    claimed exactly once, enforced by `scripts/knowledge/index_modules.py`
+    and by `tests/test_efficiency_benchmark.py`. Re-running the benchmark
+    (`docs/TOKEFF_BENCHMARK.md`, "How this has moved") measured: the briefing
+    now names the fix site in 8 of 17 comparable cases instead of 5, and
+    leaves a worker doing full re-analysis in 7 cases instead of 12 — but it
+    beats the luckiest single grep LESS often (1/8 vs 2/5), because a
+    briefing drawn from a real module is 4.67 files where the near-empty map
+    produced 0.61. The headline verdict is still FAIL. Two consequences are
+    now the open work, below (items 30 and 31). A side effect worth naming:
+    `test_dogfood_work_v1.py`'s strict test (`TERMINAL_MCP_DOGFOOD_STRICT=1`)
+    passes for the first time — the planning pipeline really does consult the
+    map now.
 
 28. **Module choice depends on the report naming the module (same
     benchmark).** The synthetic mirror pair is the evidence: one defect,
@@ -4842,6 +4986,41 @@ two existing inventory guards updated in the same commit (`tests/test_server.py`
 and `tests/test_dashboard.py`'s exact route set).
 
 ---
+30. **Module choice scores a shared identifier as strongly as a
+    discriminating one (found by the 2026-09-15 benchmark re-run).**
+    `work_reuse._score_module` awards 0.45 for any identifier overlap, so a
+    token that appears in many modules' file names counts as much as one that
+    names a single module. With 9 modules this rarely bit; with 33 it
+    dominates. Measured examples from the real corpus: `client-side CSI regex
+    leak` in `dashboard.py` matched `nodes` on the token "client"
+    (`node_client.py`); two dashboard bugs went to `webauth`, which ties with
+    `work_ui` at 0.477/0.483 because `webauth_dashboard.py` also contains the
+    token "dashboard", and the shipped ordering `(-score, name)` puts
+    `webauth` first alphabetically. `engine`, `loop`, `registry`, `service`,
+    `session`, `store` and `work` are each shared by three or more modules
+    today. Candidate direction, not attempted here (it would have been tuning
+    the scorer against the corpus that found it): weight an identifier match
+    by how few modules contain that token, and report a tie as ambiguous
+    rather than resolving it alphabetically.
+
+31. **Six modules carry no summary because their largest file has no module
+    docstring** (`config`, `http_api`, `mcp_surface`, `security`,
+    `session_ops`, `work_ui` — 2026-09-15). The indexer generates summaries
+    mechanically from the code's own docstrings, deliberately, so that no
+    summary is written to match a bug report's wording after the fact. The
+    honest consequence is that these six are found by identifier alone. The
+    fix belongs in the code: give `core.py`, `dashboard.py`, `config.py`,
+    `mcp_app.py`, `server_http.py` and `audit.py` real module docstrings, and
+    re-index. That is a change to the source, not to the map, and the
+    benchmark will measure whether it moves anything. A second, smaller
+    limitation of the same rule, recorded rather than quietly accepted: the
+    summary is the LARGEST file's first sentence, so one file speaks for the
+    whole module (`auth` is described by `enrollment.py`, `capabilities` by
+    `host_metrics.py`). Combining the top few files' sentences would describe
+    more of each module; it was not done in this pass because every further
+    rule variant chosen by its benchmark score fits the instrument a little
+    more tightly to this one corpus.
+
 ## Project Backlog (planning layer) — IMPLEMENTED
 
 Full design: `docs/backlog.md`. Example file: `docs/examples/backlog.example.json`.

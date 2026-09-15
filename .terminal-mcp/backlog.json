@@ -9,8 +9,8 @@
     "git_branch": "main",
     "is_portable": true
   },
-  "revision": 73,
-  "updated_at": "2026-09-15T01:56:50.427703+00:00",
+  "revision": 89,
+  "updated_at": "2026-09-15T05:10:43.331571+00:00",
   "items": [
     {
       "id": "blg_f52a999971d9",
@@ -68,7 +68,7 @@
       "type": "feature",
       "order": 2,
       "created_at": "2026-09-09T08:02:29.711872+00:00",
-      "updated_at": "2026-09-15T01:55:44.788392+00:00",
+      "updated_at": "2026-09-15T04:51:27.972837+00:00",
       "source": "session-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -86,7 +86,7 @@
       "queue_task_id": null,
       "branch": "feat/node-auth-throttle",
       "worktree": null,
-      "blocked_reason": "Not evidenced by the 2026-09-14 staging run. That run proved rate limiting on the ENROLMENT routes (/dashboard/api/enroll/consume: 4 attempts then HTTP 429), which is a different surface from node-agent bearer auth. AC2 (heartbeat never throttled) and AC3 (lockout cannot wedge a node) remain entirely untested. Recorded so the adjacent evidence is not mistaken for this item's.",
+      "blocked_reason": "NOT merged in this pass: semantic conflict with the AgentCredential token-rotation work that landed on main (node_agent.py, 3 hunks -- the branch changes the same signature without the credential object). Needs the owning lane to rebase onto main; forcing it would be guessing at intent. Implementation exists and is complete on the branch.",
       "evidence": {
         "commits": [],
         "tests": [],
@@ -114,6 +114,15 @@
           "changed": [
             "branch",
             "status"
+          ]
+        },
+        {
+          "at": "2026-09-15T04:51:27.972837+00:00",
+          "event": "updated",
+          "by": "m2-integrate",
+          "changed": [
+            "blocked_reason",
+            "branch"
           ]
         }
       ]
@@ -266,12 +275,12 @@
       "id": "blg_0393ee9bd3d2",
       "title": "Validate node endpoint scheme: refuse plaintext http:// to a non-private host",
       "description": "config.py accepts any non-empty string as nodes.remote[].endpoint. A plaintext http:// endpoint pointed at a public host would send the bearer token in the clear on every request. RemoteNodeClient already verifies TLS correctly for https:// - only the scheme check is missing.",
-      "status": "IN_PROGRESS",
+      "status": "DONE",
       "priority": "P1",
       "type": "bug",
       "order": 4,
       "created_at": "2026-09-09T08:02:29.711902+00:00",
-      "updated_at": "2026-09-14T08:41:33.933223+00:00",
+      "updated_at": "2026-09-15T04:47:36.742714+00:00",
       "source": "session-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -291,10 +300,16 @@
       "worktree": null,
       "blocked_reason": null,
       "evidence": {
-        "commits": [],
-        "tests": [],
+        "commits": [
+          "8a60235 (merge integrate/lane-a) / fix/node-endpoint-scheme"
+        ],
+        "tests": [
+          "node_registry 24 + config_nodes + trusted_vpn_cidrs = 69 passed"
+        ],
         "deploys": [],
-        "notes": []
+        "notes": [
+          "Integrated into main from fix/node-endpoint-scheme; targeted regression green on the merged tree."
+        ]
       },
       "history": [
         {
@@ -315,6 +330,13 @@
           "by": null,
           "session": null,
           "node_id": null
+        },
+        {
+          "at": "2026-09-15T04:47:36.742714+00:00",
+          "event": "completed",
+          "by": "m2-integrate",
+          "verified_by": "evidence",
+          "queue_task_id": null
         }
       ]
     },
@@ -2367,7 +2389,7 @@
       "type": "docs",
       "order": 44,
       "created_at": "2026-09-14T04:28:09.474240+00:00",
-      "updated_at": "2026-09-14T08:43:44.927425+00:00",
+      "updated_at": "2026-09-15T04:51:14.948075+00:00",
       "source": "analysis-gate",
       "dependencies": [],
       "acceptance_criteria": [
@@ -2390,14 +2412,16 @@
       "blocked_reason": null,
       "evidence": {
         "commits": [
-          "ec0ca05a42071a54544089c0092e97c267657fba (branch feat/worktree-janitor-contract, NOT merged to main)"
+          "ec0ca05a42071a54544089c0092e97c267657fba (branch feat/worktree-janitor-contract, NOT merged to main)",
+          "8a60235 (merge integrate/lane-a)"
         ],
         "tests": [
           "docs-only change; 12/12 factual claims verified against code; tests/test_git_worktree.py + test_git_isolation_service.py 20 passed"
         ],
         "deploys": [],
         "notes": [
-          "Contract only: docs/WORKTREE_JANITOR.md + REQUIREMENTS.md matrix row and backlog entry. No executor, no scanner, no service, nothing deletes. Branch not merged, not deployed."
+          "Contract only: docs/WORKTREE_JANITOR.md + REQUIREMENTS.md matrix row and backlog entry. No executor, no scanner, no service, nothing deletes. Branch not merged, not deployed.",
+          "INTEGRATION FOLLOW-UP for janitor contract: this was recorded DONE while the code existed only on a branch. It is now merged into main via the p5 stack tip; the earlier branch-only evidence remains above."
         ]
       },
       "history": [
@@ -2419,6 +2443,13 @@
           "by": "claude-opus5-session-01FH4tRd",
           "verified_by": "evidence",
           "queue_task_id": null
+        },
+        {
+          "at": "2026-09-15T04:51:14.948075+00:00",
+          "event": "completed",
+          "by": "m2-integrate",
+          "verified_by": "evidence",
+          "queue_task_id": null
         }
       ]
     },
@@ -2431,7 +2462,7 @@
       "type": "feature",
       "order": 45,
       "created_at": "2026-09-14T04:28:09.474308+00:00",
-      "updated_at": "2026-09-14T11:08:09.675653+00:00",
+      "updated_at": "2026-09-15T04:51:14.999346+00:00",
       "source": "analysis-gate",
       "dependencies": [
         "blg_349fb9e08b4f"
@@ -2457,14 +2488,16 @@
       "blocked_reason": null,
       "evidence": {
         "commits": [
-          "45c6dbb064d4335ea3ad3279cca81b134891620d (branch feat/worktree-janitor-p0, NOT merged)"
+          "45c6dbb064d4335ea3ad3279cca81b134891620d (branch feat/worktree-janitor-p0, NOT merged)",
+          "8a60235 (merge integrate/lane-a)"
         ],
         "tests": [
           "tests/test_worktree_janitor.py 54 passed; full suite 4556 passed / 0 failed / 2 skipped"
         ],
         "deploys": [],
         "notes": [
-          "Classifier only. AUTO_SAFE/REVIEW/BLOCKED/UNKNOWN, fail-closed. No executor: AST test asserts no removal call, no shutil import; git helper raises on non-read-only subcommands and on --force. Observe_only default. Live scan of 21 real worktrees: 18 BLOCKED, 3 REVIEW, 0 actionable. Branch unmerged, not deployed."
+          "Classifier only. AUTO_SAFE/REVIEW/BLOCKED/UNKNOWN, fail-closed. No executor: AST test asserts no removal call, no shutil import; git helper raises on non-read-only subcommands and on --force. Observe_only default. Live scan of 21 real worktrees: 18 BLOCKED, 3 REVIEW, 0 actionable. Branch unmerged, not deployed.",
+          "INTEGRATION FOLLOW-UP for janitor P0: this was recorded DONE while the code existed only on a branch. It is now merged into main via the p5 stack tip; the earlier branch-only evidence remains above."
         ]
       },
       "history": [
@@ -2494,6 +2527,13 @@
           "by": "claude-opus5-session-01FH4tRd",
           "verified_by": "evidence",
           "queue_task_id": null
+        },
+        {
+          "at": "2026-09-15T04:51:14.999346+00:00",
+          "event": "completed",
+          "by": "m2-integrate",
+          "verified_by": "evidence",
+          "queue_task_id": null
         }
       ]
     },
@@ -2506,7 +2546,7 @@
       "type": "feature",
       "order": 46,
       "created_at": "2026-09-14T04:28:09.474344+00:00",
-      "updated_at": "2026-09-14T13:14:48.706005+00:00",
+      "updated_at": "2026-09-15T04:51:15.050056+00:00",
       "source": "analysis-gate",
       "dependencies": [
         "blg_349fb9e08b4f"
@@ -2533,14 +2573,16 @@
       "blocked_reason": null,
       "evidence": {
         "commits": [
-          "d0c57a5 (P1 base, by m1) + 662f1f8f25307a11ad7c5569361fb11318d64ba6 (AC4/AC5b gaps) on feat/worktree-janitor-p1, NOT merged"
+          "d0c57a5 (P1 base, by m1) + 662f1f8f25307a11ad7c5569361fb11318d64ba6 (AC4/AC5b gaps) on feat/worktree-janitor-p1, NOT merged",
+          "8a60235 (merge integrate/lane-a)"
         ],
         "tests": [
           "targeted tests/test_worktree_cleanup_p1.py 42 passed; regressions 328 passed across queue_store/phase2/engine/persist, coordinator + remote_repo_evidence, git_worktree/isolation, event_bus/wiring/mcp"
         ],
         "deploys": [],
         "notes": [
-          "All 7 AC verified independently. AC4 root gap was vocabulary not plumbing: sink+idempotency_key already existed, the two types were missing from KNOWN_EVENT_TYPES and _EVENT_TYPE_BY_QUEUE_EVENT so every mark was dropped silently. AC5b checked BEFORE the cwd comparison so the refusal names the real cause. is_removed() counts only CLEANUP_DONE. Marking only - no classifier, no grace expiry, no executor, no delete, no --force."
+          "All 7 AC verified independently. AC4 root gap was vocabulary not plumbing: sink+idempotency_key already existed, the two types were missing from KNOWN_EVENT_TYPES and _EVENT_TYPE_BY_QUEUE_EVENT so every mark was dropped silently. AC5b checked BEFORE the cwd comparison so the refusal names the real cause. is_removed() counts only CLEANUP_DONE. Marking only - no classifier, no grace expiry, no executor, no delete, no --force.",
+          "INTEGRATION FOLLOW-UP for janitor P1: this was recorded DONE while the code existed only on a branch. It is now merged into main via the p5 stack tip; the earlier branch-only evidence remains above."
         ]
       },
       "history": [
@@ -2570,6 +2612,13 @@
           "by": "claude-opus5-session-01FH4tRd",
           "verified_by": "evidence",
           "queue_task_id": null
+        },
+        {
+          "at": "2026-09-15T04:51:15.050056+00:00",
+          "event": "completed",
+          "by": "m2-integrate",
+          "verified_by": "evidence",
+          "queue_task_id": null
         }
       ]
     },
@@ -2582,7 +2631,7 @@
       "type": "feature",
       "order": 47,
       "created_at": "2026-09-14T04:28:09.474372+00:00",
-      "updated_at": "2026-09-14T15:00:00.385709+00:00",
+      "updated_at": "2026-09-15T04:51:15.106162+00:00",
       "source": "analysis-gate",
       "dependencies": [
         "blg_cb4c52480ce6",
@@ -2611,14 +2660,16 @@
       "blocked_reason": null,
       "evidence": {
         "commits": [
-          "7151df262cdf9ab49a45964331b2c9b84ded240c on feat/worktree-janitor-p2 (merges P0 45c6dbb + P1 662f1f8), NOT merged to main"
+          "7151df262cdf9ab49a45964331b2c9b84ded240c on feat/worktree-janitor-p2 (merges P0 45c6dbb + P1 662f1f8), NOT merged to main",
+          "8a60235 (merge integrate/lane-a)"
         ],
         "tests": [
           "targeted tests/test_worktree_executor_p2.py 33 passed; regressions 436 passed; full suite 4631 passed / 0 failed / 2 skipped"
         ],
         "deploys": [],
         "notes": [
-          "All 8 AC verified. Executor: gate->lock->re-classify fresh->audit attempt->remove(force=False)->audit result->record->prune. Two independent gates (mode==auto_execute AND dry_run=False), dry_run defaults True. Fixed a real fail-open in _lock_granted caught by the concurrency test. Real directories really removed in tests. Branch unmerged, not deployed."
+          "All 8 AC verified. Executor: gate->lock->re-classify fresh->audit attempt->remove(force=False)->audit result->record->prune. Two independent gates (mode==auto_execute AND dry_run=False), dry_run defaults True. Fixed a real fail-open in _lock_granted caught by the concurrency test. Real directories really removed in tests. Branch unmerged, not deployed.",
+          "INTEGRATION FOLLOW-UP for janitor P2: this was recorded DONE while the code existed only on a branch. It is now merged into main via the p5 stack tip; the earlier branch-only evidence remains above."
         ]
       },
       "history": [
@@ -2648,6 +2699,13 @@
           "by": "claude-opus5-session-01FH4tRd",
           "verified_by": "evidence",
           "queue_task_id": null
+        },
+        {
+          "at": "2026-09-15T04:51:15.106162+00:00",
+          "event": "completed",
+          "by": "m2-integrate",
+          "verified_by": "evidence",
+          "queue_task_id": null
         }
       ]
     },
@@ -2660,7 +2718,7 @@
       "type": "feature",
       "order": 48,
       "created_at": "2026-09-14T04:28:09.474398+00:00",
-      "updated_at": "2026-09-14T16:00:57.116089+00:00",
+      "updated_at": "2026-09-15T04:51:15.157577+00:00",
       "source": "analysis-gate",
       "dependencies": [
         "blg_e0c7eabeaf72"
@@ -2687,14 +2745,16 @@
       "blocked_reason": null,
       "evidence": {
         "commits": [
-          "f2127a32d660ed870316581f59a71067b7e31b84 on feat/worktree-janitor-p3, NOT merged"
+          "f2127a32d660ed870316581f59a71067b7e31b84 on feat/worktree-janitor-p3, NOT merged",
+          "8a60235 (merge integrate/lane-a)"
         ],
         "tests": [
           "targeted tests/test_worktree_sweep_p3.py 33 passed; regressions 403 passed; full suite SERIAL 4664 passed / 0 failed / 2 skipped (an earlier concurrent run showed 2 failures, both proven environmental: literal tmux session name collision and an ephemeral-port TOCTOU race between two simultaneous suites)"
         ],
         "deploys": [],
         "notes": [
-          "Periodic sweep: daemon thread + stop Event + run_once + start/stop/is_alive/status, started in server_http only behind sweep_enabled (default off); run_once callable via MCP with the loop off. Orphans need N consecutive sightings AND a min age. Bounded by candidate count and wall clock. No sweep-wide lock. Fixed two real bugs found by their own tests: the claimed-set missed still-RUNNING tasks, and the converge half passed no probes so it was inert in production."
+          "Periodic sweep: daemon thread + stop Event + run_once + start/stop/is_alive/status, started in server_http only behind sweep_enabled (default off); run_once callable via MCP with the loop off. Orphans need N consecutive sightings AND a min age. Bounded by candidate count and wall clock. No sweep-wide lock. Fixed two real bugs found by their own tests: the claimed-set missed still-RUNNING tasks, and the converge half passed no probes so it was inert in production.",
+          "INTEGRATION FOLLOW-UP for janitor P3: this was recorded DONE while the code existed only on a branch. It is now merged into main via the p5 stack tip; the earlier branch-only evidence remains above."
         ]
       },
       "history": [
@@ -2724,6 +2784,13 @@
           "by": "claude-opus5-session-01FH4tRd",
           "verified_by": "evidence",
           "queue_task_id": null
+        },
+        {
+          "at": "2026-09-15T04:51:15.157577+00:00",
+          "event": "completed",
+          "by": "m2-integrate",
+          "verified_by": "evidence",
+          "queue_task_id": null
         }
       ]
     },
@@ -2736,7 +2803,7 @@
       "type": "feature",
       "order": 49,
       "created_at": "2026-09-14T04:28:09.474422+00:00",
-      "updated_at": "2026-09-14T20:04:52.815706+00:00",
+      "updated_at": "2026-09-15T04:51:15.210830+00:00",
       "source": "analysis-gate",
       "dependencies": [
         "blg_e0c7eabeaf72"
@@ -2763,14 +2830,16 @@
       "blocked_reason": null,
       "evidence": {
         "commits": [
-          "8642e1116ca16e4682a80da44803b50433d678c6 on feat/worktree-janitor-p4, NOT merged"
+          "8642e1116ca16e4682a80da44803b50433d678c6 on feat/worktree-janitor-p4, NOT merged",
+          "8a60235 (merge integrate/lane-a)"
         ],
         "tests": [
           "targeted tests/test_worktree_multinode_p4.py 30 passed; regressions 310 passed; full suite 4685 passed with 9 failures in dashboard_multinode_sessions/dashboard_nodes, all proven concurrency artifacts -- the same 51 tests pass 51/51 on re-run (literal tmux session names + bind(port 0) reuse make this suite unsafe to run alongside itself)"
         ],
         "deploys": [],
         "notes": [
-          "Node-agent GET /v1/worktree/candidates + POST /v1/worktree/cleanup, authenticated, refusals as 200+code. expected_head/expected_branch refuse a stale controller view. NodeClient protocol + LocalNodeClient + RemoteNodeClient; local and remote run identical engine code. Router has no removal primitive (AST-asserted) and never constructs an executor. NODE_UNREACHABLE vs NODE_LACKS_WORKTREE_JANITOR distinguished; unreachable => REVIEW, never a local fallback. Fixed the third instance of the missing-probes bug by adding one shared collect_local_probes(). Windows-locked-dir case reproduced on POSIX only -- real Windows still unverified (dell-5530 on 0.12.0)."
+          "Node-agent GET /v1/worktree/candidates + POST /v1/worktree/cleanup, authenticated, refusals as 200+code. expected_head/expected_branch refuse a stale controller view. NodeClient protocol + LocalNodeClient + RemoteNodeClient; local and remote run identical engine code. Router has no removal primitive (AST-asserted) and never constructs an executor. NODE_UNREACHABLE vs NODE_LACKS_WORKTREE_JANITOR distinguished; unreachable => REVIEW, never a local fallback. Fixed the third instance of the missing-probes bug by adding one shared collect_local_probes(). Windows-locked-dir case reproduced on POSIX only -- real Windows still unverified (dell-5530 on 0.12.0).",
+          "INTEGRATION FOLLOW-UP for janitor P4: this was recorded DONE while the code existed only on a branch. It is now merged into main via the p5 stack tip; the earlier branch-only evidence remains above."
         ]
       },
       "history": [
@@ -2800,6 +2869,13 @@
           "by": "claude-opus5-session-01FH4tRd",
           "verified_by": "evidence",
           "queue_task_id": null
+        },
+        {
+          "at": "2026-09-15T04:51:15.210830+00:00",
+          "event": "completed",
+          "by": "m2-integrate",
+          "verified_by": "evidence",
+          "queue_task_id": null
         }
       ]
     },
@@ -2807,12 +2883,12 @@
       "id": "blg_068815a02285",
       "title": "Worktree Janitor P5: review queue, dashboard panel and report API",
       "description": "Operator surface: review queue, alerts, and API. Nothing is auto-removed by this task.\n\nDashboard (dashboard.py, following its existing route + test-pinned-inventory convention --\ntests/test_dashboard.py's route dict is authoritative, update it):\n- GET /dashboard/api/worktrees -> per-node candidate list with policy_class, reasons,\n  size, age, owning task, and the evidence summary.\n- POST /dashboard/api/worktrees/review -> approve|abandon a REVIEW item (CSRF + auth like\n  every other mutating dashboard route), recorded with the acting identity in audit.actor.\n- A panel showing totals: reclaimable bytes by class, count BLOCKED with reasons, oldest\n  candidate, and a clear 'observe_only' badge when the feature is not enforcing.\n\nRules: the UI must make BLOCKED reasons legible (an operator has to understand WHY, e.g.\n'unmerged and not pushed', 'holds a .env'), must never offer a force option, and must show\npaths only -- never contents of a valuable ignored file.\n\nMCP: terminal_worktree_janitor_report(node='') for the same data.\n\nDoD: dashboard route tests (the pinned route inventory updated deliberately); a REVIEW item\ncan be approved and then becomes eligible; abandon marks CLEANUP_ABANDONED and stops\nre-proposing it; no force affordance exists anywhere in the UI or API; unauthenticated and\nCSRF-less requests are refused exactly like sibling routes.",
-      "status": "IN_PROGRESS",
+      "status": "DONE",
       "priority": "P2",
       "type": "feature",
       "order": 50,
       "created_at": "2026-09-14T04:28:09.474462+00:00",
-      "updated_at": "2026-09-14T19:48:31.575485+00:00",
+      "updated_at": "2026-09-15T04:47:36.692934+00:00",
       "source": "analysis-gate",
       "dependencies": [
         "blg_cb4c52480ce6"
@@ -2838,10 +2914,16 @@
       "worktree": null,
       "blocked_reason": null,
       "evidence": {
-        "commits": [],
-        "tests": [],
+        "commits": [
+          "8a60235 (merge integrate/lane-a) / 3bd2831 (feat/worktree-janitor-p5)"
+        ],
+        "tests": [
+          "test_worktree_review_p5 48 passed; full janitor set 54+42+33+33+30+48; transports 5; dashboard 122; coordinator 51; queue_store 79"
+        ],
         "deploys": [],
-        "notes": []
+        "notes": [
+          "Integrated into main, not branch-only. p5 is the tip of a linear stack so this merge also put contract+P0..P4 in main for the first time -- those five were DONE on a branch-only basis."
+        ]
       },
       "history": [
         {
@@ -2863,6 +2945,13 @@
           "by": "claude-opus5-session-01FH4tRd",
           "session": "claude-wj-p5",
           "node_id": null
+        },
+        {
+          "at": "2026-09-15T04:47:36.692934+00:00",
+          "event": "completed",
+          "by": "m2-integrate",
+          "verified_by": "evidence",
+          "queue_task_id": null
         }
       ]
     },
@@ -2989,7 +3078,7 @@
       "type": "feature",
       "order": 53,
       "created_at": "2026-09-14T06:22:48.024073+00:00",
-      "updated_at": "2026-09-15T01:55:44.889859+00:00",
+      "updated_at": "2026-09-15T05:03:03.264348+00:00",
       "source": "analysis-gate",
       "dependencies": [],
       "acceptance_criteria": [
@@ -3014,12 +3103,14 @@
       "queue_task_id": null,
       "branch": "feat/prompt-delivery-gate",
       "worktree": null,
-      "blocked_reason": null,
+      "blocked_reason": "NOT merged in this pass: conflicts in queue_store.py (3 hunks) and config.py (4 hunks) with the worktree-janitor cleanup lifecycle, which hangs off the same queue_store chokepoint. Two features in one chokepoint is a reconciliation for the owning lane, not a mechanical merge.",
       "evidence": {
         "commits": [],
         "tests": [],
         "deploys": [],
-        "notes": []
+        "notes": [
+          "blg_f924acfb80f1 (03820efd0715) fixed an upstream false positive this item depends on: an activate-only send used to return SUBMIT_CONFIRMED with no Enter having taken effect. Any advisory-mode verdict distribution gathered BEFORE that commit overstates SUBMIT_CONFIRMED and must not be used as the pre-enforce baseline."
+        ]
       },
       "history": [
         {
@@ -3043,6 +3134,23 @@
             "branch",
             "status"
           ]
+        },
+        {
+          "at": "2026-09-15T04:51:28.031619+00:00",
+          "event": "updated",
+          "by": "m2-integrate",
+          "changed": [
+            "blocked_reason",
+            "branch"
+          ]
+        },
+        {
+          "at": "2026-09-15T05:03:03.264348+00:00",
+          "event": "updated",
+          "by": "claude-p1",
+          "changed": [
+            "evidence"
+          ]
         }
       ]
     },
@@ -3050,12 +3158,12 @@
       "id": "blg_8d65afc1b38b",
       "title": "Scheduler: auto-refill idle workers and reclaim stalled sessions",
       "description": "Scheduling is not work-conserving: READY backlog work coexists with genuinely idle compatible workers and nothing dispatches, so capacity is wasted and stale sessions hold worker slots indefinitely.\n\nOBSERVED (production, 2026-09-14):\n- supervisor loop running every 20s, but supervisor_status: watch_count=4, enabled_watch_count=0, stalled_count=2 -- i.e. zero enabled watches despite live workers.\n- watches stop silently via max_iterations_exceeded / manual_unwatch / target_missing, removing scheduling visibility from workers that are still alive.\n- linux1 finished implementation+tests and sits at an empty prompt.\n- hp3-work reported done and sits at an empty prompt.\n- hp1 stale ~35h, never reclaimed, still occupying a worker slot.\n- linux2/hp2 had ~1h-old activity while the UI still rendered composing/imagining.\n\nSCOPE:\n1. Worker state model distinguishing RUNNING, IDLE_READY, WAITING_INPUT, STALLED, BLOCKED, UNAVAILABLE/OFFLINE, RESERVED, UNKNOWN. Empty prompt after completion becomes IDLE_READY after a configurable 30-60s debounce. UNKNOWN must be re-probed, never permanent.\n2. Refill invariant: ready_compatible_tasks>0 && idle_compatible_workers>0 must not persist beyond a configurable refill SLA (default <=60s) without a persisted reason code (DEPENDENCY_BLOCKED, CAPABILITY_MISMATCH, RESERVED_FOR_HOTFIX, NODE_OFFLINE, CONCURRENCY_LIMIT, WORKTREE_CONFLICT, PERMISSION_DENIED).\n3. Watch lifecycle robustness: max_iterations_exceeded must not permanently remove worker coverage; target_missing must trigger rediscovery/reconciliation; manual unwatch stays respected but is recorded as intentional exclusion; supervisor restart rebuilds observation idempotently from persisted sessions.\n4. Stalled reclaim on MULTIPLE signals (tmux activity age, prompt state, output hash/no-progress, running child process, pending shell command, submit/activation state). Probe before reclaim; never reclaim on one weak signal; preserve a genuinely running child command; release lease exactly once with audit trail.\n5. Dispatch safety: capability matching preserved; no two tasks into one tmux session; delivery incomplete until SUBMIT_CONFIRMED/activation evidence; unconfirmed send returns task to READY without leaking a worker reservation; compare-and-swap/lease prevents double-claim.\n6. Observability: usable worker count, RUNNING/IDLE_READY/STALLED/BLOCKED/OFFLINE counts, READY task count, compatible-ready per worker, utilization %, idle-with-ready-work duration, last dispatch timestamp, non-dispatch reason, reclaimed count. The dashboard must make it obvious WHY a worker is idle.\n\nDEPENDENCIES:\n- blg_orch_no_workers_declared (IN_PROGRESS): capability_profiles has 0 rows, so pm_router returns NO_ELIGIBLE_WORKER for everything. Capability-routed refill cannot find candidates until profiles exist; refill must still work for non-capability-routed dispatch and must report CAPABILITY_MISMATCH as an explicit reason rather than failing silently.\n- Composes with blg_orch_scheduler (P1 cross-project portfolio scheduling) and blg_967d4e3aa293 (P3 deterministic portfolio scheduler); this item is single-project work-conservation and must not pre-empt their allocation model.\n- Interacts with blg_39f82cd2fe3a (prompt delivery/acceptance gate) for SUBMIT_CONFIRMED.",
-      "status": "IN_PROGRESS",
+      "status": "DONE",
       "priority": "P1",
       "type": "bug",
       "order": 54,
       "created_at": "2026-09-14T09:01:27.558658+00:00",
-      "updated_at": "2026-09-14T09:14:03.041503+00:00",
+      "updated_at": "2026-09-15T05:10:38.192576+00:00",
       "source": "claude-code",
       "dependencies": [
         "blg_orch_no_workers_declared"
@@ -3086,7 +3194,21 @@
       "branch": null,
       "worktree": null,
       "blocked_reason": null,
-      "evidence": "ROOT CAUSE CONFIRMED: supervisor.py disables watches for 7 reasons and called set_enabled(...,True) from NOWHERE in the codebase -- every disable was permanent. A watch that hit max_iterations while its worker kept working never came back, so live workers lost scheduling visibility forever. That is exactly watch_count=4/enabled=0.\n\nPHASE 1 COMMITTED: branch fix/scheduler-refill @ 02efdf5 (NOT merged, NOT deployed).\n  terminal_mcp/scheduler_health.py (new): worker state model (RUNNING/IDLE_READY/WAITING_INPUT/STALLED/BLOCKED/OFFLINE/RESERVED/UNKNOWN), multi-signal classify_worker with configurable idle debounce, may_reclaim requiring STALLED+high confidence, watch_recovery_action, evaluate_refill with reason codes, utilization_snapshot.\n  terminal_mcp/supervisor.py: reconcile_watches() + _target_alive() + store.reenable_watch/reset_iterations/note_reconcile_attempt, reconcile_attempts column, watch_reconciled event, enriched status (disabled/recoverable/intentional counts + per-watch reasons).\n  tests: test_scheduler_health.py (35), test_supervisor_reconcile.py (9). Regression 227 passed.\n\nBEFORE/AFTER on a COPY of the real supervisor.db (production not mutated):\n  BEFORE enabled=0/4 (recoverable=3, intentional=1)\n  AFTER  enabled=2/4 -- restored mcp-work + terminal-mcp-main (max_iterations_exceeded); left mesflow-dell (manual_unwatch, deliberate) and wtest (target still missing).\n\nSTILL OPEN (phase 2): the dispatch side. evaluate_refill decides and explains but nothing yet claims a lease, sends a prompt under the SUBMIT_CONFIRMED contract, or reclaims a STALLED session. Needs wiring into queue_engine's dispatch path; deserves its own review.",
+      "evidence": {
+        "notes": [
+          "ROOT CAUSE CONFIRMED: supervisor.py disables watches for 7 reasons and called set_enabled(...,True) from NOWHERE in the codebase -- every disable was permanent. A watch that hit max_iterations while its worker kept working never came back, so live workers lost scheduling visibility forever. That is exactly watch_count=4/enabled=0.\n\nPHASE 1 COMMITTED: branch fix/scheduler-refill @ 02efdf5 (NOT merged, NOT deployed).\n  terminal_mcp/scheduler_health.py (new): worker state model (RUNNING/IDLE_READY/WAITING_INPUT/STALLED/BLOCKED/OFFLINE/RESERVED/UNKNOWN), multi-signal classify_worker with configurable idle debounce, may_reclaim requiring STALLED+high confidence, watch_recovery_action, evaluate_refill with reason codes, utilization_snapshot.\n  terminal_mcp/supervisor.py: reconcile_watches() + _target_alive() + store.reenable_watch/reset_iterations/note_reconcile_attempt, reconcile_attempts column, watch_reconciled event, enriched status (disabled/recoverable/intentional counts + per-watch reasons).\n  tests: test_scheduler_health.py (35), test_supervisor_reconcile.py (9). Regression 227 passed.\n\nBEFORE/AFTER on a COPY of the real supervisor.db (production not mutated):\n  BEFORE enabled=0/4 (recoverable=3, intentional=1)\n  AFTER  enabled=2/4 -- restored mcp-work + terminal-mcp-main (max_iterations_exceeded); left mesflow-dell (manual_unwatch, deliberate) and wtest (target still missing).\n\nSTILL OPEN (phase 2): the dispatch side. evaluate_refill decides and explains but nothing yet claims a lease, sends a prompt under the SUBMIT_CONFIRMED contract, or reclaims a STALLED session. Needs wiring into queue_engine's dispatch path; deserves its own review.",
+          "Integrated into main. Closing this also required fixing backlog_service.complete(), which raised AttributeError on this very item because its evidence field was a plain string rather than a dict -- the ledger could not close its own row. Original evidence text preserved as a note.",
+          "Second half of this work integrated via integrate/lane-b: queue_event_drain (the loop now consumes the event bus instead of polling beside it) and the fleet-aware supervisor watch (a session is watched on its own node, not assumed visible to the controller)."
+        ],
+        "commits": [
+          "8a60235 (merge integrate/lane-a) / 719474a (fix/scheduler-refill)",
+          "88a201f"
+        ],
+        "tests": [
+          "scheduler + pm_router + worker_registry = 68 passed on the merged tree",
+          "wt-audit: test_queue_event_drain + test_scheduler_health + test_supervisor_fleet_watches + test_supervisor_reconcile + test_queue_engine + test_integration_engine = 139 passed, 4 skipped; test_supervisor_v2 42 passed; test_transports 5 passed (run separately -- these suites share ~/.local/state/terminal-mcp and cannot run back-to-back from two checkouts)"
+        ]
+      },
       "history": [
         {
           "at": "2026-09-14T09:01:27.558721+00:00",
@@ -3102,6 +3224,20 @@
             "evidence",
             "status"
           ]
+        },
+        {
+          "at": "2026-09-15T04:50:49.820887+00:00",
+          "event": "completed",
+          "by": "m2-integrate",
+          "verified_by": "evidence",
+          "queue_task_id": null
+        },
+        {
+          "at": "2026-09-15T05:10:38.192576+00:00",
+          "event": "completed",
+          "by": "m2-integrate",
+          "verified_by": "evidence",
+          "queue_task_id": null
         }
       ]
     },
@@ -3154,6 +3290,110 @@
           "event": "blocked",
           "by": "m2-cleanup",
           "reason": "Blocked on the single dell-5530 maintenance window (blg_f52a999971d9). That node hosts live ConPTY sessions which are in-process children of its agent and do not survive a restart by design, so token rotation, Scheduled Task re-parenting, direct-send re-verification and session recovery all have to ride the same window. Not duplicates: each has its own deliverable."
+        }
+      ]
+    },
+    {
+      "id": "blg_be3fd1e5169d",
+      "title": "Retire or implement the dead PromptTransport Protocol -- one pipeline, one vocabulary",
+      "description": "terminal_mcp/prompt_transport.py declares a PromptTransport Protocol whose stages\n(prepare/write/verify/activate/prove_accepted/observe/cancel) and PROMPT_SUBMISSION_* states mirror\nthe pipeline core.py actually runs -- but TmuxPromptTransport.activate() and .prove_accepted() raise\nNotImplementedError, and the module's own docstring says \"Nothing in this project currently calls\nthrough this Protocol -- core.py's tmux pipeline is untouched and remains the only live path.\"\n\nSo the repo holds two vocabularies for one pipeline, one of which cannot run. That is the parallel\nstate machine the acceptance work was told not to create, already present and predating it. A reader\ndebugging a submission can land in the dead one and reason about states nothing emits.\n\nDecide and act: either implement it as the real seam and move core.py's send path behind it, or\ndelete it. Do not leave it half-alive. Deleting is the cheaper honest option unless a second\ntransport (remote node, non-tmux target) is actually planned.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "chore",
+      "order": 56,
+      "created_at": "2026-09-15T05:03:02.943502+00:00",
+      "updated_at": "2026-09-15T05:03:02.943516+00:00",
+      "source": "claude-p1",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "prompt_transport.py either has no NotImplementedError stages and is on the live path, or is gone",
+        "Exactly one set of stage names describes prompt submission in the repo",
+        "docs/prompt-submission.md names the surviving vocabulary"
+      ],
+      "tags": [
+        "prompt-delivery",
+        "tech-debt"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-15T05:03:02.943555+00:00",
+          "event": "created",
+          "by": "claude-p1"
+        }
+      ]
+    },
+    {
+      "id": "blg_f924acfb80f1",
+      "title": "Prompt acceptance: an activate-only send must not confirm a submission that never happened",
+      "description": "An activate-only send -- terminal_send_text(\"\", press_enter=True) -- reported\nSUBMIT_CONFIRMED for a submission that never happened.\n\nMEASURED on hp-linux (session p1repro-hp, 2026-09-15) against the deployed build:\n  composer empty, agent idle\n  terminal_send_text(\"\", press_enter=True) -> delivery_state: SUBMIT_CONFIRMED\n  pane afterwards: byte-identical, composer still empty\nand, with a turn already running, three consecutive activate-only calls each returned\nSUBMIT_CONFIRMED while the pane only ever showed \"Press up to edit queued messages\".\n\nROOT CAUSE: _sent_text_echoed treats an empty sent_text as trivially satisfied. That is\ncorrect for a caller with genuinely nothing to attribute, and wrong for an activate-only\nsend, which has something to attribute -- the composer's own content. Passing \"\" removed\nthe busy-window guard entirely, leaving a spinner tick sufficient to confirm.\n\nSHIPPED:\n1. VERIFY_TEXT runs BEFORE ACTIVATE. An empty composer with no text to send has nothing to\n   submit, so the Enter is withheld entirely; the call returns DELIVERY_UNKNOWN with\n   submit_outcome NOTHING_TO_SUBMIT, stage VERIFY_TEXT, activation_attempts 0. The ordering\n   is the fix: a gate placed after the keystroke would only report honestly about an Enter\n   it had already fired.\n2. An activate-only send with a full composer attributes that composer's text as the echo\n   to require -- the same rule the bare-Enter path already used.\n3. classify_remote_failure() in submit_flow: REMOTE_TIMEOUT / REMOTE_TRANSPORT_FAILED /\n   REMOTE_NODE_UNREACHABLE are retryable; REMOTE_SESSION_GONE / REMOTE_INPUT_DENIED /\n   REMOTE_UNKNOWN are not. Not knowing what happened is not evidence that retrying is safe.\n   It lives beside the existing states rather than as a second state model, carries node_id\n   and session, reads only error/reason/detail, and never touches a prompt field.\n4. docs/prompt-submission.md carries the contract, the measured failure, the Claude/Codex\n   split and an operator troubleshooting table.\n\nNOT DONE HERE, deliberately: terminal_mcp/prompt_transport.py still holds an unused\nPromptTransport Protocol whose activate()/prove_accepted() raise NotImplementedError and\nwhose own docstring says nothing calls through it. It duplicates this pipeline's stage\nvocabulary. Consolidating or deleting it is follow-up work -- see blg_be3fd1e5169d.",
+      "status": "DONE",
+      "priority": "P1",
+      "type": "bug",
+      "order": 57,
+      "created_at": "2026-09-15T05:03:03.051515+00:00",
+      "updated_at": "2026-09-15T05:03:03.159838+00:00",
+      "source": "claude-p1",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "An activate-only send into an empty composer sends no Enter and never reports SUBMIT_CONFIRMED",
+        "An activate-only send into a full composer requires that composer's text as the echo",
+        "A spinner tick or a bare pane diff cannot confirm a submission",
+        "A genuine submit still confirms -- the fix introduces no false negative",
+        "Claude receives exactly one Enter; Codex's multi-enter retry stays gated on adapter.name",
+        "Remote failures classify into distinct retryable/non-retryable states carrying node_id and session",
+        "No audit field carries prompt content",
+        "Merged into local main with the transport/session/supervisor suites green"
+      ],
+      "tags": [
+        "prompt-delivery",
+        "acceptance-gate",
+        "reliability",
+        "claude-adapter"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": "fix/submit-acceptance-p1",
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [
+          "03820efd07159246a42dfaf9ca5a1c3c7af5e441"
+        ],
+        "tests": [
+          "115 passed: test_submit_acceptance_p1 (25 new) + submit_flow_p0 + adapters + submit_config_wiring + submit_profiles + verified_submit_watchdog; broader transport/session/supervisor selection 1183 passed, 2 failures classified pre-existing/env (worktree has no .venv; both pass in the main checkout)"
+        ],
+        "deploys": [],
+        "notes": [
+          "Reproduced live on hp-linux before the fix; the repro is quoted in tests/test_submit_acceptance_p1.py's module docstring so the failure cannot be lost if the fix is ever reverted."
+        ]
+      },
+      "history": [
+        {
+          "at": "2026-09-15T05:03:03.051647+00:00",
+          "event": "created",
+          "by": "claude-p1"
+        },
+        {
+          "at": "2026-09-15T05:03:03.159838+00:00",
+          "event": "completed",
+          "by": "claude-p1",
+          "verified_by": "evidence",
+          "queue_task_id": null
         }
       ]
     }

@@ -145,7 +145,8 @@ class QueueService:
             return error
         if not prompt:
             return {"error": "TASK_PROMPT_REQUIRED"}
-        if existing := self._existing_for_request(request_key):
+        if existing := self._existing_for_request(
+                request_key, payload={"prompt": prompt, "session": session}):
             return existing
         task = {"prompt": prompt, "title": title or "", "priority": priority,
                 "metadata": metadata or {}, "request_key": request_key or None}
@@ -164,23 +165,51 @@ class QueueService:
         accepted["deduplicated"] = False
         return accepted
 
-    def _existing_for_request(self, request_key: str | None) -> dict[str, Any] | None:
+    def _existing_for_request(self, request_key: str | None, *,
+                              payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """The answer a previous call with this key already produced.
 
         A retry gets the SAME task_id and its CURRENT state, flagged
         `deduplicated` so a caller can tell a fresh accept from a replay
         without having to compare timestamps.
+
+        `payload`, when given, is compared against what was actually stored
+        under this key. A retry with a DIFFERENT payload still gets the
+        original task -- the key's whole job is that one request produces one
+        task, and inventing a second one here would be the duplicate this
+        exists to prevent. But it comes back with `payload_conflict: True` and
+        the fields that differ, because silently answering a changed request
+        with the old task is how a caller comes to believe it submitted
+        something it did not. The task is idempotent; the caller is told.
         """
         if not request_key:
             return None
         found = self.store.task_by_request_key(request_key)
         if found is None:
             return None
-        return {"status": "TASK_ACCEPTED", "task_id": found["id"],
-                "session": found["session"],
-                "queue_position": self.store.queue_position(found["id"]),
-                "request_key": request_key, "deduplicated": True,
-                "task_status": found["status"]}
+        answer = {"status": "TASK_ACCEPTED", "task_id": found["id"],
+                  "session": found["session"],
+                  "queue_position": self.store.queue_position(found["id"]),
+                  "request_key": request_key, "deduplicated": True,
+                  "task_status": found["status"]}
+        if payload:
+            # `project` is persisted into metadata, not the project_id column
+            # (create_task puts it there); comparing the column would report a
+            # conflict on every project-tagged replay.
+            stored = dict(found)
+            stored["project"] = (found.get("metadata") or {}).get("project")
+            differing = sorted(
+                field for field, value in payload.items()
+                if value is not None and str(value) != str(stored.get(field) or "")
+            )
+            if differing:
+                answer["payload_conflict"] = True
+                answer["conflicting_fields"] = differing
+                answer["conflict_detail"] = (
+                    f"request_key {request_key!r} was already used for task "
+                    f"{found['id']} with a different {', '.join(differing)}; "
+                    f"returning the original task rather than creating a second one")
+        return answer
 
     def _accepted(self, session: str, task_id: str) -> dict[str, Any]:
         return {"task_id": task_id, "session": session, "queue_position": self.store.queue_position(task_id)}
@@ -212,7 +241,9 @@ class QueueService:
         # Checked BEFORE any validation or side effect: a retry must return
         # the original answer even if the world has since changed in a way
         # that would make a fresh create fail.
-        if existing := self._existing_for_request(request_key):
+        if existing := self._existing_for_request(
+                request_key,
+                payload={"prompt": prompt, "title": title, "project": project}):
             return existing
         full_metadata = dict(metadata or {})
         if project:
