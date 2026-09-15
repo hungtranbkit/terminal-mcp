@@ -9,8 +9,8 @@
     "git_branch": "main",
     "is_portable": true
   },
-  "revision": 90,
-  "updated_at": "2026-09-15T05:12:54.405970+00:00",
+  "revision": 91,
+  "updated_at": "2026-09-15T05:14:58.120325+00:00",
   "items": [
     {
       "id": "blg_f52a999971d9",
@@ -3431,6 +3431,44 @@
       "history": [
         {
           "at": "2026-09-15T05:12:48.238647+00:00",
+          "event": "created",
+          "by": "m2-integrate"
+        }
+      ]
+    },
+    {
+      "id": "blg_a40cc780b549",
+      "title": "Converge the dell-linux clone: commits preserved, three duplicate-effort pairs need a decision",
+      "description": "docs/REPO_TOPOLOGY_AUDIT.md (merged at a728566) found that dell-linux:/home/dell/workspace/terminal-mcp is a genuinely separate clone whose branch tips existed neither in the canonical object store nor on origin.\n\nSTEP 1 IS DONE, and it was the only urgent part: `git remote add dell dell-linux:/home/dell/workspace/terminal-mcp && git fetch dell` has copied those commits into the canonical object store. Nothing was merged and no branch moved -- the commits simply now exist in more than one place. 14 commits across 6 branches are still unmerged here:\n  dell/bench/efficiency-benchmark-harness      6\n  dell/p0/dell-selfhost-converged              4  (content already in main; the 4 are merges)\n  dell/audit/ai-usage-contract                 1\n  dell/feat/impl-contract-analysis-gate        1\n  dell/feat/orch-worker-capability-profiles    1\n  dell/fix/doctor-effective-lan-bind           1\n\nWHAT IS LEFT IS A SET OF DECISIONS, NOT A MERGE. Three of these solve problems main has already solved a different way, and merging both implementations of one problem is how a project ends up with two:\n  - bench/efficiency-benchmark-harness  vs  the merged efficiency_benchmark.py\n  - fix/doctor-effective-lan-bind       vs  the merged fix/doctor-lan-truth (8f3d2fa)\n  - feat/orch-worker-capability-profiles vs the merged capability_probe.py\n\nOnly dell/audit/ai-usage-contract is clean to take as-is: it adds a test plus a fixture and has no canonical counterpart. dell/p0/dell-selfhost-converged needs nothing.\n\nAlso fetched and worth a look: dell/fix/session-registry-test-isolation, which is adjacent to blg_80635ab65719 (production session_registry polluted with test rows).",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "feature",
+      "order": 59,
+      "created_at": "2026-09-15T05:14:47.770367+00:00",
+      "updated_at": "2026-09-15T05:14:47.770382+00:00",
+      "source": "m2-integrate",
+      "dependencies": [],
+      "acceptance_criteria": [],
+      "tags": [
+        "integration",
+        "repo-topology"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-15T05:14:47.770421+00:00",
           "event": "created",
           "by": "m2-integrate"
         }
