@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -104,6 +103,16 @@ func installService() error {
 // broken one cannot hold the installer open indefinitely.
 const serviceStartTimeout = 30 * time.Second
 
+// restrictTokenACL applies the SAME ACL the installer applies to
+// node.token: inheritance broken, read for SYSTEM and Administrators, and
+// nothing for anyone else. Go's chmod cannot express this on Windows -- it
+// only toggles the read-only bit -- which is why the secret must not live
+// in a file protected by mode alone.
+func restrictTokenACL(path string) error {
+	return runCommandTimeout(15*time.Second, "icacls.exe", path,
+		"/inheritance:r", "/grant", "SYSTEM:(R)", "/grant", "Administrators:(R)")
+}
+
 // serviceState returns SCM's own word for the service state ("RUNNING",
 // "STOPPED", ...) or "" when it cannot be determined. Read-only: it never
 // creates or changes anything, so it is safe to call before deciding.
@@ -143,13 +152,30 @@ func removeService() error {
 // is already tested, deployed and hardened. Rewriting those stages in Go
 // would double the surface and halve the confidence.
 func runStages(controller, extraArg string) error {
+	_, err := runStagesBounded(controller, extraArg, installerTimeout)
+	return err
+}
+
+// runStagesBounded runs windows-setup.ps1 and returns its EXIT CODE.
+//
+// Three things it fixes beyond the timeout:
+//
+//	stdin   the child used to inherit no stdin at all, so the script's
+//	        Wait-BeforeClosing did `Read-Host`, threw, and fell into its
+//	        `catch { Start-Sleep -Seconds 60 }`. A helper that is not a
+//	        human waited a silent minute on every failure. Feeding it
+//	        newlines makes Read-Host return at once on every path.
+//	exit    the code is returned rather than flattened to error/no-error,
+//	        so the caller can report WHICH failure happened.
+//	output  stdout/stderr still go to this console for the operator, and
+//	        are deliberately NOT captured for upload: the installer prints
+//	        controller URLs, key material paths and other things that have
+//	        no business in a progress report.
+func runStagesBounded(controller, extraArg string, limit time.Duration) (int, error) {
 	script := filepath.Join(programDataDir(), "windows-setup.ps1")
 	args := []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script}
 	if extraArg != "" {
 		args = append(args, extraArg)
 	}
-	command := exec.Command("powershell.exe", args...)
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	return command.Run()
+	return runBoundedCommand(limit, newlineFeeder(), "powershell.exe", args...)
 }
