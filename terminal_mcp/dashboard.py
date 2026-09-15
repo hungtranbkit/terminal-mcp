@@ -9916,6 +9916,29 @@ AI_USAGE_HTML = """<!doctype html>
       return box;
     }
 
+    // How full the model's context is. This is NOT the subscription quota --
+    // that lives in quotaPill and is `unavailable` because no local artefact
+    // reports it. Context fullness is computed from provider-reported token
+    // counts against a window resolved from the model id, so it is shown only
+    // when that window is known; every other case is N/A with the reason on
+    // hover, never a number.
+    function contextPill(context) {
+      if (!context) return el('span', {className: 'pill na', text: '—'});
+      if (context.used_percent == null) {
+        const pill = el('span', {className: 'pill na',
+          text: context.used ? 'N/A · ' + short(context.used) : 'N/A'});
+        if (context.detail) pill.title = context.detail;
+        return pill;
+      }
+      const pct = Math.round(context.used_percent);
+      // Only classes this page actually defines: `warn` is the red one here.
+      const cls = pct >= 80 ? 'pill warn' : 'pill rep';
+      const pill = el('span', {className: cls,
+        text: pct + '% · ' + short(context.used) + '/' + short(context.window)});
+      pill.title = context.detail || '';
+      return pill;
+    }
+
     function quotaPill(window) {
       const state_ = window.state || (window.observed ? 'provider_reported' : 'unavailable');
       if (state_ === 'provider_reported') {
@@ -10002,6 +10025,7 @@ AI_USAGE_HTML = """<!doctype html>
           {title: '7d', key: 'tokens_7d', render: (r) => short(r.tokens_7d)},
           {title: 'Requests', key: 'requests', render: (r) => fmt(r.requests)},
           {title: 'TB/req', key: 'avg_tokens_per_request', render: (r) => fmt(r.avg_tokens_per_request)},
+          {title: 'Context', left: true, render: (r) => contextPill(r.context)},
           {title: 'Chi phí', key: 'estimated_cost_usd', render: (r) => usd(r.estimated_cost_usd)},
           {title: 'Quota 5h', left: true, render: () => quotaPill(quotaFor('5h') || {})},
           {title: 'Quota 1w', left: true, render: () => quotaPill(quotaFor('1w') || {})},
