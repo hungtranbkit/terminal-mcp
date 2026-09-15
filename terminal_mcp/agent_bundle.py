@@ -49,7 +49,8 @@ BUNDLE_NAME = "terminal-mcp-node-agent.zip"
 
 # Everything the install script touches, and nothing else. Paths are
 # relative to the repository root and are copied verbatim.
-BUNDLE_FILES = ("pyproject.toml", "config.example.yaml", "deploy/install-node-agent.ps1")
+BUNDLE_FILES = ("pyproject.toml", "config.example.yaml", "deploy/install-node-agent.ps1",
+                 "deploy/node-agent-config.yaml")
 BUNDLE_PACKAGE = "terminal_mcp"
 
 # Excluded from the package copy: bytecode and caches are rebuilt on the
