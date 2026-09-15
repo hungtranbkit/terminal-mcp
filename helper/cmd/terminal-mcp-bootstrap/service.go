@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/hungtranbkit/terminal-mcp/helper/internal/proto"
 )
@@ -134,9 +135,25 @@ func handleLooksValid(handle string) bool {
 // "credentials are already on disk" path. Nothing from the payload is
 // passed on a command line, where it would be visible to any process
 // listing on the machine.
+// installerTimeout bounds the whole install. Generous on purpose: an
+// ai_coding profile installs OpenSSH, winget packages and npm CLIs, which
+// legitimately takes many minutes on a cold machine. This is a backstop
+// against a wedged child, not a performance budget.
+const installerTimeout = 45 * time.Minute
+
 func continueSession(handle, controller string) error {
 	report := newReporter(controller, handle)
 	report.report(stageHelperStarted)
+
+	// Repair what an older helper build may have left here: a node.json
+	// with the token embedded and no node.token beside it. Done before
+	// anything else so a machine that already has the bad pair is fixed
+	// even on a run that later fails for an unrelated reason.
+	if migrated, err := sanitizeExistingNodeConfig(); err != nil {
+		fmt.Fprintf(os.Stderr, "      ! could not sanitise the existing node config: %v\n", err)
+	} else if migrated {
+		fmt.Println("recovered the node token from an older node.json and tightened it")
+	}
 
 	report.report(stageRedeeming)
 	hostname, _ := os.Hostname()
@@ -150,21 +167,18 @@ func continueSession(handle, controller string) error {
 	}
 	report.report(stageRedeemed)
 
-	// Persist before anything else can fail: a payload fetched and then
-	// lost is a spent, single-use pairing with nothing to show for it.
-	raw, err := json.MarshalIndent(payload, "", "  ")
+	// Split the response into exactly what the installer's own first run
+	// leaves on disk. Writing the raw payload here is what broke -Repair:
+	// it gates on node.token existing, and the old code never wrote one.
+	config, token, err := canonicalNodeConfig(payload, controller)
 	if err != nil {
 		report.fail(failServiceInstall)
-		return fmt.Errorf("encode bootstrap payload: %w", err)
+		return fmt.Errorf("bootstrap payload: %w", err)
 	}
 	report.report(stageInstallingService)
-	if err := os.MkdirAll(programDataDir(), 0o700); err != nil {
+	if err := persistNodeConfig(config, token); err != nil {
 		report.fail(failServiceInstall)
-		return fmt.Errorf("create state directory: %w", err)
-	}
-	if err := writeAtomic(nodeConfigPath(), raw, 0o600); err != nil {
-		report.fail(failServiceInstall)
-		return fmt.Errorf("write bootstrap payload: %w", err)
+		return fmt.Errorf("persist node config: %w", err)
 	}
 
 	if err := downloadSetupScript(controller); err != nil {
@@ -172,9 +186,14 @@ func continueSession(handle, controller string) error {
 		return fmt.Errorf("download setup script: %w", err)
 	}
 
+	// -Repair, deliberately: this helper has ALREADY consumed the
+	// enrollment and owns the issued config, so the installer must reuse
+	// what is on disk rather than try to enrol a second time with a
+	// pairing that is now spent.
 	report.report(stageLaunchingSetup)
-	if err := runStages(controller, "-Repair"); err != nil {
-		report.fail(failSetupLaunch)
+	code, err := runStagesBounded(controller, "-Repair", installerTimeout)
+	if err != nil {
+		report.failWithCode(failSetupLaunch, code)
 		return fmt.Errorf("run setup: %w", err)
 	}
 	// The installer has taken over and reports its own stages from here;
