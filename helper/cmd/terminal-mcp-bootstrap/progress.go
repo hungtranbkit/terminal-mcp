@@ -81,11 +81,28 @@ func (r *reporter) report(stage string) {
 	if r == nil || r.handle == "" || r.controller == "" {
 		return
 	}
-	body, err := json.Marshal(map[string]any{
+	r.reportWithCode(stage, "", 0)
+}
+
+// reportWithCode is report() plus the optional failure detail. The extra
+// keys are additive: the controller reads stage/handle/elapsed_seconds and
+// ignores the rest, so an older controller accepts this body unchanged.
+func (r *reporter) reportWithCode(stage string, code string, exitCode int) {
+	if r == nil || r.handle == "" || r.controller == "" {
+		return
+	}
+	fields := map[string]any{
 		"handle":          r.handle,
 		"stage":           stage,
 		"elapsed_seconds": int(time.Since(progressStart).Seconds()),
-	})
+	}
+	if code != "" {
+		fields["code"] = code
+	}
+	if exitCode != 0 {
+		fields["exit_code"] = exitCode
+	}
+	body, err := json.Marshal(fields)
 	if err != nil {
 		return
 	}
@@ -111,7 +128,16 @@ func (r *reporter) report(stage string) {
 // closed set above, never built from an error value.
 func (r *reporter) fail(code string) {
 	fmt.Fprintf(os.Stderr, "terminal-mcp-bootstrap: failed (%s)\n", code)
-	r.report(stageFailed)
+	r.reportWithCode(stageFailed, code, 0)
+}
+
+// failWithCode adds the installer's own exit status. Reported as a small
+// integer and a code from the closed set above -- never the installer's
+// output, which prints controller URLs and key paths that have no business
+// in a progress report.
+func (r *reporter) failWithCode(code string, exitCode int) {
+	fmt.Fprintf(os.Stderr, "terminal-mcp-bootstrap: failed (%s, installer exit %d)\n", code, exitCode)
+	r.reportWithCode(stageFailed, code, exitCode)
 }
 
 // redeemHandle exchanges the one-time pairing handle for the bootstrap

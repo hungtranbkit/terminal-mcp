@@ -219,3 +219,79 @@ func TestRepeatedReportsAreIdempotentFromTheHelperSide(t *testing.T) {
 		t.Fatalf("want both reports sent, got %d", got)
 	}
 }
+
+// -- failure detail on the wire ---------------------------------------------
+
+func TestAPlainStageCarriesNoFailureDetail(t *testing.T) {
+	// Backward compatibility: a normal stage report is byte-for-byte the
+	// body an older controller already accepts.
+	rc := newRecordingController(t)
+	newReporter(rc.server.URL, testHandle).report(stageRedeeming)
+
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	entry := rc.progress[0]
+	for _, key := range []string{"code", "exit_code"} {
+		if _, present := entry[key]; present {
+			t.Fatalf("a plain stage must not carry %q", key)
+		}
+	}
+	for _, key := range []string{"handle", "stage", "elapsed_seconds"} {
+		if _, present := entry[key]; !present {
+			t.Fatalf("a plain stage must still carry %q", key)
+		}
+	}
+}
+
+func TestAFailureCarriesItsCodeSoTheReasonLeavesTheMachine(t *testing.T) {
+	// The gap this closes: fail() used to send stage=failed alone, so the
+	// Dashboard could say "failed" and never why.
+	rc := newRecordingController(t)
+	newReporter(rc.server.URL, testHandle).fail(failScriptDownload)
+
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	entry := rc.progress[0]
+	if asString(entry["stage"]) != stageFailed {
+		t.Fatalf("stage = %v", entry["stage"])
+	}
+	if asString(entry["code"]) != failScriptDownload {
+		t.Fatalf("code = %v, want %q", entry["code"], failScriptDownload)
+	}
+}
+
+func TestAnInstallerFailureCarriesItsExitCode(t *testing.T) {
+	rc := newRecordingController(t)
+	newReporter(rc.server.URL, testHandle).failWithCode(failSetupLaunch, 3)
+
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	entry := rc.progress[0]
+	if asString(entry["code"]) != failSetupLaunch {
+		t.Fatalf("code = %v", entry["code"])
+	}
+	exit, ok := entry["exit_code"].(float64) // JSON numbers decode as float64
+	if !ok || int(exit) != 3 {
+		t.Fatalf("exit_code = %v, want 3", entry["exit_code"])
+	}
+}
+
+func TestAFailureReportStillCarriesNoCredentialOrOutput(t *testing.T) {
+	// The installer prints controller URLs and key paths. None of it may
+	// ride along with the failure code.
+	rc := newRecordingController(t)
+	newReporter(rc.server.URL, testHandle).failWithCode(failSetupLaunch, 1)
+
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	entry := rc.progress[0]
+	for _, banned := range []string{"output", "stdout", "stderr", "detail", "message", "token", "node_token"} {
+		if _, present := entry[banned]; present {
+			t.Fatalf("a failure report must not carry %q", banned)
+		}
+	}
+	// Exactly five keys at most: handle, stage, elapsed_seconds, code, exit_code.
+	if len(entry) > 5 {
+		t.Fatalf("unexpected fields in a failure report: %v", entry)
+	}
+}
