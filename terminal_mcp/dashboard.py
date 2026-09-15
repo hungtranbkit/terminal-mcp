@@ -12115,6 +12115,16 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                                 headers={"Cache-Control": "no-store"}), None
         return None, identity
 
+    def _queue_store_for_worktrees():
+        """The SAME QueueStore the queue uses -- the cleanup record lives on the
+        task's own metadata, so a second store would write to a different file
+        and the review would appear to do nothing."""
+        from .queue_store import QueueStore
+
+        if queue is not None and getattr(queue, "store", None) is not None:
+            return queue.store
+        return QueueStore()
+
     def _mutation_guard(request: Request):
         """Independent boundary in front of every dashboard POST route
         (session input, supervisor ack, supervisor2 pause) -- checked
@@ -12641,6 +12651,72 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             payload = {"error": "INBOX_READ_FAILED", "detail": str(exc),
                        "issues": [], "summary": {}}
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/worktrees", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_worktrees(request: Request) -> JSONResponse:
+        """The Worktree Janitor panel's data (docs/WORKTREE_JANITOR.md, P5).
+
+        READ-ONLY. Classifies with the same engine the executor uses and
+        summarises it for a human: reclaimable bytes by class, BLOCKED reasons
+        in plain language, the oldest candidate, and whether anything is
+        actually enforcing.
+
+        Only PATHS are ever reported for sensitive ignored files -- naming the
+        file is what makes a refusal actionable, and printing a line of it would
+        put the secret on a dashboard."""
+        from . import worktree_janitor, worktree_review
+
+        config = terminal.config.worktree_janitor
+        repo_path = (request.query_params.get("repo_path") or "").strip()
+        roots = [repo_path] if repo_path else list(config.repo_roots)
+        if not roots:
+            return JSONResponse(
+                {"error": "NO_REPO_ROOTS",
+                 "detail": "configure worktree_janitor.repo_roots, or pass repo_path",
+                 "mode": config.mode, "observe_only": config.mode != "auto_execute",
+                 "candidates": [], "counts": {}},
+                headers={"Cache-Control": "no-store"})
+
+        def _collect() -> list[dict]:
+            found: list[dict] = []
+            for root in roots:
+                report = worktree_janitor.scan(root, config.to_policy())
+                found.extend(report.get("candidates") or [])
+            return found
+
+        candidates = await anyio.to_thread.run_sync(_collect)
+        payload = worktree_review.build_report(candidates, mode=config.mode)
+        payload["repo_roots"] = roots
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/worktrees/review", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_worktrees_review(request: Request) -> JSONResponse:
+        """Record an operator decision on one review-queue item.
+
+        `decision` is approve or abandon, and NOTHING else -- there is
+        deliberately no force/delete-now option on this route, so no UI can
+        offer one. Approve moves the item to CLEANUP_ELIGIBLE, which the
+        executor re-checks with fresh evidence before removing anything; a human
+        cannot approve past a predicate. Abandon stops it being re-proposed.
+
+        Mutation-guarded exactly like every sibling POST route (auth + CSRF)."""
+        from . import worktree_review
+
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        task_id = str(body.get("task_id") or "").strip()
+        decision = str(body.get("decision") or "").strip()
+        service = worktree_review.WorktreeReviewService(
+            store=_queue_store_for_worktrees(), audit=terminal.audit)
+        result = await anyio.to_thread.run_sync(lambda: service.decide(
+            task_id, decision, actor=(identity.email if identity else None),
+            worktree_path=body.get("worktree_path") or None))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/inbox/capture", methods=["POST"],
                          include_in_schema=False)

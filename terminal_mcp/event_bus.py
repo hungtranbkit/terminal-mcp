@@ -70,6 +70,10 @@ KNOWN_EVENT_TYPES = (
     "MERGE_PENDING", "MERGE_CONFLICT", "TEST_FAILED", "PREVIEW_FAILED",
     # Fleet / resources
     "WORKER_IDLE", "NODE_LOST", "RESOURCE_CONFLICT",
+    # Worktree lifecycle (docs/WORKTREE_JANITOR.md). MARKING ONLY -- these say
+    # a worktree became eligible for cleanup, or stopped being eligible. They
+    # never mean anything was deleted; no executor exists.
+    "WORKTREE_CLEANUP_PENDING", "WORKTREE_CLEANUP_CLEARED",
     # Human
     "USER_FEEDBACK", "PROJECT_BLOCKED",
 )

@@ -90,6 +90,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Notes / Ideas store (kho ghi chú: MCP `note_*` + `/dashboard/notes`) | VERIFIED |
 | Notes surface application-layer auth (webauth session or verified CF Access) | VERIFIED |
 | Dashboard: Requirements/Feature Matrix link | VERIFIED |
+| Worktree Janitor (reclaim isolated task worktrees) | CONTRACT ONLY — no executor, nothing deletes yet |
 | Read-only repo access for external agents (`repo_*` MCP tools) | VERIFIED (V1, read-only) |
 | Permissions: read/input grants + effective permissions | VERIFIED |
 | Reliable prompt submission (press-enter, DELIVERY_UNKNOWN, idempotency) | VERIFIED |
@@ -4022,6 +4023,31 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
   beyond it.
 
 ## Backlog (explicitly not done yet — tracked here so it isn't re-discovered)
+
+0a. **Worktree Janitor — CONTRACT ONLY as of 2026-09-14. No executor exists;
+   nothing deletes anything.** The specification is
+   `docs/WORKTREE_JANITOR.md` (state model, the nine AUTO_SAFE predicates,
+   invariants I1-I8, failure modes F1-F13, multi-node ownership, audit shape,
+   rollout ladder, and the P0/P1/P2 acceptance tests). What exists in code
+   today is ONLY the pre-existing manual path: `terminal_worktree_cleanup` ->
+   `GitIsolationService.cleanup_worktree_for_task`, which is human-invoked,
+   accepts `force=True`, takes no lock, and writes NO audit row (verified:
+   `audit.db` has zero rows for any worktree action, and neither
+   `git_worktree.py` nor `git_isolation_service.py` contains an audit call).
+   Implementation is tracked as the P0-P7 backlog items tagged
+   `worktree-janitor`; the contract item is `blg_349fb9e08b4f`.
+   Two findings from the audit that the contract encodes and that must not be
+   re-litigated by an implementer:
+   - There is no `FAILED_FINAL` status. `TERMINAL_STATUSES` is
+     `(COMPLETED, SKIPPED, CANCELLED)`; `FAILED`/`BLOCKED` are retryable. The
+     trigger is those three, or `FAILED` with `attempt_count >= max_attempts`.
+     Cleaning up on a bare `FAILED` deletes the retry's own working directory.
+   - The lifecycle hook belongs in `queue_store._transition_locked`, NOT on
+     `QueueService.on_completed`/`QueueEngine.on_completed` -- those have TWO
+     call sites, so neither is a chokepoint.
+   Not urgent: measured 2026-09-14, the worktree filesystem (`/dev/sda3`) was
+   26% used with 83G free. The disk pressure that actually broke tooling was on
+   tmpfs `/tmp`, which worktree removal cannot relieve (different filesystem).
 
 0. **Repo Read V1 — the two things it deliberately does not do yet
    (2026-09-14).**
