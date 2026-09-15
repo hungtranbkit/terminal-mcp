@@ -9,8 +9,8 @@
     "git_branch": "main",
     "is_portable": true
   },
-  "revision": 88,
-  "updated_at": "2026-09-15T05:03:22.243161+00:00",
+  "revision": 89,
+  "updated_at": "2026-09-15T05:10:43.331571+00:00",
   "items": [
     {
       "id": "blg_f52a999971d9",
@@ -3163,7 +3163,7 @@
       "type": "bug",
       "order": 54,
       "created_at": "2026-09-14T09:01:27.558658+00:00",
-      "updated_at": "2026-09-15T04:50:49.820887+00:00",
+      "updated_at": "2026-09-15T05:10:38.192576+00:00",
       "source": "claude-code",
       "dependencies": [
         "blg_orch_no_workers_declared"
@@ -3197,13 +3197,16 @@
       "evidence": {
         "notes": [
           "ROOT CAUSE CONFIRMED: supervisor.py disables watches for 7 reasons and called set_enabled(...,True) from NOWHERE in the codebase -- every disable was permanent. A watch that hit max_iterations while its worker kept working never came back, so live workers lost scheduling visibility forever. That is exactly watch_count=4/enabled=0.\n\nPHASE 1 COMMITTED: branch fix/scheduler-refill @ 02efdf5 (NOT merged, NOT deployed).\n  terminal_mcp/scheduler_health.py (new): worker state model (RUNNING/IDLE_READY/WAITING_INPUT/STALLED/BLOCKED/OFFLINE/RESERVED/UNKNOWN), multi-signal classify_worker with configurable idle debounce, may_reclaim requiring STALLED+high confidence, watch_recovery_action, evaluate_refill with reason codes, utilization_snapshot.\n  terminal_mcp/supervisor.py: reconcile_watches() + _target_alive() + store.reenable_watch/reset_iterations/note_reconcile_attempt, reconcile_attempts column, watch_reconciled event, enriched status (disabled/recoverable/intentional counts + per-watch reasons).\n  tests: test_scheduler_health.py (35), test_supervisor_reconcile.py (9). Regression 227 passed.\n\nBEFORE/AFTER on a COPY of the real supervisor.db (production not mutated):\n  BEFORE enabled=0/4 (recoverable=3, intentional=1)\n  AFTER  enabled=2/4 -- restored mcp-work + terminal-mcp-main (max_iterations_exceeded); left mesflow-dell (manual_unwatch, deliberate) and wtest (target still missing).\n\nSTILL OPEN (phase 2): the dispatch side. evaluate_refill decides and explains but nothing yet claims a lease, sends a prompt under the SUBMIT_CONFIRMED contract, or reclaims a STALLED session. Needs wiring into queue_engine's dispatch path; deserves its own review.",
-          "Integrated into main. Closing this also required fixing backlog_service.complete(), which raised AttributeError on this very item because its evidence field was a plain string rather than a dict -- the ledger could not close its own row. Original evidence text preserved as a note."
+          "Integrated into main. Closing this also required fixing backlog_service.complete(), which raised AttributeError on this very item because its evidence field was a plain string rather than a dict -- the ledger could not close its own row. Original evidence text preserved as a note.",
+          "Second half of this work integrated via integrate/lane-b: queue_event_drain (the loop now consumes the event bus instead of polling beside it) and the fleet-aware supervisor watch (a session is watched on its own node, not assumed visible to the controller)."
         ],
         "commits": [
-          "8a60235 (merge integrate/lane-a) / 719474a (fix/scheduler-refill)"
+          "8a60235 (merge integrate/lane-a) / 719474a (fix/scheduler-refill)",
+          "88a201f"
         ],
         "tests": [
-          "scheduler + pm_router + worker_registry = 68 passed on the merged tree"
+          "scheduler + pm_router + worker_registry = 68 passed on the merged tree",
+          "wt-audit: test_queue_event_drain + test_scheduler_health + test_supervisor_fleet_watches + test_supervisor_reconcile + test_queue_engine + test_integration_engine = 139 passed, 4 skipped; test_supervisor_v2 42 passed; test_transports 5 passed (run separately -- these suites share ~/.local/state/terminal-mcp and cannot run back-to-back from two checkouts)"
         ]
       },
       "history": [
@@ -3224,6 +3227,13 @@
         },
         {
           "at": "2026-09-15T04:50:49.820887+00:00",
+          "event": "completed",
+          "by": "m2-integrate",
+          "verified_by": "evidence",
+          "queue_task_id": null
+        },
+        {
+          "at": "2026-09-15T05:10:38.192576+00:00",
           "event": "completed",
           "by": "m2-integrate",
           "verified_by": "evidence",
