@@ -152,7 +152,7 @@ def test_the_installer_output_is_written_to_a_log_not_discarded():
     section = _agent_section(_script())
     assert "Out-Null" not in section.split("winget install")[-1].split("$transcript")[0] or True
     assert "node-agent-install.log" in section
-    assert "$transcript = & powershell.exe" in section
+    assert "*>> $rawLog" in section, "streams captured to a file"
     assert "Add-Content -Path $agentLog" in section
 
 
@@ -164,7 +164,7 @@ def test_the_log_records_the_exit_code_and_the_interpreter_used():
 
 def test_the_token_never_reaches_the_log():
     section = _agent_section(_script())
-    scrub = section[section.index("$scrubbed = ($transcript"):section.index("Add-Content -Path $agentLog")]
+    scrub = section[section.index("$scrubbed = ''"):section.index("Add-Content -Path $agentLog")]
     # The known secret is replaced by value...
     assert "$scrubbed.Replace($secret, '<redacted>')" in scrub
     # ...and anything else token-shaped goes too.
@@ -236,3 +236,45 @@ def test_stage_accounting_stays_consistent():
     opened = script.count("\nStart-Stage ") + script.count("\n    Start-Stage ")
     closed = script.count("\nEnd-Stage") + script.count("\n    End-Stage")
     assert opened == closed
+
+
+# ---------------------------------------------------------------------------
+# capturing the installer's streams without tripping over PowerShell 5.1
+# ---------------------------------------------------------------------------
+
+def test_the_installer_streams_go_to_a_file_not_the_pipeline():
+    """`$out = & native ... 2>&1` is a trap under $ErrorActionPreference =
+    'Stop' on PS 5.1: the first stderr line becomes a terminating
+    NativeCommandError, thrown at the call -- before any log can be
+    written. That produced an EMPTY failure detail and no log at all on
+    node 54202, which is precisely the blindness the logging existed to
+    remove."""
+    section = _agent_section(_script())
+    invoke = section[section.index("$rawLog ="):section.index("$scrubbed = ''")]
+    assert "*>> $rawLog" in invoke, "streams must be file-redirected"
+    assert "2>&1" not in invoke, "the pipeline-merging form must not come back"
+
+
+def test_the_invocation_is_still_guarded():
+    section = _agent_section(_script())
+    invoke = section[section.index("$rawLog ="):section.index("$scrubbed = ''")]
+    assert "try {" in invoke and "} catch {" in invoke
+    assert "$installerExit = -1" in invoke, "a throw still yields a usable exit code"
+
+
+def test_the_raw_transcript_is_scrubbed_before_it_reaches_the_operator_log():
+    section = _agent_section(_script())
+    assert "node-agent-install.raw-" in section
+    scrub = section[section.index("$scrubbed = ''"):section.index("Remove-Item $rawLog")]
+    assert "$scrubbed.Replace($secret, '<redacted>')" in scrub
+    assert "[0-9a-fA-F]{32,}" in scrub
+    # And the unscrubbed temp file does not survive.
+    assert "Remove-Item $rawLog -Force" in section
+
+
+def test_the_log_is_written_even_when_the_installer_fails():
+    """The whole point: a failure must leave something to read."""
+    section = _agent_section(_script())
+    # Add-Content comes after the try/catch, so both paths reach it.
+    assert section.index("} catch {") < section.index("Add-Content -Path $agentLog")
+    assert section.index("$installerExit = -1") < section.index("Add-Content -Path $agentLog")
