@@ -16631,6 +16631,19 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         scheme = request.url.scheme or "http"
         return f"{scheme}://{host}" if host else ""
 
+    def _machine_origin(request: Request) -> str:
+        """The origin to hand to a MACHINE, as opposed to the one the
+        operator's browser happens to be using.
+
+        On a public deployment these are different hostnames on purpose.
+        The Dashboard stays behind Cloudflare Access; the machine being
+        onboarded has no Access session and cannot get one, so anything it
+        is told to call back to must be the public bootstrap origin. Where
+        no bootstrap origin is pinned -- every LAN deployment -- this is
+        the request's own Host exactly as before.
+        """
+        return onboarding.bootstrap_origin or _request_base_url(request)
+
     def _onboarding_error(exc: OnboardingError) -> JSONResponse:
         return JSONResponse({"error": exc.code, "detail": exc.detail}, status_code=exc.status,
                             headers={"Cache-Control": "no-store"})
@@ -16752,8 +16765,12 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 body_json = {}
             if isinstance(body_json, dict):
                 session = str(body_json.get("session") or "")
+        # The origin is encoded into the FILE NAME and is what the helper
+        # dials on a double-click, so it must be the machine-facing one.
+        # Naming the Access-gated Dashboard host here produces a helper
+        # that authenticates nothing and redeems nothing.
         download_name = helper_artifact.paired_filename(
-            artifact.filename, _request_base_url(request), session)
+            artifact.filename, _machine_origin(request), session)
 
         # The handle is a credential for its 120 seconds. It is used to
         # build a file name and is never logged, never echoed in a header,
@@ -17017,7 +17034,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             if issued is None:
                 return None
             handle, expires_at = issued
-            origin = _request_base_url(request) or onboarding.controller_urls()[0]
+            # Same reasoning as the paired file name: this origin travels
+            # to the helper and is redeemed BY THE MACHINE, not by the
+            # browser that asked for it.
+            origin = _machine_origin(request) or onboarding.controller_urls()[0]
             return {"handle": handle, "expires_at": expires_at,
                     "url": bootstrap_protocol.build_enroll_url(controller=origin, handle=handle),
                     "controller": bootstrap_protocol.normalize_origin(origin)}

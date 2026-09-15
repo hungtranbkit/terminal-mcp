@@ -5,6 +5,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit as _urlsplit
 
 import yaml
 
@@ -831,6 +832,22 @@ class OnboardingConfig:
     script", which is right for every normal deployment and wrong only
     behind a proxy that rewrites Host -- set it explicitly there.
 
+    bootstrap_origin is the PUBLIC, machine-facing origin -- the one a
+    machine being onboarded can actually reach. It exists because the
+    operator's Dashboard hostname usually cannot be that origin: it sits
+    behind Cloudflare Access, and a machine mid-enrollment has no Access
+    session and no way to obtain one. Deriving the callback from the
+    browser's Host header therefore hands every new machine an origin that
+    answers its enrollment POST with an Access login page. Setting this
+    pins the machine-side origin instead of inferring it, and suppresses
+    the browser Host as a candidate entirely -- see controller_urls() in
+    node_onboarding.py. Empty (the default) keeps the LAN behaviour, where
+    the browser Host IS a good guess because the operator and the new
+    machine are on the same network.
+
+    It is an ORIGIN: scheme and host (and port), never a path. The
+    Dashboard stays where it is; this only changes what machines are told.
+
     controller_ssh_public_key(_file) is the PUBLIC key the installer
     installs into the new node's authorized_keys so this controller can
     SSH in. A public key: safe in config, safe in the payload, useless to
@@ -838,6 +855,7 @@ class OnboardingConfig:
     enabled: bool = True
     enrollment_ttl_seconds: int = 900
     controller_url: str = ""
+    bootstrap_origin: str = ""
     controller_ssh_public_key: str = ""
     controller_ssh_public_key_file: str = ""
     agent_port: int = 8790
@@ -1313,6 +1331,19 @@ def _load_onboarding_config(raw: object) -> OnboardingConfig:
     controller_url = str(raw.get("controller_url", defaults.controller_url) or "").strip()
     if controller_url and not controller_url.startswith(("http://", "https://")):
         raise ValueError("nodes.onboarding.controller_url must start with http:// or https://")
+    bootstrap_origin = str(raw.get("bootstrap_origin", defaults.bootstrap_origin) or "").strip().rstrip("/")
+    if bootstrap_origin:
+        if not bootstrap_origin.startswith(("http://", "https://")):
+            raise ValueError("nodes.onboarding.bootstrap_origin must start with http:// or https://")
+        # An origin, not a URL. A path here would be silently concatenated
+        # onto every machine-side route and produce 404s that look like the
+        # controller is down.
+        parsed = _urlsplit(bootstrap_origin)
+        if not parsed.hostname:
+            raise ValueError("nodes.onboarding.bootstrap_origin must include a hostname")
+        if parsed.path or parsed.query or parsed.fragment:
+            raise ValueError("nodes.onboarding.bootstrap_origin must be an origin "
+                             "(scheme://host[:port]) with no path, query or fragment")
 
     firewall_raw = raw.get("ssh_firewall_cidrs", defaults.ssh_firewall_cidrs)
     if isinstance(firewall_raw, str):
@@ -1392,6 +1423,7 @@ def _load_onboarding_config(raw: object) -> OnboardingConfig:
         enabled=bool(raw.get("enabled", defaults.enabled)),
         enrollment_ttl_seconds=ttl,
         controller_url=controller_url,
+        bootstrap_origin=bootstrap_origin,
         controller_ssh_public_key=str(raw.get("controller_ssh_public_key",
                                               defaults.controller_ssh_public_key) or "").strip(),
         controller_ssh_public_key_file=str(raw.get("controller_ssh_public_key_file",
