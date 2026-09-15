@@ -100,7 +100,10 @@ def test_it_runs_the_install_script_shipped_inside_the_bundle():
     assert "-RepoDir $targetDir" in section
     assert "-ControllerUrl $ControllerUrl -NodeId $NodeId" in section
     assert "-Port 8790" in section
-    assert "$LASTEXITCODE -ne 0" in section
+    # The exit code is captured first so it can be logged alongside the
+    # transcript, then checked -- rather than tested inline and discarded.
+    assert "$installerExit = $LASTEXITCODE" in section
+    assert "if ($installerExit -ne 0)" in section
 
 
 def test_it_binds_the_interface_the_controller_reaches_not_everything():
