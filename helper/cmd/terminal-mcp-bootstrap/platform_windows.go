@@ -3,11 +3,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/hungtranbkit/terminal-mcp/helper/internal/proto"
 	"golang.org/x/sys/windows/registry"
@@ -71,13 +73,61 @@ func installService() error {
 	}
 	_ = runCommand("sc.exe", "description", ServiceName,
 		"Terminal MCP Bootstrap -- onboarding and repair for this node.")
-	if err := runCommand("sc.exe", "start", ServiceName); err != nil {
-		// Already running is not a failure.
-		if !strings.Contains(err.Error(), "1056") {
-			return err
+
+	// Already up? Then "install and start" is already achieved. Asking SCM
+	// to start a RUNNING service is how a Repair or a second enrollment on
+	// the same machine used to turn into a failure for no reason.
+	if state := serviceState(); serviceStateIsUsable(state) {
+		fmt.Printf("      service already %s\n", state)
+		return nil
+	}
+
+	// Bounded. Before the SCM handshake existed this call blocked for
+	// SCM's full ServicesPipeTimeout with nothing on screen after "[3/3]";
+	// the timeout is the backstop that guarantees the installer moves on
+	// even if a future change breaks the handshake again.
+	if err := runCommandTimeout(serviceStartTimeout, "sc.exe", "start", ServiceName); err != nil {
+		// 1056 is "already running", which is success wearing an error.
+		if strings.Contains(err.Error(), "1056") {
+			return nil
 		}
+		// A start that timed out or failed is reported with what to do
+		// about it, not just an error code. The pairing is untouched, so
+		// retrying costs nothing.
+		return fmt.Errorf("%w -- kiểm tra bằng: sc.exe query %s", err, ServiceName)
 	}
 	return nil
+}
+
+// serviceStartTimeout matches ServicesPipeTimeout's 30s default: long
+// enough that a healthy service is never cut off, short enough that a
+// broken one cannot hold the installer open indefinitely.
+const serviceStartTimeout = 30 * time.Second
+
+// serviceState returns SCM's own word for the service state ("RUNNING",
+// "STOPPED", ...) or "" when it cannot be determined. Read-only: it never
+// creates or changes anything, so it is safe to call before deciding.
+func serviceState() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "sc.exe", "query", ServiceName).CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		if !strings.Contains(line, "STATE") {
+			continue
+		}
+		for _, state := range []string{
+			"STOPPED", "START_PENDING", "STOP_PENDING", "RUNNING",
+			"CONTINUE_PENDING", "PAUSE_PENDING", "PAUSED",
+		} {
+			if strings.Contains(line, state) {
+				return state
+			}
+		}
+	}
+	return ""
 }
 
 func serviceExists() bool {

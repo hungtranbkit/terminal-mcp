@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -147,8 +148,28 @@ func sameFile(a, b string) bool {
 // passes a fixed argv -- there is no path by which a protocol URL
 // contributes to one.
 func runCommand(name string, args ...string) error {
-	command := exec.Command(name, args...)
+	return runCommandTimeout(defaultCommandTimeout, name, args...)
+}
+
+// How long any single sc.exe call may take. `sc.exe start` is the one that
+// matters: SCM makes it wait for SERVICE_RUNNING, and with a service that
+// never completed the handshake that wait was the whole bug. 30s matches
+// ServicesPipeTimeout, so a healthy service is never cut off early and a
+// broken one cannot hold the installer forever.
+const defaultCommandTimeout = 30 * time.Second
+
+// runCommandTimeout runs a command with a hard deadline. On timeout the
+// context kills ONLY this child process; nothing else on the machine is
+// touched, and in particular no pairing is consumed or revoked -- the
+// operator can still retry with the handle they already have.
+func runCommandTimeout(limit time.Duration, name string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
+	defer cancel()
+	command := exec.CommandContext(ctx, name, args...)
 	output, err := command.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("%s timed out after %s: %s", name, limit, trim(string(output)))
+	}
 	if err != nil {
 		return fmt.Errorf("%s: %v: %s", name, err, trim(string(output)))
 	}
