@@ -459,12 +459,12 @@ def test_send_result_never_contains_raw_prompt_text(tmp_path, tmux_session_facto
     v2, svc = _v2(tmp_path)
     svc.watch(session=session)
     events = svc.run_once()["events"]
-    v2.set_policy(session=session, policy_mode="approved_auto_continue", approved_template="y")
+    v2.set_policy(session=session, policy_mode="approved_auto_continue", approved_template="__RAW_PROMPT_SENTINEL_7f3c9a__")
     claim = v2.claim_event(events[0]["id"], claimed_by="a")
-    v2.submit_decision(claim["id"], "y")
+    v2.submit_decision(claim["id"], "__RAW_PROMPT_SENTINEL_7f3c9a__")
     v2.execute_send(claim["id"])
     action = v2.store.get_action(claim["id"])
-    assert "y" not in action["send_result"] or '"characters"' in action["send_result"]
+    assert "__RAW_PROMPT_SENTINEL_7f3c9a__" not in action["send_result"]
     import json
     parsed = json.loads(action["send_result"])
     # submit_status is a fixed enum value, never raw text; submit_reason
@@ -489,7 +489,16 @@ def test_send_result_never_contains_raw_prompt_text(tmp_path, tmux_session_facto
         # allowlist is a DELIBERATE decision each time, which is exactly
         # why it is an allowlist and not a denylist.
         "enter_count", "attempts", "submit_latency_ms",
+        # Delivery gate persists only its structured verdict; raw prompt text
+        # is intentionally excluded from DeliveryVerdict.to_dict().
+        "delivery_verdict",
     }
+    if "delivery_verdict" in parsed:
+        dv = parsed["delivery_verdict"]
+        assert isinstance(dv, dict)
+        assert set(dv) <= {"kind", "activation", "acceptance", "evidence", "detail",
+                           "delivery_state", "submission_id", "may_advance", "safe_to_retry"}
+        assert "__RAW_PROMPT_SENTINEL_7f3c9a__" not in json.dumps(dv)
     if "correlation_id" in parsed:
         assert isinstance(parsed["correlation_id"], str) and "y" not in parsed["correlation_id"]
     if "submit_reason" in parsed:
