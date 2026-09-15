@@ -57,3 +57,4 @@ state/
 .projectflow/knowledge/.knowledge.lock
 .projectflow/**/*.tmp
 helper/dist/
+helper/dist/

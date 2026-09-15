@@ -79,11 +79,36 @@ ENROLLMENT_MIGRATIONS: list[Migration] = [
 
 # A handle is what travels in a terminalmcp:// URL, so it is sized for the
 # gap between a click and a helper launching -- not for a human to type.
-HANDLE_TTL_SECONDS = 120
+# How long a pairing handle stays usable. 120s was the original value and
+# it was wrong by construction: the handle is minted when the DOWNLOAD
+# starts, and the clock then has to cover the operator finding the file in
+# Downloads, clearing a SmartScreen warning on an unsigned binary, and
+# accepting a UAC prompt. Two minutes routinely expired before the helper
+# ever ran, so a first-time install failed with no error anywhere -- the
+# helper simply found a dead handle. 900s matches the enrollment TTL, so
+# the pairing no longer dies before the thing it is paired with.
+#
+# Single-use and replay protection are unchanged: this widens the window
+# in which ONE redemption may happen, never the number of redemptions.
+HANDLE_TTL_SECONDS = 900
+HANDLE_TTL_MIN_SECONDS = 30
+HANDLE_TTL_MAX_SECONDS = 3600
 
 # What the installer reports while it runs. A closed set: the progress
 # route accepts nothing else, so a node cannot write arbitrary text into
 # a field the dashboard renders.
+# The helper's own stages, which happen BEFORE the PowerShell installer
+# exists to report anything. Without these the Dashboard is blind from the
+# moment the operator double-clicks until the script reaches 'starting' --
+# which, if the helper dies on a dead handle or a blocked binary, is
+# never. They are deliberately ordered: each is reported as it is entered.
+STAGE_HELPER_STARTED = "helper_started"
+STAGE_REDEEMING = "redeeming"
+STAGE_REDEEMED = "redeemed"
+STAGE_INSTALLING_SERVICE = "installing_service"
+STAGE_LAUNCHING_SETUP = "launching_setup"
+STAGE_SETUP_STARTED = "setup_started"
+
 STAGE_STARTING = "starting"
 STAGE_DOWNLOADING = "downloading"
 STAGE_INSTALLING_OPENSSH = "installing_openssh"
@@ -92,12 +117,22 @@ STAGE_REGISTERING = "registering"
 STAGE_INSTALLING_TOOLS = "installing_tools"
 STAGE_READY = "ready"
 STAGE_FAILED = "failed"
-STAGES = (STAGE_STARTING, STAGE_DOWNLOADING, STAGE_INSTALLING_OPENSSH, STAGE_CONFIGURING_SSH,
-          STAGE_REGISTERING, STAGE_INSTALLING_TOOLS, STAGE_READY, STAGE_FAILED)
+HELPER_STAGES = (STAGE_HELPER_STARTED, STAGE_REDEEMING, STAGE_REDEEMED,
+                 STAGE_INSTALLING_SERVICE, STAGE_LAUNCHING_SETUP, STAGE_SETUP_STARTED)
+
+STAGES = HELPER_STAGES + (STAGE_STARTING, STAGE_DOWNLOADING, STAGE_INSTALLING_OPENSSH,
+                          STAGE_CONFIGURING_SSH, STAGE_REGISTERING, STAGE_INSTALLING_TOOLS,
+                          STAGE_READY, STAGE_FAILED)
 
 # Human labels, kept next to the vocabulary so the dashboard and the
 # installer cannot drift apart on what a stage is called.
 STAGE_LABELS = {
+    STAGE_HELPER_STARTED: "Helper đã khởi động",
+    STAGE_REDEEMING: "Đang lấy cấu hình cài đặt",
+    STAGE_REDEEMED: "Đã nhận cấu hình",
+    STAGE_INSTALLING_SERVICE: "Đang cài dịch vụ nền",
+    STAGE_LAUNCHING_SETUP: "Đang mở trình cài đặt",
+    STAGE_SETUP_STARTED: "Trình cài đặt đã chạy",
     STAGE_STARTING: "Đang bắt đầu",
     STAGE_DOWNLOADING: "Đang tải bộ cài",
     STAGE_INSTALLING_OPENSSH: "Đang cài OpenSSH",
@@ -434,6 +469,67 @@ class EnrollmentStore:
             cursor = connection.execute("DELETE FROM enrollments WHERE created_at < ?", (_iso(cutoff),))
         return cursor.rowcount
 
+    def record_progress_by_handle(self, handle: str, *, stage: str,
+                                  elapsed_seconds: int | None = None,
+                                  now: datetime | None = None) -> "Enrollment | None":
+        """The same telemetry, authenticated by the PAIRING HANDLE instead
+        of the enrollment code.
+
+        This exists because the helper does not hold the code. It holds a
+        handle, and the most useful things it can tell us -- "I started",
+        "I am about to redeem", "redeeming failed" -- all happen BEFORE
+        the exchange that would give it a code. Reporting them was
+        impossible, so the Dashboard was blind for exactly the window in
+        which first-time installs fail.
+
+        Deliberately NOT single-use and deliberately tolerant of a handle
+        that has already been redeemed: redemption is the one-shot state
+        change, and the helper keeps narrating afterwards (installing the
+        service, launching setup). Widening this to progress would mean
+        the helper could report its first stage and then go silent.
+
+        Still fail-closed on everything that matters: an unparseable
+        handle, an unknown handle, or an enrollment that has expired or
+        been revoked all return None and are answered identically by the
+        route. A handle is 128 bits of entropy and never appears in a log.
+        """
+        if stage not in STAGES:
+            raise ValueError(f"unknown stage {stage!r}")
+        candidate = str(handle or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", candidate):
+            return None
+        moment = now or _now()
+        digest = hash_code(candidate)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT enrollment_id FROM enrollment_handles WHERE handle_hash = ?",
+                (digest,)).fetchone()
+        if not row:
+            return None
+        record = self.get(row["enrollment_id"], now=moment)
+        # An enrollment that is expired or revoked stops accepting
+        # narration: it cannot complete, so progress against it would only
+        # ever be a misleading spinner on somebody's dashboard.
+        if record is None or record.status in (STATUS_REVOKED, STATUS_EXPIRED):
+            return None
+        return self._write_progress(record.id, stage=stage, elapsed_seconds=elapsed_seconds,
+                                    now=moment)
+
+    def _write_progress(self, enrollment_id: str, *, stage: str,
+                        elapsed_seconds: int | None, now: datetime) -> "Enrollment | None":
+        """The one UPDATE both progress paths share, so code-authenticated
+        and handle-authenticated telemetry can never drift on clamping or
+        on which columns move."""
+        elapsed = None if elapsed_seconds is None else max(0, min(int(elapsed_seconds), 86_400))
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE enrollments SET progress_stage = ?, progress_at = ?, progress_elapsed_seconds = ? "
+                "WHERE id = ?",
+                (stage, _iso(now), elapsed, enrollment_id))
+            if cursor.rowcount != 1:
+                return None
+        return self.get(enrollment_id, now=now)
+
     def record_progress(self, code: str, *, stage: str, elapsed_seconds: int | None = None,
                         now: datetime | None = None) -> Enrollment | None:
         """Best-effort telemetry from a machine that is mid-install.
@@ -483,7 +579,8 @@ class EnrollmentStore:
         if record is None or record.status != STATUS_PENDING:
             return None
         handle = secrets.token_hex(16)
-        expires = _iso(moment + timedelta(seconds=max(30, min(int(ttl_seconds), 600))))
+        expires = _iso(moment + timedelta(seconds=max(HANDLE_TTL_MIN_SECONDS,
+                                                     min(int(ttl_seconds), HANDLE_TTL_MAX_SECONDS))))
         with self._connection() as connection:
             connection.execute(
                 "INSERT INTO enrollment_handles (handle_hash, enrollment_id, created_at, expires_at, created_by) "

@@ -117,14 +117,70 @@ func handleLooksValid(handle string) bool {
 	return true
 }
 
-// continueSession: fetch the setup script from the bound controller, then
-// let it do the stages. The handle is passed as an argument to the
-// script, never interpolated into a command string.
+// continueSession: redeem the pairing, save what it returns, then let the
+// installer do the stages -- narrating each step to the controller as it
+// is entered.
+//
+// The previous version accepted a handle, said in a comment that it passed
+// it to the script, and then called runStages(controller, "") -- dropping
+// it. The consequence in production was exact and silent: the controller
+// never saw a redeem, the enrollment stayed pending until it expired, and
+// the Dashboard had nothing to show because nothing had been reported.
+// Redeeming here is what makes the paired web flow able to finish at all.
+//
+// The bootstrap payload is written to the node config with the same
+// atomic, 0600 discipline as every other credential this helper touches,
+// and the installer is then run in -Repair mode, which is its documented
+// "credentials are already on disk" path. Nothing from the payload is
+// passed on a command line, where it would be visible to any process
+// listing on the machine.
 func continueSession(handle, controller string) error {
+	report := newReporter(controller, handle)
+	report.report(stageHelperStarted)
+
+	report.report(stageRedeeming)
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "windows"
+	}
+	payload, err := redeemHandle(controller, handle, hostname)
+	if err != nil {
+		report.fail(failPairingRejected)
+		return fmt.Errorf("redeem pairing: %w", err)
+	}
+	report.report(stageRedeemed)
+
+	// Persist before anything else can fail: a payload fetched and then
+	// lost is a spent, single-use pairing with nothing to show for it.
+	raw, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		report.fail(failServiceInstall)
+		return fmt.Errorf("encode bootstrap payload: %w", err)
+	}
+	report.report(stageInstallingService)
+	if err := os.MkdirAll(programDataDir(), 0o700); err != nil {
+		report.fail(failServiceInstall)
+		return fmt.Errorf("create state directory: %w", err)
+	}
+	if err := writeAtomic(nodeConfigPath(), raw, 0o600); err != nil {
+		report.fail(failServiceInstall)
+		return fmt.Errorf("write bootstrap payload: %w", err)
+	}
+
 	if err := downloadSetupScript(controller); err != nil {
+		report.fail(failScriptDownload)
 		return fmt.Errorf("download setup script: %w", err)
 	}
-	return runStages(controller, "")
+
+	report.report(stageLaunchingSetup)
+	if err := runStages(controller, "-Repair"); err != nil {
+		report.fail(failSetupLaunch)
+		return fmt.Errorf("run setup: %w", err)
+	}
+	// The installer has taken over and reports its own stages from here;
+	// this is the last thing the helper itself says.
+	report.report(stageSetupStarted)
+	return nil
 }
 
 func runService() int {
