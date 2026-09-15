@@ -32,6 +32,7 @@ import argparse
 import logging
 import shutil
 import sys
+from pathlib import Path
 
 import anyio
 import uvicorn
@@ -80,6 +81,15 @@ def detect_wsl_available() -> bool:
     return shutil.which("wsl.exe") is not None or shutil.which("wsl") is not None
 
 
+def _default_session_state_root(config) -> Path:
+    """Under the node's own workspace root, so session state lives on the same
+    disk as the work it belongs to and is covered by whatever the operator
+    already backs up there."""
+    roots = config.session_lifecycle.allowed_cwd_roots
+    base = Path(roots[0]) if roots else Path.home()
+    return base / ".terminal-mcp" / "win-sessions"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="terminal-windows-node-agent")
     parser.add_argument("--node-id", required=True, help="This node's own id, as registered on the controller")
@@ -95,6 +105,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="Default interactive shell for agent_type=shell sessions (default: powershell.exe)")
     parser.add_argument("--history-lines", type=int, default=2000,
                         help="Per-session scrollback buffer size this agent keeps in memory")
+    # Detached session hosts (docs/WINDOWS_SESSION_HOST.md). OFF by default, on
+    # purpose: enabling it changes how every session on this node is spawned, and
+    # the live 0.12.0 node's existing sessions are direct children that cannot be
+    # migrated into it (see that doc's adoption-impossibility section). Default-off
+    # means the new code can be DEPLOYED to a node without altering the behaviour
+    # of the agent currently running, so the rollout is a separate, deliberate
+    # step rather than a side effect of copying files.
+    parser.add_argument("--detached-sessions", action="store_true",
+                        help="Spawn sessions in detached per-session host processes so they "
+                             "survive this agent being restarted or updated")
+    parser.add_argument("--session-state-root", default=None,
+                        help="Directory holding detached session state "
+                             "(default: <workspace>/.terminal-mcp/win-sessions)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -109,7 +132,31 @@ def main(argv: list[str] | None = None) -> int:
     # no restart, since a restart here takes every session with it.
     credential = AgentCredential(token, token_file=args.token_file)
     config = load_config(args.config)
-    backend = WindowsSessionBackend(shell=args.shell, history_lines=args.history_lines)
+    session_state_root = None
+    session_process_factory = None
+    if args.detached_sessions:
+        from . import windows_detached
+
+        session_state_root = Path(args.session_state_root or _default_session_state_root(config))
+        session_state_root.mkdir(parents=True, exist_ok=True)
+        session_process_factory = windows_detached.session_process_factory(session_state_root)
+        _log.info("detached session hosts ENABLED, state root=%s", session_state_root)
+    backend = WindowsSessionBackend(shell=args.shell, history_lines=args.history_lines,
+                                    session_process_factory=session_process_factory)
+    if session_state_root is not None:
+        # Rediscover BEFORE serving: a request that arrives before adoption has
+        # finished would be told the session does not exist, and a create for that
+        # name would then spawn a second host for a session that is already
+        # running. Adoption is a directory read, so this costs startup nothing.
+        try:
+            verdicts = backend.adopt_detached_sessions(session_state_root)
+            if verdicts:
+                _log.info("adopted detached sessions: %s", verdicts)
+            else:
+                _log.info("no detached sessions to adopt under %s", session_state_root)
+        except Exception:  # noqa: BLE001 -- a failed adoption must not stop the agent
+            _log.exception("detached session adoption failed -- sessions left running, "
+                           "unadopted; they are NOT lost, retry by restarting this agent")
     terminal = TerminalService(config, tmux=backend)
     # Retired session-name whitelist -> real grants, same as the controller
     # does at its own startup. Every node type runs this so a fleet cannot end
