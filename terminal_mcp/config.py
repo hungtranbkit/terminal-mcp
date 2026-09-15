@@ -758,6 +758,13 @@ class OnboardingConfig:
     anyone who intercepts it."""
     enabled: bool = True
     enrollment_ttl_seconds: int = 900
+    # How long a pairing handle stays usable. The handle is minted when the
+    # helper DOWNLOAD starts, so this clock has to cover the operator
+    # finding the file, clearing SmartScreen on an unsigned binary and
+    # accepting UAC. The old 120s default expired before the helper ever
+    # ran. Single-use is unchanged -- this widens the window for ONE
+    # redemption, not the number of them.
+    pairing_handle_ttl_seconds: int = 900
     controller_url: str = ""
     bootstrap_origin: str = ""
     controller_ssh_public_key: str = ""
@@ -1214,6 +1221,9 @@ def _load_onboarding_config(raw: object) -> OnboardingConfig:
     controller_url = str(raw.get("controller_url", defaults.controller_url) or "").strip()
     if controller_url and not controller_url.startswith(("http://", "https://")):
         raise ValueError("nodes.onboarding.controller_url must start with http:// or https://")
+    handle_ttl = int(raw.get("pairing_handle_ttl_seconds", defaults.pairing_handle_ttl_seconds))
+    if handle_ttl < 30 or handle_ttl > 3600:
+        raise ValueError("nodes.onboarding.pairing_handle_ttl_seconds must be between 30 and 3600")
     bootstrap_origin = str(raw.get("bootstrap_origin", defaults.bootstrap_origin) or "").strip().rstrip("/")
     if bootstrap_origin:
         if not bootstrap_origin.startswith(("http://", "https://")):
@@ -1305,6 +1315,7 @@ def _load_onboarding_config(raw: object) -> OnboardingConfig:
     return OnboardingConfig(
         enabled=bool(raw.get("enabled", defaults.enabled)),
         enrollment_ttl_seconds=ttl,
+        pairing_handle_ttl_seconds=handle_ttl,
         controller_url=controller_url,
         bootstrap_origin=bootstrap_origin,
         controller_ssh_public_key=str(raw.get("controller_ssh_public_key",

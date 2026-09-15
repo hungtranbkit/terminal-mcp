@@ -6788,6 +6788,8 @@ NODES_ADMIN_HTML = """<!doctype html>
     // click mints two handles for one enrollment: the second invalidates
     // the first, and the helper already holding the first fails at redeem.
     let anHandleInFlight = false;
+    // When the CURRENT pairing dies. A timestamp, never the handle itself.
+    let anPairingExpiresAt = 0;
 
     // disabled AND aria-disabled: the pointer gets a cursor that says "not
     // now" instead of a click that silently does nothing, and assistive
@@ -6915,7 +6917,13 @@ NODES_ADMIN_HTML = """<!doctype html>
     // operator whose helper never started (SmartScreen, no double-click, an
     // expired pairing) saw an empty box and had no way to tell "waiting"
     // from "broken". Waiting is a state and it gets rendered like one.
+    // Two thresholds, because "quiet for half a minute" and "quiet for a
+    // minute and a half" call for different words. The first is a nudge;
+    // the second says plainly that the helper has never reached the
+    // server, which is the state a blocked or never-opened binary leaves
+    // behind and the one an operator can actually act on.
     const AN_STALL_AFTER_MS = 30000;
+    const AN_STALL_HARD_AFTER_MS = 90000;
     let anWatch = null;   // {id, nodeId, startedAt, lastStage, lastChangeAt}
 
     function anFmtDuration(ms) {
@@ -6945,10 +6953,11 @@ NODES_ADMIN_HTML = """<!doctype html>
       } catch (error) { return null; }
     }
 
-    function anBeginWatch(enrollmentId, nodeId) {
+    function anBeginWatch(enrollmentId, nodeId, pairingExpiresAt) {
       const now = Date.now();
       anWatch = {id: enrollmentId, nodeId: nodeId || '', startedAt: now,
-                 lastStage: '', lastChangeAt: now};
+                 lastStage: '', lastChangeAt: now,
+                 pairingExpiresAt: pairingExpiresAt || 0};
       anSaveWatch();
       anRenderLive(null);
       if (anProgressTimer) clearInterval(anProgressTimer);
@@ -7006,24 +7015,47 @@ NODES_ADMIN_HTML = """<!doctype html>
         return;
       }
 
-      const stalled = !stage && sinceChange > AN_STALL_AFTER_MS;
+      // Expired beats everything below: a dead code cannot be rescued by
+      // waiting, so the panel stops nudging and offers the one action that
+      // works.
+      if (current && current.status === 'expired') {
+        live.className = 'an-live failed';
+        stageEl.textContent = 'Mã cài đặt đã hết hạn — Tạo lại';
+        metaEl.textContent = `Hết hạn sau ${anFmtDuration(sinceStart)} chờ. Bấm Tạo lại để tạo mã mới.`;
+        hintEl.hidden = true;
+        actions.hidden = false;
+        if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
+        return;
+      }
+
+      const quiet = sinceChange > AN_STALL_AFTER_MS;
+      const veryQuiet = sinceChange > AN_STALL_HARD_AFTER_MS;
+      const stalled = !stage && quiet;
       live.className = 'an-live' + (stalled ? ' stalled' : '');
       stageEl.textContent = stage
         ? `${(current && current.progress_label) || stage}…`
-        : 'Đang chờ máy Windows bắt đầu cài đặt…';
+        : (quiet ? 'Chưa thấy helper kết nối' : 'Đang chờ helper trên máy Windows…');
       const bits = [`đã ${anFmtDuration(sinceStart)}`];
       bits.push(stage
         ? `cập nhật lần cuối ${anFmtDuration(sinceChange)} trước`
-        : 'máy chưa báo về bước nào');
+        : 'helper chưa báo về bước nào');
       if (anWatch.nodeId) bits.push(`node ${anWatch.nodeId}`);
+      // How long the pairing itself has left. It is the thing that dies
+      // first, and the operator cannot see it anywhere else.
+      if (anWatch.pairingExpiresAt) {
+        const left = anWatch.pairingExpiresAt - now;
+        if (left > 0) bits.push(`mã còn ${anFmtDuration(left)}`);
+      }
       metaEl.textContent = bits.join(' · ');
-      // The warning is the whole point of this panel: it names the two
-      // physical things the operator has to do, which is what nobody can
-      // guess from a silent screen.
+      // The warning names the physical things the operator has to do,
+      // which is what nobody can guess from a silent screen.
       hintEl.hidden = !stalled;
       if (stalled) {
-        hintEl.textContent = 'Chưa thấy máy Windows phản hồi. Mở file vừa tải trên máy đó và bấm Yes khi '
-                           + 'Windows hỏi quyền Administrator. Nếu SmartScreen chặn: More info → Run anyway.';
+        hintEl.textContent = veryQuiet
+          ? 'Helper chưa liên hệ máy chủ — kiểm tra SmartScreen/UAC hoặc chạy lại. '
+            + 'Mở file vừa tải trên máy Windows, chọn More info → Run anyway nếu bị chặn, rồi bấm Yes.'
+          : 'Chưa thấy helper kết nối. Mở file vừa tải trên máy đó và bấm Yes khi Windows hỏi '
+            + 'quyền Administrator.';
       }
       actions.hidden = !stalled;
     }
@@ -7228,7 +7260,12 @@ NODES_ADMIN_HTML = """<!doctype html>
         const issued = await api(
           `/dashboard/api/nodes/onboard/enrollments/${encodeURIComponent(anGenerated.enrollment.id)}/handle`,
           {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
-        if (issued.ok && issued.data.handle) handle = issued.data.handle;
+        if (issued.ok && issued.data.handle) {
+          handle = issued.data.handle;
+          // The expiry, not the handle: a timestamp is safe to keep and is
+          // the only way the panel can say how long the pairing has left.
+          anPairingExpiresAt = Date.parse(issued.data.expires_at || '') || 0;
+        }
       } catch (error) {
         // Generic download is a supported outcome, not a failure: the
         // operator installs it and presses Connect again.
@@ -7287,7 +7324,8 @@ NODES_ADMIN_HTML = """<!doctype html>
         // The installer is now in the operator's hands, so the wait starts
         // here -- including the case where they never run it, which is the
         // one the old silent panel could not express.
-        anBeginWatch(anGenerated.enrollment.id, anGenerated.enrollment.node_id);
+        anBeginWatch(anGenerated.enrollment.id, anGenerated.enrollment.node_id,
+                     anPairingExpiresAt);
         return;
       }
       if (anCtaMode !== 'connect') return;
@@ -7308,7 +7346,8 @@ NODES_ADMIN_HTML = """<!doctype html>
         // payload -- the helper redeems the handle itself, over HTTPS.
         window.location.href = issued.data.url;
         anSetMsg('anHelperMsg', 'Đã gửi sang Bootstrap helper — bấm Yes khi Windows hỏi quyền Administrator.', 'ok');
-        anBeginWatch(anGenerated.enrollment.id, anGenerated.enrollment.node_id);
+        anBeginWatch(anGenerated.enrollment.id, anGenerated.enrollment.node_id,
+                     Date.parse(issued.data.expires_at || '') || 0);
       } finally {
         anHandleInFlight = false;
         anApplyCta();   // back to whatever the current state allows
@@ -17067,7 +17106,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
         def _compute():
             issued = onboarding.enrollments.create_handle(
-                enrollment_id, created_by=(identity.email if identity else None))
+                enrollment_id, created_by=(identity.email if identity else None),
+                ttl_seconds=terminal.config.nodes.onboarding.pairing_handle_ttl_seconds)
             if issued is None:
                 return None
             handle, expires_at = issued
@@ -17165,9 +17205,23 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         except (TypeError, ValueError):
             elapsed = None
 
+        # Two authenticators, one contract. The installer holds a code;
+        # the HELPER holds only a pairing handle, and everything it can
+        # usefully say -- started, redeeming, redeem failed -- happens
+        # before the exchange that would give it a code. Accepting either
+        # here keeps one machine-facing progress route, which is also what
+        # keeps the public bootstrap ingress allowlist unchanged: no new
+        # path is exposed.
+        handle = str(body.get("handle") or "")
+        code = str(body.get("code") or "")
+
         def _compute() -> str | None:
-            record = onboarding.enrollments.record_progress(
-                str(body.get("code") or ""), stage=stage, elapsed_seconds=elapsed)
+            if handle:
+                record = onboarding.enrollments.record_progress_by_handle(
+                    handle, stage=stage, elapsed_seconds=elapsed)
+            else:
+                record = onboarding.enrollments.record_progress(
+                    code, stage=stage, elapsed_seconds=elapsed)
             return record.node_id if record else None
 
         node_id = await anyio.to_thread.run_sync(_compute)
