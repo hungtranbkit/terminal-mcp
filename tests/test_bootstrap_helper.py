@@ -317,9 +317,11 @@ def _page():
     return dashboard_module.NODES_ADMIN_HTML
 
 
-def test_cta_exists_and_is_gated_on_real_detection():
+def test_cta_exists_and_its_ACTION_is_gated_on_real_detection():
+    """Detection decides what the one button DOES, never whether it is
+    there. The gate moved from the button's existence to its meaning."""
     page = _page()
-    assert 'id="anHelperBtn"' in page and "Kết nối máy này" in page
+    assert 'id="anHelperBtn"' in page and "Cài và kết nối máy này" in page
     assert "anDetectHelper" in page
     # Loopback only -- a helper reachable on a LAN address would be
     # drivable by anything on the network.
@@ -348,10 +350,20 @@ def test_copy_paste_flow_is_kept_and_only_demoted():
     assert 'id="anDownloadBtn"' in page and "Cách khác / thủ công" in page
 
 
-def test_helper_box_is_hidden_until_detection_succeeds():
+def test_the_primary_cta_is_never_hidden_by_detection():
+    """The inverse of what this file used to assert, and deliberately so.
+    Hiding the box until a loopback probe succeeded meant the operator at a
+    fresh Windows machine -- the exact person the button is for -- was the
+    one person who never saw it. The box ships unhidden and no code path
+    takes it away; only the button's enabled state and its explanation
+    change."""
     page = _page()
-    helper_box = page[page.index('id="anHelperBox"'):page.index('id="anQuickBox"')]
-    assert "hidden" in helper_box.split(">")[0], "the CTA must not show before the helper is found"
+    box_tag = page[page.index('id="anHelperBox"'):]
+    box_tag = box_tag[:box_tag.index(">")]
+    assert "hidden" not in box_tag, "the primary CTA must be on screen before detection resolves"
+    # And nothing may put it back.
+    assert "helperBox.hidden" not in page
+    assert "anHelperBox').hidden" not in page
 
 
 # ---------------------------------------------------------------------------
@@ -431,3 +443,118 @@ func TestDifferential(t *testing.T) {
             actual_ok = False
         assert actual_ok == expected_ok, f"python disagreed on {url}"
     assert result.returncode == 0, f"go disagreed:\n{result.stdout}\n{result.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# One primary CTA, three live states -- and none of them removes the button
+# ---------------------------------------------------------------------------
+#
+# The rule these tests defend: after Generate setup there is always exactly
+# one primary call to action, reading "Cài và kết nối máy này", on screen.
+# What changes between states is what the click does and what the line above
+# it says -- never whether the operator can see the thing they were promised.
+
+
+def _cta_js():
+    """The CTA state machine, from its label constant to the end of the
+    mode-dispatching click handler."""
+    page = _page()
+    start = page.index("const AN_CTA_LABEL")
+    end = page.index("document.getElementById('anRegenBtn').addEventListener")
+    return page[start:end]
+
+
+def test_the_cta_label_is_one_fixed_promise_in_every_state():
+    """Three different labels for three detected states would make the
+    operator re-read the button each time and wonder whether it still does
+    what they wanted. One label, one promise."""
+    page = _page()
+    assert "const AN_CTA_LABEL = 'Cài và kết nối máy này';" in page
+    # The markup ships the same words, so the button reads correctly even
+    # before any script runs.
+    button = page[page.index('id="anHelperBtn"'):]
+    button = button[:button.index("</button>")]
+    assert "Cài và kết nối máy này" in button
+    # And the JS re-asserts that one label rather than composing per-state
+    # ones.
+    assert "button.textContent = AN_CTA_LABEL;" in _cta_js()
+
+
+def test_fresh_machine_with_an_artifact_downloads_the_paired_helper():
+    """Helper not installed, but this controller publishes one: the SAME
+    primary button hands over the helper paired with THIS enrollment, and
+    tells them to open the file and accept the UAC prompt."""
+    js = _cta_js()
+    assert "anSetCtaMode('download', build);" in js
+    # The click routes to the paired download, not to the connect path.
+    assert "if (anCtaMode === 'download') {" in js
+    assert "await anDownloadPairedHelper(event);" in js
+    # Paired with the pending enrollment, so no second setup is started.
+    assert "anDownloadPairedHelper" in _page()
+    # The instruction is on the button's own explanation line, before the
+    # click -- not only in a message that appears afterwards.
+    assert "Mở file vừa tải" in js
+    assert "bấm Yes khi Windows hỏi quyền Administrator" in js
+    assert "gắn sẵn phiên cài đặt này" in js
+
+
+def test_installed_helper_turns_the_same_cta_into_connect():
+    js = _cta_js()
+    assert "if (found) { anSetCtaMode('connect'); return 'connect'; }" in js
+    assert "if (anCtaMode !== 'connect') return;" in js
+    assert "đã cài trên máy này" in js
+
+
+def test_no_artifact_leaves_the_cta_visible_disabled_and_explained():
+    """The state that used to delete the button. It now keeps it, greys it
+    out, and puts the reason in words -- plus where to go instead."""
+    js = _cta_js()
+    assert "anSetCtaMode('unavailable')" in _page()
+    assert "chưa xuất bản Bootstrap helper" in js, "the reason must be stated"
+    assert "Copy lệnh cài đặt" in js, "and it must point at the fallback that works"
+    # Disabled, not hidden: nothing in the whole CTA region touches the
+    # visibility of the box that holds it.
+    assert "anCtaSetState(button, false, false);" in js
+    assert "helperBox" not in js
+    assert "anHelperBox" not in js
+
+
+def test_a_disabled_cta_is_disabled_to_the_pointer_and_to_a_screen_reader():
+    page = _page()
+    assert "button.setAttribute('aria-disabled', String(!enabled));" in page
+    assert ".an-big-btn[disabled]" in page and "cursor:not-allowed" in page
+    # The explanation is wired to the button, and announced when it changes.
+    assert 'aria-describedby="anHelperWhy"' in page
+    assert 'id="anHelperMsg" role="status" aria-live="polite"' in page
+
+
+def test_the_cta_never_mints_two_handles_for_one_enrollment():
+    """An impatient double click used to be able to mint a second handle,
+    which invalidates the first -- so the helper already holding the first
+    fails at redeem time."""
+    page = _page()
+    assert "let anHandleInFlight = false;" in page
+    assert page.count("anHandleInFlight = true;") == 2, "both click paths must take the guard"
+    assert page.count("anHandleInFlight = false;") == 3, "and both must release it in a finally"
+    js = _cta_js()
+    assert "if (button.disabled || anHandleInFlight) return;" in js
+
+
+def test_an_expired_enrollment_disables_the_cta_rather_than_failing_on_click():
+    js = _cta_js()
+    assert "if (anCtaExpired) {" in js
+    assert "hết hạn" in js and "Tạo lại" in js
+    assert "if (!anGenerated || anCtaExpired) return;" in js
+
+
+def test_the_progress_and_expiry_machinery_still_runs():
+    """The CTA rework must not have cost the live install progress, the
+    countdown, or the regenerate path."""
+    page = _page()
+    for marker in ("anPollProgress", "anProgressTimer", "anExpiryTimer",
+                   "progress_elapsed_seconds", "anRegenBtn", "anLive"):
+        assert marker in page, marker
+    # Every timer the step starts is also cleared when the panel closes.
+    done = page[page.index("document.getElementById('anDoneBtn')"):]
+    for timer in ("anExpiryTimer", "anProgressTimer", "anDetectTimer"):
+        assert "clearInterval(%s)" % timer in done[:700], timer

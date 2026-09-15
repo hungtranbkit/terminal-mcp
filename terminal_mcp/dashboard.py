@@ -6016,6 +6016,10 @@ NODES_ADMIN_HTML = """<!doctype html>
               border-radius:6px; white-space:pre-wrap; word-break:break-all }
     .an-cmd:focus { outline:2px solid var(--accent); outline-offset:1px }
     .an-big-btn { font-size:13px; padding:9px 18px }
+    /* The one primary CTA is never hidden, so its unusable states have to
+       read as unusable rather than as "nothing happened when I clicked". */
+    .an-big-btn[disabled] { opacity:.5; cursor:not-allowed }
+    .an-big-btn[aria-busy="true"] { cursor:progress }
     .an-note { font-size:11px; margin-top:8px }
     .an-helper { margin-top:10px; padding:14px; border:1px solid #6ee7a0; border-radius:10px; background:#12331f }
     .an-helper .an-big { color:#8ef0b8 }
@@ -6104,48 +6108,56 @@ NODES_ADMIN_HTML = """<!doctype html>
         </div>
       </div>
 
-      <!-- step 3: the download + the three things to do -->
+      <!-- step 3: ONE primary action, whatever this machine already has -->
       <div id="anStepDone" class="an-step" hidden>
         <div class="an-done-head">
-          <div class="an-big">Cài đặt nhanh — không cần gõ lệnh nào</div>
+          <div class="an-big">Cài và kết nối máy này</div>
           <div class="muted" id="anExpiry"></div>
         </div>
 
-        <!-- Web-only path, when the Bootstrap helper is already on the
-             machine the operator is sitting at. One click, one UAC. -->
-        <div class="an-helper" id="anHelperBox" hidden>
-          <div class="an-big">Kết nối máy này</div>
-          <div class="muted" style="font-size:12px;margin-top:4px" id="anHelperWhy"></div>
+        <!-- The one primary CTA, in the markup UNHIDDEN and staying visible
+             whatever detection finds. Someone standing at a fresh Windows
+             machine was promised this button; making them first work out
+             whether a Bootstrap helper exists is our problem leaking into
+             their screen. Detection decides only what the click DOES --
+             pair with a helper already here, or download the paired one --
+             and the no-artifact case keeps the button with the reason in
+             words rather than removing it. -->
+        <div class="an-helper" id="anHelperBox">
+          <div class="muted" style="font-size:12px;margin-top:4px" id="anHelperWhy">Đang kiểm tra máy này…</div>
           <div class="cx-row" style="margin-top:10px">
-            <button class="icon-btn an-primary an-big-btn" id="anHelperBtn" type="button">⚡ Kết nối máy này</button>
-            <a class="icon-btn an-big-btn" id="anHelperDlBtn" hidden
-               href="/dashboard/api/nodes/onboard/helper/windows-x64"
-               download="terminal-mcp-bootstrap.exe">⬇ Tải Bootstrap helper</a>
-          </div>
-          <div class="d-msg" id="anHelperMsg"></div>
-        </div>
-
-        <!-- The primary path. One button, then three physical actions on
-             the Windows machine. Nothing to type, no shell to open. -->
-        <div class="an-quick" id="anQuickBox">
-          <ol class="an-steps">
-            <li>Bấm <b>Copy lệnh cài đặt</b> bên dưới.</li>
-            <li>Trên máy Windows: nhấn <b>Win + R</b>, rồi <b>Ctrl + V</b>, rồi <b>Enter</b>.</li>
-            <li>Chọn <b>Yes</b> khi Windows hỏi quyền Administrator, rồi chờ màn hình báo hoàn tất.</li>
-          </ol>
-          <textarea id="anQuickCmd" class="an-cmd" readonly rows="3" spellcheck="false" wrap="soft"></textarea>
-          <div class="cx-row" style="margin-top:8px">
-            <button class="icon-btn an-primary an-big-btn" id="anCopyCmdBtn" type="button">📋 Copy lệnh cài đặt</button>
+            <button class="icon-btn an-primary an-big-btn" id="anHelperBtn" type="button"
+                    aria-describedby="anHelperWhy" aria-busy="true" aria-disabled="true" disabled>Cài và kết nối máy này</button>
             <button class="icon-btn" id="anRegenBtn" type="button" hidden>Tạo lại</button>
             <button class="icon-btn" id="anDoneBtn" type="button">Đã xong</button>
           </div>
-          <div class="d-msg" id="anDoneMsg"></div>
+          <div class="d-msg" id="anHelperMsg" role="status" aria-live="polite"></div>
           <div class="an-live" id="anLive" hidden></div>
-          <div class="muted an-note" id="anPlatformNote" hidden></div>
         </div>
 
+        <!-- Everything below is the fallback: the copy/paste Win + R path
+             that predates the helper, plus the raw script. It still works
+             and still matters when a machine refuses the helper -- but it
+             is no longer a second primary button competing with the one
+             above. -->
         <details class="an-manual">
           <summary>Cách khác / thủ công</summary>
+          <div class="an-quick an-demoted" id="anQuickBox">
+            <ol class="an-steps">
+              <li>Bấm <b>Copy lệnh cài đặt</b> bên dưới.</li>
+              <li>Trên máy Windows: nhấn <b>Win + R</b>, rồi <b>Ctrl + V</b>, rồi <b>Enter</b>.</li>
+              <li>Chọn <b>Yes</b> khi Windows hỏi quyền Administrator, rồi chờ màn hình báo hoàn tất.</li>
+            </ol>
+            <textarea id="anQuickCmd" class="an-cmd" readonly rows="3" spellcheck="false" wrap="soft"></textarea>
+            <div class="cx-row" style="margin-top:8px">
+              <button class="icon-btn" id="anCopyCmdBtn" type="button">📋 Copy lệnh cài đặt</button>
+              <a class="icon-btn" id="anHelperDlBtn" hidden
+                 href="/dashboard/api/nodes/onboard/helper/windows-x64"
+                 download="terminal-mcp-bootstrap.exe">⬇ Tải Bootstrap helper (thủ công)</a>
+            </div>
+            <div class="d-msg" id="anDoneMsg" role="status" aria-live="polite"></div>
+            <div class="muted an-note" id="anPlatformNote" hidden></div>
+          </div>
           <div class="cx-row" style="margin-top:10px">
             <button class="icon-btn" id="anDownloadBtn" type="button">⬇ Download windows-setup.ps1</button>
             <button class="icon-btn" id="anCopyCodeBtn" type="button">Copy enrollment code</button>
@@ -6729,6 +6741,120 @@ NODES_ADMIN_HTML = """<!doctype html>
     let anProgressTimer = null;
     let anHelper = null;   // {version} when the local Bootstrap helper answers
 
+    // -- the one primary CTA ------------------------------------------------
+    //
+    // After Generate setup there is exactly ONE primary button, and it is
+    // always on screen. Detection decides what the click DOES and what the
+    // line above it says -- never whether the button exists. Someone
+    // standing at a fresh Windows machine was promised "Cài và kết nối máy
+    // này"; making them first work out whether a Bootstrap helper is
+    // installed, or whether this controller published one, is our problem
+    // leaking onto their screen. When nothing can be done we still show the
+    // button, disabled, with the reason in words -- a missing button reads
+    // as "this page is broken", a disabled one with a reason reads as
+    // "here is what to fix".
+    const AN_CTA_LABEL = 'Cài và kết nối máy này';
+    let anCtaMode = 'checking';   // checking | connect | download | unavailable
+    let anCtaBuild = null;        // the published helper build, in download mode
+    let anCtaExpired = false;     // the enrollment behind the CTA has run out
+    let anDetectTimer = null;
+    // One handle in flight at a time. Without this an impatient double
+    // click mints two handles for one enrollment: the second invalidates
+    // the first, and the helper already holding the first fails at redeem.
+    let anHandleInFlight = false;
+
+    // disabled AND aria-disabled: the pointer gets a cursor that says "not
+    // now" instead of a click that silently does nothing, and assistive
+    // tech reads the same state rather than an enabled-looking button.
+    function anCtaSetState(button, enabled, busy) {
+      button.disabled = !enabled;
+      button.setAttribute('aria-disabled', String(!enabled));
+      if (busy) button.setAttribute('aria-busy', 'true');
+      else button.removeAttribute('aria-busy');
+    }
+
+    function anSetCtaMode(mode, build) {
+      anCtaMode = mode;
+      anCtaBuild = mode === 'download' ? (build || null) : null;
+      anApplyCta();
+    }
+
+    function anApplyCta() {
+      const button = document.getElementById('anHelperBtn');
+      if (!button) return;
+      const why = document.getElementById('anHelperWhy');
+      const dlBtn = document.getElementById('anHelperDlBtn');
+      const quickBox = document.getElementById('anQuickBox');
+      const build = anCtaBuild;
+      // The manual mirror of the download lives in the fallback section and
+      // only appears when there is actually a build to hand over.
+      if (dlBtn) {
+        dlBtn.hidden = !build;
+        if (build) dlBtn.onclick = anDownloadPairedHelper;
+      }
+      // Copy/paste is demoted whenever the CTA can act. When it cannot, it
+      // is the only thing on this screen that still works, so it stops
+      // looking like an afterthought.
+      if (quickBox) quickBox.classList.toggle('an-demoted', anCtaMode !== 'unavailable');
+      // The label never changes with the mode: the operator is promised one
+      // action, and "install and connect this machine" is what every live
+      // branch actually delivers.
+      button.textContent = AN_CTA_LABEL;
+      if (anCtaExpired) {
+        anCtaSetState(button, false, false);
+        why.textContent = 'Mã cài đặt đã hết hạn — bấm Tạo lại để tạo mã mới.';
+        return;
+      }
+      if (anCtaMode === 'checking') {
+        anCtaSetState(button, false, true);
+        why.textContent = 'Đang kiểm tra máy này…';
+        return;
+      }
+      if (anCtaMode === 'connect') {
+        anCtaSetState(button, true, false);
+        why.textContent = `Bootstrap helper v${(anHelper && anHelper.version) || '?'} đã cài trên máy này — bấm một lần, rồi bấm Yes khi Windows hỏi quyền Administrator.`;
+        return;
+      }
+      if (anCtaMode === 'download') {
+        anCtaSetState(button, true, false);
+        // Unsigned is stated plainly rather than coaching anyone past
+        // SmartScreen.
+        const warn = build && build.signed ? '' : ' (bản DEV chưa ký — Windows SmartScreen sẽ cảnh báo, chọn More info → Run anyway)';
+        why.textContent = `Chưa có helper trên máy này — bấm để tải Bootstrap helper v${(build && build.version) || '?'} đã gắn sẵn phiên cài đặt này${warn}. Mở file vừa tải, rồi bấm Yes khi Windows hỏi quyền Administrator; phần còn lại tự chạy.`;
+        return;
+      }
+      // unavailable: the button stays put and says why it cannot act.
+      anCtaSetState(button, false, false);
+      why.textContent = 'Controller này chưa xuất bản Bootstrap helper cho Windows, nên chưa cài tự động từ đây được. Dùng cách thủ công bên dưới: Copy lệnh cài đặt → Win + R trên máy Windows.';
+    }
+
+    // Detection decides the mode, and nothing else. Both the first render
+    // and the post-download re-check go through here so there is one place
+    // that maps "what is on this machine" to "what the button does".
+    async function anDecideCta() {
+      const found = await anDetectHelper();
+      anHelper = found;
+      if (found) { anSetCtaMode('connect'); return 'connect'; }
+      const published = await api('/dashboard/api/nodes/onboard/helper');
+      const build = published.ok && published.data.published ? published.data : null;
+      if (!build) { anSetCtaMode('unavailable'); return 'unavailable'; }
+      anSetCtaMode('download', build);
+      return 'download';
+    }
+
+    // After a paired download the helper usually enrolls on its own, but if
+    // the operator installs it and comes back to this tab, the CTA should
+    // already have become the connect button. Bounded re-check, not a
+    // permanent poll.
+    function anRedetectAfterDownload() {
+      if (anDetectTimer) { clearInterval(anDetectTimer); anDetectTimer = null; }
+      let tries = 0;
+      anDetectTimer = setInterval(async () => {
+        if (!anGenerated || ++tries > 12) { clearInterval(anDetectTimer); anDetectTimer = null; return; }
+        if (await anDecideCta() === 'connect') { clearInterval(anDetectTimer); anDetectTimer = null; }
+      }, 5000);
+    }
+
     // Is the Terminal MCP Bootstrap helper installed on the machine the
     // OPERATOR is sitting at? There is no way to feature-detect a custom
     // protocol handler from a page, so the helper runs a loopback-only
@@ -6812,6 +6938,11 @@ NODES_ADMIN_HTML = """<!doctype html>
           cmdEl.disabled = true;
           copyBtn.disabled = true;
           regenBtn.hidden = false;
+          // The CTA stays on screen and says it has expired, rather than
+          // minting a handle against an enrollment the controller will
+          // refuse.
+          anCtaExpired = true;
+          anApplyCta();
           if (anExpiryTimer) { clearInterval(anExpiryTimer); anExpiryTimer = null; }
           return;
         }
@@ -6822,49 +6953,15 @@ NODES_ADMIN_HTML = """<!doctype html>
       copyBtn.disabled = false;
       regenBtn.hidden = true;
       document.getElementById('anLive').hidden = true;
+      anCtaExpired = false;
+      anSetMsg('anHelperMsg', '');
 
-      // Helper present -> lead with the one-click path and demote the
-      // copy/paste one. Absent -> leave copy/paste as the primary, which
-      // is the honest state on a machine that has never been onboarded.
-      const helperBox = document.getElementById('anHelperBox');
-      const quickBox = document.getElementById('anQuickBox');
-      anDetectHelper().then(async (found) => {
-        anHelper = found;
-        const connectBtn = document.getElementById('anHelperBtn');
-        const downloadBtn = document.getElementById('anHelperDlBtn');
-        const why = document.getElementById('anHelperWhy');
-        if (found) {
-          helperBox.hidden = false;
-          connectBtn.hidden = false;
-          downloadBtn.hidden = true;
-          why.textContent =
-            `Bootstrap helper v${found.version || '?'} đã cài trên máy này — chỉ cần một cú bấm và một lần bấm Yes.`;
-          quickBox.classList.add('an-demoted');
-          return;
-        }
-        // Not installed. Offer the download only if this controller has
-        // actually published one; otherwise say nothing and leave the
-        // copy/paste path primary, which is the honest state.
-        quickBox.classList.remove('an-demoted');
-        const published = await api('/dashboard/api/nodes/onboard/helper');
-        const build = published.ok && published.data.published ? published.data : null;
-        if (!build) { helperBox.hidden = true; return; }
-        helperBox.hidden = false;
-        connectBtn.hidden = true;
-        downloadBtn.hidden = false;
-        // Pair the download with THIS pending session so a double-click on
-        // a fresh machine continues it -- no code to copy, no handle to
-        // type, no second trip back to this page. The handle lives ~2
-        // minutes and is single-use; if the browser renames the file on the
-        // way down, the helper installs normally and the Connect button
-        // below still works.
-        downloadBtn.onclick = anDownloadPairedHelper;
-        // Unsigned is stated plainly rather than coaching anyone past
-        // SmartScreen.
-        why.textContent = build.signed
-          ? `Chưa có helper trên máy này. Tải v${build.version} rồi chạy — sau đó nút Kết nối sẽ hoạt động.`
-          : `Chưa có helper trên máy này. Tải v${build.version} (bản DEV chưa ký — Windows SmartScreen sẽ cảnh báo) rồi chạy.`;
-      });
+      // The CTA is on screen from this moment, in its checking state. It
+      // is never removed from here on: anDecideCta only chooses which of
+      // the three live meanings it carries.
+      if (anDetectTimer) { clearInterval(anDetectTimer); anDetectTimer = null; }
+      anSetCtaMode('checking');
+      anDecideCta();
       if (anProgressTimer) clearInterval(anProgressTimer);
       anProgressTimer = setInterval(anPollProgress, 3000);
       anPollProgress();
@@ -6975,6 +7072,8 @@ NODES_ADMIN_HTML = """<!doctype html>
       event.preventDefault();
       if (!anGenerated) return;
       const button = event.currentTarget;
+      if (anHandleInFlight) return;
+      anHandleInFlight = true;
       button.classList.add('busy');
       let handle = '';
       try {
@@ -7010,38 +7109,64 @@ NODES_ADMIN_HTML = """<!doctype html>
         link.remove();
         setTimeout(() => URL.revokeObjectURL(url), 5000);
         anSetMsg('anHelperMsg', handle
-          ? 'Đã tải. Mở file vừa tải và bấm Yes — phần còn lại tự chạy.'
-          : 'Đã tải. Cài xong thì bấm "Kết nối máy này" lần nữa.', 'ok');
+          ? 'Đã tải. Mở file vừa tải và bấm Yes khi Windows hỏi quyền Administrator — phần còn lại tự chạy.'
+          : `Đã tải. Mở file vừa tải và bấm Yes; cài xong thì bấm "${AN_CTA_LABEL}" lần nữa.`, 'ok');
+        // They now have the installer in hand, so start watching for the
+        // helper to appear and flip the CTA to its connect meaning.
+        anRedetectAfterDownload();
       } finally {
+        anHandleInFlight = false;
         button.classList.remove('busy');
       }
     }
 
+    // The single primary action. Which of its three meanings fires is
+    // decided by detection, not by the operator having to choose: connect
+    // through a helper already here, or download the helper paired with
+    // THIS enrollment. In the unavailable state the button is disabled and
+    // never reaches this handler at all.
     document.getElementById('anHelperBtn').addEventListener('click', async (event) => {
-      if (!anGenerated) return;
+      if (!anGenerated || anCtaExpired) return;
       const button = event.currentTarget;
-      button.disabled = true;
-      anSetMsg('anHelperMsg', 'Đang tạo phiên cài đặt...', '');
-      // The handle is minted per click and lives ~2 minutes: it is what
-      // travels in the terminalmcp:// URL instead of the enrollment code.
-      const issued = await api(
-        `/dashboard/api/nodes/onboard/enrollments/${encodeURIComponent(anGenerated.enrollment.id)}/handle`,
-        {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
-      button.disabled = false;
-      if (!issued.ok) {
-        anSetMsg('anHelperMsg', issued.data.detail || issued.data.error || 'Không tạo được phiên cài đặt.', 'error');
+      if (button.disabled || anHandleInFlight) return;
+      if (anCtaMode === 'download') {
+        // Same button, same enrollment: the download carries the pending
+        // session with it, so the double-click on the Windows machine
+        // continues this setup instead of starting a second one.
+        anCtaSetState(button, false, true);
+        await anDownloadPairedHelper(event);
+        anApplyCta();
         return;
       }
-      // Hand it to the local helper. The page never sees the bootstrap
-      // payload -- the helper redeems the handle itself, over HTTPS.
-      window.location.href = issued.data.url;
-      anSetMsg('anHelperMsg', 'Đã gửi sang Bootstrap helper — bấm Yes khi Windows hỏi quyền Administrator.', 'ok');
+      if (anCtaMode !== 'connect') return;
+      anHandleInFlight = true;
+      anCtaSetState(button, false, true);
+      anSetMsg('anHelperMsg', 'Đang tạo phiên cài đặt...', '');
+      try {
+        // The handle is minted per click and lives ~2 minutes: it is what
+        // travels in the terminalmcp:// URL instead of the enrollment code.
+        const issued = await api(
+          `/dashboard/api/nodes/onboard/enrollments/${encodeURIComponent(anGenerated.enrollment.id)}/handle`,
+          {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+        if (!issued.ok) {
+          anSetMsg('anHelperMsg', issued.data.detail || issued.data.error || 'Không tạo được phiên cài đặt.', 'error');
+          return;
+        }
+        // Hand it to the local helper. The page never sees the bootstrap
+        // payload -- the helper redeems the handle itself, over HTTPS.
+        window.location.href = issued.data.url;
+        anSetMsg('anHelperMsg', 'Đã gửi sang Bootstrap helper — bấm Yes khi Windows hỏi quyền Administrator.', 'ok');
+      } finally {
+        anHandleInFlight = false;
+        anApplyCta();   // back to whatever the current state allows
+      }
     });
 
     document.getElementById('anRegenBtn').addEventListener('click', () => {
       // Same node name and profile, a fresh code. Straight back to the
       // form's submit path so there is one code-minting path, not two.
       if (anExpiryTimer) { clearInterval(anExpiryTimer); anExpiryTimer = null; }
+      if (anDetectTimer) { clearInterval(anDetectTimer); anDetectTimer = null; }
       anShow('anStepForm');
       anSetMsg('anFormMsg', 'Mã cũ đã hết hạn — bấm Generate setup để tạo lệnh mới.', '');
     });
@@ -7058,6 +7183,7 @@ NODES_ADMIN_HTML = """<!doctype html>
       anPanel.hidden = true;
       if (anExpiryTimer) { clearInterval(anExpiryTimer); anExpiryTimer = null; }
       if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
+      if (anDetectTimer) { clearInterval(anDetectTimer); anDetectTimer = null; }
       anGenerated = null;   // the only copy in this tab, dropped on close
       loadAll();
     });
