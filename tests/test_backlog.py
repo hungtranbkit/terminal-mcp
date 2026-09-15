@@ -357,3 +357,43 @@ def test_shipped_example_covers_the_interesting_states():
     assert dispatched, "example should show the backlog->queue link"
     done = [i for i in document["items"] if i["status"] == "DONE"]
     assert done and done[0]["evidence"]["commits"], "a DONE item must show its evidence"
+
+
+def test_completing_an_item_whose_evidence_is_a_string_migrates_it(svc, repo):
+    """A production item held `evidence` as a plain string, written before the
+    shape settled. complete() raised AttributeError on it, so that item could
+    never be closed -- a ledger crashing on its own stored data.
+
+    The original text is kept as a note: discarding evidence to fix a type
+    error would be the wrong trade every time.
+    """
+    added = svc.add(str(repo), tasks=[{"title": "legacy evidence shape"}])
+    # add() mints the id; assuming one would silently target a row that does
+    # not exist, which is how the first version of this test passed vacuously.
+    task_id = added["created_ids"][0]
+    # Reproduce the legacy shape the way it actually arose: straight in the
+    # stored payload. Going through import_document would not, because
+    # normalise_item rewrites evidence on the way in -- which is the very
+    # reason the bad row survived unnoticed.
+    import os
+    import sqlite3
+
+    connection = sqlite3.connect(os.environ["TERMINAL_MCP_BACKLOG_DB"])
+    with connection:
+        row = connection.execute(
+            "SELECT payload FROM backlog_items WHERE id = ?", (task_id,)).fetchone()
+        payload = json.loads(row[0])
+        payload["evidence"] = "ROOT CAUSE CONFIRMED: written before evidence became a dict"
+        connection.execute("UPDATE backlog_items SET payload = ? WHERE id = ?",
+                           (json.dumps(payload), task_id))
+    connection.close()
+
+    result = svc.complete(str(repo), task_id=task_id, commit="abc1234",
+                          test="1 passed")
+
+    assert result.get("error") is None, result
+    item = result["item"]
+    assert item["status"] == "DONE"
+    assert "ROOT CAUSE CONFIRMED" in " ".join(item["evidence"]["notes"]), \
+        "the original evidence text must survive the migration"
+    assert item["evidence"]["commits"] == ["abc1234"]

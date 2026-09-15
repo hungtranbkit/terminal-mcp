@@ -474,6 +474,15 @@ class BacklogService:
             if item is None:
                 return {"error": "TASK_NOT_FOUND", "task_id": task_id}
             evidence = item.setdefault("evidence", {})
+            if not isinstance(evidence, dict):
+                # A ledger that crashes on its own stored data is worse than a
+                # ledger with untidy data. One production item holds `evidence`
+                # as a plain string, written before this shape settled, and
+                # completing it raised AttributeError on the setdefault below --
+                # so that item could not be closed at all. Migrate in place and
+                # KEEP the original text as a note: discarding evidence to fix a
+                # type error is the wrong trade every time.
+                item["evidence"] = evidence = {"notes": [str(evidence)]}
             for key, value in (("commits", commit), ("tests", test), ("deploys", deploy), ("notes", note)):
                 if value:
                     evidence.setdefault(key, []).append(value)
