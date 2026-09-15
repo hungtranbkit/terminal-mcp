@@ -1259,7 +1259,14 @@ function Resolve-Tool {
 }
 
 function Get-AgentTypes {
-    `$found = @()
+    # 'shell' unconditionally: this backend IS powershell, so a node that
+    # can host a session at all can host a shell one. Every Linux and macOS
+    # node reports it; this one did not, which left 54202 the only node in
+    # the fleet whose agent_types disagreed with what it could actually
+    # run. The dashboard happens to special-case shell today, so the gap
+    # was invisible there -- it is still a contract every other consumer
+    # (scheduler, fleet summary, capability queries) reads literally.
+    `$found = @('shell')
     foreach (`$pair in @(@('claude','claude'), @('codex','codex'), @('opencode','opencode'))) {
         if (Resolve-Tool `$pair[1]) { `$found += `$pair[0] }
     }
@@ -1348,6 +1355,26 @@ while (`$true) {
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
             -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
             -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+        # STOP the beat that is already running before replacing it.
+        #
+        # This is what made a -Repair a no-op. The script above was
+        # rewritten on disk, but PowerShell reads a script ONCE at launch,
+        # so the instance already looping kept executing the PREVIOUS
+        # text forever. -Force rewrites the definition and leaves that
+        # instance alone, and -MultipleInstances IgnoreNew makes the
+        # Start-ScheduledTask below a silent no-op while it lives -- so
+        # the state check found 'Running', reported OK, and the node went
+        # on advertising the capabilities of a script that no longer
+        # existed. Node 54202 sat at "chua co node agent" in Create
+        # Session for hours after the repair that was supposed to fix it,
+        # because its beat predated the session_transport probe.
+        if (Get-ScheduledTask -TaskName $TaskBeat -ErrorAction SilentlyContinue) {
+            Stop-ScheduledTask -TaskName $TaskBeat -ErrorAction SilentlyContinue
+            foreach ($wait in 1..20) {
+                Start-Sleep -Milliseconds 500
+                if ([string](Get-ScheduledTask -TaskName $TaskBeat -ErrorAction SilentlyContinue).State -ne 'Running') { break }
+            }
+        }
         # -Force replaces an existing registration, so a re-run or a
         # -Repair is idempotent rather than a second task.
         Register-ScheduledTask -TaskName $TaskBeat -Action $action -Trigger $triggers -Principal $principal `
@@ -1361,8 +1388,24 @@ while (`$true) {
             $beatState = [string](Get-ScheduledTask -TaskName $TaskBeat -ErrorAction SilentlyContinue).State
             if ($beatState -eq 'Running') { break }
         }
+        # 'Running' is NOT sufficient -- it was 'Running' throughout the
+        # failure above. The instance has to be one that started AFTER the
+        # script it is supposed to be executing was written.
+        $beatFresh = $true
         if ($beatState -eq 'Running') {
+            $written = (Get-Item $BeatRunner -ErrorAction SilentlyContinue).LastWriteTime
+            $stale = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+                       Where-Object { $_.CommandLine -like "*$([System.IO.Path]::GetFileName($BeatRunner))*" } |
+                       ForEach-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue } |
+                       Where-Object { $written -and $_.StartTime -lt $written })
+            if ($stale.Count -gt 0) { $beatFresh = $false }
+        }
+        if ($beatState -eq 'Running' -and $beatFresh) {
             Add-Step 'Heartbeat task' 'OK' "every ${interval}s, running now + at startup as SYSTEM"
+        } elseif ($beatState -eq 'Running') {
+            # Reporting OK here is what hid the bug for an entire evening.
+            Add-Step 'Heartbeat task' 'FAIL' 'mot tien trinh heartbeat cu van dang chay script truoc khi sua' `
+                ("Dung roi chay lai: Stop-ScheduledTask -TaskName '{0}'" -f $TaskBeat)
         } else {
             # Registered but not running is a real failure: the node will
             # not appear on the Dashboard. Say so instead of reporting OK.
