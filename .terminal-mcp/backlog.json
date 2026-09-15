@@ -9,8 +9,8 @@
     "git_branch": "main",
     "is_portable": true
   },
-  "revision": 89,
-  "updated_at": "2026-09-15T05:10:43.331571+00:00",
+  "revision": 90,
+  "updated_at": "2026-09-15T05:12:54.405970+00:00",
   "items": [
     {
       "id": "blg_f52a999971d9",
@@ -3394,6 +3394,45 @@
           "by": "claude-p1",
           "verified_by": "evidence",
           "queue_task_id": null
+        }
+      ]
+    },
+    {
+      "id": "blg_d7582428037c",
+      "title": "PUSH_BLOCKED: m910 has no push credential -- two-hop handoff via dell-linux verified and ready",
+      "description": "FINISH_GATE requires 'commits pushed to a remote, so provenance is not one machine's disk'. m910 cannot push: no credential.helper, no ~/.git-credentials, no token in env; `git push --dry-run origin main` -> fatal: could not read Username for 'https://github.com'. main is 192 commits ahead of origin/main (695b31c).\n\nA host that CAN push has been identified and BOTH hops are dry-run verified:\n  hop 1 (m910 -> dell-linux, verified '5d3bc6b..21608d0 HEAD -> m910-main'):\n    GIT_SSH_COMMAND='ssh -F ~/.ssh/config' git push dell-linux:/home/dell/workspace/terminal-mcp HEAD:refs/heads/m910-main\n  hop 2 (dell-linux -> github over SSH, verified '* [new branch]'):\n    ssh dell-linux 'cd /home/dell/workspace/terminal-mcp && git push git@github.com:hungtranbkit/terminal-mcp.git m910-main:main'\n\nWhy two hops: dell-linux's origin is HTTPS and it has no credential either, but its SSH key authenticates to github as hungtranbkit. The reverse direction (dell-linux -> m910) is NOT available: Tailscale SSH demands an interactive browser check, and widening Tailscale scope is out of bounds -- so m910 must initiate and dell-linux only relays.\n\nAlso needed on m910 for hop 1: git's ssh does not read ~/.ssh/config here because /etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf has bad owner/permissions; GIT_SSH_COMMAND with an explicit -F is the workaround, not a fix to the system config.\n\nNOT EXECUTED: publishing 192 commits to a shared remote is outward-facing and was not part of any standing approval. Needs an explicit go-ahead. No credential was created for this.",
+      "status": "BLOCKED",
+      "priority": "P1",
+      "type": "feature",
+      "order": 58,
+      "created_at": "2026-09-15T05:12:48.238591+00:00",
+      "updated_at": "2026-09-15T05:12:48.238603+00:00",
+      "source": "m2-integrate",
+      "dependencies": [],
+      "acceptance_criteria": [],
+      "tags": [
+        "finish-gate",
+        "release",
+        "handoff"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": "Awaiting explicit approval to publish 192 commits to origin/main. Mechanism verified, nothing executed.",
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-15T05:12:48.238647+00:00",
+          "event": "created",
+          "by": "m2-integrate"
         }
       ]
     }
