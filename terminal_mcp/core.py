@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from . import submit_flow
+from . import composer, submit_flow
 from .adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STALLED, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
                        DELIVERY_UNKNOWN, TARGET_WAITING, _sent_text_echoed, select_adapter,
                        to_legacy_submit_status)
@@ -174,25 +174,28 @@ PANE_LEASE_POLL_INTERVAL_SECONDS = 0.1
 
 
 def _extract_composer_text(snapshot: list[str]) -> str:
-    """Best-effort read of whatever text is currently sitting in a
-    composer's own last non-empty line, for `_send_enter_key_verified_
-    locked`'s own ack-evidence check -- that call never typed the text
-    itself (a bare Enter alone), so this is the only source for what
-    `adapters.py`'s own `submit_ack_evidence`/`_sent_text_echoed` should
-    require an echo of during the busy-window race case. Strips a
-    leading `"> "` composer-prompt marker (the shape every real Claude/
-    Codex composer and this project's own test fixtures use) if present
-    -- never a claim of parsing every possible composer chrome, just the
-    common, well-established one. An empty/unreadable snapshot returns
-    "" (falls back to `_sent_text_echoed`'s own documented trivially-
-    true behavior for nothing to attribute -- never raises)."""
-    for line in reversed(snapshot):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        marker = stripped.find("> ")
-        return stripped[marker + 2:] if marker != -1 else stripped
-    return ""
+    """Best-effort read of whatever text is currently sitting in the
+    composer, for `_send_enter_key_verified_locked`'s own ack-evidence
+    check -- that call never typed the text itself (a bare Enter alone),
+    so this is the only source for what `adapters.py`'s own
+    `submit_ack_evidence`/`_sent_text_echoed` should require an echo of
+    during the busy-window race case. An empty/unreadable snapshot
+    returns "" (falls back to `_sent_text_echoed`'s own documented
+    trivially-true behavior for nothing to attribute -- never raises).
+
+    P0 2026-09-15: this WAS its own "last non-empty line, split on the
+    first `'> '`" implementation, with `submit_flow.extract_composer_text`
+    a second one that "mirrored" it by comment. Against a real Claude pane
+    BOTH returned the footer (`⏵⏵ auto mode on ...`) instead of the
+    prompt, because the real composer marker is followed by U+00A0 and
+    neither reader normalised it -- so the echo this function exists to
+    supply was footer chrome that CHANGES the moment Claude starts
+    working, and a genuinely accepted submit could never be confirmed.
+    See composer.py's module docstring for the captured pane and the full
+    list of decisions that were being made against UI furniture. There is
+    now exactly ONE reader and both call sites delegate to it; keeping two
+    in sync by comment is what let them drift."""
+    return composer.extract(snapshot)
 
 
 def _codex_composer_buffer_complete(snapshot: list[str], text: str) -> bool:

@@ -54,6 +54,7 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from . import composer
 from .adapters import (
     TARGET_RUNNING, TARGET_WAITING, AgentAdapter,
 )
@@ -124,29 +125,18 @@ class Plan:
 def extract_composer_text(snapshot: Sequence[str]) -> str:
     """The prompt currently sitting in the composer, best effort.
 
-    Mirrors core._extract_composer_text's rule (last non-empty line, leading
-    "> " stripped) so the two cannot disagree about what is about to be
-    submitted.
+    P0 2026-09-15: this WAS a second implementation that "mirrored"
+    core._extract_composer_text. It already knew to look for the composer
+    LINE rather than the last non-empty one -- and it was still wrong on a
+    real pane, because it required an ASCII space after the marker and real
+    Claude Code puts U+00A0 there. So it matched no marker at all, fell
+    through to its own last-non-empty-line fallback, and returned the
+    footer anyway: the identical wrong answer it existed to prevent. Both
+    readers now delegate to the single one in composer.py, which normalises
+    Unicode space separators and skips known chrome. See that module's
+    docstring for the captured pane.
     """
-    lines = list(snapshot or ())
-    # Find the COMPOSER LINE, not the last non-empty line. A real Claude pane
-    # carries footer chrome BELOW the composer box ("⏵⏵ auto mode on", a
-    # separator rule), so "last non-empty line" reads the footer and would
-    # submit -- or refuse to submit -- based on UI furniture. Found by the
-    # first run of this module's own tests against a realistic pane.
-    for line in reversed(lines):
-        stripped = line.strip()
-        for marker in (">", "❯", "›"):
-            if stripped == marker:
-                return ""                       # composer present and empty
-            if stripped.startswith(marker + " "):
-                return stripped[len(marker):].strip()
-    # No marker anywhere: fall back to the last non-empty line, which is what
-    # core._extract_composer_text has always done.
-    for line in reversed(lines):
-        if line.strip():
-            return line.strip()
-    return ""
+    return composer.extract(snapshot)
 
 
 def plan_submit(*, snapshot_a: Sequence[str], snapshot_b: Sequence[str],
