@@ -97,12 +97,16 @@ def test_it_runs_the_install_script_shipped_inside_the_bundle():
     older setup left on the machine."""
     section = _agent_section(_script())
     assert "deploy\\install-node-agent.ps1" in section
-    assert "-RepoDir $targetDir" in section
-    assert "-ControllerUrl $ControllerUrl -NodeId $NodeId" in section
-    assert "-Port 8790" in section
-    # The exit code is captured first so it can be logged alongside the
-    # transcript, then checked -- rather than tested inline and discarded.
-    assert "$installerExit = $LASTEXITCODE" in section
+    # Passed as discrete -ArgumentList entries, so a path with a space is
+    # one argument rather than something the shell re-splits.
+    assert "'-RepoDir', $targetDir" in section
+    assert "'-ControllerUrl', $ControllerUrl" in section
+    assert "'-NodeId', $NodeId" in section
+    assert "'-Port', '8790'" in section
+    # The exit code comes from the process object (Start-Process -PassThru
+    # -Wait), so it survives a child that writes to stderr, and is logged
+    # alongside the transcript before it is checked.
+    assert "$installerExit = $proc.ExitCode" in section
     assert "if ($installerExit -ne 0)" in section
 
 
@@ -110,7 +114,7 @@ def test_it_binds_the_interface_the_controller_reaches_not_everything():
     section = _agent_section(_script())
     assert "Get-LocalAddresses" in section
     assert "$addr.tailscale_ip" in section and "$addr.lan_ip" in section
-    assert "-BindHost $bindHost" in section
+    assert "'-BindHost', $bindHost" in section
     # Checked against CODE, not the comment that says "never 0.0.0.0".
     assert "0.0.0.0" not in _without_comments(section)
 

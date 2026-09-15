@@ -1600,14 +1600,28 @@ if (-not $script:EnrollmentOk) {
         # first so the transcript can be scrubbed before it reaches the log
         # an operator reads.
         $rawLog = Join-Path $LogDir ('node-agent-install.raw-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        # Start-Process, not `&`: a native call still trips
+        # $ErrorActionPreference = 'Stop' the moment the child writes to
+        # stderr, redirection or not. Start-Process launches a real process
+        # whose streams go straight to files and whose exit code is read
+        # from the object -- nothing crosses the PowerShell error stream, so
+        # nothing can throw on the way.
+        $rawErr = $rawLog + '.err'
         try {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer `
-                -ControllerUrl $ControllerUrl -NodeId $NodeId -Token $tok `
-                -RepoDir $targetDir -Port 8790 -BindHost $bindHost -PythonExe $py *>> $rawLog
-            $installerExit = $LASTEXITCODE
+            $proc = Start-Process -FilePath 'powershell.exe' -PassThru -Wait -NoNewWindow `
+                -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installer,
+                                '-ControllerUrl', $ControllerUrl, '-NodeId', $NodeId,
+                                '-Token', $tok, '-RepoDir', $targetDir, '-Port', '8790',
+                                '-BindHost', $bindHost, '-PythonExe', $py) `
+                -RedirectStandardOutput $rawLog -RedirectStandardError $rawErr
+            $installerExit = $proc.ExitCode
         } catch {
             $installerExit = -1
             $_.Exception.Message | Add-Content -Path $rawLog -Encoding utf8
+        }
+        if (Test-Path $rawErr) {
+            Get-Content $rawErr -ErrorAction SilentlyContinue | Add-Content -Path $rawLog -Encoding utf8
+            Remove-Item $rawErr -Force -ErrorAction SilentlyContinue
         }
         $scrubbed = ''
         if (Test-Path $rawLog) { $scrubbed = (Get-Content $rawLog -Raw -ErrorAction SilentlyContinue) }
