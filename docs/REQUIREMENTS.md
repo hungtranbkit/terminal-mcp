@@ -3298,6 +3298,117 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
   action.
 - **Trace:** see this file's own commit.
 
+### Windows detached session hosts (survive node-agent restart)
+
+- **Goal / user value:** a Windows node-agent update or restart must stop
+  being an outage for that node's Claude/Codex/PowerShell sessions. The
+  node-agent becomes control plane only; a session's process is no longer
+  a child whose lifetime depends on it.
+- **Status:** IMPLEMENTED and TESTED on Linux against real processes; NOT
+  YET PROVEN on real Windows, and NOT deployed. `--detached-sessions` is
+  OFF by default so shipping the code cannot change a running node's
+  behaviour. The live dell-5530 agent has not been restarted or touched.
+- **Design of record:** `docs/WINDOWS_SESSION_HOST.md` (architecture,
+  crash/reboot matrix, the adoption-impossibility proof, and the
+  zero-loss rollout).
+- **Root cause this fixes (from "Windows node-agent restart safety
+  (Phase 0)" above):** a session's ConPTY child was spawned inside the
+  node-agent process and the only registry was an in-memory dict, so the
+  child died with the agent (measured live, both via `taskkill /F` and
+  via the graceful `/v1/internal/shutdown`) and no on-disk state existed
+  to reconnect with. Phase 0's "NOT achievable" conclusion was scoped to
+  that architecture; this entry replaces the architecture.
+- **Fix:**
+  - `windows_session_host.py` (new): a detached per-session HOST process
+    that owns the PTY. Atomic `meta.json` (temp + fsync + `os.replace`,
+    its mtime doubling as the heartbeat), append-only `out.log`/`in.log`
+    offset spools, `ctl.json` control requests consumed exactly once,
+    `host.log`. Liveness is `ALIVE`/`GONE`/`PID_REUSED` — a live PID with
+    a stale heartbeat is treated as reuse, never as a session, because
+    Windows recycles PIDs and the cost of a false ALIVE is writing an
+    operator's keystrokes into a void while reporting health. POSIX
+    liveness additionally rejects zombies, since `kill(pid, 0)` succeeds
+    on an unreaped process and Windows has no such state.
+  - Spawned with `DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB |
+    CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`; breakaway denial raises
+    `BreakawayDenied` rather than silently retrying without the flag (a
+    host spawned without it looks identical and then dies with the agent
+    — the exact bug being fixed).
+  - `windows_detached.py` (new): `HostProcessProxy`, a `PtyProcessLike`
+    over the spool, so the existing reader thread, pyte VT parser,
+    history buffer, resize and kill paths are untouched. `pid` is the
+    CHILD's pid (the backend feeds it to `_win32_foreground_command`;
+    the host's pid there would make every session report the wrapper);
+    `read()` sleeps briefly on an empty spool so `_reader_loop` does not
+    spin. `adopt_sessions()` is a pure read returning a verdict per
+    session.
+  - `windows_backend.py`: new optional `session_process_factory`
+    (`(name, argv, cwd) -> PtyProcessLike`) alongside the unchanged
+    2-arg `ProcessFactory`, and `adopt_detached_sessions()` /
+    `_register_adopted()`. The duplicate-name check is re-done inside the
+    registry lock, so a create racing an adoption cannot produce two
+    hosts behind one id.
+  - `windows_agent.py`: `--detached-sessions` (default OFF) and
+    `--session-state-root`; adoption runs BEFORE serving, so a request
+    arriving early cannot be told a live session does not exist and then
+    have a create spawn a second host for it.
+- **Scope / flow:** Windows nodes only, opt-in. Linux/tmux is untouched
+  (asserted by test). Sessions created before the flag is enabled are
+  NOT migratable — see the impossibility proof below.
+- **Adoption impossibility (proved, as the task required):** a 0.12.0
+  session's `HPCON` and pipe handles live in the running agent's handle
+  table; Windows exposes no way to enumerate or re-open a pseudoconsole
+  from another process, and `DuplicateHandle` needs a cooperating source
+  that 0.12.0 does not contain. Even a duplicated handle would not help:
+  when the owning process exits, ConPTY signals the client and
+  `conhost.exe` tears the console down (measured in Phase 0). And the old
+  agent must exit to be replaced (the code, and port 8790's single
+  listener). Therefore every path that ends with the 0.12.0 agent gone
+  ends with its sessions gone; no bridge exists.
+- **Rollout (zero-loss, not yet executed):** Option A = deploy files
+  only, capture each live session's scrollback + cwd + `--session-id`,
+  quiesce, prove survival on a disposable second agent first, restart
+  once with the flag, recreate with `--resume`, then restart again to
+  demonstrate the property. Option B (recommended, loses nothing and
+  waits for nothing) = run a second agent side by side on another port
+  with its own state root and node id, prove it there, put new work on
+  it, and retire the old agent only when its sessions are finished.
+- **API/tool/command:** no new MCP tools. New agent CLI flags
+  `--detached-sessions`, `--session-state-root`; new host entry point
+  `python -m terminal_mcp.windows_session_host`.
+- **Config/permission:** none new. `TERMINAL_MCP_SESSION_PTY_FACTORY`
+  exists so the host entry point itself can be exercised on Linux CI; it
+  is unset in production, which selects the real pywinpty path.
+- **Data/schema/migration:** no DB change. New on-disk per-session state
+  directory; no migration, since existing sessions cannot be adopted.
+- **Acceptance/tests/evidence:** `tests/test_windows_session_host.py`
+  (52 tests: atomic metadata, corrupt-metadata-as-absent, zombie and
+  PID-reuse protection, spool rotation keeping the recent tail on a line
+  boundary, control requests consumed once, the exact creation flags, and
+  a spawner-death survival test verified by negative control — the same
+  scenario without detachment freezes, with it keeps running);
+  `tests/test_windows_detached_sessions.py` (19 tests: a real agent
+  process SIGKILLed with its whole process group, both host and child
+  confirmed still alive afterwards, pre-restart history readable and
+  post-restart input answered, four concurrent sessions adopted with no
+  crossed spools, host crash reported as an orphan and never adopted,
+  stale-record-with-live-pid refused, claude.exe-style argv round-tripped
+  verbatim including `--session-id`, backend create→restart→adopt→kill,
+  double adoption producing no duplicate, and the plain Linux factory
+  path unchanged). Existing `tests/test_windows_backend.py` (86) passes
+  unchanged.
+- **Known limitations:** ConPTY and the Win32 creation flags are NOT
+  measured on Windows — asserted structurally and reviewed against the
+  Win32 contract; rollout step 4 is what measures them, on a disposable
+  session. A machine reboot loses every session (only `out.log` survives)
+  and this is documented rather than papered over. Orphans are never
+  auto-deleted, because a `PID_REUSED` verdict can also be a live host
+  that was briefly slow to heartbeat.
+- **Follow-up/backlog:** execute the rollout (Option B) on dell-5530;
+  package `--detached-sessions` into `run-node-agent.ps1`'s Scheduled
+  Task definition; surface adoption verdicts/orphans in the dashboard.
+- **Trace:** branch `feat/windows-detached-sessions`.
+
 ### Conversation-continuity recovery (`--resume` wiring)
 
 - **Goal / user value:** since the 2026-09-06 Phase 0 audit proved a

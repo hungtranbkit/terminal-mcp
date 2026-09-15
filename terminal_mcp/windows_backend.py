@@ -268,6 +268,12 @@ class PtyProcessLike(Protocol):
     def terminate(self, force: bool = False) -> None: ...
 
 
+SessionProcessFactory = Callable[[str, list[str], str], PtyProcessLike]
+"""`(name, argv, cwd) -> PtyProcessLike` -- like ProcessFactory but told which
+logical session it is spawning, because a detached host keeps its state in a
+per-session directory and must be rediscoverable by name after this agent is
+gone (see windows_detached.session_process_factory)."""
+
 ProcessFactory = Callable[[list[str], str], PtyProcessLike]
 """`(argv, cwd) -> PtyProcessLike` -- how a session's process actually
 gets spawned. Swappable so tests never need a real Windows host or a
@@ -662,7 +668,8 @@ class WindowsSessionBackend:
                 process_factory: ProcessFactory | None = None,
                 foreground_command_resolver: ForegroundCommandResolver | None = None,
                 foreground_cmdline_resolver: ForegroundCommandLineResolver | None = None,
-                pid_alive_resolver: PidAliveResolver | None = None) -> None:
+                pid_alive_resolver: PidAliveResolver | None = None,
+                session_process_factory: SessionProcessFactory | None = None) -> None:
         self.shell = shell
         self.history_lines = history_lines
         self._process_factory = process_factory or _default_process_factory
@@ -674,6 +681,12 @@ class WindowsSessionBackend:
         # (pywinpty's own isalive() staying True indefinitely for a
         # ConPTY child confirmed gone at the OS level).
         self._pid_alive_resolver = pid_alive_resolver or _win32_pid_alive
+        # When set, a session's process is a DETACHED host (see
+        # windows_detached.py) instead of a direct child of this agent, which
+        # is what lets a session outlive an agent restart. Kept as a second,
+        # optional factory rather than replacing `process_factory` so every
+        # existing caller and test that injects a 2-arg factory is unaffected.
+        self._session_process_factory = session_process_factory
         self._sessions: dict[str, _WindowsSession] = {}
         self._registry_lock = threading.Lock()
 
@@ -893,7 +906,7 @@ class WindowsSessionBackend:
         # these, never client-supplied text. Ignored when there's no
         # `command` (a plain shell session has nothing to pass flags to).
         argv = [command, *extra_args] if command else [self.shell]
-        proc = self._spawn_headless(argv, cwd)
+        proc = self._spawn_headless(argv, cwd, name=name)
         now = int(time.time())
         entry = _WindowsSession(name=name, proc=proc, cwd=cwd, command=command,
                                 created_epoch=now, activity_epoch=now,
@@ -908,8 +921,90 @@ class WindowsSessionBackend:
             return False, None
         return self._attach_desktop_viewer(entry)
 
-    def _spawn_headless(self, argv: list[str], cwd: str) -> PtyProcessLike:
+    def adopt_detached_sessions(self, state_root: str | Path, *,
+                                alive: Any = None,
+                                adopter: Any = None) -> dict[str, str]:
+        """Rebuild the registry from disk after this agent was restarted.
+
+        This is the whole payoff of the detached-host design: there is no
+        handoff and no handshake. The sessions are still running because they
+        were never this process's children, their state is on disk, and adoption
+        is a read followed by registering an entry that points at the host that
+        is already there.
+
+        Each adopted session keeps its ORIGINAL logical name (requirement 2) and
+        replays its spool from the beginning, so the history produced while no
+        agent was running is in the buffer rather than lost (requirement 3).
+
+        Never creates a second entry for a name already in the registry, so
+        calling this twice -- or racing a create for the same name -- cannot
+        produce a duplicate session (requirement 5). Orphans (host GONE, or a
+        PID that looks reused) are REPORTED, never adopted and never deleted;
+        removing them is an explicit, separate action (requirement 4), because a
+        PID_REUSED verdict can also be a live host that was briefly slow to
+        heartbeat and deleting that destroys a real session's history.
+
+        Returns {session name: verdict} for logging and for the node agent's own
+        status surface. Adoption of one session never prevents adoption of the
+        rest: a single bad directory is reported and skipped."""
+        from . import windows_detached
+
+        run = adopter or windows_detached.adopt_sessions
+        with self._registry_lock:
+            existing = set(self._sessions)
+        report = run(state_root, existing=existing, alive=alive)
+        verdicts: dict[str, str] = {}
+        for name, entry in report.items():
+            verdict = entry["verdict"]
+            proxy = entry.get("proxy")
+            if verdict != windows_detached.ADOPTED or proxy is None:
+                verdicts[name] = verdict
+                continue
+            try:
+                self._register_adopted(name, proxy, entry.get("meta") or {})
+            except Exception as exc:  # noqa: BLE001 -- one bad session must not abort the rest
+                verdicts[name] = f"{windows_detached.ADOPT_FAILED}: {exc}"
+                continue
+            verdicts[name] = verdict
+        return verdicts
+
+    def _register_adopted(self, name: str, proc: PtyProcessLike,
+                          meta: dict[str, Any]) -> None:
+        """Install an entry for an ALREADY-RUNNING session and start draining it.
+
+        The duplicate check is re-done inside the registry lock, not just in
+        adopt_sessions: between that read and this write another thread could
+        have created the same name, and the losing side must not overwrite a live
+        entry (that would leak a session nobody can reach any more)."""
+        created = int(meta.get("created_at") or time.time())
+        command = None
+        argv = list(meta.get("argv") or [])
+        if argv:
+            command = argv[0]
+        entry = _WindowsSession(
+            name=name, proc=proc, cwd=str(meta.get("cwd") or ""), command=command,
+            created_epoch=created, activity_epoch=int(time.time()),
+            buffer=deque(maxlen=self.history_lines),
+            screen=_AltScreenHistoryScreen(
+                int(meta.get("cols") or DEFAULT_SCREEN_COLS),
+                int(meta.get("rows") or DEFAULT_SCREEN_ROWS),
+                history=self.history_lines))
+        with self._registry_lock:
+            if name in self._sessions:
+                raise TmuxError(f"session {name!r} appeared while being adopted")
+            self._sessions[name] = entry
+        entry.reader_thread = threading.Thread(target=self._reader_loop, args=(entry,),
+                                               daemon=True)
+        entry.reader_thread.start()
+
+    def _spawn_headless(self, argv: list[str], cwd: str,
+                        name: str | None = None) -> PtyProcessLike:
+        """`name` is needed only by the detached-host factory, whose state
+        directory is per-session; the plain ProcessFactory never sees it, so its
+        signature is unchanged."""
         try:
+            if self._session_process_factory is not None and name is not None:
+                return self._session_process_factory(name, argv, cwd)
             return self._process_factory(argv, cwd)
         except Exception as exc:  # noqa: BLE001 -- any spawn failure is a real backend error
             raise TmuxError(f"failed to spawn session in {cwd!r}: {exc}") from exc
