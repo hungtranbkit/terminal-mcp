@@ -1738,6 +1738,25 @@ class TerminalService:
                                        "the text send and the Enter send -- Enter was withheld")
             return result
 
+        # VERIFY_TEXT, and it belongs HERE -- before ACTIVATE, not after it.
+        # An activate-only send (text == "") into an EMPTY composer has nothing
+        # to submit, so the Enter has nothing to do and must not be sent at all:
+        # pressing it is how three consecutive calls on hp-linux each came back
+        # SUBMIT_CONFIRMED while the pane only ever showed "Press up to edit
+        # queued messages". Withholding the keystroke is also what keeps this
+        # from being one more Enter fired at a target nobody proved was ready.
+        if not text and not submit_flow.extract_composer_text(typed_snapshot or []):
+            result["delivery_state"] = DELIVERY_UNKNOWN
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
+            result["submit_outcome"] = submit_flow.NOTHING_TO_SUBMIT
+            result["stage"] = "VERIFY_TEXT"
+            result["activation_attempts"] = 0
+            result["acceptance_evidence"] = []
+            result["submit_reason"] = (
+                "activate-only send and the composer is empty: there is no prompt to submit, "
+                "so Enter was withheld and nothing can be reported as confirmed")
+            return result
+
         self.tmux.send_keys(session, ["Enter"])
         result["enter_sent"] = True
         result["enter_count"] = 1
@@ -1949,11 +1968,38 @@ class TerminalService:
         # dead session) still correctly times out into DELIVERY_UNKNOWN
         # -- this only removes the false negative for a send that WAS
         # about to be, and genuinely is, accepted.
-        confirmed, after = self._poll_for_ack_evidence(session, typed_snapshot, after, adapter, text,
-                                                        deadline=time.monotonic() + verify_timeout)
+        # P1 2026-09-15: what this attempt is entitled to claim an echo of.
+        #
+        # `text` is what THIS call typed. When it is empty -- the activate-only
+        # shape, terminal_send_text("", press_enter=True) -- `_sent_text_echoed`
+        # treats it as trivially satisfied by design, which silently removes the
+        # busy-window guard that is the ONLY thing standing between a spinner
+        # tick and a false SUBMIT_CONFIRMED. Measured live on hp-linux: three
+        # consecutive activate-only calls into an ALREADY EMPTY composer each
+        # returned SUBMIT_CONFIRMED with submit_reason null, while the pane
+        # showed "Press up to edit queued messages" and no turn began; a fourth,
+        # with the agent idle and the composer empty, returned SUBMIT_CONFIRMED
+        # against a byte-identical pane.
+        #
+        # So an activate-only call attributes the COMPOSER's own content, the
+        # same rule _send_enter_key_verified_locked already uses for a bare
+        # Enter. If the composer is empty too, there is nothing this Enter could
+        # have submitted and no evidence could honestly confirm one.
+        # An activate-only send attributes the COMPOSER's own content as the echo
+        # to require. Passing "" instead makes _sent_text_echoed trivially true
+        # by design, which removes the busy-window guard entirely and lets a
+        # spinner tick confirm a submission that never happened. The empty-
+        # composer case never reaches here -- VERIFY_TEXT withheld the Enter.
+        expected_echo = text or submit_flow.extract_composer_text(typed_snapshot)
+        confirmed, after = self._poll_for_ack_evidence(session, typed_snapshot, after, adapter,
+                                                       expected_echo,
+                                                       deadline=time.monotonic() + verify_timeout)
         if confirmed:
             result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
             result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
+            result["submit_reason"] = ("confirmed via adapter ack evidence"
+                                       + ("" if text else " (echo attributed to the composer's own "
+                                                          "content, not to an empty sent text)"))
             return result
         result["delivery_state"] = DELIVERY_UNKNOWN
         result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
