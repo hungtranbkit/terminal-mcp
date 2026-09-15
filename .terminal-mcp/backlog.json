@@ -1869,12 +1869,12 @@
       "id": "blg_orch_no_workers_declared",
       "title": "No worker has a capability profile, so capability routing has zero candidates",
       "description": "pm_service._candidates() reads ONLY pm_store.capability_profiles, which has 0 production rows, so pm_router.route_task returns NO_ELIGIBLE_WORKER for every task. Measured on HP 2026-09-14: session_records holds 5 ACTIVE sessions, 4 of them agent_type=claude with input_granted=1, against 0 capability_profiles -- four usable workers idle and invisible. Phase 1 reconciliation cannot help, because reconciliation repairs a worker that is represented; these were never represented at all. Phase 2 adds bounded, idempotent auto-discovery (declare + watch) before dispatch, plus work-conserving coverage reporting.",
-      "status": "IN_PROGRESS",
+      "status": "NEEDS_REVIEW",
       "priority": "P1",
       "type": "chore",
       "order": 41,
       "created_at": "2026-09-10T01:41:16.114137+00:00",
-      "updated_at": "2026-09-14T10:58:08.739076+00:00",
+      "updated_at": "2026-09-15T01:56:47.543852+00:00",
       "source": "orchestration-v1",
       "dependencies": [],
       "acceptance_criteria": [
@@ -1895,7 +1895,8 @@
       "blocked_reason": null,
       "evidence": {
         "commits": [
-          "feat/worker-discovery-dispatch"
+          "24b57aba614b380592c9a1ae770b34da64866901 (implementation)",
+          "91745f3492b39167f3274be6606871067f02cb91 (Phase-1 integration invariants)"
         ],
         "tests": [
           "47 new tests: tests/test_worker_discovery.py (30), tests/test_worker_discovery_dispatch.py (17)",
@@ -1905,7 +1906,8 @@
         "notes": [
           "NOT deployed and NOT merged. Discovery is OFF by default (WorkerDiscoveryPolicy.enabled=False).",
           "Acceptance criteria 1 and 2 are met by this branch. Criterion 3 (a non-zero VERIFIER count) is deliberately NOT met: auto-discovery declares role=WORKER only and will never auto-declare VERIFIER/INTEGRATOR/DEPLOYER, which are trust positions -- a live, input-granted tmux session is not evidence that it may verify or deploy anything. That criterion still needs an explicit human declaration or a separate probe.",
-          "Watch creation is CREATE-ONLY. SupervisorStore.upsert_watch on an EXISTING row re-enables it, re-pins session/pane identity and mints a fresh completion nonce while bumping completion_attempt. Re-watching on every reconcile tick would therefore silently re-enable operator- or phase-1-disabled watches, destroy the P0-2 identity pin, and invalidate the outstanding completion nonce -- breaking the submission/completion-confirmation semantics this work is required to preserve."
+          "Watch creation is CREATE-ONLY. SupervisorStore.upsert_watch on an EXISTING row re-enables it, re-pins session/pane identity and mints a fresh completion nonce while bumping completion_attempt. Re-watching on every reconcile tick would therefore silently re-enable operator- or phase-1-disabled watches, destroy the P0-2 identity pin, and invalidate the outstanding completion nonce -- breaking the submission/completion-confirmation semantics this work is required to preserve.",
+          "2026-09-15 reconciliation: status corrected IN_PROGRESS -> NEEDS_REVIEW. The work is finished and nothing is actively progressing it; it awaits an integrator. Phase 1 was located as fix/supervisor-node-aware-watch (ca888bb), local-only and unpushed, which is why the 2026-09-14 search across origin and all refs came back empty. The pinned contract tests were run against Phase-1's own supervisor.py: 10 of 11 pass. The single failure is test_supervisor_watch_accepts_the_source_kwarg -- both branches edit SupervisorService.watch (Phase 2 adds source=, Phase 1 adds node resolution), a mechanical merge conflict resolved by keeping both parameters. Merge Phase 1 first. Manifest: docs/HP_LINUX_BRANCH_MANIFEST.md on chore/hp-linux-branch-manifest."
         ]
       },
       "history": [
@@ -1917,6 +1919,11 @@
         {
           "at": "2026-09-14T10:58:08.739076+00:00",
           "event": "phase-2 implementation on feat/worker-discovery-dispatch",
+          "by": "mcp"
+        },
+        {
+          "at": "2026-09-15T01:56:47.543852+00:00",
+          "event": "status reconciled IN_PROGRESS -> NEEDS_REVIEW (cleanup lane D)",
           "by": "mcp"
         }
       ]
