@@ -82,6 +82,13 @@ RECOVERABLE_DISABLE_REASONS = frozenset({
     "target_missing",               # sessions come back (restart, re-create, rename)
     "same_failure_limit_exceeded",  # the failure may have been fixed since
     "access_denied_or_error",       # a grant may have been added since
+    # Fleet reasons. A node that is down, restarting or being updated is the
+    # most ordinary recoverable condition there is -- and the one that
+    # previously cost the most, because a watch disabled while its node was
+    # briefly unreachable never came back after the node did.
+    "node_unreachable",
+    "node_not_found",               # the node may be re-registered
+    "ambiguous_target",             # one of the colliding sessions may end
 })
 
 # Never re-enabled automatically. A person said no; that stands until a
@@ -91,6 +98,42 @@ INTENTIONAL_DISABLE_REASONS = frozenset({
     "autonomous_completion_blocked_no_verifier",
     "autonomous_verification_failed",
 })
+
+
+# Controller/status error code -> the disable reason to record for it.
+# Anything unlisted falls back to access_denied_or_error, which is itself
+# recoverable, so an unknown error can never make a watch permanently dead --
+# the failure mode this whole module exists to remove.
+_STATUS_ERROR_DISABLE_REASONS = {
+    "NODE_UNREACHABLE": "node_unreachable",
+    "NODE_OFFLINE": "node_unreachable",
+    "NODE_NOT_FOUND": "node_not_found",
+    "SESSION_NOT_FOUND": "target_missing",
+    "AMBIGUOUS_SESSION": "ambiguous_target",
+}
+
+
+def disable_reason_for_status_error(error: str | None) -> str:
+    """Which disable reason describes this status error?
+
+    The distinction that matters: "your node is not answering right now" and
+    "you are not allowed to read this session" both used to be recorded as
+    access_denied_or_error, so reconciliation could not tell a transient fleet
+    outage from a revoked permission. Both are recoverable, but only one is
+    expected to resolve on its own, and an operator reading
+    `supervisor_status` deserves to see which one they have.
+
+    An unrecognised error deliberately maps to a RECOVERABLE reason rather than
+    an unknown one: a watch must never become permanently invisible because the
+    fleet grew an error code this table has not met yet.
+    """
+    code = (error or "").strip().upper()
+    if code in _STATUS_ERROR_DISABLE_REASONS:
+        return _STATUS_ERROR_DISABLE_REASONS[code]
+    for known, reason in _STATUS_ERROR_DISABLE_REASONS.items():
+        if code.startswith(known):
+            return reason
+    return "access_denied_or_error"
 
 
 @dataclass(frozen=True)
