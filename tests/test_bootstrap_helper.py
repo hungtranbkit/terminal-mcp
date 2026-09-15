@@ -554,7 +554,134 @@ def test_the_progress_and_expiry_machinery_still_runs():
     for marker in ("anPollProgress", "anProgressTimer", "anExpiryTimer",
                    "progress_elapsed_seconds", "anRegenBtn", "anLive"):
         assert marker in page, marker
-    # Every timer the step starts is also cleared when the panel closes.
+    # Every timer the step starts is still cleared when the panel closes --
+    # the progress timer and the one-second ticker now via anEndWatch(),
+    # which owns them, rather than inline in the click handler.
     done = page[page.index("document.getElementById('anDoneBtn')"):]
-    for timer in ("anExpiryTimer", "anProgressTimer", "anDetectTimer"):
+    for timer in ("anExpiryTimer", "anDetectTimer"):
         assert "clearInterval(%s)" % timer in done[:700], timer
+    assert "anEndWatch();" in done[:700]
+    end_watch = page[page.index("function anEndWatch("):page.index("let anLiveTicker")]
+    for timer in ("anProgressTimer", "anLiveTicker"):
+        assert "clearInterval(%s)" % timer in end_watch, timer
+
+
+# ---------------------------------------------------------------------------
+# Installation status: waiting is a state, and it gets rendered like one
+# ---------------------------------------------------------------------------
+#
+# The live run on 2026-09-15 is what these encode. The operator created an
+# enrollment, minted a handle and downloaded the paired helper -- all three
+# returned 200 -- and then nothing: the helper never redeemed, so the
+# enrollment row carried no progress_stage. anPollProgress returned early on
+# exactly that condition and anLive ships hidden, so the screen showed no
+# panel, no timer and no warning. The operator could not tell "waiting" from
+# "broken", which is the whole failure.
+
+
+def _status_js():
+    page = _page()
+    start = page.index("const AN_STALL_AFTER_MS")
+    end = page.index("document.getElementById('anRegenBtn').addEventListener")
+    return page[start:end]
+
+
+def test_the_status_panel_is_not_gated_on_a_reported_stage():
+    """The exact early return that hid the panel is gone: a row with no
+    progress_stage must still render."""
+    page = _page()
+    assert "if (!row || !row.progress_stage) return;" not in page
+    js = _status_js()
+    # The no-stage branch renders words rather than returning.
+    assert "Đang chờ máy Windows bắt đầu cài đặt…" in js
+    assert "máy chưa báo về bước nào" in js
+
+
+def test_the_panel_opens_when_the_cta_acts_not_when_progress_arrives():
+    page = _page()
+    assert "function anBeginWatch(" in page
+    # Both CTA meanings start the watch.
+    assert page.count("anBeginWatch(anGenerated.enrollment.id") == 2
+    assert "live.hidden = false;" in _status_js()
+
+
+def test_the_panel_shows_stage_elapsed_and_last_update():
+    js = _status_js()
+    assert "anFmtDuration(sinceStart)" in js
+    assert "cập nhật lần cuối" in js
+    assert "anLiveStage" in js and "anLiveMeta" in js
+
+
+def test_the_elapsed_timer_ticks_between_polls():
+    """A frozen timer is the clearest way to make a working install look
+    hung, so the panel redraws once a second off the cached row."""
+    page = _page()
+    assert "anLiveTicker = setInterval(" in page
+    assert "}, 1000);" in page
+
+
+def test_a_stall_is_warned_about_after_thirty_seconds():
+    page = _page()
+    assert "const AN_STALL_AFTER_MS = 30000;" in page
+    js = _status_js()
+    assert "sinceChange > AN_STALL_AFTER_MS" in js
+    # And the warning names the two physical actions, which is the part
+    # nobody can guess from a silent screen.
+    assert "Mở file vừa tải" in js
+    assert "bấm Yes" in js
+    assert "SmartScreen" in js
+    # Stalled is amber, not red: the install may still be grinding.
+    assert "'an-live' + (stalled ? ' stalled' : '')" in js
+    assert ".an-live.stalled" in page
+
+
+def test_failure_is_explicit_and_offers_retry_and_repair():
+    page = _page()
+    js = _status_js()
+    assert "if (stage === 'failed') {" in js
+    assert "an-live failed" in js
+    assert 'id="anLiveRetryBtn"' in page and 'id="anLiveRepairBtn"' in page
+    assert "anLiveRetryBtn').addEventListener" in page
+    assert "anLiveRepairBtn').addEventListener" in page
+
+
+def test_a_swept_or_revoked_enrollment_stops_the_spinner_and_says_so():
+    """Polling forever against a row that no longer exists is how a screen
+    spins indefinitely with nothing behind it."""
+    js = _status_js()
+    assert "Mã cài đặt đã hết hạn hoặc bị thu hồi" in js
+    assert "if (!row) {" in js
+
+
+def test_the_watch_survives_a_reload_and_stores_no_credential():
+    page = _page()
+    assert "const AN_WATCH_KEY = 'tmcp.addnode.watch';" in page
+    assert "function anResumeWatch()" in page
+    # The enrollment id is not a credential; the code and the handle are,
+    # and neither may be persisted.
+    watch = page[page.index("function anBeginWatch("):page.index("function anEndWatch(")]
+    for secret in ("code", "handle", "script", "quick_install"):
+        assert secret not in watch, secret
+    assert "localStorage" in page
+
+
+def test_storage_failures_never_break_the_panel():
+    """A private window throws on localStorage; the panel must still run."""
+    page = _page()
+    save = page[page.index("function anSaveWatch("):page.index("function anLoadWatch(")]
+    assert "catch (error)" in save
+    load = page[page.index("function anLoadWatch("):page.index("function anBeginWatch(")]
+    assert "return null; }" in load
+
+
+def test_closing_the_panel_forgets_the_watch():
+    page = _page()
+    done = page[page.index("document.getElementById('anDoneBtn')"):]
+    assert "anEndWatch();" in done[:600]
+
+
+def test_a_transient_poll_failure_keeps_the_panel_and_the_timer():
+    """A controller blip must not tear down the operator's only view of a
+    ten-minute install."""
+    js = _status_js()
+    assert "if (!result.ok) return;   // keep the panel and its timer; transient" in js
