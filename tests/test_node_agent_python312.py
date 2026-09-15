@@ -313,3 +313,33 @@ def test_the_fallback_without_the_windows_extra_is_now_reachable():
 def test_pip_output_is_visible_rather_than_swallowed():
     source = _installer_source()
     assert 'ForEach-Object { Write-Host "   $_" }' in source
+
+
+def test_the_heartbeat_probes_the_address_the_agent_actually_binds():
+    """session_transport stayed absent on a node whose agent WAS up and
+    serving: the beat probed 127.0.0.1 while the agent binds the interface
+    the controller reaches -- the tailnet address. Loopback was never
+    listening."""
+    script = _script()
+    beat = script[script.index("$beat = @\""):script.index("Set-Content -Path $BeatRunner")]
+    caps = beat[beat.index("function Get-Capabilities"):]
+    assert "foreach (`$agentHost in @('$AgentBindHost', '127.0.0.1'))" in caps
+    assert "session_transport" in caps
+    # Loopback survives only as a fallback, never as the only candidate.
+    assert caps.index("$AgentBindHost") < caps.index("'127.0.0.1'")
+
+
+def test_the_bind_host_is_resolved_before_the_beat_script_is_generated():
+    """Resolving it in the node-agent step (stage 11) left the beat -- built
+    at stage 9 -- with an empty host."""
+    script = _script()
+    assert script.index("$AgentBindHost = if") < script.index("$beat = @\"")
+    assert script.index("$AgentBindHost = if") < script.index("Start-Stage 'Node agent")
+
+
+def test_the_agent_step_reuses_that_same_address():
+    """One resolution, so the address the beat probes and the address the
+    agent binds cannot drift."""
+    section = _agent_section(_script())
+    assert "$bindHost = $AgentBindHost" in section
+    assert "Get-LocalAddresses" not in section, "resolved once, above"
