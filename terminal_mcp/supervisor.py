@@ -34,6 +34,7 @@ from typing import Any, Callable
 from .audit import sanitized_preview, text_fingerprint
 from .config import AppConfig, SupervisorConfig
 from .core import TerminalService
+from . import scheduler_health
 from .schema import Migration, apply_migrations
 from .status import (KNOWN_VERIFIER_KINDS, SUPERVISOR_STATES, classify_supervisor_state,
                      parse_completion_marker, parse_evidence_markers, to_legacy_event_type,
@@ -81,6 +82,10 @@ EVENT_TYPES = (
     "state_changed", "attention_required", "completion_candidate", "verifying", "verified_done",
     "verification_failed", "verification_blocked",
     "error_detected", "stalled", "watch_target_missing",
+    # blg_8d65afc1b38b: a watch brought back from a recoverable disable.
+    # Recorded as its own type so "coverage was lost and restored" is
+    # visible in the event stream rather than inferred from a gap.
+    "watch_reconciled",
 )
 _ATTENTION_EVENT_TYPES = {
     "WAITING_INPUT": "attention_required",
@@ -264,6 +269,13 @@ class SupervisorStore:
                 )
                 """
             )
+            # blg_8d65afc1b38b: how many times reconciliation has tried to
+            # bring this watch back. Additive, defaulted, same ALTER-if-
+            # absent idiom as the P0-2 columns above -- an existing row
+            # simply starts at zero.
+            existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(watches)").fetchall()}
+            if "reconcile_attempts" not in existing_columns:
+                connection.execute("ALTER TABLE watches ADD COLUMN reconcile_attempts INTEGER NOT NULL DEFAULT 0")
             apply_migrations(connection, SUPERVISOR_MIGRATIONS)
         try:
             self.path.chmod(0o600)
@@ -483,6 +495,37 @@ class SupervisorStore:
                 (int(enabled), disabled_reason, now, key),
             )
         return cursor.rowcount == 1
+
+    def reenable_watch(self, key: str, *, attempts: int) -> bool:
+        """Bring a disabled watch back and record the attempt.
+
+        Separate from set_enabled on purpose: this is the ONLY path that
+        turns a watch back on, so the attempt counter can never be
+        bypassed by a caller that just flips `enabled`."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE watches SET enabled = 1, disabled_reason = NULL, reconcile_attempts = ?, "
+                "updated_at = ? WHERE watch_key = ? AND enabled = 0",
+                (attempts, now, key))
+        return cursor.rowcount == 1
+
+    def reset_iterations(self, key: str) -> None:
+        """Clear the poll ceiling and the failure streak for a watch that
+        reconciliation just brought back. Without this, a watch re-enabled
+        at iteration_count >= max_iterations disables itself again on its
+        next quiet poll and the fix looks like it did nothing."""
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE watches SET iteration_count = 0, same_failure_count = 0 WHERE watch_key = ?", (key,))
+
+    def note_reconcile_attempt(self, key: str, *, attempts: int) -> None:
+        """Record a try that did NOT re-enable (still missing, backing
+        off) so the backoff actually advances instead of retrying forever
+        at the same interval."""
+        with self._connection() as connection:
+            connection.execute("UPDATE watches SET reconcile_attempts = ? WHERE watch_key = ?",
+                               (attempts, key))
 
     def delete_watch(self, key: str) -> bool:
         with self._connection() as connection:
@@ -790,6 +833,20 @@ class SupervisorService:
             "enabled_watch_count": sum(1 for row in watches if row["enabled"]),
             "state_counts": counts,
             "stalled_count": stalled,
+            # blg_8d65afc1b38b: "4 watches, 0 enabled" was the whole symptom
+            # and the old status could not say WHY any of them were off, nor
+            # whether they were ever coming back. Split by recoverability so
+            # a glance answers both.
+            "disabled_watch_count": sum(1 for row in watches if not row["enabled"]),
+            "recoverable_disabled_count": sum(
+                1 for row in watches if not row["enabled"]
+                and row["disabled_reason"] in scheduler_health.RECOVERABLE_DISABLE_REASONS),
+            "intentionally_excluded_count": sum(
+                1 for row in watches if not row["enabled"]
+                and row["disabled_reason"] in scheduler_health.INTENTIONAL_DISABLE_REASONS),
+            "disabled_reasons": {
+                row["watch_key"]: row["disabled_reason"]
+                for row in watches if not row["enabled"] and row["disabled_reason"]},
         }
 
     def list_events(self, target: str | None = None, state: str | None = None,
@@ -807,11 +864,91 @@ class SupervisorService:
 
     # -- polling --------------------------------------------------------
 
+    def reconcile_watches(self) -> dict[str, Any]:
+        """Bring back watches that were disabled for a RECOVERABLE reason
+        and whose target is alive again.
+
+        blg_8d65afc1b38b, and the reason production showed
+        `watch_count=4, enabled_watch_count=0` while four workers were
+        running: every disable path in this file is permanent, because
+        until now nothing anywhere called set_enabled(..., True). A watch
+        that hit `max_iterations_exceeded` while its worker carried on
+        working stayed off forever, and the worker left scheduling
+        visibility with it.
+
+        What this does NOT do is override a person. `manual_unwatch` and
+        the autonomous-verification refusals are deliberate exclusions and
+        are left alone -- see scheduler_health.INTENTIONAL_DISABLE_REASONS.
+        Recovery is backed off exponentially and capped, so a target that
+        is alive but instantly re-fails does not spin.
+        """
+        now = datetime.now(timezone.utc)
+        restored, skipped = [], []
+        for row in self.store.list_watches():
+            if row["enabled"]:
+                continue
+            attempts = int(row.get("reconcile_attempts") or 0)
+            try:
+                since = (now - datetime.fromisoformat(row["updated_at"])).total_seconds()
+            except (ValueError, TypeError):
+                since = 0.0
+            action = scheduler_health.watch_recovery_action(
+                disabled_reason=row["disabled_reason"],
+                target_alive=self._target_alive(row),
+                attempts=attempts,
+                seconds_since_disabled=since)
+            if not action.should_reenable:
+                skipped.append({"watch_key": row["watch_key"], "target": row["target"],
+                                "disabled_reason": row["disabled_reason"], "reason": action.reason})
+                continue
+            if self.store.reenable_watch(row["watch_key"], attempts=attempts + 1):
+                # Reset the poll ceiling too. Re-enabling a watch that is
+                # still at iteration_count >= max_iterations would have it
+                # disable itself again on the very next quiet poll, which
+                # looks like the fix not working.
+                self.store.reset_iterations(row["watch_key"])
+                restored.append({"watch_key": row["watch_key"], "target": row["target"],
+                                 "was": row["disabled_reason"], "attempt": attempts + 1})
+                self.store.add_event(
+                    watch_key=row["watch_key"], kind=row["kind"], target=row["target"],
+                    previous_state=row["state"], state=row["state"],
+                    event_type="watch_reconciled",
+                    reason=f"re-enabled after {row['disabled_reason']}: {action.reason}",
+                    output_preview="", output_hash=row["last_output_hash"],
+                    iteration_count=0,
+                    metadata={"was_disabled_reason": row["disabled_reason"], "attempt": attempts + 1})
+        if restored:
+            _LOGGER.info("supervisor: reconciled %d watch(es) back into coverage", len(restored),
+                         extra={"restored": [item["watch_key"] for item in restored]})
+        return {"restored": restored, "skipped": skipped}
+
+    def _target_alive(self, row: dict[str, Any]) -> bool:
+        """Cheap liveness probe for reconciliation. Any error at all means
+        'not yet' -- reconciliation simply looks again next pass, which is
+        the whole point of it being a loop rather than a one-shot."""
+        try:
+            if row["kind"] == "binding":
+                if self.terminal.bindings.get(row["target"]) is None:
+                    return False
+                result = self.terminal.terminal_status_bound(row["target"])
+            else:
+                result = self.terminal.terminal_status(row["target"])
+        except Exception:  # noqa: BLE001 -- a probe that raises is simply "not alive yet"
+            return False
+        if "error" in result:
+            return False
+        return not (result.get("state") == "MISSING" or result.get("exists") is False)
+
     def run_once(self) -> dict[str, Any]:
         """One synchronous pass over every enabled watch (config-seeded ones
         included). Used by the background loop and directly exposed as
         supervisor_run_once for deterministic/manual testing."""
         self._sync_config_watches()
+        # Before polling: give back coverage that was lost to a recoverable
+        # disable. Doing it here rather than in a separate loop means a
+        # restored watch is polled in the SAME pass, so recovery costs one
+        # cycle rather than two.
+        reconciled = self.reconcile_watches()
         events = []
         for row in self.store.list_watches():
             if not row["enabled"]:
@@ -842,7 +979,7 @@ class SupervisorService:
                 events.append(event)
         self.store.prune_events(self.config.event_retention)
         _LAST_POLL_AT[0] = datetime.now(timezone.utc).isoformat()
-        return {"polled": True, "events": events}
+        return {"polled": True, "events": events, "reconciled": reconciled}
 
     def _sync_config_watches(self) -> None:
         for binding_name in self.config.watched_bindings:
