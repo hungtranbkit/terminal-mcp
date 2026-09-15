@@ -1289,17 +1289,36 @@ def test_short_alias_serves_the_same_script_as_the_long_path(tmp_path, monkeypat
 # UI acceptance for the quick-install flow
 # ---------------------------------------------------------------------------
 
-def test_quick_install_is_the_primary_action_and_download_is_secondary():
+def test_the_install_and_connect_cta_is_the_primary_action():
+    """The copy/paste command used to be styled as the primary action. It
+    is now the documented fallback, and the single styled-primary button on
+    this step is the install-and-connect CTA."""
     page = _nodes_page()
     done = page[page.index('id="anStepDone"'):page.index('id="enrollStrip"')]
+    assert done.count('an-primary an-big-btn') == 1, "exactly one primary button on this step"
+    primary = done[done.index('an-primary an-big-btn'):]
+    assert 'id="anHelperBtn"' in primary[:400], "the primary button is the CTA, not the copy button"
+    # The copy/paste path survives, unstyled, ahead of the raw download.
     assert 'id="anCopyCmdBtn"' in done and 'Copy lệnh cài đặt' in done
-    assert 'an-primary an-big-btn' in done, "the copy button must be styled as the primary action"
-    # Download still exists, but demoted behind "Cách khác / thủ công".
     assert 'id="anDownloadBtn"' in done
     assert done.index('id="anCopyCmdBtn"') < done.index('id="anDownloadBtn"')
+    # And the CTA comes before every one of them.
+    assert done.index('id="anHelperBtn"') < done.index('id="anCopyCmdBtn"')
+
+
+def test_manual_paths_all_live_under_the_fallback_disclosure():
+    """Win + R, the copy button and the raw .ps1 download are all real and
+    all secondary -- none of them may sit beside the CTA competing to be
+    the thing you press."""
+    page = _nodes_page()
+    done = page[page.index('id="anStepDone"'):page.index('id="enrollStrip"')]
     assert 'Cách khác / thủ công' in done
     manual = done[done.index('<details class="an-manual">'):]
-    assert 'id="anDownloadBtn"' in manual, "Download belongs inside the manual section"
+    for inside in ('id="anQuickBox"', 'id="anCopyCmdBtn"', 'id="anDownloadBtn"',
+                   'id="anCopyCodeBtn"', 'Win + R', 'id="anHelperDlBtn"'):
+        assert inside in manual, "%s belongs inside the manual section" % inside
+    # The CTA itself is above the disclosure, not inside it.
+    assert 'id="anHelperBtn"' not in manual
 
 
 def test_three_steps_never_ask_the_user_to_type_a_command():
@@ -1308,8 +1327,11 @@ def test_three_steps_never_ask_the_user_to_type_a_command():
     assert done.count("<li>") == 3
     assert "Win + R" in done and "Ctrl + V" in done and "Enter" in done
     assert "Yes" in done and "Administrator" in done
-    # None of the old manual instructions survive in the primary path.
-    quick = done[done.index('id="anQuickBox"'):done.index('<details class="an-manual">')]
+    # None of the old manual instructions survive inside the Win + R block
+    # itself. anQuickBox now sits inside the fallback disclosure, so this
+    # slice runs from it to the raw-download row that follows it.
+    quick = done[done.index('id="anQuickBox"'):done.index('id="anDownloadBtn"')]
+    assert quick, "the Win + R block must still exist to be checked"
     for banned in ("Set-ExecutionPolicy", "cd ", "Run with PowerShell", "Chuột phải"):
         assert banned not in quick, f"{banned!r} must not be in the no-typing path"
 

@@ -353,11 +353,14 @@ def test_the_cta_points_at_this_route_when_the_helper_is_absent():
 
 
 def test_the_cta_only_offers_a_download_this_controller_actually_published():
-    """Otherwise the button 404s in front of the operator, and the honest
-    state -- copy/paste is the only path here -- is hidden behind a dead
-    button."""
+    """A download button that 404s in front of the operator is worse than
+    no download button. The published check still gates the DOWNLOAD -- but
+    the failure is now an explained, disabled CTA rather than a vanished
+    one, so the screen still shows the promised action and says why it
+    cannot run."""
     assert "published.data.published" in NODES_ADMIN_HTML
-    assert "if (!build) { helperBox.hidden = true; return; }" in NODES_ADMIN_HTML
+    assert "if (!build) { anSetCtaMode('unavailable'); return 'unavailable'; }" in NODES_ADMIN_HTML
+    assert "helperBox.hidden" not in NODES_ADMIN_HTML
 
 
 def test_an_unsigned_build_is_stated_plainly_not_coached_past():
