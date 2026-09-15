@@ -329,6 +329,19 @@ def test_the_heartbeat_probes_the_address_the_agent_actually_binds():
     assert caps.index("$AgentBindHost") < caps.index("'127.0.0.1'")
 
 
+def test_every_beat_local_variable_in_the_probe_is_escaped():
+    """The probe is written inside the setup script's own here-string, so a
+    variable meant for the BEAT must be escaped or the SETUP script expands
+    it first. `$($agentHost) escapes only the outer `$` -- the $agentHost
+    inside the parentheses is still a live reference, and it expanded to
+    empty at generation time, failing the whole heartbeat stage. Every
+    reference to a beat-local name has to carry its own backtick."""
+    script = _script()
+    beat = script[script.index("$beat = @\""):script.index("Set-Content -Path $BeatRunner")]
+    unescaped = re.findall(r"(?<!`)\$agentHost", beat)
+    assert not unescaped, f"{len(unescaped)} unescaped $agentHost reference(s) in the beat here-string"
+
+
 def test_the_bind_host_is_resolved_before_the_beat_script_is_generated():
     """Resolving it in the node-agent step (stage 11) left the beat -- built
     at stage 9 -- with an empty host."""

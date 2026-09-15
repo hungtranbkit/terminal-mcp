@@ -1289,8 +1289,8 @@ function Get-Capabilities {
     foreach (`$agentHost in @('$AgentBindHost', '127.0.0.1')) {
         if (-not `$agentHost) { continue }
         try {
-            Invoke-RestMethod -Uri "http://`$($agentHost):8790/v1/health" -TimeoutSec 3 -UseBasicParsing | Out-Null
-            Invoke-RestMethod -Uri "http://`$($agentHost):8790/v1/sessions" ``
+            Invoke-RestMethod -Uri "http://`$(`$agentHost):8790/v1/health" -TimeoutSec 3 -UseBasicParsing | Out-Null
+            Invoke-RestMethod -Uri "http://`$(`$agentHost):8790/v1/sessions" ``
                 -Headers @{ Authorization = "Bearer `$token" } -TimeoutSec 3 -UseBasicParsing | Out-Null
             `$found += 'session_transport'
             break
