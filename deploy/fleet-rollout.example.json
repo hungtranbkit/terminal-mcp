@@ -1,0 +1,8 @@
+{
+  "nodes": [
+    {"node_id":"dell-linux","platform":"linux","ssh":"dell-linux","repo_dir":"/home/dell/terminal-mcp","health_url":"http://100.81.85.120:8790"},
+    {"node_id":"m910","platform":"linux","ssh":"m910-internet","repo_dir":"/home/mesflow/terminal-mcp","health_url":"http://100.117.214.87:8790"},
+    {"node_id":"dell-5530","platform":"windows","ssh":"dell","repo_dir":"C:\\Users\\tranv\\terminal-mcp","service":"Terminal MCP Node Agent","health_url":"http://192.168.1.250:8790"},
+    {"node_id":"macbook","platform":"macos","ssh":"rumraisin@100.104.209.93","repo_dir":"/Users/rumraisin/terminal-mcp","health_url":"http://100.104.209.93:8790","enabled":false}
+  ]
+}
