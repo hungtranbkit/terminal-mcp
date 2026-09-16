@@ -151,6 +151,7 @@ def build_mcp(service: TerminalService | None = None,
     # therefore silently non-functional: constructed, exposed as tools, and
     # holding nothing to route with.
     controller = controller or build_default_controller(terminal)
+    compact_tools = CompactTerminalTools(terminal, controller)
     recovery = recovery or RecoveryEngine(terminal.session_registry, controller, terminal.leases,
                                           terminal.config.auto_recovery)
     recovery.loop = recovery.loop or RecoveryLoop(
