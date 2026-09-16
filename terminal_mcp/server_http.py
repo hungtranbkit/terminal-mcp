@@ -17,6 +17,7 @@ from .core import TerminalService
 from .dashboard import node_token_env_var, register_dashboard
 from .health import register_health
 from .integration_service import IntegrationService
+from .lifecycle_service import LifecycleService
 from .logging_setup import RequestIdMiddleware, SecurityHeadersMiddleware, configure_logging
 from .maintenance import MaintenanceLoop
 from .mcp_app import build_mcp
@@ -30,6 +31,8 @@ from .event_bus import EventBus
 from .queue_service import QueueService
 from .recovery_engine import RecoveryEngine
 from .recovery_loop import RecoveryLoop
+from .release_service import ReleaseService
+from .release_store import ReleaseStore
 from . import network_bind, network_middleware
 from .node_client import LocalNodeClient
 from .node_registry import NodeRegistry
@@ -332,9 +335,23 @@ def main() -> None:
     # with its own users and its own sessions.
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
+    # Lifecycle Close-Loop V1: ONE shared instance, same "constructed once,
+    # passed to build_mcp" discipline as queue/integration/pm above -- the
+    # MaintenanceLoop's automatic reconcile and every manual lifecycle call
+    # through the MCP surface must act on the SAME stores, never two
+    # independently-drifting copies. `release` is left to build_mcp's own
+    # default so this stays a single construction site for it.
+    lifecycle = LifecycleService(
+        queue=queue, integration=integration, release=ReleaseService(ReleaseStore()),
+        leases=terminal.leases, session_registry=terminal.session_registry, events=events,
+        worktree_roots=config.lifecycle.worktree_roots,
+        main_branch=config.lifecycle.main_branch,
+        environment=config.lifecycle.environment,
+        allow_unverified_integration=config.lifecycle.allow_unverified_integration,
+    )
     server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
                        planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog, notes=notes,
-                       events=events)
+                       events=events, lifecycle=lifecycle, release=lifecycle.release)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
                        recovery=recovery, backlog=backlog, notes=notes, webauth=webauth)
@@ -415,6 +432,15 @@ def main() -> None:
         audit=terminal.audit, supervisor2_store=supervisor_v2.store,
         bindings_path=terminal.bindings.path, config=config.maintenance,
         leases=terminal.leases,
+        # The lifecycle reconcile rides this existing fixed-interval loop
+        # rather than starting a thread of its own: it is the same shape as
+        # the pruning already here (bounded, idempotent, safe to skip and
+        # safe to repeat), and config.lifecycle.enabled gates only the
+        # AUTOMATIC pass -- every LifecycleService method stays callable by
+        # hand either way.
+        lifecycle=lifecycle,
+        lifecycle_enabled=config.lifecycle.enabled,
+        lifecycle_reconcile_limit=config.lifecycle.reconcile_limit,
     )
     maintenance_loop.start()
     atexit.register(maintenance_loop.stop)

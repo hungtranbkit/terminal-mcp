@@ -404,7 +404,7 @@ class VerifyQueue:
     queue_tasks."""
 
     def __init__(self, store: QueueStore | None = None, *, registry: Any = None,
-                 event_sink: Any = None) -> None:
+                 event_sink: Any = None, on_verified_pass: Any = None) -> None:
         self.store = store or QueueStore()
         self.registry = registry
         # Orchestration V1: the bus DEFINED VERIFY_PENDING and this queue
@@ -412,6 +412,15 @@ class VerifyQueue:
         # verifying". Optional and exception-swallowing for the same reason
         # the queue's sink is: a publish glitch must not undo a verdict.
         self._event_sink = event_sink
+        # Lifecycle Close-Loop V1: the fast path from a PASS to an
+        # integration handoff. Called with the settled VerifyJob, and
+        # ALWAYS after the verdict has committed -- a handoff must never
+        # exist for a verdict that then rolled back. It is a fast path
+        # only: LifecycleService.reconcile re-derives any handoff this hook
+        # missed (hook unset, process killed between commit and call), so
+        # nothing here is load-bearing for correctness and every failure is
+        # swallowed exactly like the event sink's.
+        self.on_verified_pass = on_verified_pass
 
     def _emit(self, job: "VerifyJob") -> None:
         if self._event_sink is None:
@@ -424,6 +433,19 @@ class VerifyQueue:
                               "required_capabilities": list(job.required_capabilities),
                               "block_reason": job.block_reason})
         except Exception:  # noqa: BLE001 -- never let publishing undo a verdict
+            pass
+
+    def _emit_verified_pass(self, job: "VerifyJob") -> None:
+        """Post-commit only. Never called for VERIFIED_FAIL, NEEDS_REWORK,
+        VERIFY_BLOCKED or VERIFY_CANCELLED -- a failed verification must
+        not put anything into the merge queue, which is the entire point
+        of routing integration through the verdict rather than through
+        task completion."""
+        if self.on_verified_pass is None:
+            return
+        try:
+            self.on_verified_pass(job)
+        except Exception:  # noqa: BLE001 -- reconcile repairs what this misses
             pass
 
     # -- internals -------------------------------------------------------
@@ -714,6 +736,7 @@ class VerifyQueue:
                 reason=None, fields={"evidence": json.dumps(clean), "completed_at": iso_now(),
                                      "claim_token": None, "lease_expires_at": None})
         self._emit(job)
+        self._emit_verified_pass(job)
         return {"ok": True, "job": job.to_dict(), "task_status": COMPLETED}
 
     def fail(self, job_id: str, claim_token: str, *, result: str, failure_summary: dict[str, Any],
@@ -901,6 +924,9 @@ class VerifyQueue:
         now = now or iso_now()
         expired: list[str] = []
         closed: list[dict[str, str]] = []
+        # Collected inside the transaction, fired only after it commits --
+        # same ordering rule as complete()'s own hook call.
+        passed: list[VerifyJob] = []
         placeholders = ", ".join("?" * len(LEASED_VERIFY_STATUSES))
         with self._immediate() as connection:
             rows = connection.execute(
@@ -926,12 +952,12 @@ class VerifyQueue:
                     continue
                 if task_status == COMPLETED:
                     evidence = json.loads(row["task_evidence"] or "{}")
-                    self._set_status_locked(
+                    passed.append(self._set_status_locked(
                         connection, row, VERIFIED_PASS, actor=actor, event="VERIFIED_PASS",
                         reason="task completed through the in-session evidence gate before a "
                                "verifier claimed this job",
                         fields={"evidence": json.dumps(evidence), "completed_at": iso_now(),
-                                "claim_token": None, "lease_expires_at": None})
+                                "claim_token": None, "lease_expires_at": None}))
                 else:
                     self._set_status_locked(
                         connection, row, VERIFY_CANCELLED, actor=actor, event="VERIFY_CANCELLED",
@@ -940,5 +966,11 @@ class VerifyQueue:
                         fields={"completed_at": iso_now(), "claim_token": None,
                                 "lease_expires_at": None})
                 closed.append({"job_id": row["id"], "task_status": task_status or "missing"})
+        # Only the lifecycle hook, deliberately not self._emit: reconcile
+        # has never published to the event sink for this path, and starting
+        # to would change what an existing consumer sees. The lifecycle
+        # hook is new, so it has no such history to preserve.
+        for job in passed:
+            self._emit_verified_pass(job)
         return {"leases_expired": expired, "jobs_closed": closed,
                 "expired_count": len(expired), "closed_count": len(closed)}

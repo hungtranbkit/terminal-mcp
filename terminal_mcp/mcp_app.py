@@ -16,6 +16,7 @@ from .integration_loop import IntegrationLoop
 from .task_migration import TaskMigrationPlanner
 from .integration_service import IntegrationService
 from .integration_store import publish_handoff_for_completed_task
+from .lifecycle_service import LifecycleService
 from .dor_gate import check_definition_of_ready
 from .git_isolation_service import GitIsolationService
 from .node_models import node_to_dict as _node_to_dict
@@ -54,6 +55,7 @@ def build_mcp(service: TerminalService | None = None,
               pm: PMService | None = None,
               planner: PlannerService | None = None,
               release: ReleaseService | None = None,
+              lifecycle: "LifecycleService | None" = None,
               ai_usage: AiUsageService | None = None,
               recovery: RecoveryEngine | None = None,
               backlog: BacklogService | None = None,
@@ -122,8 +124,21 @@ def build_mcp(service: TerminalService | None = None,
     # has no real circularity).
     integration = integration or IntegrationService()
 
+    # Legacy trigger. It stays wired for backward compatibility but no
+    # longer publishes behind the verify queue's back: LifecycleService.
+    # on_task_completed defers to the verdict whenever a verify job exists,
+    # honours config.lifecycle.allow_unverified_integration, and records a
+    # VERIFICATION_BYPASSED event when it does fire. `lifecycle` is
+    # constructed further down (it needs `release`), so this closes over
+    # the name rather than capturing it -- by the time any task completes,
+    # build_mcp has long returned.
     def _on_task_completed(task) -> None:
-        publish_handoff_for_completed_task(task, integration.store)
+        if lifecycle is not None:
+            lifecycle.on_task_completed(task)
+        else:  # pragma: no cover -- `lifecycle` is always assigned below
+            # before any task can complete; this is the pre-lifecycle
+            # behaviour, kept only so the hook can never be a hard error.
+            publish_handoff_for_completed_task(task, integration.store)
 
     queue = queue or QueueService(on_completed=_on_task_completed)
     # `backlog` and `events` used to have NO default, while server.py calls
@@ -229,6 +244,31 @@ def build_mcp(service: TerminalService | None = None,
     # store, referencing a task_id for provenance only, never an
     # overload of queue_store.py's own task states.
     release = release or ReleaseService(ReleaseStore())
+    # Lifecycle Close-Loop V1 (lifecycle_service.py): the three edges that
+    # connect the stages above -- verify PASS -> handoff, promoted -> release,
+    # VERIFIED_PROD -> safe worktree cleanup. Constructed unconditionally so
+    # a manual reconcile works regardless of config (no MCP tool surface is
+    # added in V1 -- the entry points are the two hooks below and
+    # MaintenanceLoop); only the AUTOMATIC reconcile is gated by
+    # config.lifecycle.enabled, the same "manual always available, automatic
+    # opt-in" posture as queue/integration_loop/auto_recovery above.
+    lifecycle = lifecycle or LifecycleService(
+        queue=queue, integration=integration, release=release,
+        leases=terminal.leases, resource_locks=resource_locks,
+        session_registry=terminal.session_registry, events=events,
+        worktree_roots=terminal.config.lifecycle.worktree_roots,
+        main_branch=terminal.config.lifecycle.main_branch,
+        environment=terminal.config.lifecycle.environment,
+        allow_unverified_integration=terminal.config.lifecycle.allow_unverified_integration,
+    )
+    # The verdict now owns the edge into integration: a VERIFIED_PASS
+    # publishes the handoff, a FAIL/NEEDS_REWORK publishes nothing. Never
+    # overwrites a hook a caller (a test) already set.
+    if getattr(queue.verify_queue, "on_verified_pass", None) is None:
+        queue.verify_queue.on_verified_pass = lifecycle.on_verified_pass
+    # ...and a promotion that actually moved main now records a release.
+    if integration.engine is not None and getattr(integration.engine, "on_promoted", None) is None:
+        integration.engine.on_promoted = lifecycle.on_promoted
     # Task Migration/Load Balancing: same node-aware controller as
     # everything else, so eligibility checks (item 6) resolve a
     # destination session's real cwd/node_id regardless of which node

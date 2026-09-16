@@ -196,6 +196,40 @@ class IntegrationLoopConfig:
 
 
 @dataclass(frozen=True)
+class LifecycleConfig:
+    """Lifecycle Close-Loop V1 (lifecycle_service.py): the reconcile pass
+    that carries work from a verify PASS through merge and release to a
+    safely reaped worktree.
+
+    OFF by default, same posture as every other autonomous loop here. With
+    `enabled: false` the service is still constructed and every method is
+    still callable by hand (the MCP tools, a test) -- only the AUTOMATIC
+    invocation from MaintenanceLoop is gated, matching the established
+    "manual call always available, only the automatic trigger is gated"
+    convention of queue/integration_loop/auto_recovery.
+
+    `worktree_roots` is a genuine safety boundary, not a convenience: the
+    reaper refuses to remove any worktree outside it. Empty means "no
+    containment check", which is why it is empty only in a test rig --
+    a real deployment names its roots explicitly, and the reaper is
+    therefore incapable of touching a path the operator never listed."""
+    enabled: bool = False
+    main_branch: str = "main"
+    environment: str = "dev"
+    worktree_roots: tuple[str, ...] = ()
+    reconcile_limit: int = 50
+    allow_unverified_integration: bool = True
+    """Backward compatibility, made explicit. Before this feature a task
+    published its integration handoff on COMPLETED, so integration never
+    required a verification at all. Leaving this True keeps a deployment
+    that never adopted the verify queue working exactly as before -- but
+    the bypass is no longer silent: it is suppressed entirely whenever the
+    task has a verify job, and when it does fire it writes a
+    VERIFICATION_BYPASSED event naming the task. Set False to require a
+    VERIFIED_PASS before anything may enter the merge queue."""
+
+
+@dataclass(frozen=True)
 class AiUsageConfig:
     """Read-only integration with the separate 'AI Usage Monitor' local
     service (a SEPARATE project -- its own repo, its own systemd user
@@ -502,6 +536,12 @@ class MaintenanceConfig:
     audit_retention: int = 20_000
     action_retention: int = 5_000
     idempotency_key_retention_days: int = 30
+    lifecycle_key_retention_days: int = 90
+    """Lifecycle request keys outlive send keys by design. A send key only
+    needs to cover a keystroke retry window (30 days is already generous);
+    a lifecycle key guards a worktree that may legitimately sit at
+    VERIFIED_PROD for weeks before anyone reaps it, and pruning it early
+    would make an already-completed cleanup look un-attempted."""
 
 
 @dataclass(frozen=True)
@@ -588,6 +628,7 @@ class AppConfig:
     queue: QueueConfig = QueueConfig()
     submit: SubmitConfig = SubmitConfig()
     integration_loop: IntegrationLoopConfig = IntegrationLoopConfig()
+    lifecycle: LifecycleConfig = LifecycleConfig()
     submit_watchdog: SubmitWatchdogConfig = SubmitWatchdogConfig()
     ai_usage: AiUsageConfig = AiUsageConfig()
     notes: NotesConfig = NotesConfig()
@@ -901,6 +942,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         queue=_load_queue_config(raw.get("queue", {})),
         submit=submit_config,
         integration_loop=_load_integration_loop_config(raw.get("integration_loop", {})),
+        lifecycle=_load_lifecycle_config(raw.get("lifecycle", {})),
         submit_watchdog=watchdog_config,
         ai_usage=_load_ai_usage_config(raw.get("ai_usage", {})),
         notes=_load_notes_config(raw.get("notes", {})),
@@ -991,6 +1033,28 @@ def _load_integration_loop_config(raw: object) -> IntegrationLoopConfig:
     return IntegrationLoopConfig(enabled=bool(raw.get("enabled", False)), fallback_poll_seconds=fallback_poll)
 
 
+def _load_lifecycle_config(raw: object) -> LifecycleConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    roots = raw.get("worktree_roots", [])
+    if not isinstance(roots, list):
+        raise ValueError("lifecycle.worktree_roots must be a list of paths")
+    limit = int(raw.get("reconcile_limit", LifecycleConfig.reconcile_limit))
+    if limit < 1:
+        raise ValueError("lifecycle.reconcile_limit must be at least 1")
+    main_branch = str(raw.get("main_branch", LifecycleConfig.main_branch)).strip()
+    if not main_branch:
+        raise ValueError("lifecycle.main_branch must be a non-empty branch name")
+    environment = str(raw.get("environment", LifecycleConfig.environment)).strip()
+    return LifecycleConfig(
+        enabled=bool(raw.get("enabled", False)), main_branch=main_branch,
+        environment=environment or LifecycleConfig.environment,
+        worktree_roots=tuple(str(r) for r in roots), reconcile_limit=limit,
+        allow_unverified_integration=bool(raw.get(
+            "allow_unverified_integration", LifecycleConfig.allow_unverified_integration)),
+    )
+
+
 def _load_queue_config(queue_raw: object) -> QueueConfig:
     if not isinstance(queue_raw, dict):
         queue_raw = {}
@@ -1015,6 +1079,9 @@ def _load_maintenance_config(maintenance_raw: object) -> MaintenanceConfig:
     idempotency_days = int(maintenance_raw.get(
         "idempotency_key_retention_days", MaintenanceConfig.idempotency_key_retention_days,
     ))
+    lifecycle_days = int(maintenance_raw.get(
+        "lifecycle_key_retention_days", MaintenanceConfig.lifecycle_key_retention_days,
+    ))
     if interval < 60:
         raise ValueError("maintenance.interval_seconds must be at least 60")
     if audit_retention < 1:
@@ -1023,9 +1090,12 @@ def _load_maintenance_config(maintenance_raw: object) -> MaintenanceConfig:
         raise ValueError("maintenance.action_retention must be at least 1")
     if idempotency_days < 1:
         raise ValueError("maintenance.idempotency_key_retention_days must be at least 1")
+    if lifecycle_days < 1:
+        raise ValueError("maintenance.lifecycle_key_retention_days must be at least 1")
     return MaintenanceConfig(
         interval_seconds=interval, audit_retention=audit_retention,
         action_retention=action_retention, idempotency_key_retention_days=idempotency_days,
+        lifecycle_key_retention_days=lifecycle_days,
     )
 
 

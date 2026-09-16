@@ -161,6 +161,17 @@ def _parse_json_object(raw: str | None) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _optional_column(row: sqlite3.Row, name: str) -> Any:
+    """Read a column that a not-yet-migrated database may not have. Every
+    store here migrates on open, so this is belt-and-braces for the one
+    real case it cannot cover: a Row produced by a caller's own hand-built
+    query or an older connection still open across the migration."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
+
 def _parse_json_list(raw: str | None) -> list[str]:
     if not raw:
         return []
@@ -250,6 +261,7 @@ class RegressionBatch:
     full_test_result: dict[str, Any]
     promoted_to_main: bool
     promoted_at: str | None
+    main_commit_sha: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "RegressionBatch":
@@ -259,6 +271,7 @@ class RegressionBatch:
             created_at=row["created_at"], started_at=row["started_at"], finished_at=row["finished_at"],
             full_test_result=_parse_json_object(row["full_test_result"]),
             promoted_to_main=bool(row["promoted_to_main"]), promoted_at=row["promoted_at"],
+            main_commit_sha=_optional_column(row, "main_commit_sha"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -266,6 +279,7 @@ class RegressionBatch:
             "id": self.id, "project": self.project, "status": self.status, "handoff_ids": list(self.handoff_ids),
             "created_at": self.created_at, "started_at": self.started_at, "finished_at": self.finished_at,
             "full_test_result": self.full_test_result, "promoted_to_main": self.promoted_to_main,
+            "main_commit_sha": self.main_commit_sha,
             "promoted_at": self.promoted_at,
         }
 
@@ -373,10 +387,38 @@ def _add_v2_mechanical_conflict_resolution_column(connection: sqlite3.Connection
     )
 
 
+def _add_v3_batch_main_commit_sha(connection: sqlite3.Connection) -> None:
+    """Lifecycle Close-Loop V1: durably record WHICH commit a promoted
+    batch put on main.
+
+    promote_batch already recorded the SHA -- but only inside an
+    integration_events metadata blob, which is an audit log, not a
+    queryable key. Reconcile needs to answer "was this batch promoted, and
+    to what commit" as a plain column read, because that is exactly the
+    question a crash between the git promotion and the release INSERT
+    leaves open.
+
+    Additive and nullable: every existing row keeps working, and a batch
+    promoted before this migration simply reports None (reconcile then
+    falls back to re-deriving the SHA from git, which is what it would do
+    for an unrecorded promotion anyway). Column existence is checked with
+    a real PRAGMA rather than a try/except, following queue_store's own
+    v5/v6 precedent, so re-running this migration after a crash mid-way
+    through the list is a clean no-op instead of a duplicate-column error."""
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(integration_batches)")}
+    if "main_commit_sha" not in columns:
+        connection.execute("ALTER TABLE integration_batches ADD COLUMN main_commit_sha TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_integration_batches_promoted "
+        "ON integration_batches(project, promoted_to_main)")
+
+
 INTEGRATION_MIGRATIONS = [
     Migration(1, "initial Integration Agent schema (pipelines/handoffs/batches/events)", _create_v1_schema),
     Migration(2, "Git isolation + Merge Agent: allow_mechanical_conflict_resolution opt-in",
              _add_v2_mechanical_conflict_resolution_column),
+    Migration(3, "Lifecycle Close-Loop V1: integration_batches.main_commit_sha",
+             _add_v3_batch_main_commit_sha),
 ]
 
 
@@ -774,8 +816,9 @@ class IntegrationStore:
                 raise InvalidHandoffTransitionError(f"{batch_id}: cannot promote a batch in status {row['status']!r}")
             now = iso_now()
             connection.execute(
-                "UPDATE integration_batches SET promoted_to_main = 1, promoted_at = ? WHERE id = ?",
-                (now, batch_id),
+                "UPDATE integration_batches SET promoted_to_main = 1, promoted_at = ?, "
+                "main_commit_sha = ? WHERE id = ?",
+                (now, main_commit_sha, batch_id),
             )
             self._record_event_locked(connection, project=row["project"], handoff_id=None, batch_id=batch_id,
                                       event_type="PROMOTED_TO_MAIN", reason=None,
@@ -806,6 +849,56 @@ class IntegrationStore:
                 "ORDER BY created_at DESC LIMIT 1", (project, REGRESSION_PENDING, REGRESSION_RUNNING),
             ).fetchone()
         return self.get_batch(row["id"]) if row is not None else None
+
+    def list_promoted_batches(self, project: str | None = None, limit: int = 200) -> list[RegressionBatch]:
+        """Every batch that actually reached main. The reconcile pass's own
+        input for "promoted, but does a release exist for it yet" -- kept
+        here rather than in the lifecycle service so the SQL stays next to
+        the schema it reads."""
+        query = "SELECT * FROM integration_batches WHERE promoted_to_main = 1"
+        params: list[Any] = []
+        if project:
+            query += " AND project = ?"
+            params.append(project)
+        query += " ORDER BY promoted_at DESC LIMIT ?"
+        params.append(max(1, min(limit, 1000)))
+        with self._connection() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [RegressionBatch.from_row(row) for row in rows]
+
+    def list_handoffs_for_batch(self, batch_id: str) -> list[Handoff]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM integration_handoffs WHERE regression_batch_id = ? ORDER BY created_at ASC",
+                (batch_id,)).fetchall()
+        return [Handoff.from_row(row) for row in rows]
+
+    def find_handoff_for_task(self, task_id: str, *, commit_sha: str | None = None,
+                              project: str | None = None) -> Handoff | None:
+        """The existence check that makes handoff publication idempotent.
+
+        publish_handoff itself always INSERTs a fresh row (its provenance
+        fields are immutable by design), so "exactly one handoff per unit
+        of work" has to be enforced by the caller looking first -- this is
+        that lookup, kept beside the table so every caller shares one
+        definition of 'already published'.
+
+        Pass `commit_sha` to scope it to a specific commit, which is what
+        the lifecycle service does: the same commit must never produce a
+        second handoff, but a reworked task at a NEW commit must be able
+        to enter integration again."""
+        query = "SELECT * FROM integration_handoffs WHERE task_id = ?"
+        params: list[Any] = [task_id]
+        if commit_sha:
+            query += " AND commit_sha = ?"
+            params.append(commit_sha)
+        if project:
+            query += " AND project = ?"
+            params.append(project)
+        query += " ORDER BY created_at ASC LIMIT 1"
+        with self._connection() as connection:
+            row = connection.execute(query, params).fetchone()
+        return Handoff.from_row(row) if row else None
 
     def list_batches(self, project: str, limit: int = 50) -> list[RegressionBatch]:
         with self._connection() as connection:

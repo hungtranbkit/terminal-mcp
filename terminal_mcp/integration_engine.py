@@ -112,13 +112,23 @@ class IntegrationEngine:
     def __init__(self, store: IntegrationStore, queue_store: QueueStore, *,
                 claimed_by: str = DEFAULT_CLAIMED_BY, lease_seconds: float = DEFAULT_LEASE_SECONDS,
                 test_timeout_seconds: float = DEFAULT_TEST_TIMEOUT_SECONDS,
-                reviewer: IntegrationReviewGate | None = None) -> None:
+                reviewer: IntegrationReviewGate | None = None,
+                on_promoted: Any = None) -> None:
         self.store = store
         self.queue_store = queue_store
         self.claimed_by = claimed_by
         self.lease_seconds = lease_seconds
         self.test_timeout_seconds = test_timeout_seconds
         self.reviewer = reviewer or IntegrationReviewGate()
+        # Lifecycle Close-Loop V1: the fast path from "main moved" to a
+        # durable release row. Called with (project, batch_id,
+        # main_commit_sha) only after promote_batch has COMMITTED, so a
+        # release can never exist for a promotion that did not record.
+        # A fast path only -- LifecycleService.reconcile re-derives any
+        # release this hook missed by asking git whether main already
+        # contains the batch's commit, so a swallowed failure here costs a
+        # reconcile interval, never the release itself.
+        self.on_promoted = on_promoted
 
     def tick(self, project: str) -> EngineResult:
         self.store.reconcile_stale_handoff_claims(project)
@@ -481,4 +491,11 @@ class IntegrationEngine:
                 return {"action": "PROMOTE_FAILED", "detail": result.stderr.strip()[:500]}
         main_commit_sha = _run_git(["rev-parse", "HEAD"], repo_path).stdout.strip()
         self.store.promote_batch(batch_id, main_commit_sha=main_commit_sha)
-        return {"action": "PROMOTED", "main_commit_sha": main_commit_sha}
+        promoted = {"action": "PROMOTED", "main_commit_sha": main_commit_sha, "batch_id": batch_id}
+        if self.on_promoted is not None:
+            try:
+                promoted["release"] = self.on_promoted(project, batch_id, main_commit_sha)
+            except Exception:  # noqa: BLE001 -- reconcile repairs what this misses
+                promoted["release"] = {"error": "RELEASE_HOOK_FAILED",
+                                      "detail": "promotion succeeded; reconcile will create the release"}
+        return promoted
