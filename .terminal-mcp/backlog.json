@@ -9,8 +9,8 @@
     "git_branch": "main",
     "is_portable": true
   },
-  "revision": 91,
-  "updated_at": "2026-09-15T05:14:58.120325+00:00",
+  "revision": 95,
+  "updated_at": "2026-09-15T06:18:33.318490+00:00",
   "items": [
     {
       "id": "blg_f52a999971d9",
@@ -63,12 +63,12 @@
       "id": "blg_1f40adaadc46",
       "title": "Rate-limit / lockout on node-agent bearer auth",
       "description": "Token comparison is constant-time but unbounded: an attacker on the LAN (or on any network a node is exposed to) can attempt tokens indefinitely. Found in the 2026-09-09 internet-connectivity audit.",
-      "status": "IN_PROGRESS",
+      "status": "DONE",
       "priority": "P1",
       "type": "feature",
       "order": 2,
       "created_at": "2026-09-09T08:02:29.711872+00:00",
-      "updated_at": "2026-09-15T04:51:27.972837+00:00",
+      "updated_at": "2026-09-16T23:23:07.286115+00:00",
       "source": "session-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -86,13 +86,20 @@
       "queue_task_id": null,
       "branch": "feat/node-auth-throttle",
       "worktree": null,
-      "blocked_reason": "NOT merged in this pass: semantic conflict with the AgentCredential token-rotation work that landed on main (node_agent.py, 3 hunks -- the branch changes the same signature without the credential object). Needs the owning lane to rebase onto main; forcing it would be guessing at intent. Implementation exists and is complete on the branch.",
-      "evidence": {
-        "commits": [],
-        "tests": [],
-        "deploys": [],
-        "notes": []
-      },
+      "blocked_reason": null,
+      "evidence": [
+        {
+          "commits": [],
+          "tests": [],
+          "deploys": [],
+          "notes": []
+        },
+        {
+          "at": "2026-09-16T23:23:07.286115+00:00",
+          "kind": "audit",
+          "detail": "Merged into canonical eed9985; focused auth-throttle regression passes."
+        }
+      ],
       "history": [
         {
           "at": "2026-09-09T08:02:29.711883+00:00",
@@ -124,6 +131,13 @@
             "blocked_reason",
             "branch"
           ]
+        },
+        {
+          "at": "2026-09-16T23:23:07.286115+00:00",
+          "from": "IN_PROGRESS",
+          "to": "DONE",
+          "actor": "audit",
+          "reason": "Merged into canonical eed9985; focused auth-throttle regression passes."
         }
       ]
     },
@@ -450,12 +464,12 @@
       "id": "blg_7c61b4068f9a",
       "title": "Direct-send reliability fix: deploy and live-reverify on dell-5530",
       "description": "REQUIREMENTS Backlog item 7. Fix is shipped locally; verifying it is Windows-ConPTY-specific and needs a real dell-5530 restart, so it rides the same maintenance window as the token rotation.",
-      "status": "BLOCKED",
+      "status": "NEEDS_REVIEW",
       "priority": "P1",
       "type": "bug",
       "order": 7,
       "created_at": "2026-09-09T08:02:29.711936+00:00",
-      "updated_at": "2026-09-15T01:54:50.443747+00:00",
+      "updated_at": "2026-09-16T23:23:07.286115+00:00",
       "source": "session-audit-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -473,13 +487,20 @@
       "queue_task_id": null,
       "branch": null,
       "worktree": null,
-      "blocked_reason": "Blocked on the single dell-5530 maintenance window (blg_f52a999971d9). That node hosts live ConPTY sessions which are in-process children of its agent and do not survive a restart by design, so token rotation, Scheduled Task re-parenting, direct-send re-verification and session recovery all have to ride the same window. Not duplicates: each has its own deliverable.",
-      "evidence": {
-        "commits": [],
-        "tests": [],
-        "deploys": [],
-        "notes": []
-      },
+      "blocked_reason": null,
+      "evidence": [
+        {
+          "commits": [],
+          "tests": [],
+          "deploys": [],
+          "notes": []
+        },
+        {
+          "at": "2026-09-16T23:23:07.286115+00:00",
+          "kind": "audit",
+          "detail": "Canonical 0.13.0 is deployed on dell-5530 and health passes; still requires a live direct-send acceptance on a real Windows session."
+        }
+      ],
       "history": [
         {
           "at": "2026-09-09T08:02:29.711942+00:00",
@@ -499,6 +520,13 @@
           "event": "blocked",
           "by": "m2-cleanup",
           "reason": "Blocked on the single dell-5530 maintenance window (blg_f52a999971d9). That node hosts live ConPTY sessions which are in-process children of its agent and do not survive a restart by design, so token rotation, Scheduled Task re-parenting, direct-send re-verification and session recovery all have to ride the same window. Not duplicates: each has its own deliverable."
+        },
+        {
+          "at": "2026-09-16T23:23:07.286115+00:00",
+          "from": "BLOCKED",
+          "to": "NEEDS_REVIEW",
+          "actor": "audit",
+          "reason": "Canonical 0.13.0 is deployed on dell-5530 and health passes; still requires a live direct-send acceptance on a real Windows session."
         }
       ]
     },
@@ -1843,12 +1871,12 @@
       "id": "blg_dell5530_lost_sessions",
       "title": "dell-5530 node-agent restarted: 3 of 6 ConPTY sessions lost (wcodex, wdeploy, win3)",
       "description": "2026-09-09 ~22:30 local: dell-5530 stopped heartbeating for several minutes, then resumed. IDENTIFIED: 3 of its 6 ConPTY sessions are gone. LIVE: win1, win2, wtest (all ACTIVE). LOST: wcodex (codex agent), wdeploy (shell), win3 (shell) -- all now MISSING in the node's own registry and all marked recoverable=true, cwd C:\\\\Users\\\\tranv\\\\terminal-mcp. Consistent with the known property that dell-5530's ConPTY sessions are in-process children of the node-agent and do not survive its restart. Node is healthy now (version 0.12.0, agent_generation e19d32ef22e3bdf3). Not caused by any change in this session: only the controller's queue.db was written and dell-5530 was never touched.",
-      "status": "BLOCKED",
+      "status": "DONE",
       "priority": "P1",
       "type": "incident",
       "order": 35,
       "created_at": "2026-09-09T15:53:21.099701+00:00",
-      "updated_at": "2026-09-15T01:54:50.553155+00:00",
+      "updated_at": "2026-09-16T23:23:07.286115+00:00",
       "source": "observed-2026-09-09",
       "dependencies": [],
       "acceptance_criteria": [
@@ -1867,19 +1895,26 @@
       "queue_task_id": null,
       "branch": null,
       "worktree": null,
-      "blocked_reason": "Blocked on the single dell-5530 maintenance window (blg_f52a999971d9). That node hosts live ConPTY sessions which are in-process children of its agent and do not survive a restart by design, so token rotation, Scheduled Task re-parenting, direct-send re-verification and session recovery all have to ride the same window. Not duplicates: each has its own deliverable.",
-      "evidence": {
-        "commits": [],
-        "tests": [],
-        "deploys": [],
-        "notes": [
-          "Queried the node agent directly at http://192.168.1.250:8790 with the controller's own bearer token, read from the running process environment and never printed.",
-          "GET /v1/sessions -> 3: win1, win2, wtest. GET /v1/registry -> wcodex/wdeploy/win3 are MISSING with recoverable=true; win1/win2/wtest are ACTIVE.",
-          "CORRECTION to the earlier read in this session: dell-5530 is NOT unreachable. That conclusion came from ping (ICMP, blocked by default on Windows) plus a curl to the WRONG PORT -- 8766 is the controller, the node agent listens on 8790. On 8790 it answers HTTP 200. The heartbeat gap was real; 'network-layer unreachable' was not.",
-          "wtest -- flagged in project memory as a live attended session -- SURVIVED.",
-          "Relevant to the pending dell-5530 maintenance window (token rotation + orphaned Scheduled Task), which costs the ConPTY sessions anyway: 3 are already gone."
-        ]
-      },
+      "blocked_reason": null,
+      "evidence": [
+        {
+          "commits": [],
+          "tests": [],
+          "deploys": [],
+          "notes": [
+            "Queried the node agent directly at http://192.168.1.250:8790 with the controller's own bearer token, read from the running process environment and never printed.",
+            "GET /v1/sessions -> 3: win1, win2, wtest. GET /v1/registry -> wcodex/wdeploy/win3 are MISSING with recoverable=true; win1/win2/wtest are ACTIVE.",
+            "CORRECTION to the earlier read in this session: dell-5530 is NOT unreachable. That conclusion came from ping (ICMP, blocked by default on Windows) plus a curl to the WRONG PORT -- 8766 is the controller, the node agent listens on 8790. On 8790 it answers HTTP 200. The heartbeat gap was real; 'network-layer unreachable' was not.",
+            "wtest -- flagged in project memory as a live attended session -- SURVIVED.",
+            "Relevant to the pending dell-5530 maintenance window (token rotation + orphaned Scheduled Task), which costs the ConPTY sessions anyway: 3 are already gone."
+          ]
+        },
+        {
+          "at": "2026-09-16T23:23:07.286115+00:00",
+          "kind": "audit",
+          "detail": "Superseded by merged Windows detached-session host support; current dell-5530 node-agent 0.13.0 health OK after restart."
+        }
+      ],
       "history": [
         {
           "at": "2026-09-09T15:53:21.099701+00:00",
@@ -1897,6 +1932,13 @@
           "event": "blocked",
           "by": "m2-cleanup",
           "reason": "Blocked on the single dell-5530 maintenance window (blg_f52a999971d9). That node hosts live ConPTY sessions which are in-process children of its agent and do not survive a restart by design, so token rotation, Scheduled Task re-parenting, direct-send re-verification and session recovery all have to ride the same window. Not duplicates: each has its own deliverable."
+        },
+        {
+          "at": "2026-09-16T23:23:07.286115+00:00",
+          "from": "BLOCKED",
+          "to": "DONE",
+          "actor": "audit",
+          "reason": "Superseded by merged Windows detached-session host support; current dell-5530 node-agent 0.13.0 health OK after restart."
         }
       ]
     },
@@ -3073,12 +3115,12 @@
       "id": "blg_39f82cd2fe3a",
       "title": "Prompt delivery/acceptance gate: enforce across supervisor2 + MCP send tools, then promote advisory->enforce",
       "description": "Finish wiring the PROMPT DELIVERY / ACCEPTANCE GATE into the two send paths that still decide\nfor themselves, and promote the gate from advisory to enforce.\n\nAlready shipped on branch feat/prompt-delivery-gate (advisory default, zero behaviour change):\nterminal_mcp/delivery_gate.py (the pure decision point), config.PromptDeliveryConfig +\n_load_prompt_delivery_config, queue_engine._dispatch wired through it,\nqueue_store.record_delivery_verdict, the contract in docs/prompt-submission.md (\"The acceptance\ngate\") and a pointer in docs/REQUIREMENTS.md section 5, plus tests/test_delivery_gate.py.\nThis item is the REMAINDER, deliberately not guessed at.\n\nTHE RULE (source of truth: docs/prompt-submission.md \"The acceptance gate\"): a prompt is\nDELIVERED only when BOTH (1) the send receipt's delivery_state is SUBMIT_CONFIRMED, AND (2) a\nseparate post-submit observation shows the target actually took it. SUBMIT_CONFIRMED alone\nproves Enter was processed, not that the agent read the prompt and started.\n\n1. supervisor2.execute_send. It currently does: if submit_status == \"SUBMIT_UNCONFIRMED\" ->\n   cas_update(state=blocked, stop_reason=submit_unconfirmed) + block_policy; else ->\n   cas_update(state=observing). That is the same denylist shape queue_engine had -- a TEXT_SENT\n   receipt, or any delivery_state added to adapters.py later, falls through to observing.\n   Replace with delivery_gate.evaluate. The care needed:\n   - The action state machine is a CAS chain (approved -> sent -> observing|blocked|failed) and\n     the row is CAS'd to sent BEFORE the send. Do NOT change that ordering: it is what makes a\n     duplicate execute_send a no-op.\n   - A NOT_ACCEPTED verdict needs its OWN stop_reason (proposed: acceptance_not_observed) and\n     must not be conflated with submit_unconfirmed. They call for different operator action:\n     submit_unconfirmed means the submit itself is unproven, acceptance_not_observed means the\n     submit is confirmed but the agent has not visibly started. Conflating them would tell an\n     operator to retry something that must never be retried.\n   - DECIDE and document: should NOT_ACCEPTED call block_policy (pausing the whole watch) or\n     only block the single action? Blocking the whole policy because one agent was slow to start\n     is probably too aggressive; blocking only the action risks the chain advancing. Pick one\n     with a stated rationale.\n\n2. Direct MCP send tools (terminal_send_text, terminal_send_bound and the _bound variants).\n   These return a receipt and the CALLER decides, so in-process enforcement is impossible --\n   for an external caller the docs section IS the rule. What is possible and additive: return\n   the verdict as a receipt field (proposed name: delivery_verdict) alongside the existing\n   submission_id / evidence / stage that core.py's _enrich_receipt already adds, so a caller\n   branches on one field instead of re-deriving the rule.\n   - DECIDE: compute it inline on every send (costs one extra status read of latency per send)\n     or only when the caller opts in via a parameter. Measure before choosing.\n   - _enrich_receipt already emits stage=ACCEPTANCE for the enter-sent-but-unconfirmed case.\n     Reconcile the two vocabularies rather than introducing a third overlapping one.\n\n3. Promotion advisory -> enforce. Run advisory in production for a defined window, export the\n   recorded metadata.delivery_verdict distribution, and confirm there are no false negatives\n   (NOT_ACCEPTED returned for a task that had genuinely started) -- a false negative stalls real\n   work, which is worse than the fail-open it replaces. Only then flip prompt_delivery.mode to\n   enforce, per-deployment, with an explicit human go-ahead, the same discipline the per-lane\n   auto_dispatch_enabled decision documents. Record the observed false-negative rate in\n   docs/REQUIREMENTS.md BEFORE flipping.\n\n4. Dashboard surface: show the verdict (kind, activation, acceptance, evidence) on a held task\n   so an operator can see WHY it is held rather than just that it is. tests/test_dashboard.py's\n   pinned route inventory is authoritative -- update it deliberately if a route is added.\n\nEXPLICIT NON-GOALS: no new queue status (DISPATCH_UNCERTAIN already carries the\nheld-after-confirmed-submit case); no schema migration (the verdict lives in the existing\nmetadata JSON column, bounded to 5 history entries); no change to the bounded Escape+Enter\nactivation retry, which stays owned by core.py under its own evidence gate; no automatic resend\non NOT_ACCEPTED, ever -- the submit is confirmed, so a resend duplicates it.\n\nCLAUDE-SPECIFIC RULE that must survive any refactor here: never raw/repeated Enter. If a prompt\nis still in the input box, inspect via terminal_input_context, clear it, then exactly one\nterminal_send_text(..., press_enter=True). No bare terminal_send_keys([\"Enter\"]) to help it\nalong, no second Enter because the first looked slow.\n",
-      "status": "IN_PROGRESS",
+      "status": "NEEDS_REVIEW",
       "priority": "P1",
       "type": "feature",
       "order": 53,
       "created_at": "2026-09-14T06:22:48.024073+00:00",
-      "updated_at": "2026-09-15T05:03:03.264348+00:00",
+      "updated_at": "2026-09-16T23:23:07.286115+00:00",
       "source": "analysis-gate",
       "dependencies": [],
       "acceptance_criteria": [
@@ -3103,15 +3145,31 @@
       "queue_task_id": null,
       "branch": "feat/prompt-delivery-gate",
       "worktree": null,
-      "blocked_reason": "NOT merged in this pass: conflicts in queue_store.py (3 hunks) and config.py (4 hunks) with the worktree-janitor cleanup lifecycle, which hangs off the same queue_store chokepoint. Two features in one chokepoint is a reconciliation for the owning lane, not a mechanical merge.",
-      "evidence": {
-        "commits": [],
-        "tests": [],
-        "deploys": [],
-        "notes": [
-          "blg_f924acfb80f1 (03820efd0715) fixed an upstream false positive this item depends on: an activate-only send used to return SUBMIT_CONFIRMED with no Enter having taken effect. Any advisory-mode verdict distribution gathered BEFORE that commit overstates SUBMIT_CONFIRMED and must not be used as the pre-enforce baseline."
-        ]
-      },
+      "blocked_reason": null,
+      "evidence": [
+        {
+          "commits": [
+            "ea981a6e86fd"
+          ],
+          "tests": [
+            "tests/test_supervisor_v2_acceptance.py (20)"
+          ],
+          "deploys": [],
+          "notes": [
+            "blg_f924acfb80f1 (03820efd0715) fixed an upstream false positive this item depends on: an activate-only send used to return SUBMIT_CONFIRMED with no Enter having taken effect. Any advisory-mode verdict distribution gathered BEFORE that commit overstates SUBMIT_CONFIRMED and must not be used as the pre-enforce baseline.",
+            "AC1 satisfied in SUBSTANCE at ea981a6e86fd, but NOT by the mechanism the AC names: execute_send now asks adapters.is_submission_confirmed (a positive allowlist beside DELIVERY_STATES) rather than delivery_gate.evaluate, because delivery_gate lives on feat/prompt-delivery-gate which is still unmerged for the queue_store/config conflicts recorded in blocked_reason. TEXT_SENT and an unrecognised/absent delivery_state no longer reach state=observing and no longer increment the auto-action count.",
+            "AC2 deliberately NOT done: no distinct stop_reason for NOT_ACCEPTED. The existing spelling (submit_unconfirmed) is kept because dashboards, runbooks and tests key on it, and the specific failing delivery_state is already durable in send_result. Introducing the NOT_ACCEPTED vocabulary belongs with the delivery_gate reconciliation, not ahead of it.",
+            "AC3 verified unchanged (CAS approved->sent before the send; duplicate execute_send still refused). AC8 covered for the TEXT_SENT half; the NOT_ACCEPTED half follows AC2.",
+            "AC4/5/6/7/9 untouched: still with the owning lane.",
+            "Complementary to m1's fix/submit-acceptance-p1 (in main): m1 stopped core.py EMITTING a false SUBMIT_CONFIRMED for an activate-only send into an empty composer; this stops supervisor2 TRUSTING a result that was never confirmed. Producer and consumer side, disjoint files."
+          ]
+        },
+        {
+          "at": "2026-09-16T23:23:07.286115+00:00",
+          "kind": "audit",
+          "detail": "Implementation is merged and regression passes; keep NEEDS_REVIEW because acceptance explicitly requires a real advisory production window before enforce mode."
+        }
+      ],
       "history": [
         {
           "at": "2026-09-14T06:22:48.024139+00:00",
@@ -3151,6 +3209,21 @@
           "changed": [
             "evidence"
           ]
+        },
+        {
+          "at": "2026-09-15T05:17:33.921109+00:00",
+          "event": "updated",
+          "by": "claude-code",
+          "changed": [
+            "evidence"
+          ]
+        },
+        {
+          "at": "2026-09-16T23:23:07.286115+00:00",
+          "from": "IN_PROGRESS",
+          "to": "NEEDS_REVIEW",
+          "actor": "audit",
+          "reason": "Implementation is merged and regression passes; keep NEEDS_REVIEW because acceptance explicitly requires a real advisory production window before enforce mode."
         }
       ]
     },
@@ -3163,7 +3236,7 @@
       "type": "bug",
       "order": 54,
       "created_at": "2026-09-14T09:01:27.558658+00:00",
-      "updated_at": "2026-09-15T05:10:38.192576+00:00",
+      "updated_at": "2026-09-15T05:17:33.862803+00:00",
       "source": "claude-code",
       "dependencies": [
         "blg_orch_no_workers_declared"
@@ -3198,11 +3271,14 @@
         "notes": [
           "ROOT CAUSE CONFIRMED: supervisor.py disables watches for 7 reasons and called set_enabled(...,True) from NOWHERE in the codebase -- every disable was permanent. A watch that hit max_iterations while its worker kept working never came back, so live workers lost scheduling visibility forever. That is exactly watch_count=4/enabled=0.\n\nPHASE 1 COMMITTED: branch fix/scheduler-refill @ 02efdf5 (NOT merged, NOT deployed).\n  terminal_mcp/scheduler_health.py (new): worker state model (RUNNING/IDLE_READY/WAITING_INPUT/STALLED/BLOCKED/OFFLINE/RESERVED/UNKNOWN), multi-signal classify_worker with configurable idle debounce, may_reclaim requiring STALLED+high confidence, watch_recovery_action, evaluate_refill with reason codes, utilization_snapshot.\n  terminal_mcp/supervisor.py: reconcile_watches() + _target_alive() + store.reenable_watch/reset_iterations/note_reconcile_attempt, reconcile_attempts column, watch_reconciled event, enriched status (disabled/recoverable/intentional counts + per-watch reasons).\n  tests: test_scheduler_health.py (35), test_supervisor_reconcile.py (9). Regression 227 passed.\n\nBEFORE/AFTER on a COPY of the real supervisor.db (production not mutated):\n  BEFORE enabled=0/4 (recoverable=3, intentional=1)\n  AFTER  enabled=2/4 -- restored mcp-work + terminal-mcp-main (max_iterations_exceeded); left mesflow-dell (manual_unwatch, deliberate) and wtest (target still missing).\n\nSTILL OPEN (phase 2): the dispatch side. evaluate_refill decides and explains but nothing yet claims a lease, sends a prompt under the SUBMIT_CONFIRMED contract, or reclaims a STALLED session. Needs wiring into queue_engine's dispatch path; deserves its own review.",
           "Integrated into main. Closing this also required fixing backlog_service.complete(), which raised AttributeError on this very item because its evidence field was a plain string rather than a dict -- the ledger could not close its own row. Original evidence text preserved as a note.",
-          "Second half of this work integrated via integrate/lane-b: queue_event_drain (the loop now consumes the event bus instead of polling beside it) and the fleet-aware supervisor watch (a session is watched on its own node, not assumed visible to the controller)."
+          "Second half of this work integrated via integrate/lane-b: queue_event_drain (the loop now consumes the event bus instead of polling beside it) and the fleet-aware supervisor watch (a session is watched on its own node, not assumed visible to the controller).",
+          "INTEGRATED at ea981a6e86fd (integration/supervisor-queue-reliability), merged from fix/scheduler-refill; the branch was unmerged when this item was closed.",
+          "Gap found during integration: reconcile_watches' own liveness probe (_target_alive) asked the LOCAL TerminalService, so it could never restore the six remote watches this item exists to restore -- the recovery machinery was correct and unreachable for the majority case. Both polling and the probe now go through one fleet-aware _status_for. See blg_db4d5e4e750a."
         ],
         "commits": [
+          "88a201f",
           "8a60235 (merge integrate/lane-a) / 719474a (fix/scheduler-refill)",
-          "88a201f"
+          "ea981a6e86fd"
         ],
         "tests": [
           "scheduler + pm_router + worker_registry = 68 passed on the merged tree",
@@ -3238,6 +3314,14 @@
           "by": "m2-integrate",
           "verified_by": "evidence",
           "queue_task_id": null
+        },
+        {
+          "at": "2026-09-15T05:17:33.862803+00:00",
+          "event": "updated",
+          "by": "claude-code",
+          "changed": [
+            "evidence"
+          ]
         }
       ]
     },
@@ -3401,12 +3485,12 @@
       "id": "blg_d7582428037c",
       "title": "PUSH_BLOCKED: m910 has no push credential -- two-hop handoff via dell-linux verified and ready",
       "description": "FINISH_GATE requires 'commits pushed to a remote, so provenance is not one machine's disk'. m910 cannot push: no credential.helper, no ~/.git-credentials, no token in env; `git push --dry-run origin main` -> fatal: could not read Username for 'https://github.com'. main is 192 commits ahead of origin/main (695b31c).\n\nA host that CAN push has been identified and BOTH hops are dry-run verified:\n  hop 1 (m910 -> dell-linux, verified '5d3bc6b..21608d0 HEAD -> m910-main'):\n    GIT_SSH_COMMAND='ssh -F ~/.ssh/config' git push dell-linux:/home/dell/workspace/terminal-mcp HEAD:refs/heads/m910-main\n  hop 2 (dell-linux -> github over SSH, verified '* [new branch]'):\n    ssh dell-linux 'cd /home/dell/workspace/terminal-mcp && git push git@github.com:hungtranbkit/terminal-mcp.git m910-main:main'\n\nWhy two hops: dell-linux's origin is HTTPS and it has no credential either, but its SSH key authenticates to github as hungtranbkit. The reverse direction (dell-linux -> m910) is NOT available: Tailscale SSH demands an interactive browser check, and widening Tailscale scope is out of bounds -- so m910 must initiate and dell-linux only relays.\n\nAlso needed on m910 for hop 1: git's ssh does not read ~/.ssh/config here because /etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf has bad owner/permissions; GIT_SSH_COMMAND with an explicit -F is the workaround, not a fix to the system config.\n\nNOT EXECUTED: publishing 192 commits to a shared remote is outward-facing and was not part of any standing approval. Needs an explicit go-ahead. No credential was created for this.",
-      "status": "BLOCKED",
+      "status": "DONE",
       "priority": "P1",
       "type": "feature",
       "order": 58,
       "created_at": "2026-09-15T05:12:48.238591+00:00",
-      "updated_at": "2026-09-15T05:12:48.238603+00:00",
+      "updated_at": "2026-09-16T23:23:07.286115+00:00",
       "source": "m2-integrate",
       "dependencies": [],
       "acceptance_criteria": [],
@@ -3421,18 +3505,32 @@
       "queue_task_id": null,
       "branch": null,
       "worktree": null,
-      "blocked_reason": "Awaiting explicit approval to publish 192 commits to origin/main. Mechanism verified, nothing executed.",
-      "evidence": {
-        "commits": [],
-        "tests": [],
-        "deploys": [],
-        "notes": []
-      },
+      "blocked_reason": null,
+      "evidence": [
+        {
+          "commits": [],
+          "tests": [],
+          "deploys": [],
+          "notes": []
+        },
+        {
+          "at": "2026-09-16T23:23:07.286115+00:00",
+          "kind": "audit",
+          "detail": "Stale blocker cleared: canonical eed9985 was pushed via verified M910 -> Dell -> GitHub two-hop and fleet converged."
+        }
+      ],
       "history": [
         {
           "at": "2026-09-15T05:12:48.238647+00:00",
           "event": "created",
           "by": "m2-integrate"
+        },
+        {
+          "at": "2026-09-16T23:23:07.286115+00:00",
+          "from": "BLOCKED",
+          "to": "DONE",
+          "actor": "audit",
+          "reason": "Stale blocker cleared: canonical eed9985 was pushed via verified M910 -> Dell -> GitHub two-hop and fleet converged."
         }
       ]
     },
@@ -3471,6 +3569,246 @@
           "at": "2026-09-15T05:14:47.770421+00:00",
           "event": "created",
           "by": "m2-integrate"
+        }
+      ]
+    },
+    {
+      "id": "blg_db4d5e4e750a",
+      "title": "Supervisor watches resolve on the owning node, not local tmux",
+      "description": "Every status call in supervisor.py went to the LOCAL TerminalService, so a watch on another node's session resolved against local tmux, came back MISSING, and was disabled permanently on its FIRST poll. Live supervisor.db showed watch_count=10, enabled_watch_count=0: six rows (wtest, win2, hp1, hp2, hp3-work, hp-work) target_missing at iteration_count=1 while those sessions were alive on the hp and Windows nodes. Three further defects of the same shape: watch(session='hp/hp1') returned ACCESS_DENIED because the read gate was asked about the node-qualified name while grants are keyed by session name; _sync_config_watches listed local tmux only so watched_session_patterns could never match a remote session; rename_target matched only the exact key so a bare rename missed the qualified watch. Fixed with one _status_for used by BOTH polling and reconciliation, routing LOCAL FIRST then fleet, and fleet errors mapped to distinct recoverable disable reasons.",
+      "status": "DONE",
+      "priority": "P1",
+      "type": "bug",
+      "order": 60,
+      "created_at": "2026-09-15T05:16:57.530199+00:00",
+      "updated_at": "2026-09-16T23:23:07.286115+00:00",
+      "source": "claude-code",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "A watch whose session lives on another node is polled on that node and stays enabled",
+        "A live LOCAL watch is unaffected when the controller cannot resolve it (stale heartbeat)",
+        "The six production rows restore once their nodes return, and not before",
+        "manual_unwatch is never resurrected by reconciliation",
+        "supervisor_status accounts for every disabled watch as recoverable or intentional",
+        "No re-keying of existing watch rows is required"
+      ],
+      "tags": [
+        "supervisor",
+        "watch",
+        "multi-node",
+        "reliability"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": [
+        {
+          "commits": [
+            "ea981a6e86fd"
+          ],
+          "tests": [
+            "tests/test_supervisor_fleet_watches.py (24)",
+            "tests/test_supervisor_reconcile.py",
+            "tests/test_scheduler_health.py"
+          ],
+          "notes": [
+            "Merged into integration/supervisor-queue-reliability at ea981a6e86fd; the earlier half (f2d88ef) is already in main via integrate/lane-b.",
+            "NEEDS_REVIEW rather than DONE: the fleet is SIMULATED in tests (a fake resolver, because the defect is entirely in which resolver gets asked and a simulated node can be made unreachable on demand). The six production watches actually recovering requires a controller restart, which is a production rollout and out of scope.",
+            "Routing order is load-bearing: routing bare names through the controller unconditionally made every local watch depend on the local node being ONLINE, which broke test_supervisor_tools_registered_and_functional and would have disabled the three working local watches to fix the six remote ones."
+          ],
+          "deploys": []
+        },
+        {
+          "at": "2026-09-16T23:23:07.286115+00:00",
+          "kind": "audit",
+          "detail": "Canonical focused supervisor fleet-watch regression passes; implementation present in eed9985."
+        }
+      ],
+      "history": [
+        {
+          "at": "2026-09-15T05:16:57.530246+00:00",
+          "event": "created",
+          "by": "claude-code"
+        },
+        {
+          "at": "2026-09-16T23:23:07.286115+00:00",
+          "from": "NEEDS_REVIEW",
+          "to": "DONE",
+          "actor": "audit",
+          "reason": "Canonical focused supervisor fleet-watch regression passes; implementation present in eed9985."
+        }
+      ]
+    },
+    {
+      "id": "blg_34f6dcfe6399",
+      "title": "Event bus is consumed by the queue loop instead of growing forever",
+      "description": "event_wiring.py published every queue transition onto the EventBus and nothing ever called claim_next. The bus was write-only: events accumulated forever, a task whose depends_on edge had just been satisfied waited for whatever cycle happened to notice, and the dead-letter machinery could not fire because nothing had claimed an event to fail. QueueEventDrain consumes it as a STEP of the existing QueueLoop cycle -- not a second thread, because two schedulers on the same lanes would leave the lane claim lease arbitrating races every cycle.",
+      "status": "DONE",
+      "priority": "P1",
+      "type": "bug",
+      "order": 61,
+      "created_at": "2026-09-15T05:16:57.530268+00:00",
+      "updated_at": "2026-09-16T23:23:07.286115+00:00",
+      "source": "claude-code",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "No new background loop or scheduler is introduced",
+        "queue.drain_enabled defaults False and is independent of queue.enabled",
+        "A lane that never set auto_dispatch_enabled is never dispatched into by the drain",
+        "Redelivery after a crash before ack is harmless; one tick per lane per pass",
+        "A failing event uses fail() so attempts and dead-lettering engage",
+        "An unreadable bus never stops lane dispatch",
+        "Two concurrent drains partition events rather than duplicating them"
+      ],
+      "tags": [
+        "queue",
+        "event-bus",
+        "reliability"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": [
+        {
+          "commits": [
+            "ea981a6e86fd"
+          ],
+          "tests": [
+            "tests/test_queue_event_drain.py (39)",
+            "tests/test_queue_loop.py"
+          ],
+          "notes": [
+            "NEEDS_REVIEW rather than DONE: drain_enabled is off by default and the drain has never run against a real multi-node bus under load. Turning it on in production is a separate, deliberate step.",
+            "Actionable types exclude TASK_CREATED/READY/CLAIMED/STARTED on purpose -- they describe the queue's own progress, and ticking a lane because it just started something is wasted work at best and a second actor poking a mid-transition lane at worst. They are still consumed."
+          ],
+          "deploys": []
+        },
+        {
+          "at": "2026-09-16T23:23:07.286115+00:00",
+          "kind": "audit",
+          "detail": "Canonical QueueEventDrain regression passes; implementation present in eed9985."
+        }
+      ],
+      "history": [
+        {
+          "at": "2026-09-15T05:16:57.530294+00:00",
+          "event": "created",
+          "by": "claude-code"
+        },
+        {
+          "at": "2026-09-16T23:23:07.286115+00:00",
+          "from": "NEEDS_REVIEW",
+          "to": "DONE",
+          "actor": "audit",
+          "reason": "Canonical QueueEventDrain regression passes; implementation present in eed9985."
+        }
+      ]
+    },
+    {
+      "id": "blg_62418a1a8c08",
+      "title": "build_mcp gave the stdio surface a recovery engine with no controller",
+      "description": "build_mcp() defaulted `controller` AFTER constructing RecoveryEngine and RecoveryLoop with it. server.py builds the stdio surface by calling build_mcp() bare, so on that surface both were constructed with controller=None -- listed as tools and holding nothing to route with, making auto-recovery and reconcile_node silently non-functional there. The controller is now defaulted before the services that take it.",
+      "status": "DONE",
+      "priority": "P2",
+      "type": "bug",
+      "order": 62,
+      "created_at": "2026-09-15T05:16:57.530312+00:00",
+      "updated_at": "2026-09-15T05:16:57.530316+00:00",
+      "source": "claude-code",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "The stdio surface's RecoveryEngine and RecoveryLoop hold a real ControllerService",
+        "A caller-supplied controller is still the one used",
+        "The supervisor's fleet hooks are wired on every surface, not only HTTP"
+      ],
+      "tags": [
+        "wiring",
+        "recovery",
+        "reliability"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [
+          "ea981a6e86fd"
+        ],
+        "tests": [
+          "tests/test_mcp_app_wiring.py (3)"
+        ],
+        "notes": [
+          "Fully verifiable locally -- no runtime/real-node proof outstanding.",
+          "A wiring-order defect produces no error and no log line; the feature simply does nothing, so the test asks what the built objects actually hold."
+        ],
+        "deploys": []
+      },
+      "history": [
+        {
+          "at": "2026-09-15T05:16:57.530332+00:00",
+          "event": "created",
+          "by": "claude-code"
+        }
+      ]
+    },
+    {
+      "id": "blg_0b440766aace",
+      "title": "Remote hp1/hp2/hp3 lane work on watch/queue reliability: reconciled, not waited on",
+      "description": "Record of what was searched for and what was reimplemented instead, so the next pass does not go looking again. Candidate work attributed to the hp1/hp2/hp3 worker lanes (watch lifetime fix, node-aware watch routing, QueueLoop event-bus drain, worker discovery/dispatch) was NOT visible in any ref reachable from this machine. What was found: origin/feat/p0-3-worker-capabilities and origin/feat/p0-5-verify-queue are both already merged (empty diff vs main), and fix/scheduler-refill held the real watch-lifetime work and was absorbed. Everything else was reimplemented locally from the contracts and tests rather than blocking on a remote lane -- hp1/hp2/hp3-work were themselves among the six watches this pass fixed, so their own scheduling visibility was the thing that was broken.",
+      "status": "DONE",
+      "priority": "P3",
+      "type": "chore",
+      "order": 63,
+      "created_at": "2026-09-15T05:17:53.327753+00:00",
+      "updated_at": "2026-09-15T05:17:53.327775+00:00",
+      "source": "claude-code",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "No remote branch is waited on for watch/queue reliability",
+        "Absorbed vs reimplemented is recorded per candidate"
+      ],
+      "tags": [
+        "handoff",
+        "supervisor",
+        "queue"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [
+          "ea981a6e86fd"
+        ],
+        "notes": [
+          "ABSORBED: fix/scheduler-refill (blg_8d65afc1b38b) -- reconcile_attempts, backoff, reenable_watch, status split, scheduler_health.py, 3 test files.",
+          "ALREADY IN MAIN (empty diff): origin/feat/p0-3-worker-capabilities, origin/feat/p0-5-verify-queue.",
+          "REIMPLEMENTED LOCALLY: fleet-aware watch routing, the fleet error->disable-reason classification, the QueueLoop event drain, and the execute_send acceptance allowlist.",
+          "NOT SUPERSEDED, still with its owning lane: feat/prompt-delivery-gate (delivery_gate.py and the MCP-send-tools half of blg_39f82cd2fe3a).",
+          "scheduler_health.discover_workers/dispatch_refill/claim_task/scheduler_status remain unimplemented phase-2 seams -- 4 declared skips in tests/test_scheduler_integration.py, left as they are rather than stubbed."
+        ],
+        "tests": [],
+        "deploys": []
+      },
+      "history": [
+        {
+          "at": "2026-09-15T05:17:53.327823+00:00",
+          "event": "created",
+          "by": "claude-code"
         }
       ]
     }
