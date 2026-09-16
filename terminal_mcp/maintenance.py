@@ -46,7 +46,9 @@ class MaintenanceLoop:
                 bindings_path: Path | None, config: MaintenanceConfig,
                 leases: PaneLeaseStore | None = None,
                 resource_locks: ResourceLockStore | None = None,
-                events: Any = None) -> None:
+                events: Any = None, lifecycle: Any = None,
+                lifecycle_enabled: bool = False,
+                lifecycle_reconcile_limit: int = 50) -> None:
         self._audit = audit
         self._supervisor2_store = supervisor2_store
         self._bindings_path = bindings_path
@@ -60,6 +62,16 @@ class MaintenanceLoop:
         # exactly one sensible instance and it is cheap to open.
         self._resource_locks = resource_locks or ResourceLockStore(self._leases.path)
         self._events = events or EventBus()
+        # Lifecycle Close-Loop V1. This loop is the right host for the
+        # reconcile pass: it already runs on a fixed interval independent
+        # of supervisor/queue/integration opt-ins, and the pass is exactly
+        # the same shape as the pruning beside it -- bounded, idempotent,
+        # safe to skip, safe to repeat. `lifecycle_enabled` gates only the
+        # AUTOMATIC invocation; LifecycleService's own methods stay
+        # callable by hand either way.
+        self._lifecycle = lifecycle
+        self._lifecycle_enabled = lifecycle_enabled
+        self._lifecycle_reconcile_limit = lifecycle_reconcile_limit
         self._config = config
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -106,6 +118,23 @@ class MaintenanceLoop:
             result["resource_locks_pruned"] = self._resource_locks.prune_expired()
         except Exception:
             _LOGGER.exception("maintenance: resource lock prune failed")
+        if self._lifecycle is not None:
+            try:
+                result["lifecycle_keys_pruned"] = self._lifecycle.store.prune_settled(
+                    self._config.lifecycle_key_retention_days)
+            except Exception:
+                _LOGGER.exception("maintenance: lifecycle key prune failed")
+            if self._lifecycle_enabled:
+                try:
+                    # Never allowed to break database hygiene: a reconcile
+                    # that raises must still leave the WAL checkpointing
+                    # below to run, so the whole pass is wrapped rather
+                    # than each edge (LifecycleService.reconcile already
+                    # isolates its three sweeps internally).
+                    result["lifecycle"] = self._lifecycle.reconcile(
+                        limit=self._lifecycle_reconcile_limit)
+                except Exception:
+                    _LOGGER.exception("maintenance: lifecycle reconcile failed")
         for path in self._db_paths():
             checkpoint_wal(path)
         if any(result.get(k) for k in ("audit_pruned", "actions_pruned", "leases_pruned", "resource_locks_pruned")):
@@ -116,7 +145,17 @@ class MaintenanceLoop:
         # events.db was missing here: the bus is a durable append-only log
         # that grows forever and was never WAL-checkpointed or pruned by any
         # code path. An unlisted store simply never gets maintained.
+        # release_store.db was missing here: the release state machine is
+        # durable, WAL-journalled and now written by an automatic pass, so
+        # it needs the same checkpointing as every other store. lifecycle.db
+        # joins it for the same reason.
         paths = [self._audit.path, self._leases.path, self._events.path]
+        if self._lifecycle is not None:
+            paths.append(self._lifecycle.store.path)
+            release_store = getattr(getattr(self._lifecycle, "release", None), "store", None)
+            release_path = getattr(release_store, "path", None)
+            if release_path is not None:
+                paths.append(release_path)
         if self._supervisor2_store is not None:
             paths.append(self._supervisor2_store.path)
         if self._bindings_path is not None:

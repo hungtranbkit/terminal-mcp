@@ -4,10 +4,52 @@ import re
 from typing import Any
 
 
+# Name half of a secret-bearing assignment: a WHOLE identifier that *ends*
+# in a secret-ish suffix, not a bare `\b`-delimited keyword. `\b` never
+# matches between `_` and a letter, so the original `\b(api[-_]?key|...)`
+# and `\b(password|token)` rules silently missed every prefixed form --
+# OPENROUTER_API_KEY=..., ANTHROPIC_AUTH_TOKEN=..., GITHUB_TOKEN=... --
+# while still redacting the unprefixed `api_key=...`. That was the live
+# gap: an OpenRouter key pasted as `export OPENROUTER_API_KEY=sk-or-...`
+# survived redaction and could be captured verbatim into session_knowledge.
+#
+# Any number of `WORD_`/`WORD-` prefix segments is allowed, bounded to
+# keep the regex cheap: the separator is excluded from a segment's body,
+# so a name decomposes into segments exactly one way (no ambiguity to
+# backtrack over), and both the repetition and the segment length are
+# capped, so the worst case per start position is a small constant --
+# never catastrophic backtracking on a large pane capture.
+_SECRET_NAME = (
+    r"(?:[A-Za-z0-9]{1,64}[_\-]){0,8}"
+    r"(?:API[_\-]?KEYS?"
+    r"|API[_\-]?TOKEN|AUTH[_\-]?TOKEN|ACCESS[_\-]?TOKEN"
+    r"|SESSION[_\-]?TOKEN|REFRESH[_\-]?TOKEN|BEARER[_\-]?TOKEN"
+    r"|SECRET[_\-]?KEY|ACCESS[_\-]?KEY|CLIENT[_\-]?SECRET"
+    r"|PASSWORD|PASSWD|PASSPHRASE|TOKEN)"
+)
+# Value half. Quoted forms are matched explicitly -- `KEY="sk-or-..."` is
+# the single most common shell shape and the old `[^\s'\";]+` value class
+# stopped dead at the opening quote, leaving the secret in the clear.
+_SECRET_VALUE = r"(?:'[^'\r\n]*'|\"[^\"\r\n]*\"|[^\s'\";]+)"
+# `[ \t]`, never `\s`: a dangling `TOKEN =` at end of line must not reach
+# across the newline and swallow the next line of surrounding pane output.
+_ASSIGN = r"[ \t]*=[ \t]*"
+
+
 REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"(?i)\b(OPENAI_API_KEY|ANTHROPIC_API_KEY)\s*=\s*([^\s'\";]+)"), r"\1=<REDACTED>"),
+    # Secret-bearing assignments -- `export FOO_API_KEY = <value>`,
+    # `password=...`, `aws_session_token=...`, `--api-key=...`. Supersedes
+    # the earlier separate OPENAI_API_KEY/ANTHROPIC_API_KEY, password|token,
+    # aws_secret_access_key, aws_session_token and api_key|access_key|
+    # client_secret|secret_key rules, all of which this one subsumes (each
+    # still has its own regression test). `export` and any un-consumed
+    # prefix simply stay outside the match, so they survive verbatim.
+    (re.compile(r"(?i)(" + _SECRET_NAME + r")" + _ASSIGN + _SECRET_VALUE),
+     r"\1=<REDACTED>"),
+
     (re.compile(r"(?i)\b(Bearer)\s+([A-Za-z0-9._~+\-/]+=*)"), r"\1 <REDACTED>"),
     (re.compile(r"(?im)\b(Authorization\s*:\s*)([^\r\n]+)"), r"\1<REDACTED>"),
+
     # URL query secrets first. The rule below has to allow `&` in its value
     # (a password may contain one, and half-redacting a password is worse
     # than over-redacting), which meant `?token=abc&page=2&limit=50` matched
@@ -15,9 +57,16 @@ REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     # Found 2026-09-13 while hardening tail output; pre-existing.
     (re.compile(r"(?i)([?&](?:token|access_token|api[-_]?key|key|secret|password|passwd|"
                 r"auth|sig|signature|session)\b)=([^&\s\"'#]+)"), r"\1=<REDACTED>"),
-    # ...so this one now declines to start inside a query string, which the
-    # rule above has already handled.
-    (re.compile(r"(?i)(?<![?&])\b(password|token)\s*=\s*([^\s'\";]+)"), r"\1=<REDACTED>"),
+
+
+    # Bare vendor key shapes -- no variable name required, so a secret
+    # cannot survive merely by appearing on its own (a bare paste, a curl
+    # line, a config dump). Each prefix is fixed and distinctive, the same
+    # posture as the GitHub/AWS/npm shapes below: `sk-or-...` (OpenRouter),
+    # `sk-ant-...` (Anthropic), `sk-proj-...` (OpenAI project keys).
+    (re.compile(r"\bsk-(?:or|ant|proj)-[A-Za-z0-9_\-]{15,255}"), "<REDACTED>"),
+
+
     # P0-10 additions below. Each stays either (a) a recognizable,
     # high-confidence *token shape* (a vendor-specific prefix or fixed
     # structure unlikely to appear by chance in ordinary output -- GitHub/
@@ -41,11 +90,9 @@ REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
 
     # AWS: access key IDs have a fixed, distinctive prefix (AKIA = long-
     # term, ASIA = temporary/STS); the secret key and session token have
-    # no such shape, so only redact those when assignment-shaped (same
-    # posture as password/token above).
+    # no such shape, so those are only caught assignment-shaped, by the
+    # rule at the top.
     (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "<REDACTED>"),
-    (re.compile(r"(?i)\b(aws_secret_access_key)\s*=\s*([^\s'\";]+)"), r"\1=<REDACTED>"),
-    (re.compile(r"(?i)\b(aws_session_token)\s*=\s*([^\s'\";]+)"), r"\1=<REDACTED>"),
 
     # npm publish tokens -- fixed prefix.
     (re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"), "<REDACTED>"),
@@ -56,14 +103,7 @@ REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?im)\b(Set-Cookie\s*:\s*)([^\r\n]+)"), r"\1<REDACTED>"),
     (re.compile(r"(?im)\b(Cookie\s*:\s*)([^\r\n]+)"), r"\1<REDACTED>"),
 
-    # Generic API-key-like assignments not already covered by a specific
-    # vendor pattern above -- same assignment-shaped, non-destructive
-    # posture as password/token.
-    # Same query-string lookbehind as the password|token rule above, and for
-    # the same reason: without it `&api_key=zzz&limit=50` matched whole.
-    (re.compile(r"(?i)(?<![?&])\b(api[-_]?key|access[-_]?key|client[-_]?secret|secret[-_]?key)"
-                r"\s*=\s*([^\s'\";]+)"),
-     r"\1=<REDACTED>"),
+
     (re.compile(r"(?im)\b(X-Api-Key\s*:\s*)([^\r\n]+)"), r"\1<REDACTED>"),
 )
 

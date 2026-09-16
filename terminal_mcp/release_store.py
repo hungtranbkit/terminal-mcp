@@ -96,8 +96,34 @@ def _create_v1_schema(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX IF NOT EXISTS idx_release_events_release ON release_events(release_id, id)")
 
 
+def _add_v2_request_key(connection: sqlite3.Connection) -> None:
+    """Lifecycle Close-Loop V1: make "exactly one release per promotion"
+    a database guarantee rather than a caller's good intentions.
+
+    The lifecycle service already claims a request key before creating a
+    release, which stops the ordinary double-call. It cannot stop the
+    genuinely concurrent one: two reconcile passes (a maintenance tick and
+    a manual invocation) can both pass the claim check in the window
+    between INSERT OR IGNORE and settle. A UNIQUE index turns that race
+    into an IntegrityError the caller resolves by reading back the release
+    that already exists -- the same shape as bridge.py's own
+    ON CONFLICT(idempotency_key) claim.
+
+    Additive and nullable: a release created by a human through the MCP
+    tools carries no request_key and is unaffected. SQLite's UNIQUE index
+    treats NULLs as distinct, so any number of keyless releases coexist.
+    PRAGMA-checked for the same crash-resumability reason as every other
+    migration here."""
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(releases)")}
+    if "request_key" not in columns:
+        connection.execute("ALTER TABLE releases ADD COLUMN request_key TEXT")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_releases_request_key ON releases(request_key)")
+
+
 RELEASE_MIGRATIONS = [
     Migration(1, "initial release lifecycle schema (releases/release_events)", _create_v1_schema),
+    Migration(2, "Lifecycle Close-Loop V1: releases.request_key (unique, nullable)", _add_v2_request_key),
 ]
 
 
@@ -132,6 +158,7 @@ class Release:
     deployed_at: str | None
     verified_at: str | None
     rolled_back_at: str | None
+    request_key: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -144,6 +171,13 @@ class Release:
         }
 
 
+def _optional_column(row: sqlite3.Row, name: str) -> Any:
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
+
 def _from_row(row: sqlite3.Row) -> Release:
     return Release(
         id=row["id"], project=row["project"], task_id=row["task_id"], environment=row["environment"],
@@ -152,6 +186,7 @@ def _from_row(row: sqlite3.Row) -> Release:
         approved_by=row["approved_by"], approved_at=row["approved_at"], rollback_reason=row["rollback_reason"],
         created_at=row["created_at"], updated_at=row["updated_at"], deployed_at=row["deployed_at"],
         verified_at=row["verified_at"], rolled_back_at=row["rolled_back_at"],
+        request_key=_optional_column(row, "request_key"),
     )
 
 
@@ -182,24 +217,64 @@ class ReleaseStore:
             connection.close()
 
     def create_release(self, *, project: str, task_id: str, environment: str, artifact_ref: str,
-                       known_good_artifact_ref: str | None = None, rollback_plan: str | None = None) -> Release:
+                       known_good_artifact_ref: str | None = None, rollback_plan: str | None = None,
+                       request_key: str | None = None) -> Release:
+        """Creates a release in MERGED.
+
+        When `request_key` is supplied the call is idempotent: a second
+        create with the same key returns the release the first one made
+        instead of inserting a duplicate. The UNIQUE index is what settles
+        a genuine race -- both callers INSERT, one loses with an
+        IntegrityError, and the loser reads back the winner's row. Nothing
+        is retried and no second release_events row is written, so the
+        audit trail still shows exactly one creation."""
         now = _now_iso()
         release_id = uuid.uuid4().hex
+        if request_key is not None:
+            existing = self.find_by_request_key(request_key)
+            if existing is not None:
+                return existing
         with self._connection() as connection:
-            connection.execute(
-                """
-                INSERT INTO releases
-                    (id, project, task_id, environment, status, artifact_ref, known_good_artifact_ref,
-                     rollback_plan, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (release_id, project, task_id, environment, MERGED, artifact_ref, known_good_artifact_ref,
-                 rollback_plan, now, now),
-            )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO releases
+                        (id, project, task_id, environment, status, artifact_ref, known_good_artifact_ref,
+                         rollback_plan, created_at, updated_at, request_key)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (release_id, project, task_id, environment, MERGED, artifact_ref, known_good_artifact_ref,
+                     rollback_plan, now, now, request_key),
+                )
+            except sqlite3.IntegrityError:
+                if request_key is None:
+                    raise
+                row = connection.execute("SELECT * FROM releases WHERE request_key = ?",
+                                         (request_key,)).fetchone()
+                if row is None:
+                    raise
+                return _from_row(row)
             self._record_event_locked(connection, release_id=release_id, from_status=None, to_status=MERGED,
                                       reason="release created", actor=None)
             row = connection.execute("SELECT * FROM releases WHERE id = ?", (release_id,)).fetchone()
         return _from_row(row)
+
+    def find_by_request_key(self, request_key: str) -> Release | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM releases WHERE request_key = ?", (request_key,)).fetchone()
+        return _from_row(row) if row else None
+
+    def list_by_status(self, status: str, *, project: str | None = None, limit: int = 200) -> list[Release]:
+        query = "SELECT * FROM releases WHERE status = ?"
+        params: list[Any] = [status]
+        if project:
+            query += " AND project = ?"
+            params.append(project)
+        query += " ORDER BY updated_at ASC LIMIT ?"
+        params.append(max(1, min(limit, 1000)))
+        with self._connection() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [_from_row(row) for row in rows]
 
     def get_release(self, release_id: str) -> Release | None:
         with self._connection() as connection:
