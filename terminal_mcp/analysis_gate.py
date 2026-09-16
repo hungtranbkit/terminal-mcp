@@ -159,9 +159,14 @@ def _missing(block: Mapping[str, Any], required: Iterable[str]) -> tuple[str, ..
     out: list[str] = []
     for name in required:
         value = block.get(name)
-        if _is_filled(value):
+        # A declared N/A is a special structured value: for fields that allow
+        # it, require the justification before generic non-empty-dict logic.
+        if isinstance(value, Mapping) and value.get("n/a", value.get("na")) is True:
+            if name in NOT_APPLICABLE_ALLOWED and _is_declared_na(value):
+                continue
+            out.append(name)
             continue
-        if name in NOT_APPLICABLE_ALLOWED and _is_declared_na(value):
+        if _is_filled(value):
             continue
         out.append(name)
     return tuple(out)
