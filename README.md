@@ -174,7 +174,11 @@ and use one composite call:
 | `deploy preview` | `deploy_preview` |
 
 `project_check` combines bounded session, supervisor, Git, deploy-profile, and
-health evidence. `project_dispatch` selects only a profile target and delegates
+health evidence, including execution-aware node counts and blockers. A fresh
+heartbeat alone is never green: `EXECUTION_OK` also requires a bounded session
+backend probe. `terminal_node_health` exposes the additive transport,
+execution, retry, and last-success fields without changing legacy node APIs.
+`project_dispatch` selects only a profile target and delegates
 to the existing guarded send or durable queue. `deploy_preview` accepts fixed
 command/probe IDs from a preview-safe profile; it never accepts arbitrary shell
 commands. ChatGPT controls whether its UI visually collapses tool cards, but

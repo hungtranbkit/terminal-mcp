@@ -32,6 +32,12 @@ class NodeClientError(RuntimeError):
     so callers never need two different error-handling shapes depending
     on which node answered."""
 
+    def __init__(self, message: str, *, http_status: int | None = None,
+                 error_code: str | None = None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.error_code = error_code
+
 
 @runtime_checkable
 class NodeClient(Protocol):
@@ -69,6 +75,8 @@ class NodeClient(Protocol):
     def grant_read(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]: ...
     def grant_input(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]: ...
     def health(self) -> dict[str, Any]: ...
+    def execution_probe(self, timeout_seconds: float = 3.0) -> dict[str, Any]: ...
+    def self_heal(self, action: str) -> dict[str, Any]: ...
     def metrics(self) -> dict[str, Any]: ...
     def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]: ...
     def repo_evidence(self, cwd: str) -> dict[str, Any]: ...
@@ -184,6 +192,17 @@ class LocalNodeClient:
     def health(self) -> dict[str, Any]:
         return {"status": "ok"}
 
+    def execution_probe(self, timeout_seconds: float = 3.0) -> dict[str, Any]:
+        result = self._terminal.terminal_list_sessions()
+        if "error" in result:
+            return {"execution_ok": False, "error": result["error"]}
+        return {"execution_ok": True, "agent_process_alive": True,
+                "session_count": len(result.get("sessions", [])),
+                "session_backend": type(self._terminal.tmux).__name__}
+
+    def self_heal(self, action: str) -> dict[str, Any]:
+        return {"error": "SELF_HEAL_NOT_SUPPORTED_FOR_LOCAL_NODE", "action": action}
+
     def metrics(self) -> dict[str, Any]:
         from . import host_metrics
         collected = host_metrics.collect(workspace_path=str(self._terminal.config.session_lifecycle.allowed_cwd_roots[0])
@@ -298,7 +317,8 @@ class RemoteNodeClient:
                              body={"objects": objects, "since": since, "from": source_node})
 
     def _request(self, method: str, path: str, *, params: dict[str, Any] | None = None,
-                body: dict[str, Any] | None = None) -> dict[str, Any]:
+                body: dict[str, Any] | None = None,
+                timeout_seconds: float | None = None) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
         if params:
             query = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items() if v is not None)
@@ -310,7 +330,8 @@ class RemoteNodeClient:
         if data is not None:
             request.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(request, timeout=(self.timeout if timeout_seconds is None
+                                                         else min(self.timeout, timeout_seconds))) as response:
                 return json.loads(response.read())
         except urllib.error.HTTPError as exc:
             # node_agent.py NEVER answers an application-level error
@@ -332,7 +353,9 @@ class RemoteNodeClient:
             except (ValueError, OSError):
                 body = None
             detail = body.get("error") if isinstance(body, dict) else exc.reason
-            raise NodeClientError(f"{method} {path} -> HTTP {exc.code}: {detail}") from exc
+            raise NodeClientError(f"{method} {path} -> HTTP {exc.code}: {detail}",
+                                  http_status=exc.code,
+                                  error_code=str(detail) if detail is not None else None) from exc
         except urllib.error.URLError as exc:
             raise NodeClientError(f"{method} {path} -> {type(exc).__name__}: {exc.reason}") from exc
         except (ValueError, TimeoutError) as exc:
@@ -420,6 +443,28 @@ class RemoteNodeClient:
 
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/v1/health")
+
+    def execution_probe(self, timeout_seconds: float = 3.0) -> dict[str, Any]:
+        try:
+            return self._request("GET", "/v1/execution-health", timeout_seconds=timeout_seconds)
+        except NodeClientError as exc:
+            # Rolling upgrade compatibility: the authenticated sessions
+            # listing exercises the same backend on agents predating the
+            # richer endpoint. Only 404 falls back; auth/transport failures
+            # retain their evidence.
+            if exc.http_status != 404:
+                raise
+        result = self._request("GET", "/v1/sessions", timeout_seconds=timeout_seconds)
+        if "error" in result:
+            return {"execution_ok": False, "error": result["error"]}
+        return {"execution_ok": True, "agent_process_alive": True,
+                "session_count": len(result.get("sessions", [])),
+                "probe_mode": "legacy_sessions_fallback"}
+
+    def self_heal(self, action: str) -> dict[str, Any]:
+        if action != "graceful_agent_restart":
+            return {"error": "SELF_HEAL_ACTION_NOT_ALLOWLISTED", "action": action}
+        return self._request("POST", "/v1/internal/shutdown", body={})
 
     def metrics(self) -> dict[str, Any]:
         return self._request("GET", "/v1/metrics")

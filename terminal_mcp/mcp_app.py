@@ -1110,7 +1110,9 @@ def build_mcp(service: TerminalService | None = None,
     @server.tool()
     def terminal_list_nodes() -> list[dict]:
         """List every registered node (local and remote) with its current
-        status (online/degraded/offline, derived from heartbeat recency),
+        status (online now requires a fresh heartbeat AND a successful
+        execution probe; failures degrade it), additive transport_status,
+        health_state, retry/backoff evidence,
         capacity_status (healthy/busy/overloaded/unknown) and the resource
         metrics behind it, session/agent counts, and draining flag. Use
         this to decide which node_id to pass to terminal_create_session,
@@ -1325,7 +1327,7 @@ def build_mcp(service: TerminalService | None = None,
     _locks = resource_locks or ResourceLockStore()
     project_workflows = ProjectWorkflowTools(
         ProjectProfileRegistry.from_config(), compact_tools, queue, supervisor,
-        _locks, terminal.audit,
+        _locks, terminal.audit, controller=controller,
     )
 
     @server.tool()
@@ -2301,6 +2303,18 @@ def build_mcp(service: TerminalService | None = None,
         if node is None:
             return {"error": "NODE_NOT_FOUND", "node_id": node_id}
         return _node_to_dict(node)
+
+    @server.tool()
+    def terminal_node_health(node_id: str | None = None,
+                             force_probe: bool = False) -> dict:
+        """Execution-aware node health in one bounded read. A node is green
+        only after fresh heartbeat transport and a successful authenticated
+        execution-backend probe. Includes consecutive failures, last success,
+        sanitized last error, circuit-breaker next retry, and self-heal status.
+        force_probe bypasses the normal success/backoff cache for an explicit
+        operator diagnostic; it never bypasses the per-node probe lock."""
+        _refresh_local_heartbeat()
+        return controller.node_health_status(node_id, force_probe=force_probe)
 
     @server.tool()
     def terminal_node_sessions(node_id: str) -> dict:

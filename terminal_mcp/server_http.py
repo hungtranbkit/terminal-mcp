@@ -153,7 +153,9 @@ def register_remote_nodes(controller, config) -> list[str]:
             continue
         controller.register_remote_node(remote.node_id, display_name=remote.display_name, hostname=remote.hostname,
                                         endpoint=remote.endpoint, token=token, max_sessions=remote.max_sessions,
-                                        timeout=remote.timeout_seconds)
+                                        timeout=remote.timeout_seconds,
+                                        self_heal_enabled=remote.self_heal_enabled,
+                                        self_heal_action=remote.self_heal_action)
         _log.info("nodes: registered remote node %r (%s)", remote.node_id, remote.endpoint)
         registered.append(remote.node_id)
     return registered
@@ -346,7 +348,8 @@ def main() -> None:
     except Exception:  # noqa: BLE001 -- never block startup on a migration
         _log.exception("deny-record migration failed -- grants left unchanged")
     controller = ControllerService(registry, local_client=LocalNodeClient(terminal),
-                                   local_workspace_root=workspace_root)
+                                   local_workspace_root=workspace_root,
+                                   node_health_config=config.nodes.health)
     register_remote_nodes(controller, config)
 
     # ONE explicit, persistent (real default ~/.local/state/terminal-mcp/
@@ -515,6 +518,17 @@ def main() -> None:
                        credentials=credentials, notes=notes, webauth=webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)
     register_health(server, terminal, supervisor)
+
+    # Periodic demand for execution probes means false-online prevention and
+    # opt-in self-heal continue even with no dashboard client connected. The
+    # durable circuit breaker and resource lock in NodeHealthService remain
+    # authoritative across this loop, MCP calls, and process restarts.
+    if config.nodes.health.enabled:
+        from .node_health import NodeHealthLoop
+        health_loop = NodeHealthLoop(controller.reconcile_remote_node_health,
+                                     config.nodes.health.probe_interval_seconds)
+        health_loop.start()
+        atexit.register(health_loop.stop)
 
     # Supervisor tools (watch/status/events/run_once, and the v2 policy/
     # claim/decide/approve/send tools) are always available — only the

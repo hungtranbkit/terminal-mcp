@@ -26,7 +26,10 @@ from typing import TYPE_CHECKING, Any
 from . import contract, host_metrics
 from .node_client import LocalNodeClient, NodeClient, NodeClientError, RemoteNodeClient
 from .node_models import NODE_ONLINE, Node
+from .node_health import NodeHealthPolicy, NodeHealthService
 from .node_registry import NodeRegistry
+from .config import NodeHealthConfig
+from .lease import ResourceLockStore
 from .scheduler import PlacementResult, choose_node
 from .ephemeral_state import ephemeral_state_dir
 
@@ -89,7 +92,9 @@ def _reredact(result: dict[str, Any]) -> dict[str, Any]:
 class ControllerService:
     def __init__(self, registry: NodeRegistry, *, local_node_id: str = LOCAL_NODE_ID,
                 local_client: NodeClient | None = None, local_display_name: str = "Local",
-                local_hostname: str | None = None, local_workspace_root: str = "/") -> None:
+                local_hostname: str | None = None, local_workspace_root: str = "/",
+                node_health_config: NodeHealthConfig | None = None,
+                node_health: NodeHealthService | None = None) -> None:
         self.registry = registry
         self.local_node_id = local_node_id
         self.local_workspace_root = local_workspace_root
@@ -112,6 +117,10 @@ class ControllerService:
         # client (many tool calls in a row for the same session) doesn't
         # re-probe every node on every single call.
         self.session_cache_ttl_seconds = 20.0
+        self.node_health = node_health or NodeHealthService(
+            registry, ResourceLockStore(registry.path.with_name("leases.db")),
+            node_health_config or NodeHealthConfig(),
+        )
 
         if local_client is not None:
             self._clients[local_node_id] = local_client
@@ -123,10 +132,14 @@ class ControllerService:
 
     def register_remote_node(self, node_id: str, *, display_name: str, hostname: str, endpoint: str,
                              token: str, max_sessions: int | None = None,
-                             timeout: float = 10.0) -> None:
+                             timeout: float = 10.0,
+                             self_heal_enabled: bool = False,
+                             self_heal_action: str = "none") -> None:
         self.registry.register(node_id, display_name=display_name, hostname=hostname, endpoint=endpoint,
                                auth_token_ref=f"node:{node_id}", max_sessions=max_sessions)
         self._clients[node_id] = RemoteNodeClient(endpoint, token, timeout=timeout)
+        self.node_health.set_policy(node_id, NodeHealthPolicy(
+            self_heal_enabled=self_heal_enabled, self_heal_action=self_heal_action))
 
     def client_for(self, node_id: str) -> NodeClient | None:
         return self._clients.get(node_id)
@@ -223,7 +236,7 @@ class ControllerService:
         so, which is itself the signal that it needs converging.
         """
         report: list[dict[str, Any]] = []
-        for node in self.registry.list():
+        for node in self.list_nodes():
             entry: dict[str, Any] = {"node_id": node.id, "status": node.status,
                                      "contract_version": node.contract_version}
             client = self._clients.get(node.id)
@@ -301,8 +314,13 @@ class ControllerService:
         now = time.monotonic() if now is None else now
         if "/" in session:
             node_id, _, bare = session.partition("/")
-            if self.registry.get(node_id) is None:
+            node = self.node_status(node_id)
+            if node is None:
                 return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+            if node.status != NODE_ONLINE:
+                return {"error": "NODE_UNREACHABLE", "node_id": node_id,
+                        "health_state": node.health_state,
+                        "detail": node.last_error or "node execution health is not OK"}
             return {"node_id": node_id, "session": bare}
 
         cached = self._session_location_cache.get(session)
@@ -310,7 +328,7 @@ class ControllerService:
             return {"node_id": cached.node_id, "session": session}
 
         found_on: list[str] = []
-        for node in self.registry.list():
+        for node in self.list_nodes():
             if node.status != NODE_ONLINE:
                 continue
             client = self._clients.get(node.id)
@@ -361,7 +379,11 @@ class ControllerService:
         client = self._clients.get(node_id)
         if client is None:
             return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": "no client configured for this node"}
-        node = self.registry.get(node_id)
+        node = self.node_status(node_id)
+        if node is None or node.status != NODE_ONLINE:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id,
+                    "health_state": node.health_state if node else "UNKNOWN",
+                    "detail": (node.last_error if node else None) or "node execution health is not OK"}
         try:
             result = call(client, bare)
         except NodeClientError as exc:
@@ -540,8 +562,9 @@ class ControllerService:
                                         until: str | None = None, limit: int = 20) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
         errors: dict[str, str] = {}
-        for node in self.registry.list():
+        for node in self.list_nodes():
             if node.status != NODE_ONLINE:
+                errors[node.id] = node.last_error or f"node health={node.health_state}"
                 continue
             client = self._clients.get(node.id)
             if client is None:
@@ -592,8 +615,9 @@ class ControllerService:
 
         projects: dict[str, dict[str, Any]] = {}
         errors: dict[str, str] = {}
-        for node in self.registry.list():
+        for node in self.list_nodes():
             if node.status != NODE_ONLINE:
+                errors[node.id] = node.last_error or f"node health={node.health_state}"
                 continue
             client = self._clients.get(node.id)
             if client is None:
@@ -709,7 +733,7 @@ class ControllerService:
         reopen for any session whose 20s session-location cache entry had
         already expired, on a single-node deployment too, not only multi-
         node."""
-        for node in self.registry.list():
+        for node in self.list_nodes():
             if node.status != NODE_ONLINE:
                 continue
             client = self._clients.get(node.id)
@@ -910,14 +934,14 @@ class ControllerService:
             return {"error": "SESSION_ALREADY_EXISTS", "session": name, "node_id": existing["node_id"]}
 
         if node == "auto":
-            placement = choose_node(self.registry.list(), required_agent_type=agent_type, required_platform=platform)
+            placement = choose_node(self.list_nodes(), required_agent_type=agent_type, required_platform=platform)
             if placement.node_id is None:
                 return {"error": "NO_ELIGIBLE_NODE", "session": name, "reason": placement.reason,
                         "excluded": list(placement.excluded)}
             node_id = placement.node_id
         else:
             node_id = node
-            explicit_node = self.registry.get(node_id)
+            explicit_node = self.node_status(node_id)
             if explicit_node is None:
                 return {"error": "NODE_NOT_FOUND", "node_id": node_id}
             if platform is not None and explicit_node.platform != platform:
@@ -979,7 +1003,7 @@ class ControllerService:
         empty list indistinguishable from "no sessions exist there")."""
         sessions: list[dict[str, Any]] = []
         unreachable: list[dict[str, Any]] = []
-        for node in self.registry.list():
+        for node in self.list_nodes():
             if node.status != NODE_ONLINE:
                 unreachable.append({"node_id": node.id, "node_name": node.display_name, "status": node.status})
                 continue
@@ -1014,7 +1038,7 @@ class ControllerService:
 
     def terminal_list_killed_sessions(self) -> dict[str, Any]:
         entries: list[dict[str, Any]] = []
-        for node in self.registry.list():
+        for node in self.list_nodes():
             if node.status != NODE_ONLINE:
                 continue
             client = self._clients.get(node.id)
@@ -1045,15 +1069,71 @@ class ControllerService:
             self.registry.sync_status_transitions()
         except Exception:  # noqa: BLE001
             pass
-        return self.registry.list()
+        result = []
+        for node in self.registry.list():
+            client = self._clients.get(node.id)
+            if client is None:
+                result.append(self.node_health._cached(node))
+                continue
+            result.append(self.node_health.evaluate(node, client))
+        return result
 
     def node_status(self, node_id: str) -> Node | None:
-        return self.registry.get(node_id)
-
-    def node_sessions(self, node_id: str) -> dict[str, Any]:
         node = self.registry.get(node_id)
         if node is None:
+            return None
+        client = self._clients.get(node_id)
+        return self.node_health.evaluate(node, client) if client is not None else self.node_health._cached(node)
+
+    def node_health_status(self, node_id: str | None = None, *, force_probe: bool = False) -> dict[str, Any]:
+        if node_id is not None:
+            node = self.registry.get(node_id)
+            if node is None:
+                return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+            client = self._clients.get(node_id)
+            evaluated = (self.node_health.evaluate(node, client, force_probe=force_probe)
+                         if client is not None else self.node_health._cached(node))
+            from .node_models import node_to_dict
+            return {"node": node_to_dict(evaluated),
+                    "summary": self.node_health.summary([evaluated])}
+        nodes = []
+        for node in self.registry.list():
+            client = self._clients.get(node.id)
+            nodes.append(self.node_health.evaluate(node, client, force_probe=force_probe)
+                         if client is not None else self.node_health._cached(node))
+        from .node_models import node_to_dict
+        return {"nodes": [node_to_dict(node) for node in nodes],
+                "summary": self.node_health.summary(nodes)}
+
+    def node_health_summary(self) -> dict[str, Any]:
+        nodes = self.list_nodes()
+        return self.node_health.summary(nodes)
+
+    def reconcile_remote_node_health(self) -> list[Node]:
+        """Periodic remote-only probe pass.
+
+        Local heartbeat refresh stays owned by the existing MCP/dashboard
+        request path; the local client has no autonomous recovery action.
+        Remote nodes are where opt-in supervised restart can help without an
+        operator keeping a status page open.
+        """
+        results = []
+        for node in self.registry.list():
+            if node.id == self.local_node_id:
+                continue
+            client = self._clients.get(node.id)
+            results.append(self.node_health.evaluate(node, client)
+                           if client is not None else self.node_health._cached(node))
+        return results
+
+    def node_sessions(self, node_id: str) -> dict[str, Any]:
+        node = self.node_status(node_id)
+        if node is None:
             return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+        if node.status != NODE_ONLINE:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id,
+                    "health_state": node.health_state,
+                    "detail": node.last_error or "node execution health is not OK"}
         client = self._clients.get(node_id)
         if client is None:
             return {"error": "NODE_UNREACHABLE", "node_id": node_id}
@@ -1090,8 +1170,9 @@ class ControllerService:
                                                limit: int = 50) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
         errors: dict[str, str] = {}
-        for node in self.registry.list():
+        for node in self.list_nodes():
             if node.status != NODE_ONLINE:
+                errors[node.id] = node.last_error or f"node health={node.health_state}"
                 continue
             client = self._clients.get(node.id)
             if client is None:
@@ -1153,7 +1234,7 @@ class ControllerService:
         return {"node_id": node_id, "draining": draining}
 
     def choose_node_for(self, *, agent_type: str = "shell", platform: str | None = None) -> PlacementResult:
-        return choose_node(self.registry.list(), required_agent_type=agent_type, required_platform=platform)
+        return choose_node(self.list_nodes(), required_agent_type=agent_type, required_platform=platform)
 
 
 def build_default_controller(terminal: "TerminalService") -> ControllerService:
@@ -1189,4 +1270,5 @@ def build_default_controller(terminal: "TerminalService") -> ControllerService:
                       if terminal.config.session_lifecycle.allowed_cwd_roots else "/")
     temp_dir = str(ephemeral_state_dir("nodes"))
     registry = NodeRegistry(Path(temp_dir) / "nodes.db")
-    return ControllerService(registry, local_client=LocalNodeClient(terminal), local_workspace_root=workspace_root)
+    return ControllerService(registry, local_client=LocalNodeClient(terminal), local_workspace_root=workspace_root,
+                             node_health_config=terminal.config.nodes.health)

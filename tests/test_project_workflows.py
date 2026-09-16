@@ -108,6 +108,14 @@ class FakeLocks:
         return True
 
 
+class FakeController:
+    def node_health_summary(self):
+        return {"counts": {"EXECUTION_OK": 1, "EXECUTION_DOWN": 1},
+                "healthy": 1, "total": 2,
+                "blockers": [{"node_id": "dead-node", "state": "EXECUTION_DOWN",
+                              "reason": "execution probe timed out"}], "truncated": False}
+
+
 def profile(*, targets=("session:worker-1", "session:worker-2"), deploy=True, probes=None):
     return ProjectProfile(
         project_id="fixture", aliases=("fx",), repo_root="/repo",
@@ -176,6 +184,17 @@ def test_project_check_unreachable_is_row_and_output_is_hard_bounded():
     assert len(json.dumps(result, separators=(",", ":"), ensure_ascii=False)) <= 1000
     unreachable = svc.project_check("fixture", targets=["session:worker-2"], max_output_chars=1000)
     assert unreachable["targets"][0]["state"] == "UNREACHABLE"
+
+
+def test_project_check_adds_compact_node_health_summary():
+    svc, compact, _queue, _supervisor, _locks, _audit = service()
+    svc.controller = FakeController()
+    compact.statuses["session:worker-1"] = {"state": "IDLE", "reason": "ready"}
+    compact.statuses["session:worker-2"] = {"state": "IDLE", "reason": "ready"}
+    result = svc.project_check("fixture")
+    assert result["node_health"]["counts"] == {"EXECUTION_OK": 1, "EXECUTION_DOWN": 1}
+    assert result["status"] == "BLOCKED"
+    assert any(row.get("node_id") == "dead-node" for row in result["blockers"])
 
 
 def test_dispatch_explicit_target_sends_once_and_retry_is_idempotent():

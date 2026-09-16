@@ -702,6 +702,14 @@ nodes:
   heartbeat:                 # optional
     degraded_after_seconds: 60
     offline_after_seconds: 180
+  health:                    # execution-aware composite health
+    enabled: true
+    probe_interval_seconds: 20
+    probe_timeout_seconds: 3 # bounded; configuration rejects 5s or more
+    execution_down_after_failures: 2
+    backoff_base_seconds: 5
+    backoff_max_seconds: 300
+    backoff_jitter_ratio: 0.2
   remote:                    # optional, empty by default -- today's deployment
     - node_id: m910
       display_name: "M910 Workstation"
@@ -710,7 +718,35 @@ nodes:
       token_env: TERMINAL_MCP_NODE_TOKEN_M910  # the secret itself lives ONLY in this env var
       max_sessions: 20        # optional
       timeout_seconds: 10.0   # optional
+      self_heal_enabled: false # conservative default
+      self_heal_action: none   # or graceful_agent_restart
 ```
+
+## Execution-aware health and recovery
+
+Heartbeat freshness proves transport presence only. The controller reports
+`status=online` only after a bounded, authenticated execution probe also
+succeeds. Additive `transport_state`, `health_state`, and `execution_state`
+fields preserve the legacy status field while exposing the evidence:
+
+- `TRANSPORT_ONLINE` means the heartbeat is fresh.
+- `EXECUTION_OK` means transport is fresh and the session backend answered.
+- `DEGRADED` is the first bounded execution-probe failure.
+- `EXECUTION_DOWN` means the configured consecutive-failure threshold was met.
+- `AUTH_EXPIRED/UNAUTHORIZED` appears only after a proven HTTP 401/403.
+- `OFFLINE` always wins when the heartbeat is stale; cached probe success cannot
+  keep a stale node green. `UNKNOWN` means no conclusive probe exists yet.
+
+Probe failures persist a bounded sanitized error, failure count, last success,
+and `next_retry_at` in the existing nodes database. Exponential backoff with
+jitter suppresses repeated probes across controller restarts. Self-heal is
+per-node opt-in and only requests the allowlisted graceful agent restart;
+resource locking prevents concurrent attempts, the existing supervisor owns
+process replacement, and Terminal MCP never reboots a machine or refreshes
+credentials. A successful probe clears the circuit and failure count.
+
+Use `terminal_node_health` for a compact fleet or single-node view. Project
+checks include the same bounded state counts and actionable node blockers.
 
 The real production `config.yaml` on this host has **no `nodes:` section
 at all** — confirmed by its own regression test

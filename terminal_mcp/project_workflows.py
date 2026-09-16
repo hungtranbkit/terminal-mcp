@@ -241,7 +241,7 @@ def _cap_result(result: dict[str, Any], limit: int) -> dict[str, Any]:
 
 class ProjectWorkflowTools:
     def __init__(self, registry: ProjectProfileRegistry, compact: Any, queue: Any,
-                 supervisor: Any, locks: Any, audit: Any, *,
+                 supervisor: Any, locks: Any, audit: Any, *, controller: Any = None,
                  probe_runner: Callable[[HealthProbe], dict[str, Any]] | None = None,
                  command_runner: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
                  git_runner: Callable[[str], dict[str, Any]] | None = None) -> None:
@@ -251,6 +251,7 @@ class ProjectWorkflowTools:
         self.supervisor = supervisor
         self.locks = locks
         self.audit = audit
+        self.controller = controller
         self.probe_runner = probe_runner or self._run_probe
         self.command_runner = command_runner or self._run_command
         self.git_runner = git_runner or self._git_info
@@ -368,10 +369,17 @@ class ProjectWorkflowTools:
                    "preview_safe": profile.deploy.preview_safe}
                   if include_deploy and profile.deploy else
                   {"status": "NOT_CONFIGURED" if include_deploy else "SKIPPED"})
+        node_health = ({"counts": {}, "healthy": 0, "total": 0, "blockers": []}
+                       if not include_health or self.controller is None else
+                       self.controller.node_health_summary())
+        blockers.extend({"node_id": row.get("node_id"), "reason": row.get("reason"),
+                         "state": row.get("state")}
+                        for row in node_health.get("blockers", []))
         result = {"status": "BLOCKED" if blockers else "OK", "project": profile.project_id,
                   "summary": {"target_count": len(rows), "state_counts": counts,
                               "blocker_count": len(blockers), "ready_count": len(ready)},
                   "targets": rows, "git": git, "deploy": deploy, "health": health,
+                  "node_health": node_health,
                   "blockers": blockers[:20], "ready": ready[:20],
                   "next_actions": (["resolve blockers before dispatch"] if blockers else
                                    ["project is ready for the next requested action"]),

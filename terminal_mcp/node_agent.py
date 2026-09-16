@@ -233,6 +233,30 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         return JSONResponse({"status": "ok", "node_id": node_id, "version": __version__,
                              "agent_generation": AGENT_GENERATION, **contract_describe()})
 
+    async def execution_health(request: Request) -> JSONResponse:
+        """Cheap authenticated proof that the execution backend answers.
+
+        Process liveness alone is the public /v1/health contract. This route
+        crosses the TerminalService/backend boundary and therefore prevents a
+        live HTTP process with a dead tmux/PTY child from reading green.
+        """
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        try:
+            result = await anyio.to_thread.run_sync(terminal.terminal_list_sessions)
+        except Exception as exc:  # noqa: BLE001 - normalized, no traceback/body leakage
+            return JSONResponse({"execution_ok": False, "agent_process_alive": True,
+                                 "error": type(exc).__name__,
+                                 "agent_generation": AGENT_GENERATION})
+        if not isinstance(result, dict) or result.get("error"):
+            return JSONResponse({"execution_ok": False, "agent_process_alive": True,
+                                 "error": str((result or {}).get("error") or "MALFORMED_BACKEND_RESPONSE")[:200],
+                                 "agent_generation": AGENT_GENERATION})
+        return JSONResponse({"execution_ok": True, "agent_process_alive": True,
+                             "session_count": len(result.get("sessions", [])),
+                             "session_backend": type(terminal.tmux).__name__,
+                             "agent_generation": AGENT_GENERATION})
+
     async def internal_shutdown(request: Request) -> JSONResponse:
         """Deterministic, graceful self-shutdown (Phase 0 node-agent
         restart-safety audit, 2026-09-06) -- REPLACES relying on
@@ -829,6 +853,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
 
     routes = [
         Route("/v1/health", health, methods=["GET"]),
+        Route("/v1/execution-health", execution_health, methods=["GET"]),
         Route("/v1/metrics", metrics, methods=["GET"]),
         Route("/v1/environment", environment, methods=["GET"]),
         Route("/v1/repo-evidence", repo_evidence, methods=["GET"]),
