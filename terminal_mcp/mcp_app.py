@@ -12,6 +12,7 @@ from .config import load_config
 from .controller import ControllerService, build_default_controller
 from .core import TerminalService
 from .coordinator import CoordinatorGate, node_aware_repo_evidence
+from .project_workflows import ProjectProfileRegistry, ProjectWorkflowTools
 from .integration_engine import IntegrationEngine
 from .ai_usage_service import AiUsageService
 from .recovery_engine import RecoveryEngine
@@ -1342,6 +1343,61 @@ def build_mcp(service: TerminalService | None = None,
     # back to None would silently disable the only thing stopping two
     # dispatchers running one deploy.
     _locks = resource_locks or ResourceLockStore()
+    project_workflows = ProjectWorkflowTools(
+        ProjectProfileRegistry.from_config(), compact_tools, queue, supervisor,
+        _locks, terminal.audit,
+    )
+
+    @server.tool()
+    def project_check(project: str, targets: list[str] | None = None,
+                      include_git: bool = True, include_deploy: bool = True,
+                      include_health: bool = True, tail_lines: int = 8,
+                      max_output_chars: int = 12000) -> dict:
+        """PREFERRED one-call read for the user intent ``check``. Resolves
+        an allowlisted project profile and returns bounded target states,
+        useful tails, supervisor readiness/blockers, git state, deploy
+        readiness, health, and next actions. Missing targets are rows rather
+        than whole-call failures. This tool never mutates a session or repo."""
+        _refresh_local_heartbeat()
+        return project_workflows.project_check(
+            project, targets, include_git=include_git, include_deploy=include_deploy,
+            include_health=include_health, tail_lines=tail_lines,
+            max_output_chars=max_output_chars,
+        )
+
+    @server.tool()
+    def project_dispatch(project: str, task: str, target: str | None = None,
+                         wait_for_accept: bool = True, queue_if_busy: bool = True,
+                         idempotency_key: str | None = None, timeout: float = 30) -> dict:
+        """PREFERRED one-call action for ``giao task``. Selects only an
+        allowlisted project target, queues through the durable existing work
+        queue when busy, or delegates one guarded exactly-once submission to
+        terminal_send_task. Returns one concise final receipt; never emits
+        substep output or bypasses input policy, grants, menu detection, or
+        submission idempotency."""
+        _refresh_local_heartbeat()
+        return project_workflows.project_dispatch(
+            project, task, target, wait_for_accept=wait_for_accept,
+            queue_if_busy=queue_if_busy, idempotency_key=idempotency_key,
+            timeout=timeout,
+        )
+
+    @server.tool()
+    def deploy_preview(project: str, sha: str | None = None,
+                       source_branch: str | None = None, verify: bool = True,
+                       wait: bool = True, timeout: float = 600,
+                       idempotency_key: str | None = None) -> dict:
+        """PREFERRED one-call controlled ``deploy preview`` workflow.
+        Runs PRECHECK through proof only for an explicit preview-safe project
+        profile using fixed command/probe IDs. It accepts no shell command,
+        holds the shared per-project deploy lock, captures rollback evidence,
+        deduplicates retries, and returns one bounded final report. Missing or
+        unsafe profiles fail closed without inventing deployment commands."""
+        _refresh_local_heartbeat()
+        return project_workflows.deploy_preview(
+            project, sha, source_branch, verify=verify, wait=wait,
+            timeout=timeout, idempotency_key=idempotency_key,
+        )
 
     def _deployment_service():
         """Built over the SAME fleet store the rest of the fleet tools use --
