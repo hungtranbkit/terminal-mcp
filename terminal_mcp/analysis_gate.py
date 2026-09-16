@@ -161,8 +161,8 @@ def _missing(block: Mapping[str, Any], required: Iterable[str]) -> tuple[str, ..
         value = block.get(name)
         # A declared N/A is a special structured value: for fields that allow
         # it, require the justification before generic non-empty-dict logic.
-        if isinstance(value, Mapping) and value.get("n/a", value.get("na")) is True:
-            if name in NOT_APPLICABLE_ALLOWED and _is_declared_na(value):
+        if name in NOT_APPLICABLE_ALLOWED and isinstance(value, Mapping) and value.get("n/a", value.get("na")) is True:
+            if _is_declared_na(value):
                 continue
             out.append(name)
             continue
