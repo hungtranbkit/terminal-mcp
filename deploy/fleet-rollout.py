@@ -59,7 +59,7 @@ def health(node: Node, sha: str) -> tuple[bool,str]:
     try:
         with urllib.request.urlopen(node.health_url.rstrip('/')+"/v1/health", timeout=8) as resp:
             body=json.loads(resp.read().decode())
-        version=body.get("agent_version") or "?"
+        version=body.get("agent_version") or body.get("version") or "?"
         return resp.status==200, f"http={resp.status} agent_version={version}"
     except Exception as e: return False, f"{type(e).__name__}: {e}"
 
