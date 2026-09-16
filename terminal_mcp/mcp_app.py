@@ -10,6 +10,7 @@ from .fleet_service import auth_status_for_node
 from .agent_availability import available_agent_types
 from .config import load_config
 from .controller import ControllerService, build_default_controller
+from .compact_tools import CompactTerminalTools
 from .core import TerminalService
 from .coordinator import CoordinatorGate, node_aware_repo_evidence
 from .project_workflows import ProjectProfileRegistry, ProjectWorkflowTools
