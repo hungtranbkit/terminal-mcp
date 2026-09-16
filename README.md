@@ -164,6 +164,22 @@ and `terminal_wait_for_state` over client-side polling. These tools compose the
 existing authorization, binding, menu-detection, idempotency, and verified-submit
 paths; the lower-level tools remain available and backward compatible.
 
+For project-level intents, configure an explicit `project_profiles` allowlist
+and use one composite call:
+
+| User intent | Preferred tool |
+| --- | --- |
+| `check` | `project_check` |
+| `giao task` | `project_dispatch` |
+| `deploy preview` | `deploy_preview` |
+
+`project_check` combines bounded session, supervisor, Git, deploy-profile, and
+health evidence. `project_dispatch` selects only a profile target and delegates
+to the existing guarded send or durable queue. `deploy_preview` accepts fixed
+command/probe IDs from a preview-safe profile; it never accepts arbitrary shell
+commands. ChatGPT controls whether its UI visually collapses tool cards, but
+serving each intent with one MCP call minimizes the cards it needs to show.
+
 Its unit is `~/.config/systemd/user/terminal-mcp-http.service`, runs as the
 current user, and uses `Restart=on-failure`. Authentication is intentionally
 not implemented as an ad-hoc MCP wrapper: it must be enforced by the HTTPS
