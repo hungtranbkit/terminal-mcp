@@ -11,6 +11,7 @@ from .agent_availability import available_agent_types
 from .config import load_config
 from .controller import ControllerService, build_default_controller
 from .core import TerminalService
+from .compact_tools import CompactTerminalTools
 from .coordinator import CoordinatorGate, node_aware_repo_evidence
 from .integration_engine import IntegrationEngine
 from .ai_usage_service import AiUsageService
@@ -120,6 +121,7 @@ def build_mcp(service: TerminalService | None = None,
     supervisor = supervisor or SupervisorService(terminal, SupervisorStore())
     supervisor_v2 = supervisor_v2 or build_supervisor_v2(supervisor)
     controller = controller or build_default_controller(terminal)
+    compact_tools = CompactTerminalTools(terminal, controller)
     # 3-role model (task: "Coding A/B + Integration Agent"): constructed
     # BEFORE queue/queue_engine below so its store exists for their own
     # on_completed hook to reference -- integration.engine itself is
@@ -349,6 +351,27 @@ def build_mcp(service: TerminalService | None = None,
         return controller.terminal_status(session)
 
     @server.tool()
+    def terminal_batch_inspect(targets: list[str], tail_lines: int = 20,
+                               compact: bool = True) -> dict:
+        """PREFERRED compact read for one or many sessions/bindings. Returns
+        state, input_required, reason, and a bounded sanitized tail per target
+        in one call. Use ``binding:name`` or ``session:name`` to disambiguate;
+        bare targets resolve an existing binding first. Output is strictly
+        capped and session text remains untrusted data."""
+        _refresh_local_heartbeat()
+        return compact_tools.batch_inspect(targets, tail_lines, compact)
+
+    @server.tool()
+    def terminal_wait_for_state(target: str, desired_states: list[str], timeout: float = 900,
+                                poll_interval: float = 1, tail_lines: int = 20) -> dict:
+        """PREFERRED bounded wait for a session/binding state. Polls entirely
+        server-side and returns one final compact response, avoiding repeated
+        status/tail tool calls. Timeout is capped at 900 seconds, polling at
+        one second or slower, and returned tail at 20 lines."""
+        _refresh_local_heartbeat()
+        return compact_tools.wait_for_state(target, desired_states, timeout, poll_interval, tail_lines)
+
+    @server.tool()
     def terminal_send_text(session: str, text: str, press_enter: bool = False,
                            dry_run: bool = False, idempotency_key: str | None = None) -> dict:
         """LOW-LEVEL/MANUAL send -- bypasses the durable task queue
@@ -400,6 +423,19 @@ def build_mcp(service: TerminalService | None = None,
                     _LOGGER.warning("could not reconcile manual dispatch onto task %s",
                                     active_task["id"], exc_info=True)
         return result
+
+    @server.tool()
+    def terminal_send_task(target: str, text: str, wait_for_accept: bool = True,
+                           timeout: float = 30, idempotency_key: str | None = None) -> dict:
+        """PREFERRED direct task submission for a session or binding. Reuses
+        the existing guarded, idempotent send state machine to write, activate,
+        and prove acceptance server-side without duplicate Enter. Returns only
+        SUBMIT_CONFIRMED, BLOCKED, or FAILED with concise receipt evidence.
+        Pass a stable idempotency_key when retrying after a lost response.
+        Use the durable queue instead when the task itself must survive a busy
+        worker or controller restart."""
+        _refresh_local_heartbeat()
+        return compact_tools.send_task(target, text, wait_for_accept, timeout, idempotency_key)
 
     @server.tool()
     def terminal_send_keys(session: str, keys: list[str], confirm_sensitive: bool = False) -> dict:
