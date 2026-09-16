@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 import yaml
 
-from terminal_mcp.config import RemoteNodeConfig, load_config
+from terminal_mcp.config import NodeHealthConfig, RemoteNodeConfig, load_config
 from terminal_mcp.node_models import NodeHeartbeatThresholds, OverloadThresholds
 
 
@@ -55,6 +55,34 @@ def test_heartbeat_thresholds_override(tmp_path):
 def test_heartbeat_offline_must_be_at_least_degraded(tmp_path):
     with pytest.raises(ValueError, match="offline_after_seconds"):
         load_config(_write(tmp_path, _base_raw(heartbeat={"degraded_after_seconds": 100, "offline_after_seconds": 50})))
+
+
+def test_node_health_config_is_bounded_and_defaults_conservative(tmp_path):
+    config = load_config(_write(tmp_path, _base_raw(health={
+        "probe_interval_seconds": 12, "probe_timeout_seconds": 4.5,
+        "execution_down_after_failures": 3, "backoff_base_seconds": 2,
+        "backoff_max_seconds": 30, "backoff_jitter_ratio": 0.1,
+    })))
+    assert config.nodes.health == NodeHealthConfig(
+        enabled=True, probe_interval_seconds=12, probe_timeout_seconds=4.5,
+        execution_down_after_failures=3, backoff_base_seconds=2,
+        backoff_max_seconds=30, backoff_jitter_ratio=0.1,
+    )
+    with pytest.raises(ValueError, match="less than 5"):
+        load_config(_write(tmp_path, _base_raw(health={"probe_timeout_seconds": 5})))
+
+
+def test_self_heal_requires_explicit_allowlisted_action(tmp_path):
+    base = {"node_id": "m910", "endpoint": "http://x:8790", "token_env": "TOKEN"}
+    with pytest.raises(ValueError, match="without an action"):
+        load_config(_write(tmp_path, _base_raw(remote=[{**base, "self_heal_enabled": True}])))
+    with pytest.raises(ValueError, match="unsupported"):
+        load_config(_write(tmp_path, _base_raw(remote=[{**base, "self_heal_action": "reboot"}])))
+    config = load_config(_write(tmp_path, _base_raw(remote=[{
+        **base, "self_heal_enabled": True, "self_heal_action": "graceful_agent_restart",
+    }])))
+    assert config.nodes.remote_nodes[0].self_heal_enabled is True
+    assert config.nodes.remote_nodes[0].self_heal_action == "graceful_agent_restart"
 
 
 def test_remote_node_full_declaration_parsed(tmp_path):

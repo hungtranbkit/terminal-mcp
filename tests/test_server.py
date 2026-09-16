@@ -51,6 +51,7 @@ async def test_server_registers_v1_and_binding_tools():
         "supervisor2_execute_send",
         "supervisor2_list_actions",
         "terminal_list_nodes",
+        "terminal_node_health",
         # Fleet environment audit: tools/services/auth readiness per node, so
         # "which node could take over?" is answerable without logging into
         # each machine. Status only -- never credential contents.

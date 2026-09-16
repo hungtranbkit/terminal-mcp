@@ -22,6 +22,22 @@ NODE_DEGRADED = "degraded"
 NODE_OFFLINE = "offline"
 NODE_STATUSES = (NODE_ONLINE, NODE_DEGRADED, NODE_OFFLINE)
 
+# Layered health state. ``status`` above remains the backward-compatible
+# online/degraded/offline field; controller surfaces derive it from this
+# stronger execution-aware state instead of heartbeat freshness alone.
+HEALTH_TRANSPORT_ONLINE = "TRANSPORT_ONLINE"
+HEALTH_EXECUTION_OK = "EXECUTION_OK"
+HEALTH_DEGRADED = "DEGRADED"
+HEALTH_EXECUTION_DOWN = "EXECUTION_DOWN"
+HEALTH_AUTH_UNAUTHORIZED = "AUTH_EXPIRED/UNAUTHORIZED"
+HEALTH_OFFLINE = "OFFLINE"
+HEALTH_UNKNOWN = "UNKNOWN"
+NODE_HEALTH_STATES = (
+    HEALTH_TRANSPORT_ONLINE, HEALTH_EXECUTION_OK, HEALTH_DEGRADED,
+    HEALTH_EXECUTION_DOWN, HEALTH_AUTH_UNAUTHORIZED, HEALTH_OFFLINE,
+    HEALTH_UNKNOWN,
+)
+
 # A node whose operator has set draining=True is excluded from the
 # scheduler regardless of its online/offline status -- draining is
 # reported as a separate boolean (task's own field list), not folded into
@@ -178,6 +194,20 @@ class Node:
     # as legacy and never treated as compatible.
     contract_version: int = 0
     contract_capabilities: tuple[str, ...] = ()
+    # Execution-aware health metadata. Persisted in nodes.db and additive to
+    # every existing Node/tool/dashboard shape.
+    transport_status: str = NODE_OFFLINE
+    transport_state: str = HEALTH_UNKNOWN
+    health_state: str = HEALTH_UNKNOWN
+    execution_state: str = HEALTH_UNKNOWN
+    last_probe_at: str | None = None
+    last_successful_probe_at: str | None = None
+    consecutive_failures: int = 0
+    next_retry_at: str | None = None
+    last_error: str | None = None
+    reconnect_status: str = "IDLE"
+    agent_generation: str | None = None
+    last_self_heal_at: str | None = None
 
 
 def node_to_dict(node: Node) -> dict[str, Any]:
@@ -208,4 +238,16 @@ def node_to_dict(node: Node) -> dict[str, Any]:
         "platform": node.platform, "session_backend": node.session_backend,
         "shell_capabilities": list(node.shell_capabilities), "wsl_available": node.wsl_available,
         "claude_available": "claude" in node.agent_types, "codex_available": "codex" in node.agent_types,
+        "transport_status": node.transport_status,
+        "transport_state": node.transport_state,
+        "health_state": node.health_state,
+        "execution_state": node.execution_state,
+        "last_probe_at": node.last_probe_at,
+        "last_successful_probe_at": node.last_successful_probe_at,
+        "consecutive_failures": node.consecutive_failures,
+        "next_retry_at": node.next_retry_at,
+        "last_error": node.last_error,
+        "reconnect_status": node.reconnect_status,
+        "agent_generation": node.agent_generation,
+        "last_self_heal_at": node.last_self_heal_at,
     }

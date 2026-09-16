@@ -781,6 +781,22 @@ class RemoteNodeConfig:
     token_env: str
     max_sessions: int | None = None
     timeout_seconds: float = 10.0
+    # Conservative by default. The only supported action asks the already
+    # supervised agent process to stop gracefully; its host service manager
+    # owns the single replacement process.
+    self_heal_enabled: bool = False
+    self_heal_action: str = "none"
+
+
+@dataclass(frozen=True)
+class NodeHealthConfig:
+    enabled: bool = True
+    probe_interval_seconds: float = 20.0
+    probe_timeout_seconds: float = 3.0
+    execution_down_after_failures: int = 2
+    backoff_base_seconds: float = 5.0
+    backoff_max_seconds: float = 300.0
+    backoff_jitter_ratio: float = 0.2
 
 
 @dataclass(frozen=True)
@@ -930,6 +946,7 @@ class NodesConfig:
     discovery: DiscoveryConfig = DiscoveryConfig()
     remote_connect: RemoteConnectConfig = RemoteConnectConfig()
     onboarding: OnboardingConfig = OnboardingConfig()
+    health: NodeHealthConfig = NodeHealthConfig()
 
 
 @dataclass(frozen=True)
@@ -1208,6 +1225,32 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     if heartbeat_thresholds.offline_after_seconds < heartbeat_thresholds.degraded_after_seconds:
         raise ValueError("nodes.heartbeat.offline_after_seconds must be >= degraded_after_seconds")
 
+    health_raw = nodes_raw.get("health", {})
+    if not isinstance(health_raw, dict):
+        raise ValueError("nodes.health must be a mapping")
+    health_defaults = NodeHealthConfig()
+    node_health_config = NodeHealthConfig(
+        enabled=bool(health_raw.get("enabled", health_defaults.enabled)),
+        probe_interval_seconds=float(health_raw.get("probe_interval_seconds", health_defaults.probe_interval_seconds)),
+        probe_timeout_seconds=float(health_raw.get("probe_timeout_seconds", health_defaults.probe_timeout_seconds)),
+        execution_down_after_failures=int(health_raw.get(
+            "execution_down_after_failures", health_defaults.execution_down_after_failures)),
+        backoff_base_seconds=float(health_raw.get("backoff_base_seconds", health_defaults.backoff_base_seconds)),
+        backoff_max_seconds=float(health_raw.get("backoff_max_seconds", health_defaults.backoff_max_seconds)),
+        backoff_jitter_ratio=float(health_raw.get("backoff_jitter_ratio", health_defaults.backoff_jitter_ratio)),
+    )
+    if node_health_config.probe_interval_seconds < 1:
+        raise ValueError("nodes.health.probe_interval_seconds must be at least 1")
+    if not 0 < node_health_config.probe_timeout_seconds < 5:
+        raise ValueError("nodes.health.probe_timeout_seconds must be greater than 0 and less than 5")
+    if node_health_config.execution_down_after_failures < 2:
+        raise ValueError("nodes.health.execution_down_after_failures must be at least 2")
+    if (node_health_config.backoff_base_seconds < 1 or
+            node_health_config.backoff_max_seconds < node_health_config.backoff_base_seconds):
+        raise ValueError("nodes.health backoff must be positive and max >= base")
+    if not 0 <= node_health_config.backoff_jitter_ratio <= 0.5:
+        raise ValueError("nodes.health.backoff_jitter_ratio must be between 0 and 0.5")
+
     remote_raw = nodes_raw.get("remote", [])
     if not isinstance(remote_raw, list):
         raise ValueError("nodes.remote must be a list")
@@ -1235,6 +1278,12 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         max_sessions = entry.get("max_sessions")
         if max_sessions is not None and (not isinstance(max_sessions, int) or max_sessions < 1):
             raise ValueError(f"nodes.remote[{index}].max_sessions must be a positive integer if given")
+        self_heal_enabled = bool(entry.get("self_heal_enabled", False))
+        self_heal_action = str(entry.get("self_heal_action", "none"))
+        if self_heal_action not in {"none", "graceful_agent_restart"}:
+            raise ValueError(f"nodes.remote[{index}].self_heal_action is unsupported")
+        if self_heal_enabled and self_heal_action == "none":
+            raise ValueError(f"nodes.remote[{index}] enables self-heal without an action")
         remote_nodes.append(RemoteNodeConfig(
             node_id=node_id,
             display_name=entry.get("display_name") or node_id,
@@ -1243,6 +1292,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             token_env=token_env,
             max_sessions=max_sessions,
             timeout_seconds=float(entry.get("timeout_seconds", 10.0)),
+            self_heal_enabled=self_heal_enabled,
+            self_heal_action=self_heal_action,
         ))
     # Scheme/host gate, as a SECOND pass over the parsed entries.
     #
@@ -1296,7 +1347,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
 
     nodes_config = NodesConfig(overload_thresholds=overload_thresholds, heartbeat_thresholds=heartbeat_thresholds,
                                remote_nodes=tuple(remote_nodes), discovery=discovery_config,
-                               remote_connect=remote_connect_config, onboarding=onboarding_config)
+                               remote_connect=remote_connect_config, onboarding=onboarding_config,
+                               health=node_health_config)
 
     return AppConfig(
         permissions=PermissionsConfig(

@@ -36,6 +36,8 @@ from .node_models import (
     CAPACITY_UNKNOWN,
     PLATFORM_LINUX,
     SESSION_BACKEND_TMUX,
+    HEALTH_OFFLINE,
+    HEALTH_TRANSPORT_ONLINE,
     Node,
     NodeHeartbeatThresholds,
     OverloadThresholds,
@@ -237,6 +239,19 @@ class NodeRegistry:
                 # which is recorded as legacy and never as compatible.
                 ("contract_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("contract_capabilities", "TEXT NOT NULL DEFAULT '[]'"),
+                # Phase 3 layered node health. These are raw probe/retry
+                # facts, never credentials or response bodies. Keeping them
+                # on the existing node row preserves circuit-breaker state
+                # across controller restarts without a competing store.
+                ("execution_health_state", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
+                ("last_probe_at", "TEXT"),
+                ("last_successful_probe_at", "TEXT"),
+                ("consecutive_probe_failures", "INTEGER NOT NULL DEFAULT 0"),
+                ("next_retry_at", "TEXT"),
+                ("last_probe_error", "TEXT"),
+                ("reconnect_status", "TEXT NOT NULL DEFAULT 'IDLE'"),
+                ("last_agent_generation", "TEXT"),
+                ("last_self_heal_at", "TEXT"),
             ):
                 if column not in existing_columns:
                     connection.execute(f"ALTER TABLE nodes ADD COLUMN {column} {declaration}")
@@ -460,7 +475,44 @@ class NodeRegistry:
             wsl_available=bool(data.get("wsl_available") or 0),
             contract_version=int(data.get("contract_version") or 0),
             contract_capabilities=tuple(json.loads(data.get("contract_capabilities") or "[]")),
+            transport_status=status,
+            transport_state=HEALTH_TRANSPORT_ONLINE if status == "online" else HEALTH_OFFLINE,
+            health_state=data.get("execution_health_state") or "UNKNOWN",
+            execution_state=data.get("execution_health_state") or "UNKNOWN",
+            last_probe_at=data.get("last_probe_at"),
+            last_successful_probe_at=data.get("last_successful_probe_at"),
+            consecutive_failures=int(data.get("consecutive_probe_failures") or 0),
+            next_retry_at=data.get("next_retry_at"),
+            last_error=data.get("last_probe_error"),
+            reconnect_status=data.get("reconnect_status") or "IDLE",
+            agent_generation=data.get("last_agent_generation"),
+            last_self_heal_at=data.get("last_self_heal_at"),
         )
+
+    def record_health_probe(self, node_id: str, *, state: str, success: bool,
+                            probed_at: datetime, consecutive_failures: int,
+                            next_retry_at: datetime | None = None,
+                            last_error: str | None = None,
+                            reconnect_status: str = "IDLE",
+                            agent_generation: str | None = None,
+                            self_heal_attempted: bool = False) -> Node | None:
+        """Persist one bounded probe outcome on the existing node row."""
+        probe_iso = _iso(probed_at)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE nodes SET execution_health_state = ?, last_probe_at = ?,
+                   last_successful_probe_at = CASE WHEN ? THEN ? ELSE last_successful_probe_at END,
+                   consecutive_probe_failures = ?, next_retry_at = ?, last_probe_error = ?,
+                   reconnect_status = ?,
+                   last_agent_generation = COALESCE(?, last_agent_generation),
+                   last_self_heal_at = CASE WHEN ? THEN ? WHEN ? THEN NULL ELSE last_self_heal_at END,
+                   updated_at = ? WHERE id = ?""",
+                (state, probe_iso, int(success), probe_iso, int(consecutive_failures),
+                 _iso(next_retry_at) if next_retry_at else None, last_error,
+                 reconnect_status, agent_generation, int(self_heal_attempted), probe_iso, int(success),
+                 probe_iso, node_id),
+            )
+        return self.get(node_id, now=probed_at) if cursor.rowcount else None
 
     def _derive_status(self, last_heartbeat_at: str | None, now: datetime) -> str:
         from .node_models import NODE_DEGRADED, NODE_OFFLINE, NODE_ONLINE

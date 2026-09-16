@@ -147,6 +147,14 @@ supervisor:
 #   heartbeat:
 #     degraded_after_seconds: 60
 #     offline_after_seconds: 180
+#   health:
+#     enabled: true
+#     probe_interval_seconds: 20
+#     probe_timeout_seconds: 3       # must remain below 5 seconds
+#     execution_down_after_failures: 2
+#     backoff_base_seconds: 5
+#     backoff_max_seconds: 300
+#     backoff_jitter_ratio: 0.2
 #   remote:
 #     - node_id: m910
 #       display_name: "M910 Workstation"
@@ -155,6 +163,10 @@ supervisor:
 #       token_env: TERMINAL_MCP_NODE_TOKEN_M910
 #       max_sessions: 20
 #       timeout_seconds: 10.0
+#       # Off by default. This only requests a graceful agent stop; the
+#       # existing service supervisor owns the single replacement process.
+#       self_heal_enabled: false
+#       self_heal_action: none       # or graceful_agent_restart
 #
 #   # Self-service node onboarding -- Dashboard > Nodes > "+ Add Node".
 #   # See docs/windows-node-onboarding.md. Every field below is optional:

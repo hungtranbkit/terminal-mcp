@@ -144,6 +144,17 @@ def test_correct_token_is_accepted(agent_client):
     assert "sessions" in response.json()
 
 
+def test_execution_health_requires_auth_and_exercises_backend(agent_client):
+    assert agent_client.get("/v1/execution-health").status_code == 401
+    response = agent_client.get("/v1/execution-health", headers=_auth())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["execution_ok"] is True
+    assert body["agent_process_alive"] is True
+    assert body["agent_generation"] == AGENT_GENERATION
+    assert isinstance(body["session_count"], int)
+
+
 def test_metrics_route_returns_real_host_metrics(agent_client):
     response = agent_client.get("/v1/metrics", headers=_auth())
     assert response.status_code == 200
