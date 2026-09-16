@@ -9,8 +9,8 @@
     "git_branch": "main",
     "is_portable": true
   },
-  "revision": 7,
-  "updated_at": "2026-09-16T00:00:00+00:00",
+  "revision": 8,
+  "updated_at": "2026-09-16T11:44:00+00:00",
   "items": [
     {
       "id": "blg_f52a999971d9",
@@ -2060,6 +2060,65 @@
           "at": "2026-09-16T00:00:00+00:00",
           "event": "created",
           "by": "session-coordinator-architecture-2026-09-16"
+        }
+      ]
+    },
+    {
+      "id": "blg_agent_reach_capability_layer",
+      "title": "Agent-Reach-inspired Capability Layer for Terminal MCP",
+      "description": "DEFERRED architecture item. Learn patterns from Panniantong/Agent-Reach without importing it into Terminal MCP core. Build a capability layer so Terminal MCP can verify what each node can really do, resolve ordered backends/models, use safe doctor/dry-run semantics, inject small skill/context packs, and optionally consume Agent-Reach as a research capability provider. Keep provider, harness, model and capability as separate dimensions. Do this after Merge Coordinator V1 and Deploy V2 are stable; do not block current lifecycle work.",
+      "status": "BACKLOG",
+      "priority": "P2",
+      "type": "feature",
+      "order": 45,
+      "created_at": "2026-09-16T11:44:00+00:00",
+      "updated_at": "2026-09-16T11:44:00+00:00",
+      "source": "agent-reach-architecture-plan-2026-09-16",
+      "dependencies": [
+        "blg_283a4c0f09fe",
+        "blg_orch_integrator_worktree",
+        "blg_proj_coordinator_agent"
+      ],
+      "acceptance_criteria": [
+        "Phase 0 Capability Contract/Foundation: capability registry with UNKNOWN/AVAILABLE/DEGRADED/UNAVAILABLE/AUTH_REQUIRED and durable probe evidence; binary presence alone never means usable.",
+        "Phase 1 Universal Doctor: detect() versus check(), read-only by default, explicit dry-run/repair/execute paths, node-level verified capability view.",
+        "Phase 2 Backend Registry/Fallback: deterministic primary/fallback resolution, separating availability fallback from quality escalation, explicit reason/evidence for each selection.",
+        "Phase 3 AKE/OpenRouter Model Profiles: coding task classes, pricing/features plus observed success, retries, latency and expected cost per successful verified task; model remains separate from harness/provider.",
+        "Phase 4 Skill and Context Pack: small capability-specific SKILL/runbook/context packs so workers do not rediscover the whole repo/environment every task.",
+        "Phase 5 Agent-Reach Adapter: integrate Agent-Reach only as a capability provider/plugin for research/web/GitHub/social channels; Terminal MCP remains orchestration owner and does not fork upstream tool logic.",
+        "Phase 6 Project Coordinator Routing: task requirement -> capability resolver -> doctor evidence -> backend/model -> worker lease -> verify -> telemetry -> escalation.",
+        "Mutation capabilities follow CHECK -> DRY_RUN -> EXECUTE -> VERIFY -> AUDIT and fail closed on missing evidence.",
+        "Do not start implementation until Merge Coordinator V1 and Deploy V2 are stable; production auto-routing remains disabled until explicit rollout approval."
+      ],
+      "tags": [
+        "capability-registry",
+        "doctor",
+        "agent-reach",
+        "model-routing",
+        "context-pack",
+        "provider-fallback",
+        "architecture"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": [
+          "Reference repo: Panniantong/Agent-Reach; adopt architecture patterns, not source coupling."
+        ]
+      },
+      "history": [
+        {
+          "at": "2026-09-16T11:44:00+00:00",
+          "event": "created",
+          "by": "chatgpt-agent-reach-plan-2026-09-16"
         }
       ]
     }
