@@ -199,3 +199,137 @@ def test_redact_ansi_safe_never_returns_fewer_redactions_than_plain():
         result = redact_ansi_safe(case)
         if redacted_plain != plain:
             assert result == redacted_plain
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter/AKE hotfix: the assignment rules used `\b(api[-_]?key|...)` and
+# `\b(password|token)`, but `\b` never matches between `_` and a letter --
+# so every *prefixed* env name (OPENROUTER_API_KEY, ANTHROPIC_AUTH_TOKEN,
+# GITHUB_TOKEN, ...) fell straight through the sanitizer while the bare
+# `api_key=` form was redacted. session_knowledge captures pane output
+# verbatim, so a key exported in a watched pane was being stored in the
+# clear. Fake values only below.
+# ---------------------------------------------------------------------------
+
+FAKE_OPENROUTER = "sk-or-v1-FAKE0123456789abcdefFAKE0123456789abcdefFAKE0123456789ab"
+
+
+def test_redacts_openrouter_api_key_assignment():
+    result = redact_text(f"OPENROUTER_API_KEY={FAKE_OPENROUTER}")
+    assert FAKE_OPENROUTER not in result
+    assert result == "OPENROUTER_API_KEY=<REDACTED>"
+
+
+def test_redacts_exported_openrouter_key_with_spaces_around_equals():
+    # `export ` and the spacing are shell-ish forms the sanitizer is meant
+    # to cope with; `export` itself must survive so the line stays readable.
+    result = redact_text(f"export OPENROUTER_API_KEY = {FAKE_OPENROUTER}")
+    assert FAKE_OPENROUTER not in result
+    assert result.startswith("export OPENROUTER_API_KEY=")
+    assert "<REDACTED>" in result
+
+
+def test_redacts_quoted_openrouter_key_assignment():
+    for quoted in (f'"{FAKE_OPENROUTER}"', f"'{FAKE_OPENROUTER}'"):
+        result = redact_text(f"export OPENROUTER_API_KEY={quoted}")
+        assert FAKE_OPENROUTER not in result, quoted
+        assert "<REDACTED>" in result
+
+
+def test_redacts_anthropic_auth_token_assignment():
+    # An OpenRouter key is commonly fed to Claude Code via ANTHROPIC_AUTH_TOKEN.
+    result = redact_text(f"ANTHROPIC_AUTH_TOKEN={FAKE_OPENROUTER}")
+    assert FAKE_OPENROUTER not in result
+    assert result == "ANTHROPIC_AUTH_TOKEN=<REDACTED>"
+
+
+def test_redacts_bare_openrouter_secret_shape():
+    # No variable name at all -- a bare paste or a curl line. The shape
+    # itself (`sk-or-...`) is distinctive enough to redact on sight.
+    result = redact_text(f"curl -H 'x: {FAKE_OPENROUTER}' https://openrouter.ai/api/v1")
+    assert FAKE_OPENROUTER not in result
+    assert "<REDACTED>" in result
+    assert "https://openrouter.ai/api/v1" in result
+
+
+def test_redacts_bare_anthropic_and_openai_project_key_shapes():
+    for fake in ("sk-ant-api03-FAKE0123456789abcdefFAKE0123456789",
+                 "sk-proj-FAKE0123456789abcdefFAKE0123456789"):
+        assert fake not in redact_text(f"leaked: {fake}"), fake
+
+
+def test_generic_prefixed_api_key_and_auth_token_assignments_are_redacted():
+    for name in ("MY_API_KEY", "some-service-api-key", "GITHUB_TOKEN",
+                 "SOME_AUTH_TOKEN", "GITLAB_ACCESS_TOKEN", "APP_REFRESH_TOKEN",
+                 "DB_PASSWORD", "SVC_CLIENT_SECRET"):
+        result = redact_text(f"{name}=fakevalue12345")
+        assert "fakevalue12345" not in result, name
+        assert result == f"{name}=<REDACTED>", name
+
+
+def test_anthropic_and_openai_api_key_assignments_still_redacted():
+    # Regression guard for the two names that had their own rule before
+    # the generic one subsumed it.
+    for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "anthropic_api_key"):
+        assert "fakevalue12345" not in redact_text(f"{name}=fakevalue12345"), name
+
+
+def test_authorization_and_bearer_still_redacted():
+    result = redact_text("Authorization: Bearer fake.jwt.value\nBearer loosefaketoken")
+    assert "fake.jwt.value" not in result
+    assert "loosefaketoken" not in result
+    assert result.count("<REDACTED>") == 2
+
+
+def test_secret_suffix_words_in_ordinary_prose_are_not_mangled():
+    # The generic name rule is assignment-shaped; prose that merely uses
+    # the words, and non-secret assignments that only *contain* them as a
+    # non-suffix, must come through byte-for-byte.
+    benign = [
+        "token budget = 5000 tokens remaining",
+        "TOKEN_BUDGET_LIMIT=5000",
+        "API_KEY_ROTATION_DAYS_NOTICE=30",
+        "the password reset email was sent",
+        "checked access key rotation for this api key",
+        "keystone=granite",
+    ]
+    for line in benign:
+        assert redact_text(line) == line, line
+
+
+def test_multiline_pane_capture_redacts_only_the_secret_line():
+    pane = (
+        "$ cat .env\n"
+        f"OPENROUTER_API_KEY={FAKE_OPENROUTER}\n"
+        "OPENROUTER_MODEL=anthropic/claude-opus-4\n"
+        "$ echo done\n"
+        "done"
+    )
+    result = redact_text(pane)
+    assert FAKE_OPENROUTER not in result
+    assert result == (
+        "$ cat .env\n"
+        "OPENROUTER_API_KEY=<REDACTED>\n"
+        "OPENROUTER_MODEL=anthropic/claude-opus-4\n"
+        "$ echo done\n"
+        "done"
+    )
+
+
+def test_dangling_assignment_does_not_swallow_the_next_line():
+    # `\s*` around `=` would reach across the newline and eat the following
+    # line of surrounding pane output; `[ \t]*` must not.
+    raw = "TOKEN =\nthis line is not a secret"
+    assert redact_text(raw) == raw
+
+
+def test_redaction_is_linear_on_large_pane_like_input():
+    # Guard against catastrophic backtracking in the prefixed-name rule:
+    # long underscore-segmented identifiers with no assignment at all are
+    # exactly the shape a naive nested quantifier blows up on.
+    import time
+
+    evil = "A_" * 40000 + "API_KEY_" * 10000
+    start = time.perf_counter()
+    redact_text(evil)
+    assert time.perf_counter() - start < 5.0
