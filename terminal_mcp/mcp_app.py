@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 
 from mcp.server.mcpserver import MCPServer
 
@@ -50,6 +52,7 @@ from .repo_service import build_repo_service
 from .worker_registry import ALL_ROLES, WorkerRegistry
 
 _LOGGER = logging.getLogger(__name__)
+_LOCAL_HEARTBEAT_MIN_INTERVAL_SECONDS = 5.0
 from .queue_service import QueueService
 from .release_service import ReleaseService
 from .release_store import ReleaseStore
@@ -337,6 +340,9 @@ def build_mcp(service: TerminalService | None = None,
         version=__version__,
     )
 
+    _local_heartbeat_lock = threading.Lock()
+    _local_heartbeat_next_refresh = [0.0]
+
     def _refresh_local_heartbeat() -> None:
         # Cheap (a few /proc reads + one real tmux listing, no network) --
         # see controller.py's own refresh_local_heartbeat docstring for
@@ -346,20 +352,35 @@ def build_mcp(service: TerminalService | None = None,
         # because nothing has explicitly heartbeated it yet -- the exact
         # failure mode this project's own multi-node test suite caught
         # during development (see docs/multi-node.md).
+        now = time.monotonic()
+        if now < _local_heartbeat_next_refresh[0]:
+            return
+        # Multiple MCP requests can arrive together.  One request refreshes
+        # the process-local heartbeat; the others must not queue behind the
+        # same tmux/procfs/SQLite work before doing their actual operation.
+        if not _local_heartbeat_lock.acquire(blocking=False):
+            return
         try:
-            items = terminal.tmux.list_sessions()
-        except Exception:  # noqa: BLE001 -- a metrics refresh must never break a tool call
-            items = []
-        agent_counts: dict[str, int] = {}
-        for item in items:
-            command = (item.pane_current_command or "").casefold()
-            if command:
-                agent_counts[command] = agent_counts.get(command, 0) + 1
-        agent_types = available_agent_types(terminal.config.session_lifecycle.launch_commands)
-        controller.refresh_local_heartbeat(
-            tmux_session_count=len(items), agent_counts=agent_counts,
-            agent_types=agent_types, agent_version=None,
-        )
+            now = time.monotonic()
+            if now < _local_heartbeat_next_refresh[0]:
+                return
+            try:
+                items = terminal.tmux.list_sessions()
+            except Exception:  # noqa: BLE001 -- a metrics refresh must never break a tool call
+                items = []
+            agent_counts: dict[str, int] = {}
+            for item in items:
+                command = (item.pane_current_command or "").casefold()
+                if command:
+                    agent_counts[command] = agent_counts.get(command, 0) + 1
+            agent_types = available_agent_types(terminal.config.session_lifecycle.launch_commands)
+            controller.refresh_local_heartbeat(
+                tmux_session_count=len(items), agent_counts=agent_counts,
+                agent_types=agent_types, agent_version=None,
+            )
+            _local_heartbeat_next_refresh[0] = time.monotonic() + _LOCAL_HEARTBEAT_MIN_INTERVAL_SECONDS
+        finally:
+            _local_heartbeat_lock.release()
 
     # AUTO-DISPATCH background loop (queue_loop.py) -- constructed here
     # (not started -- see server_http.py's own config.queue.enabled gate
