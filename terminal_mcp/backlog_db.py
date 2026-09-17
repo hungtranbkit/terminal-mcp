@@ -262,7 +262,10 @@ class BacklogDB:
             item_id = historical["id"]
             current = existing.get(item_id)
             if current is None:
-                existing[item_id] = historical
+                # Store new historical rows in the same canonical metadata
+                # order used for overlaps. Otherwise the first re-run would
+                # only reorder lists and spuriously bump the revision once.
+                existing[item_id] = reconcile_item(historical, historical)[0]
                 added_ids.append(item_id)
                 continue
             merged, differing = reconcile_item(current, historical)

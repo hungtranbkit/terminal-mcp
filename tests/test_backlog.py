@@ -313,7 +313,13 @@ def test_reconcile_is_dry_run_then_idempotent(svc, repo):
     svc.export_file(str(repo))
     path = store.backlog_path(repo)
     doc = json.loads(path.read_text())
-    historical = store.normalise_item({"id": "blg_historical", "title": "historical"})
+    historical = store.normalise_item({
+        "id": "blg_historical", "title": "historical", "tags": ["z-last", "a-first"],
+        "history": [
+            {"at": "2021-01-01T00:00:00+00:00", "event": "updated"},
+            {"at": "2020-01-01T00:00:00+00:00", "event": "created"},
+        ],
+    })
     doc["revision"] = 91
     doc["items"].append(historical)
     path.write_text(json.dumps(doc))
@@ -331,6 +337,8 @@ def test_reconcile_is_dry_run_then_idempotent(svc, repo):
                                  expected_revision=before["revision"])
     assert applied["before_total"] == 1 and applied["after_total"] == 2
     assert {i["id"] for i in svc.get(str(repo))["items"]} == {current_id, "blg_historical"}
+    imported = next(i for i in svc.get(str(repo))["items"] if i["id"] == "blg_historical")
+    assert imported["tags"] == ["a-first", "z-last"]
     second = svc.reconcile_file(str(repo), dry_run=False,
                                 expected_revision=applied["revision"])
     assert second["changed"] is False and second["revision"] == applied["revision"]
