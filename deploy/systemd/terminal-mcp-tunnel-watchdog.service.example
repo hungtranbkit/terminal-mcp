@@ -11,6 +11,13 @@ After=terminal-mcp-http.service terminal-mcp-tunnel.service
 
 [Service]
 Type=oneshot
+# ACTIVE/STANDBY INVARIANT: if this host is a fallback and the tunnel unit
+# itself has an ExecCondition split-brain/primary guard, the watchdog MUST
+# have the same ExecCondition (normally via a host-specific drop-in). Otherwise
+# an intentionally inactive standby is misclassified as a dead tunnel and the
+# timer will try to restart it every cycle. Example on a fallback host:
+#   ExecCondition=%h/.local/bin/terminal-mcp-tunnel-guard condition
+# Do not add this on a single-controller host that has no primary guard.
 # The watchdog restarts its --mcp-unit when the LOCAL MCP endpoint looks
 # unhealthy; it defaults to terminal-mcp-http.service. On a fed-controller
 # host that default would try to start the RETIRED unit and crash-loop it
