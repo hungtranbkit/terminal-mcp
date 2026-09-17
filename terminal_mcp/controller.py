@@ -29,6 +29,7 @@ from .node_models import NODE_ONLINE, Node
 from .node_health import NodeHealthPolicy, NodeHealthService
 from .node_registry import NodeRegistry
 from .config import NodeHealthConfig
+from .connection_manager import ConnectionManager
 from .lease import ResourceLockStore
 from .scheduler import PlacementResult, choose_node
 from .ephemeral_state import ephemeral_state_dir
@@ -121,6 +122,7 @@ class ControllerService:
             registry, ResourceLockStore(registry.path.with_name("leases.db")),
             node_health_config or NodeHealthConfig(),
         )
+        self.connection_manager = ConnectionManager()
 
         if local_client is not None:
             self._clients[local_node_id] = local_client
@@ -233,6 +235,33 @@ class ControllerService:
                                 actor: str | None = None) -> dict[str, Any]:
         return self._route(session, "set_permissions", lambda client, name: client.set_permissions(
             name, read=read, input=input, expected_revision=expected_revision, actor=actor))
+
+    def repair_stale_session_pin(self, session: str, *, actor: str | None = None) -> dict[str, Any]:
+        """Re-pin one explicit grant to the session instance that exists now.
+
+        This never invents permissions: it re-applies exactly the stored
+        requested read/input booleans, guarded by the revision we just read.
+        If the row is not stale it is a no-op.
+        """
+        current = self.describe_session_permissions(session)
+        if "error" in current:
+            return current
+        if not current.get("stale_identity_pin"):
+            return {"session": session, "repaired": False, "reason": "NOT_STALE",
+                    "permissions": current}
+        requested = current.get("requested") or {}
+        if requested.get("read") is None:
+            return {"session": session, "repaired": False, "reason": "NO_EXPLICIT_GRANT",
+                    "permissions": current}
+        repaired = self.set_session_permissions(
+            session, read=bool(requested.get("read")), input=bool(requested.get("input")),
+            expected_revision=current.get("revision"), actor=actor or "stale-pin-repair",
+        )
+        if "error" in repaired:
+            return repaired
+        return {"session": session, "repaired": not bool(repaired.get("stale_identity_pin")),
+                "reason": "REPinned" if not repaired.get("stale_identity_pin") else "STILL_STALE",
+                "permissions": repaired}
 
     def fleet_environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]:
         """Ask every node what it is missing, in one pass.
@@ -1117,6 +1146,28 @@ class ControllerService:
     def node_health_summary(self) -> dict[str, Any]:
         nodes = self.list_nodes()
         return self.node_health.summary(nodes)
+
+    def connection_status(self, node_id: str | None = None, *,
+                          force_probe: bool = False) -> dict[str, Any]:
+        """One compact connection answer for Commander-like clients/UI.
+
+        All probing remains delegated to NodeHealthService, so this endpoint
+        inherits its bounded timeout, durable backoff and per-node probe lock.
+        """
+        if node_id is not None:
+            node = self.registry.get(node_id)
+            if node is None:
+                return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+            client = self._clients.get(node_id)
+            evaluated = (self.node_health.evaluate(node, client, force_probe=force_probe)
+                         if client is not None else self.node_health._cached(node))
+            return {"node": self.connection_manager.node_view(evaluated)}
+        nodes = []
+        for node in self.registry.list():
+            client = self._clients.get(node.id)
+            nodes.append(self.node_health.evaluate(node, client, force_probe=force_probe)
+                         if client is not None else self.node_health._cached(node))
+        return self.connection_manager.fleet_view(nodes)
 
     def reconcile_remote_node_health(self) -> list[Node]:
         """Periodic remote-only probe pass.

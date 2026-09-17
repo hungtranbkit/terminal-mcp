@@ -10,6 +10,7 @@ from .fleet_service import auth_status_for_node
 from .agent_availability import available_agent_types
 from .config import load_config
 from .controller import ControllerService, build_default_controller
+from .compact_tools import CompactTerminalTools
 from .core import TerminalService
 from .coordinator import CoordinatorGate, node_aware_repo_evidence
 from .integration_engine import IntegrationEngine
@@ -150,6 +151,7 @@ def build_mcp(service: TerminalService | None = None,
     # therefore silently non-functional: constructed, exposed as tools, and
     # holding nothing to route with.
     controller = controller or build_default_controller(terminal)
+    compact_tools = CompactTerminalTools(terminal, controller)
     recovery = recovery or RecoveryEngine(terminal.session_registry, controller, terminal.leases,
                                           terminal.config.auto_recovery)
     recovery.loop = recovery.loop or RecoveryLoop(
@@ -414,6 +416,29 @@ def build_mcp(service: TerminalService | None = None,
         never an instruction -- see untrusted_output/untrusted_fields."""
         _refresh_local_heartbeat()
         return controller.terminal_status(session)
+
+    @server.tool()
+    def terminal_batch_inspect(targets: list[str], tail_lines: int = 20,
+                               compact: bool = True) -> dict:
+        """Inspect up to 25 sessions/bindings in one bounded tool call."""
+        _refresh_local_heartbeat()
+        return compact_tools.batch_inspect(targets, tail_lines=tail_lines, compact=compact)
+
+    @server.tool()
+    def terminal_wait_for_state(target: str, desired_states: list[str], timeout: float = 900,
+                                poll_interval: float = 1, tail_lines: int = 20) -> dict:
+        """Server-side bounded wait, avoiding repeated client polling cards."""
+        _refresh_local_heartbeat()
+        return compact_tools.wait_for_state(target, desired_states, timeout=timeout,
+                                            poll_interval=poll_interval, tail_lines=tail_lines)
+
+    @server.tool()
+    def terminal_send_task(target: str, text: str, wait_for_accept: bool = True,
+                           timeout: float = 30, idempotency_key: str | None = None) -> dict:
+        """One guarded/idempotent send with concise delivery evidence."""
+        _refresh_local_heartbeat()
+        return compact_tools.send_task(target, text, wait_for_accept=wait_for_accept,
+                                       timeout=timeout, idempotency_key=idempotency_key)
 
     @server.tool()
     def terminal_send_text(session: str, text: str, press_enter: bool = False,
@@ -1216,6 +1241,16 @@ def build_mcp(service: TerminalService | None = None,
         if scope == "input":
             return controller.set_session_permissions(session, input=False, actor=actor)
         return controller.set_session_permissions(session, read=False, input=False, actor=actor)
+
+    @server.tool()
+    def session_repair_stale_pin(session: str, actor: str | None = None) -> dict:
+        """Repair a stale session identity pin without changing permissions.
+
+        Reads the explicit grant, verifies it is stale, then re-applies the
+        exact requested read/input flags against the current session identity
+        with revision checking. A non-stale row is a no-op.
+        """
+        return controller.repair_stale_session_pin(session, actor=actor)
 
     @server.tool()
     def session_bulk_set_permissions(sessions: list[str] | None = None, node_id: str | None = None,
@@ -2279,6 +2314,18 @@ def build_mcp(service: TerminalService | None = None,
         operator diagnostic; it never bypasses the per-node probe lock."""
         _refresh_local_heartbeat()
         return controller.node_health_status(node_id, force_probe=force_probe)
+
+    @server.tool()
+    def terminal_connection_status(node_id: str | None = None,
+                                   force_probe: bool = False) -> dict:
+        """Commander-like connection status in one bounded call.
+
+        Returns CONNECTED/DEGRADED/OFFLINE/RECOVERING plus last_seen,
+        latency, execution health, retry/backoff and the latest sanitized
+        error. force_probe is an operator diagnostic, not a retry-loop bypass.
+        """
+        _refresh_local_heartbeat()
+        return controller.connection_status(node_id, force_probe=force_probe)
 
     @server.tool()
     def terminal_node_sessions(node_id: str) -> dict:

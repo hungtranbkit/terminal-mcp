@@ -38,6 +38,37 @@ NODE_HEALTH_STATES = (
     HEALTH_UNKNOWN,
 )
 
+# Operator-facing connection state. This is intentionally smaller than the
+# health-state vocabulary above: it answers the same question Desktop
+# Commander exposes at a glance without hiding the richer diagnostic fields.
+CONNECTION_CONNECTED = "CONNECTED"
+CONNECTION_DEGRADED = "DEGRADED"
+CONNECTION_OFFLINE = "OFFLINE"
+CONNECTION_RECOVERING = "RECOVERING"
+CONNECTION_STATES = (
+    CONNECTION_CONNECTED, CONNECTION_DEGRADED, CONNECTION_OFFLINE,
+    CONNECTION_RECOVERING,
+)
+_RECOVERING_RECONNECT_STATES = {
+    "BACKOFF", "SELF_HEAL_REQUESTED", "SELF_HEAL_AWAITING_REPLACEMENT",
+    "SUPPRESSED_CONCURRENT_PROBE",
+}
+
+
+def connection_state_for_node(node: "Node") -> str:
+    """Collapse transport/execution/retry detail into one stable UI state."""
+    if node.transport_status != NODE_ONLINE or node.health_state == HEALTH_OFFLINE:
+        return CONNECTION_OFFLINE
+    if node.health_state == HEALTH_EXECUTION_OK:
+        return CONNECTION_CONNECTED
+    if node.reconnect_status in _RECOVERING_RECONNECT_STATES:
+        return CONNECTION_RECOVERING
+    return CONNECTION_DEGRADED
+
+
+def connection_transport_for_node(node: "Node") -> str:
+    return "local" if node.endpoint == "local" else "node_agent_http"
+
 # A node whose operator has set draining=True is excluded from the
 # scheduler regardless of its online/offline status -- draining is
 # reported as a separate boolean (task's own field list), not folded into
@@ -250,4 +281,11 @@ def node_to_dict(node: Node) -> dict[str, Any]:
         "reconnect_status": node.reconnect_status,
         "agent_generation": node.agent_generation,
         "last_self_heal_at": node.last_self_heal_at,
+        # Commander-like compact connection projection, derived from the same
+        # health evidence above rather than a second liveness implementation.
+        "connection_state": connection_state_for_node(node),
+        "connection_transport": connection_transport_for_node(node),
+        "last_seen_at": node.last_heartbeat_at,
+        "ping_latency_ms": node.latency_ms,
+        "retry_at": node.next_retry_at,
     }

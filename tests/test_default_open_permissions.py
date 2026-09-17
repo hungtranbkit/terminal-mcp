@@ -302,3 +302,36 @@ def test_a_closed_default_keeps_the_old_fail_closed_answer(tmp_path, tmux_sessio
     allowed, reason = service._input_authorized(name)
     assert allowed is False
     assert reason == "IDENTITY_MISMATCH"
+
+
+def test_controller_can_repair_stale_pin_without_changing_requested_permissions(
+    tmp_path, tmux_session_factory,
+):
+    from terminal_mcp.controller import ControllerService
+    from terminal_mcp.node_client import LocalNodeClient
+    from terminal_mcp.node_registry import NodeRegistry
+
+    service = _service(tmp_path)
+    name = _live(tmux_session_factory, "stalepin-repair")
+    _grant_pinned_to_a_dead_identity(service, name)
+    controller = ControllerService(
+        NodeRegistry(tmp_path / "nodes.db"), local_client=LocalNodeClient(service),
+        local_workspace_root=str(tmp_path),
+    )
+    controller.refresh_local_heartbeat(
+        tmux_session_count=1, agent_counts={}, agent_types=("shell",), agent_version=None,
+    )
+
+    before = controller.describe_session_permissions(name)
+    assert before["stale_identity_pin"] is True
+    assert before["requested"] == {"read": True, "input": True}
+
+    result = controller.repair_stale_session_pin(name, actor="test")
+    assert result["repaired"] is True
+    after = result["permissions"]
+    assert after["stale_identity_pin"] is False
+    assert after["requested"] == {"read": True, "input": True}
+
+    again = controller.repair_stale_session_pin(name, actor="test")
+    assert again["repaired"] is False
+    assert again["reason"] == "NOT_STALE"

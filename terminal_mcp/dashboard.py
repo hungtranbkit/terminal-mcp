@@ -6449,7 +6449,8 @@ NODES_ADMIN_HTML = """<!doctype html>
             <div><span class="status-dot ${node.status}"></span><span title="${node.platform || 'linux'}">${osIcon(node)}</span> <span class="nc-name">${node.display_name}</span>
               <div class="nc-host">${node.id} · ${node.hostname}</div>
               <div class="nc-host">${capabilityLine(node)}</div>
-              <div class="nc-host">health: ${node.health_state || 'UNKNOWN'}${node.consecutive_failures ? ` · failures ${node.consecutive_failures}` : ''}</div></div>
+              <div class="nc-host">connection: <b>${node.connection_state || 'DEGRADED'}</b> · ${node.connection_transport || '—'}${node.ping_latency_ms != null ? ` · ${Math.round(node.ping_latency_ms)}ms` : ''}</div>
+              <div class="nc-host">health: ${node.health_state || 'UNKNOWN'}${node.reconnect_status && node.reconnect_status !== 'IDLE' ? ` · ${node.reconnect_status}` : ''}${node.consecutive_failures ? ` · failures ${node.consecutive_failures}` : ''}</div></div>
             <div style="display:flex;gap:6px;align-items:center"><span class="badge ${capBadge}">${capBadge}</span>${draining}</div>
           </div>
           <div class="nc-metrics">
