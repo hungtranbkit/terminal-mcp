@@ -1613,9 +1613,37 @@ def build_mcp(service: TerminalService | None = None,
             return {"error": "TASKS_JSON_INVALID", "detail": str(exc)}
         if not isinstance(tasks, list):
             return {"error": "TASKS_JSON_INVALID", "detail": "expected a JSON array"}
-        return service.create(title=title, goal=goal, lane=lane,
-                              project_id=project_id or None, done_criteria=criteria,
-                              created_by=created_by or None, tasks=tasks)
+        result = service.create(title=title, goal=goal, lane=lane,
+                                project_id=project_id or None, done_criteria=criteria,
+                                created_by=created_by or None, tasks=tasks)
+        if result.get("error"):
+            return result
+        work_id = (result.get("work") or {}).get("work_id")
+        if not work_id:
+            return result
+        binding_name = f"work-{work_id}"
+        try:
+            binding_result = terminal.terminal_bind(binding_name, lane, False, True, False)
+            if isinstance(binding_result, dict) and binding_result.get("error"):
+                result["binding_error"] = binding_result.get("error")
+            else:
+                result["binding"] = binding_result
+        except Exception as exc:  # noqa: BLE001 -- binding is recovery metadata, not work durability
+            result["binding_error"] = str(exc)[:200]
+        journal = _journal_service()
+        if journal is not None:
+            try:
+                state = str((result.get("work") or {}).get("state") or "running")
+                next_action = "inspect work_status/work_attach"
+                journal.start_run(project_id or "", lane, binding_name, run_id=work_id,
+                                  root_task_id=work_id, state=state, next_action=next_action,
+                                  metadata={"source": "work_create"})
+                journal.record(work_id, f"work_create:{work_id}", tool_name="work_create",
+                               state=state, next_action=next_action, result_summary="work created")
+                result["journal_run_id"] = work_id
+            except Exception as exc:  # noqa: BLE001 -- journal must never undo work creation
+                result["journal_error"] = str(exc)[:200]
+        return result
 
     @server.tool()
     def work_status(work_id: str) -> dict:
@@ -1815,9 +1843,27 @@ def build_mcp(service: TerminalService | None = None,
         service = _work_service()
         if service is None:
             return {"error": "WORK_RUNTIME_UNAVAILABLE"}
-        return service.plan(work_id, [{"title": title or prompt[:60], "prompt": prompt,
-                                       "weight": weight, "required": required,
-                                       "priority": priority}])
+        response = service.plan(work_id, [{"title": title or prompt[:60], "prompt": prompt,
+                                           "weight": weight, "required": required,
+                                           "priority": priority}])
+        if response.get("error"):
+            return response
+        journal = _journal_service()
+        if journal is not None:
+            try:
+                journal.get_run(work_id)
+                tasks = response.get("tasks") or []
+                identifiers = [str(t.get("queue_task_id") or t.get("work_task_id") or t.get("title") or "task")
+                               for t in tasks]
+                event_key = "work_continue:" + work_id + ":" + ",".join(identifiers)
+                journal.record(work_id, event_key, tool_name="work_continue", state="queued",
+                               next_action="wait for queued task",
+                               result_summary=f"{len(tasks)} task(s) queued")
+            except KeyError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                response["journal_error"] = str(exc)[:200]
+        return response
 
     @server.tool()
     def work_approve(approval_id: str, decided_by: str, decision: str = "APPROVED",
@@ -1859,7 +1905,24 @@ def build_mcp(service: TerminalService | None = None,
         service = _work_service()
         if service is None:
             return {"error": "WORK_RUNTIME_UNAVAILABLE"}
-        return service.control(work_id, action, actor=actor or None, reason=reason or None)
+        response = service.control(work_id, action, actor=actor or None, reason=reason or None)
+        if response.get("error"):
+            return response
+        journal = _journal_service()
+        if journal is not None:
+            try:
+                journal.get_run(work_id)
+                state = str((response.get("work") or {}).get("state") or action)
+                journal.record(work_id, f"work_control:{work_id}:{action}:{state}",
+                               tool_name="work_control", state=state,
+                               next_action=reason or action, result_summary=f"work control {action}")
+                if state in {"COMPLETE", "CANCELLED"}:
+                    journal.update_run(work_id, state=state, completed=True)
+            except KeyError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                response["journal_error"] = str(exc)[:200]
+        return response
 
     # -- project knowledge, runbooks, policy and telemetry -------------------
     #
