@@ -7,10 +7,15 @@ from terminal_mcp.server import mcp
 async def test_server_registers_v1_and_binding_tools():
     tools = await mcp.list_tools()
     names = {tool.name for tool in tools}
+    by_name = {tool.name: tool for tool in tools}
     wait_tool = next(tool for tool in tools if tool.name == "terminal_wait_for_state")
     resume_tool = next(tool for tool in tools if tool.name == "terminal_resume_wait")
     assert wait_tool.input_schema["properties"]["timeout"]["default"] == 20
     assert resume_tool.input_schema["properties"]["timeout"]["default"] == 20
+    assert by_name["terminal_send_task"].input_schema["properties"]["timeout"]["default"] == 20
+    assert "one compact tool per logical terminal operation" in mcp.instructions
+    assert "PREFERRED inspection" in (by_name["terminal_batch_inspect"].description or "")
+    assert "PREFERRED send" in (by_name["terminal_send_task"].description or "")
     assert names == {
         "terminal_list_sessions",
         "terminal_tail",

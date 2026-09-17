@@ -321,7 +321,13 @@ def build_mcp(service: TerminalService | None = None,
     server = MCPServer(
         name="terminal-mcp",
         description="Whitelist-only tmux observation and controlled input",
-        instructions="Only access explicitly allowed tmux sessions. Input is disabled by default.",
+        instructions=(
+            "Use one compact tool per logical terminal operation: terminal_batch_inspect for status plus tail, "
+            "terminal_send_task for a guarded send, and terminal_wait_for_state for bounded waiting. Only call "
+            "terminal_resume_wait when a wait returns PENDING. Keep terminal_status, terminal_tail, and "
+            "terminal_send_text for exceptional low-level/manual work. Only access explicitly allowed sessions; "
+            "all existing authorization and input-safety gates still apply."
+        ),
         version=__version__,
     )
 
@@ -433,14 +439,14 @@ def build_mcp(service: TerminalService | None = None,
     @server.tool()
     def terminal_batch_inspect(targets: list[str], tail_lines: int = 20,
                                compact: bool = True) -> dict:
-        """Inspect up to 25 sessions/bindings in one bounded tool call."""
+        """PREFERRED inspection: status plus bounded tail for up to 25 targets in one call."""
         _refresh_local_heartbeat()
         return compact_tools.batch_inspect(targets, tail_lines=tail_lines, compact=compact)
 
     @server.tool()
     def terminal_wait_for_state(target: str, desired_states: list[str], timeout: float = 20,
                                 poll_interval: float = 1, tail_lines: int = 20) -> dict:
-        """Wait at most 20s, then return durable PENDING continuation state."""
+        """PREFERRED wait: poll server-side for at most 20s; PENDING is durably resumable."""
         _refresh_local_heartbeat()
         return compact_tools.wait_for_state(target, desired_states, timeout=timeout,
                                             poll_interval=poll_interval, tail_lines=tail_lines)
@@ -448,15 +454,15 @@ def build_mcp(service: TerminalService | None = None,
     @server.tool()
     def terminal_resume_wait(resume_token: str, timeout: float = 20,
                              poll_interval: float = 1) -> dict:
-        """Idempotently poll a durable wait without redispatching work."""
+        """Resume only a PENDING compact wait, idempotently, for at most another 20s."""
         _refresh_local_heartbeat()
         return compact_tools.resume_wait(resume_token, timeout=timeout,
                                          poll_interval=poll_interval)
 
     @server.tool()
     def terminal_send_task(target: str, text: str, wait_for_accept: bool = True,
-                           timeout: float = 30, idempotency_key: str | None = None) -> dict:
-        """One guarded/idempotent send with concise delivery evidence."""
+                           timeout: float = 20, idempotency_key: str | None = None) -> dict:
+        """PREFERRED send: one guarded/idempotent call with concise delivery evidence."""
         _refresh_local_heartbeat()
         return compact_tools.send_task(target, text, wait_for_accept=wait_for_accept,
                                        timeout=timeout, idempotency_key=idempotency_key)

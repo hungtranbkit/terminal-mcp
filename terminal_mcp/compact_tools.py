@@ -18,7 +18,7 @@ MAX_TOTAL_TAIL_CHARS = 16_000
 MAX_REASON_CHARS = 500
 SYNC_WAIT_BUDGET_SECONDS = 20
 DEFAULT_WAIT_SECONDS = 20
-MAX_SEND_WAIT_SECONDS = 30
+MAX_SEND_WAIT_SECONDS = 20
 NEXT_POLL_MIN_MS = 1_000
 _RESUME_TOKEN = re.compile(r"^wait_[0-9a-f]{32}$")
 _MAX_TARGET_CHARS = 512
@@ -53,8 +53,9 @@ class CompactTerminalTools:
         self.sleep = sleep
 
     def _resolve(self, target: str) -> tuple[str, str] | tuple[None, dict[str, Any]]:
-        if not isinstance(target, str) or not target.strip():
-            return None, {"error": "INVALID_TARGET", "target": target}
+        if (not isinstance(target, str) or not target.strip()
+                or len(target) > _MAX_TARGET_CHARS):
+            return None, {"error": "INVALID_TARGET"}
         target = target.strip()
         if target.startswith("binding:"):
             name = target.removeprefix("binding:")
@@ -99,7 +100,9 @@ class CompactTerminalTools:
 
     def batch_inspect(self, targets: list[str], tail_lines: int = 20,
                       compact: bool = True) -> dict[str, Any]:
-        if not isinstance(targets, list) or not targets or len(targets) > MAX_TARGETS:
+        if (not isinstance(targets, list) or not targets or len(targets) > MAX_TARGETS
+                or any(not isinstance(target, str) or not target.strip()
+                       or len(target) > _MAX_TARGET_CHARS for target in targets)):
             return {"error": "INVALID_TARGETS", "max_targets": MAX_TARGETS}
         if error := self._validate_tail_lines(tail_lines):
             return error
@@ -148,9 +151,9 @@ class CompactTerminalTools:
         }
 
     def send_task(self, target: str, text: str, wait_for_accept: bool = True,
-                  timeout: float = 30, idempotency_key: str | None = None) -> dict[str, Any]:
+                  timeout: float = 20, idempotency_key: str | None = None) -> dict[str, Any]:
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= MAX_SEND_WAIT_SECONDS:
-            return {"status": "FAILED", "error": "INVALID_TIMEOUT", "allowed": "0 < timeout <= 30"}
+            return {"status": "FAILED", "error": "INVALID_TIMEOUT", "allowed": "0 < timeout <= 20"}
         kind, value = self._resolve(target)
         if kind is None:
             return {"status": "FAILED", **value}
