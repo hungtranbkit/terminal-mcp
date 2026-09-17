@@ -1,0 +1,14 @@
+[Service]
+# Conservative production admission budgets.  Keep Codex at one until the
+# external provider/account accepts concurrent requests reliably.
+Environment=LLM_GLOBAL_MAX_CONCURRENCY=4
+Environment=LLM_OPENROUTER_MAX_CONCURRENCY=2
+Environment=LLM_CODEX_MAX_CONCURRENCY=1
+Environment=LLM_CLAUDE_MAX_CONCURRENCY=1
+Environment=LLM_QUEUE_WAIT_TIMEOUT_SEC=900
+Environment=LLM_RETRY_MAX_ATTEMPTS=4
+Environment=LLM_RETRY_BASE_DELAY_SEC=2
+Environment=LLM_RETRY_MAX_DELAY_SEC=32
+Environment=LLM_RETRY_JITTER=true
+Environment=LLM_429_COOLDOWN_SEC=30
+Environment=MCP_LONG_CALL_MAX_SEC=20
