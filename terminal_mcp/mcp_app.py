@@ -1623,7 +1623,8 @@ def build_mcp(service: TerminalService | None = None,
             return result
         binding_name = f"work-{work_id}"
         try:
-            binding_result = terminal.terminal_bind(binding_name, lane, False, True, False)
+            binding_result = terminal.terminal_bind(
+                binding_name, lane, replace=False, read_enabled=True, input_enabled=False)
             if isinstance(binding_result, dict) and binding_result.get("error"):
                 result["binding_error"] = binding_result.get("error")
             else:
@@ -1853,8 +1854,9 @@ def build_mcp(service: TerminalService | None = None,
             try:
                 journal.get_run(work_id)
                 tasks = response.get("tasks") or []
-                identifiers = [str(t.get("queue_task_id") or t.get("work_task_id") or t.get("title") or "task")
-                               for t in tasks]
+                identifiers = [str(t.get("work_task_id") or t.get("queue_task_id"))
+                               for t in tasks
+                               if t.get("work_task_id") or t.get("queue_task_id")]
                 event_key = "work_continue:" + work_id + ":" + ",".join(identifiers)
                 journal.record(work_id, event_key, tool_name="work_continue", state="queued",
                                next_action="wait for queued task",
@@ -1913,9 +1915,11 @@ def build_mcp(service: TerminalService | None = None,
             try:
                 journal.get_run(work_id)
                 state = str((response.get("work") or {}).get("state") or action)
-                journal.record(work_id, f"work_control:{work_id}:{action}:{state}",
+                updated_at = str((response.get("work") or {}).get("updated_at") or state)
+                journal.record(work_id, f"work_control:{work_id}:{action}:{updated_at}",
                                tool_name="work_control", state=state,
-                               next_action=reason or action, result_summary=f"work control {action}")
+                               next_action="inspect work_status/work_attach",
+                               result_summary=f"work control {action}")
                 if state in {"COMPLETE", "CANCELLED"}:
                     journal.update_run(work_id, state=state, completed=True)
             except KeyError:

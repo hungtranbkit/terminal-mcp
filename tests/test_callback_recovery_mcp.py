@@ -25,6 +25,7 @@ def _wired(tmp_path, journal=None):
     journal = journal if journal is not None else RunJournalStore(tmp_path / "journal.db")
     terminal = TerminalService(_config())
     bindings = {}
+
     def _bind(name, session, replace=False, read_enabled=True, input_enabled=False):
         bindings[name] = {"binding": name, "session": session, "read_enabled": read_enabled,
                           "input_enabled": input_enabled}
@@ -49,6 +50,8 @@ def test_checkpoint_resume_and_recovery_surface(tmp_path):
     replay = _tool(server, "work_checkpoint")(
         work_id=work_id, idempotency_key="cp-1", state="RUNNING", summary="ignored")
     assert cp["checkpoint_id"] == replay["checkpoint_id"]
+    assert [entry["tool_name"] for entry in journal.entries(work_id)].count(
+        "work_checkpoint") == 1
 
     recovered = _tool(server, "work_recover")(project_id="p")
     assert any(row["work_id"] == work_id for row in recovered["works"])
@@ -95,13 +98,29 @@ def test_work_create_binding_and_journal_hooks(tmp_path):
     bindings = _tool(server, "terminal_list_bindings")()
     assert any(row["binding"] == f"work-{work_id}" for row in bindings)
     run = journal.get_run(work_id)
+    assert run["run_id"] == work_id
     assert run["root_task_id"] == work_id
     assert run["binding"] == f"work-{work_id}"
 
-    continued = _tool(server, "work_continue")(work_id=work_id, prompt="SECRET PROMPT", title="safe-title")
+    secret = "SECRET PROMPT AND CONTROL REASON"
+    continued = _tool(server, "work_continue")(work_id=work_id, prompt=secret)
     assert not continued.get("error")
-    controlled = _tool(server, "work_control")(work_id=work_id, action="pause", reason="operator")
+    controlled = _tool(server, "work_control")(work_id=work_id, action="pause", reason=secret)
     assert not controlled.get("error")
     text = str(journal.entries(work_id))
-    assert "SECRET PROMPT" not in text
+    assert secret not in text
     assert "work_continue" in text and "work_control" in text
+
+
+def test_work_create_journal_failure_is_non_fatal(tmp_path):
+    class BrokenJournal:
+        def start_run(self, *_args, **_kwargs):
+            raise RuntimeError("journal offline")
+
+    server, work, _journal = _wired(tmp_path, journal=BrokenJournal())
+    created = _tool(server, "work_create")(title="T", goal="G", lane="test-work")
+
+    work_id = created["work"]["work_id"]
+    assert work.store.get_run(work_id) is not None
+    assert created["binding"]["binding"] == f"work-{work_id}"
+    assert "journal offline" in created["journal_error"]
