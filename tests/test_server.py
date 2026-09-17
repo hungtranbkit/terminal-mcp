@@ -91,6 +91,12 @@ async def test_server_registers_v1_and_binding_tools():
         # control. Everything else is the existing queue/task surface.
         "work_create",
         "work_status",
+        "terminal_resume_recent",
+        "work_recover",
+        "work_attach",
+        "work_events_since",
+        "work_checkpoint",
+        "work_result",
         "work_list",
         "work_continue",
         "work_request_approval",

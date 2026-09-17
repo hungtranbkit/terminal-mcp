@@ -96,6 +96,7 @@ def build_mcp(service: TerminalService | None = None,
               resource_locks: ResourceLockStore | None = None,
               fleet: "FleetService | None" = None,
               work: Any = None,
+              run_journal: Any = None,
               default_optional_services: bool = True) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
@@ -1533,6 +1534,11 @@ def build_mcp(service: TerminalService | None = None,
         return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     _work_holder: dict[str, Any] = {"service": work, "tried": work is not None}
+    _journal_holder: dict[str, Any] = {
+        "service": run_journal,
+        "tried": run_journal is not None,
+    }
+    _work_recovery_holder: dict[str, Any] = {"service": None, "tried": False}
 
     def _work_service():
         """Built on first use, over the SAME queue every other surface uses."""
@@ -1547,6 +1553,34 @@ def build_mcp(service: TerminalService | None = None,
             except Exception:  # noqa: BLE001 -- never break the tool surface
                 _work_holder["service"] = None
         return _work_holder.get("service")
+
+    def _journal_service():
+        if (_journal_holder.get("service") is None
+                and not _journal_holder.get("tried")):
+            _journal_holder["tried"] = True
+            try:
+                from .run_journal import RunJournalStore
+
+                _journal_holder["service"] = RunJournalStore()
+            except Exception:  # noqa: BLE001 -- optional persistence surface
+                _journal_holder["service"] = None
+        return _journal_holder.get("service")
+
+    def _work_recovery():
+        service = _work_service()
+        if service is None:
+            return None
+        if (_work_recovery_holder.get("service") is None
+                and not _work_recovery_holder.get("tried")):
+            _work_recovery_holder["tried"] = True
+            try:
+                from .work_recovery import WorkRecoveryService
+
+                _work_recovery_holder["service"] = WorkRecoveryService(
+                    service.store, queue=queue)
+            except Exception:  # noqa: BLE001 -- never break the tool surface
+                _work_recovery_holder["service"] = None
+        return _work_recovery_holder.get("service")
 
     @server.tool()
     def work_create(title: str, goal: str, lane: str, project_id: str = "",
@@ -1597,6 +1631,166 @@ def build_mcp(service: TerminalService | None = None,
         if service is None:
             return {"error": "WORK_RUNTIME_UNAVAILABLE"}
         return service.status(work_id)
+
+    @server.tool()
+    def terminal_resume_recent(project_id: str = "", limit: int = 10) -> list[dict]:
+        """Return recent journaled runs, enriched with Work snapshots when possible."""
+        journal = _journal_service()
+        if journal is None:
+            return []
+        rows = journal.resume_recent(project_id or None, limit)
+        recovery = _work_recovery()
+        result: list[dict] = []
+        for row in rows:
+            item = dict(row)
+            root_task_id = item.get("root_task_id")
+            if root_task_id:
+                if recovery is None:
+                    item["work_snapshot_error"] = "WORK_RUNTIME_UNAVAILABLE"
+                else:
+                    try:
+                        item["work_snapshot"] = recovery.snapshot(root_task_id)
+                    except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
+                        item["work_snapshot_error"] = str(exc)
+            result.append(item)
+        return result
+
+    @server.tool()
+    def work_recover(project_id: str = "", limit: int = 20) -> dict:
+        """Recover active Work runs from durable state."""
+        recovery = _work_recovery()
+        if recovery is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return recovery.recover_active(project_id or None, limit)
+
+    @server.tool()
+    def work_attach(work_id: str, after_event_id: int = 0) -> dict:
+        """Attach to a Work run and return its current recovery view."""
+        recovery = _work_recovery()
+        if recovery is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return recovery.attach(work_id, after_event_id=after_event_id)
+
+    @server.tool()
+    def work_events_since(work_id: str, after_event_id: int = 0,
+                          limit: int = 50) -> dict:
+        """Return durable Work events after an event id."""
+        recovery = _work_recovery()
+        if recovery is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return recovery.events_since(work_id, after_event_id=after_event_id, limit=limit)
+
+    def _checkpoint_payload(completed_json: str, remaining_json: str,
+                            blockers_json: str, changed_files_json: str,
+                            evidence_json: str) -> dict:
+        import json as _json
+
+        values: dict[str, Any] = {}
+        for name, raw in (("completed", completed_json),
+                          ("remaining", remaining_json),
+                          ("blockers", blockers_json),
+                          ("changed_files", changed_files_json)):
+            value = _json.loads(raw) if raw.strip() else []
+            if not isinstance(value, list):
+                raise TypeError(f"{name} must be a JSON array")
+            values[name] = value
+        evidence = _json.loads(evidence_json) if evidence_json.strip() else {}
+        if not isinstance(evidence, dict):
+            raise TypeError("evidence must be a JSON object")
+        values["evidence"] = evidence
+        return values
+
+    def _record_work_artifact(kind: str, work_id: str, idempotency_key: str,
+                              state: str, summary: str, work_task_id: str,
+                              next_hint: str, commit_sha: str, actor: str,
+                              completed_json: str, remaining_json: str,
+                              blockers_json: str, changed_files_json: str,
+                              evidence_json: str) -> dict:
+        try:
+            parsed = _checkpoint_payload(
+                completed_json, remaining_json, blockers_json,
+                changed_files_json, evidence_json)
+        except (ValueError, TypeError) as exc:
+            return {"error": "CHECKPOINT_JSON_INVALID", "detail": str(exc)}
+
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        method = (service.store.record_checkpoint if kind == "checkpoint"
+                  else service.store.record_result_manifest)
+        try:
+            response = method(
+                work_id=work_id,
+                idempotency_key=idempotency_key,
+                state=state,
+                summary=summary,
+                work_task_id=work_task_id or None,
+                next_hint=next_hint or None,
+                commit_sha=commit_sha or None,
+                actor=actor or None,
+                completed=parsed["completed"],
+                remaining=parsed["remaining"],
+                blockers=parsed["blockers"],
+                changed_files=parsed["changed_files"],
+                evidence=parsed["evidence"],
+            )
+        except Exception as exc:  # noqa: BLE001 -- refusal is a tool result
+            return {"error": "CHECKPOINT_REFUSED", "detail": str(exc)}
+
+        result = dict(response)
+        journal = _journal_service()
+        if journal is not None:
+            try:
+                journal.get_run(work_id)
+            except KeyError:
+                pass
+            except Exception as exc:  # noqa: BLE001 -- journal is best-effort
+                result["journal_error"] = str(exc)
+            else:
+                try:
+                    checkpoint_ref = result.get("checkpoint_id") or result.get("id")
+                    journal.record(
+                        run_id=work_id,
+                        event_key=f"{kind}:{idempotency_key}",
+                        tool_name=f"work_{kind}",
+                        state=state,
+                        checkpoint_ref=checkpoint_ref,
+                        next_action=next_hint or None,
+                        result_summary=summary,
+                    )
+                    updates = {"next_action": next_hint or None}
+                    if kind == "result":
+                        updates["result_summary"] = summary
+                    journal.update_run(work_id, **updates)
+                except Exception as exc:  # noqa: BLE001 -- journal is best-effort
+                    result["journal_error"] = str(exc)
+        return result
+
+    @server.tool()
+    def work_checkpoint(work_id: str, idempotency_key: str, state: str,
+                        summary: str, work_task_id: str = "", next_hint: str = "",
+                        commit_sha: str = "", actor: str = "",
+                        completed_json: str = "", remaining_json: str = "",
+                        blockers_json: str = "", changed_files_json: str = "",
+                        evidence_json: str = "") -> dict:
+        """Record an idempotent durable checkpoint without raw prompt/output data."""
+        return _record_work_artifact(
+            "checkpoint", work_id, idempotency_key, state, summary, work_task_id,
+            next_hint, commit_sha, actor, completed_json, remaining_json,
+            blockers_json, changed_files_json, evidence_json)
+
+    @server.tool()
+    def work_result(work_id: str, idempotency_key: str, state: str,
+                    summary: str, work_task_id: str = "", next_hint: str = "",
+                    commit_sha: str = "", actor: str = "",
+                    completed_json: str = "", remaining_json: str = "",
+                    blockers_json: str = "", changed_files_json: str = "",
+                    evidence_json: str = "") -> dict:
+        """Record an idempotent result manifest without raw prompt/output data."""
+        return _record_work_artifact(
+            "result", work_id, idempotency_key, state, summary, work_task_id,
+            next_hint, commit_sha, actor, completed_json, remaining_json,
+            blockers_json, changed_files_json, evidence_json)
 
     @server.tool()
     def work_list(state: str = "", project_id: str = "",
