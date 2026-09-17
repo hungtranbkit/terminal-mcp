@@ -71,12 +71,16 @@ class CompactTerminalTools:
             return "binding", target
         return "session", target
 
-    def _status(self, target: str) -> dict[str, Any]:
+    def _status(self, target: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         kind, value = self._resolve(target)
         if kind is None:
             return value
-        result = (self.terminal.terminal_status_bound(value) if kind == "binding"
-                  else self.controller.terminal_status(value))
+        if kind == "binding":
+            result = self.terminal.terminal_status_bound(value)
+        elif timeout_seconds is not None and hasattr(self.controller, "terminal_status_bounded"):
+            result = self.controller.terminal_status_bounded(value, timeout_seconds)
+        else:
+            result = self.controller.terminal_status(value)
         return {"target": target, "target_type": kind, **result}
 
     def _tail(self, target: str, lines: int) -> dict[str, Any]:
@@ -263,9 +267,18 @@ class CompactTerminalTools:
         polls = 0
         final: dict[str, Any] = {}
         matched = False
+        probe_timed_out = False
         while True:
+            remaining = deadline - self.monotonic()
+            if remaining <= 0 and polls:
+                break
             polls += 1
-            final = self._status(wait["target"])
+            final = self._status(wait["target"], timeout_seconds=max(0.001, remaining))
+            if final.get("error") == "STATUS_PROBE_TIMEOUT":
+                probe_timed_out = True
+                final = {"state": wait.get("last_observed_state") or "UNKNOWN",
+                         "reason": "status probe exhausted synchronous wait budget"}
+                break
             if "error" in final:
                 break
             if str(final.get("state", "UNKNOWN")).upper() in set(wait["desired_states"]):
@@ -280,6 +293,8 @@ class CompactTerminalTools:
         state = str(final.get("state", "UNKNOWN"))
         reason = redact_text(str(final.get("reason") or final.get("error") or ""))
         status = "MATCHED" if matched else ("FAILED" if "error" in final else "PENDING")
+        if probe_timed_out and status == "PENDING" and not reason:
+            reason = "status probe exhausted synchronous wait budget"
         saved = self.run_journal.record_wait_observation(
             wait["resume_token"], status=status, last_observed_state=state,
             input_required=bool(final.get("input_required", False)), reason=reason,

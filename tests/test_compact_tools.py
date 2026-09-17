@@ -18,6 +18,7 @@ class FakeController:
         self.send_result = {}
         self.send_calls = []
         self.status_calls = 0
+        self.bounded_status_timeouts = []
 
     def terminal_status(self, session):
         self.status_calls += 1
@@ -27,6 +28,10 @@ class FakeController:
         if isinstance(values, list):
             return values.pop(0) if len(values) > 1 else values[0]
         return values
+
+    def terminal_status_bounded(self, session, timeout_seconds):
+        self.bounded_status_timeouts.append(timeout_seconds)
+        return self.terminal_status(session)
 
     def terminal_tail(self, session, lines):
         value = self.tails.get(session)
@@ -180,7 +185,7 @@ def test_wait_for_state_timeout_is_pending_and_resumable():
     controller.tails["worker"] = "still busy"
     result = compact.wait_for_state("worker", ["WAITING_INPUT"], timeout=3, poll_interval=1)
     assert result["status"] == "PENDING"
-    assert result["polls"] == 4
+    assert result["polls"] == 3
     assert result["elapsed_seconds"] == 3
     assert result["waited_ms"] == 3000
     assert result["next_poll_after_ms"] == 1000
@@ -206,6 +211,9 @@ def test_public_default_and_large_requested_timeout_use_twenty_second_slice():
     assert result["waited_ms"] == 20_000
     assert result["sync_wait_budget_ms"] == 20_000
     assert clock.now == 20
+    assert controller.bounded_status_timeouts
+    assert max(controller.bounded_status_timeouts) <= SYNC_WAIT_BUDGET_SECONDS
+    assert min(controller.bounded_status_timeouts) > 0
 
 
 def test_resume_does_not_send_and_repeated_complete_poll_is_idempotent(tmp_path):

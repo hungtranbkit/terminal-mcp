@@ -76,13 +76,17 @@ class FakeNodeClient:
         self._killed = killed or []
         self.calls: list[tuple[str, str]] = []
         self.grants: dict[str, dict[str, bool]] = {}
+        self.list_timeouts: list[float | None] = []
+        self.status_timeouts: list[float | None] = []
 
-    def list_sessions(self) -> dict[str, Any]:
+    def list_sessions(self, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        self.list_timeouts.append(timeout_seconds)
         if self.broken:
             raise NodeClientError("simulated transport failure")
         return {"sessions": [{"name": name, **row} for name, row in self._sessions.items()]}
 
-    def status(self, session: str) -> dict[str, Any]:
+    def status(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        self.status_timeouts.append(timeout_seconds)
         self.calls.append(("status", session))
         if self.broken:
             raise NodeClientError("simulated transport failure")
@@ -356,6 +360,30 @@ def test_qualified_name_to_unregistered_node_is_node_not_found(tmp_path):
     _heartbeat_local(controller)
     result = controller.terminal_status("ghost-node/whatever")
     assert result["error"] == "NODE_NOT_FOUND"
+
+
+def test_bounded_status_propagates_budget_through_resolution_and_probe(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    controller.registry.register("fake-remote", display_name="Fake", hostname="fake-host", endpoint="http://fake")
+    fake = FakeNodeClient({"ctrl-bounded": {}})
+    controller._clients["fake-remote"] = fake
+    controller.registry.heartbeat(
+        "fake-remote",
+        metrics=NodeMetrics(cpu_percent=5.0, load1=0.1, load5=0.1, load15=0.1, cpu_count=4,
+                            ram_total_bytes=8_000_000_000, ram_used_bytes=1_000_000_000, ram_percent=12.5,
+                            swap_total_bytes=0, swap_used_bytes=0, swap_percent=0.0,
+                            disk_total_bytes=100_000_000_000, disk_used_bytes=1_000_000_000,
+                            disk_free_bytes=99_000_000_000, disk_percent=1.0),
+        tmux_session_count=1, agent_counts={}, agent_types=("shell",), agent_version=None, labels=(),
+    )
+
+    result = controller.terminal_status_bounded("ctrl-bounded", timeout_seconds=7)
+
+    assert result.get("error") is None
+    assert result["node_id"] == "fake-remote"
+    assert fake.list_timeouts and all(0 < value <= 3 for value in fake.list_timeouts if value is not None)
+    assert fake.status_timeouts and all(0 < value <= 3 for value in fake.status_timeouts if value is not None)
 
 
 # -- grant-read/grant-input routing (multi-node permission bug fix) -------

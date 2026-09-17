@@ -48,8 +48,8 @@ class NodeClient(Protocol):
     TerminalService method 1:1 -- LocalNodeClient is a pure pass-through,
     RemoteNodeClient reconstructs the identical shape from JSON."""
 
-    def list_sessions(self) -> dict[str, Any]: ...
-    def status(self, session: str) -> dict[str, Any]: ...
+    def list_sessions(self, *, timeout_seconds: float | None = None) -> dict[str, Any]: ...
+    def status(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]: ...
     def tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]: ...
     def capture(self, session: str, start_line: int | None = None) -> dict[str, Any]: ...
     def send_text(self, session: str, text: str, press_enter: bool = False, dry_run: bool = False, *,
@@ -109,10 +109,10 @@ class LocalNodeClient:
     def __init__(self, terminal: Any) -> None:
         self._terminal = terminal
 
-    def list_sessions(self) -> dict[str, Any]:
+    def list_sessions(self, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         return self._terminal.terminal_list_sessions()
 
-    def status(self, session: str) -> dict[str, Any]:
+    def status(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         return self._terminal.terminal_status(session)
 
     def tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]:
@@ -419,11 +419,12 @@ class RemoteNodeClient:
         except (ValueError, TimeoutError) as exc:
             raise NodeClientError(f"{method} {path} -> {type(exc).__name__}: {exc}") from exc
 
-    def list_sessions(self) -> dict[str, Any]:
-        return self._request("GET", "/v1/sessions")
+    def list_sessions(self, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        return self._request("GET", "/v1/sessions", timeout_seconds=timeout_seconds)
 
-    def status(self, session: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/sessions/{urllib.parse.quote(session)}/status")
+    def status(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        return self._request("GET", f"/v1/sessions/{urllib.parse.quote(session)}/status",
+                             timeout_seconds=timeout_seconds)
 
     def tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]:
         return self._request("GET", f"/v1/sessions/{urllib.parse.quote(session)}/tail",

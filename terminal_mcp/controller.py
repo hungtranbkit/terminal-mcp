@@ -38,6 +38,8 @@ if TYPE_CHECKING:
     from .core import TerminalService
 
 LOCAL_NODE_ID = "local"
+MAX_BOUNDED_NODE_PROBE_SECONDS = 3.0
+MIN_BOUNDED_NODE_PROBE_SECONDS = 0.05
 
 
 @dataclass
@@ -341,7 +343,8 @@ class ControllerService:
     def invalidate_session_location(self, session: str) -> None:
         self._session_location_cache.pop(session, None)
 
-    def resolve_session(self, session: str, *, now: float | None = None) -> dict[str, Any]:
+    def resolve_session(self, session: str, *, now: float | None = None,
+                        timeout_seconds: float | None = None) -> dict[str, Any]:
         """Returns {"node_id": ..., "client": ...} or {"error": ...}.
         `node/session` qualified names are checked first (never ambiguous
         by construction); a bare name is resolved via the location cache,
@@ -350,6 +353,11 @@ class ControllerService:
         reported as AMBIGUOUS_SESSION -- never routed by guessing (task
         item 3's own explicit requirement)."""
         now = time.monotonic() if now is None else now
+        deadline = None
+        if timeout_seconds is not None:
+            if timeout_seconds <= 0:
+                return {"error": "RESOLUTION_TIMEOUT", "session": session}
+            deadline = time.monotonic() + float(timeout_seconds)
         if "/" in session:
             node_id, _, bare = session.partition("/")
             node = self.node_status(node_id)
@@ -373,7 +381,14 @@ class ControllerService:
             if client is None:
                 continue
             try:
-                listing = client.list_sessions()
+                if deadline is None:
+                    listing = client.list_sessions()
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= MIN_BOUNDED_NODE_PROBE_SECONDS:
+                        return {"error": "RESOLUTION_TIMEOUT", "session": session}
+                    listing = client.list_sessions(timeout_seconds=min(
+                        MAX_BOUNDED_NODE_PROBE_SECONDS, remaining))
             except NodeClientError:
                 continue
             names = {row["name"] for row in listing.get("sessions", [])}
@@ -390,7 +405,8 @@ class ControllerService:
             # never chains more than one hop).
             redirect = self._rename_aliases.get(session)
             if redirect is not None and redirect != session:
-                resolved = self.resolve_session(redirect, now=now)
+                remaining_timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+                resolved = self.resolve_session(redirect, now=now, timeout_seconds=remaining_timeout)
                 if "error" not in resolved:
                     resolved = dict(resolved)
                     resolved["redirected_from"] = session
@@ -440,6 +456,47 @@ class ControllerService:
     def terminal_status(self, session: str) -> dict[str, Any]:
         return _reredact(self._route(session, "status",
                                      lambda client, name: client.status(name)))
+
+    def terminal_status_bounded(self, session: str, timeout_seconds: float) -> dict[str, Any]:
+        """Status read whose resolution + node I/O share one caller-owned time budget.
+
+        wait/resume tools use this path so a bare-name fleet scan or one slow node
+        cannot extend a synchronous MCP request beyond its advertised slice.
+        """
+        started = time.monotonic()
+        if timeout_seconds <= MIN_BOUNDED_NODE_PROBE_SECONDS:
+            return {"error": "STATUS_PROBE_TIMEOUT", "session": session}
+        resolution = self.resolve_session(session, timeout_seconds=timeout_seconds)
+        if "error" in resolution:
+            if resolution.get("error") == "RESOLUTION_TIMEOUT":
+                return {"error": "STATUS_PROBE_TIMEOUT", "session": session,
+                        "detail": "session resolution exceeded wait slice"}
+            return resolution
+        node_id, bare = resolution["node_id"], resolution["session"]
+        client = self._clients.get(node_id)
+        if client is None:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id,
+                    "detail": "no client configured for this node"}
+        node = self.node_status(node_id)
+        if node is None or node.status != NODE_ONLINE:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id,
+                    "health_state": node.health_state if node else "UNKNOWN",
+                    "detail": (node.last_error if node else None) or "node execution health is not OK"}
+        remaining = float(timeout_seconds) - (time.monotonic() - started)
+        if remaining <= MIN_BOUNDED_NODE_PROBE_SECONDS:
+            return {"error": "STATUS_PROBE_TIMEOUT", "session": session, "node_id": node_id}
+        try:
+            result = client.status(bare, timeout_seconds=min(MAX_BOUNDED_NODE_PROBE_SECONDS, remaining))
+        except NodeClientError as exc:
+            if (time.monotonic() - started) >= float(timeout_seconds) - MIN_BOUNDED_NODE_PROBE_SECONDS:
+                return {"error": "STATUS_PROBE_TIMEOUT", "session": session, "node_id": node_id}
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
+        if isinstance(result, dict):
+            result.setdefault("node_id", node_id)
+            result.setdefault("node_name", node.display_name if node else node_id)
+            if "redirected_from" in resolution:
+                result.setdefault("redirected_from", resolution["redirected_from"])
+        return _reredact(result)
 
     def terminal_capture(self, session: str, start_line: int | None = None) -> dict[str, Any]:
         return _reredact(self._route(session, "capture",
