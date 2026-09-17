@@ -394,3 +394,16 @@ prompt_delivery:
   acceptance_timeout_seconds: 3.0
   acceptance_poll_interval_seconds: 0.4
   acceptance_capture_lines: 40
+# Provider-bound task admission is configured with environment variables so
+# production limits can be tuned without editing this file:
+# LLM_GLOBAL_MAX_CONCURRENCY=4
+# LLM_OPENROUTER_MAX_CONCURRENCY=2
+# LLM_CODEX_MAX_CONCURRENCY=2
+# LLM_CLAUDE_MAX_CONCURRENCY=1
+# LLM_QUEUE_WAIT_TIMEOUT_SEC=900
+# LLM_RETRY_MAX_ATTEMPTS=4
+# LLM_RETRY_BASE_DELAY_SEC=2
+# LLM_RETRY_MAX_DELAY_SEC=32
+# LLM_RETRY_JITTER=true
+# LLM_429_COOLDOWN_SEC=30
+# MCP_LONG_CALL_MAX_SEC=30

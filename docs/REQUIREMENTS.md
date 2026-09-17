@@ -408,6 +408,29 @@ present).
 
 ## 7. Persistent Task Queue v2
 
+### P0 provider admission / 429 governor (2026-09-17)
+
+- Queue task count is independent from provider concurrency. Before the
+  existing atomic `QUEUED -> PRECHECK` claim, one process-wide governor counts
+  durable PRECHECK/READY/DISPATCHING/RUNNING/VERIFYING reservations and enforces
+  both a global limit and a provider limit. Tasks over capacity remain QUEUED;
+  no agent prompt is dispatched and no internal 429 is returned.
+- Defaults are finite and environment-controlled: global 4, OpenRouter 2,
+  Codex 2, Claude 1. `/health/metrics` and
+  `terminal_llm_governor_status` expose active/reserved/queued/limit/cooldown
+  gauges; logs contain task/provider/capacity without prompt or credentials.
+- Codex/Claude/OpenRouter calls currently live inside their agent CLI process,
+  not in Terminal MCP. Therefore the provider CLI is the sole retry owner for
+  those calls; Terminal MCP never resubmits the prompt on a 429. It detects 429
+  evidence in local pane status and stops new admission for that provider via
+  exponential cooldown. `RequestGovernor.execute_with_retry` is the sole retry
+  owner for any direct provider adapter added later and honors Retry-After,
+  bounded exponential backoff, jitter, and transient-only classification.
+- Long waits remain durable/resumable and bounded to at most 30 seconds;
+  legacy fields remain intact and PENDING now adds `retry_after_ms=5000`.
+- `terminal_task_batch_status` reads up to 100 task states from local SQLite in
+  one call and never polls a provider.
+
 **Status: VERIFIED**, including the background auto-dispatch loop's LIVE
 behavior on the LOCAL node (2026-09-07 P0 QUEUE + SUPERVISOR LIVE TEST
 checkpoint — see the Feature Details entry below for the full write-up).

@@ -1137,6 +1137,17 @@ class QueueStore:
             sessions = [row["session"] for row in connection.execute("SELECT session FROM queue_lanes").fetchall()]
         return [self.lane_status(session) for session in sessions]
 
+    def tasks_with_statuses(self, statuses: Sequence[str]) -> list[QueueTask]:
+        """Bounded-shape governor read from local durable state only."""
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM queue_tasks WHERE status IN ({placeholders})",
+                tuple(statuses)).fetchall()
+        return [QueueTask.from_row(row) for row in rows]
+
     def set_auto_dispatch(self, session: str, enabled: bool) -> None:
         """The explicit, per-session opt-in an automatic background
         dispatch loop is required to check (see queue_engine.py's own

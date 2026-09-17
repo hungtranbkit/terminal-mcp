@@ -58,7 +58,7 @@ GROUPS: dict[str, list[str]] = {
     "auth": ["permissions.py", "grants.py", "cf_access.py", "enrollment.py"],
     "security": ["access_policy.py", "redaction.py", "audit.py", "network_bind.py",
                  "network_middleware.py"],
-    "queue": ["queue_engine.py", "queue_store.py", "queue_service.py",
+    "queue": ["queue_engine.py", "queue_store.py", "queue_service.py", "request_governor.py",
               "queue_loop.py", "coordinator.py", "task_migration.py", "dor_gate.py"],
     "supervisor": ["supervisor.py", "supervisor2.py", "recovery_engine.py",
                    "recovery_loop.py"],

@@ -61,6 +61,7 @@ from .queue_store import (
     WAITING_SESSION, QueueStore, QueueTask,
 )
 from .status import COMPLETION_MARKER_RE, parse_completion_marker, verify_completion_marker
+from .request_governor import RequestGovernor
 
 DEFAULT_CLAIMED_BY = "queue-engine"
 DEFAULT_LEASE_SECONDS = 300.0
@@ -254,7 +255,8 @@ class QueueEngine:
     def __init__(self, store: QueueStore, ops: SessionOps, *, coordinator: CoordinatorGate | None = None,
                 claimed_by: str = DEFAULT_CLAIMED_BY, lease_seconds: float = DEFAULT_LEASE_SECONDS,
                 on_completed: Callable[[QueueTask], None] | None = None,
-                verify_queue: Any = None, delivery_policy: Any = None) -> None:
+                verify_queue: Any = None, delivery_policy: Any = None,
+                governor: RequestGovernor | None = None) -> None:
         self.store = store
         self.ops = ops
         # PROMPT DELIVERY / ACCEPTANCE GATE (delivery_gate.py). None ->
@@ -289,6 +291,7 @@ class QueueEngine:
         # integration_required. Never blocks/fails the task's own
         # COMPLETED transition if the callback itself raises.
         self.on_completed = on_completed
+        self.governor = governor
 
     def tick(self, session: str) -> TickResult:
         """One full reconciliation step for `session`'s lane. Always
@@ -305,8 +308,14 @@ class QueueEngine:
 
         active = lane["current_task"]
         if active is None:
-            claimed = self.store.claim_next_task(session, claimed_by=self.claimed_by,
-                                                  lease_seconds=self.lease_seconds)
+            if self.governor is not None:
+                claimed, queued_reason = self.governor.try_admit_and_claim(
+                    session, claimed_by=self.claimed_by, lease_seconds=self.lease_seconds)
+                if claimed is None and queued_reason:
+                    return TickResult(session, "QUEUED", detail=queued_reason)
+            else:
+                claimed = self.store.claim_next_task(session, claimed_by=self.claimed_by,
+                                                      lease_seconds=self.lease_seconds)
             if claimed is None:
                 return TickResult(session, "IDLE")
             return TickResult(session, "CLAIMED", task_id=claimed.id)
@@ -524,6 +533,12 @@ class QueueEngine:
                                        reason=f"could not read session status: {error}")
             return TickResult(session, "FAILED", task_id=task_id, detail=str(error))
 
+        if self.governor is not None:
+            # This is local pane state, not a provider poll.  It lets the
+            # admission layer stop a fresh burst while the CLI owns its one
+            # internal retry policy.
+            self.governor.note_output(task, str(status_response.get("last_output") or ""))
+
         state = status_response.get("state")
         if current_status == RUNNING:
             if state == "RUNNING":
@@ -573,6 +588,8 @@ class QueueEngine:
         if verified:
             completed = self.store.mark_completed_with_evidence(task_id, evidence={"completion_marker": marker})
             self._notify_completed(completed)
+            if self.governor is not None:
+                self.governor.note_success(completed)
             return TickResult(session, "COMPLETED", task_id=task_id)
         if state == "RUNNING":
             # A false alarm -- the agent picked back up (e.g. a slow

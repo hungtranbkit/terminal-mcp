@@ -118,6 +118,32 @@ class QueueConfig:
 
 
 @dataclass(frozen=True)
+class LLMGovernorConfig:
+    """Process-wide admission limits for provider-bound agent work.
+
+    Values are environment controlled so a production rollback/tune does not
+    require a code change.  Limits are intentionally finite by default.
+    """
+    global_max_concurrency: int = 4
+    openrouter_max_concurrency: int = 2
+    codex_max_concurrency: int = 2
+    claude_max_concurrency: int = 1
+    queue_wait_timeout_seconds: float = 900.0
+    retry_max_attempts: int = 4
+    retry_base_delay_seconds: float = 2.0
+    retry_max_delay_seconds: float = 32.0
+    retry_jitter: bool = True
+    cooldown_429_seconds: float = 30.0
+
+    def provider_limit(self, provider: str) -> int:
+        return {
+            "openrouter": self.openrouter_max_concurrency,
+            "codex": self.codex_max_concurrency,
+            "claude": self.claude_max_concurrency,
+        }.get(provider.casefold(), self.global_max_concurrency)
+
+
+@dataclass(frozen=True)
 class SubmitProfile:
     """Bounded, evidence-gated Enter submission policy for one agent."""
     max_enter_attempts: int = 1
@@ -1017,6 +1043,7 @@ class AppConfig:
     ask_chatgpt: AskChatGptConfig = AskChatGptConfig()
     nodes: NodesConfig = NodesConfig()
     queue: QueueConfig = QueueConfig()
+    llm_governor: LLMGovernorConfig = LLMGovernorConfig()
     submit: SubmitConfig = SubmitConfig()
     integration_loop: IntegrationLoopConfig = IntegrationLoopConfig()
     lifecycle: LifecycleConfig = LifecycleConfig()
@@ -1350,6 +1377,53 @@ def load_config(path: str | Path | None = None) -> AppConfig:
                                remote_connect=remote_connect_config, onboarding=onboarding_config,
                                health=node_health_config)
 
+    def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+        value = int(os.environ.get(name, default))
+        if value < minimum:
+            raise ValueError(f"{name} must be at least {minimum}")
+        return value
+
+    def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+        value = float(os.environ.get(name, default))
+        if value < minimum:
+            raise ValueError(f"{name} must be at least {minimum}")
+        return value
+
+    def _env_bool(name: str, default: bool) -> bool:
+        raw_value = os.environ.get(name)
+        if raw_value is None:
+            return default
+        if raw_value.casefold() in {"1", "true", "yes", "on"}:
+            return True
+        if raw_value.casefold() in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError(f"{name} must be a boolean")
+
+    governor_defaults = LLMGovernorConfig()
+    governor_config = LLMGovernorConfig(
+        global_max_concurrency=_env_int(
+            "LLM_GLOBAL_MAX_CONCURRENCY", governor_defaults.global_max_concurrency),
+        openrouter_max_concurrency=_env_int(
+            "LLM_OPENROUTER_MAX_CONCURRENCY", governor_defaults.openrouter_max_concurrency),
+        codex_max_concurrency=_env_int(
+            "LLM_CODEX_MAX_CONCURRENCY", governor_defaults.codex_max_concurrency),
+        claude_max_concurrency=_env_int(
+            "LLM_CLAUDE_MAX_CONCURRENCY", governor_defaults.claude_max_concurrency),
+        queue_wait_timeout_seconds=_env_float(
+            "LLM_QUEUE_WAIT_TIMEOUT_SEC", governor_defaults.queue_wait_timeout_seconds, minimum=0.1),
+        retry_max_attempts=_env_int(
+            "LLM_RETRY_MAX_ATTEMPTS", governor_defaults.retry_max_attempts),
+        retry_base_delay_seconds=_env_float(
+            "LLM_RETRY_BASE_DELAY_SEC", governor_defaults.retry_base_delay_seconds),
+        retry_max_delay_seconds=_env_float(
+            "LLM_RETRY_MAX_DELAY_SEC", governor_defaults.retry_max_delay_seconds),
+        retry_jitter=_env_bool("LLM_RETRY_JITTER", governor_defaults.retry_jitter),
+        cooldown_429_seconds=_env_float(
+            "LLM_429_COOLDOWN_SEC", governor_defaults.cooldown_429_seconds),
+    )
+    if governor_config.retry_max_delay_seconds < governor_config.retry_base_delay_seconds:
+        raise ValueError("LLM_RETRY_MAX_DELAY_SEC must be >= LLM_RETRY_BASE_DELAY_SEC")
+
     return AppConfig(
         permissions=PermissionsConfig(
             terminal_read=bool(permissions.get("terminal_read", True)),
@@ -1400,6 +1474,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ask_chatgpt=_load_ask_chatgpt_config(raw.get("ask_chatgpt", {})),
         nodes=nodes_config,
         queue=_load_queue_config(raw.get("queue", {})),
+        llm_governor=governor_config,
         submit=submit_config,
         integration_loop=_load_integration_loop_config(raw.get("integration_loop", {})),
         lifecycle=_load_lifecycle_config(raw.get("lifecycle", {})),

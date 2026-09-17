@@ -26,6 +26,8 @@ CALLING set_tasks/append_tasks against those names during this
 feature's own development, not by a technical guard in this file."""
 from __future__ import annotations
 
+import hashlib
+import logging
 import sqlite3
 from typing import Any, Callable
 
@@ -35,6 +37,8 @@ from .verify_queue import VerifyQueue
 from .queue_store import (
     TERMINAL_STATUSES, UNASSIGNED_LANE, VERIFYING, InvalidTransitionError, TaskAlreadyClaimedError, QueueStore,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 _PENDING_TASK_ID = "__task_being_created__"
@@ -187,6 +191,9 @@ class QueueService:
         found = self.store.task_by_request_key(request_key)
         if found is None:
             return None
+        request_key_hash = hashlib.sha256(request_key.encode("utf-8", "replace")).hexdigest()[:16]
+        _LOGGER.info("TASK_DEDUP request_key=sha256:%s existing_task=%s state=%s deduplicated=true",
+                     request_key_hash, found["id"], found["status"])
         answer = {"status": "TASK_ACCEPTED", "task_id": found["id"],
                   "session": found["session"],
                   "queue_position": self.store.queue_position(found["id"]),

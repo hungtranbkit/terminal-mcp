@@ -8,7 +8,7 @@ Tables: `work_runs`, `work_tasks`, `work_approvals`, `work_artifacts`,
 `work_events`. `work_tasks` POINTS at a queue task; the queue owns its state.
 
 ## Queue
-`queue_engine.py`, `queue_store.py`. Task rows key on `id`; enqueue returns
+`queue_engine.py`, `request_governor.py`, `queue_store.py`. Task rows key on `id`; enqueue returns
 `task_id`. `auto_dispatch_enabled` defaults False per lane.
 
 ## Planner
