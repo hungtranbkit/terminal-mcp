@@ -5,7 +5,12 @@ from terminal_mcp.server import mcp
 
 @pytest.mark.anyio
 async def test_server_registers_v1_and_binding_tools():
-    names = {tool.name for tool in await mcp.list_tools()}
+    tools = await mcp.list_tools()
+    names = {tool.name for tool in tools}
+    wait_tool = next(tool for tool in tools if tool.name == "terminal_wait_for_state")
+    resume_tool = next(tool for tool in tools if tool.name == "terminal_resume_wait")
+    assert wait_tool.input_schema["properties"]["timeout"]["default"] == 20
+    assert resume_tool.input_schema["properties"]["timeout"]["default"] == 20
     assert names == {
         "terminal_list_sessions",
         "terminal_tail",
@@ -13,6 +18,7 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_status",
         "terminal_batch_inspect",
         "terminal_wait_for_state",
+        "terminal_resume_wait",
         "terminal_send_text",
         "terminal_send_task",
         "terminal_send_keys",

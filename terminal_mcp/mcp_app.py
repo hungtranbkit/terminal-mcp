@@ -96,7 +96,8 @@ def build_mcp(service: TerminalService | None = None,
               resource_locks: ResourceLockStore | None = None,
               fleet: "FleetService | None" = None,
               work: Any = None,
-              default_optional_services: bool = True) -> MCPServer:
+              default_optional_services: bool = True,
+              run_journal: Any = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -151,7 +152,14 @@ def build_mcp(service: TerminalService | None = None,
     # therefore silently non-functional: constructed, exposed as tools, and
     # holding nothing to route with.
     controller = controller or build_default_controller(terminal)
-    compact_tools = CompactTerminalTools(terminal, controller)
+    if run_journal is None:
+        try:
+            from .run_journal import RunJournalStore
+
+            run_journal = RunJournalStore()
+        except Exception:  # noqa: BLE001 -- other tools remain available
+            _LOGGER.exception("durable run journal unavailable")
+    compact_tools = CompactTerminalTools(terminal, controller, run_journal=run_journal)
     recovery = recovery or RecoveryEngine(terminal.session_registry, controller, terminal.leases,
                                           terminal.config.auto_recovery)
     recovery.loop = recovery.loop or RecoveryLoop(
@@ -425,12 +433,20 @@ def build_mcp(service: TerminalService | None = None,
         return compact_tools.batch_inspect(targets, tail_lines=tail_lines, compact=compact)
 
     @server.tool()
-    def terminal_wait_for_state(target: str, desired_states: list[str], timeout: float = 900,
+    def terminal_wait_for_state(target: str, desired_states: list[str], timeout: float = 20,
                                 poll_interval: float = 1, tail_lines: int = 20) -> dict:
-        """Server-side bounded wait, avoiding repeated client polling cards."""
+        """Wait at most 20s, then return durable PENDING continuation state."""
         _refresh_local_heartbeat()
         return compact_tools.wait_for_state(target, desired_states, timeout=timeout,
                                             poll_interval=poll_interval, tail_lines=tail_lines)
+
+    @server.tool()
+    def terminal_resume_wait(resume_token: str, timeout: float = 20,
+                             poll_interval: float = 1) -> dict:
+        """Idempotently poll a durable wait without redispatching work."""
+        _refresh_local_heartbeat()
+        return compact_tools.resume_wait(resume_token, timeout=timeout,
+                                         poll_interval=poll_interval)
 
     @server.tool()
     def terminal_send_task(target: str, text: str, wait_for_accept: bool = True,

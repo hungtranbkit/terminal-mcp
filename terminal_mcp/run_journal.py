@@ -11,7 +11,7 @@ import json
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,8 @@ MAX_ERROR_CHARS = 4_000
 MAX_METADATA_CHARS = 4_000
 MAX_METADATA_KEY_CHARS = 128
 MAX_METADATA_VALUE_CHARS = 512
+MAX_WAIT_REASON_CHARS = 500
+DEFAULT_WAIT_TTL_SECONDS = 7 * 24 * 60 * 60
 
 _FORBIDDEN_METADATA_KEYS = (
     "prompt", "argument", "args", "input", "output", "transcript",
@@ -150,6 +152,35 @@ class RunJournalStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_journal_runs_project_recent "
                 "ON journal_runs(project_id, updated_at DESC)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS wait_continuations (
+                    resume_token TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL UNIQUE REFERENCES journal_runs(run_id),
+                    target TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    desired_states TEXT NOT NULL,
+                    tail_lines INTEGER NOT NULL,
+                    requested_timeout_seconds REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    last_observed_state TEXT,
+                    input_required INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT,
+                    checkpoint_version INTEGER NOT NULL DEFAULT 0,
+                    polls INTEGER NOT NULL DEFAULT 0,
+                    waited_ms INTEGER NOT NULL DEFAULT 0,
+                    pending_return_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    completed_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_wait_continuations_updated "
+                "ON wait_continuations(updated_at DESC)"
             )
         with contextlib.suppress(OSError):
             self.path.chmod(0o600)
@@ -374,3 +405,170 @@ class RunJournalStore:
                 latest = self._entry(row) if row is not None else None
                 result.append({**run, "latest_entry": latest, "cursor": latest["id"] if latest else 0})
         return result
+
+    # -- bounded MCP wait continuations -------------------------------------
+
+    @staticmethod
+    def _wait(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "resume_token": row["resume_token"],
+            "run_id": row["run_id"],
+            "target": row["target"],
+            "target_type": row["target_type"],
+            "desired_states": json.loads(row["desired_states"]),
+            "tail_lines": row["tail_lines"],
+            "requested_timeout_seconds": row["requested_timeout_seconds"],
+            "status": row["status"],
+            "last_observed_state": row["last_observed_state"],
+            "input_required": bool(row["input_required"]),
+            "reason": row["reason"],
+            "checkpoint_version": row["checkpoint_version"],
+            "polls": row["polls"],
+            "waited_ms": row["waited_ms"],
+            "pending_return_count": row["pending_return_count"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "expires_at": row["expires_at"],
+            "completed_at": row["completed_at"],
+        }
+
+    def start_wait(
+        self,
+        *,
+        target: str,
+        target_type: str,
+        desired_states: list[str],
+        tail_lines: int,
+        requested_timeout_seconds: float,
+        ttl_seconds: float = DEFAULT_WAIT_TTL_SECONDS,
+    ) -> dict[str, Any]:
+        """Persist continuation coordinates before the first observation.
+
+        The token is a random identifier only. It contains no target, prompt,
+        output, credential, or authorization material.
+        """
+        if redact_text(target) != target:
+            raise ValueError("wait target must not contain credential material")
+        if any(redact_text(state) != state for state in desired_states):
+            raise ValueError("desired states must not contain credential material")
+        resume_token = f"wait_{uuid.uuid4().hex}"
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        expires_at = (now_dt + timedelta(seconds=float(ttl_seconds))).isoformat()
+        run = self.start_run(
+            "terminal-wait", target if target_type == "session" else "",
+            target if target_type == "binding" else "", run_id=resume_token,
+            state="PENDING", next_action="poll terminal_resume_wait",
+            metadata={"kind": "terminal_wait_for_state"},
+        )
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO wait_continuations (
+                    resume_token, run_id, target, target_type, desired_states,
+                    tail_lines, requested_timeout_seconds, status, created_at,
+                    updated_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
+                """,
+                (resume_token, run["run_id"], target, target_type,
+                 json.dumps(desired_states, separators=(",", ":")), tail_lines,
+                 requested_timeout_seconds, now, now, expires_at),
+            )
+            row = connection.execute(
+                "SELECT * FROM wait_continuations WHERE resume_token = ?",
+                (resume_token,),
+            ).fetchone()
+        assert row is not None
+        return self._wait(row)
+
+    def get_wait(self, resume_token: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM wait_continuations WHERE resume_token = ?",
+                (resume_token,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown wait continuation: {resume_token}")
+        result = self._wait(row)
+        if (result["completed_at"] is None
+                and datetime.fromisoformat(result["expires_at"]) <= datetime.now(timezone.utc)):
+            raise TimeoutError(f"expired wait continuation: {resume_token}")
+        return result
+
+    def record_wait_observation(
+        self,
+        resume_token: str,
+        *,
+        status: str,
+        last_observed_state: str,
+        input_required: bool,
+        reason: str | None,
+        polls: int,
+        waited_ms: int,
+    ) -> dict[str, Any]:
+        """Atomically checkpoint one bounded slice; retries never dispatch work."""
+        if status not in {"PENDING", "MATCHED", "FAILED"}:
+            raise ValueError(f"invalid wait status: {status}")
+        now = _now_iso()
+        completed = status in {"MATCHED", "FAILED"}
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM wait_continuations WHERE resume_token = ?",
+                (resume_token,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown wait continuation: {resume_token}")
+            current = self._wait(row)
+            # A terminal result is immutable and remains retrievable even if
+            # the terminal/session later disappears.
+            if current["completed_at"] is not None:
+                return current
+            version = current["checkpoint_version"] + 1
+            connection.execute(
+                """
+                UPDATE wait_continuations
+                SET status = ?, last_observed_state = ?, input_required = ?,
+                    reason = ?, checkpoint_version = ?, polls = polls + ?,
+                    waited_ms = waited_ms + ?,
+                    pending_return_count = pending_return_count + ?,
+                    updated_at = ?, completed_at = ?
+                WHERE resume_token = ?
+                """,
+                (status, last_observed_state, int(input_required),
+                 _bounded(reason, MAX_WAIT_REASON_CHARS), version, max(0, int(polls)),
+                 max(0, int(waited_ms)), 1 if status == "PENDING" else 0,
+                 now, now if completed else None, resume_token),
+            )
+            entry = connection.execute(
+                """
+                INSERT INTO journal_entries (
+                    run_id, event_key, tool_name, state, error, checkpoint_ref,
+                    next_action, result_summary, created_at
+                ) VALUES (?, ?, 'terminal_wait_for_state', ?, ?, ?, ?, ?, ?)
+                """,
+                (resume_token, f"{resume_token}:{version}", status,
+                 _bounded(reason, MAX_ERROR_CHARS) if status == "FAILED" else None,
+                 f"{resume_token}:{version}",
+                 "poll terminal_resume_wait" if status == "PENDING" else "result retained",
+                 _bounded(last_observed_state, MAX_SUMMARY_CHARS), now),
+            )
+            connection.execute(
+                """
+                UPDATE journal_runs
+                SET state = ?, next_action = ?, result_summary = ?, updated_at = ?,
+                    completed_at = CASE WHEN ? THEN COALESCE(completed_at, ?) ELSE completed_at END
+                WHERE run_id = ?
+                """,
+                (status, "poll terminal_resume_wait" if status == "PENDING" else "result retained",
+                 _bounded(last_observed_state, MAX_SUMMARY_CHARS), now,
+                 int(completed), now, resume_token),
+            )
+            row = connection.execute(
+                "SELECT * FROM wait_continuations WHERE resume_token = ?",
+                (resume_token,),
+            ).fetchone()
+            assert entry.lastrowid is not None
+        assert row is not None
+        return self._wait(row)

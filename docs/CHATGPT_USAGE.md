@@ -220,6 +220,31 @@ use the queue flow (§4) and the git-isolation worktree flow (§4d).
 Also not available: searching git *history* (these search a work tree),
 and fetching/cloning a private remote this host cannot already read.
 
+## 2c. Bounded waits and durable resume
+
+`terminal_wait_for_state(target, desired_states, timeout=20)` never uses the
+caller's `timeout` as one long-held MCP request. The server persists a wait run
+first, observes for at most 20 seconds, and returns either the existing
+`status: "MATCHED"` success shape (`continuation_status: "COMPLETE"`) or a
+compact `status: "PENDING"` response. A caller may still pass `timeout=900` as
+its desired overall horizon; each individual MCP request remains capped at the
+20-second synchronous budget.
+
+A PENDING response includes an opaque `resume_token`, stable `run_id`, durable
+`checkpoint_id`, `desired_states`, `last_observed_state`, `waited_ms`,
+`sync_wait_budget_ms`, and `next_poll_after_ms`. Call
+`terminal_resume_wait(resume_token)` later—even from a new chat or after a
+server restart. Polling is observational and idempotent: it never resends the
+terminal task. Completed/failed results are retained in the run journal;
+invalid, unknown, and expired tokens fail deterministically. The journal stores
+only bounded, redacted state/reason metadata, never terminal output or
+credentials.
+
+The durable task queue remains the canonical persist-before-dispatch path for
+work. A wait continuation observes that already-running work; it is not another
+queue and does not change session, permission, node-affinity, or dispatch
+semantics.
+
 ## 3. Direct-send flow (canonical for a single, immediate prompt)
 
 **`terminal_send_text(session, text, press_enter=True)`** is the

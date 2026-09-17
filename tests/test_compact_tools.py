@@ -1,7 +1,14 @@
+import inspect
+import tempfile
+from pathlib import Path
+
 from terminal_mcp.compact_tools import (
+    DEFAULT_WAIT_SECONDS,
     MAX_TOTAL_TAIL_CHARS,
+    SYNC_WAIT_BUDGET_SECONDS,
     CompactTerminalTools,
 )
+from terminal_mcp.run_journal import RunJournalStore
 
 
 class FakeController:
@@ -10,8 +17,10 @@ class FakeController:
         self.tails = {}
         self.send_result = {}
         self.send_calls = []
+        self.status_calls = 0
 
     def terminal_status(self, session):
+        self.status_calls += 1
         values = self.statuses.get(session)
         if values is None:
             return {"error": "SESSION_NOT_FOUND", "session": session, "reason": "missing"}
@@ -57,10 +66,17 @@ class FakeTerminal:
         return {"binding": binding, "session": self.bindings.get(binding), **self.send_result}
 
 
-def service():
+def service(journal_path=None):
     controller = FakeController()
     terminal = FakeTerminal(controller)
-    return CompactTerminalTools(terminal, controller), terminal, controller
+    temporary = None
+    if journal_path is None:
+        temporary = tempfile.TemporaryDirectory()
+        journal_path = Path(temporary.name) / "run-journal.db"
+    journal = RunJournalStore(journal_path)
+    compact = CompactTerminalTools(terminal, controller, run_journal=journal)
+    compact._test_temporary_directory = temporary
+    return compact, terminal, controller
 
 
 def test_batch_inspect_mixed_success_missing_and_binding():
@@ -146,11 +162,14 @@ def test_wait_for_state_success_returns_once_with_final_tail():
     controller.tails["worker"] = "PROMPT"
     result = compact.wait_for_state("worker", ["WAITING_INPUT"], timeout=10, poll_interval=1)
     assert result["status"] == "MATCHED"
+    assert result["continuation_status"] == "COMPLETE"
     assert result["polls"] == 2
     assert result["tail"] == "PROMPT"
+    assert result["resume_token"].startswith("wait_")
+    assert result["checkpoint_id"]
 
 
-def test_wait_for_state_timeout_is_bounded():
+def test_wait_for_state_timeout_is_pending_and_resumable():
     compact, terminal, controller = service()
     clock = FakeClock()
     compact.monotonic = clock.monotonic
@@ -160,9 +179,127 @@ def test_wait_for_state_timeout_is_bounded():
     }
     controller.tails["worker"] = "still busy"
     result = compact.wait_for_state("worker", ["WAITING_INPUT"], timeout=3, poll_interval=1)
-    assert result["status"] == "TIMEOUT"
+    assert result["status"] == "PENDING"
     assert result["polls"] == 4
     assert result["elapsed_seconds"] == 3
+    assert result["waited_ms"] == 3000
+    assert result["next_poll_after_ms"] == 1000
+    assert result["desired_states"] == ["WAITING_INPUT"]
+    assert result["last_observed_state"] == "RUNNING"
+
+
+def test_public_default_and_large_requested_timeout_use_twenty_second_slice():
+    assert DEFAULT_WAIT_SECONDS == 20
+    assert SYNC_WAIT_BUDGET_SECONDS == 20
+    assert inspect.signature(CompactTerminalTools.wait_for_state).parameters["timeout"].default == 20
+    compact, _terminal, controller = service()
+    clock = FakeClock()
+    compact.monotonic = clock.monotonic
+    compact.sleep = clock.sleep
+    controller.statuses["worker"] = {"session": "worker", "state": "RUNNING"}
+    controller.tails["worker"] = "busy"
+
+    result = compact.wait_for_state("worker", ["DONE"], timeout=900, poll_interval=7)
+
+    assert result["status"] == "PENDING"
+    assert result["requested_timeout_seconds"] == 900
+    assert result["waited_ms"] == 20_000
+    assert result["sync_wait_budget_ms"] == 20_000
+    assert clock.now == 20
+
+
+def test_resume_does_not_send_and_repeated_complete_poll_is_idempotent(tmp_path):
+    compact, terminal, controller = service(tmp_path / "journal.db")
+    clock = FakeClock()
+    compact.monotonic = clock.monotonic
+    compact.sleep = clock.sleep
+    controller.statuses["worker"] = {"session": "worker", "state": "RUNNING"}
+    controller.tails["worker"] = "busy"
+    pending = compact.wait_for_state("worker", ["DONE"], timeout=1)
+    assert terminal.send_calls == [] and controller.send_calls == []
+
+    controller.statuses["worker"] = {"session": "worker", "state": "DONE"}
+    complete = compact.resume_wait(pending["resume_token"])
+    calls_after_complete = controller.status_calls
+    replay = compact.resume_wait(pending["resume_token"])
+
+    assert complete["status"] == replay["status"] == "MATCHED"
+    assert complete["checkpoint_id"] == replay["checkpoint_id"]
+    assert controller.status_calls == calls_after_complete
+    assert terminal.send_calls == [] and controller.send_calls == []
+
+
+def test_wait_can_resume_from_fresh_store_and_retain_result(tmp_path):
+    path = tmp_path / "journal.db"
+    first, _terminal, controller = service(path)
+    clock = FakeClock()
+    first.monotonic = clock.monotonic
+    first.sleep = clock.sleep
+    controller.statuses["worker"] = {"session": "worker", "state": "RUNNING"}
+    controller.tails["worker"] = "busy"
+    pending = first.wait_for_state("worker", ["DONE"], timeout=1)
+
+    reopened = CompactTerminalTools(first.terminal, controller, run_journal=RunJournalStore(path),
+                                    monotonic=clock.monotonic, sleep=clock.sleep)
+    controller.statuses["worker"] = {"session": "worker", "state": "DONE"}
+    complete = reopened.resume_wait(pending["resume_token"])
+    del controller.statuses["worker"]
+    retained = CompactTerminalTools(first.terminal, controller, run_journal=RunJournalStore(path)) \
+        .resume_wait(pending["resume_token"])
+
+    assert complete["status"] == "MATCHED"
+    assert retained["status"] == "MATCHED"
+    assert retained["last_observed_state"] == "DONE"
+
+
+def test_bad_unknown_and_expired_resume_tokens_fail_safely(tmp_path):
+    compact, _terminal, _controller = service(tmp_path / "journal.db")
+    assert compact.resume_wait("not-a-token") == {
+        "status": "FAILED", "error": "INVALID_RESUME_TOKEN"
+    }
+    assert compact.resume_wait("wait_" + "0" * 32) == {
+        "status": "FAILED", "error": "UNKNOWN_RESUME_TOKEN"
+    }
+    expired = compact.run_journal.start_wait(
+        target="worker", target_type="session", desired_states=["DONE"],
+        tail_lines=20, requested_timeout_seconds=900, ttl_seconds=-1,
+    )
+    assert compact.resume_wait(expired["resume_token"]) == {
+        "status": "FAILED", "error": "EXPIRED_RESUME_TOKEN"
+    }
+
+
+def test_wait_response_redacts_credentials_and_persists_no_tail(tmp_path):
+    compact, _terminal, controller = service(tmp_path / "journal.db")
+    clock = FakeClock()
+    compact.monotonic = clock.monotonic
+    compact.sleep = clock.sleep
+    controller.statuses["worker"] = {
+        "session": "worker", "state": "RUNNING",
+        "reason": "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuv",
+    }
+    controller.tails["worker"] = "Authorization: Bearer abcdefghijklmnopqrstuvwxyz"
+    result = compact.wait_for_state("worker", ["DONE"], timeout=1)
+    serialized = str(result)
+    assert "abcdefghijklmnopqrstuv" not in serialized
+    assert "abcdefghijklmnopqrstuvwxyz" not in serialized
+    reopened = RunJournalStore(tmp_path / "journal.db").get_wait(result["resume_token"])
+    assert "tail" not in reopened
+    assert "abcdefghijklmnopqrstuv" not in str(reopened)
+
+
+def test_persistence_failure_prevents_observation():
+    class BrokenJournal:
+        def start_wait(self, **_kwargs):
+            raise OSError("disk unavailable")
+
+    controller = FakeController()
+    terminal = FakeTerminal(controller)
+    controller.statuses["worker"] = {"session": "worker", "state": "RUNNING"}
+    compact = CompactTerminalTools(terminal, controller, run_journal=BrokenJournal())
+    result = compact.wait_for_state("worker", ["DONE"], timeout=900)
+    assert result["error"] == "CONTINUATION_PERSIST_FAILED"
+    assert controller.status_calls == 0
 
 
 def test_batch_output_has_strict_tail_budget_and_truncation_metadata():

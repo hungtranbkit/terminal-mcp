@@ -1,10 +1,14 @@
 """Compact, high-level terminal operations built from existing guarded APIs."""
 from __future__ import annotations
 
+import math
+import re
 import time
 import uuid
 from collections.abc import Callable
 from typing import Any
+
+from .redaction import redact_text
 
 
 MAX_TARGETS = 25
@@ -12,8 +16,13 @@ MAX_TAIL_LINES = 20
 MAX_TAIL_CHARS_PER_TARGET = 1_000
 MAX_TOTAL_TAIL_CHARS = 16_000
 MAX_REASON_CHARS = 500
-MAX_WAIT_SECONDS = 900
+SYNC_WAIT_BUDGET_SECONDS = 20
+DEFAULT_WAIT_SECONDS = 20
 MAX_SEND_WAIT_SECONDS = 30
+NEXT_POLL_MIN_MS = 1_000
+NEXT_POLL_MAX_MS = 5_000
+_RESUME_TOKEN = re.compile(r"^wait_[0-9a-f]{32}$")
+_MAX_TARGET_CHARS = 512
 
 _BLOCKED_ERRORS = {
     "ACCESS_DENIED", "ACTION_NOT_ALLOWED", "BINDING_INPUT_DISABLED",
@@ -35,10 +44,12 @@ class CompactTerminalTools:
     """Composition layer; all authorization and submission stays downstream."""
 
     def __init__(self, terminal: Any, controller: Any, *,
+                 run_journal: Any = None,
                  monotonic: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep) -> None:
         self.terminal = terminal
         self.controller = controller
+        self.run_journal = run_journal
         self.monotonic = monotonic
         self.sleep = sleep
 
@@ -181,48 +192,163 @@ class CompactTerminalTools:
             "timeout": timeout,
         }
 
-    def wait_for_state(self, target: str, desired_states: list[str], timeout: float = 900,
-                       poll_interval: float = 1, tail_lines: int = 20) -> dict[str, Any]:
-        if (not isinstance(desired_states, list) or not desired_states or len(desired_states) > 20 or
-                any(not isinstance(state, str) or not state.strip() or len(state) > 64 for state in desired_states)):
-            return {"status": "FAILED", "error": "INVALID_DESIRED_STATES"}
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= MAX_WAIT_SECONDS:
-            return {"status": "FAILED", "error": "INVALID_TIMEOUT", "allowed": "0 < timeout <= 900"}
-        if isinstance(poll_interval, bool) or not isinstance(poll_interval, (int, float)) or poll_interval < 1:
+    @staticmethod
+    def _validate_wait(timeout: float, poll_interval: float) -> dict[str, Any] | None:
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout) or timeout <= 0):
+            return {"status": "FAILED", "error": "INVALID_TIMEOUT", "allowed": "timeout > 0"}
+        if (isinstance(poll_interval, bool) or not isinstance(poll_interval, (int, float))
+                or not math.isfinite(poll_interval) or poll_interval < 1):
             return {"status": "FAILED", "error": "INVALID_POLL_INTERVAL", "minimum": 1}
-        if error := self._validate_tail_lines(tail_lines):
-            return {"status": "FAILED", **error}
-        desired = {state.strip().upper() for state in desired_states}
-        deadline = self.monotonic() + timeout
+        return None
+
+    @staticmethod
+    def _validate_resume_token(resume_token: str) -> bool:
+        return isinstance(resume_token, str) and bool(_RESUME_TOKEN.fullmatch(resume_token))
+
+    @staticmethod
+    def _checkpoint_id(wait: dict[str, Any]) -> str:
+        return f"{wait['run_id']}:{wait['checkpoint_version']}"
+
+    def _durable_result(self, wait: dict[str, Any], *, waited_ms: int = 0,
+                        polls: int = 0, tail: str = "", tail_truncated: bool = False) -> dict[str, Any]:
+        status = wait["status"]
+        result = {
+            # MATCHED is retained for existing clients. continuation_status is
+            # the durable contract's terminal/pending vocabulary.
+            "status": status,
+            "continuation_status": "COMPLETE" if status == "MATCHED" else status,
+            "target": wait["target"],
+            "target_type": wait["target_type"],
+            "run_id": wait["run_id"],
+            "task_id": wait["run_id"],
+            "resume_token": wait["resume_token"],
+            "checkpoint_id": self._checkpoint_id(wait),
+            "desired_states": wait["desired_states"],
+            "last_observed_state": wait["last_observed_state"] or "UNKNOWN",
+            # Compatibility aliases from the original response.
+            "state": wait["last_observed_state"] or "UNKNOWN",
+            "input_required": bool(wait["input_required"]),
+            "reason": wait["reason"],
+            "polls": polls,
+            "total_polls": wait["polls"],
+            "waited_ms": waited_ms,
+            "elapsed_ms": wait["waited_ms"],
+            "elapsed_seconds": round(wait["waited_ms"] / 1000, 3),
+            "sync_wait_budget_ms": SYNC_WAIT_BUDGET_SECONDS * 1000,
+            "requested_timeout_seconds": wait["requested_timeout_seconds"],
+            "pending_return_count": wait["pending_return_count"],
+            "tail": tail,
+            "tail_truncated": tail_truncated,
+            "untrusted_output": True,
+            "untrusted_fields": ["tail"],
+        }
+        if status == "PENDING":
+            result.update({
+                "next_poll_after_ms": max(
+                    NEXT_POLL_MIN_MS,
+                    min(NEXT_POLL_MAX_MS, int(1000))),
+                "pending_reason": "SYNC_WAIT_BUDGET_EXHAUSTED",
+                "next_action": "Call terminal_resume_wait with resume_token",
+            })
+        return result
+
+    def _wait_slice(self, wait: dict[str, Any], *, timeout: float,
+                    poll_interval: float) -> dict[str, Any]:
+        # Terminal results are immutable and returned from SQLite without
+        # consulting or redispatching the underlying target.
+        if wait["status"] in {"MATCHED", "FAILED"}:
+            return self._durable_result(wait)
+
+        slice_seconds = min(float(timeout), float(SYNC_WAIT_BUDGET_SECONDS))
+        started = self.monotonic()
+        deadline = started + slice_seconds
         polls = 0
         final: dict[str, Any] = {}
         matched = False
         while True:
             polls += 1
-            final = self._status(target)
+            final = self._status(wait["target"])
             if "error" in final:
                 break
-            if str(final.get("state", "UNKNOWN")).upper() in desired:
+            if str(final.get("state", "UNKNOWN")).upper() in set(wait["desired_states"]):
                 matched = True
                 break
             remaining = deadline - self.monotonic()
             if remaining <= 0:
                 break
             self.sleep(min(float(poll_interval), remaining))
-        tail = self._tail(target, tail_lines)
-        rendered, clipped = _bounded(tail.get("output", "") if "error" not in tail else "",
-                                     MAX_TAIL_CHARS_PER_TARGET)
-        reason, reason_clipped = _bounded(final.get("reason") or final.get("error"), MAX_REASON_CHARS)
-        return {
-            "status": "MATCHED" if matched else ("FAILED" if "error" in final else "TIMEOUT"),
-            "target": target,
-            "state": final.get("state", "UNKNOWN"),
-            "input_required": bool(final.get("input_required", False)),
-            "reason": reason,
-            "polls": polls,
-            "elapsed_seconds": round(timeout - max(0.0, deadline - self.monotonic()), 3),
-            "tail": rendered,
-            "tail_truncated": bool(clipped or tail.get("truncated", False) or reason_clipped),
-            "untrusted_output": True,
-            "untrusted_fields": ["tail"],
-        }
+
+        waited_ms = max(0, round((self.monotonic() - started) * 1000))
+        state = str(final.get("state", "UNKNOWN"))
+        reason = redact_text(str(final.get("reason") or final.get("error") or ""))
+        status = "MATCHED" if matched else ("FAILED" if "error" in final else "PENDING")
+        saved = self.run_journal.record_wait_observation(
+            wait["resume_token"], status=status, last_observed_state=state,
+            input_required=bool(final.get("input_required", False)), reason=reason,
+            polls=polls, waited_ms=waited_ms,
+        )
+        # Preserve the useful final tail for the legacy MATCHED shape. A
+        # PENDING slice deliberately does no extra remote read after its wait
+        # budget expires, keeping both latency and response size predictable.
+        tail: dict[str, Any] = {}
+        rendered = ""
+        clipped = False
+        if status == "MATCHED":
+            tail = self._tail(wait["target"], wait["tail_lines"])
+            rendered, clipped = _bounded(
+                redact_text(str(tail.get("output", ""))) if "error" not in tail else "",
+                MAX_TAIL_CHARS_PER_TARGET,
+            )
+        return self._durable_result(
+            saved, waited_ms=waited_ms, polls=polls, tail=rendered,
+            tail_truncated=bool(clipped or tail.get("truncated", False)),
+        )
+
+    def wait_for_state(self, target: str, desired_states: list[str], timeout: float = DEFAULT_WAIT_SECONDS,
+                       poll_interval: float = 1, tail_lines: int = 20) -> dict[str, Any]:
+        if (not isinstance(target, str) or not target.strip() or len(target) > _MAX_TARGET_CHARS
+                or redact_text(target) != target):
+            return {"status": "FAILED", "error": "INVALID_TARGET"}
+        if (not isinstance(desired_states, list) or not desired_states or len(desired_states) > 20 or
+                any(not isinstance(state, str) or not state.strip() or len(state) > 64
+                    or redact_text(state) != state for state in desired_states)):
+            return {"status": "FAILED", "error": "INVALID_DESIRED_STATES"}
+        if error := self._validate_wait(timeout, poll_interval):
+            return error
+        if error := self._validate_tail_lines(tail_lines):
+            return {"status": "FAILED", **error}
+        if self.run_journal is None:
+            return {"status": "FAILED", "error": "CONTINUATION_STORE_UNAVAILABLE"}
+        kind, _value = self._resolve(target)
+        if kind is None:
+            return {"status": "FAILED", "error": "INVALID_TARGET", "target": target}
+        normalized_states = list(dict.fromkeys(state.strip().upper() for state in desired_states))
+        try:
+            # Persist first. No status polling/sleep occurs until this durable
+            # record and its opaque resume token have committed.
+            wait = self.run_journal.start_wait(
+                target=target.strip(), target_type=kind,
+                desired_states=normalized_states, tail_lines=tail_lines,
+                requested_timeout_seconds=float(timeout),
+            )
+        except Exception as exc:  # noqa: BLE001 -- persistence is mandatory here
+            return {"status": "FAILED", "error": "CONTINUATION_PERSIST_FAILED",
+                    "reason": type(exc).__name__}
+        return self._wait_slice(wait, timeout=timeout, poll_interval=poll_interval)
+
+    def resume_wait(self, resume_token: str, timeout: float = DEFAULT_WAIT_SECONDS,
+                    poll_interval: float = 1) -> dict[str, Any]:
+        if not self._validate_resume_token(resume_token):
+            return {"status": "FAILED", "error": "INVALID_RESUME_TOKEN"}
+        if error := self._validate_wait(timeout, poll_interval):
+            return error
+        if self.run_journal is None:
+            return {"status": "FAILED", "error": "CONTINUATION_STORE_UNAVAILABLE"}
+        try:
+            wait = self.run_journal.get_wait(resume_token)
+        except KeyError:
+            return {"status": "FAILED", "error": "UNKNOWN_RESUME_TOKEN"}
+        except TimeoutError:
+            return {"status": "FAILED", "error": "EXPIRED_RESUME_TOKEN"}
+        return self._wait_slice(wait, timeout=timeout, poll_interval=poll_interval)
