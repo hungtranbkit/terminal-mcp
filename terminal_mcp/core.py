@@ -89,6 +89,14 @@ SHELL_COMMAND_NAMES = {
 # gap between polls -- short enough that a fast-confirming send doesn't pay
 # the full timeout, long enough not to hammer tmux.
 SEND_VERIFY_LINES = 20
+CODEX_SEND_VERIFY_LINES = 80
+"""Larger bounded composer capture for Codex's verified-submit watchdog.
+
+Queue dispatches include a nonce-bound completion instruction and routinely
+wrap beyond 20 terminal rows. The watchdog must observe the beginning of that
+same draft before it may send Enter; a larger Codex-only window preserves that
+safety proof without relaxing the evidence requirement for any adapter.
+"""
 SEND_VERIFY_TIMEOUT_SECONDS = 0.6
 SEND_VERIFY_POLL_INTERVAL_SECONDS = 0.05
 
@@ -2032,7 +2040,7 @@ class TerminalService:
         enter_calls = 0
 
         def capture() -> list[str]:
-            return self.tmux.capture_lines(session, SEND_VERIFY_LINES)
+            return self.tmux.capture_lines(session, CODEX_SEND_VERIFY_LINES)
 
         def inject(prompt: str) -> None:
             self.tmux.send_text(session, prompt, press_enter=False)

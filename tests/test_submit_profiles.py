@@ -46,3 +46,19 @@ def test_codex_profile_stops_at_max_without_blind_fourth_enter(tmux_session_fact
     assert result["enter_count"] == 3
     assert result["attempts"] == 3
     assert "SUBMITTED[" not in _service(tmp_path).terminal_tail(name, 20)["output"]
+
+
+def test_codex_verified_submit_observes_long_wrapped_queue_prompt(tmux_session_factory, tmp_path):
+    name = "test-codex-profile-long-queue-prompt"
+    command = (
+        "bash -lc 'CODEX_FIXTURE_MODE=submit_after_n_enters "
+        f"CODEX_REQUIRED_ENTERS=1 exec -a codex python3 -u {FIXTURE}'"
+    )
+    tmux_session_factory(name, command)
+    time.sleep(0.3)
+    # More than 20 rows at an 80-column pane: the former fixed capture lost
+    # the prompt prefix and withheld every Enter as INCOMPLETE.
+    prompt = "queue-canary-prefix " + ("x" * 1800)
+    result = _service(tmp_path).terminal_send_text(name, prompt, press_enter=True)
+    assert result["delivery_state"] == "SUBMIT_CONFIRMED"
+    assert result["enter_count"] == 1
