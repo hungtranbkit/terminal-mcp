@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from dogfood_worker import BudgetRefused, DogfoodWorker, SpecNotExecutable
+from tests.dogfood_worker import BudgetRefused, DogfoodWorker, SpecNotExecutable
 
 from terminal_mcp import bug_spec as bs
 from terminal_mcp import work_inbox as wi

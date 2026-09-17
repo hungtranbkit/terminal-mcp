@@ -35,6 +35,7 @@ from .pm_summary import (
     emergency_resume_all_lanes, emergency_stop_all_lanes, generate_summary,
 )
 from .queue_engine import QueueEngine
+from .request_governor import RequestGovernor
 from .queue_event_drain import QueueEventDrain
 from .queue_loop import QueueLoop
 from .backlog_service import BacklogService
@@ -260,8 +261,13 @@ def build_mcp(service: TerminalService | None = None,
     # AuditStore; never a second audit database.
     repo = build_repo_service(terminal, controller)
     _worktree_sweep_holder: dict[str, Any] = {}
+    request_governor = RequestGovernor(terminal.config.llm_governor, queue.store)
+    # Health registration happens later in server_http.py and only receives
+    # TerminalService; attach the same singleton for read-only gauges there.
+    terminal.request_governor = request_governor
     queue_engine = QueueEngine(queue.store, controller, coordinator=_gate,
-                              on_completed=_on_task_completed, verify_queue=queue.verify_queue)
+                              on_completed=_on_task_completed, verify_queue=queue.verify_queue,
+                              governor=request_governor)
     queue.engine = queue.engine or queue_engine
     integration.engine = integration.engine or IntegrationEngine(integration.store, queue.store)
     # Event-driven WAIT/wake background loop (integration_loop.py) --
@@ -2758,6 +2764,29 @@ def build_mcp(service: TerminalService | None = None,
         specific task (e.g. one just returned by terminal_enqueue_task)
         without needing to already know which session's lane it's in."""
         return queue.task_status(task_id)
+
+    @server.tool()
+    def terminal_task_batch_status(task_ids: list[str]) -> dict:
+        """Read up to 100 durable task states locally; never polls a provider."""
+        if (not isinstance(task_ids, list) or not task_ids or len(task_ids) > 100
+                or any(not isinstance(task_id, str) or not task_id for task_id in task_ids)):
+            return {"error": "INVALID_TASK_IDS", "max_task_ids": 100}
+        tasks = []
+        for task_id in task_ids:
+            result = queue.task_status(task_id)
+            if "task" in result:
+                task = result["task"]
+                tasks.append({"task_id": task["id"], "state": task["status"],
+                              "status": task["status"], "session": task["session"],
+                              "queue_position": result.get("queue_position")})
+            else:
+                tasks.append({"task_id": task_id, **result})
+        return {"tasks": tasks}
+
+    @server.tool()
+    def terminal_llm_governor_status() -> dict:
+        """Current global/provider admission, queue, and cooldown gauges."""
+        return {"llm_governor": request_governor.status()}
 
     @server.tool()
     def terminal_task_create(title: str, prompt: str, assigned_session_id: str | None = None,

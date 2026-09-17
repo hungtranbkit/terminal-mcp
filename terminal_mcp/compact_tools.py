@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import time
 import uuid
@@ -16,10 +17,13 @@ MAX_TAIL_LINES = 20
 MAX_TAIL_CHARS_PER_TARGET = 1_000
 MAX_TOTAL_TAIL_CHARS = 16_000
 MAX_REASON_CHARS = 500
-SYNC_WAIT_BUDGET_SECONDS = 20
+SYNC_WAIT_BUDGET_SECONDS = min(30, max(1, int(os.environ.get("MCP_LONG_CALL_MAX_SEC", "20"))))
 DEFAULT_WAIT_SECONDS = 20
 MAX_SEND_WAIT_SECONDS = 20
+# Compatibility field retained for existing clients. New clients should use
+# retry_after_ms below, which deliberately reduces polling pressure.
 NEXT_POLL_MIN_MS = 1_000
+RECOMMENDED_RETRY_AFTER_MS = 5_000
 _RESUME_TOKEN = re.compile(r"^wait_[0-9a-f]{32}$")
 _MAX_TARGET_CHARS = 512
 
@@ -252,6 +256,7 @@ class CompactTerminalTools:
         if status == "PENDING":
             result.update({
                 "next_poll_after_ms": NEXT_POLL_MIN_MS,
+                "retry_after_ms": RECOMMENDED_RETRY_AFTER_MS,
                 "pending_reason": "SYNC_WAIT_BUDGET_EXHAUSTED",
                 "next_action": "Call terminal_resume_wait with resume_token",
             })
