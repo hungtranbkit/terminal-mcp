@@ -26,6 +26,8 @@ from .git_isolation_service import GitIsolationService
 from .node_models import node_to_dict as _node_to_dict
 from .notes_service import NotesService
 from .notes_store import NotesError
+from .orchestrator_checkpoint import OrchestratorCheckpointStore
+from .chat_checkpoint_tools import register_chat_checkpoint_tools
 from .planner_service import PlannerService
 from .planner_store import PlannerStore
 from .pm_service import PMService
@@ -96,7 +98,8 @@ def build_mcp(service: TerminalService | None = None,
               resource_locks: ResourceLockStore | None = None,
               fleet: "FleetService | None" = None,
               work: Any = None,
-              default_optional_services: bool = True) -> MCPServer:
+              default_optional_services: bool = True,
+              chat_checkpoints: OrchestratorCheckpointStore | None = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -200,6 +203,8 @@ def build_mcp(service: TerminalService | None = None,
         # keeps the test suite's redirected state dir isolating it too.
         if notes is None and terminal.config.notes.enabled:
             notes = NotesService.from_config(terminal.config)
+        if chat_checkpoints is None:
+            chat_checkpoints = OrchestratorCheckpointStore()
         events = events if events is not None else EventBus()
 
     # Orchestration V1: connect the deterministic runtime to the bus. Until
@@ -4160,6 +4165,9 @@ def build_mcp(service: TerminalService | None = None,
         Refuses a task that belongs to a different project."""
         return projects.assign(project_id, task_id, session=session, node_id=node_id,
                                capabilities=capabilities, actor=actor)
+
+    if chat_checkpoints is not None:
+        register_chat_checkpoint_tools(server, chat_checkpoints, projects)
 
     # ------------------------------------------------------------------
     # P0.2 Event Bus. Publish/claim/ack only -- NOTHING here starts an
