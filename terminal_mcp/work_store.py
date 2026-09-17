@@ -97,9 +97,41 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
+def _create_work_checkpoints(connection: sqlite3.Connection) -> None:
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS work_checkpoints (
+            checkpoint_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            work_id TEXT NOT NULL,
+            work_task_id TEXT,
+            queue_task_id TEXT,
+            kind TEXT NOT NULL CHECK (kind IN ('CHECKPOINT', 'RESULT')),
+            state TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            completed TEXT NOT NULL DEFAULT '[]',
+            remaining TEXT NOT NULL DEFAULT '[]',
+            blockers TEXT NOT NULL DEFAULT '[]',
+            next_hint TEXT,
+            commit_sha TEXT,
+            changed_files TEXT NOT NULL DEFAULT '[]',
+            evidence TEXT NOT NULL DEFAULT '[]',
+            actor TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (work_id) REFERENCES work_runs(work_id) ON DELETE CASCADE,
+            FOREIGN KEY (work_task_id) REFERENCES work_tasks(work_task_id) ON DELETE CASCADE
+        )""")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_work_checkpoints_work "
+        "ON work_checkpoints(work_id, created_at)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_work_checkpoints_task_kind "
+        "ON work_checkpoints(work_task_id, kind, created_at)")
+
+
 WORK_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: work_runs/work_tasks/work_approvals/work_artifacts/work_events",
               lambda connection: None),
+    Migration(2, "add durable work checkpoint and result records", _create_work_checkpoints),
 ]
 
 
@@ -373,6 +405,119 @@ class WorkStore:
                 "UPDATE work_tasks SET queue_task_id = ?, updated_at = ? WHERE work_task_id = ?",
                 (queue_task_id, _now(), work_task_id))
 
+    # -- checkpoints --------------------------------------------------------
+
+    def record_checkpoint(self, work_id: str, *, idempotency_key: str, state: str,
+                          summary: str, work_task_id: str | None = None,
+                          queue_task_id: str | None = None,
+                          completed: Any = (), remaining: Any = (), blockers: Any = (),
+                          next_hint: str | None = None, commit_sha: str | None = None,
+                          changed_files: Any = (), evidence: Any = (),
+                          actor: str | None = None) -> dict[str, Any]:
+        return self._record_checkpoint(
+            work_id, kind="CHECKPOINT", idempotency_key=idempotency_key, state=state,
+            summary=summary, work_task_id=work_task_id, queue_task_id=queue_task_id,
+            completed=completed, remaining=remaining, blockers=blockers,
+            next_hint=next_hint, commit_sha=commit_sha, changed_files=changed_files,
+            evidence=evidence, actor=actor)
+
+    def record_result_manifest(self, work_id: str, *, idempotency_key: str, state: str,
+                               summary: str, work_task_id: str | None = None,
+                               queue_task_id: str | None = None,
+                               completed: Any = (), remaining: Any = (), blockers: Any = (),
+                               next_hint: str | None = None, commit_sha: str | None = None,
+                               changed_files: Any = (), evidence: Any = (),
+                               actor: str | None = None) -> dict[str, Any]:
+        return self._record_checkpoint(
+            work_id, kind="RESULT", idempotency_key=idempotency_key, state=state,
+            summary=summary, work_task_id=work_task_id, queue_task_id=queue_task_id,
+            completed=completed, remaining=remaining, blockers=blockers,
+            next_hint=next_hint, commit_sha=commit_sha, changed_files=changed_files,
+            evidence=evidence, actor=actor)
+
+    def _record_checkpoint(self, work_id: str, *, kind: str, idempotency_key: str,
+                           state: str, summary: str, work_task_id: str | None,
+                           queue_task_id: str | None, completed: Any, remaining: Any,
+                           blockers: Any, next_hint: str | None, commit_sha: str | None,
+                           changed_files: Any, evidence: Any,
+                           actor: str | None) -> dict[str, Any]:
+        # Replays return the first durable result without re-validating or
+        # emitting another event. The idempotency key names that original
+        # operation, not the arguments of a later retry.
+        existing = self._checkpoint_by_idempotency_key(idempotency_key)
+        if existing is not None:
+            return existing
+        if not idempotency_key or not idempotency_key.strip():
+            raise WorkError("idempotency_key is required")
+        if self.get_run(work_id) is None:
+            raise WorkError(f"unknown work run {work_id!r}")
+
+        if work_task_id is not None:
+            task = self.get_task(work_task_id)
+            if task is None:
+                raise WorkError(f"unknown work task {work_task_id!r}")
+            if task["work_id"] != work_id:
+                raise WorkError(
+                    f"work task {work_task_id!r} does not belong to work run {work_id!r}")
+            bound_queue_task = task.get("queue_task_id")
+            if queue_task_id is not None and bound_queue_task is not None \
+                    and queue_task_id != bound_queue_task:
+                raise WorkError(
+                    f"work task {work_task_id!r} is bound to queue task "
+                    f"{bound_queue_task!r}, not {queue_task_id!r}")
+            if queue_task_id is None:
+                queue_task_id = bound_queue_task
+
+        encoded = [json.dumps(value) for value in
+                   (completed, remaining, blockers, changed_files, evidence)]
+        checkpoint_id = new_id("wcp")
+        created_at = _now()
+        with self._connection:
+            cursor = self._connection.execute(
+                "INSERT INTO work_checkpoints (checkpoint_id, idempotency_key, work_id, "
+                "work_task_id, queue_task_id, kind, state, summary, completed, remaining, "
+                "blockers, next_hint, commit_sha, changed_files, evidence, actor, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(idempotency_key) DO NOTHING",
+                (checkpoint_id, idempotency_key, work_id, work_task_id, queue_task_id,
+                 kind, state, summary, encoded[0], encoded[1], encoded[2], next_hint,
+                 commit_sha, encoded[3], encoded[4], actor, created_at))
+            if cursor.rowcount:
+                self._connection.execute(
+                    "INSERT INTO work_events (work_id, work_task_id, kind, summary, detail, "
+                    "actor, created_at) VALUES (?,?,?,?,?,?,?)",
+                    (work_id, work_task_id,
+                     "checkpoint_recorded" if kind == "CHECKPOINT" else "result_recorded",
+                     summary, checkpoint_id, actor, created_at))
+        result = self._checkpoint_by_idempotency_key(idempotency_key)
+        assert result is not None
+        return result
+
+    def latest_checkpoint(self, work_task_id: str) -> dict[str, Any] | None:
+        return self._latest_for_task(work_task_id, "CHECKPOINT")
+
+    def latest_result(self, work_task_id: str) -> dict[str, Any] | None:
+        return self._latest_for_task(work_task_id, "RESULT")
+
+    def _latest_for_task(self, work_task_id: str, kind: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT * FROM work_checkpoints WHERE work_task_id = ? AND kind = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (work_task_id, kind)).fetchone()
+        return _row_to_checkpoint(row) if row else None
+
+    def checkpoints_for(self, work_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        return [_row_to_checkpoint(row) for row in self._connection.execute(
+            "SELECT * FROM work_checkpoints WHERE work_id = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (work_id, max(1, min(int(limit), 1000))))]
+
+    def _checkpoint_by_idempotency_key(self, idempotency_key: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT * FROM work_checkpoints WHERE idempotency_key = ?",
+            (idempotency_key,)).fetchone()
+        return _row_to_checkpoint(row) if row else None
+
     # -- approvals -----------------------------------------------------------
 
     def request_approval(self, work_id: str, *, kind: str, summary: str,
@@ -495,3 +640,10 @@ def _row_to_run(row: sqlite3.Row) -> WorkRun:
         updated_at=row["updated_at"], paused_reason=row["paused_reason"],
         failure_reason=row["failure_reason"],
         metadata=json.loads(row["metadata"] or "{}"))
+
+
+def _row_to_checkpoint(row: sqlite3.Row) -> dict[str, Any]:
+    result = dict(row)
+    for field_name in ("completed", "remaining", "blockers", "changed_files", "evidence"):
+        result[field_name] = json.loads(result[field_name])
+    return result
