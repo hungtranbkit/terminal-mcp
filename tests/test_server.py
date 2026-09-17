@@ -101,6 +101,14 @@ async def test_server_registers_v1_and_binding_tools():
         "work_request_approval",
         "work_approve",
         "work_control",
+        # Durable recovery/callback surface: resume recent work, recover/attach
+        # after a chat reset, stream new events, and persist checkpoints/results.
+        "terminal_resume_recent",
+        "work_recover",
+        "work_attach",
+        "work_events_since",
+        "work_checkpoint",
+        "work_result",
         # Project Knowledge, runbook registry, Work Policy and telemetry.
         # Reads, plus two deliberate writes: recording ONE verified module,
         # and a worker reporting what its own task cost. Running a procedure
