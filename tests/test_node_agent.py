@@ -278,6 +278,30 @@ def test_grant_routes_require_auth(agent_client):
     assert response2.status_code == 401
 
 
+def test_permissions_routes_are_registered_and_round_trip(agent_client):
+    create = agent_client.post("/v1/sessions", headers=_auth(),
+                               json={"name": "agent-perms", "agent_type": "shell", "cwd": None})
+    assert create.status_code == 200
+    agent_client.created.append("agent-perms")
+
+    initial = agent_client.get("/v1/sessions/agent-perms/permissions", headers=_auth())
+    assert initial.status_code == 200
+    assert initial.json()["session"] == "agent-perms"
+
+    changed = agent_client.post(
+        "/v1/sessions/agent-perms/permissions", headers=_auth(),
+        json={"read": True, "input": True, "actor": "route-test"},
+    )
+    assert changed.status_code == 200
+    assert changed.json()["requested"] == {"read": True, "input": True}
+    assert changed.json()["stale_identity_pin"] is False
+
+
+def test_permissions_routes_require_auth(agent_client):
+    assert agent_client.get("/v1/sessions/agent-perms/permissions").status_code == 401
+    assert agent_client.post("/v1/sessions/agent-perms/permissions", json={"read": True}).status_code == 401
+
+
 # -- Session Knowledge Store routes (session_knowledge.py) -------------------
 
 def test_knowledge_routes_require_auth(agent_client):

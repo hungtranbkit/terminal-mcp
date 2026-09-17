@@ -605,8 +605,8 @@ class RemoteNodeClient:
     def set_permissions(self, session: str, *, read=None, input=None,
                         expected_revision=None, actor=None) -> dict[str, Any]:
         return self._request("POST", f"/v1/sessions/{session}/permissions",
-                             {"read": read, "input": input,
-                              "expected_revision": expected_revision, "actor": actor})
+                             body={"read": read, "input": input,
+                                   "expected_revision": expected_revision, "actor": actor})
 
     def refresh_capabilities(self) -> dict[str, Any]:
         return self._request("POST", "/v1/capabilities/refresh")

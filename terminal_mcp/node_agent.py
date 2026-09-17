@@ -1037,6 +1037,8 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         Route("/v1/registry", registry_list, methods=["GET"]),
         Route("/v1/sessions/{name}/grant-read", session_grant_read, methods=["POST"]),
         Route("/v1/sessions/{name}/grant-input", session_grant_input, methods=["POST"]),
+        Route("/v1/sessions/{name}/permissions", session_permissions, methods=["GET"]),
+        Route("/v1/sessions/{name}/permissions", set_session_permissions, methods=["POST"]),
         Route("/v1/killed-sessions", killed_sessions, methods=["GET"]),
         # Fleet metadata: an exchange (POST) and this node's own cached view
         # (GET). Metadata only -- no session control reachable from either.
