@@ -63,7 +63,8 @@ class NodeClient(Protocol):
                        show_on_desktop: bool = False,
                        resume_session_id: str | None = None) -> dict[str, Any]: ...
     def detach_session(self, name: str) -> dict[str, Any]: ...
-    def delete_session(self, name: str) -> dict[str, Any]: ...
+    def delete_session(self, name: str, *, confirm: bool = False,
+                       requested_by: str | None = None) -> dict[str, Any]: ...
     def kill_session(self, name: str, confirm_name: str, *, requested_by: str | None = None) -> dict[str, Any]: ...
     def rename_session(self, name: str, new_name: str, *, requested_by: str | None = None) -> dict[str, Any]: ...
     def reopen_session(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
@@ -147,8 +148,9 @@ class LocalNodeClient:
     def detach_session(self, name: str) -> dict[str, Any]:
         return self._terminal.terminal_detach_session(name)
 
-    def delete_session(self, name: str) -> dict[str, Any]:
-        return self._terminal.terminal_delete_session(name)
+    def delete_session(self, name: str, *, confirm: bool = False,
+                       requested_by: str | None = None) -> dict[str, Any]:
+        return self._terminal.terminal_delete_session(name, confirm=confirm, requested_by=requested_by)
 
     def kill_session(self, name: str, confirm_name: str, *, requested_by: str | None = None) -> dict[str, Any]:
         return self._terminal.terminal_kill_session(name, confirm_name, requested_by=requested_by)
@@ -463,8 +465,10 @@ class RemoteNodeClient:
     def detach_session(self, name: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/sessions/{urllib.parse.quote(name)}/detach")
 
-    def delete_session(self, name: str) -> dict[str, Any]:
-        return self._request("DELETE", f"/v1/sessions/{urllib.parse.quote(name)}")
+    def delete_session(self, name: str, *, confirm: bool = False,
+                       requested_by: str | None = None) -> dict[str, Any]:
+        return self._request("DELETE", f"/v1/sessions/{urllib.parse.quote(name)}",
+                             body={"confirm": confirm, "requested_by": requested_by})
 
     def kill_session(self, name: str, confirm_name: str, *, requested_by: str | None = None) -> dict[str, Any]:
         return self._request("POST", f"/v1/sessions/{urllib.parse.quote(name)}/kill",

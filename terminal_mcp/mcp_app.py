@@ -58,6 +58,7 @@ from .release_service import ReleaseService
 from .release_store import ReleaseStore
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
+from .session_deletion import deletion_preflight
 
 
 def _fleet_session_names(controller: "ControllerService") -> list[str]:
@@ -783,18 +784,28 @@ def build_mcp(service: TerminalService | None = None,
         return controller.terminal_detach_session(name)
 
     @server.tool()
-    def terminal_delete_session(name: str) -> dict:
+    def terminal_delete_session(name: str, confirm: bool = False) -> dict:
         """Terminate and remove exactly one tmux session (never affects
         any other session, never uses tmux kill-server). The configured
+        `confirm` must be true; omission is refused server-side. The
         protected session(s) -- always including "terminal-mcp" itself --
         can never be deleted this way. Idempotent: a session already gone
         returns a success-shaped result, not an error. Cleans up any
-        binding/grant that pointed at this session; a still-enabled
+        binding/grant that pointed at this session. Attached, leased,
+        recovering, queued/running-task, and active-journal targets are
+        refused. A still-enabled
         supervisor watch on it is disabled (its history is kept, not
         deleted) rather than left pointing at a session that no longer
         exists."""
         _refresh_local_heartbeat()
-        result = controller.terminal_delete_session(name)
+        preflight = deletion_preflight(name, queue=queue, run_journal=run_journal, supervisor=supervisor)
+        if "error" in preflight:
+            terminal.audit.record(action="delete_session", session=name, result="BLOCKED",
+                                  reason=preflight["error"], actor="mcp")
+            return preflight
+        result = controller.terminal_delete_session(name, confirm=confirm, requested_by="mcp")
+        if "error" not in result:
+            result.setdefault("references", {}).update(preflight["references"])
         if "error" not in result:
             # Same wiring-layer coordination supervisor_watch/supervisor_
             # unwatch above already do for v1/v2 policy purge -- disable
@@ -825,7 +836,14 @@ def build_mcp(service: TerminalService | None = None,
         null -- nothing was actually killed by this call, so nothing new
         was captured), not an error."""
         _refresh_local_heartbeat()
+        preflight = deletion_preflight(name, queue=queue, run_journal=run_journal, supervisor=supervisor)
+        if "error" in preflight:
+            terminal.audit.record(action="kill_session", session=name, result="BLOCKED",
+                                  reason=preflight["error"], actor="mcp")
+            return preflight
         result = controller.terminal_kill_session(name, confirm_name, requested_by="mcp")
+        if "error" not in result:
+            result.setdefault("references", {}).update(preflight["references"])
         if "error" not in result:
             supervisor.unwatch(session=name, delete=False)
         return result

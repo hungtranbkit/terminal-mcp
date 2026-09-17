@@ -4,6 +4,7 @@ import re
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -3587,7 +3588,47 @@ class TerminalService:
                           reason=result.get("error") or result.get("action"))
         return result
 
-    def terminal_delete_session(self, name: str) -> dict[str, Any]:
+    def _session_delete_runtime_blocker(self, name: str, info: Any) -> str | None:
+        """Fail closed while a session is observably in use.
+
+        Queue/journal ownership is checked at the controller wiring layer,
+        where those fleet-wide stores live.  These checks deliberately live
+        beside the actual backend kill so direct node-agent callers cannot
+        bypass attachment, pane-lease, or recovery protection.
+        """
+        if info.attached:
+            return "SESSION_ATTACHED"
+        record = self.session_registry.get(self.REGISTRY_LOCAL_NODE_ID, name)
+        if record is not None and record.recovery_state == "RESTORING":
+            return "SESSION_RECOVERING"
+        identity = SessionIdentity.from_session_info(info)
+        lease_keys = (f"{identity.session_id}:{identity.pane_id}",
+                      f"recovery:{self.REGISTRY_LOCAL_NODE_ID}/{name}")
+        now = datetime.now(timezone.utc)
+        for lease_key in lease_keys:
+            holder = self.leases.holder(lease_key)
+            if holder is None:
+                continue
+            try:
+                expires_at = datetime.fromisoformat(holder["expires_at"])
+            except (KeyError, TypeError, ValueError):
+                return "SESSION_LEASED"
+            if expires_at > now:
+                return "SESSION_LEASED"
+        return None
+
+    def _session_delete_local_references(self, name: str) -> dict[str, Any]:
+        grant = self.grants.get(name)
+        return {
+            "bindings": [binding.name for binding in self.bindings.list() if binding.session == name],
+            "active_grant": bool(grant and (grant.read_enabled or grant.input_enabled)),
+            "attached": False,
+            "active_lease": False,
+            "recovery_state": None,
+        }
+
+    def terminal_delete_session(self, name: str, *, confirm: bool = False,
+                                requested_by: str | None = None) -> dict[str, Any]:
         """Terminate and remove exactly one tmux session (`kill-session`,
         never `kill-server`) -- the protected set (config.session_
         lifecycle.protected_sessions, always including "terminal-mcp")
@@ -3601,18 +3642,41 @@ class TerminalService:
         marks it disabled, rather than deleting it outright)."""
         action = "delete_session"
         if (error := require_session_lifecycle(self.config)) is not None:
-            self.audit.record(action=action, session=name, result="BLOCKED", reason=error)
+            self.audit.record(action=action, session=name, result="BLOCKED", reason=error,
+                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
             return {"error": error, "session": name}
         if not valid_session_name(name):
-            self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_SESSION_NAME")
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_SESSION_NAME",
+                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
             return {"error": "INVALID_SESSION_NAME", "session": name}
+        if session_input_denied_by_pattern(name, self.config):
+            self.audit.record(action=action, session=None, result="BLOCKED", reason="ACCESS_DENIED",
+                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
+            return {"error": "ACCESS_DENIED"}
+        if confirm is not True:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="CONFIRMATION_REQUIRED",
+                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
+            return {"error": "CONFIRMATION_REQUIRED", "session": name}
+        try:
+            info = self.tmux.get_session(name)
+        except TmuxError as exc:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="TMUX_ERROR",
+                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
+            return {"error": "TMUX_ERROR", "reason": str(exc), "session": name}
+        if info is not None and (blocker := self._session_delete_runtime_blocker(name, info)) is not None:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason=blocker,
+                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
+            return {"error": blocker, "session": name}
+        references = self._session_delete_local_references(name)
         result = self.lifecycle.delete(name, protected_sessions=self.config.session_lifecycle.protected_sessions)
         ok = "error" not in result
         if ok:
             self._cleanup_after_session_gone(name)
             self.session_registry.mark_killed(self.REGISTRY_LOCAL_NODE_ID, name, killed_by="dashboard:delete")
+            result["references"] = references
         self.audit.record(action=action, session=name, result="DELETED" if ok else "BLOCKED",
-                          reason=result.get("error") or result.get("action"))
+                          reason=result.get("error") or result.get("action"), actor=requested_by,
+                          node_id=self.REGISTRY_LOCAL_NODE_ID)
         return result
 
     def _cleanup_after_session_gone(self, session: str) -> None:
@@ -3682,28 +3746,41 @@ class TerminalService:
              possible, so it can warn BEFORE the kill if not."""
         action = "kill_session"
         if (error := require_session_lifecycle(self.config)) is not None:
-            self.audit.record(action=action, session=name, result="BLOCKED", reason=error)
+            self.audit.record(action=action, session=name, result="BLOCKED", reason=error,
+                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
             return {"error": error, "session": name}
         if not valid_session_name(name):
-            self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_SESSION_NAME")
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_SESSION_NAME",
+                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
             return {"error": "INVALID_SESSION_NAME", "session": name}
+        if session_input_denied_by_pattern(name, self.config):
+            self.audit.record(action=action, session=None, result="BLOCKED", reason="ACCESS_DENIED",
+                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
+            return {"error": "ACCESS_DENIED"}
         if confirm_name != name:
-            self.audit.record(action=action, session=name, result="BLOCKED", reason="CONFIRMATION_MISMATCH")
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="CONFIRMATION_MISMATCH",
+                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
             return {"error": "CONFIRMATION_MISMATCH", "session": name}
         # Protected check is also lifecycle.delete()'s own first move (see
         # its docstring) -- repeated here only so this can short-circuit
         # BEFORE ever querying tmux for metadata to capture, not because
         # the refusal itself would otherwise be missed.
         if name in self.config.session_lifecycle.protected_sessions:
-            self.audit.record(action=action, session=name, result="BLOCKED", reason="SESSION_PROTECTED")
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="SESSION_PROTECTED",
+                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
             return {"error": "SESSION_PROTECTED", "session": name}
         try:
             info = self.tmux.get_session(name)
         except TmuxError as exc:
-            self.audit.record(action=action, session=name, result="BLOCKED", reason="TMUX_ERROR")
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="TMUX_ERROR",
+                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
             return {"error": "TMUX_ERROR", "reason": str(exc), "session": name}
         metadata = self._capture_reopen_metadata(info) if info is not None else None
         if info is not None:
+            if blocker := self._session_delete_runtime_blocker(name, info):
+                self.audit.record(action=action, session=name, result="BLOCKED", reason=blocker,
+                                  actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
+                return {"error": blocker, "session": name}
             # Final flush + an automatic checkpoint BEFORE the process is
             # actually gone -- captures whatever output happened since
             # the last reconcile pass, and leaves an explicit marker in
@@ -3722,6 +3799,7 @@ class TerminalService:
                     self.tmux.stop_output_capture(name)
             except Exception:  # noqa: BLE001 -- knowledge capture must never block or fail an actual kill
                 pass
+        references = self._session_delete_local_references(name)
         result = self.lifecycle.delete(name, protected_sessions=self.config.session_lifecycle.protected_sessions)
         ok = "error" not in result
         if ok:
@@ -3751,8 +3829,10 @@ class TerminalService:
                 agent_type=metadata["agent_type"] if metadata else None,
                 backend_type=self._registry_backend_type(),
             )
+            result["references"] = references
         self.audit.record(action=action, session=name, result="KILLED" if ok else "BLOCKED",
-                          reason=result.get("error") or result.get("action"))
+                          reason=result.get("error") or result.get("action"), actor=requested_by,
+                          node_id=self.REGISTRY_LOCAL_NODE_ID)
         return result
 
     def terminal_rename_session(self, name: str, new_name: str, *,

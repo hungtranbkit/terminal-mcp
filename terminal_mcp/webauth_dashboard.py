@@ -50,6 +50,9 @@ from .dashboard import DASHBOARD_HTML, INPUT_ERROR_STATUS, SESSIONS_ADMIN_HTML, 
 from .permissions import valid_session_name
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
+from .queue_service import QueueService
+from .run_journal import RunJournalStore
+from .session_deletion import deletion_preflight
 from .webauth import SESSION_COOKIE_NAME, SESSION_TTL, WebAuthStore
 from .webterm import WebTerminalProcess, pump_websocket
 from .webterm_assets import ASSETS
@@ -204,7 +207,9 @@ def _origin_allowed(request: Request, allowed_origins: tuple[str, ...]) -> bool:
 def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, webauth: WebAuthStore,
                                supervisor: SupervisorService | None = None,
                                supervisor_v2: SupervisorV2Service | None = None,
-                               controller: ControllerService | None = None) -> None:
+                               controller: ControllerService | None = None,
+                               queue: QueueService | None = None,
+                               run_journal: RunJournalStore | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -639,11 +644,52 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
         except ValueError:
             body = {}
         name = body.get("name") if isinstance(body, dict) else None
-        if not isinstance(name, str) or not name:
+        confirm = body.get("confirm") if isinstance(body, dict) else False
+        if not isinstance(name, str) or not name or confirm is not True:
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         _log.info("webauth delete_session name=%s username=%s", name, user.username)
-        result = await anyio.to_thread.run_sync(terminal.terminal_delete_session, name)
+        preflight = await anyio.to_thread.run_sync(
+            lambda: deletion_preflight(name, queue=queue, run_journal=run_journal, supervisor=supervisor))
+        if "error" in preflight:
+            terminal.audit.record(action="delete_session", session=name, result="BLOCKED",
+                                  reason=preflight["error"], actor=user.username)
+            return JSONResponse(preflight, status_code=409, headers={"Cache-Control": "no-store"})
+        result = await anyio.to_thread.run_sync(
+            lambda: controller.terminal_delete_session(name, confirm=True, requested_by=user.username)
+            if controller is not None else terminal.terminal_delete_session(
+                name, confirm=True, requested_by=user.username))
         if "error" not in result:
+            result.setdefault("references", {}).update(preflight["references"])
+            await anyio.to_thread.run_sync(lambda: supervisor.unwatch(session=name, delete=False))
+        status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/app/api/session/kill", methods=["POST"], include_in_schema=False)
+    async def app_session_kill(request: Request):
+        blocked, user = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        confirm_name = body.get("confirm_name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name or not isinstance(confirm_name, str):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        preflight = await anyio.to_thread.run_sync(
+            lambda: deletion_preflight(name, queue=queue, run_journal=run_journal, supervisor=supervisor))
+        if "error" in preflight:
+            terminal.audit.record(action="kill_session", session=name, result="BLOCKED",
+                                  reason=preflight["error"], actor=user.username)
+            return JSONResponse(preflight, status_code=409, headers={"Cache-Control": "no-store"})
+        result = await anyio.to_thread.run_sync(
+            lambda: controller.terminal_kill_session(
+                name, confirm_name, requested_by=user.username)
+            if controller is not None else terminal.terminal_kill_session(
+                name, confirm_name, requested_by=user.username))
+        if "error" not in result:
+            result.setdefault("references", {}).update(preflight["references"])
             await anyio.to_thread.run_sync(lambda: supervisor.unwatch(session=name, delete=False))
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})

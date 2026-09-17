@@ -532,8 +532,10 @@ class ControllerService:
     def terminal_detach_session(self, name: str) -> dict[str, Any]:
         return self._route(name, "detach", lambda client, bare: client.detach_session(bare))
 
-    def terminal_delete_session(self, name: str) -> dict[str, Any]:
-        return self._route(name, "delete", lambda client, bare: client.delete_session(bare))
+    def terminal_delete_session(self, name: str, *, confirm: bool = False,
+                                requested_by: str | None = None) -> dict[str, Any]:
+        return self._route(name, "delete", lambda client, bare: client.delete_session(
+            bare, confirm=confirm, requested_by=requested_by))
 
     def terminal_kill_session(self, name: str, confirm_name: str, *, requested_by: str | None = None) -> dict[str, Any]:
         return self._route(name, "kill", lambda client, bare: client.kill_session(

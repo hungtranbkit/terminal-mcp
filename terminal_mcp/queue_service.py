@@ -455,6 +455,37 @@ class QueueService:
         no key here; callers use `.get(name, 0)`, never a bare index."""
         return {lane["session"]: self.count_pending(lane["tasks"]) for lane in self.store.list_all_lanes()}
 
+    def deletion_references(self, session: str) -> list[dict[str, Any]]:
+        """Non-terminal queue ownership that makes killing a lane unsafe.
+
+        Historical terminal rows are intentionally excluded: deleting a
+        tmux process must preserve task history, but completed/cancelled/
+        skipped work must not pin an otherwise disposable session forever.
+        """
+        candidates = {session, session.split("/", 1)[-1]}
+        unsafe = set(self.PENDING_STATUSES) | set(self._RUNNING_STATUSES)
+        references: list[dict[str, Any]] = []
+        for lane in self.store.list_all_lanes():
+            if lane.get("session") not in candidates:
+                continue
+            for task in lane.get("tasks", []):
+                if task.get("status") in unsafe:
+                    references.append({"task_id": task.get("id"), "status": task.get("status")})
+        return references
+
+    def deletion_reference_index(self) -> dict[str, list[dict[str, Any]]]:
+        """One bulk read for dashboard delete-button availability."""
+        unsafe = set(self.PENDING_STATUSES) | set(self._RUNNING_STATUSES)
+        result: dict[str, list[dict[str, Any]]] = {}
+        for lane in self.store.list_all_lanes():
+            references = [
+                {"task_id": task.get("id"), "status": task.get("status")}
+                for task in lane.get("tasks", []) if task.get("status") in unsafe
+            ]
+            if references:
+                result[lane["session"]] = references
+        return result
+
     _TERMINAL_RECENT_STATUSES = ("COMPLETED", "FAILED", "CANCELLED", "SKIPPED")
     _ATTENTION_STATUSES = ("BLOCKED", "FAILED", "DISPATCH_UNCERTAIN", "WAITING_SESSION", "PAUSED")
     _RUNNING_STATUSES = ("PRECHECK", "READY", "DISPATCHING", "RUNNING", "VERIFYING")

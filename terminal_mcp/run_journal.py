@@ -357,6 +357,33 @@ class RunJournalStore:
             ).fetchall()
         return [self._run(row) for row in rows]
 
+    def active_for_session(self, session: str) -> list[dict[str, Any]]:
+        """Active recovery references for a session, preserving history.
+
+        Qualified fleet names and their bare owning-node name are treated as
+        the same target.  Completed rows remain available in the journal but
+        never prevent cleanup.
+        """
+        bare = session.split("/", 1)[-1]
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM journal_runs WHERE completed_at IS NULL AND session IN (?, ?) "
+                "ORDER BY updated_at DESC", (session, bare),
+            ).fetchall()
+        return [self._run(row) for row in rows]
+
+    def active_session_index(self) -> dict[str, list[dict[str, Any]]]:
+        """All active runs grouped by session for a single dashboard read."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM journal_runs WHERE completed_at IS NULL ORDER BY updated_at DESC"
+            ).fetchall()
+        result: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            run = self._run(row)
+            result.setdefault(run["session"], []).append(run)
+        return result
+
     def update_run(
         self,
         run_id: str,

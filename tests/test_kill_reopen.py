@@ -149,7 +149,8 @@ def test_reopen_is_a_new_process_not_a_resurrection(tmp_path, cleanup_tmux):
     service.terminal_reopen_session(name)
     after = service.tmux.get_session(name)
     assert after is not None
-    assert after.session_id != before.session_id  # tmux's own never-reused-while-alive id -- proves "new", not "restored"
+    # tmux may reuse "$0" after the old server's last session exits; the
+    # process identity is the reliable proof this is a new session.
     assert after.pane_pid != before.pane_pid
 
 
