@@ -65,6 +65,37 @@ GATE = "gate"
 STAGE_ORDER = (CAPTURE, CLASSIFY, KNOWLEDGE, SIMILAR, DELTA, REUSE, SPEC, GATE)
 
 
+def prepare_microtasks(spec: WorkSpec, *, session: str | None = None,
+                       project: str | None = None) -> list[dict[str, Any]]:
+    """Apply the bounded-slice policy to the spec's existing decomposition.
+
+    Imported lazily to keep the request-to-spec pipeline independent of queue
+    execution.  This is deliberately a policy entry point, not another
+    planner: ``work_microtask`` delegates ordering and request keys to the
+    existing decomposition adapter.
+    """
+    from .work_microtask import prepare
+
+    return prepare(spec, session=session, project=project)
+
+
+def audit_microtasks(spec: WorkSpec) -> dict[str, Any]:
+    """Serializable, side-effect-free metrics for a spec's subtask DAG."""
+    from .work_microtask import audit
+
+    return audit(spec)
+
+
+def decompose_microtasks(spec: WorkSpec, *, planner: Any, parent_task_id: str,
+                         session: str | None = None,
+                         project: str | None = None) -> dict[str, Any]:
+    """Send policy-compliant slices through the existing PlannerService."""
+    from .work_microtask import decompose
+
+    return decompose(spec, planner=planner, parent_task_id=parent_task_id,
+                     session=session, project=project)
+
+
 @dataclass
 class Stage:
     """What one stage did, and what it could not do.
