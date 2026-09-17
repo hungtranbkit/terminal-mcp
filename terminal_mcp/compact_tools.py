@@ -20,7 +20,6 @@ SYNC_WAIT_BUDGET_SECONDS = 20
 DEFAULT_WAIT_SECONDS = 20
 MAX_SEND_WAIT_SECONDS = 30
 NEXT_POLL_MIN_MS = 1_000
-NEXT_POLL_MAX_MS = 5_000
 _RESUME_TOKEN = re.compile(r"^wait_[0-9a-f]{32}$")
 _MAX_TARGET_CHARS = 512
 
@@ -245,9 +244,7 @@ class CompactTerminalTools:
         }
         if status == "PENDING":
             result.update({
-                "next_poll_after_ms": max(
-                    NEXT_POLL_MIN_MS,
-                    min(NEXT_POLL_MAX_MS, int(1000))),
+                "next_poll_after_ms": NEXT_POLL_MIN_MS,
                 "pending_reason": "SYNC_WAIT_BUDGET_EXHAUSTED",
                 "next_action": "Call terminal_resume_wait with resume_token",
             })
