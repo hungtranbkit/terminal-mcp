@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit as _urlsplit
 
 import yaml
 
+from . import endpoint_policy
 from .node_models import NodeHeartbeatThresholds, OverloadThresholds
 
 
@@ -105,6 +108,13 @@ class QueueConfig:
     docstring for the full two-gate safety reasoning."""
     enabled: bool = False
     poll_interval_seconds: float = 3.0
+    # Bus-driven reaction (queue_event_drain.py), inside the SAME loop -- never
+    # a second scheduler. Its own flag rather than riding on `enabled` above:
+    # turning on auto-dispatch is a decision about lanes, while turning on the
+    # drain is a decision about consuming the event bus, and an operator should
+    # be able to make the first without silently also making the second.
+    drain_enabled: bool = False
+    drain_batch_size: int = 25
 
 
 @dataclass(frozen=True)
@@ -160,6 +170,40 @@ class AutoRecoveryConfig:
     is only the safety-net poll for whatever that misses (e.g. a node
     that was already online when this loop started)."""
     enabled: bool = False
+    # Staleness bound. A session that went MISSING long ago is not something
+    # today's reconcile pass should resurrect: this registry accumulates a row
+    # for every session that ever existed, including disposable ones from test
+    # runs that ended normally. Measured live on this deployment before this
+    # existed: 207 MISSING records, 136 of them "recoverable" -- enabling
+    # auto-recovery globally would have spawned 136 real processes, nearly all
+    # of them long-dead test sessions.
+    #
+    # Age is measured from last_seen_at (when the session was last observed
+    # ALIVE). 0 disables the bound. An explicit human force=True always
+    # bypasses it -- reopening something old on purpose stays possible.
+    #
+    # One hour, not a day: a node coming back from a reboot rejoins within
+    # minutes, so anything a legitimate recovery needs to catch is very
+    # recent. Measured against this deployment's real registry, the two
+    # windows are worlds apart -- a 24h bound left 135 of 136 "recoverable"
+    # records eligible, a 1h bound leaves 2, and the age histogram has an
+    # actual gap there (nothing between ~8 minutes and ~10 hours). The long
+    # tail is disposable test sessions that ended normally and must never be
+    # resurrected.
+    max_missing_age_seconds: float = 3600.0
+    # Only auto-recreate sessions this controller was ASKED to create.
+    #
+    # A session it merely observed -- someone's own `tmux new-session`, a test
+    # fixture, an editor terminal -- has no recorded launch command, so
+    # recreating it means guessing at another process's argv and calling the
+    # guess a recovery. Measured on this fleet: of 264 records, 29 carry a
+    # launch command, and all 9 that auto-recovery would otherwise have
+    # respawned carried none. With this on, the blast radius of enabling
+    # auto-recovery here went from 9 junk processes to 0.
+    #
+    # force=True always bypasses it: an operator reopening something
+    # explicitly is making that judgement themselves.
+    managed_sessions_only: bool = True
     max_attempts: int = 3
     lock_ttl_seconds: float = 60.0
     reconcile_poll_seconds: float = 30.0
@@ -193,6 +237,40 @@ class IntegrationLoopConfig:
     docstring for the full two-gate reasoning."""
     enabled: bool = False
     fallback_poll_seconds: float = 5.0
+
+
+@dataclass(frozen=True)
+class LifecycleConfig:
+    """Lifecycle Close-Loop V1 (lifecycle_service.py): the reconcile pass
+    that carries work from a verify PASS through merge and release to a
+    safely reaped worktree.
+
+    OFF by default, same posture as every other autonomous loop here. With
+    `enabled: false` the service is still constructed and every method is
+    still callable by hand (the MCP tools, a test) -- only the AUTOMATIC
+    invocation from MaintenanceLoop is gated, matching the established
+    "manual call always available, only the automatic trigger is gated"
+    convention of queue/integration_loop/auto_recovery.
+
+    `worktree_roots` is a genuine safety boundary, not a convenience: the
+    reaper refuses to remove any worktree outside it. Empty means "no
+    containment check", which is why it is empty only in a test rig --
+    a real deployment names its roots explicitly, and the reaper is
+    therefore incapable of touching a path the operator never listed."""
+    enabled: bool = False
+    main_branch: str = "main"
+    environment: str = "dev"
+    worktree_roots: tuple[str, ...] = ()
+    reconcile_limit: int = 50
+    allow_unverified_integration: bool = True
+    """Backward compatibility, made explicit. Before this feature a task
+    published its integration handoff on COMPLETED, so integration never
+    required a verification at all. Leaving this True keeps a deployment
+    that never adopted the verify queue working exactly as before -- but
+    the bypass is no longer silent: it is suppressed entirely whenever the
+    task has a verify job, and when it does fire it writes a
+    VERIFICATION_BYPASSED event naming the task. Set False to require a
+    VERIFIED_PASS before anything may enter the merge queue."""
 
 
 @dataclass(frozen=True)
@@ -489,6 +567,183 @@ class AskChatGptConfig:
 
 
 @dataclass(frozen=True)
+class WorkConfig:
+    # OFF by default, and that differs from FleetSyncConfig on purpose: the
+    # fleet loop only re-projects local data, while this one can cause an
+    # agent to be handed work on a real session. A capability that acts on
+    # its own starts disabled. See work_loop.py.
+    enabled: bool = False
+    interval_seconds: int = 20
+    max_runs_per_tick: int = 25
+    # The privileged action: turning a `-work` lane's auto-dispatch on. A
+    # deployment can keep the coordinator's bookkeeping and still leave the
+    # actual enabling to a human.
+    auto_enable_dispatch: bool = True
+    lease_seconds: int = 900
+    max_revisions: int = 3
+    no_progress_limit: int = 3
+
+
+@dataclass(frozen=True)
+class WorktreeJanitorConfig:
+    """Worktree Janitor (docs/WORKTREE_JANITOR.md). P0 ships the CLASSIFIER
+    ONLY -- there is no executor, so no setting here can cause a deletion.
+
+    `mode` defaults to observe_only (invariant I8) and mirrors
+    supervisor2.POLICY_MODES' escalation shape. It is recorded in every report
+    so an operator can see which mode produced a verdict; the classifier never
+    acts in any mode.
+
+    `allowed_roots` empty means NOTHING is collectable -- deliberately the
+    opposite of repo_read's fallback-to-home behaviour. A reclaim deletes; its
+    allowlist must be stated explicitly by an operator, never inherited.
+
+    `extra_valuable_globs` is additive only. There is no key that removes a
+    built-in valuable glob, so no config edit can make a credential file or a
+    sqlite db collectable."""
+
+    mode: str = "observe_only"  # observe_only | suggest_only | auto_execute
+    allowed_roots: tuple[str, ...] = ()
+    integration_ref: str = "main"
+    allow_preserved_unmerged: bool = False
+    grace_seconds: int = 86_400
+    grace_floor_seconds: int = 3_600
+    max_evidence_age_seconds: float = 120.0
+    max_candidates_per_run: int = 50
+    timeout_seconds: float = 20.0
+    extra_valuable_globs: tuple[str, ...] = ()
+    # P3 sweep. `sweep_enabled` gates only the BACKGROUND THREAD -- run_once()
+    # stays callable via MCP with it off, this project's standing "the manual
+    # path always works, only the automatic trigger is gated" posture.
+    sweep_enabled: bool = False
+    sweep_interval_seconds: float = 900.0
+    sweep_budget_seconds: float = 60.0
+    orphan_confirm_runs: int = 2
+    orphan_min_age_seconds: float = 3600.0
+    repo_roots: tuple[str, ...] = ()
+
+    def to_policy(self) -> Any:
+        from .worktree_janitor import JanitorPolicy
+
+        return JanitorPolicy(
+            mode=self.mode, allowed_roots=tuple(self.allowed_roots),
+            integration_ref=self.integration_ref,
+            allow_preserved_unmerged=self.allow_preserved_unmerged,
+            grace_seconds=self.grace_seconds,
+            max_evidence_age_seconds=self.max_evidence_age_seconds,
+            timeout_seconds=self.timeout_seconds,
+            extra_valuable_globs=tuple(self.extra_valuable_globs))
+
+
+@dataclass(frozen=True)
+class PromptDeliveryConfig:
+    """Prompt delivery / acceptance gate (see delivery_gate.py).
+
+    ADVISORY BY DEFAULT, and that default is the whole reason this can ship
+    at all: in "advisory" the gate is computed, recorded to audit/events and
+    returned as additive fields, while every existing transition happens
+    exactly as it does today. Zero behaviour change until an operator sets
+    "enforce". The escalation shape mirrors supervisor2.POLICY_MODES -- the
+    project's audited precedent for exactly this kind of rollout.
+
+    In "enforce", a send that does not reach DELIVERED cannot advance a
+    queue task to RUNNING or a supervisor action to observing. That IS a
+    real behaviour change (a task that today goes RUNNING on a confirmed
+    submit with no acceptance evidence would instead hold), which is why it
+    is opt-in and per-deployment.
+
+    `require_acceptance=False` keeps gate 1 (the positive delivery_state
+    allowlist, which is pure hardening and cannot fail open) while skipping
+    gate 2 -- for a deployment that wants the denylist fixed without the
+    extra post-submit observation.
+    """
+
+    mode: str = "advisory"  # advisory | enforce
+    require_acceptance: bool = True
+    # How long to wait after a confirmed submit before deciding acceptance
+    # was not observed. Short: this is one extra observation, not a poll
+    # loop -- the completion watcher already owns long-running observation.
+    acceptance_timeout_seconds: float = 3.0
+    acceptance_poll_interval_seconds: float = 0.4
+    acceptance_capture_lines: int = 40
+
+    @property
+    def enforcing(self) -> bool:
+        return self.mode == "enforce"
+
+
+@dataclass(frozen=True)
+class RepoReadConfig:
+    """Read-only repository access for the `repo_*` MCP tools (see
+    repo_read.py, repo_service.py).
+
+    ON by default, unlike `session_lifecycle`/`work` -- and the difference
+    is the point rather than an oversight. Those gates guard capabilities
+    that CREATE something (a real process, an auto-dispatched prompt);
+    this one only reads, has no write primitive to lose control of, and
+    would be useless to an operator who had to edit config before an
+    agent could look at a file. The real boundary here is
+    `allowed_roots`, not the on/off flag.
+
+    `allowed_roots` empty (the default) reuses
+    `session_lifecycle.allowed_cwd_roots` -- the allowlist this
+    deployment has ALREADY curated for "paths a session may live in",
+    which is very nearly the set of repos worth reading -- and falls back
+    to the server's own home directory when that is unset too. Never to
+    "/" and never to an unbounded root; see repo_read.RepoReadPolicy.
+
+    `extra_secret_globs` is additive only. There is deliberately no
+    config key that REMOVES a built-in secret glob, so no config edit can
+    reopen a path repo_read.py closed."""
+
+    enabled: bool = True
+    allowed_roots: tuple[str, ...] = ()
+    max_bytes: int = 256_000
+    max_lines: int = 2_000
+    max_results: int = 200
+    max_tree_entries: int = 2_000
+    max_tree_depth: int = 6
+    max_log_entries: int = 200
+    max_diff_bytes: int = 400_000
+    timeout_seconds: float = 15.0
+    extra_secret_globs: tuple[str, ...] = ()
+
+    def to_policy(self, fallback_roots: tuple[str, ...] = ()) -> Any:
+        """Build the immutable RepoReadPolicy the engine actually
+        enforces. Imported lazily so config.py keeps no import-time
+        dependency on a feature module -- the same layering every other
+        section here holds to."""
+        from .repo_read import RepoReadPolicy
+
+        return RepoReadPolicy(
+            enabled=self.enabled,
+            allowed_roots=tuple(self.allowed_roots or fallback_roots),
+            max_bytes=self.max_bytes, max_lines=self.max_lines,
+            max_results=self.max_results, max_tree_entries=self.max_tree_entries,
+            max_tree_depth=self.max_tree_depth, max_log_entries=self.max_log_entries,
+            max_diff_bytes=self.max_diff_bytes, timeout_seconds=self.timeout_seconds,
+            extra_secret_globs=tuple(self.extra_secret_globs))
+
+
+@dataclass(frozen=True)
+class FleetSyncConfig:
+    # ON by default, like MaintenanceConfig and for the same reason: this is
+    # not an optional feature, it is what keeps an already-shipped one
+    # telling the truth. Without it the fleet cache decays past
+    # fleet_service.STALE_AFTER_SECONDS (900) within fifteen minutes of every
+    # controller start, and every auth/readiness view can only answer
+    # UNKNOWN_STALE. See fleet_loop.py.
+    enabled: bool = True
+    # Three cycles of headroom under the 900s stale threshold, so two
+    # consecutive failed cycles still leave the data inside it.
+    interval_seconds: int = 300
+    # Separable: a deployment whose node agents all predate /v1/fleet/* keeps
+    # the local refresh (the half that makes its own dashboard correct)
+    # without emitting a 404 per node per cycle.
+    peer_exchange_enabled: bool = True
+
+
+@dataclass(frozen=True)
 class MaintenanceConfig:
     # P1 hardening item #9: periodic retention pruning (audit.db's
     # input_audit/idempotent_sends, supervisor.db's supervisor_actions --
@@ -502,6 +757,12 @@ class MaintenanceConfig:
     audit_retention: int = 20_000
     action_retention: int = 5_000
     idempotency_key_retention_days: int = 30
+    lifecycle_key_retention_days: int = 90
+    """Lifecycle request keys outlive send keys by design. A send key only
+    needs to cover a keystroke retry window (30 days is already generous);
+    a lifecycle key guards a worktree that may legitimately sit at
+    VERIFIED_PROD for weeks before anyone reaps it, and pruning it early
+    would make an already-completed cleanup look un-attempted."""
 
 
 @dataclass(frozen=True)
@@ -520,6 +781,22 @@ class RemoteNodeConfig:
     token_env: str
     max_sessions: int | None = None
     timeout_seconds: float = 10.0
+    # Conservative by default. The only supported action asks the already
+    # supervised agent process to stop gracefully; its host service manager
+    # owns the single replacement process.
+    self_heal_enabled: bool = False
+    self_heal_action: str = "none"
+
+
+@dataclass(frozen=True)
+class NodeHealthConfig:
+    enabled: bool = True
+    probe_interval_seconds: float = 20.0
+    probe_timeout_seconds: float = 3.0
+    execution_down_after_failures: int = 2
+    backoff_base_seconds: float = 5.0
+    backoff_max_seconds: float = 300.0
+    backoff_jitter_ratio: float = 0.2
 
 
 @dataclass(frozen=True)
@@ -556,6 +833,105 @@ class RemoteConnectConfig:
 
 
 @dataclass(frozen=True)
+class TailscaleOnboardConfig:
+    """Tailscale as a node's PRIMARY transport. `enabled` only expresses
+    the operator's intent -- whether a given onboarding actually uses
+    Tailscale is decided at enrollment time by whether this controller
+    itself is on a tailnet (node_onboarding.detect_controller_tailscale),
+    so a deployment with no tailnet silently falls back to LAN + rescue
+    instead of generating an installer that cannot possibly work.
+
+    auth_key_env names the ENVIRONMENT VARIABLE holding a Tailscale auth
+    key, never the key itself -- same posture as RemoteNodeConfig.
+    token_env. The key is handed to a node exactly once, inside the
+    authenticated enrollment-exchange response, and never written into
+    the downloadable script or any log line. Leave it unset and the
+    installer prints an interactive `tailscale up` instruction instead:
+    one extra manual step, zero reusable secret in flight."""
+    enabled: bool = True
+    auth_key_env: str = "TERMINAL_MCP_TAILSCALE_AUTH_KEY"
+    tags: tuple[str, ...] = ()
+    unattended: bool = True
+    login_server: str = ""  # Headscale/self-hosted coordination server, if any
+
+
+@dataclass(frozen=True)
+class RescueTunnelConfig:
+    """The reverse-SSH rescue path (rescue_gateway.py). OFF by default and
+    deliberately so: turning it on without a real gateway would produce
+    installers that fail halfway. With `enabled: false` the whole feature
+    reports `configured=false, reason=rescue_disabled` everywhere it is
+    surfaced, and onboarding still completes over the primary path.
+
+    gateway_host_key is one known_hosts line -- a PUBLIC key, safe in
+    config.yaml and safe to ship to a node. There is deliberately no
+    field here for a PRIVATE key: the node generates its own keypair
+    locally and only its public half ever reaches this controller."""
+    enabled: bool = False
+    gateway_host: str = ""
+    gateway_port: int = 22
+    gateway_user: str = ""
+    gateway_host_key: str = ""
+    port_range_start: int = 22000
+    port_range_end: int = 22999
+    keepalive_interval_seconds: int = 30
+    keepalive_count_max: int = 3
+    retry_seconds: int = 15
+
+
+@dataclass(frozen=True)
+class OnboardingConfig:
+    """Self-service node onboarding (Nodes -> + Add Node -> Windows).
+
+    controller_url is what the generated installer calls back to. Empty
+    (the default) means "derive it from the request that asked for the
+    script", which is right for every normal deployment and wrong only
+    behind a proxy that rewrites Host -- set it explicitly there.
+
+    bootstrap_origin is the PUBLIC, machine-facing origin -- the one a
+    machine being onboarded can actually reach. It exists because the
+    operator's Dashboard hostname usually cannot be that origin: it sits
+    behind Cloudflare Access, and a machine mid-enrollment has no Access
+    session and no way to obtain one. Deriving the callback from the
+    browser's Host header therefore hands every new machine an origin that
+    answers its enrollment POST with an Access login page. Setting this
+    pins the machine-side origin instead of inferring it, and suppresses
+    the browser Host as a candidate entirely -- see controller_urls() in
+    node_onboarding.py. Empty (the default) keeps the LAN behaviour, where
+    the browser Host IS a good guess because the operator and the new
+    machine are on the same network.
+
+    It is an ORIGIN: scheme and host (and port), never a path. The
+    Dashboard stays where it is; this only changes what machines are told.
+
+    controller_ssh_public_key(_file) is the PUBLIC key the installer
+    installs into the new node's authorized_keys so this controller can
+    SSH in. A public key: safe in config, safe in the payload, useless to
+    anyone who intercepts it."""
+    enabled: bool = True
+    enrollment_ttl_seconds: int = 900
+    # How long a pairing handle stays usable. The handle is minted when the
+    # helper DOWNLOAD starts, so this clock has to cover the operator
+    # finding the file, clearing SmartScreen on an unsigned binary and
+    # accepting UAC. The old 120s default expired before the helper ever
+    # ran. Single-use is unchanged -- this widens the window for ONE
+    # redemption, not the number of them.
+    pairing_handle_ttl_seconds: int = 900
+    controller_url: str = ""
+    bootstrap_origin: str = ""
+    controller_ssh_public_key: str = ""
+    controller_ssh_public_key_file: str = ""
+    agent_port: int = 8790
+    heartbeat_interval_seconds: int = 30
+    # Firewall: which source range the installer opens inbound TCP 22 to
+    # on the node. Default is Tailscale's CGNAT range -- NOT "any", so a
+    # laptop that later joins a cafe network is not serving sshd to it.
+    ssh_firewall_cidrs: tuple[str, ...] = ("100.64.0.0/10",)
+    tailscale: TailscaleOnboardConfig = TailscaleOnboardConfig()
+    rescue: RescueTunnelConfig = RescueTunnelConfig()
+
+
+@dataclass(frozen=True)
 class NodesConfig:
     """Multi-node session management (controller.py/node_registry.py/
     scheduler.py). overload_thresholds/heartbeat_thresholds are the exact
@@ -569,6 +945,55 @@ class NodesConfig:
     remote_nodes: tuple[RemoteNodeConfig, ...] = ()
     discovery: DiscoveryConfig = DiscoveryConfig()
     remote_connect: RemoteConnectConfig = RemoteConnectConfig()
+    onboarding: OnboardingConfig = OnboardingConfig()
+    health: NodeHealthConfig = NodeHealthConfig()
+
+
+@dataclass(frozen=True)
+class SessionAccessConfig:
+    """What a session may be read from / sent to, when no explicit grant says
+    otherwise.
+
+    This REPLACES the old session-name whitelist as the enforcement input.
+    Access is now decided by explicit, user-issued grants (grants.db) plus
+    this default policy -- never by whether a session's NAME happens to match
+    a glob in config.yaml. The whitelist produced a genuinely contradictory
+    state that was reported as a bug: a session could list `allowed=false`
+    (name not in the glob list) while `effective_read`/`effective_input` were
+    both true (an explicit grant said so), and the two fields meant different
+    things that looked like they should agree.
+
+    Defaults are OPEN: a session the owner just created, or that was just
+    discovered, is readable and writable immediately, with no grant step.
+    Deliberate, and an explicit product decision -- the closed default that
+    preceded it produced exactly one recurring outcome, a brand-new session
+    stuck behind a permission nobody had granted yet, which is worse than
+    useless for a session manager.
+
+    ABSENCE OF A RECORD MEANS ALLOW, not deny. A grant row now exists only
+    because someone deliberately CHANGED something, and its most useful shape
+    is an explicit revoke -- an optional lock, never a prerequisite.
+
+    This does not make the deployment open. The boundaries that actually gate
+    access are untouched: account/webauth/Cloudflare Access on the dashboard,
+    node bearer tokens between controller and agents, the sensitive-name floor
+    (root/ssh/password/secret/database, refused whatever any policy says),
+    input_policy.denied_session_patterns, and the global
+    permissions.terminal_read/terminal_input switches. What is gone is the
+    per-session paperwork, not the perimeter.
+
+    `allowed_session_patterns`/`input_policy.allowed_session_patterns` are
+    still PARSED, but only as a one-time migration source -- see
+    TerminalService.migrate_whitelist_to_grants. They no longer authorize
+    anything by themselves.
+    """
+    default_read: bool = True
+    default_input: bool = True
+    # One-time conversion of the old name whitelist into real grants, so a
+    # deployment upgrading to this does not silently lose access to every
+    # session it had whitelisted. Idempotent: it only ever ADDS a grant for a
+    # session that has none.
+    migrate_whitelist_on_start: bool = True
 
 
 @dataclass(frozen=True)
@@ -581,13 +1006,20 @@ class AppConfig:
     supervisor: SupervisorConfig = SupervisorConfig()
     dashboard: DashboardConfig = DashboardConfig()
     maintenance: MaintenanceConfig = MaintenanceConfig()
+    fleet_sync: FleetSyncConfig = FleetSyncConfig()
+    repo_read: RepoReadConfig = RepoReadConfig()
+    worktree_janitor: WorktreeJanitorConfig = WorktreeJanitorConfig()
+    prompt_delivery: PromptDeliveryConfig = PromptDeliveryConfig()
+    work: WorkConfig = WorkConfig()
     session_lifecycle: SessionLifecycleConfig = SessionLifecycleConfig()
     session_knowledge: SessionKnowledgeConfig = SessionKnowledgeConfig()
+    session_access: SessionAccessConfig = SessionAccessConfig()
     ask_chatgpt: AskChatGptConfig = AskChatGptConfig()
     nodes: NodesConfig = NodesConfig()
     queue: QueueConfig = QueueConfig()
     submit: SubmitConfig = SubmitConfig()
     integration_loop: IntegrationLoopConfig = IntegrationLoopConfig()
+    lifecycle: LifecycleConfig = LifecycleConfig()
     submit_watchdog: SubmitWatchdogConfig = SubmitWatchdogConfig()
     ai_usage: AiUsageConfig = AiUsageConfig()
     notes: NotesConfig = NotesConfig()
@@ -682,8 +1114,14 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             raise ValueError(f"input_policy.{name} must be a {'possibly empty ' if allow_empty else 'non-empty '}list of strings")
         return tuple(value)
 
-    if not isinstance(patterns, list) or not patterns or not all(isinstance(p, str) and p for p in patterns):
-        raise ValueError("allowed_session_patterns must be a non-empty list of strings")
+    # May be EMPTY. This list no longer authorizes anything -- it is only the
+    # migration input that converts a pre-grants deployment's whitelist into
+    # real grants (see SessionAccessConfig). A deployment that has finished
+    # that migration, or was never on a whitelist at all, must be able to say
+    # so; requiring a non-empty list forced it to keep a dead setting alive,
+    # and a node agent written against the new model simply failed to start.
+    if not isinstance(patterns, list) or not all(isinstance(p, str) and p for p in patterns):
+        raise ValueError("allowed_session_patterns must be a list of non-empty strings (it may be empty)")
     if not 1 <= max_lines <= 100_000:
         raise ValueError("max_capture_lines must be between 1 and 100000")
     if not 1 <= tail_lines <= max_lines:
@@ -787,6 +1225,32 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     if heartbeat_thresholds.offline_after_seconds < heartbeat_thresholds.degraded_after_seconds:
         raise ValueError("nodes.heartbeat.offline_after_seconds must be >= degraded_after_seconds")
 
+    health_raw = nodes_raw.get("health", {})
+    if not isinstance(health_raw, dict):
+        raise ValueError("nodes.health must be a mapping")
+    health_defaults = NodeHealthConfig()
+    node_health_config = NodeHealthConfig(
+        enabled=bool(health_raw.get("enabled", health_defaults.enabled)),
+        probe_interval_seconds=float(health_raw.get("probe_interval_seconds", health_defaults.probe_interval_seconds)),
+        probe_timeout_seconds=float(health_raw.get("probe_timeout_seconds", health_defaults.probe_timeout_seconds)),
+        execution_down_after_failures=int(health_raw.get(
+            "execution_down_after_failures", health_defaults.execution_down_after_failures)),
+        backoff_base_seconds=float(health_raw.get("backoff_base_seconds", health_defaults.backoff_base_seconds)),
+        backoff_max_seconds=float(health_raw.get("backoff_max_seconds", health_defaults.backoff_max_seconds)),
+        backoff_jitter_ratio=float(health_raw.get("backoff_jitter_ratio", health_defaults.backoff_jitter_ratio)),
+    )
+    if node_health_config.probe_interval_seconds < 1:
+        raise ValueError("nodes.health.probe_interval_seconds must be at least 1")
+    if not 0 < node_health_config.probe_timeout_seconds < 5:
+        raise ValueError("nodes.health.probe_timeout_seconds must be greater than 0 and less than 5")
+    if node_health_config.execution_down_after_failures < 2:
+        raise ValueError("nodes.health.execution_down_after_failures must be at least 2")
+    if (node_health_config.backoff_base_seconds < 1 or
+            node_health_config.backoff_max_seconds < node_health_config.backoff_base_seconds):
+        raise ValueError("nodes.health backoff must be positive and max >= base")
+    if not 0 <= node_health_config.backoff_jitter_ratio <= 0.5:
+        raise ValueError("nodes.health.backoff_jitter_ratio must be between 0 and 0.5")
+
     remote_raw = nodes_raw.get("remote", [])
     if not isinstance(remote_raw, list):
         raise ValueError("nodes.remote must be a list")
@@ -814,6 +1278,12 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         max_sessions = entry.get("max_sessions")
         if max_sessions is not None and (not isinstance(max_sessions, int) or max_sessions < 1):
             raise ValueError(f"nodes.remote[{index}].max_sessions must be a positive integer if given")
+        self_heal_enabled = bool(entry.get("self_heal_enabled", False))
+        self_heal_action = str(entry.get("self_heal_action", "none"))
+        if self_heal_action not in {"none", "graceful_agent_restart"}:
+            raise ValueError(f"nodes.remote[{index}].self_heal_action is unsupported")
+        if self_heal_enabled and self_heal_action == "none":
+            raise ValueError(f"nodes.remote[{index}] enables self-heal without an action")
         remote_nodes.append(RemoteNodeConfig(
             node_id=node_id,
             display_name=entry.get("display_name") or node_id,
@@ -822,7 +1292,26 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             token_env=token_env,
             max_sessions=max_sessions,
             timeout_seconds=float(entry.get("timeout_seconds", 10.0)),
+            self_heal_enabled=self_heal_enabled,
+            self_heal_action=self_heal_action,
         ))
+    # Scheme/host gate, as a SECOND pass over the parsed entries.
+    #
+    # A plaintext endpoint pointed at a public host would put that node's
+    # bearer token on the wire in the clear on every request -- see
+    # endpoint_policy for the rule. It runs after the loop above rather
+    # than inside it so that every structural and cross-entry problem
+    # (missing token_env, a duplicate node_id, a bad max_sessions) still
+    # reports itself first: those are cheap and local, this one costs a
+    # DNS lookup and would otherwise pre-empt them on an entry that is
+    # invalid for a much more obvious reason.
+    for index, remote in enumerate(remote_nodes):
+        try:
+            endpoint_policy.validate_node_endpoint(
+                remote.endpoint, context=f"nodes.remote[{index}].endpoint")
+        except endpoint_policy.EndpointPolicyError as exc:
+            raise ValueError(str(exc)) from None
+
     discovery_raw = nodes_raw.get("discovery", {})
     if not isinstance(discovery_raw, dict):
         raise ValueError("nodes.discovery must be a mapping")
@@ -854,9 +1343,12 @@ def load_config(path: str | Path | None = None) -> AppConfig:
                                                                remote_connect_defaults.bootstrap_timeout_seconds)),
     )
 
+    onboarding_config = _load_onboarding_config(nodes_raw.get("onboarding", {}))
+
     nodes_config = NodesConfig(overload_thresholds=overload_thresholds, heartbeat_thresholds=heartbeat_thresholds,
                                remote_nodes=tuple(remote_nodes), discovery=discovery_config,
-                               remote_connect=remote_connect_config)
+                               remote_connect=remote_connect_config, onboarding=onboarding_config,
+                               health=node_health_config)
 
     return AppConfig(
         permissions=PermissionsConfig(
@@ -870,7 +1362,10 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         max_capture_lines=max_lines,
         default_tail_lines=tail_lines,
         input_policy=InputPolicyConfig(
-            allowed_session_patterns=string_tuple("allowed_session_patterns", InputPolicyConfig.allowed_session_patterns),
+            # Empty is valid, same reason as allowed_session_patterns above:
+            # migration input, not an authorization list.
+            allowed_session_patterns=string_tuple("allowed_session_patterns",
+                                                  InputPolicyConfig.allowed_session_patterns, allow_empty=True),
             denied_session_patterns=string_tuple("denied_session_patterns", InputPolicyConfig.denied_session_patterns),
             allow_send_text=bool(input_raw.get("allow_send_text", True)),
             allow_keys=string_tuple("allow_keys", InputPolicyConfig.allow_keys),
@@ -894,17 +1389,155 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ),
         dashboard=_load_dashboard_config(raw.get("dashboard", {})),
         maintenance=_load_maintenance_config(raw.get("maintenance", {})),
+        fleet_sync=_load_fleet_sync_config(raw.get("fleet_sync", {})),
+        repo_read=_load_repo_read_config(raw.get("repo_read", {})),
+        worktree_janitor=_load_worktree_janitor_config(raw.get("worktree_janitor", {})),
+        prompt_delivery=_load_prompt_delivery_config(raw.get("prompt_delivery", {})),
+        work=_load_work_config(raw.get("work", {})),
         session_lifecycle=_load_session_lifecycle_config(raw.get("session_lifecycle", {})),
         session_knowledge=_load_session_knowledge_config(raw.get("session_knowledge", {})),
+        session_access=_load_session_access_config(raw.get("session_access", {})),
         ask_chatgpt=_load_ask_chatgpt_config(raw.get("ask_chatgpt", {})),
         nodes=nodes_config,
         queue=_load_queue_config(raw.get("queue", {})),
         submit=submit_config,
         integration_loop=_load_integration_loop_config(raw.get("integration_loop", {})),
+        lifecycle=_load_lifecycle_config(raw.get("lifecycle", {})),
         submit_watchdog=watchdog_config,
         ai_usage=_load_ai_usage_config(raw.get("ai_usage", {})),
         notes=_load_notes_config(raw.get("notes", {})),
         auto_recovery=_load_auto_recovery_config(raw.get("auto_recovery", {})),
+    )
+
+
+def _load_onboarding_config(raw: object) -> OnboardingConfig:
+    """nodes.onboarding -- validated hard, because every field here ends up
+    inside a script that runs as Administrator on someone else's machine.
+    An invalid value is a startup error, never a silently-corrected
+    default: a typo'd port range that quietly became 22000-22999 would be
+    discovered as a port collision months later."""
+    if not isinstance(raw, dict):
+        raise ValueError("nodes.onboarding must be a mapping")
+    defaults = OnboardingConfig()
+
+    ttl = int(raw.get("enrollment_ttl_seconds", defaults.enrollment_ttl_seconds))
+    if ttl < 60 or ttl > 86400:
+        raise ValueError("nodes.onboarding.enrollment_ttl_seconds must be between 60 and 86400")
+    agent_port = int(raw.get("agent_port", defaults.agent_port))
+    if not (1 <= agent_port <= 65535):
+        raise ValueError("nodes.onboarding.agent_port must be a valid TCP port")
+    heartbeat = int(raw.get("heartbeat_interval_seconds", defaults.heartbeat_interval_seconds))
+    if heartbeat < 5:
+        raise ValueError("nodes.onboarding.heartbeat_interval_seconds must be at least 5")
+    controller_url = str(raw.get("controller_url", defaults.controller_url) or "").strip()
+    if controller_url and not controller_url.startswith(("http://", "https://")):
+        raise ValueError("nodes.onboarding.controller_url must start with http:// or https://")
+    handle_ttl = int(raw.get("pairing_handle_ttl_seconds", defaults.pairing_handle_ttl_seconds))
+    if handle_ttl < 30 or handle_ttl > 3600:
+        raise ValueError("nodes.onboarding.pairing_handle_ttl_seconds must be between 30 and 3600")
+    bootstrap_origin = str(raw.get("bootstrap_origin", defaults.bootstrap_origin) or "").strip().rstrip("/")
+    if bootstrap_origin:
+        if not bootstrap_origin.startswith(("http://", "https://")):
+            raise ValueError("nodes.onboarding.bootstrap_origin must start with http:// or https://")
+        # An origin, not a URL. A path here would be silently concatenated
+        # onto every machine-side route and produce 404s that look like the
+        # controller is down.
+        parsed = _urlsplit(bootstrap_origin)
+        if not parsed.hostname:
+            raise ValueError("nodes.onboarding.bootstrap_origin must include a hostname")
+        if parsed.path or parsed.query or parsed.fragment:
+            raise ValueError("nodes.onboarding.bootstrap_origin must be an origin "
+                             "(scheme://host[:port]) with no path, query or fragment")
+
+    firewall_raw = raw.get("ssh_firewall_cidrs", defaults.ssh_firewall_cidrs)
+    if isinstance(firewall_raw, str):
+        firewall_raw = [firewall_raw]
+    if not isinstance(firewall_raw, (list, tuple)):
+        raise ValueError("nodes.onboarding.ssh_firewall_cidrs must be a list of CIDRs")
+    firewall_cidrs = []
+    for entry in firewall_raw:
+        text = str(entry).strip()
+        if not text:
+            continue
+        if text.lower() in ("any", "0.0.0.0/0", "*"):
+            # Allowed, but only when spelled out -- see the field comment.
+            firewall_cidrs.append("any")
+            continue
+        try:
+            ipaddress.ip_network(text, strict=False)
+        except ValueError as exc:
+            raise ValueError(f"nodes.onboarding.ssh_firewall_cidrs entry {text!r} is not a CIDR: {exc}") from exc
+        firewall_cidrs.append(text)
+
+    tailscale_raw = raw.get("tailscale", {})
+    if not isinstance(tailscale_raw, dict):
+        raise ValueError("nodes.onboarding.tailscale must be a mapping")
+    ts_defaults = TailscaleOnboardConfig()
+    tags_raw = tailscale_raw.get("tags", ts_defaults.tags)
+    if isinstance(tags_raw, str):
+        tags_raw = [tags_raw]
+    if not isinstance(tags_raw, (list, tuple)):
+        raise ValueError("nodes.onboarding.tailscale.tags must be a list")
+    tailscale = TailscaleOnboardConfig(
+        enabled=bool(tailscale_raw.get("enabled", ts_defaults.enabled)),
+        auth_key_env=str(tailscale_raw.get("auth_key_env", ts_defaults.auth_key_env) or "").strip(),
+        tags=tuple(str(tag).strip() for tag in tags_raw if str(tag).strip()),
+        unattended=bool(tailscale_raw.get("unattended", ts_defaults.unattended)),
+        login_server=str(tailscale_raw.get("login_server", ts_defaults.login_server) or "").strip(),
+    )
+    if tailscale.login_server and not tailscale.login_server.startswith(("http://", "https://")):
+        raise ValueError("nodes.onboarding.tailscale.login_server must start with http:// or https://")
+    # A key inline in config.yaml is the one thing this whole design exists
+    # to prevent -- refuse it loudly rather than accept and redact it.
+    if "auth_key" in tailscale_raw:
+        raise ValueError("nodes.onboarding.tailscale.auth_key is not accepted -- put the key in an environment "
+                         "variable and name it with auth_key_env instead")
+
+    rescue_raw = raw.get("rescue", {})
+    if not isinstance(rescue_raw, dict):
+        raise ValueError("nodes.onboarding.rescue must be a mapping")
+    for forbidden in ("gateway_private_key", "private_key", "gateway_password", "password"):
+        if forbidden in rescue_raw:
+            raise ValueError(f"nodes.onboarding.rescue.{forbidden} is not accepted -- the rescue tunnel uses a "
+                             "keypair the NODE generates locally; this controller never holds a node private key")
+    rs_defaults = RescueTunnelConfig()
+    rescue = RescueTunnelConfig(
+        enabled=bool(rescue_raw.get("enabled", rs_defaults.enabled)),
+        gateway_host=str(rescue_raw.get("gateway_host", rs_defaults.gateway_host) or "").strip(),
+        gateway_port=int(rescue_raw.get("gateway_port", rs_defaults.gateway_port)),
+        gateway_user=str(rescue_raw.get("gateway_user", rs_defaults.gateway_user) or "").strip(),
+        gateway_host_key=str(rescue_raw.get("gateway_host_key", rs_defaults.gateway_host_key) or "").strip(),
+        port_range_start=int(rescue_raw.get("port_range_start", rs_defaults.port_range_start)),
+        port_range_end=int(rescue_raw.get("port_range_end", rs_defaults.port_range_end)),
+        keepalive_interval_seconds=int(rescue_raw.get("keepalive_interval_seconds",
+                                                      rs_defaults.keepalive_interval_seconds)),
+        keepalive_count_max=int(rescue_raw.get("keepalive_count_max", rs_defaults.keepalive_count_max)),
+        retry_seconds=int(rescue_raw.get("retry_seconds", rs_defaults.retry_seconds)),
+    )
+    if not (1 <= rescue.gateway_port <= 65535):
+        raise ValueError("nodes.onboarding.rescue.gateway_port must be a valid TCP port")
+    if rescue.port_range_start < 1024 or rescue.port_range_end > 65535:
+        raise ValueError("nodes.onboarding.rescue port range must lie within 1024-65535")
+    if rescue.port_range_start > rescue.port_range_end:
+        raise ValueError("nodes.onboarding.rescue.port_range_start must be <= port_range_end")
+    if rescue.keepalive_interval_seconds < 5 or rescue.keepalive_count_max < 1 or rescue.retry_seconds < 5:
+        raise ValueError("nodes.onboarding.rescue keepalive/retry values are too small to be useful")
+
+    return OnboardingConfig(
+        enabled=bool(raw.get("enabled", defaults.enabled)),
+        enrollment_ttl_seconds=ttl,
+        pairing_handle_ttl_seconds=handle_ttl,
+        controller_url=controller_url,
+        bootstrap_origin=bootstrap_origin,
+        controller_ssh_public_key=str(raw.get("controller_ssh_public_key",
+                                              defaults.controller_ssh_public_key) or "").strip(),
+        controller_ssh_public_key_file=str(raw.get("controller_ssh_public_key_file",
+                                                   defaults.controller_ssh_public_key_file) or "").strip(),
+        agent_port=agent_port,
+        heartbeat_interval_seconds=heartbeat,
+        ssh_firewall_cidrs=tuple(firewall_cidrs) or defaults.ssh_firewall_cidrs,
+        tailscale=tailscale,
+        rescue=rescue,
     )
 
 
@@ -914,14 +1547,18 @@ def _load_auto_recovery_config(raw: object) -> AutoRecoveryConfig:
     max_attempts = int(raw.get("max_attempts", AutoRecoveryConfig.max_attempts))
     lock_ttl = float(raw.get("lock_ttl_seconds", AutoRecoveryConfig.lock_ttl_seconds))
     reconcile_poll = float(raw.get("reconcile_poll_seconds", AutoRecoveryConfig.reconcile_poll_seconds))
+    max_missing_age = float(raw.get("max_missing_age_seconds", AutoRecoveryConfig.max_missing_age_seconds))
     if max_attempts < 1:
         raise ValueError("auto_recovery.max_attempts must be at least 1")
     if lock_ttl <= 0:
         raise ValueError("auto_recovery.lock_ttl_seconds must be positive")
     if reconcile_poll < 0.5:
         raise ValueError("auto_recovery.reconcile_poll_seconds must be at least 0.5")
+    if max_missing_age < 0:
+        raise ValueError("auto_recovery.max_missing_age_seconds must be >= 0 (0 disables the bound)")
     return AutoRecoveryConfig(enabled=bool(raw.get("enabled", False)), max_attempts=max_attempts,
-                              lock_ttl_seconds=lock_ttl, reconcile_poll_seconds=reconcile_poll)
+                              lock_ttl_seconds=lock_ttl, reconcile_poll_seconds=reconcile_poll,
+                              max_missing_age_seconds=max_missing_age)
 
 
 def _load_notes_config(raw: object) -> NotesConfig:
@@ -991,6 +1628,28 @@ def _load_integration_loop_config(raw: object) -> IntegrationLoopConfig:
     return IntegrationLoopConfig(enabled=bool(raw.get("enabled", False)), fallback_poll_seconds=fallback_poll)
 
 
+def _load_lifecycle_config(raw: object) -> LifecycleConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    roots = raw.get("worktree_roots", [])
+    if not isinstance(roots, list):
+        raise ValueError("lifecycle.worktree_roots must be a list of paths")
+    limit = int(raw.get("reconcile_limit", LifecycleConfig.reconcile_limit))
+    if limit < 1:
+        raise ValueError("lifecycle.reconcile_limit must be at least 1")
+    main_branch = str(raw.get("main_branch", LifecycleConfig.main_branch)).strip()
+    if not main_branch:
+        raise ValueError("lifecycle.main_branch must be a non-empty branch name")
+    environment = str(raw.get("environment", LifecycleConfig.environment)).strip()
+    return LifecycleConfig(
+        enabled=bool(raw.get("enabled", False)), main_branch=main_branch,
+        environment=environment or LifecycleConfig.environment,
+        worktree_roots=tuple(str(r) for r in roots), reconcile_limit=limit,
+        allow_unverified_integration=bool(raw.get(
+            "allow_unverified_integration", LifecycleConfig.allow_unverified_integration)),
+    )
+
+
 def _load_queue_config(queue_raw: object) -> QueueConfig:
     if not isinstance(queue_raw, dict):
         queue_raw = {}
@@ -1006,6 +1665,221 @@ def _load_session_knowledge_config(raw: object) -> SessionKnowledgeConfig:
     return SessionKnowledgeConfig(enabled=bool(raw.get("enabled", False)))
 
 
+def _load_session_access_config(raw: object) -> SessionAccessConfig:
+    if not isinstance(raw, dict):
+        return SessionAccessConfig()
+    defaults = SessionAccessConfig()
+    return SessionAccessConfig(
+        default_read=bool(raw.get("default_read", defaults.default_read)),
+        default_input=bool(raw.get("default_input", defaults.default_input)),
+        migrate_whitelist_on_start=bool(raw.get("migrate_whitelist_on_start",
+                                                defaults.migrate_whitelist_on_start)),
+    )
+
+
+def _load_work_config(raw: object) -> WorkConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    interval = int(raw.get("interval_seconds", WorkConfig.interval_seconds))
+    if interval < 5:
+        raise ValueError("work.interval_seconds must be at least 5")
+    max_runs = int(raw.get("max_runs_per_tick", WorkConfig.max_runs_per_tick))
+    if max_runs < 1:
+        raise ValueError("work.max_runs_per_tick must be at least 1")
+    revisions = int(raw.get("max_revisions", WorkConfig.max_revisions))
+    if revisions < 0:
+        raise ValueError("work.max_revisions must not be negative")
+    return WorkConfig(
+        enabled=bool(raw.get("enabled", WorkConfig.enabled)),
+        interval_seconds=interval, max_runs_per_tick=max_runs,
+        auto_enable_dispatch=bool(raw.get("auto_enable_dispatch",
+                                          WorkConfig.auto_enable_dispatch)),
+        lease_seconds=int(raw.get("lease_seconds", WorkConfig.lease_seconds)),
+        max_revisions=revisions,
+        no_progress_limit=int(raw.get("no_progress_limit", WorkConfig.no_progress_limit)))
+
+
+def _load_worktree_janitor_config(raw: object) -> WorktreeJanitorConfig:
+    """Fail-closed: an unknown mode is a config ERROR, never silently
+    downgraded. An operator who typed "auto" instead of "auto_execute" must be
+    told, not left believing the janitor is enforcing (or that it is safe)."""
+    if not isinstance(raw, dict):
+        raw = {}
+    mode = raw.get("mode", WorktreeJanitorConfig.mode)
+    if mode not in ("observe_only", "suggest_only", "auto_execute"):
+        raise ValueError("worktree_janitor.mode must be one of: observe_only, "
+                         "suggest_only, auto_execute")
+    roots = raw.get("allowed_roots", [])
+    if not isinstance(roots, list) or not all(isinstance(r, str) and r for r in roots):
+        raise ValueError("worktree_janitor.allowed_roots must be a list of strings")
+    for root in roots:
+        if not root.startswith("/") and not root.startswith("~"):
+            raise ValueError(f"worktree_janitor.allowed_roots entry {root!r} must be absolute")
+        if root.strip() == "/":
+            raise ValueError("worktree_janitor.allowed_roots may not contain '/'")
+    ref = raw.get("integration_ref", WorktreeJanitorConfig.integration_ref)
+    if not isinstance(ref, str) or not ref.strip() or ref.startswith("-"):
+        raise ValueError("worktree_janitor.integration_ref must be a non-empty ref name")
+    allow_preserved = raw.get("allow_preserved_unmerged",
+                              WorktreeJanitorConfig.allow_preserved_unmerged)
+    if not isinstance(allow_preserved, bool):
+        raise ValueError("worktree_janitor.allow_preserved_unmerged must be a boolean")
+    globs = raw.get("extra_valuable_globs", [])
+    if not isinstance(globs, list) or not all(isinstance(g, str) and g for g in globs):
+        raise ValueError("worktree_janitor.extra_valuable_globs must be a list of strings")
+
+    def bounded(key: str, default: Any, low: float, high: float) -> Any:
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"worktree_janitor.{key} must be a number")
+        if not low <= value <= high:
+            raise ValueError(f"worktree_janitor.{key} must be between {low} and {high}")
+        return value
+
+    grace = int(bounded("grace_seconds", WorktreeJanitorConfig.grace_seconds, 300, 2_592_000))
+    floor = int(bounded("grace_floor_seconds", WorktreeJanitorConfig.grace_floor_seconds,
+                        60, 2_592_000))
+    if floor > grace:
+        raise ValueError("worktree_janitor.grace_floor_seconds must not exceed grace_seconds")
+    sweep_enabled = raw.get("sweep_enabled", WorktreeJanitorConfig.sweep_enabled)
+    if not isinstance(sweep_enabled, bool):
+        raise ValueError("worktree_janitor.sweep_enabled must be a boolean")
+    sweep_roots = raw.get("repo_roots", [])
+    if not isinstance(sweep_roots, list) or not all(isinstance(r, str) and r for r in sweep_roots):
+        raise ValueError("worktree_janitor.repo_roots must be a list of strings")
+    for root in sweep_roots:
+        if not root.startswith("/") and not root.startswith("~"):
+            raise ValueError(f"worktree_janitor.repo_roots entry {root!r} must be absolute")
+    return WorktreeJanitorConfig(
+        sweep_enabled=sweep_enabled,
+        sweep_interval_seconds=float(bounded(
+            "sweep_interval_seconds", WorktreeJanitorConfig.sweep_interval_seconds, 30, 86_400)),
+        sweep_budget_seconds=float(bounded(
+            "sweep_budget_seconds", WorktreeJanitorConfig.sweep_budget_seconds, 1, 3_600)),
+        orphan_confirm_runs=int(bounded(
+            "orphan_confirm_runs", WorktreeJanitorConfig.orphan_confirm_runs, 1, 100)),
+        orphan_min_age_seconds=float(bounded(
+            "orphan_min_age_seconds", WorktreeJanitorConfig.orphan_min_age_seconds, 0, 2_592_000)),
+        repo_roots=tuple(sweep_roots),
+        mode=mode, allowed_roots=tuple(roots), integration_ref=ref.strip(),
+        allow_preserved_unmerged=allow_preserved, grace_seconds=grace,
+        grace_floor_seconds=floor,
+        max_evidence_age_seconds=float(bounded(
+            "max_evidence_age_seconds", WorktreeJanitorConfig.max_evidence_age_seconds, 5, 3_600)),
+        max_candidates_per_run=int(bounded(
+            "max_candidates_per_run", WorktreeJanitorConfig.max_candidates_per_run, 1, 5_000)),
+        timeout_seconds=float(bounded(
+            "timeout_seconds", WorktreeJanitorConfig.timeout_seconds, 1, 300)),
+        extra_valuable_globs=tuple(globs))
+
+
+def _load_prompt_delivery_config(raw: object) -> PromptDeliveryConfig:
+    """Fail-closed validation: an unknown mode is a config ERROR, never
+    silently downgraded to advisory. An operator who typed "enforced" must
+    be told, not quietly left unprotected."""
+    if not isinstance(raw, dict):
+        raw = {}
+    mode = raw.get("mode", PromptDeliveryConfig.mode)
+    if mode not in ("advisory", "enforce"):
+        raise ValueError("prompt_delivery.mode must be one of: advisory, enforce")
+    require = raw.get("require_acceptance", PromptDeliveryConfig.require_acceptance)
+    if not isinstance(require, bool):
+        raise ValueError("prompt_delivery.require_acceptance must be a boolean")
+    timeout = raw.get("acceptance_timeout_seconds", PromptDeliveryConfig.acceptance_timeout_seconds)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("prompt_delivery.acceptance_timeout_seconds must be a number")
+    if not 0.2 <= float(timeout) <= 60.0:
+        raise ValueError("prompt_delivery.acceptance_timeout_seconds must be between 0.2 and 60")
+    poll = raw.get("acceptance_poll_interval_seconds",
+                   PromptDeliveryConfig.acceptance_poll_interval_seconds)
+    if isinstance(poll, bool) or not isinstance(poll, (int, float)):
+        raise ValueError("prompt_delivery.acceptance_poll_interval_seconds must be a number")
+    if not 0.05 <= float(poll) <= float(timeout):
+        raise ValueError("prompt_delivery.acceptance_poll_interval_seconds must be between "
+                         "0.05 and acceptance_timeout_seconds")
+    lines = raw.get("acceptance_capture_lines", PromptDeliveryConfig.acceptance_capture_lines)
+    if isinstance(lines, bool) or not isinstance(lines, int) or not 5 <= lines <= 500:
+        raise ValueError("prompt_delivery.acceptance_capture_lines must be an integer 5..500")
+    return PromptDeliveryConfig(mode=mode, require_acceptance=require,
+                                acceptance_timeout_seconds=float(timeout),
+                                acceptance_poll_interval_seconds=float(poll),
+                                acceptance_capture_lines=lines)
+
+
+def _load_repo_read_config(raw: object) -> RepoReadConfig:
+    """Validation is strict and fail-closed: a config that asks for an
+    unbounded limit is a CONFIG ERROR, not something to silently clamp,
+    because a caps section nobody can trust is worse than no caps at
+    all. Each ceiling below is a sanity bound on operator intent, not the
+    limit itself."""
+    if not isinstance(raw, dict):
+        raw = {}
+    enabled = raw.get("enabled", RepoReadConfig.enabled)
+    if not isinstance(enabled, bool):
+        raise ValueError("repo_read.enabled must be a boolean")
+    roots = raw.get("allowed_roots", [])
+    if not isinstance(roots, list) or not all(isinstance(r, str) and r for r in roots):
+        raise ValueError("repo_read.allowed_roots must be a list of strings")
+    for root in roots:
+        # A relative root cannot be reasoned about (it would resolve
+        # against whatever cwd the server happens to have) and "/" would
+        # make the allowlist meaningless -- both are refused outright.
+        if not root.startswith("/") and not root.startswith("~"):
+            raise ValueError(f"repo_read.allowed_roots entry {root!r} must be an absolute path")
+        if root.strip() == "/":
+            raise ValueError("repo_read.allowed_roots may not contain '/'")
+    globs = raw.get("extra_secret_globs", [])
+    if not isinstance(globs, list) or not all(isinstance(g, str) and g for g in globs):
+        raise ValueError("repo_read.extra_secret_globs must be a list of strings")
+
+    def bounded(key: str, default: int, low: int, high: int) -> int:
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"repo_read.{key} must be an integer")
+        if not low <= value <= high:
+            raise ValueError(f"repo_read.{key} must be between {low} and {high}")
+        return value
+
+    timeout = raw.get("timeout_seconds", RepoReadConfig.timeout_seconds)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("repo_read.timeout_seconds must be a number")
+    if not 1.0 <= float(timeout) <= 120.0:
+        raise ValueError("repo_read.timeout_seconds must be between 1 and 120")
+    return RepoReadConfig(
+        enabled=enabled, allowed_roots=tuple(roots),
+        max_bytes=bounded("max_bytes", RepoReadConfig.max_bytes, 1_024, 8_000_000),
+        max_lines=bounded("max_lines", RepoReadConfig.max_lines, 10, 100_000),
+        max_results=bounded("max_results", RepoReadConfig.max_results, 1, 5_000),
+        max_tree_entries=bounded("max_tree_entries", RepoReadConfig.max_tree_entries, 1, 50_000),
+        max_tree_depth=bounded("max_tree_depth", RepoReadConfig.max_tree_depth, 1, 32),
+        max_log_entries=bounded("max_log_entries", RepoReadConfig.max_log_entries, 1, 5_000),
+        max_diff_bytes=bounded("max_diff_bytes", RepoReadConfig.max_diff_bytes, 1_024, 16_000_000),
+        timeout_seconds=float(timeout), extra_secret_globs=tuple(globs))
+
+
+def _load_fleet_sync_config(raw: object) -> FleetSyncConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    interval = int(raw.get("interval_seconds", FleetSyncConfig.interval_seconds))
+    # The floor is 60s for the same reason maintenance has one: a tighter
+    # loop would re-project every store on this box continuously for data
+    # that changes on the order of minutes.
+    if interval < 60:
+        raise ValueError("fleet_sync.interval_seconds must be at least 60")
+    # An interval at or past the staleness threshold guarantees the very
+    # condition the loop exists to prevent, so it is refused rather than
+    # silently accepted.
+    if interval >= 900:
+        raise ValueError(
+            "fleet_sync.interval_seconds must be under 900 (the staleness "
+            "threshold) or the cache it refreshes is stale by definition")
+    return FleetSyncConfig(
+        enabled=bool(raw.get("enabled", FleetSyncConfig.enabled)),
+        interval_seconds=interval,
+        peer_exchange_enabled=bool(raw.get("peer_exchange_enabled",
+                                           FleetSyncConfig.peer_exchange_enabled)))
+
+
 def _load_maintenance_config(maintenance_raw: object) -> MaintenanceConfig:
     if not isinstance(maintenance_raw, dict):
         maintenance_raw = {}
@@ -1015,6 +1889,9 @@ def _load_maintenance_config(maintenance_raw: object) -> MaintenanceConfig:
     idempotency_days = int(maintenance_raw.get(
         "idempotency_key_retention_days", MaintenanceConfig.idempotency_key_retention_days,
     ))
+    lifecycle_days = int(maintenance_raw.get(
+        "lifecycle_key_retention_days", MaintenanceConfig.lifecycle_key_retention_days,
+    ))
     if interval < 60:
         raise ValueError("maintenance.interval_seconds must be at least 60")
     if audit_retention < 1:
@@ -1023,9 +1900,12 @@ def _load_maintenance_config(maintenance_raw: object) -> MaintenanceConfig:
         raise ValueError("maintenance.action_retention must be at least 1")
     if idempotency_days < 1:
         raise ValueError("maintenance.idempotency_key_retention_days must be at least 1")
+    if lifecycle_days < 1:
+        raise ValueError("maintenance.lifecycle_key_retention_days must be at least 1")
     return MaintenanceConfig(
         interval_seconds=interval, audit_retention=audit_retention,
         action_retention=action_retention, idempotency_key_retention_days=idempotency_days,
+        lifecycle_key_retention_days=lifecycle_days,
     )
 
 

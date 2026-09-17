@@ -1,0 +1,124 @@
+{
+  "procedures": {
+    "deploy_restart": {
+      "args_hint": "",
+      "command": [
+        "bash",
+        "scripts/agent/deploy-restart.sh"
+      ],
+      "depends_on": [],
+      "environment": "local",
+      "id": "deploy_restart",
+      "name": "controller restart (cách 1)",
+      "output_contract": "PASS/FAIL + stage + error summary + log path",
+      "prerequisites": [],
+      "risk": "production",
+      "source": "declared",
+      "success_criteria": "one restart; sessions preserved; health green",
+      "timeout_seconds": 300.0,
+      "working_dir": "."
+    },
+    "dogfood": {
+      "args_hint": "",
+      "command": [
+        "bash",
+        "scripts/agent/dogfood.sh"
+      ],
+      "depends_on": [
+        "terminal_mcp/bug_spec.py",
+        "terminal_mcp/work_planning.py",
+        "terminal_mcp/work_telemetry.py",
+        "tests/dogfood_worker.py"
+      ],
+      "environment": "local",
+      "id": "dogfood",
+      "name": "budget/gate dogfood (real run against this checkout)",
+      "output_contract": "PASS/FAIL + stage + pytest summary + log path",
+      "prerequisites": [],
+      "risk": "read_only",
+      "source": "declared",
+      "success_criteria": "an L1 run is stopped at 5 files / 2 search rounds; an incomplete spec opens nothing; plan verdicts reach telemetry",
+      "timeout_seconds": 300.0,
+      "working_dir": "."
+    },
+    "healthcheck": {
+      "args_hint": "",
+      "command": [
+        "bash",
+        "scripts/agent/healthcheck.sh"
+      ],
+      "depends_on": [],
+      "environment": "local",
+      "id": "healthcheck",
+      "name": "controller health",
+      "output_contract": "PASS/FAIL + stage + error summary + log path",
+      "prerequisites": [],
+      "risk": "read_only",
+      "source": "declared",
+      "success_criteria": "active pid present, no exceptions in window",
+      "timeout_seconds": 120.0,
+      "working_dir": "."
+    },
+    "smoke": {
+      "args_hint": "",
+      "command": [
+        "bash",
+        "scripts/agent/smoke.sh"
+      ],
+      "depends_on": [],
+      "environment": "local",
+      "id": "smoke",
+      "name": "post-deploy smoke",
+      "output_contract": "PASS/FAIL + stage + error summary + log path",
+      "prerequisites": [],
+      "risk": "read_only",
+      "source": "declared",
+      "success_criteria": "routes answer; sessions intact",
+      "timeout_seconds": 300.0,
+      "working_dir": "."
+    },
+    "test_gate": {
+      "args_hint": "",
+      "command": [
+        "bash",
+        "scripts/agent/test-gate.sh"
+      ],
+      "depends_on": [
+        "terminal_mcp",
+        "tests"
+      ],
+      "environment": "local",
+      "id": "test_gate",
+      "name": "full regression",
+      "output_contract": "PASS/FAIL + stage + error summary + log path",
+      "prerequisites": [],
+      "risk": "read_only",
+      "source": "declared",
+      "success_criteria": "exit 0; PASS line with test counts",
+      "timeout_seconds": 1800.0,
+      "working_dir": "."
+    },
+    "test_ui_fast": {
+      "args_hint": "",
+      "command": [
+        "bash",
+        "scripts/agent/test-ui-fast.sh"
+      ],
+      "depends_on": [
+        "terminal_mcp/dashboard.py",
+        "tests/test_dashboard_browser.py"
+      ],
+      "environment": "local",
+      "id": "test_ui_fast",
+      "name": "fast UI gate",
+      "output_contract": "PASS/FAIL + stage + error summary + log path",
+      "prerequisites": [],
+      "risk": "read_only",
+      "source": "declared",
+      "success_criteria": "exit 0; browser assertions pass",
+      "timeout_seconds": 600.0,
+      "working_dir": "."
+    }
+  },
+  "schema_version": 1
+}

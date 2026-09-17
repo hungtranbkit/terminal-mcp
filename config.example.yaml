@@ -147,6 +147,14 @@ supervisor:
 #   heartbeat:
 #     degraded_after_seconds: 60
 #     offline_after_seconds: 180
+#   health:
+#     enabled: true
+#     probe_interval_seconds: 20
+#     probe_timeout_seconds: 3       # must remain below 5 seconds
+#     execution_down_after_failures: 2
+#     backoff_base_seconds: 5
+#     backoff_max_seconds: 300
+#     backoff_jitter_ratio: 0.2
 #   remote:
 #     - node_id: m910
 #       display_name: "M910 Workstation"
@@ -155,6 +163,117 @@ supervisor:
 #       token_env: TERMINAL_MCP_NODE_TOKEN_M910
 #       max_sessions: 20
 #       timeout_seconds: 10.0
+#       # Off by default. This only requests a graceful agent stop; the
+#       # existing service supervisor owns the single replacement process.
+#       self_heal_enabled: false
+#       self_heal_action: none       # or graceful_agent_restart
+#
+#   # Self-service node onboarding -- Dashboard > Nodes > "+ Add Node".
+#   # See docs/windows-node-onboarding.md. Every field below is optional:
+#   # with none of it set, a Windows machine still enrols over its LAN
+#   # address, with a manual `tailscale up` and no rescue tunnel, and the
+#   # form says so up front rather than generating an installer that
+#   # cannot work.
+#   onboarding:
+#     enabled: true
+#     enrollment_ttl_seconds: 900        # 60..86400; codes are single-use
+#     # What the generated installer calls back to. Empty (the default) =
+#     # derive it from this controller's own tailnet address, else from the
+#     # request's Host header. Set it explicitly behind a proxy that
+#     # rewrites Host.
+#     controller_url: "http://100.100.0.1:8766"
+#     # PUBLIC deployments: the machine-facing origin, pinned rather than
+#     # inferred. A machine being onboarded has no Cloudflare Access session
+#     # and cannot get one, so it must never be handed the Access-gated
+#     # Dashboard hostname -- Access answers its enrollment POST with a
+#     # login page, which is a successful HTTP response carrying no
+#     # bootstrap config. Setting this makes it the first callback
+#     # candidate AND removes the browser's Host from the list entirely.
+#     # The operator's Dashboard is unaffected and keeps its own hostname.
+#     # An origin only: scheme://host[:port], never a path.
+#     # Pair it with deploy/cloudflare/bootstrap-ingress.template.yml.
+#     bootstrap_origin: "https://terminal-bootstrap.example.net"
+#     # The PUBLIC key installed into the new node's
+#     # administrators_authorized_keys so this controller can SSH in.
+#     # Defaults to ~/.ssh/id_ed25519.pub. A private key here is REFUSED.
+#     controller_ssh_public_key_file: "/home/you/.ssh/id_ed25519.pub"
+#     agent_port: 8790
+#     heartbeat_interval_seconds: 30
+#     # Which sources the node opens inbound TCP 22 to. Default is
+#     # Tailscale's CGNAT range -- deliberately not "any", so a laptop that
+#     # later joins a cafe network is not serving sshd to it.
+#     ssh_firewall_cidrs: ["100.64.0.0/10"]
+#     tailscale:
+#       enabled: true
+#       # The NAME of the env var holding an auth key, never the key. An
+#       # inline `auth_key:` here is refused at startup. Unset => the
+#       # installer prints an interactive `tailscale up` step instead,
+#       # which is the posture with no reusable secret in flight.
+#       auth_key_env: TERMINAL_MCP_TAILSCALE_AUTH_KEY
+#       tags: []
+#       unattended: true
+#       login_server: ""                 # Headscale/self-hosted, if any
+#     # Reverse-SSH rescue tunnel (rescue_gateway.py). OFF until you have
+#     # actually stood a gateway up -- see the doc's "Standing up a rescue
+#     # gateway". gateway_host_key is one PUBLIC known_hosts line
+#     # (`ssh-keyscan -t ed25519 <host>`); there is no field for a private
+#     # key because the NODE generates its own and never shares it.
+#     rescue:
+#       enabled: false
+#       gateway_host: "gw.example.net"
+#       gateway_port: 22
+#       gateway_user: "tunnel"
+#       gateway_host_key: "gw.example.net ssh-ed25519 AAAA..."
+#       port_range_start: 22000
+#       port_range_end: 22999
+#       keepalive_interval_seconds: 30
+#       keepalive_count_max: 3
+#       retry_seconds: 15
+
+# Read-only repository access for the repo_* MCP tools (repo_read.py /
+# repo_service.py) -- what lets an external agent (ChatGPT over MCP) read
+# Git and source directly instead of asking a Claude session to paste
+# file contents back.
+#
+# ON by default, unlike session_lifecycle/work: those gate capabilities
+# that CREATE something (a real process, an auto-dispatched prompt), while
+# this one only reads and has no write primitive -- there is deliberately
+# no repo_write/repo_checkout/repo_commit tool, and every mutating git
+# subcommand is refused by repo_read.READ_ONLY_GIT_SUBCOMMANDS. The real
+# boundary is allowed_roots, not the flag.
+repo_read:
+  enabled: true
+
+  # Absolute paths a repository must resolve (symlinks followed) inside
+  # of. LEAVE EMPTY to reuse session_lifecycle.allowed_cwd_roots -- the
+  # allowlist you have already curated for "where a session may live",
+  # which is very nearly the set of repos worth reading. With both empty
+  # the effective root is this server's own home directory; never "/",
+  # which the loader refuses outright.
+  allowed_roots: []
+    # - /home/dell/workspace
+
+  # Output caps. A caller cannot argue past these (asking for
+  # max_bytes=10000000 against a 256000 policy still yields 256000), and
+  # truncation is always reported as `truncated: true`, never silent.
+  # An out-of-range value here is a load-time error, not a silent clamp.
+  max_bytes: 256000          # per repo_read call
+  max_lines: 2000            # per repo_read call
+  max_results: 200           # per repo_search call
+  max_tree_entries: 2000     # per repo_tree call
+  max_tree_depth: 6          # per repo_tree call
+  max_log_entries: 200       # per repo_log call
+  max_diff_bytes: 400000     # per repo_diff / repo_show_commit patch
+  timeout_seconds: 15        # per git invocation
+
+  # ADDITIVE ONLY. Credential files are already denied by a built-in list
+  # (.env*, *.pem, *.key, id_*, .git-credentials, .npmrc, *credentials*,
+  # .git/, .ssh/, ... -- see repo_read.SECRET_PATH_GLOBS), and there is
+  # deliberately NO key that removes one, so nothing configured here can
+  # reopen a path the code closed. Use it to deny MORE for your own repo.
+  extra_secret_globs: []
+    # - "*.backup.sql"
+    # - "deploy/production-*.yaml"
 
 # -- Notes / Ideas ("Ghi chú / Ý tưởng") -------------------------------------
 # The cross-project note store ChatGPT writes into when the user says "lưu
@@ -192,3 +311,86 @@ supervisor:
 #   attachment_source_roots:
 #     - "~/Pictures/Screenshots"
 #     - "/tmp/chatgpt-drops"
+# Worktree Janitor (docs/WORKTREE_JANITOR.md). P0 ships the CLASSIFIER ONLY --
+# there is no executor in this build, so nothing here can cause a deletion.
+worktree_janitor:
+  # observe_only (default) | suggest_only | auto_execute
+  # Invariant I8: nothing is ever removed until an operator opts in. An unknown
+  # value is a load-time ValueError, never silently downgraded.
+  mode: observe_only
+
+  # EMPTY MEANS NOTHING IS COLLECTABLE -- deliberately the opposite of
+  # repo_read's fallback-to-home. A reclaim deletes; its allowlist must be
+  # stated explicitly, never inherited. "/" is refused outright.
+  allowed_roots: []
+    # - /home/mesflow/workspace
+
+  # A worktree branch is "merged" when its HEAD is an ancestor of this ref.
+  integration_ref: main
+
+  # Pushed-but-not-merged is classified REVIEW by default (the work is not lost
+  # but was never integrated). true promotes it to AUTO_SAFE.
+  allow_preserved_unmerged: false
+
+  grace_seconds: 86400        # after the task's terminal transition
+  grace_floor_seconds: 3600   # disk pressure may never shorten below this
+  max_evidence_age_seconds: 120
+  max_candidates_per_run: 50
+  timeout_seconds: 20
+
+  # ADDITIVE ONLY. Credential/database/env globs are built in (and inherited
+  # from redaction.CREDENTIAL_FILE_NAMES); there is no key that REMOVES one, so
+  # no config edit can make a secret or a sqlite db collectable.
+  extra_valuable_globs: []
+    # - "*.backup.sql"
+
+  # --- P3 periodic sweep -------------------------------------------------
+  # `sweep_enabled` gates ONLY the background thread. terminal_worktree_sweep_
+  # run_once stays callable with it off -- the project's standing "manual path
+  # always works, only the automatic trigger is gated" posture. And even with
+  # the loop running, nothing is removed unless `mode` is auto_execute, so
+  # enabling the sweep alone gets you a periodic REPORT.
+  sweep_enabled: false
+  sweep_interval_seconds: 900
+  sweep_budget_seconds: 60      # wall-clock budget for one pass
+
+  # An orphan (a worktree no task claims) is never actioned on first sight: a
+  # worktree legitimately exists for a moment before the task referencing it
+  # does, because git_isolation_service must create it first. So it must be
+  # seen unclaimed this many CONSECUTIVE passes AND be older than the min age.
+  orphan_confirm_runs: 2
+  orphan_min_age_seconds: 3600
+
+  # Repos the sweep walks. Empty = the sweep has nothing to do.
+  repo_roots: []
+    # - /home/mesflow/terminal-mcp
+
+# Prompt delivery / acceptance gate (delivery_gate.py; the contract lives in
+# docs/prompt-submission.md under "The acceptance gate").
+#
+# A prompt counts as DELIVERED only when BOTH hold:
+#   1. the send receipt's delivery_state is SUBMIT_CONFIRMED, and
+#   2. a separate post-submit observation shows the target actually took it
+#      (running/working, adapter ack, or output genuinely advanced).
+# SUBMIT_CONFIRMED alone proves Enter was processed -- NOT that the agent
+# read the prompt and started.
+prompt_delivery:
+  # advisory (default): the verdict is computed and recorded to the task's
+  #   metadata.delivery_verdict, and every existing transition behaves
+  #   exactly as before. Zero behaviour change -- safe to leave on.
+  # enforce: a confirmed submit with no acceptance evidence holds the task
+  #   as DISPATCH_UNCERTAIN instead of marking it RUNNING.
+  # NOTE: gate 1 (the positive delivery_state allowlist, which replaces a
+  # fail-open denylist) is enforced in BOTH modes -- it can only refuse a
+  # dispatch the old code would have wrongly advanced.
+  mode: advisory
+
+  # false keeps gate 1 and skips the extra post-submit observation.
+  require_acceptance: true
+
+  # ONE extra observation, not a poll loop: long-running observation belongs
+  # to the completion watcher, and the rule is that polling for completion
+  # stops once delivery is established.
+  acceptance_timeout_seconds: 3.0
+  acceptance_poll_interval_seconds: 0.4
+  acceptance_capture_lines: 40

@@ -186,7 +186,10 @@ def test_heartbeat_route_accepts_correct_token_for_registered_node(tmp_path, mon
     assert response.json() == {"ok": True, "node_id": "m910"}
 
     node = controller.node_status("m910")
-    assert node.status == "online"
+    # A heartbeat proves transport only. No client/probe is configured in
+    # this route-focused fixture, so the composite verdict cannot be green.
+    assert node.status == "degraded"
+    assert node.health_state == "UNKNOWN"
     assert node.tmux_session_count == 3
     assert node.agent_counts == {"claude": 2}
 

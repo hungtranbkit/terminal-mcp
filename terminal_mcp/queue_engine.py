@@ -47,17 +47,20 @@ that automatic loop would start.
 """
 from __future__ import annotations
 
+import re
+
 import hashlib
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 from .coordinator import CoordinatorGate, OtherLaneSnapshot, SessionSnapshot
+from . import delivery_gate
 from .queue_store import (
     BLOCKED, COMPLETED, DISPATCH_UNCERTAIN, DISPATCHING, FAILED, PRECHECK, QUEUED, READY, RUNNING, VERIFYING,
     WAITING_SESSION, QueueStore, QueueTask,
 )
-from .status import parse_completion_marker, verify_completion_marker
+from .status import COMPLETION_MARKER_RE, parse_completion_marker, verify_completion_marker
 
 DEFAULT_CLAIMED_BY = "queue-engine"
 DEFAULT_LEASE_SECONDS = 300.0
@@ -115,6 +118,16 @@ real diff already exists to check against), not here -- this is only
 the worker-facing half of the mechanism."""
 
 
+# The one sentence that is unmistakably OUR prompt rather than a worker's
+# output. `completion_after_instruction` anchors on it, so it must stay
+# byte-identical between the text we send and the text we look for.
+_WHITESPACE = re.compile(r"\s+")
+
+COMPLETION_INSTRUCTION_SENTENCE = (
+    "When (and only when) the above task is FULLY complete, print exactly one "
+    "line in this exact format (once), then stop:")
+
+
 def build_dispatch_text(task: QueueTask, *, nonce: str) -> str:
     """The 'wrapper rất ngắn' item 7 explicitly allows and limits: the
     task's own prompt is included VERBATIM, first, unmodified -- nothing
@@ -129,12 +142,87 @@ def build_dispatch_text(task: QueueTask, *, nonce: str) -> str:
         f"{task.prompt}\n\n"
         f"---\n"
         f"{REQUIREMENTS_REMINDER}\n\n"
-        f"When (and only when) the above task is FULLY complete, print exactly one line in this "
-        f"exact format (once), then stop:\n"
+        f"{COMPLETION_INSTRUCTION_SENTENCE}\n"
         f"###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1 task_id={task.id} "
         f"attempt={task.attempt_count + 1} nonce={nonce} status=completion_candidate "
         f"summary_sha256={hashlib.sha256(task.id.encode()).hexdigest()[:16]}###\n"
     )
+
+
+def _flatten(text: str) -> str:
+    """Whitespace-collapsed text, for matching against a wrapped pane."""
+    return _WHITESPACE.sub(" ", text).strip()
+
+
+_FLAT_INSTRUCTION = None
+
+
+def _is_our_own_template(output: str, marker_start: int) -> bool:
+    """Is the marker at this position the one WE dispatched?
+
+    Our template is always written immediately after the instruction
+    sentence. A worker's marker is printed later, after its own work. So the
+    text directly preceding a marker decides whose it is.
+
+    Compared on whitespace-collapsed text because a pane wraps at its width:
+    the sentence arrives split across lines, and a literal match finds none of
+    it. That exact miss let three tasks be marked COMPLETED against untouched
+    worktrees while their workers were still running.
+    """
+    global _FLAT_INSTRUCTION
+    if _FLAT_INSTRUCTION is None:
+        _FLAT_INSTRUCTION = _flatten(COMPLETION_INSTRUCTION_SENTENCE)
+    # A generous look-back: enough to hold the sentence however it wrapped,
+    # short enough that unrelated earlier text cannot reach into it.
+    window = _flatten(output[max(0, marker_start - 400):marker_start])
+    return window.endswith(_FLAT_INSTRUCTION)
+
+
+def worker_output_after_prompt(output: str) -> str:
+    """The part of the pane that is a WORKER's output, not our own prompt.
+
+    Found by dogfooding on 2026-09-13, and it invalidated every completion
+    this engine had ever verified: `build_dispatch_text` writes a COMPLETE,
+    VALID, nonce-bound marker into the pane as the INSTRUCTION, and
+    `verify_completion_marker` checks only task_id/attempt/nonce -- every one
+    of which that instruction contains. So the engine read its own prompt
+    back and called it evidence. A session running `sleep` forever, printing
+    nothing, had its task marked COMPLETED.
+
+    Implementation notes, both learned the hard way:
+
+    Anchor on the instruction SENTENCE, not on the marker string. `rfind` on
+    the marker lands on the WORKER's copy when it printed one, discarding
+    exactly the evidence we came for.
+
+    Then skip the first marker-SHAPED run after that sentence rather than a
+    reconstructed exact string. The first attempt rebuilt the expected marker
+    from `attempt_count + 1` -- right at dispatch, wrong at verification,
+    where the counter has already been incremented -- so it matched nothing
+    and the echo sailed through. The shape is what matters here, not the
+    fields; whatever follows our own template is the worker speaking.
+
+    If the prompt is not in the captured tail (it scrolled away), everything
+    present is the worker's and is returned unchanged, so a real completion
+    is never hidden.
+    """
+    if not output:
+        return ""
+    # Walk every marker in the window and keep only what follows one that is
+    # NOT our own template. Anchoring on the sentence alone was too brittle in
+    # both directions: a wrapped sentence let our template through, and
+    # demanding the sentence be visible stranded genuine completions once a
+    # long run scrolled it away.
+    last_ours_end = None
+    for match in COMPLETION_MARKER_RE.finditer(output):
+        if _is_our_own_template(output, match.start()):
+            last_ours_end = match.end()
+        elif last_ours_end is None:
+            # A marker that nothing of ours precedes: the worker's own.
+            return output
+    if last_ours_end is None:
+        return output
+    return output[last_ours_end:]
 
 
 @dataclass(frozen=True)
@@ -148,13 +236,36 @@ class TickResult:
         return {"session": self.session, "action": self.action, "task_id": self.task_id, "detail": self.detail}
 
 
+def _target_state_from_status(status: dict) -> str | None:
+    """Map terminal_status's own `state` onto the adapter target-state
+    vocabulary delivery_gate speaks. Only RUNNING is a positive
+    acceptance signal; WAITING_INPUT means the target is blocked on a
+    human, which is explicitly NOT acceptance of our prompt."""
+    from .adapters import TARGET_RUNNING, TARGET_WAITING
+    state = status.get("state")
+    if state == "RUNNING":
+        return TARGET_RUNNING
+    if state == "WAITING_INPUT":
+        return TARGET_WAITING
+    return None
+
+
 class QueueEngine:
     def __init__(self, store: QueueStore, ops: SessionOps, *, coordinator: CoordinatorGate | None = None,
                 claimed_by: str = DEFAULT_CLAIMED_BY, lease_seconds: float = DEFAULT_LEASE_SECONDS,
                 on_completed: Callable[[QueueTask], None] | None = None,
-                verify_queue: Any = None) -> None:
+                verify_queue: Any = None, delivery_policy: Any = None) -> None:
         self.store = store
         self.ops = ops
+        # PROMPT DELIVERY / ACCEPTANCE GATE (delivery_gate.py). None ->
+        # PromptDeliveryConfig()'s own default, which is advisory: the
+        # verdict is computed and recorded, and every transition below
+        # behaves exactly as it did before. Nothing here changes an
+        # outcome until an operator sets prompt_delivery.mode=enforce.
+        if delivery_policy is None:
+            from .config import PromptDeliveryConfig
+            delivery_policy = PromptDeliveryConfig()
+        self.delivery_policy = delivery_policy
         # P0.5 Verify Queue -- OPTIONAL, and inert unless a task's OWN
         # completion_policy carries a `verify` block. Wiring a
         # VerifyQueue here does NOT change how any existing lane behaves:
@@ -291,11 +402,38 @@ class QueueEngine:
         response = self.ops.terminal_send_text(session, dispatch_text, press_enter=True,
                                                idempotency_key=idempotency_key)
         delivery_state = response.get("delivery_state")
+        # PROMPT DELIVERY / ACCEPTANCE GATE. The verdict is ALWAYS computed
+        # and recorded; whether it can change a transition is gated on
+        # prompt_delivery.mode (advisory by default -- see below).
+        verdict = self._delivery_verdict(session, response, dispatch_text)
+        self.store.record_delivery_verdict(task_id, verdict.to_dict())
         if response.get("error"):
             self.store.transition_task(task_id, BLOCKED, event_type="BLOCKED",
                                        reason=f"send failed: {response['error']}")
             return TickResult(session, "BLOCKED", task_id=task_id, detail=str(response["error"]))
-        if delivery_state == "DELIVERY_UNKNOWN":
+        # Gate 1, POSITIVE allowlist. The original code asked "is this the
+        # one literal string DELIVERY_UNKNOWN?" and fell through to RUNNING
+        # otherwise -- so any other non-confirmed state (TEXT_SENT from an
+        # idempotent replay, a state added to adapters.py later) meant
+        # RUNNING. Now anything that is not provably confirmed is held.
+        # This half is pure hardening and is enforced in BOTH modes: it can
+        # only ever refuse a dispatch the old code would have wrongly
+        # advanced, and for every state that actually occurs today it
+        # produces the identical outcome.
+        if verdict.kind == delivery_gate.REFUSED:
+            self.store.transition_task(
+                task_id, BLOCKED, event_type="BLOCKED",
+                reason=f"delivery refused: {verdict.activation} ({verdict.detail or delivery_state})")
+            return TickResult(session, "BLOCKED", task_id=task_id, detail=verdict.activation)
+        # Gate 2, acceptance. ONLY enforced in enforce mode: holding a task
+        # that the old code would have marked RUNNING is a real behaviour
+        # change, so it needs the operator's explicit opt-in.
+        if verdict.kind == delivery_gate.NOT_ACCEPTED and self.delivery_policy.enforcing:
+            self.store.mark_dispatch_uncertain(
+                task_id, reason=f"submit confirmed but acceptance not observed: {verdict.acceptance}")
+            return TickResult(session, "DISPATCH_UNCERTAIN", task_id=task_id,
+                              detail=verdict.acceptance)
+        if verdict.kind == delivery_gate.UNCERTAIN or delivery_state == "DELIVERY_UNKNOWN":
             # P0 item 2: never resend blindly, and never silently look
             # like an ordinary QUEUED task either -- DISPATCH_UNCERTAIN,
             # KEEPING the same dispatch_idempotency_key (the outcome is
@@ -309,6 +447,31 @@ class QueueEngine:
             return TickResult(session, "DISPATCH_UNCERTAIN", task_id=task_id)
         self.store.transition_task(task_id, RUNNING, event_type="STARTED")
         return TickResult(session, "DISPATCHED", task_id=task_id, detail=idempotency_key)
+
+    def _delivery_verdict(self, session: str, response: dict, sent_text: str):
+        """Compute the delivery verdict for one send.
+
+        The post-submit observation is ONE extra read (status + tail), not a
+        poll loop: long-running observation already belongs to the
+        completion watcher, and the rule is explicitly that polling for
+        completion stops once delivery is established. A read that fails is
+        UNOBSERVABLE, which is never a pass."""
+        after_lines = None
+        target_state = None
+        if self.delivery_policy.require_acceptance:
+            try:
+                status = self.ops.terminal_status(session)
+                if not status.get("error"):
+                    target_state = status.get("target_state") or _target_state_from_status(status)
+                    tail = status.get("last_output")
+                    if isinstance(tail, str):
+                        after_lines = tail.splitlines()
+            except Exception:  # noqa: BLE001 -- an unobservable target must not crash dispatch
+                after_lines = None
+        return delivery_gate.evaluate(
+            response, before_lines=response.get("pre_submit_lines"), after_lines=after_lines,
+            target_state=target_state, sent_text=sent_text,
+            require_acceptance=self.delivery_policy.require_acceptance)
 
     # -- P0 persist-before-dispatch: uncertain/waiting reconciliation -------
 
@@ -398,6 +561,10 @@ class QueueEngine:
 
         capture = self.ops.terminal_tail(session, 200)
         output = capture.get("output", "")
+        # Only look at what the WORKER wrote. Our own dispatched prompt
+        # contains a fully valid marker, and reading that back as evidence is
+        # how a session that did nothing got marked COMPLETED.
+        output = worker_output_after_prompt(output)
         marker = parse_completion_marker(output)
         verified = verify_completion_marker(
             marker, task_id=task_id, attempt=task.attempt_count, nonce=task.verification_nonce,

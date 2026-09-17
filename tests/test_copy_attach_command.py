@@ -20,9 +20,11 @@ import subprocess
 
 import pytest
 
+from tests.conftest import find_node
+
 from terminal_mcp.dashboard import DASHBOARD_HTML, SESSIONS_ADMIN_HTML
 
-NODE = shutil.which("node") or shutil.which("nodejs")
+NODE = find_node()
 
 
 def _extract_function(html: str, name: str) -> str:

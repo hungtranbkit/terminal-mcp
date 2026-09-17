@@ -5,13 +5,22 @@ from terminal_mcp.server import mcp
 
 @pytest.mark.anyio
 async def test_server_registers_v1_and_binding_tools():
-    names = {tool.name for tool in await mcp.list_tools()}
+    tools = await mcp.list_tools()
+    names = {tool.name for tool in tools}
+    wait_tool = next(tool for tool in tools if tool.name == "terminal_wait_for_state")
+    resume_tool = next(tool for tool in tools if tool.name == "terminal_resume_wait")
+    assert wait_tool.input_schema["properties"]["timeout"]["default"] == 20
+    assert resume_tool.input_schema["properties"]["timeout"]["default"] == 20
     assert names == {
         "terminal_list_sessions",
         "terminal_tail",
         "terminal_capture",
         "terminal_status",
+        "terminal_batch_inspect",
+        "terminal_wait_for_state",
+        "terminal_resume_wait",
         "terminal_send_text",
+        "terminal_send_task",
         "terminal_send_keys",
         "terminal_exit_copy_mode",
         "terminal_bind",
@@ -48,6 +57,88 @@ async def test_server_registers_v1_and_binding_tools():
         "supervisor2_execute_send",
         "supervisor2_list_actions",
         "terminal_list_nodes",
+        "terminal_node_health",
+        "terminal_connection_status",
+        # Fleet environment audit: tools/services/auth readiness per node, so
+        # "which node could take over?" is answerable without logging into
+        # each machine. Status only -- never credential contents.
+        "terminal_fleet_environment",
+        # Fleet Metadata Registry: the replicated view, the SSH inventory, its
+        # readiness and its per-peer sync state. All four are reads, and all
+        # four answer from the LOCAL cache so they keep working when the
+        # controller does not.
+        "terminal_fleet_registry",
+        "terminal_fleet_ssh_inventory",
+        "terminal_fleet_readiness",
+        "terminal_fleet_sync_status",
+        # Deployment redundancy: read status, declare targets/paths, ask who
+        # would deploy, and rehearse a failover. Nothing here runs a deploy --
+        # dispatch takes a lease and is a separate, deliberate call.
+        "terminal_deployment_status",
+        "terminal_deployment_upsert_target",
+        "terminal_deployment_upsert_path",
+        "terminal_deployment_choose_node",
+        "terminal_deployment_dry_run_failover",
+        # Permission/audit policy pass: the audit log, auth status and the
+        # policy table, all readable over MCP with exactly the same rows and
+        # redaction the dashboard shows -- one implementation, so neither
+        # surface can see something the other refuses.
+        "terminal_audit_search",
+        "terminal_auth_status",
+        "terminal_access_policy",
+        # Work Runtime V1. Kept deliberately small -- the template's own
+        # "MCP SURFACE — GIỮ NHỎ": create, read, enqueue more, gate, decide,
+        # control. Everything else is the existing queue/task surface.
+        "work_create",
+        "work_status",
+        "work_list",
+        "work_continue",
+        "work_request_approval",
+        "work_approve",
+        "work_control",
+        # Project Knowledge, runbook registry, Work Policy and telemetry.
+        # Reads, plus two deliberate writes: recording ONE verified module,
+        # and a worker reporting what its own task cost. Running a procedure
+        # above preview risk still needs an explicit approval.
+        "work_knowledge",
+        "work_knowledge_record",
+        "work_procedures",
+        "work_policy",
+        "work_telemetry",
+        "work_telemetry_report",
+        # Rapid Capture Inbox + planner pool. Capture is deliberately shallow
+        # (split, title, rough type, duplicate flag) so a developer can dump a
+        # batch faster than any planner can analyse one; the pool then claims
+        # them under a concurrency cap with leases, so a dead planner does not
+        # hold an issue forever.
+        "work_inbox_capture",
+        "work_inbox_list",
+        "work_inbox_claim",
+        "work_inbox_transition",
+        "work_inbox_request_hint",
+        "work_inbox_answer_hint",
+        "work_inbox_history",
+        # Work v1: a generic spec/plan surface -- decompose a requirement,
+        # gate the spec, select the tests it needs. Two more defs land in
+        # mcp_app alongside these (_gate_report, _spec_store) but are private
+        # helpers, not registered tools, which is why this list is 8 not 10.
+        "work_spec_create",
+        "work_spec_get",
+        "work_spec_list",
+        "work_spec_update",
+        "work_spec_gate",
+        "work_plan",
+        "work_plan_redefine",
+        "work_test_selection",
+        # Session permission management: ChatGPT could rename a session but
+        # had no way to grant or revoke access to one -- that took an SSH
+        # session and a config edit.
+        "session_get_permissions",
+        "session_set_permissions",
+        "session_grant",
+        "session_revoke",
+        "session_repair_stale_pin",
+        "session_bulk_set_permissions",
         "terminal_node_status",
         # P0.3: probed tool/runtime capability axis, used for routing.
         "terminal_node_capabilities",
@@ -204,6 +295,18 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_task_create_isolated",
         "terminal_worktree_status",
         "terminal_worktree_cleanup",
+        # Worktree Janitor P0 -- AUDIT-ONLY classification. Its presence in
+        # this pinned set alongside the ABSENCE of any
+        # terminal_worktree_janitor_run/remove/prune name is part of the P0
+        # contract: the classifier ships with no executor.
+        "terminal_worktree_janitor_scan",
+        # P3 periodic sweep. run_once is exposed so the manual path works with
+        # the background loop disabled.
+        "terminal_worktree_sweep_run_once",
+        "terminal_worktree_sweep_status",
+        # P5 operator surface. READ-ONLY -- it reports, and the review
+        # decision route lives on the dashboard (auth+CSRF), not here.
+        "terminal_worktree_janitor_report",
         # Delivery discipline: Definition of Ready (§20.6 Phase A).
         "terminal_task_check_dor",
         # Incident lane (§20.6 Phase B).
@@ -234,6 +337,23 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_checkpoint_session",
         "terminal_recovery_loop_status",
         "terminal_recovery_loop_run_once",
+        # Read-only repository access (repo_read.py / repo_service.py) --
+        # the surface an external agent uses to read Git and source
+        # directly. These ten are READS ONLY: the absence of any
+        # repo_write/repo_checkout/repo_commit/repo_push name from this
+        # set is itself part of the V1 contract, and this assertion is
+        # what keeps a write primitive from being added without anyone
+        # noticing.
+        "repo_status",
+        "repo_head",
+        "repo_branches",
+        "repo_remotes",
+        "repo_tree",
+        "repo_read",
+        "repo_search",
+        "repo_diff",
+        "repo_log",
+        "repo_show_commit",
         # Notes / Ideas: the cross-project kho ghi chú (notes_store.py).
         # Deliberately NOT terminal_*-prefixed -- these touch no terminal,
         # session or node, and the name a model reads in a tool list is the

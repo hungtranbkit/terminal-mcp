@@ -15,6 +15,7 @@ from starlette.testclient import TestClient
 
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig, SessionLifecycleConfig
 from terminal_mcp.core import TerminalService
+from terminal_mcp.launcher_resolution import resolve_launcher
 from terminal_mcp.dashboard import register_dashboard
 from terminal_mcp.mcp_app import build_mcp
 
@@ -160,6 +161,15 @@ def test_create_claude_and_codex_use_server_side_allowlisted_launcher(
     # production nail/promptflow/codex-main sessions run) -- agent_type
     # never becomes client-supplied command text, only a lookup key into
     # config.session_lifecycle.launch_commands.
+    #
+    # Which of those binaries a given host has is an environment fact, not
+    # a property of this code: on a host without codex, returning
+    # LAUNCHER_NOT_CONFIGURED is the CORRECT behaviour, and is asserted by
+    # test_create_reports_launcher_not_configured_for_a_missing_binary
+    # below. So skip rather than fail -- an absent binary must not read as
+    # a regression in launcher dispatch.
+    if resolve_launcher(agent_type) is None:
+        pytest.skip(f"{agent_type!r} is not installed on this host")
     config = _lifecycle_config(tmp_path, timeout=8.0)
     service = TerminalService(config)
     name = lifecycle_session_factory(f"{session_prefix}1")
@@ -168,6 +178,22 @@ def test_create_claude_and_codex_use_server_side_allowlisted_launcher(
     assert result["state"] in ("READY", "CREATED")
     info = service.tmux.get_session(name)
     assert info is not None
+
+
+def test_create_reports_launcher_not_configured_for_a_missing_binary(tmp_path, lifecycle_session_factory):
+    # A known agent_type whose configured launcher is not present on this
+    # host. Pointing codex at a binary that cannot exist keeps the case
+    # host-independent -- it asserts the same thing whether or not the real
+    # codex is installed here.
+    config = _lifecycle_config(tmp_path, timeout=8.0,
+                               launch_commands=(("claude", "claude"),
+                                                ("codex", "terminal-mcp-no-such-binary")))
+    service = TerminalService(config)
+    name = lifecycle_session_factory("codex-lc-missing")
+    result = service.terminal_create_session(name, "codex")
+    assert result["error"] == "LAUNCHER_NOT_CONFIGURED"
+    assert result["state"] == "FAILED"
+    assert service.tmux.get_session(name) is None
 
 
 def test_create_launcher_never_accepts_raw_command_from_caller(tmp_path, lifecycle_session_factory):
@@ -303,6 +329,7 @@ def test_create_initial_prompt_goes_through_reliable_submission_once(tmp_path, l
     assert output.count("echo hello-lifecycle") == 1
 
 
+@pytest.mark.closed_access
 def test_create_initial_prompt_without_permission_reports_denied_not_silent(tmp_path, lifecycle_session_factory):
     config = _lifecycle_config(tmp_path)
     service = TerminalService(config)
@@ -542,3 +569,42 @@ async def test_mcp_tools_registered_for_session_lifecycle(tmp_path):
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+def test_a_created_session_records_both_provenance_and_its_real_launcher(
+    tmp_path, lifecycle_session_factory,
+):
+    """End-to-end through the real create path, passing nothing by hand.
+
+    Both fields are needed and they come from different places, which is
+    exactly how a unit test that supplies them itself misses a break: after
+    the discovery pass stopped inferring launch_command, the create path was
+    briefly the only writer left and did not write it -- which would have
+    made every session permanently ineligible for auto-recovery while every
+    test that set the field explicitly still passed.
+    """
+    if resolve_launcher("claude") is None:
+        pytest.skip("claude is not installed on this host")
+    config = _lifecycle_config(tmp_path, timeout=8.0)
+    service = TerminalService(config)
+    name = lifecycle_session_factory("claude-lc-provenance")
+    assert "error" not in service.terminal_create_session(name, "claude")
+
+    record = service.session_registry.get(service.REGISTRY_LOCAL_NODE_ID, name)
+    assert record is not None
+    assert record.created_by_controller is True
+    assert record.launch_command, "the launcher actually run must be recorded"
+
+
+def test_a_session_merely_observed_records_neither(tmp_path, tmux_session_factory):
+    # The complement, through the ordinary discovery path: a session running
+    # a recognised agent that this controller did not create.
+    config = _lifecycle_config(tmp_path, timeout=8.0)
+    service = TerminalService(config)
+    name = tmux_session_factory("lifecycle-observed", "bash -lc 'sleep 30'")
+    service.terminal_list_sessions()
+
+    record = service.session_registry.get(service.REGISTRY_LOCAL_NODE_ID, name)
+    assert record is not None
+    assert record.created_by_controller is False
+    assert not record.launch_command

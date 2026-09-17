@@ -181,6 +181,7 @@ def test_manual_checkpoint_requires_input_authorization(service, tmp_path):
     assert brief["checkpoint"]["summary"] == "manual checkpoint text"
 
 
+@pytest.mark.closed_access
 def test_search_and_timeline_are_permission_gated(tmp_path):
     """A session NOT statically allowed and with no read grant must never
     surface its content via search/timeline, even after it's genuinely

@@ -1,0 +1,386 @@
+{
+  "last_indexed_at": "2026-09-14T19:51:56.095685+00:00",
+  "last_indexed_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+  "modules": {
+    "ai_usage": {
+      "last_verified_at": "2026-09-14T19:51:54.863823+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/ai_usage_client.py",
+        "terminal_mcp/ai_usage_index.py",
+        "terminal_mcp/ai_usage_local.py",
+        "terminal_mcp/ai_usage_service.py"
+      ],
+      "summary": "Incremental index over local AI-CLI usage, and the aggregates the report page reads"
+    },
+    "auth": {
+      "last_verified_at": "2026-09-14T19:51:54.885912+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/permissions.py",
+        "terminal_mcp/grants.py",
+        "terminal_mcp/cf_access.py",
+        "terminal_mcp/enrollment.py"
+      ],
+      "summary": "One-time node enrollment codes -- the credential a Windows (or any) machine presents ONCE to trade for its real bootstrap configuration"
+    },
+    "backlog": {
+      "last_verified_at": "2026-09-14T19:51:54.919954+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/backlog_db.py",
+        "terminal_mcp/backlog_service.py",
+        "terminal_mcp/backlog_store.py",
+        "terminal_mcp/project_service.py",
+        "terminal_mcp/project_identity.py"
+      ],
+      "summary": "Project Backlog -- the operation layer (planning), sitting ABOVE the Task Queue (execution)"
+    },
+    "bridge": {
+      "last_verified_at": "2026-09-14T19:51:54.939395+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/bridge.py"
+      ],
+      "summary": "ask_chatgpt bridge -- Phase A (docs/ask-chatgpt-bridge.md)"
+    },
+    "capabilities": {
+      "last_verified_at": "2026-09-14T19:51:54.956648+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/capability_probe.py",
+        "terminal_mcp/agent_availability.py",
+        "terminal_mcp/launcher_resolution.py",
+        "terminal_mcp/host_metrics.py"
+      ],
+      "summary": "Local host resource metrics -- pure stdlib, no psutil dependency (this project's own existing discipline: no new dependency for something the stdlib already gives us, on either platform)"
+    },
+    "config": {
+      "last_verified_at": "2026-09-14T19:51:54.987008+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/config.py",
+        "config.yaml",
+        "config.example.yaml"
+      ],
+      "summary": ""
+    },
+    "deployment": {
+      "last_verified_at": "2026-09-14T19:51:55.020658+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/deployment_redundancy.py",
+        "terminal_mcp/deployment_service.py",
+        "terminal_mcp/tunnel_diagnostics.py",
+        "terminal_mcp/tunnel_watchdog.py",
+        "terminal_mcp/doctor.py",
+        "deploy"
+      ],
+      "summary": "Connection reliability for the OpenAI Secure MCP Tunnel (terminal-mcp- tunnel.service) -- diagnostics + the self-healing decision logic, shared by `terminal-mcp-doctor` (read-only, human/machine output) and `terminal-mcp-tunnel-watchdog` (the same checks, acting on them)"
+    },
+    "fleet": {
+      "last_verified_at": "2026-09-14T19:51:55.053643+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/fleet_registry.py",
+        "terminal_mcp/fleet_loop.py",
+        "terminal_mcp/fleet_projection.py",
+        "terminal_mcp/fleet_service.py",
+        "terminal_mcp/fleet_sync.py",
+        "terminal_mcp/scheduler.py"
+      ],
+      "summary": "Fleet Metadata Registry -- what every node knows about every other node, kept locally so it survives the controller going away"
+    },
+    "http_api": {
+      "last_verified_at": "2026-09-14T19:51:55.076006+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/server.py",
+        "terminal_mcp/server_http.py",
+        "terminal_mcp/health.py",
+        "terminal_mcp/contract.py",
+        "terminal_mcp/logging_setup.py",
+        "terminal_mcp/schema.py",
+        "terminal_mcp/maintenance.py"
+      ],
+      "summary": ""
+    },
+    "integration": {
+      "last_verified_at": "2026-09-14T19:51:55.114655+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/integration_engine.py",
+        "terminal_mcp/integration_loop.py",
+        "terminal_mcp/integration_reviewer.py",
+        "terminal_mcp/integration_service.py",
+        "terminal_mcp/integration_store.py",
+        "terminal_mcp/git_worktree.py",
+        "terminal_mcp/git_isolation_service.py",
+        "terminal_mcp/release_store.py",
+        "terminal_mcp/release_service.py"
+      ],
+      "summary": "Integration Agent -- persistence + state machine for the per-project merge/test pipeline (task: \"3-role model: Coding A/B + Integration Agent\" -- Supervisor Queue v2's own natural extension for throughput on projects with 2+ parallel coding sessions)"
+    },
+    "knowledge": {
+      "last_verified_at": "2026-09-14T19:51:55.146663+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/project_knowledge.py",
+        "terminal_mcp/context_pack.py",
+        "terminal_mcp/skill_provider.py"
+      ],
+      "summary": "Project Knowledge Map -- what a worker should read BEFORE it reads the repo"
+    },
+    "mcp_surface": {
+      "last_verified_at": "2026-09-14T19:51:55.211733+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/mcp_app.py"
+      ],
+      "summary": ""
+    },
+    "node_onboarding": {
+      "last_verified_at": "2026-09-14T19:51:55.285217+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/node_agent.py",
+        "terminal_mcp/node_onboarding.py",
+        "terminal_mcp/node_profile.py",
+        "terminal_mcp/remote_connect.py",
+        "terminal_mcp/lan_discovery.py",
+        "terminal_mcp/bootstrap_protocol.py",
+        "terminal_mcp/helper_artifact.py",
+        "terminal_mcp/rescue_gateway.py"
+      ],
+      "summary": "`terminal-node-agent` -- the lightweight process a WORKER node (e.g"
+    },
+    "nodes": {
+      "last_verified_at": "2026-09-14T19:51:55.357505+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/node_registry.py",
+        "terminal_mcp/node_models.py",
+        "terminal_mcp/node_client.py",
+        "terminal_mcp/node_transport.py",
+        "terminal_mcp/controller.py",
+        "terminal_mcp/connection_store.py"
+      ],
+      "summary": "The multi-node controller: composes NodeRegistry + one NodeClient per registered node + a session-location cache, and exposes the SAME operations TerminalService already does (terminal_tail/status/send/ create/kill/reopen/...), transparently routed to whichever node actually holds the named session"
+    },
+    "orchestration": {
+      "last_verified_at": "2026-09-14T19:51:55.405249+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/event_bus.py",
+        "terminal_mcp/event_wiring.py",
+        "terminal_mcp/outcomes.py",
+        "terminal_mcp/lease.py",
+        "terminal_mcp/verify_queue.py",
+        "terminal_mcp/worker_registry.py"
+      ],
+      "summary": "P0.5 Verify Queue -- verification as CLAIMABLE WORK routed by capability, instead of a state only the implementing session can leave"
+    },
+    "planner": {
+      "last_verified_at": "2026-09-14T19:51:55.437466+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/bug_spec.py",
+        "terminal_mcp/task_classifier.py",
+        "terminal_mcp/planner_service.py",
+        "terminal_mcp/planner_store.py",
+        "terminal_mcp/requirement_contract.py",
+        "terminal_mcp/test_selection.py"
+      ],
+      "summary": "Bug Execution Spec -- the analysis, done once, handed to whoever executes"
+    },
+    "pm": {
+      "last_verified_at": "2026-09-14T19:51:55.459116+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/pm_router.py",
+        "terminal_mcp/pm_service.py",
+        "terminal_mcp/pm_store.py",
+        "terminal_mcp/pm_summary.py"
+      ],
+      "summary": "PM/Orchestrator Agent -- persistence (docs/REQUIREMENTS.md §20.2)"
+    },
+    "policy": {
+      "last_verified_at": "2026-09-14T19:51:55.474726+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/work_policy.py",
+        ".projectflow/policies"
+      ],
+      "summary": "Canonical Work Policy: the rules a worker loads instead of being told them"
+    },
+    "procedures": {
+      "last_verified_at": "2026-09-14T19:51:55.495207+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/procedures.py",
+        "scripts/agent"
+      ],
+      "summary": "Procedure registry -- the runbook layer, so a settled workflow is CALLED rather than re-derived"
+    },
+    "prompt_submission": {
+      "last_verified_at": "2026-09-14T19:51:55.515996+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/prompt_transport.py",
+        "terminal_mcp/submit_flow.py",
+        "terminal_mcp/submit_watchdog.py",
+        "terminal_mcp/verifier.py"
+      ],
+      "summary": "Prompt-submission reliability upgrade -- extension point only (P10)"
+    },
+    "queue": {
+      "last_verified_at": "2026-09-14T19:51:55.570219+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/queue_engine.py",
+        "terminal_mcp/queue_store.py",
+        "terminal_mcp/queue_service.py",
+        "terminal_mcp/queue_loop.py",
+        "terminal_mcp/coordinator.py",
+        "terminal_mcp/task_migration.py",
+        "terminal_mcp/dor_gate.py"
+      ],
+      "summary": "Supervisor Queue v2 -- persistence + state machine (task: \"Supervisor Queue v2 cho Terminal MCP\")"
+    },
+    "repo_read": {
+      "last_verified_at": "2026-09-14T19:51:55.603734+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/repo_read.py",
+        "terminal_mcp/repo_service.py"
+      ],
+      "summary": "Read-only repository introspection -- the engine behind the `repo_*` MCP tools, so an external agent (ChatGPT, via the MCP surface) can read Git and file content DIRECTLY instead of asking a Claude session to read it and paste the result back"
+    },
+    "security": {
+      "last_verified_at": "2026-09-14T19:51:55.638370+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/access_policy.py",
+        "terminal_mcp/redaction.py",
+        "terminal_mcp/audit.py",
+        "terminal_mcp/network_bind.py",
+        "terminal_mcp/network_middleware.py"
+      ],
+      "summary": ""
+    },
+    "session_ops": {
+      "last_verified_at": "2026-09-14T19:51:55.731279+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/core.py",
+        "terminal_mcp/tmux.py",
+        "terminal_mcp/lifecycle.py",
+        "terminal_mcp/session_backend.py",
+        "terminal_mcp/models.py",
+        "terminal_mcp/bindings.py",
+        "terminal_mcp/killed_sessions.py"
+      ],
+      "summary": ""
+    },
+    "session_registry": {
+      "last_verified_at": "2026-09-14T19:51:55.757629+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/session_registry.py",
+        "terminal_mcp/session_knowledge.py",
+        "terminal_mcp/ephemeral_state.py"
+      ],
+      "summary": "Persistent Session Registry -- a durable SQLite record of every session this project has ever discovered/created, independent of whether the underlying tmux/Windows-backend process is still alive"
+    },
+    "session_state": {
+      "last_verified_at": "2026-09-14T19:51:55.778229+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/status.py",
+        "terminal_mcp/adapters.py",
+        "terminal_mcp/terminal_wall.py"
+      ],
+      "summary": "Terminal Wall: many sessions at a glance, and which of them are stuck"
+    },
+    "supervisor": {
+      "last_verified_at": "2026-09-14T19:51:55.816096+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/supervisor.py",
+        "terminal_mcp/supervisor2.py",
+        "terminal_mcp/recovery_engine.py",
+        "terminal_mcp/recovery_loop.py"
+      ],
+      "summary": "Supervisor Loop v1 — local detection + a durable event queue"
+    },
+    "webauth": {
+      "last_verified_at": "2026-09-14T19:51:55.842630+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/webauth.py",
+        "terminal_mcp/webauth_cli.py",
+        "terminal_mcp/webauth_dashboard.py"
+      ],
+      "summary": "Alternate, local-username/password entry point to the same dashboard -- /login, /logout, /app, /app/api/* -- coexisting with, and never weakening, the existing Cloudflare-Access-gated /dashboard path in dashboard.py"
+    },
+    "windows": {
+      "last_verified_at": "2026-09-14T19:51:55.870640+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/windows_backend.py",
+        "terminal_mcp/windows_agent.py",
+        "terminal_mcp/windows_onboarding.py",
+        "terminal_mcp/windows_visible_console.py"
+      ],
+      "summary": "WindowsSessionBackend -- a SessionBackend (session_backend.py) implementation for a Windows node, backed by a ConPTY-attached persistent PowerShell/cmd process per session, instead of tmux"
+    },
+    "work_planning": {
+      "last_verified_at": "2026-09-14T19:51:55.907417+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/work_spec.py",
+        "terminal_mcp/work_planning.py",
+        "terminal_mcp/work_inbox.py",
+        "terminal_mcp/work_reuse.py",
+        "terminal_mcp/work_writeback.py"
+      ],
+      "summary": "Work Execution Spec -- the planning contract for EVERY kind of task"
+    },
+    "work_runtime": {
+      "last_verified_at": "2026-09-14T19:51:55.939015+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/work_store.py",
+        "terminal_mcp/work_service.py",
+        "terminal_mcp/work_loop.py",
+        "terminal_mcp/work_eligibility.py",
+        "terminal_mcp/work_decompose.py"
+      ],
+      "summary": "Work Runtime V1 -- the binding layer"
+    },
+    "work_telemetry": {
+      "last_verified_at": "2026-09-14T19:51:55.981224+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/work_telemetry.py",
+        "terminal_mcp/work_telemetry_runtime.py",
+        "terminal_mcp/efficiency_benchmark.py",
+        "terminal_mcp/metrics.py"
+      ],
+      "summary": "Does the briefing actually cost a worker less than looking? Measured"
+    },
+    "work_ui": {
+      "last_verified_at": "2026-09-14T19:51:56.083627+00:00",
+      "last_verified_commit": "63903c1e39bc45435805dd9a01e85155d23cd91e",
+      "paths": [
+        "terminal_mcp/dashboard.py",
+        "terminal_mcp/webterm.py",
+        "terminal_mcp/webterm_assets.py",
+        "terminal_mcp/windows_webterm.py"
+      ],
+      "summary": ""
+    }
+  },
+  "schema_version": 1,
+  "topics": {}
+}

@@ -33,7 +33,7 @@ def _rig_config(tmp_path, *, auto_recovery_enabled=False) -> AppConfig:
         max_capture_lines=200, default_tail_lines=50,
         input_policy=InputPolicyConfig(allowed_session_patterns=("mcprec-*",)),
         session_lifecycle=SessionLifecycleConfig(enabled=True, allowed_cwd_roots=(str(tmp_path),)),
-        auto_recovery=AutoRecoveryConfig(enabled=auto_recovery_enabled),
+        auto_recovery=AutoRecoveryConfig(enabled=auto_recovery_enabled, managed_sessions_only=False),
     )
 
 

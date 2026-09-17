@@ -35,6 +35,115 @@ described below — which never re-types the prompt itself, only re-issues
 the submission trigger, and only when very specific evidence says the
 original text is still the one sitting in the composer.
 
+## The acceptance gate (MANDATORY — added 2026-09-14)
+
+> **A prompt is DELIVERED only when (1) the send receipt's own
+> `delivery_state` is `SUBMIT_CONFIRMED`, AND (2) a separate, post-submit
+> observation shows the target actually took it.**
+
+Both halves are required. Neither is sufficient. Anything short of both is
+NOT delivered: it must not be reported to a user as delivered, and it must
+not advance a queue task to DISPATCHED/RUNNING.
+
+`SUBMIT_CONFIRMED` means "Enter was processed and the pane moved past the
+pre-Enter baseline". It does **not** mean the agent read the prompt and
+started working. Those are different claims, and conflating them is how a
+task ends up looking dispatched while nothing is running.
+
+### The rule, operationally
+
+| Outcome | What it means | What you may do |
+|---|---|---|
+| `DELIVERED` | `SUBMIT_CONFIRMED` **and** acceptance evidence | Report delivered. Advance the task. **Stop polling for completion** — the next scheduled check watches for the result. |
+| `NOT_ACCEPTED` | submit confirmed, acceptance not observed | Do **not** report delivered. Do **not** advance. **Never resend** — the submit is confirmed, so a resend duplicates it. Re-observe; escalate to a human if it persists. |
+| `UNCERTAIN` | `DELIVERY_UNKNOWN`, or any state not provably confirmed | Do **not** report delivered. Do **not** advance. Inspect `terminal_input_context` first, then re-attempt **only** under the same `idempotency_key`/`submission_id`. |
+| `REFUSED` | `BLOCKED`/`ERROR`, or text sent with no Enter | Not delivered. Fix the cause, then re-attempt under the same idempotency key. |
+
+Acceptance evidence is any one of: the target reports a working/running
+state; the adapter's own `submit_ack_evidence` fires; output genuinely
+advanced past the post-submit baseline. Explicitly **not** acceptance: the
+composer still holding the prompt; the target waiting on a human (it has
+not started *our* work); no observation available at all — unobservable is
+never a pass.
+
+### Claude specifically: never spam Enter
+
+For a Claude target, raw/repeated Enter is forbidden. If the prompt is
+still sitting in the input box, inspect (`terminal_input_context`) and
+clear it, then use exactly **one** `terminal_send_text(..., press_enter=True)`.
+Never a bare `terminal_send_keys(["Enter"])` to "help it along", never a
+second Enter because the first looked slow. The bounded Escape+Enter
+activation retry described above is the *only* re-activation this codebase
+performs, and it is issued by `core.py` itself under its own evidence
+gate — not by a caller.
+
+### Where this is enforced
+
+`terminal_mcp/delivery_gate.py` is the single decision point. It is pure:
+it reads a receipt plus post-submit observations and returns a
+`DeliveryVerdict`; it cannot send, press Enter, or retry (asserted by a
+test that walks its AST for call names). Call sites enforce; the gate
+decides, once.
+
+**Why a new module rather than a fix at each call site** — the audit found
+every send path making the same decision independently, and every one of
+them used a **denylist**:
+
+- `queue_engine._dispatch`: `if error -> BLOCKED`; `if delivery_state ==
+  "DELIVERY_UNKNOWN" -> DISPATCH_UNCERTAIN`; then fell through to
+  `transition_task(RUNNING)` **unconditionally**. Any delivery state that
+  was not that one literal string — present or future — meant RUNNING.
+- `supervisor2.execute_send`: `if submit_status == "SUBMIT_UNCONFIRMED" ->
+  blocked`; then fell through to `state='observing'`. Same shape.
+
+Neither was *actively* broken when audited: every `BLOCKED`/`ERROR` receipt
+in `core.py` also sets `error`, and `TEXT_SENT` is only produced when
+`press_enter=False`, so the denylists happened to cover the states that
+actually occur. That is a coincidence of the current implementation, not a
+guarantee — `adapters.py` documents `DELIVERY_STATES` as extensible, and an
+idempotent replay can return an older receipt shape. The gate inverts this
+to a positive allowlist, so an unrecognised state degrades to UNCERTAIN
+instead of being promoted to delivered.
+
+Neither path checked acceptance at all.
+
+### Rollout: advisory → enforce
+
+`config.prompt_delivery.mode` defaults to **`advisory`**, mirroring
+`supervisor2.POLICY_MODES`' escalation shape. In advisory the verdict is
+computed, recorded to the task's `metadata.delivery_verdict` (plus a
+bounded 5-entry history) and available to an operator, while **every
+existing transition behaves exactly as before** — zero behaviour change.
+
+One half is enforced in *both* modes, deliberately: the positive
+activation allowlist (gate 1). It can only ever refuse a dispatch the old
+code would have wrongly advanced, and for every state that actually occurs
+today it produces the identical outcome — so it is pure hardening with no
+behavioural delta. Gate 2 (acceptance) changes outcomes — a confirmed
+submit with no acceptance evidence becomes `DISPATCH_UNCERTAIN` instead of
+`RUNNING` — so it requires `mode=enforce`.
+
+`require_acceptance=false` keeps gate 1 while skipping gate 2, for a
+deployment that wants the denylist fixed without the extra observation.
+
+### Stop polling once delivered
+
+Once a verdict is `DELIVERED`, the delivery question is settled — stop
+polling for completion. Watching for the *result* is a separate concern
+owned by the completion watcher / verify queue on its own schedule. The
+acceptance check is deliberately **one** extra observation, not a poll
+loop, for the same reason.
+
+### Not yet enforced (tracked, not assumed)
+
+`supervisor2.execute_send` and the direct MCP send tools still make their
+own decision. Wiring them through `delivery_gate` needs their own state
+machines considered (an action's `sent`/`observing`/`blocked` CAS chain,
+and a caller-facing receipt field for the MCP tools) — see the backlog
+item referenced in REQUIREMENTS rather than guessing at it here. A direct
+`terminal_send_text` caller (ChatGPT, Claude Code) cannot be enforced
+in-process at all: for them this section **is** the rule.
+
 ## What already existed (the audit)
 
 Before this upgrade, the following was already live, already tested
@@ -276,3 +385,106 @@ safe against an accidental double-submit by the existing
   current tmux-pane-content adapters have no way to distinguish those
   cases today, and inventing evidence codes that don't correspond to a
   real, checked signal would be worse than not having them.
+
+---
+
+## The acceptance contract (P1, 2026-09-15)
+
+### Text delivered is not a submission
+
+Three states, and they are not interchangeable:
+
+| State | Means |
+|---|---|
+| `TEXT_SENT` | the bytes reached the composer. Nothing was submitted, and nothing is claimed. |
+| `SUBMIT_CONFIRMED` | positive evidence ties **this** attempt to a real change of state in the target. |
+| `DELIVERY_UNKNOWN` | Enter went out, the outcome is unproven. Never silently upgraded. |
+| `SUBMIT_STALLED` | the prompt is still in the composer and the pane never moved. Specific, and retryable. |
+
+**A pane diff is not evidence.** A Claude Code redraw, a spinner tick, or an
+elapsed-timer update changes the pane without anything having been submitted.
+Confirmation requires the adapter's own ack rule to pass.
+
+### The pipeline, and the ordering that matters
+
+```
+PREPARE -> WRITE -> VERIFY_TEXT -> ACTIVATE -> PROVE_ACCEPTED -> TRACK
+```
+
+`VERIFY_TEXT` runs **before** `ACTIVATE`, not after. An activate-only send
+(`terminal_send_text("", press_enter=True)`) into an empty composer has nothing
+to submit, so the Enter is **withheld** — the call returns `DELIVERY_UNKNOWN`
+with `submit_outcome: NOTHING_TO_SUBMIT`, `stage: VERIFY_TEXT` and
+`activation_attempts: 0`.
+
+Getting that ordering wrong is not theoretical. Measured live on `hp-linux`
+(2026-09-15), before this change:
+
+```
+composer empty, agent idle
+terminal_send_text("", press_enter=True)
+  -> {"delivery_state": "SUBMIT_CONFIRMED", "submit_reason": null}
+pane afterwards: byte-identical
+```
+
+and three consecutive activate-only calls during a running turn each returned
+`SUBMIT_CONFIRMED` while the pane only ever showed
+`Press up to edit queued messages`.
+
+**Root cause.** `_sent_text_echoed` treats an empty `sent_text` as trivially
+satisfied — correct, for a caller with genuinely nothing to attribute. An
+activate-only send *does* have something to attribute: the composer's own
+content. Passing `""` removed the busy-window guard entirely, and a spinner
+tick was then sufficient to confirm. An activate-only send now attributes the
+composer, the same rule the bare-Enter path already used.
+
+### Claude vs Codex
+
+Separated by adapter capability, never by a shared default:
+
+- **Claude** — exactly one Enter. `ACTIVATION_ADAPTERS == {"claude"}` adds a
+  cursor-move nudge before it, chosen because it cannot alter what is about to
+  be submitted. Never a second Enter: two Enters submit twice.
+- **Codex** — its multi-enter/debounce retry profile is gated on
+  `adapter.name == "codex"` and is never applied to Claude. A test pins this so
+  a later edit cannot widen it silently.
+
+### Remote sends
+
+A remote failure is classified rather than collapsed into one error string:
+
+| State | Retryable | Means |
+|---|---|---|
+| `REMOTE_TIMEOUT` | yes | reached the node, no answer in time |
+| `REMOTE_TRANSPORT_FAILED` | yes | the call itself did not complete |
+| `REMOTE_NODE_UNREACHABLE` | yes | the node is not answering at all |
+| `REMOTE_SESSION_GONE` | **no** | the node answered: no such session |
+| `REMOTE_INPUT_DENIED` | **no** | the node answered: not permitted |
+| `REMOTE_UNKNOWN` | **no** | answered, unrecognised — not knowing what happened is not evidence that retrying is safe |
+
+`node_id` and `session` travel with the verdict, so a caller never has to guess
+which target a failure belongs to. Prompt content never reaches this path.
+
+### One pipeline, one vocabulary
+
+`prompt_transport.py`'s `PromptTransport` Protocol names the same stages this
+contract does, and nothing calls through it — `TmuxPromptTransport.activate()`
+and `.prove_accepted()` raise `NotImplementedError`. The live path is `core.py`
+alone, and the stage names in this document are the ones it emits. The dead
+Protocol is tracked for retirement or implementation; until that is settled,
+treat any state it declares that does not appear in the tables above as not
+real.
+
+### Troubleshooting
+
+| Symptom | Read this |
+|---|---|
+| `SUBMIT_STALLED` | the prompt is still in the composer and nothing started. Safe to retry **while** the prompt is unchanged and the target has not begun working. |
+| `DELIVERY_UNKNOWN` | bytes went out, outcome unproven. Inspect the pane before retrying — a retry may submit twice. |
+| `NOTHING_TO_SUBMIT` | the composer was empty. No Enter was sent. Write the text first. |
+| `SUBMIT_CONFIRMED` with `submit_reason` naming the composer | an activate-only send; the echo was attributed to the composer's content, not to an empty sent text. |
+| `REMOTE_*` | see the table above; only the three transport classes are worth retrying. |
+
+Audit metadata carried on every send: `submission_id`, `activation_attempts`,
+`enter_count`, `evidence`, `stage`, `submit_latency_ms`, `submit_reason`.
+None of them contain prompt text.

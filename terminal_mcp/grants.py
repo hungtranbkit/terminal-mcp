@@ -29,8 +29,23 @@ from pathlib import Path
 
 from .schema import Migration, apply_migrations
 
+def _add_revision(connection) -> None:
+    """Monotonic per-row counter for optimistic concurrency.
+
+    Two callers changing one session's permissions concurrently must not have
+    the later write silently erase the earlier one: a caller passes the
+    revision it read, and a mismatch is a conflict it can re-read and retry,
+    never a lost update. Existing rows start at 1 so a pre-migration grant is
+    immediately usable with the new API.
+    """
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(session_grants)")}
+    if "revision" not in columns:
+        connection.execute("ALTER TABLE session_grants ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+
+
 GRANT_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: session_grants", lambda connection: None),
+    Migration(2, "session_grants.revision for optimistic concurrency", _add_revision),
 ]
 
 
@@ -54,6 +69,7 @@ class SessionGrant:
     granted_by: str | None
     created_at: str
     updated_at: str
+    revision: int = 1
 
 
 def _from_row(row: sqlite3.Row | None) -> SessionGrant | None:
@@ -65,6 +81,7 @@ def _from_row(row: sqlite3.Row | None) -> SessionGrant | None:
         pinned_session_id=row["pinned_session_id"], pinned_pane_id=row["pinned_pane_id"],
         pinned_created_epoch=row["pinned_created_epoch"], granted_by=row["granted_by"],
         created_at=row["created_at"], updated_at=row["updated_at"],
+        revision=int(row["revision"]) if "revision" in row.keys() and row["revision"] is not None else 1,
     )
 
 
@@ -128,7 +145,8 @@ class SessionGrantStore:
                 VALUES (?, ?, 0, ?, ?, ?)
                 ON CONFLICT(session) DO UPDATE SET
                     read_enabled = excluded.read_enabled, granted_by = excluded.granted_by,
-                    updated_at = excluded.updated_at""",
+                    updated_at = excluded.updated_at,
+                    revision = session_grants.revision + 1""",
                 (session, int(enabled), granted_by, now, now),
             )
             if not enabled:
@@ -138,11 +156,24 @@ class SessionGrantStore:
                 # reactivate.
                 connection.execute(
                     """UPDATE session_grants SET input_enabled = 0, pinned_session_id = NULL,
-                       pinned_pane_id = NULL, pinned_created_epoch = NULL, updated_at = ?
+                       pinned_pane_id = NULL, pinned_created_epoch = NULL, updated_at = ?,
+                       revision = revision + 1
                        WHERE session = ?""",
                     (now, session),
                 )
         return self.get(session)  # type: ignore[return-value]
+
+    def delete(self, session: str) -> bool:
+        """Remove a grant row entirely.
+
+        Under the default-open model this is how a session returns to the
+        DEFAULT, which is not the same as writing read_enabled=0: absence of a
+        record means allow, a record reading 0 means someone said no. Keeping
+        those distinguishable is the whole point.
+        """
+        with self._connection() as connection:
+            cursor = connection.execute("DELETE FROM session_grants WHERE session = ?", (session,))
+            return cursor.rowcount > 0
 
     def rename_session(self, old: str, new: str) -> bool:
         """Rename Session feature: re-keys an existing grant's PRIMARY KEY
@@ -156,6 +187,10 @@ class SessionGrantStore:
         now = datetime.now(timezone.utc).isoformat()
         with self._connection() as connection:
             cursor = connection.execute(
+                # Deliberately does NOT bump revision: a rename re-keys the
+                # grant, it does not change the permission. Bumping here would
+                # make a concurrent caller's correct revision look stale for a
+                # change that never happened.
                 "UPDATE session_grants SET session = ?, updated_at = ? WHERE session = ?", (new, now, old),
             )
             return cursor.rowcount > 0
@@ -173,7 +208,8 @@ class SessionGrantStore:
         with self._connection() as connection:
             connection.execute(
                 """UPDATE session_grants SET input_enabled = ?, pinned_session_id = ?,
-                   pinned_pane_id = ?, pinned_created_epoch = ?, granted_by = ?, updated_at = ?
+                   pinned_pane_id = ?, pinned_created_epoch = ?, granted_by = ?, updated_at = ?,
+                   revision = revision + 1
                    WHERE session = ?""",
                 (int(enabled),
                  pinned_session_id if enabled else None,

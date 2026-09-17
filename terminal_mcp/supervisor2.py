@@ -40,6 +40,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from . import delivery_gate
+from .adapters import is_submission_confirmed
 from .audit import sanitized_preview, text_fingerprint
 from .metrics import increment
 from .models import SessionIdentity
@@ -476,6 +478,24 @@ class SupervisorV2Service:
         # delegating keeps a single source of truth (v1's config property).
         return self.v1.config
 
+    @property
+    def delivery_policy(self):
+        """The prompt-delivery / acceptance gate's policy.
+
+        Read through v1's terminal config rather than held as a constructor
+        field, for the same reason `config` above is: the queue engine reads
+        `config.prompt_delivery` from the identical object, and a supervisor
+        holding its own copy is how the two send paths end up enforcing two
+        different policies while an operator believes they flipped one
+        switch. Falls back to the dataclass defaults (advisory,
+        require_acceptance) only where no config is reachable at all -- a
+        test double, mainly -- because advisory changes no behaviour."""
+        try:
+            return self.v1.terminal.config.prompt_delivery
+        except AttributeError:
+            from .config import PromptDeliveryConfig
+            return PromptDeliveryConfig()
+
     # -- policy -----------------------------------------------------------
 
     def set_policy(self, binding: str | None = None, session: str | None = None, *,
@@ -757,20 +777,96 @@ class SupervisorV2Service:
                                   stop_reason=result["error"], send_result=json.dumps(result))
             return {"sent": False, **result}
         watch = self.v1.store.get_watch(action["watch_key"])
-        if result.get("submit_status") == "SUBMIT_UNCONFIRMED":
-            # P0-6: the text really was sent (sent=True stays accurate),
-            # but Enter's submission could not be confirmed -- never count
-            # this as a successful auto-action or let reconciliation
-            # advance the chain as if it had progressed. Hold for review,
-            # exactly like a content-screening block.
+        # PROMPT DELIVERY / ACCEPTANCE GATE (delivery_gate.py). The verdict is
+        # ALWAYS computed and ALWAYS recorded on the action; whether gate 2 can
+        # change the outcome depends on prompt_delivery.mode, which is advisory
+        # by default. This is the same evaluate() the queue engine calls, which
+        # is the entire point of the item: two send paths, one rule.
+        verdict = self._delivery_verdict(watch, result, action["proposed_prompt"])
+        result = {**result, "delivery_verdict": verdict.to_dict()}
+        if not is_submission_confirmed(result):
+            # P0-6: the text really was sent (sent=True stays accurate), but
+            # submission was not PROVED -- never count this as a successful
+            # auto-action or let reconciliation advance the chain as if it had
+            # progressed. Hold for review, exactly like a content-screening
+            # block.
+            #
+            # This asks adapters.is_submission_confirmed (a positive allowlist)
+            # rather than checking for the literal "SUBMIT_UNCONFIRMED" it used
+            # to. A denylist here silently advanced autonomous work on two
+            # results that prove nothing: `TEXT_SENT`, which legacy
+            # to_legacy_submit_status deliberately preserves rather than folding
+            # into the unconfirmed bucket, and a result carrying no delivery
+            # field at all. The failure mode is the one that matters least
+            # visibly and costs most -- a chain marching on after a prompt that
+            # was typed and never submitted.
+            # The stop_reason keeps its exact existing spelling: dashboards,
+            # operator runbooks and tests already key on it, and the specific
+            # delivery_state that failed to confirm is already durable in
+            # send_result below. What changed is WHICH results land here, not
+            # what they are called.
             self.store.cas_update(action_id, expected_state="sent", state="blocked",
                                   stop_reason="submit_unconfirmed", send_result=json.dumps(result))
             self.store.block_policy(action["watch_key"], "submit_unconfirmed")
+            return {"sent": True, **result}
+        # Gate 2: the submit IS confirmed, but nothing observed afterwards
+        # shows the target actually took the prompt. That is a different
+        # failure from an unproven submit and gets its own stop_reason --
+        # conflating them would tell an operator to retry a send that must
+        # never be retried, because the submit is confirmed and a resend
+        # would duplicate it.
+        #
+        # Only the ACTION is blocked; block_policy is deliberately NOT called.
+        # An agent that was slow to visibly start is latency, not a policy
+        # failure, and pausing the whole watch (and every other action under
+        # it) because of one slow start is collateral damage. Blocking the
+        # action alone is already sufficient to stop the chain: only
+        # 'observing' actions are reconciled toward completed, and the
+        # auto-action counter below is skipped, so nothing advances.
+        #
+        # Advisory mode records the verdict and changes nothing, exactly like
+        # the queue engine. Gate 1 above is enforced in BOTH modes because it
+        # can only refuse a send the old denylist would have wrongly advanced.
+        if verdict.kind == delivery_gate.NOT_ACCEPTED and self.delivery_policy.enforcing:
+            self.store.cas_update(action_id, expected_state="sent", state="blocked",
+                                  stop_reason="acceptance_not_observed",
+                                  send_result=json.dumps(result))
             return {"sent": True, **result}
         self.store.cas_update(action_id, expected_state="sent", state="observing",
                               send_result=json.dumps(result), output_hash_at_send=watch["last_output_hash"])
         self.store.increment_auto_action_count(action["watch_key"])
         return {"sent": True, **result}
+
+    def _delivery_verdict(self, watch: dict[str, Any], result: dict[str, Any], sent_text: str):
+        """Compute the delivery verdict for one supervisor send.
+
+        Mirrors queue_engine._delivery_verdict deliberately, down to the ONE
+        extra read: long-running observation belongs to the completion
+        watcher, and the rule is that polling for completion stops once
+        delivery is established. A read that fails is UNOBSERVABLE, which is
+        never a pass.
+
+        `before_lines` is whatever the receipt carries and nothing more. The
+        send path does not currently emit pre-submit lines, so gate 2 leans on
+        target state and adapter acknowledgement; capturing the pane twice per
+        send to close that gap would be a new capability, not the wiring this
+        item asks for, and it would make the two send paths disagree."""
+        after_lines = None
+        target_state = None
+        if self.delivery_policy.require_acceptance and watch is not None:
+            try:
+                status = self.v1.terminal.terminal_status(watch["target"])
+                if not status.get("error"):
+                    target_state = status.get("target_state")
+                    tail = status.get("last_output")
+                    if isinstance(tail, str):
+                        after_lines = tail.splitlines()
+            except Exception:  # noqa: BLE001 -- an unobservable target must not crash a send
+                after_lines = None
+        return delivery_gate.evaluate(
+            result, before_lines=result.get("pre_submit_lines"), after_lines=after_lines,
+            target_state=target_state, sent_text=sent_text,
+            require_acceptance=self.delivery_policy.require_acceptance)
 
     def list_actions(self, target: str | None = None, state: str | None = None, limit: int = 50) -> dict[str, Any]:
         watch_key = None

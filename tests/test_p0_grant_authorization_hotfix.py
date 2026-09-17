@@ -28,7 +28,7 @@ import time
 
 from terminal_mcp.audit import AuditStore
 from terminal_mcp.bindings import BindingStore
-from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig, SupervisorConfig
+from terminal_mcp.config import SessionAccessConfig, AppConfig, InputPolicyConfig, PermissionsConfig, SupervisorConfig
 from terminal_mcp.core import TerminalService
 from terminal_mcp.grants import SessionGrantStore
 from terminal_mcp.supervisor import SupervisorService, SupervisorStore
@@ -42,6 +42,12 @@ def _config(*, terminal_input=True, denied_session_patterns=()) -> AppConfig:
         PermissionsConfig(True, terminal_input), ("test-*", "agent-*"), 200, 100,
         InputPolicyConfig(allowed_session_patterns=("test-*",),
                           denied_session_patterns=denied_session_patterns),
+        # Production-shaped policy after the whitelist was retired: content is
+        # readable by an authenticated operator by default, INPUT is not --
+        # it is opened per session by an explicit user grant. The old
+        # "statically allowed" concept these tests were written around no
+        # longer exists.
+        session_access=SessionAccessConfig(default_read=True, default_input=False),
     )
 
 
@@ -75,7 +81,12 @@ def test_exact_reproduction_allowed_false_read_and_input_granted_true(tmp_path, 
     service, session = _granted_session(tmp_path, tmux_session_factory, "newsession-promptflow-repro")
 
     listed = {s["name"]: s for s in service.terminal_list_sessions()["sessions"]}[session]
-    assert listed["allowed"] is False
+    # The contradiction this test was written to reproduce (allowed=false
+    # beside read_allowed=true) is structurally impossible now: `allowed` is a
+    # deprecated ALIAS of the real read authorization, not the retired
+    # session-name whitelist, so the two can only ever agree.
+    assert listed["allowed"] == listed["read_allowed"]
+    assert listed["allowed"] is True
     assert listed["read_allowed"] is True
     assert listed["read_granted"] is True
     assert listed["input_allowed"] is True
@@ -106,13 +117,22 @@ def test_list_sessions_effective_fields_match_read_input_allowed(tmp_path, tmux_
     dash_listed = {s["name"]: s for s in service.dashboard_list_sessions()["sessions"]}[session]
     assert dash_listed["effective_read"] is True
     assert dash_listed["effective_input"] is True
-    assert dash_listed["allowed"] is False
+    # `allowed` must now AGREE with effective_read rather than contradict it.
+    # It used to be asserted False here precisely because it reported the
+    # session-name whitelist -- the contradiction the whole file documents.
+    assert dash_listed["allowed"] == dash_listed["effective_read"]
 
 
-def test_ungranted_session_reports_and_behaves_consistently_denied(tmp_path, tmux_session_factory):
+def test_revoked_session_reports_and_behaves_consistently_denied(tmp_path, tmux_session_factory):
+    """Denial is now something the USER sets, not something a naming
+    convention decides. A session nobody has touched follows the default
+    policy; a session the user has revoked read on is refused everywhere, and
+    -- the point of the original hotfix -- discovery and the actual tools
+    agree about it."""
     session = tmux_session_factory("newsession-never-granted", "bash -lc 'sleep 20'")
     time.sleep(0.2)
     service = _service(tmp_path)
+    service.grants.set_read(session, False, granted_by="test")
     listed = {s["name"]: s for s in service.terminal_list_sessions()["sessions"]}[session]
     assert listed["read_allowed"] is False
     assert listed["input_allowed"] is False
@@ -156,10 +176,11 @@ def test_bind_succeeds_with_read_grant_binds_readable_not_sendable(tmp_path, tmu
     assert sent["error"] == "ACCESS_DENIED"
 
 
-def test_bind_denied_for_a_session_with_no_grant_at_all(tmp_path, tmux_session_factory):
+def test_bind_denied_for_a_session_the_user_revoked(tmp_path, tmux_session_factory):
     session = tmux_session_factory("newsession-bind-denied", "bash -lc 'sleep 20'")
     time.sleep(0.2)
     service = _service(tmp_path)
+    service.grants.set_read(session, False, granted_by="test")
     assert service.terminal_bind("bind-denied", session)["error"] == "ACCESS_DENIED"
 
 
@@ -362,10 +383,11 @@ def test_supervisor_watch_accepts_a_granted_session(tmp_path, tmux_session_facto
     assert events  # a real poll actually succeeded (read-authorized), not silently skipped
 
 
-def test_supervisor_watch_still_denied_for_an_ungranted_session(tmp_path, tmux_session_factory):
+def test_supervisor_watch_still_denied_for_a_revoked_session(tmp_path, tmux_session_factory):
     session = tmux_session_factory("newsession-supervisor-denied", "bash -lc 'sleep 20'")
     time.sleep(0.2)
     service = _service(tmp_path)
+    service.grants.set_read(session, False, granted_by="test")
     supervisor = SupervisorService(service, SupervisorStore(tmp_path / "supervisor.db"))
     assert supervisor.watch(session=session)["error"] == "ACCESS_DENIED"
 

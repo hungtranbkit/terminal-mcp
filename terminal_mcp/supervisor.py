@@ -34,7 +34,7 @@ from typing import Any, Callable
 from .audit import sanitized_preview, text_fingerprint
 from .config import AppConfig, SupervisorConfig
 from .core import TerminalService
-from .permissions import session_allowed
+from . import scheduler_health
 from .schema import Migration, apply_migrations
 from .status import (KNOWN_VERIFIER_KINDS, SUPERVISOR_STATES, classify_supervisor_state,
                      parse_completion_marker, parse_evidence_markers, to_legacy_event_type,
@@ -82,6 +82,10 @@ EVENT_TYPES = (
     "state_changed", "attention_required", "completion_candidate", "verifying", "verified_done",
     "verification_failed", "verification_blocked",
     "error_detected", "stalled", "watch_target_missing",
+    # blg_8d65afc1b38b: a watch brought back from a recoverable disable.
+    # Recorded as its own type so "coverage was lost and restored" is
+    # visible in the event stream rather than inferred from a gap.
+    "watch_reconciled",
 )
 _ATTENTION_EVENT_TYPES = {
     "WAITING_INPUT": "attention_required",
@@ -265,6 +269,13 @@ class SupervisorStore:
                 )
                 """
             )
+            # blg_8d65afc1b38b: how many times reconciliation has tried to
+            # bring this watch back. Additive, defaulted, same ALTER-if-
+            # absent idiom as the P0-2 columns above -- an existing row
+            # simply starts at zero.
+            existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(watches)").fetchall()}
+            if "reconcile_attempts" not in existing_columns:
+                connection.execute("ALTER TABLE watches ADD COLUMN reconcile_attempts INTEGER NOT NULL DEFAULT 0")
             apply_migrations(connection, SUPERVISOR_MIGRATIONS)
         try:
             self.path.chmod(0o600)
@@ -316,7 +327,20 @@ class SupervisorStore:
         with self._connection() as connection:
             row = connection.execute("SELECT * FROM watches WHERE watch_key = ?", (old_key,)).fetchone()
             if row is None:
-                return 0
+                # A fleet watch is stored under its QUALIFIED target
+                # ("node/session") while a rename arrives bare, from the node
+                # that performed it. An exact-key lookup therefore missed it
+                # and the watch kept pointing at a name that no longer exists
+                # -- disabled as target_missing on its next poll, for a session
+                # that was alive the whole time under a new name.
+                row = self._find_watch_by_bare_target(connection, old_target)
+                if row is None:
+                    return 0
+                node_prefix = row["target"].partition("/")[0]
+                if "/" not in new_target:
+                    new_target = f"{node_prefix}/{new_target}"
+                    new_key = watch_key("session", new_target)
+                old_key = row["watch_key"]
             data = dict(row)
             data["watch_key"] = new_key
             data["target"] = new_target
@@ -327,6 +351,22 @@ class SupervisorStore:
             )
             connection.execute("DELETE FROM watches WHERE watch_key = ?", (old_key,))
         return 1
+
+    @staticmethod
+    def _find_watch_by_bare_target(connection, bare_target: str):
+        """The one session-kind watch whose target is `node/<bare_target>`.
+
+        Returns None when there is no match OR more than one: two nodes holding
+        the same bare name is exactly the ambiguity controller.resolve_session
+        refuses to guess about, and re-keying the wrong node's watch would point
+        it at a session on a machine that never renamed anything."""
+        if "/" in bare_target:
+            return None
+        rows = connection.execute(
+            "SELECT * FROM watches WHERE kind = 'session' AND target LIKE ? AND target NOT LIKE ?",
+            (f"%/{bare_target}", f"%/%/{bare_target}")).fetchall()
+        matches = [row for row in rows if row["target"].partition("/")[2] == bare_target]
+        return matches[0] if len(matches) == 1 else None
 
     def get_watch(self, key: str) -> dict[str, Any] | None:
         with self._connection() as connection:
@@ -485,6 +525,37 @@ class SupervisorStore:
             )
         return cursor.rowcount == 1
 
+    def reenable_watch(self, key: str, *, attempts: int) -> bool:
+        """Bring a disabled watch back and record the attempt.
+
+        Separate from set_enabled on purpose: this is the ONLY path that
+        turns a watch back on, so the attempt counter can never be
+        bypassed by a caller that just flips `enabled`."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE watches SET enabled = 1, disabled_reason = NULL, reconcile_attempts = ?, "
+                "updated_at = ? WHERE watch_key = ? AND enabled = 0",
+                (attempts, now, key))
+        return cursor.rowcount == 1
+
+    def reset_iterations(self, key: str) -> None:
+        """Clear the poll ceiling and the failure streak for a watch that
+        reconciliation just brought back. Without this, a watch re-enabled
+        at iteration_count >= max_iterations disables itself again on its
+        next quiet poll and the fix looks like it did nothing."""
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE watches SET iteration_count = 0, same_failure_count = 0 WHERE watch_key = ?", (key,))
+
+    def note_reconcile_attempt(self, key: str, *, attempts: int) -> None:
+        """Record a try that did NOT re-enable (still missing, backing
+        off) so the backoff actually advances instead of retrying forever
+        at the same interval."""
+        with self._connection() as connection:
+            connection.execute("UPDATE watches SET reconcile_attempts = ? WHERE watch_key = ?",
+                               (attempts, key))
+
     def delete_watch(self, key: str) -> bool:
         with self._connection() as connection:
             cursor = connection.execute("DELETE FROM watches WHERE watch_key = ?", (key,))
@@ -597,6 +668,44 @@ class SupervisorStore:
         return item
 
 
+def _status_is_absent(result: dict[str, Any]) -> bool:
+    """Does this status answer mean "I cannot see that session"?
+
+    One predicate for the three shapes that all mean the same thing -- an error,
+    state MISSING, or exists=False -- so the poll path and the resolution
+    fallback below cannot disagree about what counts as absent."""
+    if "error" in result:
+        return True
+    return result.get("state") == "MISSING" or result.get("exists") is False
+
+
+def bare_session_name(target: str) -> str:
+    """The session name without its node qualifier.
+
+    Grants, whitelist patterns and `_read_authorized` are all keyed by the
+    SESSION name; a node-qualified "hp/hp1" matches none of them. Asking the
+    read gate about the qualified form therefore denied every fleet watch --
+    `watch(session="hp/hp1")` returned ACCESS_DENIED outright, which is why the
+    watches in production are all bare names that then resolved against the
+    wrong node. Authorization is asked about the session; routing is done with
+    the qualified target."""
+    node, sep, bare = target.partition("/")
+    return bare if sep and bare else target
+
+
+def _deduplicate(names: list[str]) -> list[str]:
+    """Order-preserving unique. A session can appear both in the local list and
+    in a fleet listing that includes the local node; seeding it twice is
+    harmless but re-upserting it churns updated_at for no reason."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
 @dataclass
 class SupervisorService:
     """Tool-facing surface + the actual per-tick polling logic. Shared by
@@ -618,6 +727,26 @@ class SupervisorService:
     # policy anyway, so gating a v1-only watch on an independent verifier
     # it likely has none configured for would be a pure regression with
     # no safety benefit.
+    # Fleet-aware session status. Set post-construction by whoever holds a
+    # ControllerService (mcp_app.build_mcp), a duck-typed callback rather than
+    # an import of controller.py here -- the same layering choice
+    # autonomous_check below already makes, and for the same reason.
+    #
+    # Why this exists: every status call in this file used to go to the LOCAL
+    # TerminalService. A watch on another node's session therefore resolved
+    # against local tmux, came back MISSING, and was disabled permanently on
+    # its FIRST poll. That is not hypothetical -- it is what six of the ten
+    # watches in production are: wtest/win2 (the Windows node) and
+    # hp1/hp2/hp3-work/hp-work (the hp node), every one of them
+    # disabled_reason=target_missing at iteration_count=1 while the sessions
+    # themselves were alive on their own nodes.
+    #
+    # None means local-only, which is exactly what a single-node deployment
+    # and every existing test already got.
+    fleet_status: Callable[[str], dict[str, Any]] | None = None
+    # Fleet-wide session names for config-pattern seeding, same wiring and
+    # same None-means-local default.
+    fleet_sessions: Callable[[], list[str]] | None = None
     autonomous_check: Callable[[str], bool] | None = None
     # Called when an autonomous watch's completion gate resolves to FAILED
     # or BLOCKED (see _handle_completion_candidate) -- v2 wires this to
@@ -705,7 +834,7 @@ class SupervisorService:
             # grant) -- a watch can never be created for a session outside
             # both, but a granted-only session (never in the static
             # whitelist) is now watchable too, same as it is readable.
-            if not self.terminal._read_authorized(session):
+            if not self.terminal._read_authorized(bare_session_name(session)):
                 return {"error": "ACCESS_DENIED", "session": session}
             kind, target = "session", session
             # P0-2: pin identity at (re-)watch time -- best-effort; a
@@ -713,7 +842,7 @@ class SupervisorService:
             # just leaves it unpinned, lazily adopted on the watch's next
             # successful poll instead of failing the watch call itself.
             try:
-                info = self.terminal.tmux.get_session(session)
+                info = self.terminal.tmux.get_session(bare_session_name(session))
             except TmuxError:
                 info = None
             if info is not None:
@@ -791,6 +920,20 @@ class SupervisorService:
             "enabled_watch_count": sum(1 for row in watches if row["enabled"]),
             "state_counts": counts,
             "stalled_count": stalled,
+            # blg_8d65afc1b38b: "4 watches, 0 enabled" was the whole symptom
+            # and the old status could not say WHY any of them were off, nor
+            # whether they were ever coming back. Split by recoverability so
+            # a glance answers both.
+            "disabled_watch_count": sum(1 for row in watches if not row["enabled"]),
+            "recoverable_disabled_count": sum(
+                1 for row in watches if not row["enabled"]
+                and row["disabled_reason"] in scheduler_health.RECOVERABLE_DISABLE_REASONS),
+            "intentionally_excluded_count": sum(
+                1 for row in watches if not row["enabled"]
+                and row["disabled_reason"] in scheduler_health.INTENTIONAL_DISABLE_REASONS),
+            "disabled_reasons": {
+                row["watch_key"]: row["disabled_reason"]
+                for row in watches if not row["enabled"] and row["disabled_reason"]},
         }
 
     def list_events(self, target: str | None = None, state: str | None = None,
@@ -808,11 +951,88 @@ class SupervisorService:
 
     # -- polling --------------------------------------------------------
 
+    def reconcile_watches(self) -> dict[str, Any]:
+        """Bring back watches that were disabled for a RECOVERABLE reason
+        and whose target is alive again.
+
+        blg_8d65afc1b38b, and the reason production showed
+        `watch_count=4, enabled_watch_count=0` while four workers were
+        running: every disable path in this file is permanent, because
+        until now nothing anywhere called set_enabled(..., True). A watch
+        that hit `max_iterations_exceeded` while its worker carried on
+        working stayed off forever, and the worker left scheduling
+        visibility with it.
+
+        What this does NOT do is override a person. `manual_unwatch` and
+        the autonomous-verification refusals are deliberate exclusions and
+        are left alone -- see scheduler_health.INTENTIONAL_DISABLE_REASONS.
+        Recovery is backed off exponentially and capped, so a target that
+        is alive but instantly re-fails does not spin.
+        """
+        now = datetime.now(timezone.utc)
+        restored, skipped = [], []
+        for row in self.store.list_watches():
+            if row["enabled"]:
+                continue
+            attempts = int(row.get("reconcile_attempts") or 0)
+            try:
+                since = (now - datetime.fromisoformat(row["updated_at"])).total_seconds()
+            except (ValueError, TypeError):
+                since = 0.0
+            action = scheduler_health.watch_recovery_action(
+                disabled_reason=row["disabled_reason"],
+                target_alive=self._target_alive(row),
+                attempts=attempts,
+                seconds_since_disabled=since)
+            if not action.should_reenable:
+                skipped.append({"watch_key": row["watch_key"], "target": row["target"],
+                                "disabled_reason": row["disabled_reason"], "reason": action.reason})
+                continue
+            if self.store.reenable_watch(row["watch_key"], attempts=attempts + 1):
+                # Reset the poll ceiling too. Re-enabling a watch that is
+                # still at iteration_count >= max_iterations would have it
+                # disable itself again on the very next quiet poll, which
+                # looks like the fix not working.
+                self.store.reset_iterations(row["watch_key"])
+                restored.append({"watch_key": row["watch_key"], "target": row["target"],
+                                 "was": row["disabled_reason"], "attempt": attempts + 1})
+                self.store.add_event(
+                    watch_key=row["watch_key"], kind=row["kind"], target=row["target"],
+                    previous_state=row["state"], state=row["state"],
+                    event_type="watch_reconciled",
+                    reason=f"re-enabled after {row['disabled_reason']}: {action.reason}",
+                    output_preview="", output_hash=row["last_output_hash"],
+                    iteration_count=0,
+                    metadata={"was_disabled_reason": row["disabled_reason"], "attempt": attempts + 1})
+        if restored:
+            _LOGGER.info("supervisor: reconciled %d watch(es) back into coverage", len(restored),
+                         extra={"restored": [item["watch_key"] for item in restored]})
+        return {"restored": restored, "skipped": skipped}
+
+    def _target_alive(self, row: dict[str, Any]) -> bool:
+        """Cheap liveness probe for reconciliation. Any error at all means
+        'not yet' -- reconciliation simply looks again next pass, which is
+        the whole point of it being a loop rather than a one-shot."""
+        try:
+            if row["kind"] == "binding" and self.terminal.bindings.get(row["target"]) is None:
+                return False
+            result = self._status_for(row["kind"], row["target"])
+        except Exception:  # noqa: BLE001 -- a probe that raises is simply "not alive yet"
+            return False
+        if "error" in result:
+            return False
+        return not (result.get("state") == "MISSING" or result.get("exists") is False)
+
     def run_once(self) -> dict[str, Any]:
         """One synchronous pass over every enabled watch (config-seeded ones
         included). Used by the background loop and directly exposed as
         supervisor_run_once for deterministic/manual testing."""
         self._sync_config_watches()
+        # Before polling: give back coverage that was lost to a recoverable
+        # disable. Doing it here rather than in a separate loop means a
+        # restored watch is polled in the SAME pass, so recovery costs one
+        # cycle rather than two.
+        reconciled = self.reconcile_watches()
         events = []
         for row in self.store.list_watches():
             if not row["enabled"]:
@@ -843,7 +1063,7 @@ class SupervisorService:
                 events.append(event)
         self.store.prune_events(self.config.event_retention)
         _LAST_POLL_AT[0] = datetime.now(timezone.utc).isoformat()
-        return {"polled": True, "events": events}
+        return {"polled": True, "events": events, "reconciled": reconciled}
 
     def _sync_config_watches(self) -> None:
         for binding_name in self.config.watched_bindings:
@@ -851,20 +1071,91 @@ class SupervisorService:
                 self.store.upsert_watch("binding", binding_name, source="config_binding")
         if not self.config.watched_session_patterns:
             return
+        # Fleet-aware seeding. With only the local list, a watched_session_
+        # patterns entry could never match a session on another node -- a
+        # config asking to watch "hp*" simply did nothing on a controller whose
+        # hp sessions all live on the hp node, with no error to explain it.
+        names: list[str] = []
         try:
-            sessions = self.terminal.tmux.list_sessions()
+            names.extend(item.name for item in self.terminal.tmux.list_sessions())
         except Exception:
             # Best-effort skip for *this* sync pass only -- logged, not
             # silently swallowed, so a persistently broken tmux/config is
             # discoverable from the service log rather than only from the
             # absence of expected watches.
-            _LOGGER.warning("supervisor: could not list sessions for config-pattern watch sync", exc_info=True)
+            _LOGGER.warning("supervisor: could not list local sessions for config-pattern watch sync",
+                            exc_info=True)
+        if self.fleet_sessions is not None:
+            try:
+                names.extend(self.fleet_sessions())
+            except Exception:
+                # One unreachable node must not cost the local seeding that
+                # already succeeded above.
+                _LOGGER.warning("supervisor: could not list fleet sessions for config-pattern watch sync",
+                                exc_info=True)
+        if not names:
             return
-        for item in sessions:
-            if not session_allowed(item.name, self.terminal.config):
+        for name in _deduplicate(names):
+            # Readability is the supervisor's real prerequisite: it watches a
+            # session by CAPTURING its output, so a session it cannot read is
+            # a watch that can only ever report nothing. That used to be
+            # approximated by the session-name whitelist; it is now asked
+            # directly of the canonical gate (grants + session_access
+            # defaults), so a granted session is watchable and an ungranted
+            # one is not, regardless of what it is called.
+            # The read gate is asked about the BARE name: grants are keyed by
+            # session name, and a qualified "node/session" would match no grant
+            # at all -- silently excluding every remote session from seeding
+            # while looking like an authorization decision.
+            if not self.terminal._read_authorized(bare_session_name(name)):
                 continue
-            if any(fnmatch.fnmatchcase(item.name, pattern) for pattern in self.config.watched_session_patterns):
-                self.store.upsert_watch("session", item.name, source="config_pattern")
+            if any(fnmatch.fnmatchcase(name, pattern) for pattern in self.config.watched_session_patterns):
+                self.store.upsert_watch("session", name, source="config_pattern")
+
+    def _status_for(self, kind: str, target: str) -> dict[str, Any]:
+        """The ONE place a watch's target is observed.
+
+        Both polling and reconciliation go through here, deliberately: when
+        they disagreed, a watch could be disabled by a poll that asked the whole
+        fleet and then never revived by a reconciliation that only asked the
+        local node -- disabled forever by two functions that were each
+        individually correct.
+
+        Bindings stay local. A binding's target is a binding NAME, and bindings
+        are local-node-scoped in this phase (see docs/multi-node.md and
+        controller.terminal_input_context's own note), so routing one to a
+        remote node would resolve a name that node has never heard of."""
+        if kind == "binding":
+            return self.terminal.terminal_status_bound(target)
+        if self.fleet_status is None:
+            return self.terminal.terminal_status(target)
+        if "/" in target:
+            # Node-qualified: only the fleet can resolve it, and local tmux
+            # cannot hold a name with a slash in it anyway.
+            return self.fleet_status(target)
+
+        # LOCAL FIRST, then the fleet. The order is the whole point, and it is
+        # not a preference -- routing a bare name through the controller
+        # unconditionally makes every local watch depend on the local node being
+        # registered and ONLINE. A stale local heartbeat then answers
+        # SESSION_NOT_FOUND for a session that is plainly running right here,
+        # which would disable the local watches that currently work
+        # (terminal-mcp-main, mcp-work, gatefix2-work) in order to fix the remote
+        # ones. queue_loop.py already documents this exact hazard and injects a
+        # heartbeat refresher to avoid it.
+        #
+        # Asking local first means the fleet is consulted only when local cannot
+        # answer -- precisely the case that used to end in a permanent disable.
+        local = self.terminal.terminal_status(target)
+        if not _status_is_absent(local):
+            return local
+        fleet = self.fleet_status(target)
+        if not _status_is_absent(fleet):
+            return fleet
+        # Nothing can see it. Prefer the fleet's error when it has one: "that
+        # node is unreachable" tells an operator something, where a local
+        # "MISSING" for a session that was never local tells them nothing.
+        return fleet if "error" in fleet else local
 
     def _poll_one(self, row: dict[str, Any]) -> dict[str, Any] | None:
         kind, target, key = row["kind"], row["target"], row["watch_key"]
@@ -882,17 +1173,20 @@ class SupervisorService:
             # verifier never looks at the pane at all).
             return self._run_verification(row, now_iso, iteration_count)
 
-        result = (self.terminal.terminal_status_bound(target) if kind == "binding"
-                  else self.terminal.terminal_status(target))
+        result = self._status_for(kind, target)
 
         if "error" in result:
-            # Never observe a denied/errored target: stop watching it rather
-            # than retry against something the whitelist has since excluded.
+            # Stop observing, but record WHY in a way reconciliation can act on.
+            # This used to collapse every error into access_denied_or_error,
+            # which lost the one distinction that matters: a node that is merely
+            # unreachable right now is a watch to bring back when it returns,
+            # whereas a genuinely revoked grant is not the same thing at all.
+            reason_code = scheduler_health.disable_reason_for_status_error(result["error"])
             return self._transition(row, now_iso, iteration_count, new_state="UNKNOWN",
                                      event_type="watch_target_missing",
                                      reason=f"{result['error']}: no longer observable",
                                      output="", output_hash=row["last_output_hash"],
-                                     disable=True, disabled_reason="access_denied_or_error")
+                                     disable=True, disabled_reason=reason_code)
 
         if result.get("state") == "MISSING" or result.get("exists") is False:
             return self._transition(row, now_iso, iteration_count, new_state="UNKNOWN",

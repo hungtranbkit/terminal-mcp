@@ -1,0 +1,41 @@
+# Terminal MCP node agent -- configuration for a node onboarded through
+# Add Node.
+#
+# WHY THIS FILE EXISTS, and is not config.example.yaml. The example config
+# is the controller's own reference: every capability that creates real
+# processes is commented out there, because a human is expected to read it
+# and opt in. An onboarded worker node has no such human. Copying the
+# example left `session_lifecycle` at its disabled default, so the node
+# advertised session_transport, passed every readiness check -- and then
+# answered the controller's very first Create Session with
+# SESSION_LIFECYCLE_DISABLED. Hosting sessions IS what this node was
+# enrolled for, so this file opts in deliberately and narrowly.
+#
+# Written by install-node-agent.ps1, which substitutes __SESSION_ROOT__
+# with this node's own user profile directory. Edit it freely afterwards:
+# the installer never overwrites a config.yaml that already exists.
+
+permissions:
+  terminal_read: true
+  # Sending into a session. Still gated per session by the dashboard's own
+  # grant flow and by every input_policy check the agent enforces on top;
+  # off here would mean a node that can host a Claude/Codex session and
+  # then never type into it.
+  terminal_input: true
+
+# The capability this node was enrolled for: create/detach/delete real
+# sessions on request from the controller that holds its token.
+session_lifecycle:
+  enabled: true
+  # A session's working directory must resolve inside one of these
+  # (symlinks followed). This node's own user profile, never a drive root.
+  allowed_cwd_roots:
+    - "__SESSION_ROOT__"
+  protected_sessions:
+    - terminal-mcp
+  # The exact literal binaries, never anything a caller supplies as text.
+  launch_commands:
+    claude: claude
+    codex: codex
+  create_ready_timeout_seconds: 10
+  default_grant_mode: none

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from typing import Any
 from abc import ABC, abstractmethod
 
 # ---------------------------------------------------------------------------
@@ -36,8 +38,14 @@ DELIVERY_SUBMIT_CONFIRMED = "SUBMIT_CONFIRMED"
 DELIVERY_UNKNOWN = "DELIVERY_UNKNOWN"
 DELIVERY_BLOCKED = "BLOCKED"
 DELIVERY_ERROR = "ERROR"
+# P0 2026-09-14: a bare Enter on an ALREADY-VISIBLE Claude prompt leaves the
+# pane byte-identical and nothing starts. That is not DELIVERY_UNKNOWN ("bytes
+# went out, outcome unproven") -- it is a specific, stable fact: the prompt is
+# still sitting there and no execution began, so a retry is safe. Conflating
+# the two is what left callers unable to decide whether to retry.
+DELIVERY_STALLED = "SUBMIT_STALLED"
 DELIVERY_STATES = (DELIVERY_TEXT_SENT, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_UNKNOWN,
-                    DELIVERY_BLOCKED, DELIVERY_ERROR)
+                    DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STALLED)
 
 # Legacy submit_status vocabulary (pre-dates this module) -- kept as the
 # public field every existing caller/test already reads, now *derived* from
@@ -51,6 +59,36 @@ def to_legacy_submit_status(delivery_state: str) -> str:
     if delivery_state in (DELIVERY_TEXT_SENT, DELIVERY_SUBMIT_CONFIRMED):
         return delivery_state
     return "SUBMIT_UNCONFIRMED"
+
+
+def is_submission_confirmed(result: Mapping[str, Any]) -> bool:
+    """Did this send result PROVE the prompt was submitted?
+
+    A positive allowlist over the vocabulary above, and the distinction matters
+    because a caller acting autonomously has to decide whether to advance a
+    chain of work on the answer. Only SUBMIT_CONFIRMED carries adapter evidence
+    that submission actually happened.
+
+    Everything else is not-proven, including the two cases a denylist misses:
+
+      TEXT_SENT -- the text reached the composer and Enter's effect was never
+        established. Legacy `to_legacy_submit_status` deliberately preserves this
+        spelling rather than folding it into SUBMIT_UNCONFIRMED, so a consumer
+        checking `!= "SUBMIT_UNCONFIRMED"` reads it as success.
+
+      a missing field -- a result shape this function has not met. Treating
+        absence as success is how a new transport, a short-circuit path or a
+        refactor silently starts advancing autonomous work on no evidence at
+        all.
+
+    Named here, beside DELIVERY_STATES, so there is ONE definition of
+    "confirmed" for every consumer instead of each one re-deriving it from the
+    string constants and getting a slightly different answer."""
+    state = result.get("delivery_state")
+    if state is not None:
+        return state == DELIVERY_SUBMIT_CONFIRMED
+    # Older/synthesised results may carry only the legacy field.
+    return result.get("submit_status") == DELIVERY_SUBMIT_CONFIRMED
 
 
 # Target states an adapter reports the pane as currently showing.
@@ -390,5 +428,40 @@ _ADAPTERS_BY_COMMAND = {
 _GENERIC = GenericShellAdapter()
 
 
+# Executable suffixes a Windows foreground process reports and a POSIX one
+# never does. windows_backend.py derives pane_current_command as the Win32
+# foreground process's basename, to match tmux's own #{pane_current_command}
+# semantic ("always a bare process name, e.g. bash") -- but on Windows the
+# bare name KEEPS its extension, so Claude Code arrives as "claude.EXE"
+# where the same agent on Linux arrives as "claude".
+_EXECUTABLE_SUFFIXES = (".exe", ".com", ".bat", ".cmd")
+
+
+def normalize_command(pane_current_command: str) -> str:
+    """The adapter-lookup key for a foreground command name.
+
+    P0 2026-09-15: `select_adapter` looked the raw casefolded command up in
+    `_ADAPTERS_BY_COMMAND`, whose keys are "codex"/"claude". On every Windows
+    node that meant `"claude.exe"`, which is not a key, so a real Claude Code
+    session silently selected `GenericShellAdapter`. Two consequences, both
+    observed live on dell-5530 (win1/win2/wtest/win-work): the send result
+    reported `agent_type: "generic"`, and -- because
+    `submit_flow.ACTIVATION_ADAPTERS` is keyed on the adapter NAME -- the
+    Claude activation nudge was never sent, so a bare Enter on an already-
+    visible prompt did nothing at all. Upgrading the node agent alone could
+    never have fixed those sessions.
+
+    Basename first (defensive only: both backends already report a bare
+    name), then at most one executable suffix, then casefold. Deliberately
+    NOT a general "strip any extension" rule -- a command genuinely named
+    with a dot keeps it, and only the Windows executable family is stripped.
+    """
+    name = (pane_current_command or "").strip().replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    for suffix in _EXECUTABLE_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
 def select_adapter(pane_current_command: str) -> AgentAdapter:
-    return _ADAPTERS_BY_COMMAND.get((pane_current_command or "").casefold(), _GENERIC)
+    return _ADAPTERS_BY_COMMAND.get(normalize_command(pane_current_command), _GENERIC)

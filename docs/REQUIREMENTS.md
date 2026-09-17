@@ -90,6 +90,9 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Notes / Ideas store (kho ghi chú: MCP `note_*` + `/dashboard/notes`) | VERIFIED |
 | Notes surface application-layer auth (webauth session or verified CF Access) | VERIFIED |
 | Dashboard: Requirements/Feature Matrix link | VERIFIED |
+| Worktree Janitor (reclaim isolated task worktrees) | CONTRACT ONLY — no executor, nothing deletes yet |
+| Read-only repo access for external agents (`repo_*` MCP tools) | VERIFIED (V1, read-only) |
+| Prompt delivery / acceptance gate (`delivery_gate.py`) | VERIFIED (advisory default; enforce opt-in) |
 | Permissions: read/input grants + effective permissions | VERIFIED |
 | Reliable prompt submission (press-enter, DELIVERY_UNKNOWN, idempotency) | VERIFIED |
 | Supervisor v1 (watch/poll/state machine) | VERIFIED |
@@ -120,7 +123,11 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Direct-send verification: continued-polling ack evidence (P0 fix) | VERIFIED locally; NOT YET DEPLOYED to dell-5530 |
 | `terminal_create_session(initial_prompt)` double-echo (shell sessions) | FIXED, 2026-09-07 (`lifecycle.py`'s own real readiness signal) |
 | AI Usage (read-only, local AI Usage Monitor integration) | VERIFIED_LIVE (real browser smoke, real live data) |
+| Work efficiency telemetry (per-task counters + aggregation/savings) | IMPLEMENTED_NOT_LIVE_VERIFIED (runtime-driven rows + tests; not yet attached in a live deployment — the attach call is the coordinator's central wiring) |
+| Token-efficiency benchmark (18 real bugs from git + 2 synthetic) | MEASURED, 2026-09-14 — headline verdict **FAIL** against its own pre-registered bar; see `docs/TOKEFF_BENCHMARK.md` |
 | Unified Task System §20 (Kanban/PM/Planner/git isolation/Phase A-E) | VERIFIED — see §20 itself for the exact per-slice scope |
+| Work Mode: a planner claim briefs itself (similar-bug retrieval + module context pack, paths verified) | VERIFIED (V1) |
+| Work Mode: the budget and the gate constrain a REAL run (dogfood, `dogfood` runbook) | VERIFIED (dogfood; see its own "what is not claimed" note) |
 
 ---
 
@@ -329,6 +336,21 @@ sessions bringing up dell-5530/m910/macbook — see `docs/multi-node.md`).
   "legacy" migration path currently pending — this IS the live model.
 
 ## 5. Reliable prompt submission
+
+**MANDATORY RULE (2026-09-14): a prompt is DELIVERED only when BOTH (1) the
+send receipt's `delivery_state` is `SUBMIT_CONFIRMED` AND (2) a separate
+post-submit observation shows the target actually took it.** Anything short
+of both must not be reported as delivered and must not advance a queue task
+to DISPATCHED/RUNNING. `SUBMIT_CONFIRMED` proves Enter was processed, NOT
+that the agent read the prompt and started — those are different claims.
+The full contract (verdict table, acceptance evidence, the "never spam
+Enter for Claude" rule, advisory→enforce rollout, and the audit of the two
+denylist call sites this replaces) lives in `docs/prompt-submission.md`
+under "The acceptance gate", which is the source of truth for prompt
+delivery. Decision point: `terminal_mcp/delivery_gate.py` (pure; cannot
+send or retry). Config: `prompt_delivery.mode`, default `advisory` (no
+behaviour change; gate 1's positive allowlist is enforced in both modes as
+pure hardening). Tests: `tests/test_delivery_gate.py`.
 
 **Status: VERIFIED.**
 
@@ -616,6 +638,16 @@ not placeholders).
 - **SSH bootstrap node connect:** real dashboard flow, `remote_connect.py`
   (host-key trust, connection test, bootstrap), covered by `real_ssh`-
   marked tests against a real local sshd.
+- **Reading a repo that lives on another node:** `GET /v1/repo/{op}` on
+  the node agent (read-only, GET-only, dispatched through
+  `repo_read.OPERATIONS` — a fixed table of ten read functions, so the
+  endpoint cannot be asked to write/checkout/fetch regardless of input),
+  reached through `NodeClient.repo_op` and routed by
+  `repo_service.RepoService`. Each node enforces its OWN
+  `repo_read`/`session_lifecycle` allowlist over its own paths, which is
+  the correct owner of that decision. `/v1/repo-evidence` (metadata only,
+  for the Coordinator gate) is its older sibling — **and had never once
+  worked before 2026-09-14**: see the Feature Details entry below.
 
 ## 13. Watchdog / recovery / registry / knowledge
 
@@ -653,7 +685,12 @@ not placeholders).
   (`windows_webterm.py`, xterm.js) is UNAFFECTED — it gets the true raw
   byte stream directly from the reader loop, full color fidelity.
 
-## 15. API / MCP tool inventory (214 tools, from `tests/test_server.py`'s own exact set)
+## 15. API / MCP tool inventory (from `tests/test_server.py`'s own exact set)
+
+The count in this heading used to be pinned at 96 and had drifted; the
+authoritative set is and always was `tests/test_server.py`'s own
+assertion, which fails the moment a tool is added or removed. This
+section names the GROUPS, never a total.
 
 Session ops: `terminal_list_sessions`, `terminal_tail`, `terminal_capture`,
 `terminal_status`, `terminal_send_text`, `terminal_send_keys`,
@@ -710,6 +747,15 @@ Auto-dispatch loop: `terminal_queue_loop_status`,
 `terminal_queue_loop_run_once`.
 Supervisor/Coordinator panel: `terminal_queue_global_inbox`,
 `terminal_queue_recent_events`, `terminal_integration_fleet_overview`.
+Read-only repo access (V1, READ-ONLY — `repo_read.py`/`repo_service.py`):
+`repo_status`, `repo_head`, `repo_branches`, `repo_remotes`, `repo_tree`,
+`repo_read`, `repo_search`, `repo_diff`, `repo_log`, `repo_show_commit`.
+There is deliberately NO write counterpart (no `repo_write`/
+`repo_checkout`/`repo_commit`/`repo_push`/`repo_reset`/`repo_clean`), and
+`tests/test_repo_read_mcp_tools.py` asserts that absence at the MCP
+surface — the read-only guarantee is pinned by a test, not by convention.
+See the "Read-only repository access for external agents" Feature Details
+entry for the full contract.
 
 **Dashboard HTTP routes** (58, from `tests/test_dashboard.py`'s own exact
 dict) — session CRUD/grant/rename/kill/reopen, supervisor v1/v2, nodes
@@ -723,11 +769,14 @@ summarizes it, never duplicates it verbatim (avoids drift).
 
 ## 16. Config / env / service / deploy / tunnel / startup
 
-- **Config file:** `config.yaml` (`AppConfig`, `config.py`) — 14 nested
-  config sections: `permissions`, `input_policy`, `supervisor`, `queue`
-  (new), `dashboard`, `session_lifecycle`, `session_knowledge`,
-  `ask_chatgpt`, `maintenance`, plus per-node/discovery/remote-connect
-  sections under `nodes`.
+- **Config file:** `config.yaml` (`AppConfig`, `config.py`) — nested config
+  sections: `permissions`, `input_policy`, `supervisor`, `queue`,
+  `dashboard`, `session_lifecycle`, `session_knowledge`, `session_access`,
+  `ask_chatgpt`, `maintenance`, `fleet_sync`, `work`, `repo_read`,
+  `submit`, `submit_watchdog`, `integration_loop`, `ai_usage`,
+  `auto_recovery`, plus per-node/discovery/remote-connect sections under
+  `nodes`. (The count that used to head this line had drifted and is
+  dropped rather than re-pinned; `AppConfig`'s own fields are the list.)
 - **Service:** `terminal-mcp-http.service` (systemd), HTTP port `8766`
   (`server_http.py`'s `HTTP_PORT`).
 - **Remote nodes:** `node_agent.py` (Linux/macOS) / `windows_agent.py`
@@ -1825,6 +1874,633 @@ listed in §19, plus the living-requirements convention itself. This
 section is the backfill the user asked for; §1-§19 above are the fast-
 scan/audit view over the SAME facts.)*
 
+### The budget and the gate, proven against a real run (dogfood) — 2026-09-14
+
+- **Goal / user value:** `bug_spec.gate` and `bug_spec.budget_check` already
+  had unit tests, which prove the arithmetic: given these numbers, is the
+  verdict right. That is a different sentence from "the budget constrains a
+  run". A verdict nothing consults constrains nothing, and a soft budget that
+  is only ever computed is advice. This entry is the end-to-end evidence that
+  a worker is actually stopped.
+- **Status: VERIFIED (dogfood).** `tests/test_dogfood_budget_gate.py` (25) and
+  `tests/test_dogfood_work_v1.py` (8 + 1 opt-in skip), run together by the new
+  `dogfood` runbook. Real file reads and real `git grep` against THIS
+  checkout, a real `QueueService`, a real `InboxService`, a real
+  `BugSpecStore` and a real `TelemetryStore`. No fixture repository: a
+  dogfood over a convenient fake proves the fake.
+- **What is claimed, and what is deliberately NOT.** Claimed: a worker that
+  routes its reads and searches through the shipped contract is stopped at the
+  declared limits, hands the task back instead of widening it, and cannot pass
+  the budget without leaving a record of why. **Not claimed:** that an
+  unmediated agent obeys a budget it merely read in a prompt. No test can
+  establish that, and asserting it here would manufacture exactly the false
+  confidence the rest of this system refuses. The harness
+  (`tests/dogfood_worker.py`) is therefore the dogfood's worker, not a new
+  product surface — it re-implements no limit, and every verdict in it comes
+  from `bug_spec`.
+- **Permission is asked BEFORE the work, not after.** `budget_check` is asked
+  about the count the next operation WOULD reach, so the sixth file of a
+  five-file budget is never opened. Checking afterwards would report the
+  overrun accurately and permit it anyway.
+- **The five properties, and where each is proven:**
+  1. **L1 stays within 5 source files and 2 search rounds.**
+     `FILE_SEARCH_BUDGET[L1]` is asserted to be exactly `{max_files: 5,
+     max_search_rounds: 2}`, then five real package files are read and the
+     sixth is refused (`worker.opened` has five entries; `files_read` is 5,
+     not 6), and two real `git grep` rounds run before the third is refused.
+     The refusal's action is `NEEDS_REDEFINE` with the contract's own reason
+     ("an L1 that runs out of budget was not actually an L1"). A companion
+     test records the narrowing as a count: the run opened ≤ 5 of the 142
+     files in `terminal_mcp/`.
+  2. **Past the budget only by explicit, recorded escalation.**
+     `bug_spec.escalation` is the record; `TaskTelemetry.budget_escalations`
+     and a `budget escalation: <why>` note make it auditable, and
+     `record_budget_escalation("")` is refused outright — an unexplained
+     overrun and a justified one must not be the same row. The escalation
+     report carries `TASK_CONTINUES: True` and the same `bug_id`, so the
+     planner adds detail to the SAME task.
+  3. **An incomplete spec ⇒ `NEEDS_REDEFINE`, and the SAME task resumes.**
+     A thin spec blocks the session; the worker hands back
+     `reply_to_planner` with `MISSING` and `QUESTIONS_FOR_PLANNER` and the
+     hand-back is counted (`redefine_count`). Refinement is proven to resume
+     rather than restart in three places: the same `bug_id` re-gates READY,
+     the real queue board still holds exactly one task with the same
+     `queue_task_id`, and `work_planning.redefine()` returns the same
+     `spec_id` with `source_commit` from the first pass intact.
+  4. **HARD ⇒ `NEEDS_USER_HINT` with 1–3 precise questions, same issue
+     resumes, prior analysis preserved.** `triage` returns HARD with
+     `assist_recommended`; `developer_assist_request` yields at most
+     `MAX_ASSIST_QUESTIONS` questions, each ending in `?`, none of them a
+     vague "more detail", with the current findings and hypotheses attached
+     and `never block` in `if_unavailable`. The parked issue is **not**
+     offered to a second planner (`NOTHING_TO_CLAIM`), a hint request with no
+     question is refused, and after `attach_human_hint` the SAME `issue_id`
+     comes back claimable with `findings_before_hint`, the question asked, and
+     the hint all still on it.
+  5. **`PLAN_CONFIRMED` / `PLAN_ADJUSTED` / `PLAN_MISMATCH` recorded as
+     telemetry.** All three land on the telemetry row AND on the spec, in the
+     same imported vocabulary; an invented fourth verdict raises; the verdict
+     survives `TelemetryStore` and `TaskTelemetry.from_dict` (so a restart
+     does not lose it); `summarise()` reports `plan_outcomes` with
+     `unreported` kept apart from the three verdicts, and a `mismatch_rate`
+     over zero verdicts is `None` rather than `0` — zero would read as "our
+     specs are always right" when it means nobody checked.
+- **Worker must not start a broad repo audit on an incomplete spec.** Proven
+  as a fact rather than an instruction: on a blocked session both `read()` and
+  `search()` raise `SpecNotExecutable`, `worker.opened == []`, and
+  `files_read == search_rounds == 0`, against a package the test also counts
+  so the size of the audit that did NOT happen is on the record.
+- **New runbook:** `dogfood` (`scripts/agent/dogfood.sh`), declared in
+  `.projectflow/knowledge/PROCEDURE_STATE.json`, `risk: read_only`, same
+  PASS/FAIL + stage + summary + log-path output contract as the others. It
+  resolves its interpreter through the main checkout's venv when run from a
+  worktree (`git rev-parse --git-common-dir`) and pins `PYTHONPATH` to the
+  checkout it was invoked in, so the dogfood measures the code in front of
+  you rather than whichever checkout owns the interpreter. Verified through
+  the registry itself: `ProcedureRegistry.run("dogfood")` returns
+  `PASS dogfood :: run :: PASS stage=dogfood summary="33 passed, 1 skipped"`.
+- **Scope boundary held:** `mcp_app.py` and `dashboard.py` were not touched,
+  `bug_spec.py` was not edited at all (every property above is proven against
+  it as it already ships), and nothing was deployed.
+- **Known limitations:** (1) the harness proves enforcement for a worker that
+  routes through it — an agent using its own editor tools is invisible to
+  these counters, the same gap `work_telemetry` already records as an empty
+  `signal_sources` rather than a confident zero; (2) the escalation path
+  permits continuing after a recorded reason, which is what "unless an
+  explicit, recorded escalation" asks for, but `bug_spec.escalation`'s own
+  docstring describes the report as something sent INSTEAD of widening — both
+  readings are legitimate and the dogfood pins the permissive one, with the
+  record as the price; (3) the run is single-process, so the budget it proves
+  is per worker session, not per task across retries.
+- **Trace:** `tests/dogfood_worker.py` (new), `tests/test_dogfood_budget_gate.py`
+  (new), `scripts/agent/dogfood.sh` (new),
+  `.projectflow/knowledge/PROCEDURE_STATE.json`, `terminal_mcp/work_telemetry.py`
+  (`plan_status`, `plan_note`, `record_plan_outcome`, `budget_escalations`,
+  `record_budget_escalation`, `_summarise_plan_outcomes`).
+
+### Runbook registry is the DEFAULT path for test/build/deploy/smoke — 2026-09-14
+
+- **Goal / user value:** `procedures.py` already held the runbooks (status
+  VERIFIED/STALE/BROKEN, dependency-fingerprint caching, one-line output),
+  but it could only be reached by a caller who already knew a procedure
+  id — so a worker that had not been *told* about the registry simply
+  re-derived the command, which is the exact cost the registry exists to
+  remove. Now the word a worker would use anyway (`test`, `build`,
+  `deploy`, `smoke`, `health`) IS the address, and the registry populates
+  itself on the way through.
+- **Status:** VERIFIED (unit + contract tests; the repo's own
+  `scripts/agent/*` runbooks resolve through it).
+- **Scope / flow:** `procedures.Operation`/`OPERATIONS` name the five
+  operations and their spellings (`tests`, `pytest`, `regression`,
+  `restart`, `healthcheck`, …; `resolve_operation` is case- and
+  hyphen-insensitive). `ProcedureRegistry.run_operation(target)` is the
+  entry point and accepts an operation name OR a registered procedure id:
+  it resolves, calls `ensure_operations()` if nothing serves that
+  operation yet, then runs. `ensure_operations()` is idempotent and
+  ordered so nothing can drift: (1) an already-registered id wins outright
+  (a declared `depends_on`/`risk` is never overwritten by discovery), (2)
+  then what the repository ALREADY runs (`make test`, `scripts/ci.sh`, …
+  via `discover_existing`), (3) only then the conventional
+  `scripts/agent/<op>.sh`. **Nothing is generated** — an operation the
+  repository cannot perform is reported `absent`, never filled with an
+  invented script. Auto-registered test/build procedures get a default
+  `depends_on` (top-level source/test trees, capped at 8); a discovered
+  `deploy_preview`/`deploy_staging` keeps its own risk level rather than
+  the operation's production default.
+- **Output contract (the token-economy half):** `ProcedureResult`
+  gained `operation`, `status` (the registry's verdict BEFORE the run) and
+  `inspect`. `as_context()` is what callers spend context on: a PASS is
+  one line plus a log path and **nothing else**; a FAIL adds stage, exit
+  code, the failing region and `inspect {script, command, log_path, why}`.
+  The script path is therefore returned only on failure — the "inspect
+  only when it fails" rule expressed as data, not as an instruction to
+  remember. A VERIFIED+fresh result is reused (`from_cache`), a STALE one
+  is re-run rather than read, and a BROKEN one names the vanished script
+  without running anything.
+- **Two correctness fixes shipped with it:** (a) a procedure with an
+  EMPTY `depends_on` was keyed on the commit alone, so an uncommitted edit
+  left the fingerprint identical and a stale PASS could be reused; it is
+  now keyed on the working tree's dirty state (`git status --porcelain`
+  plus each listed path's mtime/size, with the registry's own
+  `.projectflow/` bookkeeping excluded so a recorded run cannot invalidate
+  the next one). (b) `_script_exists` passed a relative script path to
+  `shutil.which`, which resolves against the SERVER's working directory —
+  a deleted script looked present whenever a same-named path existed under
+  wherever the process happened to run. A relative path is now only ever
+  resolved against the repository.
+- **UI route/screen:** unchanged — `/dashboard/api/procedures` still
+  lists, never runs, and shows the new registrations like any other.
+- **API/tool/command:** `work_procedures` unchanged in name and count (no
+  new MCP tool). Naming a target now implies `action="run"`
+  (`work_procedures(procedure_id="test")`), an empty call still lists, and
+  `list` also reports the operation names. New `action="ensure"` registers
+  without running anything. The run path returns `as_context()`.
+  `work_planning.plan()` calls `ensure_operations()` before its reuse
+  stage, so "is there already a way to do this?" is asked against a
+  populated registry (failure there is a recorded gap, not a planning
+  error). `task_classifier`'s gate step and `AGENT_KNOWLEDGE_POLICY` now
+  name the call instead of describing it.
+- **Config/permission:** none new. Risk policy is unchanged and still
+  binding: `deploy` resolves to `deploy_restart` (risk `production`) and
+  is REFUSED with stage `policy` unless the caller passes `allow_risky` —
+  routing a deploy through the registry made it repeatable, never
+  automatic.
+- **Data/schema/migration:** none. `PROCEDURE_STATE.json` keeps
+  `schema_version` 1; auto-registered entries are ordinary rows with
+  `source: "discovered"`, and run evidence stays machine-local as before.
+- **Acceptance/tests/evidence:** `tests/test_procedures.py` — new "the
+  registry as the DEFAULT path" section: conventional scripts register
+  themselves, a repo-native `make test` beats them, a declared procedure
+  is never overwritten, re-ensuring keeps the green result, five spellings
+  of "test" all resolve, a pass hands back one line and no script, a
+  failure names script+log+region, STALE is re-run not read, VERIFIED is
+  reused, BROKEN names the vanished script, deploy is routed but still
+  refused without approval, an undeclared dependency set does not cache
+  across an edit, and a relative script is looked for in the repository
+  rather than the caller's directory. `tests/test_work_surfaces.py` pins
+  the MCP routing (target implies run; `run_operation`; `as_context()` not
+  `as_dict()`).
+- **Known limitations:** the working-tree fallback keys on `git status`
+  output, so an untracked DIRECTORY is tracked by its own mtime rather
+  than per-file; discovery still recognises only the entry points in
+  `DISCOVERY_RULES` (make/just/`scripts/*.sh`), so a project that runs its
+  tests some other way registers nothing and is told so rather than
+  guessed at; `build` has no runbook in THIS repository and is correctly
+  reported absent.
+- **Dependencies:** Project Knowledge (the registry is stored beside the
+  knowledge map and uses its lock), Work Policy §"Procedural Memory and
+  Runbook Registry" (unchanged — it already carried the rule; this change
+  supplies the mechanism).
+- **Follow-up/backlog:** a `build` runbook for this repo if one is ever
+  wanted; teaching `discover_existing` about `npm`/`cargo`/`go` entry
+  points for non-Python projects.
+- **Trace:** `terminal_mcp/procedures.py`, `terminal_mcp/mcp_app.py`
+  (`work_procedures`), `terminal_mcp/work_planning.py`,
+  `terminal_mcp/task_classifier.py`; see this file's own commit.
+
+### The knowledge map is LOADED at task start, not merely present — 2026-09-14
+
+- **Goal / user value:** `project_knowledge.py` (the map), its per-module
+  confidence and its freshness rules all existed and were tested, and the
+  planning path used them only to pick module NAMES. A name is not a
+  briefing: the worker still opened the repository and re-derived what the
+  map already said. This is the wiring that makes the map pay for itself —
+  the modules a spec names are loaded at the moment the task starts and
+  travel inside the worker's own handoff.
+- **Status: VERIFIED.** `tests/test_project_knowledge.py` (46),
+  `tests/test_context_pack.py` (34), `tests/test_work_planning.py` (22) and
+  `tests/test_dogfood_work_v1.py` (11, including the opt-in strict pass with
+  `TERMINAL_MCP_DOGFOOD_STRICT=1`) — all against real `git init`
+  repositories and this repo's own map. No mocked git: what a freshness
+  claim is worth depends entirely on what `git diff --name-only` and
+  `git status --porcelain` actually report.
+- **`ProjectKnowledge.rebuild()` — incremental re-verification, driven by
+  the git delta.** For each module it asks git one question: has anything
+  under this module's paths moved between the commit it was verified at and
+  HEAD? If nothing has, and the working tree is clean under it, the entry is
+  as true now as when it was written, so its `last_verified_commit` is
+  advanced and it stops reporting MEDIUM — which is precisely the value that
+  sends a worker off to re-read code that did not change. If something did
+  move, it is **never** advanced: it is returned in `needs_review` with the
+  path that moved, which is the only thing a re-index has to look at.
+  - It **re-verifies; it never re-derives.** No summary is rewritten. Only a
+    reader can say whether prose is still true, and a machine that rewrote it
+    would be inventing the one thing this map may not invent.
+  - An advanced entry records `last_refreshed_at` and says so in its own
+    confidence reason, so "a reader checked this" and "git proved nothing
+    moved" cannot wear each other's name.
+  - A module naming a path that no longer exists, or with uncommitted edits
+    under it, is never advanced — the working tree outranks the commit graph.
+  - The map as a whole is marked indexed at HEAD only when **every** module
+    is. `rebuild(modules=[...])` re-verifies a named subset and reports any
+    name the map does not have.
+  - Degrades rather than raises: no HEAD, no map, or an unreadable working
+    tree are each reported as themselves. It runs on the planning path, and
+    a refresh that failed must not take a plan down with it.
+- **Loading only what the spec names.** `ProjectKnowledge.module_state()`
+  and `load_modules()` answer about named modules without listing the map —
+  `module_states()` runs a `git diff` per module, so answering "what do we
+  know about the two modules this task names" by walking every module pays
+  for each one nobody asked about. `context_pack.load_task_knowledge(spec)`
+  builds the briefing from `likely_module` + `relevant_modules`, best first,
+  deduplicated and **capped at 3** (`MAX_TASK_MODULES`): a briefing that
+  grows with the project is the repository again under another name. It is
+  duck-typed across `WorkSpec` and `BugSpec` — a briefing that worked for
+  only one of them would be absent exactly half the time.
+- **Honest about what it did not load.** A module the spec names and the map
+  has never indexed is reported in `unknown` and named in the rendered
+  briefing, because that is exactly where a worker DOES have to read code.
+  No map, no module named, and a map that raised are three different
+  situations and each is reported as itself. The briefing takes the
+  **weakest** loaded module's confidence, never the best one's: a worker acts
+  on the whole briefing, not on its strongest part.
+- **Where it reaches the worker.** The rendered briefing is persisted on the
+  spec (`knowledge_brief`, `knowledge_modules`, alongside the existing
+  `knowledge_confidence`/`knowledge_last_verified_commit`) and
+  `WorkSpec.handoff()` emits it as `KNOWLEDGE` with the commit it was
+  verified at. On the SPEC rather than on the planning result, because the
+  spec is what is read back later: a redefine, a restart or a second worker
+  each build a handoff from it, and a result-only attachment would leave all
+  of those empty. It is a snapshot with its commit recorded beside it, never
+  a claim about the repository as it stands now — and the payload repeats the
+  rule the map is subordinate to: the map says where to look, the current
+  code is the truth.
+- **Counters.** `knowledge_hits` (modules that MATCHED, unchanged meaning)
+  is now joined by `knowledge_modules_loaded` and `knowledge_refreshed`.
+  Collapsing the first two would let a match that briefed nobody be counted
+  as a saving. The telemetry `knowledge_hits`/`context_pack_hits` signals
+  stay where they were — at the retrieval call site, one per pack that
+  actually carried a summary or files, so an empty entry is never counted as
+  a hit.
+- **Behaviour change worth knowing:** planning now WRITES to
+  `.projectflow/knowledge/KNOWLEDGE_STATE.json` when re-verification can
+  advance a module (and only then — nothing to advance means no write). The
+  map is the shared canonical one (`canonical_root`), so a planner running in
+  a worktree advances the main checkout's map under the existing knowledge
+  lock. The test suite must not leave a diff in the repository it planned
+  against, so `tests/conftest.py` snapshots the canonical state file once per
+  session and restores it at the end (the dogfood fixture does the same per
+  test) — several tests drive the real pipeline with no project path, and
+  without this a plain `pytest` run left another lane's committed file dirty.
+- **Proof that a fresh worker does not re-read the repo.**
+  `test_a_fresh_worker_is_briefed_without_reading_the_module_source` watches
+  every `Path.read_text` for the duration of a real plan against a real git
+  repository, then reads the spec back out of the store as a worker would:
+  the handoff carries where the code lives (`app/export.py`), what to look at
+  (`render_csv`) and what is known to be wrong with it, and **no file under
+  the module's own directory was opened**. It also asserts the watcher
+  recorded reads at all, so the negative is a finding rather than a broken
+  probe. The dogfood repeats the claim against this repository's own map.
+- **No secrets, even from a hand-edited map.** The briefing now rides in the
+  spec payload, which is long-lived and rarely re-read. `record_module`
+  already refuses a credential at write time; if one is put into the state
+  file by hand, `WorkSpecStore.save`'s own scrub refuses the spec and
+  planning raises `SecretInKnowledge` rather than persisting it — refused,
+  never silently stripped, and nothing reaches the store to be read back.
+- **Known limitations.** Re-verification is path-level, not symbol-level: a
+  commit that touches a module's file advances nothing even when the change
+  cannot affect what the summary says — the conservative direction, since the
+  cost of a needless re-read is smaller than the cost of a confident wrong
+  map. Entry points and runbooks come from the pack only when the map records
+  them. And the briefing rides in the spec payload, so a very large map entry
+  is capped (`MAX_BRIEF_CHARS`) rather than paged.
+- **Not touched, deliberately:** `mcp_app.py` and `dashboard.py`. The surface
+  integration is the coordinator's to make centrally; everything here reaches
+  a worker through data that already flows — `work_plan`'s result and the
+  spec's own handoff — so no MCP or route change was needed.
+- **Dependencies:** Project Knowledge, `context_pack` (the pack this briefing
+  is assembled from), Work Spec (the handoff), `work_telemetry_runtime` (the
+  hit counters).
+- **Follow-up/backlog:** entry points and past-bug history in the briefing
+  need a `BugSpecStore` on the planning path, which `work_planning.plan()`
+  does not take yet; symbol-level re-verification.
+- **Trace:** `terminal_mcp/project_knowledge.py` (`rebuild`, `module_state`,
+  `load_modules`, `ModuleState.last_refreshed_at`),
+  `terminal_mcp/context_pack.py` (`TaskKnowledge`, `load_task_knowledge`,
+  `spec_modules`), `terminal_mcp/work_planning.py` (the knowledge stage),
+  `terminal_mcp/work_spec.py` (`knowledge_brief`, `handoff`).
+
+### Retrieval before investigation — a planner claim now briefs itself (2026-09-14)
+
+- **Goal / user value:** make the SECOND bug in a module cost less than the
+  first. `context_pack.retrieval_result` (has this been seen before?) and
+  `context_pack.build_context_pack` (the bounded briefing for one module)
+  were implemented and tested, and **nothing called either of them**. Built
+  but unwired is worse than absent: the capability reads as done while every
+  planner still starts from an empty repository, and the audit that finds it
+  has to be run twice — once to notice the code exists, once to notice it is
+  unreachable.
+- **Status: VERIFIED.** `tests/test_context_pack.py` (24),
+  `tests/test_work_inbox.py` (43) and `tests/test_project_knowledge.py` (34),
+  all against real `git init` repositories, a real `git worktree`, a real
+  `BugSpecStore` and a real built MCP server. No mocked `git`: what a path
+  check is worth depends entirely on what `git diff --name-only` and
+  `git status --porcelain` actually report, and a mock of them proves nothing.
+- **Where it runs, and why there:** inside
+  `work_inbox.InboxService.claim_for_planning` — the last moment before a
+  planner starts looking. Retrieval that runs afterwards has already let the
+  cost it exists to avoid be paid in full, so it cannot be left to a planner
+  to remember to ask for. The claim reply gains two keys beside `issue`:
+  - `retrieval` — `REUSED_BUG_SPEC` (start from that spec's root cause and
+    fix strategy), `RELATED_BUGS_FOUND` (read them, assume nothing),
+    `NO_SIMILAR_BUG`, or one of `RETRIEVAL_UNAVAILABLE` / `RETRIEVAL_FAILED`.
+  - `context_pack` — the bounded module briefing (purpose, files, entry
+    points, runbooks, known issues, past bugs, and what it does **not**
+    cover), built for `issue.likely_module` or, failing that, for the module
+    the best match names.
+- **Every path a reused spec names is verified BEFORE it is offered.**
+  `context_pack.verify_reused_paths` gives each path its own verdict against
+  the working tree and the git delta from the spec's `source_commit`:
+  `UNCHANGED`, `CHANGED` (rewritten since — including an uncommitted edit,
+  because the working tree outranks the commit graph), `MISSING` (gone), or
+  `UNVERIFIED`. A path that cannot be checked is **never** reported
+  `UNCHANGED`: "I checked and nothing moved" and "I could not check" demand
+  opposite next steps. The paths that moved are named in the guidance text a
+  worker actually reads, not only in a structure it might.
+- **The downgrade rule.** A strong match whose *every* named path is gone is
+  returned as `RELATED_BUGS_FOUND` with `downgraded_from: REUSED_BUG_SPEC`,
+  and without a `reused_bug_id`. The symptom really did match, so the root
+  cause is worth reading — but a fix strategy for code that no longer exists
+  points at nothing, and offering it as a starting point would spend the
+  saving reuse exists to produce.
+- **Which repository gets asked.** `project_knowledge.worktree_root()` (new,
+  `git rev-parse --show-toplevel`), deliberately not `canonical_root()`.
+  Canonical root resolves every worktree to the one shared map, which is
+  right for a map that gets *written*; it is wrong here, because a worker in
+  a worktree edits that worktree, and the main checkout would report files
+  the worker has already rewritten as untouched — exactly the false
+  confidence this check exists to prevent. Found by a real smoke run against
+  this repo's own worktree, where it reported precisely that.
+- **Stored vs returned.** The issue row keeps `retrieval_status` plus a
+  compact record (statuses, match ids and scores, per-path verdicts, gaps);
+  the root causes, fix strategies and file lists travel to the claiming
+  planner once. Writing them into the row as well would move the same
+  paragraphs twice in a feature whose whole purpose is to move fewer of them.
+  The status is kept on the issue, not only in the reply, so an expired lease
+  does not lose what the last planner was told.
+- **Degrades, never fails.** `spec_store` and `knowledge` are both optional on
+  `InboxService`. Without a spec store the claim still succeeds and says
+  `RETRIEVAL_UNAVAILABLE` — "nobody searched" is not "nothing was found".
+  Without a repository the paths come back `UNVERIFIED` with the reason. A
+  raised lookup is caught and reported as `RETRIEVAL_FAILED`: a claim that
+  failed because the history could not be read would block real work over a
+  lookup.
+- **Two things it deliberately does not do.** (a) The throwaway spec built to
+  *ask* the question is never saved — persisting it would put an unanswered
+  query into the very history the next query reads. (b) The matched spec's
+  module is **not** written back onto the issue: a module inferred from a
+  fuzzy match would score the next retrieval higher for no new evidence, and
+  the system would grow confident by talking to itself.
+- **Known limitation (by design, not omission).** A captured issue carries no
+  module until something triages it, and without a module no past bug can
+  score above `STRONG_MATCH` — so a raw `NEW` issue gets `RELATED_BUGS_FOUND`
+  at best. That is the threshold refusing to claim more than the evidence
+  supports. Set `likely_module` on the issue (a `work_inbox_transition` field)
+  and the same claim reaches `REUSED_BUG_SPEC`.
+- **Trace:** `terminal_mcp/context_pack.py` (`named_paths`,
+  `verify_reused_paths`, `retrieval_result`), `terminal_mcp/work_inbox.py`
+  (`InboxService.brief_for_planning`, `_attach_briefing`,
+  `claim_for_planning`, `Issue.retrieval_status`),
+  `terminal_mcp/project_knowledge.py` (`worktree_root`),
+  `terminal_mcp/mcp_app.py` (`work_inbox_claim`, `work_inbox_list`).
+
+### Read-only repository access for external agents (`repo_*` MCP tools) — V1, 2026-09-14
+
+- **Goal / user value:** let an external agent reaching this server over
+  MCP (ChatGPT, specifically) read Git and source **directly**. Before
+  this, it could not: reading a file meant asking a Claude session to open
+  it and paste the content back, which is slow, lossy, and puts a second
+  agent's paraphrase between the reader and the code. Nothing in the
+  previous 240-tool surface returned file content or a diff at all.
+- **Status: VERIFIED (V1, READ-ONLY).** 97 tests across
+  `tests/test_repo_read.py` (66), `tests/test_repo_read_node.py` (26) and
+  `tests/test_repo_read_mcp_tools.py` (7)*, all against real `git init`
+  repositories, a real node-agent ASGI app and a real built MCPServer —
+  no mocked `git`, because the containment/secret/truncation rules ARE the
+  product and a mock of `git` proves nothing about what `git grep`'s
+  pathspec handling or `Path.resolve()`'s symlink following actually do.
+  (*counts as of this commit; the pinned sets, not the totals, are what
+  the tests assert.)
+- **Scope — the ten operations:** `repo_status` (branch/HEAD/dirty/
+  ahead-behind/project identity), `repo_head`, `repo_branches`,
+  `repo_remotes`, `repo_tree`, `repo_read`, `repo_search`, `repo_diff`,
+  `repo_log`, `repo_show_commit`. Declared ONCE in
+  `repo_read.OPERATIONS`, which the MCP tools, the node endpoint and
+  `LocalNodeClient` all dispatch through — so local and remote cannot
+  drift, and an operation absent from that table does not exist anywhere.
+- **Read-only, structurally rather than by convention.** Three
+  independent locks, each pinned by a test:
+  1. `repo_read.READ_ONLY_GIT_SUBCOMMANDS` — `_run_git` RAISES on any
+     subcommand outside it. `checkout`/`switch`/`reset`/`clean`/`commit`/
+     `push`/`fetch`/`pull`/`merge`/`rebase`/`stash`/`apply`/`add`/`rm`/
+     `config`/`worktree`/`update-ref` are all absent, so a later careless
+     edit inside this module fails loudly instead of shipping a write.
+  2. No tool, endpoint or client method accepts a git subcommand, a shell
+     string or an argv list. There is no arbitrary-exec path to widen.
+  3. The node endpoint is **GET-only** (`POST` → 405) and dispatches only
+     through the operation table.
+  `tests/test_repo_read_mcp_tools.py` additionally asserts that no
+  `repo_*` name beyond the ten reads is registered — adding a write
+  capability later requires editing that assertion on purpose.
+- **Security boundary, in the order a request meets it:**
+  1. `repo_read.enabled` (config gate).
+  2. `allowed_roots` — absolute-path allowlist; symlinks resolved BEFORE
+     containment is checked (`lifecycle.resolve_cwd`'s own rule), so a
+     symlink inside an allowed root pointing outside it is refused.
+  3. **The repo ROOT is checked too, not just the requested path.** Without
+     this, allowing only `<repo>/src` would expose the whole repository
+     through relative paths — a real hole, covered by its own test.
+  4. Every in-repo path is re-resolved and re-contained (PATH_OUTSIDE_REPO),
+     which is what stops `../..` and an absolute path outside the repo.
+  5. Secret paths denied by name/glob BEFORE any byte is read
+     (SECRET_PATH_DENIED), seeded from the list this project already
+     maintains (`redaction.CREDENTIAL_FILE_NAMES`) and extended with
+     `.env*`/`*.pem`/`*.key`/`id_*`/`.git-credentials`/`.npmrc`/
+     `*credentials*`/`node-agent.env`/... plus never-descended directories
+     (`.git`, `.ssh`, `.gnupg`, `.aws`, `.terminal-mcp`). `.git` is denied
+     for a concrete reason: `.git/config` can hold a tokened remote URL,
+     and `.git/objects` would let a caller reconstruct any file the path
+     rules just denied.
+     - The denial covers every route a secret could take out: `repo_read`
+       refuses it, `repo_search` DROPS hits inside it (and names the file
+       in `secret_paths_skipped`, so the omission is visible rather than
+       silent — otherwise a secret is readable one grep line at a time),
+       `repo_diff`/`repo_show_commit` EXCLUDE its hunks
+       (`secret_paths_excluded`), and `repo_log --file` refuses it.
+     - A denied path answers the same whether or not it exists — otherwise
+       the error itself is an oracle for "does this box have an
+       `id_ed25519`".
+     - A denied path is still LISTED by `repo_tree`, flagged
+       `"denied": true`: hiding it would make an agent conclude the file is
+       absent. Same posture `redaction.CREDENTIAL_FILE_NAMES` already
+       documents ("the PATH stays visible").
+  6. Everything that survives is run through `redaction.redact_output`
+     anyway — a token pasted into a README or a password in a
+     `config.sample.yaml` is caught by no path rule. The returned
+     `redaction` report carries counts and rule NAMES only, never a matched
+     value, so it is safe to return and to log.
+  7. Caps on every axis (bytes/lines/results/tree entries/log entries/diff
+     bytes/timeout), and **a caller cannot argue past a configured cap** —
+     `max_bytes=10_000_000` against a 2 KB policy still yields 2 KB.
+     Truncation is always REPORTED, never silent, and a byte-truncated read
+     is cut back to the last whole line so quoted line numbers stay
+     trustworthy. `repo_read` reports it as TWO distinct fields, which is a
+     correctness matter and not cosmetic: `has_more` means the file
+     continues past the returned window (the field to page on), while
+     `truncated` means a cap interfered — the line limit narrowed the
+     caller's own window, or the byte cap cut it short. With one flag, a
+     fully-satisfied window of lines 2-2 in a 500-line file reports
+     truncated=True and a caller paging on it never terminates.
+  8. Argument safety: refs match a strict pattern and may not begin with
+     `-`; pathspecs may not begin with `-` or contain `..`; pathspecs are
+     always passed after `--`. So `--upload-pack=...` or
+     `--output=/etc/passwd` is a rejected value, never a flag.
+  9. Every git call runs with `GIT_TERMINAL_PROMPT=0`/`GIT_ASKPASS=`/
+     `SSH_ASKPASS=` (a read can never block on a credential prompt — which
+     is what makes GIT_AUTH_REQUIRED a fast clean answer instead of a
+     stall) and `GIT_OPTIONAL_LOCKS=0` (a read never takes the index lock,
+     so it cannot interfere with a session actually working in the repo).
+- **Node-aware — reads happen where the repo lives.** The same lesson
+  `coordinator.node_aware_repo_evidence` learned for metadata, applied to
+  content: a repo at `C:\Users\tranv\project` or `/home/dell/workspace/x`
+  does not exist on the controller, and running git against that path
+  locally produces an answer about a path that means nothing here.
+  `repo_service.RepoService` LOCATES first and executes second:
+  `node`+`path` (explicit), `session` (via the controller's own
+  session→node resolution plus that node's registry record — works for a
+  remote session whose cwd the controller cannot stat), `project` (a
+  `project_identity` id, via the checkouts the fleet already reports), or
+  `path` alone (local). Every response carries `node_id` and `located_by`,
+  so an answer that came from the wrong machine is impossible to mistake
+  for the right one.
+  - A project with checkouts on two nodes returns **AMBIGUOUS_REPO with the
+    candidates listed, never a guess** — seven checkouts of this very repo
+    across three nodes is the real state of this fleet.
+  - "Could not look" is never conflated with "the repo said no":
+    NODE_UNREACHABLE (transport/timeout/404) and NODE_LACKS_REPO_READ (an
+    agent predating the endpoint) are distinct from every path/secret
+    refusal, which arrive as a 200 carrying an error code.
+  - Each node enforces its OWN allowlist over its own paths. That is the
+    correct owner of the decision, and it means a controller cannot talk a
+    node into reading something the node's operator did not allow.
+- **Git auth (V1): a local repo never needs it.** No read path touches the
+  network — `repo_remotes(check_auth=False)`, the default, is pure local
+  config. `check_auth=True` opt-in probes read access with `ls-remote` and
+  reports GIT_AUTH_REQUIRED **inside `auth`**, not as a top-level error,
+  because the remotes themselves were read fine and a caller that only
+  wanted the URL must not be failed because the network was down. Remote
+  URLs are normalised through `project_identity.normalise_git_remote`
+  (which already strips credentials) and redacted; a failed probe's stderr
+  is redacted too, since it can echo a tokened URL.
+  **Audited on the controller host, 2026-09-14:** `origin` is
+  `https://github.com/hungtranbkit/terminal-mcp.git`, anonymous HTTPS read
+  works (`ls-remote` exit 0, no credential helper configured), so **no SSH
+  key and no GitHub Deploy Key was needed or created.** Nothing was written
+  to `~/.ssh`, no key material exists in this repo or its config.
+- **Audit:** every invocation records `repo_<op>` + node + outcome +
+  latency through the EXISTING `AuditStore` (never a second database).
+  It deliberately records **no content** — no file text, no patch, no
+  matched search line, no redaction sample, and `text` is left unset so
+  `AuditStore` does not fingerprint/preview it. This log is the one an
+  operator greps freely; a read-audit that stored the secret would defeat
+  the denial it is recording. Pinned by a test that asserts the secret
+  value is absent from the serialized rows.
+- **Config:** new `repo_read` section (`config.RepoReadConfig`) — `enabled`
+  (default **true**), `allowed_roots`, the six caps, `timeout_seconds`,
+  `extra_secret_globs`. `enabled` defaults ON, unlike
+  `session_lifecycle`/`work`, and the difference is deliberate: those gates
+  guard capabilities that CREATE something (a real process, an
+  auto-dispatched prompt), while this one only reads and has no write
+  primitive to lose control of. The real boundary is `allowed_roots`, not
+  the flag. `allowed_roots` empty (the default) reuses
+  `session_lifecycle.allowed_cwd_roots` — the allowlist this deployment has
+  already curated — falling back to the server's home directory, never to
+  `/`. `extra_secret_globs` is **additive only**: there is no config key
+  that removes a built-in secret glob, so no config edit can reopen a path
+  the code closed. An out-of-range limit is a load-time ValueError, not a
+  silent clamp — a caps section nobody can trust is worse than no caps.
+- **Limitations / explicitly NOT in V1:**
+  - No write capability of any kind (that is the point, not a gap).
+  - No `fetch`/`clone`/`pull`, so a private remote this host cannot already
+    read is out of scope; an already-cloned repo is fully readable.
+  - `repo_search` uses `git grep`, so it searches tracked + untracked files
+    in a work tree, not arbitrary history. Searching history would need
+    `log -S`/`grep <rev>` and is not exposed.
+  - Binary files are refused (BINARY_FILE), never returned.
+  - `session`-based location depends on the owning node's registry record
+    having `repo_root`/`cwd`; a record predating project-info backfill
+    falls back to `cwd`, and a session in no repo answers
+    SESSION_NOT_IN_A_REPO.
+  - Reading a repo on a remote node requires that node's agent to be
+    running THIS version (`/v1/repo/{op}`); an older agent answers
+    NODE_LACKS_REPO_READ. Rolling the new agent out to dell-5530/hp is a
+    separate, explicitly-approved deployment step — see §Backlog.
+- **Trace:** `terminal_mcp/repo_read.py` (engine + operation table),
+  `terminal_mcp/repo_service.py` (node-aware routing + audit),
+  `terminal_mcp/node_agent.py` (`GET /v1/repo/{op}`),
+  `terminal_mcp/node_client.py` (`repo_op` on the protocol,
+  `LocalNodeClient`, `RemoteNodeClient`), `terminal_mcp/config.py`
+  (`RepoReadConfig`, `_load_repo_read_config`), `terminal_mcp/mcp_app.py`
+  (the ten tools), `tests/test_repo_read*.py`, `tests/test_server.py` (the
+  pinned tool set).
+
+### `/v1/repo-evidence` had never worked — NameError on every request (fixed 2026-09-14)
+
+- **Found while** adding the content-bearing `/v1/repo/{op}` sibling
+  endpoint next to it.
+- **The bug:** the handler called `resolve_cwd(cwd, config)`, but `config`
+  is not defined anywhere in `build_node_agent`'s scope (`node_agent.py`
+  imports `load_config`, the FUNCTION, and the only `config` binding in the
+  module is a local inside `main()`). So **every single request to
+  `/v1/repo-evidence` raised NameError and answered HTTP 500**, from the
+  day the endpoint was written (commit `10d2566`, "Collect pre-dispatch
+  repo evidence where the session actually lives").
+- **Blast radius:** the Coordinator's pre-dispatch gate reads repo evidence
+  for a session through `node_aware_repo_evidence`, which reports any
+  non-200 as `RepoEvidenceUnavailable` — "we could not look" — and fails
+  closed. So **nothing was ever wrong-but-believed**: no dispatch decision
+  was made on bad evidence. The capability was simply never working, and
+  silently: every remote-node dispatch fell back to the
+  unavailable/NEEDS_HUMAN path (or an `allow_unverified_repo` waiver)
+  instead of getting real evidence. The fail-closed design is exactly what
+  kept this from becoming an incident, and is also what hid it.
+- **Why it survived:** `tests/test_coordinator_remote_repo_evidence.py`
+  covers the collector and the client protocol thoroughly, but with a stub
+  client — nothing ever exercised the ROUTE end-to-end through a real ASGI
+  app. The unit tests were green the whole time.
+- **Fix:** use `terminal.config` (the node's own config, genuinely in
+  scope). One-line change; the endpoint's logic was otherwise correct.
+- **Regression cover:** `tests/test_repo_read_node.py` —
+  `test_repo_evidence_endpoint_actually_answers` (real request, real repo,
+  asserts branch/HEAD/clean), `test_repo_evidence_endpoint_enforces_the_
+  cwd_allowlist` (403 PATH_NOT_ALLOWED), and
+  `test_repo_evidence_reaches_the_controller_gate_through_the_node_client`
+  (the full collector → client → HTTP → node → git chain the gate really
+  uses).
+- **Deployment note:** the fix only takes effect on a node once THAT node's
+  agent is restarted on this version. Until then, remote repo evidence
+  keeps behaving as it has: unavailable, fail-closed.
+
 ### Supervisor Queue v2 — Phase 1 (persistence + state machine + CRUD)
 
 - **Goal / user value:** a durable, per-session task queue that survives
@@ -2638,6 +3314,226 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
   action.
 - **Trace:** see this file's own commit.
 
+### Supervisor / watch / queue reliability integration
+
+- **Goal / user value:** one coherent Supervisor/Queue lifecycle with no second
+  scheduler and no watch that is silently disabled because of an implementation
+  defect rather than a decision.
+- **Status:** IMPLEMENTED and TESTED locally; runtime effect on the live
+  controller is NOT yet proved (that needs a controller restart, out of scope
+  here). Every new behaviour is opt-in or default-off.
+- **Design of record:** `docs/supervisor-queue-lifecycle.md`.
+- **Symptom this started from (live `supervisor.db`):** `watch_count=10,
+  enabled_watch_count=0, stalled_count=3`. Six rows (`wtest`, `win2`, `hp1`,
+  `hp2`, `hp3-work`, `hp-work`) were `target_missing` at `iteration_count=1`
+  while those sessions were alive on the hp and Windows nodes; three were
+  `max_iterations_exceeded` (223/121/20 iterations); one was a person's
+  `manual_unwatch`.
+- **Root causes:**
+  1. Every status call in `supervisor.py` went to the LOCAL `TerminalService`, so
+     a watch on another node's session resolved against local tmux, came back
+     MISSING, and was disabled on its first poll.
+  2. `watch(session="hp/hp1")` returned ACCESS_DENIED: `_read_authorized` was
+     asked about the node-QUALIFIED name while grants are keyed by session name.
+     The fleet-correct way to name a watch was the one way that could not be
+     used, which is why the production rows are all bare names.
+  3. `_sync_config_watches` listed local tmux only, so `watched_session_patterns`
+     could never match a remote session, with no error to explain it; and
+     `rename_target` matched only the exact key, so a bare rename from the node
+     that performed it missed the qualified watch.
+  4. `supervisor_status` counted only two disable reasons as stalled, so six
+     disabled watches were invisible and the surface said 3 while 9 were down.
+  5. The EventBus was write-only: `event_wiring.py` published every transition
+     and nothing ever claimed one, so dependents were never woken by the
+     completion that unblocked them and the dead-letter table could not engage.
+  6. `supervisor2.execute_send` read the transport's answer with a denylist
+     (`== "SUBMIT_UNCONFIRMED"`), so `TEXT_SENT` and a result with no delivery
+     field advanced an autonomous chain and counted as a successful auto-action.
+  7. `build_mcp()` defaulted `controller` AFTER constructing `RecoveryEngine`/
+     `RecoveryLoop` with it, so the stdio surface (`build_mcp()` bare, as
+     `server.py` calls it) built both with `controller=None` -- auto-recovery and
+     `reconcile_node` silently non-functional there.
+- **Fix:**
+  - `supervisor.py`: one `_status_for` used by BOTH polling and reconciliation
+    (when they disagreed, a watch could be disabled by a poll that asked the
+    fleet and never revived by a probe that asked local); optional
+    `fleet_status`/`fleet_sessions` callbacks wired post-construction, same
+    duck-typed posture as `autonomous_check`, so `None` means today's local-only
+    behaviour; `bare_session_name` for the read gate; fleet-aware config seeding;
+    `rename_target` matching a qualified row for a bare rename, refusing when two
+    nodes hold the same bare name.
+  - Routing is LOCAL FIRST, then fleet. Not a preference: routing bare names
+    through the controller unconditionally makes every local watch depend on the
+    local node being ONLINE, and a stale heartbeat then answers
+    SESSION_NOT_FOUND for a session running right here. That regression broke
+    `test_supervisor_tools_registered_and_functional` and would have disabled the
+    three working local watches to fix the six remote ones.
+  - `scheduler_health.py`: `disable_reason_for_status_error` mapping fleet errors
+    to distinct recoverable reasons (`node_unreachable`, `node_not_found`,
+    `ambiguous_target`), with an UNRECOGNISED error mapping to a recoverable
+    reason so a new fleet error code can never permanently blind a watch.
+  - Absorbs `fix/scheduler-refill` (blg_8d65afc1b38b): `reconcile_attempts`,
+    backoff, `reenable_watch`, iteration reset, and the
+    recoverable/intentional/disabled split in `supervisor_status`.
+  - `queue_event_drain.py` (new): bus consumption as a STEP of the existing
+    `QueueLoop` cycle -- never a second thread, because two schedulers on the
+    same lanes would leave the lane claim lease arbitrating races every cycle.
+    Three stacked gates (`queue.enabled`, new `queue.drain_enabled` default
+    False, per-lane `auto_dispatch_enabled` re-checked because an event names its
+    lane directly), one tick per lane per pass, bounded batch, `fail()` not
+    `ack()` on error so attempts/dead-lettering engage, unreadable bus never
+    stops dispatch.
+  - `adapters.is_submission_confirmed` (new): positive allowlist beside
+    DELIVERY_STATES, consumed by `execute_send`. `stop_reason` keeps its exact
+    spelling; the specific failing state is already durable in `send_result`.
+  - `mcp_app.py`: controller defaulted before the services that take it.
+- **Scope / flow:** local/integration only. No production deploy, no credential
+  creation, no Windows rollout. `feat/windows-detached-sessions` (4ff5f5c) was
+  not touched and is dependency-compatible (disjoint files).
+- **API/tool/command:** no new MCP tools. New config: `queue.drain_enabled`
+  (default False), `queue.drain_batch_size` (25). New `supervisor_status` fields
+  (additive): `disabled_watch_count`, `recoverable_disabled_count`,
+  `intentionally_excluded_count`, `disabled_reasons`.
+- **Data/schema/migration:** one additive, defaulted column
+  (`watches.reconcile_attempts`, ALTER-if-absent) from the absorbed branch. No
+  re-keying of the ten live watch rows -- bare names resolve through the
+  controller as they are.
+- **Acceptance/tests/evidence:** `tests/test_supervisor_fleet_watches.py` (24:
+  the six production rows restoring only once their nodes return, the
+  `manual_unwatch` that must never be resurrected, the full ten-row production
+  mix restoring by policy rather than all-or-nothing, per-error disable reasons,
+  remote timeout isolation, fleet rename including the ambiguous refusal, and the
+  local-first regression itself); `tests/test_queue_event_drain.py` (39: every
+  actionable type, the three gates, at-least-once redelivery, poison-event
+  dead-lettering, batch bounds, re-entrancy, two concurrent drains partitioning
+  rather than duplicating, and loop start/stop lifecycle);
+  `tests/test_supervisor_v2_acceptance.py` (20); `tests/test_mcp_app_wiring.py`
+  (3). Absorbed: `tests/test_supervisor_reconcile.py`,
+  `tests/test_scheduler_health.py`, `tests/test_scheduler_integration.py`.
+- **Known limitations:** the fleet is SIMULATED in tests -- a fake resolver, not
+  real remote nodes, because the defect is entirely in which resolver gets asked
+  and a simulated node can be made unreachable on demand. The six watches
+  actually recovering, the drain under real multi-node load, and whether the
+  backoff/max_iterations constants suit real workers all still need a real node.
+  `test_scheduler_integration.py` keeps 4 declared phase-2 skips (worker
+  discovery/dispatch not landed).
+- **Follow-up/backlog:** blg_39f82cd2fe3a stays IN_PROGRESS -- its AC1 is
+  satisfied in substance but via `adapters.is_submission_confirmed` rather than
+  `delivery_gate.evaluate`, and its AC2 (a distinct stop_reason for NOT_ACCEPTED)
+  was deliberately NOT done to keep the existing label; the MCP-send-tools half
+  and the advisory->enforce promotion remain with the owning lane.
+- **Trace:** branch `integration/supervisor-queue-reliability`.
+### Windows detached session hosts (survive node-agent restart)
+
+- **Goal / user value:** a Windows node-agent update or restart must stop
+  being an outage for that node's Claude/Codex/PowerShell sessions. The
+  node-agent becomes control plane only; a session's process is no longer
+  a child whose lifetime depends on it.
+- **Status:** IMPLEMENTED and TESTED on Linux against real processes; NOT
+  YET PROVEN on real Windows, and NOT deployed. `--detached-sessions` is
+  OFF by default so shipping the code cannot change a running node's
+  behaviour. The live dell-5530 agent has not been restarted or touched.
+- **Design of record:** `docs/WINDOWS_SESSION_HOST.md` (architecture,
+  crash/reboot matrix, the adoption-impossibility proof, and the
+  zero-loss rollout).
+- **Root cause this fixes (from "Windows node-agent restart safety
+  (Phase 0)" above):** a session's ConPTY child was spawned inside the
+  node-agent process and the only registry was an in-memory dict, so the
+  child died with the agent (measured live, both via `taskkill /F` and
+  via the graceful `/v1/internal/shutdown`) and no on-disk state existed
+  to reconnect with. Phase 0's "NOT achievable" conclusion was scoped to
+  that architecture; this entry replaces the architecture.
+- **Fix:**
+  - `windows_session_host.py` (new): a detached per-session HOST process
+    that owns the PTY. Atomic `meta.json` (temp + fsync + `os.replace`,
+    its mtime doubling as the heartbeat), append-only `out.log`/`in.log`
+    offset spools, `ctl.json` control requests consumed exactly once,
+    `host.log`. Liveness is `ALIVE`/`GONE`/`PID_REUSED` — a live PID with
+    a stale heartbeat is treated as reuse, never as a session, because
+    Windows recycles PIDs and the cost of a false ALIVE is writing an
+    operator's keystrokes into a void while reporting health. POSIX
+    liveness additionally rejects zombies, since `kill(pid, 0)` succeeds
+    on an unreaped process and Windows has no such state.
+  - Spawned with `DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB |
+    CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`; breakaway denial raises
+    `BreakawayDenied` rather than silently retrying without the flag (a
+    host spawned without it looks identical and then dies with the agent
+    — the exact bug being fixed).
+  - `windows_detached.py` (new): `HostProcessProxy`, a `PtyProcessLike`
+    over the spool, so the existing reader thread, pyte VT parser,
+    history buffer, resize and kill paths are untouched. `pid` is the
+    CHILD's pid (the backend feeds it to `_win32_foreground_command`;
+    the host's pid there would make every session report the wrapper);
+    `read()` sleeps briefly on an empty spool so `_reader_loop` does not
+    spin. `adopt_sessions()` is a pure read returning a verdict per
+    session.
+  - `windows_backend.py`: new optional `session_process_factory`
+    (`(name, argv, cwd) -> PtyProcessLike`) alongside the unchanged
+    2-arg `ProcessFactory`, and `adopt_detached_sessions()` /
+    `_register_adopted()`. The duplicate-name check is re-done inside the
+    registry lock, so a create racing an adoption cannot produce two
+    hosts behind one id.
+  - `windows_agent.py`: `--detached-sessions` (default OFF) and
+    `--session-state-root`; adoption runs BEFORE serving, so a request
+    arriving early cannot be told a live session does not exist and then
+    have a create spawn a second host for it.
+- **Scope / flow:** Windows nodes only, opt-in. Linux/tmux is untouched
+  (asserted by test). Sessions created before the flag is enabled are
+  NOT migratable — see the impossibility proof below.
+- **Adoption impossibility (proved, as the task required):** a 0.12.0
+  session's `HPCON` and pipe handles live in the running agent's handle
+  table; Windows exposes no way to enumerate or re-open a pseudoconsole
+  from another process, and `DuplicateHandle` needs a cooperating source
+  that 0.12.0 does not contain. Even a duplicated handle would not help:
+  when the owning process exits, ConPTY signals the client and
+  `conhost.exe` tears the console down (measured in Phase 0). And the old
+  agent must exit to be replaced (the code, and port 8790's single
+  listener). Therefore every path that ends with the 0.12.0 agent gone
+  ends with its sessions gone; no bridge exists.
+- **Rollout (zero-loss, not yet executed):** Option A = deploy files
+  only, capture each live session's scrollback + cwd + `--session-id`,
+  quiesce, prove survival on a disposable second agent first, restart
+  once with the flag, recreate with `--resume`, then restart again to
+  demonstrate the property. Option B (recommended, loses nothing and
+  waits for nothing) = run a second agent side by side on another port
+  with its own state root and node id, prove it there, put new work on
+  it, and retire the old agent only when its sessions are finished.
+- **API/tool/command:** no new MCP tools. New agent CLI flags
+  `--detached-sessions`, `--session-state-root`; new host entry point
+  `python -m terminal_mcp.windows_session_host`.
+- **Config/permission:** none new. `TERMINAL_MCP_SESSION_PTY_FACTORY`
+  exists so the host entry point itself can be exercised on Linux CI; it
+  is unset in production, which selects the real pywinpty path.
+- **Data/schema/migration:** no DB change. New on-disk per-session state
+  directory; no migration, since existing sessions cannot be adopted.
+- **Acceptance/tests/evidence:** `tests/test_windows_session_host.py`
+  (52 tests: atomic metadata, corrupt-metadata-as-absent, zombie and
+  PID-reuse protection, spool rotation keeping the recent tail on a line
+  boundary, control requests consumed once, the exact creation flags, and
+  a spawner-death survival test verified by negative control — the same
+  scenario without detachment freezes, with it keeps running);
+  `tests/test_windows_detached_sessions.py` (19 tests: a real agent
+  process SIGKILLed with its whole process group, both host and child
+  confirmed still alive afterwards, pre-restart history readable and
+  post-restart input answered, four concurrent sessions adopted with no
+  crossed spools, host crash reported as an orphan and never adopted,
+  stale-record-with-live-pid refused, claude.exe-style argv round-tripped
+  verbatim including `--session-id`, backend create→restart→adopt→kill,
+  double adoption producing no duplicate, and the plain Linux factory
+  path unchanged). Existing `tests/test_windows_backend.py` (86) passes
+  unchanged.
+- **Known limitations:** ConPTY and the Win32 creation flags are NOT
+  measured on Windows — asserted structurally and reviewed against the
+  Win32 contract; rollout step 4 is what measures them, on a disposable
+  session. A machine reboot loses every session (only `out.log` survives)
+  and this is documented rather than papered over. Orphans are never
+  auto-deleted, because a `PID_REUSED` verdict can also be a live host
+  that was briefly slow to heartbeat.
+- **Follow-up/backlog:** execute the rollout (Option B) on dell-5530;
+  package `--detached-sessions` into `run-node-agent.ps1`'s Scheduled
+  Task definition; surface adoption verdicts/orphans in the dashboard.
+- **Trace:** branch `feat/windows-detached-sessions`.
+
 ### Conversation-continuity recovery (`--resume` wiring)
 
 - **Goal / user value:** since the 2026-09-06 Phase 0 audit proved a
@@ -3103,7 +3999,319 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
 
 ---
 
+### Work efficiency telemetry — runtime-driven, provenance-preserving
+
+- **Goal / user value:** answer "what did this task actually cost, and is
+  the fleet getting cheaper" from the runtime's own record, per task, per
+  module and per time period — without any number in the answer having
+  been invented.
+- **Status:** IMPLEMENTED_NOT_LIVE_VERIFIED (2026-09-14). Code + unit/
+  integration tests against a REAL `QueueStore` (real transitions, real
+  event hook) are green; no live deployment has attached it yet, because
+  the attach call belongs to the central MCP/dashboard wiring which this
+  lane deliberately did not touch.
+- **What changed (the contract):** telemetry rows used to exist ONLY when
+  a worker called `work_telemetry_report` about its own finished task —
+  a self-selected, retrospective sample. Rows are now opened and closed
+  by the runtime itself:
+  - `work_telemetry_runtime.py` (new) subscribes to `QueueStore`'s own
+    post-commit event hook (`event_sink`, the same one `event_wiring.py`
+    uses for the event bus — `attach()` composes with whatever sink is
+    already installed and never displaces it).
+  - `DISPATCHING` opens the row (or REOPENS the task's existing row —
+    one row per task, so a retry stays one task rather than becoming two
+    cheap-looking ones); `RUNNING` records that the agent started;
+    `VERIFYING` is first preview; `COMPLETED`/`FAILED`/`BLOCKED`/
+    `SKIPPED`/`CANCELLED` finish it.
+  - A transition for a task this recorder never saw dispatched opens
+    NOTHING: a row whose `started_at` is "whenever the process attached"
+    would make every duration in the table wrong.
+- **First preview is a stated DEFINITION, not a guess:** this runtime has
+  no separate preview state, so the row records `preview_basis` — by
+  default the transition into `VERIFYING`, the first moment a reviewable
+  result exists. A caller with a truer signal (deploy preview URL,
+  screenshot artifact) calls `RuntimeTelemetry.mark_preview(basis=...)`,
+  and the basis is REQUIRED: a preview time nobody can trace to an event
+  is a number nobody can check.
+- **Per-task record:** `files_read`, `search_calls` (stored under the
+  original field name `search_rounds`; both names are the same number in
+  every payload), `runbook_hits`/`runbook_misses`, `knowledge_hits`,
+  `context_pack_hits`, `similar_bug_hits`, `redefine_count` (read from
+  the planner's own `WorkSpec.redefine_count`, never re-counted here),
+  `time_to_preview_seconds`, `first_pass_success`, plus the dispatch
+  bookkeeping (`dispatch_count`, `reopened`, `failed_excursions`).
+  Attributes carried at open: task id, work id, module, execution mode,
+  spec level, difficulty, lane — resolved from the `WorkSpec` bound to
+  the queue task and the queue row's own metadata; a task with no spec
+  gets NULLs, never a classified guess.
+- **`first_pass_success` is three-valued** — True / False / unknown. A row
+  whose dispatches were never observed (a worker-reported row) reports
+  `None` with a stated basis, and aggregates exclude it from the rate
+  rather than counting a gap in instrumentation as a failure.
+- **Counters come from the real call sites:** `repo_read.repo_read` (one
+  `files_read` per file actually read — a refused read is not a read),
+  `repo_read.repo_search` (one `search_calls` per search CALL, whatever
+  it found), `context_pack.py` (`context_pack_hits`/`knowledge_hits`
+  when a pack was actually served, `similar_bug_hits` per past spec
+  offered), `work_reuse.analyse` (knowledge/prior-spec candidates) and
+  `procedures.run` (`runbook_hits` when a registered procedure was
+  called, `+cache_hits` when its green result was reused instead of
+  re-run, `runbook_misses` when there was no usable procedure to call).
+  All report through `work_telemetry_runtime.note()`, which does nothing
+  at all unless a recorder has been made active for a task
+  (`observing(recorder, task_id)`). So an un-instrumented process
+  behaves exactly as before, and a zero counter on a row with an empty
+  `signal_sources` means "nobody reported", not "it never happened".
+  Attaching the same recorder to a queue store twice is a no-op, so a
+  double-wire cannot count two dispatches where there was one.
+- **Provider usage counters — recorded only when reported:**
+  `ProviderUsage` holds `input_tokens`/`output_tokens`/
+  `cache_read_tokens`/`cache_write_tokens`/`total_tokens`, each present
+  only because a runtime reported it, each carrying who reported it.
+  Anything unreported is `UNAVAILABLE`, never `0` (zero is itself a
+  measurement, and a false one). A value that is not a plain
+  non-negative integer — including `True` — is IGNORED and named in
+  `ignored`. A total nobody reported is `input + output` labelled
+  `ESTIMATED` (the estimate label) with its derivation in `method`;
+  exact arithmetic is still a derived figure. Usage is NOT back-filled
+  from the local AI Usage Monitor: those figures are per-MACHINE daily
+  quota and cannot be attributed to one task without inventing the
+  attribution. This telemetry reads and writes no credential material of
+  any kind.
+- **Aggregation API:** `summarise(rows)`, `aggregate(rows, by=...)` over
+  `task` / `module` / `work` / `project` / `lane` / `execution_mode` /
+  `difficulty` / `spec_level` / `day` / `week` / `month`; rows that
+  cannot be placed on the chosen axis are counted and named as
+  `ungrouped`, never dropped into an "other" bucket that reads as a real
+  group. `TelemetryStore.query()` filters by task/work/project/module and
+  a HALF-OPEN `[since, until)` time window, so two adjacent windows can
+  never double-count a task. `TelemetryStore.aggregate()`/`report()` are
+  the read surfaces; `WorkService.telemetry_for_run(work_id)` gives one
+  run's own rows.
+- **Baseline and savings — shown only when admissible:** a `Baseline` is
+  `MEASURED` (computed from real recorded rows, carrying its window and
+  task count, with a `min_tasks` floor) or `STATED` (supplied WITH its
+  definition — a definition-less one is refused outright), otherwise
+  `UNAVAILABLE`. With no admissible baseline, `savings()` returns
+  availability `False` and a reason and NO numbers at all. Every saving
+  figure is labelled `ESTIMATED` with its derivation, because it is
+  derived from two windows rather than measured.
+- **API/tool/command:** no new MCP tool or route in this lane (see
+  "Integration note" below). New Python surfaces:
+  `work_telemetry_runtime.install(queue_store=..., telemetry_store=...,
+  spec_store=...)` (the one call that wires it to a running queue),
+  `attach`/`fan_out`/`observing`/`note`, `RuntimeTelemetry.note/
+  record_provider_usage/mark_preview/row`, `WorkService.enable_telemetry()`
+  and `WorkService.telemetry_for_run()`, `WorkSpecStore.by_queue_task()`,
+  and in `work_telemetry.py`: `ProviderUsage`, `aggregate`, `period_key`,
+  `Baseline`/`measure_baseline`/`stated_baseline`/`savings`,
+  `TelemetryStore.for_task/query/aggregate/report`, and (2026-09-14)
+  `TaskTelemetry.plan_status`/`plan_note`/`record_plan_outcome()`,
+  `TaskTelemetry.budget_escalations`/`record_budget_escalation()`, plus
+  `plan_outcomes` and `budget_escalations` in `summarise()` — and so, via
+  `summarise`, in every `aggregate()` group as well. The PLAN_* vocabulary is
+  IMPORTED from `bug_spec`, never restated, so the verdict on the spec and the
+  verdict on the row are literally the same strings and can be compared. All
+  additive: the row is a JSON payload, older rows read back with
+  `plan_status=None`, and `None` is counted as `unreported` rather than as a
+  confirmation. The existing
+  `work_telemetry_report`/`work_telemetry` MCP tools are unchanged and
+  still work: a worker adds what only it can see, on top of a lifecycle
+  the runtime now records by itself.
+- **Integration note (deliberate scope boundary):** `mcp_app.py` and
+  `dashboard.py` were NOT touched — the coordinator integrates those
+  surfaces centrally. Until that wiring calls `install(...)`, nothing is
+  attached and behaviour is byte-identical to before; this is why the
+  status above is not VERIFIED.
+- **Storage:** same `work_telemetry.db` (SQLite/WAL/0700 state dir).
+  Migration v2 is additive: indexes on `module` and `started_at` for the
+  two aggregation axes. Older builds read the same rows.
+- **Acceptance/tests/evidence:** `tests/test_work_telemetry_runtime.py`
+  (34 — real `QueueStore`/`QueueService`, real transitions incl. the
+  retry path `DISPATCHING→FAILED→QUEUED→DISPATCHING→…→COMPLETED`, real
+  `ProjectKnowledge`/`ProcedureRegistry`/`WorkSpecStore`/`repo_read` over
+  a real git repo; asserts the
+  existing sink still receives every event, and that an exploding
+  telemetry store cannot disturb a real transition),
+  `tests/test_work_telemetry.py` (50, up from 23 — provenance,
+  three-valued first-pass, grouping, half-open windows, baseline
+  admissibility, derived-savings labelling), and
+  `tests/test_dogfood_budget_gate.py` for the plan-verdict and
+  budget-escalation fields, which are asserted where they are actually
+  produced — in a real run — rather than only as setters.
+- **Known limitations:** (1) not attached in any live deployment yet (see
+  the integration note); (2) the counters only see reads that go through
+  THIS process — a worker reading files with its own editor/agent tools
+  is invisible here, which is why an empty `signal_sources` is recorded
+  rather than a confident zero, and why the worker-reported path stays;
+  (3) first preview means "a reviewable result exists", not "a human
+  looked at it"; (4) provider usage depends entirely on a runtime that
+  reports counters — with none, every token figure in every aggregate
+  stays `UNAVAILABLE`, by design.
+
+### Token-efficiency benchmark and acceptance — the measured answer (2026-09-14)
+
+- **Goal / user value:** three capabilities shipped claiming the same
+  benefit — a runbook registry, retrieval before investigation, and runtime
+  telemetry — all asserting that a worker now carries less context and does
+  less re-analysis. This is the attempt to find out whether that is true on
+  this repository's own real bugs, built so a disappointing answer is as
+  reportable as a flattering one.
+- **Status: MEASURED. The headline verdict is FAIL** against the acceptance
+  bar the benchmark itself pre-registered (`efficiency_benchmark.ACCEPTANCE`,
+  published inside every result file). This is a real outcome, not a blocked
+  task: the instrument works, the corpus is real, and the honest reading is
+  below.
+- **What was measured:** 20 cases — **18 REAL bugs recovered from this
+  repository's git history** across ui / simple_logic / backend / auth /
+  session / unknown, plus **2 SYNTHETIC** cases that say so in their own
+  `origin` and `note` and are reported apart from the headline. Each real
+  case carries its commit, its parent, the subject line as the symptom, and
+  the source files its fix actually touched (tests and docs excluded — a
+  benchmark about locating a defect must not be scored on finding the test
+  that noticed it). Corpus: `benchmarks/tokeff_corpus.json`, regenerated by
+  `scripts/benchmark/mine_corpus.py`.
+- **Baseline methodology, stated before anything was measured** (and
+  published in every report): no old model is re-run — git's record of each
+  fix is better evidence than a re-enactment and costs nothing. The baseline
+  is the UNASSISTED LOCATING SURFACE: source files matching terms derived
+  mechanically (never hand-picked per case) from the bug's own words, found
+  by really running `git grep` against the repository AS IT WAS at each
+  fix's parent commit. The headline compares against the baseline's BEST
+  case — the single most selective term, the hardest baseline to beat — not
+  the union of every term tried.
+- **The measured figures** (`docs/TOKEFF_BENCHMARK.md`,
+  `benchmarks/tokeff_result.json`, regenerated by
+  `scripts/benchmark/run_tokeff_benchmark.py`):
+  - mean unassisted locating surface **5.17 files** (ESTIMATE — a proxy for
+    what a worker would triage, not a count of files anyone read)
+  - mean assisted surface **0.61 files** (REAL — what the shipped briefing
+    actually named)
+  - searches: **3.94 real greps per case** vs **0** (REAL both sides)
+  - elapsed: 0.05s vs 0.07s (REAL — wall clock of the two retrieval paths.
+    A worker's own elapsed time is UNAVAILABLE: nothing recorded it)
+  - re-analysis depth, assisted: 3 REUSE_PRIOR / 3 READ_RELATED / 12
+    FULL_ANALYSIS
+  - provider usage delta: **UNAVAILABLE** — the host's real telemetry
+    database was opened and asked, and no provider reported counters for any
+    of these cases, which predate the telemetry runtime. No token saving is
+    claimed anywhere in this work.
+- **The honest reading, in order of importance:**
+  1. **Coverage, not retrieval, is the binding constraint.** In 11 of 18
+     real cases the knowledge map covers none of the files the fix touched,
+     so no briefing built from it could have named the site. The map holds 9
+     modules / 19 paths against ~150 source files.
+  2. **Where the map does cover the fix site** (7 cases) the briefing named
+     it in 5 of 7 and beat the luckiest single grep in 2 of 5 — reported
+     with an **UNDERPOWERED** warning by the report generator itself, because
+     seven cases can produce any percentage at all. A direction, not a result.
+  3. **The assisted path depends on the report naming the module.** The
+     synthetic mirror pair measures this directly: the same defect worded as
+     its commit subject reached `work_ui` (score 0.483, SHRUNK); worded as a
+     user would report it, nothing scored above the module-choice floor
+     (0.025, MISSED). Every rate in the report, measured from commit
+     subjects, is therefore optimistic about real bug reports.
+  4. Search rounds move unconditionally (0 vs 3.94) — and that holds whether
+     or not the briefing was useful, which is exactly why it is worth little
+     on its own.
+- **What stops this flattering itself:** a briefing that does not contain a
+  real fix path is a MISS however small it was; cases neither path could
+  locate are counted apart rather than as losses; the module is chosen from
+  the symptom alone by the SHIPPED scorer at the SHIPPED threshold; prior
+  bugs are seeded leave-one-out with a fresh spec database per case; every
+  figure carries REAL / ESTIMATE / UNAVAILABLE; and the acceptance verdict
+  is computed from the numbers with the token claim explicitly barred from
+  influencing it.
+- **Two instrument corrections made during development, neither of which
+  improved the result** (both disclosed in the report's own methodology):
+  (a) the harness chose a module by argmax with no confidence floor, so it
+  "chose" modules on scores of 0.03 — measuring a decision procedure the
+  system does not use; applying `work_reuse.MENTION_THRESHOLD` cost the
+  assisted side cases it had been credited with. (b) It reused one spec
+  database across cases, so a case could meet its own spec; each case now
+  gets its own. That changed no number, verified by re-running both ways and
+  diffing rather than assumed — the shipped matcher already refuses to match
+  a spec against itself by id.
+- **API/tool/command:** no MCP tool and no route — this is an offline
+  measuring instrument. `terminal_mcp/efficiency_benchmark.py` (corpus,
+  baseline, assisted measurement, aggregation, pre-registered acceptance,
+  map provenance, derived conclusions, markdown rendering);
+  `scripts/benchmark/mine_corpus.py`; `scripts/benchmark/run_tokeff_benchmark.py`;
+  `scripts/knowledge/index_modules.py`.
+  Nothing is deployed and nothing outside the given output paths is written;
+  a telemetry database is never CREATED by the run, because creating an
+  empty one and reading zero out of it would turn "nothing was recorded"
+  into a measurement.
+- **Acceptance/tests/evidence:** `tests/test_efficiency_benchmark.py` (41) —
+  including the map's own guards (every package file claimed exactly once,
+  every indexed path still exists, provenance recorded beside the
+  measurement) —
+  validates every REAL case against real git, asserts synthetic cases are
+  marked, and pins the anti-flattery rules (a miss earns nothing, leave-one-
+  out holds, a weak module match is no match, usage is UNAVAILABLE until a
+  provider really reports it and REAL the moment one does, the token claim
+  never decides the verdict, and the published artifacts describe the
+  committed corpus).
+- **Known limitations:** (1) the locating surface is a proxy for files read,
+  not a measurement of them — labelled ESTIMATE everywhere it appears;
+  (2) strata under ten cases are underpowered and flagged as such;
+  (3) the runbook
+  registry's own claim (calling a procedure instead of re-deriving a
+  command, and a one-line PASS instead of a log) is NOT measured here — the
+  four metrics this task names do not capture it, and inventing a weak
+  number for it would have been worse than saying so (see Backlog);
+  (4) the corpus is one repository's history, so nothing here generalises
+  beyond it.
+
 ## Backlog (explicitly not done yet — tracked here so it isn't re-discovered)
+
+0a. **Worktree Janitor — CONTRACT ONLY as of 2026-09-14. No executor exists;
+   nothing deletes anything.** The specification is
+   `docs/WORKTREE_JANITOR.md` (state model, the nine AUTO_SAFE predicates,
+   invariants I1-I8, failure modes F1-F13, multi-node ownership, audit shape,
+   rollout ladder, and the P0/P1/P2 acceptance tests). What exists in code
+   today is ONLY the pre-existing manual path: `terminal_worktree_cleanup` ->
+   `GitIsolationService.cleanup_worktree_for_task`, which is human-invoked,
+   accepts `force=True`, takes no lock, and writes NO audit row (verified:
+   `audit.db` has zero rows for any worktree action, and neither
+   `git_worktree.py` nor `git_isolation_service.py` contains an audit call).
+   Implementation is tracked as the P0-P7 backlog items tagged
+   `worktree-janitor`; the contract item is `blg_349fb9e08b4f`.
+   Two findings from the audit that the contract encodes and that must not be
+   re-litigated by an implementer:
+   - There is no `FAILED_FINAL` status. `TERMINAL_STATUSES` is
+     `(COMPLETED, SKIPPED, CANCELLED)`; `FAILED`/`BLOCKED` are retryable. The
+     trigger is those three, or `FAILED` with `attempt_count >= max_attempts`.
+     Cleaning up on a bare `FAILED` deletes the retry's own working directory.
+   - The lifecycle hook belongs in `queue_store._transition_locked`, NOT on
+     `QueueService.on_completed`/`QueueEngine.on_completed` -- those have TWO
+     call sites, so neither is a chokepoint.
+   Not urgent: measured 2026-09-14, the worktree filesystem (`/dev/sda3`) was
+   26% used with 83G free. The disk pressure that actually broke tooling was on
+   tmpfs `/tmp`, which worktree removal cannot relieve (different filesystem).
+
+0. **Repo Read V1 — the two things it deliberately does not do yet
+   (2026-09-14).**
+   a) **Rolling the new node agent out to dell-5530 / hp / any other
+      remote node.** `repo_service` routing, `NodeClient.repo_op` and the
+      `/v1/repo/{op}` endpoint are all implemented and tested, but a
+      remote node can only serve repo reads once ITS agent runs this
+      version; an older one correctly answers NODE_LACKS_REPO_READ. The
+      same restart is what activates the `/v1/repo-evidence` NameError fix
+      on that node. Not done autonomously: restarting the dell-5530 agent
+      is the exact disruptive action item 7 below documents at length (a
+      real `taskkill /F` with no known ConPTY reattach), and it needs the
+      same explicit per-instance go-ahead. **Local/controller-side reads
+      work today with no restart of anything remote.**
+   b) **Write capability (checkout/commit/branch/push/apply).** Out of
+      scope for V1 by design, not by omission — see the read-only locks in
+      the Feature Details entry. Any future write surface is a new,
+      separately-audited capability with its own gate; it must not be
+      added by widening `repo_read.READ_ONLY_GIT_SUBCOMMANDS`.
+   Also not done, and smaller: searching git HISTORY (`log -S`,
+   `grep <rev>`) rather than a work tree; `fetch`/`clone` of a private
+   remote this host cannot already read (no key was needed or created —
+   anonymous HTTPS read against `origin` works today).
 
 1. **Live remote-node auto-dispatch smoke test (dell-5530,
    `RemoteNodeClient`)** — this task batch's own required next step
@@ -3689,6 +4897,47 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
 
 ---
 
+27. **The knowledge map covers ~12% of this package — DONE, 2026-09-15, and
+    it did not produce the improvement it was expected to.** The package is
+    now indexed completely: 33 modules / 147 paths, every `terminal_mcp/*.py`
+    claimed exactly once, enforced by `scripts/knowledge/index_modules.py`
+    and by `tests/test_efficiency_benchmark.py`. Re-running the benchmark
+    (`docs/TOKEFF_BENCHMARK.md`, "How this has moved") measured: the briefing
+    now names the fix site in 8 of 17 comparable cases instead of 5, and
+    leaves a worker doing full re-analysis in 7 cases instead of 12 — but it
+    beats the luckiest single grep LESS often (1/8 vs 2/5), because a
+    briefing drawn from a real module is 4.67 files where the near-empty map
+    produced 0.61. The headline verdict is still FAIL. Two consequences are
+    now the open work, below (items 30 and 31). A side effect worth naming:
+    `test_dogfood_work_v1.py`'s strict test (`TERMINAL_MCP_DOGFOOD_STRICT=1`)
+    passes for the first time — the planning pipeline really does consult the
+    map now.
+
+28. **Module choice depends on the report naming the module (same
+    benchmark).** The synthetic mirror pair is the evidence: one defect,
+    worded as its commit subject, scored 0.483 and reached the right module;
+    worded as a user would report it, scored 0.025 and reached nothing. A
+    real bug report looks like the second. Candidate directions, none
+    attempted here: score against the module's own known-issues and past
+    bug symptoms as well as its identifiers, or let triage set
+    `likely_module` before retrieval runs (the shipped path already accepts
+    one — the benchmark deliberately measured the harder case where nothing
+    does).
+
+29. **Measure the runbook registry's own token claim (not covered by the
+    2026-09-14 benchmark).** That lane's claim -- a registered procedure is
+    called instead of a command being re-derived, and a PASS returns one line
+    instead of a log -- is about command re-derivation and output size, which
+    the four metrics that benchmark measures (files read, search rounds,
+    re-analysis, elapsed) do not capture. A real measurement needs recorded
+    runs with their logs: `as_context()` bytes against the log bytes it
+    replaces, over real runs on a real machine. Deliberately NOT approximated
+    in the benchmark: the logs available on this host are healthcheck-sized
+    (41-297 bytes) and a saving computed from them would have been a number
+    that looked like evidence.
+
+---
+
 ## Notes / Ideas store (kho ghi chú dùng chung) — IMPLEMENTED
 
 Full design + every tool with JSON examples: `docs/notes.md`. ChatGPT-facing
@@ -3753,6 +5002,40 @@ two existing inventory guards updated in the same commit (`tests/test_server.py`
 and `tests/test_dashboard.py`'s exact route set).
 
 ---
+30. **Module choice scores a shared identifier as strongly as a
+    discriminating one (found by the 2026-09-15 benchmark re-run).**
+    `work_reuse._score_module` awards 0.45 for any identifier overlap, so a
+    token that appears in many modules' file names counts as much as one that
+    names a single module. With 9 modules this rarely bit; with 33 it
+    dominates. Measured examples from the real corpus: `client-side CSI regex
+    leak` in `dashboard.py` matched `nodes` on the token "client"
+    (`node_client.py`); two dashboard bugs went to `webauth`, which ties with
+    `work_ui` at 0.477/0.483 because `webauth_dashboard.py` also contains the
+    token "dashboard", and the shipped ordering `(-score, name)` puts
+    `webauth` first alphabetically. `engine`, `loop`, `registry`, `service`,
+    `session`, `store` and `work` are each shared by three or more modules
+    today. Candidate direction, not attempted here (it would have been tuning
+    the scorer against the corpus that found it): weight an identifier match
+    by how few modules contain that token, and report a tie as ambiguous
+    rather than resolving it alphabetically.
+
+31. **Six modules carry no summary because their largest file has no module
+    docstring** (`config`, `http_api`, `mcp_surface`, `security`,
+    `session_ops`, `work_ui` — 2026-09-15). The indexer generates summaries
+    mechanically from the code's own docstrings, deliberately, so that no
+    summary is written to match a bug report's wording after the fact. The
+    honest consequence is that these six are found by identifier alone. The
+    fix belongs in the code: give `core.py`, `dashboard.py`, `config.py`,
+    `mcp_app.py`, `server_http.py` and `audit.py` real module docstrings, and
+    re-index. That is a change to the source, not to the map, and the
+    benchmark will measure whether it moves anything. A second, smaller
+    limitation of the same rule, recorded rather than quietly accepted: the
+    summary is the LARGEST file's first sentence, so one file speaks for the
+    whole module (`auth` is described by `enrollment.py`, `capabilities` by
+    `host_metrics.py`). Combining the top few files' sentences would describe
+    more of each module; it was not done in this pass because every further
+    rule variant chosen by its benchmark score fits the instrument a little
+    more tightly to this one corpus.
 
 ## Project Backlog (planning layer) — IMPLEMENTED
 
@@ -4430,3 +5713,184 @@ that can restart them must be disabled too. No canonical divergence resulted
 **Config now lives outside the repo** (`~/.config/terminal-mcp/config.yaml`).
 In-tree host config makes the checkout permanently dirty and makes "which commit
 is running" unanswerable.
+
+# 2026-09-10 Dashboard: node-grouped session lists + interactive keys
+
+Two behaviour changes to the dashboard UI. Both are user-visible, so they are
+recorded here rather than only in the commit log.
+
+## Session lists are grouped by node
+
+Previously both session lists (the main dashboard's tab strip and
+`/dashboard/sessions`) were flat, and a session's node showed only as a small
+per-row badge that was **hidden when `node_id` was `local`** — so on a fleet
+the local node was indistinguishable from "no node information at all".
+
+Now, on both surfaces:
+
+* one group per node, with a header carrying display name, `node_id` (when it
+  differs from the name), status and session count;
+* nodes sort **online → recent → offline**; within a node, attention-first,
+  then most-recent activity, then name;
+* groups collapse/expand, remembered in `localStorage` per page
+  (`tmNodeCollapse:<page>`), and the group holding the currently-viewed
+  session is always revealed;
+* an **online** node with no sessions still gets a group with a small empty
+  state, so an idle node reads as "up and free" rather than missing — except
+  while a filter is active, where a group with no matches is suppressed;
+* the main dashboard gained a session filter box that searches across groups.
+
+`degraded` (the registry's own term for "heartbeat stale but not yet offline")
+is surfaced to the operator as **recent**. An unknown status sorts with
+offline — never ahead of a node the registry has positively vouched for.
+
+The grouping logic lives in exactly one place (`dashboard.NODE_GROUP_JS`),
+injected into both pages; node identity is never hardcoded, it is read from
+`node_id`/`node_name` on the existing `/dashboard/api/sessions` rows and from
+`/dashboard/api/nodes` for status and for session-less nodes.
+
+**Layout change:** the main dashboard's tab strip no longer scrolls
+horizontally. Tabs wrap inside their node group and the strip scrolls
+vertically with a height cap, so no session is reachable only by discovering a
+sideways gesture. This supersedes the earlier horizontal-drag fix.
+
+## Interactive key sends (arrows / Tab / Esc / Enter)
+
+The dashboard could send text but not keys, so a session sitting on an agent's
+numbered menu could not be answered from the dashboard at all — an escape
+sequence typed into the composer is typed, not pressed.
+
+* New route `POST /dashboard/api/session/keys`, calling the **existing**
+  `terminal_send_keys` (same allowlist, same sensitive-key confirmation, same
+  durable pane lease as a text send). Remote sessions resolve through
+  `controller.resolve_session` exactly as `session/input` does.
+* Key sends remain their own capability: `permissions.allow_send_keys` plus
+  `input_policy.allow_keys`. `/dashboard/api/sessions` now reports
+  `send_keys_enabled`, `allowed_keys` and `sensitive_keys` so the UI **disables
+  unavailable keys with the reason** instead of offering a control that fails.
+* On-screen pad (↑ ↓ ← → Tab Esc ⏎) — on a phone this is the only way to send
+  these at all, so the buttons carry a 44px touch target. On desktop an opt-in
+  "bắt phím" mode routes those keys from the composer to the terminal;
+  Escape always leaves the mode and modified presses (Alt/Ctrl/Meta,
+  Shift+Tab) stay with the browser, so the keyboard is never trapped.
+* Works on tmux and on Windows ConPTY: `WindowsSessionBackend.KEY_BYTES`
+  already maps every key the pad offers, asserted by a test so a future pad
+  addition cannot silently no-op on Windows.
+
+## Remote composer mirror
+
+The dashboard now shows what the **agent** currently has on screen as an
+interactive choice — a numbered menu, or a composer line with text already in
+it — read from the same pane tail the output view already polls (no second
+capture, which has a real side effect on the pane).
+
+It is rendered **separately from the operator's draft**, never merged: a poll
+that overwrote a half-typed message is the data loss this separation exists to
+prevent. Copying the mirrored content into the composer is an explicit button,
+and it confirms first when a draft is in progress; a remote change arriving
+mid-draft is highlighted, not applied. Draft dirtiness follows the existing
+per-session `drafts` map rather than a second notion of "what the user typed".
+
+Detection is a heuristic over pane text and is deliberately conservative
+(≥2 numbered lines for a menu; a prompt line with non-empty content for a
+composer). It was validated against real Claude output on a live Windows
+ConPTY session — both a 3-option menu with its selected line, and a composer
+holding real typed text.
+
+# 2026-09-10 Session whitelist REMOVED — grants are the source of truth
+
+## What changed
+
+The session-name whitelist (`allowed_session_patterns` /
+`input_policy.allowed_session_patterns`) **no longer authorizes anything**.
+Access to a session is decided by:
+
+1. an explicit user grant (`grants.db`), else
+2. `session_access.default_read` / `session_access.default_input`,
+
+with a small set of hard floors that survive unchanged (below).
+
+### Why
+
+Deciding access from a session's NAME produced a state operators reported as a
+bug: a row showing `allowed=false` beside `effective_read=true` /
+`effective_input=true`. Both fields were "correct" — `allowed` was the static
+whitelist result, `effective_*` was whitelist-OR-grant — but they look like
+they must agree, and every consumer had to know which one was the real gate.
+It also meant that granting access to one session required editing config.yaml
+and restarting the service, which is precisely what a per-session grant exists
+to avoid.
+
+### `allowed` is deprecated
+
+`allowed` is now an **alias of the real read authorization** in both
+`terminal_list_sessions` and `dashboard_list_sessions`, so it can never
+contradict `effective_read` again. Nothing in the runtime reads it to make a
+decision. Existing callers keep working; new ones should read
+`effective_read` / `effective_input`.
+
+## Config
+
+```yaml
+session_access:
+  default_read: false          # a session nobody has granted: content not readable
+  default_input: false         # ...and it accepts no input
+  migrate_whitelist_on_start: true
+```
+
+Defaults are CLOSED, deliberately: opening reads by default would be a weaker
+posture than the whitelist it replaces. Discovery is unaffected and always was
+— session name/size/activity are `tmux ls` metadata, never pane content.
+
+## Migration — nobody loses access
+
+`TerminalService.migrate_whitelist_to_grants()` runs at startup on **every**
+node type (controller, Linux node agent, Windows agent). For each session that
+exists right now and that the retired whitelist would have authorized, it
+writes a real grant. It is strictly additive and idempotent:
+
+* a session that already has a grant is left alone in either direction — a
+  user who deliberately REVOKED read on a still-whitelisted session does not
+  have it handed back;
+* only running sessions are converted, because an input grant pins the
+  session's current identity and there is nothing to pin for a name that is
+  not running;
+* nothing is ever revoked, and a failure never blocks startup.
+
+## Security boundaries that did NOT change
+
+Removing the whitelist is not open access. Still enforced:
+
+* account/webauth/Cloudflare Access on the dashboard, and node bearer tokens
+  between controller and node agents;
+* the **sensitive-name floor** — a session whose name contains `root`, `ssh`,
+  `password`, `secret` or `database` is refused regardless of any grant or
+  default policy. This is the one name-based rule kept, because it guards
+  against a careless default, not against a naming convention;
+* `input_policy.denied_session_patterns` — a config-level DENY list, which a
+  grant may not override;
+* the global `permissions.terminal_read` / `terminal_input` /
+  `allow_send_keys` switches;
+* input grants still pin session identity and re-validate it at send time, so
+  a session recreated under the same name never inherits input authorization.
+
+## Code paths updated
+
+`core.py` (`_read_authorized_with_grant`, `_input_authorized_with_grant`, both
+list builders, rename target check), `supervisor.py` (watch sync now asks the
+canonical gate — readability is the supervisor's real prerequisite, since it
+watches by capturing output), `dashboard.py` and `webauth_dashboard.py`
+(session detail / input / status-tail routing).
+
+`permissions.session_allowed` / `input_session_allowed` remain **only** as the
+migration's input and are documented as such. They must not be reintroduced
+into an enforcement path.
+
+## Known limitation at time of writing
+
+The controller and its local node are fully converted. **Remote node agents
+still run the previous build**, so rows they report continue to show the old
+`allowed=false` beside `effective_read=true`. Those nodes pick up the new
+semantics when their agent is redeployed; on `dell-5530` that redeploy is
+gated on the ConPTY session-loss constraint documented in
+CONTROLLER_RUNBOOK.md.

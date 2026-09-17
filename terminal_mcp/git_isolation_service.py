@@ -30,10 +30,11 @@ class GitIsolationService:
     def __init__(self, queue: QueueService) -> None:
         self.queue = queue
 
-    def create_isolated_task(self, title: str, prompt: str, *, repo_path: str, base_ref: str = "HEAD",
+    def create_isolated_task(self, title: str, prompt: str, *, repo_path: str, base_ref: str | None = None,
                              session: str | None = None, priority: int = 0, project: str | None = None,
                              metadata: dict[str, Any] | None = None,
-                             worktree_root: str | None = None) -> dict[str, Any]:
+                             worktree_root: str | None = None,
+                             main_branch: str = git_worktree.DEFAULT_MAIN_BRANCH) -> dict[str, Any]:
         """Creates a REAL worktree+branch for a coding task, then creates
         the task itself with `metadata.expected_cwd` pointed at it --
         the same field the Coordinator's own pre-dispatch gate already
@@ -42,7 +43,16 @@ class GitIsolationService:
         proceeding on shared `main`/another task's own worktree.
         `worktree_root` defaults to `<repo_path>/../.terminal-mcp-
         worktrees/<branch>` -- override for a project with its own
-        convention."""
+        convention.
+
+        `base_ref` defaults to None, meaning "the configured trunk"
+        (git_worktree.resolve_base_ref). It used to default to the literal
+        string "HEAD", which on a worktree-hosting clone resolves to
+        whatever branch that shared clone is currently checked out on --
+        an arbitrary other lane's feature branch. New work then silently
+        started from the wrong commit and nothing noticed until merge. The
+        trunk is now named explicitly, and a caller that genuinely wants a
+        different base must say so."""
         branch = f"task/{uuid.uuid4().hex[:8]}-{git_worktree.slugify(title)}"
         if worktree_root:
             worktree_path = f"{worktree_root.rstrip('/')}/{branch.replace('/', '-')}"
@@ -50,7 +60,8 @@ class GitIsolationService:
             import os
             worktree_path = os.path.join(os.path.dirname(os.path.normpath(repo_path)),
                                          ".terminal-mcp-worktrees", branch.replace("/", "-"))
-        result = git_worktree.create_worktree(repo_path, branch, base_ref, worktree_path)
+        result = git_worktree.create_worktree(repo_path, branch, base_ref, worktree_path,
+                                              main_branch=main_branch)
         if "error" in result:
             return result
 
@@ -59,6 +70,11 @@ class GitIsolationService:
         full_metadata["git_isolation"] = {
             "repo_path": repo_path, "branch": result["branch"], "base_sha": result["base_sha"],
             "worktree_path": result["worktree_path"],
+            # Provenance for the reaper and for any later "what was this
+            # based on" question: the ref NAME that was resolved, how it
+            # was chosen, and the trunk this task is expected to land on.
+            "base_ref": result["base_ref"], "base_ref_source": result["base_ref_source"],
+            "main_branch": main_branch,
         }
         created = self.queue.create_task(title, prompt, session=session, priority=priority, project=project,
                                          metadata=full_metadata)

@@ -18,6 +18,8 @@ file, the node registry) never carry one in the first place, so there is
 nothing to redact, by construction."""
 from __future__ import annotations
 
+from . import contract
+
 import argparse
 import json
 import os
@@ -34,10 +36,21 @@ def cmd_connection(args: argparse.Namespace) -> int:
     # same env vars server_http.py's own startup resolves, so this always
     # reflects the RUNNING process's real binding, never a guess.
     from . import network_bind
+    from .listen_evidence import lan_state
     from .server_http import HTTP_PORT
+    # The env vars below belong to THIS process, not the server's. The doctor
+    # is a separate CLI; a systemd-started server's unit variables are not in
+    # its environment, which is how this used to report "not configured" about
+    # a controller listening on two LAN addresses. Runtime evidence first,
+    # env only as the labelled fallback.
+    configured = network_bind.resolve_lan_binds(os.environ.get("TERMINAL_MCP_LAN_BIND")) \
+        if os.environ.get("TERMINAL_MCP_LAN_BIND") else ()
+    runtime = lan_state(HTTP_PORT, configured_binds=configured)
+    result["lan_state"] = runtime
     result["endpoints"] = network_bind.describe_endpoints(
         port=HTTP_PORT, lan_bind_env=os.environ.get("TERMINAL_MCP_LAN_BIND"),
         cidrs_env=os.environ.get("TERMINAL_MCP_ALLOWED_NODE_CIDRS"),
+        runtime=runtime,
     )
     if args.json:
         print(json.dumps(result, sort_keys=True))
@@ -74,13 +87,33 @@ def _print_human(result: dict) -> None:
     print("  controller endpoints:")
     print(f"    loopback: {endpoints.get('loopback')}")
     if endpoints.get("lan"):
+        how = endpoints.get("lan_source") or "config"
         for url in endpoints.get("lans") or [endpoints["lan"]]:
-            print(f"    lan:      {url}  (allowed_cidrs={endpoints.get('allowed_cidrs')})")
+            print(f"    lan:      {url}  (allowed_cidrs={endpoints.get('allowed_cidrs')}, "
+                 f"source={how})")
+        drift = endpoints.get("config_drift")
+        if drift:
+            print(f"    ⚠ config drift: {', '.join(drift['configured_not_listening'])} "
+                 f"configured but not listening -- {drift['detail']}")
         print(f"    ⚠ {endpoints.get('firewall_reminder')}")
     elif endpoints.get("lan_error"):
         print(f"    lan:      DISABLED -- {endpoints['lan_error']}")
     else:
-        print("    lan:      not configured (loopback-only -- set TERMINAL_MCP_LAN_BIND to enable)")
+        # Three different facts used to print as one sentence. They call for
+        # opposite actions, so they are now said apart.
+        state = endpoints.get("lan_state")
+        detail = endpoints.get("lan_detail")
+        if state == "loopback_only":
+            print(f"    lan:      loopback-only (observed via {endpoints.get('lan_source')})"
+                 f" -- set TERMINAL_MCP_LAN_BIND to enable")
+        elif state == "unknown":
+            print(f"    lan:      UNKNOWN -- {detail or 'could not inspect the running process'}")
+        else:
+            suffix = f" (observed via {endpoints.get('lan_source')})" if endpoints.get("lan_source") else ""
+            print(f"    lan:      not configured{suffix}"
+                 f" -- set TERMINAL_MCP_LAN_BIND to enable")
+            if detail:
+                print(f"              {detail}")
     print(f"    tunnel:   {endpoints.get('tunnel')}")
 
 
@@ -165,23 +198,26 @@ def cmd_grants(args: argparse.Namespace) -> int:
     """Fleet-wide grant-health diagnostic (task: "P0 HOTFIX REMOTE
     PERMISSION FLAP" -- item 8's own "invariant/assertion/doctor check").
 
-    Flags every session, on every reachable node, where an active input
-    grant (input_granted=true) is currently NOT effective
-    (effective_input=false) while the GLOBAL terminal_input permission is
-    on. This is deliberately a DIAGNOSTIC, never an auto-fix and never
-    proof of a bug on its own -- the single most common cause is the
-    identity-pinning invariant working exactly as designed (a session
-    was recreated, e.g. after a tmux-server restart, and its grant's
-    pinned identity no longer matches; see core.py's
-    _input_authorized_with_grant for the full reasoning and the real
-    incident that invariant itself was built to prevent). Each flagged
-    row is labeled with WHY: `input_denied_reason == "IDENTITY_MISMATCH"`
-    means "re-grant to fix" (an operator/dashboard action, not a code
-    change); any other case (reason is None despite the mismatch) is
-    genuinely unexpected and worth investigating -- this command exits
-    1 only for that second, unexplained case, never for a plain
-    identity-mismatch (which is an expected, self-explanatory state, not
-    a failure this CLI should gate on)."""
+    Flags two different things, on every reachable node.
+
+    1. An active input grant (input_granted=true) that is currently NOT
+       effective while the GLOBAL terminal_input permission is on. A real
+       denial: a lock, a denied pattern, or a sensitive-name floor.
+
+    2. A grant pinned to a session instance that no longer exists
+       (`stale_identity_pin`). This USED to appear as case 1 with
+       `input_denied_reason == "IDENTITY_MISMATCH"`, because a stale pin
+       refused input. It no longer does: under a default-open policy that
+       made a grant record strictly worse than having no record at all, so
+       a mismatched grant now grants nothing and falls through to the
+       default (see core.py's _stale_pin_fallback). The row is therefore
+       inert rather than harmful -- but it is still a grant that says
+       something untrue about a session, so it is worth reporting and
+       worth clearing or re-granting.
+
+    Both are DIAGNOSTICS, never auto-fixes. Exit code is 1 only for a
+    denial this command cannot explain -- never for a stale pin, which is
+    an expected, self-explanatory state."""
     from .agent_availability import available_agent_types  # noqa: F401 -- parity with cmd_nodes's own imports
     from .config import load_config
     from .controller import ControllerService
@@ -207,6 +243,7 @@ def cmd_grants(args: argparse.Namespace) -> int:
     controller.refresh_local_heartbeat(tmux_session_count=0, agent_counts={}, agent_types=(), agent_version=None)
 
     flagged = []
+    listed_by_node: dict[str, set[str]] = {}
     node_errors = {}
     for node in controller.list_nodes():
         if node.id != controller.local_node_id and node.status != NODE_ONLINE:
@@ -219,13 +256,42 @@ def cmd_grants(args: argparse.Namespace) -> int:
         except NodeClientError as exc:
             node_errors[node.id] = str(exc)
             continue
+        listed_by_node[node.id] = {row["name"] for row in sessions}
         for row in sessions:
+            stale = bool(row.get("stale_identity_pin"))
             if row.get("input_granted") and not row.get("effective_input"):
                 flagged.append({"node_id": node.id, "session": row["name"],
                                 "reason": row.get("input_denied_reason"),
-                                "explained": row.get("input_denied_reason") == "IDENTITY_MISMATCH"})
+                                "stale_identity_pin": stale,
+                                # A stale pin explains itself; anything else
+                                # that denies a granted input needs a reason.
+                                "explained": stale or bool(row.get("input_denied_reason"))})
+            elif stale:
+                # Not a denial any more -- an inert row, reported so it can be
+                # cleared rather than left looking authoritative.
+                flagged.append({"node_id": node.id, "session": row["name"],
+                                "reason": "STALE_IDENTITY_PIN", "stale_identity_pin": True,
+                                "explained": True})
 
-    result = {"flagged": flagged, "node_errors": node_errors}
+    # A grant whose session is not listed on ANY reachable node. The per-node
+    # loop above can never see these -- it only inspects rows that came back
+    # from a listing -- yet that is exactly the shape the live `mesflow` case
+    # had: granted here while it ran here, then moved to another node, so the
+    # grant sits on the controller pointing at nothing it can see. Only
+    # reported when every node answered: an unreachable node is a far likelier
+    # explanation for a missing session than a dead grant.
+    orphaned = []
+    if not node_errors:
+        seen = {name for names in listed_by_node.values() for name in names}
+        for grant in terminal.grants.list():
+            if grant.session not in seen:
+                orphaned.append({"session": grant.session,
+                                 "reason": "NO_SUCH_SESSION_ON_ANY_NODE",
+                                 "granted_by": grant.granted_by,
+                                 "read": bool(grant.read_enabled),
+                                 "input": bool(grant.input_enabled)})
+
+    result = {"flagged": flagged, "orphaned_grants": orphaned, "node_errors": node_errors}
     if args.json:
         print(json.dumps(result, sort_keys=True))
     else:
@@ -233,8 +299,18 @@ def cmd_grants(args: argparse.Namespace) -> int:
         if not flagged:
             print("  No granted-but-ineffective input sessions found.")
         for row in flagged:
-            label = "re-grant to fix (session was recreated)" if row["explained"] else "UNEXPLAINED -- investigate"
+            if row.get("stale_identity_pin"):
+                label = "re-grant to fix (session was recreated; the grant is inert, not blocking)"
+            elif row["explained"]:
+                label = "explained -- see reason"
+            else:
+                label = "UNEXPLAINED -- investigate"
             print(f"  [{row['node_id']}] {row['session']}: reason={row['reason']} -- {label}")
+        if orphaned:
+            print("  Grants whose session is not on any reachable node:")
+            for row in orphaned:
+                print(f"    {row['session']}: granted_by={row['granted_by']} "
+                      f"read={row['read']} input={row['input']} -- clear it, or the session moved")
         for node_id, detail in node_errors.items():
             print(f"  (could not check {node_id}: {detail})")
 
@@ -350,6 +426,15 @@ def _print_nodes_human(result: dict) -> None:
             capabilities.append("shells=" + ",".join(row["shell_capabilities"]))
         if capabilities:
             print(f"        capabilities: {', '.join(capabilities)}")
+        # Protocol generation. Printed whenever it is NOT an exact match, so a
+        # node running different code is visible here rather than only showing
+        # up later as a route that behaves oddly.
+        compat = contract.compatibility(row.get("contract_version"), row.get("contract_capabilities"))
+        if compat["status"] != "ok":
+            missing = ", ".join(compat["missing_capabilities"]) or "none"
+            print(f"        contract: {compat['status'].upper()} "
+                  f"(peer v{compat['peer_contract_version']} vs local v{compat['local_contract_version']}; "
+                  f"must not assume: {missing})")
         if row["overload_reasons"]:
             print(f"        overload_reasons: {', '.join(row['overload_reasons'])}")
         if "test_connection" in row:
@@ -360,6 +445,57 @@ def _print_nodes_human(result: dict) -> None:
         print("  Remote nodes declared in config.yaml but not registered (token not set):")
         for skip in result["skipped_remote_nodes"]:
             print(f"    - {skip['node_id']}: {skip['reason']}")
+
+
+def cmd_fleet(args: argparse.Namespace) -> int:
+    """Fleet-metadata readiness, read from THIS machine's local cache.
+
+    Deliberately does not talk to the controller or to any node: this command
+    has to work during exactly the outage it is meant to diagnose. It reports
+    what this machine last replicated and how old that is -- which is the
+    honest answer, and a far more useful one than a connection error.
+
+    Exit code follows the worst check: 0 for PASS, 1 for WARN, 2 for FAIL,
+    so a cron wrapper can tell "needs a human eventually" from "something is
+    wrong right now".
+    """
+    from .fleet_registry import FleetRegistryStore
+    from .fleet_service import FAIL, PASS, WARN, FleetService
+
+    try:
+        store = FleetRegistryStore(args.db, local_node_id=args.node_id or "local")
+    except Exception as exc:  # noqa: BLE001
+        payload = {"status": FAIL, "error": f"{type(exc).__name__}: {exc}", "checks": []}
+        print(json.dumps(payload, sort_keys=True) if args.json
+              else f"FAIL  fleet registry unreadable: {payload['error']}")
+        return 2
+
+    service = FleetService(store, local_node_id=args.node_id or "local")
+    # Pinned fingerprints come from the controller's ConnectionStore when this
+    # runs on the controller; elsewhere there is nothing to compare against
+    # and the mismatch check correctly reports PASS rather than guessing.
+    pinned: dict[str, str] = {}
+    try:
+        from .connection_store import ConnectionStore
+
+        for row in ConnectionStore().list():
+            if row.host_key_fingerprint:
+                pinned[str(row.node_id)] = str(row.host_key_fingerprint)
+    except Exception:  # noqa: BLE001 -- absent on a plain node, which is fine
+        pinned = {}
+
+    result = service.readiness(known_fingerprints=pinned)
+    if args.json:
+        print(json.dumps(result, sort_keys=True, default=str))
+    else:
+        view = service.offline_view()
+        print(f"Fleet metadata on {result['local_node_id']} "
+              f"({len(view['nodes'])} node(s), {len(view['ssh_targets'])} SSH target(s), "
+              f"{len(view['sessions'])} session(s) -- served from {view['served_from']})")
+        for check in result["checks"]:
+            print(f"  {check['status']:<5} {check['check']:<26} {check['summary']}")
+        print(f"  ----- {result['status']}")
+    return {PASS: 0, WARN: 1, FAIL: 2}.get(result["status"], 2)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -390,6 +526,13 @@ def build_parser() -> argparse.ArgumentParser:
     conversations.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of text")
     conversations.add_argument("--config", default=None, help="Path to config.yaml (default: the usual lookup)")
     conversations.set_defaults(func=cmd_conversations)
+
+    fleet = subparsers.add_parser("fleet", help="Diagnose fleet metadata sync, SSH inventory and "
+                                                "credential/fingerprint readiness (works offline)")
+    fleet.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of text")
+    fleet.add_argument("--db", default=None, help="Path to fleet_registry.db (default: the usual lookup)")
+    fleet.add_argument("--node-id", default=None, help="This machine's node id (default: local)")
+    fleet.set_defaults(func=cmd_fleet)
 
     return parser
 

@@ -158,6 +158,14 @@ systemctl --user status terminal-mcp-http.service
 systemctl --user restart terminal-mcp-http.service
 ```
 
+For compact agent control, prefer `terminal_batch_inspect` over repeated
+status/tail calls, `terminal_send_task` over a manual text-plus-Enter sequence,
+and `terminal_wait_for_state` over client-side polling. These tools compose the
+existing authorization, binding, menu-detection, idempotency, and verified-submit
+paths; the lower-level tools remain available and backward compatible.
+
+Execution-aware node health is stricter than heartbeat-only presence: a node is green only after a bounded execution-backend probe succeeds. `terminal_node_health` exposes transport/execution state, retry/backoff evidence, last success, and sanitized failure details without changing legacy node APIs.
+
 Its unit is `~/.config/systemd/user/terminal-mcp-http.service`, runs as the
 current user, and uses `Restart=on-failure`. Authentication is intentionally
 not implemented as an ad-hoc MCP wrapper: it must be enforced by the HTTPS

@@ -30,6 +30,19 @@ def valid_new_session_name(session: str) -> bool:
 
 
 def session_allowed(session: str, config: AppConfig) -> bool:
+    """DEPRECATED -- MIGRATION ONLY. Not an authorization function any more.
+
+    This was the session-name whitelist that decided read access. It no longer
+    authorizes anything: access is decided by explicit grants plus the
+    session_access default policy (see TerminalService.
+    _read_authorized_with_grant). The only remaining caller is
+    migrate_whitelist_to_grants, which converts what this used to allow into
+    real grants exactly once so nobody loses access on upgrade.
+
+    Do not reintroduce this into an enforcement path. Deciding access from a
+    session's NAME is what produced the contradictory `allowed=false` +
+    `effective_read=true` state this replaced.
+    """
     if not valid_session_name(session):
         return False
     matched = [pattern for pattern in config.allowed_session_patterns if fnmatch.fnmatchcase(session, pattern)]
@@ -43,7 +56,10 @@ def session_allowed(session: str, config: AppConfig) -> bool:
 
 
 def binding_session_allowed(session: str, config: AppConfig) -> bool:
-    """Bindings never target sensitive sessions, even with an exact whitelist."""
+    """DEPRECATED -- no caller in any enforcement path. TerminalService.
+    _bind_authorized decides bind targets now, from the sensitive-name floor
+    plus ordinary read authorization. Kept only so an out-of-tree caller does
+    not break on upgrade; do not reintroduce it into a gate."""
     lowered = session.casefold()
     if any(word in lowered for word in SENSITIVE_SESSION_WORDS):
         return False
@@ -51,6 +67,7 @@ def binding_session_allowed(session: str, config: AppConfig) -> bool:
 
 
 def input_session_allowed(session: str, config: AppConfig) -> bool:
+    """DEPRECATED -- MIGRATION ONLY. See session_allowed above."""
     if not valid_session_name(session):
         return False
     policy = config.input_policy

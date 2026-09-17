@@ -13,10 +13,19 @@ import uvicorn
 
 from .ai_usage_service import AiUsageService
 from .config import load_config
+from . import endpoint_policy
 from .connection_store import ConnectionStore
+from .enrollment import EnrollmentStore
+from .node_credentials import NodeCredentialStore
+from .node_onboarding import OnboardingService
+from .node_transport import TransportStore
+from .rescue_gateway import RescuePortAllocator
 from .controller import LOCAL_NODE_ID, ControllerService
 from .core import TerminalService
 from .dashboard import node_token_env_var, register_dashboard
+from .fleet_loop import FleetSyncLoop, FleetSyncLoopConfig
+from .fleet_registry import FleetRegistryStore
+from .fleet_service import ControllerFleetSync, FleetService
 from .health import register_health
 from .integration_service import IntegrationService
 from .logging_setup import RequestIdMiddleware, SecurityHeadersMiddleware, configure_logging
@@ -43,7 +52,33 @@ from .webauth_dashboard import register_webauth_dashboard
 _log = logging.getLogger(__name__)
 
 HTTP_HOST = "127.0.0.1"
-HTTP_PORT = 8766
+
+
+def _http_port() -> int:
+    """The loopback port this controller serves on. 8766 unless
+    TERMINAL_MCP_HTTP_PORT says otherwise.
+
+    The override exists so a SECOND controller can be brought up beside a
+    running production one -- a staging instance, or the end-to-end
+    onboarding test, which needs a real process on a real socket and must
+    never bind the port the live dashboard is on. An unparseable or
+    out-of-range value falls back to the default rather than crashing a
+    production start over a typo'd environment variable."""
+    raw = os.environ.get("TERMINAL_MCP_HTTP_PORT")
+    if not raw:
+        return 8766
+    try:
+        port = int(raw)
+    except ValueError:
+        _log.warning("TERMINAL_MCP_HTTP_PORT=%r is not a number -- using 8766", raw)
+        return 8766
+    if not (1 <= port <= 65535):
+        _log.warning("TERMINAL_MCP_HTTP_PORT=%r is out of range -- using 8766", raw)
+        return 8766
+    return port
+
+
+HTTP_PORT = _http_port()
 HTTP_PATH = "/mcp"
 
 
@@ -119,7 +154,9 @@ def register_remote_nodes(controller, config) -> list[str]:
             continue
         controller.register_remote_node(remote.node_id, display_name=remote.display_name, hostname=remote.hostname,
                                         endpoint=remote.endpoint, token=token, max_sessions=remote.max_sessions,
-                                        timeout=remote.timeout_seconds)
+                                        timeout=remote.timeout_seconds,
+                                        self_heal_enabled=remote.self_heal_enabled,
+                                        self_heal_action=remote.self_heal_action)
         _log.info("nodes: registered remote node %r (%s)", remote.node_id, remote.endpoint)
         registered.append(remote.node_id)
     return registered
@@ -289,8 +326,31 @@ def main() -> None:
                       if config.session_lifecycle.allowed_cwd_roots else "/")
     registry = NodeRegistry(overload_thresholds=config.nodes.overload_thresholds,
                             heartbeat_thresholds=config.nodes.heartbeat_thresholds)
+    # Retired session-name whitelist -> real grants. Runs on EVERY node type
+    # (controller and node agent alike) so a fleet does not end up with one
+    # machine still honouring a whitelist the others have dropped. Additive,
+    # idempotent, and never fatal -- see migrate_whitelist_to_grants.
+    try:
+        _migration = terminal.migrate_whitelist_to_grants()
+        if _migration.get("read_granted") or _migration.get("input_granted") or _migration.get("errors"):
+            _log.info("session-access migration: read=%s input=%s errors=%s",
+                      _migration.get("read_granted"), _migration.get("input_granted"), _migration.get("errors"))
+    except Exception:  # noqa: BLE001 -- never block startup on a migration
+        _log.exception("session-access migration failed -- grants left unchanged")
+    # Default-open model: clear deny rows the SYSTEM wrote as bookkeeping so
+    # they stop reading as a security decision. A deny an actual person
+    # authored is preserved.
+    try:
+        _deny_migration = terminal.migrate_deny_records_to_default_open()
+        if _deny_migration.get("cleared") or _deny_migration.get("errors"):
+            _log.info("session-access migration: cleared system deny rows=%s preserved=%s errors=%s",
+                      _deny_migration.get("cleared"), _deny_migration.get("preserved_user_denies"),
+                      _deny_migration.get("errors"))
+    except Exception:  # noqa: BLE001 -- never block startup on a migration
+        _log.exception("deny-record migration failed -- grants left unchanged")
     controller = ControllerService(registry, local_client=LocalNodeClient(terminal),
-                                   local_workspace_root=workspace_root)
+                                   local_workspace_root=workspace_root,
+                                   node_health_config=config.nodes.health)
     register_remote_nodes(controller, config)
 
     # ONE explicit, persistent (real default ~/.local/state/terminal-mcp/
@@ -319,9 +379,22 @@ def main() -> None:
             _log.warning("nodes: skipping saved connection %r -- token file missing/unreadable "
                         "(re-connect it from the Nodes page)", saved.node_id)
             continue
-        controller.register_remote_node(saved.node_id, display_name=saved.node_id,
-                                        hostname=saved.hostname or saved.node_id, endpoint=saved.endpoint,
-                                        token=token)
+        try:
+            controller.register_remote_node(
+                saved.node_id, display_name=saved.node_id,
+                hostname=saved.hostname or saved.node_id, endpoint=saved.endpoint, token=token,
+                # A node the operator added under the documented opt-in
+                # must survive a restart; re-reading the same flag here is
+                # what keeps re-hydration consistent with how it was added.
+                allow_public_http=config.nodes.remote_connect.allow_public_manual_add)
+        except endpoint_policy.EndpointPolicyError as exc:
+            # A previously-saved endpoint that today's policy refuses:
+            # skip THAT node loudly rather than refusing to start at all.
+            # Failing the whole controller would take every other node
+            # down with it, which is a worse outcome than one node being
+            # visibly absent with the reason in the log.
+            _log.error("nodes: refusing to re-register %r -- %s", saved.node_id, exc)
+            continue
         # Same env var dashboard.py's node_heartbeat route re-reads on
         # every inbound push from this node -- see its own
         # node_token_env_var docstring. Without this, the node would
@@ -343,6 +416,43 @@ def main() -> None:
     # dashboard<->MCP split specifically).
     queue = QueueService()
     integration = IntegrationService()
+
+    # Self-service node onboarding (Nodes -> + Add Node -> Windows). ONE
+    # instance, real persistent default paths (~/.local/state/terminal-mcp/
+    # enrollment.db, transports.db, rescue.db) -- same "constructed once
+    # here, never the private-temp-file test default" discipline as
+    # ControllerService/NodeRegistry/ConnectionStore above. It shares this
+    # process's ConnectionStore and AuditStore on purpose: an enrolled
+    # node's bearer token lands in the SAME 0600 token store a manually
+    # connected node's does, so the re-hydration loop above brings it back
+    # after a restart with no extra code, and every enroll/revoke/remove
+    # lands in the SAME audit log as every other action.
+    # Persistent node credentials -- the durable half of rotation/revocation.
+    credentials = NodeCredentialStore()
+
+    def _manage_enrolled_token(node_id: str, token: str) -> None:
+        os.environ[node_token_env_var(node_id)] = token
+        try:
+            credentials.adopt(node_id, token)
+        except Exception:  # noqa: BLE001 -- never fail an enrollment over bookkeeping
+            _log.exception("could not record node %s's token for rotation", node_id)
+    onboarding = OnboardingService(
+        config, controller=controller, connection_store=connection_store,
+        enrollment_store=EnrollmentStore(), transport_store=TransportStore(),
+        port_allocator=RescuePortAllocator(
+            port_range=(config.nodes.onboarding.rescue.port_range_start,
+                        config.nodes.onboarding.rescue.port_range_end)),
+        audit=terminal.audit,
+        # The heartbeat route re-reads this env var on every inbound push;
+        # setting it here is what makes a freshly-enrolled node's very
+        # first heartbeat succeed instead of 401ing until a restart.
+        # Sets the env var the node's heartbeat verifies against AND
+        # records the token in the credential store, so a node enrolled
+        # today is rotatable/revocable without a later adoption step
+        # (blg_a3cc401d8275). Same helper shape as dashboard.py's own.
+        token_env_setter=_manage_enrolled_token,
+    )
+
     # Same "constructed ONCE, shared by both build_mcp and register_
     # dashboard" discipline as queue/integration just above -- the
     # Kanban board's own routing_reason display and the terminal_pm_*
@@ -390,6 +500,21 @@ def main() -> None:
     # P0.2: the bus is CONSTRUCTED (so publish/claim tools exist) but no
     # consumer loop is started here -- autonomous coordination stays off.
     events = EventBus()
+    # ONE explicit, persistent Fleet Metadata Registry (real default
+    # ~/.local/state/terminal-mcp/fleet_registry.db), shared by the MCP tools
+    # and the dashboard -- same "never fall into the private-temp-file test
+    # default" discipline as ControllerService/NodeRegistry/ConnectionStore
+    # above. Sharing one instance also means the tool surface and the
+    # dashboard read the same replicated view rather than two copies that
+    # drift apart. Never fatal: a node whose state directory is unwritable
+    # must still serve sessions, so a failure here degrades the fleet view
+    # and nothing else.
+    fleet = None
+    try:
+        fleet = FleetService(FleetRegistryStore(local_node_id=controller.local_node_id),
+                             local_node_id=controller.local_node_id)
+    except Exception:  # noqa: BLE001 -- never block startup on the fleet cache
+        _log.exception("fleet registry unavailable -- fleet views will report it")
     # ONE WebAuthStore for the whole process. Constructed HERE, before
     # register_dashboard, rather than a few lines below where it used to be:
     # the Notes routes authenticate against this exact store (see
@@ -400,12 +525,24 @@ def main() -> None:
     _ensure_webauth_bootstrap(webauth)
     server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
                        planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog, notes=notes,
-                       events=events)
+                       events=events, fleet=fleet)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
-                       recovery=recovery, backlog=backlog, notes=notes, webauth=webauth)
+                       recovery=recovery, backlog=backlog, fleet=fleet, onboarding=onboarding,
+                       credentials=credentials, notes=notes, webauth=webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)
     register_health(server, terminal, supervisor)
+
+    # Periodic demand for execution probes means false-online prevention and
+    # opt-in self-heal continue even with no dashboard client connected. The
+    # durable circuit breaker and resource lock in NodeHealthService remain
+    # authoritative across this loop, MCP calls, and process restarts.
+    if config.nodes.health.enabled:
+        from .node_health import NodeHealthLoop
+        health_loop = NodeHealthLoop(controller.reconcile_remote_node_health,
+                                     config.nodes.health.probe_interval_seconds)
+        health_loop.start()
+        atexit.register(health_loop.stop)
 
     # Supervisor tools (watch/status/events/run_once, and the v2 policy/
     # claim/decide/approve/send tools) are always available — only the
@@ -477,6 +614,35 @@ def main() -> None:
     # regardless of whether Supervisor Loop v1 is enabled, so its
     # retention/WAL maintenance is baseline hygiene, not gated behind that
     # unrelated opt-in.
+    # Worktree Janitor sweep (docs/WORKTREE_JANITOR.md, P3). The BACKGROUND
+    # THREAD is gated on its own flag, default off; terminal_worktree_sweep_
+    # run_once stays callable regardless, the same "manual always available,
+    # only the automatic trigger is gated" posture as queue/integration/
+    # auto_recovery above. Even with the loop running, nothing is removed
+    # unless worktree_janitor.mode is auto_execute -- so a deployment that
+    # enables the sweep without changing mode gets a periodic REPORT.
+    worktree_sweep = None
+    if config.worktree_janitor.sweep_enabled:
+        from .lease import ResourceLockStore
+        from .worktree_executor import WorktreeExecutor
+        from .worktree_sweep import WorktreeSweep
+
+        worktree_sweep = WorktreeSweep(
+            WorktreeExecutor(config.worktree_janitor.to_policy(), audit=terminal.audit,
+                             locks=ResourceLockStore(terminal.leases.path),
+                             store=queue.store,
+                             node_id=getattr(controller, "local_node_id", "local")),
+            store=queue.store, repo_roots=config.worktree_janitor.repo_roots,
+            interval_seconds=config.worktree_janitor.sweep_interval_seconds,
+            orphan_confirm_runs=config.worktree_janitor.orphan_confirm_runs,
+            orphan_min_age_seconds=config.worktree_janitor.orphan_min_age_seconds,
+            max_candidates_per_run=config.worktree_janitor.max_candidates_per_run,
+            budget_seconds=config.worktree_janitor.sweep_budget_seconds)
+        worktree_sweep.start()
+        _log.info("worktree janitor sweep started (mode=%s, interval=%ss)",
+                     config.worktree_janitor.mode,
+                     config.worktree_janitor.sweep_interval_seconds)
+
     maintenance_loop = MaintenanceLoop(
         audit=terminal.audit, supervisor2_store=supervisor_v2.store,
         bindings_path=terminal.bindings.path, config=config.maintenance,
@@ -484,6 +650,85 @@ def main() -> None:
     )
     maintenance_loop.start()
     atexit.register(maintenance_loop.stop)
+
+    # Fleet metadata refresh. Without it the registry decays past its own
+    # staleness threshold within fifteen minutes of every start, and every
+    # auth/readiness view can only answer UNKNOWN_STALE -- observed live on
+    # 2026-09-13 with the whole fleet 6.8 hours old. Never fatal: a
+    # controller must still serve sessions if the fleet cache cannot be
+    # opened at all.
+    if fleet is not None:
+        def _fleet_sources() -> dict:
+            """Local truth for the projectors. Each source is independently
+            failure-tolerant -- a refresh missing its SSH half is still worth
+            far more than no refresh."""
+            sessions, connections = [], []
+            try:
+                sessions = list(terminal.session_registry.list())
+            except Exception:  # noqa: BLE001
+                _log.exception("fleet sync: session registry unreadable")
+            try:
+                connections = list(connection_store.list())
+            except Exception:  # noqa: BLE001
+                _log.exception("fleet sync: connection store unreadable")
+            return {"sessions": sessions, "connections": connections}
+
+        fleet_loop = FleetSyncLoop(
+            sync=ControllerFleetSync(fleet, controller),
+            config=FleetSyncLoopConfig(
+                enabled=config.fleet_sync.enabled,
+                interval_seconds=config.fleet_sync.interval_seconds,
+                peer_exchange_enabled=config.fleet_sync.peer_exchange_enabled),
+            sources=_fleet_sources)
+        # So readiness can say WHY metadata is stale -- loop off, or loop
+        # failing -- instead of sending an operator to look at the nodes.
+        fleet.attach_sync_loop(fleet_loop)
+        fleet_loop.start()
+        atexit.register(fleet_loop.stop)
+
+    # Work Runtime coordinator. OFF unless config.work.enabled -- unlike the
+    # fleet loop, this one can cause an agent to be handed work on a real
+    # session, and a capability that acts on its own starts disabled.
+    if config.work.enabled:
+        try:
+            from .work_loop import WorkCoordinatorLoop, WorkLoopConfig
+            from .work_service import WorkService
+            from .work_store import WorkStore
+
+            work_service = WorkService(WorkStore(), queue=queue, controller=controller,
+                                       fleet=fleet)
+
+            def _work_evidence() -> dict:
+                """Sessions/nodes the eligibility gate needs. Failure-tolerant:
+                with no evidence the gate refuses, which is the safe
+                direction."""
+                try:
+                    listing = controller.terminal_list_sessions()
+                except Exception:  # noqa: BLE001
+                    _log.exception("work: session listing unavailable")
+                    return {"sessions": [], "nodes": {}, "statuses": {}}
+                nodes = {}
+                if fleet is not None:
+                    try:
+                        nodes = {n["node_id"]: n for n in fleet.offline_view()["nodes"]
+                                 if n.get("node_id")}
+                    except Exception:  # noqa: BLE001
+                        nodes = {}
+                return {"sessions": listing.get("sessions") or [], "nodes": nodes,
+                        "statuses": {}}
+
+            work_loop = WorkCoordinatorLoop(
+                service=work_service,
+                config=WorkLoopConfig(
+                    enabled=True, interval_seconds=config.work.interval_seconds,
+                    max_runs_per_tick=config.work.max_runs_per_tick,
+                    auto_enable_dispatch=config.work.auto_enable_dispatch),
+                evidence=_work_evidence)
+            work_loop.start()
+            atexit.register(work_loop.stop)
+            _log.info("work coordinator started (interval=%ss)", config.work.interval_seconds)
+        except Exception:  # noqa: BLE001 -- never block startup on an opt-in feature
+            _log.exception("work coordinator failed to start")
 
     # Durable Codex submissions are reconciled independently of request
     # workers.  This is deliberately local to the already-built TerminalService

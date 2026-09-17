@@ -58,6 +58,8 @@ attempt, independent of the lock (survives a lock TTL expiry/crash
 mid-attempt without ever being confused with an earlier attempt)."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import logging
 import uuid
 from typing import Any
@@ -66,11 +68,19 @@ from .core import (
     RECOVERY_STATE_BLOCKED, RECOVERY_STATE_DEGRADED, RECOVERY_STATE_PENDING, RECOVERY_STATE_RESUMED_OK,
 )
 from .lease import PaneLeaseStore
-from .session_registry import SessionRegistryStore
+from .session_registry import STATUS_KILLED, SessionRegistryStore
 
 _LOGGER = logging.getLogger(__name__)
 
 LOCK_KEY_PREFIX = "recovery:"
+
+# The cheapest recovery tier: the runtime session is still there, so nothing
+# is spawned and the durable record is simply reconciled back to ACTIVE. A
+# node-agent restart does not kill tmux, so a session marked MISSING while its
+# node was away is very often still sitting there when it returns -- reopening
+# it would hit SESSION_ALREADY_EXISTS and record a FAILED recovery for a
+# session that is in fact perfectly healthy.
+RECOVERY_STATE_RECONNECTED = "RECONNECTED"
 
 
 def _lock_key(node_id: str, session_name: str) -> str:
@@ -103,6 +113,107 @@ class RecoveryEngine:
             return True, None
         return False, "auto_recovery.enabled is False globally, and this session has no per-session override"
 
+    def _unmanaged_reason(self, record) -> str | None:
+        """Why this session is not ours to recreate, or None.
+
+        The controller recreates only what it was ASKED to create. A session
+        it merely observed -- someone's own `tmux new-session`, a test
+        fixture, an editor's terminal -- has no recorded launch command, so
+        recreating it would be guessing at another process's argv and cwd and
+        calling the guess a recovery.
+
+        CORRECTION (found while auditing this live): this used to key on
+        `launch_command`, believing it "is written by the lifecycle API at
+        creation and by nothing else". That was not true. An ordinary
+        discovery pass classified the agent running in a pane and wrote the
+        matching launcher onto the record, so any observed session running a
+        recognised agent -- someone's own `claude` in their own terminal, a
+        session left by a test run on a shared tmux server -- carried a launch
+        command it never got from us and was indistinguishable from one this
+        controller created. On this fleet that was 26 such records, two of
+        them inside the recovery window, with auto-recovery on.
+
+        Provenance is now recorded rather than inferred: `created_by_
+        controller` is set once by the create path and latches. A session we
+        cannot prove we launched is not ours to relaunch.
+
+        force=True bypasses it: an operator explicitly reopening something is
+        making that judgement themselves.
+        """
+        if not self.config.managed_sessions_only:
+            return None
+        if getattr(record, "created_by_controller", False) and getattr(record, "launch_command", None):
+            return None
+        return ("this controller has no record of creating the session -- it was discovered, "
+                "not launched here, so there is nothing to recreate it FROM and recreating it "
+                "would be guessing at another process's argv; reopen it explicitly if that is wanted")
+
+    def _staleness_reason(self, record) -> str | None:
+        """Why this record is too old to resurrect automatically, or None.
+
+        This registry keeps a row for every session that ever existed,
+        including disposable ones from test runs that ended normally, so
+        "MISSING and metadata_complete" is not on its own a reason to spawn a
+        process today. Age runs from last_seen_at -- when the session was last
+        observed ALIVE. An unparseable timestamp is treated as NOT stale:
+        refusing recovery on a formatting problem would be the worse failure.
+        """
+        limit = self.config.max_missing_age_seconds
+        if not limit:
+            return None
+        last_seen = getattr(record, "last_seen_at", None)
+        if not last_seen:
+            return None
+        try:
+            seen_at = datetime.fromisoformat(last_seen)
+        except (TypeError, ValueError):
+            return None
+        if seen_at.tzinfo is None:
+            seen_at = seen_at.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - seen_at).total_seconds()
+        if age <= limit:
+            return None
+        return (f"last seen alive {int(age)}s ago, beyond auto_recovery."
+                f"max_missing_age_seconds={int(limit)} -- reopen it explicitly if it is still wanted")
+
+    def _live_sessions_on(self, node_id: str) -> set[str] | None:
+        """Names currently LIVE on `node_id`, or None if that can't be known.
+
+        Deliberately a fresh fleet listing, NOT controller.resolve_session:
+        that method answers from a TTL'd session-location cache, so a session
+        killed a moment ago still resolves to its old node. Using it here made
+        a genuinely dead session look alive and silently skipped its recovery
+        -- caught by the live MCP round-trip test, which kills a real tmux
+        session and then expects a real respawn.
+
+        Best-effort: a controller without this method, or one that raises,
+        returns None and the caller proceeds with a normal recovery rather
+        than being blocked by a probe failure.
+        """
+        listing_fn = getattr(self.controller, "terminal_list_sessions", None)
+        if listing_fn is None:
+            return None
+        try:
+            listing = listing_fn()
+        except Exception:  # noqa: BLE001 -- a probe failure must never block recovery
+            _LOGGER.debug("recovery: liveness probe failed for node %s", node_id, exc_info=True)
+            return None
+        if not isinstance(listing, dict) or "sessions" not in listing:
+            return None
+        return {row.get("name") for row in listing.get("sessions", [])
+                if row.get("node_id") == node_id}
+
+    def _runtime_session_alive(self, node_id: str, session_name: str,
+                               live: set[str] | None = None) -> bool:
+        """True only if this EXACT session is live on THIS node right now.
+
+        The node_id scoping is not optional: the same bare name on another
+        node is a DIFFERENT session, and reconnecting this record to it would
+        silently rebind it onto someone else's process.
+        """
+        names = live if live is not None else self._live_sessions_on(node_id)
+        return bool(names is not None and session_name in names)
+
     def _qualified(self, node_id: str, session_name: str) -> str:
         # ALWAYS the qualified node_id/session form, local node
         # included: controller.resolve_session's own bare-name lookup
@@ -115,7 +226,7 @@ class RecoveryEngine:
         return f"{node_id}/{session_name}"
 
     def recover_session(self, node_id: str, session_name: str, *, requested_by: str | None = None,
-                        force: bool = False) -> dict[str, Any]:
+                        force: bool = False, live: set[str] | None = None) -> dict[str, Any]:
         """The one real recovery attempt -- called by reconcile_node
         below (automatic) or directly by terminal_recover_session (a
         human's explicit manual trigger, which is exactly the SAME code
@@ -128,7 +239,44 @@ class RecoveryEngine:
         if not record.recoverable:
             return {"error": "NOT_RECOVERABLE", "node_id": node_id, "session": session_name,
                     "status": record.status, "metadata_complete": record.metadata_complete}
+        # TOMBSTONE. `recoverable` deliberately includes KILLED so a human can
+        # press Reopen on it from the killed-sessions list -- that is a real,
+        # wanted feature and it still works (force=True, which is what an
+        # explicit human trigger passes). What must never happen is the
+        # BACKGROUND pass making that call on the operator's behalf:
+        # "restore what a reboot took away" and "undo what the operator chose"
+        # are different things, and only the first may happen by itself.
+        # DELETED never reaches here at all -- it is not in RECOVERABLE_STATUSES.
+        if not force and record.status == STATUS_KILLED:
+            reason = ("session was intentionally killed (tombstone) -- automatic recovery never "
+                      "undoes an operator's own stop; reopen it explicitly if that is wanted")
+            self.registry.set_recovery_state(node_id, session_name, RECOVERY_STATE_BLOCKED, detail=reason)
+            return {"error": "RECOVERY_TOMBSTONED", "node_id": node_id, "session": session_name,
+                    "status": record.status, "reason": reason}
+        # SOFT_RECONNECT, before anything that spawns or spends the attempt
+        # budget: a session that keeps coming back on its own must never
+        # exhaust max_attempts and end up BLOCKED for being healthy.
+        if self._runtime_session_alive(node_id, session_name, live):
+            self.registry.upsert_seen(node_id, session_name)
+            self.registry.set_recovery_state(
+                node_id, session_name, RECOVERY_STATE_RECONNECTED,
+                detail="runtime session was still alive -- record reconciled, nothing respawned")
+            return {"node_id": node_id, "session": session_name, "soft_reconnect": True,
+                    "recovery_state": RECOVERY_STATE_RECONNECTED,
+                    "detail": "runtime session still alive; registry reconciled without a respawn"}
         if not force:
+            unmanaged_reason = self._unmanaged_reason(record)
+            if unmanaged_reason is not None:
+                self.registry.set_recovery_state(node_id, session_name, RECOVERY_STATE_BLOCKED,
+                                                 detail=unmanaged_reason)
+                return {"error": "RECOVERY_UNMANAGED", "node_id": node_id, "session": session_name,
+                        "reason": unmanaged_reason}
+            stale_reason = self._staleness_reason(record)
+            if stale_reason is not None:
+                self.registry.set_recovery_state(node_id, session_name, RECOVERY_STATE_BLOCKED,
+                                                 detail=stale_reason)
+                return {"error": "RECOVERY_STALE", "node_id": node_id, "session": session_name,
+                        "reason": stale_reason}
             allowed, reason = self._recovery_allowed(record)
             if not allowed:
                 self.registry.set_recovery_state(node_id, session_name, RECOVERY_STATE_BLOCKED, detail=reason)
@@ -197,10 +345,15 @@ class RecoveryEngine:
         listing = self.controller.registry_list(node_id, recoverable_only=True)
         if "error" in listing:
             return [{"error": listing["error"], "node_id": node_id, "detail": listing.get("detail")}]
+        # One liveness listing for the WHOLE pass, not one per session: after a
+        # node reconnects, most of its "missing" records are usually sessions
+        # that simply survived, and probing the fleet once per record would
+        # turn a cheap reconcile into N round-trips.
+        live = self._live_sessions_on(node_id)
         results = []
         for row in listing.get("records", []):
             session_name = row["session_name"]
-            results.append(self.recover_session(node_id, session_name, requested_by=requested_by))
+            results.append(self.recover_session(node_id, session_name, requested_by=requested_by, live=live))
         return results
 
     def checkpoint(self, node_id: str, session_name: str, *, detail: str) -> dict[str, Any]:

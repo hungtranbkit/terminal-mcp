@@ -66,6 +66,11 @@ def remote_node_agent(tmp_path):
         "allowed_session_patterns": ["remoteterm-*"],
         "input_policy": {"allowed_session_patterns": ["remoteterm-*"]},
         "session_lifecycle": {"enabled": True, "allowed_cwd_roots": [str(workspace)]},
+        # The node agent runs in a SEPARATE PROCESS, so the suite-wide access
+        # default set in conftest cannot reach it -- it loads this file and
+        # would otherwise get the shipped production posture, which grants
+        # nothing. The patterns above no longer authorize anything.
+        "session_access": {"default_read": True, "default_input": True},
     }))
     env = os.environ.copy()
     env["TERMINAL_MCP_CONFIG"] = str(config_path)

@@ -1,0 +1,244 @@
+{
+  "schema_version": 1,
+  "generated_for": "Terminal MCP Finish Gate",
+  "generated_at": "2026-09-11",
+  "commit": "d661ffc84c3787e4fd1220dd0fe8f91733dd9c5b",
+  "version": "0.13.0",
+  "dashboard_template_sha256": "0eaf969175308dfaa2386fe13a0bfa17f8e46b995cefcd4b0b3d88522d10d2ce",
+  "contract_version_local": 1,
+  "statuses": [
+    "PASS",
+    "PASS_WITH_LIMITATION",
+    "MAINTENANCE_REQUIRED",
+    "BLOCKED",
+    "NOT_APPLICABLE"
+  ],
+  "rule": "PASS requires runtime verification. Code existing is not PASS.",
+  "baseline": {
+    "tmux_server_pid": 26175,
+    "controller_pid_before": 2466873,
+    "sessions_total": 20,
+    "local_sessions": [
+      {
+        "name": "m1",
+        "session_id": "$0",
+        "pane_pid": 26176,
+        "command": "claude"
+      },
+      {
+        "name": "m2",
+        "session_id": "$192",
+        "pane_pid": 158083,
+        "command": "claude"
+      },
+      {
+        "name": "terminal-mcp-main",
+        "session_id": "$141",
+        "pane_pid": 117992,
+        "command": "claude"
+      }
+    ],
+    "remote_nodes": {
+      "dell-5530": {
+        "sessions": 3,
+        "generation": "e19d32ef22e3bdf3",
+        "version": "0.12.0",
+        "contract": 0
+      },
+      "dell-linux": {
+        "sessions": 9,
+        "generation": "d7391890eff6ba34",
+        "version": "0.12.0",
+        "contract": 0
+      },
+      "hp-linux": {
+        "sessions": 4,
+        "generation": "98e17755c5f76544",
+        "version": "0.12.0",
+        "contract": 0
+      },
+      "macbook": {
+        "sessions": 1,
+        "generation": "5661867fbdae492f",
+        "version": "0.12.0",
+        "contract": 0
+      }
+    },
+    "grants": 6,
+    "registry_active": 3,
+    "bindings": 0,
+    "sessions_not_fully_open": []
+  },
+  "areas": [
+    {
+      "id": 1,
+      "name": "core MCP/API/list/status/read/send/bindings/supervisor",
+      "status": "PASS",
+      "evidence": "live MCP round-trip on 127.0.0.1:8766: tools/list=208; terminal_list_sessions=20 rows; terminal_status(hp1) exists=true; terminal_tail(m2) returned output; terminal_list_bindings=[]; terminal_send_text dry_run=true would_send=true on m1/terminal-mcp-main/mesflow/win1/hp1 (nothing sent)"
+    },
+    {
+      "id": 2,
+      "name": "default-open permissions, no whitelist, explicit lock still works",
+      "status": "PASS",
+      "evidence": "20/20 sessions effective_read=input=true; grants.db has 6 rows, none denying; sensitive-name floor + denied patterns + global switches covered by tests/test_default_open_permissions.py and tests/test_session_access_no_whitelist.py; AST test forbids any whitelist helper outside the one-time migration",
+      "fixed_this_round": "legacy `allowed` reported False on all 16 remote rows beside effective_read=true; normalised in controller.terminal_list_sessions"
+    },
+    {
+      "id": 3,
+      "name": "dashboard desktop + mobile",
+      "status": "PASS",
+      "evidence": "Chromium against the real served route (served sha256 == module sha256). desktop 1440x900 terminal 60.7%, 1920x1080 71.8%, mobile 390x844 80.8%, 430x932 82.6%; node grouping 5 groups with status+count+collapse; collapse 914->717px; attention badges 20 false -> 1 true; View/Send control visible with default-open wording; 60 bulk checkboxes on /dashboard/sessions; 7 terminal special keys; no horizontal overflow"
+    },
+    {
+      "id": 4,
+      "name": "single-submit / bounded retry / ghost suggestion / idempotency",
+      "status": "PASS",
+      "evidence": "tests/test_submit_config_wiring.py, test_submit_profiles.py, test_verified_submit_watchdog.py: 41 passed"
+    },
+    {
+      "id": 5,
+      "name": "federation / local-first / M910 unavailable",
+      "status": "PASS_WITH_LIMITATION",
+      "evidence": "all 4 node agents answer /v1/health and /v1/sessions directly, independent of the controller; agent generations unchanged across two controller restarts, proving session runtime does not depend on the controller; tests/test_selfhost_controller_outage.py passes",
+      "limitation": "no second controller is running. Losing M910 today removes the MCP surface, dashboard, cross-node routing and the recovery loop. dell-5530 has no Tailscale, so it is LAN-reachable only."
+    },
+    {
+      "id": 6,
+      "name": "recovery metadata / stable identity / tombstone / no resurrection",
+      "status": "PASS",
+      "evidence": "156 passed across recovery/self-host/contract/registry suites; after the controller restart the recovery loop ran and blocked every candidate with the provenance reason, spawning nothing; recovery-eligible rows = 0 of 270; 0 drop events"
+    },
+    {
+      "id": 7,
+      "name": "environment / auth / profile / fleet doctor / drift",
+      "status": "PASS_WITH_LIMITATION",
+      "evidence": "terminal-mcp-node-doctor on m910: FAILOVER_READY True, roles auto-detected (node, controller); gstack reported MISSING and correctly not required; version bumped to 0.13.0 so controller/node drift is visible in `version`, not only in contract_version",
+      "limitation": "the doctor cannot be run on the remote nodes from this session: outbound SSH is blocked by the sandbox, and the node agents are too old to expose it over /v1"
+    },
+    {
+      "id": 8,
+      "name": "Linux/macOS/Windows differences, tmux/ConPTY safety",
+      "status": "PASS",
+      "evidence": "100 passed across windows/conpty/backend suites; ConPTY sessions live inside the agent process, which is why dell-5530 is last in the maintenance plan"
+    },
+    {
+      "id": 9,
+      "name": "service/systemd configs, KillMode, bind",
+      "status": "PASS",
+      "evidence": "terminal-mcp-http KillMode=process active+enabled; terminal-node-agent KillMode=process inactive+disabled; heartbeat relay KillMode=process active+enabled; linger=yes; bind guard refuses 8.8.8.8 and 127.0.0.1, accepts 192.168.1.109. Static audit only; nothing restarted except terminal-mcp-http."
+    },
+    {
+      "id": 10,
+      "name": "DB migration / integrity / concurrency",
+      "status": "PASS",
+      "evidence": "integrity_check=ok and journal_mode=wal on session_registry(v4), grants(v2), bindings(v1), leases(v3), audit(v3); registry migration 4 applied live and measured (0 of 270 rows carry provenance)"
+    },
+    {
+      "id": 11,
+      "name": "security / auth / redaction / secrets / CF / Tailscale",
+      "status": "PASS",
+      "evidence": "140 passed across redaction/auth/hardening/network-bind suites; no token, credential or CF audience appears in any served template (the only cloudflareaccess.com match is the public domain suffix used to detect a login redirect); the dashboard refused unauthenticated loopback access during this gate and was not bypassed"
+    },
+    {
+      "id": 12,
+      "name": "packaging / install / update / rollback / provenance",
+      "status": "PASS_WITH_LIMITATION",
+      "evidence": "editable install from /home/mesflow/terminal-mcp; version 0.13.0; dashboard template hash matches what the route serves; rollback documented in M910_OFF_READINESS.md",
+      "limitation": "no push credential, so 16 commits are local-only. Node upgrade is by git bundle (delivered to dell-linux, sha256 verified) and needs a maintenance window."
+    },
+    {
+      "id": 13,
+      "name": "test suites incl. Playwright",
+      "status": "PASS",
+      "evidence": "see test_summary; browser suites run against a disposable in-process route with stubbed fleet data, never against production"
+    },
+    {
+      "id": 14,
+      "name": "docs / runbook / acceptance matrix",
+      "status": "PASS",
+      "evidence": "REPORT.md, M910_OFF_READINESS.md, docs/CONTROLLER_RUNBOOK.md, docs/REQUIREMENTS.md, docs/GSTACK_INTEGRATION.md, this file"
+    }
+  ],
+  "m910_off": {
+    "normal_use_readiness": {
+      "verdict": "READY",
+      "basis": "everything a normal working day needs is verified running: 20/20 sessions reachable and writable, MCP surface with 208 tools, dashboard on desktop and mobile, recovery gated and inert, no session lost across two controller restarts"
+    },
+    "ha_failover_readiness": {
+      "verdict": "NOT_READY",
+      "unmet": [
+        "no second controller is actually serving; M910 is still the only MCP/dashboard/routing plane",
+        "dell-5530 has no Tailscale, so it is unreachable once off the LAN",
+        "all 4 nodes run contract v0 and cannot report the handshake a federated peer needs",
+        "cold-boot autostart has never been observed on hp-linux or dell-linux"
+      ],
+      "note": "deliberately not expressed as a percentage; each item above is binary and none is met"
+    }
+  },
+  "maintenance_required": [
+    {
+      "id": "M1",
+      "node": "macbook",
+      "action": "upgrade agent to 0.13.0, verify contract_version 1",
+      "risk": "low",
+      "sessions_at_risk": 1
+    },
+    {
+      "id": "M2",
+      "node": "hp-linux",
+      "action": "upgrade agent; bind its controller to the tailnet address; install a node-agent unit",
+      "risk": "medium",
+      "sessions_at_risk": 4
+    },
+    {
+      "id": "M3",
+      "node": "dell-linux",
+      "action": "apply the staged bundle, upgrade agent",
+      "risk": "medium",
+      "sessions_at_risk": 9
+    },
+    {
+      "id": "M4",
+      "node": "hp-linux",
+      "action": "cold-boot acceptance",
+      "risk": "medium",
+      "sessions_at_risk": 4
+    },
+    {
+      "id": "M5",
+      "node": "dell-5530",
+      "action": "install Tailscale, repoint controller-url, upgrade agent",
+      "risk": "high",
+      "sessions_at_risk": 3,
+      "note": "ConPTY sessions live inside the agent process; restarting it destroys win1/win2/wtest. Last, and only with explicit approval."
+    }
+  ],
+  "blocked": [
+    {
+      "item": "run the fleet doctor on remote nodes",
+      "reason": "outbound SSH blocked by this session's sandbox; agents too old to expose it over /v1"
+    },
+    {
+      "item": "push commits",
+      "reason": "no push credential available"
+    },
+    {
+      "item": "fetch the production dashboard HTML directly",
+      "reason": "Cloudflare Access, deliberately not bypassed; verified by hash equality against the module instead"
+    }
+  ],
+  "test_summary": {
+    "command": "pytest -q (168 files, run in 4 sequential batches to stay inside this host's memory)",
+    "passed": 2812,
+    "failed": 0,
+    "skipped": 1,
+    "deselected": 16,
+    "skipped_detail": "codex is not installed on this host",
+    "batches": {
+      "00": 770,
+      "01": 555,
+      "02": 717,
+      "03": 770
+    }
+  }
+}

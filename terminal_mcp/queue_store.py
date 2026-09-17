@@ -42,6 +42,7 @@ from __future__ import annotations
 import calendar
 import contextlib
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -51,6 +52,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
+_LOGGER = logging.getLogger(__name__)
+
+from . import requirement_contract as rc
+
+from . import worktree_cleanup as wj
 from .schema import Migration, apply_migrations
 
 # -- Task status state machine ------------------------------------------
@@ -230,6 +236,22 @@ class InvalidTransitionError(ValueError):
     fail loudly in a test, not quietly corrupt a task's history."""
 
 
+class RequirementsNotCoveredError(ValueError):
+    """Raised by mark_completed_with_evidence when the task carries a
+    requirement contract whose required criteria are not all covered (or
+    explicitly waived with an actor and a reason), or whose evidence was
+    reconciled against a stale contract version.
+
+    Carries the full `GateDecision` so a caller can report WHICH requirement
+    ids are missing rather than only that something was refused -- the
+    reported MESFlow failure was exactly a missing id nobody could name.
+    """
+
+    def __init__(self, decision: "rc.GateDecision") -> None:
+        super().__init__(f"{decision.reason}: {decision.detail}")
+        self.decision = decision
+
+
 class TaskAlreadyClaimedError(ValueError):
     """Raised by reassign_task (Task Migration/Load Balancing, item 12's
     own race-safety requirement) when the task is no longer in a
@@ -289,6 +311,17 @@ class QueueTask:
     # Orchestration V1: which user-visible deliverable this task rolls up
     # into. Nullable -- a task with no outcome behaves exactly as before.
     outcome_id: str | None = None
+    # The caller's own key for the REQUEST that created this task, so a
+    # retry returns this task instead of making a second one. Nullable:
+    # a task created without one behaves exactly as before.
+    request_key: str | None = None
+    # Requirement Contract (migration v10). All nullable: a task without a
+    # contract reconciles to NO_CONTRACT and completes exactly as before.
+    requirement_contract: dict[str, Any] = field(default_factory=dict)
+    evidence_matrix: dict[str, Any] = field(default_factory=dict)
+    # Deployment is a fact about an artifact, NOT a task status -- see
+    # _add_v10_requirement_contract. Deploying never changes `status`.
+    deploy_state: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "QueueTask":
@@ -299,6 +332,12 @@ class QueueTask:
             attempt_count=row["attempt_count"], max_attempts=row["max_attempts"],
             completion_policy=_parse_json_object(row["completion_policy"]),
             last_error=row["last_error"], correlation_id=row["correlation_id"],
+            request_key=(row["request_key"] if "request_key" in row.keys() else None),
+            requirement_contract=(_parse_json_object(row["requirement_contract"])
+                                  if "requirement_contract" in row.keys() else {}),
+            evidence_matrix=(_parse_json_object(row["evidence_matrix"])
+                             if "evidence_matrix" in row.keys() else {}),
+            deploy_state=(row["deploy_state"] if "deploy_state" in row.keys() else None),
             metadata=_parse_json_object(row["metadata"]), updated_at=row["updated_at"],
             paused_from_status=row["paused_from_status"],
             priority=row["priority"], depends_on=tuple(_parse_json_list(row["depends_on"])),
@@ -325,7 +364,8 @@ class QueueTask:
             "created_at": self.created_at, "started_at": self.started_at, "completed_at": self.completed_at,
             "attempt_count": self.attempt_count, "max_attempts": self.max_attempts,
             "completion_policy": self.completion_policy, "last_error": self.last_error,
-            "correlation_id": self.correlation_id, "metadata": self.metadata, "updated_at": self.updated_at,
+            "correlation_id": self.correlation_id, "request_key": self.request_key,
+            "metadata": self.metadata, "updated_at": self.updated_at,
             "paused_from_status": self.paused_from_status,
             "priority": self.priority, "depends_on": list(self.depends_on), "node_id": self.node_id,
             "claimed_by": self.claimed_by, "claim_token": self.claim_token,
@@ -692,6 +732,56 @@ def _add_v8_outcomes(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_queue_tasks_outcome ON queue_tasks(outcome_id, status)")
 
 
+def _add_v9_request_key(connection: sqlite3.Connection) -> None:
+    """Idempotent task CREATION.
+
+    The queue already had idempotency for the DISPATCH side -- a sticky
+    key derived from (task_id, attempt) so a retried send cannot deliver a
+    prompt twice. Creation had none, so a caller that retried after a
+    timeout, or a client that resent on reconnect, silently produced a
+    SECOND task for one request. For an agent-driven caller that is the
+    common case, not the rare one.
+
+    `request_key` is nullable and additive: every existing row and every
+    existing call behaves exactly as before. The UNIQUE index is PARTIAL --
+    NULLs are excluded -- so tasks created without a key are unaffected and
+    can still be created freely. The uniqueness is enforced by the database
+    rather than by a read-then-write in the service, because two concurrent
+    retries of the same request would otherwise both find nothing and both
+    insert."""
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(queue_tasks)")}
+    if "request_key" not in columns:
+        connection.execute("ALTER TABLE queue_tasks ADD COLUMN request_key TEXT")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_tasks_request_key "
+        "ON queue_tasks(request_key) WHERE request_key IS NOT NULL")
+
+
+def _add_v10_requirement_contract(connection: sqlite3.Connection) -> None:
+    """What the task was asked for, what proved it, and where it was deployed.
+
+    See docs/MISS_TASK_ROOT_CAUSE.md. RC3: a missing acceptance criterion was
+    not a representable fact, so no gate could enforce it. RC6: there was no
+    DEPLOYED concept at all, so "I got it onto TEST" had only one word
+    available -- COMPLETED -- and the conflation was structural.
+
+    All three columns are nullable and additive. A task created before this
+    migration reads NULL, takes the no-contract path, and behaves exactly as it
+    did. `deploy_state` is deliberately NOT a task status: deployment is a fact
+    about an artifact, not a stage of a task's lifecycle, and modelling it as a
+    status would have meant editing VALID_TRANSITIONS and re-deciding every
+    edge. A task can be DEPLOYED_TEST while still RUNNING.
+    """
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(queue_tasks)")}
+    for column, declaration in (
+        ("requirement_contract", "TEXT"),   # JSON RequirementContract, append-only versions
+        ("evidence_matrix", "TEXT"),        # JSON EvidenceMatrix, requirement_id -> status
+        ("deploy_state", "TEXT"),           # NOT_DEPLOYED/DEPLOYED_TEST/DEPLOYED_PROD, never a status
+    ):
+        if column not in columns:
+            connection.execute(f"ALTER TABLE queue_tasks ADD COLUMN {column} {declaration}")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
@@ -711,7 +801,28 @@ QUEUE_MIGRATIONS = [
     Migration(8, "Orchestration V1: outcomes table + queue_tasks.outcome_id (nullable, additive) -- "
                  "the user-visible deliverable one backlog item may need N tasks to reach",
               _add_v8_outcomes),
+    Migration(9, "idempotent creation: queue_tasks.request_key (nullable) + a PARTIAL unique "
+                 "index, so a retried create returns the SAME task instead of a second one",
+              _add_v9_request_key),
+    Migration(10, "Requirement Contract: queue_tasks.requirement_contract/evidence_matrix "
+                  "(nullable) so a missing acceptance criterion is a representable fact, "
+                  "plus deploy_state kept OFF the status enum so deploying never reads as done",
+              _add_v10_requirement_contract),
 ]
+
+
+def _epoch_or_none(value: Any) -> float | None:
+    """An ISO timestamp -> epoch seconds, or None. Never raises: a sweep must
+    not die on one unparseable row."""
+    if not value:
+        return None
+    try:
+        from datetime import datetime
+
+        text = str(value).replace("Z", "+00:00")
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
 class QueueStore:
@@ -1077,13 +1188,13 @@ class QueueStore:
                 connection.execute(
                     "INSERT INTO queue_tasks (id, session, position, title, prompt, status, created_at, "
                     "attempt_count, max_attempts, completion_policy, metadata, updated_at, priority, depends_on, "
-                    "original_owner, project_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "original_owner, project_id, request_key) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (task_id, session, next_position + offset, task.get("title") or "", task["prompt"], QUEUED, now,
                      int(task.get("max_attempts") or 3), json.dumps(task.get("completion_policy") or {}),
                      json.dumps(task.get("metadata") or {}), now, int(task.get("priority") or 0),
                      json.dumps(list(task.get("depends_on") or [])), session,
-                     task.get("project_id")),
+                     task.get("project_id"), task.get("request_key") or None),
                 )
                 self._record_event_locked(connection, session=session, task_id=task_id, event_type="ENQUEUED",
                                           reason=None)
@@ -1091,6 +1202,64 @@ class QueueStore:
 
     def append_tasks(self, session: str, tasks: list[dict[str, Any]]) -> list[str]:
         return self.set_tasks(session, tasks, replace_pending=False)
+
+    def waiting_since(self, task_id: str, status: str) -> str | None:
+        """When this task most recently ENTERED `status`, from its own events.
+
+        Derived rather than stored: the transition is already written to
+        queue_events, and a second copy on the row could disagree with it.
+        """
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT timestamp FROM queue_events WHERE task_id = ? AND event_type = ? "
+                "ORDER BY id DESC LIMIT 1", (task_id, status)).fetchone()
+        return row["timestamp"] if row else None
+
+    def record_manual_dispatch(self, task_id: str, *, detail: dict[str, Any]) -> dict[str, Any] | None:
+        """Reconcile a send that went round the queue onto the task itself.
+
+        An event alone was not enough. Every API and every UI reads the TASK,
+        so a task whose prompt had really been delivered by hand still looked
+        untouched -- the queue said PAUSED, the worker was busy, and the
+        screen showed neither. Recording it here means "dispatched outside
+        the queue" is a visible fact rather than a discrepancy someone has to
+        notice.
+
+        Deliberately does NOT move the task's status. The queue genuinely did
+        not dispatch it, and claiming otherwise would make the state machine
+        lie about its own behaviour. What changes is that the bypass is now
+        on the record.
+        """
+        with self._connection() as connection:
+            row = connection.execute("SELECT metadata FROM queue_tasks WHERE id = ?",
+                                     (task_id,)).fetchone()
+            if row is None:
+                return None
+            try:
+                metadata = json.loads(row["metadata"] or "{}")
+            except ValueError:
+                metadata = {}
+            history = list(metadata.get("manual_dispatch_history") or [])
+            history.append(detail)
+            metadata["manual_dispatch"] = detail
+            metadata["manual_dispatch_history"] = history[-10:]
+            connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                               (json.dumps(metadata), iso_now(), task_id))
+        return detail
+
+    def task_by_request_key(self, request_key: str) -> dict[str, Any] | None:
+        """The task a previous call with this key already created, if any.
+
+        Returns the WHOLE task rather than just its id: a caller retrying
+        wants the same answer it would have got the first time, including
+        the state the task has reached since.
+        """
+        if not request_key:
+            return None
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM queue_tasks WHERE request_key = ?", (request_key,)).fetchone()
+        return QueueTask.from_row(row).to_dict() if row is not None else None
 
     def move_task_to_session(self, task_id: str, new_session: str) -> dict[str, Any]:
         """Unified Task System checkpoint (2026-09-07): reassigns an
@@ -1335,7 +1504,32 @@ class QueueStore:
         row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
         self._record_event_locked(connection, session=row["session"], task_id=task_id, event_type=event_type,
                                   reason=reason, from_status=from_status, to_status=to_status)
+        # Worktree Janitor P1 (docs/WORKTREE_JANITOR.md §2 "The lifecycle
+        # chokepoint"): this is the ONLY place a task's status changes, so it
+        # is the only correct hook site -- on_completed has two call sites and
+        # would leave the other path silently unmarked. Written inside the SAME
+        # transaction as the status update, so a crash cannot leave the status
+        # and the cleanup record disagreeing. MARKING ONLY: nothing deletes.
+        row = self._apply_worktree_cleanup_locked(
+            connection, row, from_status=from_status, to_status=to_status, now=now)
         return QueueTask.from_row(row)
+
+    def _apply_worktree_cleanup_locked(self, connection: sqlite3.Connection, row: sqlite3.Row, *,
+                                       from_status: str, to_status: str, now: str) -> sqlite3.Row:
+        """Mark or clear this task's worktree-cleanup record. Never deletes."""
+        metadata = _parse_json_object(row["metadata"])
+        decision = wj.decide(
+            from_status=from_status, to_status=to_status, metadata=metadata,
+            attempt_count=row["attempt_count"], max_attempts=row["max_attempts"],
+            terminal_statuses=TERMINAL_STATUSES)
+        if not decision.changes_record:
+            return row
+        updated = wj.apply(metadata, decision, now=now)
+        connection.execute("UPDATE queue_tasks SET metadata = ? WHERE id = ?",
+                           (json.dumps(updated), row["id"]))
+        self._record_event_locked(connection, session=row["session"], task_id=row["id"],
+                                  event_type=decision.event_type, reason=decision.reason)
+        return connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (row["id"],)).fetchone()
 
     # -- Phase 2: atomic claim + Coordinator Agent gate + reconciliation ---
 
@@ -1384,6 +1578,152 @@ class QueueStore:
             raise
         finally:
             connection.close()
+
+    def list_isolated_worktree_paths(self, *, limit: int = 10_000) -> set[str]:
+        """Every worktree path ANY task claims, in ANY status.
+
+        Deliberately NOT derived from list_worktree_cleanup_tasks: that one only
+        returns tasks which already carry a cleanup record, so a task that is
+        still RUNNING -- the most important one to protect -- would be absent and
+        its worktree would look unclaimed to the orphan sweep. Keyed on
+        git_isolation.worktree_path, which every isolated task has from the
+        moment it is created.
+
+        Read-only and bounded. Returns a set because the only question asked of
+        it is membership."""
+        try:
+            with self._connection() as connection:
+                rows = connection.execute(
+                    "SELECT json_extract(metadata, '$.git_isolation.worktree_path') AS path "
+                    "FROM queue_tasks "
+                    "WHERE json_extract(metadata, '$.git_isolation.worktree_path') IS NOT NULL "
+                    "LIMIT ?", (int(limit),)).fetchall()
+        except sqlite3.Error:
+            _LOGGER.warning("could not list isolated worktree paths", exc_info=True)
+            raise
+        return {row["path"] for row in rows if row["path"]}
+
+    def list_worktree_cleanup_tasks(self, *, states: tuple[str, ...] = (),
+                                    limit: int = 200) -> list[dict[str, Any]]:
+        """Tasks carrying a worktree-cleanup record, optionally filtered by
+        state. READ-ONLY, bounded, and the janitor sweep's only way in.
+
+        Filtered in SQL with json_extract rather than by loading every task and
+        sifting in Python: the sweep runs on a timer against a store that grows
+        forever, and "read everything then discard most of it" is how a
+        background loop quietly becomes the most expensive thing on the box.
+
+        Returns plain dicts (not QueueTask) carrying exactly what the sweep
+        needs -- id, status, attempt_count, max_attempts, metadata and the
+        derived terminal_at -- so the executor's `task` contract is satisfied
+        without the caller re-reading each row."""
+        if limit <= 0:
+            return []
+        sql = ["SELECT id, session, status, attempt_count, max_attempts, metadata, "
+               "completed_at, updated_at FROM queue_tasks "
+               "WHERE json_extract(metadata, '$.worktree_cleanup.state') IS NOT NULL"]
+        params: list[Any] = []
+        if states:
+            placeholders = ",".join("?" for _ in states)
+            sql.append(f"AND json_extract(metadata, '$.worktree_cleanup.state') IN ({placeholders})")
+            params.extend(states)
+        sql.append("ORDER BY updated_at ASC LIMIT ?")
+        params.append(int(limit))
+        try:
+            with self._connection() as connection:
+                rows = connection.execute(" ".join(sql), params).fetchall()
+        except sqlite3.Error:
+            # A malformed metadata blob makes json_extract raise for the whole
+            # query. A sweep that cannot read is a sweep that does nothing --
+            # never one that crashes the loop.
+            _LOGGER.warning("could not list worktree cleanup tasks", exc_info=True)
+            return []
+        tasks = []
+        for row in rows:
+            metadata = _parse_json_object(row["metadata"])
+            record = metadata.get(wj.METADATA_KEY) or {}
+            tasks.append({
+                "id": row["id"], "session": row["session"], "status": row["status"],
+                "attempt_count": row["attempt_count"], "max_attempts": row["max_attempts"],
+                "metadata": metadata,
+                # The executor's grace check wants a timestamp. completed_at is
+                # the real terminal moment when there is one; updated_at is the
+                # honest fallback for SKIPPED/CANCELLED, which do not set it.
+                "terminal_at": _epoch_or_none(row["completed_at"] or row["updated_at"]),
+                "cleanup_state": record.get("state"),
+                "worktree_path": (metadata.get(wj.ISOLATION_KEY) or {}).get("worktree_path"),
+                "repo_path": (metadata.get(wj.ISOLATION_KEY) or {}).get("repo_path"),
+            })
+        return tasks
+
+    def patch_worktree_cleanup(self, task_id: str, patch: dict[str, Any]) -> None:
+        """Merge fields into a task's worktree-cleanup record (P2's executor).
+
+        Kept here rather than in the executor because the metadata column is
+        this store's own, and a read-modify-write of it belongs inside the
+        store's connection. Merges rather than replaces: the executor updates
+        state/attempts/reclaimed_bytes without having to know, or preserve,
+        every field P1 wrote.
+
+        Never raises: the directory's real state is the truth, and a failed
+        metadata write is reconciled by the next sweep. Turning a completed
+        removal into a reported failure because a bookkeeping UPDATE lost a
+        race would be strictly worse."""
+        try:
+            with self._connection() as connection:
+                row = connection.execute("SELECT metadata FROM queue_tasks WHERE id = ?",
+                                         (task_id,)).fetchone()
+                if row is None:
+                    return
+                metadata = _parse_json_object(row["metadata"])
+                record = metadata.get(wj.METADATA_KEY)
+                record = dict(record) if isinstance(record, dict) else {}
+                record.update(patch)
+                metadata[wj.METADATA_KEY] = record
+                connection.execute("UPDATE queue_tasks SET metadata = ? WHERE id = ?",
+                                   (json.dumps(metadata), task_id))
+        except Exception:  # noqa: BLE001 -- bookkeeping must not mask the real outcome
+            _LOGGER.warning("could not patch worktree cleanup for %s", task_id, exc_info=True)
+
+    def record_delivery_verdict(self, task_id: str, verdict: dict[str, Any]) -> None:
+        """Record one prompt-delivery verdict on the task (delivery_gate.py).
+
+        Written into the EXISTING metadata JSON column under
+        `delivery_verdict`, deliberately without a migration: this is
+        diagnostic evidence, not something dispatch queries or indexes, and
+        adding a column to advance an advisory-by-default feature would be a
+        schema change nobody needs yet. If a future phase needs to QUERY
+        verdicts, that is the point to add a tracked Migration.
+
+        Only the LAST verdict is kept, plus a bounded history of the last
+        few, so a task retried many times cannot grow its metadata without
+        limit. Never raises: an unrecordable verdict must not fail a
+        dispatch -- the verdict's own effect on the transition is decided by
+        the caller and does not depend on this write succeeding.
+
+        Shares the metadata column with the worktree-janitor cleanup record
+        (wj.METADATA_KEY), which is why this reads-modifies-writes the whole
+        object through the same _parse_json_object helper the janitor uses
+        instead of json.loads'ing its own way: two writers with two parsers
+        on one column is how one of them silently drops the other's key."""
+        try:
+            with self._connection() as connection:
+                row = connection.execute("SELECT metadata FROM queue_tasks WHERE id = ?",
+                                         (task_id,)).fetchone()
+                if row is None:
+                    return
+                metadata = _parse_json_object(row["metadata"])
+                entry = {**verdict, "at": iso_now()}
+                metadata["delivery_verdict"] = entry
+                history = metadata.get("delivery_verdict_history")
+                if not isinstance(history, list):
+                    history = []
+                history.append(entry)
+                metadata["delivery_verdict_history"] = history[-5:]
+                connection.execute("UPDATE queue_tasks SET metadata = ? WHERE id = ?",
+                                   (json.dumps(metadata), task_id))
+        except Exception:  # noqa: BLE001 -- diagnostics must never break dispatch
+            _LOGGER.warning("could not record delivery verdict for %s", task_id, exc_info=True)
 
     def record_coordinator_decision(self, task_id: str, *, status: str, reason: str,
                                     blockers: list[str] | None = None, required_actions: list[str] | None = None,
@@ -1797,8 +2137,148 @@ class QueueStore:
         if not evidence:
             raise ValueError("mark_completed_with_evidence requires non-empty evidence -- "
                             "use transition_task directly only for a test/legacy no-evidence path")
+        # Requirement Contract gate. Non-emptiness was never the question:
+        # queue_engine passes {"completion_marker": marker}, a string the agent
+        # emitted about itself, and it satisfied this check for free (RC2). The
+        # question is whether the evidence covers what was ASKED, which needs
+        # the contract -- so ask it here, where COMPLETED is actually reached.
+        decision = self.completion_decision(task_id)
+        if not decision.verified_done:
+            self.record_event(
+                session=self.get_task(task_id).session, task_id=task_id,
+                event_type="COMPLETION_REFUSED_REQUIREMENTS",
+                reason=f"{decision.reason}: {', '.join(decision.blocking_ids()) or decision.detail}")
+            raise RequirementsNotCoveredError(decision)
         return self.transition_task(task_id, COMPLETED, event_type="VERIFIED",
                                     extra_fields={"verification_evidence": json.dumps(evidence)})
+
+    # -- Requirement Contract ------------------------------------------------
+
+    def get_requirement_contract(self, task_id: str) -> "rc.RequirementContract | None":
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        return rc.RequirementContract.from_dict(task.requirement_contract)
+
+    def get_evidence_matrix(self, task_id: str) -> "rc.EvidenceMatrix":
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        return rc.EvidenceMatrix.from_dict(task.evidence_matrix)
+
+    def set_requirement_contract(self, task_id: str, *,
+                                 requirements: Sequence[dict[str, Any]] = (),
+                                 prompt: str | None = None,
+                                 actor: str | None = None) -> "rc.RequirementContract":
+        """Create v1 of the contract for a task that has none.
+
+        `prompt` defaults to the task's own prompt, so the original wording is
+        preserved without the caller having to restate it -- v1 does not need
+        perfect parsing, it needs to not lose the source.
+        """
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        if task.requirement_contract:
+            raise rc.ContractError(
+                f"{task_id} already has a contract (v"
+                f"{task.requirement_contract.get('contract_version')}); "
+                f"use amend_requirement_contract -- a contract is never overwritten")
+        contract = rc.create_contract(
+            prompt=prompt if prompt is not None else task.prompt,
+            requirements=requirements, created_at=iso_now(), actor=actor)
+        self._write_contract(task_id, contract)
+        self.record_event(session=task.session, task_id=task_id,
+                          event_type="REQUIREMENT_CONTRACT_SET",
+                          reason=f"v1 with {len(contract.required_ids())} required criteria")
+        return contract
+
+    def amend_requirement_contract(self, task_id: str, *, prompt: str,
+                                   requirements: Sequence[dict[str, Any]] = (),
+                                   actor: str | None = None) -> "rc.RequirementContract":
+        """Append a version. The prior version is never touched.
+
+        This is the operation the reported failure had no way to express: a
+        follow-up instruction became either a second task that knew nothing of
+        the first contract, or a raw send that left the task row unchanged.
+        """
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        existing = rc.RequirementContract.from_dict(task.requirement_contract)
+        if existing is None:
+            # An amendment to a task that never had a contract creates v1 from
+            # the task's own prompt first, so the original is not lost by the
+            # act of amending it.
+            existing = rc.create_contract(prompt=task.prompt, created_at=iso_now(),
+                                          actor=actor)
+        amended = rc.amend_contract(existing, prompt=prompt, requirements=requirements,
+                                    created_at=iso_now(), actor=actor)
+        self._write_contract(task_id, amended)
+        self.record_event(
+            session=task.session, task_id=task_id, event_type="REQUIREMENT_CONTRACT_AMENDED",
+            reason=f"v{amended.contract_version}: +{len(requirements)} requirement(s)")
+        return amended
+
+    def set_evidence_matrix(self, task_id: str, matrix: "rc.EvidenceMatrix") -> None:
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE queue_tasks SET evidence_matrix = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(matrix.to_dict()), iso_now(), task_id))
+
+    def _write_contract(self, task_id: str, contract: "rc.RequirementContract") -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE queue_tasks SET requirement_contract = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(contract.to_dict()), iso_now(), task_id))
+
+    def completion_decision(self, task_id: str, *,
+                            detectors: Sequence["rc.Detector"] = ()) -> "rc.GateDecision":
+        """Reconcile this task's evidence against its LATEST contract version.
+
+        Exposed separately from the gate so a caller (a tool, the dashboard)
+        can show the Requirement | Status | Evidence checklist WITHOUT
+        attempting completion -- `GateDecision.to_dict()` is that payload.
+        """
+        return rc.reconcile(self.get_requirement_contract(task_id),
+                            self.get_evidence_matrix(task_id),
+                            detectors=detectors or (
+                                rc.detector_evidence_must_not_be_self_reported,))
+
+    # -- deployment is not completion ---------------------------------------
+
+    NOT_DEPLOYED = "NOT_DEPLOYED"
+    DEPLOYED_TEST = "DEPLOYED_TEST"
+    DEPLOYED_PROD = "DEPLOYED_PROD"
+    DEPLOY_STATES = (NOT_DEPLOYED, DEPLOYED_TEST, DEPLOYED_PROD)
+
+    def record_deploy(self, task_id: str, *, deploy_state: str, reference: str | None = None,
+                      actor: str | None = None) -> QueueTask:
+        """Record WHERE this task's work was deployed. Never changes `status`.
+
+        RC6: there was no deployment concept at all, so "it is on TEST" had
+        only `COMPLETED` available to say it with. Keeping this off the status
+        enum is the whole point -- a deployed task is still un-verified until
+        its requirements reconcile, and a reader can now see both facts at
+        once instead of one standing in for the other.
+        """
+        if deploy_state not in self.DEPLOY_STATES:
+            raise ValueError(f"unknown deploy_state {deploy_state!r}; "
+                             f"expected one of {list(self.DEPLOY_STATES)}")
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE queue_tasks SET deploy_state = ?, updated_at = ? WHERE id = ?",
+                (deploy_state, iso_now(), task_id))
+        self.record_event(session=task.session, task_id=task_id, event_type="DEPLOY_RECORDED",
+                          reason=f"{deploy_state}{f' ({reference})' if reference else ''}"
+                                 f"{f' by {actor}' if actor else ''}")
+        return self.get_task(task_id)
 
     # -- Task Migration / Load Balancing -----------------------------------
 

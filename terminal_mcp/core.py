@@ -7,7 +7,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
+from . import composer, submit_flow
+from .adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STALLED, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
                        DELIVERY_UNKNOWN, TARGET_WAITING, _sent_text_echoed, select_adapter,
                        to_legacy_submit_status)
 from .audit import AuditStore
@@ -22,7 +23,8 @@ from .models import SessionIdentity
 from .permissions import (SENSITIVE_SESSION_WORDS, input_session_allowed,
                           require_input, require_read, require_session_lifecycle, session_allowed,
                           session_input_denied_by_pattern, valid_new_session_name, valid_session_name)
-from .redaction import redact_ansi_safe, redact_text, strip_ansi
+from .redaction import (redact_ansi_safe, redact_output, redact_text,
+                        redaction_marker, strip_ansi)
 from .session_backend import SessionBackend
 from .session_knowledge import SessionKnowledgeStore, make_instance_id
 from .session_registry import SessionRegistryStore
@@ -172,25 +174,28 @@ PANE_LEASE_POLL_INTERVAL_SECONDS = 0.1
 
 
 def _extract_composer_text(snapshot: list[str]) -> str:
-    """Best-effort read of whatever text is currently sitting in a
-    composer's own last non-empty line, for `_send_enter_key_verified_
-    locked`'s own ack-evidence check -- that call never typed the text
-    itself (a bare Enter alone), so this is the only source for what
-    `adapters.py`'s own `submit_ack_evidence`/`_sent_text_echoed` should
-    require an echo of during the busy-window race case. Strips a
-    leading `"> "` composer-prompt marker (the shape every real Claude/
-    Codex composer and this project's own test fixtures use) if present
-    -- never a claim of parsing every possible composer chrome, just the
-    common, well-established one. An empty/unreadable snapshot returns
-    "" (falls back to `_sent_text_echoed`'s own documented trivially-
-    true behavior for nothing to attribute -- never raises)."""
-    for line in reversed(snapshot):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        marker = stripped.find("> ")
-        return stripped[marker + 2:] if marker != -1 else stripped
-    return ""
+    """Best-effort read of whatever text is currently sitting in the
+    composer, for `_send_enter_key_verified_locked`'s own ack-evidence
+    check -- that call never typed the text itself (a bare Enter alone),
+    so this is the only source for what `adapters.py`'s own
+    `submit_ack_evidence`/`_sent_text_echoed` should require an echo of
+    during the busy-window race case. An empty/unreadable snapshot
+    returns "" (falls back to `_sent_text_echoed`'s own documented
+    trivially-true behavior for nothing to attribute -- never raises).
+
+    P0 2026-09-15: this WAS its own "last non-empty line, split on the
+    first `'> '`" implementation, with `submit_flow.extract_composer_text`
+    a second one that "mirrored" it by comment. Against a real Claude pane
+    BOTH returned the footer (`⏵⏵ auto mode on ...`) instead of the
+    prompt, because the real composer marker is followed by U+00A0 and
+    neither reader normalised it -- so the echo this function exists to
+    supply was footer chrome that CHANGES the moment Claude starts
+    working, and a genuinely accepted submit could never be confirmed.
+    See composer.py's module docstring for the captured pane and the full
+    list of decisions that were being made against UI furniture. There is
+    now exactly ONE reader and both call sites delegate to it; keeping two
+    in sync by comment is what let them drift."""
+    return composer.extract(snapshot)
 
 
 def _codex_composer_buffer_complete(snapshot: list[str], text: str) -> bool:
@@ -253,6 +258,74 @@ def _codex_composer_marker_present(snapshot: list[str]) -> bool:
         return False
     return not any(re.search(r"SUBMITTED\[|esc to interrupt", line, re.IGNORECASE)
                    for line in snapshot[last + 1:])
+
+
+class _RedactionTelemetry:
+    """Counts, never content.
+
+    Exists so an operator can answer "is the redactor firing, and on what
+    kind of thing" without anything ever recording the value it fired on.
+    Rule NAMES are counted; matched text is not touched.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.with_redactions = 0
+        self.total_redactions = 0
+        self.credential_file_hits = 0
+        self.rule_hits: dict[str, int] = {}
+        self.rule_errors: dict[str, int] = {}
+
+    def observe(self, report: dict[str, Any]) -> None:
+        self.calls += 1
+        redactions = int(report.get("redactions") or 0)
+        if redactions:
+            self.with_redactions += 1
+            self.total_redactions += redactions
+        self.credential_file_hits += int(report.get("credential_files") or 0)
+        for name, count in (report.get("rules") or {}).items():
+            self.rule_hits[name] = self.rule_hits.get(name, 0) + int(count)
+        for entry in report.get("errors") or []:
+            self.rule_errors[str(entry)] = self.rule_errors.get(str(entry), 0) + 1
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"calls": self.calls, "responses_with_redactions": self.with_redactions,
+                "total_values_redacted": self.total_redactions,
+                "credential_file_references": self.credential_file_hits,
+                "by_rule": dict(sorted(self.rule_hits.items())),
+                "rule_errors": dict(sorted(self.rule_errors.items()))}
+
+
+_REDACTION_TELEMETRY = _RedactionTelemetry()
+
+
+def redaction_telemetry() -> dict[str, Any]:
+    """Process-wide redaction counters. Contains no secret, by construction:
+    it only ever stores rule names and integers."""
+    return _REDACTION_TELEMETRY.snapshot()
+
+
+def _public_report(report: dict[str, Any]) -> dict[str, Any]:
+    """The part of a redaction report that is safe to put in a response."""
+    return {"redacted": bool(report.get("redactions") or report.get("credential_files")),
+            "values_redacted": int(report.get("redactions") or 0),
+            "credential_file_references": int(report.get("credential_files") or 0),
+            "rules": dict(sorted((report.get("rules") or {}).items())),
+            "rules_skipped": len(report.get("errors") or [])}
+
+
+def _redacted_capture(lines: "list[str]") -> str:
+    """Redact a block of pane text for any field that is not `tail.output`.
+
+    Shares one implementation with the tail so a rule added in one place
+    cannot be missing from the other -- the way `last_output` and `output`
+    drifting apart would produce a response that redacts a secret in one
+    field and prints it in the next.
+    """
+    text, report = redact_output("\n".join(lines))
+    _REDACTION_TELEMETRY.observe(report)
+    marker = redaction_marker(report)
+    return text + ("\n" + marker if marker else "")
 
 
 class TerminalService:
@@ -402,7 +475,13 @@ class TerminalService:
             bindings_by_session: dict[str, list[str]] = {}
             for binding in self.bindings.list():
                 bindings_by_session.setdefault(binding.session, []).append(binding.name)
-            launch_commands_by_type = dict(self.config.session_lifecycle.launch_commands)
+            # NOTE: a discovery pass deliberately records no launch_command.
+            # agent_type below is an OBSERVATION of what the pane is running;
+            # turning that into "here is how to recreate this session" is how
+            # sessions the controller never launched came to look exactly like
+            # ones it did, which auto-recovery then acted on. Provenance is
+            # recorded explicitly at create time instead -- see
+            # session_registry's created_by_controller column.
             for item in items:
                 seen.add(item.name)
                 grant = grants_by_session.get(item.name)
@@ -412,11 +491,10 @@ class TerminalService:
                     if error is None:
                         cwd = str(resolved)
                 agent_type = self._classify_agent_type(item.pane_current_command)
-                launcher = launch_commands_by_type.get(agent_type) if agent_type else None
                 binding_names = tuple(bindings_by_session.get(item.name, ()))
                 self.session_registry.upsert_seen(
                     self.REGISTRY_LOCAL_NODE_ID, item.name, backend_type=self._registry_backend_type(),
-                    cwd=cwd, agent_type=agent_type, launch_command=launcher, launcher_type=agent_type,
+                    cwd=cwd, agent_type=agent_type, launcher_type=agent_type,
                     read_granted=bool(grant and grant.read_enabled), input_granted=bool(grant and grant.input_enabled),
                     binding_names=binding_names,
                 )
@@ -775,20 +853,34 @@ class TerminalService:
     # every call site below defers to them rather than re-deriving it.
 
     def _read_authorized_with_grant(self, session: str, grant: SessionGrant | None) -> bool:
-        """True iff the static read whitelist authorizes `session`, OR an
-        active grant's read_enabled does. `grant` is a parameter (rather
-        than looked up here) so a caller iterating many sessions (the list
-        endpoints) can pass in one bulk SessionGrantStore.list() fetch
-        instead of one query per session -- see _read_authorized below for
-        the single-session convenience wrapper every other call site uses.
-        Sensitive-worded names are refused even with a grant, as defense
-        in depth: grant_session_read already refuses to grant one in the
-        first place, so this should be unreachable, not a new hole."""
-        if session_allowed(session, self.config):
-            return True
+        """True iff an explicit grant authorizes reading `session`, or the
+        deployment's default access policy does.
+
+        The session-NAME whitelist is deliberately not consulted. It used to
+        be the first branch here, and it is what produced the contradictory
+        state this replaced: a session could report `allowed=false` (its name
+        matched no glob) while `effective_read` was true (a grant said so),
+        two fields that look like they must agree and did not. Access is now
+        decided by what a user actually granted, plus session_access defaults
+        -- never by whether someone happened to name a session "test-foo".
+
+        `grant` is a parameter (rather than looked up here) so a caller
+        iterating many sessions (the list endpoints) can pass in one bulk
+        SessionGrantStore.list() fetch instead of one query per session.
+
+        Sensitive-worded names are refused outright, grant or no grant, and
+        regardless of the default policy: that floor is the one name-based
+        rule that survives, because it protects against a session called
+        "root-shell" being opened up by a careless default, not against a
+        naming convention.
+        """
+        if not valid_session_name(session):
+            return False
         if any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS):
             return False
-        return bool(grant and grant.read_enabled)
+        if grant is not None:
+            return bool(grant.read_enabled)
+        return bool(self.config.session_access.default_read)
 
     def _read_authorized(self, session: str) -> bool:
         return self._read_authorized_with_grant(session, self.grants.get(session))
@@ -839,9 +931,19 @@ class TerminalService:
         literally zero extra cost, never a new tmux round-trip."""
         if session_input_denied_by_pattern(session, self.config):
             return False, None
-        if input_session_allowed(session, self.config):
-            return True, None
-        if not grant or not grant.read_enabled or not grant.input_enabled:
+        if not valid_session_name(session):
+            return False, None
+        if any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS):
+            return False, None
+        # No session-name whitelist branch here any more -- see
+        # _read_authorized_with_grant for why. An explicit grant decides;
+        # absent one, the deployment's default policy does. The identity
+        # re-validation below is deliberately reached ONLY through a real
+        # grant: a default-policy allowance has no pinned identity to
+        # compare against, so it cannot claim one.
+        if grant is None:
+            return bool(self.config.session_access.default_input), None
+        if not grant.read_enabled or not grant.input_enabled:
             return False, None
         current = current_identity
         if current is None:
@@ -849,22 +951,73 @@ class TerminalService:
                 return True, None
             current = self.resolve_identity(session)
         if current is None or not grant.pinned_session_id:
-            return False, "IDENTITY_MISMATCH"
+            return self._stale_pin_fallback(session)
         pinned = SessionIdentity(name=session, session_id=grant.pinned_session_id,
                                  pane_id=grant.pinned_pane_id or "", created_epoch=grant.pinned_created_epoch or 0)
         if not pinned.matches(current):
-            return False, "IDENTITY_MISMATCH"
+            return self._stale_pin_fallback(session)
         return True, None
+
+    def _stale_pin_fallback(self, session: str) -> tuple[bool, str | None]:
+        """What a grant pinned to an identity that is no longer live means.
+
+        The pin exists so a grant cannot CARRY OVER to a different session
+        that later takes the same name -- the user authorized session X,
+        not whatever inherits X's name. That is the whole of its job, and
+        it stays intact here: a mismatched grant grants nothing.
+
+        What it must not do is invent a denial. Under a default-OPEN
+        policy an ungranted session of this same name would be writable,
+        so refusing THIS one purely because a stale row happens to mention
+        the name makes the record strictly worse than no record at all --
+        the opposite of "absence of a record means allow". A live instance
+        of this: `mesflow` was granted while it ran on this host, later
+        moved to dell-linux, and every send was then refused with
+        IDENTITY_MISMATCH that no UI could explain, because the controller
+        resolves identity against its OWN tmux and can never match a
+        remote session's ids.
+
+        So a stale pin falls back to the default policy -- never more
+        permissive than an ungranted session, never less. A deployment
+        that closes the default keeps the old fail-closed answer, and an
+        explicit lock (read_enabled/input_enabled cleared) is checked
+        earlier and is unaffected by identity at all."""
+        if self.config.session_access.default_input:
+            return True, None
+        return False, "IDENTITY_MISMATCH"
+
+    def _grant_pin_is_stale(self, session: str, grant, current_identity=None) -> bool:
+        """Does this grant point at a session instance that is gone?
+
+        Under a default-OPEN policy such a grant decides nothing -- the
+        default does (see _stale_pin_fallback) -- so it is inert rather than
+        authoritative, and callers that show or audit grants need to be able
+        to say so. Uses the identity the caller already has when there is
+        one; only resolves fresh when there is not.
+        """
+        if grant is None or not grant.pinned_session_id:
+            return False
+        current = current_identity if current_identity is not None else self.resolve_identity(session)
+        if current is None:
+            return True
+        pinned = SessionIdentity(name=session, session_id=grant.pinned_session_id,
+                                 pane_id=grant.pinned_pane_id or "",
+                                 created_epoch=grant.pinned_created_epoch or 0)
+        return not pinned.matches(current)
 
     def _input_authorized(self, session: str) -> tuple[bool, str | None]:
         return self._input_authorized_with_grant(session, self.grants.get(session))
 
     def _bind_authorized(self, session: str) -> bool:
-        """Canonical bind-target authorization: the same 'sensitive names
-        never bindable, even with an exact whitelist entry' floor
-        binding_session_allowed already enforced, plus (new) an active
-        read grant as an alternate path to the same read-level
-        authorization terminal_status/terminal_tail/etc. now accept.
+        """Canonical bind-target authorization: the 'sensitive names are
+        never bindable' floor, plus ordinary read authorization -- the
+        same answer terminal_status/terminal_tail/etc. give, so a session
+        you can read is a session you can observe through a binding.
+
+        No whitelist is consulted here any more. The helper that used to
+        (binding_session_allowed) is retained only as a deprecated
+        migration shim and has no caller in any enforcement path.
+
         Input through a resulting binding stays separately gated by the
         binding's own input_enabled flag plus _input_guard/
         _check_binding_identity on every actual send, exactly as before
@@ -1029,11 +1182,20 @@ class TerminalService:
             read_granted = bool(grant and grant.read_enabled)
             input_granted = bool(grant and grant.input_enabled)
             read_allowed = self._read_authorized_with_grant(item.name, grant)
+            identity = SessionIdentity.from_session_info(item)
             input_ok, input_specific_reason = self._input_authorized_with_grant(
-                item.name, grant, current_identity=SessionIdentity.from_session_info(item))
+                item.name, grant, current_identity=identity)
             input_allowed = bool(self.config.permissions.terminal_input and input_ok)
+            stale_pin = self._grant_pin_is_stale(item.name, grant, identity)
             row = {
-                "name": item.name, "allowed": session_allowed(item.name, self.config), "attached": item.attached,
+                # DEPRECATED FIELD. `allowed` used to be the session-name
+                # whitelist result, which is exactly how a row could report
+                # allowed=false next to effective_read=true and look broken.
+                # It is now an alias of the real read authorization, so the
+                # two can never disagree again. Read effective_read/
+                # effective_input; this stays only so existing callers keep
+                # working.
+                "name": item.name, "allowed": read_allowed, "attached": item.attached,
                 "windows": item.windows, "created": iso_timestamp(item.created_epoch),
                 "activity": iso_timestamp(item.activity_epoch),
                 "read_allowed": read_allowed, "read_granted": read_granted,
@@ -1059,6 +1221,13 @@ class TerminalService:
                 # is what's off).
                 "input_denied_reason": (input_specific_reason if (self.config.permissions.terminal_input
                                                                    and not input_allowed) else None),
+                # A grant pinned to a session instance that is gone. Under an
+                # open default it no longer BLOCKS anything (it used to, which
+                # made a record worse than no record) -- so it no longer shows
+                # up as a denial reason either, and this is the only way a
+                # dashboard or `doctor grants` can still see that the row is
+                # inert and wants re-granting or clearing.
+                "stale_identity_pin": stale_pin,
                 # P0 CONTROL-PLANE HOTFIX (task: "P0 AUDIT/RECOVERY --
                 # window/window2 transcript collision"): passthrough of
                 # SessionInfo.resume_conversation_id -- see its own
@@ -1098,11 +1267,21 @@ class TerminalService:
         effective = min(requested, self.config.max_capture_lines)
         try:
             output_lines = self.tmux.capture_lines(session, effective, ansi=ansi)
-            redact = redact_ansi_safe if ansi else redact_text
+            # Hardened redaction, and it never fails the request: a tail whose
+            # output happens to contain a credential must still return the
+            # safe remainder, because refusing the whole thing costs the
+            # operator everything and protects nothing that was not already
+            # printed to the pane.
+            text, report = redact_output("\n".join(output_lines), ansi_safe=ansi)
+            marker = redaction_marker(report)
+            if marker:
+                text = text + "\n" + marker
+            _REDACTION_TELEMETRY.observe(report)
             return {
                 "session": session,
                 "lines_requested": requested,
-                "output": redact("\n".join(output_lines)),
+                "output": text,
+                "redaction": _public_report(report),
                 "truncated": requested > self.config.max_capture_lines,
                 # P0-9: `output` is text the *watched program* printed, not
                 # an instruction from this tool or from terminal-mcp itself
@@ -1128,7 +1307,7 @@ class TerminalService:
             return {
                 "session": session,
                 "start_line": start_line,
-                "output": redact_text("\n".join(sliced)),
+                "output": _redacted_capture(sliced),
                 "lines_returned": len(sliced),
                 "truncated": truncated,
                 "max_capture_lines": self.config.max_capture_lines,
@@ -1159,7 +1338,7 @@ class TerminalService:
                 "state": state,
                 "input_required": input_required,
                 "reason": reason,
-                "last_output": redact_text(last_output),
+                "last_output": _redacted_capture([last_output]),
                 "untrusted_output": True, "untrusted_fields": ["last_output"], "content_source": "session",
                 # Supervisor Queue v2 Phase 2 (Coordinator Agent): the
                 # session's own current working directory, when the
@@ -1559,6 +1738,25 @@ class TerminalService:
                                        "the text send and the Enter send -- Enter was withheld")
             return result
 
+        # VERIFY_TEXT, and it belongs HERE -- before ACTIVATE, not after it.
+        # An activate-only send (text == "") into an EMPTY composer has nothing
+        # to submit, so the Enter has nothing to do and must not be sent at all:
+        # pressing it is how three consecutive calls on hp-linux each came back
+        # SUBMIT_CONFIRMED while the pane only ever showed "Press up to edit
+        # queued messages". Withholding the keystroke is also what keeps this
+        # from being one more Enter fired at a target nobody proved was ready.
+        if not text and not submit_flow.extract_composer_text(typed_snapshot or []):
+            result["delivery_state"] = DELIVERY_UNKNOWN
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
+            result["submit_outcome"] = submit_flow.NOTHING_TO_SUBMIT
+            result["stage"] = "VERIFY_TEXT"
+            result["activation_attempts"] = 0
+            result["acceptance_evidence"] = []
+            result["submit_reason"] = (
+                "activate-only send and the composer is empty: there is no prompt to submit, "
+                "so Enter was withheld and nothing can be reported as confirmed")
+            return result
+
         self.tmux.send_keys(session, ["Enter"])
         result["enter_sent"] = True
         result["enter_count"] = 1
@@ -1770,11 +1968,38 @@ class TerminalService:
         # dead session) still correctly times out into DELIVERY_UNKNOWN
         # -- this only removes the false negative for a send that WAS
         # about to be, and genuinely is, accepted.
-        confirmed, after = self._poll_for_ack_evidence(session, typed_snapshot, after, adapter, text,
-                                                        deadline=time.monotonic() + verify_timeout)
+        # P1 2026-09-15: what this attempt is entitled to claim an echo of.
+        #
+        # `text` is what THIS call typed. When it is empty -- the activate-only
+        # shape, terminal_send_text("", press_enter=True) -- `_sent_text_echoed`
+        # treats it as trivially satisfied by design, which silently removes the
+        # busy-window guard that is the ONLY thing standing between a spinner
+        # tick and a false SUBMIT_CONFIRMED. Measured live on hp-linux: three
+        # consecutive activate-only calls into an ALREADY EMPTY composer each
+        # returned SUBMIT_CONFIRMED with submit_reason null, while the pane
+        # showed "Press up to edit queued messages" and no turn began; a fourth,
+        # with the agent idle and the composer empty, returned SUBMIT_CONFIRMED
+        # against a byte-identical pane.
+        #
+        # So an activate-only call attributes the COMPOSER's own content, the
+        # same rule _send_enter_key_verified_locked already uses for a bare
+        # Enter. If the composer is empty too, there is nothing this Enter could
+        # have submitted and no evidence could honestly confirm one.
+        # An activate-only send attributes the COMPOSER's own content as the echo
+        # to require. Passing "" instead makes _sent_text_echoed trivially true
+        # by design, which removes the busy-window guard entirely and lets a
+        # spinner tick confirm a submission that never happened. The empty-
+        # composer case never reaches here -- VERIFY_TEXT withheld the Enter.
+        expected_echo = text or submit_flow.extract_composer_text(typed_snapshot)
+        confirmed, after = self._poll_for_ack_evidence(session, typed_snapshot, after, adapter,
+                                                       expected_echo,
+                                                       deadline=time.monotonic() + verify_timeout)
         if confirmed:
             result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
             result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
+            result["submit_reason"] = ("confirmed via adapter ack evidence"
+                                       + ("" if text else " (echo attributed to the composer's own "
+                                                          "content, not to an empty sent text)"))
             return result
         result["delivery_state"] = DELIVERY_UNKNOWN
         result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
@@ -2095,9 +2320,51 @@ class TerminalService:
         except TmuxError:
             typed_snapshot = None
 
+        # P0 2026-09-14 (fix/submit-enter-deadlock): a bare Enter on an
+        # ALREADY-VISIBLE Claude prompt reaches the pty and Claude Code does
+        # nothing with it -- observed on wtest/win1 and local m1, while
+        # terminal_send_text with fresh text + Enter confirmed every time. So
+        # for an adapter that needs it, wake the composer with a CURSOR MOVE
+        # (which cannot change what is about to be submitted, unlike retyping
+        # the prompt) before the single Enter. Never a second Enter: two
+        # Enters submit twice. Codex is deliberately untouched.
+        submit_plan = None
+        if typed_snapshot is not None:
+            second = None
+            try:
+                second = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
+            except TmuxError:
+                second = None
+            if second is not None:
+                submit_plan = submit_flow.plan_submit(
+                    snapshot_a=typed_snapshot, snapshot_b=second, adapter=adapter,
+                    pane_identity=f"{session}")
+                if submit_plan.is_terminal:
+                    return {"session": session, "sent": False, "keys": keys,
+                            "correlation_id": correlation_id, "agent_type": adapter.name,
+                            "delivery_state": DELIVERY_BLOCKED,
+                            "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED),
+                            "submit_outcome": submit_plan.outcome,
+                            "submission_id": submit_plan.submission_id,
+                            "submit_reason": submit_plan.reason}
+                if submit_plan.send_activation:
+                    try:
+                        self.tmux.send_keys(session, [submit_flow.ACTIVATION_KEY])
+                        # Re-baseline AFTER the nudge. The nudge itself redraws
+                        # the pane, and _shows_genuine_progress cannot tell that
+                        # redraw from the one a real submit causes -- verified:
+                        # with the pre-nudge baseline, the `never_echoes`
+                        # fixture (built to never acknowledge anything) came
+                        # back SUBMIT_CONFIRMED. Only what changes AFTER the
+                        # nudge may count as evidence that the Enter landed.
+                        typed_snapshot = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
+                    except TmuxError:
+                        pass    # the nudge is best-effort; the Enter still goes
         self.tmux.send_keys(session, keys)
         result: dict[str, Any] = {"session": session, "sent": True, "keys": keys,
                                   "correlation_id": correlation_id, "agent_type": adapter.name}
+        if submit_plan is not None:
+            result["submission_id"] = submit_plan.submission_id
         if typed_snapshot is None:
             result["delivery_state"] = DELIVERY_UNKNOWN
             result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
@@ -2129,11 +2396,39 @@ class TerminalService:
             result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
             result["submit_reason"] = "confirmed via adapter ack evidence"
         else:
-            result["delivery_state"] = DELIVERY_UNKNOWN
-            result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
-            result["submit_reason"] = ("pane changed but no adapter ack evidence found in time" if after != typed_snapshot
-                                       else "the pane looked identical to its pre-send state throughout the "
-                                            "verification window")
+            # PROVE_ACCEPTED: require real evidence -- composer cleared, busy/
+            # thinking, a permission dialog, or adapter ack. Absent all four,
+            # answer SUBMIT_STALLED, which says the prompt is still there and
+            # nothing started, rather than UNKNOWN, which does not.
+            # Deliberately a NEGATIVE classifier only. The adapter's own
+            # acceptance rule is unchanged and still the only thing that can
+            # produce SUBMIT_CONFIRMED: Claude requires the echo whenever the
+            # target is busy, established by live testing (see ClaudeAdapter's
+            # docstring), and the `never_echoes` fixture proves why -- it DOES
+            # clear its composer and DOES show a busy footer while never
+            # echoing, so "cleared" and "busy" are both present on a send that
+            # genuinely failed. Treating either as acceptance would have turned
+            # that real failure into a false SUBMIT_CONFIRMED.
+            #
+            # What this adds is a better answer in the NEGATIVE case: when the
+            # pane never moved and the prompt is still sitting in the composer,
+            # say SUBMIT_STALLED -- a specific, retryable fact -- instead of
+            # DELIVERY_UNKNOWN, which cannot be acted on.
+            still_typed = (submit_flow.extract_composer_text(after) == expected_text
+                           and bool(expected_text))
+            stalled = after == typed_snapshot and still_typed
+            state = DELIVERY_STALLED if stalled else DELIVERY_UNKNOWN
+            result["delivery_state"] = state
+            result["submit_status"] = to_legacy_submit_status(state)
+            result["submit_outcome"] = submit_flow.STALLED if stalled else None
+            result["submit_reason"] = (
+                "the prompt is still in the composer and the pane never moved: "
+                "nothing started, so this submission may be retried"
+                if stalled else
+                ("pane changed but no adapter ack evidence found in time"
+                 if after != typed_snapshot else
+                 "the pane looked identical to its pre-send state throughout the "
+                 "verification window"))
         return result
 
     def terminal_exit_copy_mode(self, *, session: str | None = None,
@@ -2467,7 +2762,7 @@ class TerminalService:
                      and not info.pane_in_mode)
         return {"binding": binding, "session": session, "current_command": info.pane_current_command,
                 "status": "RUNNING" if not info.pane_dead else "DEAD",
-                "last_output": redact_text("\n".join(lines)), "effective_input": effective,
+                "last_output": _redacted_capture(lines), "effective_input": effective,
                 # See terminal_list_sessions's own "P0 HOTFIX" note --
                 # same additive, only-when-relevant reason field.
                 "input_denied_reason": (input_specific_reason if (self.config.permissions.terminal_input
@@ -2517,7 +2812,9 @@ class TerminalService:
             grant = grants_by_session.get(item.name)
             grant_read = bool(grant and grant.read_enabled)
             grant_input = bool(grant and grant.input_enabled)
-            allowed = session_allowed(item.name, self.config)
+            # DEPRECATED -- alias of the real read authorization, never the
+            # name whitelist. See terminal_list_sessions for the full note.
+            allowed = self._read_authorized_with_grant(item.name, grant)
             input_ok, input_identity_reason = self._input_authorized_with_grant(
                 item.name, grant, current_identity=SessionIdentity.from_session_info(item))
             effective_input = bool(self.config.permissions.terminal_input and input_ok)
@@ -2578,7 +2875,17 @@ class TerminalService:
         return {"sessions": sessions,
                "session_lifecycle_enabled": self.config.session_lifecycle.enabled,
                "protected_sessions": list(self.config.session_lifecycle.protected_sessions),
-               "web_terminal_enabled": self.config.dashboard.web_terminal_enabled}
+               "web_terminal_enabled": self.config.dashboard.web_terminal_enabled,
+               # Raw key sends (arrows/Tab/Escape) are their own capability,
+               # separately switchable from text submission. Reported so the
+               # dashboard can DISABLE those controls with a reason instead of
+               # offering a button that silently fails at the API -- a
+               # deployment with allow_send_keys off, or an allow_keys list
+               # missing the arrows, is a configuration decision the operator
+               # should see, not a dead control.
+               "send_keys_enabled": self.config.permissions.allow_send_keys,
+               "allowed_keys": sorted(set(self.config.input_policy.allow_keys)),
+               "sensitive_keys": sorted(set(self.config.input_policy.sensitive_keys_require_confirmation))}
 
     def _reopen_would_be_complete(self, info: Any) -> bool:
         """Preview-only version of _capture_reopen_metadata's own
@@ -2643,6 +2950,257 @@ class TerminalService:
             and self._input_authorized_with_grant(session, grant)[0]
         )
         return {"exists": True, "input": input_enabled, "attached": info.attached}
+
+    # Grant rows written by the system itself, as bookkeeping rather than as
+    # anyone's security decision. `system:session_deleted` is the teardown
+    # record left when a session is removed; under a closed default it also
+    # read as "deny", which is not what it ever meant.
+    SYSTEM_AUTHORED_GRANT_PREFIX = "system:"
+    # The retired whitelist migration also wrote rows nobody chose: a session
+    # that matched a READ-only pattern got read=1/input=0, which under the
+    # default-open model actively BLOCKS input that would otherwise be
+    # allowed. Measured on this fleet, two sessions were stuck exactly that
+    # way. These rows are bookkeeping too, and are cleared the same way.
+    SYSTEM_AUTHORED_GRANT_MARKERS = ("system:", "whitelist-migration", "migration")
+
+    def migrate_deny_records_to_default_open(self) -> dict[str, Any]:
+        """Clear deny rows that were never a user's decision.
+
+        Absence of a record now means ALLOW, so a leftover row reading
+        read_enabled=0 is the only thing that can still block a session -- and
+        most of those were written by the system, not by a person. Those are
+        removed; a deny an actual actor authored is LEFT ALONE, because that is
+        someone deliberately locking a session and this migration has no
+        business overruling it.
+
+        The distinction is `granted_by`: rows the system wrote are prefixed
+        `system:`. Measured on this fleet before the change, every single deny
+        row was `system:session_deleted` and not one was user-authored.
+
+        Idempotent, additive in effect (it only ever widens access to the new
+        default), and never fatal.
+        """
+        summary: dict[str, Any] = {"cleared": [], "preserved_user_denies": [], "errors": []}
+        try:
+            rows = self.grants.list()
+        except Exception as exc:  # noqa: BLE001 -- never block startup on a migration
+            summary["errors"].append(str(exc))
+            return summary
+        for grant in rows:
+            if grant.read_enabled and grant.input_enabled:
+                continue
+            author = (grant.granted_by or "")
+            if any(author.startswith(marker) for marker in self.SYSTEM_AUTHORED_GRANT_MARKERS):
+                try:
+                    self.grants.delete(grant.session)
+                    summary["cleared"].append(grant.session)
+                except Exception as exc:  # noqa: BLE001
+                    summary["errors"].append(f"{grant.session}: {exc}")
+            elif not grant.read_enabled:
+                # A real person turned this off. Leave it.
+                summary["preserved_user_denies"].append(
+                    {"session": grant.session, "granted_by": grant.granted_by})
+        return summary
+
+    def migrate_whitelist_to_grants(self) -> dict[str, Any]:
+        """One-time conversion of the retired session-name whitelist into real
+        grants, so upgrading does not silently revoke access.
+
+        The whitelist used to authorize by itself. Now only grants and the
+        session_access defaults do -- which means every session that was
+        readable ONLY because its name matched a glob would go dark on the
+        first restart after this change. That is the "không làm mất quyền
+        user đã setup" requirement, and it is why this runs at startup on
+        every node type (controller and node agent alike).
+
+        Strictly additive and idempotent:
+
+        * a session that already has a grant is left completely alone, in
+          either direction -- a user who deliberately REVOKED read on a
+          still-whitelisted session must not have it handed back;
+        * only sessions that actually exist right now are converted, because
+          an input grant pins the session's current identity and there is
+          nothing to pin for a name that is not running;
+        * nothing is ever revoked here.
+
+        Returns a summary for the caller to log. Never raises: a migration
+        failure must not stop the service from starting, it just leaves the
+        grants as they were.
+        """
+        summary: dict[str, Any] = {"read_granted": [], "input_granted": [], "skipped_existing": [], "errors": []}
+        access = self.config.session_access
+        if access.default_read and access.default_input:
+            # Nothing to migrate: absence of a record already means allow, and
+            # writing rows here would only ever NARROW access -- a read-only
+            # whitelist match becomes read=1/input=0, which blocks input the
+            # default would have permitted. That is the exact failure this
+            # model exists to remove.
+            summary["skipped"] = "defaults are open; a whitelist grant could only narrow access"
+            return summary
+        if not access.migrate_whitelist_on_start:
+            summary["skipped"] = "disabled by session_access.migrate_whitelist_on_start"
+            return summary
+        patterns = tuple(self.config.allowed_session_patterns)
+        input_patterns = tuple(self.config.input_policy.allowed_session_patterns)
+        if not patterns and not input_patterns:
+            return summary
+        try:
+            items = self.tmux.list_sessions()
+        except TmuxError as exc:
+            summary["errors"].append(f"list_sessions failed: {exc}")
+            return summary
+        existing = {grant.session for grant in self.grants.list()}
+        for item in items:
+            name = item.name
+            if name in existing:
+                summary["skipped_existing"].append(name)
+                continue
+            wants_read = session_allowed(name, self.config)
+            wants_input = input_session_allowed(name, self.config) and not session_input_denied_by_pattern(
+                name, self.config)
+            if not wants_read and not wants_input:
+                continue
+            # Input implies read: the grant store refuses input without it.
+            result = self.grant_session_read(name, True, granted_by="whitelist-migration")
+            if "error" in result:
+                summary["errors"].append(f"{name}: read grant failed: {result['error']}")
+                continue
+            summary["read_granted"].append(name)
+            if wants_input:
+                result = self.grant_session_input(name, True, granted_by="whitelist-migration")
+                if "error" in result:
+                    summary["errors"].append(f"{name}: input grant failed: {result['error']}")
+                else:
+                    summary["input_granted"].append(name)
+        return summary
+
+    # -- session permission management (MCP/API surface) --------------------
+    #
+    # The session-name whitelist is gone from every decision here. A session's
+    # permissions come from an explicit user grant, or -- when none exists --
+    # from the deployment's session_access default policy. `allowed` is still
+    # reported for old callers but is a DEPRECATED alias of the effective read
+    # decision and never an input to one.
+
+    def describe_session_permissions(self, session: str) -> dict[str, Any]:
+        """Everything a caller needs to decide what to change, and to change
+        it safely: what was REQUESTED (the stored grant), what is EFFECTIVE
+        right now, where each answer came from, and the revision to pass back.
+
+        Reporting source is the part that stops guesswork: "false" means
+        something very different when it comes from an explicit revoke than
+        when it comes from a default policy nobody has overridden.
+        """
+        if not valid_session_name(session):
+            return {"error": "INVALID_SESSION", "session": session}
+        grant = self.grants.get(session)
+        read_effective = self._read_authorized_with_grant(session, grant)
+        input_ok, input_reason = self._input_authorized_with_grant(session, grant)
+        input_effective = bool(self.config.permissions.terminal_input and input_ok)
+
+        sensitive = any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS)
+        denied_by_pattern = session_input_denied_by_pattern(session, self.config)
+        # A grant can outlive the exact session it was issued for (tmux
+        # server restarted, or the session moved to another node). It then
+        # decides nothing -- the default policy does -- so say so, rather
+        # than leaving a row that looks authoritative but is inert.
+        stale_pin = self._grant_pin_is_stale(session, grant)
+        if sensitive:
+            source = "sensitive_name_floor"
+        elif grant is not None:
+            source = "explicit_grant"
+        else:
+            source = "default_policy"
+
+        return {
+            "session": session,
+            # This service does not know its own node id (the controller
+            # owns that mapping); a caller that needs it qualifies the name.
+            "node_id": None,
+            "requested": {
+                "read": bool(grant.read_enabled) if grant else None,
+                "input": bool(grant.input_enabled) if grant else None,
+            },
+            "effective": {"read": read_effective, "input": input_effective},
+            "source": source,
+            "stale_identity_pin": stale_pin,
+            "inherited_from_default_policy": grant is None or stale_pin,
+            "default_policy": {"read": bool(self.config.session_access.default_read),
+                               "input": bool(self.config.session_access.default_input)},
+            "floors": {
+                "sensitive_name": sensitive,
+                "input_denied_by_pattern": denied_by_pattern,
+                "global_input_enabled": bool(self.config.permissions.terminal_input),
+                "global_read_enabled": bool(self.config.permissions.terminal_read),
+            },
+            "input_block_reason": input_reason,
+            "revision": grant.revision if grant else 0,
+            "granted_by": grant.granted_by if grant else None,
+            "updated_at": grant.updated_at if grant else None,
+            # DEPRECATED. Alias of effective read, kept only so older callers
+            # keep working; never consulted when deciding anything.
+            "allowed": read_effective,
+        }
+
+    def set_session_permissions(self, session: str, *, read: bool | None = None,
+                                input: bool | None = None, expected_revision: int | None = None,
+                                actor: str | None = None) -> dict[str, Any]:
+        """Set read/input for one session. Returns the same shape as
+        describe_session_permissions, so a caller always sees what actually
+        took effect rather than assuming its request did.
+
+        `expected_revision` is optimistic concurrency: pass the revision you
+        read, and a concurrent change makes this fail with REVISION_CONFLICT
+        (plus the current state) instead of silently erasing that change.
+        Omit it for an unconditional write.
+
+        Idempotent: setting what is already set is a no-op that still returns
+        the current state, so a retried call cannot double-apply.
+        """
+        if not valid_session_name(session):
+            return {"error": "INVALID_SESSION", "session": session}
+        if read is None and input is None:
+            return {"error": "NOTHING_TO_CHANGE", "session": session}
+        if any(word in session.casefold() for word in SENSITIVE_SESSION_WORDS):
+            # The one name-based floor kept on purpose: no grant and no policy
+            # may open a session called "prod-database".
+            return {"error": "SENSITIVE_SESSION_NOT_GRANTABLE", "session": session}
+
+        current = self.grants.get(session)
+        current_revision = current.revision if current else 0
+        if expected_revision is not None and expected_revision != current_revision:
+            return {"error": "REVISION_CONFLICT", "session": session,
+                    "expected_revision": expected_revision,
+                    "current_revision": current_revision,
+                    "current": self.describe_session_permissions(session)}
+
+        # Input implies read: the store refuses input without it, so asking
+        # for input alone on an ungranted session is a request to grant both.
+        want_read = read if read is not None else (current.read_enabled if current else
+                                                   bool(self.config.session_access.default_read))
+        if input:
+            want_read = True
+
+        result = self.grant_session_read(session, bool(want_read), granted_by=actor)
+        if "error" in result:
+            return {**result, "session": session}
+        input_not_applied = None
+        if input is not None and want_read:
+            input_result = self.grant_session_input(session, bool(input), granted_by=actor)
+            if "error" in input_result:
+                # A FLOOR refusing input is not a failure of the whole call:
+                # the read change already applied, and returning a bare error
+                # would hide that while telling the caller nothing about what
+                # is now true. Report it alongside the real state instead.
+                if input_result["error"] in ("INPUT_DISABLED", "ACTION_NOT_ALLOWED",
+                                             "SENSITIVE_TARGET", "ACCESS_DENIED"):
+                    input_not_applied = input_result["error"]
+                else:
+                    return {**input_result, "session": session}
+        described = self.describe_session_permissions(session)
+        if input_not_applied:
+            described["input_not_applied"] = input_not_applied
+        return described
 
     def grant_session_read(self, session: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
         if (error := require_read(self.config)) is not None:
@@ -2943,14 +3501,26 @@ class TerminalService:
         if conversation_id:
             result["conversation_id"] = conversation_id
             result["resumed_from"] = resume_session_id
-            # Registry row may not exist yet at all (this is often the
-            # very FIRST time this session name is ever seen) -- upsert_
-            # seen is an INSERT-or-update, same call shape terminal_
-            # registry_reopen already uses right after its own create.
-            self.session_registry.upsert_seen(
-                self.REGISTRY_LOCAL_NODE_ID, name, backend_type=self._registry_backend_type(),
-                cwd=result.get("cwd"), agent_type=agent_type, conversation_id=conversation_id,
-            )
+        # Registry row may not exist yet at all (this is often the very FIRST
+        # time this session name is ever seen) -- upsert_seen is an INSERT-or-
+        # update, same call shape terminal_registry_reopen already uses right
+        # after its own create.
+        #
+        # Runs for EVERY successful create, not only a resume-capable one:
+        # `created_by_controller` is the only record of who launched this
+        # session, and auto-recovery may recreate nothing it cannot attribute.
+        # `launch_command` cannot stand in for it -- the discovery pass infers
+        # one from whatever the pane is running (see _sync_registry below).
+        self.session_registry.upsert_seen(
+            self.REGISTRY_LOCAL_NODE_ID, name, backend_type=self._registry_backend_type(),
+            cwd=result.get("cwd"), agent_type=agent_type, conversation_id=conversation_id,
+            # The launcher we ACTUALLY ran, from the same lookup that ran it --
+            # now the only place a launch_command is ever written, which is
+            # what its docstring always claimed.
+            launch_command=self.lifecycle.launch_command_for(agent_type),
+            launcher_type=agent_type,
+            created_by_controller=True,
+        )
 
         # Session Knowledge Store: start capture IMMEDIATELY, before
         # anything else below (in particular, before initial_prompt is
@@ -3222,12 +3792,16 @@ class TerminalService:
             # either -- symmetric with the check above.
             self.audit.record(action=action, session=name, result="BLOCKED", reason="TARGET_NAME_PROTECTED")
             return {"error": "TARGET_NAME_PROTECTED", "session": name, "new_name": new_name}
-        if not session_allowed(new_name, self.config):
-            # The new name must stay inside the SAME static whitelist
-            # every session name is already held to -- a rename must
-            # never be a back door out of allowed_session_patterns (e.g.
-            # into a SENSITIVE_SESSION_WORDS name without an exact
-            # whitelist entry).
+        if (not valid_session_name(new_name)
+                or any(word in new_name.casefold() for word in SENSITIVE_SESSION_WORDS)):
+            # The name whitelist is gone, but the reason THIS check existed
+            # is not: a rename must never be a back door into a
+            # SENSITIVE_SESSION_WORDS name ("prod-database", "ssh-tunnel"),
+            # which _read_authorized_with_grant refuses outright and which no
+            # grant or default policy can open. Renaming into one would
+            # otherwise strand the session as permanently unreadable, or --
+            # worse, if that floor ever regressed -- quietly relabel a
+            # granted session as a sensitive one.
             self.audit.record(action=action, session=name, result="BLOCKED", reason="TARGET_NAME_NOT_ALLOWED")
             return {"error": "TARGET_NAME_NOT_ALLOWED", "session": name, "new_name": new_name}
         try:

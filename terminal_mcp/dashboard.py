@@ -6,6 +6,9 @@ import logging
 import os
 import re
 import secrets
+import socket
+import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -22,11 +25,32 @@ from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 from . import lan_discovery, network_bind, remote_connect, tunnel_diagnostics
 from .cf_access import verify_access_assertion
 from .agent_availability import available_agent_types
+from .access_policy import filter_record, policy_table, role_for_identity
 from .connection_store import ConnectionStore, generate_node_token
+from .enrollment import (
+    STAGES as ENROLL_STAGES,
+    EnrollmentStore,
+    normalize_exit_code,
+    normalize_failure_code,
+)
+from .node_onboarding import (OnboardingError, OnboardingService, read_controller_ssh_public_key,
+                               rescue_authorized_keys_dir)
+from . import node_credentials
+from .token_rotation import TokenRotationService
+from .node_transport import (GENERIC_SETUP_CODE, KIND_LAN, KIND_REVERSE_SSH, KIND_TAILSCALE,
+                             TransportStore, probe_reverse_tunnel, probe_ssh_banner)
+from . import agent_bundle, bootstrap_protocol, endpoint_policy, rescue_gateway
+from .rescue_gateway import RescuePortAllocator
+from .windows_onboarding import (SCRIPT_VERSION as SETUP_SCRIPT_VERSION,
+                                 SETUP_SCRIPT_SHORT_PATH, build_quick_install_command,
+                                 list_profiles, quick_install_fits_run_dialog,
+                                 render_setup_script, script_fingerprint)
+from .fleet_service import ControllerFleetSync, FleetService, auth_status_for_node
 from .controller import ControllerService, build_default_controller
 from .node_client import NodeClientError, RemoteNodeClient
 from .core import TerminalService
 from .ai_usage_service import AiUsageService
+from . import terminal_wall
 from .recovery_engine import RecoveryEngine
 from .integration_service import IntegrationService
 from .integration_store import IntegrationStore
@@ -46,6 +70,7 @@ from .supervisor2 import SupervisorV2Service, build_supervisor_v2
 from .webauth import SESSION_COOKIE_NAME, WebAuthStore
 from .webterm import WebTerminalProcess, pump_websocket
 from .webterm_assets import ASSETS
+from .ephemeral_state import ephemeral_db_path, ephemeral_state_dir
 
 _log = logging.getLogger(__name__)
 
@@ -105,6 +130,16 @@ def _notes_int(raw: str | None, default: int) -> int:
 
 
 INPUT_ERROR_STATUS = {
+    # Raw key sends (terminal_send_keys) -- a distinct capability from text
+    # submission, with its own refusals. SEND_KEYS_DISABLED/KEY_NOT_ALLOWED
+    # are configuration decisions, not caller mistakes, so the dashboard shows
+    # them as a disabled control rather than a failed click (see the
+    # send_keys_* fields on /dashboard/api/sessions).
+    "SEND_KEYS_DISABLED": 403,
+    "KEY_NOT_ALLOWED": 400,
+    "CONFIRMATION_REQUIRED": 409,
+    "TOO_MANY_KEYS": 400,
+    "PANE_IN_COPY_MODE": 409,
     "ACCESS_DENIED": 403,
     "INPUT_DISABLED": 403,
     "SENSITIVE_TARGET": 403,
@@ -149,6 +184,132 @@ INPUT_ERROR_STATUS = {
 
 _node_to_dict = node_to_dict  # local alias -- every route below predates the move to node_models.py
 
+
+# ---------------------------------------------------------------------------
+# Session-list grouping by node -- ONE implementation, injected into every page
+# that lists sessions (the main dashboard's tab bar and the sessions admin
+# table). Both surfaces had drifted into their own per-row "node badge" before
+# this; a second, parallel grouping implementation would drift the same way,
+# so the ordering/labelling/collapse rules live here exactly once and each page
+# only supplies its own DOM.
+#
+# Injected by replacing the /*__NODE_GROUP_JS__*/ marker rather than via an
+# f-string: these page templates are plain triple-quoted strings full of
+# literal CSS/JS braces, and making them f-strings would require escaping
+# every one of them.
+# ---------------------------------------------------------------------------
+NODE_GROUP_JS = """
+    // ---- Node grouping (shared) ------------------------------------------
+    // Node status comes from the registry's own derived value (see
+    // node_models.NODE_STATUSES): "online" | "degraded" | "offline".
+    // "degraded" means a heartbeat older than degraded_after_seconds but not
+    // yet offline -- surfaced to an operator as "recent", which is what that
+    // state actually communicates: it was here a moment ago.
+    const NODE_STATUS_RANK = { online: 0, degraded: 1, offline: 2 };
+    const NODE_STATUS_LABEL = { online: 'online', degraded: 'recent', offline: 'offline' };
+
+    function nodeStatusRank(status) {
+      const rank = NODE_STATUS_RANK[status];
+      // An unknown/absent status sorts with offline rather than ahead of a
+      // node we positively know is online -- never optimistic about a node
+      // the registry has not vouched for.
+      return rank === undefined ? NODE_STATUS_RANK.offline : rank;
+    }
+
+    function nodeStatusLabel(status) {
+      return NODE_STATUS_LABEL[status] || 'unknown';
+    }
+
+    // Most recent activity/created timestamp on a row, as a comparable number.
+    function sessionActivityValue(row) {
+      const raw = row.activity || row.created;
+      if (!raw) return 0;
+      const parsed = Date.parse(raw);
+      if (!Number.isNaN(parsed)) return parsed;
+      const numeric = Number(raw);
+      return Number.isNaN(numeric) ? 0 : numeric * 1000;
+    }
+
+    // Groups `rows` (any /dashboard/api/sessions-shaped list) by node.
+    //
+    // `nodes` is the /dashboard/api/nodes list when the page has it, and may
+    // be empty/absent -- grouping still works from the rows alone, because
+    // every row carries node_id/node_name from the API (never inferred from
+    // the id, and never a hardcoded "local"/"dell"/"mac" anywhere here).
+    // Its real job is the other direction: a node that is ONLINE but has no
+    // sessions at all still gets a group, so an operator can see it is up and
+    // ready rather than wondering where it went.
+    // `options.includeEmptyOnline` (default true) is what reconciles the two
+    // competing rules: an online node with no sessions SHOULD show, so an
+    // operator can see it is up and free -- but while a search/filter is
+    // active it must NOT, because a group with no matches is exactly the
+    // noise the filter exists to remove. Callers pass false when filtering.
+    function buildNodeGroups(rows, nodes, options) {
+      const includeEmptyOnline = !options || options.includeEmptyOnline !== false;
+      const groups = new Map();
+      const ensure = (id, name, status) => {
+        let group = groups.get(id);
+        if (!group) { group = { id, name: name || id, status: status || null, sessions: [] }; groups.set(id, group); }
+        if (name && (!group.name || group.name === group.id)) group.name = name;
+        if (status && !group.status) group.status = status;
+        return group;
+      };
+      for (const row of rows || []) {
+        const id = row.node_id || 'local';
+        ensure(id, row.node_name, null).sessions.push(row);
+      }
+      for (const node of nodes || []) {
+        const id = node.id || node.node_id;
+        if (!id) continue;
+        const group = ensure(id, node.display_name, node.status);
+        group.status = node.status || group.status;
+        // Only surface a session-less node when it is actually reachable.
+        // An offline node with nothing on it is noise; an online one is
+        // information ("that node is up and free").
+        if (!group.sessions.length && (!includeEmptyOnline || node.status !== 'online')) groups.delete(id);
+      }
+      const ordered = [...groups.values()];
+      for (const group of ordered) {
+        // Within a node: attention first (a session waiting on input is the
+        // thing an operator came here for), then most-recent activity, then
+        // name so the order is stable between polls.
+        group.sessions.sort((a, b) => {
+          const attention = (b.state === 'WAITING_INPUT') - (a.state === 'WAITING_INPUT');
+          if (attention) return attention;
+          const activity = sessionActivityValue(b) - sessionActivityValue(a);
+          if (activity) return activity;
+          return String(a.name).localeCompare(String(b.name));
+        });
+      }
+      ordered.sort((a, b) => {
+        const rank = nodeStatusRank(a.status) - nodeStatusRank(b.status);
+        if (rank) return rank;
+        return String(a.name).localeCompare(String(b.name));
+      });
+      return ordered;
+    }
+
+    // Collapse state, per page and per node, in localStorage. Reading it can
+    // throw (Safari private mode), and a storage failure must never stop the
+    // list from rendering -- a group simply defaults to expanded.
+    function makeNodeCollapseStore(pageKey) {
+      const storageKey = 'tmNodeCollapse:' + pageKey;
+      let state = {};
+      try { state = JSON.parse(localStorage.getItem(storageKey) || '{}') || {}; } catch (error) { state = {}; }
+      return {
+        isCollapsed(nodeId) { return state[nodeId] === true; },
+        setCollapsed(nodeId, collapsed) {
+          if (collapsed) state[nodeId] = true; else delete state[nodeId];
+          try { localStorage.setItem(storageKey, JSON.stringify(state)); } catch (error) { /* non-fatal */ }
+        },
+        // A node holding the session the operator is actually looking at is
+        // force-revealed: a collapsed group must never hide the current
+        // session. This does not persist -- reopening the group by hand
+        // stays the remembered state.
+        reveal(nodeId) { if (state[nodeId]) delete state[nodeId]; },
+      };
+    }
+"""
 
 DASHBOARD_HTML = """<!doctype html>
 <html lang="vi">
@@ -307,13 +468,52 @@ DASHBOARD_HTML = """<!doctype html>
        iOS rubber-band swipe on this strip from propagating anywhere else,
        not a page-scroll conflict (there isn't one). */
     .tabbar {
-      display:flex; align-items:stretch; overflow-x:auto; overflow-y:hidden; background:var(--panel);
+      display:flex; flex-direction:column; align-items:stretch; overflow-x:hidden; overflow-y:auto;
+      max-height:34vh; background:var(--panel);
       border-bottom:1px solid var(--line); scrollbar-width:thin;
-      -webkit-overflow-scrolling:touch; touch-action:pan-x; overscroll-behavior-x:contain;
+      -webkit-overflow-scrolling:touch; overscroll-behavior-y:contain;
     }
     .tabbar-empty { padding:12px 16px; color:var(--muted); font-size:13px }
+
+    /* ---- Node groups in the tab strip (see NODE_GROUP_JS) ----------------
+       The strip is now a stack of node sections rather than one flat row of
+       tabs. Each section is a header line plus that node's tabs, which WRAP
+       instead of scrolling off to the right -- requirement "không tràn ngang":
+       a session must never be reachable only by discovering a horizontal
+       scroll. The stack itself is height-capped and scrolls vertically, so a
+       fleet with many sessions cannot push the terminal off the screen. */
+    .tabbar-wrap { display:flex; flex-direction:column; min-width:0; flex:1 }
+    .tabbar-filter { padding:6px 10px; border-bottom:1px solid var(--line); background:var(--panel) }
+    .tabbar-filter input {
+      width:100%; background:#0e1526; border:1px solid var(--line); border-radius:8px; color:var(--text);
+      font:inherit; font-size:12px; padding:6px 10px;
+    }
+    .tabbar-filter input:focus { outline:none; border-color:var(--accent) }
+    .node-group { display:flex; flex-direction:column; min-width:0; border-bottom:1px solid var(--line) }
+    .node-group:last-child { border-bottom:none }
+    .node-group-toggle {
+      display:flex; align-items:center; gap:8px; width:100%; text-align:left; cursor:pointer;
+      background:#101728; border:0; border-bottom:1px solid transparent; color:var(--text);
+      font:inherit; font-size:11px; padding:5px 10px;
+    }
+    .node-group-toggle:hover { background:#16203a }
+    .node-group-toggle:focus-visible { outline:2px solid var(--accent); outline-offset:-2px }
+    .node-caret { flex:0 0 auto; color:var(--muted); width:9px }
+    .node-group-name { font-weight:700; letter-spacing:.02em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    .node-group-id { color:var(--muted); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    .node-group-status { flex:0 0 auto; border-radius:999px; padding:0 7px; font-size:10px; border:1px solid var(--line); color:var(--muted); white-space:nowrap }
+    .node-group-status.online { color:var(--green); border-color:rgba(67,209,124,.45) }
+    .node-group-status.degraded { color:var(--amber); border-color:rgba(255,200,87,.45) }
+    .node-group-status.offline { color:var(--red); border-color:rgba(255,107,107,.4) }
+    .node-group-count { margin-left:auto; flex:0 0 auto; color:var(--muted); font-size:10px; min-width:14px; text-align:right }
+    .node-tabs { display:flex; flex-wrap:wrap; align-items:stretch; min-width:0 }
+    /* Node-group collapse sets `tabs.hidden`; without this the author
+       display:flex above silently won and collapsing a group changed
+       nothing at all (measured: tab strip 306px before and after). */
+    .node-tabs[hidden] { display:none }
+    .node-tabs-empty { padding:7px 12px; color:var(--muted); font-size:11px; font-style:italic }
     .tab {
-      position:relative; display:flex; align-items:center; gap:7px; flex:0 0 auto; max-width:220px; min-width:0;
+      position:relative; display:flex; align-items:center; gap:7px; flex:0 1 auto; max-width:220px; min-width:0;
       padding:9px 10px 9px 12px; cursor:pointer; color:var(--muted); border-right:1px solid var(--line);
       border-bottom:2px solid transparent; white-space:nowrap;
     }
@@ -324,12 +524,22 @@ DASHBOARD_HTML = """<!doctype html>
     .tab-dot.on { background:var(--green) }
     .tab-dot.err { background:var(--red) } /* real supervisor state (FAILED/ERROR/BLOCKED) -- never a fake/invented one */
     .tab-dot.idle { background:var(--muted) }
+    .work-badge { font-size:8.5px; font-weight:700; letter-spacing:.04em; padding:1px 4px;
+                  border-radius:4px; border:1px solid var(--accent); color:var(--accent);
+                  vertical-align:middle }
     .tab-name { overflow:hidden; text-overflow:ellipsis; font-size:13px; font-weight:600 }
     /* Compact attention badge -- reused identically in the tab bar and the
        viewer header (#summary) so a WAITING_INPUT session is obvious in
        both places, driven entirely by classify_status()'s existing state
        string, nothing new inferred from pane content here. */
     .attn-badge { display:inline-block; background:var(--amber); color:#231a00; font-size:11px; font-weight:700; padding:1px 6px; border-radius:4px; vertical-align:middle }
+    /* Same author-vs-UA precedence trap .task-pending-badge already carries
+       an override for: an author `display:inline-block` beats the browser's
+       own [hidden] rule at equal specificity, so `badge.hidden = true` did
+       nothing and EVERY session tab showed the amber "needs attention"
+       mark permanently -- 20 false alarms on this fleet, which is worse
+       than no signal at all. Verified live with getComputedStyle. */
+    .attn-badge[hidden] { display:none }
     .tab .attn-badge { flex:0 0 auto; margin-left:2px }
     /* Hover/focus-only close (kill) button -- kept a fixed 18px hit target
        even hidden (visibility, not display:none) so the tab's own layout
@@ -342,15 +552,21 @@ DASHBOARD_HTML = """<!doctype html>
     .tab-close:hover { background:#3a2430; color:#ff9f9f }
     .tab-close:disabled { visibility:hidden !important; cursor:not-allowed }
     /* Layout bugfix (real-device report), still applicable with the
-       top session-tabs bar removed: .detail's 5 direct children in DOM
-       order are #summary, #grantBar, .term, #inputNote, #inputBar --
-       grid-template-rows must list exactly 5 tracks, in that order, with
-       .term (the actual output viewport) as the one flexible track, or
-       its intended growing row silently goes to #summary instead and lets
-       its content overflow into the rows below. */
-    .detail { display:grid; grid-template-rows:auto auto minmax(0,1fr) auto auto; min-width:0; min-height:0 }
+       top session-tabs bar removed: .detail's 7 direct children in DOM
+       order are #summary, #grantBar, .term, #inputNote, #remoteComposer,
+       #keyPad, #inputBar -- grid-template-rows must list exactly that many
+       tracks, in that order, with .term (the actual output viewport) as the
+       one flexible track, or its intended growing row silently goes to
+       #summary instead and lets its content overflow into the rows below.
+       ADD A TRACK HERE whenever a child is added between them. */
+    .detail { display:grid; grid-template-rows:auto minmax(0,1fr) auto auto auto auto; min-width:0; min-height:0 }
+    /* #summary and #grantBar are children of this wrapper now, not of the
+       grid, so the grid has one fewer track. #inspectorBackdrop is fixed
+       (out of flow) and never claims a row. */
+    #sessionInspector { grid-row:1; min-width:0 }
+    #inspectorBackdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:34 }
     #grantBar[hidden] { display:none } /* the plain #grantBar{display:flex} rule below would otherwise outrank the UA's own [hidden] default */
-    #summary { grid-row:1; padding:14px 16px; border-bottom:1px solid var(--line) }
+    #summary { padding:14px 16px; border-bottom:1px solid var(--line) }
     .state-WAITING_INPUT { color:var(--amber) } .state-RUNNING { color:var(--green) }
     /* P0 Part C states: VERIFYING (independent verification in progress --
        amber, same "needs a look" weight as WAITING_INPUT); FAILED/BLOCKED
@@ -365,7 +581,7 @@ DASHBOARD_HTML = """<!doctype html>
        state already shows via the tab bar's own dot + this bar's title,
        so a second, purely decorative status indicator here would be
        redundant chrome, not information. */
-    .term { grid-row:3; display:flex; flex-direction:column; min-height:0 }
+    .term { grid-row:2; display:flex; flex-direction:column; min-height:0 }
     .term-bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 10px; padding:7px 12px; background:#0e1526; border-bottom:1px solid var(--line) }
     .term-title { color:var(--muted); font-size:12px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
     /* flex:1 1 auto + min-width:0 (not flex:0 0 auto): a flex item's
@@ -453,7 +669,7 @@ DASHBOARD_HTML = """<!doctype html>
        Send button (core.py's own terminal_send_text press_enter
        semantics, and the idempotency-key/delivery-state handling in the
        JS below, are untouched -- only the visual chrome around them). */
-    #inputBar { grid-row:5; display:flex; align-items:center; gap:8px; padding:10px 16px; background:var(--term-bg); border-top:1px solid var(--line) }
+    #inputBar { grid-row:6; display:flex; align-items:center; gap:8px; padding:10px 16px; background:var(--term-bg); border-top:1px solid var(--line) }
     #inputPrompt { flex:0 0 auto; color:var(--ansi-10); font-weight:700; user-select:none }
     #inputBar input[type=text] { flex:1; min-width:0; background:transparent; border:none; color:var(--term-fg); padding:8px 2px; font:inherit }
     #inputBar input[type=text]:focus { outline:none }
@@ -462,7 +678,45 @@ DASHBOARD_HTML = """<!doctype html>
     #inputBar button:hover:not(:disabled) { background:#233252 }
     #inputBar button:disabled { opacity:.5; cursor:not-allowed }
     #inputBar label { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:12px; white-space:nowrap }
-    #inputNote { grid-row:4; padding:6px 16px 0; font-size:12px; color:var(--muted) }
+    #inputNote { grid-row:3; padding:6px 16px 0; font-size:12px; color:var(--muted) }
+
+    /* ---- Remote composer mirror + interactive key pad -------------------
+       Two separate rows on purpose: the mirror is what the AGENT has on
+       screen (read-only), the composer below is the operator's own draft.
+       Keeping them visually distinct is the whole point -- a merged box is
+       how a half-typed message gets silently replaced by a poll. */
+    #remoteComposer { grid-row:4; padding:8px 16px 0; min-width:0 }
+    #remoteComposer[hidden] { display:none }
+    .rc-head { display:flex; align-items:center; gap:8px; font-size:11px; color:var(--muted); flex-wrap:wrap }
+    .rc-title { font-weight:700; letter-spacing:.03em; text-transform:uppercase }
+    .rc-kind { color:var(--ansi-11) }
+    .rc-sync { margin-left:auto; background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); font:inherit; font-size:11px; padding:3px 9px; cursor:pointer }
+    .rc-sync:hover { background:#233252 }
+    .rc-body {
+      margin:4px 0 0; padding:7px 10px; background:#0e1526; border:1px solid var(--line); border-left:3px solid var(--ansi-11);
+      border-radius:6px; font:inherit; font-size:12px; color:var(--term-fg); white-space:pre-wrap; word-break:break-word;
+      max-height:22vh; overflow:auto;
+    }
+    /* Only ever a highlight, never an automatic overwrite: the agent's state
+       changed while the operator had a draft in progress. */
+    #remoteComposer.rc-changed .rc-body { border-left-color:var(--amber) }
+    #remoteComposer.rc-changed .rc-sync { border-color:var(--amber); color:var(--amber) }
+
+    #keyPad { grid-row:5; display:flex; align-items:center; gap:6px; padding:8px 16px 0; flex-wrap:wrap }
+    #keyPad[hidden] { display:none }
+    .kp-label { color:var(--muted); font-size:11px }
+    .kp-btn {
+      min-width:38px; min-height:34px; background:#19243b; border:1px solid var(--line); border-radius:7px;
+      color:var(--text); font:inherit; font-size:13px; cursor:pointer; padding:4px 9px;
+    }
+    .kp-btn:hover:not(:disabled) { background:#233252 }
+    .kp-btn:active:not(:disabled) { background:#2c3f66 }
+    /* A key the deployment does not allow is visibly refused, with the
+       reason in its title -- never a button that fails silently on click. */
+    .kp-btn:disabled { opacity:.35; cursor:not-allowed }
+    .kp-enter { color:var(--ansi-10) }
+    .kp-mode { display:flex; align-items:center; gap:5px; margin-left:auto; color:var(--muted); font-size:11px; white-space:nowrap }
+    #inputBar input[type=text].key-mode { color:var(--ansi-11) }
     #inputNote.error { color:#ff6b6b }
     /* Compact single-line entry point only now -- "Quyền: <label>" plus one
        "🔐 Quyền truy cập" button that opens #permModal, which does all the
@@ -470,7 +724,7 @@ DASHBOARD_HTML = """<!doctype html>
        multi-button inline bar) so re-enabling it can never reintroduce the
        real mobile overlap bug that #permModal's own separate, off-grid
        overlay design structurally avoids. */
-    #grantBar { grid-row:2; display:flex; align-items:center; gap:8px; padding:8px 16px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); flex-wrap:wrap }
+    #grantBar { display:flex; align-items:center; gap:8px; padding:8px 16px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); flex-wrap:wrap }
     #grantBar button { background:#2b3f66; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:6px 12px; cursor:pointer; font:inherit; font-size:12px }
     /* Quyền truy cập modal -- the single reusable UI for granting/revoking
        a non-whitelisted session's read/input grant, opened from a session
@@ -673,6 +927,29 @@ DASHBOARD_HTML = """<!doctype html>
        with no way to reach it, on every viewport narrower than the full
        tab strip's content width (mobile, not just very narrow desktop). */
     .tabbar-row { display:flex; align-items:stretch; background:var(--panel); border-bottom:1px solid var(--line); min-width:0 }
+    /* ---- Mobile-only chrome -------------------------------------------
+       Every one of these is display:none on desktop and is switched on by
+       the portrait media query at the bottom of this stylesheet. They are
+       declared here, outside it, so the shared look lives in one place. */
+    .m-btn { background:#19243b; border:1px solid var(--line); color:var(--text); border-radius:8px;
+             padding:8px 12px; font:13px var(--mono); cursor:pointer; min-height:44px; white-space:nowrap }
+    .m-btn:active { background:#223052 }
+    #mobileSessionsBtn, .m-title, .drawer-head, #keysToggleBtn { display:none }
+    .m-title { align-items:center; gap:7px; min-width:0; flex:1; font-size:14px }
+    #mobileSessionName { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    .m-dot { flex:0 0 auto; width:8px; height:8px; border-radius:50%; background:var(--muted) }
+    .m-dot.ok { background:var(--green) } .m-dot.warn { background:var(--amber) } .m-dot.bad { background:var(--red) }
+    .drawer-head { justify-content:space-between; align-items:center; padding:10px 14px;
+                   border-bottom:1px solid var(--line); background:var(--panel) }
+    /* One-tap "back to the bottom", floating over the output rather than
+       taking a row from it. Visible only while auto-follow is paused. */
+    #jumpFab { position:absolute; right:14px; bottom:14px; z-index:5; background:var(--accent); color:#fff;
+               border:none; border-radius:999px; padding:10px 16px; font:13px var(--mono); cursor:pointer;
+               min-height:44px; box-shadow:0 6px 18px rgba(0,0,0,.45) }
+    #jumpFab[hidden] { display:none }
+    /* .term is the positioning context for the FAB above; it already is a
+       bounded flex column, so this only adds the containing block. */
+    .term { position:relative }
     .tabbar-row .tabbar { flex:1; min-width:0; border-bottom:none }
     .killed-panel { min-width:260px; max-width:min(360px, calc(100vw - 24px)); max-height:60vh; overflow:auto }
     .killed-row { padding:8px 8px; border-radius:8px; font-size:12px }
@@ -736,6 +1013,18 @@ DASHBOARD_HTML = """<!doctype html>
          rather than whatever's left over after the dot/close button. */
       .tab { min-width:clamp(110px, 30vw, 160px); max-width:220px; padding:8px 8px 8px 10px }
       .tab-name { font-size:12.5px; max-width:200px }
+      /* Compact node headers on a phone: the id drops (the display name
+         already identifies the node), the row keeps a 40px tap target, and
+         the strip gets a little less of the screen so the terminal keeps
+         most of it. Tabs WRAP within their node rather than scrolling off
+         to the right, so nothing is reachable only via a hidden gesture. */
+      .tabbar { max-height:38vh }
+      .node-group-toggle { padding:7px 10px; min-height:40px; font-size:11px }
+      .node-group-id { display:none }
+      /* 16px: iOS Safari auto-zooms the page for any input under 16px --
+         same reason the term-search input below holds that floor. */
+      .tabbar-filter { padding:5px 10px }
+      .tabbar-filter input { font-size:16px; padding:6px 9px }
       .detail { min-height:0 }
       /* Smaller, tighter terminal text fits substantially more real output on
          a phone screen without hurting readability; desktop sizing (14px/1.45
@@ -758,6 +1047,14 @@ DASHBOARD_HTML = """<!doctype html>
          the app-shell above means there is no page scroll left to carry it
          away regardless. */
       #inputBar { padding:8px 10px; gap:6px }
+      /* Phone: the key pad IS the way to send arrows/Tab at all -- a mobile
+         soft keyboard has no such keys -- so the buttons get a real 44px
+         touch target and the row wraps instead of overflowing sideways. */
+      #keyPad { padding:6px 10px 0; gap:5px }
+      .kp-btn { min-width:44px; min-height:44px; font-size:14px }
+      .kp-mode { margin-left:0; width:100% }
+      #remoteComposer { padding:6px 10px 0 }
+      .rc-body { max-height:26vh; font-size:12px }
       #inputBar input[type=text] { padding:7px 9px; font-size:16px }
       #inputBar button { padding:7px 10px; font-size:13px }
       #inputBar label { font-size:11px }
@@ -792,9 +1089,10 @@ DASHBOARD_HTML = """<!doctype html>
          pure presentation. */
       body.fullscreen-terminal header,
       body.fullscreen-terminal .tabbar,
-      body.fullscreen-terminal #summary,
-      body.fullscreen-terminal #grantBar,
+      body.fullscreen-terminal #sessionInspector,
       body.fullscreen-terminal #inputNote,
+      body.fullscreen-terminal #remoteComposer,
+      body.fullscreen-terminal #keyPad,
       body.fullscreen-terminal #inputBar { display:none }
       body.fullscreen-terminal main { padding:0; gap:0 }
       body.fullscreen-terminal .detail { grid-template-rows:minmax(0,1fr) }
@@ -810,11 +1108,250 @@ DASHBOARD_HTML = """<!doctype html>
         padding-right:max(12px, env(safe-area-inset-right));
       }
     }
+
+    /* ================= WIDE SCREENS: the list is a column ==============
+       Same single list, laid out for the shape of the screen -- the
+       technique the portrait sheet below already uses.
+
+       Measured on this fleet (20 sessions, 5 nodes) before this block
+       existed: the horizontal strip stacked one wrapping row per node and
+       took 306px at 1440x900 / 342px at 1920x1080, pushing total chrome
+       above the terminal to 488px and 587px. The terminal got 36% of a
+       desktop screen while most of each node row sat empty -- the macbook
+       group rendered one tab and ~1300px of nothing.
+
+       A column costs a fixed 260px of width, which a desktop has, instead
+       of unbounded height, which it does not. Node grouping, the filter,
+       status dots, counts and collapse are untouched: this only changes
+       where the same elements sit. */
+    @media (min-width:1100px) {
+      main { grid-template-columns:260px minmax(0,1fr); grid-template-rows:minmax(0,1fr) }
+      .tabbar-row { grid-column:1; grid-row:1; flex-direction:column; min-height:0;
+                    border-right:1px solid var(--line); border-bottom:none }
+      .panel.detail { grid-column:2; grid-row:1 }
+      .tabbar-wrap { min-height:0; overflow:hidden }
+      .tabbar { flex:1; min-height:0; max-height:none; overflow-y:auto; flex-direction:column;
+                align-items:stretch }
+      /* Each node's sessions stack instead of wrapping across a wide row. */
+      .node-group { display:block }
+      .node-tabs { flex-direction:column; flex-wrap:nowrap }
+      .tabbar .tab { width:100%; max-width:none; min-width:0; border-right:none;
+                     border-bottom:1px solid var(--line) }
+      .tab-name { max-width:none }
+      /* The COLUMN gets a header so it reads as a panel rather than a list
+         starting abruptly under the app chrome. Scoped to the sessions
+         strip on purpose: the inspector is inline here, not a sheet, and
+         giving it a sheet header with a close button both looked broken
+         and cost ~55px of terminal height. */
+      #sessionsDrawer > .drawer-head { display:flex }
+      /* In a long scrolling column the node a row belongs to must stay on
+         screen, or a session name alone does not say which machine it is
+         on -- the exact thing grouping exists to answer. */
+      .node-group-toggle { position:sticky; top:0; z-index:2; background:var(--panel); gap:6px }
+      /* The display name already identifies the node; repeating its id in a
+         260px column is what truncated the name to "dell-5530 (...". */
+      .node-group-id { display:none }
+      #sessionsDrawerClose { display:none }   /* nothing to close on desktop */
+      #sessionInspector > .drawer-head { display:none }
+    }
+
+    /* ================= MOBILE PORTRAIT: terminal-first =================
+       A phone in portrait is the one viewport where the desktop
+       information architecture actively fails: header + filter + tab strip
+       + status card + term bar + composer + key row left the OUTPUT -- the
+       only thing anyone opens this page to read -- with about a third of
+       the screen, and less once the tab strip filled up.
+
+       So portrait is not a squeezed desktop. Three rules:
+         1. exactly one row of chrome above the terminal, and one below;
+         2. the session list is a SHEET, not a permanent column;
+         3. status/permissions/keys are on demand, never in the way.
+
+       Landscape keeps the compact-desktop treatment from the block above,
+       where a horizontal strip costs little. Everything here is layout
+       only: no element leaves the DOM and no JS behaviour is conditioned
+       on width, so every feature stays reachable. */
+    @media (max-width:760px) and (orientation:portrait) {
+      /* -- header: one 44px row ------------------------------------- */
+      .header-id { display:none }          /* the product name is not what you need on a phone */
+      #mobileSessionsBtn { display:inline-flex; align-items:center }
+      .m-title { display:flex }
+      header {
+        gap:8px; padding:6px 10px;
+        padding-top:max(6px, env(safe-area-inset-top));
+        padding-left:max(10px, env(safe-area-inset-left));
+        padding-right:max(10px, env(safe-area-inset-right));
+      }
+      /* Status pills do not get to eat the row: LIVE stays (it is the one
+         thing worth a glance), the rest are reachable from the menu. */
+      .header-right { gap:4px; flex:0 0 auto }
+      .header-right .supervisor-badge, #killedMenu, #registryMenu, #watchdogMenu { display:none }
+      #liveBadge { font-size:0; line-height:0 }   /* the bullet alone, as a status dot */
+      /* Literal glyph, never a CSS hex escape: inside a non-raw Python
+         string a backslash followed by digits is a valid OCTAL escape, so
+         the intended bullet shipped as U+0082 instead -- and because the
+         escape is valid Python, no invalid-escape check catches it. */
+      #liveBadge::before { content:'●'; font-size:17px; line-height:1 }
+
+      /* -- sessions drawer: the tab strip, as a bottom sheet ---------- */
+      .tabbar-row {
+        position:fixed; left:0; right:0; bottom:0; z-index:35;
+        flex-direction:column; max-height:72dvh;
+        border-top:1px solid var(--line); border-bottom:none;
+        border-radius:14px 14px 0 0; box-shadow:0 -12px 32px rgba(0,0,0,.5);
+        transform:translateY(102%); transition:transform .18s ease-out;
+        padding-bottom:env(safe-area-inset-bottom);
+      }
+      body.sessions-open .tabbar-row { transform:translateY(0) }
+      .drawer-head { display:flex }
+      #sessionsDrawerBackdrop { position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:34 }
+      #sessionsDrawerBackdrop[hidden] { display:none }
+      /* The list scrolls INSIDE the sheet. Nothing here scrolls the page:
+         the shell is height-bounded and overflow:hidden. */
+      .tabbar-wrap { min-height:0; overflow:hidden }
+      .tabbar { max-height:none; flex:1; min-height:0; overflow-y:auto; -webkit-overflow-scrolling:touch }
+      /* Tabs stack as full-width rows in the sheet -- a horizontal strip
+         inside a vertical sheet would hide most of the list. */
+      .tabbar .tab { min-width:0; max-width:none; width:100%; min-height:44px }
+      .tab-name { max-width:none }
+
+      /* -- inspector: status + access, on demand --------------------- */
+      #sessionInspector {
+        position:fixed; left:0; right:0; bottom:0; z-index:35;
+        background:var(--panel); border-top:1px solid var(--line);
+        border-radius:14px 14px 0 0; box-shadow:0 -12px 32px rgba(0,0,0,.5);
+        max-height:70dvh; overflow-y:auto;
+        transform:translateY(102%); transition:transform .18s ease-out;
+        padding-bottom:env(safe-area-inset-bottom);
+      }
+      body.inspector-open #sessionInspector { transform:translateY(0) }
+      body.inspector-open #inspectorBackdrop { display:block }
+      /* With the inspector out of the flow, the grid is terminal +
+         composer rows -- nothing between the header and the output. */
+      .detail { grid-template-rows:minmax(0,1fr) auto auto auto auto }
+      .term { grid-row:1 } #inputNote { grid-row:2 } #remoteComposer { grid-row:3 }
+      #keyPad { grid-row:4 } #inputBar { grid-row:5 }
+
+      /* -- the terminal owns what is left ---------------------------- */
+      /* The tab strip is position:fixed here, so it leaves the grid flow
+         entirely and `.detail` becomes the FIRST in-flow item -- which
+         placed it in the `auto` track meant for the strip and collapsed
+         the terminal to its content height (measured: 31px of an 844px
+         screen). One track, and it is the flexible one. */
+      main { padding:0; gap:0; grid-template-rows:minmax(0,1fr) }
+      body.has-selection main { padding:0 }
+      .panel.detail { border:none; border-radius:0 }
+      /* term-bar stays one line: never wrapping into a second row that
+         silently costs another 30px of output. Measured at 390px before
+         this was tuned, the row was 455px wide and pushed the fullscreen
+         and "..." buttons off-screen -- and "..." is where Kill, Chi
+         tiết, Search and Copy live, so they were unreachable. Nothing may
+         be wider than the viewport here. */
+      .term-bar { flex-wrap:nowrap; padding:4px 8px; gap:6px; overflow:hidden }
+      .term-controls { flex-wrap:nowrap; gap:4px; flex:1 1 auto; min-width:0 }
+      .term-btn { padding:6px 8px; font-size:12px; min-height:36px; flex:0 0 auto }
+      /* The header already names the session; repeating it here is what
+         squeezed the controls out. */
+      .term-title { display:none }
+      /* Auto-follow becomes its state, not a sentence. Its label is JS
+         text, so the glyph is CSS and the word is hidden rather than
+         rewritten -- the button keeps its accessible text. */
+      #followToggle { font-size:0; padding:6px 9px }
+      #followToggle::before { content:'⇣'; font-size:15px; line-height:1 }
+      #followToggle.paused::before { content:'⏸'; font-size:13px }
+      #taskManagerBtn { font-size:0; padding:6px 9px }
+      #taskManagerBtn::before { content:'📋'; font-size:14px; line-height:1 }
+      #output { padding:8px 10px }
+
+      /* -- composer: sticky, one row, keys collapsed ----------------- */
+      #keysToggleBtn { display:inline-flex; align-items:center; padding:6px 10px; min-height:38px }
+      /* [hidden] (JS sets it whenever input is not usable) still wins;
+         this only decides whether a USABLE key row is expanded. */
+      #keyPad:not([hidden]) { display:none }
+      body.keys-open #keyPad:not([hidden]) { display:flex }
+      #inputBar {
+        padding-bottom:max(8px, env(safe-area-inset-bottom));
+        padding-left:max(10px, env(safe-area-inset-left));
+        padding-right:max(10px, env(safe-area-inset-right));
+        flex-wrap:nowrap; gap:6px; overflow:hidden;
+      }
+      /* The Send button and the Enter checkbox were off-screen at 390px --
+         the row measured 455px -- which made the composer unusable on the
+         exact device this redesign is for. The text box is the only part
+         that may absorb the squeeze; everything else keeps its size. */
+      #inputBar input[type=text] { flex:1 1 auto; min-width:0 }
+      #inputPrompt { display:none }
+      #inputBar button { flex:0 0 auto }
+      /* "Enter" becomes its glyph: the checkbox still carries the same
+         press_enter semantics and the same accessible label. */
+      #inputBar label { flex:0 0 auto; font-size:0; gap:0 }
+      #inputBar label::after { content:'⏎'; font-size:15px; margin-left:2px }
+      /* Bounded so a long mirrored prompt can never push the output out of
+         the viewport -- the exact failure this redesign exists to fix. */
+      .rc-body { max-height:18dvh }
+      #remoteComposer { padding-top:4px }
+      #inputNote { padding-top:2px }
+
+      /* -- when the on-screen keyboard is up ------------------------- */
+      /* interactive-widget=resizes-content (see the viewport meta) makes
+         iOS shrink the visual viewport instead of scrolling the page, so
+         dvh tracks it and the flex chain re-solves: the terminal shrinks
+         and the newest lines stay on screen. At that point the keyboard
+         itself provides the keys, so the quick-key row stands down. */
+      @media (max-height:520px) {
+        body.keys-open #keyPad:not([hidden]) { display:none }
+        .term-bar { padding:2px 8px }
+        #output { padding:6px 10px }
+      }
+    }
+    /* ---- Short viewports (phone in landscape, split-screen) ----------
+       Measured before this block existed: a 844x390 landscape phone gave
+       the output 20px -- 5% of the screen -- because the tab strip was
+       allowed 38vh and the status card sat above the terminal, on a
+       viewport with barely any height to give. Portrait solves this by
+       making both of those sheets; landscape keeps the strip (a
+       horizontal row is cheap when width is plentiful) but bounds it
+       properly and moves the status card out of the column. */
+    @media (max-height:560px) and (orientation:landscape) {
+      .tabbar { max-height:22vh }
+      .tabbar-filter { padding:3px 8px }
+      .tabbar-filter input { padding:4px 8px }
+      /* Same sheet treatment as portrait, for the same reason: a status
+         card between the header and the output is the single most
+         expensive row on a short screen. */
+      #sessionInspector {
+        position:fixed; left:auto; right:0; top:0; bottom:0; width:min(420px, 92vw); z-index:35;
+        background:var(--panel); border-left:1px solid var(--line);
+        max-height:100dvh; overflow-y:auto;
+        transform:translateX(102%); transition:transform .18s ease-out;
+      }
+      body.inspector-open #sessionInspector { transform:translateX(0) }
+      body.inspector-open #inspectorBackdrop { display:block }
+      .drawer-head { display:flex }
+      .detail { grid-template-rows:minmax(0,1fr) auto auto auto auto }
+      .term { grid-row:1 } #inputNote { grid-row:2 } #remoteComposer { grid-row:3 }
+      #keyPad { grid-row:4 } #inputBar { grid-row:5 }
+      .term-bar { flex-wrap:nowrap; padding:3px 8px }
+      #output { padding:6px 10px }
+      .rc-body { max-height:20dvh }
+    }
+    @media (prefers-reduced-motion:reduce) {
+      .tabbar-row, #sessionInspector { transition:none }
+    }
   </style>
 </head>
 <body>
   <header>
-    <div><h1>Terminal MCP</h1><div class="muted">Whitelisted tmux session monitor</div></div>
+    <!-- "Whitelisted tmux session monitor" is gone: session access is
+         default-open now (absence of a grant record means ALLOW), so the
+         word described a mechanism that no longer exists. -->
+    <div class="header-id"><h1>Terminal MCP</h1><div class="muted">tmux session monitor</div></div>
+    <!-- Mobile portrait header row: ONE line -- open Sessions, the active
+         session's name, its state dot. Everything else lives in the "⋯"
+         menu or the Inspector sheet, because on a phone the terminal has
+         to own the screen (see the portrait media query). -->
+    <button type="button" id="mobileSessionsBtn" class="m-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="sessionsDrawer">☰ Sessions</button>
+    <div class="m-title" id="mobileSessionTitle"><span class="m-dot" id="mobileSessionDot" hidden></span><span id="mobileSessionName">Chưa chọn session</span></div>
     <div class="header-right">
       <button id="supervisorBadge" class="supervisor-badge" type="button" hidden></button>
       <span class="supervisor-badge" id="connHealthBadge" title="Kết nối OpenAI Secure MCP Tunnel" hidden></span>
@@ -875,7 +1412,11 @@ DASHBOARD_HTML = """<!doctype html>
           <a href="/dashboard/requirements" id="requirementsLink" role="menuitem" target="_blank" rel="noopener">📄 Requirements</a>
           <button type="button" id="openSupervisorPanelBtn" role="menuitem">🧭 Supervisor / Coordinator</button>
           <button type="button" id="openTaskInboxBtn" role="menuitem">📥 Task Inbox</button>
-          <button type="button" id="openAiUsageBtn" role="menuitem">📊 AI Usage</button>
+          <a href="/dashboard/terminal-wall" id="terminalWallLink" role="menuitem">🧱 Terminal Wall</a>
+          <a href="/dashboard/fleet" id="fleetRegistryLink" role="menuitem">🗺 Fleet Registry</a>
+          <a href="/dashboard/audit" id="auditLink" role="menuitem">🧾 Audit &amp; Access</a>
+          <a href="/dashboard/work" id="workLink" role="menuitem">🧩 Work</a>
+          <a href="/dashboard/ai-usage" id="aiUsageLink" role="menuitem">📊 AI Usage</a>
         </div>
       </div>
     </div>
@@ -891,12 +1432,39 @@ DASHBOARD_HTML = """<!doctype html>
          The strip itself now holds ONLY session tabs (task's own explicit
          "dải ngang phải ưu tiên session tabs 100% chiều rộng") -- New
          session/Đã kill moved to the header, see above. -->
-    <div class="tabbar-row">
-      <nav class="tabbar" id="tabbar" role="tablist" aria-label="Sessions"></nav>
+    <!-- On desktop this is the horizontal tab strip it has always been.
+         On a phone in portrait the SAME element becomes a bottom sheet
+         (see the portrait media query): identical DOM, identical JS, so
+         grouping-by-node, the filter, status dots and selection all keep
+         working exactly as before -- only where it sits changes. -->
+    <div class="tabbar-row" id="sessionsDrawer" role="group" aria-label="Sessions">
+      <div class="drawer-head">
+        <strong>Sessions</strong>
+        <button type="button" class="m-btn" id="sessionsDrawerClose" aria-label="Đóng danh sách session">✕</button>
+      </div>
+      <div class="tabbar-wrap">
+        <div class="tabbar-filter">
+          <input type="search" id="sessionFilter" placeholder="Lọc session trên mọi node..." aria-label="Lọc session">
+        </div>
+        <nav class="tabbar" id="tabbar" role="tablist" aria-label="Sessions"></nav>
+      </div>
     </div>
+    <div id="sessionsDrawerBackdrop" hidden></div>
     <section class="panel detail">
-      <div id="summary" class="muted">Chọn một session để xem output.</div>
-      <div id="grantBar" hidden></div>
+      <!-- Status card + access controls. A grid row on desktop; on a phone
+           in portrait this whole wrapper becomes a bottom sheet opened from
+           the "⋯" menu, so nothing sits between the header and the
+           terminal output. Wrapping them (rather than moving them) keeps
+           every existing JS reference to #summary/#grantBar valid. -->
+      <div id="sessionInspector">
+        <div class="drawer-head">
+          <strong>Chi tiết session</strong>
+          <button type="button" class="m-btn" id="inspectorClose" aria-label="Đóng chi tiết">✕</button>
+        </div>
+        <div id="summary" class="muted">Chọn một session để xem output.</div>
+        <div id="grantBar" hidden></div>
+      </div>
+      <div id="inspectorBackdrop" hidden></div>
       <div class="term">
         <div class="term-bar">
           <span class="term-title" id="termTitle"></span>
@@ -908,6 +1476,7 @@ DASHBOARD_HTML = """<!doctype html>
               <button class="term-btn" id="termMenuBtn" type="button" disabled aria-haspopup="true" aria-expanded="false" title="Thêm tuỳ chọn">⋯</button>
               <div class="menu-panel" id="termMenuPanel" role="menu">
                 <button id="jumpBtn" type="button" disabled>↓ Jump to latest</button>
+                <button id="inspectorBtn" type="button" disabled>ℹ Chi tiết session</button>
                 <button id="searchToggleBtn" type="button" disabled>🔍 Tìm trong output</button>
                 <button id="copyBtn" type="button" disabled>⧉ Copy output</button>
                 <button id="fontDecBtn" type="button" disabled>A− Chữ nhỏ hơn</button>
@@ -931,10 +1500,46 @@ DASHBOARD_HTML = """<!doctype html>
           <button id="searchCloseBtn" class="term-btn" type="button">✕</button>
         </div>
         <pre id="output"></pre>
+        <!-- Shown only while auto-follow is paused (the user scrolled up).
+             The "↓ Jump to latest" menu item still exists and does the same
+             thing; this is the one-tap version, which is what a phone
+             needs. -->
+        <button type="button" id="jumpFab" hidden>↓ Về cuối</button>
       </div>
       <div id="inputNote"></div>
+      <!-- Remote composer mirror: what the AGENT currently has on screen as
+           an interactive choice/prompt (a numbered menu, a confirmation, a
+           completion list). Read-only and deliberately SEPARATE from the
+           draft box below -- the two are different things, and merging them
+           silently is how a half-typed message gets destroyed by a poll. -->
+      <div id="remoteComposer" hidden>
+        <div class="rc-head">
+          <span class="rc-title">Trên terminal</span>
+          <span class="rc-kind" id="remoteComposerKind"></span>
+          <button type="button" class="rc-sync" id="remoteComposerSync" title="Chép nội dung này vào ô nhập bên dưới">⇩ Chép vào ô nhập</button>
+        </div>
+        <pre class="rc-body" id="remoteComposerBody"></pre>
+      </div>
+      <div id="keyPad" hidden>
+        <span class="kp-label">Phím:</span>
+        <button type="button" class="kp-btn" data-key="Up" title="Mũi tên lên (↑)">↑</button>
+        <button type="button" class="kp-btn" data-key="Down" title="Mũi tên xuống (↓)">↓</button>
+        <button type="button" class="kp-btn" data-key="Left" title="Mũi tên trái (←)">←</button>
+        <button type="button" class="kp-btn" data-key="Right" title="Mũi tên phải (→)">→</button>
+        <button type="button" class="kp-btn" data-key="Tab" title="Tab (autocomplete/chuyển mục)">Tab</button>
+        <button type="button" class="kp-btn" data-key="Escape" title="Escape">Esc</button>
+        <button type="button" class="kp-btn kp-enter" data-key="Enter" title="Enter">⏎</button>
+        <label class="kp-mode" title="Khi bật, ↑ ↓ ← → và Tab gõ từ bàn phím sẽ gửi thẳng vào terminal thay vì di chuyển con trỏ trong ô nhập. Esc để tắt.">
+          <input type="checkbox" id="keyModeToggle"> Bắt phím
+        </label>
+      </div>
       <div id="inputBar">
         <span id="inputPrompt">❯</span>
+        <!-- The quick-key row costs ~60px of a phone screen and is not
+             needed for most sends, so on portrait it collapses behind this
+             button (see #keyPad in the portrait media query). Hidden on
+             desktop, where the row simply stays open. -->
+        <button type="button" id="keysToggleBtn" class="m-btn" aria-expanded="false" aria-controls="keyPad" hidden>⌨ Phím</button>
         <input type="text" id="inputText" placeholder="Nhập text để gửi vào session..." disabled>
         <label><input type="checkbox" id="inputEnter" checked> Enter</label>
         <button id="inputSend" disabled>Gửi</button>
@@ -1128,6 +1733,13 @@ DASHBOARD_HTML = """<!doctype html>
     let autoFollow = true;
     let lastRenderedSession = null;
     let fullscreenTerminal = false;
+    /*__NODE_GROUP_JS__*/
+    // Node registry, polled on a slower cadence than sessions: it only feeds
+    // the group headers (status badge) and the "online but no sessions" group,
+    // neither of which needs the 5s session cadence. Grouping degrades
+    // gracefully to the rows' own node_id/node_name if this never loads.
+    let lastKnownNodes = [];
+    const nodeCollapse = makeNodeCollapseStore('dashboard');
     let lastKnownRows = []; // the most recent /dashboard/api/sessions rows, reused by openPermModal/openKillModal without a re-fetch
     let loadDetailSequence = 0; // generation counter -- see loadDetail's own guard for why a session-name check alone isn't enough
     // session name -> its persistent tab <div>, reused across every
@@ -1144,6 +1756,7 @@ DASHBOARD_HTML = """<!doctype html>
     // never be "stolen" by a rebuild again.
     const tabEls = new Map();
     const tabbarEl = document.querySelector('#tabbar');
+    const sessionFilterEl = document.querySelector('#sessionFilter');
     const outputEl = document.querySelector('#output');
     const summaryEl = document.querySelector('#summary');
     const grantBarEl = document.querySelector('#grantBar');
@@ -1250,6 +1863,12 @@ DASHBOARD_HTML = """<!doctype html>
     const inputTextEl = document.querySelector('#inputText');
     const inputEnterEl = document.querySelector('#inputEnter');
     const inputSendEl = document.querySelector('#inputSend');
+    const keyPadEl = document.querySelector('#keyPad');
+    const keyModeToggleEl = document.querySelector('#keyModeToggle');
+    const remoteComposerEl = document.querySelector('#remoteComposer');
+    const remoteComposerKindEl = document.querySelector('#remoteComposerKind');
+    const remoteComposerBodyEl = document.querySelector('#remoteComposerBody');
+    const remoteComposerSyncEl = document.querySelector('#remoteComposerSync');
     const termMenuBtnEl = document.querySelector('#termMenuBtn');
     const termOpenRealBtnEl = document.querySelector('#termOpenRealBtn');
     const termCopyAttachBtnEl = document.querySelector('#termCopyAttachBtn');
@@ -1265,8 +1884,110 @@ DASHBOARD_HTML = """<!doctype html>
     // size); this only toggles the CSS class the mobile media query above
     // uses to reclaim the desktop-style outer padding once a session fills
     // the screen.
+    // Bring the active session's row into view ONLY when it is actually
+    // out of view, measured against the list's own scroll box.
+    //
+    // scrollIntoView({block:'nearest'}) was not enough: on the desktop
+    // column it left the selected session scrolled out of sight (measured:
+    // scrollTop 53 with the active row above the fold) because it also
+    // walks ancestors and re-aligns during the render that immediately
+    // follows a click. Scrolling only when required cannot drift a row
+    // that is already where the user can see it, in either layout.
+    function revealTab(tab) {
+      if (!tab) return;
+      // Next frame, not now: this runs right after renderRows() rebuilds the
+      // list, and measuring a row mid-layout gave a stale rectangle -- the
+      // first session in a group stayed scrolled 25px above the fold while
+      // the very same call a moment later corrected it.
+      requestAnimationFrame(() => revealTabNow(tab));
+    }
+
+    function revealTabNow(tab) {
+      if (!tab || !tab.isConnected) return;
+      const list = document.querySelector('#tabbar');
+      if (!list) return;
+      const row = tab.getBoundingClientRect();
+      const box = list.getBoundingClientRect();
+      // The node header is sticky in the column layout, so it covers the
+      // top of the scroll box. A row level with box.top is BEHIND it, not
+      // visible -- which is how the first session in a group ended up
+      // hidden under its own node header after being selected.
+      const header = tab.closest('.node-group')?.querySelector('.node-group-toggle');
+      const cover = (header && getComputedStyle(header).position === 'sticky')
+        ? header.getBoundingClientRect().height : 0;
+      if (row.top < box.top + cover) {
+        list.scrollTop -= (box.top + cover - row.top);
+      } else if (row.bottom > box.bottom) {
+        list.scrollTop += (row.bottom - box.bottom);
+      }
+      // Horizontal strip (landscape/tablet): the same question, other axis.
+      if (row.left < box.left) {
+        list.scrollLeft -= (box.left - row.left);
+      } else if (row.right > box.right) {
+        list.scrollLeft += (row.right - box.right);
+      }
+    }
+
     function updateLayoutState() {
       document.body.classList.toggle('has-selection', Boolean(selected));
+      updateMobileHeadline();
+    }
+
+    // ---- mobile portrait: sessions sheet, inspector sheet, key row -------
+    // Pure presentation state. Each of these only toggles a body class that
+    // the portrait media query reads, so on desktop -- where none of those
+    // rules apply -- every one of them is inert and nothing here needs a
+    // width check of its own.
+    const mobileSessionsBtnEl = document.querySelector('#mobileSessionsBtn');
+    const sessionsDrawerEl = document.querySelector('#sessionsDrawer');
+    const sessionsDrawerCloseEl = document.querySelector('#sessionsDrawerClose');
+    const sessionsBackdropEl = document.querySelector('#sessionsDrawerBackdrop');
+    const inspectorEl = document.querySelector('#sessionInspector');
+    const inspectorBtnEl = document.querySelector('#inspectorBtn');
+    const inspectorCloseEl = document.querySelector('#inspectorClose');
+    const inspectorBackdropEl = document.querySelector('#inspectorBackdrop');
+    const keysToggleBtnEl = document.querySelector('#keysToggleBtn');
+    const jumpFabEl = document.querySelector('#jumpFab');
+    const mobileSessionNameEl = document.querySelector('#mobileSessionName');
+    const mobileSessionDotEl = document.querySelector('#mobileSessionDot');
+
+    function setSessionsDrawer(open) {
+      document.body.classList.toggle('sessions-open', open);
+      sessionsBackdropEl.hidden = !open;
+      mobileSessionsBtnEl.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (open) {
+        // The active session must be visible the moment the sheet opens,
+        // however far down a long list it sits.
+        revealTab(sessionsDrawerEl.querySelector('.tab.active'));
+      }
+    }
+    function setInspector(open) {
+      document.body.classList.toggle('inspector-open', open);
+      inspectorBackdropEl.hidden = !open;
+    }
+    function setKeysOpen(open) {
+      document.body.classList.toggle('keys-open', open);
+      keysToggleBtnEl.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+    mobileSessionsBtnEl.onclick = () => setSessionsDrawer(!document.body.classList.contains('sessions-open'));
+    sessionsDrawerCloseEl.onclick = () => setSessionsDrawer(false);
+    sessionsBackdropEl.onclick = () => setSessionsDrawer(false);
+    inspectorBtnEl.onclick = () => { closeAllMenus(); setInspector(true); };
+    inspectorCloseEl.onclick = () => setInspector(false);
+    inspectorBackdropEl.onclick = () => setInspector(false);
+    keysToggleBtnEl.onclick = () => setKeysOpen(!document.body.classList.contains('keys-open'));
+
+    // The name in the one-line mobile header, mirroring the term-bar title.
+    function updateMobileHeadline() {
+      mobileSessionNameEl.textContent = selected || 'Chưa chọn session';
+      const row = selected ? (lastKnownRows || []).find((item) => item.name === selected) : null;
+      mobileSessionDotEl.hidden = !row;
+      if (row) {
+        mobileSessionDotEl.className = 'm-dot ' + (
+          row.state === 'RUNNING' ? 'ok'
+          : (row.state === 'WAITING_INPUT' || row.state === 'VERIFYING') ? 'warn'
+          : (row.state === 'FAILED' || row.state === 'BLOCKED' || row.state === 'ERROR') ? 'bad' : '');
+      }
     }
 
     // ---- Reusable "⋯" overflow menu (task item 3) --------------------------
@@ -1299,6 +2020,13 @@ DASHBOARD_HTML = """<!doctype html>
     }
     document.addEventListener('click', closeAllMenus);
     document.addEventListener('keydown', event => { if (event.key === 'Escape') closeAllMenus(); });
+    // Escape closes whichever sheet is up -- same affordance as every other
+    // overlay on this page.
+    document.addEventListener('keydown', event => {
+      if (event.key !== 'Escape') return;
+      if (document.body.classList.contains('sessions-open')) setSessionsDrawer(false);
+      if (document.body.classList.contains('inspector-open')) setInspector(false);
+    });
     wireMenu(document.querySelector('#headerMenu'), document.querySelector('#headerMenuBtn'));
     wireMenu(document.querySelector('#termMenu'), document.querySelector('#termMenuBtn'));
     wireMenu(document.querySelector('#killedMenu'), killedToggleEl);
@@ -1510,7 +2238,7 @@ DASHBOARD_HTML = """<!doctype html>
     // captured -- never used by ansiRuns), final byte 0x40-0x7E ([@-~],
     // not just A-Za-z -- a handful of legitimate CSI final bytes fall
     // outside that narrower range).
-    const CSI_RE = /\\x1b\\[([0-?]*)[ -\/]*([@-~])/g;
+    const CSI_RE = /\\x1b\\[([0-?]*)[ -\\/]*([@-~])/g;
     // OSC sequences (ESC ] ... BEL-or-ESC\\) -- e.g. an OSC 8 hyperlink, or a
     // window-title set -- a real CLI can legitimately emit these (caught
     // live verifying this redesign against a real Claude Code session,
@@ -1736,6 +2464,9 @@ DASHBOARD_HTML = """<!doctype html>
       autoFollow = value;
       followToggleEl.textContent = autoFollow ? 'Auto-follow: ON' : 'Auto-follow: PAUSED';
       followToggleEl.classList.toggle('paused', !autoFollow);
+      // Paused means the user scrolled up to read something. Offer the way
+      // back explicitly instead of yanking them down.
+      jumpFabEl.hidden = autoFollow || !selected;
     }
     function refreshTermControls() {
       followToggleEl.disabled = !selected;
@@ -1743,6 +2474,7 @@ DASHBOARD_HTML = """<!doctype html>
       taskManagerBtnEl.disabled = !selected;
       fullscreenBtnEl.disabled = !selected;
       searchToggleBtnEl.disabled = !selected;
+      inspectorBtnEl.disabled = !selected;
       copyBtnEl.disabled = !selected;
       termMenuBtnEl.disabled = !selected;
       termTitleEl.textContent = selected || '';
@@ -1754,6 +2486,7 @@ DASHBOARD_HTML = """<!doctype html>
       if (autoFollow) outputEl.scrollTop = outputEl.scrollHeight;
     };
     jumpBtnEl.onclick = () => { setAutoFollow(true); outputEl.scrollTop = outputEl.scrollHeight; };
+    jumpFabEl.onclick = () => { setAutoFollow(true); outputEl.scrollTop = outputEl.scrollHeight; };
 
     // ---- fullscreen terminal (mobile: CSS-only chrome hide; everywhere:
     // opportunistic real Fullscreen API) --------------------------------
@@ -1842,10 +2575,182 @@ DASHBOARD_HTML = """<!doctype html>
     function refreshInputControls() {
       const enabled = Boolean(selected) && inputAllowed;
       inputTextEl.disabled = !enabled; inputSendEl.disabled = !enabled;
+      refreshKeyPad();
       if (!selected) { setInputNote(''); }
       else if (!inputAllowed) { setInputNote('Input bị tắt cho session này (permission hoặc input_policy).', false); }
       else { setInputNote(''); }
     }
+
+    // ---- Interactive key sends (arrows / Tab / Esc / Enter) --------------
+    // A menu, a completion list or a confirmation reacts to a real KEY, not
+    // to text -- writing an ESC[A sequence into the composer types those characters,
+    // it does not press Up. So these go through terminal_send_keys (the same
+    // MCP tool and the same allow_keys policy), never through the text path.
+    //
+    // Capability is server-reported, never assumed: permissions.
+    // allow_send_keys can be off, and input_policy.allow_keys can omit any
+    // individual key. A key the deployment does not allow is shown DISABLED
+    // with the reason, rather than as a button that fails on click.
+    let sendKeysEnabled = true;      // permissions.allow_send_keys
+    let allowedKeys = new Set();     // input_policy.allow_keys
+    let keysCapabilityKnown = false; // nothing reported yet -> stay quiet
+
+    function keyIsAvailable(key) {
+      return sendKeysEnabled && (!keysCapabilityKnown || allowedKeys.has(key));
+    }
+
+    function refreshKeyPad() {
+      const usable = Boolean(selected) && inputAllowed;
+      keyPadEl.hidden = !usable;
+      // A collapse toggle for a row that cannot be used would be a dead
+      // control; it appears and disappears with the row it opens.
+      keysToggleBtnEl.hidden = !usable;
+      if (!usable) { setKeyMode(false); setKeysOpen(false); return; }
+      for (const btn of keyPadEl.querySelectorAll('.kp-btn')) {
+        const key = btn.dataset.key;
+        const available = keyIsAvailable(key);
+        btn.disabled = !available;
+        btn.title = available ? btn.dataset.titleOn || btn.title
+          : (!sendKeysEnabled
+              ? 'Gửi phím đang tắt trên deployment này (permissions.allow_send_keys)'
+              : `Phím "${key}" không nằm trong input_policy.allow_keys`);
+      }
+      const anyNavKey = ['Up', 'Down', 'Left', 'Right', 'Tab'].some(keyIsAvailable);
+      keyModeToggleEl.disabled = !anyNavKey;
+      if (!anyNavKey) setKeyMode(false);
+    }
+
+    async function sendKeys(keys) {
+      if (!selected) return;
+      const targetSession = selected;
+      const usable = keys.filter(keyIsAvailable);
+      if (!usable.length) { setInputNote('Phím này không được phép trên deployment hiện tại.', true); return; }
+      try {
+        const response = await fetch('/dashboard/api/session/keys', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name: targetSession, keys: usable}),
+        });
+        // Error is read from the BODY, never from the status code alone --
+        // this app answers legitimate denials (KEY_NOT_ALLOWED,
+        // SEND_KEYS_DISABLED, PANE_IN_COPY_MODE) with a real JSON reason,
+        // and treating any non-2xx as a transport failure is the exact
+        // regression fetchJSON's own auth/offline detection exists to avoid.
+        const data = await response.json().catch(() => ({}));
+        if (data.error) {
+          if (selected === targetSession) {
+            setInputNote(`Không gửi được phím: ${data.error}${data.reason ? ' -- ' + data.reason : ''}`, true);
+          }
+          return;
+        }
+        if (selected === targetSession) setInputNote('');
+        // The pane has almost certainly changed (a menu moved, a completion
+        // expanded). Refresh now instead of waiting out the poll interval,
+        // so the mirror below reflects the new selection immediately -- the
+        // task's own "lần poll tiếp theo phản ánh lựa chọn/composer mới".
+        loadDetail();
+      } catch (error) {
+        setInputNote('Không gửi được phím: mất kết nối.', true);
+      }
+    }
+
+    for (const btn of keyPadEl.querySelectorAll('.kp-btn')) {
+      btn.dataset.titleOn = btn.title;
+      btn.onclick = () => sendKeys([btn.dataset.key]);
+    }
+
+    // Key-capture mode: while ON and the composer has focus, the navigation
+    // keys drive the TERMINAL instead of the text box. Off by default,
+    // because silently stealing Tab from a text field breaks keyboard
+    // navigation for anyone who did not ask for it.
+    let keyModeOn = false;
+    const CAPTURED_KEYS = { ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right', Tab: 'Tab' };
+
+    function setKeyMode(on) {
+      keyModeOn = Boolean(on) && !keyModeToggleEl.disabled;
+      keyModeToggleEl.checked = keyModeOn;
+      inputTextEl.classList.toggle('key-mode', keyModeOn);
+      inputTextEl.placeholder = keyModeOn
+        ? 'Chế độ bắt phím: ↑ ↓ ← → Tab gửi thẳng vào terminal (Esc để tắt)'
+        : 'Nhập text để gửi vào session...';
+    }
+    keyModeToggleEl.onchange = () => setKeyMode(keyModeToggleEl.checked);
+
+    inputTextEl.addEventListener('keydown', event => {
+      if (!keyModeOn) return;
+      // Escape always LEAVES the mode rather than being swallowed -- the
+      // accessibility escape hatch, so the keyboard is never trapped.
+      if (event.key === 'Escape') { setKeyMode(false); return; }
+      const mapped = CAPTURED_KEYS[event.key];
+      if (!mapped || !keyIsAvailable(mapped)) return;
+      // Modified presses (Alt+Tab, Ctrl+Arrow for word jumps, Shift+Tab out
+      // of the field) stay with the browser.
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
+      if (event.key === 'Tab' && event.shiftKey) return;
+      event.preventDefault();
+      sendKeys([mapped]);
+    });
+
+    // ---- Remote composer mirror -----------------------------------------
+    // What the agent currently has on screen as an interactive choice, read
+    // off the SAME pane tail the output view already polls -- no extra API
+    // and no second capture of the pane.
+    //
+    // Deliberately NOT written straight into the draft box: the draft is the
+    // operator's, the mirror is the agent's, and a poll that overwrites a
+    // half-typed message is exactly the data loss this separation prevents.
+    // Copying across is a button, and it warns before discarding a dirty
+    // draft.
+    const MENU_LINE_RE = /^\\s*[❯>*]?\\s*(\\d+)[.)]\\s+\\S/;
+    const SELECTED_LINE_RE = /^\\s*[❯>*]\\s*\\S/;
+    let localDraftDirty = false;
+    let lastRemoteComposerText = '';
+
+    inputTextEl.addEventListener('input', () => { localDraftDirty = inputTextEl.value.length > 0; });
+
+    function detectRemoteComposer(outputText) {
+      if (!outputText) return null;
+      const lines = outputText.replace(/\\s+$/, '').split('\\n');
+      const tail = lines.slice(-14);
+      const menu = tail.filter(line => MENU_LINE_RE.test(line));
+      if (menu.length >= 2) {
+        const marked = tail.filter(line => MENU_LINE_RE.test(line) && SELECTED_LINE_RE.test(line));
+        return {
+          kind: marked.length ? 'menu lựa chọn (đang chọn dòng có ❯)' : 'menu lựa chọn',
+          text: menu.join('\\n'),
+        };
+      }
+      // A composer/prompt line with something already typed into it.
+      for (let i = tail.length - 1; i >= 0; i -= 1) {
+        const line = tail[i];
+        const match = line.match(/^\\s*[❯>](.*)$/);
+        if (match && match[1].trim()) return { kind: 'composer', text: match[1].trim() };
+      }
+      return null;
+    }
+
+    function renderRemoteComposer(outputText) {
+      const detected = detectRemoteComposer(outputText);
+      if (!detected) {
+        remoteComposerEl.hidden = true; lastRemoteComposerText = ''; return;
+      }
+      const changed = detected.text !== lastRemoteComposerText;
+      lastRemoteComposerText = detected.text;
+      remoteComposerEl.hidden = false;
+      remoteComposerKindEl.textContent = detected.kind;
+      remoteComposerBodyEl.textContent = detected.text;
+      // A change while the operator is mid-draft is flagged, never applied:
+      // they decide whether the agent's new state replaces what they typed.
+      remoteComposerEl.classList.toggle('rc-changed', changed && localDraftDirty);
+      remoteComposerSyncEl.textContent = localDraftDirty ? '⇩ Thay ô nhập (đang có draft)' : '⇩ Chép vào ô nhập';
+    }
+
+    remoteComposerSyncEl.onclick = () => {
+      if (localDraftDirty && !confirm('Ô nhập đang có nội dung bạn gõ dở. Thay bằng nội dung từ terminal?')) return;
+      inputTextEl.value = lastRemoteComposerText;
+      localDraftDirty = inputTextEl.value.length > 0;
+      inputTextEl.focus();
+      remoteComposerEl.classList.remove('rc-changed');
+    };
     // P0-4: a fresh idempotency key per click/Enter -- if the fetch below
     // fails ambiguously (e.g. a network drop after the send already
     // reached the server) and the UI is retried, the retry replays the
@@ -1904,7 +2809,7 @@ DASHBOARD_HTML = """<!doctype html>
           // (switched away and, less commonly, something already wrote a
           // new draft for it while gone).
           if (selected === targetSession) {
-            if (inputTextEl.value === sentText) { inputTextEl.value = ''; drafts.set(targetSession, ''); }
+            if (inputTextEl.value === sentText) { inputTextEl.value = ''; drafts.set(targetSession, ''); localDraftDirty = false; }
             // "Accepted" vs "Unknown" -- SUBMIT_CONFIRMED/TEXT_SENT (a
             // plain append, nothing to confirm) clear the note entirely;
             // DELIVERY_UNKNOWN (Enter was sent but no adapter evidence
@@ -1972,7 +2877,11 @@ DASHBOARD_HTML = """<!doctype html>
       INVALID_SESSION: 'tên session không hợp lệ',
     };
     function inputBlockLabel(reason) { return INPUT_BLOCK_LABELS[reason] || reason; }
-    function grantable(row) { return !row.allowed; } // the one, reused "has anything to grant" test
+    // Access is open by default, so "can this row's access be changed?" is
+    // now always yes. This previously meant "is outside the static
+    // whitelist", which under default-open reads false for every accessible
+    // session -- hiding the controls from the rows that most need them.
+    function grantable(row) { return true; }
     // 'full' (xem + gửi) | 'read' (chỉ xem) | 'none' (chưa cấp quyền) --
     // derived from the durable grant itself (grants.py), NOT from
     // effective_read/effective_input (which fold in the static whitelist
@@ -2125,15 +3034,23 @@ DASHBOARD_HTML = """<!doctype html>
     // separate overlay design structurally avoids.
     function renderGrantBar(name, allowed, grant, restricted, inputBlockReason, effectiveInput) {
       grantBarEl.replaceChildren();
-      grantBarEl.hidden = true;
-      if (allowed) return; // statically whitelisted -- nothing to grant/revoke, ever
+      // This used to be `if (allowed) return` -- "statically whitelisted,
+      // nothing to grant/revoke, ever". Under default-open `allowed` is an
+      // alias of read authorization and is TRUE for every accessible
+      // session, so the control disappeared from all of them: the one place
+      // an operator can see and change a session's access showed nothing,
+      // on every session. Same mistake as `grantable(row) = !row.allowed`,
+      // fixed in the two list views and missed here.
       grantBarEl.hidden = false;
-      const state = grant && grant.input_enabled ? 'full' : grant && grant.read_enabled ? 'read' : 'none';
-      const granted = grantStateLabel(state);
       const effective = restricted ? 'Không truy cập' : (effectiveInput ? 'Xem + gửi' : 'Chỉ xem');
+      const locked = restricted || !effectiveInput;
       const label = document.createElement('span');
-      label.textContent = granted === effective ? `Quyền: ${effective}` : `Đã cấp: ${granted} · Hiệu lực: ${effective}`;
-      const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = '🔐 Quyền truy cập';
+      label.textContent = locked ? `🔒 ${effective}` : `Quyền: ${effective} (mặc định)`;
+      if (locked && inputBlockReason) { label.title = inputBlockReason; }
+      const btn = document.createElement('button'); btn.type = 'button';
+      // Wording says what the button is FOR. Access is already on; this is
+      // how you take it away, not how you obtain it.
+      btn.textContent = locked ? '🔐 Mở khoá / đổi quyền' : '🔐 Khoá quyền truy cập';
       btn.onclick = () => openPermModal(name);
       grantBarEl.append(label, btn);
     }
@@ -2155,10 +3072,24 @@ DASHBOARD_HTML = """<!doctype html>
       // never overwrite an in-progress, not-yet-saved draft with the
       // last-saved value for the same session, and must never reset
       // auto-follow/scroll/search state the user hasn't actually left.
-      if (selected === name) return;
+      if (selected === name) {
+        // Tapping the session you are already on is a no-op for STATE -- it
+        // must not clobber a draft or reset scroll/auto-follow. But it is
+        // not a no-op for the sheet: you asked for that session, so get out
+        // of the way and show it, exactly as picking a different one does.
+        setSessionsDrawer(false);
+        return;
+      }
       if (selected) { drafts.set(selected, inputTextEl.value); }
       selected = name; inputAllowed = false;
       inputTextEl.value = drafts.get(name) || '';
+      // The draft and its dirty flag belong to the SESSION, not to the box:
+      // switching tabs must not make another session's untouched draft look
+      // like something the operator just typed, nor keep the previous
+      // session's mirrored composer on screen.
+      localDraftDirty = inputTextEl.value.length > 0;
+      lastRemoteComposerText = ''; remoteComposerEl.hidden = true;
+      remoteComposerEl.classList.remove('rc-changed');
       // The previous session's output must never remain visible under the
       // new session's name while its own detail fetch is still in flight
       // (a tab click must not have to wait for the next 5s poll either).
@@ -2171,6 +3102,10 @@ DASHBOARD_HTML = """<!doctype html>
       // detail arrives and renderGrantBar repaints it for real.
       grantBarEl.hidden = true; grantBarEl.replaceChildren();
       setAutoFollow(true); refreshInputControls(); refreshTermControls(); updateLayoutState();
+      // Picking a session is the whole reason the sheet was open -- get out
+      // of the way and show the terminal, rather than leaving the list
+      // covering the output the user just asked for.
+      setSessionsDrawer(false);
       rememberSession(name);
       closeSearch(); // a search from a different session's content wouldn't make sense to keep open
       renderRows(lastKnownRows); // reflect the new active/selected row immediately, not just on the next 5s poll
@@ -2181,7 +3116,7 @@ DASHBOARD_HTML = """<!doctype html>
       // tab is actually selected. 'nearest' -- never yanks an
       // already-visible tab to a different edge on every poll.
       const activeRefs = tabEls.get(name);
-      if (activeRefs) activeRefs.tab.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      if (activeRefs) revealTab(activeRefs.tab);
       // Fire immediately; loadDetail's own generation-sequence guard (see
       // below) discards this if the user switches again before it
       // resolves. A rejected fetch here is swallowed deliberately -- the
@@ -2306,7 +3241,10 @@ DASHBOARD_HTML = """<!doctype html>
       const closeBtn = document.createElement('button');
       closeBtn.type = 'button'; closeBtn.className = 'tab-close'; closeBtn.textContent = '✕';
       tab.append(dot, label, badge, closeBtn);
-      tabbarEl.append(tab);
+      // NOT appended to the strip here any more: renderRows places it inside
+      // its own node's group container. Creating it detached keeps this
+      // function's "build once, never recreate" contract intact (see the
+      // tabEls comment) while letting the node grouping own placement.
       return { tab, dot, label, badge, closeBtn };
     }
 
@@ -2325,7 +3263,20 @@ DASHBOARD_HTML = """<!doctype html>
       tab.title = `${row.name} · ${row.windows} window · ${row.attached ? 'Terminal attached' : 'No terminal attached'}`
         + (row.effective_read ? '' : ' · chưa cấp quyền xem');
       dot.className = tabDotClass(row);
+      // A `-work` session is labelled so an operator can tell at a glance
+      // which terminals the Work runtime may drive. The badge is a LABEL,
+      // not a control: the session stays an ordinary terminal here, and
+      // nothing about this tab behaves differently because of it.
+      const isWorkSession = /-work$/.test(row.name);
       label.textContent = row.name;
+      if (isWorkSession) {
+        label.textContent = row.name + ' ';
+        const workBadge = document.createElement('span');
+        workBadge.className = 'work-badge';
+        workBadge.textContent = 'WORK';
+        workBadge.title = 'Session này có thể được Work Runtime điều khiển tự động';
+        label.appendChild(workBadge);
+      }
       badge.hidden = !needsAttention;
 
       const isProtected = protectedSessions.has(row.name);
@@ -2349,39 +3300,110 @@ DASHBOARD_HTML = """<!doctype html>
       };
     }
 
+    // One group section per node, reused across polls exactly the way tabEls
+    // reuses tab elements -- a header rebuilt every 5s would fight the
+    // operator for the collapse toggle and steal focus mid-click.
+    const nodeGroupEls = new Map(); // node_id -> { section, header, caret, name, id, status, count, tabs }
+
+    function buildNodeGroupEl(nodeId) {
+      const section = document.createElement('div'); section.className = 'node-group';
+      const header = document.createElement('button');
+      header.type = 'button'; header.className = 'node-group-toggle';
+      const caret = document.createElement('span'); caret.className = 'node-caret';
+      const name = document.createElement('span'); name.className = 'node-group-name';
+      const id = document.createElement('span'); id.className = 'node-group-id';
+      const status = document.createElement('span'); status.className = 'node-group-status';
+      const count = document.createElement('span'); count.className = 'node-group-count';
+      header.append(caret, name, id, status, count);
+      const tabs = document.createElement('div'); tabs.className = 'node-tabs'; tabs.setAttribute('role', 'tablist');
+      section.append(header, tabs);
+      header.onclick = () => {
+        nodeCollapse.setCollapsed(nodeId, !nodeCollapse.isCollapsed(nodeId));
+        renderRows(lastKnownRows);
+      };
+      return { section, header, caret, name, id, status, count, tabs };
+    }
+
     function renderRows(rows) {
       lastKnownRows = rows;
+      const query = sessionFilterEl ? sessionFilterEl.value.trim().toLowerCase() : '';
+      const visibleRows = query ? rows.filter(row => row.name.toLowerCase().includes(query)) : rows;
+      // While filtering, a node with no matching session is hidden entirely
+      // (that is what a filter is for); unfiltered, an ONLINE node with no
+      // sessions still gets its own group so it reads as "up and idle"
+      // rather than silently missing.
+      const groups = buildNodeGroups(visibleRows, lastKnownNodes, { includeEmptyOnline: !query });
+      // A collapsed group must never hide the session actually being viewed.
+      if (selected) {
+        const owner = groups.find(group => group.sessions.some(row => row.name === selected));
+        if (owner) nodeCollapse.reveal(owner.id);
+      }
+
       const emptyEl = tabbarEl.querySelector('.tabbar-empty');
-      if (!rows.length) {
+      if (!groups.length) {
         if (!emptyEl) {
-          const empty = document.createElement('div'); empty.className = 'tabbar-empty'; empty.textContent = 'Không có session nào.';
+          const empty = document.createElement('div'); empty.className = 'tabbar-empty';
           tabbarEl.append(empty);
         }
+        tabbarEl.querySelector('.tabbar-empty').textContent =
+          query ? 'Không có session khớp bộ lọc.' : 'Không có session nào.';
         for (const [name, refs] of tabEls) { refs.tab.remove(); tabEls.delete(name); }
+        for (const [id, group] of nodeGroupEls) { group.section.remove(); nodeGroupEls.delete(id); }
         refreshTermActionMenu();
-        if (selected) { selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateLayoutState();
+        if (!rows.length && selected) { selected = null; inputAllowed = false; refreshInputControls(); refreshTermControls(); updateLayoutState();
           if (fullscreenTerminal) setFullscreen(false, { persist: false });
           summaryEl.textContent = 'Session không còn tồn tại.'; outputEl.replaceChildren(); grantBarEl.hidden = true; }
         return;
       }
       if (emptyEl) emptyEl.remove();
-      // Drop tabs for sessions no longer in the list.
+      // Drop tabs for sessions no longer in the list (the FULL list, never
+      // the filtered view -- a filtered-out session still exists).
       const currentNames = new Set(rows.map(row => row.name));
       for (const [name, refs] of tabEls) {
         if (!currentNames.has(name)) { refs.tab.remove(); tabEls.delete(name); }
       }
-      // Rows already arrive sorted attention-first, then most-recent-
-      // activity, then name (see the /dashboard/api/sessions route) — no
-      // client-side reordering here, just placing each tab (reused if it
-      // already exists, built once if not) at its correct position.
+      // Drop group sections for nodes that are gone.
+      const currentNodeIds = new Set(groups.map(group => group.id));
+      for (const [id, group] of nodeGroupEls) {
+        if (!currentNodeIds.has(id)) { group.section.remove(); nodeGroupEls.delete(id); }
+      }
+      // Place each group, then each tab inside its own node's container.
       // appendChild on a node already in the DOM MOVES it rather than
-      // duplicating it, so this reorders in place without ever recreating
-      // an existing tab's element.
-      for (const row of rows) {
-        let refs = tabEls.get(row.name);
-        if (!refs) { refs = buildTabEl(row.name); tabEls.set(row.name, refs); }
-        else { tabbarEl.append(refs.tab); }
-        updateTabEl(refs, row);
+      // duplicating it, so this reorders in place without ever recreating an
+      // existing tab element -- the property the tabEls comment above exists
+      // to protect, now applied to the group sections too.
+      for (const group of groups) {
+        let els = nodeGroupEls.get(group.id);
+        if (!els) { els = buildNodeGroupEl(group.id); nodeGroupEls.set(group.id, els); }
+        tabbarEl.append(els.section);
+        const collapsed = nodeCollapse.isCollapsed(group.id);
+        els.section.className = 'node-group' + (collapsed ? ' collapsed' : '');
+        els.header.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+        els.header.title = group.id === group.name ? group.name : `${group.name} (${group.id})`;
+        els.caret.textContent = collapsed ? '\u25b8' : '\u25be';
+        els.name.textContent = group.name;
+        els.id.textContent = group.id === group.name ? '' : group.id;
+        // A long display name ellipsizes in the 260px column; the full name
+        // and the node id stay reachable on hover rather than being lost.
+        els.header.title = group.id === group.name ? group.name : `${group.name} (${group.id})`;
+        els.status.className = 'node-group-status ' + (group.status || 'unknown');
+        els.status.textContent = nodeStatusLabel(group.status);
+        els.count.textContent = String(group.sessions.length);
+        els.tabs.hidden = collapsed;
+        if (!group.sessions.length) {
+          let none = els.tabs.querySelector('.node-tabs-empty');
+          if (!none) { none = document.createElement('div'); none.className = 'node-tabs-empty'; els.tabs.append(none); }
+          none.textContent = 'Node online, chưa có session.';
+          continue;
+        }
+        const none = els.tabs.querySelector('.node-tabs-empty');
+        if (none) none.remove();
+        for (const row of group.sessions) {
+          let refs = tabEls.get(row.name);
+          if (!refs) { refs = buildTabEl(row.name); tabEls.set(row.name, refs); }
+          els.tabs.append(refs.tab);
+          updateTabEl(refs, row);
+        }
       }
       // Task button pending-count badge (2026-09-07 checkpoint) --
       // reflects the CURRENTLY selected session's own row, refreshed on
@@ -2485,6 +3507,13 @@ DASHBOARD_HTML = """<!doctype html>
       const rows = data.sessions || [];
       sessionLifecycleEnabled = data.session_lifecycle_enabled === true;
       protectedSessions = new Set(data.protected_sessions || []);
+      // Key-send capability is whatever the server reports -- never assumed.
+      // An older server that does not report it leaves keysCapabilityKnown
+      // false, which keeps the pad usable rather than dead (the API itself
+      // still enforces the real policy and returns KEY_NOT_ALLOWED).
+      if (Array.isArray(data.allowed_keys)) { allowedKeys = new Set(data.allowed_keys); keysCapabilityKnown = true; }
+      if (typeof data.send_keys_enabled === 'boolean') sendKeysEnabled = data.send_keys_enabled;
+      refreshKeyPad();
       webTerminalEnabled = data.web_terminal_enabled === true;
       // A 200 response can still legitimately carry data.error (e.g.
       // READ_DISABLED globally, alongside a correctly-empty `sessions: []`)
@@ -3136,7 +4165,13 @@ DASHBOARD_HTML = """<!doctype html>
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape' && document.body.classList.contains('ai-usage-visible')) closeAiUsage();
     });
-    openAiUsageBtnEl.onclick = () => { closeAllMenus(); openAiUsage(); };
+    // The menu entry is a link to /dashboard/ai-usage now, so this button no
+    // longer exists. The in-page panel it opened proxied a separate local
+    // service (ai_usage_client.py, 127.0.0.1:8787) that is not running on
+    // this host; the report page reads local CLI artefacts directly instead.
+    // Guarded rather than assumed present: an unguarded onclick on null
+    // throws and takes the whole dashboard script down with it.
+    if (openAiUsageBtnEl) { openAiUsageBtnEl.onclick = () => { closeAllMenus(); openAiUsage(); }; }
 
     // ---- Supervisor/Coordinator panel's own Queue/Coordinator +
     // Integration sections (task: Dashboard Supervisor/Coordinator panel)
@@ -3648,6 +4683,9 @@ DASHBOARD_HTML = """<!doctype html>
       const switchedSession = selected !== lastRenderedSession;
       if (switchedSession) setAutoFollow(true); // opening a session always starts followed
       renderAnsi(outputEl, clean(data.tail.output));
+      // Same pane text the output view just rendered -- the mirror never
+      // triggers its own capture of the session.
+      renderRemoteComposer(clean(data.tail.output));
       // Blinking cursor glyph at the very end of the rendered output --
       // purely cosmetic (task item 1/6, "clear cursor"); only ever appended
       // on this success path, never for the READ_RESTRICTED placeholder or
@@ -3720,6 +4758,21 @@ DASHBOARD_HTML = """<!doctype html>
       }
     }
     refresh(); setInterval(refresh, 5000);
+    // Filter runs entirely against the rows already in hand -- no refetch,
+    // so typing stays responsive and never races the poll.
+    if (sessionFilterEl) sessionFilterEl.oninput = () => renderRows(lastKnownRows);
+
+    async function loadNodes() {
+      // Best-effort: the session list is this page's real content and must
+      // keep rendering if the node registry is briefly unavailable.
+      try {
+        const data = await fetchJSON('/dashboard/api/nodes', {cache: 'no-store'});
+        lastKnownNodes = data.nodes || [];
+        renderRows(lastKnownRows); // repaint headers with fresh status
+      } catch (error) { /* keep the last known node list */ }
+    }
+    loadNodes(); setInterval(loadNodes, 15000);
+
 
     // ---- connection health banner (OpenAI Secure MCP Tunnel) ---------------
     // One quiet, always-present label -- never a popup, never re-fetched on
@@ -3823,11 +4876,16 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
        so it never reads as a permission state. */
     .node-badge { display:inline-block; border-radius:999px; padding:1px 7px; font-size:10px; border:1px solid var(--line); color:var(--muted); margin-left:6px; vertical-align:middle; white-space:nowrap }
     .perm-badge { display:inline-block; border-radius:999px; padding:2px 9px; font-size:11px; border:1px solid var(--line); white-space:nowrap }
-    .perm-badge.whitelist { color:var(--muted) }
+    .perm-badge.default-open { color:var(--muted) }
     .perm-badge.full { color:var(--green); border-color:var(--green) }
     .perm-badge.read { color:#8fb8ff; border-color:#8fb8ff }
     .perm-badge.none { color:#ff9f9f; border-color:#ff9f9f }
     .perm-badge.stale { color:var(--amber); border-color:var(--amber) } /* stored grant present but not currently effective (e.g. IDENTITY_MISMATCH) */
+    /* Access column: the effective state, then the two optional locks. */
+    .access-locks { display:flex; align-items:center; gap:10px; flex-wrap:wrap }
+    .lock-toggle { display:inline-flex; align-items:center; gap:4px; font-size:11px; color:var(--muted); cursor:pointer; white-space:nowrap }
+    .lock-toggle input { cursor:pointer }
+    .lock-toggle input:disabled { cursor:wait; opacity:.5 }
     .attach-dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--line); margin-right:5px; vertical-align:middle }
     .attach-dot.on { background:var(--green) }
     .row-actions { display:flex; gap:6px; align-items:center; white-space:nowrap }
@@ -3891,9 +4949,39 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     #csModal button.close { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 9px; cursor:pointer; font:inherit }
     #csModal .cs-error { color:#ff6b6b; font-size:12px; min-height:14px }
     #csModal .cs-hint { color:var(--muted); font-size:11px }
+    /* ---- Node groups (see NODE_GROUP_JS) --------------------------------
+       A header row per node, spanning the full table, with its own sessions
+       beneath it. Sticky so the node a row belongs to stays readable while
+       scrolling a long list -- the whole point of grouping is knowing WHERE
+       a session runs before acting on it. */
+    tbody tr.node-group-row td { padding:0; border-bottom:1px solid var(--line); background:#101728 }
+    tbody tr.node-group-row:hover { background:transparent }
+    .node-group-toggle {
+      display:flex; align-items:center; gap:9px; width:100%; text-align:left; cursor:pointer;
+      background:transparent; border:0; color:var(--text); font:inherit; font-size:12px; padding:8px 10px;
+    }
+    .node-group-toggle:hover { background:#16203a }
+    .node-group-toggle:focus-visible { outline:2px solid var(--accent); outline-offset:-2px }
+    .node-caret { flex:0 0 auto; color:var(--muted); width:10px }
+    .node-group-name { font-weight:700; letter-spacing:.02em }
+    .node-group-id { color:var(--muted); font-size:11px }
+    .node-group-status { border-radius:999px; padding:1px 8px; font-size:10px; border:1px solid var(--line); color:var(--muted); white-space:nowrap }
+    .node-group-status.online { color:var(--green); border-color:rgba(67,209,124,.45) }
+    .node-group-status.degraded { color:var(--amber); border-color:rgba(255,200,87,.45) }
+    .node-group-status.offline { color:var(--red); border-color:rgba(255,107,107,.4) }
+    .node-group-count { margin-left:auto; color:var(--muted); font-size:11px; white-space:nowrap }
+    .node-select-all { margin-left:auto; margin-right:10px; background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--muted); font:inherit; font-size:11px; padding:2px 9px; cursor:pointer }
+    .node-select-all:hover { color:var(--text); border-color:var(--muted) }
+    tbody tr.node-empty-row td { color:var(--muted); font-size:12px; padding:10px 14px 10px 30px; border-bottom:1px solid var(--line) }
+    tbody tr.node-empty-row:hover { background:transparent }
+
     @media (max-width:760px) {
       header { padding:12px 14px } .toolbar { padding:8px 14px } main { padding:0 14px 14px }
       #bulkBar { padding:8px 14px }
+      /* Compact group header on a phone: the id drops (the display name
+         already identifies the node) and the row gets a bigger tap target. */
+      .node-group-toggle { padding:10px 10px; gap:7px; font-size:12px; min-height:44px }
+      .node-group-id { display:none }
     }
   </style>
 </head>
@@ -3908,7 +4996,12 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
   <div class="toolbar">
     <button id="newSessionBtn" class="primary" type="button">+ Tạo session</button>
     <input type="text" id="searchBox" placeholder="Tìm theo tên session...">
-    <label><input type="checkbox" id="onlyGrantable"> Chỉ hiện session chưa whitelist</label>
+    <!-- Was "Chỉ hiện session chưa whitelist". Under default-open every
+         session is manageable, so that filter matched everything and hid
+         nothing -- a dead control describing a mechanism that no longer
+         exists. The question an operator actually has now is the opposite
+         one: which sessions has somebody deliberately LOCKED? -->
+    <label><input type="checkbox" id="onlyGrantable"> Chỉ hiện session đã khoá</label>
     <span id="count"></span>
   </div>
   <div id="bulkBar" hidden></div>
@@ -4063,7 +5156,37 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     }
     function tmuxAttachCommand(session) { return `tmux attach -t ${shellQuote(session)}`; }
 
-    function grantable(row) { return !row.allowed; }
+    // Access is open by default; these two switches are the OPT-OUT. One
+    // call site for both, node-qualified so a session on a remote node is
+    // locked on the node that owns it rather than against the local store.
+    async function setSessionAccess(row, body) {
+      const name = (row.node_id && row.node_id !== 'local') ? `${row.node_id}/${row.name}` : row.name;
+      try {
+        const response = await fetch('/dashboard/api/session/access', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name, ...body}),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (data.error) { alert('Không đổi được quyền: ' + data.error); return false; }
+        return true;
+      } catch (error) {
+        alert('Không đổi được quyền: mất kết nối.');
+        return false;
+      }
+    }
+
+    // Every real session's access can be changed now. This used to mean "is
+    // outside the static whitelist, so there is something to grant" -- under
+    // default-open that reads false for every ACCESSIBLE session, which would
+    // have quietly removed the bulk checkbox from exactly the rows an
+    // operator wants to lock.
+    function grantable(row) { return true; }
+    // Explicitly locked: an effective access that is OFF. Under default-open
+    // that can only be a deliberate revoke or a policy floor -- never the
+    // mere absence of a record, which now means allow.
+    function isLocked(row) {
+      return row.effective_read === false || row.effective_input === false;
+    }
     function grantState(row) {
       if (row.grant && row.grant.input_enabled) return 'full';
       if (row.grant && row.grant.read_enabled) return 'read';
@@ -4092,7 +5215,57 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     };
     function inputBlockLabel(reason) { return INPUT_BLOCK_LABELS[reason] || reason; }
 
+    /*__NODE_GROUP_JS__*/
     let lastKnownRows = [];
+    // The node registry, purely so a node that is online with NO sessions can
+    // still be shown (it never appears in the sessions list by definition).
+    // Never required: grouping works from the rows' own node_id/node_name if
+    // this fetch fails, it just loses session-less nodes and status badges.
+    let lastKnownNodes = [];
+    const nodeCollapse = makeNodeCollapseStore('sessions');
+
+    function buildNodeHeaderRow(group, collapsed) {
+      const tr = document.createElement('tr');
+      tr.className = 'node-group-row' + (collapsed ? ' collapsed' : '');
+      const td = document.createElement('td'); td.colSpan = 8;
+      const btn = document.createElement('button');
+      btn.type = 'button'; btn.className = 'node-group-toggle';
+      btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      const caret = document.createElement('span'); caret.className = 'node-caret'; caret.textContent = collapsed ? '▸' : '▾';
+      const name = document.createElement('span'); name.className = 'node-group-name'; name.textContent = group.name;
+      // node_id is shown alongside the display name whenever they differ --
+      // the id is what every command/API call actually takes, so it must be
+      // readable here, not only the friendly label.
+      const idEl = document.createElement('span'); idEl.className = 'node-group-id';
+      if (group.id !== group.name) idEl.textContent = group.id;
+      const status = document.createElement('span');
+      status.className = 'node-group-status ' + (group.status || 'unknown');
+      status.textContent = nodeStatusLabel(group.status);
+      const count = document.createElement('span'); count.className = 'node-group-count';
+      count.textContent = group.sessions.length + ' session';
+      btn.append(caret, name, idEl, status, count);
+      btn.onclick = () => { nodeCollapse.setCollapsed(group.id, !collapsed); renderRows(lastKnownRows); };
+      td.appendChild(btn);
+      // Bulk-by-node without a second mechanism: select this node's sessions
+      // into the existing bulk bar, which already knows how to apply a
+      // preset to a selection.
+      if (group.sessions.length) {
+        const pick = document.createElement('button');
+        pick.type = 'button'; pick.className = 'node-select-all';
+        const allSelected = group.sessions.every(row => bulkSelected.has(row.name));
+        pick.textContent = allSelected ? 'Bỏ chọn node' : 'Chọn cả node';
+        pick.onclick = (event) => {
+          event.stopPropagation();
+          for (const row of group.sessions) {
+            if (allSelected) bulkSelected.delete(row.name); else bulkSelected.add(row.name);
+          }
+          renderBulkBar(); renderRows(lastKnownRows);
+        };
+        td.appendChild(pick);
+      }
+      tr.appendChild(td);
+      return tr;
+    }
     const bulkSelected = new Set();
     let protectedSessions = new Set();
     let sessionLifecycleEnabled = true; // optimistic default until the first /dashboard/api/sessions response is seen
@@ -4112,6 +5285,27 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     // never a second, independently-drifting notion of "supported".
     function nodeCapable(node, agentType) {
       return agentType === 'shell' || (node.agent_types || []).includes(agentType);
+    }
+    // Can the controller actually REACH a session on this node?
+    //
+    // agent_types says what could be launched; it says nothing about
+    // whether anything is listening. A Windows node onboarded by
+    // windows-setup.ps1 heartbeats from a scheduled task -- it is online
+    // and healthy and has no node agent at all, so port 8790 is closed and
+    // every session create against it fails at the transport. Offering it
+    // was worse than hiding it: the operator picked a node the scheduler
+    // could not use.
+    //
+    // Two positive signals, either of which means a real agent is there:
+    // the node explicitly reports session_transport (verified health AND
+    // auth on 8790), or its heartbeat comes from the node agent itself
+    // rather than the setup script. The second keeps every node that
+    // enrolled before session_transport existed working unchanged.
+    function nodeHasTransport(node) {
+      if (!node || node.id === 'local') return true;   // in-process, no transport to dial
+      if ((node.capabilities || []).includes('session_transport')) return true;
+      const version = String(node.agent_version || '');
+      return version !== '' && !version.startsWith('windows-setup/');
     }
     function nodeSummaryLabel(node) {
       const os = node.platform === 'windows' ? 'Windows' : 'Linux';
@@ -4133,12 +5327,19 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         opt.textContent = (node.id === 'local' ? 'Local/Dell' : node.display_name || node.id) + ' — ' + nodeSummaryLabel(node);
         const capable = nodeCapable(node, csSelectedAgent);
         const online = node.status === 'online';
+        const reachable = nodeHasTransport(node);
         if (!capable) {
           opt.disabled = true;
           opt.textContent += `  (thiếu agent_type=${csSelectedAgent})`;
         } else if (!online) {
           opt.disabled = true;
           opt.textContent += '  (offline)';
+        } else if (!reachable) {
+          // Online, and still unusable: the heartbeat arrives from the
+          // setup script's scheduled task, but nothing is listening on
+          // 8790 for the controller to dial.
+          opt.disabled = true;
+          opt.textContent += '  (chưa có node agent — chạy lại setup)';
         }
         csNodeEl.append(opt);
       }
@@ -4439,17 +5640,34 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       const query = searchEl.value.trim().toLowerCase();
       const filtered = rows.filter(row => {
         if (query && !row.name.toLowerCase().includes(query)) return false;
-        if (onlyGrantableEl.checked && !grantable(row)) return false;
+        if (onlyGrantableEl.checked && !isLocked(row)) return false;
         return true;
       });
-      if (!filtered.length) {
+      const filtering = Boolean(query) || onlyGrantableEl.checked;
+      // Session-less ONLINE nodes still get a group when nothing is being
+      // filtered (so "dell-linux is up and idle" is visible rather than
+      // absent); while filtering they are suppressed, because a group with
+      // no matching rows is the noise the filter is there to remove.
+      const groups = buildNodeGroups(filtered, lastKnownNodes, { includeEmptyOnline: !filtering });
+      if (!groups.length) {
         const tr = document.createElement('tr'); tr.className = 'empty-row';
         const td = document.createElement('td'); td.colSpan = 8;
         td.textContent = rows.length ? 'Không có session khớp bộ lọc.' : 'Không có session nào.';
         tr.appendChild(td); tbodyEl.appendChild(tr);
         return;
       }
-      for (const row of filtered) {
+      for (const group of groups) {
+        const collapsed = nodeCollapse.isCollapsed(group.id);
+        tbodyEl.appendChild(buildNodeHeaderRow(group, collapsed));
+        if (collapsed) continue;
+        if (!group.sessions.length) {
+          const emptyTr = document.createElement('tr'); emptyTr.className = 'node-empty-row';
+          const emptyTd = document.createElement('td'); emptyTd.colSpan = 8;
+          emptyTd.textContent = 'Node đang online, chưa có session nào.';
+          emptyTr.appendChild(emptyTd); tbodyEl.appendChild(emptyTr);
+          continue;
+        }
+      for (const row of group.sessions) {
         const tr = document.createElement('tr');
         if (row.state === 'WAITING_INPUT') tr.className = 'needs-attention';
 
@@ -4480,27 +5698,51 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         }
         tr.appendChild(tdName);
 
+        // ---- Access column: EFFECTIVE access plus optional locks ----------
+        //
+        // Access is open by default now: a session is readable and writable
+        // the moment it exists, with no grant step. So this column answers
+        // "what is true right now?" and offers two switches to turn it OFF.
+        // It used to report the static name allowlist beside an
+        // effective state that could disagree with it -- the contradiction
+        // that made a usable session look forbidden.
         const tdPerm = document.createElement('td');
+        const locks = document.createElement('div'); locks.className = 'access-locks';
+
         const permBadge = document.createElement('span'); permBadge.className = 'perm-badge';
-        if (!grantable(row)) { permBadge.classList.add('whitelist'); permBadge.textContent = 'Whitelist tĩnh'; }
-        else {
-          const state = grantState(row);
-          const granted = grantStateLabel(state);
-          const effective = effectiveLabel(row);
-          permBadge.classList.add(state);
-          // P0 fix: a STORED grant of "Xem + gửi" whose runtime is
-          // actually blocked (most commonly IDENTITY_MISMATCH -- the
-          // session was recreated, e.g. a tmux-server restart, since the
-          // grant was pinned) must never render as a plain, unqualified
-          // "Xem + gửi" here -- that's exactly what let this list badge
-          // claim send access was active while ChatGPT/terminal_send_text
-          // was actually refused. Same "Đã cấp: X · Hiệu lực: Y" wording
-          // this project's own term-bar grant card (#grantBar) and
-          // #permModal already use when the two diverge.
-          permBadge.textContent = granted === effective ? granted : `Đã cấp: ${granted} · Hiệu lực: ${effective}`;
-          if (granted !== effective) permBadge.classList.add('stale');
+        const readOn = row.effective_read !== false;
+        const inputOn = row.effective_input !== false;
+        if (readOn && inputOn) { permBadge.classList.add('full'); permBadge.textContent = 'Xem + gửi'; }
+        else if (readOn) { permBadge.classList.add('read'); permBadge.textContent = 'Chỉ xem (đã khoá gửi)'; }
+        else { permBadge.classList.add('none'); permBadge.textContent = '🔒 Đã khoá'; }
+        // A stored grant whose runtime is actually blocked (most commonly
+        // IDENTITY_MISMATCH -- the session was recreated since the grant was
+        // pinned) must never read as plain "Xem + gửi": that is what let this
+        // badge claim send access while terminal_send_text was refused.
+        if (row.input_denied_reason && inputOn === false && readOn) {
+            permBadge.classList.add('stale');
+            permBadge.title = 'Gửi bị chặn: ' + row.input_denied_reason;
         }
-        tdPerm.appendChild(permBadge);
+        locks.appendChild(permBadge);
+
+        const makeLock = (label, on, kind) => {
+          const wrap = document.createElement('label'); wrap.className = 'lock-toggle';
+          const box = document.createElement('input'); box.type = 'checkbox'; box.checked = on;
+          box.setAttribute('aria-label', `${label} cho ${row.name}`);
+          box.onchange = async () => {
+            box.disabled = true;
+            const body = kind === 'read' ? {read: box.checked} : {input: box.checked};
+            const ok = await setSessionAccess(row, body);
+            box.disabled = false;
+            if (!ok) box.checked = on;   // server refused -- do not lie about state
+            else load();
+          };
+          wrap.append(box, document.createTextNode(label));
+          return wrap;
+        };
+        locks.appendChild(makeLock('Xem', readOn, 'read'));
+        locks.appendChild(makeLock('Gửi', inputOn, 'input'));
+        tdPerm.appendChild(locks);
         tr.appendChild(tdPerm);
 
         // Process/session liveness ("● Running" -- always true for a row
@@ -4615,12 +5857,23 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
 
         tbodyEl.appendChild(tr);
       }
+      }
+    }
+
+    async function loadNodes() {
+      // Best-effort: a failure here must never break the session list, which
+      // is the actual content of this page.
+      try {
+        const data = await fetchJSON('/dashboard/api/nodes', {cache:'no-store'});
+        lastKnownNodes = data.nodes || [];
+      } catch (error) { /* keep the last known list */ }
     }
 
     async function load() {
       const data = await fetchJSON('/dashboard/api/sessions', {cache:'no-store'});
       const rows = data.sessions || [];
       lastKnownRows = rows;
+      await loadNodes();
       protectedSessions = new Set(data.protected_sessions || ['terminal-mcp']);
       sessionLifecycleEnabled = data.session_lifecycle_enabled !== false;
       webTerminalEnabled = data.web_terminal_enabled === true;
@@ -4758,6 +6011,86 @@ NODES_ADMIN_HTML = """<!doctype html>
     #cxScanTable tbody td { padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top }
     #cxScanTable button { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 10px; cursor:pointer; font:inherit; font-size:11px }
     #cxScanTable button:hover { background:#233252 }
+    /* + Add Node wizard. Deliberately plain: the same tokens (--panel,
+       --line, --accent, --muted) the rest of this page already uses, so
+       it reads as one dashboard rather than a bolted-on flow. */
+    .an-step { margin-top:14px }
+    .an-hint { color:var(--muted); font-size:12px; margin-bottom:10px }
+    .an-os-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px }
+    .an-os { display:flex; flex-direction:column; align-items:flex-start; gap:2px; padding:14px 16px; cursor:pointer;
+             background:#0f1730; border:1px solid var(--line); border-radius:10px; color:var(--text); font:inherit; text-align:left }
+    .an-os:hover:not(:disabled) { border-color:var(--accent); background:#16223d }
+    .an-os:disabled { opacity:.45; cursor:not-allowed }
+    .an-os-icon { font-size:22px }
+    .an-os .muted { font-size:11px }
+    .an-profiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px; margin-top:12px }
+    .an-profile { padding:12px 14px; border:1px solid var(--line); border-radius:10px; background:#0f1730; cursor:pointer }
+    .an-profile:hover { border-color:var(--accent) }
+    .an-profile.active { border-color:var(--accent); background:#16223d }
+    .an-profile b { display:block; font-size:13px; margin-bottom:4px }
+    .an-profile .an-desc { color:var(--muted); font-size:11px; line-height:1.45 }
+    .an-profile .an-warn { color:#e6b800; font-size:11px; margin-top:6px }
+    .an-advanced { margin-top:12px; font-size:12px }
+    .an-advanced summary { cursor:pointer; color:var(--muted) }
+    .an-conn { margin-top:8px; display:flex; flex-direction:column; gap:6px }
+    .an-conn label { display:flex; gap:8px; align-items:flex-start; font-size:12px }
+    .an-conn .an-why { color:var(--muted); font-size:11px }
+    .an-primary { border-color:var(--accent) !important; background:#16223d !important }
+    .an-done-head { display:flex; justify-content:space-between; align-items:baseline; gap:10px; flex-wrap:wrap }
+    .an-big { font-size:14px; font-weight:600 }
+    .an-steps { margin:10px 0 0 0; padding-left:20px; font-size:12.5px; line-height:1.8 }
+    .an-fine { margin-top:12px; font-size:11px; color:var(--muted); line-height:1.6 }
+    .an-fine code { background:#0f1730; border:1px solid var(--line); border-radius:4px; padding:1px 5px; user-select:all }
+    /* Quick install: the primary path, and it should look like it. */
+    .an-quick { margin-top:10px; padding:14px; border:1px solid var(--accent); border-radius:10px; background:#111c33 }
+    .an-cmd { width:100%; box-sizing:border-box; margin-top:10px; padding:10px; resize:vertical;
+              font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11.5px; line-height:1.5;
+              color:var(--text); background:#0b1324; border:1px solid var(--line);
+              border-radius:6px; white-space:pre-wrap; word-break:break-all }
+    .an-cmd:focus { outline:2px solid var(--accent); outline-offset:1px }
+    .an-big-btn { font-size:13px; padding:9px 18px }
+    /* The one primary CTA is never hidden, so its unusable states have to
+       read as unusable rather than as "nothing happened when I clicked". */
+    .an-big-btn[disabled] { opacity:.5; cursor:not-allowed }
+    .an-big-btn[aria-busy="true"] { cursor:progress }
+    .an-note { font-size:11px; margin-top:8px }
+    .an-helper { margin-top:10px; padding:14px; border:1px solid #6ee7a0; border-radius:10px; background:#12331f }
+    .an-helper .an-big { color:#8ef0b8 }
+    .an-live { margin-top:10px; padding:9px 12px; border-radius:8px; background:#12243d; border:1px solid var(--accent);
+               font-size:12px; display:flex; gap:10px; align-items:center }
+    .an-live .an-spin { width:9px; height:9px; border-radius:50%; background:var(--accent); animation:anPulse 1.1s infinite }
+    .an-live.done { border-color:#2c6e49; background:#12331f }
+    .an-live.done .an-spin { background:#6ee7a0; animation:none }
+    .an-live.failed { border-color:#7a2333; background:#3a1620 }
+    .an-live.failed .an-spin { background:#ff9aa8; animation:none }
+    /* Stalled is NOT failed: the installer may still be grinding through a
+       slow OpenSSH install. Amber says "nothing has reported for a while",
+       which is the honest claim, rather than red's "this is over". */
+    .an-live.stalled { border-color:var(--amber); background:#2e2410 }
+    .an-live.stalled .an-spin { background:var(--amber) }
+    .an-live-body { flex:1; min-width:0 }
+    .an-live-stage { font-weight:600 }
+    .an-live-meta { font-size:11px; color:var(--muted); margin-top:2px }
+    .an-live-hint { font-size:11px; margin-top:4px; color:var(--amber) }
+    .an-live .cx-row { margin-top:6px }
+    @keyframes anPulse { 0%,100% { opacity:1 } 50% { opacity:.25 } }
+    .an-manual { margin-top:14px; font-size:12px }
+    .an-quick.an-demoted { border-color:var(--line); background:#0f1730; opacity:.85 }
+    .an-manual summary { cursor:pointer; color:var(--muted) }
+    .an-trouble-row { display:flex; gap:8px; align-items:center; margin-top:6px; flex-wrap:wrap }
+    .an-trouble-row code { flex:1 1 auto; min-width:0 }
+    /* transport health table in the node detail */
+    .tr-table { width:100%; border-collapse:collapse; margin-top:8px; font-size:12px }
+    .tr-table th, .tr-table td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line) }
+    .tr-h { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px }
+    .tr-h.healthy { background:#12331f; color:#6ee7a0 }
+    .tr-h.failing { background:#3a1620; color:#ff9aa8 }
+    .tr-h.unknown { background:#22283a; color:var(--muted) }
+    .tr-h.disabled { background:#22283a; color:var(--muted); text-decoration:line-through }
+    @media (max-width:760px) {
+      .an-os-grid, .an-profiles { grid-template-columns:1fr }
+      .tr-table th:nth-child(4), .tr-table td:nth-child(4) { display:none }
+    }
     @media (max-width:760px) {
       header { padding:12px 14px } main { padding:14px } #cards { grid-template-columns:1fr }
     }
@@ -4767,6 +6100,7 @@ NODES_ADMIN_HTML = """<!doctype html>
   <header>
     <div><h1>Quản lý node</h1><div class="muted">Trạng thái, tài nguyên và session theo từng node</div></div>
     <div style="display:flex;align-items:center;gap:10px">
+      <button class="icon-btn an-primary" id="addNodeWizardBtn" type="button">+ Add Node</button>
       <button class="icon-btn" id="connectNodeBtn" type="button">+ Connect Node</button>
       <button class="icon-btn" id="addNodeBtn" type="button">+ Thêm node</button>
       <button class="icon-btn" id="refreshBtn" type="button">⟳ Refresh</button>
@@ -4776,6 +6110,123 @@ NODES_ADMIN_HTML = """<!doctype html>
     </div>
   </header>
   <main>
+    <!-- ==================================================================
+         + Add Node -> Windows. Three steps, one screen, no scrolling
+         through options nobody changes: pick the OS, name it, pick a
+         profile, download. Connectivity is decided by the server (it
+         knows whether it has a tailnet and a rescue gateway); Advanced
+         exists only to turn something OFF.
+         ================================================================== -->
+    <div id="addNodePanel" hidden style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+        <strong style="font-size:15px">Add Node</strong>
+        <button class="icon-btn" id="anCloseBtn" type="button">✕</button>
+      </div>
+
+      <!-- step 1: platform -->
+      <div id="anStepOs" class="an-step">
+        <div class="an-hint">Chọn hệ điều hành của máy bạn muốn thêm.</div>
+        <div class="an-os-grid">
+          <button class="an-os" type="button" data-os="windows"><span class="an-os-icon">🪟</span><span>Windows</span><span class="muted">10 / 11 / Server</span></button>
+          <button class="an-os" type="button" data-os="linux" disabled><span class="an-os-icon">🐧</span><span>Linux</span><span class="muted">dùng Connect Node</span></button>
+          <button class="an-os" type="button" data-os="macos" disabled><span class="an-os-icon">🍎</span><span>macOS</span><span class="muted">dùng Connect Node</span></button>
+        </div>
+      </div>
+
+      <!-- step 2: the form -->
+      <div id="anStepForm" class="an-step" hidden>
+        <div class="an-hint">Máy Windows này sẽ tự đăng ký, tự bật SSH và tự hoạt động lại sau khi khởi động lại.</div>
+        <div class="cx-row">
+          <label class="cx-field">Node name<input type="text" id="anNodeId" placeholder="win-work" autocomplete="off"></label>
+        </div>
+        <div id="anProfiles" class="an-profiles"></div>
+        <details id="anAdvanced" class="an-advanced">
+          <summary>Advanced (connectivity)</summary>
+          <div id="anConnectivity" class="an-conn"></div>
+        </details>
+        <div id="anFormMsg" class="d-msg"></div>
+        <div class="cx-row" style="margin-top:12px">
+          <button class="icon-btn an-primary" id="anGenerateBtn" type="button">Generate setup</button>
+          <button class="icon-btn" id="anBackBtn" type="button">← Đổi hệ điều hành</button>
+        </div>
+      </div>
+
+      <!-- step 3: ONE primary action, whatever this machine already has -->
+      <div id="anStepDone" class="an-step" hidden>
+        <div class="an-done-head">
+          <div class="an-big">Cài và kết nối máy này</div>
+          <div class="muted" id="anExpiry"></div>
+        </div>
+
+        <!-- The one primary CTA, in the markup UNHIDDEN and staying visible
+             whatever detection finds. Someone standing at a fresh Windows
+             machine was promised this button; making them first work out
+             whether a Bootstrap helper exists is our problem leaking into
+             their screen. Detection decides only what the click DOES --
+             pair with a helper already here, or download the paired one --
+             and the no-artifact case keeps the button with the reason in
+             words rather than removing it. -->
+        <div class="an-helper" id="anHelperBox">
+          <div class="muted" style="font-size:12px;margin-top:4px" id="anHelperWhy">Đang kiểm tra máy này…</div>
+          <div class="cx-row" style="margin-top:10px">
+            <button class="icon-btn an-primary an-big-btn" id="anHelperBtn" type="button"
+                    aria-describedby="anHelperWhy" aria-busy="true" aria-disabled="true" disabled>Cài và kết nối máy này</button>
+            <button class="icon-btn" id="anRegenBtn" type="button" hidden>Tạo lại</button>
+            <button class="icon-btn" id="anDoneBtn" type="button">Đã xong</button>
+          </div>
+          <div class="d-msg" id="anHelperMsg" role="status" aria-live="polite"></div>
+          <!-- Installation status. Shown from the moment the CTA is used
+               and never hidden again while an enrollment is pending: the
+               previous version only appeared once the machine reported a
+               stage, so an operator whose helper never started saw an
+               empty panel and no way to tell waiting from broken. -->
+          <div class="an-live" id="anLive" hidden role="status" aria-live="polite">
+            <span class="an-spin" id="anLiveSpin"></span>
+            <div class="an-live-body">
+              <div class="an-live-stage" id="anLiveStage"></div>
+              <div class="an-live-meta" id="anLiveMeta"></div>
+              <div class="an-live-hint" id="anLiveHint" hidden></div>
+              <div class="cx-row" id="anLiveActions" hidden>
+                <button class="icon-btn" id="anLiveRetryBtn" type="button">Thử lại</button>
+                <button class="icon-btn" id="anLiveRepairBtn" type="button">Cách thủ công</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Everything below is the fallback: the copy/paste Win + R path
+             that predates the helper, plus the raw script. It still works
+             and still matters when a machine refuses the helper -- but it
+             is no longer a second primary button competing with the one
+             above. -->
+        <details class="an-manual">
+          <summary>Cách khác / thủ công</summary>
+          <div class="an-quick an-demoted" id="anQuickBox">
+            <ol class="an-steps">
+              <li>Bấm <b>Copy lệnh cài đặt</b> bên dưới.</li>
+              <li>Trên máy Windows: nhấn <b>Win + R</b>, rồi <b>Ctrl + V</b>, rồi <b>Enter</b>.</li>
+              <li>Chọn <b>Yes</b> khi Windows hỏi quyền Administrator, rồi chờ màn hình báo hoàn tất.</li>
+            </ol>
+            <textarea id="anQuickCmd" class="an-cmd" readonly rows="3" spellcheck="false" wrap="soft"></textarea>
+            <div class="cx-row" style="margin-top:8px">
+              <button class="icon-btn" id="anCopyCmdBtn" type="button">📋 Copy lệnh cài đặt</button>
+              <a class="icon-btn" id="anHelperDlBtn" hidden
+                 href="/dashboard/api/nodes/onboard/helper/windows-x64"
+                 download="terminal-mcp-bootstrap.exe">⬇ Tải Bootstrap helper (thủ công)</a>
+            </div>
+            <div class="d-msg" id="anDoneMsg" role="status" aria-live="polite"></div>
+            <div class="muted an-note" id="anPlatformNote" hidden></div>
+          </div>
+          <div class="cx-row" style="margin-top:10px">
+            <button class="icon-btn" id="anDownloadBtn" type="button">⬇ Download windows-setup.ps1</button>
+            <button class="icon-btn" id="anCopyCodeBtn" type="button">Copy enrollment code</button>
+          </div>
+          <div class="an-fine" id="anFine"></div>
+          <div class="an-fine" id="anTrouble"></div>
+        </details>
+      </div>
+    </div>
+    <div id="enrollStrip" hidden style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin-bottom:16px"></div>
     <div id="onboardPanel" hidden style="background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:16px">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
         <strong>Thêm node mới</strong>
@@ -4997,7 +6448,9 @@ NODES_ADMIN_HTML = """<!doctype html>
           <div class="nc-head">
             <div><span class="status-dot ${node.status}"></span><span title="${node.platform || 'linux'}">${osIcon(node)}</span> <span class="nc-name">${node.display_name}</span>
               <div class="nc-host">${node.id} · ${node.hostname}</div>
-              <div class="nc-host">${capabilityLine(node)}</div></div>
+              <div class="nc-host">${capabilityLine(node)}</div>
+              <div class="nc-host">connection: <b>${node.connection_state || 'DEGRADED'}</b> · ${node.connection_transport || '—'}${node.ping_latency_ms != null ? ` · ${Math.round(node.ping_latency_ms)}ms` : ''}</div>
+              <div class="nc-host">health: ${node.health_state || 'UNKNOWN'}${node.reconnect_status && node.reconnect_status !== 'IDLE' ? ` · ${node.reconnect_status}` : ''}${node.consecutive_failures ? ` · failures ${node.consecutive_failures}` : ''}</div></div>
             <div style="display:flex;gap:6px;align-items:center"><span class="badge ${capBadge}">${capBadge}</span>${draining}</div>
           </div>
           <div class="nc-metrics">
@@ -5062,7 +6515,9 @@ NODES_ADMIN_HTML = """<!doctype html>
             ${sessions.length ? sessions.map((s) => `<tr><td>${s.name}</td><td>${s.node_id || node.id}</td><td>${s.windows ?? '—'}</td><td>${s.attached ? 'có' : 'không'}</td></tr>`).join('')
                               : '<tr><td colspan="4" class="d-empty">' + (result.data.sessions_error ? 'Không lấy được danh sách session: ' + result.data.sessions_error : 'Không có session nào trên node này') + '</td></tr>'}
           </tbody>
-        </table>`;
+        </table>
+        <div id="nodeTransports"></div>`;
+      renderOnboardingSection(nodeId);
       document.getElementById('refreshDetailBtn').addEventListener('click', () => loadDetail(nodeId));
       document.getElementById('testConnBtn').addEventListener('click', async () => {
         const msg = document.getElementById('detailMsg');
@@ -5115,7 +6570,7 @@ NODES_ADMIN_HTML = """<!doctype html>
       }
     }
 
-    document.getElementById('refreshBtn').addEventListener('click', () => { loadAll(); if (selectedNodeId) loadDetail(selectedNodeId); });
+    document.getElementById('refreshBtn').addEventListener('click', () => { loadAll(); loadEnrollments(); if (selectedNodeId) loadDetail(selectedNodeId); });
 
     document.getElementById('addNodeBtn').addEventListener('click', () => {
       document.getElementById('onboardPanel').hidden = false;
@@ -5143,6 +6598,1009 @@ NODES_ADMIN_HTML = """<!doctype html>
         ${pre('3) Export biến môi trường nơi terminal-mcp-http.service đọc env (rồi safe-restart):', r.data.env_var + '=' + r.data.token)}
         <div class="muted" style="font-size:11px;margin-top:6px">4) Xác minh: terminal-mcp-doctor nodes -- ${nodeId} phải chuyển status=online trong vài giây sau khi node-agent kết nối.</div>`;
     });
+
+
+    // ======================================================================
+    // + Add Node -> Windows.
+    //
+    // Everything the operator sees here comes from
+    // /dashboard/api/nodes/onboard/profiles, which reports what THIS
+    // controller can actually do today -- so the form never offers
+    // Tailscale on a controller with no tailnet, or a rescue tunnel with
+    // no gateway. The generated script and the one-time code come back in
+    // ONE response and are never fetched again: the code is single-use,
+    // and there is no endpoint that could re-serve it.
+    //
+    // DOM is built with createElement/textContent for every value that
+    // came off the wire, same discipline as the Scan LAN table below.
+    // ======================================================================
+    const anPanel = document.getElementById('addNodePanel');
+    let anCatalog = null;        // last /onboard/profiles payload
+    let anProfile = 'minimal';
+    let anGenerated = null;      // the one create-enrollment response, held only in this tab
+
+    function anShow(step) {
+      for (const id of ['anStepOs', 'anStepForm', 'anStepDone']) {
+        document.getElementById(id).hidden = (id !== step);
+      }
+    }
+
+    function anSetMsg(id, text, kind) {
+      const el = document.getElementById(id);
+      el.textContent = text || '';
+      el.className = 'd-msg' + (kind ? ' ' + kind : '');
+    }
+
+    // Why a connectivity option is unavailable, in words an operator can act on.
+    const AN_REASONS = {
+      rescue_disabled: 'chưa bật rescue gateway trong config controller',
+      gateway_host_not_configured: 'thiếu nodes.onboarding.rescue.gateway_host',
+      gateway_user_not_configured: 'thiếu nodes.onboarding.rescue.gateway_user',
+      gateway_host_key_not_configured: 'thiếu nodes.onboarding.rescue.gateway_host_key',
+      gateway_port_range_invalid: 'dải cổng rescue không hợp lệ',
+      tailscale_not_installed: 'controller chưa cài Tailscale',
+      tailscale_logged_out: 'controller đã cài Tailscale nhưng chưa đăng nhập',
+      tailscale_disabled_in_config: 'đã tắt trong config controller',
+      declined_by_operator: 'bạn đã bỏ chọn',
+    };
+    function anReason(code) { return AN_REASONS[code] || code || 'không khả dụng'; }
+
+    function anRenderProfiles() {
+      const host = document.getElementById('anProfiles');
+      host.replaceChildren();
+      for (const profile of (anCatalog?.profiles || [])) {
+        const card = document.createElement('div');
+        card.className = 'an-profile' + (profile.id === anProfile ? ' active' : '');
+        card.tabIndex = 0;
+        const title = document.createElement('b');
+        title.textContent = profile.label;
+        const desc = document.createElement('div');
+        desc.className = 'an-desc';
+        desc.textContent = profile.description;
+        card.append(title, desc);
+        if (profile.needs_signin) {
+          const warn = document.createElement('div');
+          warn.className = 'an-warn';
+          warn.textContent = 'Cần đăng nhập thủ công cho từng AI CLI trên máy đó.';
+          card.append(warn);
+        }
+        const choose = () => { anProfile = profile.id; anRenderProfiles(); };
+        card.addEventListener('click', choose);
+        card.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); choose(); } });
+        host.append(card);
+      }
+    }
+
+    function anRenderConnectivity() {
+      const host = document.getElementById('anConnectivity');
+      host.replaceChildren();
+      const plan = anCatalog?.connectivity || {};
+      const rows = [
+        ['tailscale', 'Tailscale (primary)', plan.tailscale, plan.tailscale_reason],
+        ['rescue', 'Reverse SSH rescue', plan.rescue, plan.rescue_reason],
+        ['lan', 'LAN address', plan.lan !== false, null],
+      ];
+      for (const [key, label, available, reason] of rows) {
+        const wrap = document.createElement('label');
+        const box = document.createElement('input');
+        box.type = 'checkbox';
+        box.dataset.conn = key;
+        box.checked = !!available;
+        box.disabled = !available;   // an unavailable path cannot be turned ON from here
+        const text = document.createElement('span');
+        text.textContent = label;
+        wrap.append(box, text);
+        if (!available) {
+          const why = document.createElement('span');
+          why.className = 'an-why';
+          why.textContent = '— ' + anReason(reason);
+          wrap.append(why);
+        }
+        host.append(wrap);
+      }
+    }
+
+    async function anOpen() {
+      anPanel.hidden = false;
+      anGenerated = null;
+      anShow('anStepOs');
+      const result = await api('/dashboard/api/nodes/onboard/profiles');
+      if (!result.ok) {
+        anCatalog = null;
+        anShow('anStepForm');
+        anSetMsg('anFormMsg', result.data.detail || result.data.error || 'Không tải được cấu hình onboarding.', 'error');
+        return;
+      }
+      anCatalog = result.data;
+      if (!anCatalog.enabled) {
+        anShow('anStepForm');
+        anSetMsg('anFormMsg', 'Onboarding đang tắt trên controller (nodes.onboarding.enabled: false).', 'error');
+      }
+    }
+
+    document.getElementById('addNodeWizardBtn').addEventListener('click', anOpen);
+    document.getElementById('anCloseBtn').addEventListener('click', () => { anPanel.hidden = true; });
+    document.getElementById('anBackBtn').addEventListener('click', () => anShow('anStepOs'));
+
+    for (const button of anPanel.querySelectorAll('.an-os')) {
+      button.addEventListener('click', () => {
+        if (button.dataset.os !== 'windows') return;
+        anRenderProfiles();
+        anRenderConnectivity();
+        anSetMsg('anFormMsg', '');
+        anShow('anStepForm');
+        document.getElementById('anNodeId').focus();
+      });
+    }
+
+    document.getElementById('anGenerateBtn').addEventListener('click', async () => {
+      const button = document.getElementById('anGenerateBtn');
+      const nodeId = document.getElementById('anNodeId').value.trim();
+      if (!nodeId) { anSetMsg('anFormMsg', 'Đặt tên cho node (ví dụ: win-work).', 'error'); return; }
+      const connectivity = {};
+      for (const box of document.querySelectorAll('#anConnectivity input[data-conn]')) {
+        connectivity[box.dataset.conn] = box.checked;
+      }
+      button.disabled = true;
+      anSetMsg('anFormMsg', 'Đang tạo setup...', '');
+      const result = await api('/dashboard/api/nodes/onboard/enrollments', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ node_id: nodeId, os: 'windows', profile: anProfile, connectivity }),
+      });
+      button.disabled = false;
+      if (!result.ok) {
+        const detail = result.data.detail || result.data.error || 'Lỗi';
+        anSetMsg('anFormMsg', result.data.error === 'NODE_ALREADY_EXISTS'
+          ? `Đã có node tên "${nodeId}". Chọn tên khác, hoặc xoá node cũ trước.` : detail, 'error');
+        return;
+      }
+      anGenerated = result.data;
+      anRenderDone();
+      anShow('anStepDone');
+      loadEnrollments();
+    });
+
+    // One clipboard helper for every copy button on this page. The
+    // fallback matters: navigator.clipboard is undefined on a page served
+    // over plain http:// to anything but localhost, which is exactly how
+    // this dashboard is reached over the LAN -- so the primary action
+    // would silently do nothing without it.
+    async function anCopy(text) {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch (error) { /* fall through to the textarea path */ }
+      try {
+        const scratch = document.createElement('textarea');
+        scratch.value = text;
+        scratch.setAttribute('readonly', '');
+        scratch.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+        document.body.append(scratch);
+        scratch.select();
+        scratch.setSelectionRange(0, text.length);
+        const ok = document.execCommand('copy');
+        scratch.remove();
+        return ok;
+      } catch (error) { return false; }
+    }
+
+    // Flash "Đã copy ✓" then restore. Guards against double-clicks
+    // stacking timers and leaving the button stuck on the flashed label.
+    function anFlash(button, okLabel) {
+      if (button.dataset.restoreTo === undefined) button.dataset.restoreTo = button.textContent;
+      if (button.dataset.timer) clearTimeout(Number(button.dataset.timer));
+      button.textContent = okLabel;
+      button.dataset.timer = String(setTimeout(() => {
+        button.textContent = button.dataset.restoreTo;
+        delete button.dataset.timer;
+      }, 2500));
+    }
+
+    let anExpiryTimer = null;
+    let anProgressTimer = null;
+    let anHelper = null;   // {version} when the local Bootstrap helper answers
+
+    // -- the one primary CTA ------------------------------------------------
+    //
+    // After Generate setup there is exactly ONE primary button, and it is
+    // always on screen. Detection decides what the click DOES and what the
+    // line above it says -- never whether the button exists. Someone
+    // standing at a fresh Windows machine was promised "Cài và kết nối máy
+    // này"; making them first work out whether a Bootstrap helper is
+    // installed, or whether this controller published one, is our problem
+    // leaking onto their screen. When nothing can be done we still show the
+    // button, disabled, with the reason in words -- a missing button reads
+    // as "this page is broken", a disabled one with a reason reads as
+    // "here is what to fix".
+    const AN_CTA_LABEL = 'Cài và kết nối máy này';
+    let anCtaMode = 'checking';   // checking | connect | download | unavailable
+    let anCtaBuild = null;        // the published helper build, in download mode
+    let anCtaExpired = false;     // the enrollment behind the CTA has run out
+    let anDetectTimer = null;
+    // One handle in flight at a time. Without this an impatient double
+    // click mints two handles for one enrollment: the second invalidates
+    // the first, and the helper already holding the first fails at redeem.
+    let anHandleInFlight = false;
+    // When the CURRENT pairing dies. A timestamp, never the handle itself.
+    let anPairingExpiresAt = 0;
+
+    // disabled AND aria-disabled: the pointer gets a cursor that says "not
+    // now" instead of a click that silently does nothing, and assistive
+    // tech reads the same state rather than an enabled-looking button.
+    function anCtaSetState(button, enabled, busy) {
+      button.disabled = !enabled;
+      button.setAttribute('aria-disabled', String(!enabled));
+      if (busy) button.setAttribute('aria-busy', 'true');
+      else button.removeAttribute('aria-busy');
+    }
+
+    function anSetCtaMode(mode, build) {
+      anCtaMode = mode;
+      anCtaBuild = mode === 'download' ? (build || null) : null;
+      anApplyCta();
+    }
+
+    function anApplyCta() {
+      const button = document.getElementById('anHelperBtn');
+      if (!button) return;
+      const why = document.getElementById('anHelperWhy');
+      const dlBtn = document.getElementById('anHelperDlBtn');
+      const quickBox = document.getElementById('anQuickBox');
+      const build = anCtaBuild;
+      // The manual mirror of the download lives in the fallback section and
+      // only appears when there is actually a build to hand over.
+      if (dlBtn) {
+        dlBtn.hidden = !build;
+        if (build) dlBtn.onclick = anDownloadPairedHelper;
+      }
+      // Copy/paste is demoted whenever the CTA can act. When it cannot, it
+      // is the only thing on this screen that still works, so it stops
+      // looking like an afterthought.
+      if (quickBox) quickBox.classList.toggle('an-demoted', anCtaMode !== 'unavailable');
+      // The label never changes with the mode: the operator is promised one
+      // action, and "install and connect this machine" is what every live
+      // branch actually delivers.
+      button.textContent = AN_CTA_LABEL;
+      if (anCtaExpired) {
+        anCtaSetState(button, false, false);
+        why.textContent = 'Mã cài đặt đã hết hạn — bấm Tạo lại để tạo mã mới.';
+        return;
+      }
+      if (anCtaMode === 'checking') {
+        anCtaSetState(button, false, true);
+        why.textContent = 'Đang kiểm tra máy này…';
+        return;
+      }
+      if (anCtaMode === 'connect') {
+        anCtaSetState(button, true, false);
+        why.textContent = `Bootstrap helper v${(anHelper && anHelper.version) || '?'} đã cài trên máy này — bấm một lần, rồi bấm Yes khi Windows hỏi quyền Administrator.`;
+        return;
+      }
+      if (anCtaMode === 'download') {
+        anCtaSetState(button, true, false);
+        // Unsigned is stated plainly rather than coaching anyone past
+        // SmartScreen.
+        const warn = build && build.signed ? '' : ' (bản DEV chưa ký — Windows SmartScreen sẽ cảnh báo, chọn More info → Run anyway)';
+        why.textContent = `Chưa có helper trên máy này — bấm để tải Bootstrap helper v${(build && build.version) || '?'} đã gắn sẵn phiên cài đặt này${warn}. Mở file vừa tải, rồi bấm Yes khi Windows hỏi quyền Administrator; phần còn lại tự chạy.`;
+        return;
+      }
+      // unavailable: the button stays put and says why it cannot act.
+      anCtaSetState(button, false, false);
+      why.textContent = 'Controller này chưa xuất bản Bootstrap helper cho Windows, nên chưa cài tự động từ đây được. Dùng cách thủ công bên dưới: Copy lệnh cài đặt → Win + R trên máy Windows.';
+    }
+
+    // Detection decides the mode, and nothing else. Both the first render
+    // and the post-download re-check go through here so there is one place
+    // that maps "what is on this machine" to "what the button does".
+    async function anDecideCta() {
+      const found = await anDetectHelper();
+      anHelper = found;
+      if (found) { anSetCtaMode('connect'); return 'connect'; }
+      const published = await api('/dashboard/api/nodes/onboard/helper');
+      const build = published.ok && published.data.published ? published.data : null;
+      if (!build) { anSetCtaMode('unavailable'); return 'unavailable'; }
+      anSetCtaMode('download', build);
+      return 'download';
+    }
+
+    // After a paired download the helper usually enrolls on its own, but if
+    // the operator installs it and comes back to this tab, the CTA should
+    // already have become the connect button. Bounded re-check, not a
+    // permanent poll.
+    function anRedetectAfterDownload() {
+      if (anDetectTimer) { clearInterval(anDetectTimer); anDetectTimer = null; }
+      let tries = 0;
+      anDetectTimer = setInterval(async () => {
+        if (!anGenerated || ++tries > 12) { clearInterval(anDetectTimer); anDetectTimer = null; return; }
+        if (await anDecideCta() === 'connect') { clearInterval(anDetectTimer); anDetectTimer = null; }
+      }, 5000);
+    }
+
+    // Is the Terminal MCP Bootstrap helper installed on the machine the
+    // OPERATOR is sitting at? There is no way to feature-detect a custom
+    // protocol handler from a page, so the helper runs a loopback-only
+    // listener and we probe it. A failure here is the normal case (no
+    // helper yet) and must be silent, not an error.
+    async function anDetectHelper() {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 1200);
+      try {
+        const response = await fetch('http://127.0.0.1:8791/detect',
+                                     {signal: controller.signal, cache: 'no-store'});
+        if (!response.ok) return null;
+        const body = await response.json();
+        return body && body.product === 'terminal-mcp-bootstrap' ? body : null;
+      } catch (error) {
+        return null;   // not installed, or not reachable -- same outcome
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    // While the installer runs, the enrollment row carries the stage it is
+    // on. Polling it is what turns "nothing is happening" into "installing
+    // OpenSSH, 1m32s" -- the single most useful thing to show someone
+    // staring at a machine that looks stuck.
+    // -- installation status -------------------------------------------------
+    //
+    // This panel is shown the moment the CTA is used and is NOT hidden again
+    // while the enrollment is pending. The version this replaces returned
+    // early whenever the row carried no progress_stage, which is precisely
+    // the state a machine is in before its helper has called back -- so the
+    // operator whose helper never started (SmartScreen, no double-click, an
+    // expired pairing) saw an empty box and had no way to tell "waiting"
+    // from "broken". Waiting is a state and it gets rendered like one.
+    // Two thresholds, because "quiet for half a minute" and "quiet for a
+    // minute and a half" call for different words. The first is a nudge;
+    // the second says plainly that the helper has never reached the
+    // server, which is the state a blocked or never-opened binary leaves
+    // behind and the one an operator can actually act on.
+    const AN_STALL_AFTER_MS = 30000;
+    const AN_STALL_HARD_AFTER_MS = 90000;
+    let anWatch = null;   // {id, nodeId, startedAt, lastStage, lastChangeAt}
+
+    function anFmtDuration(ms) {
+      const secs = Math.max(0, Math.round(ms / 1000));
+      return secs >= 60 ? `${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, '0')}s` : `${secs}s`;
+    }
+
+    // Survives a reload: the enrollment ID is not a credential (the code
+    // and the handle are, and neither is stored). Without this, refreshing
+    // the page during a ten-minute OpenSSH install left the operator with
+    // no way back to the status of the thing they had just started.
+    const AN_WATCH_KEY = 'tmcp.addnode.watch';
+
+    function anSaveWatch() {
+      try {
+        if (anWatch) localStorage.setItem(AN_WATCH_KEY, JSON.stringify(anWatch));
+        else localStorage.removeItem(AN_WATCH_KEY);
+      } catch (error) { /* private window / blocked storage: in-memory only */ }
+    }
+
+    function anLoadWatch() {
+      try {
+        const raw = localStorage.getItem(AN_WATCH_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        return (parsed && parsed.id) ? parsed : null;
+      } catch (error) { return null; }
+    }
+
+    function anBeginWatch(enrollmentId, nodeId, pairingExpiresAt) {
+      const now = Date.now();
+      anWatch = {id: enrollmentId, nodeId: nodeId || '', startedAt: now,
+                 lastStage: '', lastChangeAt: now,
+                 pairingExpiresAt: pairingExpiresAt || 0};
+      anSaveWatch();
+      anRenderLive(null);
+      if (anProgressTimer) clearInterval(anProgressTimer);
+      anProgressTimer = setInterval(anPollProgress, 3000);
+      anPollProgress();
+    }
+
+    function anEndWatch() {
+      anWatch = null;
+      anSaveWatch();
+      if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
+      if (anLiveTicker) { clearInterval(anLiveTicker); anLiveTicker = null; }
+    }
+
+    let anLiveTicker = null;
+    let anLiveRow = null;
+
+    // Redrawn once a second off a cached row, so "đã 41s" counts up between
+    // the 3-second polls instead of freezing -- a frozen timer is the single
+    // clearest way to make a working install look hung.
+    function anRenderLive(row) {
+      if (row !== undefined) anLiveRow = row;
+      const live = document.getElementById('anLive');
+      if (!live || !anWatch) return;
+      const stageEl = document.getElementById('anLiveStage');
+      const metaEl = document.getElementById('anLiveMeta');
+      const hintEl = document.getElementById('anLiveHint');
+      const actions = document.getElementById('anLiveActions');
+      const current = anLiveRow;
+      const stage = (current && current.progress_stage) || '';
+      const now = Date.now();
+      const sinceChange = now - anWatch.lastChangeAt;
+      // Prefer the elapsed the MACHINE reports: it measures the install
+      // itself, and it stays right across a reload and across a clock that
+      // disagrees with the controller's. The browser-side measure is the
+      // fallback, and is all there is during the wait before any stage.
+      const serverSecs = Number((current && current.progress_elapsed_seconds) || 0);
+      const sinceStart = serverSecs > 0 ? serverSecs * 1000 : (now - anWatch.startedAt);
+      live.hidden = false;
+
+      if (stage === 'ready') {
+        live.className = 'an-live done';
+        stageEl.textContent = `${(current && current.progress_label) || 'Hoàn tất'} — máy đã cài xong.`;
+        metaEl.textContent = `Tổng thời gian ${anFmtDuration(sinceStart)}.`;
+        hintEl.hidden = true;
+        actions.hidden = true;
+        return;
+      }
+      if (stage === 'failed') {
+        live.className = 'an-live failed';
+        stageEl.textContent = `${(current && current.progress_label) || 'Cài đặt thất bại'}`;
+        metaEl.textContent = `Dừng sau ${anFmtDuration(sinceStart)}. Xem cửa sổ PowerShell trên máy đó để biết bước nào lỗi.`;
+        hintEl.hidden = true;
+        actions.hidden = false;
+        return;
+      }
+
+      // Expired beats everything below: a dead code cannot be rescued by
+      // waiting, so the panel stops nudging and offers the one action that
+      // works.
+      if (current && current.status === 'expired') {
+        live.className = 'an-live failed';
+        stageEl.textContent = 'Mã cài đặt đã hết hạn — Tạo lại';
+        metaEl.textContent = `Hết hạn sau ${anFmtDuration(sinceStart)} chờ. Bấm Tạo lại để tạo mã mới.`;
+        hintEl.hidden = true;
+        actions.hidden = false;
+        if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
+        return;
+      }
+
+      const quiet = sinceChange > AN_STALL_AFTER_MS;
+      const veryQuiet = sinceChange > AN_STALL_HARD_AFTER_MS;
+      const stalled = !stage && quiet;
+      live.className = 'an-live' + (stalled ? ' stalled' : '');
+      stageEl.textContent = stage
+        ? `${(current && current.progress_label) || stage}…`
+        : (quiet ? 'Chưa thấy helper kết nối' : 'Đang chờ helper trên máy Windows…');
+      const bits = [`đã ${anFmtDuration(sinceStart)}`];
+      bits.push(stage
+        ? `cập nhật lần cuối ${anFmtDuration(sinceChange)} trước`
+        : 'helper chưa báo về bước nào');
+      if (anWatch.nodeId) bits.push(`node ${anWatch.nodeId}`);
+      // How long the pairing itself has left. It is the thing that dies
+      // first, and the operator cannot see it anywhere else.
+      if (anWatch.pairingExpiresAt) {
+        const left = anWatch.pairingExpiresAt - now;
+        if (left > 0) bits.push(`mã còn ${anFmtDuration(left)}`);
+      }
+      metaEl.textContent = bits.join(' · ');
+      // The warning names the physical things the operator has to do,
+      // which is what nobody can guess from a silent screen.
+      hintEl.hidden = !stalled;
+      if (stalled) {
+        hintEl.textContent = veryQuiet
+          ? 'Helper chưa liên hệ máy chủ — kiểm tra SmartScreen/UAC hoặc chạy lại. '
+            + 'Mở file vừa tải trên máy Windows, chọn More info → Run anyway nếu bị chặn, rồi bấm Yes.'
+          : 'Chưa thấy helper kết nối. Mở file vừa tải trên máy đó và bấm Yes khi Windows hỏi '
+            + 'quyền Administrator.';
+      }
+      actions.hidden = !stalled;
+    }
+
+    async function anPollProgress() {
+      if (!anWatch) return;
+      const result = await api('/dashboard/api/nodes/onboard/enrollments');
+      if (!result.ok) return;   // keep the panel and its timer; transient
+      const row = (result.data.enrollments || []).find((e) => e.id === anWatch.id);
+      if (!row) {
+        // Gone from the list entirely: expired and swept, or revoked. Say
+        // so rather than spinning forever against nothing.
+        anLiveRow = {progress_stage: 'failed',
+                     progress_label: 'Mã cài đặt đã hết hạn hoặc bị thu hồi'};
+        anRenderLive(anLiveRow);
+        if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
+        return;
+      }
+      const stage = row.progress_stage || '';
+      if (stage !== anWatch.lastStage) {
+        anWatch.lastStage = stage;
+        anWatch.lastChangeAt = Date.now();
+        anSaveWatch();
+      }
+      anRenderLive(row);
+      if (stage === 'ready' || stage === 'failed') {
+        if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
+        try { localStorage.removeItem(AN_WATCH_KEY); } catch (error) { /* ignore */ }
+        loadAll();
+      }
+    }
+
+    function anRenderDone() {
+      const expiresAt = new Date(anGenerated.enrollment.expires_at);
+      const cmdEl = document.getElementById('anQuickCmd');
+      const regenBtn = document.getElementById('anRegenBtn');
+      const copyBtn = document.getElementById('anCopyCmdBtn');
+      cmdEl.value = anGenerated.quick_install_command || '';
+
+      // A command longer than the Run dialog accepts would be silently
+      // truncated on paste -- say so rather than let them find out.
+      const note = document.getElementById('anPlatformNote');
+      const notes = [];
+      if (anGenerated.quick_install_fits_run_dialog === false) {
+        notes.push('Lệnh dài hơn giới hạn của hộp Win + R — dùng cách thủ công bên dưới.');
+      }
+      if (!/Win/i.test(navigator.platform || '')) {
+        notes.push('Chạy lệnh này trên máy Windows cần thêm.');
+      }
+      note.textContent = notes.join(' ');
+      note.hidden = notes.length === 0;
+
+      // Live countdown: the code is the whole credential, so "still valid?"
+      // must never be a guess.
+      function tick() {
+        const left = Math.round((expiresAt.getTime() - Date.now()) / 1000);
+        const expiryEl = document.getElementById('anExpiry');
+        if (left <= 0) {
+          expiryEl.textContent = 'Lệnh đã hết hạn — bấm Tạo lại.';
+          cmdEl.disabled = true;
+          copyBtn.disabled = true;
+          regenBtn.hidden = false;
+          // The CTA stays on screen and says it has expired, rather than
+          // minting a handle against an enrollment the controller will
+          // refuse.
+          anCtaExpired = true;
+          anApplyCta();
+          if (anExpiryTimer) { clearInterval(anExpiryTimer); anExpiryTimer = null; }
+          return;
+        }
+        const mins = Math.floor(left / 60), secs = left % 60;
+        expiryEl.textContent = `Lệnh có hiệu lực khoảng 15 phút — còn ${mins}:${String(secs).padStart(2, '0')}. Dùng một lần.`;
+      }
+      cmdEl.disabled = false;
+      copyBtn.disabled = false;
+      regenBtn.hidden = true;
+      document.getElementById('anLive').hidden = true;
+      anLiveRow = null;
+      anCtaExpired = false;
+      anSetMsg('anHelperMsg', '');
+
+      // The CTA is on screen from this moment, in its checking state. It
+      // is never removed from here on: anDecideCta only chooses which of
+      // the three live meanings it carries.
+      if (anDetectTimer) { clearInterval(anDetectTimer); anDetectTimer = null; }
+      anSetCtaMode('checking');
+      anDecideCta();
+      // The status panel stays dark until the operator actually uses the
+      // CTA -- generating a code is not yet an install to watch.
+      if (anExpiryTimer) clearInterval(anExpiryTimer);
+      tick();
+      anExpiryTimer = setInterval(tick, 1000);
+
+      anSetMsg('anDoneMsg', '');
+      const fine = document.getElementById('anFine');
+      fine.replaceChildren();
+      const lines = [
+        ['Node', anGenerated.enrollment.node_id],
+        ['Controller', anGenerated.controller_url],
+        ['Script', `windows-setup.ps1 v${anGenerated.script_version} · sha256 ${anGenerated.script_sha256.slice(0, 16)}…`],
+      ];
+      for (const [label, value] of lines) {
+        const row = document.createElement('div');
+        const strong = document.createElement('b');
+        strong.textContent = label + ': ';
+        const code = document.createElement('code');
+        code.textContent = value;
+        row.append(strong, code);
+        fine.append(row);
+      }
+      const alt = document.createElement('div');
+      alt.style.marginTop = '8px';
+      alt.textContent = 'Hoặc tự chạy trong PowerShell (Administrator), sau khi đã tải file:';
+      const cmd = document.createElement('div');
+      cmd.style.marginTop = '4px';
+      const cmdCode = document.createElement('code');
+      cmdCode.textContent = `.\\${anGenerated.filename} `;
+      cmd.append(cmdCode);
+      fine.append(alt, cmd);
+
+      // Troubleshooting: a short, fixed list, each with its own copy
+      // button. Deliberately three lines, not a manual -- the primary
+      // action stays the one button above.
+      const trouble = document.getElementById('anTrouble');
+      trouble.replaceChildren();
+      const heading = document.createElement('div');
+      heading.style.marginTop = '10px';
+      heading.textContent = 'Nếu máy không hiện Ready, chạy trên máy đó để kiểm tra:';
+      trouble.append(heading);
+      for (const [label, command] of [
+        ['OpenSSH', 'Get-Service sshd'],
+        ['Tailscale', 'tailscale status'],
+        ['Tác vụ nền', "Get-ScheduledTask -TaskName 'TerminalMCP-*' | Get-ScheduledTaskInfo"],
+        ['Chạy lại/sửa', `.\\${anGenerated.filename} -Repair`],
+      ]) {
+        const row = document.createElement('div');
+        row.className = 'an-trouble-row';
+        const name = document.createElement('span');
+        name.className = 'muted';
+        name.style.minWidth = '86px';
+        name.textContent = label;
+        const code = document.createElement('code');
+        code.textContent = command;
+        const copy = document.createElement('button');
+        copy.className = 'icon-btn';
+        copy.type = 'button';
+        copy.textContent = 'Copy';
+        copy.addEventListener('click', async () => {
+          anFlash(copy, await anCopy(command) ? '✓' : '✕');
+        });
+        row.append(name, code, copy);
+        trouble.append(row);
+      }
+    }
+
+    document.getElementById('anDownloadBtn').addEventListener('click', () => {
+      if (!anGenerated) return;
+      // A Blob download, never a URL with the code in the query string --
+      // a code in a URL lands in browser history, proxy logs and the
+      // controller's own access log.
+      const blob = new Blob([anGenerated.script], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = anGenerated.filename;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      anSetMsg('anDoneMsg', 'Đã tải. Chuột phải file → Run with PowerShell trên máy Windows.', 'ok');
+    });
+
+    document.getElementById('anCopyCmdBtn').addEventListener('click', async (event) => {
+      if (!anGenerated) return;
+      const button = event.currentTarget;
+      const ok = await anCopy(anGenerated.quick_install_command || '');
+      if (ok) {
+        anFlash(button, 'Đã copy ✓');
+        anSetMsg('anDoneMsg', 'Trên máy Windows: Win + R → Ctrl + V → Enter → Yes.', 'ok');
+      } else {
+        // Never leave them stuck: select the box so Ctrl+C still works.
+        const box = document.getElementById('anQuickCmd');
+        box.focus(); box.select();
+        anFlash(button, 'Nhấn Ctrl + C');
+        anSetMsg('anDoneMsg', 'Trình duyệt chặn clipboard — lệnh đã được bôi đen, nhấn Ctrl + C để copy.', '');
+      }
+    });
+
+    // Fetch the helper with the handle in the BODY, then save it under the
+    // paired name the controller chose. A query string would put a live
+    // credential into access logs and browser history; a POST plus a blob
+    // keeps it out of both. Same mechanism the .ps1 download already uses.
+    async function anDownloadPairedHelper(event) {
+      event.preventDefault();
+      if (!anGenerated) return;
+      const button = event.currentTarget;
+      if (anHandleInFlight) return;
+      anHandleInFlight = true;
+      button.classList.add('busy');
+      let handle = '';
+      try {
+        const issued = await api(
+          `/dashboard/api/nodes/onboard/enrollments/${encodeURIComponent(anGenerated.enrollment.id)}/handle`,
+          {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+        if (issued.ok && issued.data.handle) {
+          handle = issued.data.handle;
+          // The expiry, not the handle: a timestamp is safe to keep and is
+          // the only way the panel can say how long the pairing has left.
+          anPairingExpiresAt = Date.parse(issued.data.expires_at || '') || 0;
+        }
+      } catch (error) {
+        // Generic download is a supported outcome, not a failure: the
+        // operator installs it and presses Connect again.
+      }
+      try {
+        const response = await fetch('/dashboard/api/nodes/onboard/helper/windows-x64', {
+          method: 'POST', cache: 'no-store',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(handle ? {session: handle} : {}),
+        });
+        if (!response.ok) {
+          anSetMsg('anHelperMsg', 'Không tải được helper.', 'error');
+          return;
+        }
+        // The controller names the file; honour that name exactly, because
+        // it is what the helper reads on a double-click.
+        const disposition = response.headers.get('Content-Disposition') || '';
+        const match = /filename="([^"]+)"/.exec(disposition);
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = match ? match[1] : 'terminal-mcp-bootstrap.exe';
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        anSetMsg('anHelperMsg', handle
+          ? 'Đã tải. Mở file vừa tải và bấm Yes khi Windows hỏi quyền Administrator — phần còn lại tự chạy.'
+          : `Đã tải. Mở file vừa tải và bấm Yes; cài xong thì bấm "${AN_CTA_LABEL}" lần nữa.`, 'ok');
+        // They now have the installer in hand, so start watching for the
+        // helper to appear and flip the CTA to its connect meaning.
+        anRedetectAfterDownload();
+      } finally {
+        anHandleInFlight = false;
+        button.classList.remove('busy');
+      }
+    }
+
+    // The single primary action. Which of its three meanings fires is
+    // decided by detection, not by the operator having to choose: connect
+    // through a helper already here, or download the helper paired with
+    // THIS enrollment. In the unavailable state the button is disabled and
+    // never reaches this handler at all.
+    document.getElementById('anHelperBtn').addEventListener('click', async (event) => {
+      if (!anGenerated || anCtaExpired) return;
+      const button = event.currentTarget;
+      if (button.disabled || anHandleInFlight) return;
+      if (anCtaMode === 'download') {
+        // Same button, same enrollment: the download carries the pending
+        // session with it, so the double-click on the Windows machine
+        // continues this setup instead of starting a second one.
+        anCtaSetState(button, false, true);
+        await anDownloadPairedHelper(event);
+        anApplyCta();
+        // The installer is now in the operator's hands, so the wait starts
+        // here -- including the case where they never run it, which is the
+        // one the old silent panel could not express.
+        anBeginWatch(anGenerated.enrollment.id, anGenerated.enrollment.node_id,
+                     anPairingExpiresAt);
+        return;
+      }
+      if (anCtaMode !== 'connect') return;
+      anHandleInFlight = true;
+      anCtaSetState(button, false, true);
+      anSetMsg('anHelperMsg', 'Đang tạo phiên cài đặt...', '');
+      try {
+        // The handle is minted per click and lives ~2 minutes: it is what
+        // travels in the terminalmcp:// URL instead of the enrollment code.
+        const issued = await api(
+          `/dashboard/api/nodes/onboard/enrollments/${encodeURIComponent(anGenerated.enrollment.id)}/handle`,
+          {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+        if (!issued.ok) {
+          anSetMsg('anHelperMsg', issued.data.detail || issued.data.error || 'Không tạo được phiên cài đặt.', 'error');
+          return;
+        }
+        // Hand it to the local helper. The page never sees the bootstrap
+        // payload -- the helper redeems the handle itself, over HTTPS.
+        window.location.href = issued.data.url;
+        anSetMsg('anHelperMsg', 'Đã gửi sang Bootstrap helper — bấm Yes khi Windows hỏi quyền Administrator.', 'ok');
+        anBeginWatch(anGenerated.enrollment.id, anGenerated.enrollment.node_id,
+                     Date.parse(issued.data.expires_at || '') || 0);
+      } finally {
+        anHandleInFlight = false;
+        anApplyCta();   // back to whatever the current state allows
+      }
+    });
+
+    // Retry re-runs whatever the CTA currently means; Repair opens the
+    // manual path, which is the one that works when the helper will not.
+    document.getElementById('anLiveRetryBtn').addEventListener('click', () => {
+      if (anWatch) { anWatch.lastChangeAt = Date.now(); anSaveWatch(); }
+      anRenderLive(anLiveRow);
+      const cta = document.getElementById('anHelperBtn');
+      if (cta && !cta.disabled) cta.click();
+    });
+
+    document.getElementById('anLiveRepairBtn').addEventListener('click', () => {
+      const manual = document.querySelector('details.an-manual');
+      if (manual) { manual.open = true; manual.scrollIntoView({block: 'nearest'}); }
+    });
+
+    // One tick a second so elapsed/last-update count up between polls.
+    anLiveTicker = setInterval(() => { if (anWatch) anRenderLive(undefined); }, 1000);
+
+    // Resume across a reload: a pending enrollment this browser started is
+    // still worth watching even though anGenerated (which holds the code)
+    // is deliberately gone.
+    (function anResumeWatch() {
+      const saved = anLoadWatch();
+      if (!saved) return;
+      // Anything older than an enrollment can possibly live is stale.
+      if (Date.now() - Number(saved.startedAt || 0) > 3600000) { anWatch = null; anSaveWatch(); return; }
+      anWatch = saved;
+      anPanel.hidden = false;
+      anShow('anStepDone');
+      document.getElementById('anExpiry').textContent = 'Đang theo dõi lần cài đặt trước đó.';
+      anRenderLive(null);
+      if (anProgressTimer) clearInterval(anProgressTimer);
+      anProgressTimer = setInterval(anPollProgress, 3000);
+      anPollProgress();
+    })();
+
+    document.getElementById('anRegenBtn').addEventListener('click', () => {
+      // Same node name and profile, a fresh code. Straight back to the
+      // form's submit path so there is one code-minting path, not two.
+      if (anExpiryTimer) { clearInterval(anExpiryTimer); anExpiryTimer = null; }
+      if (anDetectTimer) { clearInterval(anDetectTimer); anDetectTimer = null; }
+      anShow('anStepForm');
+      anSetMsg('anFormMsg', 'Mã cũ đã hết hạn — bấm Generate setup để tạo lệnh mới.', '');
+    });
+
+    document.getElementById('anCopyCodeBtn').addEventListener('click', async (event) => {
+      if (!anGenerated) return;
+      const button = event.currentTarget;
+      const ok = await anCopy(anGenerated.code);
+      anFlash(button, ok ? 'Đã copy ✓' : '✕');
+      if (!ok) anSetMsg('anDoneMsg', 'Không copy được enrollment code.', '');
+    });
+
+    document.getElementById('anDoneBtn').addEventListener('click', () => {
+      anPanel.hidden = true;
+      if (anExpiryTimer) { clearInterval(anExpiryTimer); anExpiryTimer = null; }
+      if (anDetectTimer) { clearInterval(anDetectTimer); anDetectTimer = null; }
+      anEndWatch();         // stops polling AND forgets the resume marker
+      anGenerated = null;   // the only copy in this tab, dropped on close
+      loadAll();
+    });
+
+    // -- pending enrollments strip ----------------------------------------
+    async function loadEnrollments() {
+      const host = document.getElementById('enrollStrip');
+      const result = await api('/dashboard/api/nodes/onboard/enrollments');
+      if (!result.ok) { host.hidden = true; return; }
+      const pending = (result.data.enrollments || []).filter((row) => row.status === 'pending');
+      host.replaceChildren();
+      if (!pending.length) { host.hidden = true; return; }
+      host.hidden = false;
+      const title = document.createElement('div');
+      title.className = 'muted';
+      title.style.fontSize = '12px';
+      title.textContent = `Đang chờ cài đặt (${pending.length}):`;
+      host.append(title);
+      for (const row of pending) {
+        const line = document.createElement('div');
+        line.style.cssText = 'display:flex;gap:10px;align-items:center;margin-top:6px;font-size:12px';
+        const name = document.createElement('b');
+        name.textContent = row.node_id;
+        const meta = document.createElement('span');
+        meta.className = 'muted';
+        meta.textContent = `${row.profile} · ${row.code_display} · hết hạn ${new Date(row.expires_at).toLocaleTimeString()}`;
+        const revoke = document.createElement('button');
+        revoke.className = 'icon-btn';
+        revoke.type = 'button';
+        revoke.textContent = 'Revoke';
+        revoke.addEventListener('click', async () => {
+          revoke.disabled = true;
+          await api(`/dashboard/api/nodes/onboard/enrollments/${encodeURIComponent(row.id)}/revoke`, { method: 'POST' });
+          loadEnrollments();
+        });
+        line.append(name, meta, revoke);
+        host.append(line);
+      }
+    }
+
+    // ======================================================================
+    // Node detail: transports, Test Primary / Test Rescue, Remove Node.
+    // ======================================================================
+    const TR_LABEL = { tailscale: 'Tailscale (primary)', lan: 'LAN', reverse_ssh: 'Reverse SSH (rescue)' };
+
+    async function renderOnboardingSection(nodeId) {
+      const host = document.getElementById('nodeTransports');
+      if (!host) return;
+      host.replaceChildren();
+      const result = await api(`/dashboard/api/nodes/${encodeURIComponent(nodeId)}/onboarding`);
+      if (!result.ok) return;
+      const info = result.data;
+      const transports = info.transports || [];
+
+      const heading = document.createElement('h3');
+      heading.style.cssText = 'margin:18px 0 0 0;font-size:13px';
+      heading.textContent = 'Kết nối';
+      host.append(heading);
+
+      if (!transports.length) {
+        const empty = document.createElement('div');
+        empty.className = 'muted';
+        empty.style.fontSize = '12px';
+        empty.textContent = 'Node này chưa có transport nào được ghi nhận (chỉ node onboard qua + Add Node mới có).';
+        host.append(empty);
+      } else {
+        const table = document.createElement('table');
+        table.className = 'tr-table';
+        const head = document.createElement('thead');
+        head.innerHTML = '<tr><th>Đường</th><th>Địa chỉ</th><th>Trạng thái</th><th>Lần cuối OK</th><th>Lỗi gần nhất</th></tr>';
+        const body = document.createElement('tbody');
+        for (const transport of transports) {
+          const row = document.createElement('tr');
+          const cell = (text, className) => {
+            const td = document.createElement('td');
+            if (className) { const span = document.createElement('span'); span.className = className; span.textContent = text; td.append(span); }
+            else { td.textContent = text; }
+            row.append(td);
+          };
+          cell(TR_LABEL[transport.kind] || transport.kind);
+          cell(transport.endpoint);
+          cell(transport.health, 'tr-h ' + transport.health);
+          cell(transport.last_success_at ? new Date(transport.last_success_at).toLocaleString() : '—');
+          cell(transport.last_error || '—');
+          body.append(row);
+        }
+        table.append(head, body);
+        host.append(table);
+      }
+
+      if (info.rescue) {
+        const line = document.createElement('div');
+        line.className = 'muted';
+        line.style.cssText = 'font-size:11px;margin-top:6px';
+        line.textContent = `Rescue: cổng ${info.rescue.port} trên ${info.gateway.host || 'gateway'} (chỉ bind 127.0.0.1).`;
+        host.append(line);
+      } else if (info.gateway && !info.gateway.configured) {
+        const line = document.createElement('div');
+        line.className = 'muted';
+        line.style.cssText = 'font-size:11px;margin-top:6px';
+        line.textContent = 'Rescue: ' + anReason(info.gateway.reason);
+        host.append(line);
+      }
+
+      const actions = document.createElement('div');
+      actions.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-top:10px';
+      const message = document.createElement('div');
+      message.className = 'd-msg';
+
+      const makeTest = (label, which) => {
+        const button = document.createElement('button');
+        button.className = 'icon-btn';
+        button.type = 'button';
+        button.textContent = label;
+        button.addEventListener('click', async () => {
+          button.disabled = true;
+          message.textContent = 'Đang kiểm tra...'; message.className = 'd-msg';
+          const test = await api(`/dashboard/api/nodes/${encodeURIComponent(nodeId)}/test-transport`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ transport: which }),
+          });
+          button.disabled = false;
+          if (!test.ok) { message.textContent = test.data.detail || test.data.error || 'Lỗi'; message.className = 'd-msg error'; return; }
+          if (test.data.reachable) {
+            message.textContent = `OK qua ${TR_LABEL[test.data.transport] || test.data.transport} (${test.data.endpoint}).`;
+            message.className = 'd-msg ok';
+          } else {
+            const why = (test.data.attempts || []).map((a) => `${TR_LABEL[a.kind] || a.kind}: ${a.error}`).join(' · ');
+            message.textContent = 'Không tới được. ' + (why || test.data.reason);
+            message.className = 'd-msg error';
+          }
+          renderOnboardingSection(nodeId);
+        });
+        return button;
+      };
+      actions.append(makeTest('Test Primary', 'primary'), makeTest('Test Rescue', 'rescue'));
+
+      if (info.registered) {
+        const remove = document.createElement('button');
+        remove.className = 'icon-btn';
+        remove.type = 'button';
+        remove.textContent = '🗑 Remove Node';
+        remove.addEventListener('click', async () => {
+          if (!window.confirm(`Xoá node "${nodeId}" khỏi Terminal MCP?\n\nSẽ thu hồi credential, mã enrollment đang chờ và cổng rescue. KHÔNG gỡ phần mềm nào trên máy đó.`)) return;
+          remove.disabled = true;
+          const removal = await api(`/dashboard/api/nodes/${encodeURIComponent(nodeId)}/remove`, { method: 'POST' });
+          if (!removal.ok) { message.textContent = removal.data.detail || removal.data.error || 'Lỗi'; message.className = 'd-msg error'; remove.disabled = false; return; }
+          selectedNodeId = null;
+          document.getElementById('detail').hidden = true;
+          loadAll();
+        });
+        actions.append(remove);
+      }
+      host.append(actions, message);
+    }
 
     // ======================================================================
     // Connect Node: Scan LAN / Add Remote SSH / Add via Cloudflare Tunnel /
@@ -5428,7 +7886,8 @@ NODES_ADMIN_HTML = """<!doctype html>
       });
     })();
 
-    loadAll(); setInterval(loadAll, 8000);
+    loadAll(); loadEnrollments();
+    setInterval(loadAll, 8000); setInterval(loadEnrollments, 30000);
   </script>
 </body>
 </html>"""
@@ -5450,6 +7909,2809 @@ NODES_ADMIN_HTML = """<!doctype html>
 # ?session=) pre-fills the session filter so the per-session Task button
 # elsewhere can deep-link here filtered to one session without this page
 # needing any server-side templating of its own.
+# ---------------------------------------------------------------------------
+# AI Usage report page.
+#
+# Its data comes from files the coding CLIs already wrote on this machine
+# (ai_usage_local.py / ai_usage_index.py) -- never from a provider's usage
+# API, and never from an inference request made just to read a header.
+#
+# Two different things are shown, and the page keeps them apart on purpose:
+#   (A) rolling 5h token ACTIVITY, summed from transcript timestamps;
+#   (B) subscription quota window and reset time, shown ONLY where a CLI
+#       actually recorded one. On this host Claude records none, so it reads
+#       "Not observed" rather than a guessed "5h from session start".
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Terminal Wall: many sessions at once, and which of them have stopped.
+#
+# READ-ONLY BY CONSTRUCTION. There is no composer, no key pad and no call to
+# any send endpoint on this page -- a monitor that can type is a monitor that
+# will eventually type into the wrong session.
+# ---------------------------------------------------------------------------
+# Raw: this template writes JS escapes such as `.join('\n')` directly.
+# In a non-raw literal Python would turn that into a real newline inside a
+# JS string -- a syntax error that kills the whole script, which is exactly
+# what happened here and what the backlog-panel guard now catches.
+TERMINAL_WALL_HTML = r"""<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Terminal Wall — Terminal MCP</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd;
+      --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#3b78ff; --term-bg:#0c0c0c;
+      --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono','Courier New',monospace;
+    }
+    * { box-sizing:border-box }
+    body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text) }
+    a { color:var(--accent); text-decoration:none }
+    header { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+             padding:12px max(14px, env(safe-area-inset-right)) 12px max(14px, env(safe-area-inset-left));
+             border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5 }
+    h1 { margin:0; font-size:16px; white-space:nowrap }
+    .muted { color:var(--muted) } .spacer { flex:1 }
+    .btn { background:#19243b; border:1px solid var(--line); color:var(--text); border-radius:8px;
+           padding:7px 11px; font:13px var(--mono); cursor:pointer; min-height:40px;
+           display:inline-flex; align-items:center; gap:6px }
+    .btn.on { border-color:var(--accent); color:var(--accent) }
+    .bar { display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+           padding:10px max(14px, env(safe-area-inset-right)) 4px max(14px, env(safe-area-inset-left)) }
+    .bar select, .bar input { background:var(--panel); border:1px solid var(--line); color:var(--text);
+                              border-radius:8px; padding:8px 10px; font:16px var(--mono); min-height:40px }
+    .counts { display:flex; gap:6px; flex-wrap:wrap }
+    main { padding:10px max(14px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom))
+                   max(14px, env(safe-area-inset-left)) }
+    /* Desktop default is three columns; the toggle overrides it. */
+    /* Sessions are grouped per node, never mixed: #wall stacks the sections
+       and the terminal grid lives inside each one. The column count is set on
+       #wall and inherited by every grid, so the 2/3/4 toggle still drives the
+       whole screen from one place. */
+    #wall { display:flex; flex-direction:column; gap:18px }
+    .node-grid { display:grid; gap:10px; grid-template-columns:repeat(3, minmax(0, 1fr)) }
+    #wall[data-cols="2"] .node-grid { grid-template-columns:repeat(2, minmax(0, 1fr)) }
+    #wall[data-cols="4"] .node-grid { grid-template-columns:repeat(4, minmax(0, 1fr)) }
+    .node-sec { min-width:0 }
+    /* The whole header is the collapse control -- a <button> so Enter/Space
+       and screen readers get it for free. */
+    .node-head { width:100%; display:flex; align-items:center; gap:9px; flex-wrap:wrap;
+                 background:transparent; border:0; border-bottom:1px solid var(--line);
+                 color:var(--text); font:inherit; text-align:left; cursor:pointer;
+                 padding:4px 2px 7px; margin:0 0 10px }
+    .node-head:hover { border-bottom-color:#3a4a70 }
+    .node-head:focus-visible { outline:2px solid var(--accent); outline-offset:3px }
+    .node-caret { color:var(--muted); font-size:11px; width:11px; flex:none }
+    .node-title { font-weight:700; font-size:13.5px }
+    .node-meta { font-size:11px; color:var(--muted) }
+    /* Node reachability is a different claim from session state, so it gets
+       its own badge rather than borrowing the session palette. */
+    .node-state { font-size:10px; font-weight:700; letter-spacing:.03em; padding:2px 8px;
+                  border-radius:999px; border:1px solid var(--line); white-space:nowrap }
+    .node-state.online { color:var(--green); border-color:var(--green) }
+    .node-state.offline { color:var(--muted); border-style:dashed }
+    .node-tally { display:flex; gap:5px; flex-wrap:wrap; margin-left:auto }
+    /* Metadata freshness is a DIFFERENT claim from node reachability -- a
+       node can be answering right now while the fleet's record of it is
+       hours old -- so it gets its own badge rather than colouring the
+       existing one and conflating the two. */
+    .node-meta-stale { font-size:10px; font-weight:700; letter-spacing:.03em;
+                       padding:2px 8px; border-radius:999px; color:var(--amber);
+                       border:1px solid var(--amber); white-space:nowrap }
+    .node-link { font-size:10.5px; color:var(--accent); text-decoration:none;
+                 border-bottom:1px dotted currentColor }
+    .box { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+           overflow:hidden; display:flex; flex-direction:column; cursor:pointer; min-width:0 }
+    .box:hover { border-color:#3a4a70 }
+    .box:focus-visible { outline:2px solid var(--accent); outline-offset:2px }
+    .box-head { padding:8px 10px; display:flex; align-items:center; gap:7px; flex-wrap:wrap;
+                border-bottom:1px solid var(--line) }
+    .box-name { font-weight:700; font-size:13px; overflow:hidden; text-overflow:ellipsis;
+                white-space:nowrap; min-width:0 }
+    .box-node { font-size:10.5px; color:var(--muted); white-space:nowrap }
+    .box-sub { padding:4px 10px; font-size:11px; color:var(--muted); display:flex;
+               justify-content:space-between; gap:8px; flex-wrap:wrap }
+    /* Status never relies on colour alone: every badge carries a glyph and a
+       word, so it survives colour blindness and a greyscale screenshot. */
+    .badge { font-size:10px; font-weight:700; letter-spacing:.03em; padding:2px 7px;
+             border-radius:999px; border:1px solid var(--line); white-space:nowrap; margin-left:auto }
+    .badge.RUNNING { color:var(--green); border-color:var(--green) }
+    .badge.WAITING { color:var(--amber); border-color:var(--amber) }
+    .badge.ERROR   { color:var(--red); border-color:var(--red) }
+    .badge.DONE    { color:#8fb8ff; border-color:#8fb8ff }
+    .badge.IDLE, .badge.UNKNOWN { color:var(--muted) }
+    .badge.OFFLINE { color:var(--muted); border-style:dashed }
+    .term { background:var(--term-bg); color:#cccccc; font-size:10.5px; line-height:1.35;
+            padding:7px 9px; margin:0; white-space:pre-wrap; word-break:break-word;
+            height:190px; overflow:hidden; display:flex; flex-direction:column;
+            justify-content:flex-end }
+    .box.stale .term { opacity:.55 }
+    .empty { padding:30px; text-align:center; color:var(--muted) }
+    .note { font-size:11.5px; color:var(--muted); margin:12px 0 0; line-height:1.6 }
+    @media (max-width:1100px) {
+      .node-grid, #wall[data-cols="3"] .node-grid, #wall[data-cols="4"] .node-grid {
+        grid-template-columns:repeat(2, minmax(0, 1fr)) } }
+    @media (max-width:720px) {
+      /* Measured on a 390x844 phone: header + filter stack pushed the first
+         tile to y=450 -- over half the screen spent on chrome before a single
+         terminal was visible, on the one screen whose job is showing
+         terminals. Everything below buys that space back. */
+      header { padding:8px 12px; gap:6px } h1 { font-size:15px }
+      .btn { padding:6px 9px; min-height:36px }
+      /* The badges already say RUNNING/IDLE/..., so the status line goes
+         first, then the back-link's label (the arrow still reads as "back"). */
+      #status { display:none }
+      #backLink { font-size:0 }
+      #backLink::before { content:'← '; font-size:13px }
+      .bar { display:grid; grid-template-columns:1fr 1fr; gap:6px; padding:8px 12px 2px }
+      main { padding:8px 12px 22px }
+      #wall { gap:14px }
+      .node-grid, #wall[data-cols="2"] .node-grid, #wall[data-cols="3"] .node-grid,
+      #wall[data-cols="4"] .node-grid { grid-template-columns:minmax(0, 1fr) }
+      /* The node header is information, not chrome, but on a phone it still
+         has to be cheap: one tight line, and the per-state tally scrolls
+         sideways the same way the global counts do. */
+      .node-head { margin:0 0 7px; padding:2px 2px 5px; gap:7px }
+      .node-title { font-size:12.5px }
+      .node-tally { flex-wrap:nowrap; overflow-x:auto; scrollbar-width:none }
+      .node-tally::-webkit-scrollbar { display:none }
+      .bar select, .bar input { flex:none; width:100%; min-width:0 }
+      /* Two per row: node|state, agent|search. Only the toggle spans, so the
+         filter block is three rows instead of four. */
+      #activeOnly { grid-column:1 / -1 }
+      /* The badges stay on ONE line and scroll sideways rather than wrapping
+         to a second row -- five states wrapped cost 24px of every screen. */
+      #counts { flex-wrap:nowrap; overflow-x:auto; max-width:100%;
+                -webkit-overflow-scrolling:touch; scrollbar-width:none }
+      #counts::-webkit-scrollbar { display:none }
+      #colToggle { display:none }   /* one column is the only sensible width here */
+      .term { height:150px }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🧱 Terminal Wall</h1>
+    <span class="counts" id="counts"></span>
+    <span class="spacer"></span>
+    <span class="muted" id="status">đang tải…</span>
+    <button class="btn" id="pauseBtn" type="button" aria-pressed="false">⏸ Tạm dừng</button>
+    <button class="btn" id="refreshBtn" type="button">Làm mới</button>
+    <a class="btn" id="backLink" href="/dashboard" aria-label="Về Dashboard">← Dashboard</a>
+  </header>
+  <div class="bar">
+    <select id="fNode" aria-label="Node"><option value="">Tất cả node</option></select>
+    <select id="fState" aria-label="Trạng thái"><option value="">Tất cả trạng thái</option></select>
+    <select id="fAgent" aria-label="Agent"><option value="">Tất cả agent</option></select>
+    <input type="search" id="fSearch" placeholder="Tìm session..." aria-label="Tìm session">
+    <button class="btn" id="activeOnly" type="button" aria-pressed="false">Chỉ session đang hoạt động</button>
+    <span id="colToggle" class="counts" role="group" aria-label="Số cột">
+      <button class="btn" type="button" data-cols="2">2</button>
+      <button class="btn" type="button" data-cols="3">3</button>
+      <button class="btn" type="button" data-cols="4">4</button>
+    </span>
+  </div>
+  <main>
+    <div id="wall" data-cols="3"></div>
+    <p class="note" id="note"></p>
+  </main>
+  <script>
+    const $ = (s) => document.querySelector(s);
+    const state = {boxes: [], nodes: [], paused: false, activeOnly: false, cols: 3,
+                   tokens: new Map(), collapsed: new Set()};
+
+    const GLYPH = {RUNNING: '▶', WAITING: '⏳', ERROR: '✕', DONE: '✔',
+                   IDLE: '⏸', UNKNOWN: '?', OFFLINE: '⊘'};
+
+    const age = (seconds) => {
+      if (seconds == null) return '—';
+      if (seconds < 90) return Math.round(seconds) + 's';
+      if (seconds < 5400) return Math.round(seconds / 60) + 'm';
+      if (seconds < 172800) return Math.round(seconds / 3600) + 'h';
+      return Math.round(seconds / 86400) + 'd';
+    };
+
+    // "hoạt động 3s" is a claim that output appeared 3s ago. We may only make
+    // it about a change this wall actually saw; otherwise the number is a
+    // lower bound on silence since we started watching, and says so.
+    function ageLabel(b) {
+      if (b.age_seconds == null) return '—';
+      return (b.age_is_witnessed ? 'hoạt động ' : 'theo dõi ') + age(b.age_seconds);
+    }
+
+    function el(tag, opts) {
+      const node = document.createElement(tag);
+      if (opts && opts.className) node.className = opts.className;
+      if (opts && opts.text != null) node.textContent = opts.text;
+      return node;
+    }
+
+    function visible() {
+      const node = $('#fNode').value, st = $('#fState').value, agent = $('#fAgent').value;
+      const q = $('#fSearch').value.trim().toLowerCase();
+      return state.boxes.filter((b) =>
+        (!node || b.node_id === node) &&
+        (!st || b.state === st) &&
+        (!agent || (b.command || b.agent) === agent) &&
+        (!q || (b.session || '').toLowerCase().includes(q)) &&
+        (!state.activeOnly || ['RUNNING', 'WAITING', 'ERROR'].includes(b.state)));
+    }
+
+    function buildBox(b) {
+      const box = el('div', {className: 'box'});
+      box.tabIndex = 0;
+      box.dataset.session = b.session;
+      const open = () => {
+        if (b.offline || b.session === '(node unreachable)') return;
+        // The wall never sends anything; it hands off to the existing
+        // session view, which is where input belongs.
+        location.href = '/dashboard?session=' + encodeURIComponent(b.session);
+      };
+      box.onclick = open;
+      box.onkeydown = (event) => { if (event.key === 'Enter') open(); };
+
+      const head = el('div', {className: 'box-head'});
+      head.append(el('span', {className: 'box-name', text: b.session}),
+                  el('span', {className: 'box-node', text: b.node_name || b.node_id}));
+      const badge = el('span', {className: 'badge ' + b.state,
+                                text: (GLYPH[b.state] || '') + ' ' + b.state});
+      badge.title = b.reason || '';
+      head.appendChild(badge);
+      box.appendChild(head);
+
+      const sub = el('div', {className: 'box-sub'});
+      const when = el('span', {text: ageLabel(b)});
+      when.title = b.age_is_witnessed
+        ? 'Đo từ lần output thật sự thay đổi mà màn hình này nhìn thấy.'
+        : 'Chưa từng thấy output đổi kể từ khi bắt đầu theo dõi — đây là thời gian im lặng tối thiểu, không phải mốc hoạt động.';
+      sub.append(el('span', {text: b.command || b.agent || '—'}), when);
+      box.appendChild(sub);
+
+      const term = el('pre', {className: 'term', text: (b.lines || []).join('\n')});
+      box.appendChild(term);
+      if (b.age_seconds != null && b.age_seconds > 3600) box.classList.add('stale');
+      return box;
+    }
+
+    // Collapse state is per node and lives only in the page: it is a viewing
+    // preference, not fleet state, and every node starts expanded.
+    function sectionFor(node, rows) {
+      const sec = el('div', {className: 'node-sec'});
+      sec.dataset.node = node.node_id;
+
+      const head = el('button', {className: 'node-head'});
+      head.type = 'button';
+      const collapsed = state.collapsed.has(node.node_id);
+      head.setAttribute('aria-expanded', String(!collapsed));
+      head.append(el('span', {className: 'node-caret', text: collapsed ? '▸' : '▾'}),
+                  el('span', {className: 'node-title', text: node.node_name || node.node_id}));
+      // Node reachability comes from the fleet's own unreachable list, never
+      // from how quiet its sessions look.
+      head.appendChild(el('span', {className: 'node-state ' + (node.online ? 'online' : 'offline'),
+                                   text: node.online ? '● ONLINE' : '⊘ OFFLINE'}));
+      // Total is the node's whole inventory; the filtered count is only shown
+      // when it differs, so an unfiltered wall stays quiet.
+      const shown = rows.length === node.total ? String(node.total)
+                                               : rows.length + '/' + node.total;
+      head.appendChild(el('span', {className: 'node-meta', text: shown + ' session'}));
+      // Fleet metadata staleness, when the registry could be read. Says how
+      // old, because "stale" without a number is not actionable.
+      if (node.metadata_stale) {
+        const badge = el('span', {className: 'node-meta-stale',
+          text: '⚠ METADATA ' + age(node.metadata_age_seconds)});
+        badge.title = 'Fleet metadata for this node has not been refreshed recently. '
+          + 'The node itself may still be answering — this is about the replicated record.';
+        head.appendChild(badge);
+      }
+      if (node.ssh_route_count) {
+        // A COUNT, never a route. Addresses, fingerprints and credential
+        // posture live behind the fleet view's own guard, not on a monitor.
+        const link = el('a', {className: 'node-link',
+          text: node.ssh_route_count + ' SSH route' + (node.ssh_route_count > 1 ? 's' : '')});
+        link.href = '/dashboard/fleet#node=' + encodeURIComponent(node.node_id);
+        link.title = 'Xem thông tin node & SSH trong Fleet Registry';
+        // The header is a collapse button; this link must not toggle it.
+        link.onclick = (event) => event.stopPropagation();
+        head.appendChild(link);
+      }
+
+      const tally = el('span', {className: 'node-tally'});
+      for (const key of ['RUNNING', 'WAITING', 'ERROR', 'IDLE', 'DONE', 'UNKNOWN', 'OFFLINE']) {
+        const n = (node.counts || {})[key];
+        if (!n) continue;
+        tally.appendChild(el('span', {className: 'badge ' + key,
+          text: (GLYPH[key] || '') + ' ' + n + ' ' + key}));
+      }
+      head.appendChild(tally);
+      sec.appendChild(head);
+
+      const grid = el('div', {className: 'node-grid'});
+      grid.hidden = collapsed;
+      sec.appendChild(grid);
+      head.onclick = () => {
+        if (state.collapsed.has(node.node_id)) state.collapsed.delete(node.node_id);
+        else state.collapsed.add(node.node_id);
+        render();
+      };
+      return {sec, grid};
+    }
+
+    function render() {
+      const wall = $('#wall');
+      wall.dataset.cols = String(state.cols);
+      const rows = visible();
+      const seen = new Set();
+      // Tiles are reused across polls; they are looked up by session name
+      // wherever they currently sit, so moving one between sections (a node
+      // that came back, say) does not force a rebuild.
+      const existing = new Map([...wall.querySelectorAll('.box')].map((c) => [c.dataset.session, c]));
+      const byNode = new Map();
+      for (const b of rows) {
+        const key = b.node_id || 'local';
+        if (!byNode.has(key)) byNode.set(key, []);
+        byNode.get(key).push(b);
+      }
+      wall.replaceChildren();
+
+      // Section order comes from the server, so it is one testable rule
+      // rather than a sort restated here. A node with no matching session is
+      // dropped entirely -- an empty section reads as "nothing running here",
+      // which is not what a filter means.
+      const nodes = (state.nodes.length ? state.nodes
+                     : [...byNode.keys()].map((id) => ({node_id: id, node_name: id,
+                                                        online: true, total: 0, counts: {}})));
+      for (const node of nodes) {
+        const mine = byNode.get(node.node_id);
+        if (!mine || !mine.length) continue;
+        const {sec, grid} = sectionFor(node, mine);
+        for (const b of mine) {
+          seen.add(b.session);
+          const prior = existing.get(b.session);
+          // Only rebuild a tile whose visible content actually changed: the
+          // token deliberately excludes the age, which ticks every second and
+          // would otherwise mark everything dirty on every poll.
+          if (prior && state.tokens.get(b.session) === b.change_token) {
+            const sub = prior.querySelector('.box-sub span:last-child');
+            if (sub) sub.textContent = ageLabel(b);
+            grid.appendChild(prior);
+            continue;
+          }
+          state.tokens.set(b.session, b.change_token);
+          grid.appendChild(buildBox(b));
+        }
+        wall.appendChild(sec);
+      }
+      for (const key of [...state.tokens.keys()]) if (!seen.has(key)) state.tokens.delete(key);
+      if (!rows.length) {
+        wall.appendChild(el('div', {className: 'empty',
+          text: 'Không có session nào khớp bộ lọc.'}));
+      }
+      for (const btn of document.querySelectorAll('#colToggle .btn'))
+        btn.classList.toggle('on', Number(btn.dataset.cols) === state.cols);
+    }
+
+    function fillFilters() {
+      for (const [sel, pick] of [['#fNode', (b) => b.node_id],
+                                 ['#fState', (b) => b.state],
+                                 ['#fAgent', (b) => b.command || b.agent]]) {
+        const node = $(sel), keep = node.value;
+        const values = [...new Set(state.boxes.map(pick).filter(Boolean))].sort();
+        const first = node.firstElementChild;
+        node.replaceChildren(first);
+        for (const value of values) {
+          const opt = document.createElement('option');
+          opt.value = value; opt.textContent = value;
+          node.appendChild(opt);
+        }
+        node.value = values.includes(keep) ? keep : '';
+      }
+    }
+
+    function renderCounts(counts) {
+      const box = $('#counts');
+      box.replaceChildren();
+      for (const key of ['RUNNING', 'WAITING', 'ERROR', 'IDLE', 'DONE', 'UNKNOWN', 'OFFLINE']) {
+        if (!counts[key]) continue;
+        box.appendChild(el('span', {className: 'badge ' + key,
+          text: (GLYPH[key] || '') + ' ' + counts[key] + ' ' + key}));
+      }
+    }
+
+    async function load() {
+      try {
+        const response = await fetch('/dashboard/api/terminal-wall', {cache: 'no-store'});
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const data = await response.json();
+        state.boxes = data.boxes || [];
+        state.nodes = data.nodes || [];
+        renderCounts(data.counts || {});
+        fillFilters();
+        render();
+        $('#status').textContent = state.paused ? 'đã tạm dừng'
+          : (data.cached ? 'cache ' + data.cache_age_seconds + 's' : 'vừa cập nhật');
+        // The threshold is read off the payload, never hard-coded here: a
+        // page that states its own number goes stale the first time the
+        // server's constant is tuned.
+        const within = Math.round(data.running_within_seconds || 0);
+        $('#note').textContent =
+          'Chỉ đọc: màn hình này không gửi phím hay text vào bất kỳ session nào. ' +
+          'Trạng thái suy ra từ status/activity/output sẵn có — RUNNING chỉ khi màn hình này ' +
+          'TỰ nhìn thấy output đổi trong ' + within + ' giây gần nhất, nên một agent còn sống mà ' +
+          'đứng yên sẽ hiện IDLE. Session chưa từng thấy đổi output sẽ ở "?" tối đa ' + within +
+          ' giây (thời gian theo dõi chưa đủ để kết luận) rồi chuyển sang IDLE.';
+      } catch (err) {
+        $('#status').textContent = 'lỗi tải: ' + err.message;
+      }
+    }
+
+    $('#pauseBtn').onclick = () => {
+      state.paused = !state.paused;
+      $('#pauseBtn').classList.toggle('on', state.paused);
+      $('#pauseBtn').setAttribute('aria-pressed', String(state.paused));
+      $('#pauseBtn').textContent = state.paused ? '▶ Tiếp tục' : '⏸ Tạm dừng';
+      $('#status').textContent = state.paused ? 'đã tạm dừng' : 'đang chạy';
+    };
+    $('#refreshBtn').onclick = () => load();
+    $('#activeOnly').onclick = () => {
+      state.activeOnly = !state.activeOnly;
+      $('#activeOnly').classList.toggle('on', state.activeOnly);
+      $('#activeOnly').setAttribute('aria-pressed', String(state.activeOnly));
+      render();
+    };
+    for (const sel of ['#fNode', '#fState', '#fAgent']) $(sel).onchange = render;
+    $('#fSearch').oninput = render;
+    for (const btn of document.querySelectorAll('#colToggle .btn'))
+      btn.onclick = () => { state.cols = Number(btn.dataset.cols); render(); };
+
+    load();
+    setInterval(() => { if (!state.paused) load(); }, 6000);
+  </script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Fleet Registry: what every node knows about the fleet, including how to SSH
+# to it -- and deliberately NOT including anything that could be replayed as
+# a credential.
+#
+# Raw string: this template writes JS escapes such as `.join('\n')` directly.
+# ---------------------------------------------------------------------------
+FLEET_HTML = r"""<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Fleet Registry</title>
+  <style>
+    :root {
+      --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd;
+      --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#3b78ff;
+      --mono:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    * { box-sizing:border-box }
+    body { margin:0; font:14px/1.55 var(--mono); background:var(--bg); color:var(--text) }
+    a { color:var(--accent) }
+    header { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+             padding:12px max(14px, env(safe-area-inset-right)) 12px max(14px, env(safe-area-inset-left));
+             border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5 }
+    h1 { margin:0; font-size:16px; white-space:nowrap }
+    h2 { font-size:13.5px; margin:22px 0 9px; padding-bottom:6px; border-bottom:1px solid var(--line) }
+    .spacer { flex:1 }
+    .btn { background:var(--panel); border:1px solid var(--line); color:var(--text);
+           border-radius:9px; padding:7px 11px; font:13px var(--mono); cursor:pointer;
+           min-height:40px; display:inline-flex; align-items:center; gap:6px }
+    .btn:hover { border-color:#3a4a70 }
+    main { padding:10px max(14px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom))
+                   max(14px, env(safe-area-inset-left)) }
+    .muted { color:var(--muted); font-size:12px }
+    .pill { font-size:10px; font-weight:700; letter-spacing:.03em; padding:2px 8px;
+            border-radius:999px; border:1px solid var(--line); white-space:nowrap }
+    .pill.PASS, .pill.online, .pill.PRESENT { color:var(--green); border-color:var(--green) }
+    .pill.WARN, .pill.NEEDS_AUTH { color:var(--amber); border-color:var(--amber) }
+    .pill.FAIL, .pill.MISSING_CREDENTIAL { color:var(--red); border-color:var(--red) }
+    .pill.offline, .pill.UNKNOWN { color:var(--muted); border-style:dashed }
+    .wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px; background:var(--panel) }
+    table { border-collapse:collapse; width:100%; min-width:680px }
+    th, td { text-align:left; padding:8px 11px; border-bottom:1px solid var(--line);
+             font-size:12px; white-space:nowrap }
+    th { color:var(--muted); font-weight:700; font-size:11px; text-transform:uppercase;
+         letter-spacing:.04em }
+    tr:last-child td { border-bottom:0 }
+    tr.hit td { background:#17223b }
+    .checks { display:grid; gap:7px; grid-template-columns:repeat(auto-fill, minmax(320px, 1fr)) }
+    .dep { border:1px solid var(--line); border-radius:12px; background:var(--panel);
+           padding:11px 13px; margin-bottom:10px }
+    .dep-head { display:flex; align-items:center; gap:9px; flex-wrap:wrap }
+    .dep-name { font-weight:700; font-size:13.5px }
+    /* Redundancy and deployability are DIFFERENT claims and get different
+       pills: a 1/2 target still ships, and merging the two is how someone
+       holds a release they could have sent. */
+    .dep-avail { font-size:10px; font-weight:700; padding:2px 8px; border-radius:999px;
+                 border:1px solid var(--green); color:var(--green); white-space:nowrap }
+    .dep-avail.no { border-color:var(--red); color:var(--red) }
+    .dep-paths { margin-top:9px; display:grid; gap:6px }
+    .dep-path { display:flex; align-items:center; gap:9px; flex-wrap:wrap;
+                border-top:1px solid var(--line); padding-top:7px; font-size:12px }
+    .dep-node { font-weight:700; min-width:104px }
+    .tick { font-size:11.5px; white-space:nowrap }
+    .tick.ok { color:var(--green) } .tick.no { color:var(--red) }
+    .tick.meh { color:var(--muted) }
+    .dep-warn { margin-top:8px; font-size:11.5px; color:var(--amber); line-height:1.55 }
+    .dep-reason { color:var(--muted); font-size:11px }
+    .check { border:1px solid var(--line); border-radius:11px; padding:9px 11px; background:var(--panel) }
+    .check b { font-size:12px }
+    .note { font-size:11.5px; color:var(--muted); margin:18px 0 0; line-height:1.65 }
+    @media (max-width:720px) {
+      header { padding:9px 12px } h1 { font-size:15px }
+      main { padding:8px 12px 24px }
+      th, td { padding:7px 9px }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🗺 Fleet Registry</h1>
+    <span class="muted" id="status">đang tải…</span>
+    <span class="spacer"></span>
+    <button class="btn" id="refreshBtn" type="button">Làm mới</button>
+    <a class="btn" href="/dashboard/terminal-wall">🧱 Terminal Wall</a>
+    <a class="btn" href="/dashboard">← Dashboard</a>
+  </header>
+  <main>
+    <h2>Readiness</h2>
+    <div class="checks" id="checks"></div>
+
+    <h2>Deployment Redundancy</h2>
+    <div id="deploy"></div>
+
+    <h2>Nodes</h2>
+    <div class="wrap"><table id="nodes"><thead><tr>
+      <th>Node</th><th>Trạng thái</th><th>Platform</th><th>LAN</th><th>Tailscale</th>
+      <th>Endpoint</th><th>Contract</th><th>Metadata</th><th>Nguồn</th>
+    </tr></thead><tbody></tbody></table></div>
+
+    <h2>SSH inventory</h2>
+    <div class="wrap"><table id="ssh"><thead><tr>
+      <th>Alias</th><th>Host</th><th>Port</th><th>User</th><th>Transport</th>
+      <th>Proxy/Jump</th><th>Host key</th><th>Credential</th><th>Nguồn</th><th>Verified</th>
+    </tr></thead><tbody></tbody></table></div>
+
+    <h2>Peer sync</h2>
+    <div class="wrap"><table id="peers"><thead><tr>
+      <th>Peer</th><th>Pull gần nhất</th><th>Push gần nhất</th><th>OK gần nhất</th>
+      <th>Đã kéo</th><th>Đã đẩy</th><th>Lỗi</th>
+    </tr></thead><tbody></tbody></table></div>
+
+    <p class="note" id="note"></p>
+  </main>
+  <script>
+    const $ = (s) => document.querySelector(s);
+
+    const age = (seconds) => {
+      if (seconds == null) return '—';
+      if (seconds < 90) return Math.round(seconds) + 's';
+      if (seconds < 5400) return Math.round(seconds / 60) + 'm';
+      if (seconds < 172800) return Math.round(seconds / 3600) + 'h';
+      return Math.round(seconds / 86400) + 'd';
+    };
+
+    function el(tag, opts) {
+      const node = document.createElement(tag);
+      if (opts && opts.className) node.className = opts.className;
+      if (opts && opts.text != null) node.textContent = opts.text;
+      return node;
+    }
+
+    function cell(row, value, className) {
+      const td = el('td', {text: value == null || value === '' ? '—' : String(value)});
+      if (className) { td.replaceChildren(el('span', {className: className, text: String(value)})); }
+      row.appendChild(td);
+      return td;
+    }
+
+    function fillNodes(nodes) {
+      const body = $('#nodes').tBodies[0];
+      body.replaceChildren();
+      for (const node of nodes) {
+        const row = el('tr');
+        row.dataset.node = node.node_id || '';
+        cell(row, node.display_name || node.node_id);
+        cell(row, node.status || 'unknown', 'pill ' + (node.status || 'UNKNOWN'));
+        cell(row, node.platform);
+        cell(row, node.lan_ip);
+        cell(row, node.tailscale_hostname || node.tailscale_ip);
+        cell(row, node.endpoint);
+        cell(row, node.contract_version);
+        const metaCell = el('td');
+        metaCell.appendChild(el('span', {
+          className: 'pill ' + (node.metadata_stale ? 'WARN' : 'PASS'),
+          text: (node.metadata_stale ? '⚠ ' : '') + age(node.metadata_age_seconds)}));
+        row.appendChild(metaCell);
+        cell(row, node.source_node);
+        body.appendChild(row);
+      }
+    }
+
+    function fillSsh(targets) {
+      const body = $('#ssh').tBodies[0];
+      body.replaceChildren();
+      for (const target of targets) {
+        const row = el('tr');
+        row.dataset.node = target.node_id || '';
+        cell(row, (target.aliases || [target.alias]).join(', '));
+        cell(row, target.host);
+        cell(row, target.port);
+        cell(row, target.username);
+        cell(row, target.transport, 'pill');
+        cell(row, target.proxy_jump);
+        // The FINGERPRINT is shown -- it is a hash, it is what pinning
+        // compares, and an operator needs it to verify a host. No key, no
+        // password, no token appears anywhere on this page.
+        cell(row, target.host_key_fingerprint ? target.host_key_fingerprint : 'chưa ghim');
+        cell(row, target.credential_status || 'UNKNOWN', 'pill ' + (target.credential_status || 'UNKNOWN'));
+        cell(row, target.source);
+        cell(row, age(target.last_verified_age_seconds));
+        body.appendChild(row);
+      }
+    }
+
+    function fillPeers(peers) {
+      const body = $('#peers').tBodies[0];
+      body.replaceChildren();
+      for (const peer of peers) {
+        const row = el('tr');
+        cell(row, peer.peer_node);
+        cell(row, peer.last_pull_at);
+        cell(row, peer.last_push_at);
+        cell(row, peer.last_ok_at);
+        cell(row, peer.objects_pulled);
+        cell(row, peer.objects_pushed);
+        cell(row, peer.last_error);
+        body.appendChild(row);
+      }
+      if (!peers.length) {
+        const row = el('tr');
+        const td = el('td', {text: 'Chưa đồng bộ với peer nào.'});
+        td.colSpan = 7; td.className = 'muted';
+        row.appendChild(td); body.appendChild(row);
+      }
+    }
+
+    // A tick is only ✓ on evidence. "not yet proven" gets its own neutral
+    // mark rather than a ✗, because "we have not checked" and "it is broken"
+    // are different things to tell an operator.
+    function tick(label, value) {
+      const state = value === true ? 'ok' : value === false ? 'no' : 'meh';
+      const glyph = value === true ? '✓' : value === false ? '✗' : '?';
+      return el('span', {className: 'tick ' + state, text: glyph + ' ' + label});
+    }
+
+    function fillDeployment(targets) {
+      const box = $('#deploy');
+      box.replaceChildren();
+      if (!targets.length) {
+        box.appendChild(el('div', {className: 'muted',
+          text: 'Chưa khai báo deployment target nào.'}));
+        return;
+      }
+      for (const target of targets) {
+        const card = el('div', {className: 'dep'});
+        card.dataset.target = target.target_id;
+        const head = el('div', {className: 'dep-head'});
+        head.append(el('span', {className: 'dep-name', text: target.display_name || target.target_id}),
+                    el('span', {className: 'pill ' + target.status,
+                      text: 'Redundancy ' + target.redundancy.label + ' ' + target.status}));
+        head.appendChild(el('span', {
+          className: 'dep-avail' + (target.deploy_available ? '' : ' no'),
+          text: target.deploy_available ? 'deploy khả dụng' : 'deploy KHÔNG khả dụng'}));
+        if (target.primary_node)
+          head.appendChild(el('span', {className: 'muted',
+            text: 'primary ' + target.primary_node}));
+        if ((target.backup_nodes || []).length)
+          head.appendChild(el('span', {className: 'muted',
+            text: 'backup ' + target.backup_nodes.join(', ')}));
+        card.appendChild(head);
+
+        const paths = el('div', {className: 'dep-paths'});
+        for (const path of target.paths || []) {
+          const row = el('div', {className: 'dep-path'});
+          row.append(el('span', {className: 'dep-node', text: path.node_id}),
+                     el('span', {className: 'pill ' + path.state, text: path.state}));
+          // SSH, deploy and VPN/transport each answered separately: an
+          // operator needs to know WHICH leg is broken, not just that one is.
+          row.appendChild(tick('SSH', path.last_probe_ok));
+          row.appendChild(tick('Deploy', path.deploy_prereqs_ok));
+          row.appendChild(tick(
+            (path.transport === 'tailscale' ? 'Tailscale'
+             : path.transport === 'lan' ? 'LAN'
+             : path.transport === 'tunnel' ? 'Tunnel' : 'VPN'),
+            path.transport && path.transport !== 'unknown' ? true : null));
+          row.appendChild(tick('Độc lập', path.independent));
+          if (path.latency_ms != null)
+            row.appendChild(el('span', {className: 'muted', text: Math.round(path.latency_ms) + 'ms'}));
+          row.appendChild(el('span', {className: 'muted',
+            text: 'probe ' + age(path.last_probe_at ? secondsSince(path.last_probe_at) : null)}));
+          row.appendChild(el('span', {className: 'dep-reason', text: path.reason || ''}));
+          paths.appendChild(row);
+        }
+        card.appendChild(paths);
+        for (const warning of target.warnings || [])
+          card.appendChild(el('div', {className: 'dep-warn', text: '⚠ ' + warning}));
+        box.appendChild(card);
+      }
+    }
+
+    function secondsSince(stamp) {
+      const parsed = Date.parse(stamp);
+      return Number.isNaN(parsed) ? null : (Date.now() - parsed) / 1000;
+    }
+
+    function fillChecks(readiness) {
+      const box = $('#checks');
+      box.replaceChildren();
+      for (const check of (readiness.checks || [])) {
+        const card = el('div', {className: 'check'});
+        const head = el('div');
+        head.append(el('span', {className: 'pill ' + check.status, text: check.status}),
+                    document.createTextNode(' '),
+                    el('b', {text: check.check}));
+        card.appendChild(head);
+        card.appendChild(el('div', {className: 'muted', text: check.summary}));
+        box.appendChild(card);
+      }
+    }
+
+    function highlight() {
+      const wanted = new URLSearchParams(location.hash.slice(1)).get('node');
+      for (const row of document.querySelectorAll('tr[data-node]'))
+        row.classList.toggle('hit', !!wanted && row.dataset.node === wanted);
+    }
+
+    async function load() {
+      try {
+        const [view, readiness, deployment] = await Promise.all([
+          fetch('/dashboard/api/fleet', {cache: 'no-store'}).then((r) => r.json()),
+          fetch('/dashboard/api/fleet/readiness', {cache: 'no-store'}).then((r) => r.json()),
+          fetch('/dashboard/api/deployment', {cache: 'no-store'}).then((r) => r.json()),
+        ]);
+        fillDeployment(deployment.targets || []);
+        fillNodes(view.nodes || []);
+        fillSsh(view.ssh_targets || []);
+        fillPeers(view.peers || []);
+        fillChecks(readiness);
+        highlight();
+        $('#status').textContent = 'đọc từ cache local · ' + (view.nodes || []).length
+          + ' node · ' + (view.ssh_targets || []).length + ' SSH target';
+        $('#note').textContent =
+          'Trang này đọc từ bản sao metadata trên chính máy này, không gọi node nào — nên nó vẫn '
+          + 'trả lời khi controller mất mạng, đúng như một node sống sót sẽ thấy. '
+          + 'Chỉ có identity và reference: fingerprint host key (một hash, chính là thứ việc ghim '
+          + 'đem ra so) và trạng thái credential. Không có private key, password, passphrase hay '
+          + 'token nào được đồng bộ hay hiển thị; node thiếu credential báo MISSING_CREDENTIAL để '
+          + 'người thật cấp tại chỗ, không bao giờ copy từ máy khác.';
+      } catch (err) {
+        $('#status').textContent = 'lỗi tải: ' + err.message;
+      }
+    }
+
+    $('#refreshBtn').onclick = () => load();
+    window.addEventListener('hashchange', highlight);
+    load();
+  </script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Audit & Access: the screen the 2026-09-12 permission audit found missing.
+#
+# Operators reported being "blocked" from the audit log. They were not being
+# denied -- there was no way to ask. A missing surface and a deny-all guard
+# look identical from outside, and both get resolved by someone turning off
+# a control that mattered.
+#
+# Raw string: this template writes JS escapes such as `.join('\n')` directly.
+# ---------------------------------------------------------------------------
+AUDIT_HTML = r"""<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Audit &amp; Access</title>
+  <style>
+    :root {
+      --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd;
+      --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#3b78ff;
+      --mono:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    * { box-sizing:border-box }
+    body { margin:0; font:14px/1.55 var(--mono); background:var(--bg); color:var(--text) }
+    a { color:var(--accent) }
+    header { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+             padding:12px max(14px, env(safe-area-inset-right)) 12px max(14px, env(safe-area-inset-left));
+             border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5 }
+    h1 { margin:0; font-size:16px; white-space:nowrap }
+    h2 { font-size:13.5px; margin:20px 0 9px; padding-bottom:6px; border-bottom:1px solid var(--line) }
+    .spacer { flex:1 }
+    .btn { background:var(--panel); border:1px solid var(--line); color:var(--text);
+           border-radius:9px; padding:7px 11px; font:13px var(--mono); cursor:pointer;
+           min-height:40px; display:inline-flex; align-items:center; gap:6px; text-decoration:none }
+    .btn:hover { border-color:#3a4a70 }
+    .btn.on { border-color:var(--accent); color:var(--accent) }
+    .bar { display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+           padding:10px max(14px, env(safe-area-inset-right)) 4px max(14px, env(safe-area-inset-left)) }
+    .bar select, .bar input { background:var(--panel); border:1px solid var(--line);
+                              color:var(--text); border-radius:8px; padding:8px 10px;
+                              font:16px var(--mono); min-height:40px }
+    main { padding:8px max(14px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom))
+                  max(14px, env(safe-area-inset-left)) }
+    .muted { color:var(--muted); font-size:12px }
+    .wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px; background:var(--panel) }
+    table { border-collapse:collapse; width:100%; min-width:900px }
+    th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line);
+             font-size:11.5px; vertical-align:top }
+    th { color:var(--muted); font-weight:700; font-size:10.5px; text-transform:uppercase;
+         letter-spacing:.04em; white-space:nowrap }
+    tr:last-child td { border-bottom:0 }
+    td.nowrap { white-space:nowrap }
+    .pill { font-size:10px; font-weight:700; padding:2px 7px; border-radius:999px;
+            border:1px solid var(--line); white-space:nowrap }
+    .pill.ok { color:var(--green); border-color:var(--green) }
+    .pill.deny { color:var(--red); border-color:var(--red) }
+    .pill.warn { color:var(--amber); border-color:var(--amber) }
+    .prev { color:var(--muted); max-width:380px; overflow:hidden; text-overflow:ellipsis;
+            display:block; white-space:nowrap }
+    .tier { display:grid; gap:6px; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)) }
+    .tierbox { border:1px solid var(--line); border-radius:11px; padding:9px 11px; background:var(--panel) }
+    .note { font-size:11.5px; color:var(--muted); margin:16px 0 0; line-height:1.65 }
+    @media (max-width:720px) {
+      header { padding:8px 12px } h1 { font-size:15px }
+      .bar { display:grid; grid-template-columns:1fr 1fr; gap:6px; padding:8px 12px 2px }
+      .bar select, .bar input { width:100%; min-width:0 }
+      #q { grid-column:1 / -1 }
+      main { padding:8px 12px 22px }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🧾 Audit &amp; Access</h1>
+    <span class="muted" id="status">đang tải…</span>
+    <span class="spacer"></span>
+    <button class="btn" id="deniedBtn" type="button" aria-pressed="false">Chỉ bị từ chối</button>
+    <a class="btn" id="exportBtn" href="/dashboard/api/audit/export">⇩ CSV</a>
+    <button class="btn" id="refreshBtn" type="button">Làm mới</button>
+    <a class="btn" href="/dashboard/fleet">🗺 Fleet</a>
+    <a class="btn" href="/dashboard">← Dashboard</a>
+  </header>
+  <div class="bar">
+    <select id="fActor" aria-label="Actor"><option value="">Tất cả actor</option></select>
+    <select id="fAction" aria-label="Action"><option value="">Tất cả action</option></select>
+    <select id="fResult" aria-label="Result"><option value="">Tất cả kết quả</option></select>
+    <select id="fNode" aria-label="Node"><option value="">Tất cả node</option></select>
+    <input type="search" id="q" placeholder="Tìm session / reason / correlation id…" aria-label="Tìm">
+  </div>
+  <main>
+    <h2>Audit log</h2>
+    <div class="wrap"><table id="log"><thead><tr>
+      <th>Thời điểm</th><th>Actor</th><th>Action</th><th>Session</th><th>Node</th>
+      <th>Kết quả</th><th>Lý do</th><th>Policy</th><th>Latency</th>
+      <th>Correlation</th><th>Fingerprint</th><th>Preview (đã redact)</th>
+    </tr></thead><tbody></tbody></table></div>
+    <div class="muted" id="paging" style="margin-top:8px"></div>
+
+    <h2>Auth &amp; capability</h2>
+    <div class="wrap"><table id="auth"><thead><tr>
+      <th>Node</th><th>Auth</th><th>Nguồn</th><th>Capability</th><th>Contract</th>
+      <th>Last verified</th><th>SSH routes</th>
+    </tr></thead><tbody></tbody></table></div>
+
+    <h2>Policy</h2>
+    <div class="tier" id="tiers"></div>
+    <p class="note" id="note"></p>
+  </main>
+  <script>
+    const $ = (s) => document.querySelector(s);
+    const state = {denied: false, offset: 0, limit: 100};
+
+    function el(tag, opts) {
+      const node = document.createElement(tag);
+      if (opts && opts.className) node.className = opts.className;
+      if (opts && opts.text != null) node.textContent = opts.text;
+      return node;
+    }
+
+    function cell(row, value, className) {
+      const td = el('td', {text: value == null || value === '' ? '—' : String(value)});
+      if (className) td.className = className;
+      row.appendChild(td);
+      return td;
+    }
+
+    function resultPill(result) {
+      const bad = /DENIED|BLOCKED|FAILED|ERROR/i.test(result || '');
+      const warn = /REVOKED|SKIPPED/i.test(result || '');
+      return el('span', {className: 'pill ' + (bad ? 'deny' : warn ? 'warn' : 'ok'),
+                         text: result || '—'});
+    }
+
+    function params() {
+      const search = new URLSearchParams();
+      for (const [key, sel] of [['actor', '#fActor'], ['action', '#fAction'],
+                                ['result', '#fResult'], ['node', '#fNode']]) {
+        const value = $(sel).value;
+        if (value) search.set(key, value);
+      }
+      if ($('#q').value.trim()) search.set('q', $('#q').value.trim());
+      if (state.denied) search.set('denied', '1');
+      search.set('limit', String(state.limit));
+      search.set('offset', String(state.offset));
+      return search;
+    }
+
+    function fillFilters(filters) {
+      for (const [key, sel] of [['actor', '#fActor'], ['action', '#fAction'],
+                                ['result', '#fResult'], ['node_id', '#fNode']]) {
+        const node = $(sel), keep = node.value;
+        const values = filters[key] || [];
+        const first = node.firstElementChild;
+        node.replaceChildren(first);
+        for (const value of values) {
+          const option = document.createElement('option');
+          option.value = value; option.textContent = value;
+          node.appendChild(option);
+        }
+        node.value = values.includes(keep) ? keep : '';
+      }
+    }
+
+    function fillLog(data) {
+      const body = $('#log').tBodies[0];
+      body.replaceChildren();
+      for (const event of data.events || []) {
+        const row = el('tr');
+        cell(row, event.timestamp, 'nowrap');
+        cell(row, event.actor, 'nowrap');
+        cell(row, event.action, 'nowrap');
+        cell(row, event.session, 'nowrap');
+        cell(row, event.node_id, 'nowrap');
+        const resultCell = el('td', {className: 'nowrap'});
+        resultCell.appendChild(resultPill(event.result));
+        row.appendChild(resultCell);
+        // The reason a thing was denied is the single most useful field in
+        // this table, so it is never truncated away.
+        cell(row, event.reason);
+        cell(row, [event.policy_source, event.policy_version].filter(Boolean).join(' ') || null,
+             'nowrap');
+        cell(row, event.latency_ms != null ? Math.round(event.latency_ms) + 'ms' : null, 'nowrap');
+        cell(row, event.correlation_id, 'nowrap');
+        // A fingerprint, shown short: it correlates two rows without being
+        // a way to recover what was sent.
+        cell(row, event.text_sha256 ? event.text_sha256.slice(0, 12) : null, 'nowrap');
+        const preview = el('td');
+        preview.appendChild(el('span', {className: 'prev', text: event.preview || '—'}));
+        if (event.preview) preview.title = event.preview;
+        row.appendChild(preview);
+        body.appendChild(row);
+      }
+      $('#paging').textContent = (data.total || 0) + ' sự kiện · đang xem '
+        + (data.offset + 1) + '–' + (data.offset + (data.returned || 0))
+        + (data.has_more ? ' · còn nữa' : '');
+    }
+
+    function fillAuth(payload) {
+      const body = $('#auth').tBodies[0];
+      body.replaceChildren();
+      for (const node of payload.nodes || []) {
+        const row = el('tr');
+        cell(row, node.display_name || node.node_id, 'nowrap');
+        const authCell = el('td', {className: 'nowrap'});
+        authCell.appendChild(el('span', {
+          className: 'pill ' + (node.auth_status === 'AUTHENTICATED' ? 'ok' : 'warn'),
+          text: node.auth_status}));
+        row.appendChild(authCell);
+        // The NAME of the variable holding the token, never its value.
+        cell(row, node.auth_source);
+        cell(row, (node.capability || []).join(', '));
+        cell(row, node.contract_version, 'nowrap');
+        cell(row, node.last_verified_at, 'nowrap');
+        cell(row, (node.ssh_routes || []).map(
+          (r) => r.alias + ' (' + r.transport + ', ' + (r.auth_status || '?') + ')').join('; '));
+        body.appendChild(row);
+      }
+    }
+
+    function fillTiers(tiers) {
+      const box = $('#tiers');
+      box.replaceChildren();
+      const groups = {};
+      for (const row of tiers || []) (groups[row.tier] = groups[row.tier] || []).push(row);
+      for (const tier of ['SECRET', 'SENSITIVE_METADATA', 'OPERATIONAL']) {
+        const rows = groups[tier] || [];
+        if (!rows.length) continue;
+        const card = el('div', {className: 'tierbox'});
+        card.appendChild(el('div', {
+          className: 'pill ' + (tier === 'SECRET' ? 'deny' : tier === 'OPERATIONAL' ? 'ok' : 'warn'),
+          text: tier}));
+        card.appendChild(el('div', {className: 'muted',
+          text: rows.map((r) => r.field).join(', ')}));
+        box.appendChild(card);
+      }
+    }
+
+    async function load() {
+      try {
+        const search = params();
+        $('#exportBtn').href = '/dashboard/api/audit/export?' + search.toString();
+        const [log, auth] = await Promise.all([
+          fetch('/dashboard/api/audit?' + search.toString(), {cache: 'no-store'}).then((r) => r.json()),
+          fetch('/dashboard/api/auth-status', {cache: 'no-store'}).then((r) => r.json()),
+        ]);
+        if (log.error) throw new Error(log.error);
+        fillFilters(log.filters || {});
+        fillLog(log);
+        fillAuth(auth);
+        fillTiers(auth.policy || []);
+        $('#status').textContent = 'role ' + (log.role || '?');
+        $('#note').textContent =
+          'Mọi field hiển thị ở đây đều đi qua bảng policy: SECRET (token, password, '
+          + 'passphrase, private key, cookie, bearer) không có đường đọc nào cho bất kỳ role '
+          + 'nào — bị loại bỏ hẳn chứ không phải che bằng dấu sao. SENSITIVE (preview, pane '
+          + 'text) đã redact và kèm sha256 để đối chiếu mà không khôi phục được nội dung gốc. '
+          + 'OPERATIONAL (ai, khi nào, làm gì, cho phép hay từ chối, vì sao, mất bao lâu, '
+          + 'policy nào quyết định) trả đầy đủ cho người vận hành đã xác thực.';
+      } catch (err) {
+        $('#status').textContent = 'lỗi tải: ' + err.message;
+      }
+    }
+
+    $('#refreshBtn').onclick = () => { state.offset = 0; load(); };
+    $('#deniedBtn').onclick = () => {
+      state.denied = !state.denied;
+      state.offset = 0;
+      $('#deniedBtn').classList.toggle('on', state.denied);
+      $('#deniedBtn').setAttribute('aria-pressed', String(state.denied));
+      load();
+    };
+    for (const sel of ['#fActor', '#fAction', '#fResult', '#fNode'])
+      $(sel).onchange = () => { state.offset = 0; load(); };
+    let timer = null;
+    $('#q').oninput = () => { clearTimeout(timer); timer = setTimeout(() => {
+      state.offset = 0; load(); }, 250); };
+    load();
+  </script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Work mode. Terminal mode is untouched -- this is a SECOND view, reachable
+# from the menu, and a session without the `-work` suffix never appears here
+# as something the runtime drives.
+#
+# Mobile-first on purpose: the two things an operator needs away from a desk
+# are "what does it need from me" and "can I send it the next instruction",
+# so approvals and the composer come before the plan, and the raw terminal is
+# a link rather than an embedded pane.
+#
+# Raw string: this template writes JS escapes such as `.join('\n')` directly.
+# ---------------------------------------------------------------------------
+WORK_HTML = r"""<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Work Runtime</title>
+  <style>
+    :root {
+      --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd;
+      --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#3b78ff; --dim:#1c2540;
+      --mono:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    * { box-sizing:border-box }
+    body { margin:0; font:14px/1.55 var(--mono); background:var(--bg); color:var(--text) }
+    a { color:var(--accent) }
+    header { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+             padding:11px max(14px, env(safe-area-inset-right)) 11px max(14px, env(safe-area-inset-left));
+             border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5 }
+    h1 { margin:0; font-size:16px; white-space:nowrap }
+    h2 { font-size:11.5px; margin:15px 0 8px; color:var(--muted); text-transform:uppercase;
+         letter-spacing:.06em }
+    .spacer { flex:1 }
+    .btn { background:var(--panel); border:1px solid var(--line); color:var(--text);
+           border-radius:9px; padding:8px 12px; font:13px var(--mono); cursor:pointer;
+           min-height:42px; display:inline-flex; align-items:center; gap:6px; text-decoration:none }
+    .btn:hover { border-color:#3a4a70 }
+    .btn.primary { border-color:var(--accent); color:var(--accent) }
+    .btn.danger { border-color:var(--red); color:var(--red) }
+    .btn.small { min-height:34px; padding:5px 10px; font-size:12px }
+    main { padding:10px max(14px, env(safe-area-inset-right)) max(28px, env(safe-area-inset-bottom))
+                   max(14px, env(safe-area-inset-left)) }
+    .muted { color:var(--muted); font-size:12px }
+    .pill { font-size:10px; font-weight:700; padding:2px 8px; border-radius:999px;
+            border:1px solid var(--line); white-space:nowrap; display:inline-block }
+    .pill.RUNNING, .pill.COMPLETE, .pill.COMPLETED, .pill.BUSY { color:var(--green); border-color:var(--green) }
+    .pill.VERIFYING, .pill.WAITING_APPROVAL, .pill.PAUSED, .pill.DISPATCHING,
+    .pill.DISPATCH_UNCERTAIN, .pill.PRECHECK, .pill.REVISION_REQUIRED {
+      color:var(--amber); border-color:var(--amber) }
+    .pill.BLOCKED, .pill.FAILED, .pill.OFFLINE, .pill.UNAVAILABLE, .pill.CANCELLED {
+      color:var(--red); border-color:var(--red) }
+    .pill.WORK { color:var(--accent); border-color:var(--accent) }
+    .pill.QUEUED, .pill.READY, .pill.IDLE, .pill.DRAFT { color:var(--muted) }
+    .card { border:1px solid var(--line); border-radius:12px; background:var(--panel);
+            padding:12px 14px; margin-bottom:10px }
+    .card.selected { border-color:var(--accent) }
+    .card-head { display:flex; align-items:center; gap:9px; flex-wrap:wrap }
+    .title { font-weight:700; font-size:14px }
+    .bar { height:6px; border-radius:999px; background:var(--dim); margin-top:9px; overflow:hidden }
+    .bar > i { display:block; height:100%; background:var(--green); transition:width .4s }
+    /* "Need from you" is why this screen gets opened on a phone, so it sits
+       above everything including the run's own header. */
+    .need { border:1px solid var(--amber); border-radius:12px; padding:11px 13px;
+            margin-bottom:10px; background:#191606 }
+    .need h3 { margin:0 0 6px; font-size:13px; color:var(--amber) }
+    .row { display:flex; align-items:center; gap:9px; flex-wrap:wrap;
+           padding:7px 0; border-top:1px solid var(--line) }
+    .row:first-of-type { border-top:0 }
+    .grow { flex:1; min-width:0 }
+    .ellip { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12.5px }
+    input, select { width:100%; background:#0c1222; border:1px solid var(--line);
+                    color:var(--text); border-radius:9px; padding:9px 10px;
+                    font:13px var(--mono); margin-bottom:7px; min-height:40px }
+    textarea { width:100%; background:#0c1222; border:1px solid var(--line); color:var(--text);
+               border-radius:10px; padding:10px; font:14px var(--mono); min-height:86px }
+    .unmet { font-size:11.5px; color:var(--amber); margin-top:6px; line-height:1.6 }
+    .err { font-size:11.5px; color:var(--red); margin-top:4px; line-height:1.55;
+           overflow-wrap:anywhere }
+    .empty { padding:22px; text-align:center; color:var(--muted) }
+    .cols { display:grid; gap:12px; grid-template-columns:minmax(0,350px) minmax(0,1fr) }
+    /* The lifecycle, drawn so an operator can see WHERE a task is rather
+       than decoding a status word. Steps past the current one stay dim. */
+    .flow { display:flex; gap:4px; flex-wrap:wrap; margin-top:7px }
+    .step { font-size:9.5px; letter-spacing:.03em; padding:2px 6px; border-radius:5px;
+            background:var(--dim); color:var(--muted); white-space:nowrap }
+    .step.done { background:#14301f; color:var(--green) }
+    .step.at { background:#2a2408; color:var(--amber); font-weight:700 }
+    .step.bad { background:#2e1414; color:var(--red); font-weight:700 }
+    .dep { font-size:10.5px; color:var(--muted) }
+    table { border-collapse:collapse; width:100%; min-width:520px }
+    th, td { text-align:left; padding:6px 9px; border-bottom:1px solid var(--line);
+             font-size:11.5px; vertical-align:top }
+    th { color:var(--muted); font-weight:700; font-size:10.5px; text-transform:uppercase }
+    tr:last-child td { border-bottom:0 }
+    .wrap { overflow-x:auto }
+    .note { font-size:11.5px; color:var(--muted); margin:16px 0 0; line-height:1.65 }
+    @media (max-width:900px) {
+      .cols { grid-template-columns:minmax(0,1fr) }
+      header { padding:9px 12px } h1 { font-size:15px }
+      main { padding:8px 12px 26px }
+      /* On a phone you opened this to act on ONE thing, not to browse. */
+      #detail { order:-1 }
+      #list { order:1 }
+      table { min-width:0 }
+      th:nth-child(n+5), td:nth-child(n+5) { display:none }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🧩 Work</h1>
+    <span class="muted" id="status">đang tải…</span>
+    <span class="spacer"></span>
+    <button class="btn small" id="liveBtn" type="button" aria-pressed="true">⏸ Tạm dừng</button>
+    <span class="muted" id="policyBadge" title="Work Policy đang áp dụng">policy …</span>
+    <button class="btn small" id="refreshBtn" type="button">Làm mới</button>
+    <a class="btn small" href="/dashboard/work">🧩 Work</a>
+    <a class="btn small" href="/dashboard">🖥 Terminal</a>
+  </header>
+  <main>
+    <div class="cols">
+      <section id="list">
+        <h2>Work runs</h2>
+        <button class="btn small primary" id="newBtn" type="button">＋ Work mới</button>
+        <div class="card" id="createCard" hidden>
+          <h2>Tạo Work</h2>
+          <input id="cProject" placeholder="project / repo (tuỳ chọn)">
+          <input id="cLane" placeholder="worker session (phải kết thúc -work)" list="laneList">
+          <datalist id="laneList"></datalist>
+          <input id="cTitle" placeholder="Tiêu đề">
+          <textarea id="cPrompt" placeholder="Task đầu tiên: mô tả việc cần làm…"></textarea>
+          <div class="row">
+            <select id="cMode" aria-label="Mode">
+              <option value="NORMAL">NORMAL</option>
+              <option value="FAST_FIX">⚡ FAST_FIX</option>
+              <option value="SAFE">🔒 SAFE</option>
+            </select>
+            <input id="cPriority" type="number" value="0" aria-label="Priority" style="width:88px">
+            <input id="cModule" placeholder="module (tuỳ chọn)">
+          </div>
+          <div class="row">
+            <button class="btn primary" id="cSubmit" type="button">Tạo Work</button>
+            <button class="btn small" id="cCancel" type="button">Huỷ</button>
+            <span class="muted" id="cMsg"></span>
+          </div>
+        </div>
+        <div id="works"></div>
+        <h2>Workers</h2>
+        <div id="workers"></div>
+        <h2>Inbox <span class="muted" id="inMeta"></span></h2>
+        <div class="row">
+          <textarea id="inCapture" rows="3"
+                    placeholder="Dán nhiều issue một lúc, mỗi dòng một gạch đầu dòng…"></textarea>
+        </div>
+        <div class="row">
+          <input id="inProject" placeholder="project (tuỳ chọn)">
+          <button class="btn small primary" id="inCaptureBtn" type="button">Ghi nhận</button>
+          <select id="inFilter" aria-label="Lọc theo trạng thái">
+            <option value="">tất cả trạng thái</option>
+          </select>
+          <button class="btn small" id="inRefreshBtn" type="button">Làm mới</button>
+          <span class="muted" id="inMsg"></span>
+        </div>
+        <div id="inbox"></div>
+        <h2>Knowledge <span class="muted" id="kMeta"></span></h2>
+        <div class="row">
+          <input id="kQuery" placeholder="tìm trong knowledge map…">
+          <button class="btn small" id="kSearchBtn" type="button">Tìm</button>
+          <button class="btn small" id="kRefreshBtn" type="button">Làm mới</button>
+        </div>
+        <div id="knowledge"></div>
+        <h2>Runbooks</h2>
+        <div id="procedures"></div>
+        <h2>Telemetry <span class="muted" id="tMeta"></span></h2>
+        <div id="telemetry"></div>
+      </section>
+      <section id="detail"></section>
+    </div>
+    <p class="note" id="note"></p>
+  </main>
+  <script>
+    const $ = (s) => document.querySelector(s);
+    const state = {works: [], workers: [], selected: null, detail: null, live: true};
+
+    // The task lifecycle, in the order it really happens. Drawn as steps so
+    // an operator sees WHERE a task is instead of decoding one word.
+    const FLOW = ['QUEUED', 'PRECHECK', 'READY', 'DISPATCHING', 'RUNNING', 'VERIFYING', 'COMPLETED'];
+    const BAD = {BLOCKED: 1, FAILED: 1, CANCELLED: 1, REVISION_REQUIRED: 1,
+                 DISPATCH_UNCERTAIN: 1, WAITING_SESSION: 1, PAUSED: 1};
+
+    function el(tag, opts) {
+      const node = document.createElement(tag);
+      if (opts && opts.className) node.className = opts.className;
+      if (opts && opts.text != null) node.textContent = opts.text;
+      return node;
+    }
+
+    function duration(seconds) {
+      if (seconds === null || seconds === undefined) return '—';
+      if (seconds < 90) return Math.round(seconds) + 's';
+      if (seconds < 5400) return Math.round(seconds / 60) + 'm';
+      if (seconds < 172800) return Math.round(seconds / 3600) + 'h';
+      return Math.round(seconds / 86400) + 'd';
+    }
+
+    function ago(stamp) {
+      if (!stamp) return '—';
+      const seconds = (Date.now() - Date.parse(stamp)) / 1000;
+      if (Number.isNaN(seconds)) return '—';
+      if (seconds < 90) return Math.round(seconds) + 's';
+      if (seconds < 5400) return Math.round(seconds / 60) + 'm';
+      if (seconds < 172800) return Math.round(seconds / 3600) + 'h';
+      return Math.round(seconds / 86400) + 'd';
+    }
+
+    async function api(path, body) {
+      const options = body
+        ? {method: 'POST', headers: {'Content-Type': 'application/json'},
+           body: JSON.stringify(body)}
+        : {cache: 'no-store'};
+      const response = await fetch(path, options);
+      return response.json();
+    }
+
+    function progressBar(percent) {
+      const bar = el('div', {className: 'bar'});
+      const fill = el('i');
+      fill.style.width = Math.max(0, Math.min(100, percent || 0)) + '%';
+      bar.appendChild(fill);
+      return bar;
+    }
+
+    function flowStrip(status) {
+      const strip = el('div', {className: 'flow'});
+      const index = FLOW.indexOf(status);
+      for (let i = 0; i < FLOW.length; i += 1) {
+        const cls = index === -1 ? '' : i < index ? ' done' : i === index ? ' at' : '';
+        strip.appendChild(el('span', {className: 'step' + cls, text: FLOW[i]}));
+      }
+      // A status outside the happy path is shown as its own terminal step
+      // rather than silently leaving every step dim.
+      if (BAD[status]) strip.appendChild(el('span', {className: 'step bad', text: status}));
+      return strip;
+    }
+
+    // -- left column -------------------------------------------------------
+
+    function renderList() {
+      const box = $('#works');
+      box.replaceChildren();
+      if (!state.works.length) {
+        box.appendChild(el('div', {className: 'empty', text: 'Chưa có Work nào.'}));
+        return;
+      }
+      for (const work of state.works) {
+        const card = el('div', {className: 'card' + (work.work_id === state.selected ? ' selected' : '')});
+        card.dataset.work = work.work_id;
+        const head = el('div', {className: 'card-head'});
+        head.append(el('span', {className: 'title', text: work.title}),
+                    el('span', {className: 'pill ' + work.state, text: work.state}));
+        if (work.needs_you)
+          head.appendChild(el('span', {className: 'pill WAITING_APPROVAL',
+                                       text: '⚠ cần bạn (' + work.needs_you + ')'}));
+        if (work.blocked_tasks)
+          head.appendChild(el('span', {className: 'pill BLOCKED',
+                                       text: '⛔ ' + work.blocked_tasks + ' blocked'}));
+        card.appendChild(head);
+        const meta = [work.project_id || 'no project',
+                      work.progress.done_tasks + '/' + work.progress.total_tasks + ' task',
+                      work.progress.percent + '%',
+                      'sửa ' + ago(work.updated_at)];
+        card.appendChild(el('div', {className: 'muted', text: meta.join(' · ')}));
+        if ((work.running_workers || []).length)
+          card.appendChild(el('div', {className: 'muted',
+            text: '▶ đang chạy trên: ' + work.running_workers.join(', ')}));
+        card.appendChild(progressBar(work.progress.percent));
+        card.onclick = () => { state.selected = work.work_id; load(); };
+        box.appendChild(card);
+      }
+    }
+
+    function renderWorkers() {
+      const box = $('#workers');
+      box.replaceChildren();
+      if (!state.workers.length) {
+        box.appendChild(el('div', {className: 'empty',
+          text: 'Chưa có session -work nào. Chỉ session có hậu tố -work mới là worker.'}));
+        return;
+      }
+      for (const worker of state.workers) {
+        const card = el('div', {className: 'card'});
+        const head = el('div', {className: 'card-head'});
+        // A state name alone cannot say WHY a worker is busy. "BUSY" means the
+        // queue put work here; "đang chạy (ngoài queue)" means a human did,
+        // and dispatching into it would type over their conversation. The old
+        // label called that second case IDLE, which invited exactly that.
+        const WORKER_LABEL = {
+          BUSY: 'BUSY · queue', RUNNING_MANUAL: 'đang chạy (ngoài queue)',
+          IDLE: 'IDLE · sẵn sàng', OFFLINE: 'OFFLINE', UNAVAILABLE: 'không dùng được',
+        };
+        head.append(el('span', {className: 'title', text: worker.session}),
+                    el('span', {className: 'pill WORK', text: 'WORK'}),
+                    el('span', {className: 'pill ' + worker.state,
+                                text: WORKER_LABEL[worker.state] || worker.state}));
+        card.appendChild(head);
+        // The agent now comes from the occupancy probe when the listing has
+        // none; an unknown agent is still shown as unknown rather than
+        // defaulted to 'shell', which labelled a Claude worker wrong.
+        const evidence = worker.occupancy_evidence || {};
+        card.appendChild(el('div', {className: 'muted',
+          text: [worker.node_id || 'local',
+                 worker.agent_type || evidence.current_command || 'agent ?'].join(' · ')}));
+        if (worker.busy_untracked)
+          card.appendChild(el('div', {className: 'muted',
+            text: 'đang bận nhưng không do queue giao — không tự gửi task vào đây'}));
+        if (worker.current_task)
+          card.appendChild(el('div', {className: 'muted ellip',
+            text: '▶ ' + worker.current_task.title + ' (' + worker.current_task.status + ')'}));
+        // Why a worker is not usable, stated -- "no workers" with no reason
+        // is how an operator concludes the runtime is broken.
+        if (!worker.eligible)
+          card.appendChild(el('div', {className: 'err', text: worker.detail || worker.reason}));
+        box.appendChild(card);
+      }
+    }
+
+    // -- detail ------------------------------------------------------------
+
+    function renderApprovals(box, data) {
+      for (const approval of data.pending_approvals || []) {
+        const need = el('div', {className: 'need'});
+        need.appendChild(el('h3', {text: '⚠ Cần bạn duyệt'}));
+        need.appendChild(el('div', {text: approval.summary}));
+        need.appendChild(el('div', {className: 'muted',
+          text: approval.kind + ' · yêu cầu bởi ' + approval.requested_by
+                + ' · ' + ago(approval.requested_at)}));
+        if (approval.detail) need.appendChild(el('div', {className: 'muted', text: approval.detail}));
+        const actions = el('div', {className: 'row'});
+        const approve = el('button', {className: 'btn primary', text: '✓ Duyệt'});
+        approve.onclick = async () => {
+          await api('/dashboard/api/work/approve',
+                    {approval_id: approval.approval_id, decision: 'APPROVED'});
+          load();
+        };
+        const reject = el('button', {className: 'btn danger', text: '✕ Từ chối'});
+        reject.onclick = async () => {
+          await api('/dashboard/api/work/approve',
+                    {approval_id: approval.approval_id, decision: 'REJECTED'});
+          load();
+        };
+        actions.append(approve, reject);
+        need.appendChild(actions);
+        box.appendChild(need);
+      }
+    }
+
+    function renderOverview(box, data) {
+      const work = data.work;
+      const card = el('div', {className: 'card'});
+      const head = el('div', {className: 'card-head'});
+      head.append(el('span', {className: 'title', text: work.title}),
+                  el('span', {className: 'pill ' + work.state, text: work.state}));
+      if (data.lane_is_work_session)
+        head.appendChild(el('span', {className: 'pill WORK', text: 'WORK'}));
+      card.appendChild(head);
+      card.appendChild(el('div', {className: 'muted',
+        text: [work.project_id || 'no project', work.lane || '—',
+               'sửa ' + ago(work.updated_at)].join(' · ')}));
+      card.appendChild(el('h2', {text: 'Goal'}));
+      card.appendChild(el('div', {text: work.goal}));
+      if ((work.done_criteria || []).length) {
+        card.appendChild(el('h2', {text: 'Done criteria'}));
+        for (const criterion of work.done_criteria)
+          card.appendChild(el('div', {className: 'muted', text: '• ' + criterion}));
+      }
+      const constraints = (work.metadata && work.metadata.constraints) || [];
+      if (constraints.length) {
+        card.appendChild(el('h2', {text: 'Constraints'}));
+        for (const constraint of constraints)
+          card.appendChild(el('div', {className: 'muted', text: '• ' + constraint}));
+      }
+      card.appendChild(progressBar(data.progress.percent));
+      card.appendChild(el('div', {className: 'muted',
+        text: data.progress.percent + '% · ' + data.progress.done_tasks + '/'
+              + data.progress.total_tasks + ' task xong · trọng số '
+              + data.progress.done_weight + '/' + data.progress.total_weight}));
+      // Why it is not finished -- stated, never left to be inferred from a
+      // progress bar that stopped moving.
+      if (!data.contract.satisfied && (data.contract.unmet || []).length) {
+        const unmet = el('div', {className: 'unmet'});
+        unmet.textContent = 'Chưa đạt: ' + data.contract.unmet.map(
+          (u) => u.title ? (u.reason + ' (' + u.title + ')') : u.reason).join('; ');
+        card.appendChild(unmet);
+      }
+      if (work.paused_reason) card.appendChild(el('div', {className: 'err', text: work.paused_reason}));
+      if (work.failure_reason) card.appendChild(el('div', {className: 'err', text: work.failure_reason}));
+      box.appendChild(card);
+    }
+
+    function renderComposer(box, work) {
+      const card = el('div', {className: 'card'});
+      card.appendChild(el('h2', {text: 'Giao thêm việc'}));
+      const input = el('textarea');
+      input.id = 'composer';
+      input.placeholder = 'Mô tả task tiếp theo… (vào hàng đợi, không gõ thẳng vào session đang bận)';
+      card.appendChild(input);
+      const controls = el('div', {className: 'row'});
+      const send = el('button', {className: 'btn primary', text: '➤ Thêm vào hàng đợi'});
+      send.id = 'sendBtn';
+      send.onclick = async () => {
+        if (!input.value.trim()) return;
+        send.disabled = true;
+        await api('/dashboard/api/work/continue', {work_id: work.work_id, prompt: input.value});
+        input.value = '';
+        send.disabled = false;
+        load();
+      };
+      controls.appendChild(send);
+      for (const action of ['pause', 'resume', 'cancel']) {
+        const button = el('button', {className: 'btn small', text: action});
+        button.onclick = async () => {
+          await api('/dashboard/api/work/control', {work_id: work.work_id, action});
+          load();
+        };
+        controls.appendChild(button);
+      }
+      if (work.lane) {
+        const open = el('a', {className: 'btn small', text: '🖥 Open Terminal'});
+        open.href = '/dashboard?session=' + encodeURIComponent(work.lane);
+        controls.appendChild(open);
+      }
+      card.appendChild(controls);
+      box.appendChild(card);
+    }
+
+    function renderPlan(box, data) {
+      const card = el('div', {className: 'card'});
+      card.appendChild(el('h2', {text: 'Plan / Task DAG'}));
+      const byId = {};
+      for (const task of data.tasks || []) byId[task.queue_task_id] = task.title;
+      for (const task of data.tasks || []) {
+        const row = el('div', {className: 'row'});
+        const left = el('div', {className: 'grow'});
+        left.appendChild(el('div', {className: 'ellip', text: task.title}));
+        const bits = ['w' + task.weight, task.required ? 'required' : 'optional'];
+        if (task.priority) bits.push('prio ' + task.priority);
+        if (task.attempts != null) bits.push('attempt ' + task.attempts + '/' + (task.max_attempts || '?'));
+        if (task.worker_session) bits.push('@' + task.worker_session);
+        left.appendChild(el('div', {className: 'muted', text: bits.join(' · ')}));
+        if ((task.depends_on || []).length)
+          left.appendChild(el('div', {className: 'dep',
+            text: '↳ sau: ' + task.depends_on.map((d) => byId[d] || d).join(', ')}));
+        left.appendChild(flowStrip(task.queue_status));
+        // How long this task has been waiting, and why. Without it a task
+        // parked in VERIFYING renders exactly like one that just got there,
+        // so the page looks frozen when it is in fact faithfully showing a
+        // stall. This is also the value that changes between polls.
+        if (task.waiting_seconds !== undefined && task.waiting_seconds !== null) {
+          const waited = el('div', {className: task.waiting_stale ? 'err' : 'muted',
+                                    text: 'đang chờ ' + duration(task.waiting_seconds)
+                                          + ' ở ' + task.queue_status});
+          left.appendChild(waited);
+          if (task.waiting_reason) {
+            left.appendChild(el('div', {className: 'muted', text: task.waiting_reason}));
+          }
+        }
+        if (task.last_error) left.appendChild(el('div', {className: 'err', text: task.last_error}));
+        if (task.coordinator_reason && /NEEDS|BLOCK|loop/i.test(task.coordinator_reason))
+          left.appendChild(el('div', {className: 'err', text: task.coordinator_reason}));
+        row.appendChild(left);
+        row.appendChild(el('span', {className: 'pill ' + (task.queue_status || ''),
+                                    text: task.queue_status || 'UNBOUND'}));
+        card.appendChild(row);
+      }
+      if (!(data.tasks || []).length)
+        card.appendChild(el('div', {className: 'muted', text: 'Chưa có task.'}));
+      box.appendChild(card);
+    }
+
+    function renderQueue(box, data) {
+      const card = el('div', {className: 'card'});
+      card.appendChild(el('h2', {text: 'Queue'}));
+      const wrap = el('div', {className: 'wrap'});
+      const table = el('table');
+      const thead = el('thead');
+      const hrow = el('tr');
+      for (const label of ['#', 'Task', 'State', 'Prio', 'Attempt', 'Worker'])
+        hrow.appendChild(el('th', {text: label}));
+      thead.appendChild(hrow);
+      table.appendChild(thead);
+      const body = el('tbody');
+      const ordered = (data.tasks || []).slice().sort(
+        (a, b) => (a.queue_position || 0) - (b.queue_position || 0));
+      for (const task of ordered) {
+        const row = el('tr');
+        row.appendChild(el('td', {text: String(task.queue_position != null ? task.queue_position : '—')}));
+        row.appendChild(el('td', {text: task.title}));
+        const stateCell = el('td');
+        stateCell.appendChild(el('span', {className: 'pill ' + (task.queue_status || ''),
+                                          text: task.queue_status || 'UNBOUND'}));
+        row.appendChild(stateCell);
+        row.appendChild(el('td', {text: String(task.priority != null ? task.priority : 0)}));
+        row.appendChild(el('td', {text: String(task.attempts != null ? task.attempts : '—')}));
+        row.appendChild(el('td', {text: task.claimed_by || task.worker_session || '—'}));
+        body.appendChild(row);
+      }
+      table.appendChild(body);
+      wrap.appendChild(table);
+      card.appendChild(wrap);
+      box.appendChild(card);
+    }
+
+    function renderArtifacts(box, data) {
+      if (!(data.artifacts || []).length) return;
+      const card = el('div', {className: 'card'});
+      card.appendChild(el('h2', {text: 'Artifacts / Evidence'}));
+      for (const artifact of data.artifacts) {
+        const row = el('div', {className: 'row'});
+        row.append(el('span', {className: 'grow ellip',
+                               text: artifact.kind + ': ' + artifact.reference}),
+                   el('span', {className: 'muted', text: ago(artifact.created_at)}));
+        if (artifact.summary) row.appendChild(el('div', {className: 'muted', text: artifact.summary}));
+        card.appendChild(row);
+      }
+      box.appendChild(card);
+    }
+
+    function renderActivity(box, data) {
+      const card = el('div', {className: 'card'});
+      card.appendChild(el('h2', {text: 'Activity'}));
+      for (const event of (data.events || []).slice(0, 20)) {
+        const row = el('div', {className: 'row'});
+        row.append(el('span', {className: 'grow ellip', text: event.summary}),
+                   el('span', {className: 'muted', text: event.kind}),
+                   el('span', {className: 'muted', text: ago(event.created_at)}));
+        card.appendChild(row);
+      }
+      if (!(data.events || []).length)
+        card.appendChild(el('div', {className: 'muted', text: 'Chưa có sự kiện.'}));
+      box.appendChild(card);
+    }
+
+    function renderDetail() {
+      const box = $('#detail');
+      box.replaceChildren();
+      const data = state.detail;
+      if (!data || data.error) {
+        box.appendChild(el('div', {className: 'empty',
+          text: data && data.error ? data.error : 'Chọn một Work để xem chi tiết.'}));
+        return;
+      }
+      renderApprovals(box, data);
+      renderOverview(box, data);
+      renderComposer(box, data.work);
+      renderPlan(box, data);
+      renderQueue(box, data);
+      renderArtifacts(box, data);
+      renderActivity(box, data);
+    }
+
+    // -- loading -----------------------------------------------------------
+
+    async function load() {
+      try {
+        const [listing, workers] = await Promise.all([
+          api('/dashboard/api/work'),
+          api('/dashboard/api/work/workers'),
+        ]);
+        state.works = listing.works || [];
+        state.workers = workers.workers || [];
+        if (state.selected && !state.works.some((w) => w.work_id === state.selected))
+          state.selected = null;
+        if (!state.selected && state.works.length) state.selected = state.works[0].work_id;
+        state.detail = state.selected
+          ? await api('/dashboard/api/work?work=' + encodeURIComponent(state.selected))
+          : null;
+        const lanes = $('#laneList');
+        lanes.replaceChildren();
+        for (const worker of state.workers) {
+          const option = document.createElement('option');
+          option.value = worker.session;
+          lanes.appendChild(option);
+        }
+        renderList();
+        renderWorkers();
+        renderDetail();
+        $('#status').textContent = state.works.length + ' work · ' + state.workers.length
+          + ' worker' + (state.live ? '' : ' · đã tạm dừng');
+        $('#note').textContent =
+          'Work Runtime chỉ tự động điều khiển session có hậu tố -work; danh sách Workers ở '
+          + 'đây không bao giờ chứa session thường. Session thường giữ nguyên hành vi cũ: '
+          + 'không bị claim, không bị tự gửi prompt, không bị đổi state. Tiến độ tính từ '
+          + 'trọng số task và trạng thái thật trong queue, không phải phần trăm do model tự '
+          + 'báo; một Work chỉ COMPLETE khi mọi task bắt buộc đã xong, không có task blocked '
+          + 'và không còn approval chờ.';
+      } catch (err) {
+        $('#status').textContent = 'lỗi tải: ' + err.message;
+      }
+    }
+
+    $('#refreshBtn').onclick = () => load();
+    // -- create ------------------------------------------------------------
+
+    function setCreateVisible(visible) {
+      $('#createCard').hidden = !visible;
+      $('#newBtn').hidden = visible;
+      if (visible) $('#cTitle').focus();
+    }
+
+    $('#newBtn').onclick = () => setCreateVisible(true);
+    $('#cCancel').onclick = () => { setCreateVisible(false); $('#cMsg').textContent = ''; };
+    $('#cSubmit').onclick = async () => {
+      const lane = $('#cLane').value.trim();
+      const title = $('#cTitle').value.trim();
+      const prompt = $('#cPrompt').value.trim();
+      if (!lane || !title || !prompt) {
+        $('#cMsg').textContent = 'Cần worker session, tiêu đề và task.';
+        return;
+      }
+      // Checked here too so the operator gets the rule immediately rather
+      // than a round-trip; the server refuses it regardless.
+      if (!/-work$/.test(lane)) {
+        $('#cMsg').textContent = 'Session phải kết thúc bằng -work. Session thường '
+          + 'không bao giờ được Work Runtime điều khiển.';
+        return;
+      }
+      $('#cSubmit').disabled = true;
+      $('#cMsg').textContent = 'đang tạo…';
+      const result = await api('/dashboard/api/work/create', {
+        title: title, goal: $('#cPrompt').value.trim(), lane: lane,
+        project_id: $('#cProject').value.trim() || null,
+        tasks: [{title: title, prompt: prompt,
+                 priority: Number($('#cPriority').value || 0),
+                 metadata: {mode: $('#cMode').value,
+                            module: $('#cModule').value.trim() || null}}]});
+      $('#cSubmit').disabled = false;
+      if (result.error) {
+        $('#cMsg').textContent = result.error + (result.detail ? ' — ' + result.detail : '');
+        return;
+      }
+      // Select the new run so it is visible immediately with its real state,
+      // rather than leaving the operator to find it in the list.
+      state.selected = result.work.work_id;
+      $('#cMsg').textContent = '';
+      $('#cTitle').value = ''; $('#cPrompt').value = '';
+      setCreateVisible(false);
+      load();
+    };
+
+    // -- knowledge, runbooks, policy, telemetry ----------------------------
+    // Loaded on open and on demand, NOT on the 6s work poll: these move at the
+    // speed of commits, and re-fetching them every six seconds would spend
+    // real work to re-render an unchanged panel.
+    //
+    // Built with el()/textContent like the rest of this page. Everything here
+    // is text read off disk -- module summaries, runbook commands, git
+    // reasons -- so it is never interpolated into markup.
+
+    function confidenceClass(level) {
+      return level === 'HIGH' ? 'ok' : level === 'MEDIUM' ? 'warn' : 'bad';
+    }
+
+    function pill(text, cls) {
+      return el('span', {className: 'pill ' + cls, text: text});
+    }
+
+    function replace(box, nodes) {
+      box.replaceChildren.apply(box, nodes);
+    }
+
+    function muted(box, text) {
+      replace(box, [el('p', {className: 'muted', text: text})]);
+    }
+
+    async function getJSON(url) {
+      const response = await fetch(url, {credentials: 'same-origin'});
+      return await response.json();
+    }
+
+    const INBOX_STATE_CLASS = {
+      NEW: 'warn', TRIAGED: 'warn', PLANNING: 'ok', NEEDS_USER_HINT: 'bad',
+      NEEDS_REDEFINE: 'bad', READY: 'ok', EXECUTING: 'ok', PREVIEW_READY: 'ok',
+      VERIFYING: 'ok', DONE: 'ok', FAILED: 'bad', BLOCKED: 'bad',
+      REWORK: 'warn', DUPLICATE: 'muted', CANCELLED: 'muted',
+    };
+
+    async function loadInbox() {
+      const box = $('#inbox');
+      try {
+        const filter = $('#inFilter').value;
+        const data = await getJSON('/dashboard/api/inbox'
+          + (filter ? '?state=' + encodeURIComponent(filter) : ''));
+        if (data.error) { muted(box, data.detail || data.error); return; }
+        const summary = data.summary || {};
+        const counts = summary.counts || {};
+        // Counts come from the persisted issue store. A count taken from a
+        // transport queue is what made this screen read zero while work was
+        // actually in flight.
+        $('#inMeta').textContent = (summary.total || 0) + ' issue · '
+          + Object.keys(counts).map((k) => k + ' ' + counts[k]).join(' · ')
+          + ' · planner ' + (summary.planning_active || 0)
+          + '/' + (summary.planner_concurrency || 0);
+
+        const select = $('#inFilter');
+        if (select.options.length <= 1) {
+          Object.keys(INBOX_STATE_CLASS).forEach((state) => {
+            const option = document.createElement('option');
+            option.value = state; option.textContent = state;
+            select.append(option);
+          });
+          select.value = filter;
+        }
+
+        const issues = data.issues || [];
+        if (!issues.length) { muted(box, 'Chưa có issue nào.'); return; }
+        replace(box, issues.map((issue) => {
+          const row = el('div', {className: 'row'});
+          row.append(pill(issue.state, INBOX_STATE_CLASS[issue.state] || 'muted'));
+          row.append(el('b', {text: issue.title}));
+          const meta = [issue.project, issue.module, issue.type,
+                        'difficulty ' + issue.difficulty,
+                        'p' + issue.priority].filter(Boolean).join(' · ');
+          row.append(el('span', {className: 'muted', text: meta}));
+          if (issue.claimed_by) row.append(pill('planner ' + issue.claimed_by, 'ok'));
+          if (issue.queue_task_id) {
+            row.append(pill('task ' + issue.queue_task_id.slice(0, 8), 'ok'));
+          }
+          if (issue.duplicate_of) {
+            row.append(pill('dup of ' + issue.duplicate_of.slice(0, 10), 'muted'));
+          }
+          if ((issue.questions || []).length) {
+            row.append(el('br'));
+            row.append(el('span', {className: 'muted',
+                                   text: 'hỏi developer: ' + issue.questions.join(' | ')}));
+          }
+          row.append(el('br'));
+          row.append(el('span', {className: 'muted',
+                                 text: issue.issue_id + ' · cập nhật ' + ago(issue.updated_at)}));
+          return row;
+        }));
+      } catch (err) {
+        muted(box, 'lỗi tải inbox: ' + err.message);
+      }
+    }
+
+    async function captureIssues() {
+      const text = $('#inCapture').value;
+      if (!text.trim()) { $('#inMsg').textContent = 'Chưa có nội dung'; return; }
+      $('#inMsg').textContent = 'đang ghi nhận…';
+      try {
+        const response = await fetch('/dashboard/api/inbox/capture', {
+          method: 'POST', credentials: 'same-origin',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({text: text, project: $('#inProject').value.trim() || null}),
+        });
+        const data = await response.json();
+        if (data.error) { $('#inMsg').textContent = 'lỗi: ' + data.error; return; }
+        // Only clear the box once the server has confirmed the write, so a
+        // failed capture never looks like it succeeded.
+        $('#inCapture').value = '';
+        $('#inMsg').textContent = data.captured + ' issue · ' + data.new + ' mới · '
+          + data.duplicates + ' trùng';
+        loadInbox();
+      } catch (err) {
+        $('#inMsg').textContent = 'lỗi: ' + err.message;
+      }
+    }
+
+    $('#inCaptureBtn').onclick = () => captureIssues();
+    $('#inRefreshBtn').onclick = () => loadInbox();
+    $('#inFilter').onchange = () => loadInbox();
+
+    async function loadKnowledge(query) {
+      const box = $('#knowledge');
+      try {
+        const data = await getJSON(query
+          ? '/dashboard/api/knowledge?action=search&q=' + encodeURIComponent(query)
+          : '/dashboard/api/knowledge');
+        if (data.error === 'NO_KNOWLEDGE_MAP' || data.error === 'NOT_A_GIT_REPOSITORY') {
+          $('#kMeta').textContent = '';
+          muted(box, 'Chưa có knowledge map cho project này.');
+          return;
+        }
+        if (data.error) throw new Error(data.detail || data.error);
+
+        if (query) {
+          const hits = data.matches || [];
+          $('#kMeta').textContent = hits.length + ' kết quả cho "' + query + '"';
+          if (!hits.length) {
+            // The map is a map: absence here is not absence in the code.
+            muted(box, 'Không có kết quả trong knowledge map. Không thấy ở đây '
+                     + 'không có nghĩa là không có trong code.');
+            return;
+          }
+          replace(box, hits.map((hit) => {
+            const row = el('div', {className: 'row'});
+            row.append(el('code', {text: hit.document + ':' + hit.line}));
+            if (hit.heading) row.append(el('span', {className: 'muted', text: hit.heading}));
+            row.append(el('span', {text: hit.text}));
+            return row;
+          }));
+          return;
+        }
+
+        const modules = data.modules || [];
+        const stale = modules.filter((m) => m.confidence === 'LOW').length;
+        $('#kMeta').textContent = modules.length + ' module'
+          + (data.last_indexed_commit
+              ? ' · indexed ' + String(data.last_indexed_commit).slice(0, 8) : '')
+          + (stale ? ' · ' + stale + ' cần kiểm tra lại' : '');
+        if (!modules.length) { muted(box, 'Chưa index module nào.'); return; }
+        replace(box, modules.map((module) => {
+          const row = el('div', {className: 'row'});
+          row.append(el('b', {text: module.name}));
+          row.append(pill(module.confidence, confidenceClass(module.confidence)));
+          // The REASON travels with the badge: a bare label tells a reader
+          // what to feel, the reason tells them what to do next.
+          if (module.confidence_reason) {
+            row.append(el('span', {className: 'muted', text: module.confidence_reason}));
+          }
+          if (module.summary) {
+            row.append(el('br'));
+            row.append(el('span', {className: 'muted', text: module.summary}));
+          }
+          return row;
+        }));
+      } catch (err) {
+        muted(box, 'lỗi tải knowledge: ' + err.message);
+      }
+    }
+
+    async function loadProcedures() {
+      const box = $('#procedures');
+      try {
+        const data = await getJSON('/dashboard/api/procedures');
+        if (data.error) { muted(box, data.detail || data.error); return; }
+        const rows = data.procedures || [];
+        const auto = data.auto_invokable_risk || [];
+        if (!rows.length) { muted(box, 'Chưa đăng ký runbook nào.'); return; }
+        replace(box, rows.map((procedure) => {
+          // A registered runbook whose script is gone is BROKEN and says so.
+          // Showing it as available would send a worker to run something
+          // that cannot run.
+          const state = !procedure.script_exists ? ['BROKEN', 'bad']
+            : procedure.last_success_at ? ['VERIFIED', 'ok'] : ['UNVERIFIED', 'warn'];
+          const row = el('div', {className: 'row'});
+          row.append(el('b', {text: procedure.id}));
+          row.append(pill(state[0], state[1]));
+          if (auto.indexOf(procedure.risk) === -1) row.append(pill('cần duyệt', 'warn'));
+          row.append(el('span', {className: 'muted',
+                                 text: (procedure.command || []).join(' ')}));
+          row.append(el('br'));
+          row.append(el('span', {className: 'muted',
+            text: procedure.last_success_at
+              ? 'lần chạy xanh gần nhất: ' + procedure.last_success_at
+              : 'chưa có lần chạy xanh nào được ghi nhận'}));
+          return row;
+        }));
+      } catch (err) {
+        muted(box, 'lỗi tải runbooks: ' + err.message);
+      }
+    }
+
+    async function loadPolicy() {
+      const badge = $('#policyBadge');
+      try {
+        const data = await getJSON('/dashboard/api/policy');
+        if (data.error) { badge.textContent = 'policy: không đọc được'; return; }
+        badge.textContent = 'Policy v' + data.version
+          + (data.override_present ? ' + override ' + (data.override_version || '?') : '')
+          + (data.source === 'built-in' ? ' (mặc định)' : '');
+        badge.title = (data.drift || []).join(' · ') || ('Đã nạp từ ' + data.source);
+      } catch (err) {
+        badge.textContent = 'policy: lỗi';
+      }
+    }
+
+    function tokenText(tokens) {
+      // Provenance travels with the number wherever it is shown. A figure we
+      // did not measure must never look like one we did.
+      if (!tokens || tokens.value === null || tokens.value === undefined) {
+        return 'không có số liệu'
+          + (tokens && tokens.method ? ' (' + tokens.method + ')' : '');
+      }
+      const n = Number(tokens.value).toLocaleString('en-US');
+      if (tokens.source === 'ESTIMATED') return '~' + n + ' (ước lượng)';
+      if (tokens.source === 'PARTIAL') {
+        return n + ' (thiếu ' + (tokens.missing_tasks || 0) + ' task)';
+      }
+      return n;
+    }
+
+    function metric(label, value, note) {
+      const line = el('div');
+      line.append(el('span', {text: label + ': '}));
+      line.append(el('b', {text: value}));
+      if (note) line.append(el('span', {className: 'muted', text: ' ' + note}));
+      return line;
+    }
+
+    async function loadTelemetry() {
+      const box = $('#telemetry');
+      try {
+        const data = await getJSON('/dashboard/api/telemetry');
+        if (data.error) { muted(box, data.detail || data.error); return; }
+        if (!data.tasks) {
+          $('#tMeta').textContent = '';
+          muted(box, 'Chưa có telemetry.');
+          return;
+        }
+        $('#tMeta').textContent = data.tasks + ' task';
+        // "chưa đủ dữ liệu" rather than 0%: no data and a zero rate are
+        // different facts, and conflating them flatters the system.
+        const hitRate = (data.runbook_hit_rate === null
+                         || data.runbook_hit_rate === undefined)
+          ? 'chưa đủ dữ liệu' : Math.round(data.runbook_hit_rate * 100) + '%';
+        const preview = (data.median_seconds_to_preview === null
+                         || data.median_seconds_to_preview === undefined)
+          ? 'chưa có preview nào' : Math.round(data.median_seconds_to_preview) + 's';
+        const wrap = el('div', {className: 'row'});
+        wrap.append(metric('token', tokenText(data.tokens)));
+        wrap.append(metric('runbook hit rate', hitRate));
+        wrap.append(metric('file đã đọc', String(data.files_read),
+                           '· lượt search: ' + data.search_rounds));
+        wrap.append(metric('redefine', String(data.redefine_count),
+                           '· hỏi developer: ' + data.assist_requests));
+        wrap.append(metric('time-to-preview (median)', preview,
+                           data.tasks_without_preview
+                             ? '(' + data.tasks_without_preview + ' task không preview)' : ''));
+        replace(box, [wrap]);
+      } catch (err) {
+        muted(box, 'lỗi tải telemetry: ' + err.message);
+      }
+    }
+
+    function loadContext() {
+      loadPolicy();
+      loadInbox();
+      loadKnowledge('');
+      loadProcedures();
+      loadTelemetry();
+    }
+
+    $('#kSearchBtn').onclick = () => loadKnowledge($('#kQuery').value.trim());
+    $('#kQuery').onkeydown = (event) => {
+      if (event.key === 'Enter') loadKnowledge($('#kQuery').value.trim());
+    };
+    $('#kRefreshBtn').onclick = () => loadContext();
+
+    $('#liveBtn').onclick = () => {
+      state.live = !state.live;
+      $('#liveBtn').textContent = state.live ? '⏸ Tạm dừng' : '▶ Tiếp tục';
+      $('#liveBtn').setAttribute('aria-pressed', String(state.live));
+      if (state.live) load();
+    };
+    load();
+    loadContext();
+    // Polling, not a fake animation: every number on this screen comes from
+    // a real read of the queue and the work store.
+    setInterval(() => { if (state.live) load(); }, 6000);
+  </script>
+</body>
+</html>
+"""
+
+
+AI_USAGE_HTML = """<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>AI Usage — Terminal MCP</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff; --muted:#9aa7bd;
+      --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#3b78ff;
+      --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono','Courier New',monospace;
+    }
+    * { box-sizing:border-box }
+    html, body { height:100%; margin:0 }
+    body { font:14px/1.5 var(--mono); background:var(--bg); color:var(--text);
+           display:grid; grid-template-columns:196px 1fr; grid-template-rows:auto 1fr }
+    a { color:var(--accent) }
+    header { grid-column:1/-1; display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+             padding:12px max(16px, env(safe-area-inset-right)) 12px max(16px, env(safe-area-inset-left));
+             border-bottom:1px solid var(--line) }
+    h1 { margin:0; font-size:16px; white-space:nowrap }
+    .muted { color:var(--muted) } .spacer { flex:1 }
+    .btn { background:#19243b; border:1px solid var(--line); color:var(--text); border-radius:8px;
+           padding:7px 11px; font:13px var(--mono); cursor:pointer; min-height:40px;
+           display:inline-flex; align-items:center; gap:6px; text-decoration:none }
+    .btn:active { background:#223052 }
+    .btn.on { border-color:var(--accent); color:var(--accent) }
+    nav { grid-row:2; border-right:1px solid var(--line); background:var(--panel);
+          padding:10px 8px; display:flex; flex-direction:column; gap:4px; overflow-y:auto }
+    nav button { background:none; border:none; color:var(--muted); text-align:left;
+                 padding:9px 11px; border-radius:8px; font:13px var(--mono); cursor:pointer;
+                 min-height:40px; width:100% }
+    nav button:hover { background:#17203a; color:var(--text) }
+    nav button.active { background:#17203a; color:var(--text); font-weight:700;
+                        box-shadow:inset 3px 0 0 var(--accent) }
+    nav .nav-title { font-size:10px; text-transform:uppercase; letter-spacing:.06em;
+                     color:var(--muted); padding:10px 11px 4px }
+    main { grid-row:2; min-width:0; overflow-y:auto;
+           padding:14px max(16px, env(safe-area-inset-right)) max(28px, env(safe-area-inset-bottom)) 14px }
+    .bar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px }
+    .chips { display:flex; gap:6px }
+    .chip { padding:7px 12px }
+    /* Quota bars. A bar with no measurement is drawn empty and hatched, never
+       filled with a guess: an empty bar reads as "unknown", a filled one
+       reads as fact. */
+    .qgrid { display:grid; grid-template-columns:repeat(auto-fit, minmax(260px,1fr));
+             gap:10px; margin-bottom:14px }
+    .qcard { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 14px }
+    .qcard .qhead { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; margin-bottom:8px }
+    .qcard .qwin { font-weight:700; font-size:13.5px }
+    .qcard .qpct { margin-left:auto; font-size:18px; font-weight:700 }
+    .qtrack { height:12px; border-radius:999px; background:#0b1224; border:1px solid var(--line); overflow:hidden }
+    .qfill { height:100%; width:0; background:var(--green) }
+    .qfill.warn { background:var(--amber) } .qfill.crit { background:var(--red) }
+    .qtrack.na { background:repeating-linear-gradient(45deg,#0b1224,#0b1224 6px,#131c30 6px,#131c30 12px) }
+    .qmeta { display:flex; justify-content:space-between; gap:10px; margin-top:7px;
+             font-size:11.5px; color:var(--muted); flex-wrap:wrap }
+    .bar select, .bar input { background:var(--panel); border:1px solid var(--line); color:var(--text);
+                              border-radius:8px; padding:8px 10px; font:16px var(--mono); min-height:40px }
+    .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(168px,1fr)); gap:10px; margin-bottom:14px }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:11px 13px; min-width:0 }
+    .card h2 { margin:0 0 5px; font-size:10px; font-weight:700; letter-spacing:.05em;
+               text-transform:uppercase; color:var(--muted) }
+    .card .big { font-size:20px; font-weight:700; word-break:break-all }
+    .card .sub { font-size:11px; color:var(--muted); margin-top:3px; word-break:break-all }
+    .wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px; background:var(--panel) }
+    table { border-collapse:collapse; width:100%; min-width:680px }
+    th, td { padding:8px 10px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--line) }
+    th:first-child, td:first-child, th.l, td.l { text-align:left }
+    th { position:sticky; top:0; background:#0e1526; cursor:pointer; user-select:none; font-size:10px;
+         text-transform:uppercase; letter-spacing:.04em; color:var(--muted); z-index:1 }
+    th.sorted { color:var(--accent) }
+    tbody tr:hover { background:#17203a }
+    tbody tr.clickable { cursor:pointer }
+    td.prompt { max-width:460px; white-space:normal; word-break:break-word; font-size:12.5px }
+    .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:1px 8px;
+            font-size:10px; color:var(--muted); white-space:nowrap }
+    .pill.rep { color:var(--green); border-color:var(--green) }
+    .pill.est { color:var(--amber); border-color:var(--amber) }
+    .pill.na { color:var(--muted) }
+    .pill.warn { color:var(--red); border-color:var(--red) }
+    .empty { padding:24px; text-align:center; color:var(--muted) }
+    .note { font-size:11.5px; color:var(--muted); margin:12px 0 0; line-height:1.6 }
+    .chart { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+             padding:12px; margin-bottom:14px }
+    .chart .bars { display:flex; align-items:flex-end; gap:2px; height:132px; overflow-x:auto }
+    .chart .col { flex:1 0 7px; display:flex; flex-direction:column; justify-content:flex-end;
+                  min-width:7px; border-radius:2px 2px 0 0; overflow:hidden }
+    .chart .seg { width:100% }
+    .chart .seg.i { background:#3b78ff } .chart .seg.o { background:#43d17c }
+    .chart .seg.cr { background:#3a4f7a } .chart .seg.cw { background:#ffc857 }
+    .legend { display:flex; gap:12px; flex-wrap:wrap; font-size:11px; color:var(--muted); margin-top:8px }
+    .legend i { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:4px }
+    .drill { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+             padding:12px 14px; margin-bottom:14px }
+    .drill h3 { margin:0 0 8px; font-size:13px }
+    .kv { display:grid; grid-template-columns:auto 1fr; gap:3px 12px; font-size:12px }
+    .kv b { color:var(--muted); font-weight:400 }
+    @media (max-width:860px) {
+      body { grid-template-columns:1fr }
+      nav { grid-row:auto; grid-column:1; flex-direction:row; overflow-x:auto;
+            border-right:none; border-bottom:1px solid var(--line); padding:8px }
+      nav button { width:auto; white-space:nowrap; box-shadow:none }
+      nav button.active { box-shadow:inset 0 -3px 0 var(--accent) }
+      nav .nav-title { display:none }
+      main { grid-row:auto; padding:12px }
+      /* A wide table on a phone becomes one card per row -- an 11-column
+         grid squeezed into 390px is unreadable however it scrolls. */
+      table, thead, tbody, tr, th, td { display:block }
+      thead { display:none }
+      table { min-width:0 }
+      tbody tr { border-bottom:1px solid var(--line); padding:9px 11px }
+      tbody tr:last-child { border-bottom:none }
+      td { border:none; padding:2px 0; text-align:left; white-space:normal; display:flex;
+           justify-content:space-between; gap:12px }
+      td::before { content:attr(data-label); color:var(--muted); font-size:11px }
+      td:first-child { font-weight:700; padding-bottom:5px }
+      td.prompt { max-width:none }
+      .wrap { overflow-x:visible }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📊 AI Usage</h1>
+    <span class="muted" id="sourceLine">đang tải…</span>
+    <span class="spacer"></span>
+    <label class="muted" style="font-size:12px"><input type="checkbox" id="autoRefresh" checked> Tự làm mới</label>
+    <button class="btn" id="refreshBtn" type="button">Làm mới</button>
+    <a class="btn" href="/dashboard">← Dashboard</a>
+  </header>
+  <nav>
+    <div class="nav-title">Báo cáo</div>
+    <button type="button" data-tab="overview" class="active">Tổng quan</button>
+    <button type="button" data-tab="prompts">Top prompts</button>
+    <button type="button" data-tab="sessions">Top sessions</button>
+    <button type="button" data-tab="projects">Top projects</button>
+    <button type="button" data-tab="models">Model / provider</button>
+    <button type="button" data-tab="quota">Quota</button>
+    <button type="button" data-tab="events">Raw events</button>
+  </nav>
+  <main>
+    <div class="bar">
+      <span class="chips" id="rangeChips" role="group" aria-label="Khoảng thời gian nhanh">
+        <button type="button" class="btn chip" data-range="24h">Hôm nay</button>
+        <button type="button" class="btn chip" data-range="7d">7 ngày</button>
+        <button type="button" class="btn chip" data-range="30d">30 ngày</button>
+      </span>
+      <select id="fRange" aria-label="Khoảng thời gian">
+        <option value="1h">1 giờ</option><option value="5h">5 giờ</option>
+        <option value="24h" selected>Hôm nay (24h)</option><option value="7d">7 ngày</option>
+        <option value="30d">30 ngày</option><option value="">Toàn bộ lịch sử</option>
+      </select>
+      <select id="fNode" aria-label="Node"><option value="">Tất cả node</option></select>
+      <select id="fAgent" aria-label="Provider"><option value="">Tất cả provider</option></select>
+      <select id="fProject" aria-label="Project"><option value="">Tất cả project</option></select>
+      <select id="fModel" aria-label="Model"><option value="">Tất cả model</option></select>
+      <input type="search" id="fSearch" placeholder="Tìm..." aria-label="Tìm">
+      <a class="btn" id="exportBtn" href="#" download>⬇ CSV</a>
+    </div>
+    <div id="view"></div>
+    <p class="note" id="provenance"></p>
+  </main>
+  <script>
+    const $ = (s) => document.querySelector(s);
+    const state = {tab: 'overview', data: {}, sort: {}, drill: null};
+
+    const fmt = (n) => (n == null ? '—' : Number(n).toLocaleString('en-US'));
+    const short = (n) => {
+      n = Number(n || 0);
+      if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+      return String(Math.round(n));
+    };
+    const usd = (n) => (n == null ? '—' : '$' + Number(n).toFixed(2));
+    const ago = (ts) => {
+      if (!ts) return '—';
+      const s = Math.max(0, Date.now() / 1000 - ts);
+      if (s < 90) return Math.round(s) + 's';
+      if (s < 5400) return Math.round(s / 60) + 'm';
+      if (s < 172800) return Math.round(s / 3600) + 'h';
+      return Math.round(s / 86400) + 'd';
+    };
+    const shortPath = (p) => (!p ? 'unassigned' : p.split('/').slice(-2).join('/'));
+
+    // Filters live in the URL so a link means the same thing when reopened.
+    function readUrl() {
+      const q = new URLSearchParams(location.search);
+      state.tab = q.get('tab') || 'overview';
+      for (const [key, sel] of [['range', '#fRange'], ['node_id', '#fNode'], ['agent', '#fAgent'],
+                                ['project', '#fProject'], ['model', '#fModel'], ['q', '#fSearch']]) {
+        const el = $(sel);
+        if (el && q.has(key)) el.value = q.get(key);
+      }
+    }
+    function query(extra) {
+      const q = new URLSearchParams();
+      const range = $('#fRange').value;
+      if (range) q.set('range', range);
+      for (const [key, sel] of [['node_id', '#fNode'], ['agent', '#fAgent'],
+                                ['project', '#fProject'], ['model', '#fModel']]) {
+        if ($(sel).value) q.set(key, $(sel).value);
+      }
+      for (const [k, v] of Object.entries(extra || {})) q.set(k, v);
+      return q;
+    }
+    function syncUrl() {
+      const q = query({});
+      q.set('tab', state.tab);
+      if ($('#fSearch').value) q.set('q', $('#fSearch').value);
+      history.replaceState(null, '', location.pathname + '?' + q.toString());
+      $('#exportBtn').href = '/dashboard/api/ai-usage/export?' +
+        query({dataset: state.tab === 'overview' ? 'sessions' : state.tab, format: 'csv'});
+    }
+
+    async function api(path, extra) {
+      const response = await fetch('/dashboard/api/ai-usage/' + path + '?' + query(extra),
+                                   {cache: 'no-store'});
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.json();
+    }
+
+    // "hoạt động 3s" is a claim that output appeared 3s ago. We may only make
+    // it about a change this wall actually saw; otherwise the number is a
+    // lower bound on silence since we started watching, and says so.
+    function ageLabel(b) {
+      if (b.age_seconds == null) return '—';
+      return (b.age_is_witnessed ? 'hoạt động ' : 'theo dõi ') + age(b.age_seconds);
+    }
+
+    function el(tag, opts) {
+      const node = document.createElement(tag);
+      if (opts && opts.className) node.className = opts.className;
+      if (opts && opts.text != null) node.textContent = opts.text;
+      if (opts && opts.label) node.dataset.label = opts.label;
+      return node;
+    }
+
+    function table(columns, rows, opts) {
+      const wrap = el('div', {className: 'wrap'});
+      const tbl = document.createElement('table');
+      const thead = document.createElement('thead');
+      const hrow = document.createElement('tr');
+      for (const col of columns) {
+        const th = el('th', {text: col.title, className: col.left ? 'l' : ''});
+        if (col.key) {
+          th.dataset.k = col.key;
+          if (state.sort[state.tab] && state.sort[state.tab].key === col.key) th.classList.add('sorted');
+          th.onclick = () => {
+            // The first click on the column a table is ALREADY sorted by has
+            // no recorded direction, so negating it produced NaN and the
+            // comparator returned 0 -- the table simply did not move.
+            const cur = state.sort[state.tab] || {key: col.defaultKey, dir: -1};
+            const dir = (cur.key === col.key && Number.isFinite(cur.dir)) ? -cur.dir : -1;
+            state.sort[state.tab] = {key: col.key, dir};
+            render();
+          };
+        }
+        hrow.appendChild(th);
+      }
+      thead.appendChild(hrow); tbl.appendChild(thead);
+      const tbody = document.createElement('tbody');
+      if (!rows.length) {
+        const tr = document.createElement('tr');
+        const td = el('td', {className: 'empty', text: (opts && opts.empty) || 'Không có dữ liệu.'});
+        td.colSpan = columns.length; tr.appendChild(td); tbody.appendChild(tr);
+      }
+      for (const row of rows) {
+        const tr = document.createElement('tr');
+        if (opts && opts.onClick) { tr.className = 'clickable'; tr.onclick = () => opts.onClick(row); }
+        for (const col of columns) {
+          const td = el('td', {className: col.cls || (col.left ? 'l' : ''), label: col.title});
+          const value = col.render(row);
+          if (value instanceof Node) td.appendChild(value); else td.textContent = value;
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      }
+      tbl.appendChild(tbody); wrap.appendChild(tbl);
+      return wrap;
+    }
+
+    function sorted(rows, fallbackKey) {
+      if (!state.sort[state.tab]) state.sort[state.tab] = {key: fallbackKey, dir: -1};
+      const s = state.sort[state.tab];
+      return [...rows].sort((a, b) => {
+        const x = a[s.key], y = b[s.key];
+        if (x == null && y == null) return 0;
+        if (x == null) return 1;
+        if (y == null) return -1;
+        return (x < y ? -1 : x > y ? 1 : 0) * s.dir;
+      });
+    }
+
+    function searchFilter(rows, fields) {
+      const q = $('#fSearch').value.trim().toLowerCase();
+      if (!q) return rows;
+      return rows.filter((r) => fields.some((f) => String(r[f] || '').toLowerCase().includes(q)));
+    }
+
+    function cards(items) {
+      const box = el('div', {className: 'cards'});
+      for (const [title, big, sub] of items) {
+        const card = el('div', {className: 'card'});
+        card.append(el('h2', {text: title}), el('div', {className: 'big', text: big}),
+                    el('div', {className: 'sub', text: sub || ''}));
+        box.appendChild(card);
+      }
+      return box;
+    }
+
+    function chart(points) {
+      const box = el('div', {className: 'chart'});
+      const bars = el('div', {className: 'bars'});
+      const max = Math.max(1, ...points.map((p) => p.total_tokens || 0));
+      for (const p of points) {
+        const col = el('div', {className: 'col'});
+        col.title = new Date(p.bucket_start * 1000).toLocaleString() + ' · ' +
+                    fmt(p.total_tokens) + ' tokens';
+        const height = Math.max(2, Math.round((p.total_tokens || 0) / max * 128));
+        for (const [cls, value] of [['cw', p.cache_write_tokens], ['cr', p.cache_read_tokens],
+                                    ['o', p.output_tokens], ['i', p.input_tokens]]) {
+          const part = Math.round((value || 0) / (p.total_tokens || 1) * height);
+          if (part > 0) {
+            const seg = el('div', {className: 'seg ' + cls});
+            seg.style.height = part + 'px';
+            col.appendChild(seg);
+          }
+        }
+        bars.appendChild(col);
+      }
+      box.appendChild(bars);
+      const legend = el('div', {className: 'legend'});
+      for (const [cls, label] of [['i', 'Input'], ['o', 'Output'],
+                                  ['cr', 'Cache read'], ['cw', 'Cache write']]) {
+        const span = el('span', {text: ' ' + label});
+        const dot = el('i', {className: 'seg ' + cls});
+        dot.classList.add(cls);
+        span.prepend(dot);
+        legend.appendChild(span);
+      }
+      box.appendChild(legend);
+      return box;
+    }
+
+    // How full the model's context is. This is NOT the subscription quota --
+    // that lives in quotaPill and is `unavailable` because no local artefact
+    // reports it. Context fullness is computed from provider-reported token
+    // counts against a window resolved from the model id, so it is shown only
+    // when that window is known; every other case is N/A with the reason on
+    // hover, never a number.
+    function contextPill(context) {
+      if (!context) return el('span', {className: 'pill na', text: '—'});
+      if (context.used_percent == null) {
+        const pill = el('span', {className: 'pill na',
+          text: context.used ? 'N/A · ' + short(context.used) : 'N/A'});
+        if (context.detail) pill.title = context.detail;
+        return pill;
+      }
+      const pct = Math.round(context.used_percent);
+      // Only classes this page actually defines: `warn` is the red one here.
+      const cls = pct >= 80 ? 'pill warn' : 'pill rep';
+      const pill = el('span', {className: cls,
+        text: pct + '% · ' + short(context.used) + '/' + short(context.window)});
+      pill.title = context.detail || '';
+      return pill;
+    }
+
+    function quotaPill(window) {
+      const state_ = window.state || (window.observed ? 'provider_reported' : 'unavailable');
+      if (state_ === 'provider_reported') {
+        const pct = window.used_percent == null ? '?' : Math.round(window.used_percent) + '%';
+        let text = 'reported · ' + pct;
+        if (window.resets_at) {
+          const left = Math.max(0, window.resets_at - Date.now() / 1000);
+          text += ' · reset ' + (left > 3600 ? Math.round(left / 3600) + 'h' : Math.round(left / 60) + 'm');
+        }
+        return el('span', {className: 'pill rep', text});
+      }
+      if (state_ === 'locally_estimated') {
+        return el('span', {className: 'pill est', text: 'ƯỚC TÍNH · ' +
+          (window.used_percent == null ? '?' : Math.round(window.used_percent) + '%')});
+      }
+      const pill = el('span', {className: 'pill na', text: 'N/A'});
+      if (window.detail) pill.title = window.detail;
+      return pill;
+    }
+
+    // -- tabs ----------------------------------------------------------------
+    const TABS = {
+      overview: async () => {
+        const [summary, timeline, projects] = await Promise.all([
+          api('summary'), api('timeline', {bucket: bucketFor()}), api('projects', {limit: 5})]);
+        state.data.summary = summary;
+        const box = document.createDocumentFragment();
+        const s = summary.spans || {};
+        box.appendChild(cards([
+          ['Hôm nay (24h)', short(s['24h'] && s['24h'].total_tokens), (s['24h'] ? s['24h'].requests : 0) + ' request'],
+          ['7 ngày', short(s['7d'] && s['7d'].total_tokens), (s['7d'] ? s['7d'].requests : 0) + ' request'],
+          ['30 ngày', short(s['30d'] && s['30d'].total_tokens), (s['30d'] ? s['30d'].requests : 0) + ' request'],
+          ['Chi phí · ' + rangeLabel(), usd(summary.estimated_cost_usd),
+           summary.cost_source ? 'CLI tính, chia theo range' : 'chưa có cost cho range này'],
+          ['Session hoạt động', String(summary.active_sessions_24h || 0), '24 giờ qua'],
+          ['Session tốn nhất', summary.peak_session_24h ? short(summary.peak_session_24h.total) : '—',
+           summary.peak_session_24h ? shortPath(summary.peak_session_24h.project) : ''],
+          ['Project tốn nhất', summary.top_project_24h ? short(summary.top_project_24h.total) : '—',
+           summary.top_project_24h ? shortPath(summary.top_project_24h.project) : ''],
+          ['Quota thấp nhất', lowestQuota(), quotaNote()],
+        ]));
+        box.appendChild(quotaStrip());
+        box.appendChild(chart(timeline.points || []));
+        box.appendChild(table([
+          {title: 'Project', left: true, key: 'project', render: (r) => shortPath(r.project)},
+          {title: 'Sessions', key: 'sessions', render: (r) => fmt(r.sessions)},
+          {title: '24h', key: 'tokens_24h', render: (r) => short(r.tokens_24h)},
+          {title: '7d', key: 'tokens_7d', render: (r) => short(r.tokens_7d)},
+          {title: 'Tổng', key: 'total_tokens', render: (r) => short(r.total_tokens)},
+        ], sorted(projects.items || [], 'tokens_7d').slice(0, 5), {}));
+        return box;
+      },
+
+      prompts: async () => {
+        const data = await api('prompts', {limit: 100});
+        const rows = searchFilter(data.items || [], ['preview', 'project', 'agent_session_id']);
+        return table([
+          {title: 'Prompt', left: true, cls: 'prompt', key: 'preview',
+           render: (r) => r.preview || (r.prompt_id ? '(không có preview)' : 'unassigned')},
+          {title: 'Project', left: true, key: 'project', render: (r) => shortPath(r.project)},
+          {title: 'Model', left: true, key: 'models', render: (r) => r.models || '—'},
+          {title: 'Input', key: 'input_tokens', render: (r) => fmt(r.input_tokens)},
+          {title: 'Output', key: 'output_tokens', render: (r) => fmt(r.output_tokens)},
+          {title: 'Tổng', key: 'total_tokens', render: (r) => fmt(r.total_tokens)},
+          {title: '% tổng', key: 'share_percent', render: (r) => r.share_percent + '%'},
+          {title: 'Turns', key: 'requests', render: (r) => fmt(r.requests)},
+          {title: 'Kéo dài', key: 'duration_seconds',
+           render: (r) => Math.round(r.duration_seconds / 60) + 'm'},
+          {title: 'Khi nào', key: 'last_ts', render: (r) => ago(r.last_ts)},
+        ], sorted(rows, 'total_tokens'), {onClick: (r) => { state.drill = {kind: 'prompt', row: r}; render(); }});
+      },
+
+      sessions: async () => {
+        const data = await api('sessions', {limit: 100});
+        const rows = searchFilter(data.items || [], ['agent_session_id', 'project', 'models']);
+        return table([
+          {title: 'Session', left: true, key: 'agent_session_id',
+           render: (r) => (r.agent_session_id || '').slice(0, 10) + (r.is_subagent ? ' · sub' : '')},
+          {title: 'Node', left: true, key: 'node_id', render: (r) => r.node_id},
+          {title: 'Project', left: true, key: 'project', render: (r) => shortPath(r.project)},
+          {title: 'Model', left: true, key: 'models', render: (r) => r.models || '—'},
+          {title: '5h', key: 'tokens_5h', render: (r) => short(r.tokens_5h)},
+          {title: '24h', key: 'tokens_24h', render: (r) => short(r.tokens_24h)},
+          {title: '7d', key: 'tokens_7d', render: (r) => short(r.tokens_7d)},
+          {title: 'Requests', key: 'requests', render: (r) => fmt(r.requests)},
+          {title: 'TB/req', key: 'avg_tokens_per_request', render: (r) => fmt(r.avg_tokens_per_request)},
+          {title: 'Context', left: true, render: (r) => contextPill(r.context)},
+          {title: 'Chi phí', key: 'estimated_cost_usd', render: (r) => usd(r.estimated_cost_usd)},
+          {title: 'Quota 5h', left: true, render: () => quotaPill(quotaFor('5h') || {})},
+          {title: 'Quota 1w', left: true, render: () => quotaPill(quotaFor('1w') || {})},
+          {title: 'Hoạt động', key: 'last_activity', render: (r) => ago(r.last_activity)},
+        ], sorted(rows, 'tokens_24h'), {onClick: (r) => { state.drill = {kind: 'session', row: r}; render(); }});
+      },
+
+      projects: async () => {
+        const data = await api('projects', {limit: 100});
+        const rows = searchFilter(data.items || [], ['project', 'models']);
+        return table([
+          {title: 'Project', left: true, key: 'project', render: (r) => r.project},
+          {title: 'Sessions', key: 'sessions', render: (r) => fmt(r.sessions)},
+          {title: '24h', key: 'tokens_24h', render: (r) => short(r.tokens_24h)},
+          {title: '7d', key: 'tokens_7d', render: (r) => short(r.tokens_7d)},
+          {title: '30d', key: 'tokens_30d', render: (r) => short(r.tokens_30d)},
+          {title: 'All-time', key: 'total_tokens', render: (r) => short(r.total_tokens)},
+          {title: 'Requests', key: 'requests', render: (r) => fmt(r.requests)},
+          {title: 'Model', left: true, key: 'models', render: (r) => r.models || '—'},
+          {title: 'Trend 7d', key: 'trend_percent',
+           render: (r) => r.trend_percent == null ? '—' : (r.trend_percent > 0 ? '+' : '') + r.trend_percent + '%'},
+          {title: 'Hoạt động', key: 'last_activity', render: (r) => ago(r.last_activity)},
+        ], sorted(rows, 'tokens_7d'), {onClick: (r) => { state.drill = {kind: 'project', row: r}; render(); }});
+      },
+
+      models: async () => {
+        const data = await api('models');
+        return table([
+          {title: 'Provider', left: true, key: 'agent', render: (r) => r.agent},
+          {title: 'Model', left: true, key: 'model', render: (r) => r.model},
+          {title: 'Input', key: 'input_tokens', render: (r) => short(r.input_tokens)},
+          {title: 'Output', key: 'output_tokens', render: (r) => short(r.output_tokens)},
+          {title: 'Cache read', key: 'cache_read_tokens', render: (r) => short(r.cache_read_tokens)},
+          {title: 'Cache write', key: 'cache_write_tokens', render: (r) => short(r.cache_write_tokens)},
+          {title: 'Tổng', key: 'total_tokens', render: (r) => short(r.total_tokens)},
+          {title: 'Share', key: 'share_percent', render: (r) => r.share_percent + '%'},
+          {title: 'Chi phí', key: 'estimated_cost_usd', render: (r) => usd(r.estimated_cost_usd)},
+        ], sorted(data.items || [], 'total_tokens'), {});
+      },
+
+      quota: async () => {
+        const box = document.createDocumentFragment();
+        box.appendChild(quotaStrip());
+        const windows = (state.data.local && state.data.local.quota_windows) || [];
+        const rows = [];
+        for (const agent of ['claude', 'codex']) {
+          for (const label of ['5h', '1w']) {
+            const found = windows.find((w) => w.agent === agent &&
+              (w.window === label || w.label === label));
+            rows.push({agent, window: label, w: found || {state: 'unavailable',
+              detail: 'Không có artifact local nào khai báo cửa sổ này.'}});
+          }
+        }
+        box.appendChild(table([
+          {title: 'Provider', left: true, render: (r) => r.agent},
+          {title: 'Cửa sổ', left: true, render: (r) => r.window},
+          {title: 'Trạng thái', left: true, render: (r) => quotaPill(r.w)},
+          {title: 'Nguồn', left: true, render: (r) => (r.w.source || 'unavailable')},
+          {title: 'Ghi chú', left: true, cls: 'prompt', render: (r) => r.w.detail || '—'},
+        ], rows, {}));
+        const history = await api('quota-history', {limit: 50});
+        const h = el('div', {className: 'drill'});
+        h.appendChild(el('h3', {text: 'Lịch sử quota snapshot'}));
+        h.appendChild(el('div', {className: 'muted',
+          text: (history.items || []).length + ' snapshot đã ghi. Dùng để báo cáo peak/reset về sau.'}));
+        box.appendChild(h);
+        return box;
+      },
+
+      events: async () => {
+        const data = await api('events', {limit: 100});
+        return table([
+          {title: 'Thời điểm', left: true, key: 'ts', render: (r) => new Date(r.ts * 1000).toLocaleString()},
+          {title: 'Session', left: true, key: 'agent_session_id',
+           render: (r) => (r.agent_session_id || '').slice(0, 10)},
+          {title: 'Model', left: true, key: 'model', render: (r) => r.model || '—'},
+          {title: 'Input', key: 'input_tokens', render: (r) => fmt(r.input_tokens)},
+          {title: 'Output', key: 'output_tokens', render: (r) => fmt(r.output_tokens)},
+          {title: 'Cache read', key: 'cache_read_tokens', render: (r) => fmt(r.cache_read_tokens)},
+          {title: 'Cache write', key: 'cache_write_tokens', render: (r) => fmt(r.cache_write_tokens)},
+          {title: 'Nguồn', left: true, key: 'source', render: (r) => r.source},
+        ], sorted(data.items || [], 'ts'), {empty: 'Chưa có event nào trong khoảng đã chọn.'});
+      },
+    };
+
+    function bucketFor() {
+      const range = $('#fRange').value;
+      if (range === '1h' || range === '5h') return 'minute';
+      if (range === '24h' || !range) return 'hour';
+      if (range === '7d') return 'hour';
+      return 'day';
+    }
+    const RANGE_LABEL = {'1h': '1 giờ qua', '5h': '5 giờ qua', '24h': 'Hôm nay',
+                         '7d': '7 ngày', '30d': '30 ngày', '': 'Toàn bộ lịch sử'};
+    function rangeLabel() {
+      const value = $('#fRange').value;
+      return RANGE_LABEL[value] !== undefined ? RANGE_LABEL[value] : 'Khoảng đã chọn';
+    }
+
+    // The two windows a Claude subscription is metered on. Both are ALWAYS
+    // drawn: a missing measurement is itself worth showing, and an absent bar
+    // is indistinguishable from one nobody looked at.
+    const QUOTA_WINDOWS = [
+      {key: '5h', title: 'Claude · cửa sổ 5 giờ'},
+      {key: '1w', title: 'Claude · cửa sổ 1 tuần'},
+    ];
+
+    function quotaFor(key) {
+      const windows = (state.data.local && state.data.local.quota_windows) || [];
+      return windows.find((w) => w.agent === 'claude' &&
+        (w.window === key || w.label === key)) || null;
+    }
+
+    function countdown(at) {
+      const left = Math.max(0, at - Date.now() / 1000);
+      if (left >= 3600) return Math.floor(left / 3600) + 'h' + Math.round((left % 3600) / 60) + 'm';
+      return Math.round(left / 60) + 'm';
+    }
+
+    function quotaCard(spec) {
+      const found = quotaFor(spec.key);
+      const card = el('div', {className: 'qcard'});
+      const head = el('div', {className: 'qhead'});
+      head.appendChild(el('span', {className: 'qwin', text: spec.title}));
+
+      // A provider that reports what is LEFT is converted here, and the
+      // conversion is stated on the card rather than hidden.
+      let used = null, derived = false;
+      if (found && found.used_percent != null) {
+        used = Number(found.used_percent);
+      } else if (found && found.remaining_percent != null) {
+        used = 100 - Number(found.remaining_percent);
+        derived = true;
+      }
+      const observed = used != null && found && found.observed;
+      const estimated = used != null && !observed;
+      const label = observed ? 'REPORTED' : estimated ? 'ƯỚC TÍNH' : 'N/A';
+      head.appendChild(el('span', {
+        className: 'pill ' + (observed ? 'rep' : estimated ? 'est' : 'na'), text: label}));
+      head.appendChild(el('span', {className: 'qpct',
+        text: used == null ? 'N/A' : Math.round(used) + '%'}));
+      card.appendChild(head);
+
+      const track = el('div', {className: 'qtrack' + (used == null ? ' na' : '')});
+      const fill = el('div', {className: 'qfill' +
+        (used >= 90 ? ' crit' : used >= 75 ? ' warn' : '')});
+      if (used != null) fill.style.width = Math.max(0, Math.min(100, used)) + '%';
+      track.appendChild(fill);
+      card.appendChild(track);
+
+      const meta = el('div', {className: 'qmeta'});
+      if (used == null) {
+        meta.appendChild(el('span', {text: (found && found.detail) ||
+          'Claude CLI không ghi quota vào state local trên máy này.'}));
+      } else {
+        meta.appendChild(el('span', {text: 'đã dùng ' + Math.round(used) + '% · còn ' +
+          Math.round(100 - used) + '%' + (derived ? ' (quy đổi: 100 − remaining)' : '')}));
+        meta.appendChild(el('span', {text: (found && found.resets_at)
+          ? 'reset sau ' + countdown(found.resets_at) : 'reset: không rõ'}));
+      }
+      meta.appendChild(el('span', {text: 'nguồn: ' + ((found && found.source) || 'unavailable')}));
+      card.appendChild(meta);
+      return card;
+    }
+
+    function quotaStrip() {
+      const grid = el('div', {className: 'qgrid'});
+      for (const spec of QUOTA_WINDOWS) grid.appendChild(quotaCard(spec));
+      return grid;
+    }
+    function lowestQuota() {
+      const windows = ((state.data.local && state.data.local.quota_windows) || [])
+        .filter((w) => w.observed && w.used_percent != null);
+      if (!windows.length) return 'N/A';
+      const worst = windows.reduce((a, b) => (a.used_percent > b.used_percent ? a : b));
+      return Math.round(100 - worst.used_percent) + '% còn';
+    }
+    function quotaNote() {
+      const windows = (state.data.local && state.data.local.quota_windows) || [];
+      return windows.some((w) => w.observed) ? 'provider reported' : 'không provider nào báo';
+    }
+
+    function drillPanel() {
+      if (!state.drill) return null;
+      const box = el('div', {className: 'drill'});
+      const row = state.drill.row;
+      const head = el('h3', {text: 'Chi tiết · ' + state.drill.kind});
+      const close = el('button', {className: 'btn', text: '✕'});
+      close.style.float = 'right';
+      close.onclick = () => { state.drill = null; render(); };
+      box.append(close, head);
+      const kv = el('div', {className: 'kv'});
+      const fields = state.drill.kind === 'prompt'
+        ? [['prompt_id', row.prompt_id], ['session', row.agent_session_id], ['project', row.project],
+           ['branch', row.git_branch], ['models', row.models], ['turns', fmt(row.requests)],
+           ['input', fmt(row.input_tokens)], ['output', fmt(row.output_tokens)],
+           ['cache read', fmt(row.cache_read_tokens)], ['cache write', fmt(row.cache_write_tokens)],
+           ['tổng', fmt(row.total_tokens)], ['% tổng', row.share_percent + '%'],
+           ['hash', row.text_hash], ['độ dài prompt', fmt(row.char_length) + ' ký tự'],
+           ['preview', row.preview || '—']]
+        : state.drill.kind === 'session'
+        ? [['session', row.agent_session_id], ['node', row.node_id], ['project', row.project],
+           ['models', row.models], ['subagent', row.is_subagent ? 'yes' : 'no'],
+           ['requests', fmt(row.requests)], ['5h', fmt(row.tokens_5h)], ['24h', fmt(row.tokens_24h)],
+           ['7d', fmt(row.tokens_7d)], ['30d', fmt(row.tokens_30d)],
+           ['tổng', fmt(row.total_tokens)], ['chi phí', usd(row.estimated_cost_usd)]]
+        : [['project', row.project], ['sessions', fmt(row.sessions)], ['models', row.models],
+           ['24h', fmt(row.tokens_24h)], ['7d', fmt(row.tokens_7d)], ['30d', fmt(row.tokens_30d)],
+           ['all-time', fmt(row.total_tokens)], ['requests', fmt(row.requests)],
+           ['trend 7d', row.trend_percent == null ? '—' : row.trend_percent + '%']];
+      for (const [k, v] of fields) {
+        kv.append(el('b', {text: k}), el('span', {text: v == null ? '—' : String(v)}));
+      }
+      box.appendChild(kv);
+      if (state.drill.kind === 'project') {
+        const go = el('button', {className: 'btn', text: '→ Xem sessions của project này'});
+        go.onclick = () => {
+          $('#fProject').value = row.project;
+          state.drill = null; state.tab = 'sessions'; render();
+        };
+        box.appendChild(go);
+      }
+      return box;
+    }
+
+    async function render() {
+      syncUrl();
+      for (const btn of document.querySelectorAll('nav button'))
+        btn.classList.toggle('active', btn.dataset.tab === state.tab);
+      const view = $('#view');
+      view.replaceChildren();
+      const drill = drillPanel();
+      if (drill) view.appendChild(drill);
+      try {
+        const content = await TABS[state.tab]();
+        view.appendChild(content);
+      } catch (err) {
+        view.appendChild(el('div', {className: 'empty', text: 'Không tải được: ' + err.message}));
+      }
+    }
+
+    async function loadBase(force) {
+      try {
+        const response = await fetch('/dashboard/api/ai-usage/local' + (force ? '?refresh=1' : ''),
+                                     {cache: 'no-store'});
+        state.data.local = await response.json();
+        const src = state.data.local.sources || {};
+        $('#sourceLine').textContent = 'Claude: ' + (src.claude ? src.claude.status : '?') +
+                                       ' · Codex: ' + (src.codex ? src.codex.status : '?');
+        const notes = [state.data.local.window ? state.data.local.window.note : ''];
+        for (const w of state.data.local.quota_windows || [])
+          if (!w.observed && w.detail) notes.push(w.agent + ': ' + w.detail);
+        $('#provenance').textContent = notes.filter(Boolean).join('  •  ');
+        // Fill the filter selects from the sessions actually present.
+        const rows = state.data.local.sessions || [];
+        for (const [sel, key] of [['#fNode', 'node_id'], ['#fAgent', 'agent'],
+                                  ['#fProject', 'project'], ['#fModel', 'model']]) {
+          const el_ = $(sel), keep = el_.value;
+          const values = [...new Set(rows.map((r) => r[key]).filter(Boolean))].sort();
+          const first = el_.firstElementChild;
+          el_.replaceChildren(first);
+          for (const v of values) {
+            const opt = document.createElement('option');
+            opt.value = v; opt.textContent = key === 'project' ? shortPath(v) : v;
+            el_.appendChild(opt);
+          }
+          el_.value = values.includes(keep) ? keep : '';
+        }
+      } catch (err) {
+        $('#sourceLine').textContent = 'Không tải được nguồn: ' + err.message;
+      }
+    }
+
+    for (const btn of document.querySelectorAll('nav button'))
+      btn.onclick = () => { state.tab = btn.dataset.tab; state.drill = null; render(); };
+    function syncChips() {
+      for (const chip of document.querySelectorAll('#rangeChips .chip'))
+        chip.classList.toggle('on', chip.dataset.range === $('#fRange').value);
+    }
+    for (const sel of ['#fRange', '#fNode', '#fAgent', '#fProject', '#fModel'])
+      $(sel).onchange = () => { syncChips(); render(); };
+    for (const chip of document.querySelectorAll('#rangeChips .chip'))
+      chip.onclick = () => { $('#fRange').value = chip.dataset.range; syncChips(); render(); };
+    $('#fSearch').oninput = () => render();
+    $('#refreshBtn').onclick = async () => { await loadBase(true); render(); };
+
+    readUrl();
+    syncChips();
+    loadBase(true).then(render);
+    setInterval(async () => {
+      if ($('#autoRefresh').checked) { await loadBase(true); render(); }
+    }, 60000);
+  </script>
+</body>
+</html>
+"""
+
+
 GLOBAL_TASKS_HTML = """<!doctype html>
 <html lang="vi">
 <head>
@@ -5685,6 +10947,13 @@ GLOBAL_TASKS_HTML = """<!doctype html>
     document.querySelector('#refreshBtn').onclick = load;
     sessionFilterEl.addEventListener('input', () => renderBoard(lastData));
 
+    let ntRequestKey = null;
+    function newRequestKey() {
+      // crypto.randomUUID is not available on every browser/origin this
+      // dashboard is opened from, so fall back rather than throw.
+      if (window.crypto && window.crypto.randomUUID) return 'dash-' + window.crypto.randomUUID();
+      return 'dash-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    }
     const newTaskPanelEl = document.querySelector('#newTaskPanel');
     document.querySelector('#newTaskBtn').onclick = () => { newTaskPanelEl.hidden = false; document.querySelector('#ntTitle').focus(); };
     document.querySelector('#ntCancelBtn').onclick = () => { newTaskPanelEl.hidden = true; };
@@ -5696,17 +10965,34 @@ GLOBAL_TASKS_HTML = """<!doctype html>
       const errEl = document.querySelector('#ntError');
       if (!prompt) { errEl.textContent = 'Prompt là bắt buộc.'; return; }
       errEl.textContent = '';
+      const btn = document.querySelector('#ntSubmitBtn');
+      if (btn.disabled) return;          // a second click of one submission
+      // One key per SUBMISSION, not per click and not per page load. It
+      // survives every retry of this submission -- including a reconnect --
+      // and is cleared only once the server has accepted it, so the next
+      // real submission is a new request rather than a replay of this one.
+      if (!ntRequestKey) ntRequestKey = newRequestKey();
+      btn.disabled = true;
       try {
         const result = await fetchJSON('/dashboard/api/tasks/create', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({title, prompt, session, project}),
+          body: JSON.stringify({title, prompt, session, project, request_key: ntRequestKey}),
         });
         if (result && result.error) { errEl.textContent = clean(result.error); return; }
+        if (result && result.payload_conflict) {
+          errEl.textContent = clean(result.conflict_detail || 'request_key conflict');
+          return;
+        }
+        ntRequestKey = null;             // accepted -- the next submit is new
         document.querySelector('#ntTitle').value = ''; document.querySelector('#ntPrompt').value = '';
         document.querySelector('#ntSession').value = ''; document.querySelector('#ntProject').value = '';
         newTaskPanelEl.hidden = true;
         await load();
-      } catch (error) { errEl.textContent = clean(error.message || error); }
+      } catch (error) {
+        // Keep ntRequestKey: this submission is unfinished, and the retry
+        // must be the SAME request, not a second one.
+        errEl.textContent = clean(error.message || error);
+      } finally { btn.disabled = false; }
     };
 
     load(); setInterval(load, 4000);
@@ -7023,11 +12309,24 @@ loadFacets().then(() => load(false));
 """
 
 
+# One shared grouping implementation, injected into every page that lists
+# sessions. Done here, once, rather than per-template so a page can never
+# silently ship without it (a missing marker would leave its own group calls
+# undefined at load time, which the template tests below assert against).
+for _page_name in ("DASHBOARD_HTML", "SESSIONS_ADMIN_HTML"):
+    _page = globals()[_page_name]
+    if "/*__NODE_GROUP_JS__*/" not in _page:
+        raise AssertionError(f"{_page_name} lost its /*__NODE_GROUP_JS__*/ marker")
+    globals()[_page_name] = _page.replace("/*__NODE_GROUP_JS__*/", NODE_GROUP_JS, 1)
+del _page_name, _page
+
+
 def register_dashboard(server: MCPServer, terminal: TerminalService,
                        supervisor: SupervisorService | None = None,
                        supervisor_v2: SupervisorV2Service | None = None,
                        controller: ControllerService | None = None,
                        connection_store: ConnectionStore | None = None,
+                       fleet: "FleetService | None" = None,
                        queue: QueueService | None = None,
                        integration: IntegrationService | None = None,
                        pm: PMService | None = None,
@@ -7035,6 +12334,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        ai_usage: AiUsageService | None = None,
                        recovery: RecoveryEngine | None = None,
                        backlog: BacklogService | None = None,
+                       onboarding: "OnboardingService | None" = None,
+                       credentials: "node_credentials.NodeCredentialStore | None" = None,
+                       rotation: "TokenRotationService | None" = None,
                        notes: NotesService | None = None,
                        webauth: WebAuthStore | None = None) -> None:
     if supervisor is None:
@@ -7062,8 +12364,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # write into the real ~/.local/state/terminal-mcp/connections.db).
         # server_http.py's real main() always passes an explicit,
         # persistent ConnectionStore instead of relying on this fallback.
-        import tempfile
-        connection_store = ConnectionStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-connections-")) / "connections.db")
+        connection_store = ConnectionStore(ephemeral_db_path("connections", "connections.db"))
     if queue is None:
         # SAME private-temp-file discipline as connection_store's own
         # default just above: every EXISTING caller of register_dashboard
@@ -7075,12 +12376,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # Dashboard Task Manager's rename/task routes and the MCP
         # terminal_queue_*/terminal_task_* tool surface share one real,
         # persistent store -- never two independently-drifting ones.
-        import tempfile
-        queue = QueueService(QueueStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-queue-")) / "queue.db"))
+        queue = QueueService(QueueStore(ephemeral_db_path("queue", "queue.db")))
     if integration is None:
-        import tempfile
         integration = IntegrationService(IntegrationStore(
-            Path(tempfile.mkdtemp(prefix="terminal-mcp-integration-")) / "integration.db"))
+            ephemeral_db_path("integration", "integration.db")))
     if ai_usage is None:
         # No persistent store at all (in-memory cache only) -- no
         # private-temp-file discipline needed, unlike queue/integration
@@ -7106,20 +12405,17 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # instance) and passes it here so the Kanban board's own
         # routing_reason display and the MCP terminal_pm_* tool surface
         # read/write the exact same store.
-        import tempfile
-
         def _local_permission_checker(node_id: str, session: str) -> bool:
             if node_id != controller.local_node_id:
                 return True
             authorized, _reason = terminal._input_authorized(session)
             return authorized
 
-        pm = PMService(PMStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-pm-")) / "pm.db"), queue, controller,
+        pm = PMService(PMStore(ephemeral_db_path("pm", "pm.db")), queue, controller,
                        permission_checker=_local_permission_checker)
     if planner is None:
-        import tempfile
         planner = PlannerService(
-            PlannerStore(Path(tempfile.mkdtemp(prefix="terminal-mcp-planner-")) / "planner.db"), queue)
+            PlannerStore(ephemeral_db_path("planner", "planner.db")), queue)
     if notes is None and terminal.config.notes.enabled:
         # SAME private-temp-file discipline as queue/integration/pm/planner
         # above -- and here it covers a DIRECTORY too, not just a db: a
@@ -7129,8 +12425,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # NotesService and passes the SAME instance to both build_mcp and
         # register_dashboard, so the /dashboard/notes page and the note_*
         # MCP tools read and write one store.
-        import tempfile
-        notes_root = Path(tempfile.mkdtemp(prefix="terminal-mcp-notes-"))
+        notes_root = ephemeral_state_dir("notes")
         notes = NotesService(NotesStore(notes_root / "notes.db"),
                              attachments_dir=notes_root / "attachments")
     discovery_config = terminal.config.nodes.discovery
@@ -7141,6 +12436,76 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     )
     host_key_store = remote_connect.HostKeyStore()
     ssh_known_hosts_dir = connection_store.path.parent / "ssh_known_hosts"
+    # Versioned/revocable node credentials (blg_a3cc401d8275). Same
+    # private-temp-file discipline as every other store default here:
+    # server_http.py's real main() passes a persistent one.
+    if credentials is None:
+        credentials = node_credentials.NodeCredentialStore(
+            ephemeral_db_path("credentials", "node-credentials.db"))
+    if rotation is None:
+        def _apply_outbound_token(node_id: str, token: str | None) -> None:
+            """The controller's outbound half of a rotation, in one place.
+
+            A controller presents a node token from three places -- the
+            0600 token file, the per-node env var and the live
+            RemoteNodeClient -- and all three must move together or the
+            next call out picks up whichever one lagged. `None` clears
+            all three, which is what revocation means in this direction.
+            """
+            if token:
+                connection = connection_store.get(node_id)
+                if connection is not None:
+                    token_file = connection_store.write_token(node_id, token)
+                    connection_store.save(node_id, transport_type=connection.transport_type,
+                                          endpoint=connection.endpoint, hostname=connection.hostname,
+                                          username=connection.username, port=connection.port,
+                                          host_key_fingerprint=connection.host_key_fingerprint,
+                                          token_file=token_file)
+                os.environ[node_token_env_var(node_id)] = token
+            else:
+                os.environ.pop(node_token_env_var(node_id), None)
+            if controller is not None:
+                controller.update_remote_token(node_id, token)
+
+        rotation = TokenRotationService(credentials, connection_store=connection_store,
+                                        audit=terminal.audit, apply_outbound=_apply_outbound_token)
+
+    def _manage_node_token(node_id: str, token: str) -> None:
+        """Every place a node GETS its token routes through here.
+
+        Setting the env var is what makes the node's next heartbeat
+        verify (see node_token_env_var); adopting it is what makes that
+        credential rotatable and revocable from day one, instead of
+        leaving each new node to be adopted by hand later. Adoption is
+        best-effort on purpose: a node that enrolled successfully must
+        not be turned away because the credential ledger was
+        unwritable -- it stays on the legacy path, which still works.
+        """
+        os.environ[node_token_env_var(node_id)] = token
+        try:
+            credentials.adopt(node_id, token)
+        except Exception:  # noqa: BLE001
+            _log.exception("could not record node %s's token for rotation -- "
+                           "it will authenticate via the legacy env var", node_id)
+    if onboarding is None:
+        # SAME private-temp-file discipline as connection_store/queue/pm
+        # above: an ad-hoc caller (every test that does not pass one)
+        # must never write enrollment codes or rescue port allocations
+        # into the real ~/.local/state/terminal-mcp databases.
+        # server_http.py's real main() always passes an explicit,
+        # persistent OnboardingService.
+        _onboard_dir = ephemeral_state_dir("onboard")
+        onboarding = OnboardingService(
+            terminal.config, controller=controller, connection_store=connection_store,
+            enrollment_store=EnrollmentStore(_onboard_dir / "enrollment.db"),
+            transport_store=TransportStore(_onboard_dir / "transports.db"),
+            port_allocator=RescuePortAllocator(
+                _onboard_dir / "rescue.db",
+                port_range=(terminal.config.nodes.onboarding.rescue.port_range_start,
+                            terminal.config.nodes.onboarding.rescue.port_range_end)),
+            audit=terminal.audit,
+            token_env_setter=_manage_node_token,
+        )
 
     def _origin_allowed(request: Request) -> bool:
         # CSRF defense (P1 hardening item #3), always on, no config
@@ -7186,6 +12551,16 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                                 headers={"Cache-Control": "no-store"}), None
         return None, identity
 
+    def _queue_store_for_worktrees():
+        """The SAME QueueStore the queue uses -- the cleanup record lives on the
+        task's own metadata, so a second store would write to a different file
+        and the review would appear to do nothing."""
+        from .queue_store import QueueStore
+
+        if queue is not None and getattr(queue, "store", None) is not None:
+            return queue.store
+        return QueueStore()
+
     def _mutation_guard(request: Request):
         """Independent boundary in front of every dashboard POST route
         (session input, supervisor ack, supervisor2 pause) -- checked
@@ -7205,6 +12580,14 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "ORIGIN_NOT_ALLOWED"}, status_code=403,
                                 headers={"Cache-Control": "no-store"}), None
         return _cloudflare_access_guard(request)
+
+    def _node_of(qualified: str | None) -> str | None:
+        """The node half of a `node/session` qualified name, for the audit's
+        own node_id column -- so "what happened on hp-linux" is a filter
+        rather than a string search."""
+        if not qualified or "/" not in str(qualified):
+            return None
+        return str(qualified).split("/", 1)[0] or None
 
     def _read_guard(request: Request):
         """P0 audit re-pass finding: GET/read routes (the dashboard page
@@ -7285,6 +12668,1073 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             NODES_ADMIN_HTML,
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
+
+    # One fan-out per TTL window, shared by every open wall. Twenty sessions
+    # cost ~20 node round-trips; without this, three open tabs would triple
+    # that every few seconds for data that has not changed.
+    # Fleet Metadata Registry. Same private-temp-file discipline as
+    # connection_store above: a test caller of register_dashboard must never
+    # write into the real ~/.local/state/terminal-mcp/fleet_registry.db.
+    # server_http.py's main() passes the persistent one.
+    if fleet is None:
+        from .fleet_registry import FleetRegistryStore as _FleetStore
+        from .fleet_service import FleetService as _FleetService
+
+        fleet = _FleetService(
+            _FleetStore(ephemeral_db_path("fleet", "fleet.db"),
+                        local_node_id=controller.local_node_id),
+            local_node_id=controller.local_node_id)
+    _fleet_sync = ControllerFleetSync(fleet, controller)
+
+    def _fleet_sources() -> dict[str, Any]:
+        """The local truth the projectors read. Each source is optional and
+        failure-tolerant: a fleet view missing its SSH half is still worth
+        serving, and is far better than a 500 on the page an operator opens
+        precisely because something is already wrong."""
+        sessions: list[Any] = []
+        connections: list[Any] = []
+        try:
+            sessions = list(terminal.session_registry.list())
+        except Exception:  # noqa: BLE001
+            _log.exception("fleet: session registry unreadable")
+        try:
+            connections = list(connection_store.list())
+        except Exception:  # noqa: BLE001
+            _log.exception("fleet: connection store unreadable")
+        return {"sessions": sessions, "connections": connections}
+
+    @server.custom_route("/dashboard/fleet", methods=["GET"], include_in_schema=False)
+    async def dashboard_fleet_page(request: Request) -> HTMLResponse | JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(FLEET_HTML,
+                            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
+
+    def _role(identity) -> str:
+        """Which role this request reads as.
+
+        Access-not-configured is OPERATOR, not anonymous: the deployment has
+        then chosen edge protection, and treating it as anonymous would lock
+        every self-hosted operator out of their own audit log -- the exact
+        over-restriction this pass was called to fix. A configured-but-
+        unverified request never reaches here; the guard already refused it.
+        """
+        configured = bool(terminal.config.dashboard.cloudflare_access_team_domain
+                          and terminal.config.dashboard.cloudflare_access_audience)
+        return role_for_identity(identity, access_configured=configured)
+
+    @server.custom_route("/dashboard/audit", methods=["GET"], include_in_schema=False)
+    async def dashboard_audit_page(request: Request) -> HTMLResponse | JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(AUDIT_HTML, headers={"Cache-Control": "no-store",
+                                                 "X-Frame-Options": "DENY"})
+
+    @server.custom_route("/dashboard/api/audit", methods=["GET"], include_in_schema=False)
+    async def dashboard_audit(request: Request) -> JSONResponse:
+        """The operational audit log, filterable.
+
+        This route is the substance of the 2026-09-12 permission audit: the
+        log had no HTTP surface at all, which is indistinguishable from a
+        deny-all rule from the outside and gets "fixed" by someone turning
+        off something that mattered.
+
+        Every field returned passes access_policy.may_read for the caller's
+        role, so SECRET fields cannot appear even if a future column is added
+        without anyone remembering to classify it -- an unknown
+        credential-shaped name defaults to SECRET.
+        """
+        blocked, identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        role = _role(identity)
+        params = request.query_params
+
+        def _int(name: str, default: int) -> int:
+            try:
+                return int(params.get(name, default))
+            except (TypeError, ValueError):
+                return default
+
+        def _build() -> dict[str, Any]:
+            found = terminal.audit.search(
+                limit=_int("limit", 100), offset=_int("offset", 0),
+                session=params.get("session"), actor=params.get("actor"),
+                action=params.get("action"), result=params.get("result"),
+                node_id=params.get("node"), binding=params.get("binding"),
+                since=params.get("since"), until=params.get("until"),
+                query=params.get("q"), denied_only=params.get("denied") == "1")
+            found["events"] = [filter_record(event, role=role) for event in found["events"]]
+            found["role"] = role
+            found["filters"] = {name: terminal.audit.distinct_values(name)
+                                for name in ("actor", "action", "result", "node_id")}
+            return found
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001 -- an audit screen never 5xxs
+            payload = {"error": "AUDIT_READ_FAILED", "detail": str(exc), "events": []}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/audit/export", methods=["GET"], include_in_schema=False)
+    async def dashboard_audit_export(request: Request) -> Response:
+        """The same rows as CSV, through the same filter and the same policy.
+
+        Sharing `search` + `filter_record` with the JSON route is the point:
+        an export that built its own row shape is how a redaction rule gets
+        applied in one place and forgotten in the other.
+        """
+        blocked, identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        role = _role(identity)
+        params = request.query_params
+
+        def _build() -> str:
+            import csv
+            import io
+
+            found = terminal.audit.search(
+                limit=min(int(params.get("limit", 1000) or 1000), 1000),
+                session=params.get("session"), actor=params.get("actor"),
+                action=params.get("action"), result=params.get("result"),
+                node_id=params.get("node"), since=params.get("since"),
+                until=params.get("until"), query=params.get("q"),
+                denied_only=params.get("denied") == "1")
+            rows = [filter_record(event, role=role) for event in found["events"]]
+            columns = ["timestamp", "actor", "action", "session", "node_id", "result",
+                       "reason", "policy_source", "policy_version", "latency_ms",
+                       "correlation_id", "source_transport", "server_version",
+                       "text_sha256", "text_length", "preview"]
+            buffer = io.StringIO()
+            writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key) for key in columns})
+            return buffer.getvalue()
+
+        body = await anyio.to_thread.run_sync(_build)
+        return Response(body, media_type="text/csv",
+                        headers={"Cache-Control": "no-store",
+                                 "Content-Disposition": 'attachment; filename="audit.csv"'})
+
+    @server.custom_route("/dashboard/api/auth-status", methods=["GET"], include_in_schema=False)
+    async def dashboard_auth_status(request: Request) -> JSONResponse:
+        """Which node/provider is authenticated, and which needs a human.
+
+        Status ONLY, and that is not a compromise -- it is the whole design:
+        node_profile probes existence and readiness without opening a
+        credential file, so there is nothing here that could be replayed even
+        if this route were left open. What an operator gets is exactly what
+        they need: who is logged in, who is NOT, since when, and the one-time
+        command to fix it.
+        """
+        blocked, identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        role = _role(identity)
+
+        def _build() -> dict[str, Any]:
+            nodes: list[dict[str, Any]] = []
+            view = fleet.offline_view()
+            ssh_by_node: dict[str, list[dict[str, Any]]] = {}
+            for target in view.get("ssh_targets", []):
+                if target.get("node_id"):
+                    ssh_by_node.setdefault(target["node_id"], []).append(target)
+            for node in view.get("nodes", []):
+                node_id = node.get("node_id")
+                routes = ssh_by_node.get(node_id, [])
+                nodes.append(filter_record({
+                    "node_id": node_id,
+                    "display_name": node.get("display_name"),
+                    "auth_status": auth_status_for_node(node)[0],
+                    "auth_status_reason": auth_status_for_node(node)[1],
+                    "auth_source": "node_agent_bearer_token",
+                    # The NAME of the variable the owning machine reads its
+                    # token from. Never the value -- see fleet_registry's
+                    # scrub_payload, which refuses rather than strips.
+                    "auth_token_ref": node.get("auth_token_ref"),
+                    "capability": sorted(node.get("capabilities") or []),
+                    "contract_version": node.get("contract_version"),
+                    "agent_version": node.get("agent_version"),
+                    "last_verified_at": node.get("last_heartbeat_at"),
+                    "metadata_age_seconds": node.get("metadata_age_seconds"),
+                    "ssh_routes": [{
+                        "alias": route.get("alias"),
+                        "transport": route.get("transport"),
+                        "auth_status": route.get("credential_status"),
+                        "host_key_fingerprint": route.get("host_key_fingerprint"),
+                        "last_verified_at": route.get("last_verified_at"),
+                    } for route in routes],
+                }, role=role))
+            return {"role": role, "nodes": nodes,
+                    "readiness": fleet.readiness(),
+                    "policy": policy_table()}
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001
+            payload = {"error": "AUTH_STATUS_FAILED", "detail": str(exc), "nodes": []}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/access-policy", methods=["GET"], include_in_schema=False)
+    async def dashboard_access_policy(request: Request) -> JSONResponse:
+        """The policy table itself.
+
+        Served so an operator can read the rules rather than infer them from
+        what happens to be missing -- which is how a missing surface gets
+        mistaken for a security decision.
+        """
+        blocked, identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return JSONResponse({"role": _role(identity), "tiers": policy_table()},
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/fleet", methods=["GET"], include_in_schema=False)
+    async def dashboard_fleet(request: Request) -> JSONResponse:
+        """The whole replicated fleet, read from the LOCAL cache.
+
+        Deliberately does not contact any node: this is the same answer a
+        surviving node gives when the controller is gone, so the page an
+        operator opens during an outage behaves identically to the one they
+        already know.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        if request.query_params.get("refresh") == "1":
+            sources = await anyio.to_thread.run_sync(_fleet_sources)
+            await anyio.to_thread.run_sync(
+                lambda: fleet.refresh_local(nodes=controller.list_nodes(),
+                                            sessions=sources["sessions"],
+                                            connections=sources["connections"]))
+        return JSONResponse(await anyio.to_thread.run_sync(fleet.offline_view),
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/fleet/ssh", methods=["GET"], include_in_schema=False)
+    async def dashboard_fleet_ssh(request: Request) -> JSONResponse:
+        """SSH inventory: addresses, transports, fingerprints and credential
+        POSTURE. No key, no password, no token -- see fleet_registry's
+        scrub_payload, which refuses rather than strips."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return JSONResponse({"targets": await anyio.to_thread.run_sync(fleet.ssh_inventory)},
+                            headers={"Cache-Control": "no-store"})
+
+    def _deployment_service():
+        """Deployment targets/paths live in the SAME fleet store -- two more
+        replicated kinds, not a second registry."""
+        from .deployment_service import DeploymentRegistry, DeploymentService
+
+        view = fleet.offline_view()
+        online = {n["node_id"]: str(n.get("status") or "").casefold() != "offline"
+                  for n in view["nodes"] if n.get("node_id")}
+        aliases: dict[str, set[str]] = {}
+        for node in view["nodes"]:
+            node_id = node.get("node_id")
+            if not node_id:
+                continue
+            aliases[node_id] = {str(v) for v in (node.get("lan_ip"), node.get("tailscale_ip"),
+                                                 node.get("tailscale_hostname"),
+                                                 node.get("hostname")) if v}
+        for target in view["ssh_targets"]:
+            if target.get("node_id") and target.get("host"):
+                aliases.setdefault(target["node_id"], set()).add(str(target["host"]))
+        return DeploymentService(
+            DeploymentRegistry(fleet.store, local_node_id=fleet.local_node_id),
+            locks=terminal.leases if hasattr(terminal, "leases") else None,
+            node_online=lambda: online, node_aliases=lambda: aliases)
+
+    def _work_service():
+        """One WorkService over the same queue every other surface uses."""
+        from .work_service import WorkService
+        from .work_store import WorkStore
+
+        if _work_holder.get("service") is None:
+            _work_holder["service"] = WorkService(WorkStore(), queue=queue,
+                                                  controller=controller, fleet=fleet)
+        return _work_holder["service"]
+
+    @server.custom_route("/dashboard/api/work", methods=["GET"], include_in_schema=False)
+    async def dashboard_work_list(request: Request) -> JSONResponse:
+        """Work runs, or one run in full when `?work=` is given.
+
+        Read-only. Creating and controlling work are POSTs below, and they
+        are separate routes so a read cannot be confused for an action.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        work_id = request.query_params.get("work")
+
+        def _build() -> dict[str, Any]:
+            service = _work_service()
+            if work_id:
+                return service.status(work_id)
+            return service.list_runs(
+                include_terminal=request.query_params.get("finished") == "1")
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001 -- a status screen never 5xxs
+            payload = {"error": "WORK_READ_FAILED", "detail": str(exc), "works": []}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/work/workers", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_work_workers(request: Request) -> JSONResponse:
+        """The `-work` sessions the runtime may drive, and nothing else.
+
+        An ordinary session must never appear in this list even as a rejected
+        candidate: the UI labels it "Workers", and a human seeing their own
+        terminal there would reasonably conclude the runtime had taken it
+        over. Rejected `-work` sessions DO stay, with the reason -- those are
+        workers, and "why is mine not being used" is the question this
+        answers.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+
+        def _build() -> dict[str, Any]:
+            try:
+                listing = controller.terminal_list_sessions()
+            except Exception as exc:  # noqa: BLE001
+                return {"workers": [], "error": "SESSION_LISTING_UNAVAILABLE",
+                        "detail": str(exc)}
+            nodes = {}
+            if fleet is not None:
+                try:
+                    nodes = {n["node_id"]: n for n in fleet.offline_view()["nodes"]
+                             if n.get("node_id")}
+                except Exception:  # noqa: BLE001 -- freshness is a bonus here
+                    nodes = {}
+            from .work_eligibility import is_work_session
+
+            rows = listing.get("sessions") or []
+            # Occupancy has to be fetched, not inferred: neither session
+            # listing carries current_command, so without this every worker
+            # running an agent looked IDLE and the queue would happily
+            # dispatch on top of a live conversation. Only `-work` sessions
+            # are probed -- there are few of them, and an ordinary session is
+            # none of this list's business.
+            statuses: dict[str, Any] = {}
+            for row in rows:
+                name = row.get("name")
+                if not name or not is_work_session(name):
+                    continue
+                try:
+                    statuses[name] = controller.terminal_input_context(name)
+                except Exception:  # noqa: BLE001 -- occupancy is best-effort
+                    continue
+            return _work_service().workers(sessions=rows, nodes=nodes, statuses=statuses)
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001
+            payload = {"workers": [], "error": "WORKERS_READ_FAILED", "detail": str(exc)}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    def _inbox_service():
+        from .work_inbox import InboxService, InboxStore
+
+        if "inbox" not in _work_holder:
+            _work_holder["inbox"] = InboxService(InboxStore())
+        return _work_holder["inbox"]
+
+    @server.custom_route("/dashboard/api/inbox", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_inbox(request: Request) -> JSONResponse:
+        """Captured issues and their state counts.
+
+        Counts come from the persisted issue store, never from a Claude
+        prompt buffer -- a queue that only exists in a transport is exactly
+        what made the Tasks modal read zero while work was in flight.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        state = request.query_params.get("state") or ""
+        project = request.query_params.get("project") or ""
+        try:
+            limit = max(1, min(int(request.query_params.get("limit") or 100), 300))
+        except ValueError:
+            limit = 100
+
+        def _build() -> dict[str, Any]:
+            service = _inbox_service()
+            issues = service.store.list_issues(state=state or None,
+                                               project=project or None, limit=limit)
+            return {"summary": service.summary(),
+                    "issues": [{"issue_id": i.issue_id, "title": i.short_title,
+                                "state": i.state, "type": i.rough_type,
+                                "difficulty": i.rough_difficulty, "priority": i.priority,
+                                "project": i.project, "module": i.likely_module,
+                                "duplicate_of": i.duplicate_of, "claimed_by": i.claimed_by,
+                                "queue_task_id": i.queue_task_id,
+                                "questions": list(i.questions),
+                                "human_hints": list(i.human_hints),
+                                "created_at": i.created_at, "updated_at": i.updated_at}
+                               for i in issues]}
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001 -- a status screen never 5xxs
+            payload = {"error": "INBOX_READ_FAILED", "detail": str(exc),
+                       "issues": [], "summary": {}}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/worktrees", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_worktrees(request: Request) -> JSONResponse:
+        """The Worktree Janitor panel's data (docs/WORKTREE_JANITOR.md, P5).
+
+        READ-ONLY. Classifies with the same engine the executor uses and
+        summarises it for a human: reclaimable bytes by class, BLOCKED reasons
+        in plain language, the oldest candidate, and whether anything is
+        actually enforcing.
+
+        Only PATHS are ever reported for sensitive ignored files -- naming the
+        file is what makes a refusal actionable, and printing a line of it would
+        put the secret on a dashboard."""
+        from . import worktree_janitor, worktree_review
+
+        config = terminal.config.worktree_janitor
+        repo_path = (request.query_params.get("repo_path") or "").strip()
+        roots = [repo_path] if repo_path else list(config.repo_roots)
+        if not roots:
+            return JSONResponse(
+                {"error": "NO_REPO_ROOTS",
+                 "detail": "configure worktree_janitor.repo_roots, or pass repo_path",
+                 "mode": config.mode, "observe_only": config.mode != "auto_execute",
+                 "candidates": [], "counts": {}},
+                headers={"Cache-Control": "no-store"})
+
+        def _collect() -> list[dict]:
+            found: list[dict] = []
+            for root in roots:
+                report = worktree_janitor.scan(root, config.to_policy())
+                found.extend(report.get("candidates") or [])
+            return found
+
+        candidates = await anyio.to_thread.run_sync(_collect)
+        payload = worktree_review.build_report(candidates, mode=config.mode)
+        payload["repo_roots"] = roots
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/worktrees/review", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_worktrees_review(request: Request) -> JSONResponse:
+        """Record an operator decision on one review-queue item.
+
+        `decision` is approve or abandon, and NOTHING else -- there is
+        deliberately no force/delete-now option on this route, so no UI can
+        offer one. Approve moves the item to CLEANUP_ELIGIBLE, which the
+        executor re-checks with fresh evidence before removing anything; a human
+        cannot approve past a predicate. Abandon stops it being re-proposed.
+
+        Mutation-guarded exactly like every sibling POST route (auth + CSRF)."""
+        from . import worktree_review
+
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        task_id = str(body.get("task_id") or "").strip()
+        decision = str(body.get("decision") or "").strip()
+        service = worktree_review.WorktreeReviewService(
+            store=_queue_store_for_worktrees(), audit=terminal.audit)
+        result = await anyio.to_thread.run_sync(lambda: service.decide(
+            task_id, decision, actor=(identity.email if identity else None),
+            worktree_path=body.get("worktree_path") or None))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/inbox/capture", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_inbox_capture(request: Request) -> JSONResponse:
+        """Capture a pasted batch as persisted issues. Mutation-guarded."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        text = str(body.get("text") or "")
+        if not text.strip():
+            return JSONResponse({"error": "TEXT_REQUIRED"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        try:
+            priority = int(body.get("priority") or 0)
+        except (TypeError, ValueError):
+            priority = 0
+        result = await anyio.to_thread.run_sync(lambda: _inbox_service().capture(
+            text, project=body.get("project") or None, priority=priority,
+            source="dashboard", actor=(identity.email if identity else None)))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/inbox/priority", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_inbox_priority(request: Request) -> JSONResponse:
+        """Bulk priority change over selected issues."""
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        ids = [str(i) for i in (body.get("issue_ids") or []) if str(i).strip()]
+        if not ids:
+            return JSONResponse({"error": "ISSUE_IDS_REQUIRED"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        try:
+            priority = int(body.get("priority"))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "PRIORITY_REQUIRED"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+
+        def _apply() -> dict[str, Any]:
+            service = _inbox_service()
+            changed = []
+            for issue_id in ids:
+                issue = service.store.get(issue_id)
+                if issue is None:
+                    continue
+                issue.priority = priority
+                service.store._write(issue)
+                service.store.record_event(issue_id, kind="priority",
+                                           detail=f"priority -> {priority}")
+                changed.append(issue_id)
+            return {"changed": changed, "priority": priority}
+
+        return JSONResponse(await anyio.to_thread.run_sync(_apply),
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/knowledge", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_knowledge(request: Request) -> JSONResponse:
+        """The project knowledge map: status, one document, or a search.
+
+        Read-only. Confidence per module is recomputed here on every read
+        from git and the working tree, never served from a stored value --
+        a stored confidence is a claim about a repository state that has
+        since moved on.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        action = request.query_params.get("action") or "status"
+        query = request.query_params.get("q") or ""
+        document = request.query_params.get("document") or ""
+
+        def _build() -> dict[str, Any]:
+            from .project_knowledge import ProjectKnowledge, canonical_root
+
+            root = canonical_root(request.query_params.get("project") or os.getcwd())
+            if root is None:
+                return {"error": "NOT_A_GIT_REPOSITORY", "modules": []}
+            knowledge = ProjectKnowledge(root)
+            if not knowledge.exists():
+                return {"error": "NO_KNOWLEDGE_MAP", "modules": [],
+                        "detail": "nothing indexed for this project yet"}
+            if action == "show":
+                return knowledge.show(document or None)
+            if action == "search":
+                return knowledge.search(query) if query.strip() else {
+                    "error": "QUERY_REQUIRED", "matches": []}
+            if action == "validate":
+                return knowledge.validate()
+            return knowledge.status()
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001 -- a status screen never 5xxs
+            payload = {"error": "KNOWLEDGE_READ_FAILED", "detail": str(exc), "modules": []}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/procedures", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_procedures(request: Request) -> JSONResponse:
+        """Registered runbooks with their CURRENT status.
+
+        Read-only: this route lists, it never runs. Running a procedure is a
+        separate, explicit decision -- and anything above preview risk is not
+        auto-invokable at all.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+
+        def _build() -> dict[str, Any]:
+            from . import procedures as _procedures
+            from .project_knowledge import ProjectKnowledge, canonical_root
+
+            root = canonical_root(request.query_params.get("project") or os.getcwd())
+            if root is None:
+                return {"error": "NOT_A_GIT_REPOSITORY", "procedures": []}
+            knowledge = ProjectKnowledge(root)
+            registry = _procedures.ProcedureRegistry(knowledge)
+            return {"procedures": registry.list(),
+                    "discovered": _procedures.discover_existing(root),
+                    "auto_invokable_risk": list(_procedures.AUTO_INVOKABLE_RISK)}
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001
+            payload = {"error": "PROCEDURES_READ_FAILED", "detail": str(exc),
+                       "procedures": []}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/policy", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_policy(request: Request) -> JSONResponse:
+        """The effective Work Policy: version, hash, override and any drift.
+
+        Section BODIES are omitted unless asked for by name. The policy is
+        long, this is a status panel, and shipping the whole document to
+        render a version badge is the waste the policy itself prohibits.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        wanted = [s.strip() for s in (request.query_params.get("sections") or "").split(",")
+                  if s.strip()]
+
+        def _build() -> dict[str, Any]:
+            from . import work_policy as _policy
+
+            policy = _policy.load_policy(request.query_params.get("project") or os.getcwd())
+            payload = policy.as_dict()
+            payload["section_titles"] = dict(_policy.SECTIONS)
+            if wanted:
+                payload["text"] = policy.load(wanted)
+            return payload
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001
+            payload = {"error": "POLICY_READ_FAILED", "detail": str(exc)}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/telemetry", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_telemetry(request: Request) -> JSONResponse:
+        """What recent Work tasks cost, with every number's provenance intact."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        work_id = request.query_params.get("work") or ""
+        project_id = request.query_params.get("project_id") or ""
+
+        def _build() -> dict[str, Any]:
+            from .work_telemetry import TelemetryStore
+
+            store = TelemetryStore()
+            try:
+                if work_id:
+                    return {"work_id": work_id, "tasks": store.for_work(work_id)}
+                return store.summary(project_id=project_id or None)
+            finally:
+                store.close()
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001
+            payload = {"error": "TELEMETRY_READ_FAILED", "detail": str(exc), "tasks": 0}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/work/create", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_work_create(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        lane = str(body.get("lane") or "")
+        result = await anyio.to_thread.run_sync(lambda: _work_service().create(
+            title=str(body.get("title") or ""), goal=str(body.get("goal") or ""),
+            lane=lane, project_id=body.get("project_id") or None,
+            done_criteria=body.get("done_criteria") or [],
+            created_by=(identity.email if identity else None),
+            tasks=body.get("tasks") or []))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/work/continue", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_work_continue(request: Request) -> JSONResponse:
+        """Enqueue another task into a run -- the durable way to hand a busy
+        worker something to do without typing into its session mid-turn."""
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        prompt = str(body.get("prompt") or "")
+        if not prompt.strip():
+            return JSONResponse({"error": "TASK_PROMPT_REQUIRED"}, status_code=400)
+        result = await anyio.to_thread.run_sync(lambda: _work_service().plan(
+            str(body.get("work_id") or ""),
+            [{"title": body.get("title") or prompt[:60], "prompt": prompt,
+              "weight": float(body.get("weight") or 1.0),
+              "required": bool(body.get("required", True))}]))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/work/control", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_work_control(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        result = await anyio.to_thread.run_sync(lambda: _work_service().control(
+            str(body.get("work_id") or ""), str(body.get("action") or ""),
+            actor=(identity.email if identity else None),
+            reason=body.get("reason")))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/work/approve", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_work_approve(request: Request) -> JSONResponse:
+        """Decide a gate. The decider is the VERIFIED Access identity, never a
+        value the caller supplies -- an approval whose approver is
+        self-declared is not an approval."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        decided_by = (identity.email if identity else None) or "dashboard:unverified"
+        result = await anyio.to_thread.run_sync(lambda: _work_service().decide_approval(
+            str(body.get("approval_id") or ""),
+            decision=str(body.get("decision") or "APPROVED").upper(),
+            decided_by=decided_by, note=body.get("note")))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/work", methods=["GET"], include_in_schema=False)
+    async def dashboard_work_page(request: Request) -> HTMLResponse | JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(WORK_HTML, headers={"Cache-Control": "no-store",
+                                                "X-Frame-Options": "DENY"})
+
+    @server.custom_route("/dashboard/api/deployment", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_deployment(request: Request) -> JSONResponse:
+        """Redundancy per deployment target, from the local cache.
+
+        Read-only and network-free, like every other fleet read: the screen
+        an operator opens because something is already wrong must not depend
+        on the thing that is wrong.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        target_id = request.query_params.get("target")
+
+        def _build() -> dict[str, Any]:
+            service = _deployment_service()
+            if target_id:
+                evaluation = service.evaluate(target_id)
+                return evaluation or {"error": "UNKNOWN_TARGET", "target_id": target_id}
+            return {"targets": service.evaluate_all()}
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001 -- never 5xx the status screen
+            payload = {"error": "DEPLOYMENT_EVAL_FAILED", "detail": str(exc), "targets": []}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/deployment/dry-run", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_deployment_dry_run(request: Request) -> JSONResponse:
+        """What would happen if these nodes were gone. A READ: nothing is
+        taken offline, no probe runs, no lease is taken."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        target_id = request.query_params.get("target") or ""
+        offline = [n for n in (request.query_params.get("offline") or "").split(",") if n]
+        result = await anyio.to_thread.run_sync(
+            lambda: _deployment_service().dry_run_failover(target_id, assume_offline=offline))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/fleet/readiness", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_fleet_readiness(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return JSONResponse(await anyio.to_thread.run_sync(fleet.readiness),
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/fleet/sync", methods=["POST"], include_in_schema=False)
+    async def dashboard_fleet_sync(request: Request) -> JSONResponse:
+        """Run one exchange with every node. A mutation only in the sense that
+        it writes metadata -- nothing here can touch a session."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        sources = await anyio.to_thread.run_sync(_fleet_sources)
+        result = await anyio.to_thread.run_sync(
+            lambda: _fleet_sync.run_once(sessions=sources["sessions"],
+                                         connections=sources["connections"]))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    _work_holder: dict[str, Any] = {"service": None}
+
+    async def _json_body(request: Request) -> dict[str, Any]:
+        """A malformed body is a client error, not a 500."""
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    _wall_cache = terminal_wall.WallSnapshotCache()
+
+    @server.custom_route("/dashboard/terminal-wall", methods=["GET"], include_in_schema=False)
+    async def dashboard_terminal_wall(request: Request) -> HTMLResponse | JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(
+            TERMINAL_WALL_HTML,
+            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
+        )
+
+    @server.custom_route("/dashboard/api/terminal-wall", methods=["GET"], include_in_schema=False)
+    async def dashboard_terminal_wall_snapshot(request: Request) -> JSONResponse:
+        """Status + a short tail for every visible session, in one request.
+
+        _read_guard only: this is a read of the same status/tail the session
+        views already expose, and the wall has no write path at all.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            lines = int(request.query_params.get("lines", terminal_wall.DEFAULT_TAIL_LINES))
+        except (TypeError, ValueError):
+            lines = terminal_wall.DEFAULT_TAIL_LINES
+        force = request.query_params.get("refresh") == "1"
+
+        def _build() -> dict[str, Any]:
+            # Freshness only, and never fatal: the wall's job is showing
+            # terminals, so a fleet cache that cannot be read costs the
+            # staleness badge and nothing else.
+            meta: dict[str, dict[str, Any]] = {}
+            try:
+                view = fleet.offline_view()
+                routes: dict[str, int] = {}
+                for target in view.get("ssh_targets", []):
+                    node_id = target.get("node_id")
+                    if node_id:
+                        routes[node_id] = routes.get(node_id, 0) + 1
+                for node in view.get("nodes", []):
+                    node_id = node.get("node_id")
+                    if node_id:
+                        meta[node_id] = {
+                            "metadata_stale": node.get("metadata_stale"),
+                            "metadata_age_seconds": node.get("metadata_age_seconds"),
+                            "ssh_route_count": routes.get(node_id, 0),
+                        }
+            except Exception:  # noqa: BLE001 -- a badge is never worth a 500
+                meta = {}
+            return terminal_wall.build_snapshot(controller, tail_lines=lines,
+                                                tracker=_wall_cache.tracker,
+                                                fleet_meta=meta)
+
+        try:
+            payload = await anyio.to_thread.run_sync(
+                lambda: _wall_cache.get(_build, force=force))
+        except Exception as exc:  # noqa: BLE001 -- a monitor never 5xxs the screen
+            return JSONResponse({"error": "TERMINAL_WALL_FAILED", "detail": str(exc),
+                                 "boxes": [], "counts": {}}, status_code=200)
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/ai-usage", methods=["GET"], include_in_schema=False)
+    async def dashboard_ai_usage_page(request: Request) -> HTMLResponse | JSONResponse:
+        # Same _read_guard as every other dashboard view. Read-only: the page
+        # never writes and its data comes from files the CLIs already wrote.
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(
+            AI_USAGE_HTML,
+            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
+        )
+
+    def _usage_filters(request: Request) -> dict[str, Any]:
+        """Filters shared by every analytics endpoint, parsed once.
+
+        `range` is a convenience over `since`: the UI speaks in windows
+        ("5h", "7d") and a URL that round-trips those is what makes a shared
+        link mean the same thing tomorrow.
+        """
+        import time as _time
+
+        query = request.query_params
+        spans = {"1h": 3600, "5h": 18000, "24h": 86400, "7d": 604800, "30d": 2592000}
+        filters: dict[str, Any] = {}
+        window = query.get("range")
+        if window in spans:
+            filters["since"] = _time.time() - spans[window]
+        for key in ("since", "until"):
+            if query.get(key):
+                try:
+                    filters[key] = float(query[key])
+                except ValueError:
+                    pass
+        for key in ("node_id", "agent", "model", "project", "agent_session_id"):
+            if query.get(key):
+                filters[key] = query[key]
+        return filters
+
+    def _usage_index():
+        from .ai_usage_index import AiUsageIndex
+
+        return AiUsageIndex()
+
+    def _usage_route(name: str, build):
+        """Register one analytics endpoint.
+
+        Every one of them is _read_guard'ed, read-only, and returns 200 with
+        an `error` field rather than a 5xx -- an analytics page that 500s
+        takes the whole screen down for a question that was only ever
+        informational.
+        """
+
+        async def handler(request: Request) -> JSONResponse:
+            blocked, _identity = _read_guard(request)
+            if blocked is not None:
+                return blocked
+            filters = _usage_filters(request)
+            try:
+                payload = await anyio.to_thread.run_sync(lambda: build(request, filters))
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse({"error": "AI_USAGE_QUERY_FAILED", "detail": str(exc),
+                                     "items": []}, status_code=200)
+            return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+        handler.__name__ = f"ai_usage_{name}"
+        server.custom_route(f"/dashboard/api/ai-usage/{name}", methods=["GET"],
+                            include_in_schema=False)(handler)
+
+    def _int_param(request: Request, key: str, default: int) -> int:
+        try:
+            return int(request.query_params.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    _usage_route("summary", lambda request, filters: _usage_index().summary(filters=filters))
+    _usage_route("timeline", lambda request, filters: _usage_index().timeline(
+        bucket=request.query_params.get("bucket", "hour"), filters=filters))
+    _usage_route("prompts", lambda request, filters: _usage_index().top_prompts(
+        limit=_int_param(request, "limit", 25), offset=_int_param(request, "offset", 0),
+        filters=filters))
+    _usage_route("sessions", lambda request, filters: _usage_index().top_sessions(
+        limit=_int_param(request, "limit", 50), filters=filters))
+    _usage_route("projects", lambda request, filters: _usage_index().top_projects(
+        limit=_int_param(request, "limit", 50), filters=filters))
+    _usage_route("models", lambda request, filters: _usage_index().model_breakdown(filters=filters))
+    _usage_route("events", lambda request, filters: _usage_index().raw_events(
+        limit=_int_param(request, "limit", 100), offset=_int_param(request, "offset", 0),
+        filters=filters))
+    _usage_route("quota-history", lambda request, filters: _usage_index().quota_history(
+        since=filters.get("since"), limit=_int_param(request, "limit", 500)))
+
+    @server.custom_route("/dashboard/api/ai-usage/export", methods=["GET"], include_in_schema=False)
+    async def ai_usage_export(request: Request) -> Response:
+        """CSV or JSON for whatever the filters currently select.
+
+        Deliberately the same filter parsing as the screen, so an export is
+        the thing you were looking at rather than a different query that
+        happens to be nearby.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        filters = _usage_filters(request)
+        dataset = request.query_params.get("dataset", "sessions")
+        fmt = request.query_params.get("format", "csv")
+        builders = {
+            "sessions": lambda index: index.top_sessions(limit=1000, filters=filters)["items"],
+            "projects": lambda index: index.top_projects(limit=1000, filters=filters)["items"],
+            "prompts": lambda index: index.top_prompts(limit=1000, filters=filters)["items"],
+            "models": lambda index: index.model_breakdown(filters=filters)["items"],
+            "events": lambda index: index.raw_events(limit=500, filters=filters)["items"],
+        }
+        if dataset not in builders:
+            return JSONResponse({"error": "UNKNOWN_DATASET", "known": sorted(builders)},
+                                status_code=400)
+        try:
+            rows = await anyio.to_thread.run_sync(lambda: builders[dataset](_usage_index()))
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"error": "AI_USAGE_EXPORT_FAILED", "detail": str(exc)},
+                                status_code=200)
+        if fmt == "json":
+            return JSONResponse({"dataset": dataset, "items": rows},
+                                headers={"Cache-Control": "no-store"})
+        import csv
+        import io
+
+        buffer = io.StringIO()
+        if rows:
+            writer = csv.DictWriter(buffer, fieldnames=list(rows[0].keys()), extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        return Response(
+            buffer.getvalue(), media_type="text/csv",
+            headers={"Cache-Control": "no-store",
+                     "Content-Disposition": f'attachment; filename="ai-usage-{dataset}.csv"'})
+
+    @server.custom_route("/dashboard/api/ai-usage/local", methods=["GET"], include_in_schema=False)
+    async def dashboard_ai_usage_local(request: Request) -> JSONResponse:
+        """Usage read from local CLI artefacts. No provider API is contacted.
+
+        `?refresh=1` ingests whatever has been appended since the last read
+        (byte offsets per file, event ids for exactly-once); without it the
+        already-indexed data is served, so a poll cannot be made expensive by
+        asking for it often.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        from .ai_usage_index import AiUsageIndex
+
+        def _build() -> dict[str, Any]:
+            index = AiUsageIndex()
+            ingest = None
+            if request.query_params.get("refresh"):
+                ingest = index.refresh(node_id=terminal.REGISTRY_LOCAL_NODE_ID)
+            # tmux session name -> stable_session_id, resolved fresh so a
+            # renamed or restarted session keeps its usage history instead of
+            # splitting it across two rows.
+            names: dict[str, str] = {}
+            try:
+                for record in terminal.session_registry.list(
+                        node_id=terminal.REGISTRY_LOCAL_NODE_ID):
+                    if record.stable_session_id:
+                        names[record.session_name] = record.stable_session_id
+            except Exception:  # noqa: BLE001 -- a registry hiccup must not blank the page
+                names = {}
+            report = index.report(session_names=names)
+            if ingest is not None:
+                report["ingest"] = ingest
+            return report
+
+        try:
+            payload = await anyio.to_thread.run_sync(_build)
+        except Exception as exc:  # noqa: BLE001 -- a report page never 500s the dashboard
+            return JSONResponse({"error": "AI_USAGE_INDEX_FAILED", "detail": str(exc),
+                                 "sessions": [], "quota_windows": [],
+                                 "totals": {"rolling_5h": {}, "today": {}, "lifetime": {}}},
+                                status_code=200)
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/tasks", methods=["GET"], include_in_schema=False)
     async def dashboard_global_tasks(request: Request) -> HTMLResponse | JSONResponse:
@@ -7886,12 +14336,21 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # never reaches terminal_status/_granted at all: a clear,
         # explicit READ_RESTRICTED response, never a silent failure or a
         # generic 404 that could be mistaken for "session doesn't exist".
-        if not session_allowed(name, terminal.config) and not (
-            (grant := terminal.grants.get(name)) is not None and grant.read_enabled
-        ):
-            # Not authorized against the LOCAL whitelist/grants store --
-            # before giving up, check whether this bare name actually
-            # lives on a REMOTE node (task item 9: the real bug this
+        # The canonical read gate, not a re-derivation of it: grants plus
+        # the session_access default policy, with the sensitive-name floor.
+        # This used to be "whitelisted OR granted", which is precisely the
+        # split that let the list and the detail view disagree.
+        # Remote-first resolution. This branch used to be entered when the
+        # session was "not authorized locally", which worked only because an
+        # unlisted name was automatically unauthorized. With the whitelist
+        # retired and reads possibly open by default, that condition is no
+        # longer a proxy for "not here" -- a REMOTE session would authorize
+        # locally and then 404 against the local tmux. The real question was
+        # always whether the session exists on THIS node.
+        local_session = await anyio.to_thread.run_sync(terminal.tmux.get_session, name)
+        if local_session is None or not terminal._read_authorized(name):
+            # Not here (or not readable here) -- before giving up, check
+            # whether this bare name actually lives on a REMOTE node (task item 9: the real bug this
             # fixes -- a session like "window" on dell-5530 was correctly
             # LISTED by /dashboard/api/sessions (that route already merges
             # in fleet-wide rows) but this route only ever consulted the
@@ -7906,16 +14365,28 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 return await _remote_session_detail(resolution["node_id"], resolution["session"])
             if resolution.get("error") == "AMBIGUOUS_SESSION":
                 return JSONResponse(resolution, status_code=409, headers={"Cache-Control": "no-store"})
-            # Proactive, not just reactive: an operator opening a
-            # never-granted session sees up front whether input would ALSO
-            # be blocked by policy once read is granted, rather than only
-            # discovering it after a first click.
-            block_reason = await anyio.to_thread.run_sync(terminal._input_grant_block_reason, name)
-            return JSONResponse(
-                {"error": "READ_RESTRICTED", "session": name, "input_block_reason": block_reason},
-                status_code=403, headers={"Cache-Control": "no-store"},
-            )
-        use_granted = not session_allowed(name, terminal.config)
+            if terminal._read_authorized(name):
+                # Authorized here, just not present on any node -- fall
+                # through to the local path so this answers SESSION_NOT_FOUND
+                # (404) like it always has. Returning READ_RESTRICTED for a
+                # name that simply does not exist would report an access
+                # problem the caller does not have.
+                pass
+            else:
+                # Proactive, not just reactive: an operator opening a
+                # never-granted session sees up front whether input would ALSO
+                # be blocked by policy once read is granted, rather than only
+                # discovering it after a first click.
+                block_reason = await anyio.to_thread.run_sync(terminal._input_grant_block_reason, name)
+                return JSONResponse(
+                    {"error": "READ_RESTRICTED", "session": name, "input_block_reason": block_reason},
+                    status_code=403, headers={"Cache-Control": "no-store"},
+                )
+        # A grant carries a pinned identity the *_granted variants
+        # re-validate at use time; without one the plain variants apply the
+        # same default policy. Chosen by whether a grant EXISTS, never by
+        # whether the name matched a glob.
+        use_granted = terminal.grants.get(name) is not None
         status_fn = terminal.terminal_status_granted if use_granted else terminal.terminal_status
         tail_fn = (lambda: terminal.terminal_tail_granted(name, ansi=True)) if use_granted \
             else (lambda: terminal.terminal_tail(name, ansi=True))
@@ -7965,11 +14436,12 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # -- the dashboard only ever reveals its input composer when this
         # is true, never merely because read succeeded.
         grant = terminal.grants.get(name)
-        input_allowed = bool(
-            terminal.config.permissions.terminal_input
-            and (input_session_allowed(name, terminal.config) or (grant is not None and grant.input_enabled))
-        )
-        allowed = session_allowed(name, terminal.config)
+        input_ok, _input_reason = terminal._input_authorized_with_grant(name, grant)
+        input_allowed = bool(terminal.config.permissions.terminal_input and input_ok)
+        # DEPRECATED field, kept for existing callers -- now an alias of the
+        # real read authorization so it can never contradict input_allowed /
+        # the list's effective_read again.
+        allowed = terminal._read_authorized_with_grant(name, grant)
         body = {
             "session": name, "status": status, "tail": tail, "input_allowed": input_allowed,
             "allowed": allowed,
@@ -8020,7 +14492,11 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # pinned identity against the session's current tmux identity at
         # send time.
         grant = terminal.grants.get(name)
-        if grant is None and not input_session_allowed(name, terminal.config):
+        # Same correction as the detail route above: "does this session live
+        # on another node?" is a question about EXISTENCE here, not about
+        # local authorization -- which is no longer a proxy for it.
+        local_session = await anyio.to_thread.run_sync(terminal.tmux.get_session, name)
+        if local_session is None or (grant is None and not terminal._input_authorized(name)[0]):
             # No local grant and not locally input-whitelisted -- before
             # falling through to terminal_send_text's generic
             # ACCESS_DENIED, check whether this bare name actually lives
@@ -8044,7 +14520,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
             if resolution.get("error") == "AMBIGUOUS_SESSION":
                 return JSONResponse(resolution, status_code=409, headers={"Cache-Control": "no-store"})
-        use_granted = grant is not None and not input_session_allowed(name, terminal.config)
+        use_granted = grant is not None
         send_fn = terminal.terminal_send_text_granted if use_granted else terminal.terminal_send_text
         result = await anyio.to_thread.run_sync(
             lambda: send_fn(name, text, press_enter=press_enter, idempotency_key=idempotency_key)
@@ -8053,6 +14529,91 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if "error" in result:
             status_code = INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/keys", methods=["POST"], include_in_schema=False)
+    async def session_keys(request: Request) -> JSONResponse:
+        """Raw key sends (arrows/Tab/Enter/Escape) from the dashboard.
+
+        Deliberately the SAME terminal_send_keys the MCP tool surface already
+        uses -- key sends have their own permission (permissions.allow_send_keys),
+        their own allowlist (input_policy.allow_keys), their own confirmation
+        rule for sensitive keys, and the same durable pane lease as a text
+        send. A dashboard-specific shortcut around any of that would be a
+        second, weaker input path to the same panes.
+
+        Arrows and Tab are NOT simulated as text: a menu or a completion
+        reacts to the real key, and writing an escape sequence into the
+        composer would type it, not press it.
+        """
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        keys = body.get("keys") if isinstance(body, dict) else None
+        confirm_sensitive = bool(body.get("confirm_sensitive", False)) if isinstance(body, dict) else False
+        if not isinstance(name, str) or not name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        if not isinstance(keys, list) or not keys or not all(isinstance(key, str) and key for key in keys):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        _log.info("dashboard session_keys session=%s keys=%s identity=%s",
+                  name, keys, identity.email if identity else None)
+        # Same node-aware resolution session_input uses -- a granted session
+        # on a remote node (a Windows ConPTY session, say) must get its arrow
+        # keys routed to that node, never silently attempted locally.
+        target = name
+        if "/" not in name:
+            resolution = await anyio.to_thread.run_sync(controller.resolve_session, name)
+            if resolution.get("error") == "AMBIGUOUS_SESSION":
+                return JSONResponse(resolution, status_code=409, headers={"Cache-Control": "no-store"})
+            if "error" not in resolution and resolution["node_id"] != controller.local_node_id:
+                target = f"{resolution['node_id']}/{resolution['session']}"
+        result = await anyio.to_thread.run_sync(
+            lambda: controller.terminal_send_keys(target, list(keys), confirm_sensitive=confirm_sensitive)
+        )
+        status_code = 200
+        if "error" in result:
+            status_code = INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/session/access", methods=["POST"], include_in_schema=False)
+    async def session_access(request: Request) -> JSONResponse:
+        """Turn a session's view/send access OFF or back ON.
+
+        Access is OPEN by default -- a session is readable and writable the
+        moment it exists -- so this route is the opt-out, not the setup step.
+        It routes through the controller to the session's home node, which
+        owns its grants, and returns the same shape the MCP permission tools
+        do, so the UI can render what actually took effect rather than what it
+        asked for.
+        """
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        read = body.get("read")
+        send = body.get("input")
+        if read is None and send is None:
+            return JSONResponse({"error": "NOTHING_TO_CHANGE"}, status_code=400)
+        actor = identity.email if identity else "dashboard"
+        _log.info("dashboard session_access session=%s read=%s input=%s identity=%s",
+                  name, read, send, actor)
+        result = await anyio.to_thread.run_sync(lambda: controller.set_session_permissions(
+            name, read=read, input=send, actor=actor))
+        status = 200
+        if "error" in result:
+            status = 409 if result["error"] == "REVISION_CONFLICT" else \
+                INPUT_ERROR_STATUS.get(result["error"], 400)
+        return JSONResponse(result, status_code=status, headers={"Cache-Control": "no-store"})
 
     def _qualify_grant_name(name: str, body: dict) -> str:
         """A grant-read/grant-input request's `name` is qualified with an
@@ -8104,7 +14665,11 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         terminal.audit.record(
             action="grant_read", session=name, result="GRANTED" if (enabled and "error" not in result)
             else ("REVOKED" if "error" not in result else "BLOCKED"),
-            reason=result.get("error") or granted_by, source_transport="dashboard",
+            # actor and reason are SEPARATE columns. They shared one until
+            # 2026-09-12, so a BLOCKED grant recorded why it failed and
+            # forgot who attempted it -- the one row where you most need both.
+            actor=granted_by, reason=result.get("error"), source_transport="dashboard",
+            node_id=_node_of(qualified), policy_source="session_grant",
         )
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
@@ -8138,7 +14703,11 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         terminal.audit.record(
             action="grant_input", session=name, result="GRANTED" if (enabled and "error" not in result)
             else ("REVOKED" if "error" not in result else "BLOCKED"),
-            reason=result.get("error") or granted_by, source_transport="dashboard",
+            # actor and reason are SEPARATE columns. They shared one until
+            # 2026-09-12, so a BLOCKED grant recorded why it failed and
+            # forgot who attempted it -- the one row where you most need both.
+            actor=granted_by, reason=result.get("error"), source_transport="dashboard",
+            node_id=_node_of(qualified), policy_source="session_grant",
         )
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
@@ -8325,6 +14894,83 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         result = await anyio.to_thread.run_sync(integration.fleet_overview)
         return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
 
+    def _local_ai_usage_panel(force: bool) -> dict[str, Any]:
+        """The local report, in the shape the pre-existing panel renders.
+
+        Two clients read this route: the older in-page panel (which expects
+        `providers[]` with `windows[]`) and anything else already pointed at
+        it. Rather than break them, the local numbers are projected into that
+        shape, with the rolling-5h activity as a window that reports no
+        percentage -- because it is activity, not a quota, and inventing a
+        denominator for it would be the exact fiction this build refuses.
+        """
+        from .ai_usage_index import AiUsageIndex
+
+        index = AiUsageIndex()
+        if force:
+            index.refresh(node_id=terminal.REGISTRY_LOCAL_NODE_ID)
+        report = index.report()
+        providers = []
+        for agent in ("claude", "codex"):
+            rows = [row for row in report["sessions"] if row["agent"] == agent]
+            quota = [w for w in report["quota_windows"] if w["agent"] == agent]
+            observed = [w for w in quota if w["observed"]]
+            rolling_total = sum(r["rolling_5h"]["total"] for r in rows)
+            rolling_messages = sum(r["rolling_5h"]["messages"] for r in rows)
+            windows = [{
+                # The number lives in the label because the older panel renders
+                # a window with no percentage as the single word "unavailable".
+                # A tab still running that code then shows the figure anyway.
+                "label": (f"5h activity · {rolling_total:,} tokens"
+                          f" · {rolling_messages} msg"),
+                # Deliberately null: a percentage needs a limit, and no local
+                # artefact states one. The panel renders this as "unavailable"
+                # rather than a made-up bar.
+                "used_percent": None,
+                "remaining_percent": None,
+                "total_tokens": sum(r["rolling_5h"]["total"] for r in rows),
+                "messages": sum(r["rolling_5h"]["messages"] for r in rows),
+                "source": "session_transcript",
+            }]
+            for window in observed:
+                windows.append({
+                    "label": window["label"],
+                    "used_percent": window["used_percent"],
+                    "remaining_percent": (None if window["used_percent"] is None
+                                          else 100 - window["used_percent"]),
+                    "resets_at": window["resets_at"],
+                    "source": window["source"],
+                })
+            has_data = bool(rows)
+            providers.append({
+                "provider": agent,
+                "ok": has_data,
+                "warning": False,
+                "critical": False,
+                "plan": None,
+                "account": None,
+                "windows": windows if has_data else [],
+                "usage_message": (None if has_data else
+                                  (quota[0]["detail"] if quota else "No local data observed")),
+                "error": None if has_data else "No local data observed",
+                "sessions": len(rows),
+            })
+        return {
+            "available": True,
+            "error": None,
+            "providers": providers,
+            "sessions": report["sessions"],
+            "totals": report["totals"],
+            "quota_windows": report["quota_windows"],
+            "source": "local:~/.claude, $CODEX_HOME",
+            "report_url": "/dashboard/ai-usage",
+            "app_version": None,
+            "fetched_at": report["generated_at"],
+            "cached": not force,
+            "cache_age_seconds": 0.0,
+            "stale": False,
+        }
+
     @server.custom_route("/dashboard/api/ai-usage", methods=["GET"], include_in_schema=False)
     async def ai_usage_status_route(request: Request) -> JSONResponse:
         # Same _read_guard-only posture as the fleet-level routes just
@@ -8337,7 +14983,16 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         force = request.query_params.get("force") == "1"
-        result = await anyio.to_thread.run_sync(lambda: ai_usage.get_usage(force=force))
+        # Served from the LOCAL collector, not from the separate AI Usage
+        # Monitor this route used to proxy. That service is not installed on
+        # this fleet, so proxying it returned
+        # `available:false, "Connection refused"` and every client -- including
+        # a dashboard tab left open from before the report page existed --
+        # rendered an empty panel. Answering here from the same local data the
+        # report page uses means a stale tab starts showing real numbers
+        # without being reloaded, and nothing at runtime depends on an
+        # external project any more.
+        result = await anyio.to_thread.run_sync(lambda: _local_ai_usage_panel(force))
         return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
 
     # -- Auto Recovery (item 7: "hiện recovery state, last checkpoint,
@@ -8469,9 +15124,18 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         project = body.get("project") if isinstance(body.get("project"), str) and body.get("project") else None
         if session is not None and not terminal._read_authorized(session):
             return JSONResponse({"error": "READ_RESTRICTED", "session": session}, status_code=403)
-        _log.info("dashboard task_create session=%s identity=%s", session, identity.email if identity else None)
+        # Idempotency. The browser mints one key per submission and reuses it
+        # across every retry of THAT submission, so a double-click, a resent
+        # request after a dropped connection, or a reconnect mid-flight all
+        # resolve to the one task the first attempt created. Absent (an older
+        # page, a non-dashboard caller) behaves exactly as before.
+        request_key = body.get("request_key") if isinstance(body.get("request_key"), str) else None
+        request_key = (request_key or "").strip()[:200] or None
+        _log.info("dashboard task_create session=%s identity=%s request_key=%s",
+                  session, identity.email if identity else None, bool(request_key))
         result = await anyio.to_thread.run_sync(
-            lambda: queue.create_task(title or "", prompt, session=session, project=project)
+            lambda: queue.create_task(title or "", prompt, session=session, project=project,
+                                      request_key=request_key)
         )
         status_code = 200 if "error" not in result else 400
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
@@ -8550,9 +15214,13 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         title = body.get("title") if isinstance(body.get("title"), str) else None
         priority = body.get("priority") if isinstance(body.get("priority"), int) else 0
-        _log.info("dashboard queue_enqueue session=%s identity=%s", name, identity.email if identity else None)
+        request_key = body.get("request_key") if isinstance(body.get("request_key"), str) else None
+        request_key = (request_key or "").strip()[:200] or None
+        _log.info("dashboard queue_enqueue session=%s identity=%s request_key=%s",
+                  name, identity.email if identity else None, bool(request_key))
         result = await anyio.to_thread.run_sync(
-            lambda: queue.enqueue(name, prompt, title=title, priority=priority)
+            lambda: queue.enqueue(name, prompt, title=title, priority=priority,
+                                  request_key=request_key)
         )
         status_code = 200 if "error" not in result else 400
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
@@ -9866,7 +16534,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # controller's own os.environ, not the shell's) so the very next
         # heartbeat push already verifies correctly, no separate manual
         # export step needed for a discovery/SSH-connected node.
-        os.environ[node_token_env_var(node_id)] = token
+        _manage_node_token(node_id, token)
         node = controller.node_status(node_id)
         return JSONResponse({"ok": True, "node_id": node_id, "endpoint": endpoint,
                             "node": _node_to_dict(node) if node else None}, headers={"Cache-Control": "no-store"})
@@ -9918,9 +16586,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
         endpoint = (body.get("endpoint") or "").strip()
         token = body.get("token") or ""
-        if not endpoint.startswith(("http://", "https://")) or not token:
+        if not token:
             return JSONResponse({"error": "INVALID_REQUEST", "detail": "endpoint (http(s)://host:port) and token are required"},
                                 status_code=400)
+
         if controller.node_status(node_id) is not None:
             return JSONResponse({"error": "NODE_ALREADY_EXISTS", "node_id": node_id}, status_code=409)
         host_part = re.sub(r"^https?://", "", endpoint).split("/", 1)[0].split(":", 1)[0]
@@ -9928,6 +16597,18 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             remote_connect.validate_hostname_or_ip(host_part, allow_public=_remote_connect_config().allow_public_manual_add)
         except remote_connect.ValidationError as exc:
             return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
+        # Scheme gate, on top of the host gate just above. That one asks
+        # "is this host public"; this one asks "would the bearer token
+        # travel in plaintext". They are different questions -- an https
+        # endpoint to a public host is fine, a http one is not -- and the
+        # same documented opt-in (allow_public_manual_add) governs both.
+        try:
+            endpoint_policy.validate_node_endpoint(
+                endpoint, context=f"node {node_id!r} endpoint",
+                allow_public_http=_remote_connect_config().allow_public_manual_add)
+        except endpoint_policy.EndpointPolicyError as exc:
+            return JSONResponse({"error": exc.reason, "detail": str(exc)}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
 
         def _probe() -> tuple[bool, str | None]:
             client = RemoteNodeClient(endpoint, token, timeout=8.0)
@@ -9944,14 +16625,44 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         connection_store.save(node_id, transport_type="agent_token", endpoint=endpoint, hostname=host_part,
                               token_file=token_file)
         controller.register_remote_node(node_id, display_name=body.get("display_name") or node_id,
-                                        hostname=host_part, endpoint=endpoint, token=token)
+                                        hostname=host_part, endpoint=endpoint, token=token,
+                                        allow_public_http=_remote_connect_config().allow_public_manual_add)
         # See node_token_env_var's own docstring -- makes the node's
         # (already-running) heartbeat loop verify successfully against
         # THIS controller the moment its next push arrives.
-        os.environ[node_token_env_var(node_id)] = token
+        _manage_node_token(node_id, token)
         node = controller.node_status(node_id)
         return JSONResponse({"ok": True, "node_id": node_id, "endpoint": endpoint,
                             "node": _node_to_dict(node) if node else None}, headers={"Cache-Control": "no-store"})
+
+    def _verify_node_token(node_id: str, request: Request):
+        """The ONE inbound node-token check, shared by every machine-facing
+        route (blg_a3cc401d8275).
+
+        Backward compatible by construction: a node that has a credential
+        record is checked against it -- so rotation and revocation take
+        effect immediately -- and a node that predates the store falls back
+        to the legacy env var it has always used. No flag day, and no node
+        stops working because this landed.
+
+        Fail-closed on ambiguity: a token matching a REVOKED record is
+        refused with its own reason rather than folded into "unknown",
+        because a revoked credential still in use is an incident. The
+        token_id is safe to log; the token never is.
+        """
+        header = request.headers.get("authorization", "")
+        presented = header[len("Bearer "):] if header.startswith("Bearer ") else ""
+        if credentials.is_managed(node_id):
+            result = credentials.verify(node_id, presented)
+            if not result.accepted:
+                _log.warning("dashboard node auth refused node_id=%s verdict=%s token_id=%s",
+                             node_id, result.verdict, result.token_id)
+            return result.accepted, result
+        expected = os.environ.get(node_token_env_var(node_id))
+        legacy_ok = bool(expected) and hmac.compare_digest(presented, expected)
+        return legacy_ok, node_credentials.VerifyResult(
+            node_credentials.OK if legacy_ok else node_credentials.UNKNOWN,
+            None, "legacy env-var credential (not yet under rotation management)")
 
     @server.custom_route("/dashboard/api/nodes/{node_id}/heartbeat", methods=["POST"], include_in_schema=False)
     async def node_heartbeat(request: Request) -> JSONResponse:
@@ -9963,11 +16674,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # before touching the registry at all -- never silently accepted
         # as "must be the local node" or similarly guessed.
         node_id = request.path_params["node_id"]
-        expected_token = os.environ.get(node_token_env_var(node_id))
-        header = request.headers.get("authorization", "")
-        presented = header[len("Bearer "):] if header.startswith("Bearer ") else ""
-        if not expected_token or not hmac.compare_digest(presented, expected_token):
-            return JSONResponse({"error": "UNAUTHORIZED"}, status_code=401)
+        accepted, verdict = _verify_node_token(node_id, request)
+        if not accepted:
+            return JSONResponse({"error": "UNAUTHORIZED", "verdict": verdict.verdict},
+                                status_code=401, headers={"Cache-Control": "no-store"})
         try:
             body = await request.json()
         except ValueError:
@@ -9988,14 +16698,180 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 # never assumed capable.
                 capabilities=tuple(body.get("capabilities") or ()),
                 wsl_available=bool(body.get("wsl_available", False)),
+                # Protocol generation. A node that reports nothing stays at 0
+                # (legacy) rather than inheriting whatever it had before.
+                contract_version=int(body.get("contract_version") or 0),
+                contract_capabilities=tuple(body.get("contract_capabilities") or ()),
             )
             if node is None:
                 return {"error": "NODE_NOT_FOUND", "node_id": node_id}
             return {"ok": True, "node_id": node_id}
 
         result = await anyio.to_thread.run_sync(_compute)
+        # A heartbeat signed with the staged token is the PROOF that the
+        # node has adopted it -- the only moment at which this controller
+        # can safely move its own outbound copy over and revoke the old
+        # credential. Doing it here, on the node's own traffic, is what
+        # removes the restart from rotation (blg_a3cc401d8275 AC2).
+        await anyio.to_thread.run_sync(lambda: rotation.confirm(node_id, verdict.token_id))
+        hint = await anyio.to_thread.run_sync(lambda: rotation.refresh_hint(node_id, verdict.token_id))
+        if hint:
+            result = {**result, "token_refresh": hint}
         status_code = 200 if "error" not in result else 404
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/agent-bundle", methods=["GET", "HEAD"],
+                         include_in_schema=False)
+    async def node_agent_bundle(request: Request) -> Response:
+        """The node-agent source bundle, for a node that already has a
+        credential.
+
+        MACHINE-FACING and authenticated by exactly the same per-node
+        bearer token as the heartbeat route -- never a cookie, never
+        anonymous. A node can only ever fetch with its OWN credential, and
+        a missing or wrong token is refused before the store is touched.
+        Deliberately not a public download: the bundle is this project's
+        own source tree, and serving that anonymously would be a very
+        different decision from serving an enrollment code.
+
+        HEAD answers with the metadata alone, which is what makes the
+        installer idempotent -- it compares version and sha256 against what
+        is already on disk and skips the download when they match. GET adds
+        the bytes. One path, one ingress entry, two verbs.
+        """
+        node_id = request.path_params["node_id"]
+        accepted, verdict = _verify_node_token(node_id, request)
+        if not accepted:
+            return JSONResponse({"error": "UNAUTHORIZED", "verdict": verdict.verdict},
+                                status_code=401, headers={"Cache-Control": "no-store"})
+        try:
+            found = await anyio.to_thread.run_sync(agent_bundle.resolve)
+        except agent_bundle.BundleError as exc:
+            # 404 for "nothing published" -- an honest state on a
+            # controller that has not built one yet, not a server error.
+            status = 404 if exc.code == "NOT_PUBLISHED" else 500
+            return JSONResponse({"error": exc.code, "detail": exc.detail}, status_code=status,
+                                headers={"Cache-Control": "no-store"})
+
+        headers = {
+            "Cache-Control": "no-store",
+            "X-Terminal-Mcp-Agent-Version": found["version"],
+            "X-Terminal-Mcp-Agent-Build-Sha": found["build_sha"],
+            "X-Terminal-Mcp-Agent-Sha256": found["sha256"],
+            "X-Terminal-Mcp-Agent-Size": str(found["size"]),
+            "Content-Disposition": 'attachment; filename="%s"' % found["name"],
+        }
+        _log.info("dashboard agent_bundle node_id=%s version=%s size=%s method=%s",
+                 node_id, found["version"], found["size"], request.method)
+        if request.method == "HEAD":
+            headers["Content-Length"] = str(found["size"])
+            return Response(b"", media_type="application/zip", headers=headers)
+        body = await anyio.to_thread.run_sync(found["path"].read_bytes)
+        return Response(body, media_type="application/zip", headers=headers)
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/token/refresh", methods=["POST"], include_in_schema=False)
+    async def node_token_refresh(request: Request) -> JSONResponse:
+        """The node collects the replacement token staged for it.
+
+        Machine-facing, and authenticated by exactly the credential being
+        replaced: only something already holding this node's current (or
+        still-in-grace) token can collect its successor, which is why no
+        second enrollment step is needed. This is the ONE response in the
+        system that carries a token in its body -- it is never logged,
+        never audited (the audit row records the fingerprint), and the
+        staged copy is deleted once the node proves it took it.
+        """
+        node_id = request.path_params["node_id"]
+        accepted, verdict = _verify_node_token(node_id, request)
+        if not accepted:
+            return JSONResponse({"error": "UNAUTHORIZED", "verdict": verdict.verdict},
+                                status_code=401, headers={"Cache-Control": "no-store"})
+        result = await anyio.to_thread.run_sync(lambda: rotation.collect(node_id))
+        status_code = 200 if result.get("ok") else 404
+        return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/token", methods=["GET"], include_in_schema=False)
+    async def node_token_status(request: Request) -> JSONResponse:
+        """What credentials this node has, by fingerprint. No secret can
+        appear here: the store holds only hashes."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        return JSONResponse(await anyio.to_thread.run_sync(lambda: rotation.status(node_id)),
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/token/adopt", methods=["POST"], include_in_schema=False)
+    async def node_token_adopt(request: Request) -> JSONResponse:
+        """Bring a node enrolled before this feature under management,
+        without changing its token -- so nothing about that node stops
+        working at the moment it becomes rotatable. Idempotent."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        actor = identity.email if identity else None
+        result = await anyio.to_thread.run_sync(lambda: rotation.adopt_existing(node_id, actor=actor))
+        return JSONResponse(result, status_code=200 if result.get("ok") else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/token/rotate", methods=["POST"], include_in_schema=False)
+    async def node_token_rotate(request: Request) -> JSONResponse:
+        """Stage a replacement token for the node to collect.
+
+        Returns fingerprints and state only -- the new token goes to the
+        NODE, over the channel it authenticates itself on, and never back
+        to the operator who pressed the button. An operator who never
+        sees a token cannot leak one, and nothing downstream needs them
+        to: `grace_seconds` omitted means the old token stays valid until
+        the new one is confirmed in use, rather than until a clock runs
+        out on a node that happened to be offline.
+        """
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        raw_grace = body.get("grace_seconds")
+        try:
+            grace = None if raw_grace is None else max(0, int(raw_grace))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "grace_seconds must be an integer"},
+                                status_code=400, headers={"Cache-Control": "no-store"})
+        force = bool(body.get("force"))
+        actor = identity.email if identity else None
+        result = await anyio.to_thread.run_sync(
+            lambda: rotation.rotate(node_id, grace_seconds=grace, force=force, actor=actor))
+        return JSONResponse(result, status_code=200 if result.get("ok") else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/token/revoke", methods=["POST"], include_in_schema=False)
+    async def node_token_revoke(request: Request) -> JSONResponse:
+        """Refuse a credential from now on. With no token_id, refuses
+        every credential this node has -- which is what "revoke this
+        node" means and is the safe default. Idempotent."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        token_id = str(body.get("token_id") or "").strip() or None
+        reason = str(body.get("reason") or "manual_revoke")[:200]
+        actor = identity.email if identity else None
+        result = await anyio.to_thread.run_sync(
+            lambda: rotation.revoke(node_id, token_id=token_id, reason=reason, actor=actor))
+        return JSONResponse(result, status_code=200 if result.get("ok") else 400,
+                            headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/nodes/{node_id}/refresh-capabilities", methods=["POST"], include_in_schema=False)
     async def node_refresh_capabilities(request: Request) -> JSONResponse:
@@ -10007,6 +16883,650 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 502)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
+
+
+    def _probe_transport(transport):
+        """The prober handed to TransportResolver -- see node_transport.py
+        for what each kind's probe actually measures."""
+        if transport.kind == KIND_REVERSE_SSH:
+            return probe_reverse_tunnel(onboarding.gateway(), int(transport.port or 0))
+        return probe_ssh_banner(transport.host or "", int(transport.port or 22))
+
+    # ======================================================================
+    # Windows node onboarding (Nodes -> + Add Node -> Windows).
+    #
+    # Two audiences, two auth models, deliberately not mixed:
+    #
+    #   OPERATOR routes (/dashboard/api/nodes/onboard/*, and the per-node
+    #   onboarding/test/remove routes) go through the SAME _read_guard/
+    #   _mutation_guard every other dashboard route uses -- Cloudflare
+    #   Access identity plus the CSRF/Origin check. A browser that cannot
+    #   pass those cannot create an enrollment, and therefore cannot
+    #   create a node.
+    #
+    #   MACHINE routes (/dashboard/api/enroll/consume, the node-token
+    #   deregister, and the plain setup-script download) are called by a
+    #   Windows box that has no browser session and no Access cookie --
+    #   exactly like the existing /dashboard/api/nodes/{id}/heartbeat
+    #   route, which has always been bearer-authenticated for the same
+    #   reason. consume is authenticated by the one-time enrollment code
+    #   itself; deregister by the node's own bearer token; the script
+    #   download carries no secret at all and needs none.
+    #
+    # No route below ever returns a secret except the two that exist to
+    # deliver one exactly once: create-enrollment (the code, in the same
+    # response as the script that carries it) and consume (the bootstrap
+    # payload). Nothing is logged but identifiers.
+    # ======================================================================
+
+    # Rate limit for the unauthenticated consume route: a fixed window per
+    # source address. The code itself is 75 bits, so this is not what makes
+    # guessing infeasible -- it is what keeps a broken installer in a retry
+    # loop from becoming a denial of service against the controller.
+    _enroll_attempts: dict[str, list[float]] = {}
+    _ENROLL_WINDOW_SECONDS = 60.0
+    _ENROLL_MAX_PER_WINDOW = 12
+
+    def _enroll_rate_limited(source: str) -> bool:
+        now = time.monotonic()
+        bucket = [t for t in _enroll_attempts.get(source, []) if now - t < _ENROLL_WINDOW_SECONDS]
+        bucket.append(now)
+        _enroll_attempts[source] = bucket
+        if len(_enroll_attempts) > 4096:  # bound the dict itself
+            for key in [k for k, v in _enroll_attempts.items() if not v or now - v[-1] > _ENROLL_WINDOW_SECONDS][:2048]:
+                _enroll_attempts.pop(key, None)
+        return len(bucket) > _ENROLL_MAX_PER_WINDOW
+
+    def _request_base_url(request: Request) -> str:
+        host = request.headers.get("host") or ""
+        scheme = request.url.scheme or "http"
+        return f"{scheme}://{host}" if host else ""
+
+    def _machine_origin(request: Request) -> str:
+        """The origin to hand to a MACHINE, as opposed to the one the
+        operator's browser happens to be using.
+
+        On a public deployment these are different hostnames on purpose.
+        The Dashboard stays behind Cloudflare Access; the machine being
+        onboarded has no Access session and cannot get one, so anything it
+        is told to call back to must be the public bootstrap origin. Where
+        no bootstrap origin is pinned -- every LAN deployment -- this is
+        the request's own Host exactly as before.
+        """
+        return onboarding.bootstrap_origin or _request_base_url(request)
+
+    def _onboarding_error(exc: OnboardingError) -> JSONResponse:
+        return JSONResponse({"error": exc.code, "detail": exc.detail}, status_code=exc.status,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/onboard/profiles", methods=["GET"], include_in_schema=False)
+    async def onboard_profiles(request: Request) -> JSONResponse:
+        """Everything the Add Node form needs to render itself: the three
+        profiles, what connectivity this controller can actually offer
+        today, and a suggested node id -- so the form never offers an
+        option that would fail at enrollment time."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+
+        def _compute() -> dict:
+            plan = onboarding.plan_connectivity({})
+            gateway = onboarding.gateway()
+            return {
+                "profiles": list_profiles(),
+                "connectivity": plan.to_dict(),
+                "gateway": gateway.to_dict(),
+                "controller_url": onboarding.controller_url(request_base_url=_request_base_url(request)),
+                "script_version": SETUP_SCRIPT_VERSION,
+                "enrollment_ttl_seconds": terminal.config.nodes.onboarding.enrollment_ttl_seconds,
+                "enabled": terminal.config.nodes.onboarding.enabled,
+                "controller_ssh_key_configured": bool(
+                    read_controller_ssh_public_key(terminal.config.nodes.onboarding)[0]),
+            }
+
+        return JSONResponse(await anyio.to_thread.run_sync(_compute), headers={"Cache-Control": "no-store"})
+
+    # GET (list) and POST (create) share ONE registration rather than two
+    # for the same path. Two registrations work at runtime, but
+    # test_dashboard.py's route-inventory guard keys its expected surface
+    # by path, so the second would quietly overwrite the first and the
+    # inventory would stop describing -- and stop protecting -- the GET.
+    # -- Bootstrap helper artifact -------------------------------------
+    # Operator-facing, _read_guard like every other fleet read route: the
+    # same Cloudflare-Access-protected hostname the Dashboard itself is
+    # behind, and nothing wider. This deliberately does NOT get its own
+    # public path -- the binary is for the operator standing in front of
+    # the Dashboard, not for the open Internet.
+    #
+    # No credential ever rides along: no enrollment code, no handle, no
+    # node token, nothing in the URL and nothing in the body. The helper
+    # gets its credential later, from the terminalmcp:// handle it
+    # redeems itself.
+
+    @server.custom_route("/dashboard/api/nodes/onboard/helper", methods=["GET"],
+                        include_in_schema=False)
+    async def onboard_helper_manifest(request: Request) -> JSONResponse:
+        """What helper builds this controller can hand out.
+
+        Never an error for "nothing published" -- the CTA reads this to
+        decide whether to offer the one-click path at all, and an empty
+        list is the honest answer that keeps it on the manual fallback.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        from . import helper_artifact
+
+        payload = await anyio.to_thread.run_sync(helper_artifact.available)
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/onboard/helper/{target}",
+                        methods=["GET", "POST"], include_in_schema=False)
+    async def onboard_helper_download(request: Request) -> Response:
+        """Stream one verified helper binary.
+
+        The bytes are hashed against the manifest on every request rather
+        than trusted from publish time. A truncated copy or a half-written
+        replacement is REFUSED, not served with a warning: the reason to
+        check at all is that the operator about to run it elevated cannot
+        check for themselves.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        from . import helper_artifact
+
+        target = str(request.path_params.get("target") or "")
+
+        def _resolve():
+            return helper_artifact.resolve(target)
+
+        try:
+            artifact = await anyio.to_thread.run_sync(_resolve)
+        except helper_artifact.ArtifactError as exc:
+            status = 404 if exc.code in (helper_artifact.NO_MANIFEST,
+                                         helper_artifact.UNKNOWN_TARGET,
+                                         helper_artifact.MISSING_FILE) else 500
+            _log.warning("helper artifact refused target=%s code=%s", target, exc.code)
+            return JSONResponse(exc.as_dict(), status_code=status,
+                                headers={"Cache-Control": "no-store"})
+
+        try:
+            body = await anyio.to_thread.run_sync(artifact.path.read_bytes)
+        except OSError as exc:
+            return JSONResponse({"error": helper_artifact.MISSING_FILE,
+                                 "detail": str(exc)}, status_code=404,
+                                headers={"Cache-Control": "no-store"})
+
+        # A fresh machine has no helper, so no terminalmcp:// handler for
+        # the page to hand the session to -- the operator just runs what
+        # they downloaded. So the download is NAMED after the pending
+        # session, and the helper reads its own file name on a double-click.
+        # The bytes are untouched: the manifest hash (and one day the
+        # Authenticode signature) must survive the download unchanged.
+        # POST carries the handle in the BODY, never the query string: a
+        # query string lands in access logs, proxy logs and browser history,
+        # and outlives the handle's two minutes by months. GET stays the
+        # plain, unpaired download.
+        session = ""
+        if request.method == "POST":
+            try:
+                body_json = await request.json()
+            except ValueError:
+                body_json = {}
+            if isinstance(body_json, dict):
+                session = str(body_json.get("session") or "")
+        # The origin is encoded into the FILE NAME and is what the helper
+        # dials on a double-click, so it must be the machine-facing one.
+        # Naming the Access-gated Dashboard host here produces a helper
+        # that authenticates nothing and redeems nothing.
+        download_name = helper_artifact.paired_filename(
+            artifact.filename, _machine_origin(request), session)
+
+        # The handle is a credential for its 120 seconds. It is used to
+        # build a file name and is never logged, never echoed in a header,
+        # and never included in an error.
+        _log.info("helper artifact served target=%s version=%s signed=%s paired=%s",
+                 artifact.target, artifact.version, artifact.signed,
+                 download_name != artifact.filename)
+        return Response(
+            body, media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{download_name}"',
+                # An executable must never be cached by a shared proxy, and
+                # a stale copy of a binary is worse than a slow download.
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                # So a careful operator can verify the download themselves
+                # without a second round trip.
+                "X-Artifact-Sha256": artifact.sha256,
+                "X-Artifact-Version": artifact.version,
+                "X-Artifact-Build-Sha": artifact.build_sha,
+                # Reported, never inferred. Absent evidence is unsigned.
+                "X-Artifact-Signed": "true" if artifact.signed else "false",
+            })
+
+    @server.custom_route("/dashboard/api/nodes/onboard/enrollments", methods=["GET", "POST"],
+                        include_in_schema=False)
+    async def onboard_enrollments(request: Request) -> JSONResponse:
+        if request.method == "GET":
+            blocked, _identity = _read_guard(request)
+            if blocked is not None:
+                return blocked
+            records = await anyio.to_thread.run_sync(lambda: onboarding.list_enrollments(limit=50))
+            return JSONResponse({"enrollments": records}, headers={"Cache-Control": "no-store"})
+        return await onboard_create_enrollment(request)
+
+    async def onboard_create_enrollment(request: Request) -> JSONResponse:
+        """Creates the one-time code AND renders the script that carries
+        it, in one response. The code is never persisted in plaintext and
+        never appears in a URL, a log line, or any later response -- if
+        the operator loses this response they generate a new code, which
+        is the correct outcome for a single-use credential."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        connectivity = body.get("connectivity") if isinstance(body.get("connectivity"), dict) else {}
+
+        def _compute() -> dict:
+            created = onboarding.create_enrollment(
+                node_id=body.get("node_id"), display_name=body.get("display_name"),
+                os_name=(body.get("os") or "windows"), profile=(body.get("profile") or "minimal"),
+                connectivity=connectivity, created_by=(identity.email if identity else None),
+                hostname_hint=body.get("hostname"))
+            node_id = created["enrollment"]["node_id"]
+            controller_urls = onboarding.controller_urls(request_base_url=_request_base_url(request))
+            controller_url = controller_urls[0]
+            script = render_setup_script(
+                enrollment_code=created["code"], controller_url=controller_url, node_id=node_id,
+                display_name=created["enrollment"]["display_name"], profile=created["enrollment"]["profile"],
+                controller_urls=controller_urls)
+            created["script"] = script
+            created["script_sha256"] = script_fingerprint(script)
+            # The one-liner the wizard shows as its PRIMARY action. Built
+            # server-side, where the PowerShell quoting is unit-tested,
+            # rather than assembled in the browser.
+            command = build_quick_install_command(controller_url=controller_url,
+                                                  enrollment_code=created["code"])
+            created["quick_install_command"] = command
+            created["quick_install_fits_run_dialog"] = quick_install_fits_run_dialog(command)
+            created["script_version"] = SETUP_SCRIPT_VERSION
+            created["filename"] = f"terminal-mcp-setup-{node_id}.ps1"
+            created["controller_url"] = controller_url
+            created["controller_urls"] = controller_urls
+            return created
+
+        try:
+            result = await anyio.to_thread.run_sync(_compute)
+        except OnboardingError as exc:
+            return _onboarding_error(exc)
+        except ValueError as exc:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
+        # node_id/profile only -- never the code, never the script body.
+        _log.info("dashboard onboard_create_enrollment node_id=%s profile=%s identity=%s",
+                 result["enrollment"]["node_id"], result["enrollment"]["profile"],
+                 identity.email if identity else None)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/onboard/enrollments/{enrollment_id}/revoke",
+                        methods=["POST"], include_in_schema=False)
+    async def onboard_revoke_enrollment(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        enrollment_id = request.path_params["enrollment_id"]
+        revoked = await anyio.to_thread.run_sync(
+            lambda: onboarding.revoke_enrollment(enrollment_id, by=(identity.email if identity else None)))
+        _log.info("dashboard onboard_revoke_enrollment id=%s revoked=%s identity=%s",
+                 enrollment_id, revoked, identity.email if identity else None)
+        return JSONResponse({"revoked": revoked, "enrollment_id": enrollment_id},
+                            status_code=200 if revoked else 404, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/onboard/gateway", methods=["GET"], include_in_schema=False)
+    async def onboard_gateway(request: Request) -> JSONResponse:
+        """The rescue gateway's configured state plus the ONE combined
+        authorized_keys file an admin copies to it. Public keys only --
+        there is no secret in this response."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+
+        def _compute() -> dict:
+            gateway = onboarding.gateway()
+            directory = rescue_authorized_keys_dir()
+            combined = directory / "authorized_keys"
+            try:
+                content = combined.read_text(encoding="utf-8")
+            except OSError:
+                content = ""
+            return {
+                "gateway": gateway.to_dict(include_host_key=True),
+                "allocations": [a.to_dict() for a in onboarding.ports.list()],
+                "authorized_keys_path": str(combined),
+                "authorized_keys": content,
+                "sync_command": (f"scp {combined} {gateway.user}@{gateway.host}:~/.ssh/authorized_keys"
+                                 if gateway.configured else None),
+            }
+
+        return JSONResponse(await anyio.to_thread.run_sync(_compute), headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/onboarding", methods=["GET"], include_in_schema=False)
+    async def node_onboarding_status(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        result = await anyio.to_thread.run_sync(lambda: onboarding.describe_node(node_id))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/test-transport", methods=["POST"], include_in_schema=False)
+    async def node_test_transport(request: Request) -> JSONResponse:
+        """Test Primary / Test Rescue. Runs the REAL resolver against the
+        node's REAL recorded transports and writes the result back into
+        each transport row, so the Nodes page's health column is a record
+        of what actually happened rather than a live guess."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        which = (body.get("transport") if isinstance(body, dict) else None) or "all"
+        if which not in ("all", "primary", "rescue"):
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "transport must be all, primary or rescue"},
+                                status_code=400)
+
+        def _compute() -> dict:
+            wanted = {"all": None, "primary": (KIND_TAILSCALE, KIND_LAN), "rescue": (KIND_REVERSE_SSH,)}[which]
+            resolver = onboarding.resolver
+            if wanted is None:
+                preference = resolver.preference
+            else:
+                preference = tuple(kind for kind in resolver.preference if kind in wanted)
+            from .node_transport import TransportResolver
+            scoped = TransportResolver(onboarding.transports, preference=preference)
+            resolution = scoped.resolve(node_id, probe=_probe_transport)
+            return resolution.to_dict()
+
+        result = await anyio.to_thread.run_sync(_compute)
+        _log.info("dashboard node_test_transport node_id=%s which=%s reachable=%s transport=%s identity=%s",
+                 node_id, which, result.get("reachable"), result.get("transport"),
+                 identity.email if identity else None)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/remove", methods=["POST"], include_in_schema=False)
+    async def node_remove(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params["node_id"]
+        if node_id == controller.local_node_id:
+            return JSONResponse({"error": "CANNOT_REMOVE_LOCAL_NODE",
+                                "detail": "the controller's own node cannot be removed from here"},
+                                status_code=400, headers={"Cache-Control": "no-store"})
+        result = await anyio.to_thread.run_sync(
+            lambda: onboarding.remove_node(node_id, by=(identity.email if identity else None)))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    # -- machine-facing ----------------------------------------------------
+
+    @server.custom_route("/dashboard/api/enroll/consume", methods=["POST"], include_in_schema=False)
+    async def enroll_consume(request: Request) -> JSONResponse:
+        """The one unauthenticated-by-cookie route in this feature. It is
+        authenticated by the enrollment code, which is single-use and
+        short-lived; a wrong or replayed code is refused before anything
+        is created. Nothing about the request body is trusted beyond
+        being recorded: the node's claimed addresses are validated
+        (a "tailscale IP" outside 100.64.0.0/10 is filed as LAN) and its
+        claimed hostname is metadata, never an authorization input."""
+        source = (request.client.host if request.client else "unknown")
+        if _enroll_rate_limited(source):
+            return JSONResponse({"error": "RATE_LIMITED", "detail": "too many enrollment attempts"},
+                                status_code=429, headers={"Cache-Control": "no-store", "Retry-After": "60"})
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        code = str(body.get("code") or "")
+        hostname = str(body.get("hostname") or "").strip()[:255]
+        if not code or not hostname:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "code and hostname are required"},
+                                status_code=400, headers={"Cache-Control": "no-store"})
+        addresses = body.get("addresses") if isinstance(body.get("addresses"), dict) else {}
+
+        def _compute() -> dict:
+            return onboarding.consume_enrollment(
+                code, hostname=hostname, source_ip=source,
+                platform=str(body.get("platform") or "windows")[:32],
+                addresses=addresses, rescue_public_key=body.get("rescue_public_key"),
+                agent_version=str(body.get("script_version") or "")[:64] or None,
+                request_base_url=_request_base_url(request))
+
+        try:
+            result = await anyio.to_thread.run_sync(_compute)
+        except OnboardingError as exc:
+            return _onboarding_error(exc)
+        # node_id/hostname only. The response body holds the only copy of
+        # the token that will ever exist outside the node -- it is never
+        # written to a log.
+        _log.info("dashboard enroll_consume node_id=%s hostname=%s source=%s",
+                 result["node_id"], hostname, source)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/onboard/enrollments/{enrollment_id}/handle",
+                        methods=["POST"], include_in_schema=False)
+    async def onboard_create_handle(request: Request) -> JSONResponse:
+        """Mint the one-time handle the browser hands to the local helper.
+
+        Operator-authenticated, like every other dashboard mutation: a
+        page that cannot pass _mutation_guard cannot cause a helper to
+        install anything. The handle is what travels in the
+        terminalmcp:// URL instead of the enrollment code -- see
+        docs/windows-bootstrap-helper.md for why a custom-protocol URL is
+        not treated as a private channel."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        enrollment_id = request.path_params["enrollment_id"]
+
+        def _compute():
+            issued = onboarding.enrollments.create_handle(
+                enrollment_id, created_by=(identity.email if identity else None),
+                ttl_seconds=terminal.config.nodes.onboarding.pairing_handle_ttl_seconds)
+            if issued is None:
+                return None
+            handle, expires_at = issued
+            # Same reasoning as the paired file name: this origin travels
+            # to the helper and is redeemed BY THE MACHINE, not by the
+            # browser that asked for it.
+            origin = _machine_origin(request) or onboarding.controller_urls()[0]
+            return {"handle": handle, "expires_at": expires_at,
+                    "url": bootstrap_protocol.build_enroll_url(controller=origin, handle=handle),
+                    "controller": bootstrap_protocol.normalize_origin(origin)}
+
+        try:
+            result = await anyio.to_thread.run_sync(_compute)
+        except ValueError as exc:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400)
+        if result is None:
+            return JSONResponse({"error": "ENROLLMENT_NOT_PENDING",
+                                "detail": "this enrollment is already used, revoked or expired"},
+                                status_code=409, headers={"Cache-Control": "no-store"})
+        # enrollment id only -- the handle is a credential for its 120s.
+        _log.info("dashboard onboard_create_handle enrollment=%s identity=%s",
+                 enrollment_id, identity.email if identity else None)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/enroll/redeem", methods=["POST"], include_in_schema=False)
+    async def enroll_redeem(request: Request) -> JSONResponse:
+        """The Bootstrap helper exchanges its one-time handle for the full
+        bootstrap payload.
+
+        Machine-facing, like consume. The enrollment CODE is never part of
+        this exchange in either direction: the controller resolves the
+        handle to an enrollment and consumes that itself, so nothing the
+        helper is left holding can be replayed."""
+        source = (request.client.host if request.client else "unknown")
+        if _enroll_rate_limited(source):
+            return JSONResponse({"error": "RATE_LIMITED"}, status_code=429,
+                                headers={"Cache-Control": "no-store", "Retry-After": "60"})
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        hostname = str(body.get("hostname") or "").strip()[:255]
+        if not body.get("handle") or not hostname:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "handle and hostname are required"},
+                                status_code=400, headers={"Cache-Control": "no-store"})
+        addresses = body.get("addresses") if isinstance(body.get("addresses"), dict) else {}
+
+        def _compute() -> dict:
+            return onboarding.redeem_handle(
+                str(body.get("handle")), hostname=hostname, source_ip=source,
+                platform=str(body.get("platform") or "windows")[:32], addresses=addresses,
+                rescue_public_key=body.get("rescue_public_key"),
+                request_base_url=_request_base_url(request))
+
+        try:
+            result = await anyio.to_thread.run_sync(_compute)
+        except OnboardingError as exc:
+            return _onboarding_error(exc)
+        _log.info("dashboard enroll_redeem node_id=%s hostname=%s source=%s",
+                 result["node_id"], hostname, source)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/enroll/progress", methods=["POST"], include_in_schema=False)
+    async def enroll_progress(request: Request) -> JSONResponse:
+        """Where the installer says which stage it is on.
+
+        Machine-facing, like consume, and authenticated the same way: by
+        the enrollment code the installer already holds. It does NOT
+        consume the code -- progress arrives both before the exchange
+        (OpenSSH can take minutes) and after it (winget can take longer),
+        and one mechanism for both beats two.
+
+        Answers 202 whether or not the code is known. A distinct 404 would
+        turn this into an oracle for "is this code real", which is exactly
+        the question an attacker holding a guess wants answered."""
+        source = (request.client.host if request.client else "unknown")
+        if _enroll_rate_limited(source):
+            return JSONResponse({"error": "RATE_LIMITED"}, status_code=429,
+                                headers={"Cache-Control": "no-store", "Retry-After": "60"})
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        stage = str(body.get("stage") or "")
+        if stage not in ENROLL_STAGES:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "unknown stage"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        elapsed = body.get("elapsed_seconds")
+        try:
+            elapsed = int(elapsed) if elapsed is not None else None
+        except (TypeError, ValueError):
+            elapsed = None
+
+        # Two authenticators, one contract. The installer holds a code;
+        # the HELPER holds only a pairing handle, and everything it can
+        # usefully say -- started, redeeming, redeem failed -- happens
+        # before the exchange that would give it a code. Accepting either
+        # here keeps one machine-facing progress route, which is also what
+        # keeps the public bootstrap ingress allowlist unchanged: no new
+        # path is exposed.
+        handle = str(body.get("handle") or "")
+        code = str(body.get("code") or "")
+
+        def _compute() -> str | None:
+            if handle:
+                record = onboarding.enrollments.record_progress_by_handle(
+                    handle, stage=stage, elapsed_seconds=elapsed)
+            else:
+                record = onboarding.enrollments.record_progress(
+                    code, stage=stage, elapsed_seconds=elapsed)
+            return record.node_id if record else None
+
+        node_id = await anyio.to_thread.run_sync(_compute)
+        # node_id (not the code) is the only identifier that reaches a log.
+        #
+        # The helper also sends WHY it failed. Both values are normalised
+        # against a closed set before they are written down, so nothing the
+        # machine sends can put free text into this log: an unrecognised
+        # code or an out-of-range exit status becomes None and is simply
+        # not logged. Deliberately log-only -- no column, no migration --
+        # because the reason is a diagnostic, not state the Dashboard
+        # renders today.
+        failure_code = normalize_failure_code(body.get("code"))
+        exit_code = normalize_exit_code(body.get("exit_code"))
+        if node_id:
+            detail = ""
+            if failure_code:
+                detail += " code=%s" % failure_code
+            if exit_code is not None:
+                detail += " exit_code=%d" % exit_code
+            _log.info("dashboard enroll_progress node_id=%s stage=%s elapsed=%s%s",
+                     node_id, stage, elapsed, detail)
+        return JSONResponse({"accepted": True}, status_code=202, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/deregister", methods=["POST"], include_in_schema=False)
+    async def node_self_deregister(request: Request) -> JSONResponse:
+        """A node removing ITSELF (windows-setup.ps1 -Uninstall). Bearer-
+        authenticated with that node's own token, exactly like the
+        heartbeat route above -- a node can only ever deregister itself,
+        never another node."""
+        node_id = request.path_params["node_id"]
+        accepted, verdict = _verify_node_token(node_id, request)
+        if not accepted:
+            return JSONResponse({"error": "UNAUTHORIZED", "verdict": verdict.verdict},
+                                status_code=401, headers={"Cache-Control": "no-store"})
+        result = await anyio.to_thread.run_sync(lambda: onboarding.remove_node(node_id, by=f"node:{node_id}"))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    # Two paths, ONE handler. The short alias exists only so the
+    # quick-install one-liner fits the Win+R dialog's ~259-character
+    # limit; it serves byte-identical content.
+    @server.custom_route(SETUP_SCRIPT_SHORT_PATH, methods=["GET"], include_in_schema=False)
+    @server.custom_route("/enroll/windows-setup.ps1", methods=["GET"], include_in_schema=False)
+    async def enroll_setup_script(request: Request) -> Response:
+        """The GENERIC installer -- identical to the downloaded one except
+        that it has no code baked in and requires -EnrollmentCode. Served
+        without an Access cookie because the machine fetching it does not
+        have one, and safe to serve that way because it contains no
+        secret: the code, which is the only credential in this flow, is
+        supplied by the operator on the command line.
+
+        Versioned: /enroll/windows-setup.ps1?v=1.0.0 pins a version, and
+        the response always carries the version it actually served."""
+        if not terminal.config.nodes.onboarding.enabled:
+            return PlainTextResponse("Terminal MCP node onboarding is disabled on this controller.\n",
+                                     status_code=403)
+        requested = request.query_params.get("v")
+        if requested and requested != SETUP_SCRIPT_VERSION:
+            return PlainTextResponse(
+                f"Requested setup script version {requested!r} is not served by this controller "
+                f"(it has {SETUP_SCRIPT_VERSION}).\n", status_code=404)
+        controller_url = onboarding.controller_url(request_base_url=_request_base_url(request))
+        text = render_setup_script(enrollment_code=GENERIC_SETUP_CODE, controller_url=controller_url,
+                                   node_id="pending", display_name="pending", profile="minimal")
+        return PlainTextResponse(text, media_type="text/plain; charset=utf-8", headers={
+            "Cache-Control": "no-store",
+            "X-Terminal-Mcp-Setup-Version": SETUP_SCRIPT_VERSION,
+            "X-Terminal-Mcp-Setup-Sha256": script_fingerprint(text),
+            "Content-Disposition": 'attachment; filename="windows-setup.ps1"',
+        })
 
     # ---------------------------------------------------------------- Project Backlog
     # Read is gated like every other dashboard read; every WRITE goes

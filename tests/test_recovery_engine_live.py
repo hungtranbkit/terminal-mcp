@@ -75,7 +75,9 @@ def rig(tmp_path, tmux_cleanup):
     controller.refresh_local_heartbeat(tmux_session_count=0, agent_counts={}, agent_types=(), agent_version=None)
     lease_store = PaneLeaseStore(tmp_path / "recovery_leases.db")
     engine = RecoveryEngine(service.session_registry, controller, lease_store,
-                            AutoRecoveryConfig(enabled=True))
+                            # Mechanics, not the managed-only policy -- see
+                            # test_recovery_engine.py's _engine for why.
+                            AutoRecoveryConfig(enabled=True, managed_sessions_only=False))
     return {"service": service, "controller": controller, "engine": engine, "cleanup": tmux_cleanup}
 
 

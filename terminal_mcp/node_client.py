@@ -32,6 +32,12 @@ class NodeClientError(RuntimeError):
     so callers never need two different error-handling shapes depending
     on which node answered."""
 
+    def __init__(self, message: str, *, http_status: int | None = None,
+                 error_code: str | None = None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.error_code = error_code
+
 
 @runtime_checkable
 class NodeClient(Protocol):
@@ -42,8 +48,8 @@ class NodeClient(Protocol):
     TerminalService method 1:1 -- LocalNodeClient is a pure pass-through,
     RemoteNodeClient reconstructs the identical shape from JSON."""
 
-    def list_sessions(self) -> dict[str, Any]: ...
-    def status(self, session: str) -> dict[str, Any]: ...
+    def list_sessions(self, *, timeout_seconds: float | None = None) -> dict[str, Any]: ...
+    def status(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]: ...
     def tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]: ...
     def capture(self, session: str, start_line: int | None = None) -> dict[str, Any]: ...
     def send_text(self, session: str, text: str, press_enter: bool = False, dry_run: bool = False, *,
@@ -69,7 +75,20 @@ class NodeClient(Protocol):
     def grant_read(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]: ...
     def grant_input(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]: ...
     def health(self) -> dict[str, Any]: ...
+    def execution_probe(self, timeout_seconds: float = 3.0) -> dict[str, Any]: ...
+    def self_heal(self, action: str) -> dict[str, Any]: ...
     def metrics(self) -> dict[str, Any]: ...
+    def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]: ...
+    def repo_evidence(self, cwd: str) -> dict[str, Any]: ...
+    def repo_op(self, op: str, path: str, params: dict[str, Any]) -> dict[str, Any]: ...
+    def worktree_candidates(self, repo_path: str) -> dict[str, Any]: ...
+    def worktree_cleanup(self, worktree_path: str, *, repo_path: str | None = None,
+                         expected_head: str | None = None, expected_branch: str | None = None,
+                         task: dict[str, Any] | None = None,
+                         dry_run: bool = True) -> dict[str, Any]: ...
+    def describe_permissions(self, session: str) -> dict[str, Any]: ...
+    def set_permissions(self, session: str, *, read: bool | None, input: bool | None,
+                        expected_revision: int | None, actor: str | None) -> dict[str, Any]: ...
     def refresh_capabilities(self) -> dict[str, Any]: ...
     def knowledge_search(self, query: str, *, session_name: str | None = None, project: str | None = None,
                          since: str | None = None, until: str | None = None, limit: int = 20) -> dict[str, Any]: ...
@@ -90,10 +109,10 @@ class LocalNodeClient:
     def __init__(self, terminal: Any) -> None:
         self._terminal = terminal
 
-    def list_sessions(self) -> dict[str, Any]:
+    def list_sessions(self, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         return self._terminal.terminal_list_sessions()
 
-    def status(self, session: str) -> dict[str, Any]:
+    def status(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         return self._terminal.terminal_status(session)
 
     def tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]:
@@ -178,11 +197,114 @@ class LocalNodeClient:
     def health(self) -> dict[str, Any]:
         return {"status": "ok"}
 
+    def execution_probe(self, timeout_seconds: float = 3.0) -> dict[str, Any]:
+        result = self._terminal.terminal_list_sessions()
+        if "error" in result:
+            return {"execution_ok": False, "error": result["error"]}
+        return {"execution_ok": True, "agent_process_alive": True,
+                "session_count": len(result.get("sessions", [])),
+                "session_backend": type(self._terminal.tmux).__name__}
+
+    def self_heal(self, action: str) -> dict[str, Any]:
+        return {"error": "SELF_HEAL_NOT_SUPPORTED_FOR_LOCAL_NODE", "action": action}
+
     def metrics(self) -> dict[str, Any]:
         from . import host_metrics
         collected = host_metrics.collect(workspace_path=str(self._terminal.config.session_lifecycle.allowed_cwd_roots[0])
                                          if self._terminal.config.session_lifecycle.allowed_cwd_roots else "/")
         return collected.__dict__
+
+    def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]:
+        from . import node_profile
+        return node_profile.inventory(tuple(roles))
+
+    def repo_evidence(self, cwd: str) -> dict[str, Any]:
+        """Git metadata for a path on THIS host (controller == node here)."""
+        from .coordinator import RepoEvidenceError, git_repo_evidence
+
+        try:
+            evidence = git_repo_evidence(cwd)
+        except RepoEvidenceError as exc:
+            return {"error": "REPO_EVIDENCE_FAILED", "detail": str(exc)}
+        return {"cwd": cwd, "branch": evidence.branch, "head": evidence.head,
+                "clean": evidence.clean, "status_lines": list(evidence.status_lines),
+                "has_upstream": evidence.has_upstream,
+                "ahead": evidence.ahead, "behind": evidence.behind}
+
+    def repo_op(self, op: str, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Read-only repo introspection on THIS host (controller == node).
+
+        Goes through the SAME repo_read.run_operation the remote node's
+        HTTP endpoint calls, with the policy built from this process's own
+        config -- so a local repo and a remote one are read by identical
+        code under identical limits, and a behaviour difference between
+        them would be a bug in the transport, never in the engine."""
+        from . import repo_read
+
+        config = self._terminal.config
+        policy = config.repo_read.to_policy(config.session_lifecycle.allowed_cwd_roots)
+        return repo_read.run_operation(op, path, params or {}, policy)
+
+    def worktree_candidates(self, repo_path: str) -> dict[str, Any]:
+        """Classify this host's worktrees (controller == node here).
+
+        Goes through the SAME worktree_janitor.scan the remote node's HTTP
+        handler calls, with the policy built from this process's own config --
+        so local and remote are decided by identical code under identical
+        rules, and any difference between them would be a transport bug rather
+        than a policy one."""
+        from . import worktree_janitor
+
+        config = self._terminal.config.worktree_janitor
+        result = worktree_janitor.scan(repo_path, config.to_policy())
+        result["node_id"] = "local"
+        return result
+
+    def worktree_cleanup(self, worktree_path: str, *, repo_path: str | None = None,
+                         expected_head: str | None = None, expected_branch: str | None = None,
+                         task: dict[str, Any] | None = None,
+                         dry_run: bool = True) -> dict[str, Any]:
+        """Remove one worktree on this host. Same executor, same identity
+        pre-check and same force=False guarantee the remote handler applies."""
+        from . import git_worktree
+        from .lease import ResourceLockStore
+        from .worktree_executor import WorktreeExecutor
+
+        config = self._terminal.config.worktree_janitor
+        if expected_head or expected_branch:
+            observed = git_worktree.worktree_status(repo_path or worktree_path, worktree_path)
+            if not observed.get("exists"):
+                return {"outcome": "SKIPPED", "error": "WORKTREE_ABSENT",
+                        "worktree_path": worktree_path, "node_id": "local"}
+            if expected_head and observed.get("head_sha") != expected_head:
+                return {"outcome": "ABORTED", "error": "IDENTITY_MISMATCH",
+                        "worktree_path": worktree_path, "node_id": "local",
+                        "expected_head": expected_head, "observed_head": observed.get("head_sha")}
+            if expected_branch and observed.get("branch") != expected_branch:
+                return {"outcome": "ABORTED", "error": "IDENTITY_MISMATCH",
+                        "worktree_path": worktree_path, "node_id": "local",
+                        "expected_branch": expected_branch,
+                        "observed_branch": observed.get("branch")}
+        executor = WorktreeExecutor(
+            config.to_policy(), audit=getattr(self._terminal, "audit", None),
+            locks=ResourceLockStore(self._terminal.leases.path), node_id="local")
+        from . import worktree_janitor
+
+        probes = worktree_janitor.collect_local_probes(
+            getattr(self._terminal, "session_registry", None))
+        result = executor.execute({"worktree_path": worktree_path, "node_id": "local"},
+                                  task=task, repo_path=repo_path, dry_run=dry_run, **probes)
+        payload = result.to_dict()
+        payload["node_id"] = "local"
+        return payload
+
+    def describe_permissions(self, session: str) -> dict[str, Any]:
+        return self._terminal.describe_session_permissions(session)
+
+    def set_permissions(self, session: str, *, read=None, input=None,
+                        expected_revision=None, actor=None) -> dict[str, Any]:
+        return self._terminal.set_session_permissions(
+            session, read=read, input=input, expected_revision=expected_revision, actor=actor)
 
     def refresh_capabilities(self) -> dict[str, Any]:
         from .agent_availability import available_agent_types
@@ -230,8 +352,31 @@ class RemoteNodeClient:
         self._token = token
         self.timeout = timeout
 
+    def set_token(self, token: str) -> None:
+        """Point this client at a rotated credential in place.
+
+        Every request reads `self._token` when it is sent, so replacing
+        it here is enough -- no client needs rebuilding and no in-flight
+        caller holds a stale one. An empty token is deliberately allowed:
+        that is how revocation stops this controller from continuing to
+        command a node with a credential it has just refused."""
+        self._token = token
+
+    def fleet_exchange(self, *, objects: list[dict[str, Any]], since: str | None,
+                       source_node: str) -> dict[str, Any]:
+        """One fleet-metadata exchange with this node.
+
+        A node agent older than the fleet endpoint answers 404, which
+        _request turns into NodeClientError -- the caller records that node as
+        unsupported rather than failed, so rolling the fleet out one machine
+        at a time never makes the healthy ones look broken.
+        """
+        return self._request("POST", "/v1/fleet/objects",
+                             body={"objects": objects, "since": since, "from": source_node})
+
     def _request(self, method: str, path: str, *, params: dict[str, Any] | None = None,
-                body: dict[str, Any] | None = None) -> dict[str, Any]:
+                body: dict[str, Any] | None = None,
+                timeout_seconds: float | None = None) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
         if params:
             query = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items() if v is not None)
@@ -243,7 +388,8 @@ class RemoteNodeClient:
         if data is not None:
             request.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(request, timeout=(self.timeout if timeout_seconds is None
+                                                         else min(self.timeout, timeout_seconds))) as response:
                 return json.loads(response.read())
         except urllib.error.HTTPError as exc:
             # node_agent.py NEVER answers an application-level error
@@ -265,17 +411,20 @@ class RemoteNodeClient:
             except (ValueError, OSError):
                 body = None
             detail = body.get("error") if isinstance(body, dict) else exc.reason
-            raise NodeClientError(f"{method} {path} -> HTTP {exc.code}: {detail}") from exc
+            raise NodeClientError(f"{method} {path} -> HTTP {exc.code}: {detail}",
+                                  http_status=exc.code,
+                                  error_code=str(detail) if detail is not None else None) from exc
         except urllib.error.URLError as exc:
             raise NodeClientError(f"{method} {path} -> {type(exc).__name__}: {exc.reason}") from exc
         except (ValueError, TimeoutError) as exc:
             raise NodeClientError(f"{method} {path} -> {type(exc).__name__}: {exc}") from exc
 
-    def list_sessions(self) -> dict[str, Any]:
-        return self._request("GET", "/v1/sessions")
+    def list_sessions(self, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        return self._request("GET", "/v1/sessions", timeout_seconds=timeout_seconds)
 
-    def status(self, session: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/sessions/{urllib.parse.quote(session)}/status")
+    def status(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        return self._request("GET", f"/v1/sessions/{urllib.parse.quote(session)}/status",
+                             timeout_seconds=timeout_seconds)
 
     def tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]:
         return self._request("GET", f"/v1/sessions/{urllib.parse.quote(session)}/tail",
@@ -354,8 +503,111 @@ class RemoteNodeClient:
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/v1/health")
 
+    def execution_probe(self, timeout_seconds: float = 3.0) -> dict[str, Any]:
+        try:
+            return self._request("GET", "/v1/execution-health", timeout_seconds=timeout_seconds)
+        except NodeClientError as exc:
+            # Rolling upgrade compatibility: the authenticated sessions
+            # listing exercises the same backend on agents predating the
+            # richer endpoint. Only 404 falls back; auth/transport failures
+            # retain their evidence.
+            if exc.http_status != 404:
+                raise
+        result = self._request("GET", "/v1/sessions", timeout_seconds=timeout_seconds)
+        if "error" in result:
+            return {"execution_ok": False, "error": result["error"]}
+        return {"execution_ok": True, "agent_process_alive": True,
+                "session_count": len(result.get("sessions", [])),
+                "probe_mode": "legacy_sessions_fallback"}
+
+    def self_heal(self, action: str) -> dict[str, Any]:
+        if action != "graceful_agent_restart":
+            return {"error": "SELF_HEAL_ACTION_NOT_ALLOWLISTED", "action": action}
+        return self._request("POST", "/v1/internal/shutdown", body={})
+
     def metrics(self) -> dict[str, Any]:
         return self._request("GET", "/v1/metrics")
+
+    def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]:
+        return self._request("GET", "/v1/environment?roles=" + ",".join(roles))
+
+    def repo_evidence(self, cwd: str) -> dict[str, Any]:
+        """Ask THIS node for git metadata about one of its own paths.
+
+        A node whose agent predates this endpoint answers 404. That is
+        surfaced as an error payload rather than swallowed, because the
+        caller must tell "this repo is dirty" apart from "this node cannot
+        say" -- confusing the two is the bug this endpoint exists to fix.
+        """
+        import urllib.parse as _urlparse
+
+        return self._request(
+            "GET", "/v1/repo-evidence?cwd=" + _urlparse.quote(str(cwd), safe=""))
+
+    def repo_op(self, op: str, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Ask THIS node to read one of its own repositories.
+
+        A node whose agent predates /v1/repo/{op} answers 404, which
+        surfaces as a NodeClientError from `_request` and is reported by
+        the caller as NODE_UNREACHABLE/unsupported -- never as "the repo
+        said no". That is the same distinction /v1/repo-evidence had to
+        draw, and confusing the two here would be worse: a caller would
+        conclude a file does not exist when the truth is that nobody
+        looked.
+        """
+        import urllib.parse as _urlparse
+
+        query: list[tuple[str, str]] = [("path", str(path))]
+        for key, value in (params or {}).items():
+            if value is None or value == "":
+                continue
+            if isinstance(value, bool):
+                query.append((key, "true" if value else "false"))
+            elif isinstance(value, (list, tuple)):
+                # Repeated key, not a joined string: a pathspec may legally
+                # contain a comma.
+                query.extend((key, str(item)) for item in value)
+            else:
+                query.append((key, str(value)))
+        return self._request(
+            "GET", f"/v1/repo/{_urlparse.quote(str(op), safe='')}?"
+                   + _urlparse.urlencode(query))
+
+    def worktree_candidates(self, repo_path: str) -> dict[str, Any]:
+        """Ask THIS node to classify its own worktrees.
+
+        A node whose agent predates these routes answers 404, which _request
+        raises as NodeClientError -- reported by the caller as
+        NODE_LACKS_WORKTREE_JANITOR, kept distinct from NODE_UNREACHABLE. An old
+        agent and a dead one need different operator action."""
+        import urllib.parse as _urlparse
+
+        return self._request("GET", "/v1/worktree/candidates?repo_path="
+                            + _urlparse.quote(str(repo_path), safe=""))
+
+    def worktree_cleanup(self, worktree_path: str, *, repo_path: str | None = None,
+                         expected_head: str | None = None, expected_branch: str | None = None,
+                         task: dict[str, Any] | None = None,
+                         dry_run: bool = True) -> dict[str, Any]:
+        """Ask THIS node to remove one of its own worktrees.
+
+        The controller never removes a remote path itself -- it cannot see that
+        filesystem, and a same-named directory here is exactly what it would
+        delete instead. expected_head/expected_branch travel so the node can
+        refuse a stale view rather than act on it."""
+        return self._request("POST", "/v1/worktree/cleanup", body={
+            "worktree_path": worktree_path, "repo_path": repo_path,
+            "expected_head": expected_head, "expected_branch": expected_branch,
+            "task": task, "dry_run": dry_run})
+
+    def describe_permissions(self, session: str) -> dict[str, Any]:
+        return self._request("GET", f"/v1/sessions/{session}/permissions")
+
+    def set_permissions(self, session: str, *, read=None, input=None,
+                        expected_revision=None, actor=None) -> dict[str, Any]:
+        return self._request("POST", f"/v1/sessions/{session}/permissions",
+                             body={"read": read, "input": input,
+                                   "expected_revision": expected_revision, "actor": actor})
 
     def refresh_capabilities(self) -> dict[str, Any]:
         return self._request("POST", "/v1/capabilities/refresh")

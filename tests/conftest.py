@@ -1,17 +1,68 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+from pathlib import Path
 import time
 
 import pytest
 
-from terminal_mcp.config import AppConfig, PermissionsConfig
+from terminal_mcp.config import AppConfig, PermissionsConfig, SessionAccessConfig
+
+
+# The session-name whitelist no longer authorizes anything (see
+# SessionAccessConfig): access comes from explicit grants plus this default
+# policy. Production defaults are CLOSED. This fixture opens read/input
+# explicitly, because the tests using it are exercising something else
+# entirely -- ANSI rendering, redaction, Cloudflare Access, tail bounds --
+# and a session is just the vehicle. A test that is actually about
+# authorization builds its own config and grants explicitly.
+_OPEN_ACCESS = SessionAccessConfig(default_read=True, default_input=True)
 
 
 @pytest.fixture
 def read_config() -> AppConfig:
-    return AppConfig(PermissionsConfig(True, False), ("test-*", "agent-*"), 50, 20)
+    return AppConfig(PermissionsConfig(True, False), ("test-*", "agent-*"), 50, 20,
+                     session_access=_OPEN_ACCESS)
+
+
+# ---------------------------------------------------------------------------
+# Session access defaults for the SUITE.
+#
+# Production defaults are CLOSED (see SessionAccessConfig): a session nobody
+# has granted anything on is discoverable but not readable. This suite was
+# written when the session-name whitelist authorized reads, so hundreds of
+# tests express "this session is accessible" as "its name matches my config's
+# patterns" while actually testing something else entirely -- ANSI rendering,
+# queue dispatch, node routing, Windows backends.
+#
+# Rather than rewrite that assertion in every one of them, the shared DEFAULT
+# instance every AppConfig falls back to is opened here. Tests that are
+# genuinely about authorization -- test_dashboard_grants.py,
+# test_p0_grant_authorization_hotfix.py, test_session_access_no_whitelist.py,
+# test_supervisor.py -- pass their own SessionAccessConfig explicitly and are
+# unaffected by this, which is what keeps it from masking a real regression.
+_ACCESS_DEFAULT = AppConfig.__dataclass_fields__["session_access"].default
+object.__setattr__(_ACCESS_DEFAULT, "default_read", True)
+object.__setattr__(_ACCESS_DEFAULT, "default_input", True)
+
+
+@pytest.fixture(autouse=True)
+def _session_access_policy(request):
+    """Per-test override of the suite-wide OPEN default above.
+
+    A test marked `@pytest.mark.closed_access` runs against the production
+    posture -- nothing readable or sendable without an explicit grant -- which
+    is what every "this must be refused" test actually means now that refusal
+    no longer comes from a session's name.
+    """
+    closed = request.node.get_closest_marker("closed_access") is not None
+    object.__setattr__(_ACCESS_DEFAULT, "default_read", not closed)
+    object.__setattr__(_ACCESS_DEFAULT, "default_input", not closed)
+    yield
+    object.__setattr__(_ACCESS_DEFAULT, "default_read", True)
+    object.__setattr__(_ACCESS_DEFAULT, "default_input", True)
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -83,12 +134,158 @@ def pytest_configure(config: pytest.Config) -> None:
     tmux session ends) -- clean up periodically with the same read-only-
     diff-then-DELETE approach used to discover this, never treat it as
     a regression to chase further."""
+    # Isolation unchanged; what is added is the other half of it. This used to
+    # be a bare mkdtemp that nothing removed, so every pytest run left one more
+    # directory in /tmp forever -- the same shape of leak as the six in
+    # register_dashboard, one per run instead of six per call. See
+    # terminal_mcp/ephemeral_state.py for the measurement that found both.
+    import atexit
+    import shutil
     import tempfile
-    os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="terminal-mcp-test-state-")
+    state_home = tempfile.mkdtemp(prefix="terminal-mcp-test-state-")
+    os.environ["XDG_STATE_HOME"] = state_home
+    atexit.register(lambda: shutil.rmtree(state_home, ignore_errors=True))
+    config.addinivalue_line(
+        "markers",
+        "closed_access: run with session_access defaults CLOSED (the production posture) -- "
+        "for tests asserting that access is REFUSED without an explicit grant")
+
+
+def find_node() -> str | None:
+    """Path to a JS engine, PATH or not.
+
+    The dashboard's inline scripts are only ever parsed by these tests, and
+    on this fleet node is installed through nvm -- which puts it on PATH via
+    a shell function in an interactive profile, so `shutil.which("node")`
+    finds nothing under pytest. The result was 23 tests reporting "node not
+    installed on this host" and skipping, on a host that has node 24, for as
+    long as the suite has existed. Those are exactly the tests that would
+    have caught the `.split('\n')` syntax error that shipped a dead
+    dashboard panel, so a silent skip here is expensive.
+    """
+    found = shutil.which("node") or shutil.which("nodejs")
+    if found:
+        return found
+    candidates = sorted(Path.home().glob(".nvm/versions/node/*/bin/node"), reverse=True)
+    for candidate in candidates:
+        if os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
 
 
 def tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["tmux", *args], check=check, capture_output=True, text=True, timeout=10)
+
+
+# Set on every tmux session this fixture creates, and read back on a later
+# run to tell OUR OWN leftovers (from a run interrupted before teardown)
+# apart from a real session that merely shares the name. Without this, one
+# interrupted run poisoned that test's literal name on the host forever:
+# the guard below refused it on every subsequent run.
+OWNER_OPTION = "@terminal_mcp_test_session"
+
+# The tag now carries WHICH run owns the session, not just "a test does".
+# Two full suites on one host is this project's normal state (one per
+# worktree lane), and they collide on these literal names. With the old
+# "1" marker the second run read "test-owned" and KILLED a session the
+# first run was actively using, which surfaces as a storm of unrelated
+# failures in the other run rather than as anything pointing here.
+
+# Names this suite has actually CREATED on this host, remembered across
+# runs. Needed because the tag lives on the session, and a session can be
+# recreated during a test by the code under test (the recovery engine
+# rebuilds a session by name; so does terminal_create_session). That
+# replacement carries no tag, so an interrupted run leaves an UNTAGGED
+# session under a name only this suite ever uses -- which is exactly what
+# poisoned `webterm-smoke-readonly` and `test-tail-order` here. A name
+# only lands in this ledger when the fixture created it from nothing, so
+# a real session's name can never enter it by being refused.
+def _name_ledger() -> Path:
+    """Deliberately NOT under XDG_STATE_HOME, and deliberately resolved on
+    each call rather than at import.
+
+    pytest_configure above points XDG_STATE_HOME at a fresh temp directory
+    per run and deletes it on exit -- correct for everything the suite
+    writes, and fatal for this one file, whose entire job is to be read by
+    the NEXT run. Resolving at import would also make the path depend on
+    whether this module was imported before or after that hook ran, which
+    is the kind of difference that shows up as one baffling failure and
+    nothing else."""
+    return Path.home() / ".local" / "state" / "terminal-mcp" / "test-session-names"
+
+
+def _process_start_time(pid: int) -> str | None:
+    """Field 22 of /proc/<pid>/stat: the tick the process started at.
+
+    Paired with the pid so a recycled pid cannot make a dead owner look
+    alive. Returns None off Linux or when the process is gone, and every
+    caller treats None as "cannot prove it is alive".
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "r") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    # The comm field can contain spaces and parentheses; everything after
+    # the LAST ')' is positional.
+    tail = data[data.rfind(")") + 1:].split()
+    return tail[19] if len(tail) > 19 else None
+
+
+_RUN_OWNER = f"{os.getpid()}:{_process_start_time(os.getpid()) or 0}"
+
+
+def _owner_alive(owner: str) -> bool:
+    """True only when the run that tagged this session is provably still
+    running. Anything unparseable is treated as not alive: the sessions
+    this is asked about carry test-only names, and refusing to reap a
+    genuine leftover forever is the failure mode that sent a human to a
+    terminal to run kill-session by hand."""
+    if owner == _RUN_OWNER:
+        return True
+    pid_text, _, start = owner.partition(":")
+    if not pid_text.isdigit():
+        return False
+    return _process_start_time(int(pid_text)) == start
+
+
+def _session_owner(name: str) -> str | None:
+    """The run that owns this session, "" for the legacy untargeted marker,
+    or None when the session carries no marker at all."""
+    got = tmux("show-options", "-t", name, "-v", OWNER_OPTION, check=False)
+    if got.returncode != 0:
+        return None
+    value = got.stdout.strip()
+    if not value:
+        return None
+    # "1" is what runs from before this change write. Treat it as owned by
+    # a run we cannot identify -- reapable, since that is what it meant.
+    return "" if value == "1" else value
+
+
+def _remember_created(name: str) -> None:
+    try:
+        _name_ledger().parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if name in _known_created_names():
+            return
+        with open(_name_ledger(), "a") as handle:
+            handle.write(name + "\n")
+    except OSError:
+        # A ledger that cannot be written costs us the untagged-orphan
+        # cleanup and nothing else; it must never fail a test run.
+        pass
+
+
+def _known_created_names() -> set[str]:
+    try:
+        with open(_name_ledger(), "r") as handle:
+            return {line.strip() for line in handle if line.strip()}
+    except OSError:
+        return set()
+
+
+def _is_test_owned(name: str) -> bool:
+    return _session_owner(name) is not None
 
 
 @pytest.fixture
@@ -113,6 +310,38 @@ def tmux_session_factory():
     def create(name: str, command: str = "bash") -> str:
         exists = tmux("has-session", "-t", name, check=False).returncode == 0
         if exists and name not in created:
+            owner = _session_owner(name)
+            if owner is not None and _owner_alive(owner):
+                # Tagged, and the run that tagged it is STILL RUNNING --
+                # another suite on this host (one per worktree lane is
+                # normal here) is using this session right now. Killing it
+                # would break that run in ways that point nowhere near
+                # this line, so refuse loudly instead.
+                raise RuntimeError(
+                    f"tmux session {name!r} belongs to another test run that is still "
+                    f"alive (owner {owner}). Two suites on one host collide on these "
+                    "literal names -- run them one at a time, or give this test a "
+                    "unique disposable name."
+                )
+            if owner is not None:
+                # Tagged by a run that is gone: a leftover from a suite
+                # interrupted before teardown. Reaping it cannot touch
+                # anyone's work.
+                tmux("kill-session", "-t", name, check=False)
+                exists = False
+            elif name in _known_created_names():
+                # UNTAGGED, but this suite has created this exact name on
+                # this host before. That is the recreated-by-the-code-under
+                # -test case: the recovery engine (and terminal_create_
+                # session) rebuild a session by name, and the replacement
+                # carries no tag, so an interrupted run leaves a nameless
+                # squatter that refused this test on every later run until
+                # a human killed it by hand. The name reached the ledger
+                # only by being created from nothing here, so a real
+                # session's name cannot arrive this way.
+                tmux("kill-session", "-t", name, check=False)
+                exists = False
+        if exists and name not in created:
             # A session by this name already exists and this fixture
             # instance did not make it -- refuse rather than kill it. Once
             # a name IS in `created`, calling create() again for the same
@@ -128,6 +357,8 @@ def tmux_session_factory():
         if exists:
             tmux("kill-session", "-t", name, check=False)
         tmux("new-session", "-d", "-s", name, command)
+        tmux("set-option", "-t", name, OWNER_OPTION, _RUN_OWNER, check=False)
+        _remember_created(name)
         created.add(name)
         time.sleep(0.15)
         return name
@@ -136,3 +367,36 @@ def tmux_session_factory():
     for name in created:
         tmux("kill-session", "-t", name, check=False)
 
+
+
+# ---------------------------------------------------------------------------
+# The suite must not leave a diff in the repository it planned against.
+#
+# Planning RE-VERIFIES the knowledge map, and re-verification writes: a module
+# whose paths no commit has touched gets its verified commit advanced. That is
+# the feature. But several tests drive the real pipeline with no project path,
+# which resolves to the CANONICAL map -- the main worktree's, shared by every
+# worktree on this machine. A test run must not advance another lane's file,
+# so the canonical state is snapshotted here and put back at the end.
+#
+# Session-scoped rather than per-test: the file is shared, not per-test state,
+# and paying a read on every one of several thousand tests to catch a write
+# that only a handful can make is the wrong trade.
+
+@pytest.fixture(scope="session", autouse=True)
+def _canonical_knowledge_map_is_left_as_it_was():
+    try:
+        from terminal_mcp.project_knowledge import ProjectKnowledge, canonical_root
+
+        root = canonical_root(str(Path(__file__).resolve().parent.parent))
+        path = ProjectKnowledge(root).state_path if root else None
+    except Exception:  # noqa: BLE001 -- no repo, no map, nothing to protect
+        path = None
+    before = path.read_bytes() if path and path.exists() else None
+    yield
+    if path is None:
+        return
+    if before is None:
+        path.unlink(missing_ok=True)
+    elif path.exists() and path.read_bytes() != before:
+        path.write_bytes(before)
