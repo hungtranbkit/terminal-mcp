@@ -495,7 +495,36 @@ class QueueEngine:
         tick, before this method is ever reached -- so by construction
         this branch only sees a task still genuinely within its grace
         window)."""
+        task = self.store.get_task(task_id)
         status_response = self.ops.terminal_status(session)
+        # DELIVERY_UNKNOWN means only that acceptance was not observable in
+        # the submit window. The worker may already have completed before a
+        # later tick. Reconcile the same nonce-bound evidence used by the
+        # ordinary VERIFYING path before considering any grace-period retry;
+        # this completes without resending and cannot accept the marker that
+        # was embedded in our own dispatched instruction.
+        capture = self.ops.terminal_tail(session, 200)
+        output = worker_output_after_prompt(str(capture.get("output") or ""))
+        marker = parse_completion_marker(output)
+        if verify_completion_marker(
+            marker, task_id=task_id, attempt=task.attempt_count,
+            nonce=task.verification_nonce, nonce_consumed=False,
+        ):
+            # Preserve the existing state machine/audit path: uncertain
+            # delivery is first confirmed as started, then verified complete.
+            self.store.transition_task(
+                task_id, RUNNING, event_type="STARTED",
+                reason="verified completion proves uncertain dispatch was accepted")
+            self.store.transition_task(
+                task_id, VERIFYING, event_type="VERIFYING",
+                reason="nonce-bound completion evidence observed during reconciliation")
+            completed = self.store.mark_completed_with_evidence(
+                task_id, evidence={"completion_marker": marker, "reconciled_from": DISPATCH_UNCERTAIN})
+            self._notify_completed(completed)
+            if self.governor is not None:
+                self.governor.note_success(completed)
+            return TickResult(session, "COMPLETED", task_id=task_id,
+                              detail="verified completion after uncertain dispatch")
         if not status_response.get("error") and status_response.get("state") == "RUNNING":
             self.store.transition_task(task_id, RUNNING, event_type="STARTED",
                                        reason="confirmed real activity after DISPATCH_UNCERTAIN")
