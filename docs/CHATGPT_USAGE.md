@@ -75,6 +75,27 @@ only, nothing to call yet. Never treat a PLANNED item as available.
   whenever you already know which node you mean (registry/recovery
   calls in particular *require* the qualified form — see §7).
 
+## 1b. Survive a new-chat / UI reset
+
+The visible ChatGPT conversation is **not** the source of truth for delegated work.
+Before a long analysis or multi-agent delegation, call
+`terminal_chat_checkpoint(project_id, ...)` with the current goal, decisions, active
+tasks/sessions/branches, blockers and next actions. Checkpoint again after important
+decisions or dispatches and immediately before merge/deploy. The store is append-only,
+persistent across controller restarts, and recursively redacts credential-shaped text.
+
+If ChatGPT unexpectedly returns to a new chat, call
+`terminal_chat_recover(project_id)` **first**. It returns the latest saved orchestration
+checkpoint and a fresh `live_project_status` from the queue/backlog/worker projection.
+Then use `terminal_knowledge_recover(session)` for any individual terminal session that
+needs lower-level history. `terminal_chat_checkpoint_list` provides older handoff points.
+
+These are complementary recovery layers: chat checkpoint preserves the decisions ChatGPT
+explicitly saved; project status preserves live delegated-work state; session knowledge
+preserves terminal-level execution context. The server cannot recover unsaved private
+thoughts from a conversation that disappeared, so checkpoint **before** expensive work,
+not only after it. None of these checkpoint calls dispatches or changes project tasks.
+
 ## 2. Session discovery / status / read / input
 
 1. **`terminal_list_sessions()`** — every session this node/fleet

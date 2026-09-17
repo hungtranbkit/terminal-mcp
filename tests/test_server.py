@@ -86,6 +86,10 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_project_pause",
         "terminal_project_resume",
         "terminal_project_assign",
+        # Chat reset recovery tools.
+        "terminal_chat_checkpoint",
+        "terminal_chat_recover",
+        "terminal_chat_checkpoint_list",
         # Previously HTTP-only: build_mcp() left `backlog`/`events` at None
         # while server.py calls it bare, so these 19 were absent from the
         # stdio surface AND from this contract test. Both surfaces now match.
