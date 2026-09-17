@@ -1,6 +1,10 @@
 """Compact, high-level terminal operations built from existing guarded APIs."""
 from __future__ import annotations
 
+import base64
+import binascii
+import json
+import math
 import time
 import uuid
 from collections.abc import Callable
@@ -12,8 +16,11 @@ MAX_TAIL_LINES = 20
 MAX_TAIL_CHARS_PER_TARGET = 1_000
 MAX_TOTAL_TAIL_CHARS = 16_000
 MAX_REASON_CHARS = 500
-MAX_WAIT_SECONDS = 900
+MAX_WAIT_SECONDS = 45
 MAX_SEND_WAIT_SECONDS = 30
+MAX_RESUME_TOKEN_CHARS = 4_096
+_RESUME_TOKEN_VERSION = 1
+_MAX_TARGET_CHARS = 512
 
 _BLOCKED_ERRORS = {
     "ACCESS_DENIED", "ACTION_NOT_ALLOWED", "BINDING_INPUT_DISABLED",
@@ -82,6 +89,39 @@ class CompactTerminalTools:
         if isinstance(tail_lines, bool) or not isinstance(tail_lines, int) or not 1 <= tail_lines <= MAX_TAIL_LINES:
             return {"error": "INVALID_TAIL_LINES", "allowed": "1..20"}
         return None
+
+    @staticmethod
+    def _encode_resume_token(target: str, desired_states: list[str], tail_lines: int) -> str:
+        payload = {"v": _RESUME_TOKEN_VERSION, "target": target,
+                   "desired_states": desired_states, "tail_lines": tail_lines}
+        raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    @classmethod
+    def _decode_resume_token(cls, token: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        if (not isinstance(token, str) or not token or len(token) > MAX_RESUME_TOKEN_CHARS or
+                any(char.isspace() for char in token)):
+            return None, {"status": "FAILED", "error": "INVALID_RESUME_TOKEN"}
+        try:
+            padded = token + "=" * (-len(token) % 4)
+            raw = base64.b64decode(padded, altchars=b"-_", validate=True)
+            if len(raw) > MAX_RESUME_TOKEN_CHARS:
+                raise ValueError
+            payload = json.loads(raw.decode("utf-8"))
+        except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return None, {"status": "FAILED", "error": "INVALID_RESUME_TOKEN"}
+        if not isinstance(payload, dict) or set(payload) != {"v", "target", "desired_states", "tail_lines"}:
+            return None, {"status": "FAILED", "error": "INVALID_RESUME_TOKEN"}
+        target = payload.get("target")
+        states = payload.get("desired_states")
+        tail_lines = payload.get("tail_lines")
+        if (type(payload.get("v")) is not int or payload["v"] != _RESUME_TOKEN_VERSION or
+                not isinstance(target, str) or not target.strip() or len(target) > _MAX_TARGET_CHARS or
+                not isinstance(states, list) or not states or len(states) > 20 or
+                any(not isinstance(state, str) or not state.strip() or len(state) > 64 for state in states) or
+                cls._validate_tail_lines(tail_lines)):
+            return None, {"status": "FAILED", "error": "INVALID_RESUME_TOKEN"}
+        return payload, None
 
     def batch_inspect(self, targets: list[str], tail_lines: int = 20,
                       compact: bool = True) -> dict[str, Any]:
@@ -181,18 +221,26 @@ class CompactTerminalTools:
             "timeout": timeout,
         }
 
-    def wait_for_state(self, target: str, desired_states: list[str], timeout: float = 900,
+    def wait_for_state(self, target: str, desired_states: list[str], timeout: float = 30,
                        poll_interval: float = 1, tail_lines: int = 20) -> dict[str, Any]:
+        if not isinstance(target, str) or not target.strip() or len(target) > _MAX_TARGET_CHARS:
+            return {"status": "FAILED", "error": "INVALID_TARGET", "target": target}
         if (not isinstance(desired_states, list) or not desired_states or len(desired_states) > 20 or
                 any(not isinstance(state, str) or not state.strip() or len(state) > 64 for state in desired_states)):
             return {"status": "FAILED", "error": "INVALID_DESIRED_STATES"}
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= MAX_WAIT_SECONDS:
-            return {"status": "FAILED", "error": "INVALID_TIMEOUT", "allowed": "0 < timeout <= 900"}
-        if isinstance(poll_interval, bool) or not isinstance(poll_interval, (int, float)) or poll_interval < 1:
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or
+                not math.isfinite(timeout) or not 0 < timeout <= MAX_WAIT_SECONDS):
+            return {"status": "FAILED", "error": "INVALID_TIMEOUT", "allowed": "0 < timeout <= 45"}
+        if (isinstance(poll_interval, bool) or not isinstance(poll_interval, (int, float)) or
+                not math.isfinite(poll_interval) or poll_interval < 1):
             return {"status": "FAILED", "error": "INVALID_POLL_INTERVAL", "minimum": 1}
         if error := self._validate_tail_lines(tail_lines):
             return {"status": "FAILED", **error}
-        desired = {state.strip().upper() for state in desired_states}
+        normalized_states = list(dict.fromkeys(state.strip().upper() for state in desired_states))
+        desired = set(normalized_states)
+        resume_token = self._encode_resume_token(target, normalized_states, tail_lines)
+        if len(resume_token) > MAX_RESUME_TOKEN_CHARS:
+            return {"status": "FAILED", "error": "INVALID_WAIT_COORDINATES"}
         deadline = self.monotonic() + timeout
         polls = 0
         final: dict[str, Any] = {}
@@ -213,12 +261,18 @@ class CompactTerminalTools:
         rendered, clipped = _bounded(tail.get("output", "") if "error" not in tail else "",
                                      MAX_TAIL_CHARS_PER_TARGET)
         reason, reason_clipped = _bounded(final.get("reason") or final.get("error"), MAX_REASON_CHARS)
-        return {
-            "status": "MATCHED" if matched else ("FAILED" if "error" in final else "TIMEOUT"),
+        task_id = final.get("task_id")
+        if task_id is None and isinstance(final.get("current_task"), dict):
+            task_id = final["current_task"].get("id")
+        task_id = task_id or final.get("submission_id") or final.get("correlation_id")
+        result = {
+            "status": "MATCHED" if matched else ("FAILED" if "error" in final else "PENDING"),
             "target": target,
+            "desired_states": normalized_states,
             "state": final.get("state", "UNKNOWN"),
             "input_required": bool(final.get("input_required", False)),
             "reason": reason,
+            "task_id": task_id,
             "polls": polls,
             "elapsed_seconds": round(timeout - max(0.0, deadline - self.monotonic()), 3),
             "tail": rendered,
@@ -226,3 +280,16 @@ class CompactTerminalTools:
             "untrusted_output": True,
             "untrusted_fields": ["tail"],
         }
+        if result["status"] == "PENDING":
+            result["next_action"] = "Call terminal_resume_wait with resume_token"
+            result["resume_token"] = resume_token
+        return result
+
+    def resume_wait(self, resume_token: str, timeout: float = 30,
+                    poll_interval: float = 1) -> dict[str, Any]:
+        payload, error = self._decode_resume_token(resume_token)
+        if error:
+            return error
+        assert payload is not None
+        return self.wait_for_state(payload["target"], payload["desired_states"], timeout=timeout,
+                                   poll_interval=poll_interval, tail_lines=payload["tail_lines"])
