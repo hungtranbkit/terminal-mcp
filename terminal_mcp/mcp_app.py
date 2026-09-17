@@ -425,12 +425,19 @@ def build_mcp(service: TerminalService | None = None,
         return compact_tools.batch_inspect(targets, tail_lines=tail_lines, compact=compact)
 
     @server.tool()
-    def terminal_wait_for_state(target: str, desired_states: list[str], timeout: float = 900,
+    def terminal_wait_for_state(target: str, desired_states: list[str], timeout: float = 30,
                                 poll_interval: float = 1, tail_lines: int = 20) -> dict:
         """Server-side bounded wait, avoiding repeated client polling cards."""
         _refresh_local_heartbeat()
         return compact_tools.wait_for_state(target, desired_states, timeout=timeout,
                                             poll_interval=poll_interval, tail_lines=tail_lines)
+
+    @server.tool()
+    def terminal_resume_wait(resume_token: str, timeout: float = 30,
+                             poll_interval: float = 1) -> dict:
+        """Resume a bounded wait from a stateless terminal_wait_for_state token."""
+        _refresh_local_heartbeat()
+        return compact_tools.resume_wait(resume_token, timeout=timeout, poll_interval=poll_interval)
 
     @server.tool()
     def terminal_send_task(target: str, text: str, wait_for_accept: bool = True,
