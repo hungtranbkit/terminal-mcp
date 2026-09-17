@@ -4,6 +4,7 @@ from pathlib import Path
 
 from terminal_mcp.compact_tools import (
     DEFAULT_WAIT_SECONDS,
+    MAX_SEND_WAIT_SECONDS,
     MAX_TOTAL_TAIL_CHARS,
     SYNC_WAIT_BUDGET_SECONDS,
     CompactTerminalTools,
@@ -142,6 +143,15 @@ def test_send_task_codex_confirm_path_is_concise():
     assert result["status"] == "SUBMIT_CONFIRMED"
     assert result["submission_id"] == "corr-codex"
     assert "output" not in result and "output" not in result["evidence"]
+
+
+def test_send_task_public_wait_budget_is_at_most_twenty_seconds():
+    assert MAX_SEND_WAIT_SECONDS == 20
+    assert inspect.signature(CompactTerminalTools.send_task).parameters["timeout"].default == 20
+    compact, _terminal, _controller = service()
+    assert compact.send_task("worker", "task", timeout=21) == {
+        "status": "FAILED", "error": "INVALID_TIMEOUT", "allowed": "0 < timeout <= 20"
+    }
 
 
 class FakeClock:
@@ -322,3 +332,11 @@ def test_batch_output_has_strict_tail_budget_and_truncation_metadata():
     assert result["response_truncated"] is True
     assert sum(len(row["tail"]) for row in result["targets"]) <= MAX_TOTAL_TAIL_CHARS
     assert all(row["tail_truncated"] for row in result["targets"])
+
+
+def test_batch_rejects_oversized_target_without_echoing_it():
+    compact, _terminal, _controller = service()
+    oversized = "x" * 100_000
+    result = compact.batch_inspect([oversized])
+    assert result == {"error": "INVALID_TARGETS", "max_targets": 25}
+    assert oversized not in str(result)

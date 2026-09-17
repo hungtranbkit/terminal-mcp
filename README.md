@@ -162,7 +162,10 @@ For compact agent control, prefer `terminal_batch_inspect` over repeated
 status/tail calls, `terminal_send_task` over a manual text-plus-Enter sequence,
 and `terminal_wait_for_state` over client-side polling. These tools compose the
 existing authorization, binding, menu-detection, idempotency, and verified-submit
-paths; the lower-level tools remain available and backward compatible.
+paths; the lower-level tools remain available and backward compatible. Treat one
+logical operation as one compact call. A wait holds the MCP request for at most
+20 seconds; if it returns `PENDING`, continue with `terminal_resume_wait` and its
+opaque `resume_token` rather than resending the task or restarting the wait.
 
 Execution-aware node health is stricter than heartbeat-only presence: a node is green only after a bounded execution-backend probe succeeds. `terminal_node_health` exposes transport/execution state, retry/backoff evidence, last success, and sanitized failure details without changing legacy node APIs.
 

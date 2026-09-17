@@ -116,7 +116,10 @@ async def test_stdio_real_handshake_and_tools(tmp_path):
         command=str(root / ".venv/bin/terminal-mcp"),
         cwd=str(root),
         env={"TERMINAL_MCP_CONFIG": _config_with_open_access(tmp_path),
-             "TERMINAL_MCP_BINDINGS_DB": str(tmp_path / "bindings.db")},
+             "TERMINAL_MCP_BINDINGS_DB": str(tmp_path / "bindings.db"),
+             # Keep an isolated worktree authoritative even when its .venv is
+             # shared with an editable install from the primary checkout.
+             "PYTHONPATH": str(root)},
     )
     async with stdio_client(params) as streams:
         async with ClientSession(*streams) as session:
@@ -124,10 +127,13 @@ async def test_stdio_real_handshake_and_tools(tmp_path):
             tools = await session.list_tools()
     assert initialized.server_info.name == "terminal-mcp"
     assert initialized.server_info.version == __version__
+    assert "one compact tool per logical terminal operation" in (initialized.instructions or "")
     names = {tool.name for tool in tools.tools}
-    assert len(names) == 275  # adds terminal_resume_wait; ONE surface (stdio == HTTP)
+    assert len(names) == 281  # includes compact tools; ONE surface (stdio == HTTP)
     assert {"terminal_tail", "terminal_send_keys", "terminal_exit_copy_mode",
             "terminal_bind", "terminal_tail_bound"} <= names
+    assert {"terminal_batch_inspect", "terminal_send_task", "terminal_wait_for_state",
+            "terminal_resume_wait"} <= names
 
 
 @pytest.mark.anyio
@@ -168,6 +174,7 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
 
     assert initialized.server_info.name == "terminal-mcp"
     assert initialized.server_info.version == __version__
+    assert "one compact tool per logical terminal operation" in (initialized.instructions or "")
     assert "test-http-secure" in {row["name"] for row in listed["sessions"]}
     assert "sk-live-secret" not in tail["output"]
     assert "<REDACTED>" in tail["output"]
@@ -179,6 +186,11 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
     assert text_disabled["error"] == "ACCESS_DENIED"
     assert keys_disabled["error"] == "ACCESS_DENIED"
     assert len(tools.tools) == 281  # includes durable terminal_resume_wait; ONE surface (stdio == HTTP)
+    names = {tool.name for tool in tools.tools}
+    assert {"terminal_batch_inspect", "terminal_send_task", "terminal_wait_for_state",
+            "terminal_resume_wait"} <= names
+    assert {"terminal_list_sessions", "terminal_status", "terminal_tail",
+            "terminal_send_text", "terminal_send_keys"} <= names
 
 
 @pytest.mark.anyio
