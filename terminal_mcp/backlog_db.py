@@ -45,6 +45,43 @@ BACKLOG_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: project-keyed backlog", lambda connection: None),
 ]
 
+_RECONCILE_LIST_FIELDS = ("dependencies", "acceptance_criteria", "tags", "history")
+_RECONCILE_SCALAR_FIELDS = (
+    "title", "description", "status", "priority", "type", "order", "created_at",
+    "updated_at", "source", "assignee", "session", "node_id", "queue_task_id",
+    "branch", "worktree", "blocked_reason",
+)
+
+
+def _stable_union(current: list[Any], historical: list[Any]) -> list[Any]:
+    """Return a deterministic, idempotent union for scalar or object metadata."""
+    keyed: dict[str, Any] = {}
+    for value in [*current, *historical]:
+        key = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        keyed.setdefault(key, value)
+    return [keyed[key] for key in sorted(keyed)]
+
+
+def reconcile_item(current: dict[str, Any], historical: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Keep canonical fields, merging only additive historical metadata."""
+    merged = dict(current)
+    differing = [field for field in _RECONCILE_SCALAR_FIELDS
+                 if current.get(field) != historical.get(field)]
+    for field in _RECONCILE_LIST_FIELDS:
+        merged[field] = _stable_union(current.get(field) or [], historical.get(field) or [])
+    current_evidence = current.get("evidence") or {}
+    historical_evidence = historical.get("evidence") or {}
+    evidence: dict[str, Any] = dict(current_evidence)
+    for field in sorted(set(current_evidence) | set(historical_evidence)):
+        left, right = current_evidence.get(field), historical_evidence.get(field)
+        if isinstance(left, list) or isinstance(right, list):
+            evidence[field] = _stable_union(left if isinstance(left, list) else [],
+                                            right if isinstance(right, list) else [])
+        elif field not in evidence:
+            evidence[field] = right
+    merged["evidence"] = evidence
+    return merged, differing
+
 
 def default_backlog_db_path() -> Path:
     override = os.environ.get("TERMINAL_MCP_BACKLOG_DB")
@@ -202,3 +239,59 @@ class BacklogDB:
             merged = list(existing.values())
         revision = self.replace_items(project_id, merged)
         return {"added": added, "updated": updated, "total": len(merged), "revision": revision}
+
+    def reconcile_document(self, project_id: str, document: dict[str, Any], *,
+                           dry_run: bool = True) -> dict[str, Any]:
+        """Safely union a historical projection into the canonical store.
+
+        Existing canonical scalar/operational fields always win. Historical
+        evidence, history, tags, dependencies and acceptance criteria are
+        additive. A byte-equivalent second run performs no write or revision
+        bump, which makes this suitable for restartable migrations.
+        """
+        incoming = [normalise_item(i) for i in document.get("items", [])]
+        incoming = [i for i in incoming if i]
+        existing_items = self.items(project_id)
+        existing = {i["id"]: i for i in existing_items}
+        added_ids: list[str] = []
+        updated_ids: list[str] = []
+        unchanged_ids: list[str] = []
+        conflicts: list[dict[str, Any]] = []
+
+        for historical in incoming:
+            item_id = historical["id"]
+            current = existing.get(item_id)
+            if current is None:
+                existing[item_id] = historical
+                added_ids.append(item_id)
+                continue
+            merged, differing = reconcile_item(current, historical)
+            if differing:
+                conflicts.append({"id": item_id, "fields": differing,
+                                  "resolution": "current_canonical_wins"})
+            if merged == current:
+                unchanged_ids.append(item_id)
+            else:
+                existing[item_id] = merged
+                updated_ids.append(item_id)
+
+        merged_items = list(existing.values())
+        changed = bool(added_ids or updated_ids)
+        revision_before = self.revision(project_id)
+        revision_after = revision_before
+        if changed and not dry_run:
+            revision_after = self.replace_items(project_id, merged_items)
+        return {
+            "dry_run": bool(dry_run),
+            "changed": changed,
+            "before_total": len(existing_items),
+            "after_total": len(merged_items),
+            "added": len(added_ids),
+            "updated": len(updated_ids),
+            "unchanged": len(unchanged_ids),
+            "added_ids": sorted(added_ids),
+            "updated_ids": sorted(updated_ids),
+            "conflicts": sorted(conflicts, key=lambda row: row["id"]),
+            "revision_before": revision_before,
+            "revision": revision_after,
+        }

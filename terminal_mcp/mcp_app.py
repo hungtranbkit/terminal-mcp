@@ -4036,6 +4036,18 @@ def build_mcp(service: TerminalService | None = None,
             return backlog.import_file(path, replace=replace)
 
         @server.tool()
+        def terminal_backlog_reconcile(path: str, dry_run: bool = True,
+                                       expected_revision: int | None = None) -> dict:
+            """Safely reconcile an older backlog projection into the canonical store.
+
+            Existing canonical state wins every scalar conflict (especially
+            DONE/CANCELLED and ownership fields); historical evidence/history/tags
+            are merged additively. Defaults to a no-write preview. Re-running an
+            applied reconciliation is a no-op with no revision bump."""
+            return backlog.reconcile_file(path, dry_run=dry_run,
+                                          expected_revision=expected_revision)
+
+        @server.tool()
         def terminal_backlog_validate(path: str | None = None) -> dict:
             """Validate the backlog file after a MANUAL edit (a human
             editing .terminal-mcp/backlog.json by hand is expected and

@@ -50,8 +50,18 @@ async def test_all_backlog_tools_are_registered(rig):
     for tool in ("terminal_backlog_get", "terminal_backlog_add", "terminal_backlog_update",
                  "terminal_backlog_bulk_update", "terminal_backlog_claim",
                  "terminal_backlog_dispatch", "terminal_backlog_block",
-                 "terminal_backlog_complete", "terminal_backlog_validate"):
+                 "terminal_backlog_complete", "terminal_backlog_validate",
+                 "terminal_backlog_reconcile"):
         assert tool in names, tool
+
+
+@pytest.mark.anyio
+async def test_reconcile_tool_defaults_to_preview(rig):
+    server, repo, _ = rig
+    await _call(server, "terminal_backlog_add", path=str(repo), tasks=[{"title": "current"}])
+    await _call(server, "terminal_backlog_export", path=str(repo))
+    result = await _call(server, "terminal_backlog_reconcile", path=str(repo))
+    assert result["dry_run"] is True and result["changed"] is False
 
 
 @pytest.mark.anyio

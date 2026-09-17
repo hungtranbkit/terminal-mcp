@@ -612,6 +612,38 @@ class BacklogService:
         return {"project": identity.to_dict(), "backlog_file": str(file),
                 "repairs": repairs, "replaced": replace, **outcome}
 
+    def reconcile_file(self, path: str | None = None, *, dry_run: bool = True,
+                       expected_revision: int | None = None) -> dict[str, Any]:
+        """Idempotently merge an older projection without clobbering canonical state."""
+        identity, error = self._resolve(path)
+        if error is not None:
+            return error
+        file = backlog_path(identity.repo_root)
+        if not file.exists():
+            return {"error": "NO_BACKLOG_FILE", "path": str(file)}
+        try:
+            document, repairs = store.load(file)
+        except BacklogError as exc:
+            return {"error": "BACKLOG_UNREADABLE", "detail": str(exc), "path": str(file)}
+        if len(document.get("items", [])) > _MAX_ITEMS:
+            return {"error": "BACKLOG_TOO_LARGE", "limit": _MAX_ITEMS}
+        pid = identity.project_id
+        lock = _project_lock(pid)
+        with lock:
+            if not dry_run:
+                self.db.ensure_project(identity.to_dict())
+            current = self.db.revision(pid)
+            if expected_revision is not None and int(expected_revision) != current:
+                self._audit("backlog_reconcile", result="conflict")
+                return {"error": "REVISION_CONFLICT", "expected_revision": int(expected_revision),
+                        "actual_revision": current, "project_id": pid}
+            outcome = self.db.reconcile_document(pid, document, dry_run=dry_run)
+        self._audit("backlog_reconcile", result="preview" if dry_run else "ok")
+        return {"project": identity.to_dict(), "backlog_file": str(file),
+                "projection_revision": int(document.get("revision", 0)),
+                "repairs": repairs, "conflict_policy": "current_canonical_wins",
+                "metadata_policy": "additive_union", **outcome}
+
     # ------------------------------------------------- knowledge-store seam
     def open_items_for_brief(self, path: str | None = None, *, limit: int = 20,
                              project_id: str | None = None, project_node_id: str | None = None,

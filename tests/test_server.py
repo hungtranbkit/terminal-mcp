@@ -209,6 +209,7 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_backlog_validate",
         "terminal_backlog_export",
         "terminal_backlog_import",
+        "terminal_backlog_reconcile",
         "terminal_event_publish",
         "terminal_event_list",
         "terminal_event_claim",
