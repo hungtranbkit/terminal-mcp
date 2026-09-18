@@ -47,6 +47,12 @@ normal first-Enter submit stops immediately. Receipts expose
 result remains `SUBMIT_UNCONFIRMED`/`STUCK`; the adapter never spams Enter or
 duplicates the prompt.
 
+When Codex is already working and its composer shows `tab to queue message`,
+the verified path sends Tab (never Enter) and requires the explicit queued or
+consumed acknowledgement before reporting `SUBMIT_CONFIRMED`. A working
+footer or a temporarily cleared composer alone is not acceptance evidence if
+the draft remains or reappears.
+
 ## The acceptance gate (MANDATORY — added 2026-09-14)
 
 > **A prompt is DELIVERED only when (1) the send receipt's own
