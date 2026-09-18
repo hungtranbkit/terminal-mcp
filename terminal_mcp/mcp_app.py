@@ -39,6 +39,7 @@ from .pm_summary import (
 from .queue_engine import QueueEngine
 from .request_governor import RequestGovernor
 from .queue_event_drain import QueueEventDrain
+from .project_dispatch_bridge import ProjectDispatchBridge
 from .queue_loop import QueueLoop
 from .backlog_service import BacklogService
 from .event_bus import KNOWN_EVENT_TYPES, EventBus
@@ -375,8 +376,14 @@ def build_mcp(service: TerminalService | None = None,
     # drain that claims events and then cannot act on them.
     _event_drain = None
     if terminal.config.queue.drain_enabled and events is not None:
+        _project_bridge = None
+        if terminal.config.queue.project_dispatch_rules:
+            _project_bridge = ProjectDispatchBridge(
+                queue, terminal.config.queue.project_dispatch_rules)
         _event_drain = QueueEventDrain(
-            events, queue_engine, batch_size=terminal.config.queue.drain_batch_size)
+            events, queue_engine,
+            batch_size=terminal.config.queue.drain_batch_size,
+            project_bridge=_project_bridge)
     queue.loop = queue.loop or QueueLoop(
         queue_engine, poll_interval_seconds=terminal.config.queue.poll_interval_seconds,
         heartbeat_refresher=_refresh_local_heartbeat,
