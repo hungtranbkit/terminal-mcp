@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -16091,6 +16092,11 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             payload["long_task_watches"] = queue_store.list_long_task_watches(active_only=False)
         else:
             payload["long_task_watches"] = []
+        watcher_state = Path.home() / ".local/state/terminal-mcp/prompt-start-watcher.json"
+        try:
+            payload["background_watcher"] = json.loads(watcher_state.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload["background_watcher"] = {"enabled": False, "tracked_count": 0}
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/connection-health", methods=["GET"], include_in_schema=False)
