@@ -104,7 +104,7 @@ queue:
     - project_id: novaretail
       lane: linux-codex-work
       owner: linux-codex-work
-      registry_path: /home/dell/workspace/novaretail-web/TASKS.json
+      registry_path: /home/dell/workspace/novaretail-web-ui-v3-audit/TASKS.json
       preferred_task_ids:
         - NWR-UI-V3-POLISH-001
 
