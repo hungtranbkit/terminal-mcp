@@ -175,14 +175,26 @@ class CompactTerminalTools:
                   self.controller.terminal_send_text(
                     value, text, True, False, idempotency_key=effective_key))
         delivery = result.get("delivery_state") or result.get("submit_status")
-        if delivery == "SUBMIT_CONFIRMED":
+        contradictory_confirm = (
+            delivery == "SUBMIT_CONFIRMED"
+            and result.get("press_enter") is True
+            and result.get("enter_sent") is False
+        )
+        if contradictory_confirm:
+            status = "FAILED"
+        elif delivery == "SUBMIT_CONFIRMED":
             status = "SUBMIT_CONFIRMED"
         elif delivery == "BLOCKED" or result.get("error") in _BLOCKED_ERRORS:
             status = "BLOCKED"
         else:
             status = "FAILED"
-        reason, clipped = _bounded(result.get("submit_reason") or result.get("reason") or result.get("error"),
-                                   MAX_REASON_CHARS)
+        raw_reason = result.get("submit_reason") or result.get("reason") or result.get("error")
+        if contradictory_confirm:
+            raw_reason = (
+                "receipt invariant violation: SUBMIT_CONFIRMED cannot be trusted because "
+                "press_enter=True but enter_sent=False"
+            )
+        reason, clipped = _bounded(raw_reason, MAX_REASON_CHARS)
         evidence = {
             key: result[key] for key in
             ("delivery_state", "submit_status", "agent_type", "enter_count", "attempts", "enter_sent")
