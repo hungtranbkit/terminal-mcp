@@ -37,6 +37,15 @@ def load_config(path: Path = CONFIG) -> dict[str, Any]:
         return dict(DEFAULTS)
 
 
+def load_raw_config(path: Path = CONFIG) -> dict[str, Any]:
+    """Read persisted config metadata without exposing it to the editor."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def validate_config(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("payload must be an object")
@@ -71,6 +80,9 @@ def validate_config(payload: Any) -> dict[str, Any]:
 
 def save_config_atomic(cfg: dict[str, Any], path: Path = CONFIG) -> None:
     normalized = validate_config(cfg)
+    # Keep deployment-era metadata (for example dispatcher_project and future
+    # watchdog keys) server-side.  It is never accepted from the user payload.
+    persisted = {**load_raw_config(path), **normalized}
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = None
     try:
@@ -80,7 +92,7 @@ def save_config_atomic(cfg: dict[str, Any], path: Path = CONFIG) -> None:
     fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent), text=True)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(normalized, handle, indent=2, sort_keys=False)
+            json.dump(persisted, handle, indent=2, sort_keys=False)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
