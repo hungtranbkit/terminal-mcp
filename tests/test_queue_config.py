@@ -60,3 +60,42 @@ def test_queue_config_rejects_invalid_drain_values(tmp_path):
     path = _write_config(tmp_path, {"queue": {"drain_batch_size": 0}})
     with pytest.raises(ValueError, match="drain_batch_size"):
         load_config(path)
+
+
+def test_queue_config_loads_project_dispatch_rule(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    path = _write_config(tmp_path, {"queue": {
+        "enabled": True,
+        "drain_enabled": True,
+        "project_dispatch_rules": [{
+            "name": "novaretail",
+            "session_patterns": ["linux-codex-work"],
+            "repo_root": str(repo),
+            "planner_path": "tools/orchestration/continuous_dispatch.py",
+            "event_types": ["TASK_COMPLETED"],
+            "timeout_seconds": 8,
+        }],
+    }})
+    config = load_config(path)
+    assert len(config.queue.project_dispatch_rules) == 1
+    rule = config.queue.project_dispatch_rules[0]
+    assert rule.name == "novaretail"
+    assert rule.session_patterns == ("linux-codex-work",)
+    assert rule.repo_root == str(repo)
+    assert rule.timeout_seconds == 8
+
+
+def test_queue_config_rejects_escaping_project_planner(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    path = _write_config(tmp_path, {"queue": {
+        "project_dispatch_rules": [{
+            "name": "bad",
+            "session_patterns": ["*-work"],
+            "repo_root": str(repo),
+            "planner_path": "../outside.py",
+        }],
+    }})
+    with pytest.raises(ValueError, match="planner_path"):
+        load_config(path)
