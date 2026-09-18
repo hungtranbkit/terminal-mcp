@@ -16074,7 +16074,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     server._custom_starlette_routes.append(
         WebSocketRoute("/dashboard/ws/terminal", endpoint=dashboard_terminal_ws, name="dashboard_terminal_ws")
     )
-    register_novaretail_dispatch_dashboard(server, _read_guard)
+    register_novaretail_dispatch_dashboard(server, _read_guard, _mutation_guard)
 
     @server.custom_route("/dashboard/api/connection-health", methods=["GET"], include_in_schema=False)
     async def connection_health(request: Request) -> JSONResponse:
