@@ -49,6 +49,25 @@ def test_feeder_prefers_configured_p0_task(tmp_path):
     assert row.request_key == "project-feed:novaretail:NWR-UI-V3-POLISH-001"
 
 
+
+def test_matching_owner_in_progress_beats_preferred_ready_task(tmp_path):
+    store = QueueStore(tmp_path / "queue.db")
+    registry, queue, feeder = _feed(
+        tmp_path, store, preferred=("NWR-UI-V3-POLISH-001",)
+    )
+    _write_registry(registry, [
+        {"id": "NWR-UI-V3-POLISH-001", "title": "polish", "status": "READY",
+         "priority": "P0", "dependencies": [], "acceptance": ["visual polish"]},
+        {"id": "ACTIVE", "title": "finish current work", "status": "IN_PROGRESS",
+         "priority": "P1", "owner": "linux-codex-work",
+         "dependencies": [], "acceptance": ["finish safely"]},
+    ])
+
+    result = feeder.feed_if_idle("linux-codex-work")
+
+    assert result["action"] == "ENQUEUED"
+    assert result["task_id"] == "ACTIVE"
+
 def test_feeder_rechecks_dependencies_fail_closed(tmp_path):
     store = QueueStore(tmp_path / "queue.db")
     registry, queue, feeder = _feed(tmp_path, store)
