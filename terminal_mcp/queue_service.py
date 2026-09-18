@@ -26,13 +26,25 @@ CALLING set_tasks/append_tasks against those names during this
 feature's own development, not by a technical guard in this file."""
 from __future__ import annotations
 
+import hashlib
+import logging
+import sqlite3
 from typing import Any, Callable
 
 from .dor_gate import check_definition_of_ready
 from .permissions import valid_session_name
+from .verify_queue import VerifyQueue
 from .queue_store import (
     TERMINAL_STATUSES, UNASSIGNED_LANE, VERIFYING, InvalidTransitionError, TaskAlreadyClaimedError, QueueStore,
 )
+
+_LOGGER = logging.getLogger(__name__)
+
+
+_PENDING_TASK_ID = "__task_being_created__"
+"""A task cannot depend on itself before it has an id. This stand-in lets
+the cycle walk run against the real graph without inventing a row -- any
+path that returns to it is a cycle the new edges would close."""
 
 
 class QueueService:
@@ -63,6 +75,20 @@ class QueueService:
         # enabled gate starts/stops the real, wired-up loop rather than a
         # second, disconnected one.
         self.loop: Any = None
+        # P0.5 Verify Queue, over the SAME store -- a verify job and the
+        # task it verifies must commit together, which is only possible
+        # in one database. Its `registry` (used solely to explain WHY a
+        # job is unroutable) is assigned later by mcp_app.py, the same
+        # deferred pattern as engine/planner above; without one,
+        # routability answers "unknown" rather than guessing.
+        #
+        # NAMED verify_queue, not `verify`: this class already has a
+        # verify() METHOD (the explicit human/ChatGPT evidence-supplying
+        # fallback, exposed as terminal_queue_verify). Binding an
+        # attribute called `verify` here silently shadowed it and turned
+        # that tool into "'VerifyQueue' object is not callable" -- caught
+        # by test_integration_mcp_tools, not by review.
+        self.verify_queue = VerifyQueue(self.store)
 
     def _validate_session(self, session: str) -> dict[str, Any] | None:
         if not session or not valid_session_name(session):
@@ -106,7 +132,8 @@ class QueueService:
                "tasks": [self._accepted(session, task_id) for task_id in ids]}
 
     def enqueue(self, session: str, prompt: str, *, title: str | None = None, priority: int = 0,
-               metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+               metadata: dict[str, Any] | None = None,
+               request_key: str | None = None) -> dict[str, Any]:
         """terminal_enqueue_task's own service method (P0 item 1/12: the
         new high-level, single-task, append-only convenience path --
         the RECOMMENDED default for a normal ChatGPT/UI/API-originated
@@ -122,18 +149,82 @@ class QueueService:
             return error
         if not prompt:
             return {"error": "TASK_PROMPT_REQUIRED"}
-        task = {"prompt": prompt, "title": title or "", "priority": priority, "metadata": metadata or {}}
-        (task_id,) = self.store.append_tasks(session, [task])
+        if existing := self._existing_for_request(
+                request_key, payload={"prompt": prompt, "session": session}):
+            return existing
+        task = {"prompt": prompt, "title": title or "", "priority": priority,
+                "metadata": metadata or {}, "request_key": request_key or None}
+        try:
+            (task_id,) = self.store.append_tasks(session, [task])
+        except sqlite3.IntegrityError:
+            # Two retries of one request raced and the other won. The loser
+            # returns the winner's task -- which is the correct answer to the
+            # question that was asked, not an error.
+            if existing := self._existing_for_request(request_key):
+                return existing
+            raise
         accepted = self._accepted(session, task_id)
         accepted["status"] = "TASK_ACCEPTED"
+        accepted["request_key"] = request_key or None
+        accepted["deduplicated"] = False
         return accepted
+
+    def _existing_for_request(self, request_key: str | None, *,
+                              payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """The answer a previous call with this key already produced.
+
+        A retry gets the SAME task_id and its CURRENT state, flagged
+        `deduplicated` so a caller can tell a fresh accept from a replay
+        without having to compare timestamps.
+
+        `payload`, when given, is compared against what was actually stored
+        under this key. A retry with a DIFFERENT payload still gets the
+        original task -- the key's whole job is that one request produces one
+        task, and inventing a second one here would be the duplicate this
+        exists to prevent. But it comes back with `payload_conflict: True` and
+        the fields that differ, because silently answering a changed request
+        with the old task is how a caller comes to believe it submitted
+        something it did not. The task is idempotent; the caller is told.
+        """
+        if not request_key:
+            return None
+        found = self.store.task_by_request_key(request_key)
+        if found is None:
+            return None
+        request_key_hash = hashlib.sha256(request_key.encode("utf-8", "replace")).hexdigest()[:16]
+        _LOGGER.info("TASK_DEDUP request_key=sha256:%s existing_task=%s state=%s deduplicated=true",
+                     request_key_hash, found["id"], found["status"])
+        answer = {"status": "TASK_ACCEPTED", "task_id": found["id"],
+                  "session": found["session"],
+                  "queue_position": self.store.queue_position(found["id"]),
+                  "request_key": request_key, "deduplicated": True,
+                  "task_status": found["status"]}
+        if payload:
+            # `project` is persisted into metadata, not the project_id column
+            # (create_task puts it there); comparing the column would report a
+            # conflict on every project-tagged replay.
+            stored = dict(found)
+            stored["project"] = (found.get("metadata") or {}).get("project")
+            differing = sorted(
+                field for field, value in payload.items()
+                if value is not None and str(value) != str(stored.get(field) or "")
+            )
+            if differing:
+                answer["payload_conflict"] = True
+                answer["conflicting_fields"] = differing
+                answer["conflict_detail"] = (
+                    f"request_key {request_key!r} was already used for task "
+                    f"{found['id']} with a different {', '.join(differing)}; "
+                    f"returning the original task rather than creating a second one")
+        return answer
 
     def _accepted(self, session: str, task_id: str) -> dict[str, Any]:
         return {"task_id": task_id, "session": session, "queue_position": self.store.queue_position(task_id)}
 
     def create_task(self, title: str, prompt: str, *, session: str | None = None, priority: int = 0,
                     project: str | None = None, metadata: dict[str, Any] | None = None,
-                    depends_on: list[str] | None = None) -> dict[str, Any]:
+                    depends_on: list[str] | None = None,
+                    request_key: str | None = None) -> dict[str, Any]:
         """Unified Task System checkpoint (2026-09-07, docs/REQUIREMENTS.
         md §20): the canonical `task_create` entry point (§20.7) --
         `session=None` creates a real, durable, UNASSIGNED (Global/
@@ -154,6 +245,13 @@ class QueueService:
         dependency mechanism for Planner-created children."""
         if not prompt:
             return {"error": "TASK_PROMPT_REQUIRED"}
+        # Checked BEFORE any validation or side effect: a retry must return
+        # the original answer even if the world has since changed in a way
+        # that would make a fresh create fail.
+        if existing := self._existing_for_request(
+                request_key,
+                payload={"prompt": prompt, "title": title, "project": project}):
+            return existing
         full_metadata = dict(metadata or {})
         if project:
             full_metadata["project"] = project
@@ -172,13 +270,33 @@ class QueueService:
                 return {"error": "NEEDS_CLARIFICATION", **dor}
         else:
             target = UNASSIGNED_LANE
-        task = {"prompt": prompt, "title": title or "", "priority": priority, "metadata": full_metadata}
+        task = {"prompt": prompt, "title": title or "", "priority": priority,
+                "metadata": full_metadata}
         if depends_on:
+            # Validate BEFORE the row exists. The dispatch-time check is
+            # fail-closed, which is right for a dependency that is merely not
+            # done yet and exactly wrong for one that can NEVER be satisfied:
+            # a cycle or a typo'd id produces a lane that is silently,
+            # permanently idle -- no event, no error, no alarm. Creation is
+            # the only place it can still be reported to whoever caused it.
+            try:
+                self.store.validate_dependencies(_PENDING_TASK_ID, depends_on)
+            except QueueStore.DependencyError as exc:
+                return {"error": "INVALID_DEPENDENCY", "detail": str(exc),
+                        "depends_on": list(depends_on)}
             task["depends_on"] = list(depends_on)
-        (task_id,) = self.store.append_tasks(target, [task])
+        task["request_key"] = request_key or None
+        try:
+            (task_id,) = self.store.append_tasks(target, [task])
+        except sqlite3.IntegrityError:
+            if existing := self._existing_for_request(request_key):
+                return existing
+            raise
         accepted = self._accepted(target, task_id)
         accepted["status"] = "TASK_ACCEPTED"
         accepted["assigned"] = session is not None
+        accepted["request_key"] = request_key or None
+        accepted["deduplicated"] = False
         return accepted
 
     def assign_task(self, task_id: str, session: str) -> dict[str, Any]:

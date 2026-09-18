@@ -164,6 +164,14 @@ Two independent pieces:
    genuine OpenAI-side or sustained network outage can never become an
    unbounded local restart loop.
 
+**Active/standby controllers:** if a fallback host deliberately keeps its local
+tunnel stopped while a primary controller is reachable, apply the SAME primary/
+split-brain `ExecCondition` to the watchdog oneshot as to the tunnel unit. Without
+that shared guard, the watchdog interprets healthy standby as a dead tunnel and
+can create a restart storm every timer tick. On the Dell fallback deployment this
+is a `terminal-mcp-tunnel-watchdog.service.d` drop-in that runs
+`%h/.local/bin/terminal-mcp-tunnel-guard condition`.
+
 Install/update:
 
 ```bash

@@ -55,6 +55,7 @@ import time
 import tty
 
 MODE = os.environ.get("CODEX_FIXTURE_MODE", "stuck_then_escape")
+REQUIRED_ENTERS = int(os.environ.get("CODEX_REQUIRED_ENTERS", "1"))
 
 fd = sys.stdin.fileno()
 old_attrs = termios.tcgetattr(fd)
@@ -65,6 +66,7 @@ escape_pending = False
 redraw_tick = 0
 submitted = 0
 escape_count = 0
+bare_enters = 0
 
 
 def render_composer() -> None:
@@ -97,6 +99,16 @@ try:
             escape_count += 1
             continue
         if ch in ("\n", "\r"):
+            if MODE == "submit_after_n_enters":
+                bare_enters += 1
+                if bare_enters < REQUIRED_ENTERS:
+                    render_composer()
+                    continue
+                submitted += 1
+                sys.stdout.write(f"\r\nSUBMITTED[{submitted}]: {buf}\r\nesc to interrupt\r\n")
+                sys.stdout.flush()
+                buf = ""
+                continue
             if MODE == "submits_and_shows_working":
                 submitted += 1
                 sys.stdout.write(f"\r\nSUBMITTED[{submitted}]: {buf}\r\nesc to interrupt\r\n")

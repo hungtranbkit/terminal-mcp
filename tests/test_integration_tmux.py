@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 import time
 import subprocess
 
@@ -15,10 +17,12 @@ def test_real_tmux_list_tail_status_and_denial(read_config, tmux_session_factory
     tmux_session_factory("private-session", "bash -lc 'echo SHOULD_NOT_LEAK; sleep 10'")
     time.sleep(0.8)
     service = TerminalService(read_config)
+    # "private-session" used to be denied by not matching the whitelist.
+    # Denial is now what the user sets, so it is set explicitly.
+    service.grants.set_read("private-session", False, granted_by="test")
 
-    # terminal_list_sessions discovers the FULL tmux inventory (see
-    # core.py's dashboard-grant feature) -- "private-session" (outside
-    # the static whitelist) is listed too, but strictly as metadata: no
+    # terminal_list_sessions discovers the FULL tmux inventory -- a session
+    # the user has revoked read on is listed too, but strictly as metadata: no
     # content field anywhere, and its capability flags all say no.
     rows = {item["name"]: item for item in service.terminal_list_sessions()["sessions"]}
     assert {"test-running", "test-waiting", "private-session"} <= set(rows)
@@ -33,10 +37,15 @@ def test_real_tmux_list_tail_status_and_denial(read_config, tmux_session_factory
                                 "input_allowed", "input_granted",
                                 "effective_read", "effective_input",
                                 "input_denied_reason",
+                                # Whether this session's grant is pinned to an instance
+                                # that no longer exists. Under default-open that no longer
+                                # blocks anything, so it is reported here rather than as a
+                                # denial reason.
+                                "stale_identity_pin",
                                 "resume_conversation_id"}  # no content field, ever
     assert "BUILD STEP 5" in service.terminal_tail("test-running", 20)["output"]
-    # Discovery never grants access -- still the exact same ACCESS_DENIED
-    # a raw, unmodified whitelist check has always produced.
+    # Discovery never grants access -- a revoked session still yields the
+    # same ACCESS_DENIED every read path has always produced.
     assert service.terminal_tail("private-session", 20)["error"] == "ACCESS_DENIED"
     assert service.terminal_status("test-waiting")["state"] == "WAITING_INPUT"
     assert service.terminal_status("test-running")["state"] != "WAITING_INPUT"
@@ -137,10 +146,12 @@ def test_terminal_tail_ansi_redacts_secret_even_when_colored(tmux_session_factor
     time.sleep(0.3)
     config = AppConfig(PermissionsConfig(True, False), ("test-*",), 50, 20)
     service = TerminalService(config)
+    service.grants.set_read("private-ansi-session", False, granted_by="test")
     result = service.terminal_tail(session, 10, ansi=True)
     assert "livesecretvalue1234567890" not in result["output"]
     assert "<REDACTED>" in result["output"]
-    # Whitelist is unaffected by the ansi flag: a disallowed session is still denied.
+    # Authorization is unaffected by the ansi flag: a revoked session is still
+    # denied, so the rendering path is not a second, weaker read path.
     assert service.terminal_tail("private-ansi-session", 10, ansi=True)["error"] == "ACCESS_DENIED"
 
 

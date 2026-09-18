@@ -1,9 +1,28 @@
 [Unit]
 Description=Terminal MCP tunnel connection watchdog (one check-and-act cycle)
+#
+# NOTE (2026-09-13): on a host where the controller runs as
+# terminal-mcp-fed-controller.service instead of terminal-mcp-http.service
+# (the self-hosted/federated layout), change the unit named below to match.
+# An After=/Wants= pointing at a unit that never starts is not just inert
+# ordering -- a Wants= will actively TRY to start it, and a second controller
+# racing for 127.0.0.1:8766 crash-loops on EADDRINUSE. Observed live.
 After=terminal-mcp-http.service terminal-mcp-tunnel.service
 
 [Service]
 Type=oneshot
+# ACTIVE/STANDBY INVARIANT: if this host is a fallback and the tunnel unit
+# itself has an ExecCondition split-brain/primary guard, the watchdog MUST
+# have the same ExecCondition (normally via a host-specific drop-in). Otherwise
+# an intentionally inactive standby is misclassified as a dead tunnel and the
+# timer will try to restart it every cycle. Example on a fallback host:
+#   ExecCondition=%h/.local/bin/terminal-mcp-tunnel-guard condition
+# Do not add this on a single-controller host that has no primary guard.
+# The watchdog restarts its --mcp-unit when the LOCAL MCP endpoint looks
+# unhealthy; it defaults to terminal-mcp-http.service. On a fed-controller
+# host that default would try to start the RETIRED unit and crash-loop it
+# against the port the real controller holds -- pass the right one:
+#   ... /terminal-mcp-tunnel-watchdog --mcp-unit terminal-mcp-fed-controller.service
 ExecStart=/home/dell/workspace/terminal-mcp/.venv/bin/terminal-mcp-tunnel-watchdog
 
 # Never touches tmux (terminal_mcp/tunnel_watchdog.py holds no tmux

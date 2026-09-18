@@ -167,6 +167,9 @@ def register_health(server: MCPServer, terminal: TerminalService, supervisor=Non
         # their own counters, reset on restart) -- see metrics.py's module
         # docstring for the full scope/rationale.
         body: dict[str, Any] = {"counters": metrics.snapshot()}
+        governor = getattr(terminal, "request_governor", None)
+        if governor is not None:
+            body["llm_governor"] = await anyio.to_thread.run_sync(governor.status)
         if supervisor is not None:
             body["supervisor"] = await anyio.to_thread.run_sync(_check_supervisor_staleness, supervisor)
         return JSONResponse(body, headers={"Cache-Control": "no-store"})

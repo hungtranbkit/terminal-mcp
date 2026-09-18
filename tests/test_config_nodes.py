@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 import yaml
 
-from terminal_mcp.config import RemoteNodeConfig, load_config
+from terminal_mcp.config import NodeHealthConfig, RemoteNodeConfig, load_config
 from terminal_mcp.node_models import NodeHeartbeatThresholds, OverloadThresholds
 
 
@@ -57,6 +57,34 @@ def test_heartbeat_offline_must_be_at_least_degraded(tmp_path):
         load_config(_write(tmp_path, _base_raw(heartbeat={"degraded_after_seconds": 100, "offline_after_seconds": 50})))
 
 
+def test_node_health_config_is_bounded_and_defaults_conservative(tmp_path):
+    config = load_config(_write(tmp_path, _base_raw(health={
+        "probe_interval_seconds": 12, "probe_timeout_seconds": 4.5,
+        "execution_down_after_failures": 3, "backoff_base_seconds": 2,
+        "backoff_max_seconds": 30, "backoff_jitter_ratio": 0.1,
+    })))
+    assert config.nodes.health == NodeHealthConfig(
+        enabled=True, probe_interval_seconds=12, probe_timeout_seconds=4.5,
+        execution_down_after_failures=3, backoff_base_seconds=2,
+        backoff_max_seconds=30, backoff_jitter_ratio=0.1,
+    )
+    with pytest.raises(ValueError, match="less than 5"):
+        load_config(_write(tmp_path, _base_raw(health={"probe_timeout_seconds": 5})))
+
+
+def test_self_heal_requires_explicit_allowlisted_action(tmp_path):
+    base = {"node_id": "m910", "endpoint": "http://127.0.0.1:8790", "token_env": "TOKEN"}
+    with pytest.raises(ValueError, match="without an action"):
+        load_config(_write(tmp_path, _base_raw(remote=[{**base, "self_heal_enabled": True}])))
+    with pytest.raises(ValueError, match="unsupported"):
+        load_config(_write(tmp_path, _base_raw(remote=[{**base, "self_heal_action": "reboot"}])))
+    config = load_config(_write(tmp_path, _base_raw(remote=[{
+        **base, "self_heal_enabled": True, "self_heal_action": "graceful_agent_restart",
+    }])))
+    assert config.nodes.remote_nodes[0].self_heal_enabled is True
+    assert config.nodes.remote_nodes[0].self_heal_action == "graceful_agent_restart"
+
+
 def test_remote_node_full_declaration_parsed(tmp_path):
     config = load_config(_write(tmp_path, _base_raw(remote=[{
         "node_id": "m910", "display_name": "M910 Workstation", "hostname": "m910.local",
@@ -83,7 +111,7 @@ def test_remote_node_minimal_declaration_defaults_display_name_and_hostname_to_n
 
 def test_remote_node_missing_required_field_rejected(tmp_path):
     for missing in ("node_id", "endpoint", "token_env"):
-        entry = {"node_id": "m910", "endpoint": "http://x:8790", "token_env": "TERMINAL_MCP_NODE_TOKEN_M910"}
+        entry = {"node_id": "m910", "endpoint": "http://127.0.0.1:8790", "token_env": "TERMINAL_MCP_NODE_TOKEN_M910"}
         del entry[missing]
         with pytest.raises(ValueError, match=missing):
             load_config(_write(tmp_path, _base_raw(remote=[entry])))
@@ -92,12 +120,12 @@ def test_remote_node_missing_required_field_rejected(tmp_path):
 def test_remote_node_id_local_is_reserved(tmp_path):
     with pytest.raises(ValueError, match="reserved"):
         load_config(_write(tmp_path, _base_raw(remote=[{
-            "node_id": "local", "endpoint": "http://x:8790", "token_env": "TOKEN",
+            "node_id": "local", "endpoint": "http://127.0.0.1:8790", "token_env": "TOKEN",
         }])))
 
 
 def test_remote_node_duplicate_id_rejected(tmp_path):
-    entry = {"node_id": "m910", "endpoint": "http://x:8790", "token_env": "TOKEN"}
+    entry = {"node_id": "m910", "endpoint": "http://127.0.0.1:8790", "token_env": "TOKEN"}
     with pytest.raises(ValueError, match="more than once"):
         load_config(_write(tmp_path, _base_raw(remote=[dict(entry), dict(entry)])))
 
@@ -105,7 +133,7 @@ def test_remote_node_duplicate_id_rejected(tmp_path):
 def test_remote_node_max_sessions_must_be_positive_int_if_given(tmp_path):
     with pytest.raises(ValueError, match="max_sessions"):
         load_config(_write(tmp_path, _base_raw(remote=[{
-            "node_id": "m910", "endpoint": "http://x:8790", "token_env": "TOKEN", "max_sessions": 0,
+            "node_id": "m910", "endpoint": "http://127.0.0.1:8790", "token_env": "TOKEN", "max_sessions": 0,
         }])))
 
 

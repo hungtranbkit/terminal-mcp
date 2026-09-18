@@ -23,16 +23,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import host_metrics
+from . import contract, endpoint_policy, host_metrics
 from .node_client import LocalNodeClient, NodeClient, NodeClientError, RemoteNodeClient
 from .node_models import NODE_ONLINE, Node
+from .node_health import NodeHealthPolicy, NodeHealthService
 from .node_registry import NodeRegistry
+from .config import NodeHealthConfig
+from .connection_manager import ConnectionManager
+from .lease import ResourceLockStore
 from .scheduler import PlacementResult, choose_node
+from .ephemeral_state import ephemeral_state_dir
 
 if TYPE_CHECKING:
     from .core import TerminalService
 
 LOCAL_NODE_ID = "local"
+MAX_BOUNDED_NODE_PROBE_SECONDS = 3.0
+MIN_BOUNDED_NODE_PROBE_SECONDS = 0.05
 
 
 @dataclass
@@ -41,10 +48,56 @@ class SessionLocation:
     cached_at: float
 
 
+# Fields that carry pane text and therefore must be re-redacted here.
+_OUTPUT_FIELDS = ("output", "last_output")
+
+
+def _reredact(result: dict[str, Any]) -> dict[str, Any]:
+    """Redact a routed result again, on THIS controller, before it leaves.
+
+    A remote node redacts with the rules ITS build shipped with. On this
+    fleet four of five node agents run an older release -- audited 2026-09-12,
+    contract_version 0 against the controller's 1 -- so trusting a node's
+    sanitizer means the weakest build in the fleet decides what leaves the
+    controller. Re-running the current rules here costs one pass over text we
+    already hold and removes that dependency entirely.
+
+    Idempotent: redacting already-redacted text is a no-op, so a modern node
+    is not penalised and `<REDACTED>` never nests.
+    """
+    if not isinstance(result, dict):
+        return result
+    from .core import _public_report, _REDACTION_TELEMETRY
+    from .redaction import redact_output, redaction_marker
+
+    for field in _OUTPUT_FIELDS:
+        value = result.get(field)
+        if not isinstance(value, str) or not value:
+            continue
+        text, report = redact_output(value)
+        _REDACTION_TELEMETRY.observe(report)
+        if report.get("redactions") or report.get("credential_files"):
+            marker = redaction_marker(report)
+            # Only append a marker the node did not already add, so a hop
+            # through the controller does not stack two of them.
+            if marker and "[REDACTED]" not in text:
+                text = text + "\n" + marker
+            existing = result.get("redaction") or {}
+            merged = _public_report(report)
+            if isinstance(existing, dict) and existing.get("values_redacted"):
+                merged["values_redacted"] += int(existing.get("values_redacted") or 0)
+                merged["redacted_by_node"] = True
+            result["redaction"] = merged
+        result[field] = text
+    return result
+
+
 class ControllerService:
     def __init__(self, registry: NodeRegistry, *, local_node_id: str = LOCAL_NODE_ID,
                 local_client: NodeClient | None = None, local_display_name: str = "Local",
-                local_hostname: str | None = None, local_workspace_root: str = "/") -> None:
+                local_hostname: str | None = None, local_workspace_root: str = "/",
+                node_health_config: NodeHealthConfig | None = None,
+                node_health: NodeHealthService | None = None) -> None:
         self.registry = registry
         self.local_node_id = local_node_id
         self.local_workspace_root = local_workspace_root
@@ -67,6 +120,11 @@ class ControllerService:
         # client (many tool calls in a row for the same session) doesn't
         # re-probe every node on every single call.
         self.session_cache_ttl_seconds = 20.0
+        self.node_health = node_health or NodeHealthService(
+            registry, ResourceLockStore(registry.path.with_name("leases.db")),
+            node_health_config or NodeHealthConfig(),
+        )
+        self.connection_manager = ConnectionManager()
 
         if local_client is not None:
             self._clients[local_node_id] = local_client
@@ -78,13 +136,46 @@ class ControllerService:
 
     def register_remote_node(self, node_id: str, *, display_name: str, hostname: str, endpoint: str,
                              token: str, max_sessions: int | None = None,
-                             timeout: float = 10.0) -> None:
+                             timeout: float = 10.0, allow_public_http: bool = False,
+                             self_heal_enabled: bool = False,
+                             self_heal_action: str = "none") -> None:
+        """Raises EndpointPolicyError for an endpoint this controller must
+        not send a bearer token to.
+
+        This is the chokepoint on purpose: config, dashboard connect routes,
+        onboarding and startup re-hydration all arrive here. Execution-health
+        policy is additive and never bypasses endpoint validation.
+        """
+        endpoint_policy.validate_node_endpoint(endpoint, context=f"node {node_id!r} endpoint",
+                                               allow_public_http=allow_public_http)
         self.registry.register(node_id, display_name=display_name, hostname=hostname, endpoint=endpoint,
                                auth_token_ref=f"node:{node_id}", max_sessions=max_sessions)
         self._clients[node_id] = RemoteNodeClient(endpoint, token, timeout=timeout)
+        self.node_health.set_policy(node_id, NodeHealthPolicy(
+            self_heal_enabled=self_heal_enabled, self_heal_action=self_heal_action))
 
     def client_for(self, node_id: str) -> NodeClient | None:
         return self._clients.get(node_id)
+
+    def update_remote_token(self, node_id: str, token: str | None) -> bool:
+        """Swap the credential this controller PRESENTS to a node agent.
+
+        The outbound half of token rotation (blg_a3cc401d8275): the
+        registry row, endpoint and every other piece of that node's
+        configuration stay exactly as they are -- only the bearer token
+        changes. `None` clears it, which is what revocation needs: a
+        refused credential must stop being used in both directions, not
+        just the inbound one.
+
+        Returns False when this controller holds no client for the node
+        (nothing to update), so a caller can tell "changed" from
+        "nothing there" instead of assuming."""
+        client = self._clients.get(node_id)
+        setter = getattr(client, "set_token", None)
+        if client is None or setter is None:
+            return False
+        setter(token or "")
+        return True
 
     # -- local self-heartbeat ----------------------------------------------
     # No background thread: cheap enough (a few /proc reads + one
@@ -95,17 +186,28 @@ class ControllerService:
     # MUST be push-based (task item 2) -- see node_agent.py.
     def refresh_local_heartbeat(self, *, tmux_session_count: int, agent_counts: dict[str, int],
                                 agent_types: tuple[str, ...], agent_version: str | None) -> Node | None:
+        from .capability_probe import probe_capabilities
         metrics = host_metrics.collect(workspace_path=self.local_workspace_root)
         return self.registry.heartbeat(
             self.local_node_id, metrics=metrics, tmux_session_count=tmux_session_count,
             agent_counts=agent_counts, agent_types=agent_types, agent_version=agent_version,
             labels=(), latency_ms=0.0,
+            # The local node probes itself the same way a remote agent does.
+            capabilities=probe_capabilities(),
+            # ...and reports the SAME protocol generation a remote agent does.
+            # Without this the controller's own node read as legacy v0, which
+            # is both wrong and the most confusing possible starting point for
+            # diagnosing a real skew elsewhere.
+            **contract.describe_for_heartbeat(),
         )
 
     def receive_remote_heartbeat(self, node_id: str, *, metrics: host_metrics.NodeMetrics,
                                  tmux_session_count: int, agent_counts: dict[str, int],
                                  agent_types: tuple[str, ...], agent_version: str | None,
                                  labels: tuple[str, ...], platform: str = "linux",
+                                 capabilities: tuple[str, ...] = (),
+                                 contract_version: int = 0,
+                                 contract_capabilities: tuple[str, ...] = (),
                                  session_backend: str = "tmux", shell_capabilities: tuple[str, ...] = (),
                                  wsl_available: bool = False) -> Node | None:
         """Called by the heartbeat-receiving HTTP route (dashboard.py) once
@@ -120,14 +222,129 @@ class ControllerService:
                                        agent_counts=agent_counts, agent_types=agent_types,
                                        agent_version=agent_version, labels=labels, platform=platform,
                                        session_backend=session_backend, shell_capabilities=shell_capabilities,
-                                       wsl_available=wsl_available)
+                                       wsl_available=wsl_available, capabilities=capabilities,
+                                       contract_version=contract_version,
+                                       contract_capabilities=contract_capabilities)
+
+    def describe_session_permissions(self, session: str) -> dict[str, Any]:
+        """Routed to the session's HOME NODE, which is authoritative for its
+        grants. No second copy is kept here: a cached permission is a
+        permission that can be wrong at exactly the wrong moment."""
+        return self._route(session, "describe_permissions", lambda client, name: client.describe_permissions(name))
+
+    def set_session_permissions(self, session: str, *, read: bool | None = None,
+                                input: bool | None = None, expected_revision: int | None = None,
+                                actor: str | None = None) -> dict[str, Any]:
+        return self._route(session, "set_permissions", lambda client, name: client.set_permissions(
+            name, read=read, input=input, expected_revision=expected_revision, actor=actor))
+
+    def repair_stale_session_pin(self, session: str, *, actor: str | None = None) -> dict[str, Any]:
+        """Re-pin one explicit grant to the session instance that exists now.
+
+        This never invents permissions: it re-applies exactly the stored
+        requested read/input booleans, guarded by the revision we just read.
+        If the row is not stale it is a no-op.
+        """
+        current = self.describe_session_permissions(session)
+        if "error" in current:
+            return current
+        if not current.get("stale_identity_pin"):
+            return {"session": session, "repaired": False, "reason": "NOT_STALE",
+                    "permissions": current}
+        requested = current.get("requested") or {}
+        if requested.get("read") is None:
+            return {"session": session, "repaired": False, "reason": "NO_EXPLICIT_GRANT",
+                    "permissions": current}
+        repaired = self.set_session_permissions(
+            session, read=bool(requested.get("read")), input=bool(requested.get("input")),
+            expected_revision=current.get("revision"), actor=actor or "stale-pin-repair",
+        )
+        if "error" in repaired:
+            return repaired
+        return {"session": session, "repaired": not bool(repaired.get("stale_identity_pin")),
+                "reason": "REPinned" if not repaired.get("stale_identity_pin") else "STILL_STALE",
+                "permissions": repaired}
+
+    def fleet_environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]:
+        """Ask every node what it is missing, in one pass.
+
+        The point is to stop discovering at failover time that a surviving
+        node has no Claude login or no Tailscale. A node that cannot answer is
+        reported as UNAVAILABLE with the reason -- never as passing, and never
+        as a hard error that hides the nodes that DID answer. A node running a
+        build older than the environment audit is exactly that case, and says
+        so, which is itself the signal that it needs converging.
+        """
+        report: list[dict[str, Any]] = []
+        for node in self.list_nodes():
+            entry: dict[str, Any] = {"node_id": node.id, "status": node.status,
+                                     "contract_version": node.contract_version}
+            client = self._clients.get(node.id)
+            if client is None:
+                entry.update({"environment": None, "failover_ready": False,
+                              "detail": "no client configured for this node"})
+                report.append(entry)
+                continue
+            try:
+                result = client.environment(roles)
+            except Exception as exc:  # noqa: BLE001 -- one unreachable node must not hide the rest
+                entry.update({"environment": None, "failover_ready": False,
+                              "detail": f"environment audit unavailable: {type(exc).__name__}: {exc}"})
+                report.append(entry)
+                continue
+            if not isinstance(result, dict) or "checks" not in result:
+                entry.update({"environment": None, "failover_ready": False,
+                              "detail": "node did not return an environment audit "
+                                        "(it predates this build -- converge it first)"})
+                report.append(entry)
+                continue
+            entry.update({"environment": result,
+                          "failover_ready": bool(result.get("failover_ready")),
+                          "missing_failover_auth": result.get("missing_failover_auth", []),
+                          "blocking": result.get("blocking", []),
+                          "profile_fingerprint": result.get("profile_fingerprint")})
+            report.append(entry)
+
+        ready = [e["node_id"] for e in report if e["failover_ready"]]
+        return {
+            "nodes": report,
+            "failover_ready_nodes": ready,
+            # The number the M910-off gate actually turns on: how many nodes
+            # could carry the fleet if this controller went away.
+            "failover_ready_count": len(ready),
+        }
+
+    def refresh_node_capabilities(self, node_id: str) -> dict[str, Any]:
+        """Ask one node to re-probe launchers and update only capabilities.
+
+        This is intentionally separate from heartbeat metrics: a user-level
+        Windows PATH may change while the node remains healthy, and a
+        capability refresh must not manufacture a new liveness sample.
+        """
+        client = self._clients.get(node_id)
+        if client is None:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": "no client"}
+        try:
+            result = client.refresh_capabilities()
+        except NodeClientError as exc:
+            return {"error": "CAPABILITY_REFRESH_UNAVAILABLE", "node_id": node_id, "detail": str(exc)}
+        if "error" in result:
+            return {**result, "node_id": node_id}
+        agent_types = tuple(result.get("agent_types") or ())
+        node = self.registry.update_capabilities(node_id, agent_types=agent_types,
+                                                 agent_version=result.get("agent_version"))
+        if node is None:
+            return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+        return {"ok": True, "node_id": node_id, "agent_types": list(agent_types),
+                "launcher_paths": result.get("launcher_paths") or {}}
 
     # -- session location resolution ---------------------------------------
 
     def invalidate_session_location(self, session: str) -> None:
         self._session_location_cache.pop(session, None)
 
-    def resolve_session(self, session: str, *, now: float | None = None) -> dict[str, Any]:
+    def resolve_session(self, session: str, *, now: float | None = None,
+                        timeout_seconds: float | None = None) -> dict[str, Any]:
         """Returns {"node_id": ..., "client": ...} or {"error": ...}.
         `node/session` qualified names are checked first (never ambiguous
         by construction); a bare name is resolved via the location cache,
@@ -136,10 +353,20 @@ class ControllerService:
         reported as AMBIGUOUS_SESSION -- never routed by guessing (task
         item 3's own explicit requirement)."""
         now = time.monotonic() if now is None else now
+        deadline = None
+        if timeout_seconds is not None:
+            if timeout_seconds <= 0:
+                return {"error": "RESOLUTION_TIMEOUT", "session": session}
+            deadline = time.monotonic() + float(timeout_seconds)
         if "/" in session:
             node_id, _, bare = session.partition("/")
-            if self.registry.get(node_id) is None:
+            node = self.node_status(node_id)
+            if node is None:
                 return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+            if node.status != NODE_ONLINE:
+                return {"error": "NODE_UNREACHABLE", "node_id": node_id,
+                        "health_state": node.health_state,
+                        "detail": node.last_error or "node execution health is not OK"}
             return {"node_id": node_id, "session": bare}
 
         cached = self._session_location_cache.get(session)
@@ -147,14 +374,21 @@ class ControllerService:
             return {"node_id": cached.node_id, "session": session}
 
         found_on: list[str] = []
-        for node in self.registry.list():
+        for node in self.list_nodes():
             if node.status != NODE_ONLINE:
                 continue
             client = self._clients.get(node.id)
             if client is None:
                 continue
             try:
-                listing = client.list_sessions()
+                if deadline is None:
+                    listing = client.list_sessions()
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= MIN_BOUNDED_NODE_PROBE_SECONDS:
+                        return {"error": "RESOLUTION_TIMEOUT", "session": session}
+                    listing = client.list_sessions(timeout_seconds=min(
+                        MAX_BOUNDED_NODE_PROBE_SECONDS, remaining))
             except NodeClientError:
                 continue
             names = {row["name"] for row in listing.get("sessions", [])}
@@ -171,7 +405,8 @@ class ControllerService:
             # never chains more than one hop).
             redirect = self._rename_aliases.get(session)
             if redirect is not None and redirect != session:
-                resolved = self.resolve_session(redirect, now=now)
+                remaining_timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+                resolved = self.resolve_session(redirect, now=now, timeout_seconds=remaining_timeout)
                 if "error" not in resolved:
                     resolved = dict(resolved)
                     resolved["redirected_from"] = session
@@ -198,7 +433,11 @@ class ControllerService:
         client = self._clients.get(node_id)
         if client is None:
             return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": "no client configured for this node"}
-        node = self.registry.get(node_id)
+        node = self.node_status(node_id)
+        if node is None or node.status != NODE_ONLINE:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id,
+                    "health_state": node.health_state if node else "UNKNOWN",
+                    "detail": (node.last_error if node else None) or "node execution health is not OK"}
         try:
             result = call(client, bare)
         except NodeClientError as exc:
@@ -211,13 +450,57 @@ class ControllerService:
         return result
 
     def terminal_tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]:
-        return self._route(session, "tail", lambda client, name: client.tail(name, lines, ansi=ansi))
+        return _reredact(self._route(session, "tail",
+                                     lambda client, name: client.tail(name, lines, ansi=ansi)))
 
     def terminal_status(self, session: str) -> dict[str, Any]:
-        return self._route(session, "status", lambda client, name: client.status(name))
+        return _reredact(self._route(session, "status",
+                                     lambda client, name: client.status(name)))
+
+    def terminal_status_bounded(self, session: str, timeout_seconds: float) -> dict[str, Any]:
+        """Status read whose resolution + node I/O share one caller-owned time budget.
+
+        wait/resume tools use this path so a bare-name fleet scan or one slow node
+        cannot extend a synchronous MCP request beyond its advertised slice.
+        """
+        started = time.monotonic()
+        if timeout_seconds <= MIN_BOUNDED_NODE_PROBE_SECONDS:
+            return {"error": "STATUS_PROBE_TIMEOUT", "session": session}
+        resolution = self.resolve_session(session, timeout_seconds=timeout_seconds)
+        if "error" in resolution:
+            if resolution.get("error") == "RESOLUTION_TIMEOUT":
+                return {"error": "STATUS_PROBE_TIMEOUT", "session": session,
+                        "detail": "session resolution exceeded wait slice"}
+            return resolution
+        node_id, bare = resolution["node_id"], resolution["session"]
+        client = self._clients.get(node_id)
+        if client is None:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id,
+                    "detail": "no client configured for this node"}
+        node = self.node_status(node_id)
+        if node is None or node.status != NODE_ONLINE:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id,
+                    "health_state": node.health_state if node else "UNKNOWN",
+                    "detail": (node.last_error if node else None) or "node execution health is not OK"}
+        remaining = float(timeout_seconds) - (time.monotonic() - started)
+        if remaining <= MIN_BOUNDED_NODE_PROBE_SECONDS:
+            return {"error": "STATUS_PROBE_TIMEOUT", "session": session, "node_id": node_id}
+        try:
+            result = client.status(bare, timeout_seconds=min(MAX_BOUNDED_NODE_PROBE_SECONDS, remaining))
+        except NodeClientError as exc:
+            if (time.monotonic() - started) >= float(timeout_seconds) - MIN_BOUNDED_NODE_PROBE_SECONDS:
+                return {"error": "STATUS_PROBE_TIMEOUT", "session": session, "node_id": node_id}
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
+        if isinstance(result, dict):
+            result.setdefault("node_id", node_id)
+            result.setdefault("node_name", node.display_name if node else node_id)
+            if "redirected_from" in resolution:
+                result.setdefault("redirected_from", resolution["redirected_from"])
+        return _reredact(result)
 
     def terminal_capture(self, session: str, start_line: int | None = None) -> dict[str, Any]:
-        return self._route(session, "capture", lambda client, name: client.capture(name, start_line))
+        return _reredact(self._route(session, "capture",
+                                     lambda client, name: client.capture(name, start_line)))
 
     def terminal_send_text(self, session: str, text: str, press_enter: bool = False, dry_run: bool = False,
                            **kwargs: Any) -> dict[str, Any]:
@@ -267,6 +550,29 @@ class ControllerService:
         docstring), exactly what recovering a gone session needs."""
         return self._route(name, "registry_reopen", lambda client, bare: client.registry_reopen(
             bare, agent_type=agent_type, cwd=cwd, grant_mode=grant_mode, requested_by=requested_by))
+
+    def registry_list(self, node_id: str, *, recoverable_only: bool = False) -> dict[str, Any]:
+        """Auto Recovery follow-up (2026-09-07): the fleet-aware read a
+        reconciliation engine needs -- session_registry.py is per-node-
+        agent-process-local (each node has its OWN session_registry.db),
+        so this is the only way to see a REMOTE node's own registry rows
+        at all. Node-keyed (not session-keyed like _route above), since
+        this reads a whole node's registry, not one session's routed
+        operation -- NODE_UNREACHABLE for an unregistered/unreachable
+        node, never a silent empty list that could be mistaken for
+        "this node genuinely has zero registry rows"."""
+        client = self._clients.get(node_id)
+        if client is None:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": "no client configured for this node"}
+        try:
+            result = client.registry_list(recoverable_only=recoverable_only)
+        except NodeClientError as exc:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
+        if isinstance(result, dict):
+            node = self.registry.get(node_id)
+            result.setdefault("node_id", node_id)
+            result.setdefault("node_name", node.display_name if node else node_id)
+        return result
 
     def terminal_rename_session(self, name: str, new_name: str, *,
                                 requested_by: str | None = None) -> dict[str, Any]:
@@ -351,8 +657,9 @@ class ControllerService:
                                         until: str | None = None, limit: int = 20) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
         errors: dict[str, str] = {}
-        for node in self.registry.list():
+        for node in self.list_nodes():
             if node.status != NODE_ONLINE:
+                errors[node.id] = node.last_error or f"node health={node.health_state}"
                 continue
             client = self._clients.get(node.id)
             if client is None:
@@ -381,6 +688,105 @@ class ControllerService:
         results.sort(key=lambda r: r.get("captured_at", ""), reverse=True)
         return {"query": query, "results": results[:limit], "node_errors": errors,
                 "untrusted_output": True, "untrusted_fields": ["results"]}
+
+    def discover_projects(self) -> dict[str, Any]:
+        """Auto-detect the GIT PROJECTS this fleet is actually working on,
+        from data every node already records -- no new tracking, no
+        scanning, no config.
+
+        Each node's session registry already stores repo_root/git_remote/
+        git_branch per session (session_registry.probe_project_info fills
+        them at capture time). Normalising each git_remote through
+        project_identity collapses every checkout of one repository --
+        worktrees, scratch clones, a different path on every machine --
+        onto ONE canonical project_id. Measured on this deployment: 7
+        checkouts of terminal-mcp across 3 nodes resolve to a single id.
+
+        This is what makes a project-keyed backlog possible: "which
+        project is this session working on" is answerable for a REMOTE
+        session without the controller ever touching that node's
+        filesystem (it cannot -- those paths do not exist here)."""
+        from .project_identity import normalise_git_remote
+
+        projects: dict[str, dict[str, Any]] = {}
+        errors: dict[str, str] = {}
+        for node in self.list_nodes():
+            if node.status != NODE_ONLINE:
+                errors[node.id] = node.last_error or f"node health={node.health_state}"
+                continue
+            client = self._clients.get(node.id)
+            if client is None:
+                continue
+            try:
+                response = client.registry_list(recoverable_only=False)
+            except NodeClientError as exc:
+                errors[node.id] = str(exc)
+                continue
+            if "error" in response:
+                errors[node.id] = str(response["error"])
+                continue
+            for row in response.get("records", []):
+                repo_root = row.get("repo_root")
+                if not repo_root:
+                    continue  # a session not in a repo belongs to no project
+                remote = normalise_git_remote(row.get("git_remote"))
+                project_id = f"git:{remote}" if remote else f"path:{repo_root}"
+                entry = projects.setdefault(project_id, {
+                    "project_id": project_id, "is_portable": bool(remote),
+                    "name": (remote.rsplit("/", 1)[-1] if remote else Path(repo_root).name),
+                    "git_remote": row.get("git_remote"), "nodes": set(),
+                    "checkouts": set(), "branches": set(), "sessions": [],
+                })
+                # Every remote node labels its own rows "local" (core.py's
+                # REGISTRY_LOCAL_NODE_ID convention) -- overwrite with the
+                # real node id, exactly like the fleet knowledge search
+                # has to.
+                entry["nodes"].add(node.id)
+                entry["checkouts"].add(repo_root)
+                if row.get("git_branch"):
+                    entry["branches"].add(row["git_branch"])
+                entry["sessions"].append({"node_id": node.id, "session_name": row.get("session_name"),
+                                          "status": row.get("status")})
+        result = []
+        for entry in projects.values():
+            entry["nodes"] = sorted(entry["nodes"])
+            entry["checkouts"] = sorted(entry["checkouts"])
+            entry["branches"] = sorted(entry["branches"])
+            entry["session_count"] = len(entry["sessions"])
+            result.append(entry)
+        result.sort(key=lambda e: (-e["session_count"], e["project_id"]))
+        return {"projects": result, "node_errors": errors}
+
+    def resolve_project_for_session(self, node_id: str, session_name: str) -> dict[str, Any]:
+        """"Which project is THIS session working on?" -- answered from the
+        owning node's own registry record, never from the controller's
+        filesystem. That distinction is the whole point: a session on m910
+        or dell-5530 has a repo_root this controller cannot stat."""
+        from .project_identity import normalise_git_remote
+
+        client = self._clients.get(node_id)
+        if client is None:
+            return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+        try:
+            response = client.registry_list(recoverable_only=False)
+        except NodeClientError as exc:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
+        for row in response.get("records", []):
+            if row.get("session_name") != session_name:
+                continue
+            repo_root = row.get("repo_root")
+            if not repo_root:
+                return {"error": "SESSION_NOT_IN_A_REPO", "node_id": node_id, "session": session_name}
+            remote = normalise_git_remote(row.get("git_remote"))
+            return {
+                "project_id": f"git:{remote}" if remote else f"path:{repo_root}",
+                "name": (remote.rsplit("/", 1)[-1] if remote else Path(repo_root).name),
+                "source": "git_remote" if remote else "path",
+                "git_remote": row.get("git_remote"), "git_branch": row.get("git_branch"),
+                "repo_root": repo_root, "is_portable": bool(remote),
+                "node_id": node_id, "session": session_name,
+            }
+        return {"error": "SESSION_NOT_FOUND", "node_id": node_id, "session": session_name}
 
     def terminal_grant_session_read(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
         """Node-aware equivalent of TerminalService.grant_session_read --
@@ -422,7 +828,7 @@ class ControllerService:
         reopen for any session whose 20s session-location cache entry had
         already expired, on a single-node deployment too, not only multi-
         node."""
-        for node in self.registry.list():
+        for node in self.list_nodes():
             if node.status != NODE_ONLINE:
                 continue
             client = self._clients.get(node.id)
@@ -623,14 +1029,14 @@ class ControllerService:
             return {"error": "SESSION_ALREADY_EXISTS", "session": name, "node_id": existing["node_id"]}
 
         if node == "auto":
-            placement = choose_node(self.registry.list(), required_agent_type=agent_type, required_platform=platform)
+            placement = choose_node(self.list_nodes(), required_agent_type=agent_type, required_platform=platform)
             if placement.node_id is None:
                 return {"error": "NO_ELIGIBLE_NODE", "session": name, "reason": placement.reason,
                         "excluded": list(placement.excluded)}
             node_id = placement.node_id
         else:
             node_id = node
-            explicit_node = self.registry.get(node_id)
+            explicit_node = self.node_status(node_id)
             if explicit_node is None:
                 return {"error": "NODE_NOT_FOUND", "node_id": node_id}
             if platform is not None and explicit_node.platform != platform:
@@ -657,6 +1063,14 @@ class ControllerService:
                 # fallback... Fail rõ ràng" requirement.
                 return {"error": "NODE_UNREACHABLE", "node_id": node_id,
                         "detail": f"node status={explicit_node.status!r}, not online"}
+            if agent_type != "shell" and agent_type not in explicit_node.agent_types:
+                # Keep explicit-node creation honest too.  The dashboard
+                # normally disables this choice from the same capability
+                # field, but an API caller must not bypass the gate and then
+                # discover a launcher failure on the remote node.
+                return {"error": "AGENT_TYPE_NOT_AVAILABLE_ON_TARGET", "node_id": node_id,
+                        "detail": f"agent_type={agent_type!r} not available on {node_id!r} "
+                                  f"(has {explicit_node.agent_types!r})"}
 
         client = self._clients.get(node_id)
         if client is None:
@@ -684,7 +1098,7 @@ class ControllerService:
         empty list indistinguishable from "no sessions exist there")."""
         sessions: list[dict[str, Any]] = []
         unreachable: list[dict[str, Any]] = []
-        for node in self.registry.list():
+        for node in self.list_nodes():
             if node.status != NODE_ONLINE:
                 unreachable.append({"node_id": node.id, "node_name": node.display_name, "status": node.status})
                 continue
@@ -702,12 +1116,24 @@ class ControllerService:
                 row = dict(row)
                 row.setdefault("node_id", node.id)
                 row.setdefault("node_name", node.display_name)
+                # `allowed` is a DEPRECATED alias of read authorization, kept
+                # only so older callers keep working. A remote agent old
+                # enough to still compute it from its own session-name
+                # whitelist reports False for sessions this fleet can plainly
+                # read -- which is exactly the contradictory
+                # "allowed=false next to effective_read=true" state the
+                # default-open model exists to remove, and it survived here
+                # because the local listing was normalised and this merge was
+                # not. Never widens access: it only restates the answer
+                # effective_read already gave.
+                if "effective_read" in row:
+                    row["allowed"] = bool(row["effective_read"])
                 sessions.append(row)
         return {"sessions": sessions, "unreachable_nodes": unreachable}
 
     def terminal_list_killed_sessions(self) -> dict[str, Any]:
         entries: list[dict[str, Any]] = []
-        for node in self.registry.list():
+        for node in self.list_nodes():
             if node.status != NODE_ONLINE:
                 continue
             client = self._clients.get(node.id)
@@ -738,15 +1164,93 @@ class ControllerService:
             self.registry.sync_status_transitions()
         except Exception:  # noqa: BLE001
             pass
-        return self.registry.list()
+        result = []
+        for node in self.registry.list():
+            client = self._clients.get(node.id)
+            if client is None:
+                result.append(self.node_health._cached(node))
+                continue
+            result.append(self.node_health.evaluate(node, client))
+        return result
 
     def node_status(self, node_id: str) -> Node | None:
-        return self.registry.get(node_id)
-
-    def node_sessions(self, node_id: str) -> dict[str, Any]:
         node = self.registry.get(node_id)
         if node is None:
+            return None
+        client = self._clients.get(node_id)
+        return self.node_health.evaluate(node, client) if client is not None else self.node_health._cached(node)
+
+    def node_health_status(self, node_id: str | None = None, *, force_probe: bool = False) -> dict[str, Any]:
+        if node_id is not None:
+            node = self.registry.get(node_id)
+            if node is None:
+                return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+            client = self._clients.get(node_id)
+            evaluated = (self.node_health.evaluate(node, client, force_probe=force_probe)
+                         if client is not None else self.node_health._cached(node))
+            from .node_models import node_to_dict
+            return {"node": node_to_dict(evaluated),
+                    "summary": self.node_health.summary([evaluated])}
+        nodes = []
+        for node in self.registry.list():
+            client = self._clients.get(node.id)
+            nodes.append(self.node_health.evaluate(node, client, force_probe=force_probe)
+                         if client is not None else self.node_health._cached(node))
+        from .node_models import node_to_dict
+        return {"nodes": [node_to_dict(node) for node in nodes],
+                "summary": self.node_health.summary(nodes)}
+
+    def node_health_summary(self) -> dict[str, Any]:
+        nodes = self.list_nodes()
+        return self.node_health.summary(nodes)
+
+    def connection_status(self, node_id: str | None = None, *,
+                          force_probe: bool = False) -> dict[str, Any]:
+        """One compact connection answer for Commander-like clients/UI.
+
+        All probing remains delegated to NodeHealthService, so this endpoint
+        inherits its bounded timeout, durable backoff and per-node probe lock.
+        """
+        if node_id is not None:
+            node = self.registry.get(node_id)
+            if node is None:
+                return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+            client = self._clients.get(node_id)
+            evaluated = (self.node_health.evaluate(node, client, force_probe=force_probe)
+                         if client is not None else self.node_health._cached(node))
+            return {"node": self.connection_manager.node_view(evaluated)}
+        nodes = []
+        for node in self.registry.list():
+            client = self._clients.get(node.id)
+            nodes.append(self.node_health.evaluate(node, client, force_probe=force_probe)
+                         if client is not None else self.node_health._cached(node))
+        return self.connection_manager.fleet_view(nodes)
+
+    def reconcile_remote_node_health(self) -> list[Node]:
+        """Periodic remote-only probe pass.
+
+        Local heartbeat refresh stays owned by the existing MCP/dashboard
+        request path; the local client has no autonomous recovery action.
+        Remote nodes are where opt-in supervised restart can help without an
+        operator keeping a status page open.
+        """
+        results = []
+        for node in self.registry.list():
+            if node.id == self.local_node_id:
+                continue
+            client = self._clients.get(node.id)
+            results.append(self.node_health.evaluate(node, client)
+                           if client is not None else self.node_health._cached(node))
+        return results
+
+    def node_sessions(self, node_id: str) -> dict[str, Any]:
+        node = self.node_status(node_id)
+        if node is None:
             return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+        if node.status != NODE_ONLINE:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id,
+                    "health_state": node.health_state,
+                    "detail": node.last_error or "node execution health is not OK"}
         client = self._clients.get(node_id)
         if client is None:
             return {"error": "NODE_UNREACHABLE", "node_id": node_id}
@@ -783,8 +1287,9 @@ class ControllerService:
                                                limit: int = 50) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
         errors: dict[str, str] = {}
-        for node in self.registry.list():
+        for node in self.list_nodes():
             if node.status != NODE_ONLINE:
+                errors[node.id] = node.last_error or f"node health={node.health_state}"
                 continue
             client = self._clients.get(node.id)
             if client is None:
@@ -846,7 +1351,7 @@ class ControllerService:
         return {"node_id": node_id, "draining": draining}
 
     def choose_node_for(self, *, agent_type: str = "shell", platform: str | None = None) -> PlacementResult:
-        return choose_node(self.registry.list(), required_agent_type=agent_type, required_platform=platform)
+        return choose_node(self.list_nodes(), required_agent_type=agent_type, required_platform=platform)
 
 
 def build_default_controller(terminal: "TerminalService") -> ControllerService:
@@ -880,6 +1385,7 @@ def build_default_controller(terminal: "TerminalService") -> ControllerService:
     location."""
     workspace_root = (terminal.config.session_lifecycle.allowed_cwd_roots[0]
                       if terminal.config.session_lifecycle.allowed_cwd_roots else "/")
-    temp_dir = tempfile.mkdtemp(prefix="terminal-mcp-nodes-")
+    temp_dir = str(ephemeral_state_dir("nodes"))
     registry = NodeRegistry(Path(temp_dir) / "nodes.db")
-    return ControllerService(registry, local_client=LocalNodeClient(terminal), local_workspace_root=workspace_root)
+    return ControllerService(registry, local_client=LocalNodeClient(terminal), local_workspace_root=workspace_root,
+                             node_health_config=terminal.config.nodes.health)

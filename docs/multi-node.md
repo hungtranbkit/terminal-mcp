@@ -9,6 +9,15 @@ through the real production controller, not just the test suite. See
 **Windows node support** and **Bringing up the M910** below for exactly
 what was verified on each and what (if anything) still isn't.
 
+> **Adding a Windows machine?** Use **Dashboard → Nodes → `+ Add Node` →
+> Windows** and see [docs/windows-node-onboarding.md](windows-node-onboarding.md).
+> That flow (one-time enrollment code → one PowerShell script → OpenSSH +
+> optional Tailscale primary + reverse-SSH rescue + heartbeat, all
+> reboot-persistent) replaces the manual "edit config.yaml, export a token
+> env var, restart the controller" steps described further down this page
+> for the Windows case. Those manual steps remain correct and supported
+> for Linux/macOS and for installing the full `terminal-node-agent`.
+
 ## What this is
 
 Converts Terminal MCP from a single-host tmux manager into a Controller
@@ -693,6 +702,14 @@ nodes:
   heartbeat:                 # optional
     degraded_after_seconds: 60
     offline_after_seconds: 180
+  health:                    # execution-aware composite health
+    enabled: true
+    probe_interval_seconds: 20
+    probe_timeout_seconds: 3 # bounded; configuration rejects 5s or more
+    execution_down_after_failures: 2
+    backoff_base_seconds: 5
+    backoff_max_seconds: 300
+    backoff_jitter_ratio: 0.2
   remote:                    # optional, empty by default -- today's deployment
     - node_id: m910
       display_name: "M910 Workstation"
@@ -701,7 +718,35 @@ nodes:
       token_env: TERMINAL_MCP_NODE_TOKEN_M910  # the secret itself lives ONLY in this env var
       max_sessions: 20        # optional
       timeout_seconds: 10.0   # optional
+      self_heal_enabled: false # conservative default
+      self_heal_action: none   # or graceful_agent_restart
 ```
+
+## Execution-aware health and recovery
+
+Heartbeat freshness proves transport presence only. The controller reports
+`status=online` only after a bounded, authenticated execution probe also
+succeeds. Additive `transport_state`, `health_state`, and `execution_state`
+fields preserve the legacy status field while exposing the evidence:
+
+- `TRANSPORT_ONLINE` means the heartbeat is fresh.
+- `EXECUTION_OK` means transport is fresh and the session backend answered.
+- `DEGRADED` is the first bounded execution-probe failure.
+- `EXECUTION_DOWN` means the configured consecutive-failure threshold was met.
+- `AUTH_EXPIRED/UNAUTHORIZED` appears only after a proven HTTP 401/403.
+- `OFFLINE` always wins when the heartbeat is stale; cached probe success cannot
+  keep a stale node green. `UNKNOWN` means no conclusive probe exists yet.
+
+Probe failures persist a bounded sanitized error, failure count, last success,
+and `next_retry_at` in the existing nodes database. Exponential backoff with
+jitter suppresses repeated probes across controller restarts. Self-heal is
+per-node opt-in and only requests the allowlisted graceful agent restart;
+resource locking prevents concurrent attempts, the existing supervisor owns
+process replacement, and Terminal MCP never reboots a machine or refreshes
+credentials. A successful probe clears the circuit and failure count.
+
+Use `terminal_node_health` for a compact fleet or single-node view. Project
+checks include the same bounded state counts and actionable node blockers.
 
 The real production `config.yaml` on this host has **no `nodes:` section
 at all** — confirmed by its own regression test
@@ -995,6 +1040,268 @@ state and linger were confirmed by inspection instead.
   LAN afterward and confirmed `m910` (`192.168.1.109`) is correctly
   detected with real MAC, both `22`/`8790` open, `os_guess=linux`,
   `status=already_connected`.
+
+## Reaching a node over the internet (audit 2026-09-09)
+
+**Read this before assuming any node works off-LAN.** The data plane is
+`controller -> node`, not the reverse: `RemoteNodeClient` (node_client.py)
+dials the node's registered `endpoint` for EVERY operation (list/status/
+tail/send/create/kill/...). Only the *heartbeat* travels node -> controller.
+So a node behind NAT/CGNAT with no inbound reachability is **visible but
+uncontrollable** — its heartbeat lands, its dashboard row goes ONLINE, and
+every actual operation against it fails. Do not read a green node row as
+proof the node is usable.
+
+Three consequences that were each verified live during this audit:
+
+1. **The Cloudflare Access tunnel does not carry node traffic.** The
+   `cloudflared-terminal-mcp-dashboard` ingress only maps `^/dashboard(...)$`
+   and `^/(login|logout|app)(...)$` to the controller, and Cloudflare Access
+   fronts it — an unauthenticated POST to the heartbeat path over that
+   hostname returns `302` to the Access login page (`auth_status: NONE`,
+   `service_token_status: false`), never `401` from this application. A
+   node agent sends no Access service-token headers, so it cannot heartbeat
+   through that hostname. That tunnel is ChatGPT/browser -> controller only,
+   exactly like the separate OpenAI Secure MCP Tunnel
+   (`terminal-mcp-tunnel.service`, loopback `8767`). Neither is a node
+   transport.
+2. **`cloudflare_ssh` is a bootstrap transport, not a data plane.** The
+   "Connect Node -> SSH via Cloudflare Tunnel" flow installs the agent over
+   an Access-gated SSH session, then registers a plain
+   `http://{bind_host}:{agent_port}` endpoint (dashboard.py). The ongoing
+   control channel is that direct address — it does not ride the tunnel.
+   The section below ("If M910 needs to be reachable from outside the LAN")
+   describes step 1 only.
+3. **Overlay VPN is the only zero-inbound-port path that works today**, and
+   until this audit it was blocked in three places at once — see next.
+
+### Trusted overlay ranges (`TERMINAL_MCP_TRUSTED_VPN_CIDRS`)
+
+Tailscale is already installed and running on this controller host, and an
+overlay VPN is the one option that needs **no port-forward on the node**:
+both sides dial out to the coordination service, and the controller then
+reaches the node on its stable overlay address.
+
+The blocker (found and fixed 2026-09-09): a Tailscale address is in
+**100.64.0.0/10 (CGNAT), which Python's `ipaddress` does NOT classify as
+private** — verified live, `IPv4Address("100.81.85.120").is_private` is
+`False`. `lan_discovery.is_lan_scannable()` therefore rejected it, and that
+one predicate gated all three node-connectivity paths independently:
+
+| Gate | Effect before the fix |
+| --- | --- |
+| `network_bind.resolve_lan_bind` | controller refuses to bind its own Tailscale IP, so no node can reach it over the overlay |
+| `network_bind.resolve_allowed_cidrs` | `LanCidrGuardMiddleware` allowlist refuses a `100.64.0.0/10` entry |
+| `remote_connect.validate_hostname_or_ip` | dashboard "Connect Node" refuses a Tailscale-addressed node as an SSRF target |
+
+`is_lan_scannable()` is deliberately **unchanged** — it also governs active
+subnet scanning, and a `/10` shared with every other tailnet is precisely
+what this project must never port-sweep. Instead the three gates above now
+call `lan_discovery.is_trusted_node_address()`, which is
+`is_lan_scannable() OR inside an operator-declared range`.
+
+Declared via one env var on the **controller** service, empty by default
+(unset == today's exact behaviour, no range is trusted implicitly):
+
+```ini
+# ~/.config/systemd/user/terminal-mcp-http.service.d/override.conf
+[Service]
+Environment=TERMINAL_MCP_TRUSTED_VPN_CIDRS=100.64.0.0/10
+Environment=TERMINAL_MCP_LAN_BIND=100.x.y.z          # this host's own tailnet IP
+Environment=TERMINAL_MCP_ALLOWED_NODE_CIDRS=100.64.0.0/10
+```
+
+Guard rails, all covered by `tests/test_trusted_vpn_cidrs.py`:
+
+- A **globally-routable** entry is refused outright (`8.8.8.0/24`,
+  `0.0.0.0/0`) — the override may widen the gate to an overlay, never to
+  the internet. Loopback/multicast/reserved are refused too.
+- A malformed entry **raises rather than being skipped**: silently dropping
+  one entry would leave an operator believing a range is trusted while the
+  real gate stayed closed.
+- When the bind address is an overlay address, the allowlist auto-derives
+  the **declared range**, not the bind address's conventional `/24` —
+  tailnet peers are scattered across the whole `/10`, so the `/24` fallback
+  would be far too narrow.
+- Loopback is still always bound; the LAN/overlay socket is an addition.
+
+Live acceptance evidence (2026-09-09, disposable port, no production
+state touched) using the real `network_bind` + `LanCidrGuardMiddleware`:
+
+```
+[gate] resolve_lan_bind -> 100.81.85.120
+[gate] resolve_allowed_cidrs -> ['100.64.0.0/10']
+[bind] listening on [('127.0.0.1', 18799), ('100.81.85.120', 18799)]
+[OVERLAY-PEER ] src=100.81.85.120 -> HTTP 200 {"ok":true,"seen_from":"100.81.85.120"}
+[OFF-ALLOWLIST] src=192.168.1.132 -> HTTP 403 Forbidden: source address not in the allowed LAN range
+```
+
+### Binding LAN and overlay at the same time
+
+`TERMINAL_MCP_LAN_BIND` accepts a **comma-separated list**, and the
+controller opens one socket per address (loopback always, unchanged).
+This exists because a single bind makes overlay adoption all-or-nothing:
+repointing the one bind at the tailnet address would cut the heartbeat
+path out from under every node already on the LAN, since they push to
+`http://192.168.1.132:8766`. Binding both lets LAN nodes and off-LAN
+nodes coexist, during the move and after it.
+
+```ini
+[Service]
+Environment=TERMINAL_MCP_TRUSTED_VPN_CIDRS=100.64.0.0/10
+Environment=TERMINAL_MCP_LAN_BIND=192.168.1.132,100.81.85.120
+Environment=TERMINAL_MCP_ALLOWED_NODE_CIDRS=192.168.1.0/24,100.64.0.0/10
+```
+
+Semantics worth knowing:
+
+- **The CIDR allowlist is global, not per-socket.** A source is allowed if
+  it matches any entry, whichever bound socket it arrived on. Pairing each
+  bind to its own range would be marginally tighter, but the flat env var
+  cannot express the pairing and the practical gap is nil (nothing routes
+  tailnet traffic to the LAN address or vice versa).
+- **Every bound socket is guarded.** The guard matches the arrival socket
+  against the whole bind set — a single-address guard would treat traffic
+  on the second socket as "not the LAN socket" and wave it through
+  completely unchecked. `tests/test_multi_address_bind.py` pins this.
+- **Auto-derivation unions across binds** when
+  `TERMINAL_MCP_ALLOWED_NODE_CIDRS` is unset: each bind contributes its
+  NIC subnet, or the declared overlay range containing it, or its
+  conventional `/24`. A bind whose range is missing would be fail-closed
+  for all of its peers.
+- **Every address in the list is validated**, not just the first — a
+  public address anywhere in it is refused.
+- `resolve_lan_bind()` (singular) is retained for `describe_endpoints`/
+  doctor/dashboard and returns the FIRST bind. Anything that opens
+  sockets or builds the guard must use `resolve_lan_binds()`.
+
+Live acceptance evidence (2026-09-09, disposable port 18798, real LAN and
+Tailscale interfaces, no production state touched):
+
+```
+[gate] binds -> ['192.168.1.132', '100.81.85.120']
+[gate] cidrs -> ['192.168.1.0/24', '100.64.0.0/10']
+[bind] [('127.0.0.1', 18798), ('192.168.1.132', 18798), ('100.81.85.120', 18798)]
+192.168.1.132 -> 192.168.1.132 : HTTP 200
+100.81.85.120 -> 100.81.85.120 : HTTP 200
+127.0.0.1     -> 127.0.0.1     : HTTP 200
+```
+
+**Done against the live deployment on 2026-09-10** — see
+"dell-linux over the Tailscale overlay" below. What that took, beyond the
+code-level permission this section describes: the node joined the tailnet,
+its `endpoint` became its overlay address, and the controller was restarted
+with the env above. `TERMINAL_MCP_TRUSTED_VPN_CIDRS` only removes the
+code-level refusal; it does not configure the overlay for you.
+
+### dell-linux over the Tailscale overlay (live since 2026-09-10)
+
+The first node actually running off-LAN. The Dell Latitude 5511 left
+`192.168.1.0/24` (it is now on a different network entirely) and reaches
+the controller only over the tailnet. **No inbound port-forward exists or
+is needed on either router** — Tailscale is an outbound-only WireGuard
+mesh, and it carries both directions of this protocol: the node's
+outbound heartbeat push, and the controller's calls back to the node's
+`:8790`.
+
+| | Address |
+| --- | --- |
+| controller (m910) | `100.117.214.87:8766` |
+| node (dell-linux) | `100.81.85.120:8790` |
+
+Controller side — `~/.config/systemd/user/terminal-mcp-http.service.d/30-tailnet-overlay.conf`:
+
+```ini
+[Service]
+Environment=TERMINAL_MCP_TRUSTED_VPN_CIDRS=100.64.0.0/10
+Environment=TERMINAL_MCP_LAN_BIND=192.168.1.109,100.117.214.87
+Environment=TERMINAL_MCP_ALLOWED_NODE_CIDRS=192.168.1.0/24,100.64.0.0/10
+```
+
+Additive on purpose: the LAN bind and loopback are untouched, so
+`dell-5530` and `macbook` keep the exact heartbeat path they already had.
+`TRUSTED_VPN_CIDRS` must be present or `network_bind` refuses to bind a
+`100.64.0.0/10` address at all. `config.yaml`'s `dell-linux` entry has its
+`hostname`/`endpoint` on the overlay address to match.
+
+Node side — `~/.config/systemd/user/terminal-node-agent.service` on the Dell:
+
+```
+ExecStart=.../terminal-node-agent --node-id dell-linux \
+    --controller-url http://100.117.214.87:8766 \
+    --host 100.81.85.120 --port 8790 --heartbeat-interval-seconds 20
+```
+
+`--host` is the node's own **tailnet** address, never `0.0.0.0`: the agent
+is reachable by the controller and by nothing on the public Internet.
+
+Two unit bugs were fixed here that are worth not regressing:
+
+- **`After=default.target` together with `WantedBy=default.target`** is an
+  ordering cycle; systemd resolves it by silently deleting the start job at
+  boot. The controller unit carries a comment about this exact bug — the
+  node unit still had it.
+- **`StartLimitIntervalSec`/`StartLimitBurst` in `[Service]`** are ignored by
+  modern systemd; they belong in `[Unit]`. That left the agent on the
+  5-starts-in-10s default, which is too tight for a unit whose bind address
+  only exists once `tailscaled` has configured `tailscale0`. Now
+  `600s`/`30` in `[Unit]`.
+
+**`deploy/install-node-agent.sh` still emits `After=default.target`** into the
+unit it generates, so a fresh install reintroduces the ordering cycle above and
+the new node silently fails to start at its first boot. Not fixed in the same
+change as this note on purpose: m910 is carrying unpushed commits that already
+touch that template's surrounding lines (the `StartLimit*` move and
+`KillMode=process`), and editing it from a second checkout would collide with
+them. Fix it wherever those commits land, not here.
+
+Live acceptance evidence (2026-09-10, disposable session, deleted after):
+
+```
+[health]  {"status": "ok", "node_id": "dell-linux", "version": "0.12.0"}
+[create]  tmcp-verify-... state=READY cwd=/home/dell/workspace
+[send]    pwd; hostname; uname -a  -> SUBMIT_CONFIRMED
+[tail]    /home/dell/workspace
+          dell-Latitude-5511
+          Linux dell-Latitude-5511 7.0.0-31-generic ... x86_64 GNU/Linux
+[delete]  {"deleted": true}   # sessions before == sessions after == []
+```
+
+Reconnect behaviour, both verified live rather than assumed: restarting the
+agent brings the heartbeat back within one interval, and stopping the
+controller makes the agent log `heartbeat push to controller failed (will
+retry)` and keep running on the **same PID** — it retries, it does not
+crash-loop.
+
+#### Recovering this node after a reinstall or a reboot
+
+After a plain reboot: nothing manual. `loginctl show-user dell -p Linger` is
+`Linger=yes` and the unit is `enabled`, so the agent comes back on its own;
+it retries until `tailscale0` exists. Long-lived tmux sessions do **not**
+survive a reboot — that is tmux, not this agent, and `tmux_session_count: 0`
+right after a boot is correct, not a fault.
+
+After a reinstall, in order:
+
+1. `tailscale up` — confirm this host still holds `100.81.85.120`
+   (`tailscale status`). If the tailnet address changed, it must be updated
+   in **both** the node's `--host` and the controller's `config.yaml`
+   `dell-linux` endpoint.
+2. Restore `~/workspace/terminal-mcp` and its `.venv`.
+3. Restore `node-agent.env` (mode `0600`, never committed — `*.env` is
+   gitignored). Its value must equal the controller's
+   `TERMINAL_MCP_NODE_TOKEN_DELL_LINUX`; compare `sha256sum` of the two, never
+   the tokens themselves. **Do not rotate it** — the same file is the only
+   copy on this node, and rotating means editing the controller too.
+4. Reinstall the unit above, then
+   `systemctl --user daemon-reload && systemctl --user enable --now terminal-node-agent`.
+5. Verify from the controller, not from here: the node is `online` with a
+   heartbeat younger than `degraded_after_seconds` (60s).
+
+Never register a second node id (`dell-linux-2`, a hostname-derived one, ...)
+to work around a node that looks offline. The registry row persists across
+outages by design — `status` is always derived from heartbeat age, never
+stored — so an offline `dell-linux` is a row to fix, never a row to replace.
 
 ### If M910 needs to be reachable from outside the LAN
 

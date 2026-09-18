@@ -1,0 +1,114 @@
+# Project/Agent Coordination — Capability Audit (Phase A)
+
+**Date:** 2026-09-09 · **Method:** source + tests + **live production DB row counts**.
+Nothing below is inferred from a filename. "Production-used" means real rows in
+`~/.local/state/terminal-mcp/*.db` on the live controller.
+
+## Ground truth: what is actually exercised
+
+| Store | Rows (live) | Verdict |
+|---|---|---|
+| `session_knowledge.db` | 3462 sessions / 52692 chunks / 131592 checkpoints | **heavily used** |
+| `audit.db` | 12434 input_audit / 437 idempotent_sends | **heavily used** |
+| `session_registry.db` | 522 records / 4014 drop_events | **heavily used** |
+| `queue.db` | 37 tasks / 35 lanes / **241 events** | **used** |
+| `grants.db` / `bindings.db` | 25 / 7 | used |
+| `nodes.db` | 4 nodes / 4 status events | used |
+| `supervisor.db` | 60 events, 13 actions, **0 watches, 0 policies** | partly used, autonomy inert |
+| `backlog.db` | 1 project / 19 items | new (this session) |
+| `leases.db` | **0** (TTL rows, empty at rest — expected) | used transiently |
+| `integration.db` | **0 / 0 / 0 / 0** | **built + 68 tests, never used** |
+| `planner_store.db` | **0** | built, never used |
+| `pm_store.db` | **0 / 0** | built, never used |
+| `release_store.db` | **0 / 0** | built, never used |
+
+Two facts that reframe everything below:
+
+1. **The Coordinator gate is real and production-exercised** — `queue_events`
+   holds `COORDINATOR_DECISION` ×32, `COORDINATOR_READY` ×15,
+   `COORDINATOR_NEEDS_REWORK` ×10, `COORDINATOR_NEEDS_HUMAN` ×6,
+   `COORDINATOR_BLOCKED` ×1, and 15 tasks reached `COMPLETED` (= VERIFIED_DONE).
+   The full enqueue → precheck → dispatch → run → verify → complete cycle has
+   genuinely run.
+2. **Auto-dispatch is inert.** `config.queue.enabled = True` globally, but
+   **0 of 35 lanes** have `auto_dispatch_enabled=1`, and **`queue_lanes.project`
+   is `None` for every lane**. Those 15 completions were driven by explicit
+   calls, not by the loop.
+
+## Capability matrix
+
+| # | Capability | Status | Evidence (file · table · test) | Real behaviour & limits |
+|---|---|---|---|---|
+| 1 | Project registry | **PARTIAL → improved (P0.1)** | `project_identity.py`, `backlog_db.backlog_projects`, `controller.discover_projects()`, `tests/test_backlog.py` | Canonical `project_id` from normalised git remote; 7 checkouts of terminal-mcp across 3 nodes collapse to one id. Fleet discovery works (6 projects live). But only 1 project has state, and `queue_lanes.project` is unused (`None` everywhere) — the queue does not know about projects. |
+| 2 | Persistent project knowledge | **PARTIAL** | `session_knowledge.py` (3462 sessions), `_project_matches` | Rich and durable, but **session-scoped**. Project filtering is a **fuzzy substring word-match** over `cwd/repo_root/display_name` — not the canonical `project_id`. No project-level state object. |
+| 3 | Task registry / runtime state | **EXISTS** | `queue_store.queue_tasks` (37), `VALID_TRANSITIONS`, `tests/test_queue_store.py` | Full explicit state machine (QUEUED→PRECHECK→READY→DISPATCHING→RUNNING→VERIFYING→COMPLETED + BLOCKED/FAILED/PAUSED/WAITING_SESSION/DISPATCH_UNCERTAIN). Invalid transitions raise. Production-verified. |
+| 4 | Atomic claim + lease | **EXISTS (+ P0.4 verbs)** | `queue_store.claim_next_task` (BEGIN IMMEDIATE + `claim_token` + `lease_expires_at`), `lease.PaneLeaseStore` (`acquire/renew/release/holder/prune_expired`), `integration_store.claim_next_handoff` | Genuine TOCTOU-closing atomic claim. Pane lease is cross-process, TTL-based, crash-recoverable. **Handoff** is the only claim path with an explicit `handoff` concept; task-level handoff between workers is not modelled. |
+| 5 | Worker capability registry | **PARTIAL → EXISTS (P0.3)** | `nodes.db`: `platform`, `session_backend`, `shell_capabilities`, `wsl_available`, `agent_types`, `labels` | Real per-node capability: dell-5530 = `windows`/`windows_pty`/`["powershell","cmd"]`/wsl=1/`["shell","claude","codex"]`. **Missing the tool/runtime axis** the target needs — nothing expresses "has Playwright", "can build WPF", "has WebView2". `labels` exists but is empty everywhere. |
+| 6 | Availability / heartbeat / quota | **PARTIAL** | `node_registry.classify_capacity`, heartbeat 20s, `capacity_status` | Heartbeat + EWMA-smoothed, duration-aware overload heuristic (healthy/busy/overloaded) is real and live. **`max_sessions` is stored but never enforced** — no admission control anywhere. |
+| 7 | Shared-file / resource ownership lock | **EXISTS** (P0.6, 2026-09-09) | `lease.ResourceLockStore` (`resource_locks`, migration v2), 8 `terminal_resource_*` tools; plus the pre-existing `git_worktree.py`/`git_isolation_service.py` isolation | Was PARTIAL: worktree/branch isolation was real but there was **no generic named-resource lock**. Now project-scoped named locks with the pane lease's own atomic acquire (generalised into `_LeaseTable`, pane hot path byte-identical), holder-reporting refusals, all-or-nothing multi-acquire for deadlock avoidance, and an audited operator override. **Advisory**, not enforcement — and deliberately no waiter queue. |
+| 8 | Event bus | **PARTIAL → EXISTS (P0.2)** | `queue_events` (241), `integration_events` (0), `supervisor_events` (60) | Three **separate append-only per-store logs**, not a bus: no subscribe, no cross-store ordering, no fan-out. Real types include `ENQUEUED/CLAIMED/DISPATCHED/STARTED/VERIFYING/VERIFIED/COORDINATOR_*/LANE_PAUSED`. **Absent from the target list:** `WORKER_IDLE`, `PREVIEW_FAILED`, `USER_FEEDBACK`, `MERGE_CONFLICT` (integration has its own equivalents but unused). |
+| 9 | Verify queue by capability | **EXISTS** (P0.5, 2026-09-09) | `verify_queue.py`, `verify_jobs` (migration v7), 12 `terminal_verify_*` tools | Was PARTIAL: verification was a **state of the same task in the same session**. Now a claimable job routed by capability (AND over probed + platform facts), with lease/token ownership, an evidence gate stricter than the task-side one, and duplicate prevention in the schema. Reuses the existing `VERIFYING`/`COMPLETED` states and `verification_evidence` column — **zero new task statuses or edges**. |
+| 10 | Merge / integration queue | **BUILT, UNUSED** | `integration_store.py` (pipelines/handoffs/batches/events), `claim_next_handoff(project, lease_seconds)`, `integration_engine.tick(project)`, 68 tests | A genuine **project-scoped, leased, claimable merge queue with its own state machine and conflict-rework routing** already exists — and has **0 production rows**. This is the single biggest piece of already-built leverage. |
+| 11 | Preview-fast queue | **MISSING** | — | No preview concept anywhere in source or DB. |
+| 12 | Per-project coordinator, event-driven | **PARTIAL** | `coordinator.py` (production-used, 32 decisions), `queue_loop.py` | Gate is **deterministic by explicit design** and **fail-closed** (any unreadable evidence → NEEDS_HUMAN, never READY). It has a **pluggable `scope_reasoner`** for the one judgment-needing check — the natural LLM seam. But it is **per-task, per-lane/session — not per-project**, and the loop **polls** rather than reacting to events. |
+| 13 | Global portfolio scheduler | **MISSING** | `queue_service.rebalance(project, sessions)` | Rebalance moves tasks **between sessions inside one project label**, dry-run by default, and depends on `planner` (0 rows). No cross-project resource allocation, no priority arbitration between projects. |
+| 14 | Module/outcome owner on child tasks | **PARTIAL** | `planner_store.plan_proposals` (0 rows), `parent_task_id`/`acceptance_criteria` in task `metadata` | Split-into-children exists via metadata on ordinary tasks (deliberately no new table). Never used in production. No "module owner" concept. |
+| 15 | Dependency graph / DAG | **PARTIAL** | `queue_tasks.depends_on` (JSON list), enforced in `next_dispatchable_task` | **Fail-closed and cross-lane**: every `depends_on` id must be COMPLETED, and a *missing* id counts as unmet. It is a dependency **list**, not a graph object — no cycle detection, no critical path, no visualisation. |
+| 16 | Project APIs for ChatGPT | **EXISTS** (P0.7, 2026-09-09) | `project_service.py`, 7 `terminal_project_*` tools (171 total) | Was PARTIAL: everything existed but only one layer at a time. Now `status`/`submit_goal`/`events`/`report`/`pause`/`resume`/`assign` at project level, as **pure composition over P0.1-P0.6** — no table, no migration, no loop. `submit_goal` records intent and never dispatches; project resume never undoes a pause it did not place. |
+| 17 | Runtime state ↔ canonical backlog sync | **PARTIAL** | `backlog_service.export_file/import_file`, `git_isolation_service` | Controller DB is authoritative; file is an export/import projection with merge-by-id. Per-task worktrees mean workers don't contend on one branch. **There is no `TASKS.json` in this repo** — the canonical backlog is `.terminal-mcp/backlog.json` (tracked). |
+| 18 | Idempotency / recovery / restart | **EXISTS** | `audit.idempotent_sends` (437), `claim_token` reconcile, `recovery_engine.py`/`recovery_loop.py`, `AGENT_GENERATION` | Idempotency keys are production-used. Stale-claim reconciliation, restart-safe ticks, and an (off-by-default) auto-recovery engine exist. Node `agent_generation` distinguishes process lifetimes. |
+| 19 | Audit trail / decision log | **EXISTS** | `audit.db` (12434), `COORDINATOR_DECISION` events, `queue_events` (241), `supervisor_actions` | Every send is audited with hashes (never raw prompt text). Coordinator decisions are persisted **with their reasons** and re-read to enforce a review-attempt budget. |
+| 20 | Dashboard observability | **PARTIAL** | `/dashboard`, `/dashboard/nodes`, `/dashboard/tasks`, `/dashboard/backlog` | Sessions, nodes, task board and backlog are all visible. **No project → module → task → worker → verify/merge/preview drill-down**; nothing surfaces integration/preview at all. |
+
+## Score
+
+`EXISTS = 1`, `PARTIAL = 0.5`, `BUILT-UNUSED = 0.75`, `MISSING = 0`:
+
+- EXISTS (4): items 3, 4, 18, 19
+- BUILT-UNUSED (1): item 10
+- PARTIAL (13): 1, 2, 5, 6, 7, 8, 9, 12, 14, 15, 16, 17, 20
+- MISSING (2): 11, 13
+
+**≈ 11.25 / 20 ≈ 56 % at audit time (2026-09-09, pre-P0).**
+
+**After P0.1-P0.4 (implemented 2026-09-09): ≈ 13 / 20 ≈ 65 %.**
+Item 8 (event bus) moved PARTIAL → EXISTS; item 1 (project registry) gained
+a real runtime dimension (`queue_tasks.project_id`, `queue_lanes.project`
+now populated-capable) on top of the existing `backlog_projects` registry.
+Item 5 (worker capability) moved PARTIAL → EXISTS: the tool/runtime axis
+it lacked is now probed per node and queryable with AND semantics. Item 4
+gained the post-claim verbs it was missing (renew/release/handoff) —
+including renew, which `reconcile_stale_claims` already assumed existed.
+Items 11/13 are unchanged — P0 deliberately did not touch preview or
+portfolio scheduling.
+
+**After P0.5 (2026-09-09): ≈ 13.5 / 20 ≈ 68 %.** Item 9 (verify queue by
+capability) moved PARTIAL → EXISTS: verification is now a claimable job routed
+by capability rather than a state only the implementing session can leave,
+built on P0.2's bus vocabulary, P0.3's capability axis and P0.4's lease verbs
+— which is why it was sequenced last. The medium risk flagged for it ("changes
+who verifies") was retired by making the opt-in per task rather than global:
+every existing lane still verifies in-session, unchanged.
+
+**After P0.6 (2026-09-09): ≈ 14 / 20 ≈ 70 %.** Item 7 (shared-resource
+ownership lock) moved PARTIAL → EXISTS. Notably this was built by
+GENERALISING an existing primitive rather than adding one: the pane lease's
+atomic check-and-set — the statement whose exact shape came from reproducing
+a real race — now serves both subjects, and the pane path's generated SQL is
+asserted byte-identical to what shipped. The remaining P0 item is 16 (project
+APIs for ChatGPT), which is additive tooling over what now exists.
+
+**After P0.7 (2026-09-09): ≈ 14.5 / 20 ≈ 73 %. P0 IS COMPLETE.** Item 16
+(project APIs) moved PARTIAL → EXISTS, and did so by adding **no state at
+all** — it is a facade over the six primitives P0.1-P0.6 built, which is the
+clearest evidence those primitives were the right ones. What remains
+un-shipped is now genuinely the P1/P2 work the audit always described as
+orchestration: items 11 (preview queue) and 13 (portfolio scheduler) are still
+MISSING, item 10 (integration queue) is still BUILT-UNUSED with 0 production
+rows, and item 12 (per-project event-driven coordinator) is still PARTIAL and
+still polling. None of those are blocked on a missing primitive any more.
+
+The weighting matters more than the number: the *hard, safety-critical* primitives
+(atomic claim, lease, state machine, fail-closed gate, idempotency, audit) are the
+ones that EXIST. What is missing is mostly **orchestration above them** — project
+scoping, routing, and a real event bus.

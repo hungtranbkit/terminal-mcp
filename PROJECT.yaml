@@ -1,0 +1,25 @@
+schema_version: 1
+project:
+  code: terminal-mcp
+  name: Terminal MCP
+  type: web-application
+  role: local-development-tool
+source:
+  root: .
+runtime:
+  type: python
+# Added by ServerHub's Project Watchdog identity-resolution fix (2026-09-05): this
+# process runs under systemd (terminal-mcp-http.service, loopback + LAN, port 8766)
+# inside ServerHub's own hardened sandbox (ProtectSystem=strict), which blocks the
+# cross-process /proc introspection ServerHub would otherwise use to attribute this
+# port to this repo's root_path automatically -- declaring it here (the documented,
+# sandbox-independent fallback) is what lets ServerHub correlate them instead of
+# tracking this as two split project rows (this repo's systemd-detected row, and a
+# second rootless row for the cloudflared-fronted dashboard on the same port). See
+# ~/workspace/serverhub/serverhub/project_discovery.py (scan_project_yaml_ports /
+# parse_project_yaml) for the mechanism this feeds. Minimal on purpose -- no
+# commands/deployment section added since none was verified here; add those
+# separately if this repo adopts the full PROJECT.yaml convention later.
+service:
+  healthcheck:
+    url: http://127.0.0.1:8766/health/live

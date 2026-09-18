@@ -22,6 +22,53 @@ NODE_DEGRADED = "degraded"
 NODE_OFFLINE = "offline"
 NODE_STATUSES = (NODE_ONLINE, NODE_DEGRADED, NODE_OFFLINE)
 
+# Layered health state. ``status`` above remains the backward-compatible
+# online/degraded/offline field; controller surfaces derive it from this
+# stronger execution-aware state instead of heartbeat freshness alone.
+HEALTH_TRANSPORT_ONLINE = "TRANSPORT_ONLINE"
+HEALTH_EXECUTION_OK = "EXECUTION_OK"
+HEALTH_DEGRADED = "DEGRADED"
+HEALTH_EXECUTION_DOWN = "EXECUTION_DOWN"
+HEALTH_AUTH_UNAUTHORIZED = "AUTH_EXPIRED/UNAUTHORIZED"
+HEALTH_OFFLINE = "OFFLINE"
+HEALTH_UNKNOWN = "UNKNOWN"
+NODE_HEALTH_STATES = (
+    HEALTH_TRANSPORT_ONLINE, HEALTH_EXECUTION_OK, HEALTH_DEGRADED,
+    HEALTH_EXECUTION_DOWN, HEALTH_AUTH_UNAUTHORIZED, HEALTH_OFFLINE,
+    HEALTH_UNKNOWN,
+)
+
+# Operator-facing connection state. This is intentionally smaller than the
+# health-state vocabulary above: it answers the same question Desktop
+# Commander exposes at a glance without hiding the richer diagnostic fields.
+CONNECTION_CONNECTED = "CONNECTED"
+CONNECTION_DEGRADED = "DEGRADED"
+CONNECTION_OFFLINE = "OFFLINE"
+CONNECTION_RECOVERING = "RECOVERING"
+CONNECTION_STATES = (
+    CONNECTION_CONNECTED, CONNECTION_DEGRADED, CONNECTION_OFFLINE,
+    CONNECTION_RECOVERING,
+)
+_RECOVERING_RECONNECT_STATES = {
+    "BACKOFF", "SELF_HEAL_REQUESTED", "SELF_HEAL_AWAITING_REPLACEMENT",
+    "SUPPRESSED_CONCURRENT_PROBE",
+}
+
+
+def connection_state_for_node(node: "Node") -> str:
+    """Collapse transport/execution/retry detail into one stable UI state."""
+    if node.transport_status != NODE_ONLINE or node.health_state == HEALTH_OFFLINE:
+        return CONNECTION_OFFLINE
+    if node.health_state == HEALTH_EXECUTION_OK:
+        return CONNECTION_CONNECTED
+    if node.reconnect_status in _RECOVERING_RECONNECT_STATES:
+        return CONNECTION_RECOVERING
+    return CONNECTION_DEGRADED
+
+
+def connection_transport_for_node(node: "Node") -> str:
+    return "local" if node.endpoint == "local" else "node_agent_http"
+
 # A node whose operator has set draining=True is excluded from the
 # scheduler regardless of its online/offline status -- draining is
 # reported as a separate boolean (task's own field list), not folded into
@@ -107,6 +154,11 @@ class NodeCapabilities:
     agent_types: tuple[str, ...] = ("shell",)
     agent_version: str | None = None  # this project's own __version__ on that node
     labels: tuple[str, ...] = ()
+    # P0.3: PROBED tool/runtime capabilities (git/node/docker/dotnet/
+    # playwright/...). Deliberately separate from `labels`, which is an
+    # operator-supplied grouping tag -- see capability_probe.py for why
+    # conflating declared and probed capability is the bug this avoids.
+    capabilities: tuple[str, ...] = ()
     platform: str = PLATFORM_LINUX
     session_backend: str = SESSION_BACKEND_TMUX
     shell_capabilities: tuple[str, ...] = ()
@@ -150,6 +202,11 @@ class Node:
     agent_types: tuple[str, ...] = ()
     agent_version: str | None = None
     labels: tuple[str, ...] = ()
+    # P0.3: PROBED tool/runtime capabilities (git/node/docker/dotnet/
+    # playwright/...). Deliberately separate from `labels`, which is an
+    # operator-supplied grouping tag -- see capability_probe.py for why
+    # conflating declared and probed capability is the bug this avoids.
+    capabilities: tuple[str, ...] = ()
     max_sessions: int | None = None
     capacity_status: str = CAPACITY_UNKNOWN
     overload_reasons: tuple[str, ...] = ()
@@ -161,6 +218,27 @@ class Node:
     session_backend: str = SESSION_BACKEND_TMUX
     shell_capabilities: tuple[str, ...] = ()
     wsl_available: bool = False
+    # PROTOCOL generation this node reported (contract.py), deliberately
+    # separate from `capabilities` above: those are PROBED tool features
+    # ("can this node run docker?"), this is "does this node speak the same
+    # wire contract?". 0 means the node reported nothing, which is recorded
+    # as legacy and never treated as compatible.
+    contract_version: int = 0
+    contract_capabilities: tuple[str, ...] = ()
+    # Execution-aware health metadata. Persisted in nodes.db and additive to
+    # every existing Node/tool/dashboard shape.
+    transport_status: str = NODE_OFFLINE
+    transport_state: str = HEALTH_UNKNOWN
+    health_state: str = HEALTH_UNKNOWN
+    execution_state: str = HEALTH_UNKNOWN
+    last_probe_at: str | None = None
+    last_successful_probe_at: str | None = None
+    consecutive_failures: int = 0
+    next_retry_at: str | None = None
+    last_error: str | None = None
+    reconnect_status: str = "IDLE"
+    agent_generation: str | None = None
+    last_self_heal_at: str | None = None
 
 
 def node_to_dict(node: Node) -> dict[str, Any]:
@@ -182,10 +260,32 @@ def node_to_dict(node: Node) -> dict[str, Any]:
         "disk_used_bytes": node.disk_used_bytes, "disk_free_bytes": node.disk_free_bytes,
         "tmux_session_count": node.tmux_session_count, "agent_counts": node.agent_counts,
         "agent_types": list(node.agent_types), "agent_version": node.agent_version,
-        "labels": list(node.labels), "max_sessions": node.max_sessions,
+        "labels": list(node.labels), "capabilities": list(node.capabilities),
+        "contract_version": node.contract_version,
+        "contract_capabilities": list(node.contract_capabilities),
+        "max_sessions": node.max_sessions,
         "capacity_status": node.capacity_status, "overload_reasons": list(node.overload_reasons),
         "registered_at": node.registered_at, "updated_at": node.updated_at,
         "platform": node.platform, "session_backend": node.session_backend,
         "shell_capabilities": list(node.shell_capabilities), "wsl_available": node.wsl_available,
         "claude_available": "claude" in node.agent_types, "codex_available": "codex" in node.agent_types,
+        "transport_status": node.transport_status,
+        "transport_state": node.transport_state,
+        "health_state": node.health_state,
+        "execution_state": node.execution_state,
+        "last_probe_at": node.last_probe_at,
+        "last_successful_probe_at": node.last_successful_probe_at,
+        "consecutive_failures": node.consecutive_failures,
+        "next_retry_at": node.next_retry_at,
+        "last_error": node.last_error,
+        "reconnect_status": node.reconnect_status,
+        "agent_generation": node.agent_generation,
+        "last_self_heal_at": node.last_self_heal_at,
+        # Commander-like compact connection projection, derived from the same
+        # health evidence above rather than a second liveness implementation.
+        "connection_state": connection_state_for_node(node),
+        "connection_transport": connection_transport_for_node(node),
+        "last_seen_at": node.last_heartbeat_at,
+        "ping_latency_ms": node.latency_ms,
+        "retry_at": node.next_retry_at,
     }

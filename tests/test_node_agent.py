@@ -144,6 +144,17 @@ def test_correct_token_is_accepted(agent_client):
     assert "sessions" in response.json()
 
 
+def test_execution_health_requires_auth_and_exercises_backend(agent_client):
+    assert agent_client.get("/v1/execution-health").status_code == 401
+    response = agent_client.get("/v1/execution-health", headers=_auth())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["execution_ok"] is True
+    assert body["agent_process_alive"] is True
+    assert body["agent_generation"] == AGENT_GENERATION
+    assert isinstance(body["session_count"], int)
+
+
 def test_metrics_route_returns_real_host_metrics(agent_client):
     response = agent_client.get("/v1/metrics", headers=_auth())
     assert response.status_code == 200
@@ -267,6 +278,30 @@ def test_grant_routes_require_auth(agent_client):
     assert response2.status_code == 401
 
 
+def test_permissions_routes_are_registered_and_round_trip(agent_client):
+    create = agent_client.post("/v1/sessions", headers=_auth(),
+                               json={"name": "agent-perms", "agent_type": "shell", "cwd": None})
+    assert create.status_code == 200
+    agent_client.created.append("agent-perms")
+
+    initial = agent_client.get("/v1/sessions/agent-perms/permissions", headers=_auth())
+    assert initial.status_code == 200
+    assert initial.json()["session"] == "agent-perms"
+
+    changed = agent_client.post(
+        "/v1/sessions/agent-perms/permissions", headers=_auth(),
+        json={"read": True, "input": True, "actor": "route-test"},
+    )
+    assert changed.status_code == 200
+    assert changed.json()["requested"] == {"read": True, "input": True}
+    assert changed.json()["stale_identity_pin"] is False
+
+
+def test_permissions_routes_require_auth(agent_client):
+    assert agent_client.get("/v1/sessions/agent-perms/permissions").status_code == 401
+    assert agent_client.post("/v1/sessions/agent-perms/permissions", json={"read": True}).status_code == 401
+
+
 # -- Session Knowledge Store routes (session_knowledge.py) -------------------
 
 def test_knowledge_routes_require_auth(agent_client):
@@ -369,3 +404,57 @@ def _config_for_loop_test() -> AppConfig:
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+def test_repo_evidence_endpoint_answers_for_a_real_repo_on_this_node(agent_client, tmp_path):
+    """Regression, found 2026-09-14.
+
+    This endpoint called `resolve_cwd(cwd, config)`, but `config` is not
+    defined anywhere in `build_node_agent`'s scope -- the module imports
+    `load_config` (the function), and the only `config` binding is a local
+    inside `main()`. So EVERY request to /v1/repo-evidence raised NameError
+    and answered 500, from the commit that added it.
+
+    It failed closed (the Coordinator's collector reports any non-200 as
+    RepoEvidenceUnavailable -- "we could not look"), so no dispatch decision
+    was ever made on bad evidence; the capability was simply never working,
+    and silently. Nothing exercised the ROUTE end-to-end -- the collector
+    and client protocol are well covered, but with a stub client -- which is
+    why a NameError survived with a green suite. This test is that exercise.
+    """
+    repo = tmp_path / "evidence-repo"
+    repo.mkdir()
+    env = {"HOME": str(tmp_path), "PATH": "/usr/bin:/bin",
+           "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@x",
+           "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@x"}
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True, env=env)
+    (repo / "tracked.txt").write_text("committed\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "c"], cwd=repo, check=True, env=env)
+
+    response = agent_client.get("/v1/repo-evidence", params={"cwd": str(repo)}, headers=_auth())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["branch"] == "main"
+    assert len(body["head"]) == 40
+    assert body["clean"] is True
+    # No upstream configured is NOT a failure -- it must be reported, not guessed.
+    assert body["has_upstream"] is False
+    assert (body["ahead"], body["behind"]) == (0, 0)
+
+    (repo / "dirty.txt").write_text("uncommitted\n")
+    dirty = agent_client.get("/v1/repo-evidence", params={"cwd": str(repo)}, headers=_auth()).json()
+    assert dirty["clean"] is False
+    assert any("dirty.txt" in line for line in dirty["status_lines"])
+
+
+def test_repo_evidence_endpoint_enforces_the_cwd_allowlist(agent_client):
+    response = agent_client.get("/v1/repo-evidence", params={"cwd": "/etc"}, headers=_auth())
+    assert response.status_code == 403
+    assert response.json()["error"] == "PATH_NOT_ALLOWED"
+
+
+def test_repo_evidence_endpoint_requires_a_cwd(agent_client):
+    response = agent_client.get("/v1/repo-evidence", headers=_auth())
+    assert response.status_code == 400
+    assert response.json()["error"] == "CWD_REQUIRED"

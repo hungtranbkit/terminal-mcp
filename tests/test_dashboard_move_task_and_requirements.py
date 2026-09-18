@@ -48,6 +48,7 @@ def test_reassign_moves_a_real_task_to_a_new_session(client_and_queue):
     assert queue.store.get_task(created["task_id"]).session == "test-b"
 
 
+@pytest.mark.closed_access
 def test_reassign_refuses_a_non_allowed_target_session(client_and_queue):
     client, queue = client_and_queue
     created = queue.create_task("t", "a real prompt here", session="test-a")

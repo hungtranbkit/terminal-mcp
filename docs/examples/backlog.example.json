@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "project": {
+    "project_id": "git:github.com/acme/widget",
+    "source": "git_remote",
+    "repo_root": "/home/dev/widget",
+    "name": "widget",
+    "git_remote": "git@github.com:acme/widget.git",
+    "git_branch": "main",
+    "is_portable": true
+  },
+  "revision": 4,
+  "updated_at": "2026-09-09T10:15:00+00:00",
+  "items": [
+    {
+      "id": "blg_9f2c1a4b77de",
+      "title": "Add rate limiting to the public API",
+      "description": "Token bucket per API key. Needs a shared counter so it holds across replicas.",
+      "status": "IN_PROGRESS",
+      "priority": "P1",
+      "type": "feature",
+      "order": 1,
+      "created_at": "2026-09-08T09:00:00+00:00",
+      "updated_at": "2026-09-09T10:15:00+00:00",
+      "source": "chatgpt",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "429 returned after N requests in a window",
+        "limit is per API key, not per IP",
+        "counter survives a single replica restart"
+      ],
+      "tags": [
+        "api",
+        "reliability"
+      ],
+      "assignee": "win1",
+      "session": "win1",
+      "node_id": "dell-5530",
+      "queue_task_id": "3f9a2c81b7d4",
+      "branch": "feat/rate-limit",
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-08T09:00:00+00:00",
+          "event": "created",
+          "by": "chatgpt"
+        },
+        {
+          "at": "2026-09-09T10:15:00+00:00",
+          "event": "dispatched",
+          "queue_task_id": "3f9a2c81b7d4",
+          "session": "win1"
+        }
+      ]
+    },
+    {
+      "id": "blg_1c77e0aa3b52",
+      "title": "Flaky test: test_session_reattach times out on CI",
+      "description": "Fails ~1 in 20 runs. Suspect a race between attach and the readiness probe.",
+      "status": "BACKLOG",
+      "priority": "P0",
+      "type": "bug",
+      "order": 2,
+      "created_at": "2026-09-09T08:30:00+00:00",
+      "updated_at": "2026-09-09T08:30:00+00:00",
+      "source": "chatgpt",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "200 consecutive CI runs with no timeout"
+      ],
+      "tags": [
+        "ci",
+        "flaky"
+      ],
+      "assignee": null,
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "notes": []
+      },
+      "history": [
+        {
+          "at": "2026-09-09T08:30:00+00:00",
+          "event": "created",
+          "by": "chatgpt"
+        }
+      ]
+    },
+    {
+      "id": "blg_44b9de10c7a1",
+      "title": "Document the deploy runbook",
+      "description": "",
+      "status": "DONE",
+      "priority": "P2",
+      "type": "docs",
+      "order": 3,
+      "created_at": "2026-09-05T14:00:00+00:00",
+      "updated_at": "2026-09-07T16:40:00+00:00",
+      "source": "human",
+      "dependencies": [],
+      "acceptance_criteria": [
+        "a new engineer can deploy without asking"
+      ],
+      "tags": [
+        "docs"
+      ],
+      "assignee": "human",
+      "session": null,
+      "node_id": null,
+      "queue_task_id": null,
+      "branch": null,
+      "worktree": null,
+      "blocked_reason": null,
+      "evidence": {
+        "commits": [
+          "a1b2c3d4"
+        ],
+        "tests": [],
+        "deploys": [],
+        "notes": [
+          "reviewed in PR #214"
+        ]
+      },
+      "history": [
+        {
+          "at": "2026-09-05T14:00:00+00:00",
+          "event": "created",
+          "by": "human"
+        },
+        {
+          "at": "2026-09-07T16:40:00+00:00",
+          "event": "completed",
+          "by": "human",
+          "verified_by": "evidence"
+        }
+      ]
+    }
+  ]
+}

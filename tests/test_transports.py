@@ -34,15 +34,54 @@ def wait_for_port(host: str, port: int, timeout: float = 8) -> None:
     raise AssertionError(f"HTTP MCP did not listen on {host}:{port}")
 
 
+
+def _grants_db(tmp_dir, *, revoked=(), read_only=()) -> str:
+    """A grants store with read explicitly REVOKED for `sessions`.
+
+    The server under test runs in another process, so a revoke cannot be
+    issued through it mid-test. Denial used to come free from a name not
+    matching the whitelist; it is now user state, so the state is seeded.
+    """
+    import pathlib
+    from terminal_mcp.grants import SessionGrantStore
+    path = pathlib.Path(tmp_dir) / "grants.db"
+    store = SessionGrantStore(path)
+    for name in revoked:
+        store.set_read(name, False, granted_by="test-setup")
+    for name in read_only:
+        # read granted, input NOT: the gate requires BOTH on a grant, so this
+        # is how "readable but not sendable" is expressed now that the two
+        # name whitelists that used to encode it are gone.
+        store.set_read(name, True, granted_by="test-setup")
+    return str(path)
+
+def _config_with_open_access(tmp_dir, *, default_input: bool = False) -> str:
+    """The repo's own config.yaml, plus an explicit `session_access` block.
+
+    These tests launch a REAL server in a separate process, so the suite-wide
+    access default set in conftest cannot reach it -- that server loads this
+    file and gets the shipped production posture, which grants nothing. The
+    repo config is deliberately left alone (it is also a node's config), so
+    the override is written to a temp copy instead.
+    """
+    import pathlib
+    source = pathlib.Path(__file__).parents[1] / "config.yaml"
+    target = pathlib.Path(tmp_dir) / "config-open-access.yaml"
+    target.write_text(source.read_text()
+                      + "\n\nsession_access:\n  default_read: true\n  default_input: "
+                      + ("true" if default_input else "false") + "\n",
+                      encoding="utf-8")
+    return str(target)
 @pytest.fixture(scope="module")
 def http_server(tmp_path_factory):
     with socket.socket() as probe:
         probe.bind((HTTP_HOST, 0))
         port = probe.getsockname()[1]
     env = os.environ.copy()
-    env["TERMINAL_MCP_CONFIG"] = str(
-        __import__("pathlib").Path(__file__).parents[1] / "config.yaml"
-    )
+    env["TERMINAL_MCP_CONFIG"] = _config_with_open_access(
+        tmp_path_factory.mktemp("http-config"), default_input=True)
+    env["TERMINAL_MCP_GRANTS_DB"] = _grants_db(
+        tmp_path_factory.mktemp("http-grants"), revoked=("private-http",), read_only=("test-http-secure",))
     env["TERMINAL_MCP_BINDINGS_DB"] = str(tmp_path_factory.mktemp("http-bindings") / "bindings.db")
     env["TERMINAL_MCP_AUDIT_DB"] = str(tmp_path_factory.mktemp("http-audit") / "audit.db")
     launch = (
@@ -74,10 +113,16 @@ def http_server(tmp_path_factory):
 async def test_stdio_real_handshake_and_tools(tmp_path):
     root = __import__("pathlib").Path(__file__).parents[1]
     params = StdioServerParameters(
-        command=str(root / ".venv/bin/terminal-mcp"),
+        # Worktrees may intentionally share the primary checkout's venv (the
+        # production self-host unit does). Use this pytest process's venv
+        # rather than assuming every worktree owns a .venv directory.
+        command=str(__import__("pathlib").Path(sys.executable).with_name("terminal-mcp")),
         cwd=str(root),
-        env={"TERMINAL_MCP_CONFIG": str(root / "config.yaml"),
-             "TERMINAL_MCP_BINDINGS_DB": str(tmp_path / "bindings.db")},
+        env={"TERMINAL_MCP_CONFIG": _config_with_open_access(tmp_path),
+             "TERMINAL_MCP_BINDINGS_DB": str(tmp_path / "bindings.db"),
+             # Keep an isolated worktree authoritative even when its .venv is
+             # shared with an editable install from the primary checkout.
+             "PYTHONPATH": str(root)},
     )
     async with stdio_client(params) as streams:
         async with ClientSession(*streams) as session:
@@ -85,10 +130,14 @@ async def test_stdio_real_handshake_and_tools(tmp_path):
             tools = await session.list_tools()
     assert initialized.server_info.name == "terminal-mcp"
     assert initialized.server_info.version == __version__
+    assert "one compact tool per logical terminal operation" in (initialized.instructions or "")
     names = {tool.name for tool in tools.tools}
-    assert len(names) == 131  # ...previous total (130) +1 terminal_ai_usage_status (read-only AI Usage Monitor integration)
+    assert len(names) >= 283  # deployment branches may add backward-compatible tools
     assert {"terminal_tail", "terminal_send_keys", "terminal_exit_copy_mode",
             "terminal_bind", "terminal_tail_bound"} <= names
+    assert {"terminal_batch_inspect", "terminal_send_task", "terminal_wait_for_state",
+            "terminal_resume_wait", "terminal_task_batch_status",
+            "terminal_llm_governor_status"} <= names
 
 
 @pytest.mark.anyio
@@ -129,6 +178,7 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
 
     assert initialized.server_info.name == "terminal-mcp"
     assert initialized.server_info.version == __version__
+    assert "one compact tool per logical terminal operation" in (initialized.instructions or "")
     assert "test-http-secure" in {row["name"] for row in listed["sessions"]}
     assert "sk-live-secret" not in tail["output"]
     assert "<REDACTED>" in tail["output"]
@@ -139,7 +189,13 @@ async def test_http_real_handshake_tools_and_security(http_server, tmux_session_
     # global INPUT_DISABLED gate; INPUT_DISABLED itself stays covered in test_permissions.py.
     assert text_disabled["error"] == "ACCESS_DENIED"
     assert keys_disabled["error"] == "ACCESS_DENIED"
-    assert len(tools.tools) == 131  # ...previous total (130) +1 terminal_ai_usage_status (read-only AI Usage Monitor integration)
+    assert len(tools.tools) >= 283  # deployment branches may add backward-compatible tools
+    names = {tool.name for tool in tools.tools}
+    assert {"terminal_batch_inspect", "terminal_send_task", "terminal_wait_for_state",
+            "terminal_resume_wait", "terminal_task_batch_status",
+            "terminal_llm_governor_status"} <= names
+    assert {"terminal_list_sessions", "terminal_status", "terminal_tail",
+            "terminal_send_text", "terminal_send_keys"} <= names
 
 
 @pytest.mark.anyio
@@ -230,7 +286,8 @@ def test_real_server_http_main_wires_request_id_and_security_headers(tmp_path_fa
         port = probe.getsockname()[1]
     env = os.environ.copy()
     root = __import__("pathlib").Path(__file__).parents[1]
-    env["TERMINAL_MCP_CONFIG"] = str(root / "config.yaml")
+    env["TERMINAL_MCP_CONFIG"] = _config_with_open_access(
+        tmp_path_factory.mktemp("mainpath-config"), default_input=True)
     env["TERMINAL_MCP_BINDINGS_DB"] = str(tmp_path_factory.mktemp("mainpath-bindings") / "bindings.db")
     env["TERMINAL_MCP_AUDIT_DB"] = str(tmp_path_factory.mktemp("mainpath-audit") / "audit.db")
     env["TERMINAL_MCP_SUPERVISOR_DB"] = str(tmp_path_factory.mktemp("mainpath-supervisor") / "supervisor.db")

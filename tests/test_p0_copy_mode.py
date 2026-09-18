@@ -9,6 +9,8 @@ Every input path must now refuse with a specific, actionable
 PANE_IN_COPY_MODE error instead, and never auto-exit copy-mode itself."""
 from __future__ import annotations
 
+import pytest
+
 import subprocess
 import time
 
@@ -202,6 +204,8 @@ def test_exit_copy_mode_not_in_mode_is_audited_noop(tmux_session_factory, tmp_pa
 def test_exit_copy_mode_denies_forbidden_session_and_binding(tmux_session_factory, tmp_path):
     service = _service(tmp_path)
     forbidden = tmux_session_factory("private-copy-mode", "bash -lc 'sleep 20'")
+    # Explicit revoke -- "not in the whitelist" is no longer a denial.
+    service.grants.set_read("private-copy-mode", False, granted_by="test")
     time.sleep(0.2)
     _enter_copy_mode(forbidden)
     assert service.terminal_exit_copy_mode(session=forbidden)["error"] == "ACCESS_DENIED"

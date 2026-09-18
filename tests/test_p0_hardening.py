@@ -324,8 +324,24 @@ def test_prompt_injection_in_pane_output_remains_inert_data(tmux_session_factory
     supervisor = SupervisorService(service, SupervisorStore(tmp_path / "supervisor.db"))
     v2 = build_supervisor_v2(supervisor)
     supervisor.watch(session=session)
-    events = supervisor.run_once()["events"]
-    assert events
+    # Poll for the pane to actually emit, rather than trusting the fixture's
+    # fixed 150ms settle. Under load -- a full suite, or anything else busy on
+    # the box -- bash's own startup can outlast that, and run_once() then
+    # captures an empty pane: the assertion below fails on output_preview == ""
+    # even though nothing about injection handling changed. This waits for the
+    # PRECONDITION (output exists) and still fails loudly if it never arrives,
+    # so the test measures inertness of the text, not scheduling luck.
+    deadline = time.monotonic() + 10.0
+    events = []
+    while time.monotonic() < deadline:
+        events = supervisor.run_once()["events"]
+        if events and events[0]["output_preview"].strip():
+            break
+        time.sleep(0.1)
+    assert events, "supervisor produced no events for a watched session"
+    assert events[0]["output_preview"].strip(), (
+        "pane produced no output within 10s -- the session never started, which is "
+        "a different failure than the injected text being altered")
 
     # The injected text really does come back as data (proving it wasn't
     # silently stripped/altered beyond normal redaction)...

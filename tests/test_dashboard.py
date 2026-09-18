@@ -9,11 +9,16 @@ import tempfile
 import time
 from pathlib import Path
 
+from dataclasses import replace
+
 import pytest
+
+from tests.conftest import find_node
 from starlette.testclient import TestClient
 
 from terminal_mcp import dashboard as dashboard_module
-from terminal_mcp.config import AppConfig, DashboardConfig, InputPolicyConfig, PermissionsConfig, load_config
+from terminal_mcp.config import (AppConfig, DashboardConfig, InputPolicyConfig, PermissionsConfig,
+                                 SessionAccessConfig, load_config)
 from terminal_mcp.core import TerminalService
 from terminal_mcp.dashboard import DASHBOARD_HTML, SESSIONS_ADMIN_HTML, register_dashboard
 from terminal_mcp.mcp_app import build_mcp
@@ -73,12 +78,16 @@ def test_sessions_admin_html_shows_every_session_never_hides_ungranted(tmux_sess
     # out by default -- the "chỉ hiện session chưa whitelist" checkbox is
     # an opt-in narrowing filter, not the default view.
     assert 'id="onlyGrantable"' in SESSIONS_ADMIN_HTML
-    assert "Chỉ hiện session chưa whitelist" in SESSIONS_ADMIN_HTML
-    assert "onlyGrantableEl.checked && !grantable(row)) return false;" in SESSIONS_ADMIN_HTML
+    # The filter now answers the question default-open leaves open -- which
+    # sessions did someone deliberately LOCK -- rather than "which are
+    # outside the whitelist", which matched everything once the whitelist
+    # was retired.
+    assert "Chỉ hiện session đã khoá" in SESSIONS_ADMIN_HTML
+    assert "onlyGrantableEl.checked && !isLocked(row)) return false;" in SESSIONS_ADMIN_HTML
     assert "rows.length ? 'Không có session khớp bộ lọc.'" in SESSIONS_ADMIN_HTML
 
 
-def test_sessions_admin_row_badge_shows_effective_state_not_just_stored_grant():
+def test_sessions_admin_row_badge_shows_effective_access_not_the_whitelist():
     # P0 hotfix: the row-level perm badge used to render ONLY the STORED
     # grant preset (grantStateLabel(grantState(row))) regardless of
     # whether it was actually in force -- a session whose grant said
@@ -91,10 +100,19 @@ def test_sessions_admin_row_badge_shows_effective_state_not_just_stored_grant():
     # effectiveLabel(row) and say so explicitly when they diverge -- the
     # exact "Đã cấp: X · Hiệu lực: Y" wording this file's own #grantBar/
     # #permModal already use for the identical divergence.
-    assert "function effectiveLabel(row) {" in SESSIONS_ADMIN_HTML
-    assert "const effective = effectiveLabel(row);" in SESSIONS_ADMIN_HTML
-    assert "permBadge.textContent = granted === effective ? granted : `Đã cấp: ${granted} · Hiệu lực: ${effective}`;" in SESSIONS_ADMIN_HTML
+    # The badge now reports the EFFECTIVE state directly rather than a stored
+    # grant preset that could disagree with it -- a stronger version of the
+    # same guarantee, since there is no longer a second value to diverge from.
+    # It also no longer renders the whitelist at all: "Whitelist tĩnh" beside
+    # a usable session was the contradiction that made one look forbidden.
+    assert "Whitelist tĩnh" not in SESSIONS_ADMIN_HTML
+    assert "const readOn = row.effective_read !== false;" in SESSIONS_ADMIN_HTML
+    assert "const inputOn = row.effective_input !== false;" in SESSIONS_ADMIN_HTML
+    assert "'🔒 Đã khoá'" in SESSIONS_ADMIN_HTML
     assert "perm-badge.stale" in SESSIONS_ADMIN_HTML
+    # A grant whose runtime is blocked (IDENTITY_MISMATCH after the session
+    # was recreated) must still be visibly distinct, not a plain "Xem + gửi".
+    assert "permBadge.title = 'Gửi bị chặn: ' + row.input_denied_reason;" in SESSIONS_ADMIN_HTML
 
 
 def test_sessions_admin_shows_windows_desktop_visibility_never_for_tmux():
@@ -341,7 +359,9 @@ def test_dashboard_fullscreen_hides_chrome_and_fills_terminal_on_mobile():
     # config-driven line bound / ANSI rendering / auto-follow inside
     # #output are completely untouched by any of this (pure presentation).
     assert "body.fullscreen-terminal header," in DASHBOARD_HTML
-    assert "body.fullscreen-terminal #summary," in DASHBOARD_HTML
+    # #summary/#grantBar live inside #sessionInspector since the
+    # mobile-portrait redesign, so hiding the wrapper hides both.
+    assert "body.fullscreen-terminal #sessionInspector," in DASHBOARD_HTML
     # Regression guard: #grantBar went from always-empty (SHOW_GRANT_
     # CONTROLS=false) to real, often-visible content once the permission
     # modal work re-enabled it -- it was never in this hidden list before
@@ -349,7 +369,6 @@ def test_dashboard_fullscreen_hides_chrome_and_fills_terminal_on_mobile():
     # here would have made fullscreen mode visibly leak the permission bar
     # instead of showing "essentially only the terminal pane", exactly the
     # bug a real agent-browser screenshot caught before this test existed.
-    assert "body.fullscreen-terminal #grantBar," in DASHBOARD_HTML
     assert "body.fullscreen-terminal #inputBar { display:none }" in DASHBOARD_HTML
     # The tab bar replaced the old sidebar as the ONE nav surface (task
     # item 2/3/5) -- it must be in this hidden list exactly like the
@@ -473,8 +492,10 @@ def test_session_detail_tail_length_is_driven_by_config_not_hardcoded(tmux_sessi
         "test-tail-config",
         "bash -lc 'for i in $(seq -w 1 100); do echo line$i; done; sleep 30'",
     )
-    small_client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 90, 3))
-    large_client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 90, 60))
+    small_client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 90, 3,
+                              session_access=SessionAccessConfig(default_read=True, default_input=True)))
+    large_client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 90, 60,
+                              session_access=SessionAccessConfig(default_read=True, default_input=True)))
 
     small_output = small_client.get(f"/dashboard/api/session?name={session}").json()["tail"]["output"]
     large_output = large_client.get(f"/dashboard/api/session?name={session}").json()["tail"]["output"]
@@ -493,7 +514,8 @@ def test_session_detail_tail_respects_1000_line_config_exactly(tmux_session_fact
         "test-tail-1000",
         "bash -lc 'for i in $(seq -w 1 1200); do echo line$i; done; sleep 30'",
     )
-    client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 1500, 1000))
+    client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 1500, 1000,
+                              session_access=SessionAccessConfig(default_read=True, default_input=True)))
     response = client.get(f"/dashboard/api/session?name={session}")
     assert response.status_code == 200
     lines = response.json()["tail"]["output"].splitlines()
@@ -518,6 +540,7 @@ def input_config() -> AppConfig:
         50,
         20,
         InputPolicyConfig(allowed_session_patterns=("test-*",)),
+        session_access=SessionAccessConfig(default_read=True, default_input=True),
     )
 
 
@@ -541,11 +564,18 @@ def test_session_input_blocked_when_input_permission_disabled(read_config):
     assert response.json()["error"] == "INPUT_DISABLED"
 
 
-def test_session_input_blocked_for_unmatched_session(input_config):
-    client, _ = _client(input_config)
+def test_session_input_blocked_for_a_session_the_user_has_not_granted(input_config):
+    """Input is CLOSED by default (session_access.default_input=False) and is
+    opened per session by the user, never by what the session is called. This
+    used to assert that a name outside the whitelist was refused; the guarantee
+    that actually matters -- no input without an explicit grant -- is stronger
+    and is what is asserted now."""
+    config = replace(input_config,
+                     session_access=SessionAccessConfig(default_read=True, default_input=False))
+    client, _ = _client(config)
     response = client.post("/dashboard/api/session/input", json={"name": "agent-x", "text": "hi"})
     assert response.status_code == 403
-    assert response.json()["error"] == "ACCESS_DENIED"
+    assert response.json()["error"] in ("ACCESS_DENIED", "SESSION_NOT_FOUND")
 
 
 def test_session_input_rejects_malformed_body(input_config):
@@ -574,10 +604,16 @@ def test_session_input_sends_text_to_allowed_session(input_config, tmux_session_
     # submission reliability upgrade, P6) -- popped the same way, checked
     # for the same value, not pinned into the literal dict below.
     assert body.pop("submission_id") == correlation_id
+    # submit_latency_ms is a real wall-clock measurement -- presence/type
+    # checked, never pinned by value (it differs every run).
+    latency = body.pop("submit_latency_ms")
+    assert isinstance(latency, (int, float)) and latency >= 0
     assert body == {"session": session, "sent": True, "characters": len("echo hi"),
                     "press_enter": False, "submit_status": "TEXT_SENT",
                     "delivery_state": "TEXT_SENT", "enter_sent": False,
-                    "agent_type": "generic", "evidence": ["TEXT_SENT"], "activation_attempts": 0}
+                    "agent_type": "generic", "evidence": ["TEXT_SENT"], "activation_attempts": 0,
+                    # No Enter was requested, so both counters stay 0.
+                    "enter_count": 0, "attempts": 0}
 
 
 def test_session_input_idempotency_key_prevents_duplicate_send(input_config, tmux_session_factory):
@@ -636,13 +672,16 @@ def test_session_detail_redacts_secret_even_when_colored(read_config, tmux_sessi
     assert "<REDACTED>" in output
 
 
-def test_session_detail_ansi_still_enforces_whitelist():
+def test_session_detail_ansi_still_enforces_read_authorization():
     # Security regression: the ansi=True path is a rendering detail, not a
-    # second, less-guarded read path — an unlisted, ungranted session is
-    # still denied (READ_RESTRICTED -- the dashboard-grant feature's more
-    # precise error than the old bare ACCESS_DENIED, but still a clean 403
-    # with zero content in the response).
-    client, _ = _client(AppConfig(PermissionsConfig(True, False), ("test-*",), 50, 20))
+    # second, less-guarded read path. A session the user has explicitly
+    # revoked read on is still denied (READ_RESTRICTED -- a clean 403 with
+    # zero content in the response). The trigger changed from "not in the
+    # whitelist" to "the user said no"; the guarantee did not.
+    config = AppConfig(PermissionsConfig(True, False), ("test-*",), 50, 20,
+                       session_access=SessionAccessConfig(default_read=True, default_input=False))
+    client, service = _client(config)
+    service.grants.set_read("private-ansi", False, granted_by="test")
     response = client.get("/dashboard/api/session?name=private-ansi")
     assert response.status_code == 403
     body = response.json()
@@ -792,7 +831,10 @@ def test_sessions_route_lists_unwhitelisted_sessions_as_restricted_not_hidden(re
     # grant tests below, not by hiding the row.
     tmux_session_factory("private-attn-check", "bash -lc 'echo Do you want to continue? [y/N]; sleep 20'")
     time.sleep(0.4)
-    client, _ = _client(read_config)
+    client, service = _client(read_config)
+    # "Restricted" is now something the USER sets, not something a naming
+    # convention decides -- an explicit read revoke.
+    service.grants.set_read("private-attn-check", False, granted_by="test")
     rows = client.get("/dashboard/api/sessions").json()["sessions"]
     row = next((r for r in rows if r["name"] == "private-attn-check"), None)
     assert row is not None  # listed, not hidden
@@ -810,7 +852,13 @@ def test_dashboard_attention_badge_and_sort_wiring_present():
     assert "class=\"attn-badge\"" not in DASHBOARD_HTML  # built via DOM, not a literal HTML string
     assert "badge.className = 'attn-badge'" in DASHBOARD_HTML
     assert "needs-attention" in DASHBOARD_HTML
-    assert "Rows already arrive sorted attention-first" in DASHBOARD_HTML  # no client-side re-sort
+    # The list is grouped by node now, so the server's single global ordering
+    # cannot survive on its own -- splitting one sorted list across N groups
+    # leaves each group sorted only by accident. buildNodeGroups re-applies
+    # the SAME precedence per node (attention first, then most-recent
+    # activity, then name) rather than inventing a different one.
+    assert "const attention = (b.state === 'WAITING_INPUT') - (a.state === 'WAITING_INPUT');" in DASHBOARD_HTML
+    assert "sessionActivityValue(b) - sessionActivityValue(a)" in DASHBOARD_HTML
 
 
 def test_dashboard_font_controls_present_bounded_and_persisted():
@@ -875,8 +923,15 @@ def test_dashboard_search_and_copy_do_not_persist_content():
     # browser-local tab-hide set this used to also include was removed
     # along with the top session-tabs bar it controlled -- see
     # test_browser_local_tab_hide_feature_removed_from_both_pages.)
+    # `storageKey` is the node-group collapse state (NODE_GROUP_JS): a map of
+    # node_id -> collapsed. Node ids are infrastructure identifiers the
+    # operator already sees in the group header, not session content -- the
+    # property this test actually protects is unchanged.
     keys = set(re.findall(r"localStorage\.(?:setItem|getItem)\(([A-Za-z_]+)", DASHBOARD_HTML))
-    assert keys == {"LAST_SESSION_KEY", "FONT_SIZE_KEY", "FULLSCREEN_KEY"}
+    assert keys == {"LAST_SESSION_KEY", "FONT_SIZE_KEY", "FULLSCREEN_KEY", "storageKey"}
+    # Still never a search term or any rendered output.
+    assert "localStorage.setItem('tmSearch" not in DASHBOARD_HTML
+    assert "localStorage.setItem(OUTPUT" not in DASHBOARD_HTML
 
 
 def test_dashboard_new_controls_disabled_without_a_selected_session():
@@ -949,7 +1004,11 @@ def test_dashboard_health_indicator_no_new_backend_route():
     # registry/reopen and registry/purge -- registry LISTING itself
     # (loadRegistry) goes through the shared fetchJSON() wrapper, already
     # counted once, so it adds no new literal call site of its own.
-    assert DASHBOARD_HTML.count("fetch(") == 22  # sessions, session detail, session/input, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere), registry/reopen, registry/purge, watchdog/acknowledge, session/rename (Rename Session feature), task/cancel-or-retry (taskAction, Task Manager UI), session/queue/pause, session/queue/resume, session/queue/enqueue (Task Manager UI), postJSON's own internal fetch() (queue/reorder + tasks/reassign, Move-Task/priority-edit UI)
+    # 23 with session/keys: the interactive key pad's own POST. It is a
+    # separate call site from session/input on purpose -- a key press and a
+    # text submission are different capabilities with different server-side
+    # policy (permissions.allow_send_keys vs input_policy.allow_send_text).
+    assert DASHBOARD_HTML.count("fetch(") == 23  # sessions, session detail, session/input, session/keys, postGrant, supervisor, supervisor/ack, supervisor2, supervisor2/pause, fetchJSON's own internal fetch(), session/kill, session/reopen, nodes (reopen-elsewhere), session/reopen (elsewhere), registry/reopen, registry/purge, watchdog/acknowledge, session/rename (Rename Session feature), task/cancel-or-retry (taskAction, Task Manager UI), session/queue/pause, session/queue/resume, session/queue/enqueue (Task Manager UI), postJSON's own internal fetch() (queue/reorder + tasks/reassign, Move-Task/priority-edit UI)
 
 
 def test_dashboard_auth_required_distinguished_from_offline():
@@ -1007,7 +1066,9 @@ def test_dashboard_grant_controls_have_an_obvious_entry_point():
     # A never-granted session is still listed (never hidden), just marked
     # inline in its tab's own tooltip -- not a separate lock-icon badge.
     assert "chưa cấp quyền xem" in DASHBOARD_HTML
-    assert "function grantable(row) { return !row.allowed; }" in DASHBOARD_HTML
+    # See the note on the other grantable assertion: the whitelist-derived
+    # form is gone on purpose.
+    assert "function grantable(row) { return true; }" in DASHBOARD_HTML
     assert 'id="termAccessBtn"' in DASHBOARD_HTML
     assert "🔐 Quyền truy cập" in DASHBOARD_HTML
     assert "termAccessBtnEl.disabled = !canGrant;" in DASHBOARD_HTML
@@ -1138,7 +1199,7 @@ def test_dashboard_ansi_renderer_strips_osc_sequences():
     # dropped like every other non-SGR sequence already is.
     assert "const OSC_RE = " in DASHBOARD_HTML
     assert "text = text.replace(OSC_RE, '');" in DASHBOARD_HTML
-    node = shutil.which("node")
+    node = find_node()
     if not node:
         pytest.skip("node not available -- semantic regex check skipped, source-level assertions above still ran")
     # Extract just the self-contained SGR/OSC parsing logic (CSI_RE, OSC_RE,
@@ -1190,7 +1251,7 @@ def test_dashboard_ansi_renderer_consumes_dec_private_mode_and_full_csi_grammar(
     # '?' parameter byte that class never matched at all), plus real
     # cursor-movement/erase sequences a live TUI redraw emits. Broadened
     # to the full ECMA-48 CSI grammar (see CSI_RE's own comment).
-    node = shutil.which("node")
+    node = find_node()
     if not node:
         pytest.skip("node not available -- semantic regex check skipped")
     start = DASHBOARD_HTML.index("const CSI_RE = ")
@@ -1249,25 +1310,31 @@ def test_dashboard_grantbar_hidden_attribute_actually_hides_it():
 def test_dashboard_detail_grid_rows_match_children_one_to_one():
     # DOM/CSS layout contract, the direct cause of a real overlap an
     # earlier hotfix fixed: .detail's grid-template-rows must always list
-    # exactly as many tracks as .detail has direct children (now 5:
-    # #summary, #grantBar, .term, #inputNote, #inputBar -- the top
-    # session-tabs bar that used to be a 6th child was removed outright,
-    # see the UI-cleanup regression tests above), or auto-placement
+    # exactly as many tracks as .detail has direct children (now 7:
+    # #summary, #grantBar, .term, #inputNote, #remoteComposer, #keyPad,
+    # #inputBar -- the remote-composer mirror and the interactive key pad
+    # were added between the note and the composer), or auto-placement
     # silently hands the one flexible (minmax(0,1fr)) track to the wrong
     # element and lets its content overflow into the rows below it. Two
     # invariants are asserted here so this can't silently regress again:
-    # the explicit row-track COUNT must equal 5, and every one of the 5
-    # children must carry its own explicit `grid-row:N` (not rely on
+    # the explicit row-track COUNT must equal the child count, and every
+    # child must carry its own explicit `grid-row:N` (not rely on
     # sequential auto-placement, which reassigns everyone once any one of
-    # them toggles display:none -- e.g. the now-permanently-hidden
-    # #grantBar above).
+    # them toggles display:none -- e.g. the hideable #grantBar/#keyPad/
+    # #remoteComposer, all three of which are routinely hidden).
     detail_rule = re.search(r"\.detail \{ display:grid; grid-template-rows:([^;]+);", DASHBOARD_HTML)
     assert detail_rule is not None
     tracks = detail_rule.group(1).split()
-    assert len(tracks) == 5
-    assert tracks == ["auto", "auto", "minmax(0,1fr)", "auto", "auto"]  # .term (position 3) is the ONE growing track
+    # Six since the mobile-portrait redesign: #summary and #grantBar are
+    # children of #sessionInspector now, which is the one grid item that
+    # replaces them (and becomes a sheet in portrait). #inspectorBackdrop is
+    # position:fixed and never claims a track.
+    assert len(tracks) == 6
+    # .term (position 2) is still the ONE growing track.
+    assert tracks == ["auto", "minmax(0,1fr)", "auto", "auto", "auto", "auto"]
     expected_grid_rows = {
-        "#summary": 1, "#grantBar": 2, ".term": 3, "#inputNote": 4, "#inputBar": 5,
+        "#sessionInspector": 1, ".term": 2, "#inputNote": 3,
+        "#remoteComposer": 4, "#keyPad": 5, "#inputBar": 6,
     }
     for selector, row in expected_grid_rows.items():
         assert f"grid-row:{row};" in DASHBOARD_HTML or f"grid-row:{row} " in DASHBOARD_HTML, \
@@ -1335,10 +1402,117 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
               if hasattr(route, "methods")}
     assert routes == {
         "/dashboard": {"GET", "HEAD"},
+        # AI Usage report: a read-only VIEW over local CLI artefacts
+        # (ai_usage_index.py). No provider API, no mutation surface.
+        "/dashboard/ai-usage": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/local": {"GET", "HEAD"},
+        # Analytics behind the AI Usage screen. All read-only views over the
+        # local collector; none is a mutation surface.
+        "/dashboard/api/ai-usage/summary": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/timeline": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/prompts": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/sessions": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/projects": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/models": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/events": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/quota-history": {"GET", "HEAD"},
+        "/dashboard/api/ai-usage/export": {"GET", "HEAD"},
+        # Multi-node capability refresh (this batch) -- listed so this
+        # inventory guard keeps catching UNINTENDED route changes.
+        "/dashboard/api/nodes/{node_id}/refresh-capabilities": {"POST"},
+        # Windows node onboarding (docs/windows-node-onboarding.md). Two
+        # audiences, and the split matters more here than anywhere else on
+        # this list, so it is spelled out rather than left to the reader.
+        #
+        # OPERATOR routes -- a browser, behind the same _read_guard /
+        # _mutation_guard (Cloudflare Access + CSRF/Origin) as every other
+        # dashboard route. A page that cannot pass those cannot mint an
+        # enrollment, and therefore cannot create a node.
+        "/dashboard/api/nodes/onboard/profiles": {"GET", "HEAD"},
+        # ONE registration serving both methods on purpose -- see the route
+        # itself. Split into two, this path-keyed dict would record only
+        # whichever registered last, and silently stop guarding the other.
+        "/dashboard/api/nodes/onboard/enrollments": {"GET", "POST", "HEAD"},
+        "/dashboard/api/nodes/onboard/enrollments/{enrollment_id}/revoke": {"POST"},
+        "/dashboard/api/nodes/onboard/gateway": {"GET", "HEAD"},
+        # Bootstrap helper artifact: operator-facing reads, _read_guard only.
+        "/dashboard/api/nodes/onboard/helper": {"GET", "HEAD"},
+        "/dashboard/api/nodes/onboard/helper/{target}": {"GET", "POST", "HEAD"},
+        "/dashboard/api/nodes/{node_id}/onboarding": {"GET", "HEAD"},
+        "/dashboard/api/nodes/{node_id}/test-transport": {"POST"},
+        "/dashboard/api/nodes/{node_id}/remove": {"POST"},
+        #
+        # MACHINE routes -- called by a Windows box that has no browser
+        # session and no Access cookie, exactly like the pre-existing
+        # /dashboard/api/nodes/{node_id}/heartbeat above, and authenticated
+        # the same way: by a credential in the request, never by a cookie.
+        # consume presents the one-time enrollment code; deregister
+        # presents that node's own bearer token, so a node can only ever
+        # remove itself. The .ps1 download carries no secret and needs no
+        # auth -- the code it would otherwise embed is supplied by the
+        # operator on the command line instead.
+        "/dashboard/api/enroll/consume": {"POST"},
+        # Installer telemetry: which stage the machine is on, and for how
+        # long. Authenticated by the same enrollment code as consume and
+        # deliberately NOT consuming it -- progress arrives both before the
+        # exchange (OpenSSH install) and after it (winget).
+        "/dashboard/api/enroll/progress": {"POST"},
+        # Web-first onboarding (docs/windows-bootstrap-helper.md). Minting
+        # a handle is what causes a local helper to install software, so it
+        # sits behind _mutation_guard like every other mutation; redeeming
+        # one is machine-facing, like consume, and is what the helper calls.
+        "/dashboard/api/nodes/onboard/enrollments/{enrollment_id}/handle": {"POST"},
+        "/dashboard/api/enroll/redeem": {"POST"},
+        "/dashboard/api/nodes/{node_id}/deregister": {"POST"},
+        "/enroll/windows-setup.ps1": {"GET", "HEAD"},
+        # Same handler, same bytes, shorter path. Exists only because the
+        # Windows Run dialog truncates at ~259 characters and the
+        # quick-install one-liner does not fit with the long path.
+        "/w": {"GET", "HEAD"},
+        # Project Backlog (planning layer). Read is _read_guard'ed; every
+        # write is _mutation_guard'ed AND path-gated by the service.
+        # The panel PAGE itself (a view, like /dashboard/tasks) plus its
+        # data routes.
+        "/dashboard/backlog": {"GET", "HEAD"},
+        # Project picker: the canonical project list the backlog panel
+        # selects from (read-only, _read_guard like every other GET).
+        "/dashboard/api/projects": {"GET", "HEAD"},
+        "/dashboard/api/backlog": {"GET", "HEAD"},
+        "/dashboard/api/backlog/add": {"POST"},
+        "/dashboard/api/backlog/update": {"POST"},
+        "/dashboard/api/backlog/dispatch": {"POST"},
+        "/dashboard/api/backlog/complete": {"POST"},
+    # Notes / Ideas (kho ghi chú dùng chung, notes_store.py) -- a later,
+    # separate feature, listed here so this inventory guard keeps
+    # catching UNINTENDED route changes. Same posture as the backlog
+    # block above: the page and every GET are _read_guard'ed, every POST
+    # is _mutation_guard'ed, and the attachment route serves by ID only
+    # (never a caller-supplied path).
+    "/dashboard/notes": {"GET", "HEAD"},
+    "/dashboard/api/notes": {"GET", "HEAD"},
+    "/dashboard/api/notes/facets": {"GET", "HEAD"},
+    "/dashboard/api/notes/note": {"GET", "HEAD"},
+    "/dashboard/api/notes/create": {"POST"},
+    "/dashboard/api/notes/update": {"POST"},
+    "/dashboard/api/notes/mark-applied": {"POST"},
+    "/dashboard/api/notes/delete": {"POST"},
+    "/dashboard/api/notes/restore": {"POST"},
+    "/dashboard/api/notes/attachment": {"GET", "HEAD"},
+    "/dashboard/api/notes/attachment/upload": {"POST"},
+    "/dashboard/api/notes/attachment/remove": {"POST"},
         "/dashboard/sessions": {"GET", "HEAD"},
         "/dashboard/api/sessions": {"GET", "HEAD"},
         "/dashboard/api/session": {"GET", "HEAD"},
         "/dashboard/api/session/input": {"POST"},
+        # Interactive key sends (arrows/Tab/Esc/Enter) for menus and
+        # completions -- a distinct capability from text submission above,
+        # with its own permission (permissions.allow_send_keys) and its own
+        # allowlist (input_policy.allow_keys), so it is a distinct route
+        # rather than a mode of session/input.
+        "/dashboard/api/session/keys": {"POST"},
+        # Optional view/send LOCKS. Access is open by default, so this route
+        # is the opt-out rather than a setup step.
+        "/dashboard/api/session/access": {"POST"},
         "/dashboard/api/session/grant-read": {"POST"},
         "/dashboard/api/session/grant-input": {"POST"},
         "/dashboard/api/session/create": {"POST"},
@@ -1362,7 +1536,25 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/node/drain": {"POST"},
         "/dashboard/api/node/test-connection": {"POST"},
         "/dashboard/api/node/generate-onboarding": {"POST"},
+        # Machine-facing, authenticated by the node's own bearer token --
+        # GET fetches the node-agent bundle, HEAD just its metadata so an
+        # installer can skip a download it already has.
+        "/dashboard/api/nodes/{node_id}/agent-bundle": {"GET", "HEAD"},
         "/dashboard/api/nodes/{node_id}/heartbeat": {"POST"},
+        # Node token rotation/revocation (blg_a3cc401d8275, token_rotation.py).
+        # Declared deliberately, not to quiet this guard: /token is a
+        # read (fingerprints and statuses, never a secret), /adopt,
+        # /rotate and /revoke are operator mutations behind the same
+        # guard as every other node action, and /refresh is the ONE
+        # machine-facing one -- authenticated by the node token being
+        # replaced, the same way /heartbeat above is, and the only route
+        # in this whole inventory whose response body carries a token.
+        # No dashboard UI: this feature is API-only by design.
+        "/dashboard/api/nodes/{node_id}/token": {"GET", "HEAD"},
+        "/dashboard/api/nodes/{node_id}/token/adopt": {"POST"},
+        "/dashboard/api/nodes/{node_id}/token/rotate": {"POST"},
+        "/dashboard/api/nodes/{node_id}/token/revoke": {"POST"},
+        "/dashboard/api/nodes/{node_id}/token/refresh": {"POST"},
         # LAN discovery + remote connect/bootstrap (Scan LAN / Add Remote
         # SSH / Add via Cloudflare Tunnel / Add by Agent Token) -- another
         # later, separate feature, same as the nodes routes above.
@@ -1409,6 +1601,9 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/queue/global-inbox": {"GET", "HEAD"},
         "/dashboard/api/queue/recent-events": {"GET", "HEAD"},
         "/dashboard/api/queue/loop-status": {"GET", "HEAD"},
+        # P0.5 Verify Queue visibility (read-only, _read_guard only --
+        # same fleet-level posture as the queue/integration summaries).
+        "/dashboard/api/verify/queue": {"GET", "HEAD"},
         "/dashboard/api/integration/fleet-overview": {"GET", "HEAD"},
         # Unified Task System: Global Tasks Kanban (queue.board()) --
         # another later, separate feature, same as the Task Manager routes
@@ -1423,6 +1618,72 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/ai-usage": {"GET", "HEAD"},
         "/dashboard/api/tasks/reassign": {"POST"},
         "/dashboard/requirements": {"GET", "HEAD"},
+        # Permission/audit policy pass (2026-09-12). All READS: the audit
+        # log, who is authenticated, and the policy table itself. They exist
+        # because an operator previously had NO surface for any of them,
+        # which looks exactly like a deny-all rule from the outside.
+        "/dashboard/audit": {"GET", "HEAD"},
+        "/dashboard/api/audit": {"GET", "HEAD"},
+        "/dashboard/api/audit/export": {"GET", "HEAD"},
+        "/dashboard/api/auth-status": {"GET", "HEAD"},
+        "/dashboard/api/access-policy": {"GET", "HEAD"},
+        # Work Runtime V1. One read, four writes -- and the writes are the
+        # only way the dashboard can create or steer work, deliberately
+        # separate routes so a read can never be mistaken for an action.
+        "/dashboard/work": {"GET", "HEAD"},
+        "/dashboard/api/work": {"GET", "HEAD"},
+        "/dashboard/api/work/workers": {"GET", "HEAD"},
+        "/dashboard/api/work/create": {"POST"},
+        "/dashboard/api/work/continue": {"POST"},
+        "/dashboard/api/work/control": {"POST"},
+        "/dashboard/api/work/approve": {"POST"},
+        # Project Knowledge, runbook registry, Work Policy and telemetry --
+        # a later, separate feature. All four are READS: they render status
+        # panels on the Work page. None can index the map, run a procedure,
+        # edit the policy or write telemetry, so none is a control surface
+        # wearing a panel's clothes.
+        "/dashboard/api/knowledge": {"GET", "HEAD"},
+        "/dashboard/api/procedures": {"GET", "HEAD"},
+        "/dashboard/api/policy": {"GET", "HEAD"},
+        "/dashboard/api/telemetry": {"GET", "HEAD"},
+        # Rapid Capture Inbox. The read is _read_guard'ed like every other GET;
+        # capture and bulk-priority are _mutation_guard'ed writes, because they
+        # create and reprioritise durable issue records.
+        "/dashboard/api/inbox": {"GET", "HEAD"},
+        # Worktree Janitor panel (docs/WORKTREE_JANITOR.md, P5). The GET is a
+        # read-only report; the POST records an approve/abandon decision and is
+        # mutation-guarded like every sibling. There is deliberately NO
+        # force/delete route -- the absence is part of the contract.
+        "/dashboard/api/worktrees": {"GET", "HEAD"},
+        "/dashboard/api/worktrees/review": {"POST"},
+        "/dashboard/api/inbox/capture": {"POST"},
+        "/dashboard/api/inbox/priority": {"POST"},
+        # Fleet Metadata Registry -- a later, separate feature. Three reads
+        # and exactly one write, and the write only touches METADATA: there is
+        # no path from any of these to starting, stopping or typing into a
+        # session. The reads answer from the LOCAL cache on purpose, so they
+        # keep working when the fleet does not.
+        "/dashboard/fleet": {"GET", "HEAD"},
+        "/dashboard/api/fleet": {"GET", "HEAD"},
+        "/dashboard/api/fleet/ssh": {"GET", "HEAD"},
+        "/dashboard/api/fleet/readiness": {"GET", "HEAD"},
+        "/dashboard/api/fleet/sync": {"POST"},
+        # Deployment redundancy: both READS. Choosing a node and taking a
+        # deploy lease are MCP operations, deliberately not a dashboard
+        # button -- a screen that can start a production deploy is a screen
+        # someone starts one from by accident.
+        "/dashboard/api/deployment": {"GET", "HEAD"},
+        "/dashboard/api/deployment/dry-run": {"GET", "HEAD"},
+        # Terminal Wall -- a later, separate feature, and READ-ONLY by
+        # design: both entries are GET/HEAD, and the absence of any POST
+        # here is itself part of the guarantee that the monitor screen
+        # cannot send input to a session.
+        "/dashboard/terminal-wall": {"GET", "HEAD"},
+        "/dashboard/api/terminal-wall": {"GET", "HEAD"},
+        # Auto Recovery -- another later, separate feature.
+        "/dashboard/api/recovery": {"GET", "HEAD"},
+        "/dashboard/api/recovery/recover": {"POST"},
+        "/dashboard/api/recovery/policy": {"POST"},
     }
     # The web terminal's WebSocket route is registered too, just outside
     # this HTTP-methods-only dict (WebSocketRoute has no .methods).
@@ -1453,15 +1714,32 @@ def test_dashboard_mobile_media_query_matches_landscape_phones_too():
     # stops applying mid-rotation even though the JS fullscreen state
     # (and selected session, auto-follow, font size) never changed.
     assert "@media (max-width:760px), (max-height:760px)" in DASHBOARD_HTML
-    # Only the one, combined VIEWPORT-breakpoint query should exist -- a
-    # second, width-only one would be exactly the kind of orientation trap
-    # this fixes if introduced by accident. The one other @media in the
-    # file (prefers-reduced-motion, for the blinking terminal cursor) is an
-    # accessibility-preference query, not a viewport breakpoint -- it can
-    # never create that trap, so it is fine for it to coexist.
-    assert DASHBOARD_HTML.count("@media (prefers-reduced-motion:reduce)") == 1
-    assert DASHBOARD_HTML.count("@media (max-width") == 1
-    assert DASHBOARD_HTML.count("@media") == 2
+    # The mobile-portrait redesign added two more viewport queries. Both are
+    # ORIENTATION-QUALIFIED refinements of the breakpoint above, which is
+    # what keeps them out of the trap this test exists for: rotating a phone
+    # swaps which refinement applies, and the base block keeps applying
+    # either way, so no rule silently stops mid-rotation.
+    portrait_start = DASHBOARD_HTML.index("@media (max-width:760px) and (orientation:portrait)")
+    portrait_end = DASHBOARD_HTML.index("@media (max-height:560px) and (orientation:landscape)")
+    for match in re.finditer(r"@media \([^)]*(?:max-width|max-height)[^{]*\{", DASHBOARD_HTML):
+        query = match.group(0)
+        if "max-width:760px), (max-height:760px" in query:
+            continue                                  # the base breakpoint
+        if "orientation:" in query:
+            continue                                  # an orientation-qualified refinement
+        # A query NESTED inside an orientation-qualified block inherits that
+        # qualifier, so it cannot strand a rule across a rotation either.
+        assert portrait_start < match.start() < portrait_end, \
+            f"viewport query without an orientation qualifier: {query.strip()}"
+    assert "@media (max-width:760px) and (orientation:portrait)" in DASHBOARD_HTML
+    assert "@media (max-height:560px) and (orientation:landscape)" in DASHBOARD_HTML
+    # prefers-reduced-motion is an accessibility preference, never a
+    # breakpoint, so any number of them is harmless here.
+    assert DASHBOARD_HTML.count("@media (prefers-reduced-motion:reduce)") >= 1
+    # Exactly two width-keyed queries: the base breakpoint and the portrait
+    # refinement. A third would need its own justification -- the loop above
+    # is what actually enforces the orientation rule.
+    assert DASHBOARD_HTML.count("@media (max-width") == 2
 
 
 def test_dashboard_fullscreen_rules_live_inside_the_orientation_safe_query():
@@ -1519,6 +1797,7 @@ def read_only_dashboard_config() -> AppConfig:
         ("test-*", "agent-*"), 50, 20,  # this is a dashboard-specific gate,
         InputPolicyConfig(allowed_session_patterns=("test-*",)),  # not a
         dashboard=DashboardConfig(mutations_enabled=False),        # replacement for it.
+        session_access=SessionAccessConfig(default_read=True, default_input=True),
     )
 
 
@@ -1646,6 +1925,7 @@ def test_mutation_allowed_from_an_explicitly_configured_extra_origin(tmux_sessio
         PermissionsConfig(True, True), ("test-*", "agent-*"), 50, 20,
         InputPolicyConfig(allowed_session_patterns=("test-*",)),
         dashboard=DashboardConfig(allowed_origins=("https://proxy.example.com",)),
+        session_access=SessionAccessConfig(default_read=True, default_input=True),
     )
     service = TerminalService(config)
     server = build_mcp(service)
@@ -1684,6 +1964,8 @@ def _cf_access_config(**dashboard_overrides) -> AppConfig:
             cloudflare_access_audience="test-aud",
             **dashboard_overrides,
         ),
+        # These tests are about the Access edge, not about session grants.
+        session_access=SessionAccessConfig(default_read=True, default_input=True),
     )
 
 

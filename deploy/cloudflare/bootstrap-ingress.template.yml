@@ -1,0 +1,145 @@
+# Public bootstrap hostname -- TEMPLATE. NOT ACTIVATED.
+#
+# This file is repo-managed so the allowlist is reviewable in a diff rather
+# than living only in a tunnel operator's shell history. Applying it is a
+# separate, deliberate act: nothing in this repository turns it on, and no
+# DNS record is created by checking it in.
+#
+# WHY A SEPARATE HOSTNAME AT ALL
+#
+# A machine being onboarded for the first time has no Cloudflare Access
+# session and cannot get one -- there is no human at a browser on it, and
+# the point of the exercise is that there does not need to be. The three
+# enrollment routes are built for exactly that: they are machine-facing,
+# carry no Access guard, and authenticate the CALLER by the one-time code or
+# handle it presents, with a rate limit in front. Those, and nothing else,
+# are what this hostname exposes.
+#
+# WHAT IS DELIBERATELY NOT HERE
+#
+#   /mcp                the MCP surface itself
+#   /dashboard/...      every operator route, including the helper download
+#   /terminal, /webterm session content
+#   /supervisor         fleet control
+#   /login, /app        the operator's own auth flow
+#
+# WHY THE SETUP SCRIPT IS HERE TOO
+#
+# Both machine-facing install paths fetch it from this hostname, and until
+# now neither could: the edge 404'd the request and the install died with
+# no error anywhere the operator could see.
+#
+#   the helper   downloadSetupScript() GETs /enroll/windows-setup.ps1 from
+#                the origin it was paired with -- which, on a public
+#                deployment, is this hostname. A live run on 2026-09-15
+#                redeemed successfully, reported installing_service, then
+#                failed here: 404 at the edge, 200 on loopback.
+#   Win + R      build_quick_install_command() builds
+#                `iwr '<origin>/w'`, the same script under its short path.
+#
+# It is safe to serve unauthenticated -- and was always designed to be. The
+# route's own contract is that the machine fetching it has no Access
+# session and cannot get one, so the GENERIC script carries no credential:
+# the enrollment code is baked as TMCP-00000-00000-00000 and the real one
+# is supplied by the operator or by the redeemed payload. A test asserts no
+# 64-hex secret appears in what is served.
+#
+# GET only, two exact paths, both anchored. Not a prefix: /enroll/... must
+# not become a door to anything else added under /enroll later.
+#
+# WHY HEARTBEAT IS HERE TOO
+#
+# Enrollment is not the end of the machine's need for this hostname. A node
+# that finishes enrolling and then cannot heartbeat is registered and
+# permanently unhealthy -- the Dashboard shows it, the scheduler will not
+# place work on it, and the operator is left with a node that onboarded
+# "successfully" and never came up. The heartbeat route is machine-facing
+# for the same reason the enrollment routes are, and authenticates the same
+# way the rest of the machine surface does: a per-node bearer token, issued
+# at enrollment, verified before the registry is touched.
+#
+# It is ONE path and ONE verb. The node's other machine-facing routes are
+# deliberately NOT here -- notably token/refresh, which means a node whose
+# token rotates while it can only reach this hostname will need that route
+# added in a separate, deliberate edit, exactly like this one.
+#
+# The catch-all 404 at the bottom is what makes that list enforceable: a
+# path that does not match is refused at the edge, so a route added later
+# is NOT exposed here by default. Adding one is an edit to this file.
+#
+# THE HELPER DOWNLOAD IS NOT ON THIS HOSTNAME
+#
+# It stays operator-facing, behind Cloudflare Access on the Dashboard
+# hostname. Publishing an unauthenticated binary on the open Internet is a
+# different decision with a different blast radius, and it is not this one.
+# The consequence is honest and worth stating: an operator downloads the
+# helper from the Dashboard and carries it to the new machine. The public
+# hostname is what lets that machine COMPLETE its enrollment afterwards,
+# not what lets it fetch the binary.
+#
+# TO APPLY (a human, deliberately, after approval):
+#   1. create the DNS record for the hostname below
+#   2. merge these ingress rules into the tunnel config ABOVE its catch-all
+#   3. cloudflared tunnel ingress validate
+#   4. reload the tunnel service
+#
+# Substitute ${BOOTSTRAP_HOSTNAME} and ${CONTROLLER_ORIGIN} before applying.
+
+ingress:
+  # Machine-facing enrollment. No Cloudflare Access: a fresh machine has no
+  # session and cannot obtain one. Each route authenticates its caller by
+  # the one-time code or handle presented, and is rate-limited in the
+  # application.
+  #
+  #   consume   trade a one-time enrollment code for bootstrap config
+  #   redeem    trade a one-time handle for the same, for the helper
+  #   progress  report an install stage back, so the page can show it
+  - hostname: ${BOOTSTRAP_HOSTNAME}
+    path: ^/dashboard/api/enroll/(consume|redeem|progress)$
+    service: ${CONTROLLER_ORIGIN}
+
+  # The generic setup script, under both paths that serve it. Byte
+  # identical on either, GET only, and carrying no secret -- see the header.
+  - hostname: ${BOOTSTRAP_HOSTNAME}
+    path: ^/(w|enroll/windows-setup\.ps1)$
+    service: ${CONTROLLER_ORIGIN}
+
+  # The node-agent bundle, so an onboarded node can install the agent that
+  # makes it able to host sessions at all. Added 2026-09-15: without it a
+  # node could reach "registered and heartbeating" and no further -- 8790
+  # closed, no transport, Create Session offering a node it could never
+  # reach -- because deploy/install-node-agent.ps1 needs a source tree the
+  # machine has no way to obtain (private repo, Access-gated Dashboard).
+  #
+  # NOT an anonymous download. Authenticated by the SAME per-node bearer
+  # token as the heartbeat below, verified before the store is touched, so
+  # only a node that already holds its own credential can fetch it. GET and
+  # HEAD on one exact path -- HEAD is what lets the installer skip a
+  # download it already has.
+  - hostname: ${BOOTSTRAP_HOSTNAME}
+    path: ^/dashboard/api/nodes/[A-Za-z0-9_-]{1,64}/agent-bundle$
+    service: ${CONTROLLER_ORIGIN}
+
+  # Post-enrollment liveness of the NODE, not of the controller. Bearer
+  # token per node, issued at enrollment and verified before the registry is
+  # touched, so this is not an unauthenticated write.
+  #
+  # The node id is bounded to the charset the registry accepts, which is
+  # what stops this pattern reaching any other route under /nodes/: there is
+  # no '/' and no '.' in the class, so neither a deeper path nor a traversal
+  # can be spelled through it.
+  - hostname: ${BOOTSTRAP_HOSTNAME}
+    path: ^/dashboard/api/nodes/[A-Za-z0-9_-]{1,64}/heartbeat$
+    service: ${CONTROLLER_ORIGIN}
+
+  # Liveness only. No readiness detail, no metrics, no version: enough for a
+  # machine to know whether to retry, and nothing that describes the host.
+  - hostname: ${BOOTSTRAP_HOSTNAME}
+    path: ^/health/(live|ready)$
+    service: ${CONTROLLER_ORIGIN}
+
+  # Everything else on this hostname. Present so the refusal is explicit in
+  # the file rather than inherited from whatever happens to be last in the
+  # merged config.
+  - hostname: ${BOOTSTRAP_HOSTNAME}
+    service: http_status:404

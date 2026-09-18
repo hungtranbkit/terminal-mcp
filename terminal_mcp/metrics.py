@@ -38,6 +38,10 @@ COUNTER_NAMES = (
     "delivery.recovery_attempted",
     "supervisor.policy_blocked",
     "supervisor.action_failed",
+    "llm.admission_queued",
+    "llm.admission_started",
+    "llm.provider_429",
+    "llm.retry_attempt",
 )
 
 

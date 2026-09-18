@@ -191,8 +191,11 @@ def test_real_loop_drives_a_clean_handoff_to_integrated_with_zero_manual_ticks(s
     finally:
         loop.stop()
 
-    _git(["checkout", "-q", "integration"], repo)
-    assert (repo / "x.txt").read_text() == "content\n"
+    # Read the integrator's own worktree; checking the branch out in the
+    # shared tree is the mutation this engine must never make.
+    from terminal_mcp.integration_worktree import worktree_path_for
+    from pathlib import Path as _Path
+    assert (_Path(worktree_path_for(str(repo), "proj-loop")) / "x.txt").read_text() == "content\n"
 
 
 def test_real_loop_routes_a_real_conflict_to_rework_required_with_zero_manual_ticks(store, engine, queue_store, repo):
@@ -254,7 +257,6 @@ def test_two_concurrent_loop_instances_never_double_merge_the_same_handoff(tmp_p
         loop_a.stop()
         loop_b.stop()
 
-    _git(["checkout", "-q", "integration"], repo)
     log = _git(["log", "--oneline", "--all"], repo).stdout
     assert log.count("integrate feature/race") == 1  # never double-merged
     assert store_a.get_handoff(handoff.id).status == "INTEGRATED"
@@ -307,6 +309,5 @@ def test_a_fresh_loop_instance_recovers_a_handoff_abandoned_by_a_dead_loop(tmp_p
 
     assert store2.get_handoff(handoff.id).merge_commit_sha == first_merge_commit  # git no-op re-merge, no duplicate
 
-    _git(["checkout", "-q", "integration"], repo)
     log = _git(["log", "--oneline", "--all"], repo).stdout
     assert log.count("integrate feature/restart") == 1

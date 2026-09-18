@@ -22,13 +22,39 @@ only, nothing to call yet. Never treat a PLANNED item as available.
 
 ## 1. Quick start
 
-- The production control plane is `terminal-mcp-http.service` (a
-  user-scoped systemd unit — `systemctl --user status
-  terminal-mcp-http.service`, not a system-wide one), serving the MCP
-  endpoint at `http://127.0.0.1:8766/mcp` and the dashboard at
+- The production control plane serves the MCP endpoint at
+  `http://127.0.0.1:8766/mcp` and the dashboard at
   `http://127.0.0.1:8766/dashboard` (both loopback-only; a real
   deployment fronts this with an authenticated tunnel/Cloudflare Access
-  — see `docs/REQUIREMENTS.md` §16 for exact config keys).
+  — see `docs/REQUIREMENTS.md` §16 for exact config keys). **Which unit
+  serves it depends on the host**, and getting this wrong sends you
+  debugging a process that is not running:
+    - `terminal-mcp-fed-controller.service` — the self-hosted/federated
+      layout (dell-linux today). Its code authority is a worktree pinned
+      by `PYTHONPATH=`, and its state lives under a separate
+      `XDG_STATE_HOME`, so `/version` is the only reliable way to tell
+      which commit is actually answering.
+    - `terminal-mcp-http.service` — the original layout. On a
+      fed-controller host this unit is **retired**: it is kept as a
+      rollback point but must never start, because it would race the
+      real controller for `127.0.0.1:8766` and crash-loop on
+      `EADDRINUSE`.
+  `systemctl --user list-units 'terminal-mcp*'` tells you which one is
+  live; `curl -s localhost:8766/version` proves what it is running.
+
+- **If your MCP client shows no tools at all (or a stale list missing
+  recently-added ones), the server is almost certainly fine and the
+  TUNNEL is down.** The endpoint above is loopback-only; ChatGPT reaches
+  it through `terminal-mcp-tunnel.service` (the OpenAI Secure MCP
+  Tunnel, profile `terminal-mcp`, targeting `http://127.0.0.1:8766/mcp`).
+  If that unit is dead, `tools/list` never reaches this server and the
+  client falls back to whatever it cached — which is exactly how a newly
+  added tool family appears to "not exist". Diagnose with
+  `terminal-mcp-doctor connection`: it distinguishes `mcp_local`
+  (the server itself) from `tunnel_process`/`tunnel_ready` (the path to
+  ChatGPT) and prints the exact remediation. `tunnel_ready: unknown` in
+  the first ~30s after a restart is normal — it means "no successful
+  control-plane poll yet", not a fault.
 - `config.yaml` gates most of what you can do: `permissions.
   terminal_read`/`terminal_input` (read/send at all), `session_
   lifecycle.enabled` (create/kill/reopen/rename), `supervisor.enabled`/
@@ -48,6 +74,27 @@ only, nothing to call yet. Never treat a PLANNED item as available.
   `dell-5530/window`) whenever a tool tells you `AMBIGUOUS_SESSION`, or
   whenever you already know which node you mean (registry/recovery
   calls in particular *require* the qualified form — see §7).
+
+## 1b. Survive a new-chat / UI reset
+
+The visible ChatGPT conversation is **not** the source of truth for delegated work.
+Before a long analysis or multi-agent delegation, call
+`terminal_chat_checkpoint(project_id, ...)` with the current goal, decisions, active
+tasks/sessions/branches, blockers and next actions. Checkpoint again after important
+decisions or dispatches and immediately before merge/deploy. The store is append-only,
+persistent across controller restarts, and recursively redacts credential-shaped text.
+
+If ChatGPT unexpectedly returns to a new chat, call
+`terminal_chat_recover(project_id)` **first**. It returns the latest saved orchestration
+checkpoint and a fresh `live_project_status` from the queue/backlog/worker projection.
+Then use `terminal_knowledge_recover(session)` for any individual terminal session that
+needs lower-level history. `terminal_chat_checkpoint_list` provides older handoff points.
+
+These are complementary recovery layers: chat checkpoint preserves the decisions ChatGPT
+explicitly saved; project status preserves live delegated-work state; session knowledge
+preserves terminal-level execution context. The server cannot recover unsaved private
+thoughts from a conversation that disappeared, so checkpoint **before** expensive work,
+not only after it. None of these checkpoint calls dispatches or changes project tasks.
 
 ## 2. Session discovery / status / read / input
 
@@ -71,6 +118,153 @@ only, nothing to call yet. Never treat a PLANNED item as available.
 4. Reading requires `effective_read: true` on that session's own row —
    if false, you have no access; ask a human to grant it (dashboard) or
    use a session already in `allowed_session_patterns`.
+
+## 2b. Reading a repository directly (`repo_*` — READ-ONLY)
+
+**Use these instead of asking a session to read a file for you.** Before
+these existed, the only way to see code through this server was to send a
+prompt like "cat the file and paste it back" into a Claude/Codex session
+and read the pane output. Don't do that any more: it is slow, it burns
+another agent's context, and what comes back is that agent's paraphrase
+rather than the file.
+
+The ten tools, all reads:
+
+| Tool | Answers |
+|---|---|
+| `repo_status` | branch, HEAD, dirty state, ahead/behind, project identity |
+| `repo_head` | just the checked-out commit (cheapest) |
+| `repo_branches` | local branches, tips, upstreams |
+| `repo_remotes` | remote URLs (credentials stripped); optional auth probe |
+| `repo_tree` | file/directory listing, bounded by depth + limit |
+| `repo_read` | one text file's content, by line window or byte cap |
+| `repo_search` | content search -> path + line number + line |
+| `repo_diff` | working-tree diff, or `base..head` |
+| `repo_log` | commit history, optionally for one path |
+| `repo_show_commit` | one commit's metadata, message and patch |
+
+### Saying WHICH repo you mean
+
+Pass exactly one of these on any `repo_*` call:
+
+- `path` — a repo root, or any path inside one, **on the controller host**.
+- `session` — "the repo this session is working in". Resolved on the node
+  that session actually runs on, so this is the right choice when you are
+  already watching a session and want to see its code.
+- `project` — a `project_identity` project_id or name (e.g.
+  `git:github.com/hungtranbkit/terminal-mcp`).
+- `node` + `path` — explicit, no discovery.
+
+Every response carries `node_id` and `located_by`, so you can always see
+which machine answered and how it was chosen. **Check them**: if you asked
+by `session` and got a different node than you expected, the answer is
+about a different working tree than you thought.
+
+### The normal workflow
+
+```
+repo_tree(project="…", depth=2)              # orient
+repo_search(project="…", query="some_symbol") # find it
+repo_read(project="…", file="pkg/mod.py",     # read around the hit
+          start_line=1, end_line=120)
+repo_diff(project="…")                        # what is uncommitted right now
+repo_log(project="…", limit=10)               # recent history
+repo_show_commit(project="…", commit="<sha>") # one commit in full
+```
+
+`repo_search` is FIXED-STRING by default — searching `find_me()` finds
+that literal text. Pass `regex=true` only if you actually want a regex.
+
+### What you will be refused, and what it means
+
+Refusals come back as an error CODE in a normal result (never an
+exception, never prose), so branch on them:
+
+| Code | Meaning |
+|---|---|
+| `REPO_NOT_ALLOWED` | that path is outside the server's configured repo allowlist |
+| `PATH_OUTSIDE_REPO` | the path (after resolving `..` and symlinks) leaves the repo |
+| `SECRET_PATH_DENIED` | a credential file (`.env`, `*.pem`, `id_*`, …) — never readable |
+| `PATH_NOT_FOUND` / `NOT_A_FILE` / `BINARY_FILE` | ordinary "that isn't a readable text file" |
+| `NOT_A_GIT_REPO` | the path exists but is not inside a repository |
+| `INVALID_REF` | your `commit`/`base`/`head` isn't a valid revision |
+| `INVALID_ARGUMENT` | a bad/misspelled parameter, or no locator given |
+| `AMBIGUOUS_REPO` | the project has checkouts on >1 node — re-ask with `node` + `path` |
+| `NODE_UNREACHABLE` | that node could not be asked (this is **not** "the file is missing") |
+| `NODE_LACKS_REPO_READ` | that node's agent predates this feature |
+| `GIT_AUTH_REQUIRED` | only from `repo_remotes(check_auth=true)`; local reads never need auth |
+| `REPO_READ_DISABLED` | the operator turned `repo_read` off in config |
+
+Two of these matter especially:
+
+- **`SECRET_PATH_DENIED` is final.** Don't try to route around it — the
+  same denial applies to `repo_search` hits (dropped, and listed in
+  `secret_paths_skipped`), to diff hunks (excluded, listed in
+  `secret_paths_excluded`) and to `repo_log --file`. There is no
+  combination of these tools that returns a credential file's content.
+  A denied file is still *listed* by `repo_tree` with `"denied": true`, so
+  you can tell "refused" from "absent".
+- **`NODE_UNREACHABLE` means nobody looked.** Never report it as "the file
+  does not exist" or "the repo is broken".
+
+### Things to expect
+
+- **Content is redacted.** Even in an ordinary file, a token/password-shaped
+  value comes back as `<REDACTED>`; the `redaction` field says how many
+  rules hit (by rule name, never the value). That is not corruption —
+  don't ask for the file a second way to try to get the raw value.
+- **Output is capped, and two different flags say so.** On `repo_read`,
+  **`has_more: true`** means the file continues past what you got — that is
+  the field to page on, with `start_line`/`end_line`. **`truncated: true`**
+  means a cap interfered: your window was narrowed by the line limit, or
+  cut short by the byte cap. A window you asked for and fully received
+  reports `truncated: false` even when `has_more` is true — so page on
+  `has_more`, never on `truncated`, or you will re-request a satisfied
+  window forever. Raising `max_bytes` past the server's configured cap does
+  nothing. `start_line`/`end_line`/`lines_returned` describe exactly what
+  you got, so line numbers you quote back are trustworthy.
+- **Local reads never need GitHub auth.** Nothing in the read path touches
+  the network. `repo_remotes` only probes the network if you pass
+  `check_auth=true`, and even then a failure lands in `auth`, not as a
+  top-level error.
+
+### What these tools CANNOT do (V1)
+
+There is **no write capability at all** — no checkout, commit, branch,
+reset, clean, apply, push, fetch or pull, and no arbitrary git/shell
+command. This is structural, not a policy you can ask to have relaxed at
+call time: every mutating git subcommand is refused by the engine, and no
+tool accepts a git subcommand or shell string. If a task needs the
+repository *changed*, that is still a real task for a coding session —
+use the queue flow (§4) and the git-isolation worktree flow (§4d).
+
+Also not available: searching git *history* (these search a work tree),
+and fetching/cloning a private remote this host cannot already read.
+
+## 2c. Bounded waits and durable resume
+
+`terminal_wait_for_state(target, desired_states, timeout=20)` never uses the
+caller's `timeout` as one long-held MCP request. The server persists a wait run
+first, observes for at most 20 seconds, and returns either the existing
+`status: "MATCHED"` success shape (`continuation_status: "COMPLETE"`) or a
+compact `status: "PENDING"` response. A caller may still pass `timeout=900` as
+its desired overall horizon; each individual MCP request remains capped at the
+20-second synchronous budget.
+
+A PENDING response includes an opaque `resume_token`, stable `run_id`, durable
+`checkpoint_id`, `desired_states`, `last_observed_state`, `waited_ms`,
+`sync_wait_budget_ms`, and `next_poll_after_ms`. Call
+`terminal_resume_wait(resume_token)` later—even from a new chat or after a
+server restart. Polling is observational and idempotent: it never resends the
+terminal task. Completed/failed results are retained in the run journal;
+invalid, unknown, and expired tokens fail deterministically. The journal stores
+only bounded, redacted state/reason metadata, never terminal output or
+credentials.
+
+The durable task queue remains the canonical persist-before-dispatch path for
+work. A wait continuation observes that already-running work; it is not another
+queue and does not change session, permission, node-affinity, or dispatch
+semantics.
 
 ## 3. Direct-send flow (canonical for a single, immediate prompt)
 
@@ -549,6 +743,55 @@ see REQUIREMENTS.md Backlog item 7).
   with this recovery mechanism built and tested, this remains a real,
   disruptive, outward-facing action on a live machine with real
   attended sessions.
+
+## 7b. Saving an idea ("lưu lại") — the notes/ideas store
+
+When the user says **"lưu lại"**, **"ghi chú cái này"**, **"lưu ý tưởng
+này"**, **"đưa vào kho ý tưởng"** — that is `note_create`, not a task and
+not a session operation. Full reference: [`notes.md`](notes.md).
+
+What to put where, because this is the part that decides whether the note
+is still useful in six weeks:
+
+- `original_content` — what the USER wanted kept, verbatim (the pasted
+  text, the link, their own words about why).
+- `analysis` — YOUR reading of it. Keep it separate: the note must stand
+  on its own after the source URL dies.
+- `source_url` — if there is one.
+- `tags` + `type` — real labels; call `note_facets` first if you want to
+  reuse the user's existing tag spellings rather than inventing near-
+  duplicates.
+- `project_id`/`project_name` — only if the user actually said which
+  project. Leave them empty otherwise and attach later with
+  `note_link_to_project`; a guessed project is worse than none.
+- `title` — optional; one is derived from the content if you omit it.
+
+An image the user just shared goes in the same call:
+`attachments_base64: [{"filename": "shot.png", "data_base64": "..."}]`.
+If the file is already on this host, `attachment_paths` takes absolute
+paths — but that transport is refused (`ATTACHMENT_SOURCE_DISABLED`)
+unless the operator configured `notes.attachment_source_roots`, so fall
+back to base64 rather than reporting failure to the user. A failed
+attachment never loses the note: check `attachment_results` in the
+response and tell the user which image did not make it.
+
+Confirm back with the note id and title, and mention the page
+(`/dashboard/notes`) where they can see it.
+
+Recall — **"trước đây tôi có lưu gì về X không?"** — is `note_search`.
+It is local and deterministic (SQLite FTS5 bm25, diacritics-insensitive:
+`y tuong` finds `ý tưởng`). Order results by `rank_position` (1 = best),
+not by `score`, and summarise from the `excerpt` + metadata each hit
+carries. Use `note_list` when the user is browsing by filter rather than
+searching by words.
+
+When an idea actually gets used, `note_mark_applied` with an
+`applied_ref` (commit / PR / task id) — that is what keeps the kho from
+turning into an undifferentiated pile.
+
+Deleting is soft by default and reversible with `note_restore`. Only pass
+`hard=true` on an explicit "xóa hẳn": it unlinks the image files and
+cannot be undone.
 
 ## 8. What NOT to do (anti-patterns, repeated for emphasis)
 

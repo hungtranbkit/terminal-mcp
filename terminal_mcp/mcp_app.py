@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import logging
+
 from mcp.server.mcpserver import MCPServer
 
 from . import __version__
+from .access_policy import ROLE_OPERATOR, filter_record, policy_table
+from .fleet_service import auth_status_for_node
 from .agent_availability import available_agent_types
 from .config import load_config
 from .controller import ControllerService, build_default_controller
+from .compact_tools import CompactTerminalTools
 from .core import TerminalService
-from .coordinator import CoordinatorGate
+from .coordinator import CoordinatorGate, node_aware_repo_evidence
 from .integration_engine import IntegrationEngine
 from .ai_usage_service import AiUsageService
+from .recovery_engine import RecoveryEngine
+from .recovery_loop import RecoveryLoop
 from .integration_loop import IntegrationLoop
 from .task_migration import TaskMigrationPlanner
 from .integration_service import IntegrationService
@@ -17,6 +24,10 @@ from .integration_store import publish_handoff_for_completed_task
 from .dor_gate import check_definition_of_ready
 from .git_isolation_service import GitIsolationService
 from .node_models import node_to_dict as _node_to_dict
+from .notes_service import NotesService
+from .notes_store import NotesError
+from .orchestrator_checkpoint import OrchestratorCheckpointStore
+from .chat_checkpoint_tools import register_chat_checkpoint_tools
 from .planner_service import PlannerService
 from .planner_store import PlannerStore
 from .pm_service import PMService
@@ -26,12 +37,50 @@ from .pm_summary import (
     emergency_resume_all_lanes, emergency_stop_all_lanes, generate_summary,
 )
 from .queue_engine import QueueEngine
+from .request_governor import RequestGovernor
+from .queue_event_drain import QueueEventDrain
 from .queue_loop import QueueLoop
+from .project_task_feeder import ProjectTaskFeeder
+from .backlog_service import BacklogService
+from .event_bus import KNOWN_EVENT_TYPES, EventBus
+from .event_wiring import build_queue_event_sink, build_verify_event_sink
+from .lease import DEFAULT_RESOURCE_LOCK_TTL_SECONDS, ResourceLockStore
+from .outcomes import OutcomeError, OutcomeStore
+from .project_service import ProjectService
+from .repo_service import build_repo_service
+from .worker_registry import ALL_ROLES, WorkerRegistry
+
+_LOGGER = logging.getLogger(__name__)
 from .queue_service import QueueService
 from .release_service import ReleaseService
 from .release_store import ReleaseStore
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
+
+
+def _fleet_session_names(controller: "ControllerService") -> list[str]:
+    """Every session the fleet can see, qualified as "node/session".
+
+    Qualified on purpose: a bare name is ambiguous the moment two nodes hold the
+    same one, and the supervisor stores whatever it is given as the watch
+    target. Qualifying at the source means a config-pattern watch routes to one
+    specific node forever, instead of resolving differently as the fleet
+    changes. One unreachable node is skipped, never fatal -- the alternative is
+    that a single node being down stops the supervisor seeing any session at
+    all.
+    """
+    names: list[str] = []
+    try:
+        listing = controller.terminal_list_sessions()
+    except Exception:  # noqa: BLE001 -- seeding is best-effort by design
+        _LOGGER.warning("supervisor: fleet session listing failed; local sessions only", exc_info=True)
+        return names
+    for row in listing.get("sessions", []) or []:
+        node_id, name = row.get("node_id"), row.get("name")
+        if not name:
+            continue
+        names.append(f"{node_id}/{name}" if node_id else name)
+    return names
 
 
 def build_mcp(service: TerminalService | None = None,
@@ -43,7 +92,17 @@ def build_mcp(service: TerminalService | None = None,
               pm: PMService | None = None,
               planner: PlannerService | None = None,
               release: ReleaseService | None = None,
-              ai_usage: AiUsageService | None = None) -> MCPServer:
+              ai_usage: AiUsageService | None = None,
+              recovery: RecoveryEngine | None = None,
+              backlog: BacklogService | None = None,
+              notes: NotesService | None = None,
+              events: EventBus | None = None,
+              resource_locks: ResourceLockStore | None = None,
+              fleet: "FleetService | None" = None,
+              work: Any = None,
+              default_optional_services: bool = True,
+              chat_checkpoints: OrchestratorCheckpointStore | None = None,
+              run_journal: Any = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -81,9 +140,49 @@ def build_mcp(service: TerminalService | None = None,
         return [{"name": item.name, "agent_type": item.pane_current_command} for item in items]
 
     ai_usage = ai_usage or AiUsageService(terminal.config.ai_usage, session_lister=_local_sessions_for_ai_usage)
+    # Auto Recovery (2026-09-07): constructed here (not started -- see
+    # server_http.py's own config.auto_recovery.enabled gate for that
+    # background loop) so terminal_recover_session/reconcile_node below
+    # always work even with the automatic loop off, same "manual call
+    # always available, only the *automatic* trigger is gated" posture
+    # as queue.loop/integration.loop. Reuses terminal.leases (the SAME
+    # already-real PaneLeaseStore instance send/verify locking already
+    # uses) for the recovery lock -- never a second lock table; keys are
+    # namespaced ("recovery:...") so there is no collision risk.
+    # The controller is defaulted FIRST, because everything below takes it as a
+    # collaborator. It used to be defaulted after RecoveryEngine/RecoveryLoop
+    # were constructed with it, so `build_mcp()` called bare -- which is exactly
+    # how server.py builds the stdio surface -- handed both of them
+    # controller=None. Auto-recovery and reconcile_node on that surface were
+    # therefore silently non-functional: constructed, exposed as tools, and
+    # holding nothing to route with.
+    controller = controller or build_default_controller(terminal)
+    if run_journal is None:
+        try:
+            from .run_journal import RunJournalStore
+
+            run_journal = RunJournalStore()
+        except Exception:  # noqa: BLE001 -- other tools remain available
+            _LOGGER.exception("durable run journal unavailable")
+    compact_tools = CompactTerminalTools(terminal, controller, run_journal=run_journal)
+    recovery = recovery or RecoveryEngine(terminal.session_registry, controller, terminal.leases,
+                                          terminal.config.auto_recovery)
+    recovery.loop = recovery.loop or RecoveryLoop(
+        recovery, controller, poll_interval_seconds=terminal.config.auto_recovery.reconcile_poll_seconds)
     supervisor = supervisor or SupervisorService(terminal, SupervisorStore())
     supervisor_v2 = supervisor_v2 or build_supervisor_v2(supervisor)
-    controller = controller or build_default_controller(terminal)
+    # Give the supervisor the fleet's view. Wired HERE rather than at
+    # construction because this is the first point where both objects exist,
+    # and as a callback rather than a controller reference because supervisor.py
+    # importing controller.py would invert the layering (see its own
+    # fleet_status docstring).
+    #
+    # Without this, every watch on a remote node's session resolved against
+    # local tmux and was disabled target_missing on its first poll -- six of the
+    # ten watches in production, all of them sessions that were alive on their
+    # own nodes the entire time.
+    supervisor.fleet_status = controller.terminal_status
+    supervisor.fleet_sessions = lambda: _fleet_session_names(controller)
     # 3-role model (task: "Coding A/B + Integration Agent"): constructed
     # BEFORE queue/queue_engine below so its store exists for their own
     # on_completed hook to reference -- integration.engine itself is
@@ -96,6 +195,44 @@ def build_mcp(service: TerminalService | None = None,
         publish_handoff_for_completed_task(task, integration.store)
 
     queue = queue or QueueService(on_completed=_on_task_completed)
+    # `backlog` and `events` used to have NO default, while server.py calls
+    # build_mcp() bare -- so the stdio surface silently exposed 19 fewer
+    # tools than the HTTP one, and the contract test (which builds the stdio
+    # server) could not see them at all. Defaulting them makes ONE tool
+    # surface, and the contract test now covers every tool. Pass
+    # default_optional_services=False for a rig that deliberately wants the
+    # narrower surface.
+    if default_optional_services:
+        backlog = backlog if backlog is not None else BacklogService(
+            terminal.config, queue=queue, controller=controller)
+        # Notes/Ideas: same "one tool surface" reasoning as backlog/events
+        # just above -- stdio and HTTP must expose the SAME note_* tools,
+        # so it defaults here rather than only where server_http.py builds
+        # it. Its own store honours TERMINAL_MCP_NOTES_DB then
+        # XDG_STATE_HOME (notes_store.default_notes_path), which is what
+        # keeps the test suite's redirected state dir isolating it too.
+        if notes is None and terminal.config.notes.enabled:
+            notes = NotesService.from_config(terminal.config)
+        if chat_checkpoints is None:
+            chat_checkpoints = OrchestratorCheckpointStore()
+        events = events if events is not None else EventBus()
+
+    # Orchestration V1: connect the deterministic runtime to the bus. Until
+    # now the bus DEFINED the vocabulary (TASK_CREATED, VERIFY_PENDING,
+    # WORKER_DONE) that the queue and verify queue produce, and neither ever
+    # called publish() -- six subsystems, zero coupling, one event in
+    # production. Everything above them was waiting on a stream nobody fed.
+    #
+    # Attaching a sink is READ-ONLY with respect to behaviour: it adds rows
+    # to events.db and changes nothing about how a task is claimed,
+    # dispatched or verified. Nothing consumes the stream automatically --
+    # autonomous coordination stays behind its existing gates.
+    if events is not None:
+        if getattr(queue.store, "_event_sink", None) is None:
+            queue.store._event_sink = build_queue_event_sink(events)
+        verify_queue = getattr(queue, "verify_queue", None)
+        if verify_queue is not None and getattr(verify_queue, "_event_sink", None) is None:
+            verify_queue._event_sink = build_verify_event_sink(events)
     # Phase 2 (task: "Supervisor Queue v2 Phase 2 -- Coordinator Agent"):
     # one shared QueueEngine over the SAME queue store + the SAME
     # (already node-aware) controller every other routed tool in this
@@ -107,8 +244,36 @@ def build_mcp(service: TerminalService | None = None,
     # still have to check). on_completed publishes a Handoff for any
     # task whose own metadata opts in (integration_store.py's own
     # publish_handoff_for_completed_task) -- a no-op for every other task.
-    queue_engine = QueueEngine(queue.store, controller, coordinator=CoordinatorGate(),
-                              on_completed=_on_task_completed)
+    # P0.5: give the verify queue the node registry so it can EXPLAIN an
+    # unroutable job ("no online node reports dotnet+windows") instead of
+    # leaving it mysteriously pending, and hand the same VerifyQueue to
+    # the engine. Both are inert for every task that does not carry a
+    # `verify` block in its own completion_policy -- which is all of them
+    # today, so no existing lane changes behaviour.
+    if controller is not None:
+        queue.verify_queue.registry = getattr(controller, "registry", None)
+    # The pre-dispatch gate must read repo evidence where the SESSION lives.
+    # Given only a cwd it ran git locally, so a session on another node made
+    # it report "could not read git/repo status" about a repository that was
+    # perfectly healthy -- just not on this host. Handing it the controller's
+    # node adapter lets it ask the right machine.
+    _gate = CoordinatorGate(evidence_collector=node_aware_repo_evidence(
+        local_node_id=getattr(controller, "local_node_id", None),
+        node_client_factory=(controller.client_for if controller is not None else None)))
+    # Read-only repo access for the repo_* tools. Built from the SAME
+    # controller the gate above uses, so a repo on dell-linux/hp/windows is
+    # read by asking that node -- the identical "read it where it lives"
+    # rule, applied to content instead of metadata. Uses terminal's own
+    # AuditStore; never a second audit database.
+    repo = build_repo_service(terminal, controller)
+    _worktree_sweep_holder: dict[str, Any] = {}
+    request_governor = RequestGovernor(terminal.config.llm_governor, queue.store)
+    # Health registration happens later in server_http.py and only receives
+    # TerminalService; attach the same singleton for read-only gauges there.
+    terminal.request_governor = request_governor
+    queue_engine = QueueEngine(queue.store, controller, coordinator=_gate,
+                              on_completed=_on_task_completed, verify_queue=queue.verify_queue,
+                              governor=request_governor)
     queue.engine = queue.engine or queue_engine
     integration.engine = integration.engine or IntegrationEngine(integration.store, queue.store)
     # Event-driven WAIT/wake background loop (integration_loop.py) --
@@ -163,7 +328,15 @@ def build_mcp(service: TerminalService | None = None,
     server = MCPServer(
         name="terminal-mcp",
         description="Whitelist-only tmux observation and controlled input",
-        instructions="Only access explicitly allowed tmux sessions. Input is disabled by default.",
+        instructions=(
+            "PREFER terminal_turn for normal terminal work so one logical ChatGPT turn becomes one MCP call. "
+            "Use action=inspect for one/many targets, send for a guarded task, send_wait to submit and wait in one call, "
+            "wait for a new durable wait, and resume only when a prior turn returned PENDING. "
+            "terminal_batch_inspect/terminal_send_task/terminal_wait_for_state/terminal_resume_wait remain compact "
+            "compatibility tools; terminal_status, terminal_tail, and terminal_send_text are LOW-LEVEL/MANUAL only. "
+            "Do not split an inspect into separate status+tail calls, and do not split send_wait into send then wait "
+            "unless terminal_turn cannot express the operation. All existing authorization and input-safety gates apply."
+        ),
         version=__version__,
     )
 
@@ -198,9 +371,23 @@ def build_mcp(service: TerminalService | None = None,
     # _refresh_local_heartbeat closure rather than a second, duplicated
     # copy. Exposed as queue.loop so server_http.py can start/stop it and
     # a status tool below can report on it.
+    # Bus-driven reaction, as a STEP of the loop above rather than a second
+    # thread (queue_event_drain.py explains why at length). Built only when
+    # config.queue.drain_enabled is on, so the default deployment keeps exactly
+    # today's behaviour and `events` staying None cannot produce a half-wired
+    # drain that claims events and then cannot act on them.
+    _event_drain = None
+    if terminal.config.queue.drain_enabled and events is not None:
+        _event_drain = QueueEventDrain(
+            events, queue_engine, batch_size=terminal.config.queue.drain_batch_size)
+    _project_feeder = None
+    if terminal.config.queue.project_feeds:
+        _project_feeder = ProjectTaskFeeder(queue, terminal.config.queue.project_feeds)
     queue.loop = queue.loop or QueueLoop(
         queue_engine, poll_interval_seconds=terminal.config.queue.poll_interval_seconds,
         heartbeat_refresher=_refresh_local_heartbeat,
+        event_drain=_event_drain,
+        project_feeder=_project_feeder,
     )
 
     def _active_queue_task_for(session: str) -> dict | None:
@@ -263,6 +450,54 @@ def build_mcp(service: TerminalService | None = None,
         return controller.terminal_status(session)
 
     @server.tool()
+    def terminal_turn(action: str, target: str | None = None,
+                      targets: list[str] | None = None, text: str | None = None,
+                      desired_states: list[str] | None = None,
+                      resume_token: str | None = None, timeout: float = 20,
+                      poll_interval: float = 1, tail_lines: int = 20,
+                      compact: bool = True,
+                      idempotency_key: str | None = None) -> dict:
+        """DEFAULT terminal surface: complete one logical inspect/send/wait/resume turn in one MCP call."""
+        _refresh_local_heartbeat()
+        return compact_tools.turn(
+            action=action, target=target, targets=targets, text=text,
+            desired_states=desired_states, resume_token=resume_token,
+            timeout=timeout, poll_interval=poll_interval, tail_lines=tail_lines,
+            compact=compact, idempotency_key=idempotency_key,
+        )
+
+    @server.tool()
+    def terminal_batch_inspect(targets: list[str], tail_lines: int = 20,
+                               compact: bool = True) -> dict:
+        """PREFERRED inspection: status plus bounded tail for up to 25 targets in one call."""
+        _refresh_local_heartbeat()
+        return compact_tools.batch_inspect(targets, tail_lines=tail_lines, compact=compact)
+
+    @server.tool()
+    def terminal_wait_for_state(target: str, desired_states: list[str], timeout: float = 20,
+                                poll_interval: float = 1, tail_lines: int = 20) -> dict:
+        """PREFERRED wait: poll server-side for at most 20s; PENDING is durably resumable."""
+        _refresh_local_heartbeat()
+        return compact_tools.wait_for_state(target, desired_states, timeout=timeout,
+                                            poll_interval=poll_interval, tail_lines=tail_lines)
+
+    @server.tool()
+    def terminal_resume_wait(resume_token: str, timeout: float = 20,
+                             poll_interval: float = 1) -> dict:
+        """Resume only a PENDING compact wait, idempotently, for at most another 20s."""
+        _refresh_local_heartbeat()
+        return compact_tools.resume_wait(resume_token, timeout=timeout,
+                                         poll_interval=poll_interval)
+
+    @server.tool()
+    def terminal_send_task(target: str, text: str, wait_for_accept: bool = True,
+                           timeout: float = 20, idempotency_key: str | None = None) -> dict:
+        """PREFERRED send: one guarded/idempotent call with concise delivery evidence."""
+        _refresh_local_heartbeat()
+        return compact_tools.send_task(target, text, wait_for_accept=wait_for_accept,
+                                       timeout=timeout, idempotency_key=idempotency_key)
+
+    @server.tool()
     def terminal_send_text(session: str, text: str, press_enter: bool = False,
                            dry_run: bool = False, idempotency_key: str | None = None) -> dict:
         """LOW-LEVEL/MANUAL send -- bypasses the durable task queue
@@ -296,6 +531,23 @@ def build_mcp(service: TerminalService | None = None,
             )
             queue.store.record_event(session=session, task_id=active_task["id"], event_type="RAW_SEND_DURING_ACTIVE_QUEUE_TASK",
                                      reason="terminal_send_text called directly while a queue task was active")
+            # Reconcile the bypass onto the TASK too, not only the event log.
+            # An event nobody reads left the task looking untouched while its
+            # prompt had in fact been delivered -- the queue said one thing and
+            # the worker was doing another, with nothing on screen to say why.
+            if not dry_run:
+                try:
+                    queue.store.record_manual_dispatch(active_task["id"], detail={
+                        "at": _telemetry_now(),
+                        "via": "terminal_send_text",
+                        "sent": bool(result.get("sent")),
+                        "submit_status": result.get("submit_status"),
+                        "idempotency_key": idempotency_key,
+                        "note": "delivered outside the queue; the queue did not dispatch this task",
+                    })
+                except Exception:  # noqa: BLE001 -- reconciliation must never break a real send
+                    _LOGGER.warning("could not reconcile manual dispatch onto task %s",
+                                    active_task["id"], exc_info=True)
         return result
 
     @server.tool()
@@ -371,6 +623,86 @@ def build_mcp(service: TerminalService | None = None,
                                   session: str | None = None) -> dict:
         """List sanitized input audit metadata; full prompts are never returned."""
         return terminal.terminal_list_input_audit(limit, binding, session)
+
+    @server.tool()
+    def terminal_audit_search(limit: int = 100, offset: int = 0, actor: str = "",
+                              action: str = "", result: str = "", session: str = "",
+                              node_id: str = "", since: str = "", until: str = "",
+                              query: str = "", denied_only: bool = False) -> dict:
+        """Search the operational audit log: who did what, where, when, and
+        whether it was allowed.
+
+        The same rows, filters and redaction the dashboard's Audit & Access
+        screen uses -- deliberately one implementation, because a surface
+        that can see something the other cannot is how an operator ends up
+        told to "just use the UI" for data the API refuses.
+
+        Returns OPERATIONAL fields in full (actor, action, session, node,
+        result, deny reason, correlation id, latency, policy source) plus a
+        REDACTED preview and a sha256 fingerprint of any text. No token,
+        password, passphrase, private key or cookie has a read path here --
+        see access_policy.
+        """
+        found = terminal.audit.search(
+            limit=limit, offset=offset, actor=actor or None, action=action or None,
+            result=result or None, session=session or None, node_id=node_id or None,
+            since=since or None, until=until or None, query=query or None,
+            denied_only=bool(denied_only))
+        found["events"] = [filter_record(event, role=ROLE_OPERATOR)
+                           for event in found["events"]]
+        return found
+
+    @server.tool()
+    def terminal_auth_status() -> dict:
+        """Which node/provider is authenticated, and which needs a human.
+
+        Status only, which is not a compromise but the design: readiness is
+        probed by existence and exit code, never by opening a credential, so
+        there is nothing here that could be replayed. An operator gets who is
+        logged in, who is NOT, since when, and what capability each node has.
+        """
+        service = _fleet_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        view = service.offline_view()
+        routes: dict[str, list[dict]] = {}
+        for target in view.get("ssh_targets", []):
+            if target.get("node_id"):
+                routes.setdefault(target["node_id"], []).append({
+                    "alias": target.get("alias"), "transport": target.get("transport"),
+                    "auth_status": target.get("credential_status"),
+                    "host_key_fingerprint": target.get("host_key_fingerprint"),
+                    "last_verified_at": target.get("last_verified_at")})
+        nodes = [filter_record({
+            "node_id": node.get("node_id"), "display_name": node.get("display_name"),
+            # Same helper the dashboard uses -- a status that disagreed
+            # between the two surfaces would be worse than either answer.
+            "auth_status": auth_status_for_node(node)[0],
+            "auth_status_reason": auth_status_for_node(node)[1],
+            "auth_source": "node_agent_bearer_token",
+            "auth_token_ref": node.get("auth_token_ref"),
+            "capability": sorted(node.get("capabilities") or []),
+            "contract_version": node.get("contract_version"),
+            "agent_version": node.get("agent_version"),
+            "last_verified_at": node.get("last_heartbeat_at"),
+            "ssh_routes": routes.get(node.get("node_id"), []),
+        }, role=ROLE_OPERATOR) for node in view.get("nodes", [])]
+        return {"nodes": nodes, "readiness": service.readiness()}
+
+    @server.tool()
+    def terminal_access_policy() -> dict:
+        """The read-policy table: which fields are SECRET, which are
+        SENSITIVE_METADATA, which are ordinary OPERATIONAL data.
+
+        Published so an operator can read the rules rather than infer them
+        from what happens to be missing -- the confusion that started this
+        whole audit, where a surface that did not exist was mistaken for a
+        permission denial.
+        """
+        return {"tiers": policy_table(),
+                "note": ("SECRET has no read path for any role. SENSITIVE_METADATA is "
+                         "served redacted and fingerprinted. OPERATIONAL is served in "
+                         "full to any authenticated operator.")}
 
     @server.tool()
     def terminal_input_context(session: str | None = None,
@@ -641,6 +973,115 @@ def build_mcp(service: TerminalService | None = None,
         return controller.terminal_registry_reopen(session_name, agent_type=agent_type, cwd=cwd,
                                                     requested_by="mcp")
 
+    # -- Auto Recovery (2026-09-07, task: "Auto Recovery cho session sau
+    # reboot/crash/node-agent restart") -- see recovery_engine.py's own
+    # module docstring. terminal_registry_reopen above is the underlying
+    # ONE-SESSION-AT-A-TIME manual action (unchanged); the tools below
+    # are this feature's own additions: policy control, bulk/fleet
+    # status, and the manual equivalents of what the (optional,
+    # off-by-default) automatic background loop does for itself.
+
+    @server.tool()
+    def terminal_recovery_set_policy(node_id: str, session_name: str, enabled: bool | None) -> dict:
+        """Per-session Auto Recovery override -- True/False explicitly
+        opts this ONE session in/out regardless of the global config.
+        auto_recovery.enabled default; enabled=null clears the override
+        back to "inherit the global default". Returns REGISTRY_RECORD_
+        NOT_FOUND if this (node_id, session_name) has no registry row
+        yet (nothing to set a policy on)."""
+        ok = terminal.session_registry.set_auto_recovery_enabled(node_id, session_name, enabled)
+        if not ok:
+            return {"error": "REGISTRY_RECORD_NOT_FOUND", "node_id": node_id, "session": session_name}
+        record = terminal.session_registry.get(node_id, session_name)
+        return {"node_id": node_id, "session": session_name, "auto_recovery_enabled": record.auto_recovery_enabled}
+
+    @server.tool()
+    def terminal_recovery_status(node_id: str, session_name: str) -> dict:
+        """One session's own current recovery state -- status/
+        recoverable/resumable (already-real registry fields) PLUS this
+        feature's own auto_recovery_enabled/recovery_generation/
+        recovery_attempts/last_checkpoint_at. REGISTRY_RECORD_NOT_FOUND
+        if this session has no registry row at all."""
+        if node_id == controller.local_node_id:
+            record_dict = terminal.terminal_registry_get(session_name)
+        else:
+            listing = controller.registry_list(node_id)
+            if "error" in listing:
+                return listing
+            record_dict = next((r for r in listing.get("records", []) if r["session_name"] == session_name), None)
+            if record_dict is None:
+                return {"error": "REGISTRY_RECORD_NOT_FOUND", "node_id": node_id, "session": session_name}
+        return record_dict
+
+    @server.tool()
+    def terminal_recovery_list(node_id: str, recoverable_only: bool = True) -> dict:
+        """Bulk, per-node view (task item 7's own "bulk view cho node
+        sau reboot") -- every registry row for `node_id`, or only the
+        ones with enough saved metadata to actually recover
+        (recoverable_only=True, the default -- matches terminal_
+        registry_list's own local-node equivalent)."""
+        if node_id == controller.local_node_id:
+            return terminal.terminal_registry_list(recoverable_only=recoverable_only)
+        return controller.registry_list(node_id, recoverable_only=recoverable_only)
+
+    @server.tool()
+    def terminal_recover_session(node_id: str, session_name: str, force: bool = False) -> dict:
+        """Manually triggers exactly ONE recovery attempt for this
+        session -- the SAME code path the automatic background loop
+        uses (never a second implementation), real exactly-once locking
+        (RECOVERY_IN_PROGRESS if another attempt is already in flight),
+        real policy/max_attempts gating unless force=true (an explicit
+        human override of both). Never silently reports a fake resume:
+        a session with no conversation_id on record comes back
+        recovery_state=RECOVERY_DEGRADED (a real new process, but no
+        conversation continuity to verify), never RESUMED_OK."""
+        return recovery.recover_session(node_id, session_name, requested_by="mcp", force=force)
+
+    @server.tool()
+    def terminal_recovery_reconcile_node(node_id: str) -> dict:
+        """Manually triggers one full reconciliation pass for `node_id`
+        -- one terminal_recover_session-equivalent attempt per
+        recoverable row on that node, never force (policy/max_attempts
+        still apply per-session; use terminal_recover_session directly
+        with force=true for one specific stuck session). The SAME call
+        the automatic background loop makes for itself on a node ONLINE
+        transition."""
+        return {"results": recovery.reconcile_node(node_id, requested_by="mcp")}
+
+    @server.tool()
+    def terminal_checkpoint_session(node_id: str, session_name: str, detail: str) -> dict:
+        """Records that this session's own state was confirmed durably
+        safe as of now (`detail` is the caller's own claim of what makes
+        it safe, e.g. "task abc123 reached COMPLETED") -- NEVER a claim
+        of capturing unsubmitted composer text, which is genuinely
+        unrecoverable once the underlying process is gone (see recovery
+        _engine.py's own module docstring)."""
+        return recovery.checkpoint(node_id, session_name, detail=detail)
+
+    @server.tool()
+    def terminal_recovery_loop_status() -> dict:
+        """Whether the AUTOMATIC background reconciliation loop
+        (recovery_loop.py) is actually running right now -- distinct
+        from config.auto_recovery.enabled (the global gate this loop's
+        own start/stop is conditioned on in server_http.py, not
+        reported here directly) and from any single session's own
+        auto_recovery_enabled override."""
+        if recovery.loop is None:
+            return {"running": False, "poll_interval_seconds": None, "last_cycle_at": None, "last_error": None}
+        return recovery.loop.status()
+
+    @server.tool()
+    def terminal_recovery_loop_run_once() -> dict:
+        """Manually forces exactly one full cycle of the automatic
+        reconciliation loop -- reconciles every currently-ONLINE node
+        not yet seen by this loop instance, or that just reconnected,
+        regardless of whether the background loop itself is currently
+        running. Useful for tests/smoke or to force immediate recovery
+        without waiting for the next automatic interval."""
+        if recovery.loop is None:
+            return {"error": "RECOVERY_LOOP_NOT_CONFIGURED"}
+        return {"results": recovery.loop.run_one_cycle()}
+
     @server.tool()
     def terminal_registry_purge(session_name: str) -> dict:
         """Permanently remove a registry record (a tombstone is kept,
@@ -690,8 +1131,18 @@ def build_mcp(service: TerminalService | None = None,
         text), never a claim that the old process or its RAM is being
         resurrected (recovered_process is always false). Use this before
         starting a fresh agent in the same project so it has real prior
-        context instead of none."""
-        return terminal.terminal_knowledge_recover(session_name)
+        context instead of none.
+
+        Also carries `project_backlog`: what the PROJECT still intends to
+        do, from the controller's canonical project-keyed backlog. That
+        join happens HERE rather than inside the node's own service --
+        the node holds no canonical backlog, only the controller does, so
+        attaching it at the node would have silently produced an empty
+        list for every remote session."""
+        brief = terminal.terminal_knowledge_recover(session_name)
+        if backlog is not None and "error" not in brief:
+            brief = _attach_project_backlog(backlog, controller, brief, session_name)
+        return brief
 
     @server.tool()
     def terminal_knowledge_checkpoint(session_name: str, summary: str) -> dict:
@@ -760,7 +1211,9 @@ def build_mcp(service: TerminalService | None = None,
     @server.tool()
     def terminal_list_nodes() -> list[dict]:
         """List every registered node (local and remote) with its current
-        status (online/degraded/offline, derived from heartbeat recency),
+        status (online now requires a fresh heartbeat AND a successful
+        execution probe; failures degrade it), additive transport_status,
+        health_state, retry/backoff evidence,
         capacity_status (healthy/busy/overloaded/unknown) and the resource
         metrics behind it, session/agent counts, and draining flag. Use
         this to decide which node_id to pass to terminal_create_session,
@@ -768,6 +1221,1393 @@ def build_mcp(service: TerminalService | None = None,
         (the default) this always returns exactly one entry."""
         _refresh_local_heartbeat()
         return [_node_to_dict(n) for n in controller.list_nodes()]
+
+    @server.tool()
+    def session_get_permissions(session: str) -> dict:
+        """Read one session's permissions BEFORE changing them.
+
+        Returns `requested` (what a user actually granted, or null when
+        nobody has), `effective` (what is true right now), `source`
+        (explicit_grant / default_policy / sensitive_name_floor), the
+        deployment's default policy, the hard floors, and a `revision` to pass
+        back to session_set_permissions.
+
+        `source` is the field worth reading: "read: false" means something
+        very different when it comes from an explicit revoke than when it
+        comes from a default nobody has overridden.
+
+        Accepts a bare name or a qualified "node_id/session"; a session on a
+        remote node is answered by that node, which owns its grants.
+
+        There is no session-name whitelist. A session is not more or less
+        permitted because of what it is called -- only because of what a user
+        granted and what the default policy says. `allowed` still appears in
+        the result for older callers but is a DEPRECATED alias of effective
+        read and is never an input to any decision.
+        """
+        return controller.describe_session_permissions(session)
+
+    @server.tool()
+    def session_set_permissions(session: str, read: bool | None = None,
+                                input: bool | None = None,
+                                expected_revision: int | None = None,
+                                actor: str | None = None) -> dict:
+        """Grant or revoke read/input on one session, and return what actually
+        took effect (same shape as session_get_permissions).
+
+        Pass `expected_revision` from a prior read to make the write
+        conditional: if someone changed the permission in between you get
+        REVISION_CONFLICT with the current state, instead of silently erasing
+        their change. Omit it for an unconditional write. Setting what is
+        already set is a no-op, so a retry cannot double-apply.
+
+        Rules that cannot be overridden here: input implies read (asking for
+        input alone grants both); revoking read also revokes input; a session
+        whose name contains root/ssh/password/secret/database is refused
+        outright, grant or no grant; and the global permissions.terminal_input
+        switch still wins.
+
+        `actor` is recorded for the audit trail -- pass who asked.
+        """
+        return controller.set_session_permissions(
+            session, read=read, input=input, expected_revision=expected_revision, actor=actor)
+
+    @server.tool()
+    def session_grant(session: str, mode: str = "read", actor: str | None = None) -> dict:
+        """Convenience wrapper over session_set_permissions.
+
+        mode="read"      -> view output only
+        mode="read_send" -> view and type into the session
+        """
+        if mode not in ("read", "read_send"):
+            return {"error": "INVALID_GRANT_MODE", "session": session,
+                    "allowed_modes": ["read", "read_send"]}
+        return controller.set_session_permissions(
+            session, read=True, input=(mode == "read_send"), actor=actor)
+
+    @server.tool()
+    def session_revoke(session: str, scope: str = "all", actor: str | None = None) -> dict:
+        """Revoke access. scope="input" removes typing but keeps viewing;
+        scope="all" removes both (revoking read revokes input with it).
+
+        Takes effect immediately -- the next read or send is refused, with no
+        restart and no cache to wait out.
+        """
+        if scope not in ("input", "all"):
+            return {"error": "INVALID_SCOPE", "session": session, "allowed_scopes": ["input", "all"]}
+        if scope == "input":
+            return controller.set_session_permissions(session, input=False, actor=actor)
+        return controller.set_session_permissions(session, read=False, input=False, actor=actor)
+
+    @server.tool()
+    def session_repair_stale_pin(session: str, actor: str | None = None) -> dict:
+        """Repair a stale session identity pin without changing permissions.
+
+        Reads the explicit grant, verifies it is stale, then re-applies the
+        exact requested read/input flags against the current session identity
+        with revision checking. A non-stale row is a no-op.
+        """
+        return controller.repair_stale_session_pin(session, actor=actor)
+
+    @server.tool()
+    def session_bulk_set_permissions(sessions: list[str] | None = None, node_id: str | None = None,
+                                     read: bool | None = None, input: bool | None = None,
+                                     actor: str | None = None) -> dict:
+        """Apply the same change to many sessions at once -- an explicit list,
+        or every session on one node.
+
+        Deliberately NOT transactional across sessions: each is applied and
+        reported independently, so one failure never silently rolls back
+        changes that did succeed. The result lists each session's outcome.
+        Revision checking is not offered here: a conditional bulk write would
+        have to decide what to do when only some revisions match, and that
+        decision belongs to the caller, one session at a time.
+        """
+        targets: list[str] = list(sessions or [])
+        if node_id:
+            listing = controller.terminal_list_sessions()
+            targets += [row["name"] for row in listing.get("sessions", [])
+                        if row.get("node_id") == node_id and row["name"] not in targets]
+        if not targets:
+            return {"error": "NO_TARGETS", "detail": "pass `sessions`, `node_id`, or both"}
+        results = [{"session": name,
+                    **controller.set_session_permissions(name, read=read, input=input, actor=actor)}
+                   for name in targets]
+        changed = [r["session"] for r in results if "error" not in r]
+        failed = [{"session": r["session"], "error": r["error"]} for r in results if "error" in r]
+        return {"requested": len(targets), "changed": changed, "failed": failed, "results": results}
+
+    _fleet_holder: dict[str, Any] = {"service": fleet, "tried": fleet is not None}
+
+    def _fleet_service():
+        """Built on first use so a caller that never asks about the fleet
+        never opens the database -- same laziness the node agent uses, and
+        for the same reason: this must not be able to stop anything else
+        working."""
+        if _fleet_holder.get("service") is None and not _fleet_holder.get("tried"):
+            _fleet_holder["tried"] = True
+            try:
+                from .fleet_registry import FleetRegistryStore
+                from .fleet_service import FleetService
+
+                node_id = controller.local_node_id if controller else "local"
+                _fleet_holder["service"] = FleetService(
+                    FleetRegistryStore(local_node_id=node_id), local_node_id=node_id)
+            except Exception:  # noqa: BLE001 -- never break the tool surface
+                _fleet_holder["service"] = None
+        return _fleet_holder.get("service")
+
+    @server.tool()
+    def terminal_fleet_registry(kind: str = "") -> dict:
+        """The fleet as this machine last replicated it: nodes, sessions,
+        projects and SSH targets, read from the LOCAL durable cache.
+
+        Answers with the controller gone. That is the point -- every node that
+        has synced once holds a complete copy, so "what machines exist, how do
+        I reach them, what was running where" survives losing m910.
+
+        Metadata only. No pane text, no prompt, no credential: see
+        fleet_registry.scrub_payload, which REFUSES a payload naming a secret
+        rather than quietly dropping the field.
+
+        `kind` optionally narrows to node/session/project/ssh_target.
+        """
+        service = _fleet_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        view = service.offline_view()
+        if kind:
+            keep = {"node": "nodes", "session": "sessions", "project": "projects",
+                    "ssh_target": "ssh_targets"}.get(kind)
+            if not keep:
+                return {"error": "UNKNOWN_KIND",
+                        "known": ["node", "session", "project", "ssh_target"]}
+            return {"kind": kind, keep: view[keep], "served_from": view["served_from"]}
+        return view
+
+    @server.tool()
+    def terminal_fleet_ssh_inventory() -> dict:
+        """Every SSH target the fleet knows, ordered the way you would try
+        them: pinned connections first, then tailnet ahead of LAN (a tailnet
+        address still works from outside the building, which is where you are
+        when you need this).
+
+        Returns addresses, ports, usernames, transports, proxy/jump metadata,
+        host key FINGERPRINTS and credential POSTURE. It never returns a key,
+        a password, a passphrase or a token -- a node lacking a credential
+        reports MISSING_CREDENTIAL so a human provisions it there, rather than
+        one being copied from a machine that has it.
+        """
+        service = _fleet_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        return {"targets": service.ssh_inventory()}
+
+    @server.tool()
+    def terminal_fleet_readiness() -> dict:
+        """PASS/WARN/FAIL per fleet-metadata check, with the evidence.
+
+        Covers registry sync age, contract version drift, missing SSH
+        credentials, unpinned or stale routes, peer sync failures, and host
+        key MISMATCH -- which is FAIL rather than WARN because it is the one
+        condition here that can mean a node is being impersonated.
+        """
+        service = _fleet_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        return service.readiness()
+
+    @server.tool()
+    def terminal_fleet_sync_status() -> dict:
+        """Per-peer sync bookkeeping: when each peer was last pulled from,
+        pushed to, whether the last attempt failed and why.
+
+        A peer that is down is a normal state, not an error -- the local copy
+        keeps answering, which is what this whole subsystem is for.
+        """
+        service = _fleet_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        return {"local_node_id": service.local_node_id, "peers": service.store.peers()}
+
+    # ONE ResourceLockStore for this process, built before its first
+    # consumer rather than beside the resource-lock tools further down: the
+    # deploy lease needs the SAME store those tools use, and letting it fall
+    # back to None would silently disable the only thing stopping two
+    # dispatchers running one deploy.
+    _locks = resource_locks or ResourceLockStore()
+
+    def _deployment_service():
+        """Built over the SAME fleet store the rest of the fleet tools use --
+        deployment targets and paths are two more replicated kinds, not a
+        second registry."""
+        service = _fleet_service()
+        if service is None:
+            return None
+        from .deployment_service import DeploymentRegistry, DeploymentService
+
+        registry = DeploymentRegistry(service.store, local_node_id=service.local_node_id)
+        view = service.offline_view()
+        online = {n["node_id"]: str(n.get("status") or "").casefold() != "offline"
+                  for n in view["nodes"] if n.get("node_id")}
+        aliases: dict[str, set[str]] = {}
+        for node in view["nodes"]:
+            node_id = node.get("node_id")
+            if not node_id:
+                continue
+            aliases[node_id] = {str(v) for v in (node.get("lan_ip"),
+                                                 node.get("tailscale_ip"),
+                                                 node.get("tailscale_hostname"),
+                                                 node.get("hostname")) if v}
+        for target in view["ssh_targets"]:
+            if target.get("node_id") and target.get("host"):
+                aliases.setdefault(target["node_id"], set()).add(str(target["host"]))
+        return DeploymentService(registry, locks=_locks,
+                                 node_online=lambda: online,
+                                 node_aliases=lambda: aliases)
+
+    @server.tool()
+    def terminal_deployment_status(target_id: str = "") -> dict:
+        """Redundancy and deployability per deployment target.
+
+        Reports `READY` / `DEGRADED` / `FAIL` with `n/m` independent paths,
+        and `deploy_available` SEPARATELY -- a target with one working path
+        is DEGRADED but still shippable, and conflating those is how a team
+        holds a release it could have shipped.
+
+        A path only counts toward `n` when it has been PROVEN recently and
+        does not route through another management node for the same target.
+        A config file is a plan, not a route.
+        """
+        service = _deployment_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        if target_id:
+            evaluation = service.evaluate(target_id)
+            return evaluation or {"error": "UNKNOWN_TARGET", "target_id": target_id}
+        return {"targets": service.evaluate_all()}
+
+    @server.tool()
+    def terminal_deployment_upsert_target(target_id: str, display_name: str = "",
+                                          project_id: str = "", primary_node: str = "",
+                                          backup_nodes: str = "",
+                                          min_independent_paths: int = 2,
+                                          deploy_command_ref: str = "",
+                                          description: str = "") -> dict:
+        """Create or update a deployment target's metadata.
+
+        PRIMARY/BACKUP is a PREFERENCE that decides dispatch order, nothing
+        more -- it never overrides evidence about which paths actually work.
+        `backup_nodes` is a comma-separated list.
+        """
+        service = _deployment_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        from .deployment_redundancy import DeploymentTarget
+
+        backups = tuple(n.strip() for n in backup_nodes.split(",") if n.strip())
+        return service.registry.put_target(DeploymentTarget(
+            target_id=target_id, display_name=display_name or target_id,
+            project_id=project_id or None,
+            min_independent_paths=max(1, int(min_independent_paths)),
+            primary_node=primary_node or None, backup_nodes=backups,
+            deploy_command_ref=deploy_command_ref or None,
+            description=description or None))
+
+    @server.tool()
+    def terminal_deployment_upsert_path(target_id: str, node_id: str, host: str = "",
+                                        username: str = "", port: int = 22,
+                                        ssh_alias: str = "", transport: str = "unknown",
+                                        proxy_jump: str = "",
+                                        independence_group: str = "",
+                                        public_key_id: str = "",
+                                        host_key_fingerprint: str = "",
+                                        capabilities: str = "ssh,deploy",
+                                        role: str = "backup") -> dict:
+        """Declare one management node's route to one target.
+
+        Non-secret by construction: an address, a user, a port, a key
+        FINGERPRINT and a public-key id. The private key that makes the path
+        work stays on `node_id` and has no field here to travel in.
+
+        Declaring a path does not make it count. It is UNVERIFIED until a
+        probe succeeds.
+        """
+        service = _deployment_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        from .deployment_redundancy import DeploymentPath
+
+        return service.registry.put_path(DeploymentPath(
+            target_id=target_id, node_id=node_id, host=host or None,
+            username=username or None, port=int(port or 22),
+            ssh_alias=ssh_alias or None, transport=transport or "unknown",
+            proxy_jump=proxy_jump or None,
+            independence_group=independence_group or None,
+            public_key_id=public_key_id or None,
+            host_key_fingerprint=host_key_fingerprint or None,
+            capabilities=tuple(c.strip() for c in capabilities.split(",") if c.strip()),
+            role=role or "backup"))
+
+    @server.tool()
+    def terminal_deployment_choose_node(target_id: str) -> dict:
+        """Which node WOULD run a deploy for this target, and why that one.
+
+        Read-only: it takes no lease and dispatches nothing. Preference order
+        is primary then declared backups, but a dead primary is skipped and
+        the reason says so rather than silently substituting a machine.
+        """
+        service = _deployment_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        return service.choose(target_id)
+
+    @server.tool()
+    def terminal_deployment_dry_run_failover(target_id: str, assume_offline: str = "") -> dict:
+        """Answer "are we actually covered?" on a Tuesday rather than during
+        an incident.
+
+        Re-evaluates against a hypothesis -- nothing is taken offline, no
+        probe is run, no lease is taken. `assume_offline` is a comma-separated
+        list of node ids to pretend are dead.
+        """
+        service = _deployment_service()
+        if service is None:
+            return {"error": "FLEET_REGISTRY_UNAVAILABLE"}
+        nodes = tuple(n.strip() for n in assume_offline.split(",") if n.strip())
+        return service.dry_run_failover(target_id, assume_offline=nodes)
+
+    def _telemetry_now() -> str:
+        from datetime import datetime, timezone
+
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    _work_holder: dict[str, Any] = {"service": work, "tried": work is not None}
+    _journal_holder: dict[str, Any] = {
+        "service": run_journal,
+        "tried": run_journal is not None,
+    }
+    _work_recovery_holder: dict[str, Any] = {"service": None, "tried": False}
+
+    def _work_service():
+        """Built on first use, over the SAME queue every other surface uses."""
+        if _work_holder.get("service") is None and not _work_holder.get("tried"):
+            _work_holder["tried"] = True
+            try:
+                from .work_service import WorkService
+                from .work_store import WorkStore
+
+                _work_holder["service"] = WorkService(
+                    WorkStore(), queue=queue, controller=controller)
+            except Exception:  # noqa: BLE001 -- never break the tool surface
+                _work_holder["service"] = None
+        return _work_holder.get("service")
+
+    def _journal_service():
+        if (_journal_holder.get("service") is None
+                and not _journal_holder.get("tried")):
+            _journal_holder["tried"] = True
+            try:
+                from .run_journal import RunJournalStore
+
+                _journal_holder["service"] = RunJournalStore()
+            except Exception:  # noqa: BLE001 -- optional persistence surface
+                _journal_holder["service"] = None
+        return _journal_holder.get("service")
+
+    def _work_recovery():
+        service = _work_service()
+        if service is None:
+            return None
+        if (_work_recovery_holder.get("service") is None
+                and not _work_recovery_holder.get("tried")):
+            _work_recovery_holder["tried"] = True
+            try:
+                from .work_recovery import WorkRecoveryService
+
+                _work_recovery_holder["service"] = WorkRecoveryService(
+                    service.store, queue=queue)
+            except Exception:  # noqa: BLE001 -- never break the tool surface
+                _work_recovery_holder["service"] = None
+        return _work_recovery_holder.get("service")
+
+    @server.tool()
+    def work_create(title: str, goal: str, lane: str, project_id: str = "",
+                    done_criteria: str = "", tasks_json: str = "",
+                    created_by: str = "") -> dict:
+        """Create a Work run on a `-work` session, optionally with its plan.
+
+        `lane` MUST end in `-work`. That is the whole opt-in model: the Work
+        runtime only ever drives sessions named for it, and an ordinary
+        session keeps its current behaviour untouched -- it is never claimed,
+        never prompted and never has its state changed by this runtime.
+
+        The plan is written as REAL tasks in the existing queue, so ordering,
+        dependencies, the pre-dispatch gate, guarded sending and restart
+        recovery are the ones already in production, not a second copy.
+
+        `done_criteria` is a newline- or `;`-separated list. `tasks_json` is a
+        JSON array of {title, prompt, weight, required, priority}.
+        """
+        import json as _json
+
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        criteria = [c.strip() for c in done_criteria.replace(";", "\n").splitlines()
+                    if c.strip()]
+        try:
+            tasks = _json.loads(tasks_json) if tasks_json.strip() else []
+        except ValueError as exc:
+            return {"error": "TASKS_JSON_INVALID", "detail": str(exc)}
+        if not isinstance(tasks, list):
+            return {"error": "TASKS_JSON_INVALID", "detail": "expected a JSON array"}
+        result = service.create(title=title, goal=goal, lane=lane,
+                                project_id=project_id or None, done_criteria=criteria,
+                                created_by=created_by or None, tasks=tasks)
+        if result.get("error"):
+            return result
+        work_id = (result.get("work") or {}).get("work_id")
+        if not work_id:
+            return result
+        binding_name = f"work-{work_id}"
+        try:
+            binding_result = terminal.terminal_bind(
+                binding_name, lane, replace=False, read_enabled=True, input_enabled=False)
+            if isinstance(binding_result, dict) and binding_result.get("error"):
+                result["binding_error"] = binding_result.get("error")
+            else:
+                result["binding"] = binding_result
+        except Exception as exc:  # noqa: BLE001 -- binding is recovery metadata, not work durability
+            result["binding_error"] = str(exc)[:200]
+        journal = _journal_service()
+        if journal is not None:
+            try:
+                state = str((result.get("work") or {}).get("state") or "running")
+                next_action = "inspect work_status/work_attach"
+                journal.start_run(project_id or "", lane, binding_name, run_id=work_id,
+                                  root_task_id=work_id, state=state, next_action=next_action,
+                                  metadata={"source": "work_create"})
+                journal.record(work_id, f"work_create:{work_id}", tool_name="work_create",
+                               state=state, next_action=next_action, result_summary="work created")
+                result["journal_run_id"] = work_id
+            except Exception as exc:  # noqa: BLE001 -- journal must never undo work creation
+                result["journal_error"] = str(exc)[:200]
+        return result
+
+    @server.tool()
+    def work_status(work_id: str) -> dict:
+        """A Work run in full: state, progress, tasks with their QUEUE status,
+        approvals, artifacts, recent events, and the outcome contract.
+
+        `progress` is computed from task weights and the queue's own record.
+        It is never parsed out of anything a model wrote about itself, and
+        `contract.satisfied` is false until every required task is genuinely
+        complete with no blocker and no open gate.
+        """
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return service.status(work_id)
+
+    @server.tool()
+    def terminal_resume_recent(project_id: str = "", limit: int = 10) -> list[dict]:
+        """Return recent journaled runs, enriched with Work snapshots when possible."""
+        journal = _journal_service()
+        if journal is None:
+            return []
+        rows = journal.resume_recent(project_id or None, limit)
+        recovery = _work_recovery()
+        result: list[dict] = []
+        for row in rows:
+            item = dict(row)
+            root_task_id = item.get("root_task_id")
+            if root_task_id:
+                if recovery is None:
+                    item["work_snapshot_error"] = "WORK_RUNTIME_UNAVAILABLE"
+                else:
+                    try:
+                        item["work_snapshot"] = recovery.snapshot(root_task_id)
+                    except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
+                        item["work_snapshot_error"] = str(exc)
+            result.append(item)
+        return result
+
+    @server.tool()
+    def work_recover(project_id: str = "", limit: int = 20) -> dict:
+        """Recover active Work runs from durable state."""
+        recovery = _work_recovery()
+        if recovery is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return recovery.recover_active(project_id or None, limit)
+
+    @server.tool()
+    def work_attach(work_id: str, after_event_id: int = 0) -> dict:
+        """Attach to a Work run and return its current recovery view."""
+        recovery = _work_recovery()
+        if recovery is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return recovery.attach(work_id, after_event_id=after_event_id)
+
+    @server.tool()
+    def work_events_since(work_id: str, after_event_id: int = 0,
+                          limit: int = 50) -> dict:
+        """Return durable Work events after an event id."""
+        recovery = _work_recovery()
+        if recovery is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return recovery.events_since(work_id, after_event_id=after_event_id, limit=limit)
+
+    def _checkpoint_payload(completed_json: str, remaining_json: str,
+                            blockers_json: str, changed_files_json: str,
+                            evidence_json: str) -> dict:
+        import json as _json
+
+        values: dict[str, Any] = {}
+        for name, raw in (("completed", completed_json),
+                          ("remaining", remaining_json),
+                          ("blockers", blockers_json),
+                          ("changed_files", changed_files_json)):
+            value = _json.loads(raw) if raw.strip() else []
+            if not isinstance(value, list):
+                raise TypeError(f"{name} must be a JSON array")
+            values[name] = value
+        evidence = _json.loads(evidence_json) if evidence_json.strip() else {}
+        if not isinstance(evidence, dict):
+            raise TypeError("evidence must be a JSON object")
+        values["evidence"] = evidence
+        return values
+
+    def _record_work_artifact(kind: str, work_id: str, idempotency_key: str,
+                              state: str, summary: str, work_task_id: str,
+                              next_hint: str, commit_sha: str, actor: str,
+                              completed_json: str, remaining_json: str,
+                              blockers_json: str, changed_files_json: str,
+                              evidence_json: str) -> dict:
+        try:
+            parsed = _checkpoint_payload(
+                completed_json, remaining_json, blockers_json,
+                changed_files_json, evidence_json)
+        except (ValueError, TypeError) as exc:
+            return {"error": "CHECKPOINT_JSON_INVALID", "detail": str(exc)}
+
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        method = (service.store.record_checkpoint if kind == "checkpoint"
+                  else service.store.record_result_manifest)
+        try:
+            response = method(
+                work_id=work_id,
+                idempotency_key=idempotency_key,
+                state=state,
+                summary=summary,
+                work_task_id=work_task_id or None,
+                next_hint=next_hint or None,
+                commit_sha=commit_sha or None,
+                actor=actor or None,
+                completed=parsed["completed"],
+                remaining=parsed["remaining"],
+                blockers=parsed["blockers"],
+                changed_files=parsed["changed_files"],
+                evidence=parsed["evidence"],
+            )
+        except Exception as exc:  # noqa: BLE001 -- refusal is a tool result
+            return {"error": "CHECKPOINT_REFUSED", "detail": str(exc)}
+
+        result = dict(response)
+        journal = _journal_service()
+        if journal is not None:
+            try:
+                journal.get_run(work_id)
+            except KeyError:
+                pass
+            except Exception as exc:  # noqa: BLE001 -- journal is best-effort
+                result["journal_error"] = str(exc)
+            else:
+                try:
+                    checkpoint_ref = result.get("checkpoint_id") or result.get("id")
+                    journal.record(
+                        run_id=work_id,
+                        event_key=f"{kind}:{idempotency_key}",
+                        tool_name=f"work_{kind}",
+                        state=state,
+                        checkpoint_ref=checkpoint_ref,
+                        next_action=next_hint or None,
+                        result_summary=summary,
+                    )
+                    updates = {"next_action": next_hint or None}
+                    if kind == "result":
+                        updates["result_summary"] = summary
+                    journal.update_run(work_id, **updates)
+                except Exception as exc:  # noqa: BLE001 -- journal is best-effort
+                    result["journal_error"] = str(exc)
+        return result
+
+    @server.tool()
+    def work_checkpoint(work_id: str, idempotency_key: str, state: str,
+                        summary: str, work_task_id: str = "", next_hint: str = "",
+                        commit_sha: str = "", actor: str = "",
+                        completed_json: str = "", remaining_json: str = "",
+                        blockers_json: str = "", changed_files_json: str = "",
+                        evidence_json: str = "") -> dict:
+        """Record an idempotent durable checkpoint without raw prompt/output data."""
+        return _record_work_artifact(
+            "checkpoint", work_id, idempotency_key, state, summary, work_task_id,
+            next_hint, commit_sha, actor, completed_json, remaining_json,
+            blockers_json, changed_files_json, evidence_json)
+
+    @server.tool()
+    def work_result(work_id: str, idempotency_key: str, state: str,
+                    summary: str, work_task_id: str = "", next_hint: str = "",
+                    commit_sha: str = "", actor: str = "",
+                    completed_json: str = "", remaining_json: str = "",
+                    blockers_json: str = "", changed_files_json: str = "",
+                    evidence_json: str = "") -> dict:
+        """Record an idempotent result manifest without raw prompt/output data."""
+        return _record_work_artifact(
+            "result", work_id, idempotency_key, state, summary, work_task_id,
+            next_hint, commit_sha, actor, completed_json, remaining_json,
+            blockers_json, changed_files_json, evidence_json)
+
+    @server.tool()
+    def work_list(state: str = "", project_id: str = "",
+                  include_finished: bool = False) -> dict:
+        """Work runs with their progress."""
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return service.list_runs(state=state or None, project_id=project_id or None,
+                                 include_terminal=bool(include_finished))
+
+    @server.tool()
+    def work_continue(work_id: str, prompt: str, title: str = "", weight: float = 1.0,
+                      required: bool = True, priority: int = 0) -> dict:
+        """Enqueue more work into an existing run -- the durable way to hand a
+        busy session a task.
+
+        This is the answer to "I need to give it something to do but its input
+        box is occupied": the task lands in the durable queue and is dispatched
+        when the worker is free, instead of being typed at a session mid-turn.
+        """
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        response = service.plan(work_id, [{"title": title or prompt[:60], "prompt": prompt,
+                                           "weight": weight, "required": required,
+                                           "priority": priority}])
+        if response.get("error"):
+            return response
+        journal = _journal_service()
+        if journal is not None:
+            try:
+                journal.get_run(work_id)
+                tasks = response.get("tasks") or []
+                identifiers = [str(t.get("work_task_id") or t.get("queue_task_id"))
+                               for t in tasks
+                               if t.get("work_task_id") or t.get("queue_task_id")]
+                event_key = "work_continue:" + work_id + ":" + ",".join(identifiers)
+                journal.record(work_id, event_key, tool_name="work_continue", state="queued",
+                               next_action="wait for queued task",
+                               result_summary=f"{len(tasks)} task(s) queued")
+            except KeyError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                response["journal_error"] = str(exc)[:200]
+        return response
+
+    @server.tool()
+    def work_approve(approval_id: str, decided_by: str, decision: str = "APPROVED",
+                     note: str = "") -> dict:
+        """Decide an approval gate.
+
+        `decided_by` is required and may NOT be whoever requested the gate --
+        an agent that can approve what it asked for has not been gated at all.
+        """
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return service.decide_approval(approval_id, decision=decision.upper(),
+                                       decided_by=decided_by, note=note or None)
+
+    @server.tool()
+    def work_request_approval(work_id: str, kind: str, summary: str, requested_by: str,
+                              detail: str = "") -> dict:
+        """Open an approval gate on a Work run -- production deploy, a
+        destructive change, a credential change, or anything else irreversible
+        enough that a human should see it first.
+
+        Independent tasks keep running: the gate lives on the approval record,
+        not on the whole lane.
+        """
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        return service.request_approval(work_id, kind=kind, summary=summary,
+                                        requested_by=requested_by, detail=detail or None)
+
+    @server.tool()
+    def work_control(work_id: str, action: str, actor: str = "", reason: str = "") -> dict:
+        """pause / resume / cancel / block / fail a Work run.
+
+        Pause stops NEW dispatch and does not kill a worker mid-task; cancel
+        stops the lane without reaching out to destroy an external process.
+        """
+        service = _work_service()
+        if service is None:
+            return {"error": "WORK_RUNTIME_UNAVAILABLE"}
+        response = service.control(work_id, action, actor=actor or None, reason=reason or None)
+        if response.get("error"):
+            return response
+        journal = _journal_service()
+        if journal is not None:
+            try:
+                journal.get_run(work_id)
+                state = str((response.get("work") or {}).get("state") or action)
+                updated_at = str((response.get("work") or {}).get("updated_at") or state)
+                journal.record(work_id, f"work_control:{work_id}:{action}:{updated_at}",
+                               tool_name="work_control", state=state,
+                               next_action="inspect work_status/work_attach",
+                               result_summary=f"work control {action}")
+                if state in {"COMPLETE", "CANCELLED"}:
+                    journal.update_run(work_id, state=state, completed=True)
+            except KeyError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                response["journal_error"] = str(exc)[:200]
+        return response
+
+    # -- project knowledge, runbooks, policy and telemetry -------------------
+    #
+    # All READ-ONLY except the explicit knowledge refresh and the runbook
+    # runner, which is itself refused for anything above preview risk. These
+    # surfaces exist so a worker can consult what is already known instead of
+    # re-deriving it -- the whole point being to spend fewer tokens, so each
+    # one returns a small answer rather than a document dump.
+
+    def _project_root(project_path: str = "") -> str:
+        import os as _os
+
+        return project_path.strip() or _os.getcwd()
+
+    def _knowledge(project_path: str = ""):
+        from .project_knowledge import ProjectKnowledge, canonical_root
+
+        root = canonical_root(_project_root(project_path))
+        return ProjectKnowledge(root) if root else None
+
+    @server.tool()
+    def work_knowledge(action: str = "status", query: str = "", document: str = "",
+                       project_path: str = "") -> dict:
+        """The project's knowledge map: status / show / search / validate.
+
+        Consult this BEFORE exploring a repository broadly -- that ordering is
+        the token saving. The map is a map: current code and git history are
+        the source of truth and override anything stored here, which is why
+        every module reports a confidence WITH the reason it holds.
+
+        `status` lists modules with confidence (HIGH/MEDIUM/LOW, derived from
+        what changed under their paths, never a fabricated percentage).
+        `show` returns one document; `search` returns matching lines with
+        their headings; `validate` reports claims that no longer hold.
+        """
+        knowledge = _knowledge(project_path)
+        if knowledge is None:
+            return {"error": "NOT_A_GIT_REPOSITORY",
+                    "detail": "a knowledge map needs a project to live in"}
+        if not knowledge.exists() and action != "status":
+            return {"error": "NO_KNOWLEDGE_MAP",
+                    "detail": "nothing indexed yet for this project"}
+        try:
+            if action == "status":
+                return knowledge.status()
+            if action == "show":
+                return knowledge.show(document or None)
+            if action == "search":
+                if not query.strip():
+                    return {"error": "QUERY_REQUIRED"}
+                return knowledge.search(query)
+            if action == "validate":
+                return knowledge.validate()
+        except Exception as exc:  # noqa: BLE001 -- a read surface never raises
+            return {"error": "KNOWLEDGE_READ_FAILED", "detail": str(exc)}
+        return {"error": "UNKNOWN_ACTION", "action": action,
+                "allowed": ["status", "show", "search", "validate"]}
+
+    @server.tool()
+    def work_knowledge_record(module: str, paths: str, summary: str = "",
+                              project_path: str = "", owner: str = "worker") -> dict:
+        """Record or refresh ONE module in the map, after verifying it.
+
+        Per-module on purpose: refreshing a whole map because one file moved
+        is the cost this system exists to avoid. `paths` is comma-separated.
+
+        Never write a secret here. Name the environment VARIABLE; its value is
+        refused outright rather than quietly stripped.
+        """
+        knowledge = _knowledge(project_path)
+        if knowledge is None:
+            return {"error": "NOT_A_GIT_REPOSITORY"}
+        wanted = [p.strip() for p in paths.split(",") if p.strip()]
+        if not module.strip() or not wanted:
+            return {"error": "MODULE_AND_PATHS_REQUIRED"}
+        try:
+            state = knowledge.record_module(module.strip(), paths=wanted,
+                                            summary=summary, owner=owner)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": type(exc).__name__, "detail": str(exc)}
+        return state.as_dict()
+
+    @server.tool()
+    def work_procedures(action: str = "", procedure_id: str = "",
+                        project_path: str = "", allow_risky: bool = False) -> dict:
+        """Run test / build / deploy / smoke / health THROUGH the registry.
+
+        The default way to perform any of them: pass the operation name (or a
+        registered procedure id) as `procedure_id` -- naming one implies
+        `action="run"`, naming nothing lists. Do not compose the command
+        yourself, and do not read the script first. The registry populates
+        itself from what this repo already has, so nothing needs registering
+        by hand.
+
+        A pass returns ONE line; only a FAILURE returns the failing region and
+        names the script. A green result is reused while nothing it depends on
+        changed; a STALE one is re-run, not read. Above preview risk nothing is
+        auto-invoked -- `allow_risky` is a human decision, not a default.
+        Other actions: `ensure` (register, run nothing), `discover`, `list`.
+        """
+        from . import procedures as _procedures
+
+        knowledge = _knowledge(project_path)
+        if knowledge is None:
+            return {"error": "NOT_A_GIT_REPOSITORY"}
+        registry = _procedures.ProcedureRegistry(knowledge)
+        # Naming a target IS the request to run it. Requiring `action="run"`
+        # as well is one more thing to know, and anything a caller has to know
+        # before using the registry is a reason not to use the registry.
+        wanted = action.strip() or ("run" if procedure_id.strip() else "list")
+        try:
+            if wanted == "run":                 # the common path, listed first
+                if not procedure_id.strip():
+                    return {"error": "PROCEDURE_ID_REQUIRED",
+                            "operations": list(_procedures.OPERATION_NAMES)}
+                result = registry.run_operation(procedure_id.strip(),
+                                                allow_risky=allow_risky)
+                # as_context(), not as_dict(): a pass must not carry a log
+                # excerpt or a script path back into the caller's context.
+                return result.as_context()
+            if wanted == "list":
+                return {"procedures": registry.list(),
+                        "operations": list(_procedures.OPERATION_NAMES),
+                        "note": "call an operation by name; read a script only on FAIL"}
+            if wanted == "discover":
+                return {"found": _procedures.discover_existing(knowledge.root),
+                        "note": "reuse what a project already has before adding a script"}
+            if wanted == "ensure":
+                return registry.ensure_operations()
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "PROCEDURE_FAILED", "detail": str(exc)}
+        return {"error": "UNKNOWN_ACTION", "action": action,
+                "allowed": ["list", "run", "discover", "ensure"]}
+
+    @server.tool()
+    def work_policy(action: str = "status", sections: str = "",
+                    project_path: str = "", session: str = "") -> dict:
+        """The canonical Work Policy this project runs under.
+
+        A `-work` session loads this before executing, so the rules do not
+        depend on chat history surviving. `sections` is a comma-separated
+        subset -- load only what the decision at hand needs, because pulling
+        twenty sections to answer one question is the waste the policy itself
+        prohibits.
+
+        `status` reports version, hash, override and any drift; `load` returns
+        the requested sections plus the binding to record on the task;
+        `ensure` materialises the file into a project that has none.
+        """
+        from . import work_policy as _policy
+
+        root = _project_root(project_path)
+        try:
+            if action == "status":
+                return _policy.load_policy(root).as_dict()
+            if action == "load":
+                wanted = [s.strip() for s in sections.split(",") if s.strip()]
+                return _policy.policy_for_task(root, session=session or None,
+                                               sections=wanted)
+            if action == "ensure":
+                return _policy.ensure_policy_file(root)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "POLICY_READ_FAILED", "detail": str(exc)}
+        return {"error": "UNKNOWN_ACTION", "action": action,
+                "allowed": ["status", "load", "ensure"]}
+
+    @server.tool()
+    def work_telemetry_report(task_id: str, work_id: str = "", bug_id: str = "",
+                              project_id: str = "", module: str = "",
+                              execution_mode: str = "", spec_level: str = "",
+                              difficulty: str = "", files_read: int = 0,
+                              search_rounds: int = 0, runbook_hits: int = 0,
+                              runbook_misses: int = 0, redefine_count: int = 0,
+                              assist_requests: int = 0, tokens_used: int = -1,
+                              tokens_source: str = "", previewed: bool = False,
+                              outcome: str = "") -> dict:
+        """A worker reports what its OWN task cost. The only honest source.
+
+        The controller cannot observe how many files an agent read or how many
+        tokens its provider charged -- so it does not guess. Anything not
+        reported here stays unreported rather than being filled in with a
+        plausible number.
+
+        `tokens_used` left at -1 means "not available", which is recorded as
+        exactly that. `tokens_source` should be EXACT when a provider reported
+        the figure and ESTIMATED when it was derived; an unrecognised value is
+        treated as ESTIMATED, because a count of unknown origin is at best an
+        estimate.
+        """
+        from .work_telemetry import EXACT, TaskTelemetry, TelemetryStore, TokenCount
+
+        if not task_id.strip():
+            return {"error": "TASK_ID_REQUIRED"}
+        store = TelemetryStore()
+        try:
+            existing = next((row for row in store.recent(limit=500)
+                             if row.get("task_id") == task_id.strip()), None)
+            # Re-reporting the same task UPDATES its row rather than adding a
+            # second one, so a worker can report progress and then completion.
+            known_id = (existing or {}).get("telemetry_id")
+            record = TaskTelemetry(task_id=task_id.strip(), work_id=work_id or None, bug_id=bug_id or None,
+                project_id=project_id or None, module=module or None,
+                execution_mode=execution_mode or None, spec_level=spec_level or None,
+                difficulty=difficulty or None,
+                files_read=max(0, int(files_read)),
+                search_rounds=max(0, int(search_rounds)),
+                runbook_hits=max(0, int(runbook_hits)),
+                runbook_misses=max(0, int(runbook_misses)),
+                redefine_count=max(0, int(redefine_count)),
+                assist_requests=max(0, int(assist_requests)),
+                started_at=(existing or {}).get("started_at") or _telemetry_now())
+            if known_id:
+                record.telemetry_id = known_id
+            if int(tokens_used) >= 0:
+                record.tokens = (TokenCount.reported(int(tokens_used), by="worker")
+                                 if tokens_source.upper() == EXACT
+                                 else TokenCount(value=int(tokens_used),
+                                                 source="ESTIMATED",
+                                                 method="reported by worker as an estimate"))
+            if previewed:
+                record.mark_preview()
+            elif (existing or {}).get("first_preview_at"):
+                record.first_preview_at = existing["first_preview_at"]
+            if outcome.strip():
+                record.finish(outcome.strip())
+            store.save(record)
+            return {"recorded": record.telemetry_id, "line": record.one_line()}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "TELEMETRY_WRITE_FAILED", "detail": str(exc)}
+        finally:
+            store.close()
+
+    @server.tool()
+    def work_telemetry(work_id: str = "", project_id: str = "", limit: int = 100) -> dict:
+        """What recent Work tasks actually cost.
+
+        Token counts carry their provenance: EXACT when a runtime reported
+        one, ESTIMATED when derived, PARTIAL for a total missing some inputs,
+        UNAVAILABLE when nothing reported anything. A number that was not
+        measured is never presented as one -- an invented figure would
+        corrupt every efficiency decision made from it afterwards.
+        """
+        from .work_telemetry import TelemetryStore
+
+        try:
+            store = TelemetryStore()
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "TELEMETRY_UNAVAILABLE", "detail": str(exc)}
+        try:
+            if work_id.strip():
+                return {"work_id": work_id, "tasks": store.for_work(work_id.strip())}
+            return store.summary(limit=max(1, min(int(limit or 100), 500)),
+                                 project_id=project_id or None)
+        finally:
+            store.close()
+
+    # -- rapid capture inbox and the planner pool ----------------------------
+
+    _inbox_holder: dict[str, Any] = {}
+
+    def _inbox():
+        if "service" not in _inbox_holder:
+            from .bug_spec import BugSpecStore
+            from .project_knowledge import ProjectKnowledge, worktree_root
+            from .work_inbox import InboxService, InboxStore
+
+            # The bug history and the repository are what turn a claim into a
+            # briefing. Both are optional to the inbox and both degrade on
+            # their own, so a server outside a git checkout still hands out
+            # work -- it just says the paths could not be checked.
+            #
+            # THIS checkout, not `_knowledge()`'s canonical root: the briefing
+            # only reads, and what it reads has to be the tree the worker will
+            # edit. Resolved through the shared root, a claim made inside a
+            # worktree would report files the worker has already rewritten as
+            # untouched -- precisely the false confidence the path check
+            # exists to prevent.
+            root = worktree_root(_project_root())
+            _inbox_holder["service"] = InboxService(
+                InboxStore(), spec_store=BugSpecStore(),
+                knowledge=ProjectKnowledge(root) if root else None)
+        return _inbox_holder["service"]
+
+    @server.tool()
+    def work_inbox_capture(text: str, project: str = "", priority: int = 0,
+                           source: str = "capture") -> dict:
+        """Capture a batch of free-form issues as persisted records, fast.
+
+        A developer can describe twenty problems faster than any planner can
+        analyse one, so this does NOT plan: it splits the batch, gives each
+        item an id, a short title and a rough type, flags likely duplicates,
+        and returns a count. Analysis happens afterwards in the planner pool.
+
+        Bullets are one issue each; a bulleted item's continuation lines stay
+        with it. A duplicate is linked and kept, never dropped -- a second
+        report of one defect is still a fact about the world.
+        """
+        try:
+            return _inbox().capture(text, project=project or None,
+                                    priority=int(priority), source=source or "capture")
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "CAPTURE_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_inbox_list(state: str = "", project: str = "", limit: int = 50) -> dict:
+        """Issues in the inbox, newest priority first, with the state counts."""
+        try:
+            service = _inbox()
+            issues = service.store.list_issues(state=state or None,
+                                               project=project or None,
+                                               limit=max(1, min(int(limit), 200)))
+            return {"summary": service.summary(),
+                    "issues": [{"issue_id": i.issue_id, "title": i.short_title,
+                                "state": i.state, "type": i.rough_type,
+                                "difficulty": i.rough_difficulty, "priority": i.priority,
+                                "project": i.project, "duplicate_of": i.duplicate_of,
+                                "claimed_by": i.claimed_by, "updated_at": i.updated_at,
+                                "retrieval": i.retrieval_status}
+                               for i in issues]}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "INBOX_READ_FAILED", "detail": str(exc), "issues": []}
+
+    @server.tool()
+    def work_inbox_claim(planner_id: str, project: str = "") -> dict:
+        """Claim ONE issue for planning, and get its briefing with it.
+
+        Claims carry a lease so a planner that dies does not hold an issue
+        forever; an expired lease is reclaimed automatically, which is what
+        makes this recoverable across a restart. Two planners can never hold
+        the same issue.
+
+        The reply also carries `retrieval` and `context_pack`, computed HERE
+        rather than left for the planner to request: read them before opening
+        a single file. `retrieval.status` is `REUSED_BUG_SPEC` (start from
+        that spec's root cause), `RELATED_BUGS_FOUND` (read them, assume
+        nothing) or `NO_SIMILAR_BUG`. When a spec is offered for reuse,
+        `retrieval.path_check` has already checked every path it names
+        against the current tree and git delta -- act on `missing` and
+        `changed` before trusting any of its fix strategy.
+        """
+        try:
+            return _inbox().claim_for_planning(planner_id, project=project or None)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "CLAIM_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_inbox_transition(issue_id: str, state: str, actor: str = "",
+                              detail: str = "") -> dict:
+        """Move one issue to another state, recording the transition."""
+        try:
+            return _inbox().transition(issue_id, state, actor=actor or None,
+                                       detail=detail or None)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "TRANSITION_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_inbox_request_hint(issue_id: str, questions: list[str],
+                                findings: list[str] | None = None) -> dict:
+        """Park a hard issue on the developer with at most 3 precise questions.
+
+        The analysis already done is preserved, and other issues keep moving --
+        this blocks one issue, never the pool.
+        """
+        try:
+            return _inbox().request_user_hint(issue_id, questions or [],
+                                              findings=findings or [])
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "HINT_REQUEST_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_inbox_answer_hint(issue_id: str, hint: str, actor: str = "developer") -> dict:
+        """Record a developer's answer and resume the SAME issue.
+
+        The hint is stored as guidance with its provenance, not as truth: a
+        planner weighs it against the current code. A secret in the text is
+        refused outright.
+        """
+        try:
+            return _inbox().attach_human_hint(issue_id, hint, actor=actor or "developer")
+        except Exception as exc:  # noqa: BLE001
+            return {"error": type(exc).__name__, "detail": str(exc)}
+
+    @server.tool()
+    def work_inbox_history(issue_id: str) -> dict:
+        """Every recorded transition for one issue, oldest first."""
+        try:
+            service = _inbox()
+            issue = service.store.get(issue_id)
+            if issue is None:
+                return {"error": "ISSUE_NOT_FOUND", "issue_id": issue_id}
+            return {"issue": issue.as_dict(), "history": service.store.history(issue_id)}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "HISTORY_READ_FAILED", "detail": str(exc)}
+
+    # -- work execution specs, for every kind of task ------------------------
+    # `bug_spec` shipped the spec->worker handoff but only for bugs, and an
+    # audit found it had no production caller at all: 800 lines reachable only
+    # from its own tests. These tools are that wiring, over the generic
+    # contract -- so a FEATURE_NEW/REFACTOR/INTEGRATION/RESEARCH/DEPLOY task is
+    # asked for the fields it actually needs instead of for a root cause.
+
+    def _spec_store():
+        from .work_spec import WorkSpecStore
+
+        return WorkSpecStore()
+
+    def _gate_report(spec) -> dict:
+        from .work_spec import gate
+
+        return gate(spec)
+
+    @server.tool()
+    def work_spec_create(title: str, task_type: str = "", requirement: str = "",
+                         symptom: str = "", research_question: str = "",
+                         project_id: str = "", created_by: str = "",
+                         changed_paths: str = "") -> dict:
+        """Start a work spec -- the analysis done ONCE, handed to the worker.
+
+        The worker receives the spec instead of the conversation, which is the
+        whole token saving: without it the executing agent repeats the
+        planner's analysis from an empty repository.
+
+        `task_type` is one of FEATURE_NEW, BUG, REFACTOR, INTEGRATION,
+        RESEARCH, DEPLOY. Leave it empty to have it inferred from the text and
+        then confirm it -- the type decides which fields the gate requires.
+
+        The returned spec is deliberately INCOMPLETE. Fill it with
+        `work_spec_update`, then check it with `work_spec_gate` before
+        dispatching anything.
+        """
+        from .work_spec import plan_from_request
+
+        try:
+            paths = tuple(p.strip() for p in changed_paths.split(",") if p.strip())
+            spec = plan_from_request(
+                title=title, requirement=requirement, symptom=symptom,
+                research_question=research_question,
+                task_type=task_type.strip().upper() or None,
+                changed_paths=paths, project_id=project_id or None,
+                created_by=created_by or None)
+            _spec_store().save(spec)
+            return {"spec": spec.as_dict(), "gate": _gate_report(spec)}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "SPEC_CREATE_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_spec_update(spec_id: str, fields: dict) -> dict:
+        """Fill in spec fields. Returns the spec with its gate re-evaluated.
+
+        List-valued fields (scope, out_of_scope, reuse_candidates,
+        acceptance_criteria, likely_files, ...) accept a list of strings. A
+        secret is REFUSED rather than stripped: a spec is long-lived and
+        rarely re-read, the worst place for a quiet strip to fail open.
+        """
+        try:
+            store = _spec_store()
+            spec = store.get(spec_id)
+            if spec is None:
+                return {"error": "SPEC_NOT_FOUND", "spec_id": spec_id}
+            for key, value in (fields or {}).items():
+                if not hasattr(spec, key):
+                    return {"error": "UNKNOWN_FIELD", "field": key}
+                current = getattr(spec, key)
+                setattr(spec, key, tuple(value)
+                        if isinstance(current, tuple) and isinstance(value, list) else value)
+            store.save(spec)
+            return {"spec": spec.as_dict(), "gate": _gate_report(spec)}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "SPEC_UPDATE_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_spec_gate(spec_id: str) -> dict:
+        """Is this spec executable, and if not, what exactly is missing?
+
+        SPEC_READY returns the compact handoff a worker starts from.
+        NEEDS_REDEFINE returns the short questions for the planner plus a
+        BLOCKING list -- fields no amount of detail elsewhere substitutes for.
+        A worker that gets NEEDS_REDEFINE hands back rather than investigating:
+        earning that detail in the worker is the re-analysis the spec exists
+        to avoid.
+        """
+        try:
+            spec = _spec_store().get(spec_id)
+            if spec is None:
+                return {"error": "SPEC_NOT_FOUND", "spec_id": spec_id}
+            return _gate_report(spec)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "SPEC_GATE_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_spec_get(spec_id: str) -> dict:
+        """One spec in full, with its derived level and gate verdict."""
+        try:
+            store = _spec_store()
+            spec = store.get(spec_id)
+            if spec is None:
+                return {"error": "SPEC_NOT_FOUND", "spec_id": spec_id}
+            return {"spec": spec.as_dict(), "gate": _gate_report(spec),
+                    "children": [s.spec_id for s in store.children(spec_id)]}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "SPEC_READ_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_spec_list(task_type: str = "", project_id: str = "",
+                       work_id: str = "", limit: int = 50) -> dict:
+        """Specs, most recently updated first, with their gate status."""
+        try:
+            specs = _spec_store().list(task_type=task_type.strip().upper() or None,
+                                       project_id=project_id or None,
+                                       work_id=work_id or None, limit=limit)
+            return {"specs": [{"spec_id": s.spec_id, "title": s.title,
+                               "task_type": s.task_type, "level": s.level(),
+                               "plan_status": s.plan_status,
+                               "ready": _gate_report(s)["ready"]} for s in specs]}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "SPEC_LIST_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_plan(request: str, task_type: str = "", project_path: str = "",
+                  project_id: str = "", created_by: str = "") -> dict:
+        """Run the whole planning pipeline once: request in, spec + verdict out.
+
+        capture -> classify -> knowledge -> similar prior work -> git delta ->
+        reuse -> spec -> gate. The order is the saving: cheapest evidence
+        first, each stage narrowing the next, and the git delta AFTER the
+        knowledge map so a stale claim is caught before it reaches the spec.
+
+        Every stage reports what it could NOT do as well as what it found, so
+        "this module has no known issues" stays distinguishable from "there is
+        no knowledge map". A project with nothing indexed still gets a spec.
+
+        The spec is saved whatever the verdict. A NEEDS_REDEFINE is resumed
+        with `work_plan_redefine` on the same spec id -- the work already done
+        is not thrown away.
+        """
+        try:
+            import os as _os
+
+            from . import work_planning as wplan
+            from .procedures import ProcedureRegistry
+            from .work_spec import WorkSpecStore
+
+            root = project_path.strip() or _os.getcwd()
+            knowledge = _knowledge(root)
+            # The registry is scoped to a project's knowledge map, so without
+            # one there is nothing to look procedures up in -- a gap the
+            # pipeline reports, not an error it raises.
+            registry = None
+            if knowledge is not None:
+                try:
+                    registry = ProcedureRegistry(knowledge)
+                except Exception:  # noqa: BLE001
+                    registry = None
+            result = wplan.plan(request, store=WorkSpecStore(),
+                                task_type=task_type.strip().upper() or None,
+                                knowledge=knowledge, registry=registry, cwd=root,
+                                project_id=project_id or None,
+                                created_by=created_by or None)
+            return result.as_dict()
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "PLANNING_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_plan_redefine(spec_id: str, fields: dict) -> dict:
+        """Add the missing detail the gate asked for, and re-gate the SAME spec.
+
+        This is a resume, not a restart: same spec id, same queue task, and the
+        redefine count is kept rather than cleared, because how many rounds a
+        spec took is what says whether planning is learning the shape of this
+        project.
+        """
+        try:
+            from . import work_planning as wplan
+            from .work_spec import WorkSpecStore
+
+            return wplan.redefine(WorkSpecStore(), spec_id, fields or {}).as_dict()
+        except KeyError:
+            return {"error": "SPEC_NOT_FOUND", "spec_id": spec_id}
+        except ValueError as exc:
+            return {"error": "UNKNOWN_FIELD", "detail": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "REDEFINE_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def work_test_selection(changed_paths: str, project_path: str = "") -> dict:
+        """Which tests this change has to run, and when the full suite does.
+
+        Two stages: a fast lane of the tests that import what changed, then
+        FULL_VERIFY before the change is called done. The fast lane never
+        replaces FULL_VERIFY -- it shortens the author's loop.
+
+        Fails CLOSED. A path no test imports, a path outside the package, a
+        high-fan-in module, or an empty change list all answer FULL_VERIFY
+        with the reason. "Selected nothing" is never an answer, because a
+        narrow pass that missed the one test that mattered reads exactly like
+        a real one.
+
+        `changed_paths` is comma-separated and repo-relative.
+        """
+        from . import test_selection as ts
+
+        try:
+            import os as _os
+
+            root = project_path.strip() or _os.getcwd()
+            paths = [p.strip() for p in changed_paths.split(",") if p.strip()]
+            return ts.plan(paths, tests_dir=_os.path.join(root, "tests"))
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "TEST_SELECTION_FAILED", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_fleet_environment(roles: str = "node") -> dict:
+        """Audit every node's ENVIRONMENT in one call: tools, services and
+        auth readiness against deploy/node-profile.yaml.
+
+        Answers "if this controller went away, which node could actually take
+        over?" -- a question source-code convergence cannot answer, because a
+        node on the right commit is still useless without a Claude login, tmux
+        or Tailscale. Each node reports PASS/MISSING/DRIFT/NEEDS_AUTH per
+        requirement plus the one-time command to fix it.
+
+        Auth is reported as STATUS ONLY. No credential is read, printed or
+        transmitted, and nothing here can be replayed as one. `roles` is a
+        comma-separated list (node, controller).
+
+        A node that cannot answer -- offline, or running a build older than
+        this audit -- is reported as unavailable with the reason, never as
+        passing. `failover_ready_count` is the number that matters: how many
+        nodes could carry the fleet right now.
+        """
+        _refresh_local_heartbeat()
+        return controller.fleet_environment(tuple(filter(None, roles.split(","))))
 
     @server.tool()
     def terminal_node_status(node_id: str) -> dict:
@@ -779,6 +2619,30 @@ def build_mcp(service: TerminalService | None = None,
         if node is None:
             return {"error": "NODE_NOT_FOUND", "node_id": node_id}
         return _node_to_dict(node)
+
+    @server.tool()
+    def terminal_node_health(node_id: str | None = None,
+                             force_probe: bool = False) -> dict:
+        """Execution-aware node health in one bounded read. A node is green
+        only after fresh heartbeat transport and a successful authenticated
+        execution-backend probe. Includes consecutive failures, last success,
+        sanitized last error, circuit-breaker next retry, and self-heal status.
+        force_probe bypasses the normal success/backoff cache for an explicit
+        operator diagnostic; it never bypasses the per-node probe lock."""
+        _refresh_local_heartbeat()
+        return controller.node_health_status(node_id, force_probe=force_probe)
+
+    @server.tool()
+    def terminal_connection_status(node_id: str | None = None,
+                                   force_probe: bool = False) -> dict:
+        """Commander-like connection status in one bounded call.
+
+        Returns CONNECTED/DEGRADED/OFFLINE/RECOVERING plus last_seen,
+        latency, execution health, retry/backoff and the latest sanitized
+        error. force_probe is an operator diagnostic, not a retry-loop bypass.
+        """
+        _refresh_local_heartbeat()
+        return controller.connection_status(node_id, force_probe=force_probe)
 
     @server.tool()
     def terminal_node_sessions(node_id: str) -> dict:
@@ -1168,7 +3032,7 @@ def build_mcp(service: TerminalService | None = None,
 
     @server.tool()
     def terminal_enqueue_task(session: str, prompt: str, title: str | None = None, priority: int = 0,
-                              metadata: dict | None = None) -> dict:
+                              metadata: dict | None = None, request_key: str | None = None) -> dict:
         """THE RECOMMENDED default for any normal ChatGPT/UI/API-
         originated task (item 12) -- creates a durable, restart-safe
         task record for `session`'s own queue BEFORE anything is ever
@@ -1180,7 +3044,8 @@ def build_mcp(service: TerminalService | None = None,
         progress. Always appends (never cancels anything already
         queued). The task's own prompt is stored VERBATIM -- nothing
         here rewrites it."""
-        return queue.enqueue(session, prompt, title=title, priority=priority, metadata=metadata)
+        return queue.enqueue(session, prompt, title=title, priority=priority, metadata=metadata,
+                             request_key=request_key)
 
     @server.tool()
     def terminal_task_status(task_id: str) -> dict:
@@ -1190,9 +3055,32 @@ def build_mcp(service: TerminalService | None = None,
         return queue.task_status(task_id)
 
     @server.tool()
+    def terminal_task_batch_status(task_ids: list[str]) -> dict:
+        """Read up to 100 durable task states locally; never polls a provider."""
+        if (not isinstance(task_ids, list) or not task_ids or len(task_ids) > 100
+                or any(not isinstance(task_id, str) or not task_id for task_id in task_ids)):
+            return {"error": "INVALID_TASK_IDS", "max_task_ids": 100}
+        tasks = []
+        for task_id in task_ids:
+            result = queue.task_status(task_id)
+            if "task" in result:
+                task = result["task"]
+                tasks.append({"task_id": task["id"], "state": task["status"],
+                              "status": task["status"], "session": task["session"],
+                              "queue_position": result.get("queue_position")})
+            else:
+                tasks.append({"task_id": task_id, **result})
+        return {"tasks": tasks}
+
+    @server.tool()
+    def terminal_llm_governor_status() -> dict:
+        """Current global/provider admission, queue, and cooldown gauges."""
+        return {"llm_governor": request_governor.status()}
+
+    @server.tool()
     def terminal_task_create(title: str, prompt: str, assigned_session_id: str | None = None,
                              priority: int = 0, project: str | None = None,
-                             metadata: dict | None = None) -> dict:
+                             metadata: dict | None = None, request_key: str | None = None) -> dict:
         """Unified Task System's canonical task-creation entry point
         (docs/REQUIREMENTS.md §20) -- the ONE way to create a Global
         Task, whether or not a session is known yet. assigned_session_id
@@ -1208,7 +3096,7 @@ def build_mcp(service: TerminalService | None = None,
         (visible in terminal_task_board's per-card metadata) for the
         Kanban's own project affinity/grouping."""
         return queue.create_task(title, prompt, session=assigned_session_id, priority=priority,
-                                 project=project, metadata=metadata)
+                                 project=project, metadata=metadata, request_key=request_key)
 
     @server.tool()
     def terminal_task_assign(task_id: str, session: str) -> dict:
@@ -1399,6 +3287,140 @@ def build_mcp(service: TerminalService | None = None,
         `task_id` was created with. Refuses (TASK_NOT_ISOLATED) for a
         task that was never created via terminal_task_create_isolated."""
         return git_isolation.worktree_status_for_task(task_id)
+
+    @server.tool()
+    def terminal_worktree_janitor_scan(repo_path: str = "", include_safe: bool = True) -> dict:
+        """AUDIT-ONLY classification of every git worktree a repo knows about
+        (docs/WORKTREE_JANITOR.md). READS ONLY -- it cannot remove, prune or
+        change anything, and there is no executor in this build at all.
+
+        Each candidate comes back with a `policy_class`:
+          AUTO_SAFE -- clean, merged (or preserved), no live reference, no
+                       valuable ignored data, grace elapsed, evidence fresh.
+                       Reported only; nothing acts on it.
+          REVIEW    -- a human should decide (detached HEAD, pushed-but-unmerged,
+                       orphan, stale admin entry, grace not yet elapsed).
+          BLOCKED   -- dangerous to remove (dirty, unmerged AND unpushed, a
+                       process/tmux pane/session/service using it, a credential
+                       or database in ignored files, the main worktree, a path
+                       outside the allowlist, a symlink/mount).
+          UNKNOWN   -- the facts could not be established at all. Fail-closed:
+                       never treated as safe.
+
+        `reasons` carries stable machine-readable codes and `predicates` shows
+        each individual check's True/False/None outcome, so a verdict is always
+        explainable. Only paths are reported for sensitive ignored files, never
+        their contents.
+
+        Requires worktree_janitor.allowed_roots to be configured -- with none
+        set, nothing is collectable by design."""
+        from . import worktree_janitor
+
+        config = terminal.config.worktree_janitor
+        target = repo_path.strip() or None
+        if not target:
+            return {"error": "REPO_PATH_REQUIRED",
+                    "detail": "pass repo_path -- the janitor never guesses which repo to scan"}
+        report = worktree_janitor.scan(target, config.to_policy())
+        if not include_safe:
+            report["candidates"] = [c for c in report.get("candidates", [])
+                                    if c.get("policy_class") != worktree_janitor.AUTO_SAFE]
+        return report
+
+    def _worktree_sweep():
+        """Built lazily and cached on the closure, the same shape mcp_app uses
+        for other optional services. Constructed even when the background
+        thread is disabled -- run_once must stay callable with the loop off."""
+        if "sweep" not in _worktree_sweep_holder:
+            from .worktree_executor import WorktreeExecutor
+            from .worktree_sweep import WorktreeSweep
+
+            config = terminal.config.worktree_janitor
+            executor = WorktreeExecutor(
+                config.to_policy(), audit=terminal.audit,
+                locks=ResourceLockStore(terminal.leases.path),
+                store=queue.store,
+                node_id=getattr(controller, "local_node_id", "local"))
+            _worktree_sweep_holder["sweep"] = WorktreeSweep(
+                executor, store=queue.store, repo_roots=config.repo_roots,
+                interval_seconds=config.sweep_interval_seconds,
+                orphan_confirm_runs=config.orphan_confirm_runs,
+                orphan_min_age_seconds=config.orphan_min_age_seconds,
+                max_candidates_per_run=config.max_candidates_per_run,
+                budget_seconds=config.sweep_budget_seconds)
+        return _worktree_sweep_holder["sweep"]
+
+    @server.tool()
+    def terminal_worktree_sweep_run_once(dry_run: bool = True) -> dict:
+        """Run ONE worktree-janitor sweep pass now (docs/WORKTREE_JANITOR.md).
+
+        Callable whether or not the background loop is enabled -- the loop gates
+        the AUTOMATIC trigger only. Converges cleanup records whose directory
+        already vanished, then looks for orphaned worktrees no task claims.
+
+        `dry_run=True` (the default) reports what it would do and removes
+        nothing. Even with dry_run=False, nothing is removed unless
+        worktree_janitor.mode is auto_execute -- two independent gates.
+
+        An orphan is never actioned on first sighting: it must be seen unclaimed
+        in `orphan_confirm_runs` consecutive passes AND be older than
+        `orphan_min_age_seconds`, because a worktree can legitimately exist for
+        a moment before the task that references it does.
+
+        Returns the full report: per-candidate outcomes, what was skipped and
+        why, errors per repo, and reclaimed bytes. Never raises."""
+        sweep = _worktree_sweep()
+        sweep.dry_run = bool(dry_run)
+        return sweep.run_once()
+
+    @server.tool()
+    def terminal_worktree_janitor_report(repo_path: str = "") -> dict:
+        """The Worktree Janitor report an operator reads -- the SAME data the
+        dashboard panel shows (docs/WORKTREE_JANITOR.md, P5).
+
+        READ-ONLY. Summarises classifications: reclaimable bytes by class, the
+        review queue, BLOCKED items with their reasons in plain language
+        alongside the machine codes, the oldest candidate, and whether anything
+        is enforcing (`observe_only` is true unless mode is auto_execute).
+
+        `reclaimable_bytes` counts AUTO_SAFE only -- BLOCKED and REVIEW items
+        are not going to be removed, so including them would promise space that
+        is not coming.
+
+        Sensitive ignored files are named by PATH only, never by content. There
+        is no force option here or anywhere else in this surface."""
+        from . import worktree_janitor, worktree_review
+
+        config = terminal.config.worktree_janitor
+        roots = [repo_path.strip()] if repo_path.strip() else list(config.repo_roots)
+        if not roots:
+            return {"error": "NO_REPO_ROOTS", "mode": config.mode,
+                    "observe_only": config.mode != "auto_execute",
+                    "detail": "configure worktree_janitor.repo_roots, or pass repo_path",
+                    "candidates": [], "counts": {}}
+        candidates: list[dict] = []
+        errors: list[dict] = []
+        for root in roots:
+            report = worktree_janitor.scan(root, config.to_policy())
+            if report.get("error"):
+                errors.append({"repo_path": root, "error": report["error"]})
+            candidates.extend(report.get("candidates") or [])
+        payload = worktree_review.build_report(candidates, mode=config.mode)
+        payload["repo_roots"] = roots
+        if errors:
+            # Surfaced rather than folded into the totals: a root that could not
+            # be scanned is not a root with nothing in it.
+            payload["errors"] = errors
+            payload["complete"] = False
+        else:
+            payload["complete"] = True
+        return payload
+
+    @server.tool()
+    def terminal_worktree_sweep_status() -> dict:
+        """Whether the sweep loop is running, its configured bounds, and the
+        last pass's report. Read-only."""
+        return _worktree_sweep().status()
 
     @server.tool()
     def terminal_worktree_cleanup(task_id: str, force: bool = False) -> dict:
@@ -1842,4 +3864,1495 @@ def build_mcp(service: TerminalService | None = None,
         real provider APIs early -- see its own docstring)."""
         return ai_usage.get_usage(force=force)
 
+
+    # ------------------------------------------------------------------
+    # Project Backlog (planning layer). Deliberately SEPARATE from the
+    # Task Queue below it: a backlog item is what the project INTENDS to
+    # do (durable, project-scoped, shared by every session on that repo);
+    # a queue task is what is EXECUTING now. backlog_dispatch is the one
+    # crossing point and records the link both ways.
+    # ------------------------------------------------------------------
+    if backlog is not None:
+
+        @server.tool()
+        def terminal_backlog_get(path: str | None = None, project_id: str | None = None,
+                                 project_node_id: str | None = None, project_session: str | None = None,
+                                 status: str | None = None,
+                                 priority: str | None = None, type: str | None = None,
+                                 tag: str | None = None, assignee: str | None = None,
+                                 include_terminal: bool = True, limit: int = 500) -> dict:
+            """READ a project's backlog. START HERE.
+
+            WORKFLOW: get -> analyse -> add/update -> dispatch -> verify -> complete.
+
+            THREE ways to say WHICH project, in precedence order:
+              - `project_id` (e.g. "git:github.com/acme/widget") -- works
+                even when no checkout exists on this machine.
+              - `project_node_id` + `project_session` -- "the project THIS
+                session is working on", resolved from the owning node's
+                own registry. Use this for a session on a remote node.
+              - `path` -- a local checkout; identity comes from its git
+                REPO, so every checkout of that repo maps to one backlog.
+            Omit all three to use the server's default root.
+
+            The backlog is stored CONTROLLER-side keyed by that canonical
+            project id, so every node and session working the same repo
+            sees one shared backlog -- not one per checkout.
+
+            Returns the canonical `project` identity, `revision` (pass it
+            back as expected_revision when you write, to avoid clobbering
+            another agent), per-status `counts`, and the filtered `items`.
+            A project with no backlog yet returns exists=false and an
+            empty list -- that is success, not an error.
+
+            Status values: BACKLOG (captured), READY (groomed), IN_PROGRESS,
+            BLOCKED, NEEDS_REVIEW (done but unverified), DONE (verified),
+            CANCELLED. Priority: P0..P3."""
+            return backlog.get(path, project_id=project_id, node_id=project_node_id,
+                               session=project_session, status=status, priority=priority,
+                               type=type, tag=tag, assignee=assignee,
+                               include_terminal=include_terminal, limit=limit)
+
+        @server.tool()
+        def terminal_backlog_add(tasks: list[dict], path: str | None = None,
+                                 project_id: str | None = None,
+                                 project_node_id: str | None = None,
+                                 project_session: str | None = None,
+                                 expected_revision: int | None = None,
+                                 source: str = "chatgpt") -> dict:
+            """ADD backlog items. Use this the MOMENT new work is
+            identified, even if nothing can run it yet -- capturing intent
+            is the point, and it is how work stops getting lost between
+            sessions. Do NOT create a queue task for future work; add it
+            here and dispatch later.
+
+            Each task needs `title`; optional: description, priority
+            (P0..P3, default P2), type (feature/bug/chore/incident/
+            research/docs/test), acceptance_criteria (list of strings),
+            dependencies, tags, order.
+
+            Returns created_ids and the new revision."""
+            return backlog.add(path, tasks=tasks, expected_revision=expected_revision, source=source,
+                               project_id=project_id, project_node_id=project_node_id,
+                               project_session=project_session)
+
+        @server.tool()
+        def terminal_backlog_update(task_id: str, patch: dict, path: str | None = None,
+                                    expected_revision: int | None = None,
+                                    actor: str = "chatgpt") -> dict:
+            """PATCH one item (title/description/status/priority/type/
+            order/tags/dependencies/acceptance_criteria/assignee/branch/
+            worktree...).
+
+            Cannot set status=DONE -- that is gated on evidence, use
+            terminal_backlog_complete. Setting status=BLOCKED requires
+            blocked_reason (or use terminal_backlog_block).
+
+            Pass expected_revision (from _get) for safe concurrent edits:
+            a stale write is refused with REVISION_CONFLICT instead of
+            overwriting another agent's change."""
+            return backlog.update(path, task_id=task_id, patch=patch,
+                                  expected_revision=expected_revision, actor=actor)
+
+        @server.tool()
+        def terminal_backlog_bulk_update(updates: list[dict], path: str | None = None,
+                                         expected_revision: int | None = None,
+                                         actor: str = "chatgpt") -> dict:
+            """Apply MANY patches in ONE atomic write (one revision bump)
+            -- use for re-prioritising or reordering a whole board, rather
+            than N separate updates each with its own conflict window.
+            Each entry: {"task_id": ..., "patch": {...}}."""
+            return backlog.bulk_update(path, updates=updates, expected_revision=expected_revision,
+                                       actor=actor)
+
+        @server.tool()
+        def terminal_backlog_claim(task_id: str, session: str | None = None,
+                                   node_id: str | None = None, assignee: str | None = None,
+                                   path: str | None = None,
+                                   expected_revision: int | None = None) -> dict:
+            """Take ownership of an item and mark it IN_PROGRESS. Refuses
+            with ALREADY_CLAIMED if another session holds it (pass
+            `assignee` to reassign deliberately). Use when an agent starts
+            work directly; use terminal_backlog_dispatch instead when the
+            work should go through the Task Queue."""
+            return backlog.claim(path, task_id=task_id, session=session, node_id=node_id,
+                                 assignee=assignee, expected_revision=expected_revision)
+
+        @server.tool()
+        def terminal_backlog_dispatch(task_id: str, session: str | None = None,
+                                      prompt: str | None = None, path: str | None = None,
+                                      expected_revision: int | None = None) -> dict:
+            """PROMOTE a backlog item into a real, executing queue task --
+            the ONE crossing point from planning to execution.
+
+            Creates the task through the canonical queue path and links
+            both ways (item.queue_task_id, and queue metadata.backlog_id),
+            so backlog_id -> queue task_id -> session -> commit/test stays
+            traceable. The item becomes IN_PROGRESS when dispatched to a
+            `session`, or READY when queued unassigned. The generated
+            prompt carries the item's acceptance_criteria unless you pass
+            your own `prompt`."""
+            return backlog.dispatch(path, task_id=task_id, session=session, prompt=prompt,
+                                    expected_revision=expected_revision)
+
+        @server.tool()
+        def terminal_backlog_block(task_id: str, reason: str, path: str | None = None,
+                                   expected_revision: int | None = None,
+                                   actor: str = "chatgpt") -> dict:
+            """Mark an item BLOCKED with a required, human-readable
+            reason. A blocked item stays in the open counts -- it is not
+            hidden or silently dropped."""
+            return backlog.block(path, task_id=task_id, reason=reason,
+                                 expected_revision=expected_revision, actor=actor)
+
+        @server.tool()
+        def terminal_backlog_complete(task_id: str, commit: str | None = None,
+                                      test: str | None = None, deploy: str | None = None,
+                                      note: str | None = None, path: str | None = None,
+                                      expected_revision: int | None = None,
+                                      actor: str = "chatgpt") -> dict:
+            """Mark an item DONE. **Requires real evidence** -- a commit
+            SHA, a test result, or a deploy ref -- OR a linked queue task
+            that actually reached COMPLETED (the queue's VERIFIED_DONE).
+
+            Saying "I finished it" is NOT accepted and returns
+            EVIDENCE_REQUIRED. If the work is finished but unverified, set
+            status=NEEDS_REVIEW via terminal_backlog_update instead."""
+            return backlog.complete(path, task_id=task_id, commit=commit, test=test, deploy=deploy,
+                                    note=note, expected_revision=expected_revision, actor=actor)
+
+        @server.tool()
+        def terminal_project_list() -> dict:
+            """List the GIT PROJECTS this fleet works on, auto-detected.
+
+            Merges two sources: projects that already have a backlog, and
+            projects discovered live from every online node's session
+            registry (repo_root/git_remote per session). Every checkout of
+            one repo -- worktrees, scratch clones, a different path on each
+            machine -- collapses onto ONE project_id.
+
+            Use this to find the project_id to pass to the other backlog
+            tools, and to see which projects have sessions but no backlog
+            captured yet. Each row carries nodes, checkouts, session_count,
+            has_backlog, open_total."""
+            return backlog.list_projects()
+
+        @server.tool()
+        def terminal_backlog_export(path: str, project_id: str | None = None) -> dict:
+            """Write a project's backlog out to
+            `<repo>/.terminal-mcp/backlog.json` in a LOCAL checkout, so it
+            can be committed and reviewed in git.
+
+            The controller DB stays the source of truth; this file is a
+            deliberate projection, not the thing agents race on. `path`
+            must be a checkout this server can actually write to."""
+            return backlog.export_file(path, project_id=project_id)
+
+        @server.tool()
+        def terminal_backlog_import(path: str, replace: bool = False) -> dict:
+            """Read `<repo>/.terminal-mcp/backlog.json` back into the
+            controller's backlog -- how a backlog committed by a teammate
+            (or produced by an older file-based deployment) gets adopted.
+
+            MERGES by default: a known item id is updated, an unknown one
+            added, and nothing local is deleted. Pass replace=true for the
+            deliberate destructive form."""
+            return backlog.import_file(path, replace=replace)
+
+        @server.tool()
+        def terminal_backlog_validate(path: str | None = None) -> dict:
+            """Validate the backlog file after a MANUAL edit (a human
+            editing .terminal-mcp/backlog.json by hand is expected and
+            supported). Reports what it had to normalise and rewrites the
+            repaired form only if something actually changed. Use this if
+            _get reports non-empty `repairs`."""
+            return backlog.validate(path)
+
+
+
+    # ------------------------------------------------------------------
+    # P0.6 Named-resource ownership lock. "No two agents touch the same
+    # file / module / branch at once."
+    #
+    # Same TTL + owner semantics as the pane lease, and the SAME atomic
+    # acquire (lease.py's _LeaseTable, inherited rather than copied). It
+    # is a separate TABLE from pane_leases in the same database: the two
+    # have different lifetimes and different subjects, and pane_leases is
+    # on the send hot path.
+    #
+    # ADVISORY, by design. Nothing here can physically stop an agent from
+    # editing a file it did not lock -- these tools give coordinating
+    # agents a durable, crash-recoverable way to agree, which is what a
+    # fleet of cooperating workers actually needs. Treating it as
+    # enforcement would be a false guarantee.
+    # ------------------------------------------------------------------
+    locks = _locks
+
+    @server.tool()
+    def terminal_resource_lock(project_id: str, resource_key: str, owner_id: str,
+                               ttl_seconds: float = DEFAULT_RESOURCE_LOCK_TTL_SECONDS,
+                               reason: str | None = None) -> dict:
+        """Claim exclusive ownership of ONE named resource in a project --
+        a file, a module, a branch, a migration, anything two agents must
+        not touch at once.
+
+        `resource_key` is the caller's own naming scheme (e.g.
+        "src/app.py", "branch:main", "db:migrations"); it is scoped to
+        `project_id`, so the same key in two projects is two independent
+        locks. `owner_id` should identify one WORKER (or one task
+        attempt), the same way the pane lease uses a correlation id.
+
+        On refusal this returns WHO holds it and until when, so the caller
+        can wait, pick different work, or escalate -- it never blocks.
+        Re-acquiring your own lock is idempotent and refreshes the TTL; a
+        lock whose holder stopped renewing is reclaimable by anyone."""
+        try:
+            return locks.acquire(project_id, resource_key, owner_id,
+                                 ttl_seconds=ttl_seconds, reason=reason)
+        except ValueError as exc:
+            return {"error": "INVALID_REQUEST", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_resource_lock_many(project_id: str, resource_keys: list[str], owner_id: str,
+                                    ttl_seconds: float = DEFAULT_RESOURCE_LOCK_TTL_SECONDS,
+                                    reason: str | None = None) -> dict:
+        """ALL of these resources, or NONE of them, in one transaction.
+
+        Use this instead of several terminal_resource_lock calls whenever
+        a task needs more than one resource. Two agents that each need
+        {a, b} and take them one at a time can end up holding one apiece
+        and waiting on each other forever; taking the whole set under a
+        single write lock makes that impossible -- the loser gets nothing
+        and can retry cleanly. Returns the first conflicting resource and
+        its holder."""
+        try:
+            return locks.acquire_many(project_id, resource_keys, owner_id,
+                                      ttl_seconds=ttl_seconds, reason=reason)
+        except ValueError as exc:
+            return {"error": "INVALID_REQUEST", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_resource_renew(project_id: str, resource_key: str, owner_id: str,
+                                ttl_seconds: float = DEFAULT_RESOURCE_LOCK_TTL_SECONDS) -> dict:
+        """Extend a lock you still hold. A holder that stops renewing is
+        treated as gone and its lock becomes reclaimable -- so long work
+        MUST renew, the same contract as the queue task lease. Renewing an
+        already-expired lock fails: re-acquire instead (and accept that
+        you may lose the race)."""
+        try:
+            return locks.renew(project_id, resource_key, owner_id, ttl_seconds=ttl_seconds)
+        except ValueError as exc:
+            return {"error": "INVALID_REQUEST", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_resource_unlock(project_id: str, resource_key: str, owner_id: str) -> dict:
+        """Release your own lock. Never removes another owner's active
+        lock -- if it returns released=false, yours had already expired and
+        been reclaimed by someone else."""
+        try:
+            return {"released": locks.release(project_id, resource_key, owner_id),
+                    "project_id": project_id, "resource_key": resource_key}
+        except ValueError as exc:
+            return {"error": "INVALID_REQUEST", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_resource_unlock_all(owner_id: str, project_id: str | None = None) -> dict:
+        """Drop every lock this owner holds -- what a worker calls when it
+        finishes or aborts, so a completed agent never leaves a resource
+        pinned until its TTL lapses."""
+        try:
+            return {"released": locks.release_all(owner_id, project_id=project_id),
+                    "owner_id": owner_id, "project_id": project_id}
+        except ValueError as exc:
+            return {"error": "INVALID_REQUEST", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_resource_holder(project_id: str, resource_key: str) -> dict:
+        """Who holds this resource and until when. An EXPIRED lock is
+        still reported (with expired: true) rather than hidden -- "nobody
+        holds this" and "the last holder died and nobody has taken it
+        since" are different answers."""
+        try:
+            holder = locks.holder(project_id, resource_key)
+        except ValueError as exc:
+            return {"error": "INVALID_REQUEST", "detail": str(exc)}
+        return holder or {"project_id": project_id, "resource_key": resource_key, "held": False}
+
+    @server.tool()
+    def terminal_resource_locks(project_id: str | None = None, owner_id: str | None = None,
+                                include_expired: bool = False) -> dict:
+        """Every lock currently held, optionally filtered by project or
+        owner -- the read a coordinator needs to answer "what is pinned
+        right now and by whom"."""
+        rows = locks.list_locks(project_id=project_id, owner_id=owner_id,
+                                include_expired=include_expired)
+        return {"locks": rows, "count": len(rows)}
+
+    @server.tool()
+    def terminal_resource_force_unlock(project_id: str, resource_key: str, actor: str,
+                                       reason: str) -> dict:
+        """Operator override: break a lock REGARDLESS of owner.
+
+        A deliberately separate verb from terminal_resource_unlock, not a
+        flag on it: breaking someone else's lock is a different action
+        from giving up your own and should be impossible to do by
+        accident. Requires an actor and a reason, and reports whose lock
+        was broken. Use it when a holder is genuinely gone but its TTL has
+        not yet lapsed -- otherwise just wait for expiry."""
+        try:
+            return locks.force_release(project_id, resource_key, actor=actor, reason=reason)
+        except ValueError as exc:
+            return {"error": "INVALID_REQUEST", "detail": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Orchestration V1: the WORKER view -- roles, capabilities, liveness.
+    #
+    # A composition, not a fourth store: declared skills live in pm_store,
+    # PROBED tools and liveness in the node registry, current work in
+    # queue_tasks. A `workers` table would duplicate all three and drift.
+    # ------------------------------------------------------------------
+    workers = WorkerRegistry(pm_store=pm.store if pm is not None else None,
+                             node_registry=getattr(controller, "registry", None),
+                             queue=queue)
+
+    @server.tool()
+    def terminal_worker_declare(node_id: str, session: str, roles: list[str] | None = None,
+                                skills: list[dict] | None = None,
+                                runtime_tools: list[str] | None = None,
+                                project_affinity: str | None = None,
+                                os: str | None = None, max_queued: int | None = None) -> dict:
+        """Declare what a session is FOR: its runtime roles, its skills, and
+        optionally which project it belongs to.
+
+        `roles` must come from WORKER / VERIFIER / INTEGRATOR / DEPLOYER /
+        COORDINATOR. A session may hold SEVERAL -- the same session can
+        implement one project's work and verify another's. Previously role
+        was free text compared by string equality, so a typo silently
+        created a new role nothing would ever match.
+
+        Declared capabilities are kept DISTINCT from probed ones: what an
+        operator asserts a session can do is never merged into what a node
+        was measured to have."""
+        return workers.declare(node_id, session, roles=roles, skills=skills,
+                               runtime_tools=runtime_tools, project_affinity=project_affinity,
+                               os=os, max_queued=max_queued)
+
+    @server.tool()
+    def terminal_worker_list(role: str | None = None, project_id: str | None = None,
+                             required_capabilities: list[str] | None = None,
+                             online_only: bool = True, trust_declared: bool = True) -> dict:
+        """Who can do work right now, and what each of them can do.
+
+        Filters are AND. `trust_declared=false` matches only PROBED
+        capability -- what a scheduler should use before sending work
+        somewhere expensive, since a declared tool is an assertion and a
+        probed one is a measurement.
+
+        Each row reports `capability_age_seconds`: node capabilities carry
+        no verified_at, so heartbeat age is the only honest freshness
+        signal and it is surfaced rather than assumed fresh."""
+        rows = [w.to_dict() for w in workers.list_workers(
+            role=role, project_id=project_id,
+            required_capabilities=tuple(required_capabilities or ()),
+            online_only=online_only, trust_declared=trust_declared)]
+        return {"workers": rows, "count": len(rows), "roles": list(ALL_ROLES)}
+
+    @server.tool()
+    def terminal_worker_status(node_id: str, session: str) -> dict:
+        """One worker: roles, both capability sets, liveness, current task
+        and queue depth."""
+        worker = workers.get(node_id, session)
+        if worker is None:
+            return {"error": "WORKER_NOT_FOUND", "node_id": node_id, "session": session}
+        return {"worker": worker.to_dict()}
+
+    @server.tool()
+    def terminal_worker_roles() -> dict:
+        """How many LIVE workers hold each role -- the read that answers
+        "can this fleet verify anything at all right now", which is exactly
+        the question that decides whether a verify job will ever be
+        claimed or sit pending forever."""
+        return {"summary": workers.roles_summary(), "roles": list(ALL_ROLES)}
+
+    # ------------------------------------------------------------------
+    # Orchestration V1: the OUTCOME layer -- the unit of user-visible
+    # completion between a backlog item and the tasks that deliver it.
+    #
+    # The rule these tools exist to enforce: an outcome is NOT done because
+    # its children are done. Children finishing is necessary, never
+    # sufficient; every acceptance criterion needs its own evidence.
+    # ------------------------------------------------------------------
+    outcomes = OutcomeStore(queue.store)
+
+    @server.tool()
+    def terminal_outcome_create(project_id: str, title: str, acceptance_criteria: list[str],
+                                description: str = "", backlog_id: str | None = None,
+                                priority: str = "P2", actor: str = "mcp") -> dict:
+        """Declare a user-visible deliverable that may take SEVERAL tasks.
+
+        `acceptance_criteria` is REQUIRED and is the contract for done:
+        terminal_outcome_complete demands separate, checkable evidence for
+        each one. An outcome without criteria could be completed with an
+        empty payload, so it is refused at creation instead.
+
+        Use this when "did X ship?" is a question someone will ask. Use
+        terminal_task_create alone when the task IS the deliverable."""
+        try:
+            outcome = outcomes.create(project_id, title, acceptance_criteria=acceptance_criteria,
+                                      description=description, backlog_id=backlog_id,
+                                      priority=priority, actor=actor)
+        except OutcomeError as exc:
+            return {"error": "INVALID_OUTCOME", "detail": str(exc)}
+        return {"outcome": outcome.to_dict()}
+
+    @server.tool()
+    def terminal_outcome_attach_task(outcome_id: str, task_id: str, actor: str = "mcp") -> dict:
+        """Link an existing task to an outcome. MANY tasks per outcome --
+        that is the point; the previous backlog->task model was welded 1:1
+        and refused a second dispatch forever. A task with no project
+        inherits the outcome's."""
+        try:
+            return outcomes.attach_task(outcome_id, task_id, actor=actor)
+        except OutcomeError as exc:
+            return {"error": "ATTACH_REFUSED", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_outcome_status(outcome_id: str, refresh: bool = True) -> dict:
+        """One outcome with its child-task rollup.
+
+        `refresh` re-derives OPEN/IN_PROGRESS/AWAITING_ACCEPTANCE from the
+        children first. Note it can never derive DONE: reaching DONE
+        requires acceptance evidence and only terminal_outcome_complete can
+        do it. AWAITING_ACCEPTANCE is the state a naive implementation
+        would have called done -- all work finished, nothing verified."""
+        try:
+            if refresh:
+                outcomes.refresh_status(outcome_id)
+        except OutcomeError as exc:
+            return {"error": "OUTCOME_NOT_FOUND", "detail": str(exc)}
+        outcome = outcomes.get(outcome_id)
+        if outcome is None:
+            return {"error": "OUTCOME_NOT_FOUND", "outcome_id": outcome_id}
+        return {"outcome": outcome.to_dict(), "progress": outcomes.progress(outcome_id)}
+
+    @server.tool()
+    def terminal_outcome_list(project_id: str | None = None, status: str | None = None,
+                              backlog_id: str | None = None, limit: int = 100) -> dict:
+        """Outcomes, optionally scoped. This is the read that answers "what
+        is this project actually trying to ship", as opposed to
+        terminal_queue_list_all which answers "what work is queued"."""
+        rows = [o.to_dict() for o in outcomes.list_outcomes(
+            project_id=project_id, status=status, backlog_id=backlog_id, limit=limit)]
+        return {"outcomes": rows, "count": len(rows)}
+
+    @server.tool()
+    def terminal_outcome_complete(outcome_id: str, evidence: dict, actor: str = "mcp") -> dict:
+        """Mark a deliverable DONE -- the only route, and the strictest gate
+        in this system.
+
+        `evidence` maps EACH acceptance criterion to its own evidence
+        object. Two independent conditions, both required: no child task
+        may still be open, AND every criterion must have evidence that is
+        more than a self-report and does not contradict itself.
+
+        Refusals are structured, naming the missing or rejected criteria,
+        so weak evidence can be replaced rather than the call being lost."""
+        return outcomes.complete(outcome_id, evidence=evidence, actor=actor)
+
+    @server.tool()
+    def terminal_outcome_block(outcome_id: str, reason: str, actor: str = "mcp") -> dict:
+        """Park an outcome that cannot progress. A blocked outcome is never
+        silently rolled forward by the child-task rollup."""
+        try:
+            return {"outcome": outcomes.block(outcome_id, reason=reason, actor=actor).to_dict()}
+        except OutcomeError as exc:
+            return {"error": "INVALID_TRANSITION", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_outcome_unblock(outcome_id: str, actor: str = "mcp") -> dict:
+        """Clear a block and re-derive status from the child tasks."""
+        try:
+            return {"outcome": outcomes.unblock(outcome_id, actor=actor).to_dict()}
+        except OutcomeError as exc:
+            return {"error": "INVALID_TRANSITION", "detail": str(exc)}
+
+    @server.tool()
+    def terminal_outcome_trace(outcome_id: str) -> dict:
+        """backlog_id -> outcome -> tasks -> worker/branch/commit/evidence
+        in one read. The chain a project report has to be able to walk to
+        answer "how do we know this shipped"."""
+        return outcomes.trace(outcome_id)
+
+    # ------------------------------------------------------------------
+    # P0.7 Project APIs -- the PROJECT-level view, for ChatGPT.
+    #
+    # Pure composition over P0.1-P0.6 plus the backlog: NO new table, no
+    # migration, no background loop. Every number is read live from the
+    # store that owns it, because a project view holding its own copy of
+    # anything would immediately be a second source of truth to drift.
+    #
+    # Nothing here starts work. submit_goal records an INTENT in the
+    # backlog and never dispatches -- autonomous dispatch stays behind its
+    # existing two-gate opt-in, and a "submit a goal" API that quietly
+    # queued work would be exactly that bypass.
+    # ------------------------------------------------------------------
+    projects = ProjectService(queue=queue, backlog=backlog, events=events,
+                              verify=getattr(queue, "verify_queue", None), locks=locks,
+                              registry=getattr(controller, "registry", None),
+                              outcomes=outcomes)
+
+    @server.tool()
+    def terminal_project_status(project_id: str) -> dict:
+        """What project X is doing RIGHT NOW, in one read.
+
+        Lanes (and whether each is paused, by whom), task counts, the
+        workers actually holding tasks with their lease expiry, the
+        blockers a human should look at, pending verification with WHY
+        anything unroutable is stuck, held resource locks, event counts
+        and backlog totals.
+
+        A section reads `null` when that subsystem is not wired on this
+        server -- distinct from zero, which means it is wired and empty.
+        Use terminal_project_list to find a project_id."""
+        return projects.status(project_id)
+
+    @server.tool()
+    def terminal_project_submit_goal(project_id: str, goal: str, priority: str = "P2",
+                                     description: str | None = None,
+                                     acceptance_criteria: list[str] | None = None,
+                                     type: str = "feature", actor: str = "mcp") -> dict:
+        """Record an INTENT for a project -- the "I want X" entry point.
+
+        Creates a BACKLOG item and deliberately does NOT create or
+        dispatch a queue task: submitting a goal never starts work. The
+        returned item id is what terminal_backlog_dispatch takes when you
+        decide it should actually run.
+
+        Use terminal_enqueue_task instead when you already know the exact
+        prompt and session and want it queued now."""
+        return projects.submit_goal(project_id, goal, priority=priority, description=description,
+                                    acceptance_criteria=acceptance_criteria, type=type, actor=actor)
+
+    @server.tool()
+    def terminal_project_events(project_id: str, since_seq: int | None = None,
+                                types: list[str] | None = None, limit: int = 100) -> dict:
+        """A project's two event streams, kept apart on purpose.
+
+        `bus` is the claimable/leased event bus; `queue` is the task state
+        machine's own audit trail, derived for this project (queue_events
+        has no project column of its own). They are NOT merged: different
+        id spaces, different meanings, and interleaving them by timestamp
+        would invent an ordering neither guarantees.
+
+        `since_seq` pages the bus stream; `types` filters both."""
+        return projects.project_events(project_id, since_seq=since_seq, types=types, limit=limit)
+
+    @server.tool()
+    def terminal_project_report(project_id: str, window_hours: float = 24.0) -> dict:
+        """What HAPPENED in a window, as opposed to what the queue looks
+        like now (terminal_project_status).
+
+        Throughput is counted from state TRANSITIONS, not current
+        statuses: a task that completed and was later retried is still a
+        completion that happened, and a snapshot would have lost it.
+        `current` is included alongside so both readings are visible."""
+        return projects.report(project_id, window_hours=window_hours)
+
+    @server.tool()
+    def terminal_project_pause(project_id: str, reason: str | None = None,
+                               actor: str = "mcp") -> dict:
+        """Pause dispatch for every lane this project owns.
+
+        A lane already paused is LEFT EXACTLY AS IT IS and reported --
+        overwriting its reason would destroy why someone else paused it.
+        Running tasks move to PAUSED with their prior status saved, the
+        same mechanism terminal_queue_pause uses per lane."""
+        return projects.pause(project_id, reason=reason, actor=actor)
+
+    @server.tool()
+    def terminal_project_resume(project_id: str, actor: str = "mcp",
+                                force: bool = False) -> dict:
+        """Resume the lanes THIS project's pause paused.
+
+        NOT the exact inverse of pause, on purpose: a lane paused by
+        something else -- an operator, a coordinator NEEDS_HUMAN decision
+        -- is SKIPPED and reported with its reason, because silently
+        undoing a deliberate pause is the worst thing this API could do.
+
+        `force=true` overrides that and says so in the result. It is an
+        explicit decision to override someone else, never a convenience."""
+        return projects.resume(project_id, actor=actor, force=force)
+
+    @server.tool()
+    def terminal_project_assign(project_id: str, task_id: str, session: str | None = None,
+                                node_id: str | None = None,
+                                capabilities: list[str] | None = None,
+                                actor: str = "mcp") -> dict:
+        """Route one of a project's tasks to somewhere that can run it.
+
+        Precedence: an explicit `session` assigns there; otherwise
+        `node_id` and/or `capabilities` RESOLVE candidate nodes and report
+        them WITHOUT moving the task -- picking a lane on a remote node is
+        a decision this tool will not make silently for you. Capability
+        matching is AND, over the same reported facts (probed tools plus
+        platform) P0.5 verifier routing uses.
+
+        Refuses a task that belongs to a different project."""
+        return projects.assign(project_id, task_id, session=session, node_id=node_id,
+                               capabilities=capabilities, actor=actor)
+
+    if chat_checkpoints is not None:
+        register_chat_checkpoint_tools(server, chat_checkpoints, projects)
+
+    # ------------------------------------------------------------------
+    # P0.2 Event Bus. Publish/claim/ack only -- NOTHING here starts an
+    # autonomous consumer. Turning events into automatic dispatch is a
+    # later phase behind the existing two-gate opt-in.
+    # ------------------------------------------------------------------
+    if events is not None:
+
+        @server.tool()
+        def terminal_event_publish(type: str, project_id: str | None = None,
+                                   entity_type: str | None = None, entity_id: str | None = None,
+                                   payload: dict | None = None, correlation_id: str | None = None,
+                                   idempotency_key: str | None = None) -> dict:
+            """Append an event to the project-scoped bus.
+
+            Known types: TASK_CREATED, TASK_READY, WORKER_IDLE, WORKER_DONE,
+            VERIFY_PENDING, MERGE_CONFLICT, TEST_FAILED, PREVIEW_FAILED,
+            USER_FEEDBACK (others are accepted -- the bus does not police
+            vocabulary).
+
+            `payload` is for SAFE METADATA AND REFERENCES ONLY -- never raw
+            prompt text; this store follows audit.py's rule of recording
+            references/hashes rather than content.
+
+            Passing `idempotency_key` makes a retry a no-op: the ORIGINAL
+            event is returned with duplicate=true and nothing new is
+            created. `project_id=null` publishes an unscoped/global event,
+            which a project-scoped claim will never receive."""
+            return events.publish(type, project_id=project_id, entity_type=entity_type,
+                                  entity_id=entity_id, payload=payload,
+                                  correlation_id=correlation_id, idempotency_key=idempotency_key)
+
+        @server.tool()
+        def terminal_event_list(project_id: str | None = None, types: list[str] | None = None,
+                                status: str | None = None, since_seq: int | None = None,
+                                limit: int = 100) -> dict:
+            """Read events in order. Ordering is guaranteed PER PROJECT
+            (filter by project_id, ordered by ascending `seq`); a global
+            total order across the other stores' own logs is NOT promised.
+            Page with `since_seq` from the last row you saw."""
+            return {"events": events.list_events(project_id=project_id, types=types,
+                                                 status=status, since_seq=since_seq, limit=limit),
+                    "known_types": list(KNOWN_EVENT_TYPES)}
+
+        @server.tool()
+        def terminal_event_claim(consumer: str, project_id: str | None = None,
+                                 types: list[str] | None = None,
+                                 lease_seconds: float = 300.0) -> dict:
+            """Atomically claim the OLDEST eligible event and take a lease
+            on it. Two consumers can never claim the same event. An event
+            whose lease EXPIRES becomes claimable again, so a consumer that
+            crashes mid-handling never strands it.
+
+            Returns the event plus a `claim_token` you must pass to
+            terminal_event_ack/_release. Returns {} when nothing matches."""
+            claimed = events.claim_next(consumer=consumer, project_id=project_id,
+                                        types=types, lease_seconds=lease_seconds)
+            return claimed or {}
+
+        @server.tool()
+        def terminal_event_ack(event_id: str, claim_token: str) -> dict:
+            """Mark a claimed event handled. Requires the CURRENT token, so
+            a consumer whose lease already expired and was reclaimed cannot
+            ack someone else's work."""
+            return {"acked": events.ack(event_id, claim_token), "event_id": event_id}
+
+        @server.tool()
+        def terminal_event_release(event_id: str, claim_token: str, error: str | None = None) -> dict:
+            """Hand a claimed event back for another consumer to take."""
+            return {"released": events.release(event_id, claim_token, error=error),
+                    "event_id": event_id}
+
+        @server.tool()
+        def terminal_event_retry(event_id: str) -> dict:
+            """Operator action: put a FAILED event back in play and reset
+            its attempt budget."""
+            return {"retried": events.retry(event_id), "event_id": event_id}
+
+        @server.tool()
+        def terminal_event_stats(project_id: str | None = None) -> dict:
+            """Event counts by status, optionally for one project."""
+            return {"stats": events.stats(project_id=project_id)}
+
+
+    @server.tool()
+    def terminal_node_capabilities(required: list[str] | None = None,
+                                   online_only: bool = True) -> dict:
+        """Tool/runtime capabilities each node ACTUALLY has (probed, never
+        declared) -- the axis needed to route work like "needs Playwright"
+        or "needs .NET" to a node that can really run it.
+
+        `required` filters with AND semantics: a node must have EVERY
+        listed capability. Omit it to list every node's capabilities.
+
+        A node running an older agent reports an EMPTY list and therefore
+        matches only an empty requirement -- it is never assumed capable.
+        Capabilities are distinct from `labels` (operator-supplied tags)
+        and from `agent_types` (claude/codex launchers)."""
+        if controller is None:
+            return {"error": "CONTROLLER_UNAVAILABLE"}
+        wanted = tuple(required or ())
+        nodes = controller.registry.nodes_with_capabilities(wanted, online_only=online_only)
+        return {
+            "required": list(wanted),
+            "online_only": online_only,
+            "matches": [{"node_id": n.id, "platform": n.platform, "status": n.status,
+                         "capabilities": list(n.capabilities),
+                         "agent_types": list(n.agent_types)} for n in nodes],
+            "match_count": len(nodes),
+        }
+
+
+
+    # ------------------------------------------------------------------
+    # P0.4 Task lease verbs. claim_next_task already stamped the lease
+    # atomically; these are the operations AFTER the claim. Every one
+    # requires the CURRENT claim_token, so a holder whose lease expired
+    # and was reclaimed cannot act on the new holder's work.
+    # ------------------------------------------------------------------
+    if queue is not None:
+
+        @server.tool()
+        def terminal_task_renew_lease(task_id: str, claim_token: str,
+                                      lease_seconds: float = 300.0) -> dict:
+            """Extend an active task claim.
+
+            A long-running worker MUST renew: a task past its
+            lease_expires_at is treated as a crashed worker and reconciled
+            back to QUEUED by reconcile_stale_claims. Returns
+            {"renewed": false} if the token is not the current holder's --
+            losing a lease is an ordinary outcome to handle, not an
+            error."""
+            task = queue.store.renew_task_lease(task_id, claim_token, lease_seconds=lease_seconds)
+            if task is None:
+                return {"renewed": False, "task_id": task_id,
+                        "reason": "claim_token is not the current holder, or the task is not leased"}
+            return {"renewed": True, "task_id": task_id,
+                    "lease_expires_at": task.lease_expires_at, "status": task.status}
+
+        @server.tool()
+        def terminal_task_release_claim(task_id: str, claim_token: str,
+                                        reason: str | None = None) -> dict:
+            """Give a claim back BEFORE its TTL expires -- the graceful
+            form of what crash-reconciliation does forcibly. The task
+            returns to QUEUED with claim fields cleared, so a released
+            task and a reconciled one are indistinguishable downstream."""
+            task = queue.store.release_task_claim(task_id, claim_token, reason=reason)
+            if task is None:
+                return {"released": False, "task_id": task_id,
+                        "reason": "claim_token is not the current holder, or the task is not leased"}
+            return {"released": True, "task_id": task_id, "status": task.status}
+
+        @server.tool()
+        def terminal_task_handoff(task_id: str, claim_token: str, to_worker: str,
+                                  reason: str, to_session: str | None = None,
+                                  lease_seconds: float = 300.0) -> dict:
+            """Transfer an ACTIVE claim to another worker WITHOUT the task
+            returning to the queue -- the verb a worker -> verifier
+            handoff needs.
+
+            Distinct from terminal_task_reassign, which moves a task's
+            LANE and deliberately refuses an actively-claimed task. This
+            moves the CLAIM: same task_id, same prompt/attempt_count, a
+            fresh token for the receiver, and an appended entry in the
+            same migration_history trail. `to_session` is optional --
+            handing to a verifier on the same lane is the common case."""
+            task = queue.store.handoff_task(task_id, claim_token, to_worker=to_worker,
+                                            to_session=to_session, reason=reason,
+                                            lease_seconds=lease_seconds)
+            if task is None:
+                return {"handed_off": False, "task_id": task_id,
+                        "reason": "claim_token is not the current holder, or the task is not leased"}
+            return {"handed_off": True, "task_id": task_id, "claimed_by": task.claimed_by,
+                    "session": task.session, "claim_token": task.claim_token,
+                    "lease_expires_at": task.lease_expires_at}
+
+        # ------------------------------------------------------------------
+        # P0.5 Verify Queue. Verification as CLAIMABLE WORK routed by
+        # capability, so a verifier can be chosen for what it can actually
+        # run rather than being whichever session did the implementing.
+        #
+        # Every one of these is additive: a task that does not carry a
+        # `verify` block in its own completion_policy never produces a
+        # job, and the in-session marker path (queue_engine's own
+        # _check_completion) remains the default and is untouched.
+        # ------------------------------------------------------------------
+
+        @server.tool()
+        def terminal_verify_request(task_id: str, required_capabilities: list[str] | None = None,
+                                    require_independent: bool = True,
+                                    fallback: str = "in_session", backlog_id: str | None = None,
+                                    branch: str | None = None, commit_sha: str | None = None,
+                                    actor: str = "mcp") -> dict:
+            """Open a verify job for a task whose implementation is done.
+
+            IDEMPOTENT per (task_id, attempt): calling twice returns the
+            SAME job -- the guarantee is a UNIQUE constraint in the
+            database, so it survives a restart. A genuine retry (which
+            bumps attempt_count) gets its own job, so a reworked
+            implementation is verified afresh instead of overwriting the
+            previous attempt's verdict.
+
+            `fallback` decides what happens while no capable verifier
+            exists: "in_session" (default) lets the existing in-session
+            evidence check keep running; "hold" suppresses it, so a job
+            demanding independent verification is never quietly signed off
+            by the implementer. Neither ever auto-passes the task.
+
+            Moves the task RUNNING -> VERIFYING in the same transaction
+            when it is not already there."""
+            task = queue.store.get_task(task_id)
+            if task is None:
+                return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+            try:
+                job = queue.verify_queue.ensure_verify_job(
+                    task, required_capabilities=tuple(required_capabilities or ()),
+                    require_independent=require_independent, fallback=fallback,
+                    backlog_id=backlog_id, branch=branch, commit_sha=commit_sha, actor=actor)
+            except (ValueError, KeyError) as exc:
+                return {"error": "VERIFY_REQUEST_REFUSED", "task_id": task_id, "reason": str(exc)}
+            return {"job": job.to_dict(), "routability": queue.verify_queue.routability(job)}
+
+        @server.tool()
+        def terminal_verify_list(status: str | None = None, project_id: str | None = None,
+                                 task_id: str | None = None, limit: int = 50) -> dict:
+            """Verify jobs with everything needed to act on them: status,
+            required capabilities, verifier, age, and -- for anything still
+            pending -- WHY it has not been picked up (no capable node
+            online, or the only capable node is the implementer).
+
+            This is the read a coordinator/ChatGPT uses to answer "what is
+            waiting on verification and what is blocking it"."""
+            jobs = queue.verify_queue.list_jobs(status=status, project_id=project_id,
+                                          task_id=task_id, limit=limit)
+            rows = []
+            for job in jobs:
+                entry = job.to_dict()
+                if job.status == "VERIFY_PENDING":
+                    entry["routability"] = queue.verify_queue.routability(job)
+                rows.append(entry)
+            return {"jobs": rows, "count": len(rows),
+                    "stats": queue.verify_queue.stats(project_id=project_id)}
+
+        @server.tool()
+        def terminal_verify_claim(verifier: str, capabilities: list[str] | None = None,
+                                  project_id: str | None = None, verifier_node_id: str | None = None,
+                                  lease_seconds: float = 600.0) -> dict:
+            """Claim the oldest pending verify job THIS verifier can
+            actually do. `capabilities` is what the verifier HAS; a job
+            matches only when every capability it requires is present (AND,
+            never OR).
+
+            Refuses a job whose implementer is this same verifier when the
+            job asked for independence. Returns {"claimed": false} when
+            nothing matches -- an ordinary outcome, not an error.
+
+            The returned claim_token is required by every subsequent verb
+            and is the ONLY thing that authorises them; keep it."""
+            job = queue.verify_queue.claim_next(
+                verifier=verifier, capabilities=tuple(capabilities or ()),
+                project_id=project_id, verifier_node_id=verifier_node_id,
+                lease_seconds=lease_seconds)
+            if job is None:
+                return {"claimed": False,
+                        "reason": "no pending verify job matches these capabilities "
+                                  "(or the only match is this verifier's own work)"}
+            return {"claimed": True, "job": job.to_dict(include_token=True)}
+
+        @server.tool()
+        def terminal_verify_start(job_id: str, claim_token: str, detail: str | None = None) -> dict:
+            """VERIFY_CLAIMED -> VERIFY_RUNNING: verification has actually
+            begun, as distinct from merely being held."""
+            job = queue.verify_queue.start(job_id, claim_token, detail=detail)
+            if job is None:
+                return {"started": False, "job_id": job_id,
+                        "reason": "claim_token is not the current holder, or the job is not claimed"}
+            return {"started": True, "job": job.to_dict()}
+
+        @server.tool()
+        def terminal_verify_renew(job_id: str, claim_token: str,
+                                  lease_seconds: float = 600.0) -> dict:
+            """Extend an active verify lease. A verifier that stops
+            renewing is treated as crashed and its job returns to the pool
+            -- so a long verification MUST renew."""
+            job = queue.verify_queue.renew(job_id, claim_token, lease_seconds=lease_seconds)
+            if job is None:
+                return {"renewed": False, "job_id": job_id,
+                        "reason": "claim_token is not the current holder, or the job is not claimed"}
+            return {"renewed": True, "job_id": job_id, "lease_expires_at": job.lease_expires_at,
+                    "status": job.status}
+
+        @server.tool()
+        def terminal_verify_release(job_id: str, claim_token: str,
+                                    reason: str | None = None) -> dict:
+            """Give a verify claim back before its TTL. The job returns to
+            the pending pool in exactly the shape crash-recovery produces,
+            so the next claimer cannot tell the difference."""
+            job = queue.verify_queue.release(job_id, claim_token, reason=reason)
+            if job is None:
+                return {"released": False, "job_id": job_id,
+                        "reason": "claim_token is not the current holder, or the job is not claimed"}
+            return {"released": True, "job": job.to_dict()}
+
+        @server.tool()
+        def terminal_verify_handoff(job_id: str, claim_token: str, to_verifier: str, reason: str,
+                                    to_node_id: str | None = None,
+                                    lease_seconds: float = 600.0) -> dict:
+            """Pass an ACTIVE verify claim to another verifier without the
+            job returning to the pool. The token is ROTATED: the previous
+            holder can no longer renew, complete, fail or hand off this
+            job, because every one of those verbs matches on the current
+            token."""
+            job = queue.verify_queue.handoff(job_id, claim_token, to_verifier=to_verifier,
+                                       reason=reason, to_node_id=to_node_id,
+                                       lease_seconds=lease_seconds)
+            if job is None:
+                return {"handed_off": False, "job_id": job_id,
+                        "reason": "claim_token is not the current holder, or the job is not claimed"}
+            return {"handed_off": True, "job": job.to_dict(include_token=True)}
+
+        @server.tool()
+        def terminal_verify_complete(job_id: str, claim_token: str, evidence: dict) -> dict:
+            """VERIFIED_PASS -- the only route to it, and EVIDENCE-GATED.
+
+            An agent saying it worked is NOT evidence. The payload must
+            carry something checkable (exit_code, command, test_results,
+            completion_marker, commit_sha, artifact, ...) and must not
+            contradict itself: exit_code != 0, passed=false or
+            tests_failed > 0 are all refused as EVIDENCE_REJECTED, with
+            the reason, and the job stays claimed so real evidence can be
+            supplied instead.
+
+            On acceptance the task moves VERIFYING -> COMPLETED with the
+            evidence stored in its own verification_evidence column, in
+            the same transaction as the verdict."""
+            return queue.verify_queue.complete(job_id, claim_token, evidence=evidence)
+
+        @server.tool()
+        def terminal_verify_fail(job_id: str, claim_token: str, result: str,
+                                 failure_summary: dict) -> dict:
+            """A negative verdict: VERIFIED_FAIL, NEEDS_REWORK or
+            VERIFY_BLOCKED.
+
+            `failure_summary` must be a structured, non-empty object --
+            "it failed" is not something anyone can act on. Every string
+            in it is redacted before storage, so a pasted log carrying a
+            token does not become a durable leak.
+
+            VERIFIED_FAIL and NEEDS_REWORK both put the TASK in FAILED
+            (from where the existing terminal_queue_retry returns it to
+            QUEUED); the distinction between them is preserved on the job.
+            VERIFY_BLOCKED puts the task in BLOCKED and is itself
+            recoverable via terminal_verify_requeue."""
+            return queue.verify_queue.fail(job_id, claim_token, result=result,
+                                     failure_summary=failure_summary)
+
+        @server.tool()
+        def terminal_verify_requeue(job_id: str, reason: str, actor: str = "mcp") -> dict:
+            """VERIFY_BLOCKED -> VERIFY_PENDING: the explicit way back for
+            a job that was blocked on an environment which has since
+            returned."""
+            job = queue.verify_queue.requeue(job_id, actor=actor, reason=reason)
+            if job is None:
+                return {"requeued": False, "job_id": job_id,
+                        "reason": "job not found, or not in VERIFY_BLOCKED"}
+            return {"requeued": True, "job": job.to_dict()}
+
+        @server.tool()
+        def terminal_verify_trace(task_id: str) -> dict:
+            """The full traceability chain for one task in a single read:
+            backlog_id -> task -> implementer -> branch/commit -> verify
+            job -> verifier -> evidence -> result, with the append-only
+            audit trail (actor, time, reason) of every state change.
+
+            Assembled from what is actually recorded -- a field nothing
+            ever set comes back null rather than being inferred."""
+            return queue.verify_queue.trace(task_id)
+
+        @server.tool()
+        def terminal_verify_reconcile() -> dict:
+            """Restart/crash recovery for the verify queue.
+
+            Returns expired verifier leases to the pending pool (never
+            losing the job), and closes jobs whose task left VERIFYING by
+            another route -- as VERIFIED_PASS carrying the task's OWN
+            recorded evidence when the in-session path completed it, or
+            VERIFY_CANCELLED otherwise. Idempotent; a verdict is never
+            invented."""
+            return queue.verify_queue.reconcile()
+
+        @server.tool()
+        def terminal_task_lease_holder(task_id: str) -> dict:
+            """Who holds this task's lease and until when. Never returns
+            the claim_token itself -- that is the holder's capability, not
+            an observability field."""
+            holder = queue.store.lease_holder(task_id)
+            return holder or {"task_id": task_id, "held": False}
+
+
+    # -- read-only repository access (repo_read.py / repo_service.py) -----
+    # Why these exist: an external agent (ChatGPT over this MCP surface)
+    # previously could not read Git or source at all -- it had to ask a
+    # Claude session to read a file and paste the content back, which is
+    # slow, lossy and puts a second agent's summary between the reader and
+    # the code. These ten tools let it read directly.
+    #
+    # V1 is READ-ONLY, enforced structurally rather than by convention:
+    # repo_read.READ_ONLY_GIT_SUBCOMMANDS excludes every mutating git
+    # subcommand, no tool here takes a git subcommand / shell string /
+    # argv list, and there is deliberately no repo_write / repo_checkout /
+    # repo_commit counterpart. Nothing below can modify a repository.
+    #
+    # Locating the repo: pass `path` for a repo on this host, `session`
+    # for "wherever the session I am watching is working", `project` for a
+    # project_identity id, or `node` + `path` to be explicit. Every
+    # response carries `node_id` and `located_by` so the caller can always
+    # see which machine answered.
+    #
+    # Errors are codes, not prose: REPO_READ_DISABLED, REPO_NOT_ALLOWED,
+    # PATH_OUTSIDE_REPO, SECRET_PATH_DENIED, PATH_NOT_FOUND, NOT_A_GIT_REPO,
+    # BINARY_FILE, INVALID_REF, INVALID_ARGUMENT, GIT_AUTH_REQUIRED,
+    # GIT_COMMAND_FAILED, GIT_UNAVAILABLE, NODE_UNREACHABLE,
+    # NODE_LACKS_REPO_READ, AMBIGUOUS_REPO, REPO_NOT_LOCATED.
+
+    @server.tool()
+    def repo_status(path: str = "", session: str = "", project: str = "",
+                    node: str = "") -> dict:
+        """Branch, HEAD, dirty state, ahead/behind and project identity for
+        one repository -- the "where am I and is it clean" read.
+
+        Locate the repo with exactly one of: `path` (a repo root or any
+        path inside one), `session` (the repo that session is working in,
+        resolved on the node that session actually runs on), `project` (a
+        project_identity project_id or name), or `node`+`path`.
+
+        `status_lines` are raw `git status --porcelain` lines. `diverged`
+        is true only when the branch is BOTH ahead and behind -- merely
+        ahead (unpushed work) or merely behind (a fast-forward away) is
+        routine mid-task state, not a divergence."""
+        return repo.status(path=path or None, session=session or None,
+                           project=project or None, node=node or None, actor="mcp")
+
+    @server.tool()
+    def repo_head(path: str = "", session: str = "", project: str = "",
+                  node: str = "") -> dict:
+        """HEAD's commit id, short id, author, timestamp, subject and
+        branch -- the cheapest "which commit is checked out" read, for when
+        full status is more than you need."""
+        return repo.head(path=path or None, session=session or None,
+                         project=project or None, node=node or None, actor="mcp")
+
+    @server.tool()
+    def repo_branches(path: str = "", session: str = "", project: str = "",
+                      node: str = "", limit: int = 100) -> dict:
+        """Local branches, most recently committed first, each with its tip
+        commit, upstream and whether it is the current one."""
+        return repo.branches(limit=limit, path=path or None, session=session or None,
+                             project=project or None, node=node or None, actor="mcp")
+
+    @server.tool()
+    def repo_remotes(path: str = "", session: str = "", project: str = "",
+                     node: str = "", check_auth: bool = False) -> dict:
+        """Configured git remotes, with any embedded credential stripped
+        from every URL.
+
+        `check_auth=False` (the default) is pure local config and touches
+        no network -- so this call works, and a repository stays fully
+        readable, even when remote authentication is unavailable.
+        `check_auth=True` additionally probes READ access with `ls-remote`
+        (read-only, bounded, every credential prompt disabled); a failed
+        probe reports GIT_AUTH_REQUIRED inside `auth` rather than failing
+        the call, because the remotes themselves were read fine."""
+        return repo.remotes(check_auth=check_auth, path=path or None, session=session or None,
+                            project=project or None, node=node or None, actor="mcp")
+
+    @server.tool()
+    def repo_tree(path: str = "", session: str = "", project: str = "", node: str = "",
+                  subpath: str = "", depth: int = 2, limit: int = 200) -> dict:
+        """List files and directories, breadth-first, bounded by `depth`
+        and `limit` (both capped by server config; `truncated` says when a
+        cap was hit).
+
+        Includes untracked files -- a file a session just created is
+        exactly what you will want to ask about. Dependency/build caches
+        (node_modules, __pycache__, .venv, dist, ...) are not descended
+        into. A path denied by the secret rules is still LISTED, marked
+        `"denied": true`, so you can tell "refused" from "absent"; its
+        content is never read."""
+        return repo.tree(subpath=subpath or None, depth=depth, limit=limit,
+                         path=path or None, session=session or None,
+                         project=project or None, node=node or None, actor="mcp")
+
+    @server.tool()
+    def repo_read(path: str = "", session: str = "", project: str = "", node: str = "",
+                  file: str = "", start_line: int = 0, end_line: int = 0,
+                  max_bytes: int = 0) -> dict:
+        """Read one text file's content.
+
+        `file` is relative to the repo root. Give `start_line`/`end_line`
+        for a window (1-based, inclusive), or `max_bytes` for a byte cap;
+        with neither, you get the start of the file up to the server's line
+        limit. `truncated` is always set honestly when a cap was hit, and
+        `start_line`/`end_line`/`lines_returned` describe exactly what came
+        back, so quoted line numbers are trustworthy.
+
+        Content is redacted before it is returned (`redaction` reports how
+        many rules hit, by rule name only). A credential file is refused
+        outright with SECRET_PATH_DENIED, and a binary file with
+        BINARY_FILE rather than being returned as mojibake."""
+        return repo.read(file=file or None, start_line=start_line or None,
+                         end_line=end_line or None, max_bytes=max_bytes or None,
+                         path=path or None, session=session or None,
+                         project=project or None, node=node or None, actor="mcp")
+
+    @server.tool()
+    def repo_search(query: str, path: str = "", session: str = "", project: str = "",
+                    node: str = "", paths: list[str] | None = None, max_results: int = 100,
+                    regex: bool = False, ignore_case: bool = False,
+                    include_untracked: bool = True) -> dict:
+        """Search file contents for `query` and return path + line number +
+        the matching line.
+
+        FIXED-STRING by default, which is what "find this symbol" wants;
+        pass `regex=True` for an extended-regex search. `paths` narrows to
+        git pathspecs (e.g. ["terminal_mcp", "docs/*.md"]). Binary files are
+        skipped; dependency/build caches are excluded.
+
+        A hit inside a credential file is dropped rather than returned --
+        `secret_paths_skipped` names those files so the omission is visible
+        instead of silent. Matched lines are redacted like any other
+        content."""
+        return repo.search(query=query, paths=paths, max_results=max_results, regex=regex,
+                           ignore_case=ignore_case, include_untracked=include_untracked,
+                           path=path or None, session=session or None,
+                           project=project or None, node=node or None, actor="mcp")
+
+    @server.tool()
+    def repo_diff(path: str = "", session: str = "", project: str = "", node: str = "",
+                  base: str = "", head: str = "", staged: bool = False,
+                  paths: list[str] | None = None, stat_only: bool = False,
+                  max_bytes: int = 0) -> dict:
+        """A unified diff.
+
+        With no `base`/`head` this is the UNCOMMITTED working-tree change
+        (`staged=True` for the index instead) -- which is what "what is
+        this session doing right now" actually means. Give BOTH `base` and
+        `head` to diff two revisions; giving only one is INVALID_ARGUMENT
+        rather than a guess. `stat_only=True` returns just the file/line
+        summary.
+
+        Hunks touching a credential path are excluded from the patch and
+        named in `secret_paths_excluded` -- a diff is the obvious way a
+        path-only rule would otherwise leak a secret."""
+        return repo.diff(base=base or None, head=head or None, staged=staged, paths=paths,
+                         stat_only=stat_only, max_bytes=max_bytes or None,
+                         path=path or None, session=session or None,
+                         project=project or None, node=node or None, actor="mcp")
+
+    @server.tool()
+    def repo_log(path: str = "", session: str = "", project: str = "", node: str = "",
+                 limit: int = 20, file: str = "", base: str = "", head: str = "") -> dict:
+        """Commit history, newest first: commit id, short id, author,
+        timestamp and subject.
+
+        `file` restricts the history to one path. Give BOTH `base` and
+        `head` for the `base..head` range. Subjects and author names are
+        redacted like any other content -- a commit message is a real place
+        secrets get pasted."""
+        return repo.log(limit=limit, file=file or None, base=base or None, head=head or None,
+                        path=path or None, session=session or None,
+                        project=project or None, node=node or None, actor="mcp")
+
+    @server.tool()
+    def repo_show_commit(commit: str, path: str = "", session: str = "", project: str = "",
+                         node: str = "", file: str = "", stat_only: bool = False,
+                         max_bytes: int = 0) -> dict:
+        """One commit in full: metadata, parents, message, and its patch
+        (or just the `--stat` summary with `stat_only=True`).
+
+        `commit` is any revision git understands (a sha, `HEAD`, `HEAD~3`,
+        a tag); it is validated before use and an unknown one answers
+        INVALID_REF. `file` narrows the patch to one path. Credential paths
+        are excluded from the patch, same as repo_diff."""
+        return repo.show_commit(commit=commit, file=file or None, stat_only=stat_only,
+                                max_bytes=max_bytes or None,
+                                path=path or None, session=session or None,
+                                project=project or None, node=node or None, actor="mcp")
+
+    # -- Notes / Ideas (kho ghi chú dùng chung cho nhiều project --
+    # notes_store.py + notes_service.py). Deliberately NOT prefixed
+    # `terminal_` like every tool above: these do not touch a terminal,
+    # a session or a node, and the name a model reads in a tool list is
+    # the main thing steering it to the right tool. Local to the
+    # controller (one shared store), never routed per-node -- an idea has
+    # no node.
+
+    if notes is not None:
+
+        def _notes(operation, *args, **kwargs) -> dict:
+            """Every note_* tool answers with a dict, never an exception:
+            a NotesError's stable `code` becomes the response's own
+            `error` field (plus whatever detail the error carried), so a
+            caller branches on a documented string instead of parsing a
+            traceback out of a transport error."""
+            try:
+                return operation(*args, **kwargs)
+            except NotesError as exc:
+                return exc.to_dict()
+
+        @server.tool()
+        def note_create(title: str | None = None, summary: str = "", original_content: str = "",
+                        analysis: str = "", source_url: str | None = None,
+                        source_chat: str | None = None, source_session: str | None = None,
+                        type: str = "idea", status: str = "new", tags: list[str] | None = None,
+                        project_id: str | None = None, project_name: str | None = None,
+                        attachment_paths: list[str] | None = None,
+                        attachments_base64: list[dict] | None = None) -> dict:
+            """Save an idea/note/link the user just asked you to keep --
+            "lưu lại", "ghi chú cái này", "đưa vào kho ý tưởng".
+
+            Put the user's own material in `original_content` and YOUR
+            analysis in `analysis` -- they are separate fields on purpose,
+            so the note is still useful when the source URL dies. `title`
+            is optional (a short one is derived if you omit it). `type` is
+            one of idea/reference/todo/research/prompt/design/other;
+            `status` one of new/reviewing/planned/applied/archived.
+            `project_id`/`project_name` are optional and settable later
+            (note_link_to_project) -- do not guess a project just to fill
+            them.
+
+            Images: `attachments_base64` takes [{"filename": "shot.png",
+            "data_base64": "..."}] for bytes you hold in-band, and
+            `attachment_paths` takes absolute paths to files already on
+            this host (allowed only inside the operator-configured
+            notes.attachment_source_roots). Either way the bytes are
+            written to real files -- never stored base64 in the database.
+            A failed attachment never loses the note: the note is created
+            first and each attachment result is reported separately under
+            `attachment_results`."""
+            result = _notes(notes.create, title=title, summary=summary,
+                            original_content=original_content, analysis=analysis,
+                            source_url=source_url, source_chat=source_chat,
+                            source_session=source_session, type=type, status=status,
+                            tags=tags, project_id=project_id, project_name=project_name)
+            if "error" in result:
+                return result
+            attachment_results: list[dict] = []
+            for path in attachment_paths or []:
+                attachment_results.append(_notes(notes.add_attachment, result["id"], source_path=path))
+            for item in attachments_base64 or []:
+                if not isinstance(item, dict):
+                    attachment_results.append({"error": "ATTACHMENT_TRANSPORT_REQUIRED",
+                                               "message": "attachments_base64 items must be objects"})
+                    continue
+                attachment_results.append(_notes(
+                    notes.add_attachment, result["id"], filename=item.get("filename"),
+                    data_base64=item.get("data_base64"),
+                    declared_mime_type=item.get("mime_type")))
+            if attachment_results:
+                fresh = _notes(notes.get, result["id"])
+                if "error" not in fresh:
+                    result = fresh
+                result["attachment_results"] = attachment_results
+            return result
+
+        @server.tool()
+        def note_get(note_id: str, include_deleted: bool = False) -> dict:
+            """One note in full -- every field plus its attachments (each
+            with a `url` the dashboard serves the image from)."""
+            return _notes(notes.get, note_id, include_deleted=include_deleted)
+
+        @server.tool()
+        def note_search(query: str, type: str | None = None, status: str | None = None,
+                        tag: str | None = None, project: str | None = None,
+                        since: str | None = None, until: str | None = None,
+                        limit: int = 20, offset: int = 0, include_archived: bool = True) -> dict:
+            """Ranked full-text search across title + summary +
+            original_content + analysis + tags -- the tool to answer
+            "trước đây tôi có lưu ý tưởng nào về landing page MESFlow
+            không?".
+
+            Deterministic and fully local (SQLite FTS5 bm25, diacritics-
+            insensitive so "y tuong" finds "ý tưởng") -- no embedding
+            service, no network. Each hit carries `rank_position` (1 =
+            best; order by this), `score` (higher is more relevant), and a
+            short `excerpt` around the match, so you can summarise the
+            results yourself. `project` matches project_id or
+            project_name; `since`/`until` are ISO timestamps against
+            created_at. Archived notes ARE included by default here (a
+            recall question should not silently skip them). An empty
+            `query` degrades to a newest-first browse with the same
+            filters."""
+            return _notes(notes.search, query, type=type, status=status, tag=tag,
+                          project=project, since=since, until=until, limit=limit,
+                          offset=offset, include_archived=include_archived)
+
+        @server.tool()
+        def note_list(type: str | None = None, status: str | None = None, tag: str | None = None,
+                      project: str | None = None, since: str | None = None,
+                      until: str | None = None, sort: str = "newest", limit: int = 50,
+                      offset: int = 0, include_archived: bool = False) -> dict:
+            """Browse/filter notes without a text query. `sort` is
+            newest/oldest/updated; paginate with limit+offset (the
+            response carries total/has_more). Archived notes are hidden
+            unless include_archived=true or status="archived"."""
+            return _notes(notes.list, type=type, status=status, tag=tag, project=project,
+                          since=since, until=until, sort=sort, limit=limit, offset=offset,
+                          include_archived=include_archived)
+
+        @server.tool()
+        def note_update(note_id: str, title: str | None = None, summary: str | None = None,
+                        original_content: str | None = None, analysis: str | None = None,
+                        source_url: str | None = None, source_chat: str | None = None,
+                        source_session: str | None = None, type: str | None = None,
+                        status: str | None = None, tags: list[str] | None = None,
+                        project_id: str | None = None, project_name: str | None = None) -> dict:
+            """Partial update: ONLY the fields you actually pass are
+            written, so changing the status cannot blank the analysis.
+            Passing tags REPLACES the whole list (read the note first if
+            you mean to append)."""
+            fields = {key: value for key, value in (
+                ("title", title), ("summary", summary), ("original_content", original_content),
+                ("analysis", analysis), ("source_url", source_url), ("source_chat", source_chat),
+                ("source_session", source_session), ("type", type), ("status", status),
+                ("tags", tags), ("project_id", project_id), ("project_name", project_name),
+            ) if value is not None}
+            if not fields:
+                return {"error": "NOTHING_TO_UPDATE",
+                        "message": "pass at least one field to change"}
+            return _notes(notes.update, note_id, **fields)
+
+        @server.tool()
+        def note_delete(note_id: str, hard: bool = False) -> dict:
+            """Soft delete by default: the note leaves every listing and
+            the search index but is recoverable with note_restore, and its
+            image files are untouched. hard=true also removes the row and
+            unlinks the files -- irreversible, so only on an explicit
+            "xóa hẳn"."""
+            return _notes(notes.delete, note_id, hard=hard)
+
+        @server.tool()
+        def note_restore(note_id: str) -> dict:
+            """Undo a soft delete."""
+            return _notes(notes.restore, note_id)
+
+        @server.tool()
+        def note_add_attachment(note_id: str, filename: str | None = None,
+                                source_path: str | None = None,
+                                data_base64: str | None = None,
+                                mime_type: str | None = None) -> dict:
+            """Attach an image (png/jpeg/webp/gif) to an existing note --
+            e.g. the screenshot behind a saved URL, so the note survives
+            the page going away.
+
+            Exactly ONE transport per call, and both are real (this MCP
+            runtime has no binary channel, so there is no third):
+              - `data_base64`: the bytes in-band (a data: URI is accepted
+                too). Decoded here and written to a file.
+              - `source_path`: an ABSOLUTE path to a file already on this
+                host. Refused with ATTACHMENT_SOURCE_DISABLED unless the
+                operator has configured notes.attachment_source_roots, and
+                then only inside those roots.
+            The stored type is decided by the file's own bytes, not by
+            `filename` or `mime_type` -- a mismatch is refused
+            (ATTACHMENT_MIME_MISMATCH) rather than quietly corrected."""
+            return _notes(notes.add_attachment, note_id, filename=filename,
+                          source_path=source_path, data_base64=data_base64,
+                          declared_mime_type=mime_type)
+
+        @server.tool()
+        def note_remove_attachment(attachment_id: str) -> dict:
+            """Detach one image and delete its file. The note itself is
+            untouched."""
+            return _notes(notes.remove_attachment, attachment_id)
+
+        @server.tool()
+        def note_link_to_project(note_id: str, project_id: str | None = None,
+                                 project_name: str | None = None) -> dict:
+            """Attach a captured note to a project once it is clear which
+            one it belongs to. Pass project_id and/or project_name; only
+            the link changes, nothing else about the note."""
+            return _notes(notes.link_to_project, note_id, project_id=project_id,
+                          project_name=project_name)
+
+        @server.tool()
+        def note_mark_applied(note_id: str, applied_ref: str | None = None,
+                              project_id: str | None = None,
+                              project_name: str | None = None) -> dict:
+            """Mark that the idea actually got used: status becomes
+            "applied" and applied_at is stamped. `applied_ref` is a free
+            text pointer to where it landed (a commit, a PR, a task id);
+            passing a project also links it."""
+            return _notes(notes.mark_applied, note_id, applied_ref=applied_ref,
+                          project_id=project_id, project_name=project_name)
+
+        @server.tool()
+        def note_facets() -> dict:
+            """What values actually exist in the store (types, statuses,
+            tags, projects, counts) -- use it to offer the user real
+            filters instead of guessing tag spellings."""
+            return _notes(notes.facets)
+
+
     return server
+
+
+def _attach_project_backlog(backlog: Any, controller: Any, brief: dict, session_name: str) -> dict:
+    """Project Brief <- Project Backlog. Resolves the session's project
+    the way the new architecture requires: by asking the OWNING NODE's
+    registry (via the controller) when possible, falling back to the
+    repo_root the brief itself reports for a local session.
+
+    Never fatal: a session in no repo, a project with no backlog, or any
+    lookup failure attaches {"available": false, "reason": ...} and
+    leaves the rest of the brief intact -- recovering context must not
+    depend on a backlog existing."""
+    meta = brief.get("meta") or {}
+    node_id = meta.get("node_id")
+    result = None
+    try:
+        if controller is not None and node_id and node_id != "local":
+            result = backlog.open_items_for_brief(None, project_node_id=node_id,
+                                                  project_session=session_name, limit=15)
+        elif meta.get("repo_root"):
+            result = backlog.open_items_for_brief(meta["repo_root"], limit=15)
+        else:
+            brief["project_backlog"] = {"available": False, "reason": "SESSION_NOT_IN_A_REPO"}
+            return brief
+    except Exception as exc:  # noqa: BLE001 - a brief must never fail on this
+        brief["project_backlog"] = {"available": False, "reason": "BACKLOG_ERROR",
+                                    "detail": f"{type(exc).__name__}: {exc}"}
+        return brief
+    if result is None or "error" in result:
+        brief["project_backlog"] = {"available": False,
+                                    "reason": (result or {}).get("error", "UNKNOWN"),
+                                    "detail": (result or {}).get("detail")}
+        return brief
+    result["available"] = True
+    brief["project_backlog"] = result
+    lines = [f"-- open project backlog: {result['open_total']} open, "
+             f"{result['unrun_total']} never dispatched "
+             f"(project {result['project']['project_id']}) --"]
+    for item in result["open_items"]:
+        marker = "" if item.get("queue_task_id") else "  [unrun]"
+        lines.append(f"[{item['priority']}] {item['status']:<12} {item['id']}  {item['title']}{marker}")
+    if not result["open_items"]:
+        lines.append("(no open backlog items for this project)")
+    brief["recovery_brief_text"] = brief.get("recovery_brief_text", "") + "\n" + "\n".join(lines)
+    # Backlog text is written by AGENTS through the backlog API -- structured
+    # and deliberate, but not this server's own words, and a confused agent
+    # could park injection text in a title that reaches another agent's brief.
+    brief["untrusted_fields"] = list(brief.get("untrusted_fields") or []) + ["project_backlog"]
+    return brief

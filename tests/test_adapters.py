@@ -5,10 +5,10 @@ tmux panes) lives in test_send_reliability.py (Codex, via the reproduced
 fixture) and test_adapters_real_cli.py (both CLIs, live)."""
 from __future__ import annotations
 
-from terminal_mcp.adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STATES, DELIVERY_SUBMIT_CONFIRMED,
+from terminal_mcp.adapters import (DELIVERY_STALLED, DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STATES, DELIVERY_SUBMIT_CONFIRMED,
                                    DELIVERY_TEXT_SENT, DELIVERY_UNKNOWN, TARGET_RUNNING, TARGET_STATES,
                                    TARGET_UNKNOWN, TARGET_WAITING, ClaudeAdapter, CodexAdapter, GenericShellAdapter,
-                                   select_adapter, to_legacy_submit_status)
+                                   normalize_command, select_adapter, to_legacy_submit_status)
 
 
 def test_select_adapter_dispatches_by_command_case_insensitive():
@@ -25,8 +25,9 @@ def test_to_legacy_submit_status_maps_every_delivery_state():
     assert to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED) == "SUBMIT_CONFIRMED"
     for state in (DELIVERY_UNKNOWN, DELIVERY_BLOCKED, DELIVERY_ERROR):
         assert to_legacy_submit_status(state) == "SUBMIT_UNCONFIRMED"
+        assert to_legacy_submit_status(DELIVERY_STALLED) == "SUBMIT_UNCONFIRMED"
     assert set(DELIVERY_STATES) == {DELIVERY_TEXT_SENT, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_UNKNOWN,
-                                     DELIVERY_BLOCKED, DELIVERY_ERROR}
+                                    DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STALLED}
 
 
 def test_generic_shell_adapter_never_recovers_and_uses_bare_diff():
@@ -202,3 +203,70 @@ def test_claude_adapter_empty_sent_text_never_blocks_confirmation():
 
 def test_all_target_states_are_distinct_and_documented():
     assert len(set(TARGET_STATES)) == len(TARGET_STATES) == 5
+
+
+# ---------------------------------------------------------------------------
+# P0 2026-09-15: Windows executable-name normalization.
+#
+# windows_backend.py reports pane_current_command as the Win32 foreground
+# process's BASENAME, matching tmux's own #{pane_current_command} semantic --
+# but a Windows basename keeps its extension, so real Claude Code sessions on
+# dell-5530 (win1/win2/wtest/win-work) arrived as "claude.EXE". The raw
+# casefolded lookup missed the "claude" key, selected GenericShellAdapter, and
+# because submit_flow.ACTIVATION_ADAPTERS is keyed on the adapter NAME the
+# Claude activation nudge was never sent -- a bare Enter on an already-visible
+# prompt did nothing at all on every Windows session.
+# ---------------------------------------------------------------------------
+
+def test_select_adapter_matches_claude_on_posix():
+    assert select_adapter("claude").name == "claude"
+
+
+def test_select_adapter_matches_windows_claude_exe_in_both_cases():
+    # The exact spelling observed live on dell-5530 is upper-case ".EXE".
+    assert select_adapter("claude.EXE").name == "claude"
+    assert select_adapter("claude.exe").name == "claude"
+    assert select_adapter("Claude.Exe").name == "claude"
+
+
+def test_select_adapter_matches_claude_from_a_full_windows_path():
+    # Defensive: neither backend reports a full path today, but a future one
+    # that did must not silently fall back to the generic adapter.
+    assert select_adapter(r"C:\Users\tranv\AppData\Local\claude.EXE").name == "claude"
+    assert select_adapter("/home/mesflow/.local/bin/claude").name == "claude"
+
+
+def test_select_adapter_normalizes_codex_the_same_way():
+    # The fix must not be Claude-specific: Codex on a Windows node has the
+    # identical problem and the identical answer.
+    assert select_adapter("codex").name == "codex"
+    assert select_adapter("codex.exe").name == "codex"
+
+
+def test_select_adapter_still_falls_back_to_generic_for_unknown_commands():
+    for command in ("bash", "powershell.exe", "cmd.exe", "node", "python3", "pwsh.exe"):
+        assert select_adapter(command).name == "generic", command
+
+
+def test_select_adapter_handles_empty_and_none_commands():
+    assert select_adapter("").name == "generic"
+    assert select_adapter(None).name == "generic"  # type: ignore[arg-type]
+
+
+def test_normalize_command_strips_only_the_windows_executable_family():
+    # A dot in a command name is not automatically an extension to strip.
+    assert normalize_command("claude.EXE") == "claude"
+    assert normalize_command("thing.bat") == "thing"
+    assert normalize_command("thing.cmd") == "thing"
+    assert normalize_command("thing.com") == "thing"
+    assert normalize_command("my.tool") == "my.tool"
+    assert normalize_command("  Claude.EXE  ") == "claude"
+
+
+def test_windows_claude_now_receives_the_activation_nudge():
+    # The consequence that actually broke submission: ACTIVATION_ADAPTERS is
+    # keyed on adapter.name, so a generic adapter meant no nudge and a bare
+    # Enter that Claude Code ignores.
+    from terminal_mcp.submit_flow import ACTIVATION_ADAPTERS
+    assert select_adapter("claude.EXE").name in ACTIVATION_ADAPTERS
+    assert select_adapter("bash").name not in ACTIVATION_ADAPTERS

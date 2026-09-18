@@ -176,6 +176,7 @@ class WatchdogConfig:
     # recovery Enter.  Never turn an ambiguous send into an unbounded key
     # spam loop (which can double-submit destructive confirmations).
     max_enter_attempts: int = 2
+    retry_agent_types: frozenset[str] = frozenset({"codex"})
 
 
 class VerifiedSubmitWatchdog:
@@ -236,6 +237,12 @@ class VerifiedSubmitWatchdog:
                 return finish()
             inject(record.prompt)  # exactly once; retries never call inject
             record = self.store.update(submission_id, ack_state=ACK_INJECTED, evidence="text_injected_once")
+        # This watchdog is Codex's only multi-Enter policy.  If a record is
+        # ever created by another front door/backend, fail closed to the
+        # single-submit contract: one initial Enter may already have happened,
+        # but no automatic retry is permitted.
+        max_enter_attempts = (self.config.max_enter_attempts
+                              if record.agent_type in self.config.retry_agent_types else 1)
         self.store.update(submission_id, ack_state=ACK_SUBMITTING)
         deadline = time.monotonic() + self.config.timeout_seconds
         last_lines: list[str] | None = None
@@ -271,7 +278,7 @@ class VerifiedSubmitWatchdog:
                 self.store.update(submission_id, evidence=reason)
                 time.sleep(self.config.poll_interval_seconds)
                 continue
-            if current.enter_count >= self.config.max_enter_attempts:
+            if current.enter_count >= max_enter_attempts:
                 break
             # A slow TUI may still be consuming the previous Enter. Require
             # either a composer redraw or two stable polls (~0.8s by default)

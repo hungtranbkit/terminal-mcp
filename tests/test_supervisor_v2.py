@@ -17,7 +17,7 @@ import pytest
 _TRIVIAL_PASSING_VERIFIER = [sys.executable, "-c", "exit(0)"]
 
 from terminal_mcp.audit import AuditStore
-from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig, SupervisorConfig
+from terminal_mcp.config import SessionAccessConfig, AppConfig, InputPolicyConfig, PermissionsConfig, SupervisorConfig
 from terminal_mcp.core import TerminalService
 from terminal_mcp.supervisor import SupervisorService, SupervisorStore
 from terminal_mcp.supervisor2 import build_supervisor_v2
@@ -400,13 +400,15 @@ def test_execute_send_still_respects_terminal_input_disabled(tmp_path, tmux_sess
 
 
 def test_execute_send_still_respects_input_policy_denied_pattern(tmp_path, tmux_session_factory):
-    # allowed_session_patterns includes this session for *reading*, but
-    # input_policy only allows "test-*" here too — use a session outside
-    # input_policy specifically to prove the send path's own guard still runs.
+    # The premise -- readable but NOT sendable -- used to come from two
+    # separate name whitelists. Both are retired, so it is now expressed as
+    # what it always meant: read is open by policy, INPUT is not granted.
+    # The point of the test is unchanged: the send path runs its own guard.
     terminal = TerminalService(AppConfig(
         PermissionsConfig(True, True), ("test-*", "agent-*"), 50, 20,
-        InputPolicyConfig(allowed_session_patterns=("agent-*",)),  # deliberately excludes "test-*"
+        InputPolicyConfig(allowed_session_patterns=("agent-*",)),
         supervisor=SupervisorConfig(v2_enabled=True),
+        session_access=SessionAccessConfig(default_read=True, default_input=False),
     ))
     session_factory_name = "test-v2-policyoff"
     import subprocess
@@ -457,12 +459,12 @@ def test_send_result_never_contains_raw_prompt_text(tmp_path, tmux_session_facto
     v2, svc = _v2(tmp_path)
     svc.watch(session=session)
     events = svc.run_once()["events"]
-    v2.set_policy(session=session, policy_mode="approved_auto_continue", approved_template="y")
+    v2.set_policy(session=session, policy_mode="approved_auto_continue", approved_template="__RAW_PROMPT_SENTINEL_7f3c9a__")
     claim = v2.claim_event(events[0]["id"], claimed_by="a")
-    v2.submit_decision(claim["id"], "y")
+    v2.submit_decision(claim["id"], "__RAW_PROMPT_SENTINEL_7f3c9a__")
     v2.execute_send(claim["id"])
     action = v2.store.get_action(claim["id"])
-    assert "y" not in action["send_result"] or '"characters"' in action["send_result"]
+    assert "__RAW_PROMPT_SENTINEL_7f3c9a__" not in action["send_result"]
     import json
     parsed = json.loads(action["send_result"])
     # submit_status is a fixed enum value, never raw text; submit_reason
@@ -481,7 +483,22 @@ def test_send_result_never_contains_raw_prompt_text(tmp_path, tmux_session_facto
         # activation_attempts is a small int (0/1/2) -- none of these can
         # ever carry raw prompt content either.
         "submission_id", "agent_type", "evidence", "activation_attempts", "stage",
+        # Submit-profile work: enter_count/attempts are small ints and
+        # submit_latency_ms is a rounded float (core.py sets all three from
+        # counters/timers, never from prompt text) -- extending this
+        # allowlist is a DELIBERATE decision each time, which is exactly
+        # why it is an allowlist and not a denylist.
+        "enter_count", "attempts", "submit_latency_ms",
+        # Delivery gate persists only its structured verdict; raw prompt text
+        # is intentionally excluded from DeliveryVerdict.to_dict().
+        "delivery_verdict",
     }
+    if "delivery_verdict" in parsed:
+        dv = parsed["delivery_verdict"]
+        assert isinstance(dv, dict)
+        assert set(dv) <= {"kind", "activation", "acceptance", "evidence", "detail",
+                           "delivery_state", "submission_id", "may_advance", "safe_to_retry"}
+        assert "__RAW_PROMPT_SENTINEL_7f3c9a__" not in json.dumps(dv)
     if "correlation_id" in parsed:
         assert isinstance(parsed["correlation_id"], str) and "y" not in parsed["correlation_id"]
     if "submit_reason" in parsed:

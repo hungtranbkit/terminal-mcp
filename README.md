@@ -158,6 +158,17 @@ systemctl --user status terminal-mcp-http.service
 systemctl --user restart terminal-mcp-http.service
 ```
 
+For compact agent control, prefer `terminal_batch_inspect` over repeated
+status/tail calls, `terminal_send_task` over a manual text-plus-Enter sequence,
+and `terminal_wait_for_state` over client-side polling. These tools compose the
+existing authorization, binding, menu-detection, idempotency, and verified-submit
+paths; the lower-level tools remain available and backward compatible. Treat one
+logical operation as one compact call. A wait holds the MCP request for at most
+20 seconds; if it returns `PENDING`, continue with `terminal_resume_wait` and its
+opaque `resume_token` rather than resending the task or restarting the wait.
+
+Execution-aware node health is stricter than heartbeat-only presence: a node is green only after a bounded execution-backend probe succeeds. `terminal_node_health` exposes transport/execution state, retry/backoff evidence, last success, and sanitized failure details without changing legacy node APIs.
+
 Its unit is `~/.config/systemd/user/terminal-mcp-http.service`, runs as the
 current user, and uses `Restart=on-failure`. Authentication is intentionally
 not implemented as an ad-hoc MCP wrapper: it must be enforced by the HTTPS
@@ -299,6 +310,12 @@ Restart the MCP child process after changing configuration. Enabling input lets 
 - `terminal_send_bound`
 - `terminal_list_input_audit`
 - `terminal_input_context`
+- `note_create`, `note_get`, `note_search`, `note_list`, `note_update`,
+  `note_delete`, `note_restore`, `note_add_attachment`,
+  `note_remove_attachment`, `note_link_to_project`, `note_mark_applied`,
+  `note_facets` — the cross-project notes/ideas store; see
+  "Ghi chú / Ý tưởng (Notes / Ideas)" below and
+  [`docs/notes.md`](docs/notes.md)
 - `supervisor_watch`, `supervisor_set_verifier_policy`, `supervisor_unwatch`,
   `supervisor_list_watches`, `supervisor_status`, `supervisor_list_events`,
   `supervisor_ack_event`, `supervisor_run_once` — see "Supervisor Loop v1"
@@ -353,6 +370,8 @@ variable overrides an individual store's path:
 | `grants.db` | `SessionGrantStore` | Dynamic, time-boxed read/input grants outside the static whitelist |
 | `leases.db` | `PaneLeaseStore` | Short-lived per-pane send leases used for the submit-guarantee path |
 | `supervisor.db` | `SupervisorStore` / `SupervisorV2Store` | Watch state, policy decisions, and v2 action/approval history (v1 and v2 share one file) |
+| `notes.db` | `NotesStore` | Notes/ideas text + metadata, and the FTS5 search index |
+| `notes_attachments/` | `NotesService` | **Not a database** — the attachment IMAGE FILES, laid out `YYYY/MM/<attachment-uuid>.<ext>`. A backup of `notes.db` alone is not a backup of the notes; see [`docs/notes.md`](docs/notes.md) for the two-part procedure. |
 
 Plus `config.yaml` (whitelist, permissions, input policy, supervisor
 config — not itself in a state directory; wherever `--config`/the default
@@ -403,6 +422,44 @@ expiry) rather than assuming restore always narrows access.
 A missing store file is not an error at startup — every store creates its
 schema on first open — so restoring a subset of files (e.g. `audit.db` only,
 after a disk incident that spared the others) is safe.
+
+## Ghi chú / Ý tưởng (Notes / Ideas)
+
+A cross-project store for things worth keeping. The user is chatting, sees
+something good, says **"lưu lại"** — ChatGPT calls `note_create` with the
+content, its own analysis, the source URL and (optionally) a screenshot.
+Later the same material is findable from ChatGPT (`note_search`) or from a
+browser at **`/dashboard/notes`** (gallery / list / Kanban, Vietnamese,
+mobile-friendly).
+
+- Fully local and deterministic: SQLite + FTS5 bm25. No embedding service,
+  no cloud dependency, no new infrastructure.
+- Not tied to any one project — `project_id`/`project_name` are optional and
+  can be attached later with `note_link_to_project`.
+- Images are real files on disk (`notes_attachments/YYYY/MM/`), never base64
+  blobs in the database. Type is decided by the file's own magic bytes, the
+  on-disk name is a generated uuid, and the bytes are served only through
+  `/dashboard/api/notes/attachment?id=...` — no static mount, no path ever
+  accepted from a caller.
+- **The Notes web surface requires a real login** (`notes.require_auth`,
+  default on): the page, its JSON API and attachment serving all demand either
+  a webauth session cookie (the existing `/login` path) or a verified
+  Cloudflare Access assertion. Edge-only Access is not enough — `cloudflared`
+  connects over loopback, so a tunnel request is indistinguishable from a local
+  one once it arrives. No new auth mechanism was introduced; this reuses the
+  same `WebAuthStore` `/app/*` uses. The `note_*` MCP tools are covered by the
+  MCP transport's own controls only (loopback + CIDR allowlist + authenticated
+  tunnel) — see `docs/notes.md` for why gating one tool family there would be
+  theater.
+- Needs no configuration to work. To let `note_add_attachment(source_path=…)`
+  read files already on this host, an operator must name the allowed
+  directories in `notes.attachment_source_roots` — until then that transport
+  is refused outright and only in-band base64 / the dashboard upload form
+  can add images.
+
+Full reference — data model, every tool with JSON examples, the routes,
+the security posture, backup/restore and the V1 limitations:
+[`docs/notes.md`](docs/notes.md).
 
 ## Known limitations
 

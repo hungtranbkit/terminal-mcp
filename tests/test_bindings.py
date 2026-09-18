@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from terminal_mcp.bindings import BindingStore, valid_binding_name
 from terminal_mcp.config import AppConfig, PermissionsConfig
 from terminal_mcp.core import TerminalService
@@ -63,6 +65,9 @@ def test_bind_get_list_duplicate_replace_and_unbind(tmp_path):
 
 def test_bind_rejects_missing_forbidden_and_sensitive(tmp_path):
     terminal, _ = service(tmp_path)
+    # "private-one" used to be denied simply by not matching the whitelist.
+    # Denial is now something the user sets, so it is set explicitly here.
+    terminal.grants.set_read("private-one", False, granted_by="test")
     assert terminal.terminal_bind("missing", "test-missing")["error"] == "SESSION_NOT_FOUND"
     assert terminal.terminal_bind("private", "private-one")["error"] == "ACCESS_DENIED"
     assert terminal.terminal_bind("sensitive", "test-secret-one")["error"] == "ACCESS_DENIED"

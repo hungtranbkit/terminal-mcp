@@ -36,6 +36,8 @@ from .node_models import (
     CAPACITY_UNKNOWN,
     PLATFORM_LINUX,
     SESSION_BACKEND_TMUX,
+    HEALTH_OFFLINE,
+    HEALTH_TRANSPORT_ONLINE,
     Node,
     NodeHeartbeatThresholds,
     OverloadThresholds,
@@ -224,6 +226,32 @@ class NodeRegistry:
                 # freshly-derived status against, to detect a transition
                 # (never just re-deriving the same answer twice).
                 ("last_known_status", "TEXT"),
+                # P0.3 worker capability (tool/runtime axis). Additive and
+                # defaulted, so a node registered before this feature --
+                # or a remote node still running an older agent that does
+                # not report them -- simply has an empty list rather than
+                # a wrong one.
+                ("capabilities", "TEXT NOT NULL DEFAULT '[]'"),
+                # PROTOCOL generation, deliberately separate from the tool
+                # capabilities above -- they answer different questions
+                # ("can this node run docker?" vs "does this node speak the
+                # same wire contract?"). 0 means the node reported nothing,
+                # which is recorded as legacy and never as compatible.
+                ("contract_version", "INTEGER NOT NULL DEFAULT 0"),
+                ("contract_capabilities", "TEXT NOT NULL DEFAULT '[]'"),
+                # Phase 3 layered node health. These are raw probe/retry
+                # facts, never credentials or response bodies. Keeping them
+                # on the existing node row preserves circuit-breaker state
+                # across controller restarts without a competing store.
+                ("execution_health_state", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
+                ("last_probe_at", "TEXT"),
+                ("last_successful_probe_at", "TEXT"),
+                ("consecutive_probe_failures", "INTEGER NOT NULL DEFAULT 0"),
+                ("next_retry_at", "TEXT"),
+                ("last_probe_error", "TEXT"),
+                ("reconnect_status", "TEXT NOT NULL DEFAULT 'IDLE'"),
+                ("last_agent_generation", "TEXT"),
+                ("last_self_heal_at", "TEXT"),
             ):
                 if column not in existing_columns:
                     connection.execute(f"ALTER TABLE nodes ADD COLUMN {column} {declaration}")
@@ -299,6 +327,26 @@ class NodeRegistry:
             )
         return cursor.rowcount == 1
 
+    def nodes_with_capabilities(self, required: tuple[str, ...], *,
+                                online_only: bool = True) -> list[Node]:
+        """Nodes that have EVERY capability in `required` (AND, not OR --
+        "needs playwright and node" must not match a node with only one).
+
+        An EMPTY `required` matches every node, so an unconstrained
+        caller keeps today's behaviour. A node still running an older
+        agent reports no capabilities and therefore matches only the
+        empty requirement -- it is never assumed capable, matching this
+        project's standing "capability is reported, never guessed" rule."""
+        from .node_models import NODE_ONLINE
+        wanted = set(required)
+        result = []
+        for node in self.list():
+            if online_only and node.status != NODE_ONLINE:
+                continue
+            if wanted.issubset(set(node.capabilities)):
+                result.append(node)
+        return result
+
     # -- heartbeat ----------------------------------------------------------
 
     def heartbeat(self, node_id: str, *, metrics: NodeMetrics, tmux_session_count: int,
@@ -306,7 +354,10 @@ class NodeRegistry:
                  agent_version: str | None, labels: tuple[str, ...], latency_ms: float | None = None,
                  now: datetime | None = None, platform: str = PLATFORM_LINUX,
                  session_backend: str = SESSION_BACKEND_TMUX, shell_capabilities: tuple[str, ...] = (),
-                 wsl_available: bool = False) -> Node | None:
+                 wsl_available: bool = False,
+                 capabilities: tuple[str, ...] = (),
+                 contract_version: int = 0,
+                 contract_capabilities: tuple[str, ...] = ()) -> Node | None:
         """Writes a fresh sample, applies EWMA smoothing on top of
         whatever was previously stored, updates the sustained-high-CPU/
         load duration trackers, recomputes capacity_status/
@@ -357,8 +408,10 @@ class NodeRegistry:
                     swap_total_bytes = ?, swap_used_bytes = ?, swap_percent = ?, swap_percent_smoothed = ?,
                     disk_total_bytes = ?, disk_used_bytes = ?, disk_free_bytes = ?, disk_percent = ?,
                     tmux_session_count = ?, agent_counts = ?, agent_types = ?, agent_version = ?, labels = ?,
+                    capabilities = ?,
                     high_cpu_since = ?, high_load_since = ?, capacity_status = ?, overload_reasons = ?,
                     platform = ?, session_backend = ?, shell_capabilities = ?, wsl_available = ?,
+                    contract_version = ?, contract_capabilities = ?,
                     updated_at = ?
                 WHERE id = ?""",
                 (now_iso, latency_ms,
@@ -368,11 +421,24 @@ class NodeRegistry:
                  metrics.swap_total_bytes, metrics.swap_used_bytes, metrics.swap_percent, swap_smoothed,
                  metrics.disk_total_bytes, metrics.disk_used_bytes, metrics.disk_free_bytes, metrics.disk_percent,
                  tmux_session_count, json.dumps(agent_counts), json.dumps(list(agent_types)), agent_version,
-                 json.dumps(list(labels)), high_cpu_since, high_load_since, capacity_status, json.dumps(reasons),
+                 json.dumps(list(labels)), json.dumps(list(capabilities)),
+                 high_cpu_since, high_load_since, capacity_status, json.dumps(reasons),
                  platform, session_backend, json.dumps(list(shell_capabilities)), int(wsl_available),
+                 int(contract_version), json.dumps(sorted(contract_capabilities)),
                  now_iso, node_id),
             )
         return self.get(node_id, now=now)
+
+    def update_capabilities(self, node_id: str, *, agent_types: tuple[str, ...],
+                            agent_version: str | None) -> Node | None:
+        """Apply an authenticated live capability re-probe without faking a
+        metrics heartbeat or changing node liveness/capacity fields."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE nodes SET agent_types = ?, agent_version = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(list(agent_types)), agent_version, _iso(_now()), node_id),
+            )
+        return self.get(node_id) if cursor.rowcount else None
 
     # -- reads (status is ALWAYS derived here, never trusted from storage) --
 
@@ -398,6 +464,7 @@ class NodeRegistry:
             agent_types=tuple(json.loads(data.get("agent_types") or "[]")),
             agent_version=data.get("agent_version"),
             labels=tuple(json.loads(data.get("labels") or "[]")),
+            capabilities=tuple(json.loads(data.get("capabilities") or "[]")),
             max_sessions=data.get("max_sessions"),
             capacity_status=data.get("capacity_status") or CAPACITY_UNKNOWN,
             overload_reasons=tuple(json.loads(data.get("overload_reasons") or "[]")),
@@ -406,7 +473,46 @@ class NodeRegistry:
             session_backend=data.get("session_backend") or SESSION_BACKEND_TMUX,
             shell_capabilities=tuple(json.loads(data.get("shell_capabilities") or "[]")),
             wsl_available=bool(data.get("wsl_available") or 0),
+            contract_version=int(data.get("contract_version") or 0),
+            contract_capabilities=tuple(json.loads(data.get("contract_capabilities") or "[]")),
+            transport_status=status,
+            transport_state=HEALTH_TRANSPORT_ONLINE if status == "online" else HEALTH_OFFLINE,
+            health_state=data.get("execution_health_state") or "UNKNOWN",
+            execution_state=data.get("execution_health_state") or "UNKNOWN",
+            last_probe_at=data.get("last_probe_at"),
+            last_successful_probe_at=data.get("last_successful_probe_at"),
+            consecutive_failures=int(data.get("consecutive_probe_failures") or 0),
+            next_retry_at=data.get("next_retry_at"),
+            last_error=data.get("last_probe_error"),
+            reconnect_status=data.get("reconnect_status") or "IDLE",
+            agent_generation=data.get("last_agent_generation"),
+            last_self_heal_at=data.get("last_self_heal_at"),
         )
+
+    def record_health_probe(self, node_id: str, *, state: str, success: bool,
+                            probed_at: datetime, consecutive_failures: int,
+                            next_retry_at: datetime | None = None,
+                            last_error: str | None = None,
+                            reconnect_status: str = "IDLE",
+                            agent_generation: str | None = None,
+                            self_heal_attempted: bool = False) -> Node | None:
+        """Persist one bounded probe outcome on the existing node row."""
+        probe_iso = _iso(probed_at)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE nodes SET execution_health_state = ?, last_probe_at = ?,
+                   last_successful_probe_at = CASE WHEN ? THEN ? ELSE last_successful_probe_at END,
+                   consecutive_probe_failures = ?, next_retry_at = ?, last_probe_error = ?,
+                   reconnect_status = ?,
+                   last_agent_generation = COALESCE(?, last_agent_generation),
+                   last_self_heal_at = CASE WHEN ? THEN ? WHEN ? THEN NULL ELSE last_self_heal_at END,
+                   updated_at = ? WHERE id = ?""",
+                (state, probe_iso, int(success), probe_iso, int(consecutive_failures),
+                 _iso(next_retry_at) if next_retry_at else None, last_error,
+                 reconnect_status, agent_generation, int(self_heal_attempted), probe_iso, int(success),
+                 probe_iso, node_id),
+            )
+        return self.get(node_id, now=probed_at) if cursor.rowcount else None
 
     def _derive_status(self, last_heartbeat_at: str | None, now: datetime) -> str:
         from .node_models import NODE_DEGRADED, NODE_OFFLINE, NODE_ONLINE

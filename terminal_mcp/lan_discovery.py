@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import os
 import re
 import socket
 import subprocess
@@ -75,6 +76,92 @@ def is_lan_scannable(ip: ipaddress.IPv4Address) -> bool:
         and not ip.is_reserved
         and not ip.is_unspecified
     )
+
+
+# Opt-in extra ranges an operator has declared trustworthy for NODE
+# CONNECTIVITY specifically (a WireGuard/Tailscale overlay, typically) --
+# empty by default, so every gate below behaves EXACTLY as it did before
+# this existed unless an operator deliberately sets the env var.
+#
+# Why this is separate from is_lan_scannable() rather than widening it:
+# is_lan_scannable() also governs ACTIVE SUBNET SCANNING (local_ipv4_
+# subnets/DiscoveryService) -- a range being safe to *route a node's own
+# authenticated traffic over* does not make it safe to *sweep with probe
+# connections*, and an overlay range is exactly where that distinction
+# matters (Tailscale's 100.64.0.0/10 is a /10 shared with every other
+# tailnet peer, never something this project should port-scan). So
+# is_lan_scannable() is left byte-for-byte unchanged and this is a
+# second, narrower predicate used ONLY by the three node-connectivity
+# gates (controller LAN bind, LAN CIDR guard allowlist, manual-add SSRF
+# check).
+TRUSTED_VPN_CIDRS_ENV = "TERMINAL_MCP_TRUSTED_VPN_CIDRS"
+
+
+class TrustedCidrError(ValueError):
+    pass
+
+
+def _is_overlay_safe(network: ipaddress.IPv4Network) -> bool:
+    """An operator may only declare a range that is NOT globally
+    routable -- this keeps the SSRF/bind posture intact (the point of
+    the gate is "never a public address"), while still admitting the
+    ranges real overlay VPNs actually use: RFC1918, link-local, and
+    CGNAT 100.64.0.0/10 (Tailscale's own range, which Python's
+    `is_private` does NOT cover -- verified live, this is precisely why
+    a Tailscale-addressed node is refused everywhere today)."""
+    addr = network.network_address
+    return (
+        not addr.is_global
+        and not addr.is_loopback
+        and not addr.is_multicast
+        and not addr.is_reserved
+        and not addr.is_unspecified
+    )
+
+
+def trusted_vpn_cidrs(raw: str | None = None) -> tuple[ipaddress.IPv4Network, ...]:
+    """Parse TERMINAL_MCP_TRUSTED_VPN_CIDRS (comma-separated CIDRs).
+    Unset/empty -> () -- today's exact behavior, unchanged. A malformed
+    or globally-routable entry raises rather than being skipped: silently
+    dropping one entry of an operator's allowlist would fail OPEN in the
+    reader's mind ("I configured it, so it must be active") while the
+    real gate stayed closed, which is the worse of the two failures."""
+    if raw is None:
+        raw = os.environ.get(TRUSTED_VPN_CIDRS_ENV)
+    if not raw or not raw.strip():
+        return ()
+    networks: list[ipaddress.IPv4Network] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            network = ipaddress.IPv4Network(part, strict=False)
+        except ValueError as exc:
+            raise TrustedCidrError(f"{TRUSTED_VPN_CIDRS_ENV} entry {part!r} is not a valid IPv4 CIDR") from exc
+        if not _is_overlay_safe(network):
+            raise TrustedCidrError(
+                f"{TRUSTED_VPN_CIDRS_ENV} entry {part!r} is globally routable (or loopback/multicast/"
+                "reserved) -- refusing; this list may only ever cover a private/CGNAT overlay range "
+                "such as 100.64.0.0/10 (Tailscale) or an RFC1918 VPN subnet"
+            )
+        networks.append(network)
+    return tuple(networks)
+
+
+def is_trusted_node_address(ip: ipaddress.IPv4Address,
+                            extra_cidrs: tuple[ipaddress.IPv4Network, ...] | None = None) -> bool:
+    """The gate for "may this address take part in node connectivity" --
+    is_lan_scannable() (unchanged, still the whole answer when no
+    override is configured) OR a member of an operator-declared trusted
+    overlay range. Used by network_bind (controller bind + LAN CIDR
+    guard) and remote_connect (manual-add SSRF check); NEVER by the
+    scanner, see TRUSTED_VPN_CIDRS_ENV's own comment above."""
+    if is_lan_scannable(ip):
+        return True
+    if extra_cidrs is None:
+        extra_cidrs = trusted_vpn_cidrs()
+    return any(ip in network for network in extra_cidrs)
 
 
 def _run(cmd: list[str], timeout: float = 5.0) -> str:
