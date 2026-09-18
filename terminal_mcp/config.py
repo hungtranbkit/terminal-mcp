@@ -1731,7 +1731,18 @@ def _load_queue_config(queue_raw: object) -> QueueConfig:
     poll_interval = float(queue_raw.get("poll_interval_seconds", QueueConfig.poll_interval_seconds))
     if poll_interval < 0.5:
         raise ValueError("queue.poll_interval_seconds must be at least 0.5")
-    return QueueConfig(enabled=bool(queue_raw.get("enabled", False)), poll_interval_seconds=poll_interval)
+    drain_batch_size = int(queue_raw.get("drain_batch_size", QueueConfig.drain_batch_size))
+    if drain_batch_size < 1 or drain_batch_size > 1000:
+        raise ValueError("queue.drain_batch_size must be between 1 and 1000")
+    drain_enabled = queue_raw.get("drain_enabled", QueueConfig.drain_enabled)
+    if not isinstance(drain_enabled, bool):
+        raise ValueError("queue.drain_enabled must be a boolean")
+    return QueueConfig(
+        enabled=bool(queue_raw.get("enabled", False)),
+        poll_interval_seconds=poll_interval,
+        drain_enabled=drain_enabled,
+        drain_batch_size=drain_batch_size,
+    )
 
 
 def _load_session_knowledge_config(raw: object) -> SessionKnowledgeConfig:
