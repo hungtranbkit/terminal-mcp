@@ -30,8 +30,9 @@ def register(server, read_guard, mutation_guard, run_service=None):
   blocked,_=read_guard(request); return blocked or HTMLResponse(HTML)
  @server.custom_route('/dashboard/api/ops/novaretail-dispatch',methods=['GET'],include_in_schema=False)
  async def api(request:Request):
-  blocked,_=read_guard(request)
-  return blocked or JSONResponse({'timer':timer(),'events':events(),'workers':[{'session':w,'state':'UNKNOWN','eligible':False,'input_required':None,'node':'unavailable','last_activity':None,'task':None} for w in WORKERS]})
+  blocked,_=read_guard(request); recent=events(); classification=(recent[0].get('worker_classification') if recent else None) or []; by_session={x.get('session'):x for x in classification if isinstance(x,dict)}
+  workers=[{'session':w,'state':'UNKNOWN','eligible':by_session.get(w,{}).get('eligibility_reason')=='IDLE_MATCH','input_required':None,'node':'unavailable','last_activity':None,'task':None,'project_id':by_session.get(w,{}).get('project_id'),'cwd':by_session.get(w,{}).get('cwd'),'project_match':by_session.get(w,{}).get('project_match'),'eligibility_reason':by_session.get(w,{}).get('eligibility_reason','UNKNOWN')} for w in WORKERS]
+  return blocked or JSONResponse({'timer':timer(),'events':recent,'workers':workers})
  @server.custom_route('/dashboard/api/ops/novaretail-dispatch/run',methods=['POST'],include_in_schema=False)
  async def run(request:Request):
   blocked,_=mutation_guard(request)
