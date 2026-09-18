@@ -151,14 +151,9 @@ def test_non_codex_usage_limited_and_unknown_workers_fail_closed(tmp_path):
                             allowed_agent_types=("codex",))
     _, _, feeder, _ = _feeder(tmp_path, [])
     feeder = ProjectTaskFeeder(feeder.queue, [cfg])
-    rows = feeder.fleet_status([
-        {"session": "wcodex-work", "agent_type": "shell", "state": "IDLE", "input_allowed": True},
-        {"session": "wcodex-work", "agent_type": "codex", "state": "UNKNOWN", "usage_limited": True},
-        {"session": "wcodex-work", "agent_type": "codex", "state": "UNKNOWN", "background_work": True},
-    ])
-    assert rows[0]["classification"] == "BLOCKED_AGENT_TYPE"
-    assert rows[1]["classification"] == "NO_COMPATIBLE_TASK"
-    assert rows[2]["classification"] == "BLOCKED_UNKNOWN_ACTIVITY"
+    assert feeder.fleet_status([{"session": "wcodex-work", "agent_type": "shell", "state": "IDLE", "input_allowed": True}])[0]["classification"] == "BLOCKED_AGENT_TYPE"
+    assert feeder.fleet_status([{"session": "wcodex-work", "agent_type": "codex", "state": "UNKNOWN", "usage_limited": True}])[0]["classification"] == "NO_COMPATIBLE_TASK"
+    assert feeder.fleet_status([{"session": "wcodex-work", "agent_type": "codex", "state": "UNKNOWN", "background_work": True}])[0]["classification"] == "BLOCKED_UNKNOWN_ACTIVITY"
 
 
 def test_cross_node_affinity_and_offline_node_are_visible(tmp_path):
@@ -167,12 +162,8 @@ def test_cross_node_affinity_and_offline_node_are_visible(tmp_path):
                             target_node_id="dell-5530")
     _, _, feeder, _ = _feeder(tmp_path, [])
     feeder = ProjectTaskFeeder(feeder.queue, [cfg])
-    rows = feeder.fleet_status([
-        {"session": "wcodex-work2", "node_id": "local", "state": "IDLE", "input_allowed": True},
-        {"session": "wcodex-work2", "node_id": "dell-5530", "node_status": "offline", "state": "IDLE", "input_allowed": True},
-    ])
-    assert rows[0]["classification"] == "NO_COMPATIBLE_TASK"
-    assert rows[1]["reason"] == "node_unavailable"
+    assert feeder.fleet_status([{"session": "wcodex-work2", "node_id": "local", "state": "IDLE", "input_allowed": True}])[0]["classification"] == "NO_COMPATIBLE_TASK"
+    assert feeder.fleet_status([], unreachable_nodes=[{"node_id": "dell-5530", "status": "offline"}])[0]["reason"] == "node_unavailable"
 
 
 def test_missing_duration_is_inferred_and_forms_target_packet(tmp_path):
@@ -187,3 +178,42 @@ def test_missing_duration_is_inferred_and_forms_target_packet(tmp_path):
     assert 2 <= len(result["task_ids"]) <= 5
     assert 45 <= result["packet_minutes"] <= 90
     assert all(source in {"inferred", "explicit"} for _, (source, _) in result["estimations"].items())
+
+
+def test_authoritative_remote_inventory_discovers_two_windows_sessions(tmp_path):
+    path = _registry(tmp_path, [])
+    store = QueueStore(tmp_path / "queue.db")
+    queue = QueueService(store)
+    feeds = [ProjectFeedConfig("p", name, str(path), target_session=name,
+                               target_node_id="dell-5530", allowed_agent_types=("codex",))
+             for name in ("wcodex-work", "wcodex-work2")]
+    feeder = ProjectTaskFeeder(queue, feeds, inventory_provider=lambda: {
+        "sessions": [
+            {"name": "wcodex-work", "node_id": "dell-5530", "agent_type": "codex",
+             "state": "IDLE", "effective_input": True, "effective_read": True, "background_work": False},
+            {"name": "wcodex-work2", "node_id": "dell-5530", "agent_type": "codex",
+             "state": "WAITING_INPUT", "effective_input": True, "effective_read": True},
+        ], "unreachable_nodes": []})
+    rows = feeder.status()["fleet"]
+    assert {row["session"] for row in rows} == {"wcodex-work", "wcodex-work2"}
+    assert rows[0]["classification"] == "IDLE_ELIGIBLE"
+    assert rows[1]["classification"] == "ACTIVE"
+
+
+def test_authoritative_inventory_marks_remote_node_offline_and_stale_pin(tmp_path):
+    path = _registry(tmp_path, [])
+    store = QueueStore(tmp_path / "queue.db")
+    queue = QueueService(store)
+    feeder = ProjectTaskFeeder(queue, [
+        ProjectFeedConfig("p", "wcodex-work", str(path), target_session="wcodex-work",
+                          target_node_id="dell-5530", allowed_agent_types=("codex",)),
+        ProjectFeedConfig("p", "wcodex-work2", str(path), target_session="wcodex-work2",
+                          target_node_id="dell-5530", allowed_agent_types=("codex",)),
+    ], inventory_provider=lambda: {
+        "sessions": [{"name": "wcodex-work", "node_id": "other-node", "agent_type": "codex",
+                       "state": "IDLE", "effective_input": True}],
+        "unreachable_nodes": [{"node_id": "dell-5530", "status": "offline"}],
+    })
+    rows = {row["session"]: row for row in feeder.status()["fleet"]}
+    assert rows["wcodex-work"]["reason"] == "node_unavailable"
+    assert rows["wcodex-work2"]["reason"] == "node_unavailable"

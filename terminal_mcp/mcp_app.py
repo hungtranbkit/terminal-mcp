@@ -382,7 +382,12 @@ def build_mcp(service: TerminalService | None = None,
             events, queue_engine, batch_size=terminal.config.queue.drain_batch_size)
     _project_feeder = None
     if terminal.config.queue.project_feeds:
-        _project_feeder = ProjectTaskFeeder(queue, terminal.config.queue.project_feeds)
+        # Use the controller's authoritative fleet listing (including remote
+        # node sessions), not the local tmux list. The provider is read-only;
+        # feeder dispatch still passes through queue/ownership gates.
+        _project_feeder = ProjectTaskFeeder(
+            queue, terminal.config.queue.project_feeds,
+            inventory_provider=controller.terminal_list_sessions)
     queue.loop = queue.loop or QueueLoop(
         queue_engine, poll_interval_seconds=terminal.config.queue.poll_interval_seconds,
         heartbeat_refresher=_refresh_local_heartbeat,

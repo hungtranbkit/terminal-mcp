@@ -107,11 +107,18 @@ class QueueLoop:
 
     def status(self) -> dict:
         with self._lock:
+            feeder_status = None
+            if self.project_feeder is not None and hasattr(self.project_feeder, "status"):
+                try:
+                    feeder_status = self.project_feeder.status()
+                except Exception as exc:  # status is observability only
+                    feeder_status = {"error": type(exc).__name__}
             return {"running": self.is_alive(), "poll_interval_seconds": self.poll_interval_seconds,
                     "last_cycle_at": self._last_cycle_at, "last_error": self._last_error,
                     "drain_enabled": self.event_drain is not None,
                     "last_drain": self._last_drain,
                     "project_feed_enabled": self.project_feeder is not None,
+                    "project_fleet": feeder_status,
                     "last_feed": self._last_feed}
 
     def run_one_cycle(self) -> list[dict]:
