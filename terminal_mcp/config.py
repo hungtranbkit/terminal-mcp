@@ -1761,6 +1761,12 @@ def _load_queue_config(queue_raw: object) -> QueueConfig:
             owner=(str(item.get("owner")) if item.get("owner") is not None else None),
             preferred_task_ids=tuple(preferred),
             max_registry_bytes=int(item.get("max_registry_bytes", 5_000_000)),
+            target_session=(str(item.get("target_session")) if item.get("target_session") is not None else None),
+            target_node_id=(str(item.get("target_node_id")) if item.get("target_node_id") is not None else None),
+            target_node_name=(str(item.get("target_node_name")) if item.get("target_node_name") is not None else None),
+            allowed_agent_types=tuple(str(v) for v in (item.get("allowed_agent_types") or [])),
+            required_capabilities=tuple(str(v) for v in (item.get("required_capabilities") or [])),
+            infer_task_size=bool(item.get("infer_task_size", False)),
         )
         if feed.lane in seen_lanes:
             raise ValueError(f"duplicate queue.project_feeds lane: {feed.lane}")
