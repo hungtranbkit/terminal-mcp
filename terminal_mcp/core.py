@@ -1504,6 +1504,21 @@ class TerminalService:
         delivery_state = result.get("delivery_state")
         enter_sent = bool(result.get("enter_sent"))
         recovered = bool(result.get("recovery_attempted"))
+        # Contract invariant: a submit that REQUIRED Enter cannot be confirmed
+        # if no Enter was actually sent. This also repairs stale/idempotent
+        # replay receipts produced by older builds before they leave core.
+        if (result.get("press_enter") is True
+                and delivery_state == DELIVERY_SUBMIT_CONFIRMED
+                and not enter_sent):
+            delivery_state = DELIVERY_UNKNOWN
+            result["delivery_state"] = DELIVERY_UNKNOWN
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
+            result["submit_reason"] = (
+                "receipt invariant violation repaired: press_enter=True and "
+                "SUBMIT_CONFIRMED but enter_sent=False; submission is unproven"
+            )
+            result["evidence"] = []
+            result["receipt_invariant_repaired"] = True
         result.setdefault("activation_attempts", (2 if recovered else 1) if enter_sent else 0)
         result.setdefault("enter_count", result.get("activation_attempts", 0))
         result.setdefault("attempts", result.get("enter_count", 0))
@@ -2127,14 +2142,15 @@ class TerminalService:
             # first Enter; otherwise keep polling without any keypress.
             if not has_submitted_enter and not _codex_composer_buffer_complete(lines, text):
                 return "INCOMPLETE", "composer_buffer_not_fully_observed"
-            # An explicit Codex working footer is execution evidence in its
-            # own right (and remains reliable when the submitted prompt has
-            # already scrolled out of the bounded capture window).
-            if adapter.identify_target_state(lines) == "running":
-                return ACK_RUNNING, "adapter_working_indicator"
-            if baseline is not None and adapter.submit_ack_evidence(baseline, lines, text):
+            # A working footer or adapter delta is only attributable to
+            # THIS submission after at least one Enter was actually sent.
+            # Before that it may be stale activity from a previous turn.
+            if has_submitted_enter and adapter.identify_target_state(lines) == "running":
+                return ACK_RUNNING, "adapter_working_indicator_after_enter"
+            if (has_submitted_enter and baseline is not None
+                    and adapter.submit_ack_evidence(baseline, lines, text)):
                 state = ACK_RUNNING if adapter.identify_target_state(lines) == "running" else ACK_ACCEPTED
-                return state, "adapter_execution_evidence"
+                return state, "adapter_execution_evidence_after_enter"
             # Before the first Enter, a complete echo is the safety gate.
             # After an Enter, the composer is expected to disappear, so its
             # absence is evidence of either acceptance or a stuck/changed
@@ -2153,7 +2169,12 @@ class TerminalService:
             self.submissions.update(record.submission_id, ack_state=ACK_STUCK, evidence=str(exc))
             result = self.submissions.get(record.submission_id).public()  # type: ignore[union-attr]
         state = result["ack_state"]
-        delivery = DELIVERY_SUBMIT_CONFIRMED if state in (ACK_ACCEPTED, ACK_RUNNING) else DELIVERY_UNKNOWN
+        enter_count = int(result.get("enter_count") or 0)
+        delivery = (
+            DELIVERY_SUBMIT_CONFIRMED
+            if state in (ACK_ACCEPTED, ACK_RUNNING) and enter_count > 0
+            else DELIVERY_UNKNOWN
+        )
         return {
             "sent": True, "enter_sent": result["enter_count"] > 0,
             "characters": len(text), "press_enter": True, "correlation_id": correlation_id,
