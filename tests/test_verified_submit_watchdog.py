@@ -192,6 +192,31 @@ def test_persisted_cap_is_shared_by_watcher_passes_and_restart(tmp_path: Path):
     assert result["enter_count"] == 6 and result["ack_state"] == ACK_STUCK
 
 
+@pytest.mark.parametrize("required_enters", [1, 2, 3, 6])
+def test_execution_starts_after_each_bounded_enter_count(tmp_path: Path, required_enters: int):
+    store = SubmissionStore(tmp_path / f"required-{required_enters}.db")
+    record, _ = store.create(idempotency_key=f"required-{required_enters}", session="codex",
+                             agent_type="codex", prompt="long prompt")
+    enters: list[int] = []
+    injected: list[str] = []
+
+    def evidence(_lines, current):
+        if current.enter_count >= required_enters:
+            return ACK_RUNNING, "Working/tool execution"
+        return "COMPOSER", "draft_still_in_composer"
+
+    result = VerifiedSubmitWatchdog(
+        store, WatchdogConfig(poll_interval_seconds=.01, timeout_seconds=.2,
+                              max_enter_attempts=6, max_total_enters=6),
+    ).run(record.submission_id, capture=lambda: ["> long prompt"],
+          inject=lambda text: injected.append(text), send_enter=lambda: enters.append(1),
+          evidence=evidence)
+    assert len(injected) == 1
+    assert len(enters) == required_enters
+    assert result["execution_started"] is True
+    assert result["enter_count"] == required_enters
+
+
 def test_execution_evidence_stops_and_sessions_are_isolated(tmp_path: Path):
     store = SubmissionStore(tmp_path / "isolation.db")
     first, _ = store.create(idempotency_key="first", session="codex-a", agent_type="codex", prompt="a")

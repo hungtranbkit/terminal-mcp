@@ -2205,9 +2205,26 @@ class TerminalService:
             return "COMPOSER", "draft_still_in_composer"
 
         try:
-            result = self.submit_watchdog.run(record.submission_id, capture=capture,
-                                              send_enter=send_enter, evidence=evidence,
-                                              inject=inject)
+            # The direct submit profile remains the compatibility cap for a
+            # caller that explicitly configures a smaller bound. The
+            # background sweeper uses the service watchdog's six-Enter cap
+            # for production recovery.
+            profile = _submit_profile_for(self.config, adapter.name)
+            direct_watchdog = self.submit_watchdog
+            if profile.max_enter_attempts != self.submit_watchdog.config.max_total_enters:
+                direct_watchdog = VerifiedSubmitWatchdog(
+                    self.submissions,
+                    WatchdogConfig(
+                        poll_interval_seconds=self.submit_watchdog.config.poll_interval_seconds,
+                        timeout_seconds=self.submit_watchdog.config.timeout_seconds,
+                        max_enter_attempts=min(profile.max_enter_attempts, 6),
+                        max_total_enters=min(profile.max_enter_attempts, 6),
+                        retry_agent_types=self.submit_watchdog.config.retry_agent_types,
+                    ),
+                )
+            result = direct_watchdog.run(record.submission_id, capture=capture,
+                                         send_enter=send_enter, evidence=evidence,
+                                         inject=inject)
         except (TmuxError, ValueError) as exc:
             self.submissions.update(record.submission_id, ack_state=ACK_STUCK, evidence=str(exc))
             result = self.submissions.get(record.submission_id).public()  # type: ignore[union-attr]

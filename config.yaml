@@ -27,7 +27,7 @@ submit:
     verify_after_each_enter: true
     fixed_enter_count: 0
   codex:
-    max_enter_attempts: 3
+    max_enter_attempts: 6
     enter_interval_ms: 180
     verify_after_each_enter: true
     fixed_enter_count: 0
