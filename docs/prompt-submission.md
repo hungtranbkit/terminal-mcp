@@ -35,6 +35,18 @@ described below — which never re-types the prompt itself, only re-issues
 the submission trigger, and only when very specific evidence says the
 original text is still the one sitting in the composer.
 
+## IME-aware Enter submission (P0 hotfix)
+
+Callers must rely on the verified receipt and must not add a manual second
+Enter. The shared watchdog injects text once, sends one Enter, waits for
+bounded composer/execution evidence, and sends at most one recovery Enter only
+when the exact draft is still present and no execution evidence exists. A
+normal first-Enter submit stops immediately. Receipts expose
+`first_enter_effect`, `recovery_enter_sent`, `composer_before`,
+`composer_after`, `submit_reason`, and `submit_latency_ms`. An unresolved
+result remains `SUBMIT_UNCONFIRMED`/`STUCK`; the adapter never spams Enter or
+duplicates the prompt.
+
 ## What already existed (the audit)
 
 Before this upgrade, the following was already live, already tested

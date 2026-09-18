@@ -16,13 +16,13 @@ from terminal_mcp.submit_watchdog import (
 
 @pytest.mark.parametrize("backend", ["linux-tmux", "windows-conpty"])
 @pytest.mark.parametrize("prompt", ["short", "x" * 5_000, "x" * 20_000, "line 1\n```py\nprint(1)\n```"])
-@pytest.mark.parametrize("accepted_after", [1, 2, 3])
+@pytest.mark.parametrize("accepted_after", [1, 2])
 def test_verified_submit_sends_enter_only_until_ack(tmp_path: Path, backend: str,
                                                      prompt: str, accepted_after: int):
     store = SubmissionStore(tmp_path / f"{backend}.db")
     watchdog = VerifiedSubmitWatchdog(store, WatchdogConfig(poll_interval_seconds=.3,
                                                               timeout_seconds=2,
-                                                              max_enter_attempts=3))
+                                                              max_enter_attempts=2))
     record, _ = store.create(idempotency_key=f"{backend}-{accepted_after}-{len(prompt)}",
                              session="codex-disposable", agent_type="codex", prompt=prompt)
     injected: list[str] = []
@@ -46,13 +46,62 @@ def test_verified_submit_sends_enter_only_until_ack(tmp_path: Path, backend: str
     assert result["ack_state"] == ACK_RUNNING
     assert result["enter_count"] == accepted_after
     assert len(enters) == accepted_after
+    assert result["recovery_enter_sent"] is (accepted_after == 2)
+    assert result["composer_before"] == "present"
+    assert result["submit_latency_ms"] >= 0
+
+
+def test_vietnamese_ime_first_enter_commits_composition_then_one_recovery_enter(tmp_path: Path):
+    store = SubmissionStore(tmp_path / "ime.db")
+    watchdog = VerifiedSubmitWatchdog(store, WatchdogConfig(poll_interval_seconds=.3,
+                                                              timeout_seconds=2,
+                                                              max_enter_attempts=2))
+    prompt = "Kiểm tra tồn kho tiếng Việt\nDòng thứ hai"
+    record, _ = store.create(idempotency_key="ime", session="codex", agent_type="codex", prompt=prompt)
+    enters: list[int] = []
+    polls = {"n": 0}
+
+    def capture() -> list[str]:
+        polls["n"] += 1
+        # First Enter is consumed by the IME; the exact draft remains.
+        if polls["n"] == 1:
+            return ["> " + prompt]
+        if polls["n"] == 2:
+            return ["> " + prompt + " [composition committed]"]
+        return ["esc to interrupt"]
+
+    def evidence(lines, _record):
+        return (ACK_RUNNING, "working_indicator") if lines == ["esc to interrupt"] else ("COMPOSER", "draft_still_in_composer")
+
+    result = watchdog.run(record.submission_id, capture=capture,
+                          inject=lambda text: None, send_enter=lambda: enters.append(1), evidence=evidence)
+    assert len(enters) == 2
+    assert result["ack_state"] == ACK_RUNNING
+    assert result["recovery_enter_sent"] is True
+    assert result["first_enter_effect"] == "composition_commit_or_submit"
+    assert result["composer_after"] == "cleared_or_executing"
+
+
+def test_stuck_submit_never_spams_more_than_two_enters(tmp_path: Path):
+    store = SubmissionStore(tmp_path / "stuck.db")
+    watchdog = VerifiedSubmitWatchdog(store, WatchdogConfig(poll_interval_seconds=.3,
+                                                              timeout_seconds=.8,
+                                                              max_enter_attempts=2))
+    record, _ = store.create(idempotency_key="stuck", session="codex", agent_type="codex", prompt="Xin chào")
+    enters: list[int] = []
+    result = watchdog.run(record.submission_id, capture=lambda: ["> Xin chào"],
+                          inject=lambda text: None, send_enter=lambda: enters.append(1),
+                          evidence=lambda _lines, _record: ("COMPOSER", "draft_still_in_composer"))
+    assert result["ack_state"] == ACK_STUCK
+    assert len(enters) == 2
+    assert result["recovery_enter_sent"] is True
 
 
 def test_verified_submit_stops_without_enter_when_pager_or_buffer_incomplete(tmp_path: Path):
     store = SubmissionStore(tmp_path / "pager.db")
     watchdog = VerifiedSubmitWatchdog(store, WatchdogConfig(poll_interval_seconds=.3,
                                                               timeout_seconds=1,
-                                                              max_enter_attempts=5))
+                                                              max_enter_attempts=2))
     record, _ = store.create(idempotency_key="pager", session="codex", agent_type="codex",
                              prompt="long prompt")
     enters: list[int] = []

@@ -3,6 +3,7 @@ from __future__ import annotations
 import shlex
 import subprocess
 import time
+import uuid
 from datetime import datetime, timezone
 
 from .models import SessionInfo
@@ -29,6 +30,8 @@ later keystroke. See tests/fixtures/laggy_line_reader.py for a real,
 disposable-tmux-pane reproduction of this exact race, and
 TerminalService._send_text_and_verify (core.py) for the best-effort
 post-send confirmation layered on top of this."""
+
+PASTE_BUFFER_THRESHOLD = 4096
 
 
 class TmuxClient:
@@ -132,7 +135,20 @@ class TmuxClient:
         return captured[-lines:]
 
     def send_text(self, session: str, text: str, press_enter: bool) -> None:
-        self._run(["send-keys", "-t", session, "-l", "--", text])
+        if len(text.encode("utf-8")) > PASTE_BUFFER_THRESHOLD:
+            buffer_name = "terminal-mcp-paste-" + uuid.uuid4().hex
+            try:
+                result = subprocess.run(
+                    [self.binary, "load-buffer", "-b", buffer_name, "-"],
+                    input=text, check=False, capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode != 0:
+                    raise TmuxError(result.stderr.strip() or "tmux load-buffer failed")
+                self._run(["paste-buffer", "-p", "-b", buffer_name, "-t", session])
+            finally:
+                self._run(["delete-buffer", "-b", buffer_name], check=False)
+        else:
+            self._run(["send-keys", "-t", session, "-l", "--", text])
         if press_enter:
             # See SEND_TEXT_ENTER_SETTLE_SECONDS above -- this is the fix
             # for the intermittent "typed but not submitted" race, not an

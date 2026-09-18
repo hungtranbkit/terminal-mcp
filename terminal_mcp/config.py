@@ -113,7 +113,7 @@ class SubmitWatchdogConfig:
     enabled: bool = True
     poll_interval_seconds: float = 0.4
     timeout_seconds: float = 5.0
-    max_enter_attempts: int = 3
+    max_enter_attempts: int = 2
     sweeper_interval_seconds: float = 1.5
 
 
@@ -564,8 +564,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         raise ValueError("submit_watchdog.poll_interval_seconds must be between 0.3 and 0.5")
     if submit_config.timeout_seconds <= 0 or submit_config.sweeper_interval_seconds < 1:
         raise ValueError("submit_watchdog timeouts must be positive")
-    if not 1 <= submit_config.max_enter_attempts <= 5:
-        raise ValueError("submit_watchdog.max_enter_attempts must be between 1 and 5")
+    if not 1 <= submit_config.max_enter_attempts <= 2:
+        raise ValueError("submit_watchdog.max_enter_attempts must be between 1 and 2")
 
     nodes_raw = raw.get("nodes", {})
     if not isinstance(nodes_raw, dict):

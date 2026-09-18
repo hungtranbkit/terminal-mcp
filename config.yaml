@@ -35,7 +35,7 @@ input_policy:
   allow_send_text: true
   allow_keys: [Enter, Escape, Up, Down, Left, Right, Tab]
   sensitive_keys_require_confirmation: [C-c, C-d]
-  max_text_length: 12000
+  max_text_length: 30000
   allowed_sensitive_commands: []
 
 # Supervisor Loop v1 — detection + durable event queue only (see README.md
@@ -190,5 +190,6 @@ submit_watchdog:
   # is persisted before the one-shot injection and is never re-injected.
   poll_interval_seconds: 0.4
   timeout_seconds: 5.0
-  max_enter_attempts: 3
+  # One normal Enter plus at most one evidence-gated IME recovery Enter.
+  max_enter_attempts: 2
   sweeper_interval_seconds: 1.5
