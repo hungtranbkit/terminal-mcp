@@ -19,7 +19,10 @@ Safety rules:
 from __future__ import annotations
 
 import json
+import hashlib
 import time
+import uuid
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -43,6 +46,9 @@ class ProjectFeedConfig:
     owner: str | None = None
     preferred_task_ids: tuple[str, ...] = ()
     max_registry_bytes: int = 5_000_000
+    packet_min_minutes: int = 45
+    packet_max_minutes: int = 90
+    packet_lease_seconds: int = 7_200
 
     def __post_init__(self) -> None:
         if not self.project_id.strip():
@@ -53,6 +59,8 @@ class ProjectFeedConfig:
             raise ValueError("project feed registry_path is required")
         if self.max_registry_bytes < 1_024:
             raise ValueError("project feed max_registry_bytes is too small")
+        if not 1 <= self.packet_min_minutes <= self.packet_max_minutes:
+            raise ValueError("invalid project packet duration bounds")
 
 
 class ProjectTaskFeeder:
@@ -62,6 +70,7 @@ class ProjectTaskFeeder:
         self.queue = queue
         self._feeds = {feed.lane: feed for feed in feeds}
         self._last: dict[str, dict[str, Any]] = {}
+        self._idle_since: dict[str, float] = {}
 
     def configured_lanes(self) -> tuple[str, ...]:
         return tuple(sorted(self._feeds))
@@ -83,12 +92,78 @@ class ProjectTaskFeeder:
             return self._record(session, "REGISTRY_ERROR",
                                 detail=f"{type(exc).__name__}: {exc}")
 
+        idle_seconds = self._idle_seconds(session)
+        worker = feed.owner or feed.lane
+        active = self._active_packet(worker)
+        stale_recovered = False
+        if active and self._lease_expired(active.get("lease_expires_at")):
+            self.queue.store.update_project_packet(active["packet_id"], state="EXPIRED",
+                                                   checkpoint={"recovered": True, "reason": "stale_worker_lease"})
+            active = None
+            stale_recovered = True
         by_id = {str(task.get("id") or ""): task for task in tasks if task.get("id")}
         candidates = [task for task in tasks if self._eligible(task, feed, by_id)]
+        # A canonical READY record can lag the durable queue. Never reserve a
+        # second packet for a queue row that already reached a terminal state.
+        terminal_existing = [str(task["id"]) for task in candidates
+                             if self._queue_task_terminal(feed.project_id, str(task["id"]))]
+        queued_existing = [] if stale_recovered else [str(task["id"]) for task in candidates
+                           if self._queue_task_active(feed.project_id, str(task["id"]))]
+        candidates = [task for task in candidates
+                      if str(task["id"]) not in set(terminal_existing + queued_existing)]
         candidates.sort(key=lambda task: self._rank(task, feed))
 
+        if active:
+            progress = self._packet_progress(active)
+            if progress == "COMPLETE":
+                self.queue.store.update_project_packet(active["packet_id"], state="COMPLETED",
+                                                       checkpoint={"completed": True})
+            else:
+                # A feeder cycle is also the worker heartbeat for a packet;
+                # extending the lease is bounded to the configured packet
+                # window and never creates a second packet.
+                feed_lease = (datetime.now(timezone.utc) + timedelta(seconds=feed.packet_lease_seconds)).isoformat()
+                self.queue.store.update_project_packet(active["packet_id"],
+                                                       lease_expires_at=feed_lease)
+                return self._record(session, "PACKET_ACTIVE", packet_id=active["packet_id"],
+                                    task_ids=active["task_ids"], idle_seconds=idle_seconds,
+                                    why_not_dispatched="worker_packet_active",
+                                    next_candidate=(str(candidates[0]["id"]) if candidates else None))
+
+        if not candidates:
+            blocked = self._ownership_conflicts(tasks, feed)
+            if blocked:
+                return self._record(session, "REASSIGN_REQUIRED", task_ids=blocked,
+                                    idle_seconds=idle_seconds, why_not_dispatched="owned_by_other_active_worker",
+                                    next_candidate=blocked[0])
+            if terminal_existing:
+                return self._record(session, "REGISTRY_STALE", skipped_terminal=terminal_existing,
+                                    idle_seconds=idle_seconds, why_not_dispatched="queue_row_terminal", next_candidate=None)
+            return self._record(session, "NO_EXECUTABLE_TASK", idle_seconds=idle_seconds,
+                                why_not_dispatched="dependencies_or_status_not_ready", next_candidate=None)
+
+        selected = self._select_packet(candidates, by_id, feed)
+        task_ids = [str(task["id"]) for task in selected]
+        task_shas = {task_id: self._task_sha(task) for task_id, task in
+                     ((str(task["id"]), task) for task in selected)}
+        packet_key = "project-packet:" + feed.project_id + ":" + worker + ":" + \
+            hashlib.sha256(json.dumps(task_shas, sort_keys=True).encode()).hexdigest()[:24]
+        if stale_recovered:
+            packet_key += ":recovery"
+        packet_id = uuid.uuid4().hex
+        lease = (datetime.now(timezone.utc) + timedelta(seconds=feed.packet_lease_seconds)).isoformat()
+        telemetry = {"idle_seconds": 0, "task_ids": task_ids,
+                     "next_candidate": task_ids[0] if task_ids else None,
+                     "why_not_dispatched": None}
+        reserved = self._reserve_packet(packet_id, feed, worker, task_ids, task_shas, packet_key, lease, telemetry)
+        if reserved.get("blocked"):
+            return self._record(session, "PACKET_ACTIVE", **reserved)
+        if reserved.get("deduplicated"):
+            return self._record(session, "EXISTING_PACKET", **reserved)
+
         skipped_terminal: list[str] = []
-        for task in candidates:
+        queue_ids: list[str] = []
+        for task in selected:
             task_id = str(task["id"])
             result = self.queue.enqueue(
                 session,
@@ -104,25 +179,154 @@ class ProjectTaskFeeder:
                 request_key=f"project-feed:{feed.project_id}:{task_id}",
             )
             if result.get("error"):
-                return self._record(session, "ENQUEUE_ERROR", task_id=task_id,
+                self.queue.store.update_project_packet(packet_id, state="BLOCKED",
+                                                       checkpoint={"error": str(result.get("error"))})
+                return self._record(session, "ENQUEUE_ERROR", task_id=task_id, packet_id=packet_id,
                                     detail=str(result.get("error")))
+            queue_ids.append(str(result.get("task_id")))
             state = str(result.get("task_status") or "")
             if result.get("deduplicated") and state in _TERMINAL_QUEUE_STATUSES:
                 skipped_terminal.append(task_id)
                 continue
             if result.get("deduplicated") and state in _STOP_QUEUE_STATUSES:
+                self.queue.store.update_project_packet(packet_id, state="RUNNING",
+                                                       checkpoint={"queue_task_ids": queue_ids},
+                                                       telemetry=telemetry, lease_expires_at=lease)
                 return self._record(session, "EXISTING_TASK", task_id=task_id,
+                                    packet_id=packet_id, task_ids=task_ids,
                                     queue_task_id=result.get("task_id"),
                                     queue_status=state)
-            return self._record(session, "ENQUEUED", task_id=task_id,
-                                queue_task_id=result.get("task_id"),
-                                deduplicated=bool(result.get("deduplicated")))
+        self.queue.store.update_project_packet(packet_id, state="RUNNING",
+                                               checkpoint={"queue_task_ids": queue_ids},
+                                               telemetry=telemetry, lease_expires_at=lease)
+        self._idle_since.pop(session, None)
+        return self._record(session, "ENQUEUED", task_id=task_ids[0], task_ids=task_ids,
+                            packet_id=packet_id, queue_task_id=queue_ids[0],
+                            queue_task_ids=queue_ids, deduplicated=False,
+                            packet_minutes=sum(self._estimate_minutes(t) for t in selected))
 
-        if skipped_terminal:
-            return self._record(session, "REGISTRY_STALE",
-                                detail="canonical READY/IN_PROGRESS tasks already terminal in queue",
-                                skipped_terminal=skipped_terminal)
-        return self._record(session, "NO_EXECUTABLE_TASK")
+    def _active_packet(self, worker: str) -> dict[str, Any] | None:
+        store = getattr(self.queue, "store", None)
+        return store.active_project_packet(worker) if store is not None and hasattr(store, "active_project_packet") else None
+
+    @staticmethod
+    def _lease_expired(value: str | None) -> bool:
+        if not value:
+            return True
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")) <= datetime.now(timezone.utc)
+        except ValueError:
+            return True
+
+    def _packet_progress(self, packet: dict[str, Any]) -> str:
+        store = getattr(self.queue, "store", None)
+        if store is None:
+            return "ACTIVE"
+        terminal = {"COMPLETED", "CANCELLED", "SKIPPED"}
+        for task_id in packet.get("task_ids", []):
+            key = f"project-feed:{packet['project_id']}:{task_id}"
+            row = store.task_by_request_key(key)
+            if row is None or row.get("status") not in terminal:
+                return "ACTIVE"
+        return "COMPLETE"
+
+    def _queue_task_terminal(self, project_id: str, task_id: str) -> bool:
+        store = getattr(self.queue, "store", None)
+        if store is None:
+            return False
+        row = store.task_by_request_key(f"project-feed:{project_id}:{task_id}")
+        return bool(row and row.get("status") in _TERMINAL_QUEUE_STATUSES)
+
+    def _queue_task_active(self, project_id: str, task_id: str) -> bool:
+        store = getattr(self.queue, "store", None)
+        if store is None:
+            return False
+        row = store.task_by_request_key(f"project-feed:{project_id}:{task_id}")
+        return bool(row and row.get("status") not in _TERMINAL_QUEUE_STATUSES)
+
+    def _reserve_packet(self, packet_id: str, feed: ProjectFeedConfig, worker: str,
+                        task_ids: list[str], task_shas: dict[str, str], request_key: str,
+                        lease: str, telemetry: dict[str, Any]) -> dict[str, Any]:
+        store = getattr(self.queue, "store", None)
+        if store is None or not hasattr(store, "reserve_project_packet"):
+            return {"packet_id": packet_id, "task_ids": task_ids}
+        return store.reserve_project_packet(packet_id=packet_id, project_id=feed.project_id,
+                                            lane=feed.lane, worker=worker, task_ids=task_ids,
+                                            task_shas=task_shas, request_key=request_key,
+                                            lease_expires_at=lease, telemetry=telemetry)
+
+    @staticmethod
+    def _task_sha(task: dict[str, Any]) -> str:
+        canonical = json.dumps(task, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _estimate_minutes(task: dict[str, Any]) -> int:
+        for key in ("estimated_minutes", "duration_minutes", "timebox_minutes"):
+            try:
+                value = int(task.get(key))
+                if value > 0:
+                    return value
+            except (TypeError, ValueError):
+                pass
+        return 15
+
+    def _select_packet(self, candidates: list[dict[str, Any]], by_id: dict[str, dict[str, Any]],
+                       feed: ProjectFeedConfig) -> list[dict[str, Any]]:
+        selected = [candidates[0]]
+        # Only explicit estimates are bundleable. This preserves the legacy
+        # one-task feeder for registries that provide no sizing metadata.
+        if not any(any(key in task for key in ("estimated_minutes", "duration_minutes", "timebox_minutes"))
+                   for task in candidates):
+            return selected
+        total = self._estimate_minutes(selected[0])
+        scopes = self._scopes(selected[0])
+        ordered_candidates = list(candidates)
+        # A directly dependent READY task may be included after its parent in
+        # the same packet. It is intentionally not eligible on its own; the
+        # ordered packet is the only way it can cross this boundary safely.
+        selected_ids = {str(task["id"]) for task in selected}
+        for task in by_id.values():
+            if str(task.get("status") or "") == "READY" and str(task.get("id")) not in selected_ids:
+                deps = [str(dep) for dep in (task.get("dependencies") or [])]
+                if deps and all(dep in selected_ids for dep in deps):
+                    ordered_candidates.append(task)
+        for task in ordered_candidates[1:]:
+            if len(selected) >= 5:
+                break
+            if task.get("dependencies") and not all(str(dep) in {str(t["id"]) for t in selected} or
+                                                     str(by_id.get(str(dep), {}).get("status")) == "DONE"
+                                                     for dep in task.get("dependencies", [])):
+                continue
+            if self._scopes_overlap(self._scopes(task), scopes):
+                continue
+            estimate = self._estimate_minutes(task)
+            if total + estimate > feed.packet_max_minutes:
+                continue
+            selected.append(task); total += estimate; scopes |= self._scopes(task)
+            if total >= feed.packet_min_minutes:
+                break
+        return selected
+
+    @staticmethod
+    def _scopes(task: dict[str, Any]) -> set[str]:
+        values = task.get("scope") or task.get("files") or task.get("owned_files") or task.get("file_scope") or []
+        return {str(value).strip().rstrip("/") for value in values if str(value).strip()} if isinstance(values, list) else set()
+
+    @staticmethod
+    def _scopes_overlap(left: set[str], right: set[str]) -> bool:
+        return any(a == b or a.startswith(b + "/") or b.startswith(a + "/")
+                   for a in left for b in right)
+
+    def _ownership_conflicts(self, tasks: list[dict[str, Any]], feed: ProjectFeedConfig) -> list[str]:
+        owner = feed.owner or feed.lane
+        return [str(task["id"]) for task in tasks
+                if str(task.get("status") or "") == "READY" and task.get("owner")
+                and str(task.get("owner")) != owner]
+
+    def _idle_seconds(self, session: str) -> int:
+        started = self._idle_since.setdefault(session, time.monotonic())
+        return max(0, int(time.monotonic() - started))
 
     def _load(self, feed: ProjectFeedConfig) -> list[dict[str, Any]]:
         path = Path(feed.registry_path).expanduser().resolve()
@@ -152,6 +356,9 @@ class ProjectTaskFeeder:
                   by_id: dict[str, dict[str, Any]]) -> bool:
         status = str(task.get("status") or "")
         if status == "READY":
+            expected_owner = feed.owner or feed.lane
+            if task.get("owner") and str(task.get("owner")) != expected_owner:
+                return False
             return self._deps_done(task, by_id)
         if status != "IN_PROGRESS":
             return False
