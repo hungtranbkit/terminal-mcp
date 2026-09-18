@@ -14,7 +14,7 @@ def events(path=STATE, limit=100):
     for line in lines:
         try:
             item=json.loads(line)
-            if isinstance(item,dict): rows.append(normalize_event_metrics({k:item.get(k) for k in ("timestamp","selected_session","result","submission_id","correlation_id","submit_confirmed","execution_started","waiting_approval","attempted_sessions","submit","worker_classification")}))
+            if isinstance(item,dict): rows.append(normalize_event_metrics({k:item.get(k) for k in ("timestamp","selected_session","result","submission_id","correlation_id","submit_confirmed","execution_started","waiting_approval","attempted_sessions","submit","worker_classification","dispatcher_session","dispatcher_state","dispatcher_reason")}))
         except json.JSONDecodeError: continue
     return list(reversed(rows))
 def normalize_event_metrics(event):
@@ -41,7 +41,7 @@ def register(server, read_guard, mutation_guard, run_service=None):
  async def api(request:Request):
   blocked,_=read_guard(request); recent=events(); classification=(recent[0].get('worker_classification') if recent else None) or []; by_session={x.get('session'):x for x in classification if isinstance(x,dict)}
   workers=[{'session':w,'state':'UNKNOWN','eligible':by_session.get(w,{}).get('eligibility_reason')=='IDLE_MATCH','input_required':None,'node':'unavailable','last_activity':None,'task':None,'project_id':by_session.get(w,{}).get('project_id'),'cwd':by_session.get(w,{}).get('cwd'),'project_match':by_session.get(w,{}).get('project_match'),'eligibility_reason':by_session.get(w,{}).get('eligibility_reason','UNKNOWN')} for w in WORKERS]
-  return blocked or JSONResponse({'timer':timer(),'events':recent,'workers':workers})
+  return blocked or JSONResponse({'timer':timer(),'events':recent,'dispatcher':{'session':(recent[0].get('dispatcher_session') if recent else 'codex1'),'state':(recent[0].get('dispatcher_state') if recent else 'UNKNOWN'),'reason':(recent[0].get('dispatcher_reason') if recent else 'UNKNOWN')},'workers':[x for x in workers if x['session'] != (recent[0].get('dispatcher_session') if recent else 'codex1')]})
  @server.custom_route('/dashboard/api/ops/novaretail-dispatch/run',methods=['POST'],include_in_schema=False)
  async def run(request:Request):
   blocked,_=mutation_guard(request)
