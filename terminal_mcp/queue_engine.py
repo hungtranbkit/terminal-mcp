@@ -51,6 +51,7 @@ import re
 
 import hashlib
 import time
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
@@ -58,7 +59,7 @@ from .coordinator import CoordinatorGate, OtherLaneSnapshot, SessionSnapshot
 from . import delivery_gate
 from .queue_store import (
     BLOCKED, COMPLETED, DISPATCH_UNCERTAIN, DISPATCHING, FAILED, PRECHECK, QUEUED, READY, RUNNING, VERIFYING,
-    WAITING_SESSION, QueueStore, QueueTask,
+    WAITING_SESSION, QueueStore, QueueTask, iso_now,
 )
 from .status import COMPLETION_MARKER_RE, parse_completion_marker, verify_completion_marker
 from .request_governor import RequestGovernor
@@ -455,7 +456,36 @@ class QueueEngine:
             self.store.mark_dispatch_uncertain(task_id, reason="delivery_state=DELIVERY_UNKNOWN")
             return TickResult(session, "DISPATCH_UNCERTAIN", task_id=task_id)
         self.store.transition_task(task_id, RUNNING, event_type="STARTED")
+        self._ensure_long_task_watch(task, session, response, idempotency_key)
         return TickResult(session, "DISPATCHED", task_id=task_id, detail=idempotency_key)
+
+    @staticmethod
+    def _long_task_metadata(task: QueueTask) -> tuple[bool, int | None]:
+        metadata = task.metadata or {}
+        expected = metadata.get("expected_minutes", metadata.get("packet_duration_minutes"))
+        try:
+            expected = int(expected) if expected is not None else None
+        except (TypeError, ValueError):
+            expected = None
+        return bool(metadata.get("long_task") is True or (expected is not None and expected >= 10)), expected
+
+    def _ensure_long_task_watch(self, task: QueueTask, session: str, response: dict[str, Any], request_key: str) -> None:
+        long_task, expected = self._long_task_metadata(task)
+        if not long_task:
+            return
+        submission_id = response.get("submission_id") or response.get("correlation_id")
+        if not submission_id:
+            return
+        watch = self.store.ensure_long_task_watch(
+            task.id, str(submission_id), request_key, session,
+            node_id=response.get("node_id"), expected_minutes=expected,
+        )
+        if response.get("execution_started") or response.get("ack_state") in {"RUNNING", "EXECUTION_STARTED"}:
+            now = iso_now()
+            self.store.update_long_task_watch(
+                task.id, state="WATCHING", execution_started_at=now, last_progress_at=now,
+                watch_lease_expires_at=(datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(),
+            )
 
     def _delivery_verdict(self, session: str, response: dict, sent_text: str):
         """Compute the delivery verdict for one send.
@@ -527,6 +557,8 @@ class QueueEngine:
             # SESSION (auto-recoverable), never FAILED (a real execution
             # failure) and never silently dropped.
             self.store.mark_waiting_session(task_id, reason=error)
+            if self.store.long_task_watch(task_id):
+                self.store.update_long_task_watch(task_id, state="BLOCKED", blocker="NODE_UNAVAILABLE", reason=error)
             return TickResult(session, "WAITING_SESSION", task_id=task_id, detail=error)
         if error:
             self.store.transition_task(task_id, FAILED, event_type="FAILED",
@@ -540,9 +572,41 @@ class QueueEngine:
             self.governor.note_output(task, str(status_response.get("last_output") or ""))
 
         state = status_response.get("state")
+        watch = self.store.long_task_watch(task_id)
+        if watch:
+            output = str(status_response.get("last_output") or "")
+            if state == "RUNNING" and watch.get("state") == "EXECUTION_START_PENDING":
+                now = iso_now()
+                self.store.update_long_task_watch(task_id, state="WATCHING", execution_started_at=now,
+                                                  last_progress_at=now, watch_lease_expires_at=(datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(),
+                                                  status_hash=hashlib.sha256(str(status_response).encode()).hexdigest())
+            elif state == "RUNNING":
+                self.store.update_long_task_watch(task_id, state="WATCHING", last_progress_at=iso_now(),
+                                                  watch_lease_expires_at=(datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(),
+                                                  status_hash=hashlib.sha256(str(status_response).encode()).hexdigest())
+            if state == "RUNNING" and output and not watch.get("first_checkpoint_at"):
+                self.store.update_long_task_watch(task_id, first_checkpoint_at=iso_now(), last_progress_at=iso_now(),
+                                                  output_hash=hashlib.sha256(output.encode()).hexdigest(),
+                                                  reason="execution_output_checkpoint")
         if current_status == RUNNING:
             if state == "RUNNING":
                 return TickResult(session, "RUNNING", task_id=task_id)
+            if watch and watch.get("state") == "WATCHING" and not watch.get("first_checkpoint_at"):
+                # A long task that fell back to an idle prompt before its
+                # first checkpoint gets one bounded continuation.  This is
+                # a new send with a stable key, never a duplicate prompt.
+                if (watch.get("resume_count", 0) < 1
+                        and not status_response.get("input_required")
+                        and str(status_response.get("state") or "").upper() not in {"WAITING_APPROVAL", "WAITING_INPUT", "PAGER"}):
+                    resume_key = f"{watch['request_key']}:resume:1"
+                    self.ops.terminal_send_text(
+                        session,
+                        "Continue the same task from the persisted task context; do not restart or duplicate work.",
+                        press_enter=True, idempotency_key=resume_key,
+                    )
+                    self.store.update_long_task_watch(task_id, resume_count=1,
+                                                      state="EXECUTION_START_PENDING", reason="auto_resume_before_checkpoint")
+                    return TickResult(session, "LONG_TASK_RESUMED", task_id=task_id)
             # Anything else (IDLE/WAITING_INPUT/UNKNOWN) -- the agent has
             # gone quiet; move to VERIFYING to look for real evidence.
             #
@@ -587,6 +651,9 @@ class QueueEngine:
         )
         if verified:
             completed = self.store.mark_completed_with_evidence(task_id, evidence={"completion_marker": marker})
+            if watch:
+                self.store.update_long_task_watch(task_id, state="DONE", first_checkpoint_at=watch.get("first_checkpoint_at") or iso_now(),
+                                                  last_progress_at=iso_now(), reason="verified_completion")
             self._notify_completed(completed)
             if self.governor is not None:
                 self.governor.note_success(completed)
