@@ -372,3 +372,79 @@ class CompactTerminalTools:
         except TimeoutError:
             return {"status": "FAILED", "error": "EXPIRED_RESUME_TOKEN"}
         return self._wait_slice(wait, timeout=timeout, poll_interval=poll_interval)
+
+
+    def turn(self, *, action: str, target: str | None = None,
+             targets: list[str] | None = None, text: str | None = None,
+             desired_states: list[str] | None = None, resume_token: str | None = None,
+             timeout: float = DEFAULT_WAIT_SECONDS, poll_interval: float = 1,
+             tail_lines: int = 20, compact: bool = True,
+             idempotency_key: str | None = None) -> dict[str, Any]:
+        """One MCP-call surface for one logical terminal turn.
+
+        Supported actions:
+        - inspect: status+tail for one target or many targets.
+        - send: guarded/idempotent task submission.
+        - send_wait: submit, then create one durable bounded wait in the same call.
+        - wait: create one durable bounded wait.
+        - resume: resume a previously PENDING wait.
+
+        This deliberately composes the existing methods rather than creating a
+        second authorization, send, wait or idempotency implementation.
+        """
+        normalized = str(action or "").strip().lower().replace("-", "_")
+        if normalized not in {"inspect", "send", "send_wait", "wait", "resume"}:
+            return {"status": "FAILED", "error": "INVALID_ACTION",
+                    "allowed": ["inspect", "send", "send_wait", "wait", "resume"]}
+
+        if normalized == "inspect":
+            resolved_targets = list(targets or ([] if target is None else [target]))
+            if not resolved_targets:
+                return {"status": "FAILED", "error": "TARGET_REQUIRED"}
+            result = self.batch_inspect(resolved_targets, tail_lines=tail_lines, compact=compact)
+            return {"status": "OK" if "error" not in result else "FAILED",
+                    "action": normalized, "result": result}
+
+        if normalized == "resume":
+            if not resume_token:
+                return {"status": "FAILED", "error": "RESUME_TOKEN_REQUIRED"}
+            result = self.resume_wait(resume_token, timeout=timeout,
+                                      poll_interval=poll_interval)
+            return {"status": result.get("status", "FAILED"),
+                    "action": normalized, "result": result}
+
+        if not target:
+            return {"status": "FAILED", "error": "TARGET_REQUIRED"}
+
+        if normalized == "send":
+            if not text:
+                return {"status": "FAILED", "error": "TEXT_REQUIRED"}
+            result = self.send_task(target, text, wait_for_accept=True,
+                                    timeout=min(float(timeout), MAX_SEND_WAIT_SECONDS),
+                                    idempotency_key=idempotency_key)
+            return {"status": result.get("status", "FAILED"),
+                    "action": normalized, "result": result}
+
+        states = desired_states or ["IDLE", "WAITING_INPUT"]
+        if normalized == "wait":
+            result = self.wait_for_state(target, states, timeout=timeout,
+                                         poll_interval=poll_interval,
+                                         tail_lines=tail_lines)
+            return {"status": result.get("status", "FAILED"),
+                    "action": normalized, "result": result}
+
+        # send_wait: send first, and only wait if the guarded submit was
+        # positively confirmed. A blocked/failed send never creates a wait.
+        if not text:
+            return {"status": "FAILED", "error": "TEXT_REQUIRED"}
+        sent = self.send_task(target, text, wait_for_accept=True,
+                              timeout=min(float(timeout), MAX_SEND_WAIT_SECONDS),
+                              idempotency_key=idempotency_key)
+        if sent.get("status") != "SUBMIT_CONFIRMED":
+            return {"status": sent.get("status", "FAILED"),
+                    "action": normalized, "send": sent, "wait": None}
+        waited = self.wait_for_state(target, states, timeout=timeout,
+                                     poll_interval=poll_interval,
+                                     tail_lines=tail_lines)
+        return {"status": waited.get("status", "FAILED"),
+                "action": normalized, "send": sent, "wait": waited}
