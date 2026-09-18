@@ -782,6 +782,38 @@ def _add_v10_requirement_contract(connection: sqlite3.Connection) -> None:
             connection.execute(f"ALTER TABLE queue_tasks ADD COLUMN {column} {declaration}")
 
 
+def _add_v11_project_packets(connection: sqlite3.Connection) -> None:
+    """Durable project-feeder packets (additive, restart-safe).
+
+    A packet is the feeder's idempotency/lease unit, separate from queue
+    tasks so a reconnect cannot create a second bundle.  The queue remains
+    the source of truth for execution state; this table only records the
+    durable dispatch decision and its lease/checkpoint.
+    """
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS project_packets (
+            packet_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            lane TEXT NOT NULL,
+            worker TEXT NOT NULL,
+            task_ids TEXT NOT NULL,
+            task_shas TEXT NOT NULL,
+            request_key TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL,
+            lease_expires_at TEXT,
+            heartbeat_at TEXT,
+            checkpoint TEXT NOT NULL DEFAULT '{}',
+            telemetry TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_project_packets_worker_state "
+                       "ON project_packets(worker, state)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_project_packets_project_state "
+                       "ON project_packets(project_id, state)")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
@@ -805,9 +837,11 @@ QUEUE_MIGRATIONS = [
                  "index, so a retried create returns the SAME task instead of a second one",
               _add_v9_request_key),
     Migration(10, "Requirement Contract: queue_tasks.requirement_contract/evidence_matrix "
-                  "(nullable) so a missing acceptance criterion is a representable fact, "
-                  "plus deploy_state kept OFF the status enum so deploying never reads as done",
-              _add_v10_requirement_contract),
+              "(nullable) so a missing acceptance criterion is a representable fact, "
+              "plus deploy_state kept OFF the status enum so deploying never reads as done",
+             _add_v10_requirement_contract),
+    Migration(11, "durable project feeder packets with leases/checkpoints/idempotency",
+             _add_v11_project_packets),
 ]
 
 
@@ -1164,6 +1198,90 @@ class QueueStore:
             self._record_event_locked(connection, session=session, task_id=None,
                                       event_type="AUTO_DISPATCH_ENABLED" if enabled else "AUTO_DISPATCH_DISABLED",
                                       reason=None)
+
+    # -- durable project feeder packets -----------------------------------
+    def reserve_project_packet(self, *, packet_id: str, project_id: str, lane: str,
+                               worker: str, task_ids: list[str], task_shas: dict[str, str],
+                               request_key: str, lease_expires_at: str | None,
+                               telemetry: dict[str, Any]) -> dict[str, Any]:
+        """Atomically reserve one packet per idempotency key/worker.
+
+        A live packet is never replaced.  A stale packet is returned to the
+        caller for explicit recovery, keeping duplicate feeder cycles safe
+        across process restarts.
+        """
+        now = iso_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM project_packets WHERE request_key = ?", (request_key,)).fetchone()
+            if existing is not None:
+                return self._packet_row(existing, deduplicated=True)
+            active = connection.execute(
+                "SELECT * FROM project_packets WHERE worker = ? AND state IN ('RESERVED','RUNNING') "
+                "ORDER BY created_at DESC LIMIT 1", (worker,)).fetchone()
+            if active is not None:
+                return self._packet_row(active, blocked="worker_packet_active")
+            connection.execute(
+                "INSERT INTO project_packets(packet_id, project_id, lane, worker, task_ids, task_shas, "
+                "request_key, state, lease_expires_at, heartbeat_at, checkpoint, telemetry, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'RESERVED', ?, ?, '{}', ?, ?, ?)",
+                (packet_id, project_id, lane, worker, json.dumps(task_ids, sort_keys=True),
+                 json.dumps(task_shas, sort_keys=True), request_key, lease_expires_at, now,
+                 json.dumps(telemetry, sort_keys=True), now, now))
+            row = connection.execute("SELECT * FROM project_packets WHERE packet_id = ?", (packet_id,)).fetchone()
+            return self._packet_row(row)
+
+    @staticmethod
+    def _packet_row(row: sqlite3.Row, **extra: Any) -> dict[str, Any]:
+        result = {
+            "packet_id": row["packet_id"], "project_id": row["project_id"],
+            "lane": row["lane"], "worker": row["worker"],
+            "task_ids": _parse_json_list(row["task_ids"]),
+            "task_shas": _parse_json_object(row["task_shas"]), "request_key": row["request_key"],
+            "state": row["state"], "lease_expires_at": row["lease_expires_at"],
+            "heartbeat_at": row["heartbeat_at"], "checkpoint": _parse_json_object(row["checkpoint"]),
+            "telemetry": _parse_json_object(row["telemetry"]), "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        result.update(extra)
+        return result
+
+    def update_project_packet(self, packet_id: str, *, state: str | None = None,
+                              checkpoint: dict[str, Any] | None = None,
+                              telemetry: dict[str, Any] | None = None,
+                              lease_expires_at: str | None = None) -> dict[str, Any] | None:
+        fields = ["heartbeat_at = ?", "updated_at = ?"]
+        values: list[Any] = [iso_now(), iso_now()]
+        if state is not None:
+            fields.append("state = ?"); values.append(state)
+        if checkpoint is not None:
+            fields.append("checkpoint = ?"); values.append(json.dumps(checkpoint, sort_keys=True))
+        if telemetry is not None:
+            fields.append("telemetry = ?"); values.append(json.dumps(telemetry, sort_keys=True))
+        if lease_expires_at is not None:
+            fields.append("lease_expires_at = ?"); values.append(lease_expires_at)
+        values.append(packet_id)
+        with self._connection() as connection:
+            connection.execute(f"UPDATE project_packets SET {', '.join(fields)} WHERE packet_id = ?", values)
+            row = connection.execute("SELECT * FROM project_packets WHERE packet_id = ?", (packet_id,)).fetchone()
+        return self._packet_row(row) if row else None
+
+    def project_packet(self, packet_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM project_packets WHERE packet_id = ?", (packet_id,)).fetchone()
+        return self._packet_row(row) if row else None
+
+    def project_packet_by_request_key(self, request_key: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM project_packets WHERE request_key = ?", (request_key,)).fetchone()
+        return self._packet_row(row) if row else None
+
+    def active_project_packet(self, worker: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM project_packets WHERE worker = ? AND state IN ('RESERVED','RUNNING') "
+                "ORDER BY created_at DESC LIMIT 1", (worker,)).fetchone()
+        return self._packet_row(row) if row else None
 
     # -- task CRUD ---------------------------------------------------------
 
