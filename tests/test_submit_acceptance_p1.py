@@ -212,3 +212,30 @@ def test_no_prompt_content_can_reach_the_classifier_output():
                                     "prompt": "SECRET PROMPT TEXT"})
     import json
     assert "SECRET" not in json.dumps(v)
+
+
+def test_core_repairs_confirmed_receipt_when_enter_was_not_sent():
+    from terminal_mcp.core import TerminalService
+    service = object.__new__(TerminalService)
+    receipt = {
+        "sent": True,
+        "press_enter": True,
+        "enter_sent": False,
+        "delivery_state": DELIVERY_SUBMIT_CONFIRMED,
+        "submit_status": "SUBMIT_CONFIRMED",
+        "correlation_id": "corr-invariant",
+    }
+    repaired = TerminalService._enrich_receipt(service, receipt)
+    assert repaired["delivery_state"] == DELIVERY_UNKNOWN
+    assert repaired["submit_status"] != "SUBMIT_CONFIRMED"
+    assert repaired["receipt_invariant_repaired"] is True
+    assert repaired["evidence"] == []
+
+
+def test_codex_ack_paths_require_an_enter_before_running_or_adapter_ack():
+    import inspect
+    from terminal_mcp import core
+    src = inspect.getsource(core.TerminalService._verified_codex_submit_locked)
+    assert 'if has_submitted_enter and adapter.identify_target_state(lines) == "running"' in src
+    assert 'if (has_submitted_enter and baseline is not None' in src
+    assert 'and enter_count > 0' in src

@@ -66,6 +66,15 @@ def test_a_receipt_with_no_delivery_state_is_never_delivered():
     assert delivery_gate.classify_activation(None)[0] == delivery_gate.REFUSED
 
 
+
+def test_submit_confirmed_with_enter_sent_false_is_refused():
+    kind, reason, detail = delivery_gate.classify_activation(
+        {"delivery_state": DELIVERY_SUBMIT_CONFIRMED, "press_enter": True,
+         "enter_sent": False})
+    assert kind == delivery_gate.REFUSED
+    assert reason == delivery_gate.ACTIVATION_REFUSED
+    assert "enter_sent=False" in detail
+
 def test_confirmed_alongside_an_error_fails_closed():
     kind, reason, _ = delivery_gate.classify_activation(
         {"delivery_state": DELIVERY_SUBMIT_CONFIRMED, "error": "PANE_BUSY"})
