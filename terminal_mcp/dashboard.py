@@ -72,6 +72,7 @@ from .webterm import WebTerminalProcess, pump_websocket
 from .webterm_assets import ASSETS
 from .ephemeral_state import ephemeral_db_path, ephemeral_state_dir
 from .novaretail_dispatch_dashboard import register as register_novaretail_dispatch_dashboard
+from .dispatch_settings_dashboard import register as register_dispatch_settings_dashboard
 
 _log = logging.getLogger(__name__)
 
@@ -16075,6 +16076,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         WebSocketRoute("/dashboard/ws/terminal", endpoint=dashboard_terminal_ws, name="dashboard_terminal_ws")
     )
     register_novaretail_dispatch_dashboard(server, _read_guard, _mutation_guard)
+    register_dispatch_settings_dashboard(server, _read_guard, _mutation_guard)
 
     @server.custom_route("/dashboard/api/connection-health", methods=["GET"], include_in_schema=False)
     async def connection_health(request: Request) -> JSONResponse:
