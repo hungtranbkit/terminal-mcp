@@ -50,6 +50,19 @@ def test_shared_grouping_module_is_injected_into_every_session_list(page_name):
     assert "__NODE_GROUP_JS__" not in page
 
 
+def test_grouping_derives_nodes_from_session_rows_when_nodes_payload_missing():
+    assert "function mergeNodeSources(rows, nodes)" in NODE_GROUP_JS
+    assert "for (const node of mergeNodeSources(rows, nodes))" in NODE_GROUP_JS
+    assert "row.node_id || 'local'" in NODE_GROUP_JS
+
+
+def test_nodes_page_falls_back_from_stale_selected_node_and_merges_sessions():
+    from terminal_mcp.dashboard import NODES_ADMIN_HTML
+    assert "api('/dashboard/api/sessions')" in NODES_ADMIN_HTML
+    assert "if (!selectedNodeId || !known.has(selectedNodeId))" in NODES_ADMIN_HTML
+    assert "nodesCache.push({ id, display_name: row.node_name || id" in NODES_ADMIN_HTML
+
+
 def test_grouping_logic_is_defined_exactly_once_per_page():
     """A second copy pasted into one page is the drift this module exists to
     prevent -- it would pass every other assertion here while silently
