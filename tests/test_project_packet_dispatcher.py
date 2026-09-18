@@ -131,3 +131,59 @@ def test_stale_worker_lease_is_recovered(tmp_path):
     store.update_project_packet(first["packet_id"], lease_expires_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat())
     second = feeder.feed_if_idle("linux-codex-work")
     assert second["action"] in {"EXISTING_TASK", "ENQUEUED"}
+
+
+def test_explicit_codex_names_and_remote_affinity_are_supported(tmp_path):
+    path = _registry(tmp_path, [])
+    cfg = ProjectFeedConfig("p", "codex1", str(path), target_session="codex1",
+                            target_node_id="dell-5530", allowed_agent_types=("codex",))
+    _, _, feeder, _ = _feeder(tmp_path, [])
+    feeder = ProjectTaskFeeder(feeder.queue, [cfg])
+    rows = feeder.fleet_status([{"session": "codex1", "node_id": "dell-5530",
+                                 "agent_type": "codex", "state": "IDLE",
+                                 "input_allowed": True, "background_work": False}])
+    assert rows[0]["classification"] == "IDLE_ELIGIBLE"
+
+
+def test_non_codex_usage_limited_and_unknown_workers_fail_closed(tmp_path):
+    path = _registry(tmp_path, [])
+    cfg = ProjectFeedConfig("p", "wcodex-work", str(path), target_session="wcodex-work",
+                            allowed_agent_types=("codex",))
+    _, _, feeder, _ = _feeder(tmp_path, [])
+    feeder = ProjectTaskFeeder(feeder.queue, [cfg])
+    rows = feeder.fleet_status([
+        {"session": "wcodex-work", "agent_type": "shell", "state": "IDLE", "input_allowed": True},
+        {"session": "wcodex-work", "agent_type": "codex", "state": "UNKNOWN", "usage_limited": True},
+        {"session": "wcodex-work", "agent_type": "codex", "state": "UNKNOWN", "background_work": True},
+    ])
+    assert rows[0]["classification"] == "BLOCKED_AGENT_TYPE"
+    assert rows[1]["classification"] == "NO_COMPATIBLE_TASK"
+    assert rows[2]["classification"] == "BLOCKED_UNKNOWN_ACTIVITY"
+
+
+def test_cross_node_affinity_and_offline_node_are_visible(tmp_path):
+    path = _registry(tmp_path, [])
+    cfg = ProjectFeedConfig("p", "wcodex-work2", str(path), target_session="wcodex-work2",
+                            target_node_id="dell-5530")
+    _, _, feeder, _ = _feeder(tmp_path, [])
+    feeder = ProjectTaskFeeder(feeder.queue, [cfg])
+    rows = feeder.fleet_status([
+        {"session": "wcodex-work2", "node_id": "local", "state": "IDLE", "input_allowed": True},
+        {"session": "wcodex-work2", "node_id": "dell-5530", "node_status": "offline", "state": "IDLE", "input_allowed": True},
+    ])
+    assert rows[0]["classification"] == "NO_COMPATIBLE_TASK"
+    assert rows[1]["reason"] == "node_unavailable"
+
+
+def test_missing_duration_is_inferred_and_forms_target_packet(tmp_path):
+    tasks = [{"id": f"I{i}", "title": f"I{i}", "status": "READY", "dependencies": [],
+              "acceptance": ["a", "b"], "scope": [f"src/{i}.py", f"tests/{i}.py"]}
+             for i in range(1, 5)]
+    store = QueueStore(tmp_path / "queue.db")
+    queue = QueueService(store)
+    path = _registry(tmp_path, tasks)
+    cfg = ProjectFeedConfig("p", "codex1", str(path), target_session="codex1", infer_task_size=True)
+    result = ProjectTaskFeeder(queue, [cfg]).feed_if_idle("codex1")
+    assert 2 <= len(result["task_ids"]) <= 5
+    assert 45 <= result["packet_minutes"] <= 90
+    assert all(source in {"inferred", "explicit"} for _, (source, _) in result["estimations"].items())

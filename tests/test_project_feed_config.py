@@ -47,3 +47,24 @@ queue:
     )
     with pytest.raises(ValueError, match="-work"):
         load_config(cfg)
+
+
+def test_queue_project_feed_explicit_target_allows_non_work_name_and_affinity(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("""
+queue:
+  project_feeds:
+    - project_id: novaretail
+      lane: codex1
+      target_session: codex1
+      target_node_id: dell-5530
+      allowed_agent_types: [codex]
+      infer_task_size: true
+      registry_path: /tmp/novaretail/TASKS.json
+""", encoding="utf-8")
+    loaded = load_config(cfg)
+    feed = loaded.queue.project_feeds[0]
+    assert feed.target_session == "codex1"
+    assert feed.target_node_id == "dell-5530"
+    assert feed.allowed_agent_types == ("codex",)
+    assert feed.infer_task_size is True

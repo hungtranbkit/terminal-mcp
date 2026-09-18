@@ -49,11 +49,17 @@ class ProjectFeedConfig:
     packet_min_minutes: int = 45
     packet_max_minutes: int = 90
     packet_lease_seconds: int = 7_200
+    target_session: str | None = None
+    target_node_id: str | None = None
+    target_node_name: str | None = None
+    allowed_agent_types: tuple[str, ...] = ()
+    required_capabilities: tuple[str, ...] = ()
+    infer_task_size: bool = False
 
     def __post_init__(self) -> None:
         if not self.project_id.strip():
             raise ValueError("project feed project_id is required")
-        if not is_work_session(self.lane):
+        if not is_work_session(self.lane) and not self.target_session:
             raise ValueError("project feed lane must be an explicit -work session")
         if not self.registry_path.strip():
             raise ValueError("project feed registry_path is required")
@@ -79,12 +85,58 @@ class ProjectTaskFeeder:
         return {"configured_lanes": list(self.configured_lanes()),
                 "last": dict(self._last)}
 
-    def feed_if_idle(self, session: str) -> dict[str, Any]:
+    def fleet_status(self, discovered: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Classify discovered session evidence without dispatching anything.
+
+        This is deliberately a pure/read-only surface used by fleet dashboards
+        and canary checks. Unknown activity and missing permissions fail closed.
+        """
+        result = []
+        for item in discovered:
+            session = str(item.get("session") or item.get("name") or "")
+            feed = self._feeds.get(session)
+            if feed is None:
+                continue
+            state = str(item.get("state") or "UNKNOWN").upper()
+            agent = str(item.get("agent_type") or item.get("agent") or "").casefold()
+            node_id = item.get("node_id")
+            reason = None
+            classification = "IDLE_ELIGIBLE"
+            if feed.target_node_id and node_id != feed.target_node_id:
+                classification, reason = "NO_COMPATIBLE_TASK", "node_affinity_mismatch"
+            elif feed.allowed_agent_types and agent not in {x.casefold() for x in feed.allowed_agent_types}:
+                classification, reason = "BLOCKED_AGENT_TYPE", "agent_type_not_allowed"
+            elif item.get("input_allowed") is False or item.get("effective_input") is False:
+                classification, reason = "BLOCKED_PERMISSION", "effective_input_denied"
+            elif str(item.get("node_status") or "").casefold() in {"offline", "degraded"}:
+                classification, reason = "NO_COMPATIBLE_TASK", "node_unavailable"
+            elif item.get("usage_limited") or str(item.get("capacity_status") or "").casefold() in {"limited", "exhausted"}:
+                classification, reason = "NO_COMPATIBLE_TASK", "worker_usage_limited"
+            elif state in {"RUNNING", "WAITING_INPUT", "BUSY", "WORKING"}:
+                classification, reason = "ACTIVE", "worker_not_idle"
+            elif state == "UNKNOWN" and item.get("background_work", True):
+                classification, reason = "BLOCKED_UNKNOWN_ACTIVITY", "unknown_with_background_work"
+            result.append({"session": session, "node_id": node_id,
+                           "classification": classification, "reason": reason,
+                           "agent_type": agent or None,
+                           "next_candidate": item.get("next_candidate")})
+        return result
+
+    def feed_if_idle(self, session: str, worker_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
         feed = self._feeds.get(session)
         if feed is None:
             return self._record(session, "NOT_CONFIGURED")
-        if not is_work_session(session):
+        if not is_work_session(session) and not feed.target_session:
             return self._record(session, "REFUSED_NOT_WORK_SESSION")
+        if feed.target_session and session != feed.target_session:
+            return self._record(session, "TARGET_SESSION_MISMATCH",
+                                why_not_dispatched="explicit_target_session_mismatch")
+        if worker_evidence:
+            classified = self.fleet_status([{"session": session, **worker_evidence}])[0]
+            if classified["classification"] != "IDLE_ELIGIBLE":
+                return self._record(session, classified["classification"],
+                                    why_not_dispatched=classified["reason"],
+                                    next_candidate=classified.get("next_candidate"))
 
         try:
             tasks = self._load(feed)
@@ -200,10 +252,12 @@ class ProjectTaskFeeder:
                                                checkpoint={"queue_task_ids": queue_ids},
                                                telemetry=telemetry, lease_expires_at=lease)
         self._idle_since.pop(session, None)
+        estimates = {str(t["id"]): self._estimate(t, feed)[1:] for t in selected}
         return self._record(session, "ENQUEUED", task_id=task_ids[0], task_ids=task_ids,
                             packet_id=packet_id, queue_task_id=queue_ids[0],
                             queue_task_ids=queue_ids, deduplicated=False,
-                            packet_minutes=sum(self._estimate_minutes(t) for t in selected))
+                            packet_minutes=sum(self._estimate(t, feed)[0] for t in selected),
+                            estimations=estimates)
 
     def _active_packet(self, worker: str) -> dict[str, Any] | None:
         store = getattr(self.queue, "store", None)
@@ -261,25 +315,33 @@ class ProjectTaskFeeder:
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _estimate_minutes(task: dict[str, Any]) -> int:
+    def _estimate(task: dict[str, Any], feed: ProjectFeedConfig) -> tuple[int, str, str]:
         for key in ("estimated_minutes", "duration_minutes", "timebox_minutes"):
             try:
                 value = int(task.get(key))
                 if value > 0:
-                    return value
+                    return min(value, feed.packet_max_minutes), "explicit", "high"
             except (TypeError, ValueError):
                 pass
-        return 15
+        if not feed.infer_task_size:
+            return 15, "default", "low"
+        acceptance = task.get("acceptance") or []
+        scope = task.get("scope") or task.get("files") or task.get("owned_files") or []
+        deps = task.get("dependencies") or []
+        risk = str(task.get("risk") or task.get("risk_level") or "").casefold()
+        risk_points = {"high": 12, "critical": 18, "medium": 6}.get(risk, 0)
+        raw = 15 + min(len(acceptance), 6) * 4 + min(len(scope), 6) * 3 + min(len(deps), 5) * 2 + risk_points
+        return max(15, min(raw, 45)), "inferred", "medium"
 
     def _select_packet(self, candidates: list[dict[str, Any]], by_id: dict[str, dict[str, Any]],
                        feed: ProjectFeedConfig) -> list[dict[str, Any]]:
         selected = [candidates[0]]
         # Only explicit estimates are bundleable. This preserves the legacy
         # one-task feeder for registries that provide no sizing metadata.
-        if not any(any(key in task for key in ("estimated_minutes", "duration_minutes", "timebox_minutes"))
-                   for task in candidates):
+        if not feed.infer_task_size and not any(any(key in task for key in ("estimated_minutes", "duration_minutes", "timebox_minutes"))
+                                                for task in candidates):
             return selected
-        total = self._estimate_minutes(selected[0])
+        total = self._estimate(selected[0], feed)[0]
         scopes = self._scopes(selected[0])
         ordered_candidates = list(candidates)
         # A directly dependent READY task may be included after its parent in
@@ -300,7 +362,7 @@ class ProjectTaskFeeder:
                 continue
             if self._scopes_overlap(self._scopes(task), scopes):
                 continue
-            estimate = self._estimate_minutes(task)
+            estimate = self._estimate(task, feed)[0]
             if total + estimate > feed.packet_max_minutes:
                 continue
             selected.append(task); total += estimate; scopes |= self._scopes(task)
