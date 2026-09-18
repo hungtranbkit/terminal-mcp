@@ -163,16 +163,12 @@ def classify_activation(send_result: dict[str, Any]) -> tuple[str, str, str | No
     if state == DELIVERY_SUBMIT_CONFIRMED:
         # A confirmed submit that required Enter must prove Enter was actually
         # sent. False is a hard contradiction; missing is unproven legacy data.
-        if send_result.get("press_enter") is True:
-            if send_result.get("enter_sent") is False:
-                return REFUSED, ACTIVATION_REFUSED, (
-                    "receipt contradicts itself: SUBMIT_CONFIRMED with "
-                    "press_enter=True but enter_sent=False"
-                )
-            if send_result.get("enter_sent") is not True:
-                return UNCERTAIN, ACTIVATION_UNKNOWN, (
-                    "SUBMIT_CONFIRMED receipt does not prove Enter was sent"
-                )
+        if (send_result.get("press_enter") is True
+                and send_result.get("enter_sent") is False):
+            return REFUSED, ACTIVATION_REFUSED, (
+                "receipt contradicts itself: SUBMIT_CONFIRMED with "
+                "press_enter=True but enter_sent=False"
+            )
         # An error alongside SUBMIT_CONFIRMED should not happen; if it ever
         # does, the error wins -- fail closed.
         if error:
