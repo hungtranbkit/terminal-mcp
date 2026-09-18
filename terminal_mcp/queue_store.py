@@ -814,6 +814,21 @@ def _add_v11_project_packets(connection: sqlite3.Connection) -> None:
                        "ON project_packets(project_id, state)")
 
 
+def _add_v12_long_task_watches(connection: sqlite3.Connection) -> None:
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS long_task_watches (
+            task_id TEXT PRIMARY KEY, submission_id TEXT NOT NULL UNIQUE,
+            request_key TEXT NOT NULL UNIQUE, session TEXT NOT NULL, node_id TEXT,
+            state TEXT NOT NULL, expected_minutes INTEGER, long_task INTEGER NOT NULL DEFAULT 1,
+            execution_started_at TEXT, first_checkpoint_at TEXT, last_progress_at TEXT,
+            recovery_enter_count INTEGER NOT NULL DEFAULT 0, resume_count INTEGER NOT NULL DEFAULT 0,
+            output_hash TEXT, status_hash TEXT, blocker TEXT, reason TEXT,
+            watch_lease_expires_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )
+    """)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_long_task_watches_state ON long_task_watches(state)")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
@@ -842,6 +857,7 @@ QUEUE_MIGRATIONS = [
              _add_v10_requirement_contract),
     Migration(11, "durable project feeder packets with leases/checkpoints/idempotency",
              _add_v11_project_packets),
+    Migration(12, "durable long-task execution watches", _add_v12_long_task_watches),
 ]
 
 
@@ -1282,6 +1298,54 @@ class QueueStore:
                 "SELECT * FROM project_packets WHERE worker = ? AND state IN ('RESERVED','RUNNING') "
                 "ORDER BY created_at DESC LIMIT 1", (worker,)).fetchone()
         return self._packet_row(row) if row else None
+
+    # -- long-task watches -------------------------------------------------
+
+    def ensure_long_task_watch(self, task_id: str, submission_id: str, request_key: str,
+                               session: str, *, node_id: str | None = None,
+                               expected_minutes: int | None = None) -> dict[str, Any]:
+        now = iso_now()
+        with self._connection() as connection:
+            connection.execute(
+                """INSERT INTO long_task_watches
+                   (task_id, submission_id, request_key, session, node_id, state,
+                    expected_minutes, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'EXECUTION_START_PENDING', ?, ?, ?)
+                   ON CONFLICT(task_id) DO UPDATE SET updated_at=excluded.updated_at,
+                     node_id=COALESCE(excluded.node_id, long_task_watches.node_id)""",
+                (task_id, submission_id, request_key, session, node_id, expected_minutes, now, now),
+            )
+        return self.long_task_watch(task_id) or {}
+
+    def update_long_task_watch(self, task_id: str, **fields: Any) -> bool:
+        allowed = {"state", "execution_started_at", "first_checkpoint_at", "last_progress_at",
+                   "recovery_enter_count", "resume_count", "output_hash", "status_hash",
+                   "blocker", "reason", "watch_lease_expires_at", "node_id"}
+        values = {k: v for k, v in fields.items() if k in allowed}
+        if not values:
+            return False
+        values["updated_at"] = iso_now()
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                f"UPDATE long_task_watches SET {assignments} WHERE task_id = ?",
+                (*values.values(), task_id),
+            )
+        return cursor.rowcount > 0
+
+    def long_task_watch(self, task_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM long_task_watches WHERE task_id = ?", (task_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_long_task_watches(self, *, active_only: bool = False) -> list[dict[str, Any]]:
+        query = "SELECT * FROM long_task_watches"
+        if active_only:
+            query += " WHERE state NOT IN ('CHECKPOINTED','BLOCKED','DONE','FAILED','STUCK')"
+        query += " ORDER BY updated_at DESC"
+        with self._connection() as connection:
+            rows = connection.execute(query).fetchall()
+        return [dict(row) for row in rows]
 
     # -- task CRUD ---------------------------------------------------------
 

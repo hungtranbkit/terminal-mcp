@@ -16085,7 +16085,13 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         blocked, _identity = _read_guard(request)
         if blocked is not None:
             return blocked
-        return JSONResponse(terminal.submissions.watcher_status(), headers={"Cache-Control": "no-store"})
+        payload = terminal.submissions.watcher_status()
+        queue_store = getattr(queue, "store", None) if queue is not None else None
+        if queue_store is not None and hasattr(queue_store, "list_long_task_watches"):
+            payload["long_task_watches"] = queue_store.list_long_task_watches(active_only=False)
+        else:
+            payload["long_task_watches"] = []
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/connection-health", methods=["GET"], include_in_schema=False)
     async def connection_health(request: Request) -> JSONResponse:
