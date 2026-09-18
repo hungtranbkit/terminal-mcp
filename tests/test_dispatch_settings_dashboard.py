@@ -27,6 +27,23 @@ def test_atomic_save_roundtrip(tmp_path):
     assert json.loads(path.read_text()) == cfg
 
 
+def test_atomic_save_preserves_legacy_metadata_and_rejects_unknown(tmp_path):
+    path = tmp_path / "dispatch.json"
+    path.write_text(json.dumps({"project_id": "novaretail", "dispatcher_project": "novaretail",
+                                "legacy_meta": {"source": "watchdog"}, "dispatcher_session": "codex1",
+                                "workers": [], "mode": "SINGLE_PROJECT", "allowed_roots": [], "bindings": {}}))
+    save_config_atomic({"project_id": "novaretail", "dispatcher_session": "codex1", "workers": ["codex2"]}, path)
+    saved = json.loads(path.read_text())
+    assert saved["dispatcher_project"] == "novaretail"
+    assert saved["legacy_meta"] == {"source": "watchdog"}
+    try:
+        validate_config({"dispatcher_session": "codex1", "workers": [], "unknown": 1})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown field accepted")
+
+
 def test_routes_get_and_post_guard(tmp_path):
     path = tmp_path / "dispatch.json"
     server = build_mcp(TerminalService(AppConfig(PermissionsConfig(True, True), ())))
