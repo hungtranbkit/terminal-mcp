@@ -171,7 +171,9 @@ class ProjectTaskFeeder:
             preferred = len(feed.preferred_task_ids) + 1000
         in_progress = 0 if str(task.get("status") or "") == "IN_PROGRESS" else 1
         priority = -ProjectTaskFeeder._queue_priority(task)
-        return (preferred, in_progress, priority, task_id)
+        # Resume matching-owner in-flight work before starting any preferred
+        # READY task. Preferred ids only order otherwise-equivalent work.
+        return (in_progress, preferred, priority, task_id)
 
     @staticmethod
     def _prompt(task: dict[str, Any]) -> str:
