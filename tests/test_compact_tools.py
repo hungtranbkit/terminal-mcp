@@ -340,3 +340,73 @@ def test_batch_rejects_oversized_target_without_echoing_it():
     result = compact.batch_inspect([oversized])
     assert result == {"error": "INVALID_TARGETS", "max_targets": 25}
     assert oversized not in str(result)
+
+
+def test_turn_inspect_wraps_batch_in_one_logical_result():
+    compact, _terminal, controller = service()
+    controller.statuses["worker"] = {
+        "session": "worker", "state": "IDLE", "input_required": False, "reason": "ready"
+    }
+    controller.tails["worker"] = "READY"
+
+    result = compact.turn(action="inspect", target="worker", tail_lines=5)
+
+    assert result["status"] == "OK"
+    assert result["action"] == "inspect"
+    assert result["result"]["count"] == 1
+    assert result["result"]["targets"][0]["tail"] == "READY"
+
+
+def test_turn_send_wait_sends_once_then_creates_one_durable_wait():
+    compact, _terminal, controller = service()
+    clock = FakeClock()
+    compact.monotonic = clock.monotonic
+    compact.sleep = clock.sleep
+    controller.send_result = {
+        "delivery_state": "SUBMIT_CONFIRMED", "submit_status": "SUBMIT_CONFIRMED",
+        "agent_type": "codex", "enter_sent": True, "enter_count": 1,
+        "attempts": 1, "correlation_id": "corr-turn",
+    }
+    controller.statuses["worker"] = {"session": "worker", "state": "IDLE"}
+    controller.tails["worker"] = "done"
+
+    result = compact.turn(
+        action="send_wait", target="worker", text="do work",
+        desired_states=["IDLE"], timeout=5, idempotency_key="turn:1",
+    )
+
+    assert result["status"] == "MATCHED"
+    assert result["send"]["status"] == "SUBMIT_CONFIRMED"
+    assert result["wait"]["status"] == "MATCHED"
+    assert len(controller.send_calls) == 1
+    assert result["wait"]["resume_token"].startswith("wait_")
+
+
+def test_turn_resume_never_sends_or_creates_new_wait():
+    compact, _terminal, controller = service()
+    clock = FakeClock()
+    compact.monotonic = clock.monotonic
+    compact.sleep = clock.sleep
+    controller.statuses["worker"] = {"session": "worker", "state": "RUNNING"}
+    controller.tails["worker"] = "busy"
+    pending = compact.turn(
+        action="wait", target="worker", desired_states=["DONE"],
+        timeout=1, poll_interval=1,
+    )
+    token = pending["result"]["resume_token"]
+    sends_before = len(controller.send_calls)
+
+    controller.statuses["worker"] = {"session": "worker", "state": "DONE"}
+    resumed = compact.turn(action="resume", resume_token=token, timeout=5)
+
+    assert resumed["status"] == "MATCHED"
+    assert resumed["result"]["resume_token"] == token
+    assert len(controller.send_calls) == sends_before
+
+
+def test_turn_rejects_unknown_action_without_touching_terminal():
+    compact, _terminal, controller = service()
+    result = compact.turn(action="do_everything_magically", target="worker")
+    assert result["error"] == "INVALID_ACTION"
+    assert controller.status_calls == 0
+    assert controller.send_calls == []
