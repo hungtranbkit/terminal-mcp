@@ -82,6 +82,13 @@ HTTP_PORT = _http_port()
 HTTP_PATH = "/mcp"
 
 
+def local_node_identity() -> tuple[str, str]:
+    """Optional host-local identity; preserve local/Local compatibility."""
+    node_id = os.environ.get("TERMINAL_MCP_LOCAL_NODE_ID", "local").strip() or "local"
+    node_name = os.environ.get("TERMINAL_MCP_LOCAL_NODE_NAME", "Local").strip() or "Local"
+    return node_id, node_name
+
+
 def endpoint_is_this_host(endpoint: str) -> bool:
     """True if `endpoint`'s address belongs to the machine we are running on.
 
@@ -348,7 +355,10 @@ def main() -> None:
                       _deny_migration.get("errors"))
     except Exception:  # noqa: BLE001 -- never block startup on a migration
         _log.exception("deny-record migration failed -- grants left unchanged")
-    controller = ControllerService(registry, local_client=LocalNodeClient(terminal),
+    local_node_id, local_display_name = local_node_identity()
+    controller = ControllerService(registry, local_node_id=local_node_id,
+                                   local_display_name=local_display_name,
+                                   local_client=LocalNodeClient(terminal),
                                    local_workspace_root=workspace_root,
                                    node_health_config=config.nodes.health)
     register_remote_nodes(controller, config)
