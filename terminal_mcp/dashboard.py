@@ -1419,6 +1419,8 @@ DASHBOARD_HTML = """<!doctype html>
           <a href="/dashboard/audit" id="auditLink" role="menuitem">🧾 Audit &amp; Access</a>
           <a href="/dashboard/work" id="workLink" role="menuitem">🧩 Work</a>
           <a href="/dashboard/ai-usage" id="aiUsageLink" role="menuitem">📊 AI Usage</a>
+          <a href="/dashboard/ops/novaretail-dispatch" id="dispatchMonitorLink" role="menuitem">🚦 Dispatch Monitor</a>
+          <a href="/dashboard/ops/dispatch-settings?project=novaretail" id="dispatchSettingsLink" role="menuitem">⚙ Dispatch Settings</a>
         </div>
       </div>
     </div>
