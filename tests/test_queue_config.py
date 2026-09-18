@@ -33,13 +33,30 @@ def test_queue_config_defaults_when_absent(tmp_path):
 
 
 def test_queue_config_can_be_explicitly_enabled(tmp_path):
-    path = _write_config(tmp_path, {"queue": {"enabled": True, "poll_interval_seconds": 2}})
+    path = _write_config(tmp_path, {"queue": {
+        "enabled": True,
+        "poll_interval_seconds": 2,
+        "drain_enabled": True,
+        "drain_batch_size": 17,
+    }})
     config = load_config(path)
     assert config.queue.enabled is True
     assert config.queue.poll_interval_seconds == 2
+    assert config.queue.drain_enabled is True
+    assert config.queue.drain_batch_size == 17
 
 
 def test_queue_config_rejects_too_small_a_poll_interval(tmp_path):
     path = _write_config(tmp_path, {"queue": {"poll_interval_seconds": 0.1}})
     with pytest.raises(ValueError, match="poll_interval_seconds"):
+        load_config(path)
+
+
+def test_queue_config_rejects_invalid_drain_values(tmp_path):
+    path = _write_config(tmp_path, {"queue": {"drain_enabled": "yes"}})
+    with pytest.raises(ValueError, match="drain_enabled"):
+        load_config(path)
+
+    path = _write_config(tmp_path, {"queue": {"drain_batch_size": 0}})
+    with pytest.raises(ValueError, match="drain_batch_size"):
         load_config(path)
