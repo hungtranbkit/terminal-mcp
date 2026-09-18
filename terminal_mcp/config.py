@@ -11,6 +11,7 @@ import yaml
 
 from . import endpoint_policy
 from .node_models import NodeHeartbeatThresholds, OverloadThresholds
+from .project_task_feeder import ProjectFeedConfig
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,10 @@ class QueueConfig:
     # be able to make the first without silently also making the second.
     drain_enabled: bool = False
     drain_batch_size: int = 25
+    # Canonical project backlog -> queue bridge. Empty by default: no project
+    # file is read and no new work is created unless an operator explicitly
+    # maps a -work lane to a TASKS.json path.
+    project_feeds: tuple[ProjectFeedConfig, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1731,7 +1736,43 @@ def _load_queue_config(queue_raw: object) -> QueueConfig:
     poll_interval = float(queue_raw.get("poll_interval_seconds", QueueConfig.poll_interval_seconds))
     if poll_interval < 0.5:
         raise ValueError("queue.poll_interval_seconds must be at least 0.5")
-    return QueueConfig(enabled=bool(queue_raw.get("enabled", False)), poll_interval_seconds=poll_interval)
+    drain_batch_size = int(queue_raw.get("drain_batch_size", QueueConfig.drain_batch_size))
+    if drain_batch_size < 1 or drain_batch_size > 500:
+        raise ValueError("queue.drain_batch_size must be between 1 and 500")
+    feeds_raw = queue_raw.get("project_feeds", [])
+    if feeds_raw is None:
+        feeds_raw = []
+    if not isinstance(feeds_raw, list):
+        raise ValueError("queue.project_feeds must be a list")
+    feeds: list[ProjectFeedConfig] = []
+    seen_lanes: set[str] = set()
+    for index, item in enumerate(feeds_raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"queue.project_feeds[{index}] must be a mapping")
+        preferred = item.get("preferred_task_ids", [])
+        if isinstance(preferred, str):
+            preferred = [preferred]
+        if not isinstance(preferred, list) or not all(isinstance(v, str) for v in preferred):
+            raise ValueError(f"queue.project_feeds[{index}].preferred_task_ids must be a list of strings")
+        feed = ProjectFeedConfig(
+            project_id=str(item.get("project_id") or ""),
+            lane=str(item.get("lane") or ""),
+            registry_path=str(item.get("registry_path") or ""),
+            owner=(str(item.get("owner")) if item.get("owner") is not None else None),
+            preferred_task_ids=tuple(preferred),
+            max_registry_bytes=int(item.get("max_registry_bytes", 5_000_000)),
+        )
+        if feed.lane in seen_lanes:
+            raise ValueError(f"duplicate queue.project_feeds lane: {feed.lane}")
+        seen_lanes.add(feed.lane)
+        feeds.append(feed)
+    return QueueConfig(
+        enabled=bool(queue_raw.get("enabled", False)),
+        poll_interval_seconds=poll_interval,
+        drain_enabled=bool(queue_raw.get("drain_enabled", False)),
+        drain_batch_size=drain_batch_size,
+        project_feeds=tuple(feeds),
+    )
 
 
 def _load_session_knowledge_config(raw: object) -> SessionKnowledgeConfig:
