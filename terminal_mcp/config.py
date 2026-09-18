@@ -1101,12 +1101,12 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         max_attempts = int(raw_profile.get("max_enter_attempts", default.max_enter_attempts))
         interval_ms = int(raw_profile.get("enter_interval_ms", default.enter_interval_ms))
         fixed_count = int(raw_profile.get("fixed_enter_count", default.fixed_enter_count))
-        if not 1 <= max_attempts <= 5:
-            raise ValueError("submit.*.max_enter_attempts must be between 1 and 5")
+        if not 1 <= max_attempts <= 6:
+            raise ValueError("submit.*.max_enter_attempts must be between 1 and 6")
         if not 50 <= interval_ms <= 1000:
             raise ValueError("submit.*.enter_interval_ms must be between 50 and 1000")
-        if not 0 <= fixed_count <= 5:
-            raise ValueError("submit.*.fixed_enter_count must be between 0 and 5")
+        if not 0 <= fixed_count <= 6:
+            raise ValueError("submit.*.fixed_enter_count must be between 0 and 6")
         return SubmitProfile(max_enter_attempts=max_attempts, enter_interval_ms=interval_ms,
                              verify_after_each_enter=bool(raw_profile.get(
                                  "verify_after_each_enter", default.verify_after_each_enter)),
