@@ -241,6 +241,7 @@ class ProjectTaskFeeder:
         queue_ids: list[str] = []
         for task in selected:
             task_id = str(task["id"])
+            estimate_minutes, estimate_source, estimate_confidence = self._estimate(task, feed)
             result = self.queue.enqueue(
                 session,
                 self._prompt(task),
@@ -251,6 +252,13 @@ class ProjectTaskFeeder:
                     "canonical_task_id": task_id,
                     "canonical_registry": str(Path(feed.registry_path).expanduser()),
                     "continuous_dispatch": True,
+                    # Explicit packet metadata lets queue_engine create a
+                    # durable long-task watch without inferring from prose.
+                    "long_task": True,
+                    "expected_minutes": estimate_minutes,
+                    "packet_duration_minutes": sum(self._estimate(item, feed)[0] for item in selected),
+                    "estimation_source": estimate_source,
+                    "estimation_confidence": estimate_confidence,
                 },
                 request_key=f"project-feed:{feed.project_id}:{task_id}",
             )
