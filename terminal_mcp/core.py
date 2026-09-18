@@ -2209,10 +2209,14 @@ class TerminalService:
             self.submissions.update(record.submission_id, ack_state=ACK_STUCK, evidence=str(exc))
             result = self.submissions.get(record.submission_id).public()  # type: ignore[union-attr]
         state = result["ack_state"]
-        delivery = DELIVERY_SUBMIT_CONFIRMED if state in (ACK_ACCEPTED, ACK_RUNNING) else DELIVERY_UNKNOWN
         actual_enter_count = 0 if activation_key == "Tab" else result["enter_count"]
         enter_count = actual_enter_count
-        if activation_key == "Tab" and state in (ACK_ACCEPTED, ACK_RUNNING):
+        delivery = (
+            DELIVERY_SUBMIT_CONFIRMED
+            if state in (ACK_ACCEPTED, ACK_RUNNING) and enter_count > 0
+            else DELIVERY_UNKNOWN
+        )
+        if queue_followup_sent and state in (ACK_ACCEPTED, ACK_RUNNING):
             delivery = DELIVERY_SUBMIT_CONFIRMED
         return {
             "sent": True, "enter_sent": activation_key == "Enter",
