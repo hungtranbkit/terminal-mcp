@@ -11,6 +11,7 @@ import yaml
 
 from . import endpoint_policy
 from .node_models import NodeHeartbeatThresholds, OverloadThresholds
+from .project_dispatch_bridge import ProjectDispatchRule
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,9 @@ class QueueConfig:
     # be able to make the first without silently also making the second.
     drain_enabled: bool = False
     drain_batch_size: int = 25
+    # Optional project-level continuation bridge. Rules are explicit,
+    # OFF by default, and still depend on the queue's per-lane opt-in.
+    project_dispatch_rules: tuple[ProjectDispatchRule, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1737,11 +1741,49 @@ def _load_queue_config(queue_raw: object) -> QueueConfig:
     drain_enabled = queue_raw.get("drain_enabled", QueueConfig.drain_enabled)
     if not isinstance(drain_enabled, bool):
         raise ValueError("queue.drain_enabled must be a boolean")
+
+    raw_rules = queue_raw.get("project_dispatch_rules", [])
+    if not isinstance(raw_rules, list):
+        raise ValueError("queue.project_dispatch_rules must be a list")
+    rules: list[ProjectDispatchRule] = []
+    for index, raw_rule in enumerate(raw_rules):
+        if not isinstance(raw_rule, dict):
+            raise ValueError(f"queue.project_dispatch_rules[{index}] must be a mapping")
+        name = raw_rule.get("name")
+        patterns = raw_rule.get("session_patterns")
+        repo_root = raw_rule.get("repo_root")
+        planner_path = raw_rule.get("planner_path", "tools/orchestration/continuous_dispatch.py")
+        event_types = raw_rule.get("event_types", ["TASK_COMPLETED"])
+        timeout = float(raw_rule.get("timeout_seconds", 10.0))
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"queue.project_dispatch_rules[{index}].name must be non-empty")
+        if not isinstance(patterns, list) or not patterns or not all(isinstance(x, str) and x for x in patterns):
+            raise ValueError(f"queue.project_dispatch_rules[{index}].session_patterns must be a non-empty string list")
+        if not isinstance(repo_root, str) or not repo_root.strip():
+            raise ValueError(f"queue.project_dispatch_rules[{index}].repo_root must be non-empty")
+        expanded_root = str(Path(repo_root).expanduser())
+        if not Path(expanded_root).is_absolute():
+            raise ValueError(f"queue.project_dispatch_rules[{index}].repo_root must be absolute or ~/...")
+        if not isinstance(planner_path, str) or not planner_path or Path(planner_path).is_absolute() or ".." in Path(planner_path).parts:
+            raise ValueError(f"queue.project_dispatch_rules[{index}].planner_path must stay relative to repo_root")
+        if not isinstance(event_types, list) or not event_types or not all(isinstance(x, str) and x for x in event_types):
+            raise ValueError(f"queue.project_dispatch_rules[{index}].event_types must be a non-empty string list")
+        if not 0.5 <= timeout <= 60.0:
+            raise ValueError(f"queue.project_dispatch_rules[{index}].timeout_seconds must be between 0.5 and 60")
+        rules.append(ProjectDispatchRule(
+            name=name.strip(),
+            session_patterns=tuple(patterns),
+            repo_root=expanded_root,
+            planner_path=planner_path,
+            event_types=tuple(event_types),
+            timeout_seconds=timeout,
+        ))
     return QueueConfig(
         enabled=bool(queue_raw.get("enabled", False)),
         poll_interval_seconds=poll_interval,
         drain_enabled=drain_enabled,
         drain_batch_size=drain_batch_size,
+        project_dispatch_rules=tuple(rules),
     )
 
 
