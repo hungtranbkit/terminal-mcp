@@ -178,7 +178,8 @@ require execution evidence: a new Working/Thinking state, Ran/Edited/tool
 activity, a pane-output delta, or equivalent evidence. If the prompt remains
 visible in the composer or no execution evidence appears, retry Enter with
 bounded recovery, checking status/tail after each press and allowing at most
-four total Enter presses for that submission. If the target is
+six total Enter presses for that submission across manual and watcher
+recovery combined. If the target is
 `WAITING_APPROVAL`/`input_required`, do not spam Enter; handle approval
 explicitly. Report `task started/running` only when `execution_started=true`
 or equivalent evidence exists. If execution still cannot be verified after

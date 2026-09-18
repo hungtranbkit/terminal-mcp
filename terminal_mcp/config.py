@@ -247,7 +247,10 @@ class SubmitWatchdogConfig:
     poll_interval_seconds: float = 0.4
     timeout_seconds: float = 5.0
     max_enter_attempts: int = 2
-    sweeper_interval_seconds: float = 1.5
+    # Hard cap shared by the initial/manual Enter and all background recovery.
+    max_total_enters: int = 6
+    sweeper_interval_seconds: float = 3.0
+    ttl_seconds: float = 600.0
     retry_agent_types: tuple[str, ...] = ("codex",)
 
 
@@ -1209,15 +1212,21 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         poll_interval_seconds=float(submit_raw.get("poll_interval_seconds", submit_defaults.poll_interval_seconds)),
         timeout_seconds=float(submit_raw.get("timeout_seconds", submit_defaults.timeout_seconds)),
         max_enter_attempts=int(submit_raw.get("max_enter_attempts", submit_defaults.max_enter_attempts)),
+        max_total_enters=int(submit_raw.get("max_total_enters", submit_defaults.max_total_enters)),
         sweeper_interval_seconds=float(submit_raw.get("sweeper_interval_seconds", submit_defaults.sweeper_interval_seconds)),
+        ttl_seconds=float(submit_raw.get("ttl_seconds", submit_defaults.ttl_seconds)),
         retry_agent_types=tuple(submit_raw.get("retry_agent_types", submit_defaults.retry_agent_types)),
     )
     if not 0.3 <= watchdog_config.poll_interval_seconds <= 0.5:
         raise ValueError("submit_watchdog.poll_interval_seconds must be between 0.3 and 0.5")
-    if watchdog_config.timeout_seconds <= 0 or watchdog_config.sweeper_interval_seconds < 1:
+    if watchdog_config.timeout_seconds <= 0 or watchdog_config.sweeper_interval_seconds < 3:
         raise ValueError("submit_watchdog timeouts must be positive")
-    if not 1 <= watchdog_config.max_enter_attempts <= 2:
-        raise ValueError("submit_watchdog.max_enter_attempts must be between 1 and 2")
+    if not 1 <= watchdog_config.max_enter_attempts <= 6:
+        raise ValueError("submit_watchdog.max_enter_attempts must be between 1 and 6")
+    if not 1 <= watchdog_config.max_total_enters <= 6:
+        raise ValueError("submit_watchdog.max_total_enters must be between 1 and 6")
+    if watchdog_config.ttl_seconds <= 0:
+        raise ValueError("submit_watchdog.ttl_seconds must be positive")
     if not watchdog_config.retry_agent_types or not all(isinstance(agent, str) and agent for agent in watchdog_config.retry_agent_types):
         raise ValueError("submit_watchdog.retry_agent_types must be a non-empty list of agent types")
 
