@@ -29,7 +29,7 @@ from .session_backend import SessionBackend
 from .session_knowledge import SessionKnowledgeStore, make_instance_id
 from .session_registry import SessionRegistryStore
 from .status import classify_status
-from .submit_watchdog import (ACK_ACCEPTED, ACK_RUNNING, ACK_STUCK, Submission,
+from .submit_watchdog import (ACK_ACCEPTED, ACK_NODE_UNAVAILABLE, ACK_RUNNING, ACK_STUCK, Submission,
                                SubmissionStore, SubmissionSweeper, VerifiedSubmitWatchdog, WatchdogConfig)
 from .tmux import SEND_TEXT_ENTER_SETTLE_SECONDS, TmuxClient, TmuxError, iso_timestamp
 
@@ -453,13 +453,15 @@ class TerminalService:
         watchdog_config = WatchdogConfig(
             poll_interval_seconds=config.submit_watchdog.poll_interval_seconds,
             timeout_seconds=config.submit_watchdog.timeout_seconds,
-            max_enter_attempts=config.submit_watchdog.max_enter_attempts,
+            max_enter_attempts=config.submit_watchdog.max_total_enters,
+            max_total_enters=config.submit_watchdog.max_total_enters,
             retry_agent_types=frozenset(config.submit_watchdog.retry_agent_types),
         )
         self.submit_watchdog = VerifiedSubmitWatchdog(self.submissions, watchdog_config)
         self.submission_sweeper = SubmissionSweeper(
             self.submissions, self.recover_submission,
             interval_seconds=config.submit_watchdog.sweeper_interval_seconds,
+            ttl_seconds=config.submit_watchdog.ttl_seconds,
         )
 
     def start_submission_sweeper(self) -> None:
@@ -479,8 +481,9 @@ class TerminalService:
             return
         info = self.tmux.get_session(record.session)
         if info is None or (info.pane_current_command or "").casefold() != "codex":
-            self.submissions.update(record.submission_id, ack_state=ACK_STUCK,
-                                    evidence="session_or_codex_not_available")
+            self.submissions.update(record.submission_id, ack_state=ACK_NODE_UNAVAILABLE,
+                                    evidence="session_or_codex_not_available",
+                                    last_action="node_unavailable", stop_reason="NODE_UNAVAILABLE")
             return
         adapter = select_adapter(info.pane_current_command or "")
         baseline = self.tmux.capture_lines(record.session, SEND_VERIFY_LINES)
@@ -508,7 +511,7 @@ class TerminalService:
             return "COMPOSER", "draft_still_in_composer"
 
         self.submit_watchdog.run(record.submission_id, capture=capture, send_enter=send_enter,
-                                 evidence=evidence, inject=None)
+                                 evidence=evidence, inject=None, max_new_enters=1)
 
     # Private, per-process convention for this TerminalService's OWN node
     # in the Persistent Session Registry -- see session_registry.py's own

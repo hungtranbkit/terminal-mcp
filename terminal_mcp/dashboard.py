@@ -16080,6 +16080,13 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     register_novaretail_dispatch_dashboard(server, _read_guard, _mutation_guard)
     register_dispatch_settings_dashboard(server, _read_guard, _mutation_guard)
 
+    @server.custom_route("/dashboard/api/verified-prompt-watcher", methods=["GET"], include_in_schema=False)
+    async def verified_prompt_watcher_status(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return JSONResponse(terminal.submissions.watcher_status(), headers={"Cache-Control": "no-store"})
+
     @server.custom_route("/dashboard/api/connection-health", methods=["GET"], include_in_schema=False)
     async def connection_health(request: Request) -> JSONResponse:
         # One coarse label (task item 5: "chỉ cần một trạng thái tổng...

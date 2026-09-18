@@ -169,6 +169,28 @@ Ordinary terminal sessions are not Work sessions and this policy does not
 apply to them. Work features are opt-in via the `-work` suffix, and existing
 sessions, APIs and tools keep working unchanged.
 
+## VERIFIED PROMPT START — MANDATORY
+
+After `terminal_send_text`/submit of any coding or task prompt, especially a
+long prompt, do **not** consider the task started from `SUBMIT_CONFIRMED` or
+`ACCEPTED` alone. Immediately inspect the target session status/tail and
+require execution evidence: a new Working/Thinking state, Ran/Edited/tool
+activity, a pane-output delta, or equivalent evidence. If the prompt remains
+visible in the composer or no execution evidence appears, retry Enter with
+bounded recovery, checking status/tail after each press and allowing at most
+six total Enter presses for that submission across manual and watcher
+recovery combined. If the target is
+`WAITING_APPROVAL`/`input_required`, do not spam Enter; handle approval
+explicitly. Report `task started/running` only when `execution_started=true`
+or equivalent evidence exists. If execution still cannot be verified after
+the bounded retries, report `SUBMIT_FAILED`/`STUCK` and never pretend it is
+running. Record or mention `enter_count` and execution evidence in
+orchestration status where available. Before ending a ChatGPT turn that
+handed off work, verify that the target prompt has actually begun executing.
+
+This rule applies to every project, including NovaRetail, MESFlow, Terminal
+MCP, and PromptFlow.
+
 ## Secrets
 
 Never store secret values in a policy, spec, knowledge document, runbook or

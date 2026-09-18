@@ -25,8 +25,10 @@ ACK_SUBMITTING = "SUBMITTING"
 ACK_ACCEPTED = "ACCEPTED"
 ACK_RUNNING = "RUNNING"
 ACK_STUCK = "STUCK"
+ACK_BLOCKED_APPROVAL = "BLOCKED_APPROVAL"
+ACK_NODE_UNAVAILABLE = "NODE_UNAVAILABLE"
 
-FINAL_ACKS = {ACK_ACCEPTED, ACK_RUNNING, ACK_STUCK}
+FINAL_ACKS = {ACK_ACCEPTED, ACK_RUNNING, ACK_STUCK, ACK_BLOCKED_APPROVAL, ACK_NODE_UNAVAILABLE}
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,13 @@ class Submission:
     evidence: tuple[str, ...]
     created_at: float
     updated_at: float
+    node_id: str | None = None
+    first_seen: float | None = None
+    last_check: float | None = None
+    last_action: str | None = None
+    execution_started: bool = False
+    terminal_state: str | None = None
+    stop_reason: str | None = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -58,6 +67,13 @@ class Submission:
             "characters": len(self.prompt),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "node_id": self.node_id,
+            "first_seen": self.first_seen,
+            "last_check": self.last_check,
+            "last_action": self.last_action,
+            "execution_started": self.execution_started,
+            "terminal_state": self.terminal_state,
+            "stop_reason": self.stop_reason,
         }
 
 
@@ -73,8 +89,17 @@ class SubmissionStore:
                 prompt_sha256 TEXT NOT NULL, ack_state TEXT NOT NULL,
                 enter_count INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
                 evidence_json TEXT NOT NULL DEFAULT '[]', created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
+                updated_at REAL NOT NULL, node_id TEXT, first_seen REAL,
+                last_check REAL, last_action TEXT, execution_started INTEGER NOT NULL DEFAULT 0,
+                terminal_state TEXT, stop_reason TEXT
             )""")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(prompt_submissions)")}
+            for name, declaration in (("node_id", "TEXT"), ("first_seen", "REAL"),
+                                      ("last_check", "REAL"), ("last_action", "TEXT"),
+                                      ("execution_started", "INTEGER NOT NULL DEFAULT 0"),
+                                      ("terminal_state", "TEXT"), ("stop_reason", "TEXT")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE prompt_submissions ADD COLUMN {name} {declaration}")
         try:
             self.path.chmod(0o600)
         except OSError:
@@ -105,10 +130,13 @@ class SubmissionStore:
             enter_count=row["enter_count"], attempts=row["attempts"],
             evidence=tuple(json.loads(row["evidence_json"])),
             created_at=row["created_at"], updated_at=row["updated_at"],
+            node_id=row["node_id"], first_seen=row["first_seen"], last_check=row["last_check"],
+            last_action=row["last_action"], execution_started=bool(row["execution_started"]),
+            terminal_state=row["terminal_state"], stop_reason=row["stop_reason"],
         )
 
     def create(self, *, idempotency_key: str, session: str, agent_type: str,
-               prompt: str) -> tuple[Submission, bool]:
+               prompt: str, node_id: str | None = None) -> tuple[Submission, bool]:
         digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         now = time.time()
         with self._connection() as db:
@@ -123,9 +151,9 @@ class SubmissionStore:
             sid = uuid.uuid4().hex
             db.execute("""INSERT INTO prompt_submissions
                 (submission_id,idempotency_key,session,agent_type,prompt,prompt_sha256,
-                 ack_state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+                ack_state,created_at,updated_at,node_id,first_seen,last_check,terminal_state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                        (sid, idempotency_key, session, agent_type, prompt, digest,
-                        ACK_QUEUED, now, now))
+                        ACK_QUEUED, now, now, node_id, now, now, ACK_QUEUED))
             row = db.execute("SELECT * FROM prompt_submissions WHERE submission_id=?", (sid,)).fetchone()
         created = self._row(row)
         assert created is not None
@@ -133,7 +161,9 @@ class SubmissionStore:
 
     def update(self, submission_id: str, *, ack_state: str | None = None,
                enter_count: int | None = None, attempts: int | None = None,
-               evidence: str | None = None) -> Submission:
+               evidence: str | None = None, node_id: str | None = None,
+               last_action: str | None = None, execution_started: bool | None = None,
+               terminal_state: str | None = None, stop_reason: str | None = None) -> Submission:
         current = self.get(submission_id)
         if current is None:
             raise KeyError(submission_id)
@@ -141,15 +171,39 @@ class SubmissionStore:
         if evidence and evidence not in evidence_list:
             evidence_list.append(evidence)
         with self._connection() as db:
+            now = time.time()
             db.execute("""UPDATE prompt_submissions SET ack_state=?, enter_count=?, attempts=?,
-                evidence_json=?, updated_at=? WHERE submission_id=?""",
+                evidence_json=?, updated_at=?, node_id=?, last_check=?, last_action=?,
+                execution_started=?, terminal_state=?, stop_reason=? WHERE submission_id=?""",
                        (ack_state or current.ack_state,
                         current.enter_count if enter_count is None else enter_count,
                         current.attempts if attempts is None else attempts,
-                        json.dumps(evidence_list), time.time(), submission_id))
+                        json.dumps(evidence_list), now, node_id or current.node_id, now,
+                        last_action or current.last_action,
+                        int(current.execution_started if execution_started is None else execution_started),
+                        terminal_state or ack_state or current.terminal_state,
+                        stop_reason or current.stop_reason, submission_id))
         result = self.get(submission_id)
         assert result is not None
         return result
+
+    def reserve_enter(self, submission_id: str, *, cap: int, action: str) -> Submission | None:
+        """Persist an Enter reservation before sending it.
+
+        Both the foreground submit path and the sweeper use this compare-and-
+        increment so concurrent recovery can never emit a seventh Enter.
+        Counting a failed send is intentional: ambiguity fails closed.
+        """
+        now = time.time()
+        with self._connection() as db:
+            changed = db.execute(
+                """UPDATE prompt_submissions SET enter_count=enter_count+1,
+                   attempts=attempts+1, updated_at=?, last_check=?, last_action=?
+                   WHERE submission_id=? AND enter_count < ?
+                     AND ack_state IN (?, ?, ?)""",
+                (now, now, action, submission_id, cap, ACK_QUEUED, ACK_INJECTED, ACK_SUBMITTING),
+            ).rowcount
+        return self.get(submission_id) if changed else None
 
     def get(self, submission_id: str) -> Submission | None:
         with self._connection() as db:
@@ -163,9 +217,25 @@ class SubmissionStore:
 
     def active(self) -> list[Submission]:
         with self._connection() as db:
-            rows = db.execute("SELECT * FROM prompt_submissions WHERE ack_state IN (?, ?, ?, ?)",
-                              (ACK_QUEUED, ACK_INJECTED, ACK_SUBMITTING, ACK_STUCK)).fetchall()
+            rows = db.execute("SELECT * FROM prompt_submissions WHERE ack_state IN (?, ?, ?)",
+                              (ACK_QUEUED, ACK_INJECTED, ACK_SUBMITTING)).fetchall()
         return [self._row(row) for row in rows if self._row(row) is not None]  # type: ignore[misc]
+
+    def watcher_status(self) -> dict[str, Any]:
+        with self._connection() as db:
+            rows = db.execute("SELECT * FROM prompt_submissions ORDER BY updated_at DESC LIMIT 100").fetchall()
+        records = [self._row(row) for row in rows]
+        records = [row for row in records if row is not None]
+        pending = [row for row in records if row.ack_state in {ACK_QUEUED, ACK_INJECTED, ACK_SUBMITTING}]
+        return {
+            "active": True,
+            "pending_submissions": len(pending),
+            "recovered_submissions": sum(row.execution_started for row in records),
+            "stuck_submissions": sum(row.ack_state == ACK_STUCK for row in records),
+            "approval_blocked_count": sum(row.ack_state == ACK_BLOCKED_APPROVAL for row in records),
+            "node_unavailable_count": sum(row.ack_state == ACK_NODE_UNAVAILABLE for row in records),
+            "submissions": [row.public() for row in records[:50]],
+        }
 
 
 @dataclass(frozen=True)
@@ -175,7 +245,8 @@ class WatchdogConfig:
     # A submission has one normal Enter and at most one evidence-gated
     # recovery Enter.  Never turn an ambiguous send into an unbounded key
     # spam loop (which can double-submit destructive confirmations).
-    max_enter_attempts: int = 2
+    max_enter_attempts: int = 6
+    max_total_enters: int = 6
     retry_agent_types: frozenset[str] = frozenset({"codex"})
 
 
@@ -195,7 +266,8 @@ class VerifiedSubmitWatchdog:
     def run(self, submission_id: str, *, capture: Callable[[], list[str]],
             send_enter: Callable[[], None],
             evidence: Callable[[list[str], Submission], tuple[str, str]],
-            inject: Callable[[str], None] | None = None) -> dict[str, Any]:
+            inject: Callable[[str], None] | None = None,
+            max_new_enters: int | None = None) -> dict[str, Any]:
         record = self.store.get(submission_id)
         if record is None:
             raise KeyError(submission_id)
@@ -241,8 +313,10 @@ class VerifiedSubmitWatchdog:
         # ever created by another front door/backend, fail closed to the
         # single-submit contract: one initial Enter may already have happened,
         # but no automatic retry is permitted.
-        max_enter_attempts = (self.config.max_enter_attempts
+        max_enter_attempts = min(self.config.max_enter_attempts, self.config.max_total_enters)
+        max_enter_attempts = (max_enter_attempts
                               if record.agent_type in self.config.retry_agent_types else 1)
+        initial_enter_count = record.enter_count
         self.store.update(submission_id, ack_state=ACK_SUBMITTING)
         deadline = time.monotonic() + self.config.timeout_seconds
         last_lines: list[str] | None = None
@@ -269,7 +343,15 @@ class VerifiedSubmitWatchdog:
             if state in (ACK_ACCEPTED, ACK_RUNNING):
                 if current.enter_count == 1 and first_enter_effect is None:
                     first_enter_effect = "submitted"
-                self.store.update(submission_id, ack_state=state, evidence=reason)
+                self.store.update(submission_id, ack_state=state, evidence=reason,
+                                  execution_started=True, last_action="execution_evidence")
+                return finish()
+            if state.upper() in {"PAGER", "WAITING_APPROVAL", "WAITING_INPUT", "INPUT_REQUIRED"} or any(
+                    word in reason.casefold() for word in
+                    ("approval", "permission", "confirmation", "numbered choice", "numbered-choice", "input_required")):
+                self.store.update(submission_id, ack_state=ACK_BLOCKED_APPROVAL,
+                                  evidence=reason or "approval_or_input_required",
+                                  last_action="approval_blocked", stop_reason="approval_or_input_required")
                 return finish()
             if state in ("PAGER", "INCOMPLETE"):
                 # Never use Enter to advance a pager or to submit a draft
@@ -279,7 +361,16 @@ class VerifiedSubmitWatchdog:
                 time.sleep(self.config.poll_interval_seconds)
                 continue
             if current.enter_count >= max_enter_attempts:
-                break
+                self.store.update(submission_id, ack_state=ACK_STUCK, evidence="recovery: enter_cap_reached",
+                                  last_action="enter_cap_reached", stop_reason="max_enter_cap")
+                return finish()
+            if max_new_enters is not None and current.enter_count - initial_enter_count >= max_new_enters:
+                # Leave it active for the next bounded sweeper pass.  The
+                # persisted count and backoff decide whether another Enter is
+                # ever allowed; a single pass never sends two.
+                self.store.update(submission_id, ack_state=ACK_SUBMITTING,
+                                  last_action="watcher_cycle_complete")
+                return finish()
             # A slow TUI may still be consuming the previous Enter. Require
             # either a composer redraw or two stable polls (~0.8s by default)
             # before another Enter; this preserves recovery for swallowed
@@ -291,18 +382,31 @@ class VerifiedSubmitWatchdog:
                 first_enter_effect = "composition_commit_or_submit"
             else:
                 first_enter_effect = first_enter_effect or "composition_commit_or_submit"
+            action = "watcher_enter" if max_new_enters is not None else "submit_enter"
+            current = self.store.reserve_enter(submission_id, cap=max_enter_attempts, action=action)
+            if current is None:
+                self.store.update(submission_id, ack_state=ACK_STUCK, evidence="recovery: enter_cap_reached",
+                                  last_action="enter_cap_reached", stop_reason="max_enter_cap")
+                return finish()
             send_enter()
-            current = self.store.update(submission_id, enter_count=current.enter_count + 1,
-                                        attempts=current.attempts + 1, evidence=reason or "enter_sent")
+            current = self.store.update(submission_id, evidence=reason or "enter_sent", last_action=action)
             time.sleep(self.config.poll_interval_seconds)
-        self.store.update(submission_id, ack_state=ACK_STUCK, evidence="recovery: submit_evidence_timeout")
+        if max_new_enters is not None:
+            self.store.update(submission_id, ack_state=ACK_SUBMITTING, evidence="watcher_cycle_timeout",
+                              last_action="watcher_cycle_complete")
+            return finish()
+        self.store.update(submission_id, ack_state=ACK_STUCK, evidence="recovery: submit_evidence_timeout",
+                          stop_reason="execution_evidence_timeout")
         return finish()
 
 
 class SubmissionSweeper:
+    """Continuous verified-start watcher using the durable submission store."""
     def __init__(self, store: SubmissionStore, recover: Callable[[Submission], None],
-                 interval_seconds: float = 1.5) -> None:
+                 interval_seconds: float = 3.0, ttl_seconds: float = 600.0,
+                 backoff_seconds: tuple[float, ...] = (1.0, 2.0, 3.0, 5.0, 8.0)) -> None:
         self.store, self.recover, self.interval_seconds = store, recover, interval_seconds
+        self.ttl_seconds, self.backoff_seconds = ttl_seconds, backoff_seconds
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -320,11 +424,24 @@ class SubmissionSweeper:
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval_seconds):
-            for record in self.store.active():
-                try:
-                    self.recover(record)
-                except Exception:
-                    # Recovery is best effort; the durable record remains for
-                    # the next pass and the caller's normal audit path owns
-                    # detailed error reporting.
+            self.run_once()
+
+    def run_once(self) -> None:
+        for record in self.store.active():
+            try:
+                now = time.time()
+                if now - record.created_at > self.ttl_seconds:
+                    self.store.update(record.submission_id, ack_state=ACK_STUCK,
+                                      evidence="watcher_stale_submission_ttl",
+                                      last_action="watcher_stale", stop_reason="stale_submission_ttl")
                     continue
+                delay = self.backoff_seconds[min(record.enter_count, len(self.backoff_seconds) - 1)]
+                if record.last_check and now - record.last_check < delay:
+                    continue
+                self.store.update(record.submission_id, last_action="watcher_check")
+                self.recover(record)
+            except Exception:
+                # Recovery is best effort; the durable record remains for
+                # the next pass and the caller's normal audit path owns
+                # detailed error reporting.
+                continue

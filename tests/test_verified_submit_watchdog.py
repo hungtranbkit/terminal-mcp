@@ -6,9 +6,12 @@ import pytest
 
 from terminal_mcp.submit_watchdog import (
     ACK_ACCEPTED,
+    ACK_BLOCKED_APPROVAL,
+    ACK_NODE_UNAVAILABLE,
     ACK_RUNNING,
     ACK_STUCK,
     SubmissionStore,
+    SubmissionSweeper,
     VerifiedSubmitWatchdog,
     WatchdogConfig,
 )
@@ -108,7 +111,7 @@ def test_verified_submit_stops_without_enter_when_pager_or_buffer_incomplete(tmp
     result = watchdog.run(record.submission_id, capture=lambda: ["-- MORE --"],
                           inject=lambda _: None, send_enter=lambda: enters.append(1),
                           evidence=lambda _lines, _record: ("PAGER", "pager_visible"))
-    assert result["ack_state"] == ACK_STUCK
+    assert result["ack_state"] == "BLOCKED_APPROVAL"
     assert result["enter_count"] == 0
     assert enters == []
 
@@ -155,3 +158,67 @@ def test_claude_watchdog_is_single_submit_even_when_evidence_stays_pending(tmp_p
     assert enters == [1]
     assert result["enter_count"] == 1
     assert result["ack_state"] == ACK_STUCK
+
+
+@pytest.mark.parametrize("state,reason", [
+    ("WAITING_APPROVAL", "pending"), ("COMPOSER", "permission confirmation required"),
+    ("COMPOSER", "numbered-choice menu"),
+])
+def test_approval_looking_state_blocks_without_enter(tmp_path: Path, state: str, reason: str):
+    store = SubmissionStore(tmp_path / ("approval-" + state + ".db"))
+    record, _ = store.create(idempotency_key=state + reason, session="codex", agent_type="codex", prompt="safe")
+    entered: list[int] = []
+    result = VerifiedSubmitWatchdog(store, WatchdogConfig(poll_interval_seconds=.01, timeout_seconds=.1)).run(
+        record.submission_id, capture=lambda: ["menu"], inject=lambda _: None,
+        send_enter=lambda: entered.append(1), evidence=lambda _lines, _record: (state, reason))
+    assert result["ack_state"] == ACK_BLOCKED_APPROVAL
+    assert entered == []
+
+
+def test_persisted_cap_is_shared_by_watcher_passes_and_restart(tmp_path: Path):
+    path = tmp_path / "cap.db"
+    store = SubmissionStore(path)
+    record, _ = store.create(idempotency_key="cap", session="codex", agent_type="codex", prompt="once")
+    config = WatchdogConfig(poll_interval_seconds=.01, timeout_seconds=.1, max_enter_attempts=6, max_total_enters=6)
+    entered: list[int] = []
+    for _ in range(6):
+        VerifiedSubmitWatchdog(store, config).run(record.submission_id, capture=lambda: ["> once"],
+                                                  inject=lambda _: None, send_enter=lambda: entered.append(1),
+                                                  evidence=lambda _lines, _record: ("COMPOSER", "draft"), max_new_enters=1)
+    result = VerifiedSubmitWatchdog(SubmissionStore(path), config).run(
+        record.submission_id, capture=lambda: ["> once"], inject=lambda _: None,
+        send_enter=lambda: entered.append(1), evidence=lambda _lines, _record: ("COMPOSER", "draft"), max_new_enters=1)
+    assert entered == [1] * 6
+    assert result["enter_count"] == 6 and result["ack_state"] == ACK_STUCK
+
+
+def test_execution_evidence_stops_and_sessions_are_isolated(tmp_path: Path):
+    store = SubmissionStore(tmp_path / "isolation.db")
+    first, _ = store.create(idempotency_key="first", session="codex-a", agent_type="codex", prompt="a")
+    second, _ = store.create(idempotency_key="second", session="codex-b", agent_type="codex", prompt="b")
+    watchdog = VerifiedSubmitWatchdog(store, WatchdogConfig(poll_interval_seconds=.01, timeout_seconds=.1))
+    started = watchdog.run(first.submission_id, capture=lambda: ["Working"], inject=lambda _: None,
+                           send_enter=lambda: pytest.fail("no Enter after execution evidence"),
+                           evidence=lambda _lines, _record: (ACK_RUNNING, "tool execution"))
+    other = watchdog.run(second.submission_id, capture=lambda: ["> b"], inject=lambda _: None,
+                         send_enter=lambda: None, evidence=lambda _lines, _record: ("COMPOSER", "draft"),
+                         max_new_enters=1)
+    assert started["execution_started"] is True and started["enter_count"] == 0
+    assert other["enter_count"] == 1 and store.get(first.submission_id).enter_count == 0  # type: ignore[union-attr]
+
+
+def test_sweeper_ttl_and_remote_unavailable_fail_closed(tmp_path: Path):
+    import time
+    from types import SimpleNamespace
+    from terminal_mcp.core import TerminalService
+    store = SubmissionStore(tmp_path / "terminal.db")
+    stale, _ = store.create(idempotency_key="stale", session="codex", agent_type="codex", prompt="x")
+    with store._connection() as db:
+        db.execute("UPDATE prompt_submissions SET created_at=? WHERE submission_id=?", (time.time() - 601, stale.submission_id))
+    SubmissionSweeper(store, lambda _: pytest.fail("stale recovery"), ttl_seconds=600).run_once()
+    assert store.get(stale.submission_id).ack_state == ACK_STUCK  # type: ignore[union-attr]
+    remote, _ = store.create(idempotency_key="remote", session="gone", agent_type="codex", prompt="x")
+    service = object.__new__(TerminalService)
+    service.submissions, service.tmux = store, SimpleNamespace(get_session=lambda _: None)
+    service.recover_submission(remote)
+    assert store.get(remote.submission_id).ack_state == ACK_NODE_UNAVAILABLE  # type: ignore[union-attr]
