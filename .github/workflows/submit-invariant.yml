@@ -1,0 +1,27 @@
+name: Submit invariant checks
+
+on:
+  pull_request:
+    paths:
+      - "terminal_mcp/core.py"
+      - "terminal_mcp/delivery_gate.py"
+      - "terminal_mcp/compact_tools.py"
+      - "tests/test_delivery_gate.py"
+      - "tests/test_compact_tools.py"
+      - "tests/test_submit_acceptance_p1.py"
+      - ".github/workflows/submit-invariant.yml"
+  workflow_dispatch:
+
+jobs:
+  targeted:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest -q tests/test_delivery_gate.py tests/test_compact_tools.py tests/test_submit_acceptance_p1.py

@@ -410,3 +410,19 @@ def test_turn_rejects_unknown_action_without_touching_terminal():
     assert result["error"] == "INVALID_ACTION"
     assert controller.status_calls == 0
     assert controller.send_calls == []
+
+
+def test_send_task_rejects_contradictory_submit_confirmed_receipt():
+    compact, _terminal, controller = service()
+    controller.send_result = {
+        "delivery_state": "SUBMIT_CONFIRMED",
+        "submit_status": "SUBMIT_CONFIRMED",
+        "press_enter": True,
+        "enter_sent": False,
+        "enter_count": 0,
+        "correlation_id": "corr-bad-confirm",
+    }
+    result = compact.send_task("codex-idle", "do work")
+    assert result["status"] == "FAILED"
+    assert "enter_sent=False" in result["reason"]
+    assert result["evidence"]["enter_sent"] is False
