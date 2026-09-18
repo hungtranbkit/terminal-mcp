@@ -98,6 +98,15 @@ supervisor:
 # session, confirmed repeatedly earlier this same day.
 queue:
   enabled: true
+  drain_enabled: true
+  drain_batch_size: 25
+  project_feeds:
+    - project_id: novaretail
+      lane: linux-codex-work
+      owner: linux-codex-work
+      registry_path: /home/dell/workspace/novaretail-web-ui-v3-audit/TASKS.json
+      preferred_task_ids:
+        - NWR-UI-V3-POLISH-001
 
 # P1 hardening item #2: this deployment's dashboard hostname
 # (terminal-dashboard.mesflow.net) sits behind a real Cloudflare Access

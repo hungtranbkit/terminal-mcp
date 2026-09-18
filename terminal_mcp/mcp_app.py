@@ -40,6 +40,7 @@ from .queue_engine import QueueEngine
 from .request_governor import RequestGovernor
 from .queue_event_drain import QueueEventDrain
 from .queue_loop import QueueLoop
+from .project_task_feeder import ProjectTaskFeeder
 from .backlog_service import BacklogService
 from .event_bus import KNOWN_EVENT_TYPES, EventBus
 from .event_wiring import build_queue_event_sink, build_verify_event_sink
@@ -377,10 +378,14 @@ def build_mcp(service: TerminalService | None = None,
     if terminal.config.queue.drain_enabled and events is not None:
         _event_drain = QueueEventDrain(
             events, queue_engine, batch_size=terminal.config.queue.drain_batch_size)
+    _project_feeder = None
+    if terminal.config.queue.project_feeds:
+        _project_feeder = ProjectTaskFeeder(queue, terminal.config.queue.project_feeds)
     queue.loop = queue.loop or QueueLoop(
         queue_engine, poll_interval_seconds=terminal.config.queue.poll_interval_seconds,
         heartbeat_refresher=_refresh_local_heartbeat,
         event_drain=_event_drain,
+        project_feeder=_project_feeder,
     )
 
     def _active_queue_task_for(session: str) -> dict | None:

@@ -1,0 +1,29 @@
+name: Continuous dispatch checks
+
+on:
+  pull_request:
+    paths:
+      - "terminal_mcp/project_task_feeder.py"
+      - "terminal_mcp/queue_loop.py"
+      - "terminal_mcp/config.py"
+      - "terminal_mcp/mcp_app.py"
+      - "tests/test_project_task_feeder.py"
+      - "tests/test_project_feed_config.py"
+      - "tests/test_queue_loop.py"
+      - "config.yaml"
+      - ".github/workflows/continuous-dispatch.yml"
+  workflow_dispatch:
+
+jobs:
+  targeted:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest -q tests/test_project_task_feeder.py tests/test_project_feed_config.py tests/test_queue_loop.py

@@ -57,7 +57,8 @@ DEFAULT_POLL_INTERVAL_SECONDS = 3.0
 class QueueLoop:
     def __init__(self, engine: QueueEngine, *, poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
                 heartbeat_refresher: Callable[[], None] | None = None,
-                event_drain: "QueueEventDrain | None" = None) -> None:
+                event_drain: "QueueEventDrain | None" = None,
+                project_feeder: object | None = None) -> None:
         self.engine = engine
         # The event-bus drain, run as a STEP of this cycle. Injected and
         # optional: None means exactly today's behaviour, and there is still
@@ -65,6 +66,10 @@ class QueueLoop:
         # queue_event_drain.py's own docstring on why a second loop was the
         # wrong shape).
         self.event_drain = event_drain
+        # Optional project-level feeder. QueueEngine already advances rows that
+        # exist in the durable queue; this bridge only supplies the next
+        # canonical project task when an opted-in lane is genuinely IDLE.
+        self.project_feeder = project_feeder
         self.poll_interval_seconds = max(0.5, poll_interval_seconds)
         # Injected, not imported -- this module has no business knowing
         # HOW to compute a fresh local heartbeat (that's mcp_app.py's/
@@ -81,6 +86,7 @@ class QueueLoop:
         self._thread: threading.Thread | None = None
         self._last_cycle_at: str | None = None
         self._last_drain: dict | None = None
+        self._last_feed: dict | None = None
         self._last_error: dict[str, str] | None = None
         self._lock = threading.Lock()
 
@@ -104,7 +110,9 @@ class QueueLoop:
             return {"running": self.is_alive(), "poll_interval_seconds": self.poll_interval_seconds,
                     "last_cycle_at": self._last_cycle_at, "last_error": self._last_error,
                     "drain_enabled": self.event_drain is not None,
-                    "last_drain": self._last_drain}
+                    "last_drain": self._last_drain,
+                    "project_feed_enabled": self.project_feeder is not None,
+                    "last_feed": self._last_feed}
 
     def run_one_cycle(self) -> list[dict]:
         """One full pass over every auto-dispatch-enabled lane -- the
@@ -129,7 +137,15 @@ class QueueLoop:
             session = lane["session"]
             try:
                 result = self.engine.tick(session)
-                results.append(result.to_dict())
+                row = result.to_dict()
+                results.append(row)
+                if result.action == "IDLE" and self.project_feeder is not None:
+                    feed = self._feed_project_task(session)
+                    if feed and feed.get("action") in ("ENQUEUED", "EXISTING_TASK"):
+                        # Persist-first: feeder wrote or found the queue row.
+                        # Tick once more so the same cycle claims it immediately.
+                        next_result = self.engine.tick(session)
+                        results.append({**next_result.to_dict(), "project_feed": feed})
             except Exception as exc:  # noqa: BLE001 -- one lane's failure must never stop the others
                 _LOGGER.exception("queue-loop: tick failed for session %r, continuing with other lanes", session)
                 results.append({"session": session, "action": "ENGINE_ERROR", "task_id": None,
@@ -137,6 +153,24 @@ class QueueLoop:
         with self._lock:
             self._last_cycle_at = datetime.now(timezone.utc).isoformat()
         return results
+
+    def _feed_project_task(self, session: str) -> dict | None:
+        """Ask the configured canonical-project feeder for one task.
+
+        Never raises into the scheduler. A bad/unreadable registry must leave
+        the lane idle rather than inventing or dispatching work.
+        """
+        if self.project_feeder is None:
+            return None
+        try:
+            result = self.project_feeder.feed_if_idle(session)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.exception("queue-loop: project feeder failed for %r", session)
+            result = {"session": session, "action": "FEED_ERROR",
+                      "detail": f"{type(exc).__name__}: {exc}"}
+        with self._lock:
+            self._last_feed = result
+        return result
 
     def _drain_events(self) -> dict | None:
         """One bounded drain pass. Never raises: an unreadable bus must not stop
