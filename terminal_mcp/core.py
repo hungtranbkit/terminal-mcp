@@ -2225,8 +2225,10 @@ class TerminalService:
             "ack_state": state, "attempts": result["attempts"],
             "activation_attempts": result["enter_count"],
             "enter_count": actual_enter_count, "evidence": result["evidence"],
-            "first_enter_effect": result.get("first_enter_effect", "unknown"),
-            "recovery_enter_sent": bool(result.get("recovery_enter_sent", result["enter_count"] > 1)),
+            "first_enter_effect": ("working_followup_tab" if queue_followup_sent
+                                    else result.get("first_enter_effect", "unknown")),
+            "recovery_enter_sent": (False if queue_followup_sent
+                                     else bool(result.get("recovery_enter_sent", result["enter_count"] > 1))),
             "queue_followup_sent": queue_followup_sent,
             "submit_key": activation_key or None,
             "composer_before": result.get("composer_before", "unknown"),
@@ -2234,7 +2236,7 @@ class TerminalService:
             "submit_latency_ms": result.get("submit_latency_ms"),
             **({"recovery_attempted": True,
                "recovery_enter_count": result["enter_count"] - 1}
-               if result["enter_count"] > 1 else {}),
+               if result["enter_count"] > 1 and not queue_followup_sent else {}),
             "delivery_state": delivery, "submit_status": to_legacy_submit_status(delivery),
             "submit_reason": (
                 "followup_queued_after_tab" if queue_followup_sent and state in (ACK_ACCEPTED, ACK_RUNNING)
