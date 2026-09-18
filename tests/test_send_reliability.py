@@ -307,6 +307,24 @@ def test_codex_already_working_never_gets_escape_recovery(tmux_session_factory, 
     assert pane.count("SUBMITTED[") == 1
 
 
+def test_codex_working_composer_queues_followup_with_tab_not_false_enter_ack(
+    tmux_session_factory, tmp_path
+):
+    """A working Codex composer requires Tab queue evidence, not Enter ACK."""
+    session = _codex_session(tmux_session_factory, "test-codex-followup-queue", "working_followup_queue")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "follow-up Vietnamese prompt", press_enter=True)
+    assert result["submit_status"] == "SUBMIT_CONFIRMED"
+    assert result["queue_followup_sent"] is True
+    assert result["submit_key"] == "Tab"
+    assert result["enter_sent"] is False
+    assert result["submit_reason"] == "followup_queued_after_tab"
+    pane = service.terminal_tail(session, 20)["output"]
+    assert "Queued follow-up inputs" in pane
+    assert "SUBMITTED[" not in pane
+
+
 def test_codex_recovery_failure_reports_unconfirmed_not_false_success(tmux_session_factory, tmp_path):
     session = _codex_session(tmux_session_factory, "test-codex-alwaysstuck", "always_stuck")
     time.sleep(0.3)

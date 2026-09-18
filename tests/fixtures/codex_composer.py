@@ -47,6 +47,9 @@ CODEX_FIXTURE_MODE env var selects behavior:
     composer is emptied rather than replaced with different text (models
     a cancel) -- the sent text is equally absent, so recovery must be
     withheld for the same reason.
+  working_followup_queue -- Codex is already working; the draft remains in
+    the composer with the "tab to queue message" affordance. Tab queues it,
+    while Enter is the wrong activation key.
 """
 import os
 import sys
@@ -87,6 +90,13 @@ def render_composer() -> None:
     sys.stdout.flush()
 
 
+def render_working_followup() -> None:
+    """Render a working composer with its Tab queue affordance."""
+    sys.stdout.write("\r\x1b[2K")
+    sys.stdout.write(f"> {buf}\r\nesc to interrupt\r\ntab to queue message")
+    sys.stdout.flush()
+
+
 try:
     sys.stdout.write("codex composer ready\r\n> ")
     sys.stdout.flush()
@@ -99,6 +109,10 @@ try:
             escape_count += 1
             continue
         if ch in ("\n", "\r"):
+            if MODE == "working_followup_queue":
+                render_working_followup()
+                escape_pending = False
+                continue
             if MODE == "submit_after_n_enters":
                 bare_enters += 1
                 if bare_enters < REQUIRED_ENTERS:
@@ -168,9 +182,19 @@ try:
                 render_composer()
             escape_pending = False
             continue
+        if ch == "\t" and MODE == "working_followup_queue":
+            submitted += 1
+            sys.stdout.write("\r\nQueued follow-up inputs\r\nesc to interrupt\r\n")
+            sys.stdout.flush()
+            buf = ""
+            escape_pending = False
+            continue
         escape_pending = False
         buf += ch
-        sys.stdout.write(ch)
-        sys.stdout.flush()
+        if MODE == "working_followup_queue":
+            render_working_followup()
+        else:
+            sys.stdout.write(ch)
+            sys.stdout.flush()
 finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)

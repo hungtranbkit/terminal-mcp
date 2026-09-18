@@ -214,6 +214,16 @@ def _codex_composer_buffer_complete(snapshot: list[str], text: str) -> bool:
     return bool(match and int(match.group(1)) >= len(text))
 
 
+def _codex_followup_queue_prompt_present(snapshot: list[str]) -> bool:
+    """Codex exposes this affordance when a working turn can queue input."""
+    return bool(re.search(r"\btab\s+to\s+queue\s+message\b", " ".join(snapshot), re.IGNORECASE))
+
+
+def _codex_followup_queued(snapshot: list[str]) -> bool:
+    """Positive evidence that a Tab queue action was consumed by Codex."""
+    return bool(re.search(r"\bqueued\s+follow[- ]up\s+inputs?\b", " ".join(snapshot), re.IGNORECASE))
+
+
 def _codex_draft_in_composer(snapshot: list[str], text: str) -> bool:
     """Return true only when this submission is still in Codex's composer.
 
@@ -232,8 +242,12 @@ def _codex_draft_in_composer(snapshot: list[str], text: str) -> bool:
     # scrollback.  It is not the live composer when a submission/working
     # result follows it; only the last active marker can be the draft.
     last_marker = marker_indexes[-1]
-    if any(re.search(r"SUBMITTED\[|esc to interrupt", line, re.IGNORECASE)
+    queue_prompt = _codex_followup_queue_prompt_present(snapshot)
+    if any(re.search(r"SUBMITTED\[", line, re.IGNORECASE)
            for line in snapshot[last_marker + 1:]):
+        return False
+    if (not queue_prompt and any(re.search(r"esc to interrupt", line, re.IGNORECASE)
+                                 for line in snapshot[last_marker + 1:])):
         return False
     for line in snapshot[last_marker:last_marker + 1]:
         stripped = line.strip()
@@ -1504,12 +1518,14 @@ class TerminalService:
         delivery_state = result.get("delivery_state")
         enter_sent = bool(result.get("enter_sent"))
         recovered = bool(result.get("recovery_attempted"))
-        # Contract invariant: a submit that REQUIRED Enter cannot be confirmed
-        # if no Enter was actually sent. This also repairs stale/idempotent
-        # replay receipts produced by older builds before they leave core.
+        # Contract invariant: an Enter-based submit cannot be confirmed if no
+        # Enter was sent. Codex's explicit working-composer queue path is the
+        # one intentional exception: it requires Tab plus queued evidence.
         if (result.get("press_enter") is True
                 and delivery_state == DELIVERY_SUBMIT_CONFIRMED
-                and not enter_sent):
+                and not enter_sent
+                and not (result.get("queue_followup_sent") is True
+                         and result.get("submit_key") == "Tab")):
             delivery_state = DELIVERY_UNKNOWN
             result["delivery_state"] = DELIVERY_UNKNOWN
             result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
@@ -2093,6 +2109,9 @@ class TerminalService:
         baseline: list[str] | None = None
         has_submitted_enter = False
         enter_calls = 0
+        queue_followup_requested = False
+        queue_followup_sent = False
+        activation_key = ""
 
         def capture() -> list[str]:
             return self.tmux.capture_lines(session, SEND_VERIFY_LINES)
@@ -2101,13 +2120,20 @@ class TerminalService:
             self.tmux.send_text(session, prompt, press_enter=False)
 
         def send_enter() -> None:
-            nonlocal has_submitted_enter, enter_calls
+            nonlocal has_submitted_enter, enter_calls, queue_followup_requested
+            nonlocal queue_followup_sent, activation_key
             info = self.tmux.get_session(session)
             current = None if info is None else SessionIdentity.from_session_info(info)
             command = "" if info is None else (info.pane_current_command or "")
             if current is None or not identity_before.matches(current) or command != command_before:
                 raise TmuxError("IDENTITY_CHANGED_BEFORE_RETRY")
             enter_calls += 1
+            if queue_followup_requested:
+                self.tmux.send_keys(session, ["Tab"])
+                queue_followup_requested = False
+                queue_followup_sent = True
+                activation_key = "Tab"
+                return
             # Codex's known composer-swallow signature can require clearing
             # the still-focused composer before the final bounded retry. This
             # is still one Enter attempt (and never re-injects text); pager /
@@ -2117,9 +2143,10 @@ class TerminalService:
                 time.sleep(SEND_TEXT_ENTER_SETTLE_SECONDS)
             self.tmux.send_keys(session, ["Enter"])
             has_submitted_enter = True
+            activation_key = "Enter"
 
         def evidence(lines: list[str], current: Submission) -> tuple[str, str]:
-            nonlocal baseline
+            nonlocal baseline, queue_followup_requested
             if baseline is None or (not has_submitted_enter
                                     and _codex_draft_in_composer(lines, text)
                                     and not _codex_draft_in_composer(baseline, text)):
@@ -2129,6 +2156,19 @@ class TerminalService:
                 return "COMPOSER", "draft_still_in_composer"
             if adapter.identify_target_state(lines) == "waiting":
                 return "PAGER", "approval_or_pager_visible"
+            if (queue_followup_sent and _codex_followup_queued(lines)
+                    and not _codex_followup_queued(baseline or [])):
+                return ACK_RUNNING, "followup_queued_after_tab"
+            if queue_followup_sent:
+                # A working composer must never fall through to Enter after
+                # the Tab queue action. Keep observing for the explicit
+                # queued/consumed acknowledgement only.
+                return "INCOMPLETE", "followup_queue_evidence_pending"
+            if (adapter.identify_target_state(lines) == "running"
+                    and _codex_followup_queue_prompt_present(lines)
+                    and _codex_composer_buffer_complete(lines, text)):
+                queue_followup_requested = True
+                return "COMPOSER", "working_followup_requires_tab"
             if _codex_draft_in_composer(lines, text):
                 return "COMPOSER", "draft_still_in_composer"
             if (has_submitted_enter and baseline is not None
@@ -2169,20 +2209,26 @@ class TerminalService:
             self.submissions.update(record.submission_id, ack_state=ACK_STUCK, evidence=str(exc))
             result = self.submissions.get(record.submission_id).public()  # type: ignore[union-attr]
         state = result["ack_state"]
-        enter_count = int(result.get("enter_count") or 0)
+        actual_enter_count = 0 if activation_key == "Tab" else result["enter_count"]
+        enter_count = actual_enter_count
         delivery = (
             DELIVERY_SUBMIT_CONFIRMED
             if state in (ACK_ACCEPTED, ACK_RUNNING) and enter_count > 0
             else DELIVERY_UNKNOWN
         )
+        if queue_followup_sent and state in (ACK_ACCEPTED, ACK_RUNNING):
+            delivery = DELIVERY_SUBMIT_CONFIRMED
         return {
-            "sent": True, "enter_sent": result["enter_count"] > 0,
+            "sent": True, "enter_sent": activation_key == "Enter",
             "characters": len(text), "press_enter": True, "correlation_id": correlation_id,
             "agent_type": adapter.name, "submission_id": result["submission_id"],
             "ack_state": state, "attempts": result["attempts"],
-            "enter_count": result["enter_count"], "evidence": result["evidence"],
+            "activation_attempts": result["enter_count"],
+            "enter_count": actual_enter_count, "evidence": result["evidence"],
             "first_enter_effect": result.get("first_enter_effect", "unknown"),
             "recovery_enter_sent": bool(result.get("recovery_enter_sent", result["enter_count"] > 1)),
+            "queue_followup_sent": queue_followup_sent,
+            "submit_key": activation_key or None,
             "composer_before": result.get("composer_before", "unknown"),
             "composer_after": result.get("composer_after", "unknown"),
             "submit_latency_ms": result.get("submit_latency_ms"),
@@ -2191,6 +2237,8 @@ class TerminalService:
                if result["enter_count"] > 1 else {}),
             "delivery_state": delivery, "submit_status": to_legacy_submit_status(delivery),
             "submit_reason": (
+                "followup_queued_after_tab" if queue_followup_sent and state in (ACK_ACCEPTED, ACK_RUNNING)
+                else
                 (next((item for item in reversed(result["evidence"]) if "withheld" in item),
                       result["evidence"][-1]) if state == ACK_STUCK and result["evidence"]
                  else "verified-submit-watchdog")
