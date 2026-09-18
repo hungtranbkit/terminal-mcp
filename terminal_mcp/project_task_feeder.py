@@ -72,9 +72,11 @@ class ProjectFeedConfig:
 class ProjectTaskFeeder:
     """Bounded, idempotent source of the next canonical project task."""
 
-    def __init__(self, queue: Any, feeds: Iterable[ProjectFeedConfig]) -> None:
+    def __init__(self, queue: Any, feeds: Iterable[ProjectFeedConfig],
+                 inventory_provider: Any | None = None) -> None:
         self.queue = queue
         self._feeds = {feed.lane: feed for feed in feeds}
+        self._inventory_provider = inventory_provider
         self._last: dict[str, dict[str, Any]] = {}
         self._idle_since: dict[str, float] = {}
 
@@ -82,20 +84,42 @@ class ProjectTaskFeeder:
         return tuple(sorted(self._feeds))
 
     def status(self) -> dict[str, Any]:
+        fleet = []
+        if self._inventory_provider is not None:
+            try:
+                inventory = self._inventory_provider() or {}
+                fleet = self.fleet_status(inventory.get("sessions") or [],
+                                          unreachable_nodes=inventory.get("unreachable_nodes") or [])
+            except Exception as exc:  # fail closed; status must never break queue loop
+                fleet = [{"classification": "BLOCKED_UNKNOWN_ACTIVITY",
+                          "reason": f"inventory_error:{type(exc).__name__}"}]
         return {"configured_lanes": list(self.configured_lanes()),
-                "last": dict(self._last)}
+                "last": dict(self._last), "fleet": fleet}
 
-    def fleet_status(self, discovered: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    def fleet_status(self, discovered: Iterable[dict[str, Any]],
+                     unreachable_nodes: Iterable[dict[str, Any]] = ()) -> list[dict[str, Any]]:
         """Classify discovered session evidence without dispatching anything.
 
         This is deliberately a pure/read-only surface used by fleet dashboards
         and canary checks. Unknown activity and missing permissions fail closed.
         """
         result = []
+        discovered_by_name = {}
         for item in discovered:
-            session = str(item.get("session") or item.get("name") or "")
-            feed = self._feeds.get(session)
-            if feed is None:
+            name = str(item.get("session") or item.get("name") or "")
+            discovered_by_name.setdefault(name, []).append(item)
+        unavailable = {str(item.get("node_id") or "") for item in unreachable_nodes}
+        for session, feed in self._feeds.items():
+            matches = discovered_by_name.get(feed.target_session or session, [])
+            item = next((row for row in matches if not feed.target_node_id or
+                         row.get("node_id") == feed.target_node_id), None)
+            if item is None:
+                reason = "session_not_discovered"
+                if feed.target_node_id and feed.target_node_id in unavailable:
+                    reason = "node_unavailable"
+                result.append({"session": session, "node_id": feed.target_node_id,
+                               "classification": "NO_COMPATIBLE_TASK", "reason": reason,
+                               "agent_type": None, "next_candidate": None})
                 continue
             state = str(item.get("state") or "UNKNOWN").upper()
             agent = str(item.get("agent_type") or item.get("agent") or "").casefold()
