@@ -247,6 +247,24 @@ NODE_GROUP_JS = """
     // operator can see it is up and free -- but while a search/filter is
     // active it must NOT, because a group with no matches is exactly the
     // noise the filter exists to remove. Callers pass false when filtering.
+    function mergeNodeSources(rows, nodes) {
+      const merged = new Map();
+      for (const node of nodes || []) {
+        const id = node && (node.id || node.node_id);
+        if (id) merged.set(id, { ...node, id });
+      }
+      for (const row of rows || []) {
+        // Rows without a node id are handled by the grouping pass's local
+        // fallback below; only merge explicit inventory identities here.
+        const id = row && row.node_id;
+        if (!id) continue;
+        const existing = merged.get(id) || { id, display_name: row.node_name || id, status: null };
+        if (!existing.display_name || existing.display_name === existing.id) existing.display_name = row.node_name || id;
+        merged.set(id, existing);
+      }
+      return [...merged.values()];
+    }
+
     function buildNodeGroups(rows, nodes, options) {
       const includeEmptyOnline = !options || options.includeEmptyOnline !== false;
       const groups = new Map();
@@ -261,7 +279,7 @@ NODE_GROUP_JS = """
         const id = row.node_id || 'local';
         ensure(id, row.node_name, null).sessions.push(row);
       }
-      for (const node of nodes || []) {
+      for (const node of mergeNodeSources(rows, nodes)) {
         const id = node.id || node.node_id;
         if (!id) continue;
         const group = ensure(id, node.display_name, node.status);
@@ -6563,9 +6581,26 @@ NODES_ADMIN_HTML = """<!doctype html>
     async function loadAll() {
       const liveBadgeEl = document.getElementById('liveBadge');
       try {
-        const result = await api('/dashboard/api/nodes');
+        const [result, sessionsResult] = await Promise.all([
+          api('/dashboard/api/nodes'), api('/dashboard/api/sessions'),
+        ]);
         if (!result.ok) throw new Error(result.data.error || 'failed');
         nodesCache = result.data.nodes || [];
+        // The session inventory is authoritative for node/session presence.
+        // Keep a node visible even if a transient nodes response is empty or
+        // omits it; do not let stale selected state render an empty screen.
+        const known = new Set(nodesCache.map((node) => node.id || node.node_id));
+        for (const row of (sessionsResult.ok ? (sessionsResult.data.sessions || []) : [])) {
+          const id = row.node_id || 'local';
+          if (known.has(id)) continue;
+          known.add(id);
+          nodesCache.push({ id, display_name: row.node_name || id, status: 'online',
+            hostname: '—', session_backend: row.session_backend || '—', tmux_session_count: 0 });
+        }
+        if (!selectedNodeId || !known.has(selectedNodeId)) {
+          selectedNodeId = nodesCache.find((node) => node.status === 'online')?.id
+            || nodesCache[0]?.id || null;
+        }
         renderCards();
         renderEndpointsBadge(result.data.controller_endpoints);
         liveBadgeEl.textContent = '● LIVE'; liveBadgeEl.className = 'live';
