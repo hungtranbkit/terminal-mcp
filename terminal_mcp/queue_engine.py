@@ -51,6 +51,7 @@ import re
 
 import hashlib
 import time
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
@@ -483,7 +484,7 @@ class QueueEngine:
             now = iso_now()
             self.store.update_long_task_watch(
                 task.id, state="WATCHING", execution_started_at=now, last_progress_at=now,
-                watch_lease_expires_at=now,
+                watch_lease_expires_at=(datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(),
             )
 
     def _delivery_verdict(self, session: str, response: dict, sent_text: str):
@@ -577,9 +578,11 @@ class QueueEngine:
             if state == "RUNNING" and watch.get("state") == "EXECUTION_START_PENDING":
                 now = iso_now()
                 self.store.update_long_task_watch(task_id, state="WATCHING", execution_started_at=now,
-                                                  last_progress_at=now, status_hash=hashlib.sha256(str(status_response).encode()).hexdigest())
+                                                  last_progress_at=now, watch_lease_expires_at=(datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(),
+                                                  status_hash=hashlib.sha256(str(status_response).encode()).hexdigest())
             elif state == "RUNNING":
                 self.store.update_long_task_watch(task_id, state="WATCHING", last_progress_at=iso_now(),
+                                                  watch_lease_expires_at=(datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(),
                                                   status_hash=hashlib.sha256(str(status_response).encode()).hexdigest())
             if state == "RUNNING" and output and not watch.get("first_checkpoint_at"):
                 self.store.update_long_task_watch(task_id, first_checkpoint_at=iso_now(), last_progress_at=iso_now(),
