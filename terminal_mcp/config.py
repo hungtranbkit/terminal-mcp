@@ -1759,11 +1759,13 @@ def _load_queue_config(queue_raw: object) -> QueueConfig:
             raise ValueError(f"queue.project_dispatch_rules[{index}].name must be non-empty")
         if not isinstance(patterns, list) or not patterns or not all(isinstance(x, str) and x for x in patterns):
             raise ValueError(f"queue.project_dispatch_rules[{index}].session_patterns must be a non-empty string list")
-        if not isinstance(repo_root, str) or not repo_root.strip():
-            raise ValueError(f"queue.project_dispatch_rules[{index}].repo_root must be non-empty")
-        expanded_root = str(Path(repo_root).expanduser())
-        if not Path(expanded_root).is_absolute():
-            raise ValueError(f"queue.project_dispatch_rules[{index}].repo_root must be absolute or ~/...")
+        expanded_root = None
+        if repo_root is not None:
+            if not isinstance(repo_root, str) or not repo_root.strip():
+                raise ValueError(f"queue.project_dispatch_rules[{index}].repo_root must be a non-empty string when set")
+            expanded_root = str(Path(repo_root).expanduser())
+            if not Path(expanded_root).is_absolute():
+                raise ValueError(f"queue.project_dispatch_rules[{index}].repo_root must be absolute or ~/...")
         if not isinstance(planner_path, str) or not planner_path or Path(planner_path).is_absolute() or ".." in Path(planner_path).parts:
             raise ValueError(f"queue.project_dispatch_rules[{index}].planner_path must stay relative to repo_root")
         if not isinstance(event_types, list) or not event_types or not all(isinstance(x, str) and x for x in event_types):
