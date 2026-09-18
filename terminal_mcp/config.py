@@ -246,7 +246,7 @@ class SubmitWatchdogConfig:
     enabled: bool = True
     poll_interval_seconds: float = 0.4
     timeout_seconds: float = 5.0
-    max_enter_attempts: int = 3
+    max_enter_attempts: int = 2
     sweeper_interval_seconds: float = 1.5
     retry_agent_types: tuple[str, ...] = ("codex",)
 
@@ -1216,8 +1216,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         raise ValueError("submit_watchdog.poll_interval_seconds must be between 0.3 and 0.5")
     if watchdog_config.timeout_seconds <= 0 or watchdog_config.sweeper_interval_seconds < 1:
         raise ValueError("submit_watchdog timeouts must be positive")
-    if not 1 <= watchdog_config.max_enter_attempts <= 5:
-        raise ValueError("submit_watchdog.max_enter_attempts must be between 1 and 5")
+    if not 1 <= watchdog_config.max_enter_attempts <= 2:
+        raise ValueError("submit_watchdog.max_enter_attempts must be between 1 and 2")
     if not watchdog_config.retry_agent_types or not all(isinstance(agent, str) and agent for agent in watchdog_config.retry_agent_types):
         raise ValueError("submit_watchdog.retry_agent_types must be a non-empty list of agent types")
 

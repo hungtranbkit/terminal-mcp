@@ -328,6 +328,54 @@ def _redacted_capture(lines: "list[str]") -> str:
     return text + ("\n" + marker if marker else "")
 
 
+def _codex_composer_buffer_complete(snapshot: list[str], text: str) -> bool:
+    """Recognize Codex's own bracketed-paste acknowledgement.
+
+    Codex intentionally replaces a long pasted draft with
+    ``[Pasted Content N chars]`` instead of rendering all text.  That marker
+    is stronger than a viewport substring check and is the only long-buffer
+    shortcut accepted by the verified-submit path; pager/unknown output does
+    not qualify.
+    """
+    if _sent_text_echoed(snapshot, text):
+        return True
+    visible = " ".join(snapshot)
+    match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", visible, re.IGNORECASE)
+    return bool(match and int(match.group(1)) >= len(text))
+
+
+def _codex_draft_in_composer(snapshot: list[str], text: str) -> bool:
+    """Return true only when this submission is still in Codex's composer."""
+    normalized_prefix = " ".join(text.split())[:80]
+    marker_indexes = [index for index, line in enumerate(snapshot)
+                      if re.match(r"^\s*[>›]\s*", line.strip())]
+    if not marker_indexes:
+        return False
+    last_marker = marker_indexes[-1]
+    if any(re.search(r"SUBMITTED\[|esc to interrupt", line, re.IGNORECASE)
+           for line in snapshot[last_marker + 1:]):
+        return False
+    body = re.sub(r"^[>›]\s*", "", snapshot[last_marker].strip())
+    if normalized_prefix and normalized_prefix in " ".join(body.split()):
+        return True
+    match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", body, re.IGNORECASE)
+    return bool(match and int(match.group(1)) >= len(text))
+
+
+def _codex_composer_marker_present(snapshot: list[str]) -> bool:
+    """Whether a live-looking Codex composer marker remains in the pane."""
+    markers = [index for index, line in enumerate(snapshot)
+               if re.match(r"^\s*[>›]\s*", line.strip())]
+    if not markers:
+        return False
+    last = markers[-1]
+    body = re.sub(r"^\s*[>›]\s*", "", snapshot[last].strip()).strip()
+    if not body or body.casefold().startswith("ask codex to do anything"):
+        return False
+    return not any(re.search(r"SUBMITTED\[|esc to interrupt", line, re.IGNORECASE)
+                   for line in snapshot[last + 1:])
+
+
 class TerminalService:
     def __init__(self, config: AppConfig, tmux: SessionBackend | None = None,
                  bindings: BindingStore | None = None,
@@ -2049,7 +2097,7 @@ class TerminalService:
             # the still-focused composer before the final bounded retry. This
             # is still one Enter attempt (and never re-injects text); pager /
             # incomplete-buffer paths never reach this callback.
-            if enter_calls >= 3:
+            if enter_calls >= 2:
                 self.tmux.send_keys(session, ["Escape"])
                 time.sleep(SEND_TEXT_ENTER_SETTLE_SECONDS)
             self.tmux.send_keys(session, ["Enter"])
@@ -2112,9 +2160,14 @@ class TerminalService:
             "agent_type": adapter.name, "submission_id": result["submission_id"],
             "ack_state": state, "attempts": result["attempts"],
             "enter_count": result["enter_count"], "evidence": result["evidence"],
+            "first_enter_effect": result.get("first_enter_effect", "unknown"),
+            "recovery_enter_sent": bool(result.get("recovery_enter_sent", result["enter_count"] > 1)),
+            "composer_before": result.get("composer_before", "unknown"),
+            "composer_after": result.get("composer_after", "unknown"),
+            "submit_latency_ms": result.get("submit_latency_ms"),
             **({"recovery_attempted": True,
                "recovery_enter_count": result["enter_count"] - 1}
-               if result["enter_count"] > 1 and state != ACK_RUNNING else {}),
+               if result["enter_count"] > 1 else {}),
             "delivery_state": delivery, "submit_status": to_legacy_submit_status(delivery),
             "submit_reason": (
                 (next((item for item in reversed(result["evidence"]) if "withheld" in item),

@@ -172,7 +172,10 @@ class SubmissionStore:
 class WatchdogConfig:
     poll_interval_seconds: float = 0.4
     timeout_seconds: float = 5.0
-    max_enter_attempts: int = 3
+    # A submission has one normal Enter and at most one evidence-gated
+    # recovery Enter.  Never turn an ambiguous send into an unbounded key
+    # spam loop (which can double-submit destructive confirmations).
+    max_enter_attempts: int = 2
     retry_agent_types: frozenset[str] = frozenset({"codex"})
 
 
@@ -197,11 +200,41 @@ class VerifiedSubmitWatchdog:
         if record is None:
             raise KeyError(submission_id)
         if record.ack_state in FINAL_ACKS:
-            return record.public()
+            result = record.public()
+            result.update({"first_enter_effect": "already_submitted",
+                           "recovery_enter_sent": record.enter_count > 1,
+                           "composer_before": "unknown", "composer_after": "unknown",
+                           "submit_reason": "already_submitted",
+                           "submit_latency_ms": 0})
+            return result
+        started = time.monotonic()
+        first_enter_effect: str | None = None
+        composer_before = "unknown"
+        composer_after = "unknown"
+
+        def finish() -> dict[str, Any]:
+            current = self.store.get(submission_id)
+            assert current is not None
+            if current.ack_state in (ACK_ACCEPTED, ACK_RUNNING):
+                after = "cleared_or_executing"
+            elif composer_after == "unknown":
+                after = "unknown"
+            else:
+                after = composer_after
+            return {
+                **current.public(),
+                "first_enter_effect": first_enter_effect or "not_sent",
+                "recovery_enter_sent": current.enter_count > 1,
+                "composer_before": composer_before,
+                "composer_after": after,
+                "submit_reason": (current.evidence[-1] if current.evidence
+                                   else current.ack_state),
+                "submit_latency_ms": round((time.monotonic() - started) * 1000, 1),
+            }
         if record.ack_state == ACK_QUEUED:
             if inject is None:
                 self.store.update(submission_id, ack_state=ACK_STUCK, evidence="inject_callback_missing")
-                return self.store.get(submission_id).public()  # type: ignore[union-attr]
+                return finish()
             inject(record.prompt)  # exactly once; retries never call inject
             record = self.store.update(submission_id, ack_state=ACK_INJECTED, evidence="text_injected_once")
         # This watchdog is Codex's only multi-Enter policy.  If a record is
@@ -225,9 +258,19 @@ class VerifiedSubmitWatchdog:
                 unchanged_polls = 0
             last_lines = list(lines)
             state, reason = evidence(lines, current)
+            if current.enter_count == 0:
+                composer_before = "present" if state == "COMPOSER" else state.lower()
+            if state == "COMPOSER":
+                composer_after = "present"
+            elif state in (ACK_ACCEPTED, ACK_RUNNING):
+                composer_after = "cleared_or_executing"
+            else:
+                composer_after = state.lower()
             if state in (ACK_ACCEPTED, ACK_RUNNING):
+                if current.enter_count == 1 and first_enter_effect is None:
+                    first_enter_effect = "submitted"
                 self.store.update(submission_id, ack_state=state, evidence=reason)
-                return self.store.get(submission_id).public()  # type: ignore[union-attr]
+                return finish()
             if state in ("PAGER", "INCOMPLETE"):
                 # Never use Enter to advance a pager or to submit a draft
                 # whose full buffer cannot yet be observed. Keep polling;
@@ -244,12 +287,16 @@ class VerifiedSubmitWatchdog:
             if unchanged and unchanged_polls < 2 and current.enter_count > 0:
                 time.sleep(self.config.poll_interval_seconds)
                 continue
+            if current.enter_count == 0:
+                first_enter_effect = "composition_commit_or_submit"
+            else:
+                first_enter_effect = first_enter_effect or "composition_commit_or_submit"
             send_enter()
             current = self.store.update(submission_id, enter_count=current.enter_count + 1,
                                         attempts=current.attempts + 1, evidence=reason or "enter_sent")
             time.sleep(self.config.poll_interval_seconds)
         self.store.update(submission_id, ack_state=ACK_STUCK, evidence="recovery: submit_evidence_timeout")
-        return self.store.get(submission_id).public()  # type: ignore[union-attr]
+        return finish()
 
 
 class SubmissionSweeper:
