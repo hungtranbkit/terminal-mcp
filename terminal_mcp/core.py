@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import os
 import threading
 import time
 import uuid
@@ -518,7 +519,10 @@ class TerminalService:
     # module docstring and this class's __init__ comment on
     # self.session_registry for why this is never this node's real,
     # controller-assigned id.
-    REGISTRY_LOCAL_NODE_ID = "local"
+    # Keep legacy single-host behavior by default, but align the durable
+    # session registry with the controller's configured fleet identity when
+    # a self-hosted controller is explicitly named (for example hp-linux).
+    REGISTRY_LOCAL_NODE_ID = os.environ.get("TERMINAL_MCP_LOCAL_NODE_ID", "local").strip() or "local"
 
     def _reconcile_session_registry(self, items: list[Any], grants_by_session: dict[str, SessionGrant]) -> None:
         """Called from terminal_list_sessions/dashboard_list_sessions --
