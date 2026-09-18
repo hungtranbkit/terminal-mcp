@@ -17,6 +17,19 @@ additive delta.
 
 ## The golden rule
 
+### Background verified prompt-start watcher
+
+Tracked Codex submissions are also reconciled by the user-level
+`terminal-mcp-prompt-start-watcher.timer` (10-second cadence). It reads the
+same durable `prompt_submissions.db` records as the controller and can send
+only a recovery `Enter`; it never re-injects prompt text. A submission is
+eligible only while tracked, recent, and inside the configured session
+allowlist. The persisted six-Enter cap is shared with the manual submit
+path. Execution evidence changes the record to started immediately;
+approval/input states stop recovery with `WAITING_APPROVAL`, and exhaustion
+is `STUCK`. Status is available from
+`/dashboard/api/verified-prompt-watcher` and the watcher state file.
+
 > **Never resend a prompt's text past the activation-ambiguity boundary
 > unless there is positive evidence the first activation was not
 > accepted.**

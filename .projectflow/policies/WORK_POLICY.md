@@ -187,6 +187,8 @@ the bounded retries, report `SUBMIT_FAILED`/`STUCK` and never pretend it is
 running. Record or mention `enter_count` and execution evidence in
 orchestration status where available. Before ending a ChatGPT turn that
 handed off work, verify that the target prompt has actually begun executing.
+The user-level verified prompt-start watcher enforces this same persisted
+six-Enter cap automatically for recent tracked submissions.
 
 This rule applies to every project, including NovaRetail, MESFlow, Terminal
 MCP, and PromptFlow.

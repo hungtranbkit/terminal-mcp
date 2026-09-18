@@ -1,0 +1,11 @@
+[Unit]
+Description=Terminal MCP verified prompt-start recovery (one bounded cycle)
+After=terminal-mcp-fed-controller.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/dell/workspace/terminal-mcp-selfhost
+Environment=TERMINAL_MCP_CONFIG=/home/dell/.config/terminal-mcp-fed/config.yaml
+Environment=PYTHONPATH=/home/dell/workspace/terminal-mcp-selfhost
+ExecStart=/home/dell/workspace/terminal-mcp/.venv/bin/python -m terminal_mcp.prompt_start_watcher --config %h/.config/terminal-mcp/prompt-start-watcher.json
+
