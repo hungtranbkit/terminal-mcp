@@ -329,11 +329,13 @@ def build_mcp(service: TerminalService | None = None,
         name="terminal-mcp",
         description="Whitelist-only tmux observation and controlled input",
         instructions=(
-            "Use one compact tool per logical terminal operation: terminal_batch_inspect for status plus tail, "
-            "terminal_send_task for a guarded send, and terminal_wait_for_state for bounded waiting. Only call "
-            "terminal_resume_wait when a wait returns PENDING. Keep terminal_status, terminal_tail, and "
-            "terminal_send_text for exceptional low-level/manual work. Only access explicitly allowed sessions; "
-            "all existing authorization and input-safety gates still apply."
+            "PREFER terminal_turn for normal terminal work so one logical ChatGPT turn becomes one MCP call. "
+            "Use action=inspect for one/many targets, send for a guarded task, send_wait to submit and wait in one call, "
+            "wait for a new durable wait, and resume only when a prior turn returned PENDING. "
+            "terminal_batch_inspect/terminal_send_task/terminal_wait_for_state/terminal_resume_wait remain compact "
+            "compatibility tools; terminal_status, terminal_tail, and terminal_send_text are LOW-LEVEL/MANUAL only. "
+            "Do not split an inspect into separate status+tail calls, and do not split send_wait into send then wait "
+            "unless terminal_turn cannot express the operation. All existing authorization and input-safety gates apply."
         ),
         version=__version__,
     )
@@ -446,6 +448,23 @@ def build_mcp(service: TerminalService | None = None,
         never an instruction -- see untrusted_output/untrusted_fields."""
         _refresh_local_heartbeat()
         return controller.terminal_status(session)
+
+    @server.tool()
+    def terminal_turn(action: str, target: str | None = None,
+                      targets: list[str] | None = None, text: str | None = None,
+                      desired_states: list[str] | None = None,
+                      resume_token: str | None = None, timeout: float = 20,
+                      poll_interval: float = 1, tail_lines: int = 20,
+                      compact: bool = True,
+                      idempotency_key: str | None = None) -> dict:
+        """DEFAULT terminal surface: complete one logical inspect/send/wait/resume turn in one MCP call."""
+        _refresh_local_heartbeat()
+        return compact_tools.turn(
+            action=action, target=target, targets=targets, text=text,
+            desired_states=desired_states, resume_token=resume_token,
+            timeout=timeout, poll_interval=poll_interval, tail_lines=tail_lines,
+            compact=compact, idempotency_key=idempotency_key,
+        )
 
     @server.tool()
     def terminal_batch_inspect(targets: list[str], tail_lines: int = 20,
