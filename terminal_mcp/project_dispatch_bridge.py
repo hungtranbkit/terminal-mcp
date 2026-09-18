@@ -30,7 +30,7 @@ DEFAULT_EVENT_TYPES = frozenset({"TASK_COMPLETED"})
 class ProjectDispatchRule:
     name: str
     session_patterns: tuple[str, ...]
-    repo_root: str
+    repo_root: str | None = None
     planner_path: str = "tools/orchestration/continuous_dispatch.py"
     event_types: tuple[str, ...] = ("TASK_COMPLETED",)
     timeout_seconds: float = 10.0
@@ -50,8 +50,9 @@ class ProjectDispatchBridge:
         if rule is None:
             return {"action": "NO_RULE", "session": session, "event_type": event_type}
 
+        repo_root = self._repo_root_for_event(rule, event)
         try:
-            envelope = self._run_planner(rule, event)
+            envelope = self._run_planner(rule, event, repo_root)
         except Exception as exc:  # noqa: BLE001 - caller decides retry/dead-letter policy
             _LOGGER.exception("project-dispatch: planner failed for %s", rule.name)
             raise RuntimeError(f"project planner failed: {type(exc).__name__}: {exc}") from exc
@@ -114,9 +115,26 @@ class ProjectDispatchBridge:
             return str(event["session"])
         return None
 
+    def _repo_root_for_event(self, rule: ProjectDispatchRule, event: dict[str, Any]) -> str:
+        entity_id = event.get("entity_id")
+        if entity_id:
+            try:
+                task = self.queue.store.get_task(str(entity_id))
+            except Exception:  # noqa: BLE001 -- fall back to explicit config
+                task = None
+            metadata = getattr(task, "metadata", None)
+            if isinstance(metadata, dict):
+                for key in ("repo_root", "worktree", "cwd"):
+                    value = metadata.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value
+        if rule.repo_root:
+            return rule.repo_root
+        raise ValueError("no repo root in completed task metadata or project dispatch rule")
+
     @staticmethod
-    def _safe_planner(rule: ProjectDispatchRule) -> tuple[Path, Path]:
-        root = Path(rule.repo_root).expanduser().resolve()
+    def _safe_planner(rule: ProjectDispatchRule, repo_root: str) -> tuple[Path, Path]:
+        root = Path(repo_root).expanduser().resolve()
         planner = (root / rule.planner_path).resolve()
         try:
             planner.relative_to(root)
@@ -128,8 +146,9 @@ class ProjectDispatchBridge:
             raise FileNotFoundError(f"planner does not exist: {planner}")
         return root, planner
 
-    def _run_planner(self, rule: ProjectDispatchRule, event: dict[str, Any]) -> dict[str, Any]:
-        root, planner = self._safe_planner(rule)
+    def _run_planner(self, rule: ProjectDispatchRule, event: dict[str, Any],
+                     repo_root: str) -> dict[str, Any]:
+        root, planner = self._safe_planner(rule, repo_root)
         entity_id = event.get("entity_id")
         event_type = str(event.get("type") or "")
         project_event = "TASK_DONE" if event_type == "TASK_COMPLETED" else "TASK_BLOCKED"
