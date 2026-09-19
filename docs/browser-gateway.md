@@ -7,9 +7,16 @@ The gateway is disabled by default.
 ## Architecture
 
 The MCP server registers `browser_verify`, `browser_run_task`, `browser_status`,
-and `browser_screenshot`. The compact `terminal_turn` surface dispatches the same
-four action names to the same handlers. The ChatGPT sidecar still publishes only
-`terminal_turn`.
+`browser_screenshot` and `browser_stop`. The compact `terminal_turn` surface
+dispatches the same five action names to the same handlers. The ChatGPT sidecar
+still publishes only `terminal_turn`, so that surface is never weaker than the
+full one.
+
+`browser_stop` releases browser work still in flight. Each run already closes its
+own browser, so on an idle gateway it reports `IDLE` and touches nothing; it
+exists for what the per-call deadline cannot cover -- a worker whose caller went
+away, or a Chromium that outlived its job. It takes no arguments and only ever
+touches worker process groups this gateway started.
 
 Each verification, task, or screenshot starts a Python worker with a fresh
 Chromium context on the MCP server's host. A local dev URL therefore refers to
@@ -90,6 +97,24 @@ navigation budgets of 1–120 seconds and hard budgets of 2–300 seconds. A cal
 `timeout_seconds` can narrow these budgets but cannot enlarge them. Viewport
 dimensions are bounded to 200–4096 pixels. Browser timeouts are independent of
 terminal waiting timeouts.
+
+## Mutations are opt-in
+
+`click`, `fill` and `press` write to the page. Because this surface is reachable
+from a chat client, a task containing any of them is refused with
+`BROWSER_MUTATION_NOT_ALLOWED` unless the caller passes `allow_mutations=true`;
+the refusal happens before the browser is launched, and it names the step kinds
+it refused. "Check that the cart page renders" must not be able to press the
+button that empties it.
+
+Read-only steps -- `open`/`goto`, `wait`, `scroll`, and every `assert` -- need no
+authorization. An authorized run echoes `"mutations": [...]` back in its result,
+so the audit trail lives in the same record the chat already keeps.
+
+```json
+{"status": "ERROR", "error": "BROWSER_MUTATION_NOT_ALLOWED",
+ "mutating_steps": ["click", "fill"]}
+```
 
 ## Security and artifacts
 

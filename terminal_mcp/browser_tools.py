@@ -2,7 +2,8 @@
 from typing import Any
 from .browser_gateway import BrowserGateway
 
-BROWSER_TOOL_NAMES = ("browser_verify", "browser_run_task", "browser_status", "browser_screenshot")
+BROWSER_TOOL_NAMES = ("browser_verify", "browser_run_task", "browser_status",
+                      "browser_screenshot", "browser_stop")
 
 def register_browser_tools(server: Any, gateway: BrowserGateway) -> dict[str, Any]:
     @server.tool()
@@ -19,11 +20,16 @@ def register_browser_tools(server: Any, gateway: BrowserGateway) -> dict[str, An
     def browser_run_task(task: str, url: str | None = None,
                          viewport_width: int | None = None, viewport_height: int | None = None,
                          timeout_seconds: float | None = None, screenshot: bool = False,
-                         session_id: str | None = None) -> dict:
-        """Run deterministic steps only; assertions judge final page, no session persistence."""
+                         session_id: str | None = None,
+                         allow_mutations: bool = False) -> dict:
+        """Run deterministic steps only; assertions judge final page, no session persistence.
+
+        click/fill/press change the page and require allow_mutations=true;
+        they are echoed back in the result for audit."""
         return gateway.run_task(task, url=url, viewport_width=viewport_width,
             viewport_height=viewport_height, timeout_seconds=timeout_seconds,
-            screenshot=screenshot, session_id=session_id)
+            screenshot=screenshot, session_id=session_id,
+            allow_mutations=allow_mutations)
 
     @server.tool()
     def browser_status(probe: bool = False) -> dict:
@@ -39,8 +45,19 @@ def register_browser_tools(server: Any, gateway: BrowserGateway) -> dict[str, An
             viewport_height=viewport_height, full_page=full_page,
             timeout_seconds=timeout_seconds)
 
+    @server.tool()
+    def browser_stop() -> dict:
+        """Release any browser work still in flight; safe on an idle gateway.
+
+        Each run already closes its own browser, so this reports IDLE when
+        nothing is running. It exists for the case the per-call deadline
+        cannot cover: a worker whose caller went away, or a Chromium that
+        outlived its job."""
+        return gateway.stop()
+
     return {
         "browser_verify": browser_verify,
+        "browser_stop": browser_stop,
         "browser_run_task": browser_run_task,
         "browser_status": browser_status,
         "browser_screenshot": browser_screenshot,
