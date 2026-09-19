@@ -48,13 +48,29 @@ TURN_PANE_ACTIONS = ("inspect", "send", "send_wait", "wait", "resume", "start")
 # CALLER'S wait, not on the task, which is durable from the first step and is
 # carried the rest of the way server-side.
 MAX_START_TICKS = 6
-#: `start` returns as soon as the task reaches one of these -- the work is
-#: under way (or honestly stopped) and there is nothing a further tick in this
-#: call would tell the caller that the server will not handle itself.
-START_SETTLED_STATUSES = frozenset({
-    "DISPATCHING", "RUNNING", "VERIFYING", "COMPLETED", "SKIPPED", "CANCELLED",
-    "FAILED", "BLOCKED", "NEEDS_HUMAN", "WAITING_SESSION", "DISPATCH_UNCERTAIN",
+#: The task is genuinely UNDER WAY -- the only states that may be reported as
+#: `dispatched: True`. Found live (hp-linux, 2026-09-19): a single "settled"
+#: set conflated these with the refusal states below, so a task the coordinator
+#: had just BLOCKED would have come back `dispatched: True`.
+START_UNDERWAY_STATUSES = frozenset({
+    "DISPATCHING", "RUNNING", "VERIFYING", "COMPLETED", "SKIPPED",
 })
+#: Stopped, and only a human can move it. `start` must NOT tell the client to
+#: stop watching as though work were progressing -- also found live: the
+#: coordinator gate paused the lane ("session X is already actively working in
+#: the same repo/worktree") and the receipt still read "work is started and
+#: tracked server-side", which is how an orchestrator silently drops a task.
+START_NEEDS_HUMAN_STATUSES = frozenset({
+    "PAUSED", "BLOCKED", "NEEDS_HUMAN", "FAILED", "CANCELLED",
+})
+#: Waiting on something the server itself will retry -- neither under way nor
+#: a human's problem yet.
+START_SERVER_PENDING_STATUSES = frozenset({"WAITING_SESSION", "DISPATCH_UNCERTAIN"})
+#: `start` stops ticking at any of these: one more tick in this call would tell
+#: the caller nothing the server will not handle (or nothing a human has not
+#: already been asked for).
+START_SETTLED_STATUSES = (START_UNDERWAY_STATUSES | START_NEEDS_HUMAN_STATUSES
+                          | START_SERVER_PENDING_STATUSES)
 # action -> handler key in CompactTerminalTools.handlers
 TURN_HANDLER_ACTIONS: dict[str, str] = {
     "list_sessions": "list_sessions",
@@ -602,16 +618,15 @@ class CompactTerminalTools:
                 task_id_started = accepted.get("task_id")
                 started: dict[str, Any] = {}
                 if task_id_started:
-                    ticks, task_state = self._drive_start(target, task_id_started)
+                    ticks, task_state, blocked_reason = self._drive_start(target, task_id_started)
                     started = {
                         "task_id": task_id_started,
                         "session": target,
                         "task_state": task_state,
-                        "dispatched": task_state in START_SETTLED_STATUSES,
+                        "dispatched": task_state in START_UNDERWAY_STATUSES,
                         "dispatch_ticks": ticks,
                         "server_side_progress": self._follow(target, task_id_started, task_state),
-                        "poll": False,
-                        "next_action": "none",
+                        **self._start_next_step(task_state, blocked_reason),
                     }
                 return {
                     # Unchanged: a long_task send still reports what the
@@ -694,9 +709,9 @@ class CompactTerminalTools:
             return {"status": "FAILED", "action": "start", "result": accepted}
         task_id = accepted["task_id"]
 
-        ticks, task_state = self._drive_start(target, task_id)
+        ticks, task_state, blocked_reason = self._drive_start(target, task_id)
         follow = self._follow(target, task_id, task_state)
-        dispatched = task_state in START_SETTLED_STATUSES
+        dispatched = task_state in START_UNDERWAY_STATUSES
         return {
             "status": "TASK_STARTED" if dispatched else "TASK_ACCEPTED",
             "action": "start", "task_id": task_id, "session": target,
@@ -706,24 +721,65 @@ class CompactTerminalTools:
             "request_key": accepted.get("request_key"),
             "dispatch_ticks": ticks,
             "server_side_progress": follow,
-            # The anti-polling contract, stated in the receipt itself rather
-            # than only in the tool description, so a client that never read
-            # the description still gets it.
+            **self._start_next_step(task_state, blocked_reason),
+        }
+
+    @staticmethod
+    def _start_next_step(task_state: str, blocked_reason: str | None) -> dict[str, Any]:
+        """The anti-polling contract, stated in the receipt itself rather than
+        only in the tool description -- and stated HONESTLY.
+
+        `poll: False` is right in every case here (asking again changes
+        nothing), but "do not watch this" must never be mistaken for "this is
+        fine". A task the coordinator gate refused is stopped until a person
+        decides something, and a receipt that reads "work is started and
+        tracked server-side" over that outcome is how an orchestrator silently
+        drops a task -- observed live on hp-linux before this was split out.
+        """
+        if task_state in START_NEEDS_HUMAN_STATUSES:
+            return {
+                "poll": False,
+                "needs_human": True,
+                "next_action": "resolve",
+                "blocked_reason": blocked_reason,
+                "guidance": (
+                    f"this task is NOT running: it is {task_state}"
+                    + (f" -- {blocked_reason}" if blocked_reason else "")
+                    + ". Polling will not change that. Tell the user and resolve the blocker "
+                      "(the coordinator gate, a paused lane, or a failed attempt); do not "
+                      "re-send the prompt, the task is already durably queued under this task_id"),
+            }
+        if task_state in START_SERVER_PENDING_STATUSES:
+            return {
+                "poll": False,
+                "needs_human": False,
+                "next_action": "none",
+                "guidance": ("the target was not reachable yet, so the server will retry this "
+                             "task itself under this task_id -- do not poll and do not re-send"),
+            }
+        return {
             "poll": False,
+            "needs_human": False,
             "next_action": "none",
             "guidance": ("work is started and tracked server-side under this task_id -- do not "
                          "call wait/resume/inspect to watch it; use action=task with this "
                          "task_id only if the user explicitly asks to check"),
         }
 
-    def _drive_start(self, target: str, task_id: str) -> tuple[int, str]:
-        """Tick the lane until this task is actually under way. Bounded by
-        MAX_START_TICKS -- a bound on how long the CALLER waits, never on the
-        task, which the follower carries from here."""
+    def _drive_start(self, target: str, task_id: str) -> tuple[int, str, str | None]:
+        """Tick the lane until this task is under way or has stopped.
+
+        Bounded by MAX_START_TICKS -- a bound on how long the CALLER waits,
+        never on the task, which the follower carries from here. Stops at the
+        FIRST settled state rather than spending the rest of the budget: a
+        lane the coordinator just paused will answer PAUSED to every further
+        tick, and five more of those cost the caller latency to learn nothing
+        (observed live: dispatch_ticks=6 against an already-paused lane).
+        """
         tick = self.handlers.get("dispatch_tick")
-        state = self._task_state(task_id)
+        state, reason = self._task_snapshot(task_id)
         if tick is None:
-            return 0, state
+            return 0, state, reason
         ticks = 0
         for _ in range(MAX_START_TICKS):
             if state in START_SETTLED_STATUSES:
@@ -733,24 +789,35 @@ class CompactTerminalTools:
             except Exception:  # noqa: BLE001 -- the task is durable; report its real state
                 break
             ticks += 1
-            state = self._task_state(task_id)
-        return ticks, state
+            state, reason = self._task_snapshot(task_id)
+        return ticks, state, reason
 
-    def _task_state(self, task_id: str) -> str:
+    def _task_snapshot(self, task_id: str) -> tuple[str, str | None]:
+        """This task's durable status and, when it is stopped, WHY.
+
+        The reason comes from the record the gate itself wrote (the
+        coordinator decision, or the task's last error) -- never invented
+        here, and never guessed from the status alone."""
         status = self.handlers.get("task_status")
         if status is None:
-            return "UNKNOWN"
+            return "UNKNOWN", None
         try:
             result = status(task_id)
         except Exception:  # noqa: BLE001
-            return "UNKNOWN"
-        if isinstance(result, dict):
-            task = result.get("task")
-            if isinstance(task, dict) and task.get("status"):
-                return str(task["status"])
-            if result.get("status"):
-                return str(result["status"])
-        return "UNKNOWN"
+            return "UNKNOWN", None
+        if not isinstance(result, dict):
+            return "UNKNOWN", None
+        task = result.get("task")
+        if not isinstance(task, dict):
+            return (str(result["status"]) if result.get("status") else "UNKNOWN"), None
+        state = str(task.get("status") or "UNKNOWN")
+        reason = None
+        decision = task.get("coordinator_decision")
+        if isinstance(decision, dict) and decision.get("reason"):
+            reason = str(decision["reason"])
+        elif task.get("last_error"):
+            reason = str(task["last_error"])
+        return state, reason
 
     def _follow(self, target: str, task_id: str, task_state: str) -> dict[str, Any]:
         """Hand the started task to the server-side follower.
@@ -758,7 +825,10 @@ class CompactTerminalTools:
         Skipped when the task already settled inside this call -- there is
         nothing left to follow, and starting a thread to discover that would
         be the same wasted work in a different place."""
-        if task_state in {"COMPLETED", "SKIPPED", "CANCELLED", "FAILED", "BLOCKED", "NEEDS_HUMAN"}:
+        if task_state in START_NEEDS_HUMAN_STATUSES or task_state in {"COMPLETED", "SKIPPED"}:
+            # Nothing left to follow: either done, or stopped on something only
+            # a person can move. Starting a thread to rediscover that would be
+            # the same wasted work in a different place.
             return {"following": False, "reason": "ALREADY_SETTLED"}
         follow = self.handlers.get("follow_task")
         if follow is None:
