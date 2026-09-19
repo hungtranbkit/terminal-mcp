@@ -35,7 +35,7 @@ def _config(tmp_path, *, read=True, input=True) -> AppConfig:
     )
 
 
-def _controller(tmp_path, *, read=True, input=True) -> tuple[ControllerService, TerminalService]:
+def _controller(tmp_path, *, read=True, input=True, local_node_id="local") -> tuple[ControllerService, TerminalService]:
     # grants/audit/bindings/leases/killed_sessions/session_registry all
     # default to this host's REAL ~/.local/state/terminal-mcp/*.db when
     # not given explicitly (TerminalService.__init__) -- isolated here so
@@ -56,8 +56,19 @@ def _controller(tmp_path, *, read=True, input=True) -> tuple[ControllerService, 
                               session_registry=SessionRegistryStore(tmp_path / "session_registry.db"))
     registry = NodeRegistry(tmp_path / "nodes.db")
     controller = ControllerService(registry, local_client=LocalNodeClient(service),
+                                   local_node_id=local_node_id,
                                    local_workspace_root=str(tmp_path))
     return controller, service
+
+
+def test_legacy_local_qualified_name_aliases_canonical_local_node(tmp_path):
+    controller, _service = _controller(tmp_path, local_node_id="hp-test")
+    _heartbeat_local(controller)
+    resolved = controller.resolve_session("local/legacy-session")
+    assert resolved.get("error") is None, resolved
+    assert resolved["node_id"] == "hp-test"
+    assert resolved["session"] == "legacy-session"
+    assert controller.node_status("local") is None
 
 
 def _heartbeat_local(controller: ControllerService, *, sessions: int = 0) -> None:
