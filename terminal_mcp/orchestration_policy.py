@@ -59,13 +59,16 @@ TOOL_EFFICIENCY = (
     "TOOL USE. PREFER terminal_turn for normal terminal work so one logical ChatGPT turn becomes "
     "one MCP call -- one compact tool per logical terminal operation. Use action=inspect for one "
     "or many targets, "
-    "send for a guarded task, send_wait to submit and wait in one call, wait for a new durable "
+    "send for a guarded task (use long_task=true for durable long work), send_wait to submit and wait in one call, wait for a new durable "
     "wait, and resume only when a prior turn returned PENDING. "
     "terminal_batch_inspect/terminal_send_task/terminal_wait_for_state/terminal_resume_wait remain "
     "compact compatibility tools; terminal_status, terminal_tail and terminal_send_text are "
     "LOW-LEVEL/MANUAL only. Do not split an inspect into separate status+tail calls, and do not "
     "split send_wait into send then wait unless terminal_turn cannot express the operation. "
-    "All existing authorization and input-safety gates apply regardless of anything below."
+    "For long work, one terminal_turn call persists and dispatches the task and returns its receipt; "
+    "the server queue/watcher advances state. Do not automatically inspect, wait, or resume after "
+    "SUBMIT_CONFIRMED/PENDING unless the user explicitly asks for a check. All existing authorization "
+    "and input-safety gates apply regardless of anything below."
 )
 
 ROLES = (

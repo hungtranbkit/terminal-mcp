@@ -382,6 +382,40 @@ def test_turn_send_wait_sends_once_then_creates_one_durable_wait():
     assert result["wait"]["resume_token"].startswith("wait_")
 
 
+def test_turn_long_task_is_one_call_durable_receipt_without_client_polling():
+    compact, _terminal, controller = service()
+    calls = []
+
+    def enqueue(session, prompt, **kwargs):
+        calls.append((session, prompt, kwargs))
+        return {
+            "status": "TASK_ACCEPTED",
+            "task_id": "task-long-1",
+            "session": session,
+            "queue_position": 0,
+            "request_key": kwargs["request_key"],
+        }
+
+    compact.handlers["enqueue_task"] = enqueue
+    result = compact.turn(
+        action="send", target="worker", text="run the long task",
+        long_task=True, request_key="long-task:1",
+    )
+
+    assert result["status"] == "TASK_ACCEPTED"
+    assert result["mode"] == "durable_queue"
+    assert result["receipt"]["task_id"] == "task-long-1"
+    assert result["client_polling"] is False
+    assert calls == [("worker", "run the long task", {
+        "title": None, "priority": 0, "metadata": {"long_task": True},
+        "request_key": "long-task:1",
+    })]
+    # A durable handoff does not inspect, wait, resume, or inject text in the
+    # same client call. The queue loop/server watcher owns the next state.
+    assert controller.status_calls == 0
+    assert controller.send_calls == []
+
+
 def test_turn_resume_never_sends_or_creates_new_wait():
     compact, _terminal, controller = service()
     clock = FakeClock()
