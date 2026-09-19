@@ -35,7 +35,8 @@ from .dor_gate import check_definition_of_ready
 from .permissions import valid_session_name
 from .verify_queue import VerifyQueue
 from .queue_store import (
-    TERMINAL_STATUSES, UNASSIGNED_LANE, VERIFYING, InvalidTransitionError, TaskAlreadyClaimedError, QueueStore,
+    PAUSED, QUEUED, TERMINAL_STATUSES, UNASSIGNED_LANE, VERIFYING,
+    InvalidTransitionError, TaskAlreadyClaimedError, QueueStore,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -94,6 +95,23 @@ class QueueService:
         if not session or not valid_session_name(session):
             return {"error": "INVALID_SESSION_NAME", "session": session}
         return None
+
+    @staticmethod
+    def _never_dispatched(task: Any) -> bool:
+        """True when the engine has demonstrably never touched this task.
+
+        All four conditions, not any one of them: a pre-dispatch status, no
+        attempt recorded, no start timestamp and no claim. That combination is
+        what makes it safe to close the task from the side -- there is no
+        in-flight engine transition to race, and no half-finished attempt whose
+        outcome we would be overwriting with someone's say-so.
+        """
+        return (
+            getattr(task, "status", None) in (QUEUED, PAUSED)
+            and not getattr(task, "attempt_count", 0)
+            and not getattr(task, "started_at", None)
+            and not getattr(task, "claimed_by", None)
+        )
 
     def _validate_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any] | None:
         if not isinstance(tasks, list) or not tasks:
@@ -681,18 +699,32 @@ class QueueService:
         marker-verified completion would. This is NEVER automatic and
         NEVER a bare heuristic: it requires an explicit caller and
         non-empty evidence (queue_store.mark_completed_with_evidence's
-        own requirement)."""
+        own requirement).
+
+        It ALSO closes the other way a real task ends up unclosable: work
+        driven into the session by hand, against a task the engine never
+        dispatched. That task has no attempt, no nonce and no marker, so every
+        engine path skips it and it sits QUEUED while the work has shipped --
+        the queue reporting "pending" about a finished job, which is what makes
+        a board or dashboard lie. Such a task is accepted here and recorded as
+        RECONCILED rather than VERIFIED, so the log still says who vouched for
+        it. A task the engine is actively working (DISPATCHING/RUNNING/...) is
+        NOT accepted: closing that from the side would race the engine's own
+        transition."""
         if error := self._validate_session(session):
             return error
         task = self.store.get_task(task_id)
         if task is None or task.session != session:
             return {"error": "TASK_NOT_FOUND", "session": session, "task_id": task_id}
-        if task.status != VERIFYING:
+        undispatched = self._never_dispatched(task)
+        if task.status != VERIFYING and not undispatched:
             return {"error": "INVALID_TRANSITION", "session": session, "task_id": task_id,
                     "reason": f"task is {task.status}, not VERIFYING -- nothing to verify"}
         if not evidence:
             return {"error": "EVIDENCE_REQUIRED", "session": session, "task_id": task_id}
-        updated = self.store.mark_completed_with_evidence(task_id, evidence=evidence)
+        updated = self.store.mark_completed_with_evidence(
+            task_id, evidence=evidence,
+            event_type="RECONCILED" if undispatched else "VERIFIED")
         if self.on_completed is not None:
             try:
                 self.on_completed(updated)
