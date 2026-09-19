@@ -28,7 +28,7 @@ from typing import Any, Iterable
 
 from .fleet_registry import (CRED_MISSING, CRED_NEEDS_AUTH, CRED_PRESENT, CRED_UNKNOWN,
                              KIND_NODE, KIND_PROJECT, KIND_SESSION, KIND_SSH_TARGET,
-                             FleetRegistryStore, scrub_payload)
+                             LEGACY_LOCAL_NODE_ID, FleetRegistryStore, scrub_payload)
 
 TRANSPORT_LAN = "lan"
 TRANSPORT_TAILSCALE = "tailscale"
@@ -264,13 +264,24 @@ def project_nodes(store: FleetRegistryStore, nodes: Iterable[Any], *,
     return written
 
 
-def project_sessions(store: FleetRegistryStore, records: Iterable[Any]) -> int:
+def project_sessions(store: FleetRegistryStore, records: Iterable[Any], *,
+                     local_node_id: str | None = None) -> int:
     """Session inventory -- metadata only.
 
     NO pane text, NO prompt, NO output, NO command arguments beyond the
     launcher label already stored. This is what makes the sync safe to run
     between machines with different operators: it answers "what exists and
     where", never "what was typed".
+
+    ``refresh_local`` receives the controller's fleet-wide session listing,
+    while ``FleetRegistryStore.publish`` is deliberately single-writer. When
+    ``local_node_id`` is supplied, only sessions owned by this node are
+    projected. The historical placeholder ``node_id="local"`` is treated as
+    this node and published under its canonical owner, while keeping the old
+    object id so the migration does not create a duplicate session.
+
+    ``local_node_id=None`` preserves the old helper behaviour for callers that
+    deliberately pass an already owner-scoped list.
     """
     written = 0
     for record in records:
@@ -278,6 +289,16 @@ def project_sessions(store: FleetRegistryStore, records: Iterable[Any]) -> int:
         stable = getattr(record, "stable_session_id", None) or getattr(record, "session_name", None)
         if not node_id or not stable:
             continue
+
+        owner_node = node_id
+        if local_node_id:
+            if node_id == LEGACY_LOCAL_NODE_ID:
+                owner_node = local_node_id
+            elif node_id != local_node_id:
+                # A controller sees remote sessions too. Their owner must
+                # publish/retire them; replication will bring them here.
+                continue
+
         object_id = f"session:{node_id}:{stable}"
         status = getattr(record, "status", None)
         if status == "DELETED" or getattr(record, "deleted_at", None):
@@ -309,10 +330,9 @@ def project_sessions(store: FleetRegistryStore, records: Iterable[Any]) -> int:
             "desired_state": getattr(record, "recovery_state", None),
             "created_by_controller": bool(getattr(record, "created_by_controller", False)),
         }
-        store.publish(KIND_SESSION, object_id, payload, owner_node=node_id)
+        store.publish(KIND_SESSION, object_id, payload, owner_node=owner_node)
         written += 1
     return written
-
 
 def project_projects(store: FleetRegistryStore, records: Iterable[Any], *,
                      local_node_id: str) -> int:
