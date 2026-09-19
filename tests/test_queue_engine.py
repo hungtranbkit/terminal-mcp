@@ -491,3 +491,83 @@ def test_retry_fact_gathering_failure_never_strands_the_task(store, ops):
     broken.status_by_session = dict(ops.status_by_session)
     text = _dispatch_once(store, broken)
     assert PROMPT in text  # fell back to replay rather than stranding the task
+
+
+# ---------------------------------------------------------------------------
+# Durable capsule WRITING, and native-resume EXECUTION.
+# ---------------------------------------------------------------------------
+
+def test_identity_is_persisted_before_the_send_not_after(store, ops):
+    # After an agent dies the pane is gone, so anything not already written is
+    # unrecoverable -- the snapshot has to happen before the dispatch.
+    (task_id,) = store.set_tasks("lane-a", [{"prompt": PROMPT}])
+    ops.set_status("lane-a", {"state": "IDLE", "exists": True, "node_id": "local",
+                              "cwd": "/repo/a", "resume_conversation_id": "conv-live"})
+    _dispatch_once(store, ops)
+    state = store.get_recovery_state(task_id)
+    assert state["conversation_id"] == "conv-live"
+    assert state["worktree"] == "/repo/a"
+    assert state["node_id"] == "local"
+
+
+def test_a_capsule_is_written_when_a_dispatch_is_blocked(store, ops):
+    (task_id,) = store.set_tasks("lane-a", [{"prompt": PROMPT}])
+    ops.set_status("lane-a", {"state": "IDLE", "exists": True, "node_id": "local", "cwd": "/repo/a"})
+    ops.set_capture("lane-a", {"output": "progress: finished step one\nabout to do step two"})
+
+    class RefusingOps(type(ops)):
+        def terminal_send_text(self, session, text, press_enter=False, dry_run=False, **kwargs):
+            return {"error": "TARGET_AWAITING_APPROVAL"}
+
+    refusing = RefusingOps()
+    refusing.status_by_session = dict(ops.status_by_session)
+    refusing.capture_by_session = dict(ops.capture_by_session)
+    engine = QueueEngine(store, refusing, coordinator=_always_ready_gate())
+    for _ in range(4):
+        if engine.tick("lane-a").action == "BLOCKED":
+            break
+    capsule = store.get_recovery_state(task_id).get("capsule") or {}
+    assert "finished step one" in (capsule.get("last_decision") or "")
+
+
+def test_native_resume_relaunches_through_registry_reopen(store, ops):
+    task_id = _retryable_task(store, metadata={"recovery": {
+        "agent_type": "claude", "conversation_id": "conv-xyz"}})
+
+    class ReopeningOps(type(ops)):
+        def __init__(self):
+            super().__init__()
+            self.reopened = []
+
+        def terminal_registry_reopen(self, session, resume_session_id=None):
+            self.reopened.append((session, resume_session_id))
+            return {"session": session, "state": "READY"}
+
+    reopening = ReopeningOps()
+    # Session exists, agent gone -> RESUME_NATIVE_CONVERSATION.
+    reopening.set_status("lane-a", {"state": "UNKNOWN", "exists": True, "node_id": "local", "cwd": "/repo/a"})
+    engine = QueueEngine(store, reopening, coordinator=_always_ready_gate())
+    for _ in range(4):
+        result = engine.tick("lane-a")
+        if result.action == "DISPATCHED":
+            break
+
+    assert reopening.reopened == [("lane-a", "conv-xyz")]   # the agent's OWN resume path
+    assert "retry_mode=RESUME_NATIVE_CONVERSATION" in (result.detail or "")
+    assert "native_resume=ok" in (result.detail or "")
+    assert PROMPT not in reopening.sent[-1]["text"]
+
+
+def test_a_controller_without_registry_reopen_never_claims_a_resume_it_did_not_do(store, ops):
+    # No reopen capability -> the continuation is still sent, but the result must
+    # not assert native_resume=ok.
+    _retryable_task(store, metadata={"recovery": {
+        "agent_type": "claude", "conversation_id": "conv-xyz"}})
+    ops.set_status("lane-a", {"state": "UNKNOWN", "exists": True, "node_id": "local", "cwd": "/repo/a"})
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    for _ in range(4):
+        result = engine.tick("lane-a")
+        if result.action == "DISPATCHED":
+            break
+    assert "retry_mode=RESUME_NATIVE_CONVERSATION" in (result.detail or "")
+    assert "native_resume=ok" not in (result.detail or "")

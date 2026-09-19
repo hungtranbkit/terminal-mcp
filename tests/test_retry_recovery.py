@@ -251,3 +251,150 @@ def test_a_different_logical_task_is_not_a_duplicate():
         task_id="task-abc", request_key="rk-1",
         active_owner={"task_id": "other", "request_key": "rk-other"})
     assert is_noop is False
+
+
+# ---------------------------------------------------------------------------
+# Durable half: the capsule/identity persisted through QueueStore, and the
+# audit invariants that stop it being destroyed.
+# ---------------------------------------------------------------------------
+
+from terminal_mcp.queue_store import BLOCKED, QueueStore  # noqa: E402
+
+
+@pytest.fixture
+def store(tmp_path):
+    return QueueStore(tmp_path / "queue.db")
+
+
+def _task(store, session="lane-r", prompt="do the long work", request_key=None):
+    (task_id,) = store.set_tasks(session, [{"prompt": prompt, "request_key": request_key}])
+    return task_id
+
+
+def test_recovery_state_round_trips(store):
+    task_id = _task(store)
+    store.record_recovery_state(task_id, identity={"agent_type": "claude", "conversation_id": "conv-1"},
+                                capsule={"completed_steps": ["a"], "next_step": "b"})
+    state = store.get_recovery_state(task_id)
+    assert state["agent_type"] == "claude"
+    assert state["conversation_id"] == "conv-1"
+    assert state["capsule"]["completed_steps"] == ["a"]
+
+
+def test_a_thinner_later_write_never_truncates_a_richer_capsule(store):
+    # The realistic way persisted recovery state is destroyed is not a DELETE --
+    # it is a lease-expiry snapshot that knows only the session name landing on
+    # top of a capsule that knew five completed steps.
+    task_id = _task(store)
+    store.record_recovery_state(task_id, identity={"agent_type": "claude", "conversation_id": "conv-1"},
+                                capsule={"completed_steps": ["a", "b"], "next_step": "c",
+                                         "tests_run": ["t1"]})
+    store.record_recovery_state(task_id, identity={"session": "lane-r"}, capsule=None)
+    state = store.get_recovery_state(task_id)
+    assert state["capsule"]["completed_steps"] == ["a", "b"]   # survived
+    assert state["capsule"]["next_step"] == "c"
+    assert state["conversation_id"] == "conv-1"                 # survived
+    assert state["agent_type"] == "claude"
+
+
+def test_empty_values_are_dropped_rather_than_written_over_real_ones(store):
+    task_id = _task(store)
+    store.record_recovery_state(task_id, identity={"agent_type": "codex", "worktree": "/w"})
+    store.record_recovery_state(task_id, identity={"agent_type": None, "worktree": ""})
+    state = store.get_recovery_state(task_id)
+    assert state["agent_type"] == "codex"
+    assert state["worktree"] == "/w"
+
+
+def test_a_stored_conversation_id_is_never_swapped_for_a_different_one(store):
+    # A resume token is the most expensive thing here to lose, and a
+    # mid-recovery relaunch is exactly when something might try to replace it.
+    task_id = _task(store)
+    store.record_recovery_state(task_id, identity={"conversation_id": "conv-original"})
+    store.record_recovery_state(task_id, identity={"conversation_id": "conv-different"})
+    assert store.get_recovery_state(task_id)["conversation_id"] == "conv-original"
+
+
+def test_capsule_merges_key_by_key_so_a_partial_writer_is_safe(store):
+    task_id = _task(store)
+    store.record_recovery_state(task_id, capsule={"completed_steps": ["a"], "branch": "fix/x"})
+    store.record_recovery_state(task_id, capsule={"next_step": "do b"})
+    capsule = store.get_recovery_state(task_id)["capsule"]
+    assert capsule["completed_steps"] == ["a"]
+    assert capsule["branch"] == "fix/x"
+    assert capsule["next_step"] == "do b"
+
+
+# -- (d) restart-reload: a NEW process sees what the old one persisted -------
+
+def test_persisted_identity_and_capsule_survive_a_service_restart(tmp_path):
+    path = tmp_path / "queue.db"
+    first = QueueStore(path)
+    task_id = _task(first)
+    first.record_recovery_state(task_id, identity={"agent_type": "claude", "conversation_id": "conv-42"},
+                                capsule={"completed_steps": ["step one"], "next_step": "step two",
+                                         "branch": "fix/lane"})
+    del first  # the service goes away; nothing is carried in memory
+
+    reopened = QueueStore(path)          # a brand-new process/instance
+    state = reopened.get_recovery_state(task_id)
+    assert state["conversation_id"] == "conv-42"
+    assert state["capsule"]["completed_steps"] == ["step one"]
+
+    # ...and the decision made from the reloaded state still preserves context.
+    plan = plan_retry(RetryContext(
+        task_id=task_id, session="lane-r", attempt=2, session_alive=False,
+        agent_type=state["agent_type"], conversation_id=state["conversation_id"],
+        capsule=RecoveryCapsule.from_mapping(state["capsule"])))
+    assert plan.mode == RESUME_NATIVE_CONVERSATION
+    assert plan.resume_conversation_id == "conv-42"
+    assert plan.replays_prompt is False
+
+
+def test_after_restart_a_lost_conversation_id_still_recovers_from_the_capsule(tmp_path):
+    path = tmp_path / "queue.db"
+    first = QueueStore(path)
+    task_id = _task(first)
+    first.record_recovery_state(task_id, identity={"agent_type": "shell"},
+                                capsule={"completed_steps": ["wrote the parser"],
+                                         "next_step": "wire it up"})
+    del first
+    state = QueueStore(path).get_recovery_state(task_id)
+    plan = plan_retry(RetryContext(
+        task_id=task_id, session="lane-r", attempt=2, session_alive=False,
+        agent_type=state["agent_type"], conversation_id=state.get("conversation_id"),
+        capsule=RecoveryCapsule.from_mapping(state["capsule"])))
+    assert plan.mode == RESUME_FROM_CHECKPOINT
+    assert "wrote the parser" in plan.continuation_text
+
+
+# -- (f) ownership: a duplicate retry produces no second owner --------------
+
+def test_active_owner_is_found_by_task_id_and_by_request_key(store):
+    task_id = _task(store, request_key="rk-own-1")
+    assert store.active_owner_for(task_id=task_id) is None       # QUEUED is not in flight
+    store.transition_task(task_id, "PRECHECK", event_type="CLAIMED")
+    owner = store.active_owner_for(task_id=task_id)
+    assert owner["task_id"] == task_id
+    assert store.active_owner_for(request_key="rk-own-1")["task_id"] == task_id
+
+
+def test_retry_of_an_in_flight_task_is_deduped_not_double_owned(store):
+    task_id = _task(store, request_key="rk-own-2")
+    store.transition_task(task_id, "PRECHECK", event_type="CLAIMED")
+    store.transition_task(task_id, "READY", event_type="COORDINATOR_APPROVED")
+    store.transition_task(task_id, "DISPATCHING", event_type="DISPATCHED")
+
+    returned = store.retry_task(task_id)     # a second, racing retry
+
+    assert returned.id == task_id
+    assert returned.status == "DISPATCHING"  # untouched, still owned by the first attempt
+    events = [e["event_type"] for e in store.list_events("lane-r")]
+    assert "RETRY_DEDUPED" in events
+
+
+def test_a_genuine_retry_after_a_real_failure_still_proceeds(store):
+    task_id = _task(store, request_key="rk-own-3")
+    store.transition_task(task_id, "PRECHECK", event_type="CLAIMED")
+    store.transition_task(task_id, BLOCKED, event_type="BLOCKED", reason="interrupted")
+    assert store.retry_task(task_id).status == "QUEUED"
