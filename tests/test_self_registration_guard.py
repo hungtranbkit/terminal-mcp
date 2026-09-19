@@ -57,6 +57,11 @@ class _Remote:
     token_env: str = "TOKEN_ENV_FOR_TEST"
     max_sessions: int | None = None
     timeout_seconds: float = 5.0
+    # Mirrors RemoteNodeConfig's execution-health fields. Defaults match the
+    # real config's conservative ones, so a stub remote registers exactly the
+    # way an unconfigured real one does.
+    self_heal_enabled: bool = False
+    self_heal_action: str = "none"
 
 
 class _Config:

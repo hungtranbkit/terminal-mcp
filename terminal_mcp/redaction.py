@@ -36,7 +36,23 @@ _SECRET_VALUE = r"(?:'[^'\r\n]*'|\"[^\"\r\n]*\"|[^\s'\";]+)"
 _ASSIGN = r"[ \t]*=[ \t]*"
 
 
-REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+def _redact_assignment(match: "re.Match[str]") -> str:
+    """Replace the value of a secret-bearing assignment, unless that value is
+    a boolean/placeholder.
+
+    Same rule `_redact_labelled` applies to the `label: value` form, and for
+    the same reason: `must_change_password=true` is a FLAG, not a credential,
+    and redacting it is the pure noise that teaches a team to turn the
+    redactor off. BENIGN_VALUES is defined further down the module and
+    resolved when this runs, never at import.
+    """
+    name, value = match.group(1), match.group(2)
+    if value.strip().strip("'\"").casefold() in BENIGN_VALUES:
+        return match.group(0)
+    return name + "=" + REDACTED
+
+
+REDACTIONS: tuple[tuple[re.Pattern[str], Any], ...] = (
     # Secret-bearing assignments -- `export FOO_API_KEY = <value>`,
     # `password=...`, `aws_session_token=...`, `--api-key=...`. Supersedes
     # the earlier separate OPENAI_API_KEY/ANTHROPIC_API_KEY, password|token,
@@ -44,8 +60,8 @@ REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     # client_secret|secret_key rules, all of which this one subsumes (each
     # still has its own regression test). `export` and any un-consumed
     # prefix simply stay outside the match, so they survive verbatim.
-    (re.compile(r"(?i)(" + _SECRET_NAME + r")" + _ASSIGN + _SECRET_VALUE),
-     r"\1=<REDACTED>"),
+    (re.compile(r"(?i)(" + _SECRET_NAME + r")" + _ASSIGN + r"(" + _SECRET_VALUE + r")"),
+     _redact_assignment),
 
     (re.compile(r"(?i)\b(Bearer)\s+([A-Za-z0-9._~+\-/]+=*)"), r"\1 <REDACTED>"),
     (re.compile(r"(?im)\b(Authorization\s*:\s*)([^\r\n]+)"), r"\1<REDACTED>"),

@@ -7,8 +7,23 @@ Description=OpenAI Secure MCP Tunnel for Terminal MCP
 # An After=/Wants= pointing at a unit that never starts is not just inert
 # ordering -- a Wants= will actively TRY to start it, and a second controller
 # racing for 127.0.0.1:8766 crash-loops on EADDRINUSE. Observed live.
-After=network-online.target terminal-mcp-http.service
-Wants=network-online.target
+#
+# ORDERING (2026-09-19): this unit's profile
+# (~/.config/tunnel-client/terminal-mcp.yaml) points its `main` channel at
+# http://127.0.0.1:8768/mcp -- the compact ChatGPT sidecar -- so the sidecar,
+# not the controller, is its real upstream. Ordering only after
+# terminal-mcp-http.service left a boot race in which tunnel-client's startup
+# probe of 8768 got a TCP refusal and /readyz then served that stale
+# `connection refused` indefinitely while /metrics showed healthy 200s.
+# Dispatch recovered on its own; the readiness signal did not -- and a health
+# check that lies is the same class of problem as the stale catalog this
+# sidecar exists for. Wants=, not Requires=: the sidecar answers
+# BACKEND_UNAVAILABLE while the controller comes up, so a tunnel that starts
+# anyway beats one that needs a manual kick after a boot race. If your host
+# does not run the sidecar, drop the two chatgpt-v1 references below and point
+# the profile at the controller instead.
+After=network-online.target terminal-mcp-http.service terminal-mcp-chatgpt-v1.service
+Wants=network-online.target terminal-mcp-chatgpt-v1.service
 
 # --- Connection-reliability hardening ---------------------------------
 # Real root cause found in this host's own 4-day log history (journalctl

@@ -197,13 +197,22 @@ def test_key_route_rejects_a_malformed_request(tmp_path):
     assert client.post("/dashboard/api/session/keys", json={"keys": ["Up"]}).status_code == 400
 
 
+# The fixture session does not exist, so the route may refuse either at the
+# key guard or earlier, when it fails to locate the session. Both are
+# refusals, which is what these two tests are about. SESSION_LOCATION_UNKNOWN
+# is the same "no node has this session" condition SESSION_NOT_FOUND covered,
+# reported more precisely (see controller.resolve_session) -- it names which
+# nodes answered, rather than implying the session never existed.
+_NO_SUCH_SESSION = ("SESSION_NOT_FOUND", "SESSION_LOCATION_UNKNOWN")
+
+
 def test_key_route_refuses_a_key_outside_the_allowlist(tmp_path):
     client = _client(tmp_path, allow_keys=("Enter",))
     response = client.post("/dashboard/api/session/keys", json={"name": "ik-x", "keys": ["Up"]})
-    assert response.json()["error"] in ("KEY_NOT_ALLOWED", "SESSION_NOT_FOUND")
+    assert response.json()["error"] in ("KEY_NOT_ALLOWED", *_NO_SUCH_SESSION)
 
 
 def test_key_route_refuses_everything_when_send_keys_is_disabled(tmp_path):
     client = _client(tmp_path, allow_send_keys=False)
     response = client.post("/dashboard/api/session/keys", json={"name": "ik-x", "keys": ["Up"]})
-    assert response.json()["error"] in ("SEND_KEYS_DISABLED", "SESSION_NOT_FOUND")
+    assert response.json()["error"] in ("SEND_KEYS_DISABLED", *_NO_SUCH_SESSION)

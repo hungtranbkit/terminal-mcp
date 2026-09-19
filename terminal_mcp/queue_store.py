@@ -950,8 +950,20 @@ def _add_v14_paused_origin(connection: sqlite3.Connection) -> None:
     which `pause_origin()` classifies from the legacy reason prefix instead of
     guessing. No backfill -- a wrong backfill would silently make an operator
     pause look auto-clearable, and the prefix inference is already exact for
-    both writers that ever set one."""
-    connection.execute("ALTER TABLE queue_lanes ADD COLUMN paused_origin TEXT")
+    both writers that ever set one.
+
+    Guarded by a real `PRAGMA table_info` for the same reason every additive
+    migration from v5 onwards is: `apply_migrations` re-runs from the version
+    the DB CLAIMS, and a database whose `user_version` under-reports what it
+    actually has is a real state on disk, not a hypothetical -- that is exactly
+    what `_add_v5_dispatch_idempotency_key_if_missing` exists to heal. An
+    unguarded ALTER makes that heal path abort with "duplicate column name:
+    paused_origin", and because this runs in `QueueStore.__init__` the failure
+    is not a skipped migration but a controller that cannot open its queue at
+    all."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(queue_lanes)")}
+    if "paused_origin" not in columns:
+        connection.execute("ALTER TABLE queue_lanes ADD COLUMN paused_origin TEXT")
 
 
 def _add_v13_task_routing(connection: sqlite3.Connection) -> None:

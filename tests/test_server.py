@@ -416,6 +416,25 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_ui_workflow_plan",
         "terminal_ui_workflow_audit_gate",
         "terminal_ui_workflow_policy",
+        # Durable Agent identity + versioned Skill Registry (8bef6bd). An
+        # agent is a durable record rather than whatever process happens to
+        # own a pane, and a skill is bound to it by version -- so both need a
+        # read/write surface of their own. Registered as plain tools, NOT
+        # terminal_turn actions, for the same reason as the UI workflow set
+        # above: the compact execution surface stays narrow.
+        "terminal_create_agent",
+        "terminal_get_agent",
+        "terminal_list_agents",
+        "terminal_update_agent",
+        "terminal_agent_start",
+        "terminal_register_skill",
+        "terminal_get_skill",
+        "terminal_list_skills",
+        "terminal_discover_skills",
+        "terminal_bind_agent_skill",
+        "terminal_unbind_agent_skill",
+        # What a task is waiting on, for the attention/inbox surface.
+        "terminal_task_attention",
     }
 
 

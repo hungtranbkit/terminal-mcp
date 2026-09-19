@@ -134,9 +134,15 @@ async def test_a_completed_queue_task_with_integration_required_publishes_a_real
         }},
     ])
     task_id = result["task_ids"][0]
-    verify_result = await _call(mcp_server, "terminal_queue_verify", session="lane-a", task_id=task_id,
-                                evidence={"manually_confirmed": True})
-    assert "error" in verify_result  # not VERIFYING yet -- but this proves the tool path itself works end to end
+
+    # There used to be a probe call here asserting that verifying a task which
+    # is not VERIFYING yet returns an error. It no longer does: verifying an
+    # UNDISPATCHED QUEUED task is now the deliberate reconciliation path for
+    # work executed by direct sends (QUEUED -> COMPLETED in VALID_TRANSITIONS,
+    # guarded by explicit evidence). That path would close this task
+    # immediately and leave nothing for the rest of the test to drive, so the
+    # probe is gone -- the real verify below still exercises the same tool
+    # end to end, which is all the probe was there for.
 
     # Drive it properly through the state machine to VERIFYING first.
     queue.store.transition_task(task_id, "PRECHECK", event_type="TEST")

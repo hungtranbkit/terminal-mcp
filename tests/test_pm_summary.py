@@ -24,7 +24,11 @@ def queue(tmp_path):
 
 def test_generate_summary_empty_fleet(queue):
     summary = generate_summary(queue)
-    assert summary["board_counts"] == {"backlog": 0, "queued": 0, "running": 0, "blocked_review": 0, "done": 0}
+    # Five lifecycle columns plus the three TMCP-AI-OWNS-AI-REVIEW-001
+    # ownership buckets, which board() reports alongside them.
+    assert summary["board_counts"] == {"backlog": 0, "queued": 0, "running": 0, "blocked_review": 0,
+                                       "done": 0, "ai_review": 0, "needs_approval": 0,
+                                       "paused_by_user": 0}
     assert summary["total_pending_tasks"] == 0
     assert summary["active_incidents"] == 0
     assert "generated_at" in summary

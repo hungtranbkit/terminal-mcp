@@ -408,6 +408,19 @@ present).
 
 ## 7. Persistent Task Queue v2
 
+### Schema invariant: every additive migration is guarded
+
+`apply_migrations` re-runs migrations from the version the database
+CLAIMS in `PRAGMA user_version`, and a database whose `user_version`
+under-reports what it actually contains is a real state on disk — healing
+exactly that is why `_add_v5_dispatch_idempotency_key_if_missing` exists.
+So every additive migration MUST check `PRAGMA table_info` before
+`ALTER TABLE ... ADD COLUMN`. An unguarded ALTER aborts the heal with
+`duplicate column name: <col>`, and because migrations run inside
+`QueueStore.__init__` the consequence is not a skipped migration but a
+controller that cannot open its queue at all. Regression:
+`tests/test_queue_store.py::test_migration_5_heals_a_real_already_migrated_db_missing_the_column`.
+
 ### P0 provider admission / 429 governor (2026-09-17)
 
 - Queue task count is independent from provider concurrency. Before the
@@ -780,8 +793,50 @@ surface — the read-only guarantee is pinned by a test, not by convention.
 See the "Read-only repository access for external agents" Feature Details
 entry for the full contract.
 
-**Dashboard HTTP routes** (58, from `tests/test_dashboard.py`'s own exact
-dict) — session CRUD/grant/rename/kill/reopen, supervisor v1/v2, nodes
+**Compact ChatGPT connector surface** (`terminal_mcp/chatgpt_sidecar.py`,
+service `terminal-mcp-chatgpt-v1`, loopback `127.0.0.1:8768/mcp`) — a second,
+NARROWER MCP endpoint in front of the same controller. It is a catalog filter
+and proxy that owns no state: authorization, routing, node selection and
+idempotency all stay in the controller on 8766.
+
+- **Published catalog (`tools/list`): exactly one tool, `terminal_turn`**
+  (`CATALOG`; `SURFACE_VERSION` is bumped whenever it changes, and is carried
+  in the MCP `instructions` so an operator can tell which surface a connector
+  is attached to from inside a chat). One logical orchestration step is one
+  call. `terminal_turn(action=inspect, targets=[...])` IS the canonical batch
+  inspect — there is no separate batch tool to publish.
+- **Cached-call compatibility (`CALL_COMPAT`/`_LEGACY_TRANSLATIONS`):** a
+  ChatGPT conversation can only emit the schema it cached, and
+  `tools.listChanged: false` means no backend change invalidates that cache.
+  So every legacy name this surface has ever advertised —
+  `terminal_batch_inspect`, `terminal_status`, `terminal_list_sessions`,
+  `terminal_list_nodes`, `terminal_create_session`, `terminal_delete_session`,
+  `terminal_send_text`, `terminal_wait_for_state`, `terminal_resume_wait`,
+  `terminal_enqueue_task`, `terminal_task_status`,
+  `terminal_task_batch_status` — is still accepted at CALL time and
+  TRANSLATED into the equivalent `terminal_turn` action. Translated, not
+  forwarded: these are all still real tools on 8766, so forwarding verbatim
+  would silently buy the older, thinner semantics (unguarded send,
+  client-side polling) that `terminal_turn` exists to replace. A call-time
+  allowance is never a listing — nothing here can put a row back in
+  `tools/list`.
+- **Admin restrictions preserved:** anything that is neither the catalog nor a
+  translatable legacy name is refused at the sidecar with
+  `TOOL_NOT_ON_THIS_SURFACE` and never forwarded, so the compact endpoint
+  cannot reach the admin surface. `terminal_send_keys` is refused by the same
+  rule (raw keystroke injection has no guarded equivalent). A translatable
+  name missing a required argument answers `INVALID_ARGUMENT` rather than
+  guessing a target or a prompt.
+- **Security:** binds loopback only, non-overridable;
+  `tests/test_chatgpt_sidecar.py` asserts `lan_route_policy` refuses `/mcp`
+  and `/mcp/chatgpt-v1` on the LAN socket for every method.
+
+Full contract, the stale-catalog incident it exists for, and the deploy/tunnel
+steps: `docs/CHATGPT_CONNECTOR.md`.
+
+**Dashboard HTTP routes** (163, from `tests/test_dashboard.py`'s own exact
+dict — the number drifts as features land; the test, not this line, is
+authoritative) — session CRUD/grant/rename/kill/reopen, supervisor v1/v2, nodes
 (list/status/drain/test-connection/onboarding/heartbeat), LAN discovery,
 SSH/Cloudflare/agent-token connect, registry, knowledge, watchdog, Task
 Manager/queue actions, Global Task Inbox, Supervisor/Coordinator panel
@@ -802,6 +857,20 @@ summarizes it, never duplicates it verbatim (avoids drift).
   dropped rather than re-pinned; `AppConfig`'s own fields are the list.)
 - **Service:** `terminal-mcp-http.service` (systemd), HTTP port `8766`
   (`server_http.py`'s `HTTP_PORT`).
+- **ChatGPT connector service:** `terminal-mcp-chatgpt-v1.service` (systemd
+  user unit), loopback port `8768` — the compact surface described in §15.
+  Owns no state and proxies to `8766`, so it is safe to restart at any time
+  and a crash cannot affect `terminal-mcp-http`.
+- **OpenAI MCP tunnel:** `terminal-mcp-tunnel.service` runs `tunnel-client run
+  --profile terminal-mcp` (health/admin on `8767`). Its `main` channel points
+  at **`http://127.0.0.1:8768/mcp`** — the compact sidecar, NOT the full
+  surface — so the unit must order itself after
+  `terminal-mcp-chatgpt-v1.service`; the shipped unit ordered only after
+  `terminal-mcp-http.service`, which on a lost boot race left `/readyz`
+  serving a stale `connection refused` while `/metrics` showed healthy 200s.
+  Corrected by the drop-in
+  `terminal-mcp-tunnel.service.d/10-after-chatgpt-sidecar.conf`. This is
+  distinct from the Cloudflare tunnel below, which fronts the dashboard.
 - **Remote nodes:** `node_agent.py` (Linux/macOS) / `windows_agent.py`
   (Windows) — a small always-on process pushing heartbeats to the
   controller's `/dashboard/api/nodes/{node_id}/heartbeat`.

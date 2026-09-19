@@ -127,11 +127,19 @@ def test_publishing_is_idempotent_per_queue_transition(store, bus):
 
 
 def test_a_rolled_back_transition_publishes_nothing(store, bus):
-    """An event describing a transition that rolled back would be a lie."""
+    """An event describing a transition that rolled back would be a lie.
+
+    Uses QUEUED -> VERIFYING as the refused edge. This test used to use
+    QUEUED -> COMPLETED, which stopped being invalid when that edge was added
+    deliberately for reconciliation-only closure of a task executed by direct
+    sends (see VALID_TRANSITIONS' own QUEUED entry). VERIFYING is unreachable
+    from QUEUED -- a task must have been dispatched and RUNNING first -- so the
+    rollback this test is actually about still happens.
+    """
     task_id = scoped_task(store)
     before = len(bus.list_events())
     with pytest.raises(qs.InvalidTransitionError):
-        store.transition_task(task_id, qs.COMPLETED, event_type="bogus")
+        store.transition_task(task_id, qs.VERIFYING, event_type="bogus")
     assert len(bus.list_events()) == before
 
 

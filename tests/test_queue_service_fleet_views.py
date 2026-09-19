@@ -234,10 +234,11 @@ def test_assign_task_refuses_a_running_task(queue):
 
 def test_board_empty_when_nothing_ever_created(queue):
     board = queue.board()
-    assert board["counts"] == {"backlog": 0, "queued": 0, "running": 0, "blocked_review": 0, "done": 0}
+    assert board["counts"] == {"backlog": 0, "queued": 0, "running": 0, "blocked_review": 0, "done": 0,
+                               "ai_review": 0, "needs_approval": 0, "paused_by_user": 0}
 
 
-def test_board_groups_tasks_into_the_five_real_lifecycle_columns(queue):
+def test_board_groups_tasks_into_the_real_lifecycle_columns(queue):
     unassigned = queue.create_task("u", "p", session=None)["task_id"]
     queued = queue.create_task("q", "p", session="lane-a")["task_id"]
     running = queue.create_task("r", "p", session="lane-a")["task_id"]
@@ -253,7 +254,13 @@ def test_board_groups_tasks_into_the_five_real_lifecycle_columns(queue):
     queue.store.mark_completed_with_evidence(done, evidence={"marker_found": True})
 
     board = queue.board()
-    assert board["counts"] == {"backlog": 1, "queued": 1, "running": 1, "blocked_review": 1, "done": 1}
+    # The five lifecycle columns, plus the three ownership buckets
+    # TMCP-AI-OWNS-AI-REVIEW-001 added alongside them. `blocked_review` is
+    # retained verbatim for existing callers, so the BLOCKED task above is
+    # counted both there and in the bucket that owns it -- the buckets are a
+    # second view of the same rows, not a sixth/seventh/eighth column.
+    assert board["counts"] == {"backlog": 1, "queued": 1, "running": 1, "blocked_review": 1, "done": 1,
+                               "ai_review": 1, "needs_approval": 0, "paused_by_user": 0}
     assert board["backlog"][0]["id"] == unassigned
     assert board["backlog"][0]["session"] is None  # sentinel never leaks to the caller
     assert board["queued"][0]["id"] == queued
