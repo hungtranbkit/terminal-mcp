@@ -56,7 +56,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 from .coordinator import CoordinatorGate, OtherLaneSnapshot, SessionSnapshot
-from . import delivery_gate
+from . import delivery_gate, retry_recovery
 from .queue_store import (
     BLOCKED, COMPLETED, DISPATCH_UNCERTAIN, DISPATCHING, FAILED, PRECHECK, QUEUED, READY, RUNNING, VERIFYING,
     WAITING_SESSION, QueueStore, QueueTask, iso_now,
@@ -137,7 +137,7 @@ COMPLETION_INSTRUCTION_SENTENCE = (
     "line in this exact format (once), then stop:")
 
 
-def build_dispatch_text(task: QueueTask, *, nonce: str) -> str:
+def build_dispatch_text(task: QueueTask, *, nonce: str, continuation_text: str | None = None) -> str:
     """The 'wrapper rất ngắn' item 7 explicitly allows and limits: the
     task's own prompt is included VERBATIM, first, unmodified -- nothing
     here rewrites or reinterprets the business request. Only a short,
@@ -146,9 +146,23 @@ def build_dispatch_text(task: QueueTask, *, nonce: str) -> str:
     appended, reusing status.py's own COMPLETION_MARKER_RE protocol
     (task_id+attempt+nonce-bound) so a real, verifiable completion
     signal is possible instead of relying on a bare 'final report'
-    heuristic (item 11)."""
+    heuristic (item 11).
+
+    `continuation_text` (TMCP-RETRY-CONTEXT-002) replaces the prompt -- and
+    ONLY the prompt -- when this dispatch is a retry that retry_recovery
+    decided can continue existing work. The completion-marker instruction
+    still travels with it, still bound to this attempt's own nonce, because a
+    continued attempt has to be able to report completion exactly like a
+    first one.
+
+    Why this parameter exists at all: replaying the prompt on every attempt is
+    the production failure TMCP-RETRY-CONTEXT-002 was raised for. An agent
+    handed its original prompt again cannot tell a retry from a new task, so
+    it re-plans and an hour of reasoning is discarded. A retry that can
+    continue must say "continue", not say everything again.
+    """
     return (
-        f"{task.prompt}\n\n"
+        f"{continuation_text if continuation_text else task.prompt}\n\n"
         f"---\n"
         f"{REQUIREMENTS_REMINDER}\n\n"
         f"{COMPLETION_INSTRUCTION_SENTENCE}\n"
@@ -396,6 +410,50 @@ class QueueEngine:
 
     # -- dispatch -----------------------------------------------------------
 
+    def _retry_plan_for(self, task: QueueTask, session: str) -> retry_recovery.RetryPlan | None:
+        """The retry plan for THIS dispatch, or None if this is a first attempt.
+
+        Returns None for `attempt_count == 0` so a brand-new task takes exactly
+        the path it always has -- the prompt, verbatim, unchanged. Only a real
+        retry consults retry_recovery, and only a mode that does not replay the
+        prompt produces a continuation.
+
+        Facts come from the session's own live status (the same terminal_status
+        every other gate here reads) plus whatever recovery capsule the task's
+        metadata durably carries. Never raises: a retry whose facts cannot be
+        gathered falls back to None, i.e. today's replay behaviour, because a
+        broken lookup must not be able to strand a task.
+        """
+        if task.attempt_count < 1:
+            return None
+        try:
+            status = self.ops.terminal_status(session) or {}
+        except Exception:  # noqa: BLE001 -- a fact-gathering failure must never strand a retry
+            status = {}
+        # `exists` is the session; a non-error status whose state is not UNKNOWN
+        # means the pane is answering, which is the agent process still being
+        # there. A session that exists while its agent died reads UNKNOWN, and
+        # that is precisely the native-resume case.
+        session_alive = bool(status.get("exists")) and not status.get("error")
+        state = str(status.get("state") or "UNKNOWN").upper()
+        agent_alive = session_alive and state in ("RUNNING", "IDLE", "WAITING_INPUT")
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        recovery = metadata.get("recovery") if isinstance(metadata.get("recovery"), dict) else {}
+        ctx = retry_recovery.RetryContext(
+            task_id=task.id, session=session, request_key=task.request_key,
+            attempt=task.attempt_count + 1,
+            session_alive=session_alive, agent_process_alive=agent_alive,
+            agent_type=recovery.get("agent_type") or metadata.get("agent_type"),
+            conversation_id=recovery.get("conversation_id"),
+            capsule=retry_recovery.RecoveryCapsule.from_mapping(recovery.get("capsule")),
+            branch=recovery.get("branch"), worktree=recovery.get("worktree"),
+        )
+        plan = retry_recovery.plan_retry(ctx)
+        # RECOVERY_RESTART is the one mode that deliberately replays the
+        # prompt, so it reports no continuation and the caller falls back to
+        # exactly the pre-existing behaviour.
+        return None if plan.replays_prompt else plan
+
     def _dispatch(self, session: str, task_id: str) -> TickResult:
         task = self.store.get_task(task_id)
         nonce = self.store.ensure_verification_nonce(task_id)
@@ -412,7 +470,10 @@ class QueueEngine:
         # attempt (an explicit operator retry_task after a real BLOCKED/
         # FAILED, which clears it).
         idempotency_key = task.dispatch_idempotency_key or idempotency_key_for(task_id, task.attempt_count + 1)
-        dispatch_text = build_dispatch_text(task, nonce=nonce)
+        retry_plan = self._retry_plan_for(task, session)
+        dispatch_text = build_dispatch_text(
+            task, nonce=nonce,
+            continuation_text=(retry_plan.continuation_text if retry_plan is not None else None))
         self.store.transition_task(task_id, DISPATCHING, event_type="DISPATCHED",
                                    extra_fields={"dispatch_idempotency_key": idempotency_key})
 
