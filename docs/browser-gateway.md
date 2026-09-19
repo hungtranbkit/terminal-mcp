@@ -1,254 +1,215 @@
-# Browser gateway (Phase 1) — TMCP-BROWSER-GATEWAY-001
+# Browser gateway (TMCP-BROWSER-GATEWAY-001)
 
-Terminal MCP stays the **only** control plane for ChatGPT. This feature adds a
-browser to that control plane without adding a second one: four declarative
-tools, no raw Python, no raw shell, no pile of low-level CDP verbs.
+Phase 1 verifies web UIs with local Playwright and Chromium. It uses deterministic
+assertions and task steps; it needs no LLM, Browser Use service, or model API key.
+The gateway is disabled by default.
 
-```
-ChatGPT / Claude / Codex
-        │  (MCP)
-        ▼
-Terminal MCP  ──►  browser gateway  ──►  node (Phase 1: the local node)
-                    browser_plan.py        │
-                    (validate + policy)    ▼
-                                      Browser Use / Browser Harness CLI
-                                           │  (CDP, loopback only)
-                                           ▼
-                                      managed Chrome (dedicated profile)
-```
+## Architecture
 
-The managed browser is **dedicated**. It has its own user-data-dir and its own
-debugging port and is launched by the gateway. It never attaches to whatever
-Chrome the operator happens to be running — on dell-linux another project
-drives a logged-in profile on `:9333`, and "found a browser" would mean driving
-someone's real session.
+The MCP server registers `browser_verify`, `browser_run_task`, `browser_status`,
+and `browser_screenshot`. The compact `terminal_turn` surface dispatches the same
+four action names to the same handlers. The ChatGPT sidecar still publishes only
+`terminal_turn`.
 
-## Tools
+Each verification, task, or screenshot starts a Python worker with a fresh
+Chromium context on the MCP server's host. A local dev URL therefore refers to
+that host, not the caller's computer or a remote terminal node.
 
-| Tool | What it does |
+| Component | Responsibility |
 | --- | --- |
-| `terminal_browser_status` | Capability/version/health; with `job_id`, the result of an earlier PENDING job |
-| `terminal_browser_verify` | Run one declarative plan; returns `PASS \| FAIL \| PENDING \| ERROR` |
-| `terminal_browser_screenshot` | Capture one page at one viewport (default 1348x768) |
-| `terminal_browser_stop` | Release the managed browser |
+| `browser_gateway.py` | Configuration, job construction, process deadline, result shaping, artifacts and recent runs |
+| `browser_worker.py` | Playwright launch, request interception, actions and observations |
+| `browser_network.py` | Per-worker loopback proxy, DNS validation and connections to validated numeric addresses |
+| `browser_safety.py` | URL policy, shared redaction rules and output bounds |
+| `browser_script.py` | Assertion/task grammar and deterministic evaluation |
 
-### Reaching it from ChatGPT
+The parent sends one JSON job through stdin; the worker emits one JSON result
+on stdout and diagnostics on stderr. The parent judges observations and enforces
+a wall-clock deadline independently of Playwright's per-operation timeout. It
+cleans up the worker process group, including browser descendants, on completion
+or failure. Combined stdout/stderr is limited to 256 KiB.
 
-ChatGPT is served by `chatgpt_sidecar`, whose catalog is a single tool
-(`terminal_turn`) so that one orchestration step is one "Called tool" row. The
-browser is therefore also an **action** on that tool, routed to the very same
-functions the standalone tools are registered from:
+## Installation
 
-```
-terminal_turn(action="verify", url="https://…", viewport={"width":1348,"height":768},
-              steps=[{"op":"assert_text","selector":"h1","contains":"…"}])
-terminal_turn(action="screenshot", url="https://…")
-terminal_turn(action="browser_status", job_id="…")   # alias: "browser"
-terminal_turn(action="browser_stop")
-```
-
-Aliases: `verify` → `browser_verify`, `screenshot` → `browser_screenshot`,
-`browser` → `browser_status`. A build with no gateway wired answers
-`ACTION_UNAVAILABLE` rather than silently doing nothing.
-
-There is deliberately **no** `browser_exec`, `browser_js` or `browser_cdp`.
-`tests/test_browser_gateway.py::test_the_browser_surface_is_exactly_four_declarative_tools`
-pins this; adding a fifth tool should be a security review, not a convenience.
-
-### A 1348x768 verification
-
-```json
-{
-  "url": "https://example.com/",
-  "viewport": {"width": 1348, "height": 768},
-  "allow_mutations": true,
-  "screenshot": "on_failure",
-  "steps": [
-    {"op": "assert_text", "selector": "h1", "contains": "Example Domain"},
-    {"op": "fill",  "selector": "#qty", "value": "12.5"},
-    {"op": "click", "selector": "#apply"},
-    {"op": "assert_value", "selector": "#qty", "equals": "12.5"},
-    {"op": "assert_text",  "selector": "#total", "equals": "25.00"},
-    {"op": "assert_url",   "contains": "/cart"}
-  ]
-}
-```
-
-Returns, compactly:
-
-```json
-{"status": "PASS", "job_id": "…", "node": "dell-linux", "summary": "6/6 checks passed",
- "mutations": ["fill", "click"], "elapsed_ms": 4120, "artifact": "…/verify-….png"}
-```
-
-### Decimal-quantity regression
-
-The shape worth copying: a decimal that silently becomes an integer between the
-input and the computed total is invisible to an HTTP check and obvious to a DOM
-assertion.
-
-```json
-{"steps": [
-  {"op": "fill", "selector": "#qty", "value": "0.25"},
-  {"op": "click", "selector": "#apply"},
-  {"op": "assert_value", "selector": "#qty",   "equals": "0.25"},
-  {"op": "assert_text",  "selector": "#total", "equals": "0.50"}
-]}
-```
-
-`assert_value` reads the input back; `assert_text` reads what the page
-computed. A rounding bug fails one of them, never both.
-
-## The vocabulary
-
-`navigate`, `click`, `fill`, `press`, `wait`, `assert_text`, `assert_value`,
-`assert_visible`, `assert_url`. Everything is bounded: ≤40 steps, ≤256-char
-selectors, ≤4096-char values, ≤30s per wait, ≤300s per plan, viewport within
-320x240 … 3840x2160.
-
-- **At least one `assert_*` is required.** A plan that asserts nothing would
-  report PASS forever.
-- **`click`/`fill`/`press` need `allow_mutations: true`** and are echoed back in
-  the result. A chat client should not click a button on a logged-in page as a
-  side effect of what reads like a health check.
-- **`press` keys are an allowlist** (`Enter`, `Tab`, `Escape`, arrows, …).
-
-## Security
-
-| Rule | Where |
-| --- | --- |
-| http/https only; `file:`/`chrome:`/`javascript:`/`data:`/`blob:`/`about:`/`view-source:` rejected by name | `browser_plan.validate_url` |
-| SSRF: private, loopback, link-local and unique-local blocked by default; public names that *resolve* into those ranges blocked too | same |
-| Cloud metadata (`169.254.169.254`, `*.internal`) blocked even when allowlisted | same |
-| Local dev targets reachable only via an explicit operator allowlist | `TERMINAL_MCP_BROWSER_ALLOW_HOSTS` |
-| Caller data never becomes code — the plan is JSON on disk, read by a static executor; selectors cross into JS as `json.dumps` literals | `browser_exec.py` |
-| Screenshots can be *named* but never *placed*; the path is re-checked for containment | `browser_gateway.artifact_path` |
-| No secrets in results/logs — every free-text field is redacted and bounded; filled values are never echoed | `browser_gateway._clip` |
-| Child processes get a minimal env (no node tokens, no API keys) | `browser_runner._child_env` |
-| Recording **off** unless an operator sets `TERMINAL_MCP_BROWSER_ALLOW_RECORDING=1` | `browser_runner.recording_enabled` |
-
-## Latency contract
-
-Sync calls are bounded: 30s default, 45s hard ceiling. A longer plan is not
-failed and not abandoned — it returns `PENDING` with a resume handle:
-
-```json
-{"status": "PENDING", "job_id": "ab12…",
- "resume": {"job_id": "ab12…", "tool": "terminal_browser_status"}}
-```
-
-## Multi-node
-
-Capability is **probed, never declared** (`capability_probe.py`, capability name
-`browser-harness`), like every other node capability.
-
-- Explicit `node` wins; otherwise a named `session` pins the plan to its own
-  node; auto-selection happens only when neither was given.
-- A named node that cannot run the plan returns a typed `BROWSER_UNAVAILABLE`
-  with a `reason` (`node_capability_missing`, `remote_execution_unsupported`,
-  `no_eligible_node`) — never a silent hop to a different host.
-
-**Phase 1 executes on the local node.** Remote execution needs a browser
-endpoint on the node agent; that is Phase 2 and deliberately not a fleet/RPC
-redesign here.
-
-## Install / upgrade
+From the checkout, using the Python environment that runs the MCP server:
 
 ```bash
-scripts/provision-browser-harness.sh          # install or upgrade
-scripts/provision-browser-harness.sh --check  # report only
+python -m pip install -e '.[browser]'
+python -m playwright install chromium
 ```
 
-Installs the official `browser-use` distribution (Browser Use CLI 3.x is
-Browser Harness-backed) into an isolated uv venv on Python 3.12, at
-`~/.local/share/terminal-mcp/browser-harness`, and writes `manifest.json` with
-the resolved version. The heavy browser stack deliberately stays out of the
-terminal-mcp service venv and off `PATH`; the gateway resolves the venv itself.
+On Linux hosts missing Chromium system libraries, the operator can install them
+with `python -m playwright install-deps chromium` (system privileges may be
+needed). Install browser binaries for the server's service account. Playwright
+is optional and imported only in the worker; ordinary server operation does not
+require it. The declared extra is `playwright>=1.48,<2`.
 
-The Browser Use **WebUI is not installed** — it is a second control plane.
-
-Verified on dell-linux: `browser-use 0.13.10`, `browser-harness 0.1.13`,
-Python 3.12.8.
-
-## Doctor / troubleshooting
-
-```bash
-terminal_browser_status()                        # from the MCP client
-~/.local/share/terminal-mcp/browser-harness/venv/bin/browser-harness doctor --json
-~/.local/share/terminal-mcp/browser-harness/venv/bin/browser-harness recordings
-```
-
-**Readiness is not liveness.** A browser whose renderer cannot start still binds
-the debugging port, still answers `/json/version`, and still returns a result
-for `Page.navigate` — and then every assertion hangs. The gateway therefore
-probes readiness by *evaluating an expression*
-(`LocalBrowserRunner.renderer_ready`) before it trusts a browser.
-
-### Known host defect on dell-linux (why the docker fallback exists)
-
-A shell-launched Chrome on this box answers CDP but its renderer never
-executes: `Runtime.evaluate` hangs, `--dump-dom` hangs. Reproduced identically
-with `--headless=new`, under Xvfb, with `--single-process`, with the system
-Chrome **and** with a user-owned Playwright Chromium; no AppArmor denials are
-logged for it. The same Chromium inside
-`mcr.microsoft.com/playwright:v1.63.0-noble` on `--network host` evaluates
-fine, which is what the fallback uses.
-
-`TERMINAL_MCP_BROWSER_LAUNCH` pins the strategy:
-
-| Value | Behaviour |
-| --- | --- |
-| `auto` (default) | reuse a *ready* browser, else host, else docker |
-| `host` | host browser only |
-| `docker` | container only (what dell-linux ends up using) |
-| `external` | attach to a browser an operator already runs; never launches one |
-
-Debugging port collisions are the other trap: a stale browser holding the port
-makes every relaunch fail to bind while `/json/version` keeps answering, so it
-looks alive and is not. `ensure_browser` stops a not-ready browser before
-retrying rather than driving it.
+`browser_status` without a probe reports configuration and package availability
+without launching Chromium. Package availability does not prove that Chromium
+can launch. An explicitly requested `probe: true` launches and closes Chromium;
+it does not verify an application page.
 
 ## Configuration
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `TERMINAL_MCP_BROWSER_HOME` | `~/.local/share/terminal-mcp/browser-harness` | provisioned venv, profile, manifest |
-| `TERMINAL_MCP_BROWSER_ARTIFACT_DIR` | `$XDG_STATE_HOME/terminal-mcp/browser-artifacts` | screenshots |
-| `TERMINAL_MCP_BROWSER_CDP_PORT` | `9444` | managed browser's loopback CDP port |
-| `TERMINAL_MCP_BROWSER_ALLOW_HOSTS` | *(empty)* | `host` / `host:port`, comma-separated |
-| `TERMINAL_MCP_BROWSER_ALLOW_PRIVATE` | off | allow all private ranges (blunt; prefer the allowlist) |
-| `TERMINAL_MCP_BROWSER_ALLOW_RECORDING` | off | permit Browser Harness recording |
-| `TERMINAL_MCP_BROWSER_LAUNCH` | `auto` | launch strategy |
-| `TERMINAL_MCP_BROWSER_DOCKER_IMAGE` | `mcr.microsoft.com/playwright:v1.63.0-noble` | fallback image |
-| `TERMINAL_MCP_BROWSER_CHROME` | *(probed)* | explicit browser binary |
-| `TERMINAL_MCP_BROWSER_CHROME_FLAGS` | *(empty)* | extra flags for the host strategy |
+Add a top-level `browser` section to the server's `config.yaml`. This example
+enables local dev servers while retaining the other conservative defaults:
 
-## Privacy
-
-Recording is off by default and the gateway never enables it for a caller. The
-managed profile is dedicated and disposable — no operator profile, no cookies,
-no logged-in session is reused. Screenshots stay in the gateway's own artifact
-directory. Filled values are never echoed back, and `secret: true` marks a
-field as sensitive for the caller's own audit trail.
-
-## Tests
-
-```bash
-pytest tests/test_browser_gateway.py            # 99 tests, no browser needed
-pytest -m browser_smoke tests/test_browser_smoke.py   # real Chrome
+```yaml
+browser:
+  enabled: true
+  allow_loopback: true
+  allow_private_networks: false
+  headless: true
+  executable: ""                  # Playwright's bundled Chromium
+  viewport_width: 1280
+  viewport_height: 800
+  navigation_timeout_seconds: 20
+  hard_timeout_seconds: 25
+  allow_url_patterns: []
+  deny_url_patterns: []
+  screenshots_enabled: false
+  artifact_dir: ""
+  keep_artifacts: 50
+  ignore_https_errors: false
+  browser_args: []
 ```
 
-The smoke suite serves its own page on loopback, asserts the page measured
-itself at 1348x768, exercises fill/click/DOM assertions and a screenshot,
-proves a wrong assertion really FAILs, and loads a credential-free NovaRetail
-preview read-only if one is running.
+Every setting has a `TERMINAL_MCP_BROWSER_<UPPERCASE_KEY>` environment override,
+applied when the gateway is constructed. Restart the server after changing
+configuration or its environment. Booleans accept `true`, `false`, `1`, or `0`;
+list settings require JSON arrays, for example:
 
-## Rollback
+```bash
+export TERMINAL_MCP_BROWSER_ENABLED=1
+export TERMINAL_MCP_BROWSER_ALLOW_LOOPBACK=true
+export TERMINAL_MCP_BROWSER_DENY_URL_PATTERNS='["/admin/delete"]'
+```
 
-The feature is additive and inert when unused:
+The hard timeout must exceed the navigation timeout. Configuration accepts
+navigation budgets of 1–120 seconds and hard budgets of 2–300 seconds. A call's
+`timeout_seconds` can narrow these budgets but cannot enlarge them. Viewport
+dimensions are bounded to 200–4096 pixels. Browser timeouts are independent of
+terminal waiting timeouts.
 
-1. `terminal_browser_stop()` — release the managed browser.
-2. Remove `browser-harness` from the node (`rm -rf ~/.local/share/terminal-mcp/browser-harness`).
-   `terminal_browser_status` then answers `DEGRADED` and every plan returns a
-   typed error; nothing else in Terminal MCP is affected.
-3. To remove the tools entirely, revert the `feat/browser-gateway-phase1` merge.
+## Security and artifacts
+
+Only HTTP and HTTPS targets are accepted. URL credentials, ambiguous URLs,
+metadata endpoints and link-local destinations are refused; metadata and
+link-local blocks cannot be overridden. Loopback and private networks each
+require their own explicit setting. Allow patterns do not grant either range
+permission. Public destinations remain eligible when the allow list is empty.
+
+Allow/deny patterns are case-insensitive substrings of the complete URL, not
+hostname rules, globs or regular expressions. Deny wins. A substring is not a
+strict origin allowlist: it can also match a path or query. Request interception
+checks navigations and subresources, while the proxy resolves and validates
+addresses before connecting to a numeric address to avoid a second DNS lookup.
+Use host-level network restrictions when a strict egress boundary is required.
+
+Contexts block service workers and WebSockets and disable accepted downloads.
+The worker disables QUIC and non-proxied WebRTC UDP. Operator browser arguments
+are restricted to `--disable-dev-shm-usage`, `--disable-gpu`, and `--no-sandbox`;
+remote debugging flags, extensions and arbitrary profile arguments are not
+passed through. `--no-sandbox` weakens Chromium isolation and should only be used
+where the deployment requires it. TLS verification is enabled unless the
+operator sets `ignore_https_errors`.
+
+Text results use the project's redaction rules, strip URL credentials, redact
+query values and enforce length/count limits. These rules do not make arbitrary
+page content safe to publish. Screenshots contain raw, unredacted pixels and
+require `screenshots_enabled: true`. They return a local PNG path, never inline
+image bytes or an uploaded image. A screenshot request on a verification/task
+does not override the operator setting.
+
+The default artifact directory is
+`$XDG_STATE_HOME/terminal-mcp/browser-artifacts`, falling back to
+`~/.local/state/terminal-mcp/browser-artifacts`. New directories request mode
+0700; existing directory permissions are not repaired. Retention removes older
+PNG files from that directory by modification time after successful runs, keeping
+`keep_artifacts` files (default 50). Use a dedicated directory: unrelated PNGs in
+it are also subject to pruning. A returned path is local to the server and may
+later be pruned; `keep_artifacts: 0` removes even the latest capture.
+
+## Examples and result contract
+
+These are JSON argument objects for `terminal_turn`:
+
+```json
+{"action":"browser_status"}
+```
+
+```json
+{"action":"browser_verify","target":"http://127.0.0.1:3000/","args":{"wait_for":"#ready","assertions":["status is: 200","text contains: Ready","selector exists: #ready","no errors"]}}
+```
+
+```json
+{"action":"browser_run_task","target":"http://127.0.0.1:3000/","text":"fill #search with widgets; click #submit; wait for #results; assert selector text contains: #results :: widgets","args":{"timeout_seconds":15}}
+```
+
+After the operator enables screenshots:
+
+```json
+{"action":"browser_screenshot","target":"http://127.0.0.1:3000/","args":{"full_page":true}}
+```
+
+Direct tool calls use `url` instead of `target` and `task` instead of `text`, with
+the contents of `args` passed as named arguments. Compact calls wrap the handler
+response in `result`. Unsupported argument keys return `UNKNOWN_ARGS` with
+`unknown` and `allowed` lists; a non-object `args` returns `INVALID_ARGS`.
+For example, `browser_status` accepts only the `probe` argument.
+
+Verification returns `PASS`, `FAIL`, or `ERROR`, per-check outcomes and bounded
+evidence: final URL, HTTP status, title, console/page/network errors and optional
+screenshot path. Without assertions, a successful load with status below 400
+(or no reported HTTP status) can return `PASS`; this is not evidence of UI
+correctness. Add explicit assertions, including `no errors` when appropriate.
+Task results use `OK` or `FAILED`, or `ERROR` for gateway/worker failures.
+Common errors include `BROWSER_GATEWAY_DISABLED`,
+`BROWSER_DEPENDENCY_UNAVAILABLE`, `BROWSER_TIMEOUT`, URL policy errors and
+`SCREENSHOTS_DISABLED`.
+
+Assertions support text contains/not contains, title is/contains, URL contains,
+HTTP status, selector exists/missing, selector text is/contains, and no
+console/page/network errors. Selector text uses `SELECTOR :: EXPECTED`; plain
+assertion text means `text contains`.
+
+Tasks accept explicit open/goto, click, fill, press, wait for selector, timed
+wait, scroll to bottom, assert and screenshot steps. Separate steps with
+semicolons, newlines or `then`; these separators also split quoted values.
+Unrecognized task prose is rejected. Actions can change the target application;
+use appropriate test data. All assertions and screenshots observe the final
+page, even if placed earlier in the task. Execution stops on the first failed
+action.
+
+## Phase 1 limitations
+
+- Local Chromium only; no remote CDP endpoint, node routing or Browser Use engine.
+  Process-group cleanup uses POSIX facilities; native Windows is not supported
+  by this implementation.
+- No persistent login/profile/storage state. `session_id` is only an echoed label;
+  every call starts a clean context. Login and subsequent actions must occur in
+  the same task if required.
+- No arbitrary JavaScript tool, autonomous planning, visual assertion engine,
+  file upload workflow or download artifacts. WebSocket-dependent applications
+  may not work under the network restrictions.
+- At most 25 task steps and 50 assertions. Observations are truncated (including
+  worker body text at 8000 characters and selector text at 400); they are not a
+  complete page dump. Worker error collections cap at 25 per category, so counts
+  are not an unlimited audit of page activity.
+- Recent-run history is in memory, not a durable audit log. Screenshots are
+  best-effort; inspect the returned screenshot field before assuming one exists.
+
+## Phase 2 adapter notes
+
+Phase 2 is not implemented. The engine identifier (`playwright-chromium`) and
+worker JSON job/result boundary are the current adapter seams, not a configurable
+engine registry. A future Browser Use or remote-browser adapter should retain
+the four public tool contracts and the compact dispatch surface.
+
+Keep deterministic assertion evaluation in the parent. An agentic planner could
+propose task actions, but its narrative must not become a verification verdict.
+Each adapter must preserve URL/DNS policy, deadlines, process/resource cleanup,
+bounded and scrubbed observations, screenshot opt-in and explicit state-lifetime
+semantics. Model credentials, remote connection authorization, session storage,
+additional costs and new network capabilities require explicit configuration
+and adapter tests before rollout.

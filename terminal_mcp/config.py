@@ -790,6 +790,56 @@ class RepoReadConfig:
 
 
 @dataclass(frozen=True)
+class BrowserGatewayConfig:
+    """The Phase-1 browser gateway (browser_gateway.py, browser_worker.py).
+
+    OFF by default, unlike `repo_read`. The difference is what the
+    capability can DO: repo_read only reads files already on this box,
+    while this one opens outbound network connections from inside the
+    trust boundary and renders whatever comes back. That is worth an
+    explicit operator decision, so an install that never wants a browser
+    never grows one by upgrading.
+
+    `allow_private_networks` is the setting to think hardest about.
+    Loopback requires explicit permission for a local dev server,
+    but the LAN is not the same thing, and a chat-driven browser that can
+    reach it is a port scanner with a friendly interface. Instance
+    metadata endpoints are blocked unconditionally by
+    browser_safety.validate_url and no setting here can reopen them.
+
+    `executable` empty means Playwright's own bundled Chromium, which is
+    the supported path. Point it at a system Chrome only when that build
+    is the thing under test.
+
+    Timeouts are two-layer by design: `navigation_timeout_seconds` is what
+    Playwright enforces per operation, and `hard_timeout_seconds` is the
+    wall clock after which the parent KILLS the worker's process group. The
+    second exists because the first cannot cover a driver that never
+    answers at all."""
+
+    enabled: bool = False
+    #: Empty -> Playwright's bundled Chromium.
+    executable: str = ""
+    headless: bool = True
+    viewport_width: int = 1280
+    viewport_height: int = 800
+    navigation_timeout_seconds: float = 20.0
+    hard_timeout_seconds: float = 25.0
+    allow_loopback: bool = False
+    allow_private_networks: bool = False
+    allow_url_patterns: tuple[str, ...] = ()
+    deny_url_patterns: tuple[str, ...] = ()
+    #: Screenshots are written here. Empty -> a subdirectory of the
+    #: server's own state directory; never the repo, so an artifact can
+    #: never be committed by accident.
+    artifact_dir: str = ""
+    keep_artifacts: int = 50
+    screenshots_enabled: bool = False
+    ignore_https_errors: bool = False
+    browser_args: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class FleetSyncConfig:
     # ON by default, like MaintenanceConfig and for the same reason: this is
     # not an optional feature, it is what keeps an already-shipped one
@@ -1072,6 +1122,7 @@ class AppConfig:
     maintenance: MaintenanceConfig = MaintenanceConfig()
     fleet_sync: FleetSyncConfig = FleetSyncConfig()
     repo_read: RepoReadConfig = RepoReadConfig()
+    browser: BrowserGatewayConfig = BrowserGatewayConfig()
     worktree_janitor: WorktreeJanitorConfig = WorktreeJanitorConfig()
     prompt_delivery: PromptDeliveryConfig = PromptDeliveryConfig()
     work: WorkConfig = WorkConfig()
@@ -1510,6 +1561,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         maintenance=_load_maintenance_config(raw.get("maintenance", {})),
         fleet_sync=_load_fleet_sync_config(raw.get("fleet_sync", {})),
         repo_read=_load_repo_read_config(raw.get("repo_read", {})),
+        browser=_load_browser_gateway_config(raw.get("browser", {})),
         worktree_janitor=_load_worktree_janitor_config(raw.get("worktree_janitor", {})),
         prompt_delivery=_load_prompt_delivery_config(raw.get("prompt_delivery", {})),
         work=_load_work_config(raw.get("work", {})),
@@ -2049,6 +2101,86 @@ def _load_repo_read_config(raw: object) -> RepoReadConfig:
         max_log_entries=bounded("max_log_entries", RepoReadConfig.max_log_entries, 1, 5_000),
         max_diff_bytes=bounded("max_diff_bytes", RepoReadConfig.max_diff_bytes, 1_024, 16_000_000),
         timeout_seconds=float(timeout), extra_secret_globs=tuple(globs))
+
+
+def _load_browser_gateway_config(raw: object) -> BrowserGatewayConfig:
+    """Strict, fail-closed validation, for the same reason repo_read's is:
+    a caps section nobody can trust is worse than no caps at all.
+
+    Note there is no key here that removes a blocked scheme or unblocks an
+    instance-metadata address. Those live in browser_safety.py and are
+    deliberately unreachable from config -- an operator can widen which
+    HOSTS are reachable, never which SCHEMES are."""
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def flag(key: str, default: bool) -> bool:
+        value = raw.get(key, default)
+        if not isinstance(value, bool):
+            raise ValueError(f"browser.{key} must be a boolean")
+        return value
+
+    def bounded(key: str, default: int, low: int, high: int) -> int:
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"browser.{key} must be an integer")
+        if not low <= value <= high:
+            raise ValueError(f"browser.{key} must be between {low} and {high}")
+        return value
+
+    def seconds(key: str, default: float, low: float, high: float) -> float:
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"browser.{key} must be a number")
+        if not low <= float(value) <= high:
+            raise ValueError(f"browser.{key} must be between {low} and {high}")
+        return float(value)
+
+    def patterns(key: str) -> tuple[str, ...]:
+        value = raw.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(p, str) and p for p in value):
+            raise ValueError(f"browser.{key} must be a list of non-empty strings")
+        return tuple(value)
+
+    for key in ("executable", "artifact_dir"):
+        value = raw.get(key, "")
+        if not isinstance(value, str):
+            raise ValueError(f"browser.{key} must be a string")
+
+    args = raw.get("browser_args", [])
+    if not isinstance(args, list) or not all(isinstance(a, str) and a for a in args):
+        raise ValueError("browser.browser_args must be a list of non-empty strings")
+
+    navigation = seconds("navigation_timeout_seconds",
+                         BrowserGatewayConfig.navigation_timeout_seconds, 1.0, 120.0)
+    hard = seconds("hard_timeout_seconds", BrowserGatewayConfig.hard_timeout_seconds, 2.0, 300.0)
+    if hard <= navigation:
+        # The hard kill exists to catch what the per-operation timeout
+        # cannot. Set at or below it, it fires first and every slow-but-fine
+        # page becomes a spurious BROWSER_TIMEOUT.
+        raise ValueError("browser.hard_timeout_seconds must be greater than "
+                         "browser.navigation_timeout_seconds")
+    return BrowserGatewayConfig(
+        enabled=flag("enabled", BrowserGatewayConfig.enabled),
+        executable=str(raw.get("executable", "") or ""),
+        headless=flag("headless", BrowserGatewayConfig.headless),
+        viewport_width=bounded("viewport_width", BrowserGatewayConfig.viewport_width, 200, 4_096),
+        viewport_height=bounded("viewport_height", BrowserGatewayConfig.viewport_height, 200, 4_096),
+        navigation_timeout_seconds=navigation,
+        hard_timeout_seconds=hard,
+        allow_loopback=flag("allow_loopback", BrowserGatewayConfig.allow_loopback),
+        allow_private_networks=flag("allow_private_networks",
+                                    BrowserGatewayConfig.allow_private_networks),
+        allow_url_patterns=patterns("allow_url_patterns"),
+        deny_url_patterns=patterns("deny_url_patterns"),
+        artifact_dir=str(raw.get("artifact_dir", "") or ""),
+        keep_artifacts=bounded("keep_artifacts", BrowserGatewayConfig.keep_artifacts, 0, 1_000),
+        screenshots_enabled=flag("screenshots_enabled",
+                                 BrowserGatewayConfig.screenshots_enabled),
+        ignore_https_errors=flag("ignore_https_errors",
+                                 BrowserGatewayConfig.ignore_https_errors),
+        browser_args=tuple(args),
+    )
 
 
 def _load_fleet_sync_config(raw: object) -> FleetSyncConfig:
