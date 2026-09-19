@@ -100,6 +100,11 @@ def test_raw_keystroke_tools_are_not_on_this_surface():
         assert forbidden not in CATALOG
 
 
+def test_streamable_http_transport_supports_current_and_legacy_tuple_shapes():
+    assert sidecar._transport_streams(("read", "write")) == ("read", "write")
+    assert sidecar._transport_streams(("read", "write", "session-id")) == ("read", "write")
+
+
 def test_every_catalog_tool_really_exists_on_the_full_surface():
     """A catalog naming a tool the controller does not publish would serve a
     silently short list -- the exact failure this surface exists to end."""
