@@ -90,7 +90,8 @@ def _fleet_session_names(controller: "ControllerService") -> list[str]:
 def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_session,
                      enqueue_task, task_status, task_batch_status,
                      browser_status, browser_verify, browser_screenshot,
-                     browser_run_task, dispatch_tick, follow_task) -> dict[str, Any]:
+                     browser_run_task, browser_stop, dispatch_tick,
+                     follow_task) -> dict[str, Any]:
     """The implementations terminal_turn's non-pane actions route to.
 
     Keyword-only and exhaustive on purpose: every key in
@@ -116,6 +117,7 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
         "browser_verify": browser_verify,
         "browser_screenshot": browser_screenshot,
         "browser_run_task": browser_run_task,
+        "browser_stop": browser_stop,
         # Not actions of their own (see compact_tools.START_HANDLER_KEYS):
         # the two steps `action="start"` (and a long_task send) compose so one
         # client call both persists the task AND gets it actually running,
@@ -577,9 +579,12 @@ def build_mcp(service: TerminalService | None = None,
                     timeout_seconds, screenshot, viewport_width, viewport_height}
           browser_run_task  target=optional URL, text=deterministic steps:
                     fill SELECTOR with VALUE; click SELECTOR; assert text contains: TEXT
-                    args={timeout_seconds, screenshot, session_id}; fresh context
+                    args={timeout_seconds, screenshot, session_id, allow_mutations};
+                    fresh context. click/fill/press need allow_mutations=true
           browser_screenshot | screenshot  target=URL, args={full_page,
                     timeout_seconds, viewport_width, viewport_height}
+          browser_stop      release any browser work still in flight; IDLE when
+                    nothing is running
           browser_status | browser  args={probe: true} launches local Chromium
           Browser actions use local Playwright, disabled by default. Loopback,
           private networks and screenshots require explicit operator opt-in.
@@ -5487,6 +5492,7 @@ def build_mcp(service: TerminalService | None = None,
         browser_verify=browser_handlers.get("browser_verify"),
         browser_screenshot=browser_handlers.get("browser_screenshot"),
         browser_run_task=browser_handlers.get("browser_run_task"),
+        browser_stop=browser_handlers.get("browser_stop"),
         dispatch_tick=lambda session: queue_engine.tick(session).to_dict(),
         follow_task=_started_task_follower.follow,
     ))
