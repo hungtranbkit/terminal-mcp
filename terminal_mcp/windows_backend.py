@@ -554,6 +554,33 @@ def _kill_process_tree(proc: PtyProcessLike) -> None:
         pass
 
 
+def _hosted_created_epoch(proc: PtyProcessLike, *, default: int) -> int:
+    """The creation second a detached session's identity is built from.
+
+    `SessionInfo.session_id` is `win:<name>:<created_epoch>`, and grants,
+    bindings and supervisor watches all pin it. That second therefore has to
+    come from ONE clock, and it used to come from two: the session host stamps
+    `created_at` into its metadata when it starts, while `new_session` read its
+    own `time.time()` afterwards -- after spawning the host and waiting for
+    that metadata to appear. The moment that wait crossed a whole second the
+    live session and the file on disk disagreed, and adoption (which can only
+    read the file) handed the restarted agent a different identity for a
+    session that never stopped running: every pinned grant went
+    `stale_identity_pin`, and every pinned binding started failing closed with
+    IDENTITY_MISMATCH.
+
+    So the host's own stamp wins whenever there is one. `default` is used for
+    the plain in-process factory, whose processes publish no metadata and
+    cannot be adopted anyway.
+    """
+    created_at = getattr(getattr(proc, "meta", None), "created_at", None)
+    try:
+        created = int(float(created_at))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return created if created > 0 else default
+
+
 @dataclass
 class _WindowsSession:
     name: str
@@ -909,7 +936,8 @@ class WindowsSessionBackend:
         proc = self._spawn_headless(argv, cwd, name=name)
         now = int(time.time())
         entry = _WindowsSession(name=name, proc=proc, cwd=cwd, command=command,
-                                created_epoch=now, activity_epoch=now,
+                                created_epoch=_hosted_created_epoch(proc, default=now),
+                                activity_epoch=now,
                                 buffer=deque(maxlen=self.history_lines),
                                 screen=_AltScreenHistoryScreen(DEFAULT_SCREEN_COLS, DEFAULT_SCREEN_ROWS,
                                                          history=self.history_lines))
