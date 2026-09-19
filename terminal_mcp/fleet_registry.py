@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -72,6 +73,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .schema import Migration, apply_migrations
+
+_LOGGER = logging.getLogger(__name__)
 
 SCHEMA_GENERATION = 1
 
@@ -228,8 +231,48 @@ def wins(incoming: FleetObject, existing: FleetObject) -> bool:
     return incoming.source_node < existing.source_node
 
 
+#: What a node calls itself before it is given a canonical id (the default
+#: `FleetRegistryStore(local_node_id=...)` value, and historically the ONLY
+#: value every deployment used). It is a placeholder, never a real machine:
+#: it resolves to a different host on every node that reads it, which is why
+#: every row still carrying it has to be resolved to a concrete id before the
+#: ownership rules mean anything. See `_migrate_local_owner_to_source` and
+#: `adopt_legacy_local_ownership`.
+LEGACY_LOCAL_NODE_ID = "local"
+
+
+def _migrate_local_owner_to_source(connection: sqlite3.Connection) -> None:
+    """Resolve legacy `owner_node="local"` rows a PEER published.
+
+    Every row records `source_node` -- who actually handed it to us -- so a
+    row that arrived from `dell-5530` while claiming `owner_node="local"` is
+    provably owned by dell-5530, not by whoever is reading it now. Rewriting
+    owner to source therefore RECOVERS the true owner rather than guessing.
+
+    Deliberately scoped to `source_node != "local"`: a row whose source is
+    also the placeholder was published by THIS machine before it had a
+    canonical id, and only the live store knows what that id is now -- that
+    half is `adopt_legacy_local_ownership`, not this migration.
+
+    Why this must exist at all: `publish` refuses to write an object owned by
+    someone else, and a controller re-projects the whole fleet on every sync
+    cycle. One un-resolved legacy row is enough to raise on every cycle
+    forever, which is how a real deployment ended up with a permanently
+    frozen fleet projection (`project:... is owned by 'local', not
+    'hp-linux' -- only its owner may publish it`).
+
+    Idempotent: after this runs no row matches, so a re-run is a no-op.
+    """
+    connection.execute(
+        "UPDATE fleet_objects SET owner_node = source_node "
+        "WHERE owner_node = ? AND source_node != ? AND source_node != ''",
+        (LEGACY_LOCAL_NODE_ID, LEGACY_LOCAL_NODE_ID))
+
+
 FLEET_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: fleet_objects + fleet_peers", lambda connection: None),
+    Migration(2, "resolve legacy owner_node='local' rows to their real source_node",
+              _migrate_local_owner_to_source),
 ]
 
 
@@ -258,6 +301,41 @@ class FleetRegistryStore:
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._create()
         apply_migrations(self._connection, FLEET_MIGRATIONS)
+        self.adopt_legacy_local_ownership()
+
+    def adopt_legacy_local_ownership(self) -> int:
+        """Claim the rows THIS machine published before it had a canonical id.
+
+        The other half of `_migrate_local_owner_to_source`, which cannot live
+        in the migration chain because a migration is handed a bare
+        connection and this step is the one that needs `local_node_id`.
+
+        Scope is deliberately narrow -- `owner_node` AND `source_node` both
+        still the placeholder. Such a row was written by this database's own
+        `publish` back when this node called itself "local"; a row a peer sent
+        us always carries that peer's real id in `source_node` (pinned by
+        `merge`), so it can never be caught here.
+
+        A no-op in the two cases that matter: when this node has no canonical
+        id of its own (nothing to adopt the rows INTO), and on every startup
+        after the first (no row matches any more). Left self-healing rather
+        than one-shot on purpose -- a node given its canonical id only after
+        its first run still converges on the next restart.
+
+        Returns the number of rows adopted, for the caller's own logging.
+        """
+        if not self.local_node_id or self.local_node_id == LEGACY_LOCAL_NODE_ID:
+            return 0
+        with self._connection:
+            cursor = self._connection.execute(
+                "UPDATE fleet_objects SET owner_node = ? "
+                "WHERE owner_node = ? AND source_node = ?",
+                (self.local_node_id, LEGACY_LOCAL_NODE_ID, LEGACY_LOCAL_NODE_ID))
+        adopted = cursor.rowcount or 0
+        if adopted:
+            _LOGGER.info("fleet registry: adopted %d legacy 'local'-owned row(s) as %r",
+                         adopted, self.local_node_id)
+        return adopted
 
     def _create(self) -> None:
         with self._connection:
@@ -416,6 +494,25 @@ class FleetRegistryStore:
                 rejected += 1
                 errors.append("object_id and owner_node are required")
                 continue
+            # A peer that has not been given a canonical node id yet calls
+            # itself LEGACY_LOCAL_NODE_ID, and therefore stamps its own
+            # objects `owner_node="local"`. Taken literally, that claim is
+            # unusable: "local" means a DIFFERENT machine on every node that
+            # reads it, so two peers pushing their own sessions would both
+            # land under one owner and the single-writer premise the whole
+            # conflict policy rests on would be silently broken.
+            #
+            # We know who actually sent this batch (`source_node`, pinned by
+            # the caller), so resolve the claim to that concrete id instead of
+            # rejecting the row -- an un-migrated peer must still be able to
+            # sync. Without this, `adopt_legacy_local_ownership` below would
+            # also re-adopt a REMOTE peer's "local" rows as this node's own on
+            # the next startup, which is exactly the ownership theft the
+            # migration was written to avoid.
+            if incoming.owner_node == LEGACY_LOCAL_NODE_ID:
+                resolved = incoming.source_node or source_node or ""
+                if resolved and resolved != LEGACY_LOCAL_NODE_ID:
+                    incoming = replace(incoming, owner_node=resolved)
             existing = self.get(incoming.kind, incoming.object_id)
             if existing is not None and not wins(incoming, existing):
                 skipped += 1

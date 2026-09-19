@@ -18,7 +18,7 @@ from terminal_mcp.fleet_projection import (SshTargetFacts, classify_transport,
                                            project_ssh_targets, ssh_target_id,
                                            ssh_targets_from_config)
 from terminal_mcp.fleet_registry import (CRED_MISSING, CRED_PRESENT, KIND_NODE,
-                                         KIND_SESSION, KIND_SSH_TARGET, FleetObject,
+                                         KIND_PROJECT, KIND_SESSION, KIND_SSH_TARGET, FleetObject,
                                          FleetRegistryStore, SecretLeak, content_hash,
                                          scrub_payload, wins)
 from terminal_mcp.fleet_service import FAIL, PASS, WARN, FleetService
@@ -201,7 +201,7 @@ def test_one_machine_reached_three_ways_is_one_target(store):
                        transport="tunnel", host_key_fingerprint=fingerprint),
     ]
     summary = project_ssh_targets(store, targets, local_node_id="m910")
-    assert summary == {"published": 1, "deduped": 2}
+    assert summary == {"published": 1, "deduped": 2, "skipped_foreign": 0}
     published = store.list(kind=KIND_SSH_TARGET)[0]
     assert set(published.payload["aliases"]) == {"dell-lan", "dell-ts", "dell-tunnel"}
 
@@ -457,3 +457,170 @@ def test_a_boolean_outcome_about_a_secret_is_not_a_secret(payload):
 def test_widening_the_suffix_allowlist_did_not_open_the_door(payload):
     with pytest.raises(SecretLeak):
         scrub_payload(payload)
+
+
+# -- legacy 'local' node identity --------------------------------------------
+#
+# Every one of these reproduces a real production failure on the HP canonical
+# controller (audited 2026-09-19). Before the fix its fleet_registry.db held
+# 3112 rows still owned by the placeholder id "local" -- including 9 `project`
+# rows that had arrived FROM dell-linux/dell-5530 -- and `fleet_loop` logged
+#   ValueError: project:project:d94eeca841acfd35dae0 is owned by 'local',
+#   not 'hp-linux' -- only its owner may publish it
+# on every single cycle, which stopped projects, ssh targets AND the node's
+# own identity row from being projected at all.
+
+
+def _project_record(node_id, repo_root, *, branch="main", session="s", remote=None):
+    return _Record(node_id=node_id, repo_root=repo_root, git_remote=remote,
+                   git_branch=branch, session_name=session,
+                   stable_session_id=f"uuid-{node_id}-{session}", status="ACTIVE")
+
+
+def test_a_peers_legacy_local_rows_are_resolved_to_that_peer_not_to_us(tmp_path):
+    """The ownership-theft case -- the reason a blanket rewrite is wrong.
+
+    A row that arrived from dell-5530 while claiming owner "local" belongs to
+    dell-5530. Rewriting every "local" row to whoever is reading would have
+    handed this controller 2343 of another machine's sessions.
+    """
+    path = tmp_path / "fleet.db"
+    store = FleetRegistryStore(path, local_node_id="hp-linux")
+    store.merge([FleetObject(kind=KIND_SESSION, object_id="session:local:remote-1",
+                             owner_node="local", revision=3,
+                             updated_at="2026-09-18T00:00:00+00:00",
+                             source_node="dell-5530", payload={"session_name": "w"})],
+                source_node="dell-5530")
+    obj = store.get(KIND_SESSION, "session:local:remote-1")
+    assert obj.owner_node == "dell-5530", "a peer's row must stay the peer's"
+    assert obj.owner_node != "hp-linux"
+
+
+def test_our_own_legacy_local_rows_are_adopted_under_our_canonical_id(tmp_path):
+    path = tmp_path / "fleet.db"
+    # The historical shape: this machine published its own facts while it
+    # still called itself "local", so owner AND source are the placeholder.
+    legacy = FleetRegistryStore(path, local_node_id="local")
+    legacy.publish(KIND_SESSION, "session:local:mine-1", {"session_name": "hp"},
+                   owner_node="local")
+    assert legacy.get(KIND_SESSION, "session:local:mine-1").owner_node == "local"
+
+    # Reopening with the canonical id is what a deploy actually does.
+    store = FleetRegistryStore(path, local_node_id="hp-linux")
+    assert store.get(KIND_SESSION, "session:local:mine-1").owner_node == "hp-linux"
+
+
+def test_adoption_is_idempotent_and_a_no_op_without_a_canonical_id(tmp_path):
+    path = tmp_path / "fleet.db"
+    legacy = FleetRegistryStore(path, local_node_id="local")
+    legacy.publish(KIND_SESSION, "session:local:mine-1", {"session_name": "hp"},
+                   owner_node="local")
+    # A node that still has no canonical id must not "adopt" anything.
+    assert FleetRegistryStore(path, local_node_id="local").adopt_legacy_local_ownership() == 0
+    assert FleetRegistryStore(path, local_node_id="").adopt_legacy_local_ownership() == 0
+
+    store = FleetRegistryStore(path, local_node_id="hp-linux")
+    assert store.adopt_legacy_local_ownership() == 0, "first open already adopted it"
+    revision = store.get(KIND_SESSION, "session:local:mine-1").revision
+    FleetRegistryStore(path, local_node_id="hp-linux")
+    assert store.get(KIND_SESSION, "session:local:mine-1").revision == revision, \
+        "re-running must not mint a revision and re-sync the whole fleet"
+
+
+def test_adoption_never_takes_a_row_a_peer_pushed_under_its_own_local_id(tmp_path):
+    """The two halves must not fight: a peer's row is pinned by source_node
+    BEFORE adoption can see it, so a restart cannot steal it later."""
+    path = tmp_path / "fleet.db"
+    store = FleetRegistryStore(path, local_node_id="hp-linux")
+    store.merge([FleetObject(kind=KIND_SESSION, object_id="session:local:peer-1",
+                             owner_node="local", revision=1,
+                             updated_at="2026-09-18T00:00:00+00:00",
+                             source_node="dell-linux", payload={"session_name": "d"})],
+                source_node="dell-linux")
+    reopened = FleetRegistryStore(path, local_node_id="hp-linux")
+    assert reopened.get(KIND_SESSION, "session:local:peer-1").owner_node == "dell-linux"
+
+
+# -- the single-writer rule the projectors have to respect --------------------
+
+def test_a_project_owned_by_another_node_is_skipped_not_raised(tmp_path):
+    """The exact production traceback: refresh_local passes the controller's
+    FLEET-wide session listing, so this node derives a project for a repo that
+    only ever existed on dell-linux."""
+    from terminal_mcp.fleet_projection import project_projects
+
+    store = FleetRegistryStore(tmp_path / "fleet.db", local_node_id="hp-linux")
+    dell_only = _project_record("dell-linux", "/home/dell/workspace/novaretail-web")
+    project_projects(store, [dell_only], local_node_id="dell-linux")   # dell got there first
+    before = store.get(KIND_PROJECT, store.list(kind=KIND_PROJECT)[0].object_id)
+    assert before.owner_node == "dell-linux"
+
+    written = project_projects(store, [dell_only], local_node_id="hp-linux")
+
+    assert written == 0, "we must not claim another node's project"
+    after = store.get(KIND_PROJECT, before.object_id)
+    assert after.owner_node == "dell-linux", "ownership must not move"
+    assert after.revision == before.revision, "and no revision may be minted"
+
+
+def test_our_own_projects_are_still_published_alongside_a_foreign_one(tmp_path):
+    """Skipping the foreign project must not stop the rest of the batch --
+    that silent all-or-nothing behaviour was the actual outage."""
+    from terminal_mcp.fleet_projection import project_projects
+
+    store = FleetRegistryStore(tmp_path / "fleet.db", local_node_id="hp-linux")
+    foreign = _project_record("dell-linux", "/home/dell/workspace/novaretail-web")
+    project_projects(store, [foreign], local_node_id="dell-linux")
+
+    mine = _project_record("hp-linux", "/home/kimex/workspace/terminal-mcp", session="hp")
+    written = project_projects(store, [foreign, mine], local_node_id="hp-linux")
+
+    assert written == 1, "our own project must still be published"
+    owners = {o.owner_node for o in store.list(kind=KIND_PROJECT)}
+    assert owners == {"dell-linux", "hp-linux"}
+
+
+def test_an_ssh_target_another_node_observed_first_is_skipped_not_raised(tmp_path):
+    """Same rule, and the reason it is tested separately: an ssh target is
+    keyed on the HOST, so any two nodes that can reach one box collide."""
+    store = FleetRegistryStore(tmp_path / "fleet.db", local_node_id="hp-linux")
+    target = SshTargetFacts(alias="box", host="192.168.1.50", port=22, username="kimex",
+                            transport="lan", host_key_fingerprint="SHA256:abc")
+    first = project_ssh_targets(store, [target], local_node_id="dell-linux")
+    assert first["published"] == 1
+
+    second = project_ssh_targets(store, [target], local_node_id="hp-linux")
+
+    assert second["skipped_foreign"] == 1
+    assert second["published"] == 0
+    key = store.list(kind=KIND_SSH_TARGET)[0].object_id
+    assert store.get(KIND_SSH_TARGET, key).owner_node == "dell-linux"
+
+
+def test_one_failing_projector_does_not_silently_drop_the_later_ones(tmp_path):
+    """The outage's real blast radius: `projects` raising took ssh targets and
+    this node's OWN identity row with it, on every cycle, reported as a single
+    'local refresh failed' line."""
+    store = FleetRegistryStore(tmp_path / "fleet.db", local_node_id="hp-linux")
+    service = FleetService(store, local_node_id="hp-linux")
+
+    import terminal_mcp.fleet_service as fs
+
+    def _boom(*_args, **_kwargs):
+        raise ValueError("project:x is owned by 'local', not 'hp-linux'")
+
+    original = fs.project_projects
+    fs.project_projects = _boom
+    try:
+        summary = service.refresh_local(nodes=[], sessions=[], connections=[],
+                                        include_ssh_config=False,
+                                        network={"node_id": "hp-linux", "lan_ip": "10.0.0.1"})
+    finally:
+        fs.project_projects = original
+
+    assert "errors" in summary and "projects" in summary["errors"], \
+        "the failure must be reported, not swallowed"
+    assert summary["ssh"] is not None, "ssh must still have been projected"
+    identity = store.get(KIND_NODE, "node:hp-linux")
+    assert identity is not None, "this node's own identity row must still be published"
+    assert identity.payload["lan_ip"] == "10.0.0.1"

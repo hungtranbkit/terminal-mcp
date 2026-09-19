@@ -13,6 +13,7 @@ M910-off story is tested through.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 
@@ -22,6 +23,8 @@ from .fleet_projection import (SshTargetFacts, local_network_identity, project_n
 from .fleet_registry import (CRED_MISSING, CRED_NEEDS_AUTH, KIND_NODE, KIND_PROJECT,
                              KIND_SESSION, KIND_SSH_TARGET, FleetRegistryStore)
 from .fleet_sync import FleetSyncService
+
+_LOGGER = logging.getLogger(__name__)
 
 # How old a node's replicated view may get before the UI should say so. Well
 # above the sync interval so an ordinary slow cycle is not called stale, well
@@ -86,17 +89,40 @@ class FleetService:
         the next sync transfers nothing.
         """
         sessions = list(sessions)
-        summary: dict[str, Any] = {
-            "nodes": project_nodes(self.store, nodes, local_node_id=self.local_node_id),
-            "sessions": project_sessions(self.store, sessions),
-            "projects": project_projects(self.store, sessions,
-                                         local_node_id=self.local_node_id),
-        }
-        targets: list[SshTargetFacts] = list(ssh_targets_from_connections(connections))
-        if include_ssh_config:
-            targets += ssh_targets_from_config(ssh_config_path)
-        summary["ssh"] = project_ssh_targets(self.store, targets,
-                                             local_node_id=self.local_node_id)
+        summary: dict[str, Any] = {}
+        # Each projector is isolated. They are INDEPENDENT facts, so one of
+        # them failing is not a reason to stop publishing the others -- and
+        # publishing them in one unguarded expression meant exactly that: a
+        # single un-resolvable ownership conflict in `projects` (see
+        # fleet_projection.project_projects) took ssh targets AND this node's
+        # own identity row down with it, on every cycle, reported only as one
+        # "local refresh failed" line. The failure is now named per projector
+        # and reported in the summary the caller already returns, so a partial
+        # refresh is visible instead of looking like a total one.
+        errors: dict[str, str] = {}
+
+        def _project(name: str, fn):
+            try:
+                summary[name] = fn()
+            except Exception as exc:  # noqa: BLE001 -- see above; never fatal
+                errors[name] = f"{type(exc).__name__}: {exc}"
+                summary[name] = None
+                _LOGGER.exception("fleet refresh: projector %r failed", name)
+
+        _project("nodes", lambda: project_nodes(self.store, nodes,
+                                                local_node_id=self.local_node_id))
+        _project("sessions", lambda: project_sessions(self.store, sessions))
+        _project("projects", lambda: project_projects(self.store, sessions,
+                                                      local_node_id=self.local_node_id))
+
+        def _ssh():
+            targets: list[SshTargetFacts] = list(ssh_targets_from_connections(connections))
+            if include_ssh_config:
+                targets.extend(ssh_targets_from_config(ssh_config_path))
+            return project_ssh_targets(self.store, targets, local_node_id=self.local_node_id)
+
+        _project("ssh", _ssh)
+
         # This machine's own addresses, attached to its own node object --
         # CREATING that object if nothing else published one. A bare node
         # agent has no node_registry rows at all, so without this the one
@@ -104,14 +130,21 @@ class FleetService:
         # the only one that never did. It is also what makes a peer able to
         # find a survivor after the controller is gone.
         identity = network if network is not None else local_network_identity()
-        object_id = f"node:{self.local_node_id}"
-        existing = self.store.get(KIND_NODE, object_id)
-        payload = dict(existing.payload) if (existing and not existing.deleted) else {
-            "node_id": self.local_node_id,
-        }
-        payload.update({key: value for key, value in identity.items()})
-        self.store.publish(KIND_NODE, object_id, payload, owner_node=self.local_node_id)
+
+        def _identity():
+            object_id = f"node:{self.local_node_id}"
+            existing = self.store.get(KIND_NODE, object_id)
+            payload = dict(existing.payload) if (existing and not existing.deleted) else {
+                "node_id": self.local_node_id,
+            }
+            payload.update({key: value for key, value in identity.items()})
+            self.store.publish(KIND_NODE, object_id, payload, owner_node=self.local_node_id)
+            return identity
+
+        _project("network", _identity)
         summary["network"] = identity
+        if errors:
+            summary["errors"] = errors
         return summary
 
     # -- reading, with or without a controller -------------------------------

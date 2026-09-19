@@ -341,12 +341,34 @@ def project_projects(store: FleetRegistryStore, records: Iterable[Any], *,
         }
         if checkout not in entry["checkouts"]:
             entry["checkouts"].append(checkout)
+    written = 0
     for project_id, payload in by_project.items():
         payload["checkouts"] = sorted(
             payload["checkouts"], key=lambda c: (str(c.get("node_id")), str(c.get("repo_root"))))
-        store.publish(KIND_PROJECT, f"project:{project_id}", payload,
-                      owner_node=local_node_id)
-    return len(by_project)
+        object_id = f"project:{project_id}"
+        # "Owned by the node that FIRST published it" (see this function's own
+        # docstring) means every later node must leave it alone -- `publish`
+        # enforces that by raising, and a controller re-projects the whole
+        # fleet on every sync cycle, so asking unconditionally here guaranteed
+        # a raise on any fleet where another node got there first.
+        #
+        # That is not a hypothetical: the records this projector reads are
+        # FLEET-wide (`refresh_local` passes the controller's own cross-node
+        # session listing), so a controller derives projects for repos that
+        # only ever existed on another machine and would claim all of them.
+        # One such project was enough to abort the whole refresh -- projects,
+        # ssh targets and this node's own identity row all stopped being
+        # projected, silently, on every cycle.
+        #
+        # Skipping is the correct resolution rather than a workaround: the
+        # owner re-projects the same project from its own sessions, and the
+        # tombstone/revision rules mean our copy converges on its next sync.
+        existing = store.get(KIND_PROJECT, object_id)
+        if existing is not None and not existing.deleted and existing.owner_node != local_node_id:
+            continue
+        store.publish(KIND_PROJECT, object_id, payload, owner_node=local_node_id)
+        written += 1
+    return written
 
 
 def _project_id(remote: str | None, root: str | None) -> str:
@@ -393,9 +415,21 @@ def project_ssh_targets(store: FleetRegistryStore, targets: Iterable[SshTargetFa
                "credential_status": _best_credential(winner.credential_status,
                                                      loser.credential_status),
                "preferred_order": min(winner.preferred_order, loser.preferred_order)})
+    published = skipped_foreign = 0
     for key, target in merged.items():
+        # Same single-writer rule as project_projects above, and the same
+        # reason it has to be checked rather than assumed: an ssh target is
+        # keyed on the HOST it points at, not on who observed it, so two
+        # nodes that can both reach one box derive the same key and the
+        # second one to ask would raise and abort the rest of the refresh.
+        existing = store.get(KIND_SSH_TARGET, key)
+        if existing is not None and not existing.deleted and existing.owner_node != local_node_id:
+            skipped_foreign += 1
+            continue
         store.publish(KIND_SSH_TARGET, key, target.payload(), owner_node=local_node_id)
-    return {"published": len(merged), "deduped": duplicates}
+        published += 1
+    return {"published": published, "deduped": duplicates,
+            "skipped_foreign": skipped_foreign}
 
 
 _CRED_RANK = {CRED_PRESENT: 0, CRED_NEEDS_AUTH: 1, CRED_MISSING: 2, CRED_UNKNOWN: 3}
