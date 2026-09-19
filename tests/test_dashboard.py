@@ -2228,3 +2228,266 @@ def test_dashboard_reopen_elsewhere_button_present_and_wired():
     assert "↩▾ Reopen elsewhere" in DASHBOARD_HTML
     assert "async function reopenKilledSessionElsewhere(entry) {" in DASHBOARD_HTML
     assert "const body = {name: entry.name, node: targetNode};" in DASHBOARD_HTML
+
+
+# -- Global Tasks runtime reconciliation -------------------------------------
+#
+# The bug (2026-09-19): Global Tasks counted only durable QueueStore rows, so
+# it displayed "Running 1" while several Claude/Codex sessions were visibly
+# executing work that had been sent straight into their panes and therefore
+# never produced a queue row. The durable queue stays canonical; these tests
+# pin the READ-layer reconciliation that stops the count under-reporting.
+
+class _StubController:
+    """Just enough ControllerService for the runtime probe.
+
+    `statuses` is keyed on the qualified "node/session" the probe builds, so a
+    test can give two same-named sessions on different nodes different states.
+    """
+
+    local_node_id = "hp-linux"
+
+    def __init__(self, sessions, statuses):
+        self._sessions = sessions
+        self._statuses = statuses
+        self.status_calls: list[str] = []
+
+    def terminal_list_sessions(self):
+        return {"sessions": self._sessions}
+
+    def terminal_status(self, target, *args, **kwargs):
+        self.status_calls.append(target)
+        return self._statuses.get(target, {"state": "IDLE", "reason": ""})
+
+    # register_dashboard touches these on unrelated routes only.
+    def list_nodes(self):
+        return []
+
+
+class _StubQueue:
+    def __init__(self, running=()):
+        self._running = list(running)
+
+    def fleet_task_summary(self):
+        return {"running": len(self._running), "queued": 0, "blocked": 0}
+
+    def global_inbox(self, *, recent_limit: int = 20):
+        return {
+            "summary": {"running": len(self._running), "queued": 0,
+                        "waiting_dependency": 0, "blocked_rework": 0,
+                        "total": len(self._running), "sessions": 1,
+                        "paused_sessions": 0},
+            "running": list(self._running), "queued": [], "waiting_dependency": [],
+            "blocked_rework": [], "recent": [],
+        }
+
+
+def _session_row(name, node_id="hp-linux"):
+    return {"name": name, "node_id": node_id, "effective_read": True,
+            "created": "2026-09-19T00:00:00+00:00", "activity": "2026-09-19T01:00:00+00:00"}
+
+
+def _runtime_client(read_config, *, sessions, statuses, durable_running=()):
+    service = TerminalService(read_config)
+    server = build_mcp(service)
+    controller = _StubController(sessions, statuses)
+    queue = _StubQueue(durable_running)
+    register_dashboard(server, service, controller=controller, queue=queue)
+    client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})
+    return client, controller
+
+
+def test_global_tasks_counts_an_untracked_claude_agent_as_running(read_config):
+    """The reported symptom: a live agent the queue never dispatched."""
+    client, _ = _runtime_client(
+        read_config,
+        sessions=[_session_row("nova-claude-long")],
+        statuses={"hp-linux/nova-claude-long":
+                  {"state": "RUNNING", "reason": "current command is 'claude'; age is 2s"}})
+
+    body = client.get("/dashboard/api/fleet-task-summary").json()
+
+    assert body["durable_running"] == 0
+    assert body["runtime_untracked"] == 1
+    assert body["running"] == 1, "running must be durable + untracked"
+
+
+def test_an_unknown_state_pane_running_claude_still_counts(read_config):
+    """UNKNOWN is explicitly included: the classifier reports it whenever it
+    cannot prove activity, and an agent mid-think lands there routinely."""
+    client, _ = _runtime_client(
+        read_config,
+        sessions=[_session_row("hp-codex1")],
+        statuses={"hp-linux/hp-codex1":
+                  {"state": "UNKNOWN", "reason": "current command is 'codex'; activity age is 40s"}})
+
+    body = client.get("/dashboard/api/fleet-task-summary").json()
+
+    assert body["runtime_untracked"] == 1
+    assert body["running"] == 1
+
+
+def test_idle_and_waiting_input_panes_are_not_counted_as_running(read_config):
+    """IDLE is not work. WAITING_INPUT is the one that matters most: an agent
+    sitting on an approval prompt is BLOCKED, and counting it as Running is
+    exactly what would hide the thing an operator has to act on."""
+    excluded = ("IDLE", "DONE", "ERROR", "NOT_FOUND", "RESTRICTED", "WAITING_INPUT")
+    sessions = [_session_row(f"agent-{state.lower()}") for state in excluded]
+    statuses = {f"hp-linux/agent-{state.lower()}":
+                {"state": state, "reason": "current command is 'claude'"}
+                for state in excluded}
+
+    client, _ = _runtime_client(read_config, sessions=sessions, statuses=statuses)
+    body = client.get("/dashboard/api/fleet-task-summary").json()
+
+    assert body["runtime_untracked"] == 0
+    assert body["running"] == 0
+
+
+def test_a_running_pane_that_is_not_an_agent_is_not_counted(read_config):
+    """A busy shell or build is not an agent task. Only claude/codex count."""
+    client, _ = _runtime_client(
+        read_config,
+        sessions=[_session_row("hp-work")],
+        statuses={"hp-linux/hp-work":
+                  {"state": "RUNNING", "reason": "current command is 'bash'; age is 1s"}})
+
+    body = client.get("/dashboard/api/fleet-task-summary").json()
+
+    assert body["runtime_untracked"] == 0
+
+
+def test_an_agent_already_tracked_by_a_durable_task_is_not_double_counted(read_config):
+    """Dedup. Without it the session with a real queue row would be counted
+    once as durable and again as runtime."""
+    client, _ = _runtime_client(
+        read_config,
+        sessions=[_session_row("nova-claude-long"), _session_row("hp-codex1")],
+        statuses={
+            "hp-linux/nova-claude-long":
+                {"state": "RUNNING", "reason": "current command is 'claude'"},
+            "hp-linux/hp-codex1":
+                {"state": "RUNNING", "reason": "current command is 'codex'"},
+        },
+        durable_running=[{"id": "abc", "session": "nova-claude-long", "status": "RUNNING"}])
+
+    body = client.get("/dashboard/api/fleet-task-summary").json()
+
+    assert body["durable_running"] == 1
+    assert body["runtime_untracked"] == 1, "only hp-codex1 is untracked"
+    assert body["running"] == 2, "not 3 -- nova-claude-long must not be counted twice"
+
+
+def test_dedup_is_node_qualified_so_same_named_sessions_stay_distinct(read_config):
+    """A durable row carrying a node_id must dedupe only that node's session,
+    not a same-named session on another node."""
+    client, _ = _runtime_client(
+        read_config,
+        sessions=[_session_row("work", node_id="hp-linux"),
+                  _session_row("work", node_id="dell-linux")],
+        statuses={
+            "hp-linux/work": {"state": "RUNNING", "reason": "current command is 'claude'"},
+            "dell-linux/work": {"state": "RUNNING", "reason": "current command is 'claude'"},
+        },
+        durable_running=[{"id": "abc", "session": "work", "node_id": "hp-linux",
+                          "status": "RUNNING"}])
+
+    body = client.get("/dashboard/api/fleet-task-summary").json()
+
+    assert body["durable_running"] == 1
+    assert body["runtime_untracked"] == 1, "dell-linux/work is still untracked"
+
+
+def test_global_inbox_appends_read_only_synthetic_rows(read_config):
+    client, _ = _runtime_client(
+        read_config,
+        sessions=[_session_row("nova-claude-long")],
+        statuses={"hp-linux/nova-claude-long":
+                  {"state": "RUNNING", "reason": "current command is 'claude'"}},
+        durable_running=[{"id": "abc", "session": "other-lane", "status": "RUNNING"}])
+
+    body = client.get("/dashboard/api/queue/global-inbox").json()
+
+    assert [row["id"] for row in body["running"]] == ["abc", "runtime:hp-linux:nova-claude-long"]
+    synthetic = body["running"][1]
+    assert synthetic["runtime_untracked"] is True
+    assert synthetic["status"] == "RUNNING"
+    assert synthetic["agent"] == "claude"
+    assert synthetic["actions_allowed"] == [], "no cancel/retry affordance"
+    assert body["summary"]["durable_running"] == 1
+    assert body["summary"]["runtime_untracked"] == 1
+    assert body["summary"]["running"] == 2
+    assert body["summary"]["total"] == 2
+
+
+def test_a_synthetic_runtime_row_cannot_be_cancelled_or_retried(read_config):
+    """They are an observation, not queue state -- there is no durable row to
+    act on, so the mutation is refused by name rather than reaching the store
+    with an id it cannot find."""
+    client, _ = _runtime_client(
+        read_config,
+        sessions=[_session_row("test-runtime")],
+        statuses={"hp-linux/test-runtime":
+                  {"state": "RUNNING", "reason": "current command is 'claude'"}})
+
+    for route in ("/dashboard/api/task/cancel", "/dashboard/api/task/retry"):
+        response = client.post(route, json={"name": "test-runtime",
+                                            "task_id": "runtime:hp-linux:test-runtime"})
+        assert response.status_code == 409, route
+        assert response.json()["error"] == "RUNTIME_TASK_NOT_MUTABLE"
+
+
+def test_the_runtime_probe_is_cached_so_polling_does_not_restorm_the_fleet(read_config):
+    """Two routes polled together must not double-probe every session."""
+    client, controller = _runtime_client(
+        read_config,
+        sessions=[_session_row("nova-claude-long")],
+        statuses={"hp-linux/nova-claude-long":
+                  {"state": "RUNNING", "reason": "current command is 'claude'"}})
+
+    client.get("/dashboard/api/fleet-task-summary")
+    after_first = len(controller.status_calls)
+    client.get("/dashboard/api/queue/global-inbox")
+    client.get("/dashboard/api/fleet-task-summary")
+
+    assert after_first == 1
+    assert len(controller.status_calls) == 1, \
+        "the ~5s cache must serve the later polls without re-probing"
+
+
+def test_a_session_that_cannot_be_read_is_never_probed(read_config):
+    """Reconciliation must not become a way to observe a restricted session."""
+    row = _session_row("secret-thing")
+    row["effective_read"] = False
+    client, controller = _runtime_client(
+        read_config, sessions=[row],
+        statuses={"hp-linux/secret-thing":
+                  {"state": "RUNNING", "reason": "current command is 'claude'"}})
+
+    body = client.get("/dashboard/api/fleet-task-summary").json()
+
+    assert controller.status_calls == []
+    assert body["runtime_untracked"] == 0
+
+
+def test_one_unreachable_session_does_not_fail_the_whole_summary(read_config):
+    """A node going away mid-sweep must degrade, not 500."""
+    class _Flaky(_StubController):
+        def terminal_status(self, target, *args, **kwargs):
+            if target == "hp-linux/broken":
+                raise RuntimeError("node unreachable")
+            return super().terminal_status(target, *args, **kwargs)
+
+    service = TerminalService(read_config)
+    server = build_mcp(service)
+    controller = _Flaky(
+        [_session_row("broken"), _session_row("nova-claude-long")],
+        {"hp-linux/nova-claude-long":
+         {"state": "RUNNING", "reason": "current command is 'claude'"}})
+    register_dashboard(server, service, controller=controller, queue=_StubQueue())
+    client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})
+
+    response = client.get("/dashboard/api/fleet-task-summary")
+
+    assert response.status_code == 200
+    assert response.json()["runtime_untracked"] == 1, "the healthy one still counts"

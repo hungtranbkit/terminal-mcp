@@ -132,6 +132,28 @@ def _notes_int(raw: str | None, default: int) -> int:
         return default
 
 
+# Synthetic runtime task rows (Global Tasks reconciliation). These describe an
+# agent the durable queue never dispatched, so their ids exist only inside a
+# dashboard response and address no QueueStore row. The prefix is what every
+# mutation route matches on to refuse them: without that, a cancel/retry click
+# on such a row would reach queue.cancel()/retry() with an id that cannot be
+# found, and the operator would get a confusing store-level error instead of a
+# clear "there is nothing durable here to act on".
+RUNTIME_TASK_ID_PREFIX = "runtime:"
+
+# How long a runtime probe sweep is reused. The dashboard polls several routes
+# on a short interval and each sweep costs one terminal_status per readable
+# session fleet-wide, so without this a single open page would re-probe every
+# session continuously. Short enough that a finished agent disappears from
+# Running promptly.
+RUNTIME_TASK_CACHE_SECONDS = 5.0
+
+
+def is_runtime_task_id(task_id: Any) -> bool:
+    """Whether this id names a synthetic runtime row rather than a queue row."""
+    return isinstance(task_id, str) and task_id.startswith(RUNTIME_TASK_ID_PREFIX)
+
+
 INPUT_ERROR_STATUS = {
     # Raw key sends (terminal_send_keys) -- a distinct capability from text
     # submission, with its own refusals. SEND_KEYS_DISABLED/KEY_NOT_ALLOWED
@@ -14823,12 +14845,182 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         status_code = 200 if "error" not in result else 400
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
+    # Runtime reconciliation for work started outside the durable queue.
+    # Durable QueueStore remains canonical; direct-send Claude/Codex work is
+    # surfaced as synthetic read-only runtime tasks so Global Tasks cannot
+    # under-count visibly active agents.
+    #
+    # WHY THIS IS A READ-LAYER RECONCILIATION AND NOT A QUEUE CHANGE
+    # The queue's state machine is the durable record of work IT dispatched.
+    # A prompt sent straight into a Claude/Codex pane (terminal_turn, a human
+    # typing, an older direct-send path) never produced a queue row and never
+    # should retroactively -- writing one would invent a task with no
+    # request_key, no lease and no completion policy. So the count is
+    # reconciled where it is READ, and every synthetic row is marked
+    # `runtime_untracked` so nothing downstream mistakes it for durable state.
+    _runtime_task_cache: dict[str, Any] = {"expires_at": 0.0, "rows": []}
+    _runtime_task_cache_lock = anyio.Lock()
+    # Dashboard polling hits both routes on a short interval and each refresh
+    # probes every readable session in the fleet. Bounded so a large fleet
+    # cannot turn one page load into dozens of concurrent status threads.
+    _runtime_probe_limiter = anyio.CapacityLimiter(8)
+
+    # States that mean "not doing work right now". Everything else -- RUNNING
+    # and UNKNOWN in practice -- counts, provided the pane is really running an
+    # agent. WAITING_INPUT is excluded deliberately: an agent sitting on an
+    # approval prompt is blocked, not executing, and counting it as Running is
+    # what would hide the thing an operator needs to act on.
+    _RUNTIME_INACTIVE_STATES = frozenset({
+        "IDLE", "DONE", "ERROR", "NOT_FOUND", "RESTRICTED", "WAITING_INPUT",
+    })
+    _RUNTIME_AGENTS = frozenset({"claude", "codex"})
+
+    def _runtime_agent_for(status: dict[str, Any]) -> str:
+        """Which agent, if any, is really running in this pane.
+
+        Prefers the structured `resource.agent` block when the status payload
+        carries one, and otherwise falls back to the pane command the
+        classifier writes into its own reason string. That fallback reuses
+        `terminal_wall.command_from` rather than re-matching the text here --
+        a second parser for the same field is the kind of thing that silently
+        stops agreeing with the first one.
+        """
+        resource = status.get("resource")
+        if isinstance(resource, dict):
+            agent = str(resource.get("agent") or "").strip().lower()
+            if agent in _RUNTIME_AGENTS:
+                return agent
+        command = terminal_wall.command_from(status) or ""
+        # The command can be a path or have arguments ("/usr/bin/claude").
+        basename = command.strip().lower().rsplit("/", 1)[-1].split()[0] if command.strip() else ""
+        return basename if basename in _RUNTIME_AGENTS else ""
+
+    async def _runtime_untracked_task_rows(
+        tracked: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Synthetic RUNNING rows for agent sessions the queue does not know.
+
+        `tracked` holds both the bare session name and the "node/session"
+        form of every durable running task, because a durable row does not
+        always carry a node_id -- matching on either avoids double-counting
+        one session while still keeping two same-named sessions on different
+        nodes distinct.
+        """
+        tracked = tracked or set()
+        async with _runtime_task_cache_lock:
+            now = anyio.current_time()
+            if now >= float(_runtime_task_cache.get("expires_at") or 0.0):
+                fleet = await anyio.to_thread.run_sync(controller.terminal_list_sessions)
+                observed: list[dict[str, Any]] = []
+
+                async def _probe(row: dict[str, Any]) -> None:
+                    name = row.get("name")
+                    if not isinstance(name, str) or not name or not row.get("effective_read", True):
+                        return
+                    node_id = row.get("node_id") or controller.local_node_id
+                    qualified = f"{node_id}/{name}" if node_id else name
+                    async with _runtime_probe_limiter:
+                        try:
+                            status = await anyio.to_thread.run_sync(
+                                controller.terminal_status, qualified)
+                        except Exception:  # noqa: BLE001 -- one unreachable
+                            # session must not fail the whole summary
+                            return
+                    if not isinstance(status, dict) or status.get("error"):
+                        return
+                    state = str(status.get("state") or "UNKNOWN").upper()
+                    if state in _RUNTIME_INACTIVE_STATES:
+                        return
+                    agent = _runtime_agent_for(status)
+                    if not agent:
+                        return
+                    observed.append({
+                        "id": f"{RUNTIME_TASK_ID_PREFIX}{node_id}:{name}",
+                        "session": name,
+                        "title": f"Runtime agent: {name}",
+                        "prompt": None,
+                        "priority": 0,
+                        "status": "RUNNING",
+                        "created_at": row.get("created"),
+                        "updated_at": row.get("activity"),
+                        "runtime_untracked": True,
+                        "runtime_state": state,
+                        "node_id": node_id,
+                        "agent": agent,
+                        # No cancel/retry affordance: these are an
+                        # observation, not queue state, and there is no
+                        # durable row behind them to act on.
+                        "actions_allowed": [],
+                        "metadata": {
+                            "synthetic_runtime": True,
+                            "runtime_state": state,
+                            "node_id": node_id,
+                            "agent": agent,
+                        },
+                    })
+
+                async with anyio.create_task_group() as tg:
+                    for row in fleet.get("sessions", []):
+                        if isinstance(row, dict):
+                            tg.start_soon(_probe, row)
+
+                # Deterministic order so two polls of an unchanged fleet
+                # render identically instead of shuffling with probe timing.
+                observed.sort(key=lambda r: (str(r.get("node_id")), str(r.get("session"))))
+                _runtime_task_cache["rows"] = observed
+                _runtime_task_cache["expires_at"] = now + RUNTIME_TASK_CACHE_SECONDS
+
+            return [
+                dict(row)
+                for row in _runtime_task_cache.get("rows", [])
+                if row.get("session") not in tracked
+                and f"{row.get('node_id')}/{row.get('session')}" not in tracked
+            ]
+
+    def _durable_running_keys(running: Any) -> set[str]:
+        """What a durable running task dedupes against.
+
+        A queue row carries a node_id only when it was dispatched to a named
+        node. So the spelling is chosen per row rather than emitting both:
+
+        * node_id present -> ONLY "node/session". Emitting the bare name too
+          would let one node-pinned task dedupe a same-named session on every
+          other node, which is a silent under-count (caught by
+          test_dedup_is_node_qualified_so_same_named_sessions_stay_distinct).
+        * node_id absent -> the bare name, which matches whichever node the
+          session turns out to be on. That is the right reading of a row that
+          never named one, and it keeps the common single-node case deduping.
+        """
+        keys: set[str] = set()
+        for task in running or []:
+            if not isinstance(task, dict):
+                continue
+            session = task.get("session")
+            if not session:
+                continue
+            node_id = task.get("node_id")
+            keys.add(f"{node_id}/{session}" if node_id else session)
+        return keys
+
     @server.custom_route("/dashboard/api/fleet-task-summary", methods=["GET"], include_in_schema=False)
     async def fleet_task_summary(request: Request) -> JSONResponse:
         blocked, _identity = _read_guard(request)
         if blocked is not None:
             return blocked
         result = await anyio.to_thread.run_sync(queue.fleet_task_summary)
+        # global_inbox is read purely to learn WHICH sessions the durable
+        # running count already covers -- fleet_task_summary returns counts
+        # only, and deduping needs identities.
+        inbox = await anyio.to_thread.run_sync(queue.global_inbox)
+        runtime_rows = await _runtime_untracked_task_rows(
+            _durable_running_keys(inbox.get("running")))
+        durable_running = int(result.get("running") or 0)
+        result["durable_running"] = durable_running
+        result["runtime_untracked"] = len(runtime_rows)
+        # `running` stays the number an operator reads as "work happening
+        # now", which is the whole bug: it used to mean "durable rows only"
+        # and so showed 1 while several agents were visibly executing.
+        result["running"] = durable_running + len(runtime_rows)
         return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
 
     # -- Dashboard Supervisor/Coordinator panel + Global Task Inbox ---------
@@ -14848,6 +15040,17 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         result = await anyio.to_thread.run_sync(queue.global_inbox)
+        durable_rows = list(result.get("running") or [])
+        runtime_rows = await _runtime_untracked_task_rows(
+            _durable_running_keys(durable_rows))
+        # Appended AFTER the durable rows, never interleaved: the canonical
+        # queue state stays first and in its own order.
+        result["running"] = durable_rows + runtime_rows
+        summary = result.setdefault("summary", {})
+        summary["durable_running"] = len(durable_rows)
+        summary["runtime_untracked"] = len(runtime_rows)
+        summary["running"] = len(result["running"])
+        summary["total"] = int(summary.get("total") or 0) + len(runtime_rows)
         return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/queue/recent-events", methods=["GET"], include_in_schema=False)
@@ -15340,6 +15543,16 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "READ_RESTRICTED", "session": name}, status_code=403)
         if not isinstance(task_id, str) or not task_id:
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        # A synthetic runtime row is an OBSERVATION of an agent the durable
+        # queue never dispatched -- there is no row to cancel or retry, so
+        # this is refused here with a name rather than handed to the store as
+        # an id it cannot find.
+        if is_runtime_task_id(task_id):
+            return JSONResponse({"error": "RUNTIME_TASK_NOT_MUTABLE", "task_id": task_id,
+                                 "detail": "this row reflects a live agent session that the "
+                                           "durable queue did not dispatch; there is no queued "
+                                           "task to act on"},
+                                status_code=409)
         _log.info("dashboard task_retry session=%s task_id=%s identity=%s", name, task_id,
                  identity.email if identity else None)
         result = await anyio.to_thread.run_sync(lambda: queue.retry(name, task_id))
@@ -15368,6 +15581,16 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "READ_RESTRICTED", "session": name}, status_code=403)
         if not isinstance(task_id, str) or not task_id:
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        # A synthetic runtime row is an OBSERVATION of an agent the durable
+        # queue never dispatched -- there is no row to cancel or retry, so
+        # this is refused here with a name rather than handed to the store as
+        # an id it cannot find.
+        if is_runtime_task_id(task_id):
+            return JSONResponse({"error": "RUNTIME_TASK_NOT_MUTABLE", "task_id": task_id,
+                                 "detail": "this row reflects a live agent session that the "
+                                           "durable queue did not dispatch; there is no queued "
+                                           "task to act on"},
+                                status_code=409)
         _log.info("dashboard task_cancel session=%s task_id=%s identity=%s", name, task_id,
                  identity.email if identity else None)
         result = await anyio.to_thread.run_sync(lambda: queue.cancel(name, task_id))
