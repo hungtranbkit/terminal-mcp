@@ -407,3 +407,41 @@ prompt_delivery:
 # LLM_RETRY_JITTER=true
 # LLM_429_COOLDOWN_SEC=30
 # MCP_LONG_CALL_MAX_SEC=30
+
+# ---------------------------------------------------------------------------
+# Session resource health (TMCP-SESSION-HEALTH-001)
+#
+# Adds a `resource` block to terminal_status / terminal_batch_inspect rows:
+# agent, model, context.{used_tokens,max_tokens,percent,status},
+# usage.{percent,reset_in_minutes,reset_at}, git.{repo,branch,dirty},
+# recommended_action and a rollover hook. Read-only; nothing here ever acts.
+#
+# CONTEXT (how full this session's window is) and USAGE (account quota) are
+# kept strictly separate -- only context feeds recommended_action. See
+# docs/session-resource-health.md.
+# ---------------------------------------------------------------------------
+session_health:
+  # false removes the `resource` key entirely; every other field is unchanged.
+  enabled: true
+
+  # Context-pressure bands, as a percentage of the context window. Must be
+  # strictly increasing. The low edge of each band belongs to the HIGHER tier:
+  #   < 70        NORMAL                        -> CONTINUE
+  #   70 .. < 85  WATCH                         -> CONTINUE_WATCH
+  #   85 .. 92    PREPARE_ROLLOVER              -> PREPARE_ROLLOVER
+  #   > 92 .. 97  FINISH_CURRENT_AND_ROLLOVER   -> no new large task
+  #   > 97        CHECKPOINT_ONLY               -> checkpoint, nothing else
+  watch_percent: 70
+  prepare_rollover_percent: 85
+  finish_rollover_percent: 92
+  checkpoint_only_percent: 97
+
+  # One bounded, cached `git status --porcelain` per session cwd, so
+  # git.dirty is real evidence. false reports dirty: null, which the
+  # rollover hook treats as not-proven-safe -- never as clean.
+  git_probe_enabled: true
+  git_probe_cache_seconds: 10
+
+# Quota severity (usage.status) deliberately reuses ai_usage's own
+# warning_threshold_percent / critical_threshold_percent rather than
+# duplicating a second pair of numbers that could drift from the dashboard's.

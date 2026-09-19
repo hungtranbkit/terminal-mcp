@@ -334,6 +334,36 @@ class AiUsageConfig:
     critical_threshold_percent: float = 90.0
 
 
+@dataclass(frozen=True)
+class SessionHealthConfig:
+    """Thresholds for session resource health (TMCP-SESSION-HEALTH-001).
+
+    Read-only and defaults ON, for the same reason AiUsageConfig above
+    does: there is no autonomous ACTION gated here. terminal_status only
+    ever REPORTS a recommended_action; nothing in this project acts on it,
+    so the worst case of enabling it is an extra bounded pane parse and (a
+    cached) `git status` per status call. Set `enabled: false` to drop the
+    `resource` block from the payload entirely -- every existing field is
+    unaffected either way.
+
+    The four percentages are the documented policy table. They apply to
+    CONTEXT ONLY; quota severity reuses ai_usage's own
+    warning/critical_threshold_percent rather than duplicating a second
+    pair of numbers that could drift from the dashboard's.
+    """
+    enabled: bool = True
+    watch_percent: float = 70.0
+    prepare_rollover_percent: float = 85.0
+    finish_rollover_percent: float = 92.0
+    checkpoint_only_percent: float = 97.0
+    # One bounded, cached `git status --porcelain` per cwd per TTL, so
+    # `git.dirty` is real evidence rather than an assumption. Turning this
+    # off reports dirty=None, which the rollover hook treats as
+    # not-proven-safe -- never as clean.
+    git_probe_enabled: bool = True
+    git_probe_cache_seconds: float = 10.0
+
+
 # The image types notes_service.py can both content-sniff and serve.
 # Kept as a literal here rather than imported from notes_service so
 # config.py's import graph stays as narrow as it is today;
@@ -1059,6 +1089,7 @@ class AppConfig:
     ai_usage: AiUsageConfig = AiUsageConfig()
     notes: NotesConfig = NotesConfig()
     auto_recovery: AutoRecoveryConfig = AutoRecoveryConfig()
+    session_health: SessionHealthConfig = SessionHealthConfig()
     # Loop-protection metadata schema (see docs/prompt-submission.md, P11):
     # terminal_send_text/_granted accept optional origin/trace_id/parent_
     # turn_id/depth kwargs (all unused by every current caller -- MCP tools,
@@ -1496,6 +1527,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ai_usage=_load_ai_usage_config(raw.get("ai_usage", {})),
         notes=_load_notes_config(raw.get("notes", {})),
         auto_recovery=_load_auto_recovery_config(raw.get("auto_recovery", {})),
+        session_health=_load_session_health_config(raw.get("session_health", {})),
     )
 
 
@@ -1705,6 +1737,37 @@ def _load_ai_usage_config(raw: object) -> AiUsageConfig:
         enabled=bool(raw.get("enabled", True)), base_url=str(raw.get("base_url", AiUsageConfig.base_url)),
         timeout_seconds=timeout, cache_ttl_seconds=cache_ttl,
         warning_threshold_percent=warning, critical_threshold_percent=critical,
+    )
+
+
+def _load_session_health_config(raw: object) -> SessionHealthConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    defaults = SessionHealthConfig()
+    watch = float(raw.get("watch_percent", defaults.watch_percent))
+    prepare = float(raw.get("prepare_rollover_percent", defaults.prepare_rollover_percent))
+    finish = float(raw.get("finish_rollover_percent", defaults.finish_rollover_percent))
+    checkpoint = float(raw.get("checkpoint_only_percent", defaults.checkpoint_only_percent))
+    cache_seconds = float(raw.get("git_probe_cache_seconds", defaults.git_probe_cache_seconds))
+    for name, value in (("watch_percent", watch), ("prepare_rollover_percent", prepare),
+                        ("finish_rollover_percent", finish), ("checkpoint_only_percent", checkpoint)):
+        if not 0 <= value <= 100:
+            raise ValueError(f"session_health.{name} must be 0-100")
+    # Strictly increasing, because a non-monotonic table would make a band
+    # unreachable -- a misconfiguration that silently never fires is worse
+    # than a startup error.
+    if not watch < prepare < finish < checkpoint:
+        raise ValueError("session_health thresholds must be strictly increasing: "
+                         "watch_percent < prepare_rollover_percent < finish_rollover_percent "
+                         "< checkpoint_only_percent")
+    if cache_seconds < 0:
+        raise ValueError("session_health.git_probe_cache_seconds must be non-negative")
+    return SessionHealthConfig(
+        enabled=bool(raw.get("enabled", defaults.enabled)),
+        watch_percent=watch, prepare_rollover_percent=prepare,
+        finish_rollover_percent=finish, checkpoint_only_percent=checkpoint,
+        git_probe_enabled=bool(raw.get("git_probe_enabled", defaults.git_probe_enabled)),
+        git_probe_cache_seconds=cache_seconds,
     )
 
 

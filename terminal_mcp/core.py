@@ -29,6 +29,8 @@ from .redaction import (redact_ansi_safe, redact_output, redact_text,
 from .session_backend import SessionBackend
 from .session_knowledge import SessionKnowledgeStore, make_instance_id
 from .session_registry import SessionRegistryStore
+from .session_resource import (ContextPolicy, build_resource_block,
+                              parse_session_resources, probe_git_state)
 from .status import classify_status
 from .submit_watchdog import (ACK_ACCEPTED, ACK_NODE_UNAVAILABLE, ACK_RUNNING, ACK_STUCK, Submission,
                                SubmissionStore, SubmissionSweeper, VerifiedSubmitWatchdog, WatchdogConfig)
@@ -1455,9 +1457,73 @@ class TerminalService:
             record = self.session_registry.get(self.REGISTRY_LOCAL_NODE_ID, session)
             if record is not None and record.recovery_state:
                 payload["recovery_state"] = record.recovery_state
+            # TMCP-SESSION-HEALTH-001: normalized session resource health,
+            # derived from the SAME 80-line capture already taken above --
+            # no extra pane read, no second API surface. Additive: the key
+            # is simply absent when session_health.enabled is false, and
+            # every field above is untouched either way.
+            resource = self._session_resource_block(info, output, record)
+            if resource is not None:
+                payload["resource"] = resource
             return payload
         except TmuxError as exc:
             return {"error": "TMUX_ERROR", "session": session, "reason": str(exc)}
+
+    def _session_resource_block(self, info: Any, output: str, record: Any) -> dict[str, Any] | None:
+        """Session resource health for one pane, or None when disabled.
+
+        Never raises: a status read is the one call an operator and every
+        autonomous poller depend on, so a parser bug or a git hiccup must
+        degrade to "unknown", never to a failed status. Everything here is
+        best-effort evidence -- see session_resource.py for why each field
+        is null rather than guessed when it was not actually observed.
+        """
+        config = getattr(self.config, "session_health", None)
+        if config is None or not config.enabled:
+            return None
+        try:
+            agent = self._classify_agent_type(info.pane_current_command)
+            parsed = parse_session_resources(output)
+            cwd = info.pane_current_path or (record.cwd if record is not None else None)
+            git: dict[str, Any] = {"repo": None, "branch": None, "dirty": None}
+            if config.git_probe_enabled:
+                git = probe_git_state(cwd, cache_seconds=config.git_probe_cache_seconds)
+            # The registry already maintains repo_root/git_branch on every
+            # reconcile pass; prefer the live probe and fall back to it
+            # rather than re-deriving anything.
+            if record is not None:
+                git["repo"] = git.get("repo") or record.repo_root
+                git["branch"] = git.get("branch") or record.git_branch
+            checkpoint = {
+                # Rollover foundation (item 5): the identifiers a rollover
+                # must carry forward, taken from the state this project
+                # ALREADY persists. task_id/resume_token live in the run
+                # journal per wait, not per session -- the keys are present
+                # with null so the shape a caller reads never changes.
+                "task_id": None,
+                "resume_token": None,
+                # Prefer the live probe: for a session in a worktree the
+                # registry may not have caught up, and the branch a rollover
+                # must resume on has to be the one actually checked out.
+                "branch": git.get("branch") or (record.git_branch if record is not None else None),
+                "last_commit": record.last_commit if record is not None else None,
+                "conversation_id": record.conversation_id if record is not None else None,
+                "worktree_path": record.worktree_path if record is not None else None,
+                "cwd": cwd,
+                "last_checkpoint_at": record.last_checkpoint_at if record is not None else None,
+            }
+            return build_resource_block(
+                agent=agent, parsed=parsed, git=git, checkpoint=checkpoint,
+                policy=ContextPolicy(
+                    watch_percent=config.watch_percent,
+                    prepare_rollover_percent=config.prepare_rollover_percent,
+                    finish_rollover_percent=config.finish_rollover_percent,
+                    checkpoint_only_percent=config.checkpoint_only_percent),
+                quota_warning_percent=self.config.ai_usage.warning_threshold_percent,
+                quota_critical_percent=self.config.ai_usage.critical_threshold_percent,
+            )
+        except Exception:  # noqa: BLE001 -- resource health must never break terminal_status
+            return None
 
     def _acquire_pane_lease(self, lock_key: str, owner_id: str) -> bool:
         """P0 Part B: bounded serialize-then-fail-safe. A concurrent

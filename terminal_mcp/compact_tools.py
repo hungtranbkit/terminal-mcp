@@ -136,6 +136,15 @@ class CompactTerminalTools:
                 "tail": rendered,
                 "tail_truncated": bool(clipped or tail.get("truncated", False)),
             }
+            # TMCP-SESSION-HEALTH-001: pass the canonical status payload's
+            # own `resource` block straight through, in BOTH compact and
+            # full mode. It is the field a dispatcher needs precisely when
+            # it is asking about many sessions at once, and it is small
+            # (fixed keys, numbers and short enum strings -- no pane text),
+            # so it does not compete with the tail budget. Absent whenever
+            # the status payload had none, so no existing response changes.
+            if isinstance(status.get("resource"), dict):
+                row["resource"] = status["resource"]
             if not compact:
                 row["exists"] = status.get("exists")
                 row["cwd"] = status.get("cwd")
