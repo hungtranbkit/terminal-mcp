@@ -84,8 +84,22 @@ def test_an_unknown_action_is_refused_and_names_what_is_allowed():
     assert result["aliases"]["list"] == "list_sessions"
 
 
-@pytest.mark.parametrize("alias,canonical", sorted(TURN_ACTION_ALIASES.items()))
-def test_every_alias_resolves_to_its_canonical_action(alias, canonical):
+def test_every_alias_points_at_a_real_action():
+    """An alias whose canonical name is not an action would be a silent
+    INVALID_ACTION for anyone who used the short spelling. `start` is a PANE
+    action, so its aliases have no handler key -- which is why the routed-alias
+    test below is scoped to TURN_HANDLER_ACTIONS."""
+    for alias, canonical in TURN_ACTION_ALIASES.items():
+        assert canonical in TURN_ACTIONS, f"{alias} -> {canonical} is not an action"
+
+
+_ROUTED_ALIASES = sorted((alias, canonical) for alias, canonical
+                         in TURN_ACTION_ALIASES.items()
+                         if canonical in TURN_HANDLER_ACTIONS)
+
+
+@pytest.mark.parametrize("alias,canonical", _ROUTED_ALIASES)
+def test_every_routed_alias_resolves_to_its_canonical_action(alias, canonical):
     handler = Recorder()
     tools = _tools({TURN_HANDLER_ACTIONS[canonical]: handler})
     # The union of what the various verbs require -- browser_verify/
@@ -237,12 +251,18 @@ def test_turn_handler_map_covers_every_routed_action():
     def stub():
         return None
 
+    from terminal_mcp.compact_tools import START_HANDLER_KEYS
+
     mapping = turn_handler_map(
         list_sessions=stub, list_nodes=stub, create_session=stub,
         delete_session=stub, enqueue_task=stub, task_status=stub,
         task_batch_status=stub, browser_status=stub, browser_verify=stub,
-        browser_screenshot=stub, browser_stop=stub)
-    assert set(mapping) == set(TURN_HANDLER_ACTIONS.values())
+        browser_screenshot=stub, browser_stop=stub, dispatch_tick=stub,
+        follow_task=stub)
+    # Every routed action, plus the keys `start` composes -- those are handlers
+    # but not actions of their own, so this is a subset check, not equality.
+    assert set(TURN_HANDLER_ACTIONS.values()) <= set(mapping)
+    assert set(START_HANDLER_KEYS) <= set(mapping)
     assert all(callable(value) for value in mapping.values())
 
 

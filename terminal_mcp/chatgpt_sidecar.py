@@ -115,45 +115,127 @@ BACKEND_UNAVAILABLE = "BACKEND_UNAVAILABLE"
 #: surface a connector is actually attached to. That is the whole diagnostic
 #: gap that made this bug recur: a stale legacy-six connector and a healthy
 #: one were indistinguishable from inside a chat.
-SURFACE_VERSION = "2.0.0"
+SURFACE_VERSION = "2.1.0"
 
-# Read-only compatibility for ChatGPT conversations whose connector identity
-# is still pinned to the historical six-tool catalog.  These names are NOT
-# advertised by tools/list (CATALOG remains the only public contract), but an
-# already-open/stale client is allowed to call the one safe inspection verb it
-# knows.  The sidecar translates it to the canonical compact operation, so the
-# backend still executes terminal_turn/action=inspect and returns the same
-# resource-health block as terminal_batch_inspect.
+# CACHED-CALL TRANSLATION: every legacy name this surface used to advertise is
+# accepted at CALL time and rewritten into the equivalent terminal_turn action.
 #
-# Mutating legacy tools are intentionally NOT present here: a stale schema must
-# never resurrect raw terminal_send_text/terminal_send_keys on the compact
-# surface.
+# WHY TRANSLATE RATHER THAN FORWARD. These names are all still real tools on the
+# full controller, so forwarding them verbatim "works" -- which is exactly the
+# trap. terminal_turn is where the current behaviour lives: the guarded send
+# path, the server-side wait/poll/task-following that TMCP-CALLED-TOOL-SPAM-002
+# moved off the client, the resource-health block. A cached connector that calls
+# terminal_batch_inspect or terminal_wait_for_state DIRECTLY silently gets the
+# older, thinner semantics and starts polling again -- a stale catalog quietly
+# buying a stale workflow. Translating means a cached conversation executes the
+# same canonical operation a new one does, and improvements to terminal_turn
+# reach both without the client ever updating.
+#
+# This is a CALL-time allowance and never a listing: nothing here can put a row
+# back in tools/list (CATALOG remains the only public contract), and every
+# translation lands on an action terminal_turn already validates, so the backend
+# stays the only authority on authorization and idempotency.
+#
+# NOT translated, and deliberately still refused: terminal_send_keys (raw
+# keystroke injection has no guarded equivalent -- terminal_turn(action=send) is
+# a composed, verified submission, not a key sequence) and every admin tool on
+# the 293-tool surface. terminal_send_text IS translated, because routing a
+# cached text send through the guarded action is strictly safer than either
+# refusing it (a cached conversation loses the ability to send at all) or
+# forwarding it raw.
+#
+# Each entry: the target action, how the legacy argument names map onto
+# terminal_turn's, which of those are required, and constants to add.
+_LEGACY_TRANSLATIONS: dict[str, dict[str, Any]] = {
+    "terminal_status": {
+        "action": "inspect", "rename": {"session": "target"}, "required": ("target",),
+        # One bounded line is enough: resource health is carried by the status
+        # payload, not inferred from the returned tail.
+        "constants": {"tail_lines": 1, "compact": True},
+    },
+    "terminal_batch_inspect": {
+        "action": "inspect", "keep": ("targets", "tail_lines", "compact"),
+        "required": ("targets",),
+    },
+    "terminal_list_sessions": {"action": "list_sessions"},
+    "terminal_list_nodes": {"action": "list_nodes"},
+    "terminal_create_session": {
+        "action": "create_session", "rename": {"name": "target"},
+        "keep": ("agent_type", "working_directory", "initial_prompt", "grant_mode",
+                 "binding", "node"),
+        "required": ("target",),
+    },
+    "terminal_delete_session": {
+        "action": "delete_session", "rename": {"name": "target"}, "required": ("target",),
+    },
+    "terminal_send_text": {
+        "action": "send", "rename": {"session": "target"}, "keep": ("text",),
+        "required": ("target", "text"),
+    },
+    "terminal_wait_for_state": {
+        "action": "wait",
+        "keep": ("target", "desired_states", "timeout", "poll_interval", "tail_lines"),
+        "required": ("target", "desired_states"),
+    },
+    "terminal_resume_wait": {
+        "action": "resume", "keep": ("resume_token", "timeout", "poll_interval"),
+        "required": ("resume_token",),
+    },
+    "terminal_enqueue_task": {
+        "action": "enqueue_task", "rename": {"session": "target", "prompt": "text"},
+        "keep": ("title", "priority", "metadata", "request_key"),
+        "required": ("target", "text"),
+    },
+    "terminal_task_status": {
+        "action": "task_status", "keep": ("task_id",), "required": ("task_id",),
+    },
+    "terminal_task_batch_status": {
+        "action": "task_batch_status", "keep": ("task_ids",), "required": ("task_ids",),
+    },
+}
+
+#: The accepted cached names, as a set. Kept as its own public name because it
+#: is what a caller/test asks "is this still callable here?" with.
+CALL_COMPAT = frozenset(_LEGACY_TRANSLATIONS)
+#: Retained for compatibility with the first bridge, which only handled
+#: terminal_status. Now simply the read-only subset of the table above.
 LEGACY_READ_COMPAT = frozenset({"terminal_status"})
 
-# Names this surface USED to advertise (v1.x) and still EXECUTES, though
-# tools/list no longer offers them. Shrinking the catalog must not break a
-# conversation that is already open: a connector caches the catalog, so a
-# client attached before v2.0.0 will keep calling these for as long as its
-# cache lives. They are forwarded verbatim -- each is a real backend tool, and
-# the backend remains the only authority -- so an in-flight orchestration
-# neither breaks nor silently changes behaviour.
-#
-# This is a CALL-time allowance, never a listing: nothing here can put a row
-# back in the catalog, and admin tools are still refused outright. Every one of
-# these is reachable as a terminal_turn action, which is what new
-# conversations get.
-CALL_COMPAT = frozenset({
-    "terminal_batch_inspect",
-    "terminal_enqueue_task",
-    "terminal_task_status",
-    "terminal_task_batch_status",
-    "terminal_wait_for_state",
-    "terminal_resume_wait",
-    "terminal_list_sessions",
-    "terminal_create_session",
-    "terminal_delete_session",
-    "terminal_list_nodes",
-})
+
+class _UntranslatableCall(ValueError):
+    """A cached call naming a translatable tool but missing a required field."""
+
+
+def translate_legacy_call(name: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
+    """terminal_turn arguments for a cached legacy call, or None if `name` is
+    not one.
+
+    Raises _UntranslatableCall when the legacy arguments cannot produce a valid
+    action -- refusing is right there, because guessing a target or a prompt is
+    how a compatibility shim ends up sending the wrong thing to the wrong pane.
+    """
+    spec = _LEGACY_TRANSLATIONS.get(name)
+    if spec is None:
+        return None
+    translated: dict[str, Any] = {"action": spec["action"]}
+    for legacy_key, turn_key in (spec.get("rename") or {}).items():
+        if legacy_key in arguments:
+            translated[turn_key] = arguments[legacy_key]
+    for key in spec.get("keep") or ():
+        if key in arguments:
+            translated[key] = arguments[key]
+    translated.update(spec.get("constants") or {})
+    for key in spec.get("required") or ():
+        value = translated.get(key)
+        # A blank string or an empty list is the same as absent: both are a
+        # client that lost its arguments, not a client asking for nothing.
+        if value is None or (isinstance(value, (str, list, tuple)) and not
+                             (value.strip() if isinstance(value, str) else value)):
+            raise _UntranslatableCall(
+                f"{name} compatibility requires {key!r}")
+        if isinstance(value, str):
+            translated[key] = value.strip()
+    return translated
 
 
 def compact_instructions() -> str:
@@ -184,10 +266,11 @@ def compact_instructions() -> str:
         "If the tool list you can see offers more than that one tool, you are "
         "attached to a STALE CACHED CATALOG. Those older names (terminal_batch_"
         "inspect, terminal_enqueue_task, terminal_wait_for_state, "
-        "terminal_list_sessions and the other v1 names, plus terminal_status) are "
-        "still accepted for compatibility so an open conversation keeps working, "
-        "but prefer terminal_turn; re-point/reconnect obtains the canonical "
-        "catalog.\n"
+        "terminal_list_sessions, terminal_status, terminal_send_text and the "
+        "other v1 names) still work: this surface TRANSLATES each one into the "
+        "equivalent terminal_turn action, so you get the current behaviour "
+        "either way. Prefer terminal_turn; re-point/reconnect obtains the "
+        "canonical catalog.\n"
         "This surface deliberately has NO terminal_send_text/terminal_send_keys: "
         "terminal_turn(action=send) is the guarded replacement. Admin tools live "
         "on the full endpoint and are not reachable here.\n\n"
@@ -324,38 +407,34 @@ def build_sidecar(backend: Backend | None = None, *,
         call_name = params.name
         call_args = dict(params.arguments or {})
 
-        # Compatibility bridge for the connector-cache incident.  A stale
-        # ChatGPT conversation can only emit the old terminal_status schema,
-        # even while tools/list on this endpoint correctly serves CATALOG.
-        # Keep the bridge read-only and translate to the COMPACT backend verb;
-        # do not forward terminal_status itself, and never alias raw sends.
-        if call_name in LEGACY_READ_COMPAT:
-            session = call_args.get("session")
-            if not isinstance(session, str) or not session.strip():
+        # Cached-catalog compatibility. A stale ChatGPT conversation can only
+        # emit the schema it cached, even while tools/list on this endpoint
+        # correctly serves CATALOG. Every legacy name is REWRITTEN into the
+        # equivalent terminal_turn action rather than forwarded, so a cached
+        # conversation executes the same canonical operation a new one does --
+        # see _LEGACY_TRANSLATIONS for why forwarding verbatim is the trap.
+        if call_name not in catalog:
+            try:
+                translated = translate_legacy_call(call_name, call_args)
+            except _UntranslatableCall as exc:
                 return types.CallToolResult(
-                    content=[types.TextContent(type="text", text=(
-                        "INVALID_ARGUMENT: terminal_status compatibility requires "
-                        "a non-empty session"))],
+                    content=[types.TextContent(type="text",
+                                               text=f"INVALID_ARGUMENT: {exc}")],
                     is_error=True)
+            if translated is None:
+                # Genuinely not on this surface. Refused here rather than
+                # forwarded: the compact endpoint's whole value is that it
+                # cannot be used to reach the rest of the 293-tool surface.
+                return types.CallToolResult(
+                    content=[types.TextContent(
+                        type="text",
+                        text=(f"TOOL_NOT_ON_THIS_SURFACE: {params.name!r} is not part of "
+                              f"{SERVER_NAME}. Use the full /mcp endpoint for admin tools."))],
+                    is_error=True)
+            _log.info("chatgpt-v1: translated cached call %s -> terminal_turn(action=%s)",
+                      call_name, translated["action"])
             call_name = "terminal_turn"
-            call_args = {
-                "action": "inspect",
-                "target": session.strip(),
-                # One bounded line is enough because resource health is carried
-                # by the status payload, not inferred from this returned tail.
-                "tail_lines": 1,
-                "compact": True,
-            }
-        elif call_name not in catalog and call_name not in CALL_COMPAT:
-            # Not on this surface. Refused here rather than forwarded: the
-            # compact endpoint's whole value is that it cannot be used to
-            # reach the rest of the 293-tool surface.
-            return types.CallToolResult(
-                content=[types.TextContent(
-                    type="text",
-                    text=(f"TOOL_NOT_ON_THIS_SURFACE: {params.name!r} is not part of "
-                          f"{SERVER_NAME}. Use the full /mcp endpoint for admin tools."))],
-                is_error=True)
+            call_args = translated
         try:
             return await client.call_tool(call_name, call_args)
         except BackendUnavailable as exc:

@@ -95,27 +95,113 @@ V1_CATALOG = (
 )
 
 
+#: Cached legacy call -> (arguments it would send, the terminal_turn action it
+#: must become). Every one of these is a real v1/legacy schema, so the mapping
+#: is what a stale conversation actually emits, not a paraphrase.
+CACHED_CALLS = (
+    ("terminal_batch_inspect", {"targets": ["s1", "s2"], "tail_lines": 3, "compact": True},
+     "inspect"),
+    ("terminal_status", {"session": "s1"}, "inspect"),
+    ("terminal_list_sessions", {}, "list_sessions"),
+    ("terminal_list_nodes", {}, "list_nodes"),
+    ("terminal_create_session", {"name": "agent-new", "agent_type": "claude"},
+     "create_session"),
+    ("terminal_delete_session", {"name": "agent-old"}, "delete_session"),
+    ("terminal_send_text", {"session": "s1", "text": "go"}, "send"),
+    ("terminal_wait_for_state", {"target": "s1", "desired_states": ["IDLE"]}, "wait"),
+    ("terminal_resume_wait", {"resume_token": "wait_" + "0" * 32}, "resume"),
+    ("terminal_enqueue_task", {"session": "s1", "prompt": "run it"}, "enqueue_task"),
+    ("terminal_task_status", {"task_id": "t1"}, "task_status"),
+    ("terminal_task_batch_status", {"task_ids": ["t1"]}, "task_batch_status"),
+)
+
+
+@pytest.mark.parametrize("name,arguments,action", CACHED_CALLS)
+def test_a_cached_legacy_call_is_translated_to_the_turn_action(name, arguments, action):
+    """THE compatibility contract. A cached name must not merely be tolerated:
+    it must execute the CANONICAL operation, because terminal_turn is where the
+    guarded send path and the server-side wait/task-following live. Forwarding
+    verbatim would silently buy a stale workflow with a stale catalog."""
+    assert name not in CATALOG, f"{name} must never be advertised"
+    assert name in sidecar.CALL_COMPAT, f"{name} must stay callable"
+    backend = FakeBackend()
+    result = _call_tool(build_sidecar(backend), name, arguments)
+    assert result.is_error in (False, None), name
+    assert len(backend.calls) == 1
+    called_name, called_args = backend.calls[0]
+    assert called_name == "terminal_turn", f"{name} must be translated, not forwarded"
+    assert called_args["action"] == action
+
+
+def test_the_cached_batch_inspect_translation_carries_its_arguments():
+    backend = FakeBackend()
+    result = _call_tool(build_sidecar(backend), "terminal_batch_inspect",
+                        {"targets": ["s1", "s2"], "tail_lines": 3, "compact": False})
+    assert result.is_error in (False, None)
+    assert backend.calls == [("terminal_turn", {
+        "action": "inspect", "targets": ["s1", "s2"], "tail_lines": 3, "compact": False,
+    })]
+
+
 def test_every_retired_v1_tool_is_still_callable_but_never_advertised():
     """Shrinking the catalog must not break a conversation that is already
     open: a connector caches the catalog, so a client attached before v2.0.0
     keeps calling the v1 names until its cache turns over."""
+    translated = {name for name, _args, _action in CACHED_CALLS}
     for name in V1_CATALOG:
         if name == "terminal_turn":
             continue
         assert name not in CATALOG, f"{name} must not be advertised"
         assert name in sidecar.CALL_COMPAT, f"{name} must stay callable"
-        backend = FakeBackend()
-        result = _call_tool(build_sidecar(backend), name, {"targets": ["x"]})
-        assert result.is_error in (False, None), name
-        assert backend.calls == [(name, {"targets": ["x"]})], \
-            f"{name} must forward verbatim to the backend"
+        assert name in translated, f"{name} needs a translation assertion"
 
 
-def test_call_compat_never_reopens_a_mutating_raw_tool():
-    for forbidden in ("terminal_send_text", "terminal_send_keys",
-                      "terminal_send_text_granted", "terminal_kill_session"):
+@pytest.mark.parametrize("name,arguments", [
+    ("terminal_batch_inspect", {}),
+    ("terminal_batch_inspect", {"targets": []}),
+    ("terminal_status", {"session": "   "}),
+    ("terminal_create_session", {"agent_type": "claude"}),
+    ("terminal_send_text", {"session": "s1"}),
+    ("terminal_enqueue_task", {"session": "s1"}),
+    ("terminal_task_status", {}),
+    ("terminal_wait_for_state", {"target": "s1"}),
+])
+def test_a_cached_call_missing_its_arguments_is_refused_not_guessed(name, arguments):
+    """Guessing a target or a prompt is how a compatibility shim sends the
+    wrong thing to the wrong pane."""
+    backend = FakeBackend()
+    result = _call_tool(build_sidecar(backend), name, arguments)
+    assert result.is_error is True
+    assert "INVALID_ARGUMENT" in _text(result)
+    assert backend.calls == [], "a refused call must not reach the controller"
+
+
+def test_raw_keystroke_injection_is_never_reopened():
+    """terminal_send_text IS accepted, but only by translation to the guarded
+    action -- raw key injection has no guarded equivalent and stays refused,
+    along with every granted/admin variant."""
+    for forbidden in ("terminal_send_keys", "terminal_send_text_granted",
+                      "terminal_kill_session", "terminal_send_bound"):
         assert forbidden not in sidecar.CALL_COMPAT
         assert forbidden not in CATALOG
+        backend = FakeBackend()
+        result = _call_tool(build_sidecar(backend), forbidden, {"session": "s1"})
+        assert result.is_error is True
+        assert "TOOL_NOT_ON_THIS_SURFACE" in _text(result)
+        assert backend.calls == []
+
+
+def test_a_cached_send_text_becomes_the_guarded_send_action():
+    backend = FakeBackend()
+    result = _call_tool(build_sidecar(backend), "terminal_send_text",
+                        {"session": "claude-1", "text": "go", "press_enter": True})
+    assert result.is_error in (False, None)
+    name, args = backend.calls[0]
+    assert name == "terminal_turn"
+    assert args == {"action": "send", "target": "claude-1", "text": "go"}
+    # press_enter is not forwarded: the guarded action owns submission, and a
+    # cached client's key-level flag must not steer it.
+    assert "press_enter" not in args
 
 
 def test_every_retired_tool_is_reachable_as_a_turn_action():
@@ -313,7 +399,8 @@ def test_an_unreachable_backend_is_a_clean_error_not_a_stack_trace():
 
 def test_a_backend_timeout_is_a_clean_error_naming_the_tool():
     backend = FakeBackend(raises=TimeoutError(), timeout_seconds=30.0)
-    result = _call_tool(build_sidecar(backend), "terminal_wait_for_state")
+    result = _call_tool(build_sidecar(backend), "terminal_wait_for_state",
+                        {"target": "s1", "desired_states": ["IDLE"]})
     assert result.is_error is True
     body = _text(result)
     assert body.startswith(f"{BACKEND_UNAVAILABLE}:")
