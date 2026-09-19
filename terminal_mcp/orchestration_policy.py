@@ -37,7 +37,7 @@ Design commitments:
 
 from __future__ import annotations
 
-ORCHESTRATION_POLICY_VERSION = "1.0.0"
+ORCHESTRATION_POLICY_VERSION = "1.1.0"
 
 #: Where the expanded, human-readable form lives, relative to the repo root.
 POLICY_DOC_PATH = "docs/CHATGPT_ORCHESTRATION_POLICY.md"
@@ -57,10 +57,16 @@ PROMPT_RETRY_CAP = 6
 # ---------------------------------------------------------------------------
 TOOL_EFFICIENCY = (
     "TOOL USE. PREFER terminal_turn for normal terminal work so one logical ChatGPT turn becomes "
-    "one MCP call -- one compact tool per logical terminal operation. Use action=inspect for one "
-    "or many targets, "
-    "send for a guarded task (use long_task=true for durable long work), send_wait to submit and wait in one call, wait for a new durable "
-    "wait, and resume only when a prior turn returned PENDING. "
+    "one MCP call -- one compact tool per logical terminal operation. "
+    "GIVING A SESSION WORK IS ONE CALL: action=start (equivalently send with long_task=true) "
+    "persists the task durably, dispatches it and returns a task_id; the server carries it from "
+    "there. After start, STOP -- do not call wait, resume or inspect to watch it, and do not "
+    "re-send. The same holds after any SUBMIT_CONFIRMED or PENDING result: the work is tracked "
+    "server-side, so polling adds tool rows and no information. Check with action=task and the "
+    "task_id ONLY when the user explicitly asks how it is going. "
+    "Use action=inspect for one or many targets, "
+    "send for a guarded task whose receipt you need, send_wait only when the user asked you to "
+    "wait, wait for a new durable wait, and resume only when a prior turn returned PENDING. "
     "terminal_batch_inspect/terminal_send_task/terminal_wait_for_state/terminal_resume_wait remain "
     "compact compatibility tools; terminal_status, terminal_tail and terminal_send_text are "
     "LOW-LEVEL/MANUAL only. Do not split an inspect into separate status+tail calls, and do not "
@@ -86,9 +92,12 @@ EXECUTION_FLOW = (
     "DEFAULT FLOW. 1) Inspect project and session state before dispatching anything. "
     "2) Prefer ONE primary, long-lived Claude session per substantial task or project over many "
     "parallel sessions. 3) Split work into durable small checkpoints when it is large, but keep "
-    "one coherent primary runner. 4) Send the implementation contract to that Claude session. "
+    "one coherent primary runner. 4) Send the implementation contract to that Claude session "
+    "with ONE terminal_turn action=start call, which persists it durably and dispatches it. "
     "5) VERIFY the prompt actually landed AND that execution started before you stop checking -- "
-    "a prompt sitting unsent in the composer is the normal failure, not an exception. If delivery "
+    "but that verification is the SERVER'S job, not a client polling loop: start, and the "
+    "prompt-start watcher beneath it, do it and report the outcome in that same call. "
+    "A prompt sitting unsent in the composer is the normal failure, not an exception. If delivery "
     f"is unconfirmed or not started, retry safely up to {PROMPT_RETRY_CAP} attempts; never retry "
     "blindly while the target shows an approval, menu or input-required state, and honour "
     "idempotency/request_key wherever a tool exposes it. 6) Let Claude implement and run local "
@@ -131,7 +140,10 @@ FAILURE_RECOVERY = (
 
 EFFICIENCY = (
     "EFFICIENCY. Prefer the compact and batch inspection tools wherever they are exposed, and "
-    "avoid repeated status/tail polling. Do not install additional overlapping harnesses "
+    "avoid repeated status/tail polling. One user request should cost ONE terminal_turn call in "
+    "the normal case; if you are about to call again only to see whether the first call is "
+    "progressing, do not -- that is what the durable task_id and the server-side watcher "
+    "are for. Do not install additional overlapping harnesses "
     "(Everything Claude Code, Superpowers, planning-with-files, GitHub MCP, Playwright MCP) "
     "merely to perform this workflow. Terminal MCP stays the single control plane."
 )
@@ -171,6 +183,10 @@ CRITICAL_INVARIANTS: tuple[str, ...] = (
     "/codex:rescue",
     "review gate stays DISABLED by default",
     "Default to one primary Claude executor",
+    # TMCP-CALLED-TOOL-SPAM-002: the one-call rule is load-bearing too -- a
+    # policy that quietly loses it puts the "Called tool" wall straight back.
+    "GIVING A SESSION WORK IS ONE CALL",
+    "After start, STOP",
     "PRODUCTION DEPLOYMENT AND RELEASE REMAIN A SEPARATE, EXPLICIT USER APPROVAL STEP",
 )
 
