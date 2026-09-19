@@ -352,3 +352,254 @@ def test_reconciled_stale_dispatch_reuses_the_same_idempotency_key_and_never_dou
     assert store.get_task(task_id).status == RUNNING
     final_task = store.get_task(task_id)
     assert final_task.dispatch_idempotency_key == first_key
+
+
+# ---------------------------------------------------------------------------
+# TMCP-RETRY-CONTEXT-002: a retry continues; it does not replay the prompt.
+#
+# The production failure: build_dispatch_text embedded task.prompt verbatim on
+# EVERY attempt, so a retried long task looked exactly like a brand-new one to
+# the agent, which re-planned and discarded an hour of reasoning.
+# ---------------------------------------------------------------------------
+
+PROMPT = "please do the real work carefully"
+
+
+def _fail_then_retry(store, task_id):
+    """A retry is only reachable from a real failure, so get there honestly
+    rather than forcing an invalid RUNNING -> QUEUED transition."""
+    store.transition_task(task_id, BLOCKED, event_type="BLOCKED", reason="simulated interruption")
+    store.retry_task(task_id)
+
+def _dispatch_once(store, ops, session="lane-a"):
+    """Claim -> review -> dispatch, returning the text actually sent."""
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    for _ in range(4):
+        result = engine.tick(session)
+        if result.action == "DISPATCHED":
+            return ops.sent[-1]["text"]
+        if result.action.startswith("BLOCKED") or result.action == "IDLE":
+            raise AssertionError(f"did not reach dispatch: {result.action} {result.detail}")
+    raise AssertionError("dispatch never happened")
+
+
+def test_first_attempt_still_sends_the_prompt_verbatim(store, ops):
+    # Unchanged behaviour for a brand-new task -- the fix must not touch it.
+    _make_task(store, prompt=PROMPT)
+    ops.set_status("lane-a", {"state": "IDLE", "node_id": "local", "cwd": "/repo/a"})
+    text = _dispatch_once(store, ops)
+    assert PROMPT in text
+
+
+def test_retry_into_a_live_session_continues_instead_of_replaying_the_prompt(store, ops):
+    task_id = _make_task(store, prompt=PROMPT)
+    ops.set_status("lane-a", {"state": "IDLE", "exists": True, "node_id": "local", "cwd": "/repo/a"})
+    _dispatch_once(store, ops)              # attempt 1 -- the real prompt
+    _fail_then_retry(store, task_id)        # operator retry; attempt_count is now 1
+    ops.sent.clear()
+
+    text = _dispatch_once(store, ops)
+
+    assert PROMPT not in text                               # (g) no replay
+    assert "continue the SAME task, do not start over" in text
+    assert f"task_id={task_id}" in text                     # same logical task
+    assert "/clear" not in text                             # (b) no history destruction
+    # The completion protocol still travels with a continued attempt.
+    assert "###TERMINAL_MCP_COMPLETION" in text
+
+
+def _plan_for(store, ops, task_id, status_response, session="lane-a"):
+    """The retry plan the engine would use for THIS task's next dispatch.
+
+    Exercised directly rather than through tick() because a task whose session
+    is gone correctly never reaches _dispatch at all -- the coordinator parks it
+    as WAITING_SESSION first, which is existing behaviour worth keeping. The
+    escalation itself is still the engine's own, not a re-implementation.
+    """
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    ops.set_status(session, status_response)
+    task = store.get_task(task_id)
+    return engine._retry_plan_for(task, session)
+
+
+def _retryable_task(store, metadata=None, session="lane-a"):
+    """A task that has already had one attempt, so the next dispatch is a retry."""
+    (task_id,) = store.set_tasks(session, [{"prompt": PROMPT, "metadata": metadata or {}}])
+    store.transition_task(task_id, "PRECHECK", event_type="CLAIMED")
+    store.transition_task(task_id, "READY", event_type="COORDINATOR_APPROVED")
+    store.transition_task(task_id, "DISPATCHING", event_type="DISPATCHED")
+    store.transition_task(task_id, BLOCKED, event_type="BLOCKED", reason="simulated interruption")
+    store.retry_task(task_id)
+    return task_id
+
+
+def test_retry_with_no_recoverable_context_plans_recovery_restart(store, ops):
+    # RECOVERY_RESTART is reachable, and it is the only mode that replays --
+    # _retry_plan_for reports None for it so the caller falls back to the prompt.
+    task_id = _retryable_task(store)
+    assert _plan_for(store, ops, task_id, {"error": "SESSION_NOT_FOUND"}) is None
+
+
+def test_retry_uses_the_durable_capsule_when_the_conversation_is_gone(store, ops):
+    task_id = _retryable_task(store, metadata={"recovery": {
+        "agent_type": "shell",
+        "capsule": {"completed_steps": ["step one done"], "next_step": "do step two",
+                    "branch": "fix/lane", "tests_run": ["tests/test_x.py"]},
+    }})
+    plan = _plan_for(store, ops, task_id, {"error": "SESSION_NOT_FOUND"})
+    assert plan is not None
+    assert plan.mode == "RESUME_FROM_CHECKPOINT"
+    assert PROMPT not in plan.continuation_text
+    assert "step one done" in plan.continuation_text     # completed work preserved
+    assert "do step two" in plan.continuation_text        # next step preserved
+    assert "fix/lane" in plan.continuation_text
+    assert plan.preserved["task_id"] == task_id
+
+
+def test_retry_resumes_the_native_conversation_when_the_agent_died(store, ops):
+    task_id = _retryable_task(store, metadata={"recovery": {
+        "agent_type": "claude", "conversation_id": "conv-xyz"}})
+    # The session exists but its agent is gone, so status cannot classify it.
+    plan = _plan_for(store, ops, task_id, {"state": "UNKNOWN", "exists": True, "node_id": "local"})
+    assert plan is not None
+    assert plan.mode == "RESUME_NATIVE_CONVERSATION"
+    assert plan.resume_conversation_id == "conv-xyz"
+    assert plan.relaunch_agent is True
+    assert plan.recreate_session is False       # the session survived; leave it alone
+    assert PROMPT not in plan.continuation_text
+
+
+def test_first_attempt_has_no_retry_plan_at_all(store, ops):
+    (task_id,) = store.set_tasks("lane-a", [{"prompt": PROMPT}])
+    assert _plan_for(store, ops, task_id, {"state": "IDLE", "exists": True}) is None
+
+
+def test_retry_fact_gathering_failure_never_strands_the_task(store, ops):
+    # A broken status lookup must degrade to today's behaviour, not refuse.
+    task_id = _make_task(store, prompt=PROMPT)
+    ops.set_status("lane-a", {"state": "IDLE", "exists": True, "node_id": "local", "cwd": "/repo/a"})
+    _dispatch_once(store, ops)
+    _fail_then_retry(store, task_id)
+
+    class ExplodingStatus(type(ops)):
+        def terminal_status(self, session):
+            if self.sent:  # let the coordinator's own pre-dispatch read succeed
+                raise RuntimeError("status backend down")
+            return {"state": "IDLE", "node_id": "local", "cwd": "/repo/a"}
+
+    broken = ExplodingStatus()
+    broken.status_by_session = dict(ops.status_by_session)
+    text = _dispatch_once(store, broken)
+    assert PROMPT in text  # fell back to replay rather than stranding the task
+
+
+# ---------------------------------------------------------------------------
+# Durable capsule WRITING, and native-resume EXECUTION.
+# ---------------------------------------------------------------------------
+
+def test_identity_is_persisted_before_the_send_not_after(store, ops):
+    # After an agent dies the pane is gone, so anything not already written is
+    # unrecoverable -- the snapshot has to happen before the dispatch.
+    (task_id,) = store.set_tasks("lane-a", [{"prompt": PROMPT}])
+    ops.set_status("lane-a", {"state": "IDLE", "exists": True, "node_id": "local",
+                              "cwd": "/repo/a", "resume_conversation_id": "conv-live"})
+    _dispatch_once(store, ops)
+    state = store.get_recovery_state(task_id)
+    assert state["conversation_id"] == "conv-live"
+    assert state["worktree"] == "/repo/a"
+    assert state["node_id"] == "local"
+
+
+def test_a_capsule_is_written_when_a_dispatch_is_blocked(store, ops):
+    (task_id,) = store.set_tasks("lane-a", [{"prompt": PROMPT}])
+    ops.set_status("lane-a", {"state": "IDLE", "exists": True, "node_id": "local", "cwd": "/repo/a"})
+    ops.set_capture("lane-a", {"output": "progress: finished step one\nabout to do step two"})
+
+    class RefusingOps(type(ops)):
+        def terminal_send_text(self, session, text, press_enter=False, dry_run=False, **kwargs):
+            return {"error": "TARGET_AWAITING_APPROVAL"}
+
+    refusing = RefusingOps()
+    refusing.status_by_session = dict(ops.status_by_session)
+    refusing.capture_by_session = dict(ops.capture_by_session)
+    engine = QueueEngine(store, refusing, coordinator=_always_ready_gate())
+    for _ in range(4):
+        if engine.tick("lane-a").action == "BLOCKED":
+            break
+    capsule = store.get_recovery_state(task_id).get("capsule") or {}
+    assert "finished step one" in (capsule.get("last_decision") or "")
+
+
+def test_native_resume_relaunches_through_registry_reopen(store, ops):
+    task_id = _retryable_task(store, metadata={"recovery": {
+        "agent_type": "claude", "conversation_id": "conv-xyz"}})
+
+    class ReopeningOps(type(ops)):
+        def __init__(self):
+            super().__init__()
+            self.reopened = []
+
+        def terminal_registry_reopen(self, session, resume_session_id=None):
+            self.reopened.append((session, resume_session_id))
+            return {"session": session, "state": "READY"}
+
+    reopening = ReopeningOps()
+    # Session exists, agent gone -> RESUME_NATIVE_CONVERSATION.
+    reopening.set_status("lane-a", {"state": "UNKNOWN", "exists": True, "node_id": "local", "cwd": "/repo/a"})
+    engine = QueueEngine(store, reopening, coordinator=_always_ready_gate())
+    for _ in range(4):
+        result = engine.tick("lane-a")
+        if result.action == "DISPATCHED":
+            break
+
+    assert reopening.reopened == [("lane-a", "conv-xyz")]   # the agent's OWN resume path
+    assert "retry_mode=RESUME_NATIVE_CONVERSATION" in (result.detail or "")
+    assert "native_resume=ok" in (result.detail or "")
+    assert PROMPT not in reopening.sent[-1]["text"]
+
+
+def test_a_controller_without_registry_reopen_never_claims_a_resume_it_did_not_do(store, ops):
+    # No reopen capability -> the continuation is still sent, but the result must
+    # not assert native_resume=ok.
+    _retryable_task(store, metadata={"recovery": {
+        "agent_type": "claude", "conversation_id": "conv-xyz"}})
+    ops.set_status("lane-a", {"state": "UNKNOWN", "exists": True, "node_id": "local", "cwd": "/repo/a"})
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    for _ in range(4):
+        result = engine.tick("lane-a")
+        if result.action == "DISPATCHED":
+            break
+    assert "retry_mode=RESUME_NATIVE_CONVERSATION" in (result.detail or "")
+    assert "native_resume=ok" not in (result.detail or "")
+
+
+def test_conversation_id_is_sourced_from_the_registry_not_terminal_status(store, ops):
+    # Live-smoke finding: terminal_status's resume_conversation_id is populated
+    # on the Windows backend ONLY -- tmux leaves it None by design -- so reading
+    # it from there persisted None for a real Claude session whose id was known
+    # all along, and native resume silently degraded to restart. The registry is
+    # where terminal_create_session durably writes it.
+    (task_id,) = store.set_tasks("lane-a", [{"prompt": PROMPT}])
+
+    class RegistryOps(type(ops)):
+        def terminal_registry_get(self, session):
+            return {"session_name": session, "conversation_id": "conv-from-registry",
+                    "agent_type": "claude", "worktree_path": "/w/lane", "git_branch": "fix/b"}
+
+    reg = RegistryOps()
+    # tmux-shaped status: NO resume_conversation_id at all.
+    reg.set_status("lane-a", {"state": "IDLE", "exists": True, "node_id": "local", "cwd": "/repo/a"})
+    _dispatch_once(store, reg)
+
+    state = store.get_recovery_state(task_id)
+    assert state["conversation_id"] == "conv-from-registry"
+    assert state["agent_type"] == "claude"
+    assert state["branch"] == "fix/b"
+
+
+def test_a_controller_without_registry_get_still_dispatches(store, ops):
+    # Optional capability: its absence must not break dispatch.
+    (task_id,) = store.set_tasks("lane-a", [{"prompt": PROMPT}])
+    ops.set_status("lane-a", {"state": "IDLE", "exists": True, "node_id": "local", "cwd": "/repo/a"})
+    assert PROMPT in _dispatch_once(store, ops)
+    assert store.get_recovery_state(task_id)["session"] == "lane-a"
