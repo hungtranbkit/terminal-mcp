@@ -138,9 +138,10 @@ def test_the_instructions_carry_a_machine_readable_discovery_signal():
     assert f"EXACTLY these {len(CATALOG)} tools" in text
     for name in CATALOG:
         assert name in text, f"{name} must be named in the discovery signal"
-    assert "legacy six-tool regression" in text
+    assert "STALE CACHED CATALOG" in text
+    assert "terminal_status" in text
     assert "NO terminal_status/terminal_tail" in text, \
-        "it must not advertise tools this surface does not publish"
+        "the compatibility bridge must not advertise legacy names in tools/list"
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +205,32 @@ def test_call_tool_forwards_arguments_verbatim():
     assert backend.calls == [("terminal_turn", {"action": "inspect", "target": "codex1"})]
     assert result.is_error in (False, None)
     assert "ok:terminal_turn" in _text(result)
+
+
+def test_stale_terminal_status_is_read_only_compat_alias_to_compact_inspect():
+    """A cached legacy catalog can still inspect safely without re-exposing
+    terminal_status in tools/list. The backend must execute terminal_turn,
+    because compact inspection is the canonical implementation."""
+    backend = FakeBackend()
+    result = _call_tool(build_sidecar(backend), "terminal_status",
+                        {"session": "nova-claude-long-2"})
+    assert backend.calls == [("terminal_turn", {
+        "action": "inspect",
+        "target": "nova-claude-long-2",
+        "tail_lines": 1,
+        "compact": True,
+    })]
+    assert result.is_error in (False, None)
+    assert "ok:terminal_turn" in _text(result)
+    assert "terminal_status" not in CATALOG
+
+
+def test_stale_terminal_status_requires_a_real_session_name():
+    backend = FakeBackend()
+    result = _call_tool(build_sidecar(backend), "terminal_status", {"session": "   "})
+    assert result.is_error is True
+    assert "INVALID_ARGUMENT" in _text(result)
+    assert backend.calls == []
 
 
 def test_a_tool_not_on_this_surface_is_refused_and_never_forwarded():

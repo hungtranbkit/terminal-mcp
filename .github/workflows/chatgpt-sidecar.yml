@@ -1,0 +1,25 @@
+name: ChatGPT compact sidecar checks
+
+on:
+  pull_request:
+    paths:
+      - "terminal_mcp/chatgpt_sidecar.py"
+      - "terminal_mcp/session_resource.py"
+      - "tests/test_chatgpt_sidecar.py"
+      - "tests/test_session_resource.py"
+      - ".github/workflows/chatgpt-sidecar.yml"
+  workflow_dispatch:
+
+jobs:
+  targeted:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest -q tests/test_chatgpt_sidecar.py tests/test_session_resource.py

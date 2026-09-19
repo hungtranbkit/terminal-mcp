@@ -123,7 +123,20 @@ BACKEND_UNAVAILABLE = "BACKEND_UNAVAILABLE"
 #: surface a connector is actually attached to. That is the whole diagnostic
 #: gap that made this bug recur: a stale legacy-six connector and a healthy
 #: one were indistinguishable from inside a chat.
-SURFACE_VERSION = "1.0.0"
+SURFACE_VERSION = "1.1.0"
+
+# Read-only compatibility for ChatGPT conversations whose connector identity
+# is still pinned to the historical six-tool catalog.  These names are NOT
+# advertised by tools/list (CATALOG remains the only public contract), but an
+# already-open/stale client is allowed to call the one safe inspection verb it
+# knows.  The sidecar translates it to the canonical compact operation, so the
+# backend still executes terminal_turn/action=inspect and returns the same
+# resource-health block as terminal_batch_inspect.
+#
+# Mutating legacy tools are intentionally NOT present here: a stale schema must
+# never resurrect raw terminal_send_text/terminal_send_keys on the compact
+# surface.
+LEGACY_READ_COMPAT = frozenset({"terminal_status"})
 
 
 def compact_instructions() -> str:
@@ -143,10 +156,11 @@ def compact_instructions() -> str:
         f"v{SURFACE_VERSION}, server version {__version__}), which publishes "
         f"EXACTLY these {len(CATALOG)} tools: {catalog}.\n"
         "If the tool list you can see does not match that, you are attached to a "
-        "STALE CACHED CATALOG and must say so instead of working around it -- in "
-        "particular, a list containing terminal_send_text/terminal_send_keys or "
-        "lacking terminal_turn/terminal_batch_inspect is the known legacy six-tool "
-        "regression and needs the connector re-pointed at this endpoint.\n"
+        "STALE CACHED CATALOG. The known legacy six-tool cache may still call "
+        "terminal_status: this sidecar accepts that ONE read-only compatibility "
+        "name and translates it to terminal_turn(action=inspect), so inspection "
+        "and resource-health verification keep working without reopening raw send "
+        "tools. Re-point/reconnect remains the way to obtain the canonical catalog.\n"
         "This surface deliberately has NO terminal_status/terminal_tail/"
         "terminal_send_text/terminal_send_keys: use terminal_turn (action=inspect/"
         "send/send_wait/wait/resume) and terminal_batch_inspect instead, which is "
@@ -268,7 +282,32 @@ def build_sidecar(backend: Backend | None = None, *,
         return types.ListToolsResult(tools=tools)
 
     async def on_call_tool(_ctx, params: types.CallToolRequestParams):
-        if params.name not in catalog:
+        call_name = params.name
+        call_args = dict(params.arguments or {})
+
+        # Compatibility bridge for the connector-cache incident.  A stale
+        # ChatGPT conversation can only emit the old terminal_status schema,
+        # even while tools/list on this endpoint correctly serves CATALOG.
+        # Keep the bridge read-only and translate to the COMPACT backend verb;
+        # do not forward terminal_status itself, and never alias raw sends.
+        if call_name in LEGACY_READ_COMPAT:
+            session = call_args.get("session")
+            if not isinstance(session, str) or not session.strip():
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=(
+                        "INVALID_ARGUMENT: terminal_status compatibility requires "
+                        "a non-empty session"))],
+                    is_error=True)
+            call_name = "terminal_turn"
+            call_args = {
+                "action": "inspect",
+                "target": session.strip(),
+                # One bounded line is enough because resource health is carried
+                # by the status payload, not inferred from this returned tail.
+                "tail_lines": 1,
+                "compact": True,
+            }
+        elif call_name not in catalog:
             # Not on this surface. Refused here rather than forwarded: the
             # compact endpoint's whole value is that it cannot be used to
             # reach the other 282 tools.
@@ -279,7 +318,7 @@ def build_sidecar(backend: Backend | None = None, *,
                           f"{SERVER_NAME}. Use the full /mcp endpoint for admin tools."))],
                 is_error=True)
         try:
-            return await client.call_tool(params.name, dict(params.arguments or {}))
+            return await client.call_tool(call_name, call_args)
         except BackendUnavailable as exc:
             _log.warning("chatgpt-v1: call %s failed: %s", params.name, exc)
             return _error_result(str(exc))
