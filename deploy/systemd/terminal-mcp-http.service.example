@@ -87,7 +87,9 @@ NoNewPrivileges=yes
 # terminal_send_bound, bind/unbind, a full supervisor_watch -> run_once
 # poll cycle producing a real sqlite-persisted event, and the dashboard
 # routes -- all against the actual sandboxed process, not assumed safe.
-SystemCallFilter=@system-service
+# Playwright Chromium additionally needs these two syscalls during browser verification.
+# They were traced from the deterministic browser smoke; keep the rest of @system-service intact.
+SystemCallFilter=@system-service landlock_create_ruleset pkey_alloc
 
 # --- Deliberately NOT included, and why -----------------------------------
 # This host's systemd --user instance cannot create the mount/user

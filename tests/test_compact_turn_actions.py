@@ -11,6 +11,7 @@ tests assert two things that together are the whole point:
 """
 from __future__ import annotations
 
+import inspect
 import tempfile
 from pathlib import Path
 
@@ -245,25 +246,37 @@ def test_pane_actions_do_not_need_any_handler_wired():
 def test_turn_handler_map_covers_every_routed_action():
     """The map build_mcp wires from. Keyword-only and exhaustive, so adding an
     action to TURN_HANDLER_ACTIONS without wiring it fails here rather than
-    silently returning ACTION_UNAVAILABLE on the live server."""
+    silently returning ACTION_UNAVAILABLE on the live server.
+
+    The arguments are DERIVED from the source of truth, never spelled out. A
+    hardcoded keyword list made this test fail for a rename it was never meant
+    to police: the browser gateway renamed its routed action (`browser_stop` ->
+    `browser_run_task`), runtime and map stayed perfectly consistent with each
+    other, and only this test's literal `browser_stop=` kwarg was left behind --
+    a TypeError that says nothing about the coverage being asserted. Deriving
+    the call means a renamed or added action is covered automatically, while a
+    routed action MISSING from the map -- the thing this test exists to catch --
+    still fails, loudly and for the right reason.
+    """
+    from terminal_mcp.compact_tools import START_HANDLER_KEYS
     from terminal_mcp.mcp_app import turn_handler_map
 
     def stub():
         return None
 
-    from terminal_mcp.compact_tools import START_HANDLER_KEYS
+    required = sorted(set(TURN_HANDLER_ACTIONS.values()) | set(START_HANDLER_KEYS))
+    accepted = set(inspect.signature(turn_handler_map).parameters)
+    missing = [key for key in required if key not in accepted]
+    assert missing == [], (
+        f"turn_handler_map does not accept handler(s) {missing}; a routed action "
+        f"with no parameter here is ACTION_UNAVAILABLE on the live server")
 
-    mapping = turn_handler_map(
-        list_sessions=stub, list_nodes=stub, create_session=stub,
-        delete_session=stub, enqueue_task=stub, task_status=stub,
-        task_batch_status=stub, browser_status=stub, browser_verify=stub,
-        browser_screenshot=stub, browser_stop=stub, dispatch_tick=stub,
-        follow_task=stub)
+    mapping = turn_handler_map(**{key: stub for key in required})
     # Every routed action, plus the keys `start` composes -- those are handlers
     # but not actions of their own, so this is a subset check, not equality.
     assert set(TURN_HANDLER_ACTIONS.values()) <= set(mapping)
     assert set(START_HANDLER_KEYS) <= set(mapping)
-    assert all(callable(value) for value in mapping.values())
+    assert all(callable(mapping[key]) for key in required)
 
 
 def test_the_real_server_routes_a_turn_action_to_a_real_handler():

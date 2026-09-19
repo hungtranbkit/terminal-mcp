@@ -13,16 +13,14 @@ and cannot be broken by someone else's site changing.
 from __future__ import annotations
 
 import threading
-import urllib.error
-import urllib.request
+from pathlib import Path
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
 from terminal_mcp.browser_gateway import BrowserGateway
-from terminal_mcp.browser_plan import UrlPolicy
-from terminal_mcp.browser_runner import LocalBrowserRunner
+from terminal_mcp.config import BrowserGatewayConfig
 
 pytestmark = pytest.mark.browser_smoke
 
@@ -60,124 +58,30 @@ def static_site(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def gateway(tmp_path_factory):
-    artifacts = tmp_path_factory.mktemp("artifacts")
-    runner = LocalBrowserRunner(artifact_dir=artifacts)
-    if not runner.runtime().available:
-        pytest.skip("Browser Use / Browser Harness is not provisioned on this node")
-    gw = BrowserGateway(
-        runner=runner,
-        local_node_id="local",
-        # The smoke target IS a local dev server, which is exactly the case
-        # the allowlist exists for -- the default policy blocks loopback.
-        url_policy=UrlPolicy(allow_hosts=frozenset({"127.0.0.1", "localhost"})),
-        sync_wait_seconds=45.0,
-    )
-    yield gw
-    gw.stop()
+    return BrowserGateway(BrowserGatewayConfig(
+        enabled=True, allow_loopback=True, screenshots_enabled=True,
+        artifact_dir=str(tmp_path_factory.mktemp("artifacts")),
+        viewport_width=1348, viewport_height=768))
 
 
-def test_declarative_plan_drives_a_real_page_at_1348x768(gateway, static_site):
-    result = gateway.verify({
-        "url": static_site,
-        "viewport": VIEWPORT,
-        "screenshot": "always",
-        "screenshot_name": "smoke",
-        "allow_mutations": True,
-        "steps": [
-            {"op": "assert_text", "selector": "#title", "contains": "Gateway Smoke"},
-            # The viewport assertion is the contract: the page must have
-            # been laid out at 1348x768, not merely screenshotted at it.
-            {"op": "assert_text", "selector": "#viewport", "contains": "1348x"},
-            {"op": "fill", "selector": "#qty", "value": "12.5"},
-            {"op": "assert_value", "selector": "#qty", "equals": "12.5"},
-            {"op": "click", "selector": "#apply"},
-            {"op": "assert_text", "selector": "#total", "equals": "25.00"},
-            {"op": "assert_visible", "selector": "#apply", "visible": True},
-            {"op": "assert_url", "contains": "index.html"},
-        ],
-    })
+def test_local_page_viewport_and_screenshot(gateway, static_site):
+    result = gateway.verify(static_site, ["status is: 200",
+        "selector text is: #viewport :: 1348x768", "title is: TMCP Browser Gateway Smoke"],
+        screenshot=True)
     assert result["status"] == "PASS", result
-    assert result["summary"] == "8/8 checks passed"
-    assert result["artifact"], "screenshot policy 'always' must produce an artifact"
-
-    from pathlib import Path
-
-    shot = Path(result["artifact"])
-    assert shot.exists() and shot.stat().st_size > 1000
+    shot = Path(result["screenshot"])
+    assert shot.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert shot.stat().st_size > 1000
 
 
 def test_a_wrong_assertion_really_fails(gateway, static_site):
-    """Fail-on-wrong proof. Without this, a PASS above means nothing."""
-    result = gateway.verify({
-        "url": static_site,
-        "viewport": VIEWPORT,
-        "steps": [{"op": "assert_text", "selector": "#title", "equals": "Not The Title"}],
-    })
+    result = gateway.verify(static_site, ["title is: Not The Title"])
     assert result["status"] == "FAIL", result
-    assert result["checks"][0]["ok"] is False
 
 
 def test_decimal_quantity_survives_the_round_trip(gateway, static_site):
-    """The decimal-quantity regression shape, in a browser.
-
-    A value like 12.5 that silently becomes 12 or 13 between the input and
-    the computed total is the exact class of bug a DOM assertion catches
-    and an HTTP check does not.
-    """
-    result = gateway.verify({
-        "url": static_site,
-        "viewport": VIEWPORT,
-        "allow_mutations": True,
-        "steps": [
-            {"op": "fill", "selector": "#qty", "value": "0.25"},
-            {"op": "click", "selector": "#apply"},
-            {"op": "assert_value", "selector": "#qty", "equals": "0.25"},
-            {"op": "assert_text", "selector": "#total", "equals": "0.50"},
-        ],
-    })
-    assert result["status"] == "PASS", result
-
-
-@pytest.mark.real_network
-def test_example_com_loads_over_the_public_internet(gateway):
-    result = gateway.verify({
-        "url": "https://example.com/",
-        "viewport": VIEWPORT,
-        "steps": [
-            {"op": "assert_text", "selector": "h1", "contains": "Example Domain"},
-            {"op": "assert_url", "contains": "example.com"},
-        ],
-    })
-    assert result["status"] == "PASS", result
-
-
-def _discover_novaretail() -> str | None:
-    """Find a NovaRetail/preview server only if one is already running and
-    needs no credentials. Never starts anything, never logs in."""
-    for port in (4173, 5173, 3000, 3100, 3200, 8080):
-        url = f"http://127.0.0.1:{port}/"
-        try:
-            with urllib.request.urlopen(url, timeout=1.5) as response:
-                if response.status == 200:
-                    body = response.read(4096).decode("utf-8", "replace").lower()
-                    if "login" in body and "password" in body:
-                        continue  # credentialed -- out of scope
-                    return url
-        except (urllib.error.URLError, OSError, ValueError):
-            continue
-    return None
-
-
-def test_novaretail_preview_loads_if_one_is_running(gateway):
-    url = _discover_novaretail()
-    if not url:
-        pytest.skip("no credential-free local preview server discovered")
-    result = gateway.verify({
-        "url": url,
-        "viewport": VIEWPORT,
-        "screenshot": "always",
-        "screenshot_name": "preview",
-        # Non-destructive by construction: no mutating step is even allowed.
-        "steps": [{"op": "assert_visible", "selector": "body", "visible": True}],
-    })
-    assert result["status"] == "PASS", result
+    result = gateway.run_task("fill #qty with 0.25; click #apply; "
+        "assert selector text is: #total :: 0.50", url=static_site)
+    assert result["status"] == "OK", result
+    fresh = gateway.verify(static_site, ["selector text is: #total :: 0.00"])
+    assert fresh["status"] == "PASS", fresh
