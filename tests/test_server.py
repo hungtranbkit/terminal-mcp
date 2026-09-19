@@ -391,15 +391,18 @@ async def test_server_registers_v1_and_binding_tools():
         "note_link_to_project",
         "note_mark_applied",
         "note_facets",
-        # Browser gateway (TMCP-BROWSER-GATEWAY-001) -- four declarative
-        # tools and no raw execution verb. This exact-set assertion is
-        # where a fifth one gets noticed: a browser tool that runs
-        # Python/shell/JS or exposes raw CDP would hand a chat client a
-        # shell on the node.
-        "terminal_browser_status",
-        "terminal_browser_verify",
-        "terminal_browser_screenshot",
-        "terminal_browser_stop",
+        # Browser gateway (TMCP-BROWSER-GATEWAY-001) -- local Playwright,
+        # declarative only, no raw execution verb. These are the same
+        # functions terminal_turn's browser_* actions route to, so the
+        # one-tool ChatGPT surface is never a weaker path than this one.
+        # This exact-set assertion is where an added tool gets noticed: a
+        # browser tool that runs Python/shell/JS or exposes raw CDP would
+        # hand a chat client a shell on the node.
+        "browser_verify",
+        "browser_run_task",
+        "browser_status",
+        "browser_screenshot",
+        "browser_stop",
     }
 
 

@@ -53,13 +53,6 @@ DEFAULT_CAPABILITY_PROBES: tuple[tuple[str, str], ...] = (
     ("docker", "docker"),
     ("dotnet", "dotnet"),
     ("playwright", "playwright"),
-    # Browser Use / Browser Harness (TMCP-BROWSER-GATEWAY-001). Probed
-    # like everything else here: a node advertises it only if the CLI
-    # really resolves on that node. The gateway ALSO detects its own
-    # provisioned venv install locally (browser_runner.detect_runtime),
-    # because scripts/provision-browser-harness.sh deliberately keeps
-    # the browser stack out of PATH and out of the service venv.
-    ("browser-harness", "browser-harness"),
     ("tmux", "tmux"),
     ("rustc", "rustc"),
     ("go", "go"),

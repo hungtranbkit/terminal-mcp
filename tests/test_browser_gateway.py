@@ -86,7 +86,8 @@ def test_bounded_redacted_result_and_parse_errors():
 def test_failed_task_details_redacted_and_no_fill_echo():
     service = gateway(lambda *_: {'ok': True, 'steps': [
         {'action': 'click', 'status': 'FAILED', 'detail': 'token=very-secret'}]})
-    result = service.run_task('fill #password with very-secret; click #submit', url='https://8.8.8.8')
+    result = service.run_task('fill #password with very-secret; click #submit', url='https://8.8.8.8',
+                              allow_mutations=True)
     assert result['status'] == 'FAILED'
     assert 'very-secret' not in json.dumps(result)
 
@@ -190,7 +191,8 @@ def test_public_registration_and_compact_dispatch(monkeypatch):
     monkeypatch.setattr(mcp_app, 'turn_handler_map', capture)
     app = mcp_app.build_mcp()
     names = {tool.name for tool in asyncio.run(app.list_tools())}
-    expected = {'browser_verify', 'browser_run_task', 'browser_status', 'browser_screenshot'}
+    expected = {'browser_verify', 'browser_run_task', 'browser_status', 'browser_screenshot',
+                'browser_stop'}
     assert {name for name in names if name.startswith('browser_')} == expected
     assert CATALOG == ('terminal_turn',)
     for action in expected:
@@ -224,3 +226,56 @@ def test_main_handler_map_forwards_browser_arguments(action, args, expected):
                           text='click #ok', args=args)
     assert calls == [expected]
     assert result == {'status': 'PASS', 'action': action, 'result': {'status': 'PASS'}}
+
+
+# ---------------------------------------------------------------------------
+# Mutations are opt-in, and `stop` is not a no-op verb.
+# ---------------------------------------------------------------------------
+
+def test_page_mutating_steps_require_explicit_authorization():
+    """A read-only-looking call must not be able to click the button.
+
+    This surface is reachable from a chat client: "check the cart renders"
+    must not empty the cart as a side effect.
+    """
+    launched = []
+    service = gateway(lambda *a: launched.append(a) or {'ok': True, 'steps': []})
+    result = service.run_task('fill #qty with 2; click #apply', url='https://8.8.8.8')
+    assert result['error'] == 'BROWSER_MUTATION_NOT_ALLOWED'
+    assert result['mutating_steps'] == ['click', 'fill']
+    assert launched == [], 'a refused task must never reach the browser'
+
+
+def test_read_only_steps_need_no_authorization():
+    service = gateway(lambda *_: {'ok': True, 'steps': [], 'observation': {}})
+    result = service.run_task('open https://8.8.8.8; wait for #main; assert text contains: hi',
+                              url='https://8.8.8.8')
+    assert result.get('error') != 'BROWSER_MUTATION_NOT_ALLOWED'
+
+
+def test_authorized_mutations_are_echoed_for_audit():
+    service = gateway(lambda *_: {'ok': True, 'steps': [], 'observation': {}})
+    result = service.run_task('fill #qty with 2; click #apply', url='https://8.8.8.8',
+                              allow_mutations=True)
+    assert result['mutations'] == ['click', 'fill']
+
+
+def test_stop_is_idle_when_nothing_is_running():
+    result = gateway(lambda *_: {'ok': True, 'steps': []}).stop()
+    assert result['status'] == 'IDLE'
+    assert result['terminated'] == 0
+
+
+def test_stop_terminates_an_in_flight_worker_group():
+    """The case the per-call deadline cannot cover: a worker still alive
+    after its caller has gone."""
+    import subprocess, sys as _sys
+    service = gateway(lambda *_: {'ok': True, 'steps': []})
+    proc = subprocess.Popen([_sys.executable, '-c', 'import time; time.sleep(30)'],
+                            start_new_session=True)
+    service._live.add(proc)
+    result = service.stop()
+    assert result['status'] == 'STOPPED'
+    assert result['terminated'] == 1
+    assert proc.poll() is not None, 'the worker process group must be gone'
+    assert service.stop()['status'] == 'IDLE'
