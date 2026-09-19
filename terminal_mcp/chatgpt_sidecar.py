@@ -57,9 +57,12 @@ source of truth -- exactly the drift this module exists to avoid.
 """
 from __future__ import annotations
 
+import base64
 import contextlib
+import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -375,8 +378,102 @@ def _error_result(message: str) -> types.CallToolResult:
         is_error=True)
 
 
+INLINE_SCREENSHOT_MAX_BYTES = 8 * 1024 * 1024
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_SCREENSHOT_ARTIFACT_ERROR = "SCREENSHOT_ARTIFACT_REJECTED"
+
+
+def _screenshot_artifact_root(override: str | Path | None = None) -> Path:
+    value = override or os.environ.get("TERMINAL_MCP_BROWSER_ARTIFACT_DIR")
+    if value:
+        return Path(value).expanduser()
+    state_home = os.environ.get("XDG_STATE_HOME")
+    base = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
+    return base / "terminal-mcp" / "browser-artifacts"
+
+
+def _is_browser_screenshot_call(call_name: str, call_args: dict[str, Any]) -> bool:
+    if call_name != "terminal_turn":
+        return False
+    action = str(call_args.get("action") or "").strip().lower().replace("-", "_")
+    return action in {"browser_screenshot", "screenshot"}
+
+
+def _screenshot_artifact_error(detail: str) -> types.CallToolResult:
+    return types.CallToolResult(
+        content=[types.TextContent(
+            type="text", text=f"{_SCREENSHOT_ARTIFACT_ERROR}: {detail}")],
+        is_error=True,
+    )
+
+
+def _attach_browser_screenshot_image(
+    result: types.CallToolResult,
+    call_name: str,
+    call_args: dict[str, Any],
+    *,
+    artifact_root: str | Path | None = None,
+) -> types.CallToolResult:
+    if not _is_browser_screenshot_call(call_name, call_args) or result.is_error:
+        return result
+
+    text_blocks = [block for block in result.content
+                   if isinstance(block, types.TextContent)]
+    if not text_blocks:
+        return _screenshot_artifact_error("controller returned no text metadata")
+
+    try:
+        envelope = json.loads(text_blocks[0].text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return _screenshot_artifact_error("controller returned invalid JSON metadata")
+    if not isinstance(envelope, dict):
+        return _screenshot_artifact_error("controller returned invalid screenshot metadata")
+    payload = envelope.get("result")
+    if not isinstance(payload, dict):
+        return result
+    if str(payload.get("status") or "").upper() != "OK":
+        return result
+    raw_path = payload.get("screenshot")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return _screenshot_artifact_error("successful screenshot response has no artifact path")
+
+    try:
+        root = _screenshot_artifact_root(artifact_root).resolve(strict=True)
+        candidate = Path(raw_path).expanduser()
+        if candidate.is_symlink():
+            return _screenshot_artifact_error("screenshot artifact may not be a symlink")
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+        stat_result = resolved.stat()
+        if not resolved.is_file():
+            return _screenshot_artifact_error("screenshot artifact is not a regular file")
+        if stat_result.st_size <= 0:
+            return _screenshot_artifact_error("screenshot artifact is empty")
+        if stat_result.st_size > INLINE_SCREENSHOT_MAX_BYTES:
+            return _screenshot_artifact_error(
+                f"screenshot artifact exceeds {INLINE_SCREENSHOT_MAX_BYTES} bytes")
+        data = resolved.read_bytes()
+    except (OSError, RuntimeError, ValueError):
+        return _screenshot_artifact_error(
+            "screenshot artifact is missing or outside the configured artifact directory")
+
+    if len(data) > INLINE_SCREENSHOT_MAX_BYTES:
+        return _screenshot_artifact_error(
+            f"screenshot artifact exceeds {INLINE_SCREENSHOT_MAX_BYTES} bytes")
+    if not data.startswith(_PNG_SIGNATURE):
+        return _screenshot_artifact_error("screenshot artifact is not a PNG")
+
+    image = types.ImageContent(
+        type="image",
+        data=base64.b64encode(data).decode("ascii"),
+        mime_type="image/png",
+    )
+    return result.model_copy(update={"content": [*result.content, image]})
+
+
 def build_sidecar(backend: Backend | None = None, *,
-                  catalog: tuple[str, ...] = CATALOG) -> Server:
+                  catalog: tuple[str, ...] = CATALOG,
+                  browser_artifact_root: str | Path | None = None) -> Server:
     """The compact server. `backend` is injectable so tests never need a
     real controller listening."""
     client = backend or Backend()
@@ -436,7 +533,9 @@ def build_sidecar(backend: Backend | None = None, *,
             call_name = "terminal_turn"
             call_args = translated
         try:
-            return await client.call_tool(call_name, call_args)
+            result = await client.call_tool(call_name, call_args)
+            return _attach_browser_screenshot_image(
+                result, call_name, call_args, artifact_root=browser_artifact_root)
         except BackendUnavailable as exc:
             _log.warning("chatgpt-v1: call %s failed: %s", params.name, exc)
             return _error_result(str(exc))

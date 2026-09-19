@@ -213,3 +213,19 @@ bounded and scrubbed observations, screenshot opt-in and explicit state-lifetime
 semantics. Model credentials, remote connection authorization, session storage,
 additional costs and new network capabilities require explicit configuration
 and adapter tests before rollout.
+
+
+### Inline screenshots in normal ChatGPT
+
+On the compact ChatGPT surface, an explicit `terminal_turn` call with
+`action="browser_screenshot"` keeps the normal compact JSON metadata and also
+returns the validated PNG as MCP `ImageContent`, so clients that support MCP
+images can render the browser view inline. This does **not** add another public
+tool: the catalog remains `terminal_turn` only.
+
+The sidecar reads images only from
+`$TERMINAL_MCP_BROWSER_ARTIFACT_DIR` (default
+`~/.local/state/terminal-mcp/browser-artifacts`), rejects symlink escapes,
+non-PNG files and files larger than 8 MiB, and never places base64 image data in
+text. Screenshots are still opt-in at the Browser Gateway level with
+`screenshots_enabled: true`; raw pixels are not redacted.

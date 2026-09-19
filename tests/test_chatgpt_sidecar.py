@@ -9,6 +9,9 @@ effect of something registered upstream.
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
+from pathlib import Path
 import logging
 
 import mcp.types as types
@@ -567,3 +570,108 @@ def test_the_full_surface_keeps_every_tool_including_the_ones_absent_here():
     assert LEGACY_SIX.issubset(names), "the full surface keeps the low-level tools"
     assert set(CATALOG).issubset(names), "the proxy forwards by name -- all must exist"
     assert "terminal_kill_session" in names, "admin tools stay on the full surface"
+
+
+# ---------------------------------------------------------------------------
+# Inline browser screenshot content
+# ---------------------------------------------------------------------------
+
+def _png_bytes() -> bytes:
+    return b"\x89PNG\r\n\x1a\n" + b"tmcp-screenshot"
+
+
+def _screenshot_result(path: Path, *, status: str = "OK") -> types.CallToolResult:
+    payload = {
+        "status": "OK",
+        "action": "browser_screenshot",
+        "result": {
+            "status": status,
+            "screenshot": str(path),
+            "bytes": path.stat().st_size if path.exists() else None,
+        },
+    }
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=json.dumps(payload))],
+        is_error=False,
+    )
+
+
+def test_explicit_browser_screenshot_appends_inline_png(tmp_path):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    shot = root / "shot.png"
+    shot.write_bytes(_png_bytes())
+    backend = FakeBackend(result=_screenshot_result(shot))
+    result = _call_tool(
+        build_sidecar(backend, browser_artifact_root=root),
+        "terminal_turn",
+        {"action": "browser_screenshot", "url": "http://127.0.0.1/"},
+    )
+    images = [block for block in result.content if isinstance(block, types.ImageContent)]
+    assert len(images) == 1
+    assert images[0].mime_type == "image/png"
+    assert base64.b64decode(images[0].data) == _png_bytes()
+    assert images[0].data not in _text(result)
+    assert CATALOG == ("terminal_turn",)
+
+
+def test_non_screenshot_call_is_unchanged(tmp_path):
+    original = types.CallToolResult(
+        content=[types.TextContent(type="text", text='{"status":"OK"}')])
+    result = sidecar._attach_browser_screenshot_image(
+        original, "terminal_turn", {"action": "inspect"}, artifact_root=tmp_path)
+    assert result is original
+    assert not any(isinstance(block, types.ImageContent) for block in result.content)
+
+
+def test_failed_screenshot_response_has_no_image(tmp_path):
+    original = types.CallToolResult(
+        content=[types.TextContent(
+            type="text",
+            text='{"status":"FAILED","action":"browser_screenshot","result":{"status":"ERROR","error":"SCREENSHOT_DISABLED"}}'
+        )],
+        is_error=False,
+    )
+    result = sidecar._attach_browser_screenshot_image(
+        original, "terminal_turn", {"action": "browser_screenshot"},
+        artifact_root=tmp_path)
+    assert result is original
+    assert not any(isinstance(block, types.ImageContent) for block in result.content)
+
+
+@pytest.mark.parametrize("case", ["outside", "missing", "non_png", "oversized", "symlink"])
+def test_unsafe_screenshot_artifacts_are_rejected(tmp_path, case):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(_png_bytes())
+    if case == "outside":
+        shot = outside
+    elif case == "missing":
+        shot = root / "missing.png"
+    elif case == "non_png":
+        shot = root / "bad.png"
+        shot.write_bytes(b"not-a-png")
+    elif case == "oversized":
+        shot = root / "huge.png"
+        shot.write_bytes(_png_bytes() + b"x" * sidecar.INLINE_SCREENSHOT_MAX_BYTES)
+    else:
+        shot = root / "link.png"
+        shot.symlink_to(outside)
+
+    original = types.CallToolResult(
+        content=[types.TextContent(
+            type="text",
+            text=json.dumps({
+                "status": "OK",
+                "action": "browser_screenshot",
+                "result": {"status": "OK", "screenshot": str(shot)},
+            }),
+        )],
+    )
+    result = sidecar._attach_browser_screenshot_image(
+        original, "terminal_turn", {"action": "browser_screenshot"},
+        artifact_root=root)
+    assert result.is_error is True
+    assert "SCREENSHOT_ARTIFACT_REJECTED" in _text(result)
+    assert not any(isinstance(block, types.ImageContent) for block in result.content)
