@@ -625,6 +625,17 @@ class ProjectRuntimeService:
                       "pm_rationale": rationale.get("reason"),
                       "pm_agent_id": project.pm_agent_id},
             request_key=request_key, target=target)
+        task_id = receipt.get("task_id") if isinstance(receipt, dict) else None
+        if task_id:
+            # The DURABLE column, not just metadata. queue_tasks.project_id is
+            # what project_service.py's view, the Global Tasks card and every
+            # per-project query read; leaving it null put the project in the
+            # metadata blob only, where none of them look. Found live: a
+            # project task came back with project_id=None.
+            try:
+                self.queue.store.set_task_project(task_id, project_id)
+            except Exception:  # noqa: BLE001 -- never fail a started task over its label
+                _LOGGER.exception("project-runtime: could not stamp project on task %s", task_id)
         return {**receipt, "project_id": project_id, "phase": project.phase,
                 "agent_role": agent.role, "pm_agent_id": project.pm_agent_id,
                 "agent_selection_reason": rationale.get("reason"),
