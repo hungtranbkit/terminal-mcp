@@ -179,7 +179,12 @@ class QueueLoop:
         # skip that sweep, never break the dispatch cycle -- the same fail-soft
         # posture as the except below.
         for name in ("reconcile_stale_lane_pause", "reconcile_stale_claims",
-                     "reconcile_uncertain_and_waiting"):
+                     "reconcile_uncertain_and_waiting",
+                     # TMCP-AI-OWNS-AI-REVIEW-001: AI-owned recovery. Both are
+                     # bounded, idempotent and dispatch-free -- a reclaimed
+                     # verify job becomes claimable, a re-evaluated refusal
+                     # becomes QUEUED, and neither sends anything anywhere.
+                     "reclaim_stale_verify_leases", "reevaluate_ai_owned_blocked"):
             sweep = getattr(self.engine.store, name, None)
             if sweep is None:
                 continue

@@ -439,11 +439,78 @@ class QueueService:
                 else:
                     queued.append(row)  # QUEUED/PRECHECK/READY/DISPATCHING/DISPATCH_UNCERTAIN, assigned
         done.sort(key=lambda t: t.get("completed_at") or t.get("updated_at") or "", reverse=True)
+        # TMCP-AI-OWNS-AI-REVIEW-001: the same rows, split by WHO OWNS THEM.
+        # `blocked_review` is retained verbatim for every existing caller
+        # (item 8) -- this is additive, and the ownership buckets are what the
+        # dashboard reads now.
+        attention = self.attention()
         return {
             "backlog": backlog, "queued": queued, "running": running,
             "blocked_review": blocked_review, "done": done,
+            "ai_review": attention["ai_review"],
+            "needs_approval": attention["needs_approval"],
+            "paused_by_user": attention["paused_by_user"],
+            "attention_summary": attention["summary"],
             "counts": {"backlog": len(backlog), "queued": len(queued), "running": len(running),
-                      "blocked_review": len(blocked_review), "done": len(done)},
+                      "blocked_review": len(blocked_review), "done": len(done),
+                      "ai_review": len(attention["ai_review"]),
+                      "needs_approval": len(attention["needs_approval"]),
+                      "paused_by_user": len(attention["paused_by_user"])},
+        }
+
+    def attention(self) -> dict[str, Any]:
+        """Every item that is not moving on its own, split by OWNER.
+
+        Three buckets, and the split is by ownership rather than by status --
+        see ai_review.py for the policy and why the old single Blocked/Review
+        column was the wrong shape:
+
+          ai_review       owner=ai   AI Recovery / AI Review. The AI reverifies,
+                                     retries, reassigns, reroutes, reconciles.
+                                     Humans should not routinely clear these.
+          needs_approval  owner=user ONLY the four true external-authorization
+                                     classes.
+          paused_by_user  owner=user An explicit operator pause. Never
+                                     auto-resumed.
+
+        Each row carries owner, diagnosis, attempts, age_seconds, last_check,
+        next_action and next_check_at, so the UI shows what is being done and
+        when it happens next instead of just "blocked".
+        """
+        import time as _time
+
+        from .ai_review import (BUCKET_AI_REVIEW, BUCKET_NEEDS_APPROVAL,
+                               BUCKET_PAUSED_BY_USER, classify_lane_pause,
+                               classify_task, summarize)
+
+        now_epoch = _time.time()
+        buckets: dict[str, list[dict[str, Any]]] = {
+            BUCKET_AI_REVIEW: [], BUCKET_NEEDS_APPROVAL: [], BUCKET_PAUSED_BY_USER: []}
+        items = []
+        for lane in self.store.list_all_lanes():
+            session = lane["session"]
+            lane_row = self.store.lane_status(session)
+            seen_paused_task = False
+            for task in lane["tasks"]:
+                entry = classify_task(dict(task, session=session), lane=lane_row, now_epoch=now_epoch)
+                if entry is None:
+                    continue
+                seen_paused_task = seen_paused_task or task["status"] == "PAUSED"
+                items.append(entry)
+                buckets[entry.bucket].append(entry.to_dict())
+            # A paused lane with no PAUSED task of its own would otherwise be
+            # invisible in every bucket -- which is exactly how one sat paused
+            # for three and a half hours.
+            if lane_row.get("paused") and not seen_paused_task:
+                entry = classify_lane_pause(lane_row)
+                if entry is not None:
+                    items.append(entry)
+                    buckets[entry.bucket].append(entry.to_dict())
+        return {
+            "ai_review": buckets[BUCKET_AI_REVIEW],
+            "needs_approval": buckets[BUCKET_NEEDS_APPROVAL],
+            "paused_by_user": buckets[BUCKET_PAUSED_BY_USER],
+            "summary": summarize(items),
         }
 
     def task_status(self, task_id: str) -> dict[str, Any]:

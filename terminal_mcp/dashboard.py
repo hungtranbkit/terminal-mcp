@@ -10863,7 +10863,9 @@ GLOBAL_TASKS_HTML = """<!doctype html>
       <div class="col" data-col="backlog"><div class="col-head"><b>Backlog</b><span id="cnt-backlog">0</span></div><div class="col-list" id="list-backlog"></div></div>
       <div class="col" data-col="queued"><div class="col-head"><b>Queued</b><span id="cnt-queued">0</span></div><div class="col-list" id="list-queued"></div></div>
       <div class="col" data-col="running"><div class="col-head"><b>Running</b><span id="cnt-running">0</span></div><div class="col-list" id="list-running"></div></div>
-      <div class="col" data-col="blocked_review"><div class="col-head"><b>Blocked/Review</b><span id="cnt-blocked_review">0</span></div><div class="col-list" id="list-blocked_review"></div></div>
+      <div class="col" data-col="ai_review"><div class="col-head"><b>AI Review</b><span id="cnt-ai_review">0</span></div><div class="col-list" id="list-ai_review"></div></div>
+      <div class="col" data-col="needs_approval"><div class="col-head"><b>Needs Approval</b><span id="cnt-needs_approval">0</span></div><div class="col-list" id="list-needs_approval"></div></div>
+      <div class="col" data-col="paused_by_user"><div class="col-head"><b>Paused by User</b><span id="cnt-paused_by_user">0</span></div><div class="col-list" id="list-paused_by_user"></div></div>
       <div class="col" data-col="done"><div class="col-head"><b>Done</b><span id="cnt-done">0</span></div><div class="col-list" id="list-done"></div></div>
     </div>
   </main>
@@ -10894,7 +10896,12 @@ GLOBAL_TASKS_HTML = """<!doctype html>
     const liveBadgeEl = document.querySelector('#liveBadge');
     const sessionFilterEl = document.querySelector('#sessionFilter');
     const totalCountEl = document.querySelector('#totalCount');
-    const COLUMNS = ['backlog', 'queued', 'running', 'blocked_review', 'done'];
+    // TMCP-AI-OWNS-AI-REVIEW-001: split by OWNER, not by status. AI Review is
+    // the AI's own work queue and a human is not expected to clear it; Needs
+    // Approval is only the four true external-authorization classes; Paused by
+    // User is a standing operator instruction and is never auto-resumed.
+    const COLUMNS = ['backlog', 'queued', 'running', 'ai_review', 'needs_approval', 'paused_by_user', 'done'];
+    const OWNERSHIP_COLUMNS = {ai_review: 1, needs_approval: 1, paused_by_user: 1};
     const params = new URLSearchParams(location.search);
     if (params.get('session')) sessionFilterEl.value = params.get('session');
 
@@ -15402,6 +15409,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # status` are additive fields; a task never routed by the PM
         # simply has neither, same "no key rather than a fake value"
         # posture as every other optional field in this project.
+        # Task rows only. The ownership buckets (ai_review/needs_approval/
+        # paused_by_user) are Attention rows with a different shape -- keyed
+        # task_id, and one of them has no task at all (a bare lane pause) --
+        # so they are deliberately NOT fed into this per-task PM enrichment.
         all_rows = [row for column in ("backlog", "queued", "running", "blocked_review", "done")
                    for row in result.get(column, [])]
         latest_decisions = await anyio.to_thread.run_sync(

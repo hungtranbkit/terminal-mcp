@@ -3366,6 +3366,34 @@ def build_mcp(service: TerminalService | None = None,
         instead of by session."""
         return queue.board()
 
+    @server.tool()
+    def terminal_task_attention() -> dict:
+        """What is stuck, split by WHO OWNS IT -- not by status.
+
+        Three buckets (see terminal_mcp/ai_review.py for the policy):
+
+          ai_review       owner=ai   AI Recovery / AI Review: VERIFYING and
+                                     evidence waits, WAITING_SESSION, dispatch
+                                     uncertainty, transient infra/session/
+                                     dependency failures, and BLOCKED by
+                                     default. The AI reverifies, retries,
+                                     reassigns, reroutes and reconciles with
+                                     bounded backoff, and never completes
+                                     anything without evidence. A human is NOT
+                                     expected to clear these routinely.
+          needs_approval  owner=user ONLY four classes: missing credentials or
+                                     secrets, destructive-action approval,
+                                     protected production deploy/merge
+                                     approval, or an irreducible human business
+                                     decision. Retry exhaustion is never one.
+          paused_by_user  owner=user An explicit operator pause. Never
+                                     auto-resumed.
+
+        Every row carries owner, diagnosis, attempts, age_seconds, last_check,
+        next_action and next_check_at. `summary` adds per-bucket counts, the
+        per-approval-class breakdown and the active policy numbers."""
+        return queue.attention()
+
     # -- PM/Orchestrator Agent: skill-based routing (docs/REQUIREMENTS.md
     # §20.2). Reads the SAME queue/tasks as every tool above -- a new
     # ROLE, not a new queue. SUGGEST is the recommended default (compute
