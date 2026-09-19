@@ -186,7 +186,7 @@ def build_mcp(service: TerminalService | None = None,
               chat_checkpoints: OrchestratorCheckpointStore | None = None,
               browser: BrowserGateway | None = None,
               agents: "AgentService | None" = None,
-              projects: "ProjectRuntimeService | None" = None,
+              project_runtime: "ProjectRuntimeService | None" = None,
               run_journal: Any = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
@@ -511,10 +511,15 @@ def build_mcp(service: TerminalService | None = None,
     # construction because the engine is built before the agent registry --
     # the alternative is reordering two long constructions for one callable.
     queue_engine.skill_loader = agents.skill_preamble
-    projects = projects or ProjectRuntimeService(agents)
+    # NOT named `projects`: that name is rebound further down to the P0.7
+    # ProjectService (a composition VIEW over queue/backlog/events, a different
+    # thing entirely). Found live -- every project tool raised
+    # "'ProjectService' object has no attribute 'plan'", because the tool
+    # closures resolve the name at CALL time and by then it meant the view.
+    project_runtime = project_runtime or ProjectRuntimeService(agents)
     queue.router = task_router
     queue.agents = agents
-    queue.projects = projects
+    queue.projects = project_runtime
     queue.loop = queue.loop or QueueLoop(
         queue_engine, poll_interval_seconds=terminal.config.queue.poll_interval_seconds,
         heartbeat_refresher=_refresh_local_heartbeat,
@@ -3354,7 +3359,7 @@ def build_mcp(service: TerminalService | None = None,
         Returns the detected stack/modules/complexity with the evidence for
         each, the team for the first phase, and the teams later phases will
         need (shown, not created). Deterministic: no model call."""
-        return projects.plan(name, description=description, repo_root=repo_root,
+        return project_runtime.plan(name, description=description, repo_root=repo_root,
                              project_id=project_id, complexity=complexity,
                              runtime=runtime, max_agents=max_agents)
 
@@ -3376,7 +3381,7 @@ def build_mcp(service: TerminalService | None = None,
 
         Idempotent by project id: re-running reconciles rather than
         duplicating, so a wizard submitted twice is harmless."""
-        return projects.bootstrap(name, description=description, repo_root=repo_root,
+        return project_runtime.bootstrap(name, description=description, repo_root=repo_root,
                                   project_id=project_id, complexity=complexity,
                                   runtime=runtime, max_agents=max_agents, policy=policy,
                                   roles=roles, request_key=request_key)
@@ -3391,13 +3396,13 @@ def build_mcp(service: TerminalService | None = None,
         team, a phase and a pipeline" -- a project can appear in either
         without appearing in the other, and collapsing them would make
         "project" mean two things."""
-        return projects.list_projects(status=status)
+        return project_runtime.list_projects(status=status)
 
     @server.tool()
     def terminal_project_get(project_id: str) -> dict:
         """One project in full: profile, policy, phase, team, phase history
         and the agents upcoming phases will need."""
-        return projects.get_project(project_id)
+        return project_runtime.get_project(project_id)
 
     @server.tool()
     def terminal_project_update(project_id: str, name: str | None = None,
@@ -3409,20 +3414,20 @@ def build_mcp(service: TerminalService | None = None,
             ("complexity", complexity)) if value is not None}
         if not fields:
             return {"error": "NO_FIELDS"}
-        return projects.update_project(project_id, **fields)
+        return project_runtime.update_project(project_id, **fields)
 
     @server.tool()
     def terminal_project_archive(project_id: str) -> dict:
         """Archive a project and retire its team. Never deletes: the project
         owns tasks and a phase history that stay readable."""
-        return projects.archive_project(project_id)
+        return project_runtime.archive_project(project_id)
 
     @server.tool()
     def terminal_project_phase_status(project_id: str) -> dict:
         """Where the project is in its pipeline: current phase, its gate,
         active and dormant agents, what later phases will need, and the full
         transition history with the evidence and handoffs."""
-        return projects.phase_status(project_id)
+        return project_runtime.phase_status(project_id)
 
     @server.tool()
     def terminal_project_advance(project_id: str, to_phase: str | None = None,
@@ -3432,13 +3437,13 @@ def build_mcp(service: TerminalService | None = None,
         the team: wake or create what the new phase needs, make the rest
         dormant. Backwards is legal -- a failed review returns to BUILD and
         the original build agents wake with their history."""
-        return projects.advance(project_id, to_phase=to_phase, reason=reason,
+        return project_runtime.advance(project_id, to_phase=to_phase, reason=reason,
                                 gate_evidence=gate_evidence, handoff=handoff)
 
     @server.tool()
     def terminal_project_reconcile_team(project_id: str) -> dict:
         """Make the live team match the current phase without moving phase."""
-        return projects.reconcile_team(project_id)
+        return project_runtime.reconcile_team(project_id)
 
     @server.tool()
     def terminal_project_start(project_id: str, prompt: str, title: str | None = None,
@@ -3458,7 +3463,7 @@ def build_mcp(service: TerminalService | None = None,
 
         When no agent can take the work you get NEEDS_TEAM_REVIEW with the
         per-candidate reasons, never a randomly chosen session."""
-        return projects.project_start(project_id, prompt, title=title,
+        return project_runtime.project_start(project_id, prompt, title=title,
                                       capabilities=capabilities or (), approval=approval,
                                       agent_id=agent_id, priority=priority, metadata=metadata,
                                       request_key=request_key, target=target)

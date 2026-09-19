@@ -129,7 +129,7 @@ def client(tmp_path, monkeypatch):
     agents = AgentService(AgentRegistryStore(tmp_path / "agents.db"), queue=queue, skill_roots=())
     projects = ProjectRuntimeService(agents)
     service = TerminalService(config)
-    server = build_mcp(service, queue=queue, agents=agents, projects=projects)
+    server = build_mcp(service, queue=queue, agents=agents, project_runtime=projects)
     register_dashboard(server, service, queue=queue, agents=agents, projects=projects)
     return (TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"}),
             projects, agents, queue)
@@ -231,3 +231,30 @@ def test_global_tasks_cards_carry_the_project(client):
     assert card["project_id"] == "demo"
     assert card["agent_id"] == "demo-core"
     assert card["skill_ids"] == ["core-engineering@1"]
+
+
+def test_the_project_tools_work_on_a_default_build_with_nothing_injected(tmp_path, monkeypatch):
+    """LIVE, hp-linux @ dbc5300: every project tool raised
+    "'ProjectService' object has no attribute 'plan'".
+
+    `projects` was already the name of the P0.7 ProjectService -- a composition
+    view over queue/backlog/events, a completely different object -- and it is
+    rebound further down build_mcp. The tool closures resolve the name at CALL
+    time, so by then every project tool was calling the wrong thing. The test
+    fixtures all passed the runtime in explicitly, which is exactly why they
+    could not see it; this one builds the app the way production does."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    config = AppConfig(
+        PermissionsConfig(True, True), ("test-*",), 50, 20,
+        InputPolicyConfig(allowed_session_patterns=("test-*",)),
+        session_access=SessionAccessConfig(default_read=True, default_input=True))
+    queue = QueueService(QueueStore(tmp_path / "queue.db"))
+    server = build_mcp(TerminalService(config), queue=queue)
+
+    runtime = queue.projects
+    assert isinstance(runtime, ProjectRuntimeService), \
+        "build_mcp must attach the project RUNTIME, not the P0.7 view"
+    assert hasattr(runtime, "plan") and hasattr(runtime, "bootstrap")
+
+    result = runtime.plan("default-build", description=BIG)
+    assert result["plan"]["profile"]["complexity"] == pa.LARGE
