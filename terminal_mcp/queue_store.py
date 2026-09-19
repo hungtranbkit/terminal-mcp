@@ -2853,6 +2853,117 @@ class QueueStore:
                 reconciled.append(row["session"])
         return reconciled
 
+    # ------------------------------------------------- AI-owned reconciliation
+    # TMCP-AI-OWNS-AI-REVIEW-001. Every sweep below is something the AI owns
+    # under ai_review.py's ownership policy, is idempotent, is bounded, and
+    # records actor=ai_reconciler so the audit log says WHO acted -- an
+    # automatic recovery and an operator's retry must never be
+    # indistinguishable after the fact.
+
+    def reclaim_stale_verify_leases(self, *, now: str | None = None) -> list[str]:
+        """Return verify jobs whose verifier lease expired to VERIFY_PENDING.
+
+        A verify job carries lease_expires_at but nothing ever swept it, so a
+        verifier that died mid-check parked its task in VERIFYING forever --
+        the one state whose only other exit is a human calling
+        terminal_queue_verify. Reclaiming makes the job claimable again by any
+        capable verifier, which is AI-owned recovery (ai_review item 1), and
+        loses nothing: the task stays in VERIFYING and is never completed
+        without evidence.
+
+        Idempotent: a job already PENDING has no lease to expire.
+        """
+        stamp = now or iso_now()
+        reclaimed: list[str] = []
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT id, task_id, session, status, verifier, claim_count FROM verify_jobs "
+                "WHERE status IN ('VERIFY_CLAIMED', 'VERIFY_RUNNING') "
+                "AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
+                (stamp,),
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    "UPDATE verify_jobs SET status = 'VERIFY_PENDING', claim_token = NULL, "
+                    "lease_expires_at = NULL, verifier = NULL, verifier_node_id = NULL, "
+                    "updated_at = ? WHERE id = ?",
+                    (stamp, row["id"]),
+                )
+                self._record_event_locked(
+                    connection, session=row["session"], task_id=row["task_id"],
+                    event_type="AI_VERIFY_LEASE_RECLAIMED",
+                    from_status=row["status"], to_status="VERIFY_PENDING",
+                    reason=(f"verifier lease expired (verifier={row['verifier'] or 'unknown'}); "
+                            "job returned to the pool for another capable verifier"),
+                    metadata={"actor": "ai_reconciler", "verify_job_id": row["id"],
+                              "claim_count": row["claim_count"]},
+                )
+                reclaimed.append(row["id"])
+        return reclaimed
+
+    def reevaluate_ai_owned_blocked(self, *, now: str | None = None,
+                                    session: str | None = None) -> list[str]:
+        """Re-queue a BLOCKED task the AI owns, once its backoff has elapsed.
+
+        BLOCKED is AI-owned by default (ai_review item 3): a coordinator
+        refusal is a diagnosis to work through, not a ticket to hand over. A
+        stale refusal must be RE-EVALUATED rather than living forever, so this
+        returns the task to QUEUED for a fresh claim + coordinator review.
+
+        Three bounds, all deliberate:
+          * A task whose refusal encodes one of the four true approval classes
+            (ai_review.approval_class_for_task) is NEVER touched -- it belongs
+            to a human and re-queueing it would re-refuse it in a loop.
+          * Bounded exponential backoff off the last coordinator check, so a
+            task that keeps being refused is retried at 30s, 60s, ... capped at
+            15 minutes rather than every cycle.
+          * At AI_MAX_AUTOMATIC_ATTEMPTS the automatic retry STOPS. The task
+            stays AI-owned and visible in AI Review with next_action
+            diagnose_and_reroute -- retry exhaustion is explicitly not an
+            escalation to a human.
+
+        Idempotent: a task already QUEUED is not BLOCKED and matches nothing.
+        """
+        from .ai_review import (AI_MAX_AUTOMATIC_ATTEMPTS, approval_class_for_task,
+                               backoff_seconds)
+
+        stamp = now or iso_now()
+        now_epoch = _epoch_or_none(stamp)
+        requeued: list[str] = []
+        with self._connection() as connection:
+            clause = "AND session = ? " if session else ""
+            params: tuple[Any, ...] = (BLOCKED, session) if session else (BLOCKED,)
+            rows = connection.execute(
+                f"SELECT * FROM queue_tasks WHERE status = ? {clause}", params,
+            ).fetchall()
+            for row in rows:
+                task = dict(row)
+                if approval_class_for_task(task) is not None:
+                    continue  # a human owns this one
+                attempts = max(int(task.get("coordinator_attempts") or 0),
+                               int(task.get("attempt_count") or 0))
+                if attempts >= AI_MAX_AUTOMATIC_ATTEMPTS:
+                    continue  # stop retrying; AI Review keeps it with a diagnose next_action
+                last = _epoch_or_none(task.get("coordinator_checked_at") or task.get("updated_at"))
+                if now_epoch is not None and last is not None and \
+                        now_epoch - last < backoff_seconds(attempts):
+                    continue  # still inside its backoff window
+                self._transition_locked(
+                    connection, task["id"], BLOCKED, QUEUED,
+                    event_type="AI_BLOCKED_REEVALUATED",
+                    reason=(f"re-evaluating a stale coordinator refusal after {attempts} attempt(s): "
+                            f"{(task.get('coordinator_reason') or 'no reason recorded')[:160]}"),
+                    extra_fields={"claimed_by": None, "claim_token": None, "lease_expires_at": None},
+                )
+                self._record_event_locked(
+                    connection, session=task["session"], task_id=task["id"],
+                    event_type="AI_RECONCILED", from_status=BLOCKED, to_status=QUEUED,
+                    reason="AI Review owns BLOCKED; refusal re-evaluated rather than left to expire",
+                    metadata={"actor": "ai_reconciler", "attempts": attempts},
+                )
+                requeued.append(task["id"])
+        return requeued
+
     def reconcile_uncertain_and_waiting(self, session: str | None = None, *, grace_seconds: float = 60.0,
                                         now: str | None = None) -> list[str]:
         """Restart-safe AND ordinary-operation reconciliation (item 2/9):
