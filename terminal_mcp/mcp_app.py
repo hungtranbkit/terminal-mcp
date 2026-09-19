@@ -493,7 +493,8 @@ def build_mcp(service: TerminalService | None = None,
                       title: str | None = None, priority: int = 0,
                       metadata: dict | None = None, request_key: str | None = None,
                       task_id: str | None = None,
-                      task_ids: list[str] | None = None) -> dict:
+                      task_ids: list[str] | None = None,
+                      long_task: bool = False) -> dict:
         """THE terminal surface: one logical orchestration step, one MCP call.
 
         This covers every normal workflow, so a caller never needs a second
@@ -501,7 +502,9 @@ def build_mcp(service: TerminalService | None = None,
 
           inspect   status + bounded tail + `resource` health for one `target`
                     or many `targets` (this IS batch inspect)
-          send      guarded, idempotent submission of `text`
+          send      guarded, idempotent submission of `text`; pass
+                    `long_task=true` to persist+dispatch through the durable
+                    queue and return a task receipt in this one call
           send_wait send, then wait in the same call
           wait      durable bounded wait for `desired_states`
           resume    continue a wait that returned PENDING (`resume_token`)
@@ -517,7 +520,10 @@ def build_mcp(service: TerminalService | None = None,
           task_status   | task     one task by `task_id`
           task_batch_status | tasks up to 100 states by `task_ids`
 
-        `target` is the session for every action that names one and `text` is
+        Long work returns a durable task receipt; the server queue/watcher
+        advances it after this call. The client must not automatically issue
+        inspect/wait/resume calls after `SUBMIT_CONFIRMED` or `PENDING` unless
+        the user explicitly asks for a check. `target` is the session for every action that names one and `text` is
         the prompt for both send and enqueue. Each action routes to the exact
         same implementation the standalone tool uses, so authorization,
         allowed-cwd, protected-session and idempotency rules are identical.
@@ -532,6 +538,7 @@ def build_mcp(service: TerminalService | None = None,
             initial_prompt=initial_prompt, grant_mode=grant_mode, binding=binding,
             node=node, title=title, priority=priority, metadata=metadata,
             request_key=request_key, task_id=task_id, task_ids=task_ids,
+            long_task=long_task,
         )
 
     @server.tool()

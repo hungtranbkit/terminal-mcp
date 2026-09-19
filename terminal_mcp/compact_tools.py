@@ -455,13 +455,16 @@ class CompactTerminalTools:
              title: str | None = None, priority: int = 0,
              metadata: dict[str, Any] | None = None, request_key: str | None = None,
              task_id: str | None = None,
-             task_ids: list[str] | None = None) -> dict[str, Any]:
+             task_ids: list[str] | None = None,
+             long_task: bool = False) -> dict[str, Any]:
         """One MCP-call surface for one logical terminal turn.
 
         Pane actions, implemented here:
         - inspect: status+tail for one target or many targets (`targets`), each
           row carrying the `resource` context/quota health block.
-        - send: guarded/idempotent task submission.
+        - send: guarded/idempotent task submission. Set ``long_task=True``
+          to persist the prompt in the durable queue and return its receipt;
+          dispatch and progress observation stay server-side.
         - send_wait: submit, then create one durable bounded wait in the same call.
         - wait: create one durable bounded wait.
         - resume: resume a previously PENDING wait.
@@ -522,6 +525,31 @@ class CompactTerminalTools:
         if normalized == "send":
             if not text:
                 return {"status": "FAILED", "error": "TEXT_REQUIRED"}
+            if long_task:
+                # Long work must cross the durable persist-before-dispatch
+                # boundary in this same MCP call. Do not send first and then
+                # make the client inspect/wait: the queue loop/watcher owns
+                # dispatch and progress after the receipt is returned.
+                queued = self._handler_turn(
+                    "enqueue_task", target=target, text=text,
+                    agent_type=agent_type, working_directory=working_directory,
+                    initial_prompt=initial_prompt, grant_mode=grant_mode,
+                    binding=binding, node=node, title=title, priority=priority,
+                    metadata={**(metadata or {}), "long_task": True},
+                    request_key=request_key or idempotency_key,
+                    task_id=task_id, task_ids=task_ids)
+                accepted = queued.get("result") if isinstance(queued, dict) else None
+                if queued.get("status") != "OK" or not isinstance(accepted, dict):
+                    return {"status": "FAILED", "action": normalized,
+                            "mode": "durable_queue", "result": queued}
+                return {
+                    "status": accepted.get("status", "TASK_ACCEPTED"),
+                    "action": normalized,
+                    "mode": "durable_queue",
+                    "receipt": accepted,
+                    "result": accepted,
+                    "client_polling": False,
+                }
             result = self.send_task(target, text, wait_for_accept=True,
                                     timeout=min(float(timeout), MAX_SEND_WAIT_SECONDS),
                                     idempotency_key=idempotency_key)
