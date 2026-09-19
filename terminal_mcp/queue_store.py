@@ -168,6 +168,55 @@ why this reserved-lane approach was chosen instead for the real,
 shipped implementation -- kept in sync with this comment, never
 contradicting it."""
 
+# ---------------------------------------------------------------------------
+# WHO paused a lane. A lane pause is not one thing: a coordinator pause is a
+# GUARD around one specific task it refused to dispatch, while an operator
+# pause is a standing instruction. Only the first kind can ever be reconciled
+# automatically, so the two must be distinguishable -- and before this column
+# they were not: both were free text in `paused_reason`.
+#
+# Real incident this closes (live, 2026-09-19, lane
+# terminal-mcp-session-health): the coordinator refused one task over a
+# `merge into main` pattern, which paused the whole lane; the task was
+# CANCELLED 32 seconds later, and the lane stayed paused for 3.5 hours with
+# nothing left to guard. Three later tasks were enqueued into a lane that was
+# already closed and never got claimed. Nothing in the system ever revisited
+# it, because resume_lane is only ever called by a human.
+PAUSE_ORIGIN_COORDINATOR = "coordinator"
+"""Set by record_coordinator_decision's NEEDS_HUMAN path. Guards ONE task;
+reconcilable once that task is no longer awaiting a human."""
+PAUSE_ORIGIN_USER = "user"
+"""An explicit operator/API pause (QueueService.pause). NEVER auto-cleared --
+a standing instruction outlives whatever task happened to be in the lane."""
+PAUSE_ORIGIN_PROJECT = "project"
+"""project_service.py's own project-level pause. Also never auto-cleared: it
+is released by the project, not by task movement."""
+
+# Legacy prefixes, for rows written before `paused_origin` existed. The
+# coordinator's own format has always been f"coordinator: {reason}" (see
+# record_coordinator_decision), and project_service writes
+# f"project-pause[{id}]: ..." -- so an old row is still classifiable without a
+# backfill that would have to guess.
+_LEGACY_PAUSE_PREFIXES = ((PAUSE_ORIGIN_COORDINATOR, "coordinator:"),
+                          (PAUSE_ORIGIN_PROJECT, "project-pause["))
+
+
+def pause_origin(paused_origin: str | None, paused_reason: str | None) -> str | None:
+    """Who paused this lane: the stored origin, else inferred from a legacy
+    reason prefix, else None.
+
+    None means UNKNOWN, and unknown is never treated as reconcilable -- the
+    safe direction, because clearing a pause somebody set deliberately is the
+    one failure mode worth designing against.
+    """
+    if paused_origin:
+        return paused_origin
+    for origin, prefix in _LEGACY_PAUSE_PREFIXES:
+        if paused_reason and paused_reason.startswith(prefix):
+            return origin
+    return None
+
+
 MOVABLE_STATUSES = (QUEUED, BLOCKED, PAUSED, WAITING_SESSION)
 """Unified Task System checkpoint: which statuses `move_task_to_session`
 will move at all -- deliberately narrower than "not yet terminal".
@@ -896,6 +945,15 @@ def _add_v12_long_task_watches(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX IF NOT EXISTS idx_long_task_watches_state ON long_task_watches(state)")
 
 
+def _add_v14_paused_origin(connection: sqlite3.Connection) -> None:
+    """Additive, nullable: NULL means "written before this column existed",
+    which `pause_origin()` classifies from the legacy reason prefix instead of
+    guessing. No backfill -- a wrong backfill would silently make an operator
+    pause look auto-clearable, and the prefix inference is already exact for
+    both writers that ever set one."""
+    connection.execute("ALTER TABLE queue_lanes ADD COLUMN paused_origin TEXT")
+
+
 def _add_v13_task_routing(connection: sqlite3.Connection) -> None:
     """TMCP-TASK-ROUTER-001: where a task is actually being EXECUTED, who
     owns it, and why the router chose that.
@@ -979,6 +1037,9 @@ QUEUE_MIGRATIONS = [
     Migration(13, "TMCP-TASK-ROUTER-001: execution_session/execution_node_id/routing_state/"
               "routing_evidence + the nullable agent_id/skill_ids bridge",
               _add_v13_task_routing),
+    Migration(14, "TMCP-BLOCKED-REVIEW-AUTOCLEAR-001: queue_lanes.paused_origin, so a "
+              "coordinator guard pause is distinguishable from a standing operator pause",
+              _add_v14_paused_origin),
 ]
 
 
@@ -1084,7 +1145,8 @@ class QueueStore:
             "VALUES (?, 0, NULL, ?, ?)", (session, now, now),
         )
 
-    def pause_lane(self, session: str, *, reason: str | None = None) -> None:
+    def pause_lane(self, session: str, *, reason: str | None = None,
+                   origin: str | None = None) -> None:
         """Pauses dispatch for this session's lane. If a task is currently
         PRECHECK/READY/DISPATCHING/RUNNING/VERIFYING, it moves to PAUSED
         too (its prior status saved in paused_from_status so resume_lane
@@ -1093,14 +1155,16 @@ class QueueStore:
         well as a plain operator-requested pause of an otherwise-idle
         lane, and record_coordinator_decision's own NEEDS_HUMAN path."""
         with self._connection() as connection:
-            self._pause_lane_locked(connection, session, reason=reason)
+            self._pause_lane_locked(connection, session, reason=reason, origin=origin)
 
-    def _pause_lane_locked(self, connection: sqlite3.Connection, session: str, *, reason: str | None) -> None:
+    def _pause_lane_locked(self, connection: sqlite3.Connection, session: str, *, reason: str | None,
+                           origin: str | None = None) -> None:
         self._ensure_lane(connection, session)
         now = iso_now()
         connection.execute(
-            "UPDATE queue_lanes SET paused = 1, paused_reason = ?, updated_at = ? WHERE session = ?",
-            (reason, now, session),
+            "UPDATE queue_lanes SET paused = 1, paused_reason = ?, paused_origin = ?, updated_at = ? "
+            "WHERE session = ?",
+            (reason, origin, now, session),
         )
         active = connection.execute(
             "SELECT id, status FROM queue_tasks WHERE session = ? AND status IN (?, ?, ?, ?, ?, ?, ?)",
@@ -1118,7 +1182,8 @@ class QueueStore:
             self._ensure_lane(connection, session)
             now = iso_now()
             connection.execute(
-                "UPDATE queue_lanes SET paused = 0, paused_reason = NULL, updated_at = ? WHERE session = ?",
+                "UPDATE queue_lanes SET paused = 0, paused_reason = NULL, paused_origin = NULL, "
+                "updated_at = ? WHERE session = ?",
                 (now, session),
             )
             paused_tasks = connection.execute(
@@ -1152,6 +1217,7 @@ class QueueStore:
             "session": session,
             "paused": bool(lane_row["paused"]),
             "paused_reason": lane_row["paused_reason"],
+            "paused_origin": pause_origin(lane_row["paused_origin"], lane_row["paused_reason"]),
             "auto_dispatch_enabled": bool(lane_row["auto_dispatch_enabled"]),
             "project": lane_row["project"],
             "last_rebalance_at": lane_row["last_rebalance_at"],
@@ -2514,7 +2580,8 @@ class QueueStore:
                 # _pause_lane_locked's own active-task sweep will not
                 # find/re-touch it -- it only sets the lane's own paused
                 # flag at this point.
-                self._pause_lane_locked(connection, row["session"], reason=f"coordinator: {reason}")
+                self._pause_lane_locked(connection, row["session"], reason=f"coordinator: {reason}",
+                                        origin=PAUSE_ORIGIN_COORDINATOR)
         return updated
 
     # ------------------------------------------------- P0.4 task lease API
@@ -2724,6 +2791,67 @@ class QueueStore:
             raise KeyError(f"no such task: {task_id}")
         return self.transition_task(task_id, WAITING_SESSION, event_type="WAITING_SESSION", reason=reason,
                                     extra_fields={"uncertain_or_waiting_since": iso_now()})
+
+    def reconcile_stale_lane_pause(self, session: str | None = None) -> list[str]:
+        """Clear a COORDINATOR lane pause that no longer guards anything.
+
+        A coordinator pause is not a standing instruction -- it is a guard put
+        around ONE task the gate refused to dispatch (record_coordinator_
+        decision's NEEDS_HUMAN path), and that task is left PAUSED for a human
+        to look at. Once no task on the lane is PAUSED any more -- it was
+        cancelled, skipped, completed or retried -- the guard has nothing left
+        to protect, and every later task enqueued into that lane is stranded
+        behind it. Nothing in the system used to revisit that: resume_lane is
+        only ever called by a human, and the engine's tick returns PAUSED
+        before it looks at any task.
+
+        Deliberately narrow, in three ways:
+          * ONLY PAUSE_ORIGIN_COORDINATOR. A user pause (a standing operator
+            instruction) and a project pause (released by the project) are
+            never touched, and an UNKNOWN origin is treated as not-clearable
+            -- clearing a pause somebody set deliberately is the one failure
+            mode worth designing against.
+          * "Nothing left to guard" is read off real task rows, never a timer.
+            A pause whose task is still PAUSED stays, however old it is.
+          * It clears the LANE flag only. No task is dispatched, nothing is
+            sent to any session; a lane with auto_dispatch_enabled=0 simply
+            becomes claimable again by an explicit terminal_queue_run_once.
+
+        Idempotent: a lane already un-paused matches nothing, so repeat sweeps
+        write no rows and emit no events. Returns the sessions actually
+        reconciled.
+        """
+        reconciled: list[str] = []
+        with self._connection() as connection:
+            clause = "AND session = ? " if session else ""
+            params: tuple[Any, ...] = (session,) if session else ()
+            rows = connection.execute(
+                f"SELECT session, paused_reason, paused_origin FROM queue_lanes "
+                f"WHERE paused = 1 {clause}",
+                params,
+            ).fetchall()
+            for row in rows:
+                if pause_origin(row["paused_origin"], row["paused_reason"]) != PAUSE_ORIGIN_COORDINATOR:
+                    continue
+                still_guarding = connection.execute(
+                    "SELECT 1 FROM queue_tasks WHERE session = ? AND status = ? LIMIT 1",
+                    (row["session"], PAUSED),
+                ).fetchone()
+                if still_guarding is not None:
+                    continue
+                connection.execute(
+                    "UPDATE queue_lanes SET paused = 0, paused_reason = NULL, paused_origin = NULL, "
+                    "updated_at = ? WHERE session = ?",
+                    (iso_now(), row["session"]),
+                )
+                self._record_event_locked(
+                    connection, session=row["session"], task_id=None,
+                    event_type="LANE_PAUSE_RECONCILED",
+                    reason=("coordinator pause no longer guards any task "
+                            f"(was: {row['paused_reason'] or 'no reason recorded'})"),
+                )
+                reconciled.append(row["session"])
+        return reconciled
 
     def reconcile_uncertain_and_waiting(self, session: str | None = None, *, grace_seconds: float = 60.0,
                                         now: str | None = None) -> list[str]:
