@@ -123,6 +123,21 @@ class QueueConfig:
 
 
 @dataclass(frozen=True)
+class AgentsConfig:
+    """TMCP-AGENT-RUNTIME-001 Phase B: the Agent/Skill runtime.
+
+    `skill_roots` is the ONLY place a skill package may be read from. It is
+    configuration, never a caller-supplied path, which is what stops a tool
+    call from widening its own search -- see skill_packages.py for the full
+    three-rule traversal defence. Empty means "use the defaults"
+    (the repo's own skills/ directory and the per-user Claude skills home),
+    never "anywhere".
+    """
+    enabled: bool = True
+    skill_roots: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class RouterConfig:
     """TMCP-TASK-ROUTER-001: which routing behaviours are allowed to act.
 
@@ -1218,6 +1233,7 @@ class AppConfig:
     nodes: NodesConfig = NodesConfig()
     queue: QueueConfig = QueueConfig()
     router: RouterConfig = RouterConfig()
+    agents: AgentsConfig = AgentsConfig()
     llm_governor: LLMGovernorConfig = LLMGovernorConfig()
     submit: SubmitConfig = SubmitConfig()
     integration_loop: IntegrationLoopConfig = IntegrationLoopConfig()
@@ -1659,6 +1675,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         nodes=nodes_config,
         queue=_load_queue_config(raw.get("queue", {})),
         router=_load_router_config(raw.get("router", {})),
+        agents=_load_agents_config(raw.get("agents", {})),
         llm_governor=governor_config,
         submit=submit_config,
         integration_loop=_load_integration_loop_config(raw.get("integration_loop", {})),
@@ -1939,6 +1956,20 @@ def _load_lifecycle_config(raw: object) -> LifecycleConfig:
         worktree_roots=tuple(str(r) for r in roots), reconcile_limit=limit,
         allow_unverified_integration=bool(raw.get(
             "allow_unverified_integration", LifecycleConfig.allow_unverified_integration)),
+    )
+
+
+def _load_agents_config(agents_raw: object) -> AgentsConfig:
+    if not isinstance(agents_raw, dict):
+        agents_raw = {}
+    roots_raw = agents_raw.get("skill_roots", []) or []
+    if isinstance(roots_raw, str):
+        roots_raw = [roots_raw]
+    if not isinstance(roots_raw, list) or not all(isinstance(item, str) for item in roots_raw):
+        raise ValueError("agents.skill_roots must be a list of paths")
+    return AgentsConfig(
+        enabled=bool(agents_raw.get("enabled", AgentsConfig.enabled)),
+        skill_roots=tuple(roots_raw),
     )
 
 

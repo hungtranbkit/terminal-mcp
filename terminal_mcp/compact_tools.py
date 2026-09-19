@@ -84,6 +84,19 @@ TURN_HANDLER_ACTIONS: dict[str, str] = {
     # silently reroute, so a caller that omitted a target by mistake should
     # get TARGET_REQUIRED, not a different session than it expected.
     "route_start": "route_start",
+    # TMCP-AGENT-RUNTIME-001 Phase B. The Agent/Skill runtime has to be
+    # reachable from the ONE advertised tool, or a connector needs a second
+    # control plane to use it -- the exact thing this surface exists to avoid.
+    "agent_start": "agent_start",
+    "list_agents": "list_agents",
+    "get_agent": "get_agent",
+    "create_agent": "create_agent",
+    "update_agent": "update_agent",
+    "list_skills": "list_skills",
+    "register_skill": "register_skill",
+    "bind_agent_skill": "bind_agent_skill",
+    # Read-only: proposes, never deletes. See stale_sessions.py.
+    "cleanup_candidates": "cleanup_candidates",
     "task_status": "task_status",
     "task_batch_status": "task_batch_status",
     # Browser gateway (TMCP-BROWSER-GATEWAY-001). The browser has to be
@@ -119,6 +132,15 @@ TURN_ACTION_ALIASES: dict[str, str] = {
     "verify": "browser_verify",
     "screenshot": "browser_screenshot",
     "start_auto": "route_start",
+    "agent": "get_agent",
+    "agents": "list_agents",
+    "skills": "list_skills",
+    "skill": "register_skill",
+    "bind": "bind_agent_skill",
+    "bind_skill": "bind_agent_skill",
+    "run_agent": "agent_start",
+    "cleanup": "cleanup_candidates",
+    "stale_sessions": "cleanup_candidates",
     "auto": "route_start",
     "route": "route_start",
     "start_task": "start",
@@ -138,6 +160,36 @@ BROWSER_ARGS: dict[str, frozenset[str]] = {
                                        "timeout_seconds", "full_page"}),
     # Takes nothing: it releases whatever this gateway has in flight.
     "browser_stop": frozenset(),
+}
+
+#: Phase B action -> the argument names it accepts through `turn(args=...)`.
+#: Mirrors BROWSER_ARGS exactly: one table, checked before the call, so an
+#: unknown key is an error here rather than a TypeError inside a handler.
+AGENT_ARGS: dict[str, frozenset[str]] = {
+    "agent_start": frozenset({"agent_id", "prompt", "title", "priority", "metadata",
+                                "request_key", "skill_ids", "include_task_skills", "target"}),
+    "list_agents": frozenset({"project_id", "state"}),
+    "get_agent": frozenset({"agent_id"}),
+    "create_agent": frozenset({"agent_id", "name", "project_id", "description", "runtime",
+                                 "max_sessions", "repo", "workspace", "model", "metadata"}),
+    "update_agent": frozenset({"agent_id", "name", "project_id", "description", "runtime",
+                                 "max_sessions", "repo", "workspace", "model", "metadata",
+                                 "state"}),
+    "list_skills": frozenset({"latest_only"}),
+    "register_skill": frozenset({"skill_id", "version", "body", "name", "summary", "metadata"}),
+    "bind_agent_skill": frozenset({"agent_id", "skill_id", "kind", "version"}),
+    "cleanup_candidates": frozenset({"limit"}),
+}
+
+#: Arguments without which the action cannot mean anything. Checked here so
+#: the refusal names the missing field instead of surfacing as a TypeError.
+AGENT_REQUIRED: dict[str, tuple[str, ...]] = {
+    "agent_start": ("agent_id", "prompt"),
+    "get_agent": ("agent_id",),
+    "create_agent": ("agent_id",),
+    "update_agent": ("agent_id",),
+    "register_skill": ("skill_id",),
+    "bind_agent_skill": ("agent_id", "skill_id"),
 }
 
 _BLOCKED_ERRORS = {
@@ -886,6 +938,50 @@ class CompactTerminalTools:
         if action in {"enqueue_task", "route_start"} and (
                 not isinstance(text, str) or not text.strip()):
             return {"status": "FAILED", "error": "TEXT_REQUIRED", "action": action}
+        if action in AGENT_ARGS:
+            # Shaped from `args` plus the two conventional positionals this
+            # surface already uses everywhere else: `target` is the agent or
+            # skill id, `text` is the prompt. Unknown keys are refused by name
+            # rather than dropped -- a typo that appears to succeed is how a
+            # caller comes to believe it set something it did not.
+            allowed = AGENT_ARGS[action]
+            if args is not None and not isinstance(args, dict):
+                return {"status": "FAILED", "error": "INVALID_ARGS", "action": action,
+                        "allowed": sorted(allowed)}
+            extra = dict(args or {})
+            if unknown := sorted(key for key in extra if key not in allowed):
+                return {"status": "FAILED", "error": "UNKNOWN_ARGS", "action": action,
+                        "unknown": unknown, "allowed": sorted(allowed)}
+            if target and "agent_id" in allowed:
+                extra.setdefault("agent_id", target)
+            if target and "skill_id" in allowed and "agent_id" not in allowed:
+                extra.setdefault("skill_id", target)
+            if text and "prompt" in allowed:
+                extra.setdefault("prompt", text)
+            elif text and "skill_id" in allowed and "agent_id" in allowed:
+                # bind_agent_skill is the one action naming TWO ids, so it
+                # reads the surface's two positionals in the obvious order:
+                # target is the agent, text is the skill.
+                extra.setdefault("skill_id", text)
+            if title and "title" in allowed:
+                extra.setdefault("title", title)
+            if metadata and "metadata" in allowed:
+                extra.setdefault("metadata", metadata)
+            if request_key and "request_key" in allowed:
+                extra.setdefault("request_key", request_key)
+            missing = sorted(key for key in AGENT_REQUIRED.get(action, ()) if not extra.get(key))
+            if missing:
+                return {"status": "FAILED", "error": "MISSING_ARGS", "action": action,
+                        "missing": missing}
+            result = handler(**extra)
+            status = "FAILED" if isinstance(result, dict) and "error" in result else "OK"
+            return {"status": status, "action": action, "result": result,
+                    **{key: result[key] for key in
+                       ("task_id", "session", "node_id", "routing_state", "routing_outcome",
+                        "routing_reason", "score", "task_state", "dispatched", "poll",
+                        "agent_id", "skills")
+                       if isinstance(result, dict) and key in result}}
+
         if action == "route_start":
             # No target: that is the point. `target`, when a caller does pass
             # one, is forwarded and honoured as hard affinity by the router --

@@ -44,6 +44,8 @@ from .queue_task_follower import StartedTaskFollower
 from .request_governor import RequestGovernor
 from .queue_event_drain import QueueEventDrain
 from .queue_loop import QueueLoop
+from .agent_registry import AgentRegistryStore
+from .agent_service import AgentService
 from .task_router import TaskRouter
 from .project_task_feeder import ProjectTaskFeeder
 from .backlog_service import BacklogService
@@ -90,6 +92,8 @@ def _fleet_session_names(controller: "ControllerService") -> list[str]:
 
 def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_session,
                      enqueue_task, route_start, task_status, task_batch_status,
+                     agent_start, list_agents, get_agent, create_agent, update_agent,
+                     list_skills, register_skill, bind_agent_skill, cleanup_candidates,
                      browser_status, browser_verify, browser_screenshot,
                      browser_run_task, browser_stop, dispatch_tick,
                      follow_task) -> dict[str, Any]:
@@ -109,6 +113,18 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
         "delete_session": delete_session,
         "enqueue_task": enqueue_task,
         "route_start": route_start,
+        # Phase B. Every one of these is the SAME function its standalone tool
+        # is registered from -- the one-tool surface must never be a weaker or
+        # differently-behaved path than the full one.
+        "agent_start": agent_start,
+        "list_agents": list_agents,
+        "get_agent": get_agent,
+        "create_agent": create_agent,
+        "update_agent": update_agent,
+        "list_skills": list_skills,
+        "register_skill": register_skill,
+        "bind_agent_skill": bind_agent_skill,
+        "cleanup_candidates": cleanup_candidates,
         "task_status": task_status,
         "task_batch_status": task_batch_status,
         # May be None on a build with no browser gateway wired. The router
@@ -154,6 +170,7 @@ def build_mcp(service: TerminalService | None = None,
               default_optional_services: bool = True,
               chat_checkpoints: OrchestratorCheckpointStore | None = None,
               browser: BrowserGateway | None = None,
+              agents: "AgentService | None" = None,
               run_journal: Any = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
@@ -460,10 +477,22 @@ def build_mcp(service: TerminalService | None = None,
     # as queue.router so the dashboard, the MCP tools and the compact `turn`
     # surface all drive the one instance rather than each constructing a
     # second one that would make its own, differently-cached fleet decisions.
+    # TMCP-AGENT-RUNTIME-001 Phase B. The agent registry is built BEFORE the
+    # router so its capacity rule can be installed as a router hook -- see
+    # AgentService.capacity_block_reason for why that has to hold on the
+    # rescue path and not only on submission.
+    agents = agents or AgentService(
+        AgentRegistryStore(), queue=queue,
+        skill_roots=getattr(terminal.config, "agents", None)
+        and terminal.config.agents.skill_roots or None)
+    agents.queue = queue
     task_router = TaskRouter(
         queue.store, controller=controller, queue=queue, engine=queue_engine,
-        session_registry=terminal.session_registry, config=terminal.config)
+        session_registry=terminal.session_registry, config=terminal.config,
+        capacity_check=agents.capacity_block_reason)
+    agents.router = task_router
     queue.router = task_router
+    queue.agents = agents
     queue.loop = queue.loop or QueueLoop(
         queue_engine, poll_interval_seconds=terminal.config.queue.poll_interval_seconds,
         heartbeat_refresher=_refresh_local_heartbeat,
@@ -3291,6 +3320,130 @@ def build_mcp(service: TerminalService | None = None,
         from .stale_sessions import cleanup_candidates
         return cleanup_candidates(queue.router, config=terminal.config, limit=limit)
 
+    # -- Agent + Skill runtime (TMCP-AGENT-RUNTIME-001 Phase B) -------------
+
+    @server.tool()
+    def terminal_agent_start(agent_id: str, prompt: str, title: str | None = None,
+                             priority: int = 0, metadata: dict | None = None,
+                             request_key: str | None = None,
+                             skill_ids: list[str] | None = None,
+                             include_task_skills: bool = False,
+                             target: str | None = None) -> dict:
+        """Start work AS a durable agent. No session target needed.
+
+        The agent supplies the identity -- its project, repo, workspace,
+        preferred runtime and its bound skills (resolved to pinned
+        id@version labels at start time). Placement is the SAME router
+        `terminal_route_start` uses, so every eligibility rule, the atomic
+        claim and Queue Rescue apply unchanged; there is no second scheduler.
+
+        The task is owned by the agent for its whole life. Its execution
+        session may be released and re-bound any number of times; `agent_id`
+        never moves. An agent already at its max_sessions limit gets its task
+        durably queued with that stated as the reason, not a second runtime."""
+        return agents.agent_start(
+            agent_id, prompt, title=title, priority=priority, metadata=metadata,
+            request_key=request_key, skill_ids=skill_ids,
+            include_task_skills=include_task_skills, target=target)
+
+    @server.tool()
+    def terminal_list_agents(project_id: str | None = None, state: str | None = None) -> dict:
+        """Every registered agent with its live state: current task, queue
+        depth, runtime session/node, skills and run counts."""
+        return agents.list_agents(project_id=project_id, state=state)
+
+    @server.tool()
+    def terminal_get_agent(agent_id: str) -> dict:
+        """One agent in full, including recent runs and recent failures."""
+        return agents.get_agent(agent_id)
+
+    @server.tool()
+    def terminal_create_agent(agent_id: str, name: str | None = None,
+                              project_id: str | None = None, description: str = "",
+                              runtime: str | None = None, max_sessions: int = 1,
+                              repo: str | None = None, workspace: str | None = None,
+                              model: str | None = None, metadata: dict | None = None) -> dict:
+        """Create a durable agent identity. `agent_id` is a slug.
+
+        `max_sessions` defaults to 1: an agent is one identity with one train
+        of thought, and two concurrent runtimes is how two sessions end up in
+        one worktree."""
+        return agents.create_agent(
+            agent_id, name=name, project_id=project_id, description=description,
+            runtime=runtime, max_sessions=max_sessions, repo=repo, workspace=workspace,
+            model=model, metadata=metadata)
+
+    @server.tool()
+    def terminal_update_agent(agent_id: str, name: str | None = None,
+                              project_id: str | None = None, description: str | None = None,
+                              runtime: str | None = None, max_sessions: int | None = None,
+                              repo: str | None = None, workspace: str | None = None,
+                              model: str | None = None, metadata: dict | None = None,
+                              state: str | None = None) -> dict:
+        """Update an agent. Only the fields you pass are written.
+
+        `state="DISABLED"` stops the agent being started and holds its queued
+        work with that stated as the reason; the agent is never deleted, so
+        its task history stays readable. Parameters are spelled out rather
+        than taken as **kwargs so the tool advertises a real schema."""
+        fields = {key: value for key, value in (
+            ("name", name), ("project_id", project_id), ("description", description),
+            ("runtime", runtime), ("max_sessions", max_sessions), ("repo", repo),
+            ("workspace", workspace), ("model", model), ("metadata", metadata),
+            ("state", state)) if value is not None}
+        if not fields:
+            return {"error": "NO_FIELDS", "detail": "pass at least one field to update"}
+        return agents.update_agent(agent_id, **fields)
+
+    @server.tool()
+    def terminal_list_skills(latest_only: bool = True) -> dict:
+        """Registered skills, newest version of each by default."""
+        return agents.list_skills(latest_only=latest_only)
+
+    @server.tool()
+    def terminal_get_skill(skill_id: str, version: str | None = None,
+                           include_body: bool = False) -> dict:
+        """One skill version and the list of versions registered for its id."""
+        return agents.get_skill(skill_id, version=version, include_body=include_body)
+
+    @server.tool()
+    def terminal_register_skill(skill_id: str, version: str | None = None,
+                                body: str | None = None, name: str = "",
+                                summary: str = "", metadata: dict | None = None) -> dict:
+        """Register one skill VERSION, from `skills/<id>/SKILL.md` under an
+        approved root, or inline when `body` is given.
+
+        The id is a strict slug and the resolved path must stay inside an
+        approved root after symlink resolution, so a traversal attempt is
+        refused before anything is read. Re-registering identical content is a
+        no-op; different content under the same version is an error, because
+        silently redefining a version invalidates every evidence trail citing
+        it."""
+        return agents.register_skill(skill_id, version=version, body=body, name=name,
+                                     summary=summary, metadata=metadata)
+
+    @server.tool()
+    def terminal_discover_skills() -> dict:
+        """What is installed under the approved skill roots. Registers
+        nothing -- a report, so an operator can see what is available and what
+        was skipped, and why."""
+        return agents.discover_skills()
+
+    @server.tool()
+    def terminal_bind_agent_skill(agent_id: str, skill_id: str, kind: str = "BASE",
+                                  version: str | None = None) -> dict:
+        """Bind a skill to an agent. BASE loads for every task the agent runs;
+        TASK is available but applied only when a task asks for it. Omit
+        `version` to float to the newest."""
+        return agents.bind_agent_skill(agent_id, skill_id, kind=kind, version=version)
+
+    @server.tool()
+    def terminal_unbind_agent_skill(agent_id: str, skill_id: str,
+                                    kind: str | None = None) -> dict:
+        """Remove a skill binding. Omit `kind` to remove every binding of that
+        skill for the agent."""
+        return agents.unbind_agent_skill(agent_id, skill_id, kind)
+
     @server.tool()
     def terminal_task_status(task_id: str) -> dict:
         """Direct by-id lookup for one task -- lets a caller track a
@@ -5674,6 +5827,15 @@ def build_mcp(service: TerminalService | None = None,
         delete_session=terminal_delete_session,
         enqueue_task=terminal_enqueue_task,
         route_start=terminal_route_start,
+        agent_start=terminal_agent_start,
+        list_agents=terminal_list_agents,
+        get_agent=terminal_get_agent,
+        create_agent=terminal_create_agent,
+        update_agent=terminal_update_agent,
+        list_skills=terminal_list_skills,
+        register_skill=terminal_register_skill,
+        bind_agent_skill=terminal_bind_agent_skill,
+        cleanup_candidates=terminal_session_cleanup_candidates,
         task_status=terminal_task_status,
         task_batch_status=terminal_task_batch_status,
         browser_status=browser_handlers.get("browser_status"),

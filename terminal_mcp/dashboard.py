@@ -1453,6 +1453,7 @@ DASHBOARD_HTML = """<!doctype html>
           <a href="/dashboard/sessions" id="sessionsAdminLink" role="menuitem">⚙ Quản lý session</a>
           <a href="/dashboard/nodes" id="nodesAdminLink" role="menuitem">🖥 Nodes</a>
           <a href="/dashboard/tasks" id="globalTasksLink" role="menuitem">🗂 Global Tasks</a>
+          <a href="/dashboard/agents" id="agentsLink" role="menuitem">🤖 Agents</a>
           <a href="/dashboard/backlog" id="backlogLink" role="menuitem">📋 Project Backlog</a>
           <a href="/dashboard/notes" id="notesLink" role="menuitem">💡 Ghi chú / Ý tưởng</a>
           <a href="/dashboard/requirements" id="requirementsLink" role="menuitem" target="_blank" rel="noopener">📄 Requirements</a>
@@ -10777,6 +10778,164 @@ AI_USAGE_HTML = """<!doctype html>
 """
 
 
+# ---------------------------------------------------------------------------
+# Agents -- the DURABLE half of the runtime (TMCP-AGENT-RUNTIME-001 Phase B).
+#
+# Global Tasks answers "what work exists". This answers "who owns it", which
+# before Phase B had no answer at all: an agent existed only as whatever
+# session happened to be running its task, so replacing the session destroyed
+# the identity. Every column here is therefore about an identity that OUTLIVES
+# its runtime -- the session and node are shown as the agent's CURRENT
+# placement, deliberately beside the agent rather than as part of it.
+#
+# A view, not a new privilege surface: the same read guard as every other
+# admin page, over /dashboard/api/agents.
+# ---------------------------------------------------------------------------
+AGENTS_HTML = """<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Agents</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff;
+            --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#5b8cff;
+            --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono',monospace; }
+    * { box-sizing:border-box }
+    body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text) }
+    a { color:var(--accent); text-decoration:none }
+    header { display:flex; justify-content:space-between; gap:16px; align-items:center;
+             padding:14px 24px; border-bottom:1px solid var(--line); flex-wrap:wrap }
+    h1 { margin:0; font-size:18px } .muted { color:var(--muted) }
+    .live { color:var(--green); font-size:12px } .live.offline { color:var(--red) }
+    a.back { color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:4px 10px; font-size:12px }
+    main { padding:16px 24px 32px; display:flex; flex-direction:column; gap:12px }
+    .agent { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 14px }
+    .agent h2 { margin:0 0 6px; font-size:15px; display:flex; align-items:center; gap:8px; flex-wrap:wrap }
+    .chip { display:inline-block; border-radius:999px; padding:1px 8px; border:1px solid var(--line);
+            font-size:10px; color:var(--muted) }
+    .chip.on { color:var(--green); border-color:var(--green) }
+    .chip.off { color:var(--red); border-color:var(--red) }
+    .chip.busy { color:var(--amber); border-color:var(--amber) }
+    .chip.skill { color:var(--accent); border-color:var(--accent) }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:8px; margin-top:8px }
+    .cell { background:#0f1730; border:1px solid var(--line); border-radius:8px; padding:7px 9px; font-size:12px }
+    .cell b { display:block; color:var(--muted); font-size:10px; font-weight:400; text-transform:uppercase }
+    .runs { margin-top:8px; font-size:11px; color:var(--muted) }
+    .runs div { padding:2px 0 }
+    .fail { color:var(--red) }
+    .empty { color:var(--muted); text-align:center; padding:40px }
+    @media (max-width:700px) { main { padding:12px 14px 24px } }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>&#129302; Agents</h1><div class="muted">Durable agent identity &#183; disposable session runtime</div></div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <button class="back" id="refreshBtn" type="button">&#10227; Refresh</button>
+      <a class="back" href="/dashboard/tasks">&#128451; Global Tasks</a>
+      <a class="back" href="/dashboard">&#8592; Terminal</a>
+      <span class="live" id="liveBadge">&#9679; LIVE</span>
+    </div>
+  </header>
+  <main id="root"><div class="empty">&#273;ang t&#7843;i&#8230;</div></main>
+  <script>
+    const root = document.querySelector('#root');
+    const liveBadge = document.querySelector('#liveBadge');
+    const clean = value => String(value === null || value === undefined ? '' : value);
+
+    function cell(label, value) {
+      const el = document.createElement('div'); el.className = 'cell';
+      const b = document.createElement('b'); b.textContent = label;
+      el.append(b, document.createTextNode(clean(value) || '\u2014'));
+      return el;
+    }
+
+    function render(agents) {
+      root.replaceChildren();
+      if (!agents.length) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'ch\u01b0a c\u00f3 agent n\u00e0o \u2014 t\u1ea1o b\u1eb1ng terminal_create_agent';
+        root.append(empty);
+        return;
+      }
+      for (const agent of agents) {
+        const card = document.createElement('div'); card.className = 'agent';
+        const head = document.createElement('h2');
+        head.append(document.createTextNode(clean(agent.name || agent.id)));
+        const state = document.createElement('span');
+        state.className = 'chip ' + (agent.enabled ? 'on' : 'off');
+        state.textContent = clean(agent.state); head.append(state);
+        if (agent.at_capacity) {
+          const cap = document.createElement('span'); cap.className = 'chip busy';
+          cap.textContent = 'at max_sessions'; head.append(cap);
+        }
+        const id = document.createElement('span'); id.className = 'chip';
+        id.textContent = '#' + clean(agent.id); head.append(id);
+        for (const skill of (agent.skills || [])) {
+          const sk = document.createElement('span'); sk.className = 'chip skill';
+          sk.textContent = clean(skill.skill_id) + '@' + clean(skill.version) +
+                           (skill.kind === 'TASK' ? ' (task)' : '');
+          head.append(sk);
+        }
+        card.append(head);
+
+        const current = agent.current_task;
+        const grid = document.createElement('div'); grid.className = 'grid';
+        grid.append(
+          cell('project', agent.project_id),
+          cell('state', agent.state),
+          cell('current task', current ? `${clean(current.title || current.task_id).slice(0, 40)} [${clean(current.status)}]` : 'idle'),
+          cell('queue', `${clean(agent.queued_tasks)} queued / ${clean(agent.active_tasks)} active`),
+          cell('runtime session', current ? current.session : null),
+          cell('node', current ? current.node_id : null),
+          cell('model', agent.model),
+          cell('runtime', agent.runtime),
+          cell('max sessions', agent.max_sessions),
+          cell('context', agent.context_percent === null || agent.context_percent === undefined
+               ? null : `${agent.context_percent}%`),
+        );
+        card.append(grid);
+
+        const runs = document.createElement('div'); runs.className = 'runs';
+        const counts = Object.entries(agent.run_counts || {})
+          .map(([key, value]) => `${clean(key)}:${clean(value)}`).join('  ');
+        if (counts) { const c = document.createElement('div'); c.textContent = 'runs \u2014 ' + counts; runs.append(c); }
+        for (const run of (agent.recent_runs || []).slice(0, 5)) {
+          const line = document.createElement('div');
+          const failed = run.status === 'FAILED' || run.status === 'BLOCKED';
+          if (failed) line.className = 'fail';
+          line.textContent = `${clean(run.updated_at).slice(0, 19)}  ${clean(run.status)}  ` +
+                             `${clean(run.session) || '\u2014'}  ${clean(run.detail || '').slice(0, 90)}`;
+          runs.append(line);
+        }
+        if (runs.childNodes.length) card.append(runs);
+        root.append(card);
+      }
+    }
+
+    async function load() {
+      try {
+        const response = await fetch('/dashboard/api/agents', { headers: { 'Accept': 'application/json' } });
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const body = await response.json();
+        render(body.agents || []);
+        liveBadge.classList.remove('offline');
+      } catch (error) {
+        liveBadge.classList.add('offline');
+      }
+    }
+
+    document.querySelector('#refreshBtn').addEventListener('click', load);
+    load();
+    setInterval(load, 5000);
+  </script>
+</body>
+</html>
+"""
+
+
 GLOBAL_TASKS_HTML = """<!doctype html>
 <html lang="vi">
 <head>
@@ -12456,6 +12615,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        credentials: "node_credentials.NodeCredentialStore | None" = None,
                        rotation: "TokenRotationService | None" = None,
                        notes: NotesService | None = None,
+                       agents: Any = None,
                        webauth: WebAuthStore | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
@@ -12483,6 +12643,12 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # server_http.py's real main() always passes an explicit,
         # persistent ConnectionStore instead of relying on this fallback.
         connection_store = ConnectionStore(ephemeral_db_path("connections", "connections.db"))
+    if agents is None:
+        # The SAME AgentService build_mcp constructed, reached through the
+        # queue it was attached to -- never a second registry over a second
+        # database, which would make this page describe a different fleet
+        # than the MCP tools act on.
+        agents = getattr(queue, "agents", None)
     if queue is None:
         # SAME private-temp-file discipline as connection_store's own
         # default just above: every EXISTING caller of register_dashboard
@@ -13853,6 +14019,57 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                                  "totals": {"rolling_5h": {}, "today": {}, "lifetime": {}}},
                                 status_code=200)
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/agents", methods=["GET"], include_in_schema=False)
+    async def dashboard_agents(request: Request) -> HTMLResponse | JSONResponse:
+        # Same read guard as every other admin page. A VIEW over the agent
+        # registry -- see AGENTS_HTML's own comment for why the durable
+        # identity needs a screen of its own.
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(
+            AGENTS_HTML,
+            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
+        )
+
+    @server.custom_route("/dashboard/api/agents", methods=["GET"], include_in_schema=False)
+    async def dashboard_api_agents(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        if agents is None:
+            return JSONResponse({"agents": [], "count": 0, "detail": "agent runtime not wired"},
+                                headers={"Cache-Control": "no-store"})
+        project_id = request.query_params.get("project_id") or None
+        state = request.query_params.get("state") or None
+        listing = await anyio.to_thread.run_sync(
+            lambda: agents.list_agents(project_id=project_id, state=state))
+        # Each card wants the detail view (recent runs, failures); the list
+        # view deliberately does not carry it, so it is fetched here per agent
+        # rather than making the list endpoint heavier for every other caller.
+        detailed = []
+        for row in listing.get("agents", []):
+            full = await anyio.to_thread.run_sync(lambda aid=row["id"]: agents.get_agent(aid))
+            view = full.get("agent", row) if isinstance(full, dict) else row
+            # Context pressure belongs to the SESSION, not the agent, so it is
+            # read from the runtime the agent currently holds rather than
+            # stored on the agent row where it would immediately go stale.
+            # Best-effort: an unreadable session leaves the field null.
+            current = view.get("current_task") or {}
+            session_name = current.get("session")
+            if session_name:
+                try:
+                    status = await anyio.to_thread.run_sync(
+                        controller.terminal_status, session_name)
+                    resource = status.get("resource") if isinstance(status, dict) else None
+                    context = (resource or {}).get("context") or {}
+                    view["context_percent"] = context.get("percent")
+                except Exception:  # noqa: BLE001 -- a view must not fail on one probe
+                    view["context_percent"] = None
+            detailed.append(view)
+        return JSONResponse({"agents": detailed, "count": len(detailed)},
+                            headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/tasks", methods=["GET"], include_in_schema=False)
     async def dashboard_global_tasks(request: Request) -> HTMLResponse | JSONResponse:

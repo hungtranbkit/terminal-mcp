@@ -1981,6 +1981,20 @@ class QueueStore:
         if task.status == WAITING_SESSION:
             return True
         return bool((task.metadata or {}).get(cls.ROUTER_OWNED_METADATA_KEY))
+    def tasks_for_agent(self, agent_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Every task this AGENT owns, newest first.
+
+        Ownership, not execution: the query is on `agent_id`, which is written
+        once at creation and never moves, so a task stays findable through any
+        number of session rebindings. That is the whole point of the column --
+        see agent_service.py on durable identity vs disposable runtime."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM queue_tasks WHERE agent_id = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (agent_id, limit)).fetchall()
+        return [QueueTask.from_row(row).to_dict() for row in rows]
+
     def get_task(self, task_id: str) -> QueueTask | None:
         with self._connection() as connection:
             row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()

@@ -82,6 +82,10 @@ class QueueService:
         # the dashboard, the rescue sweep) drives one router with one view of
         # the fleet, never several that could each decide differently.
         self.router: Any = None
+        # Phase B's AgentService, attached by mcp_app for the same reason as
+        # engine/loop/router above: one instance, one registry, shared by the
+        # MCP tools, the compact surface and the dashboard.
+        self.agents: Any = None
         # P0.5 Verify Queue, over the SAME store -- a verify job and the
         # task it verifies must commit together, which is only possible
         # in one database. Its `registry` (used solely to explain WHY a

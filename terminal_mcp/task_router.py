@@ -134,7 +134,8 @@ class TaskRouter:
 
     def __init__(self, store: QueueStore, *, controller: Any = None, queue: Any = None,
                  engine: Any = None, session_registry: Any = None,
-                 config: Any = None, clock: Callable[[], float] = time.monotonic) -> None:
+                 config: Any = None, clock: Callable[[], float] = time.monotonic,
+                 capacity_check: Callable[[Any], str | None] | None = None) -> None:
         self.store = store
         self.controller = controller
         self.queue = queue
@@ -142,6 +143,12 @@ class TaskRouter:
         self.session_registry = session_registry
         self.config = config
         self.clock = clock
+        # Phase B: an owner-level admission rule, injected rather than
+        # imported, so the router keeps knowing nothing about agents. Returns
+        # a reason to defer, or None. It is consulted on EVERY routing path --
+        # submission and rescue alike -- because a limit that only held on the
+        # submission path would be silently bypassed by the next reconcile.
+        self.capacity_check = capacity_check
         self._cache: tuple[float, list[SessionCandidate]] | None = None
         self._cache_ttl_seconds = 2.0
         # One routing decision at a time in this process. The store's
@@ -389,6 +396,20 @@ class TaskRouter:
         if not self.enabled:
             return RoutingOutcome(outcome=DEFERRED, task_id=task_id, task_state=task.status,
                                   routing_state=UNROUTED, reason="router is disabled by policy")
+
+        if self.capacity_check is not None:
+            try:
+                blocked = self.capacity_check(task)
+            except Exception:  # noqa: BLE001 -- an admission-check glitch must not strand a task
+                _LOGGER.exception("task-router: capacity check failed for task %s", task_id)
+                blocked = None
+            if blocked:
+                evidence = {"reason": blocked, "capacity_blocked": True,
+                            "candidates_considered": 0}
+                self.store.record_routing_deferral(task_id, evidence=evidence)
+                return RoutingOutcome(outcome=DEFERRED, task_id=task_id, task_state=task.status,
+                                      routing_state=WAITING_RUNTIME, reason=blocked,
+                                      evidence=evidence)
 
         profile = self.profile_for(task)
         match = sm.rank(profile, self.candidates(), probe=self._probe,
