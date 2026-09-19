@@ -40,7 +40,21 @@ _MAX_TARGET_CHARS = 512
 # and idempotency. This table is the single place the vocabulary is defined --
 # the MCP tool layer validates nothing of its own.
 # --------------------------------------------------------------------------
-TURN_PANE_ACTIONS = ("inspect", "send", "send_wait", "wait", "resume")
+TURN_PANE_ACTIONS = ("inspect", "send", "send_wait", "wait", "resume", "start")
+# How many QueueEngine ticks one `start` call may spend driving the lane from
+# QUEUED to actually dispatched. The engine makes at most ONE transition per
+# tick on purpose (claim -> coordinator gate -> dispatch), so a handful is the
+# whole start sequence with room for one reconcile; it is a bound on the
+# CALLER'S wait, not on the task, which is durable from the first step and is
+# carried the rest of the way server-side.
+MAX_START_TICKS = 6
+#: `start` returns as soon as the task reaches one of these -- the work is
+#: under way (or honestly stopped) and there is nothing a further tick in this
+#: call would tell the caller that the server will not handle itself.
+START_SETTLED_STATUSES = frozenset({
+    "DISPATCHING", "RUNNING", "VERIFYING", "COMPLETED", "SKIPPED", "CANCELLED",
+    "FAILED", "BLOCKED", "NEEDS_HUMAN", "WAITING_SESSION", "DISPATCH_UNCERTAIN",
+})
 # action -> handler key in CompactTerminalTools.handlers
 TURN_HANDLER_ACTIONS: dict[str, str] = {
     "list_sessions": "list_sessions",
@@ -60,6 +74,12 @@ TURN_HANDLER_ACTIONS: dict[str, str] = {
     "browser_screenshot": "browser_screenshot",
     "browser_stop": "browser_stop",
 }
+#: Handler keys `start` composes. They are injected exactly like the ones in
+#: TURN_HANDLER_ACTIONS (mcp_app wires them to the very same implementations
+#: the standalone tools use) but they are not actions of their own -- a caller
+#: never asks for "tick"; it asks for `start` and the server decides how many
+#: steps that takes.
+START_HANDLER_KEYS = ("enqueue_task", "task_status", "dispatch_tick", "follow_task")
 # Short spellings a caller reaches for first. Resolved before dispatch so the
 # canonical name is the only thing the routing below has to know about.
 TURN_ACTION_ALIASES: dict[str, str] = {
@@ -75,6 +95,9 @@ TURN_ACTION_ALIASES: dict[str, str] = {
     "browser": "browser_status",
     "verify": "browser_verify",
     "screenshot": "browser_screenshot",
+    "start_task": "start",
+    "dispatch": "start",
+    "run": "start",
 }
 TURN_ACTIONS = (*TURN_PANE_ACTIONS, *TURN_HANDLER_ACTIONS)
 
@@ -540,6 +563,12 @@ class CompactTerminalTools:
         if not target:
             return {"status": "FAILED", "error": "TARGET_REQUIRED"}
 
+        if normalized == "start":
+            if not text:
+                return {"status": "FAILED", "error": "TEXT_REQUIRED"}
+            return self._start_turn(target, text, title=title, priority=priority,
+                                    metadata=metadata, request_key=request_key)
+
         if normalized == "send":
             if not text:
                 return {"status": "FAILED", "error": "TEXT_REQUIRED"}
@@ -560,13 +589,42 @@ class CompactTerminalTools:
                 if queued.get("status") != "OK" or not isinstance(accepted, dict):
                     return {"status": "FAILED", "action": normalized,
                             "mode": "durable_queue", "result": queued}
+                # Persisting is only half of "one call". The comment above
+                # says the queue loop owns dispatch from here -- but that loop
+                # is OFF by default behind two gates (config.queue.enabled and
+                # the per-lane auto_dispatch_enabled, see queue_loop.py), so on
+                # an ordinary deployment the task would sit QUEUED and nothing
+                # would ever start it. Drive the same bounded start sequence
+                # `action="start"` uses, and hand it to the same server-side
+                # follower, so the durable receipt this returns describes work
+                # that is actually under way. Every key this path returned
+                # before is unchanged; the start fields are added beside them.
+                task_id_started = accepted.get("task_id")
+                started: dict[str, Any] = {}
+                if task_id_started:
+                    ticks, task_state = self._drive_start(target, task_id_started)
+                    started = {
+                        "task_id": task_id_started,
+                        "session": target,
+                        "task_state": task_state,
+                        "dispatched": task_state in START_SETTLED_STATUSES,
+                        "dispatch_ticks": ticks,
+                        "server_side_progress": self._follow(target, task_id_started, task_state),
+                        "poll": False,
+                        "next_action": "none",
+                    }
                 return {
+                    # Unchanged: a long_task send still reports what the
+                    # DURABLE QUEUE said, so an existing caller reading
+                    # status/mode/receipt/result/client_polling sees exactly
+                    # what it saw before.
                     "status": accepted.get("status", "TASK_ACCEPTED"),
                     "action": normalized,
                     "mode": "durable_queue",
                     "receipt": accepted,
                     "result": accepted,
                     "client_polling": False,
+                    **started,
                 }
             result = self.send_task(target, text, wait_for_accept=True,
                                     timeout=min(float(timeout), MAX_SEND_WAIT_SECONDS),
@@ -597,6 +655,119 @@ class CompactTerminalTools:
                                      tail_lines=tail_lines)
         return {"status": waited.get("status", "FAILED"),
                 "action": normalized, "send": sent, "wait": waited}
+
+
+    def _start_turn(self, target: str, text: str, *, title: str | None,
+                    priority: int, metadata: dict[str, Any] | None,
+                    request_key: str | None) -> dict[str, Any]:
+        """`action="start"` -- the ONE call a normal request needs.
+
+        Persist first, dispatch second, hand back a durable id, and leave
+        the rest to the server. Concretely:
+
+          1. enqueue_task, the existing durable, restart-safe, request_key-
+             deduplicated path -- so the prompt is recorded BEFORE anything
+             is sent and survives a crash between these steps;
+          2. drive the lane through its start sequence here, bounded by
+             MAX_START_TICKS, because QueueEngine.tick makes one transition
+             per call and a client should never have to spend one MCP call
+             per transition (that is this task's whole point);
+          3. hand the task to the server-side follower so it keeps
+             advancing after this call returns.
+
+        The receipt says `poll: False` and `next_action: "none"` explicitly.
+        A caller that has a task_id and a server that is still working has
+        nothing to learn by asking again -- `task_status` is for when the
+        USER asks to check, not for a loop.
+
+        Every step reuses an injected handler, so authorization, allowed-cwd,
+        protected-session and idempotency rules are the same ones the
+        standalone tools enforce; nothing about them is re-decided here.
+        """
+        enqueue = self.handlers.get("enqueue_task")
+        if enqueue is None:
+            return {"status": "FAILED", "error": "ACTION_UNAVAILABLE", "action": "start",
+                    "detail": "start is not wired on this server"}
+        accepted = enqueue(target, text, title=title, priority=priority,
+                           metadata=metadata, request_key=request_key)
+        if not isinstance(accepted, dict) or accepted.get("error") or not accepted.get("task_id"):
+            return {"status": "FAILED", "action": "start", "result": accepted}
+        task_id = accepted["task_id"]
+
+        ticks, task_state = self._drive_start(target, task_id)
+        follow = self._follow(target, task_id, task_state)
+        dispatched = task_state in START_SETTLED_STATUSES
+        return {
+            "status": "TASK_STARTED" if dispatched else "TASK_ACCEPTED",
+            "action": "start", "task_id": task_id, "session": target,
+            "task_state": task_state, "dispatched": dispatched,
+            "queue_position": accepted.get("queue_position"),
+            "deduplicated": bool(accepted.get("deduplicated")),
+            "request_key": accepted.get("request_key"),
+            "dispatch_ticks": ticks,
+            "server_side_progress": follow,
+            # The anti-polling contract, stated in the receipt itself rather
+            # than only in the tool description, so a client that never read
+            # the description still gets it.
+            "poll": False,
+            "next_action": "none",
+            "guidance": ("work is started and tracked server-side under this task_id -- do not "
+                         "call wait/resume/inspect to watch it; use action=task with this "
+                         "task_id only if the user explicitly asks to check"),
+        }
+
+    def _drive_start(self, target: str, task_id: str) -> tuple[int, str]:
+        """Tick the lane until this task is actually under way. Bounded by
+        MAX_START_TICKS -- a bound on how long the CALLER waits, never on the
+        task, which the follower carries from here."""
+        tick = self.handlers.get("dispatch_tick")
+        state = self._task_state(task_id)
+        if tick is None:
+            return 0, state
+        ticks = 0
+        for _ in range(MAX_START_TICKS):
+            if state in START_SETTLED_STATUSES:
+                break
+            try:
+                tick(target)
+            except Exception:  # noqa: BLE001 -- the task is durable; report its real state
+                break
+            ticks += 1
+            state = self._task_state(task_id)
+        return ticks, state
+
+    def _task_state(self, task_id: str) -> str:
+        status = self.handlers.get("task_status")
+        if status is None:
+            return "UNKNOWN"
+        try:
+            result = status(task_id)
+        except Exception:  # noqa: BLE001
+            return "UNKNOWN"
+        if isinstance(result, dict):
+            task = result.get("task")
+            if isinstance(task, dict) and task.get("status"):
+                return str(task["status"])
+            if result.get("status"):
+                return str(result["status"])
+        return "UNKNOWN"
+
+    def _follow(self, target: str, task_id: str, task_state: str) -> dict[str, Any]:
+        """Hand the started task to the server-side follower.
+
+        Skipped when the task already settled inside this call -- there is
+        nothing left to follow, and starting a thread to discover that would
+        be the same wasted work in a different place."""
+        if task_state in {"COMPLETED", "SKIPPED", "CANCELLED", "FAILED", "BLOCKED", "NEEDS_HUMAN"}:
+            return {"following": False, "reason": "ALREADY_SETTLED"}
+        follow = self.handlers.get("follow_task")
+        if follow is None:
+            return {"following": False, "reason": "FOLLOWER_UNAVAILABLE"}
+        try:
+            result = follow(target, task_id)
+        except Exception:  # noqa: BLE001 -- never fail a started task over its follower
+            return {"following": False, "reason": "FOLLOWER_ERROR"}
+        return result if isinstance(result, dict) else {"following": bool(result)}
 
     def _handler_turn(self, action: str, *, target: str | None, text: str | None,
                       agent_type: str, working_directory: str | None,

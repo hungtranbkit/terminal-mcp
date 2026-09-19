@@ -40,6 +40,7 @@ from .pm_summary import (
     emergency_resume_all_lanes, emergency_stop_all_lanes, generate_summary,
 )
 from .queue_engine import QueueEngine
+from .queue_task_follower import StartedTaskFollower
 from .request_governor import RequestGovernor
 from .queue_event_drain import QueueEventDrain
 from .queue_loop import QueueLoop
@@ -89,7 +90,7 @@ def _fleet_session_names(controller: "ControllerService") -> list[str]:
 def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_session,
                      enqueue_task, task_status, task_batch_status,
                      browser_status, browser_verify, browser_screenshot,
-                     browser_stop) -> dict[str, Any]:
+                     browser_stop, dispatch_tick, follow_task) -> dict[str, Any]:
     """The implementations terminal_turn's non-pane actions route to.
 
     Keyword-only and exhaustive on purpose: every key in
@@ -115,6 +116,12 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
         "browser_verify": browser_verify,
         "browser_screenshot": browser_screenshot,
         "browser_stop": browser_stop,
+        # Not actions of their own (see compact_tools.START_HANDLER_KEYS):
+        # the two steps `action="start"` (and a long_task send) compose so one
+        # client call both persists the task AND gets it actually running,
+        # instead of the client spending one MCP call per queue transition.
+        "dispatch_tick": dispatch_tick,
+        "follow_task": follow_task,
     }
 
 
@@ -352,6 +359,17 @@ def build_mcp(service: TerminalService | None = None,
     queue_engine = QueueEngine(queue.store, controller, coordinator=_gate,
                               on_completed=_on_task_completed, verify_queue=queue.verify_queue,
                               governor=request_governor)
+    # TMCP-CALLED-TOOL-SPAM-002: carries a task that `terminal_turn
+    # action="start"` explicitly started, so normal orchestration costs ONE
+    # client call instead of one per queue transition. Scoped to that single
+    # task and stopped the moment it settles, so it never claims a lane's
+    # next queued task -- the OFF-by-default autonomous-dispatch gates
+    # queue_loop.py owns are untouched by it.
+    _started_task_follower = StartedTaskFollower(
+        lambda session: queue_engine.tick(session),
+        queue.task_status,
+        poll_interval_seconds=terminal.config.queue.poll_interval_seconds,
+    )
     queue.engine = queue.engine or queue_engine
     integration.engine = integration.engine or IntegrationEngine(integration.store, queue.store)
     # Event-driven WAIT/wake background loop (integration_loop.py) --
@@ -556,9 +574,22 @@ def build_mcp(service: TerminalService | None = None,
                       screenshot: str = "on_failure") -> dict:
         """THE terminal surface: one logical orchestration step, one MCP call.
 
-        This covers every normal workflow, so a caller never needs a second
-        tool (and a chat never shows a wall of tool rows). `action` is one of:
+        NORMAL FLOW IS ONE CALL. To give a session work, use action="start":
+        it durably persists the task, dispatches it, and returns a task_id,
+        all in this one call. Then STOP. Do not call wait, resume or inspect
+        to watch it -- the server carries it from there and the receipt says
+        `poll: false` for exactly that reason. Call action="task" with the
+        task_id ONLY when the user explicitly asks to check on it. A wall of
+        "Called tool" rows is the failure this surface exists to prevent.
 
+        `action` is one of:
+
+          start     THE DEFAULT for giving a session work: persist `text` as
+                    a durable task for `target`, dispatch it server-side, and
+                    return {task_id, task_state, poll: false}. Restart-safe,
+                    `request_key`-deduplicated, and never polled by the
+                    client. Prefer this over send/send_wait for anything that
+                    takes real time.
           inspect   status + bounded tail + `resource` health for one `target`
                     or many `targets` (this IS batch inspect)
           send      guarded, idempotent submission of `text`; pass
@@ -587,13 +618,23 @@ def build_mcp(service: TerminalService | None = None,
                     by `job_id` when a verify returned PENDING
           browser_stop   release the managed browser
 
-        Long work returns a durable task receipt; the server queue/watcher
-        advances it after this call. The client must not automatically issue
-        inspect/wait/resume calls after `SUBMIT_CONFIRMED` or `PENDING` unless
-        the user explicitly asks for a check. `target` is the session for every action that names one and `text` is
-        the prompt for both send and enqueue. Each action routes to the exact
+        Long work returns a durable task receipt AND is actually dispatched in
+        that same call; the server follower advances it afterwards. The client
+        must not automatically issue inspect/wait/resume calls after `start`,
+        `SUBMIT_CONFIRMED` or `PENDING` unless the user explicitly asks for a
+        check. `target` is the session for every action that names one and
+        `text` is the prompt for start, send and enqueue. Each action routes
+        to the exact
         same implementation the standalone tool uses, so authorization,
         allowed-cwd, protected-session and idempotency rules are identical.
+
+        When to use what: `start` (or the equivalent `send` with
+        `long_task=True`) for real work -- one call, durable, dispatched, no
+        polling; plain `send` when you need the submit receipt itself and
+        nothing long follows; `enqueue` to add to a lane's backlog WITHOUT
+        dispatching now; `wait`/`resume` only when the user asked you to watch
+        something specific, never as a routine follow-up to a start or a
+        confirmed send.
         """
         _refresh_local_heartbeat()
         return compact_tools.turn(
@@ -5480,6 +5521,8 @@ def build_mcp(service: TerminalService | None = None,
         browser_verify=browser_handlers.get("browser_verify"),
         browser_screenshot=browser_handlers.get("browser_screenshot"),
         browser_stop=browser_handlers.get("browser_stop"),
+        dispatch_tick=lambda session: queue_engine.tick(session).to_dict(),
+        follow_task=_started_task_follower.follow,
     ))
 
     return server
