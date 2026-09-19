@@ -834,8 +834,9 @@ idempotency all stay in the controller on 8766.
 Full contract, the stale-catalog incident it exists for, and the deploy/tunnel
 steps: `docs/CHATGPT_CONNECTOR.md`.
 
-**Dashboard HTTP routes** (58, from `tests/test_dashboard.py`'s own exact
-dict) — session CRUD/grant/rename/kill/reopen, supervisor v1/v2, nodes
+**Dashboard HTTP routes** (163, from `tests/test_dashboard.py`'s own exact
+dict — the number drifts as features land; the test, not this line, is
+authoritative) — session CRUD/grant/rename/kill/reopen, supervisor v1/v2, nodes
 (list/status/drain/test-connection/onboarding/heartbeat), LAN discovery,
 SSH/Cloudflare/agent-token connect, registry, knowledge, watchdog, Task
 Manager/queue actions, Global Task Inbox, Supervisor/Coordinator panel

@@ -1684,6 +1684,24 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/recovery": {"GET", "HEAD"},
         "/dashboard/api/recovery/recover": {"POST"},
         "/dashboard/api/recovery/policy": {"POST"},
+        # Durable Agent identity (8bef6bd) -- read-only screen plus its data
+        # route. No POST: agents are created through the MCP surface, not by
+        # the dashboard.
+        "/dashboard/agents": {"GET", "HEAD"},
+        "/dashboard/api/agents": {"GET", "HEAD"},
+        # Verified prompt-start watcher status -- read-only.
+        "/dashboard/api/verified-prompt-watcher": {"GET", "HEAD"},
+        # Dispatch settings + the NovaRetail dispatch ops screen. Each screen
+        # is GET/HEAD and each mutation is its own explicit POST, so a read of
+        # the page can never dispatch anything.
+        "/dashboard/ops/dispatch-settings": {"GET", "HEAD"},
+        "/dashboard/api/ops/dispatch-settings": {"POST"},
+        "/dashboard/ops/novaretail-dispatch": {"GET", "HEAD"},
+        "/dashboard/api/ops/novaretail-dispatch": {"GET", "HEAD"},
+        "/dashboard/api/ops/novaretail-dispatch/run": {"POST"},
+        # Unprefixed alias kept for the operator bookmark that predates the
+        # /dashboard prefix; read-only, same handler.
+        "/ops/novaretail-dispatch": {"GET", "HEAD"},
     }
     # The web terminal's WebSocket route is registered too, just outside
     # this HTTP-methods-only dict (WebSocketRoute has no .methods).

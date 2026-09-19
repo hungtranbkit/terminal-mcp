@@ -26,6 +26,15 @@ def _controller_with(rows):
     node = type("N", (), {"id": "dell-linux", "display_name": "dell-linux", "status": NODE_ONLINE})()
     controller.registry = type("R", (), {"list": staticmethod(lambda: [node])})()
     controller._clients = {"dell-linux": _StubClient(rows)}   # type: ignore[attr-defined]
+    # terminal_list_sessions reaches the node list through list_nodes, which
+    # asks the health service to evaluate each node. These contracts are about
+    # how a REMOTE ROW's `allowed` is normalised, not about health, so the
+    # stub hands the node straight back and the status stays whatever the
+    # fixture set.
+    controller.node_health = type("H", (), {                  # type: ignore[attr-defined]
+        "evaluate": staticmethod(lambda node, client, **_kwargs: node),
+        "_cached": staticmethod(lambda node: node),
+    })()
     return controller
 
 

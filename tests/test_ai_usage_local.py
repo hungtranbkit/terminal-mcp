@@ -8,6 +8,12 @@ carries the tmux target that attributes a row to a real session.
 The hard requirement these tests protect: a reset time is reported ONLY
 where a CLI recorded one. There is deliberately no code path that derives
 one from a session start, so there is a test asserting the absence.
+
+Every refresh() below passes BOTH claude_home and codex_home, even when the
+fixture only has Claude data: an omitted home falls back to the REAL one under
+$HOME, so a test that isolates only one side quietly reads whatever the
+machine running the suite happens to have. On a developer box that is nothing
+and the test passes; on the controller host it was 194 events instead of 2.
 """
 from __future__ import annotations
 
@@ -146,11 +152,11 @@ def test_a_truncated_file_is_read_from_the_start_again(tmp_path):
 def test_re_reading_a_file_counts_nothing_twice(tmp_path, monkeypatch):
     home = _claude_home(tmp_path, [_assistant("a"), _assistant("b")])
     index = AiUsageIndex(tmp_path / "u.db")
-    assert index.refresh(claude_home=home)["events_new"] == 2
+    assert index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")["events_new"] == 2
     # Force the full re-read a rotation would cause.
     with index._connect() as connection:                        # noqa: SLF001
         connection.execute("UPDATE file_cursors SET offset = 0, inode = -1")
-    assert index.refresh(claude_home=home)["events_new"] == 0
+    assert index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")["events_new"] == 0
     assert index.report()["totals"]["lifetime"]["events"] == 2
 
 
@@ -159,7 +165,7 @@ def test_a_retried_request_is_not_double_counted(tmp_path):
     # twice (a duplicated write) is one.
     home = _claude_home(tmp_path, [_assistant("dup"), _assistant("dup")])
     index = AiUsageIndex(tmp_path / "u.db")
-    index.refresh(claude_home=home)
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
     assert index.report()["totals"]["lifetime"]["events"] == 1
 
 
@@ -168,7 +174,7 @@ def test_concurrent_sessions_are_kept_apart(tmp_path):
     _write(home / "projects" / "-a" / "s1.jsonl", [_assistant("a", session="s1")])
     _write(home / "projects" / "-b" / "s2.jsonl", [_assistant("b", session="s2")])
     index = AiUsageIndex(tmp_path / "u.db")
-    index.refresh(claude_home=home)
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
     sessions = index.report()["sessions"]
     assert {s["agent_session_id"] for s in sessions} == {"s1", "s2"}
 
@@ -180,7 +186,7 @@ def test_the_rolling_window_excludes_older_activity(tmp_path):
         _assistant("old", when=NOW - ROLLING_WINDOW_SECONDS - 600),
         _assistant("new", when=NOW - 60)])
     index = AiUsageIndex(tmp_path / "u.db")
-    index.refresh(claude_home=home)
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
     report = index.report(now=NOW)
     assert report["totals"]["rolling_5h"]["messages"] == 1
     assert report["totals"]["lifetime"]["events"] == 2
@@ -267,7 +273,7 @@ def test_a_session_is_attributed_through_the_tmux_link_the_cli_wrote(tmp_path):
     links = claude_session_links(home)
     assert links["sess-1"]["tmux_session"] == "m1"
     index = AiUsageIndex(tmp_path / "u.db")
-    index.refresh(claude_home=home)
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
     row = index.report(session_names={"m1": "stable-abc"}, claude_home=home)["sessions"][0]
     assert row["session"] == "m1"
     assert row["stable_session_id"] == "stable-abc"
@@ -280,7 +286,7 @@ def test_a_renamed_session_keeps_its_history(tmp_path):
     home = _claude_home(tmp_path, [_assistant("a", session="sess-1")],
                         links={"1": {"sessionId": "sess-1", "pid": 1, "tmux": "old-name:@0.%0"}})
     index = AiUsageIndex(tmp_path / "u.db")
-    index.refresh(claude_home=home)
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
     before = index.report(session_names={"old-name": "stable-1"}, claude_home=home)["sessions"][0]
     (home / "sessions" / "1.json").write_text(json.dumps(
         {"sessionId": "sess-1", "pid": 1, "tmux": "new-name:@0.%0"}), encoding="utf-8")
@@ -293,7 +299,7 @@ def test_a_renamed_session_keeps_its_history(tmp_path):
 def test_every_row_declares_where_its_numbers_came_from(tmp_path):
     home = _claude_home(tmp_path, [_assistant("a")])
     index = AiUsageIndex(tmp_path / "u.db")
-    index.refresh(claude_home=home)
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
     report = index.report()
     assert all(row["source"] == SOURCE_TRANSCRIPT for row in report["sessions"])
     assert set(report["sources"]) == {"claude", "codex"}
@@ -308,7 +314,7 @@ def test_no_prompt_text_reaches_the_report(tmp_path):
                _assistant("a")]
     home = _claude_home(tmp_path, entries)
     index = AiUsageIndex(tmp_path / "u.db")
-    index.refresh(claude_home=home)
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
     assert secret not in json.dumps(index.report())
 
 
@@ -342,7 +348,7 @@ def test_subagent_cost_is_its_own_row_not_folded_into_the_parent(tmp_path):
         _assistant("main", session="shared", input_tokens=100),
         _assistant("sub", session="shared", sidechain=True, input_tokens=7)])
     index = AiUsageIndex(tmp_path / "u.db")
-    index.refresh(claude_home=home)
+    index.refresh(claude_home=home, codex_home=tmp_path / "nocodex")
     rows = index.report()["sessions"]
     assert len(rows) == 2
     by_flag = {row["is_subagent"]: row for row in rows}
