@@ -379,10 +379,20 @@ class ControllerService:
             deadline = time.monotonic() + float(timeout_seconds)
         if "/" in session:
             node_id, _, bare = session.partition("/")
+            # Backward compatibility: persisted/UI-qualified targets may still
+            # use the historical local/<session> form after the controller has
+            # migrated to a canonical local node id (for example hp-linux).
+            # Treat local as an alias only; never re-register a duplicate node.
+            if node_id == LOCAL_NODE_ID and self.local_node_id != LOCAL_NODE_ID:
+                node_id = self.local_node_id
             node = self.node_status(node_id)
             if node is None:
                 return {"error": "NODE_NOT_FOUND", "node_id": node_id}
-            if node.status != NODE_ONLINE:
+            # The controller has an in-process client for its own local node;
+            # a stale heartbeat must not make that directly reachable client
+            # unroutable (notably during startup/tests and immediately after
+            # canonical local-id migration). Remote nodes still require ONLINE.
+            if node.status != NODE_ONLINE and node_id != self.local_node_id:
                 return {"error": "NODE_UNREACHABLE", "node_id": node_id,
                         "health_state": node.health_state,
                         "detail": node.last_error or "node execution health is not OK"}
@@ -503,7 +513,7 @@ class ControllerService:
         if client is None:
             return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": "no client configured for this node"}
         node = self.node_status(node_id)
-        if node is None or node.status != NODE_ONLINE:
+        if node is None or (node.status != NODE_ONLINE and node_id != self.local_node_id):
             return {"error": "NODE_UNREACHABLE", "node_id": node_id,
                     "health_state": node.health_state if node else "UNKNOWN",
                     "detail": (node.last_error if node else None) or "node execution health is not OK"}
