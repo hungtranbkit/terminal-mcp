@@ -173,11 +173,22 @@ class _RecordingApp:
         await send({"type": "http.response.body", "body": b"ok"})
 
 
-def _scope(server_ip: str, client_ip: str | None) -> dict:
+# The node heartbeat, which is the ONLY kind of request a LAN/overlay
+# socket exists to carry and the one these CIDR tests are really about.
+# It used to be "/" -- any path at all passed the guard, because the CIDR
+# was the whole check. It no longer is (see lan_route_policy.py and
+# tests/test_lan_route_policy.py for the P0 that closed), so a scope that
+# asks about CIDR behaviour has to name a path the socket actually serves,
+# or it would be measuring the route gate instead.
+HEARTBEAT_PATH = "/dashboard/api/nodes/dell-linux/heartbeat"
+
+
+def _scope(server_ip: str, client_ip: str | None, *,
+           path: str = HEARTBEAT_PATH, method: str = "POST") -> dict:
     return {
         "type": "http", "server": (server_ip, 8766),
         "client": (client_ip, 12345) if client_ip else None,
-        "headers": [], "path": "/", "method": "GET",
+        "headers": [], "path": path, "method": method,
     }
 
 
@@ -267,3 +278,14 @@ async def test_non_http_scope_passes_through():
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_lan_socket_refuses_a_path_it_does_not_serve():
+    """Companion to the CIDR tests above: being inside the allowed range is
+    necessary but no longer sufficient. See tests/test_lan_route_policy.py."""
+    inner = _RecordingApp()
+    mw = LanCidrGuardMiddleware(inner, lan_bind_ip="192.168.1.132",
+                                allowed_cidrs=(ipaddress.IPv4Network("192.168.1.0/24"),))
+    await _run(mw, _scope("192.168.1.132", "192.168.1.250", path="/mcp"))
+    assert inner.called is False

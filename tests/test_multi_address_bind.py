@@ -122,7 +122,16 @@ def test_builds_a_socket_per_bind_address():
 
 # --- the CIDR guard across several sockets ------------------------------
 
-async def _call(mw, *, local_ip, client_ip):
+# The node heartbeat: the only request kind a LAN/overlay socket exists to
+# carry, and what every CIDR assertion below is really asking about. It
+# used to be "/" -- back when source CIDR was the entire check. A LAN
+# socket now serves node routes only (lan_route_policy.py, and the P0 in
+# tests/test_lan_route_policy.py), so these tests name a path the socket
+# actually serves rather than accidentally measuring the route gate.
+HEARTBEAT_PATH = "/dashboard/api/nodes/dell-linux/heartbeat"
+
+
+async def _call(mw, *, local_ip, client_ip, path=HEARTBEAT_PATH, method="POST"):
     seen = {}
 
     async def inner(scope, receive, send):
@@ -135,7 +144,7 @@ async def _call(mw, *, local_ip, client_ip):
         sent.append(message)
 
     scope = {"type": "http", "server": (local_ip, 8766), "client": (client_ip, 5000),
-             "headers": [], "method": "GET", "path": "/"}
+             "headers": [], "method": method, "path": path}
     await mw(scope, None, send)
     return seen.get("passed", False), sent
 
@@ -160,6 +169,19 @@ async def test_allows_peer_on_its_own_socket():
     for local_ip, client_ip in [(LAN, "192.168.1.250"), (TS, "100.90.1.2")]:
         passed, _ = await _call(mw, local_ip=local_ip, client_ip=client_ip)
         assert passed is True, f"{client_ip} on {local_ip} should be allowed"
+
+
+@pytest.mark.anyio
+async def test_every_bound_socket_refuses_non_node_paths():
+    """Both bound sockets get the route gate, not just the first -- an
+    overlay address must not become a way onto /mcp either."""
+    mw = LanCidrGuardMiddleware(None, lan_bind_ip=[LAN, TS],
+                                allowed_cidrs=(ipaddress.IPv4Network("192.168.1.0/24"),
+                                               ipaddress.IPv4Network(TS_CIDR)))
+    for local_ip, client_ip in [(LAN, "192.168.1.250"), (TS, "100.90.1.2")]:
+        passed, sent = await _call(mw, local_ip=local_ip, client_ip=client_ip, path="/mcp")
+        assert passed is False, f"/mcp must not be served on {local_ip}"
+        assert sent[0]["status"] == 403
 
 
 @pytest.mark.anyio
