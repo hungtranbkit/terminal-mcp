@@ -167,6 +167,14 @@ REGISTRY_MIGRATIONS: list[Migration] = [
              _add_launch_provenance_column),
 ]
 
+#: What this process called its own node before the deployment gave the
+#: controller a canonical fleet id. Identical in meaning to
+#: fleet_registry.LEGACY_LOCAL_NODE_ID one layer down, and deliberately
+#: spelled out in both places: a row written under it IS this machine's own
+#: row, but the label resolves to a DIFFERENT machine on every node that
+#: reads it, so it cannot survive into anything fleet-wide.
+LEGACY_LOCAL_NODE_ID = "local"
+
 STATUS_ACTIVE = "ACTIVE"
 STATUS_MISSING = "MISSING"
 STATUS_OFFLINE = "OFFLINE"
@@ -884,6 +892,90 @@ class SessionRegistryStore:
                 (now, f"purged by {purged_by or 'unknown'} at {now}", node_id, session_name),
             )
         return True
+
+    def retire_legacy_local_duplicates(self, canonical_node_id: str, *,
+                                       now: str | None = None) -> dict[str, Any]:
+        """Tombstone ACTIVE rows still filed under the legacy `local` node id
+        that the canonical node already holds an ACTIVE row for.
+
+        WHY THESE ROWS EXIST. `(node_id, session_name)` is this store's
+        primary key, and this process used to call its own node `local`
+        unconditionally. Naming the controller (`TERMINAL_MCP_LOCAL_NODE_ID=
+        hp-linux`) changed the id every later reconcile writes, but it could
+        not change rows already written -- so one live tmux session ended up
+        with TWO ACTIVE rows, `local/<name>` and `hp-linux/<name>`, with
+        different `stable_session_id`s. The stale half is then re-projected
+        into the fleet registry on every cycle as an object owned by `local`,
+        which is how a node that does not exist keeps reappearing in a
+        fleet-wide view (see fleet_projection.project_sessions).
+
+        WHAT IS SAFE TO DO ABOUT THEM. Not a rename: re-keying `local/<name>`
+        onto `<canonical>/<name>` would collide with the canonical row that
+        already exists and would have to pick a winner between two
+        `stable_session_id`s, which is exactly the kind of silent decision
+        this project refuses to make about session identity. Not a delete
+        either -- history is not ours to drop. So this ONLY tombstones the
+        duplicate, and only when the canonical row provably covers the same
+        live session:
+
+          * a legacy row whose name has NO ACTIVE canonical counterpart is a
+            unique live session and is left completely alone -- never moved,
+            never retired, never touched;
+          * everything that is not ACTIVE under `local` is history and is
+            left completely alone;
+          * the tombstone is the store's ordinary DELETED status with a
+            `deleted_at` and an appended note, exactly like `purge` -- the row
+            stays readable, and `project_sessions` turns it into a fleet
+            tombstone so the phantom object is retired fleet-wide instead of
+            lingering.
+
+        Idempotent and crash-safe: the whole sweep is one transaction, and a
+        retired row is no longer ACTIVE, so re-running finds nothing. Nothing
+        can put it back either -- `upsert_seen`/`mark_missing` are only ever
+        called with the canonical id now.
+
+        A deployment that never named its controller (canonical id absent, or
+        still the placeholder) is left entirely untouched: there is no second
+        id to be a duplicate OF, and `local` is its real, working id.
+        """
+        canonical = (canonical_node_id or "").strip()
+        result: dict[str, Any] = {"canonical_node_id": canonical, "retired": [],
+                                  "kept_unique": [], "skipped": None}
+        if not canonical or canonical == LEGACY_LOCAL_NODE_ID:
+            result["skipped"] = "NO_CANONICAL_NODE_ID"
+            return result
+        stamp = now or _now_iso()
+        with self._connection() as connection:
+            legacy = [row["session_name"] for row in connection.execute(
+                "SELECT session_name FROM session_records "
+                "WHERE node_id = ? AND status = ? ORDER BY session_name",
+                (LEGACY_LOCAL_NODE_ID, STATUS_ACTIVE))]
+            if not legacy:
+                return result
+            canonical_active = {row["session_name"] for row in connection.execute(
+                "SELECT session_name FROM session_records WHERE node_id = ? AND status = ?",
+                (canonical, STATUS_ACTIVE))}
+            for name in legacy:
+                if name not in canonical_active:
+                    result["kept_unique"].append(name)
+                    continue
+                note = (f"superseded by {canonical}/{name} -- legacy "
+                        f"{LEGACY_LOCAL_NODE_ID!r} duplicate retired by the controller "
+                        f"identity migration at {stamp}")
+                connection.execute(
+                    # The status guard is repeated in the UPDATE, not just in
+                    # the SELECT above, so a concurrent reconcile pass between
+                    # the two can only make this write a no-op, never retire a
+                    # row that stopped being a duplicate in the meantime.
+                    """UPDATE session_records
+                       SET status = ?, deleted_at = ?,
+                           notes = CASE WHEN notes IS NULL OR notes = '' THEN ?
+                                        ELSE notes || char(10) || ? END
+                       WHERE node_id = ? AND session_name = ? AND status = ?""",
+                    (STATUS_DELETED, stamp, note, note,
+                     LEGACY_LOCAL_NODE_ID, name, STATUS_ACTIVE))
+                result["retired"].append(name)
+        return result
 
     def upsert_manual(self, node_id: str, session_name: str, *, status: str, node_name: str | None = None,
                       backend_type: str | None = None, cwd: str | None = None, agent_type: str | None = None,

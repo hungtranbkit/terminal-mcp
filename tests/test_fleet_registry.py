@@ -265,6 +265,66 @@ def test_a_purged_session_becomes_a_tombstone_not_a_disappearance(store):
     assert store.get(KIND_SESSION, "session:hp-linux:uuid-1").deleted is True
 
 
+def test_a_legacy_local_record_is_never_published_as_a_fleet_object(store):
+    """The phantom this whole cleanup exists to stop. `local` resolves to a
+    different machine on every node that reads it, so an object owned by it is
+    unresolvable fleet-wide -- and a controller with legacy registry rows
+    re-seeded exactly those objects on every refresh cycle, quietly undoing the
+    ownership migration that had just removed them."""
+    legacy = _Record(node_id="local", stable_session_id="uuid-legacy",
+                     session_name="hp-codex1", status="ACTIVE")
+    canonical = _Record(node_id="hp-linux", stable_session_id="uuid-canonical",
+                        session_name="hp-codex1", status="ACTIVE")
+
+    written = project_sessions(store, [legacy, canonical], local_node_id="hp-linux")
+
+    assert written == 1, "only the canonical record may be published"
+    assert store.get(KIND_SESSION, "session:local:uuid-legacy") is None
+    assert store.get(KIND_SESSION, "session:hp-linux:uuid-canonical") is not None
+    assert [obj.owner_node for obj in store.list(kind=KIND_SESSION)] == ["hp-linux"]
+
+
+def test_a_legacy_local_record_is_not_reattributed_to_this_node(store):
+    """Skipping, not claiming. `refresh_local` feeds this projector the
+    controller's FLEET-wide listing, so a record saying `local` may belong to an
+    un-migrated PEER -- taking it would move another machine's session onto this
+    one on the strength of a label that means "unknown"."""
+    legacy = _Record(node_id="local", stable_session_id="uuid-legacy",
+                     session_name="peer-session", status="ACTIVE")
+
+    project_sessions(store, [legacy], local_node_id="hp-linux")
+
+    assert store.list(kind=KIND_SESSION) == []
+    assert store.get(KIND_SESSION, "session:hp-linux:uuid-legacy") is None,         "the record must not be re-keyed onto this node either"
+
+
+def test_a_retired_legacy_record_can_still_tombstone_its_fleet_object(store):
+    """The guard must not strand what it is cleaning up: once
+    retire_legacy_local_duplicates tombstones the registry row, that DELETED
+    record has to be able to retire the phantom object, or it freezes in place
+    forever instead of going away."""
+    legacy = _Record(node_id="local", stable_session_id="uuid-legacy",
+                     session_name="hp-codex1", status="ACTIVE")
+    project_sessions(store, [legacy])  # published before the canonical id existed
+    assert store.get(KIND_SESSION, "session:local:uuid-legacy").deleted is False
+
+    legacy.status = "DELETED"
+    project_sessions(store, [legacy], local_node_id="hp-linux")
+
+    assert store.get(KIND_SESSION, "session:local:uuid-legacy").deleted is True
+
+
+def test_a_node_with_no_canonical_id_still_projects_its_own_sessions(store):
+    """A deployment that never named its controller has `local` as its real,
+    working id. Nothing about it may change."""
+    record = _Record(node_id="local", stable_session_id="uuid-1", session_name="s",
+                     status="ACTIVE")
+
+    assert project_sessions(store, [record], local_node_id="local") == 1
+    assert project_sessions(store, [record]) == 1  # caller that passes nothing
+    assert store.get(KIND_SESSION, "session:local:uuid-1") is not None
+
+
 def test_no_pane_text_or_prompt_is_projected(store):
     """The sync runs between machines with different operators. It answers
     "what exists and where", never "what was typed"."""
@@ -624,3 +684,27 @@ def test_one_failing_projector_does_not_silently_drop_the_later_ones(tmp_path):
     identity = store.get(KIND_NODE, "node:hp-linux")
     assert identity is not None, "this node's own identity row must still be published"
     assert identity.payload["lan_ip"] == "10.0.0.1"
+
+
+def test_refresh_local_does_not_re_seed_a_phantom_local_owner(tmp_path):
+    """End to end through the real call path, because that is where the
+    regression actually happened: the ownership migration cleared every
+    `local`-owned row, and then the very next refresh cycle put five of them
+    straight back, because the controller still holds legacy registry rows and
+    the projector published them verbatim."""
+    store = FleetRegistryStore(tmp_path / "fleet.db", local_node_id="hp-linux")
+    service = FleetService(store, local_node_id="hp-linux")
+    legacy = _Record(node_id="local", stable_session_id="uuid-legacy",
+                     session_name="hp-codex1", status="ACTIVE")
+    canonical = _Record(node_id="hp-linux", stable_session_id="uuid-canonical",
+                        session_name="hp-codex1", status="ACTIVE")
+
+    for _ in range(3):  # three cycles, exactly like the loop does
+        summary = service.refresh_local(nodes=[], sessions=[legacy, canonical],
+                                        connections=[], include_ssh_config=False,
+                                        network={"node_id": "hp-linux"})
+
+    assert "errors" not in summary, "the refresh must be clean, not merely quiet"
+    assert store.list(kind=KIND_SESSION, owner_node="local") == []
+    assert [obj.object_id for obj in store.list(kind=KIND_SESSION)] == \
+        ["session:hp-linux:uuid-canonical"]

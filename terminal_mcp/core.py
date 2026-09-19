@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import os
 import threading
@@ -36,6 +37,8 @@ from .status import classify_status
 from .submit_watchdog import (ACK_ACCEPTED, ACK_NODE_UNAVAILABLE, ACK_RUNNING, ACK_STUCK, Submission,
                                SubmissionStore, SubmissionSweeper, VerifiedSubmitWatchdog, WatchdogConfig)
 from .tmux import SEND_TEXT_ENTER_SETTLE_SECONDS, TmuxClient, TmuxError, iso_timestamp
+
+_log = logging.getLogger(__name__)
 
 
 class PaneLockRegistry:
@@ -438,6 +441,23 @@ class TerminalService:
         # other nodes' registries rewrites it to that node's real id,
         # exactly like it already does for plain session rows.
         self.session_registry = session_registry or SessionRegistryStore()
+        # Controller identity migration, once per process start. Naming this
+        # controller (TERMINAL_MCP_LOCAL_NODE_ID) changed the node id every
+        # later reconcile writes but could not change rows already written, so
+        # a live session can hold two ACTIVE rows -- one under the legacy
+        # `local` placeholder, one under the canonical id -- and the stale half
+        # keeps being re-projected into the fleet registry as an object owned
+        # by a node that does not exist. This retires ONLY the provable
+        # duplicates; a unique legacy session is never moved or dropped. See
+        # SessionRegistryStore.retire_legacy_local_duplicates.
+        try:
+            repair = self.session_registry.retire_legacy_local_duplicates(
+                self.REGISTRY_LOCAL_NODE_ID)
+            if repair.get("retired") or repair.get("kept_unique"):
+                _log.info("session-registry identity migration: retired=%s kept_unique=%s",
+                          repair.get("retired"), repair.get("kept_unique"))
+        except Exception:  # noqa: BLE001 -- never block startup on a migration
+            _log.exception("session-registry identity migration failed -- rows left unchanged")
         # Session Knowledge Store -- durable, searchable record of every
         # session's REAL (redacted) output, distinct from the registry
         # above (which tracks identity/lifecycle, not content). See
