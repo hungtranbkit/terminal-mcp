@@ -268,3 +268,17 @@ def test_allow_self_approval_never_promotes_the_pm_into_an_approver(wired):
     assert receipt["status"] == NEEDS_TEAM_REVIEW
     rejected = {row["agent_id"]: row.get("rejected") for row in receipt["candidates"]}
     assert "separation of duties" in (rejected.get("tiny-pm") or "")
+
+
+def test_the_task_carries_the_project_in_its_durable_column_not_only_metadata(wired):
+    """LIVE, hp-linux @ a90835e: a project task came back with
+    project_id=None. queue_tasks.project_id is what project_service's view,
+    the Global Tasks card and every per-project query read; metadata is not."""
+    projects, _agents, queue, _engine = wired
+    projects.bootstrap("demo", description=BIG)
+
+    receipt = projects.project_start("demo", "write the scope down")
+    task = queue.store.get_task(receipt["task_id"])
+
+    assert task.project_id == "demo"
+    assert queue.store.list_tasks_for_project("demo")
