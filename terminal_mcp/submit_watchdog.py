@@ -242,10 +242,21 @@ class SubmissionStore:
 class WatchdogConfig:
     poll_interval_seconds: float = 0.4
     timeout_seconds: float = 5.0
-    # A submission has one normal Enter and at most one evidence-gated
-    # recovery Enter.  Never turn an ambiguous send into an unbounded key
-    # spam loop (which can double-submit destructive confirmations).
-    max_enter_attempts: int = 6
+    # Two DIFFERENT caps, deliberately:
+    #
+    #   max_enter_attempts -- what ONE foreground run() (the caller-facing
+    #     terminal_send_text) may spend: one normal Enter and at most one
+    #     evidence-gated recovery Enter.  Never turn an ambiguous send into
+    #     an unbounded key spam loop (which can double-submit destructive
+    #     confirmations), and never make the caller wait on a six-Enter
+    #     ladder inline.
+    #   max_total_enters -- the DURABLE hard ceiling for the submission as a
+    #     whole, shared by that foreground run and every background watcher
+    #     pass (SubmissionSweeper -> recover_submission, one new Enter per
+    #     pass with backoff).  This is the "six-Enter verified prompt
+    #     recovery" budget; it can only ever lower, never raise, the
+    #     per-run cap above.
+    max_enter_attempts: int = 2
     max_total_enters: int = 6
     retry_agent_types: frozenset[str] = frozenset({"codex"})
 
@@ -313,7 +324,13 @@ class VerifiedSubmitWatchdog:
         # ever created by another front door/backend, fail closed to the
         # single-submit contract: one initial Enter may already have happened,
         # but no automatic retry is permitted.
-        max_enter_attempts = min(self.config.max_enter_attempts, self.config.max_total_enters)
+        # A background watcher pass (max_new_enters is not None) is bounded by
+        # its own per-pass budget plus the durable total; a foreground run gets
+        # the per-run contract cap.  Both are clamped by max_total_enters, the
+        # single durable ceiling shared across processes and restarts.
+        per_run_cap = (self.config.max_total_enters if max_new_enters is not None
+                       else self.config.max_enter_attempts)
+        max_enter_attempts = min(per_run_cap, self.config.max_total_enters)
         max_enter_attempts = (max_enter_attempts
                               if record.agent_type in self.config.retry_agent_types else 1)
         initial_enter_count = record.enter_count

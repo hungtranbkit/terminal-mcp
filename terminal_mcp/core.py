@@ -456,7 +456,11 @@ class TerminalService:
         watchdog_config = WatchdogConfig(
             poll_interval_seconds=config.submit_watchdog.poll_interval_seconds,
             timeout_seconds=config.submit_watchdog.timeout_seconds,
-            max_enter_attempts=config.submit_watchdog.max_total_enters,
+            # Two distinct knobs -- see WatchdogConfig. Binding BOTH to
+            # max_total_enters made submit_watchdog.max_enter_attempts dead
+            # config and silently raised the foreground per-call Enter budget
+            # from the contract's 2 to 6.
+            max_enter_attempts=config.submit_watchdog.max_enter_attempts,
             max_total_enters=config.submit_watchdog.max_total_enters,
             retry_agent_types=frozenset(config.submit_watchdog.retry_agent_types),
         )
@@ -2275,20 +2279,40 @@ class TerminalService:
             return "COMPOSER", "draft_still_in_composer"
 
         try:
-            # The direct submit profile remains the compatibility cap for a
-            # caller that explicitly configures a smaller bound. The
-            # background sweeper uses the service watchdog's six-Enter cap
-            # for production recovery.
+            # Per-run Enter budget for THIS foreground call. Two config
+            # objects have a say and they compose in one direction only:
+            #
+            #   submit_watchdog.max_enter_attempts -- the verified path's own
+            #     contract floor: the normal Enter plus at most one
+            #     evidence-gated Escape+Enter recovery.
+            #   submit.<agent>.max_enter_attempts -- the per-agent profile
+            #     (config.yaml's `submit:` block). It may RAISE that budget
+            #     for an agent with a known composer race; it must never
+            #     lower it below the contract, because its programmatic
+            #     default is the LEGACY single-Enter value (SubmitConfig's own
+            #     comment; tests/test_submit_config_wiring.py pins it) and
+            #     feeding that straight in capped this path at ONE Enter --
+            #     which made the recovery below structurally dead code, since
+            #     send_enter's `enter_calls >= 2` branch could never run.
+            #
+            # max_total_enters stays the hard ceiling over both: the durable
+            # per-submission budget this foreground run shares with every
+            # background watcher pass.
             profile = _submit_profile_for(self.config, adapter.name)
+            contract_attempts = self.submit_watchdog.config.max_enter_attempts
+            per_run_attempts = min(
+                max(int(getattr(profile, "max_enter_attempts", 0) or 0), contract_attempts),
+                self.submit_watchdog.config.max_total_enters,
+            )
             direct_watchdog = self.submit_watchdog
-            if profile.max_enter_attempts != self.submit_watchdog.config.max_total_enters:
+            if per_run_attempts != contract_attempts:
                 direct_watchdog = VerifiedSubmitWatchdog(
                     self.submissions,
                     WatchdogConfig(
                         poll_interval_seconds=self.submit_watchdog.config.poll_interval_seconds,
                         timeout_seconds=self.submit_watchdog.config.timeout_seconds,
-                        max_enter_attempts=min(profile.max_enter_attempts, 6),
-                        max_total_enters=min(profile.max_enter_attempts, 6),
+                        max_enter_attempts=per_run_attempts,
+                        max_total_enters=self.submit_watchdog.config.max_total_enters,
                         retry_agent_types=self.submit_watchdog.config.retry_agent_types,
                     ),
                 )

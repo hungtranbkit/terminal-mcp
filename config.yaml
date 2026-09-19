@@ -224,7 +224,11 @@ submit_watchdog:
   timeout_seconds: 5.0
   # Manual and watcher Enter presses share this hard per-submission cap.
   max_total_enters: 6
-  max_enter_attempts: 6
+  # The verified path's contract FLOOR for one foreground send: the normal
+  # Enter plus at most one evidence-gated Escape+Enter recovery. A per-agent
+  # `submit:` profile above may raise this for an agent with a known composer
+  # race (Codex does), never lower it -- max_total_enters stays the ceiling.
+  max_enter_attempts: 2
   sweeper_interval_seconds: 3.0
   ttl_seconds: 600.0
   # Only Codex may receive automatic Enter retries. Unknown/other agents
