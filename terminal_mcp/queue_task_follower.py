@@ -50,6 +50,12 @@ DEFAULT_MAX_CONCURRENT = 8
 #: tests drive it with a fake).
 FOLLOW_STOP_STATUSES = (
     "COMPLETED", "SKIPPED", "CANCELLED", "FAILED", "BLOCKED", "NEEDS_HUMAN",
+    # PAUSED belongs here for the same reason: the coordinator gate parks a
+    # task on a paused lane (observed live on hp-linux -- "session X is
+    # already actively working in the same repo/worktree"), and tick() answers
+    # PAUSED to every call after that. Following it would burn a thread for
+    # the full TTL to learn nothing a human has not already been asked for.
+    "PAUSED",
 )
 
 

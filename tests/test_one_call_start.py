@@ -343,3 +343,118 @@ def test_a_plain_send_is_untouched_by_the_long_task_path():
     assert result.get("mode") is None
     assert lane.tasks == {}
     assert lane.ticks == 0
+
+
+# ---------------------------------------------------------------------------
+# 6. What the LIVE run on hp-linux found (2026-09-19, session
+#    test-start-verify). `start` drove the lane correctly -- claim, then the
+#    Coordinator gate -- and the gate refused: "session
+#    'terminal-mcp-session-health' is already actively working in the same
+#    repo/worktree". Two things were wrong with how that was reported:
+#
+#      a) the receipt still said "work is started and tracked server-side",
+#         which is how an orchestrator silently drops a task;
+#      b) `dispatched` was computed from a set that lumped BLOCKED in with
+#         RUNNING, so a refused task could report dispatched=True.
+#
+#    Plus one waste: it spent all 6 ticks on a lane that answers PAUSED to
+#    every one of them.
+# ---------------------------------------------------------------------------
+
+
+class GatedLane(FakeLane):
+    """A lane whose coordinator gate refuses, exactly like the live one."""
+
+    def __init__(self, *, refuse_with: str = "PAUSED",
+                 reason: str = "session 'other' is already working in the same worktree") -> None:
+        super().__init__()
+        self.refuse_with = refuse_with
+        self.reason = reason
+
+    def tick(self, session):
+        self.ticks += 1
+        for task in self.tasks.values():
+            if task["session"] != session or task["status"] == self.refuse_with:
+                continue
+            task["status"] = self.refuse_with
+            task["coordinator_decision"] = {"status": "NEEDS_HUMAN", "reason": self.reason}
+            return {"session": session, "action": self.refuse_with, "task_id": task["id"]}
+        return {"session": session, "action": self.refuse_with}
+
+
+@pytest.mark.parametrize("refused", ["PAUSED", "BLOCKED", "NEEDS_HUMAN", "FAILED"])
+def test_a_gate_refusal_is_never_reported_as_dispatched_or_as_fine(refused: str):
+    lane = GatedLane(refuse_with=refused)
+    result = _tools(lane).turn(action="start", target="worker", text="work")
+
+    assert result["dispatched"] is False, f"{refused} must never read as dispatched"
+    assert result["status"] == "TASK_ACCEPTED"
+    assert result["needs_human"] is True
+    assert result["next_action"] == "resolve"
+    assert "NOT running" in result["guidance"]
+    assert refused in result["guidance"]
+    # The caller is told not to re-send: the task is already durable.
+    assert "do not" in result["guidance"] and "re-send" in result["guidance"]
+
+
+def test_the_refusal_carries_the_gate_s_own_reason_never_an_invented_one():
+    lane = GatedLane(reason="session 'health' is already actively working in the same worktree")
+    result = _tools(lane).turn(action="start", target="worker", text="work")
+    assert result["blocked_reason"] == "session 'health' is already actively working in the same worktree"
+    assert result["blocked_reason"] in result["guidance"]
+
+
+def test_start_stops_ticking_at_the_first_refusal_instead_of_burning_the_budget():
+    """Live: dispatch_ticks=6 against a lane that answers PAUSED every time."""
+    lane = GatedLane()
+    result = _tools(lane).turn(action="start", target="worker", text="work")
+    assert result["dispatch_ticks"] == 1, "one tick reached the gate; the rest taught nothing"
+    assert lane.ticks == 1
+
+
+def test_a_refused_task_is_not_handed_to_the_follower():
+    lane = GatedLane()
+    follower = StartedTaskFollower(lane.tick, lane.task_status,
+                                   poll_interval_seconds=0.01, ttl_seconds=5)
+    result = _tools(lane, follower).turn(action="start", target="worker", text="work")
+    assert result["server_side_progress"]["following"] is False
+    assert result["server_side_progress"]["reason"] == "ALREADY_SETTLED"
+    assert follower.active_task_ids() == ()
+
+
+def test_the_follower_stops_on_a_lane_the_gate_paused():
+    lane = GatedLane()
+    lane.enqueue_task("s", "work")
+    lane.tasks["task-1"]["status"] = "PAUSED"
+    follower = StartedTaskFollower(lane.tick, lane.task_status,
+                                   poll_interval_seconds=0.01, ttl_seconds=5)
+    assert follower.run_until_settled("s", "task-1") == "SETTLED"
+    assert lane.ticks == 0
+
+
+def test_an_unreachable_target_is_the_server_s_retry_not_the_user_s_problem():
+    lane = GatedLane(refuse_with="WAITING_SESSION")
+    result = _tools(lane).turn(action="start", target="worker", text="work")
+    assert result["dispatched"] is False
+    assert result["needs_human"] is False
+    assert result["next_action"] == "none"
+    assert "server will retry" in result["guidance"]
+
+
+def test_a_genuinely_running_task_still_reads_as_dispatched_and_needs_nobody():
+    lane = FakeLane()
+    result = _tools(lane).turn(action="start", target="worker", text="work")
+    assert result["dispatched"] is True
+    assert result["needs_human"] is False
+    assert result["next_action"] == "none"
+    assert "work is started" in result["guidance"]
+
+
+def test_the_long_task_send_spelling_reports_a_refusal_the_same_way():
+    lane = GatedLane()
+    result = _tools(lane).turn(action="send", target="worker", text="work", long_task=True)
+    assert result["mode"] == "durable_queue"       # pre-existing keys intact
+    assert result["client_polling"] is False
+    assert result["dispatched"] is False
+    assert result["needs_human"] is True
+    assert result["blocked_reason"] == lane.reason
