@@ -20,6 +20,7 @@ Object ids are chosen so that RENAME KEEPS IDENTITY:
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -28,7 +29,9 @@ from typing import Any, Iterable
 
 from .fleet_registry import (CRED_MISSING, CRED_NEEDS_AUTH, CRED_PRESENT, CRED_UNKNOWN,
                              KIND_NODE, KIND_PROJECT, KIND_SESSION, KIND_SSH_TARGET,
-                             FleetRegistryStore, scrub_payload)
+                             LEGACY_LOCAL_NODE_ID, FleetRegistryStore, scrub_payload)
+
+_LOGGER = logging.getLogger(__name__)
 
 TRANSPORT_LAN = "lan"
 TRANSPORT_TAILSCALE = "tailscale"
@@ -264,15 +267,40 @@ def project_nodes(store: FleetRegistryStore, nodes: Iterable[Any], *,
     return written
 
 
-def project_sessions(store: FleetRegistryStore, records: Iterable[Any]) -> int:
+def project_sessions(store: FleetRegistryStore, records: Iterable[Any], *,
+                     local_node_id: str | None = None) -> int:
     """Session inventory -- metadata only.
 
     NO pane text, NO prompt, NO output, NO command arguments beyond the
     launcher label already stored. This is what makes the sync safe to run
     between machines with different operators: it answers "what exists and
     where", never "what was typed".
+
+    `local_node_id` is this node's canonical id, and passing it switches on
+    the one rule that makes the legacy-ownership cleanup stick: a record still
+    filed under the placeholder node id `local` is never published as a NEW
+    fleet object. The placeholder resolves to a different machine on every
+    node that reads it, so an object owned by it is meaningless fleet-wide --
+    which is precisely what fleet_registry's own ownership migration had to
+    undo once already. Without this guard the controller's remaining legacy
+    registry rows re-seed exactly those objects on every refresh cycle, and
+    the migration can only ever be a one-shot that reality undoes.
+
+    Deliberately a SKIP and not a re-attribution: `refresh_local` feeds this
+    projector the controller's FLEET-wide session listing, so a record saying
+    `local` may well belong to an un-migrated PEER. Claiming it for this node
+    would move another machine's session onto ours on the strength of a label
+    that means "unknown". Skipping leaves the real owner free to publish it
+    under its own id, which is the same resolution project_projects and
+    project_ssh_targets already take for an object they do not own.
+
+    Retiring is exempt from the guard on purpose: a legacy row that has been
+    tombstoned locally (see SessionRegistryStore.retire_legacy_local_
+    duplicates) MUST still be able to tombstone its fleet object, or the
+    phantom would simply freeze in place instead of going away.
     """
     written = 0
+    skipped_legacy: list[str] = []
     for record in records:
         node_id = getattr(record, "node_id", None)
         stable = getattr(record, "stable_session_id", None) or getattr(record, "session_name", None)
@@ -284,6 +312,10 @@ def project_sessions(store: FleetRegistryStore, records: Iterable[Any]) -> int:
             # A purge on the owner is a fleet-wide delete, not a local one.
             store.retire(KIND_SESSION, object_id)
             written += 1
+            continue
+        if (local_node_id and node_id == LEGACY_LOCAL_NODE_ID
+                and local_node_id != LEGACY_LOCAL_NODE_ID):
+            skipped_legacy.append(str(getattr(record, "session_name", None) or stable))
             continue
         payload = {
             "stable_session_id": stable,
@@ -311,6 +343,16 @@ def project_sessions(store: FleetRegistryStore, records: Iterable[Any]) -> int:
         }
         store.publish(KIND_SESSION, object_id, payload, owner_node=node_id)
         written += 1
+    if skipped_legacy:
+        # Logged rather than returned so the int contract every caller already
+        # relies on is unchanged -- but never silent: a node still producing
+        # these has registry rows that want the retire sweep run against them.
+        _LOGGER.warning(
+            "fleet projection: skipped %d session record(s) still filed under the "
+            "legacy %r node id rather than publishing a fleet object nobody can "
+            "resolve (%s%s)", len(skipped_legacy), LEGACY_LOCAL_NODE_ID,
+            ", ".join(sorted(skipped_legacy)[:10]),
+            ", ..." if len(skipped_legacy) > 10 else "")
     return written
 
 

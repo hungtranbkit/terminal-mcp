@@ -737,3 +737,76 @@ def test_adoption_preserves_the_identity_that_pinned_grants_depend_on(
         "pane_id changed across adoption -- pinned bindings would stop matching"
     assert after.pane_current_path == before.pane_current_path
     restarted.kill_session("pinned")
+
+
+def test_the_creation_second_comes_from_the_host_not_the_agents_clock(
+        state_root, child_script, spawn_env):
+    """`session_id` is `win:<name>:<created_epoch>`, and that second has to come
+    from ONE clock.
+
+    It used to come from two. The host stamps `created_at` into its metadata
+    when it starts; `new_session` stamped its own `int(time.time())` AFTER
+    waiting for that metadata to appear. Spawning a host and waiting for it to
+    publish takes real time, so the moment that wait crossed a whole second the
+    live session reported one creation second and the file on disk held an
+    earlier one -- and adoption, which can only read the file, then handed the
+    restarted agent a DIFFERENT identity for the same running session.
+
+    The skew is simulated here rather than waited for, because a test that
+    depends on a spawn happening to straddle a second boundary passes by luck.
+    """
+    backend = _backend(state_root)
+    real_time = time.time
+    monkeypatch_target = "the agent's clock running ahead of the host's"
+    backend_module = sys.modules["terminal_mcp.windows_backend"]
+    original = backend_module.time.time
+    backend_module.time.time = lambda: real_time() + 5  # noqa: E731
+    try:
+        backend.new_session("skewed", str(REPO_ROOT), command=f"{sys.executable}")
+    finally:
+        backend_module.time.time = original
+
+    paths = SessionPaths(state_root, "skewed")
+    meta = _wait(lambda: wsh.read_meta(paths), what="metadata")
+    info = backend.get_session("skewed")
+    assert info.created_epoch == int(meta.created_at), monkeypatch_target
+    assert info.session_id == f"win:skewed:{int(meta.created_at)}"
+    backend.kill_session("skewed")
+
+
+def test_a_clock_skew_at_creation_cannot_change_the_identity_across_adoption(
+        state_root, child_script, spawn_env):
+    """The consequence the operator actually sees, end to end.
+
+    With the agent's clock ahead of the host's at creation time, a restarted
+    agent adopting the same, still-running session used to report a different
+    `session_id`/`created_epoch` -- so every grant, binding and watch pinned to
+    it silently stopped matching. Grants fall back to the default policy and
+    merely read as `stale_identity_pin`; a binding fails CLOSED with
+    IDENTITY_MISMATCH on every send. Neither is acceptable for a session that
+    never stopped running.
+    """
+    first = _backend(state_root)
+    backend_module = sys.modules["terminal_mcp.windows_backend"]
+    real_time = time.time
+    original = backend_module.time.time
+    backend_module.time.time = lambda: real_time() + 5  # noqa: E731
+    try:
+        first.new_session("pinned-skewed", str(REPO_ROOT), command=f"{sys.executable}")
+    finally:
+        backend_module.time.time = original
+    paths = SessionPaths(state_root, "pinned-skewed")
+    _wait(lambda: wsh.read_meta(paths) is not None, what="metadata")
+    before = first.get_session("pinned-skewed")
+
+    restarted = _backend(state_root)
+    assert restarted.adopt_detached_sessions(state_root) == {
+        "pinned-skewed": windows_detached.ADOPTED}
+    after = restarted.get_session("pinned-skewed")
+
+    assert after.created_epoch == before.created_epoch, \
+        "created_epoch moved across adoption -- pinned grants go stale"
+    assert after.session_id == before.session_id, \
+        "session_id moved across adoption -- pinned bindings fail closed"
+    assert after.pane_id == before.pane_id
+    restarted.kill_session("pinned-skewed")

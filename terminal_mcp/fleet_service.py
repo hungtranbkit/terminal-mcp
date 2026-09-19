@@ -111,7 +111,8 @@ class FleetService:
 
         _project("nodes", lambda: project_nodes(self.store, nodes,
                                                 local_node_id=self.local_node_id))
-        _project("sessions", lambda: project_sessions(self.store, sessions))
+        _project("sessions", lambda: project_sessions(self.store, sessions,
+                                                      local_node_id=self.local_node_id))
         _project("projects", lambda: project_projects(self.store, sessions,
                                                       local_node_id=self.local_node_id))
 

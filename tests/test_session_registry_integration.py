@@ -422,3 +422,51 @@ def test_dashboard_watchdog_acknowledge_rejects_malformed_id(tmp_path):
     for bad_id in ("no-colon", "session:notanumber", "unknownkind:5"):
         r = client.post("/dashboard/api/watchdog/acknowledge", json={"id": bad_id})
         assert r.status_code == 400, bad_id
+
+
+# -- controller identity migration runs on startup ----------------------------
+
+def test_naming_the_controller_retires_its_legacy_duplicate_rows_on_startup(
+        tmp_path, monkeypatch):
+    """The migration has to run where the canonical id actually is. Nothing
+    else in the process knows it: `TERMINAL_MCP_LOCAL_NODE_ID` reaches this
+    store only through TerminalService, so constructing one is what repairs
+    the registry -- once, at startup, like the grant migrations beside it."""
+    registry = SessionRegistryStore(tmp_path / "session_registry.db")
+    registry.upsert_seen("local", "dup")
+    registry.upsert_seen("hp-linux", "dup")
+    registry.upsert_seen("local", "unique-live")
+    monkeypatch.setattr(TerminalService, "REGISTRY_LOCAL_NODE_ID", "hp-linux")
+
+    TerminalService(
+        _config(tmp_path),
+        bindings=BindingStore(tmp_path / "bindings.db"),
+        audit=AuditStore(tmp_path / "audit.db"),
+        grants=SessionGrantStore(tmp_path / "grants.db"),
+        leases=PaneLeaseStore(tmp_path / "leases.db"),
+        killed_sessions=KilledSessionStore(tmp_path / "killed_sessions.db"),
+        session_registry=registry,
+    )
+
+    assert registry.get("local", "dup").status == "DELETED"
+    assert registry.get("hp-linux", "dup").status == "ACTIVE"
+    assert registry.get("local", "unique-live").status == "ACTIVE", \
+        "a unique live legacy session must survive startup untouched"
+
+
+def test_an_unnamed_controller_startup_leaves_the_registry_alone(tmp_path, monkeypatch):
+    registry = SessionRegistryStore(tmp_path / "session_registry.db")
+    registry.upsert_seen("local", "s1")
+    monkeypatch.setattr(TerminalService, "REGISTRY_LOCAL_NODE_ID", "local")
+
+    TerminalService(
+        _config(tmp_path),
+        bindings=BindingStore(tmp_path / "bindings.db"),
+        audit=AuditStore(tmp_path / "audit.db"),
+        grants=SessionGrantStore(tmp_path / "grants.db"),
+        leases=PaneLeaseStore(tmp_path / "leases.db"),
+        killed_sessions=KilledSessionStore(tmp_path / "killed_sessions.db"),
+        session_registry=registry,
+    )
+
+    assert registry.get("local", "s1").status == "ACTIVE"

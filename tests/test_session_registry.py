@@ -300,3 +300,137 @@ def test_drop_events_are_node_scoped(store):
     events_by_node = {e["node_id"]: e for e in store.list_drop_events()}
     assert events_by_node["node-a"]["recovered"] == 1
     assert events_by_node["node-b"]["recovered"] == 0
+
+
+# -- controller identity migration: legacy `local` duplicates ----------------
+
+def _seen(store, node_id, name, **kwargs):
+    return store.upsert_seen(node_id, name, **kwargs)
+
+
+def test_an_active_legacy_local_row_is_retired_when_the_canonical_node_has_one(store):
+    """The exact shape the live controller ended up in: naming the controller
+    changed the node id every later reconcile writes, so one running tmux
+    session held two ACTIVE rows under two different ids."""
+    _seen(store, "local", "hp-codex1")
+    _seen(store, "hp-linux", "hp-codex1")
+
+    result = store.retire_legacy_local_duplicates("hp-linux")
+
+    assert result["retired"] == ["hp-codex1"]
+    assert result["kept_unique"] == []
+    legacy = store.get("local", "hp-codex1")
+    assert legacy.status == STATUS_DELETED, "the duplicate must be tombstoned"
+    assert legacy.deleted_at, "a tombstone without a timestamp is not a tombstone"
+    assert "superseded by hp-linux/hp-codex1" in (legacy.notes or "")
+    # The row itself is KEPT -- this is a retire, never a delete.
+    assert store.get("local", "hp-codex1") is not None
+    # And the canonical row is untouched.
+    assert store.get("hp-linux", "hp-codex1").status == STATUS_ACTIVE
+
+
+def test_a_unique_live_legacy_session_is_never_retired_or_moved(store):
+    """The safety property that matters most: a legacy row with no canonical
+    counterpart is a REAL live session that only exists under the old id.
+    Retiring it would erase a running session from the registry; re-keying it
+    would move a session between nodes on the strength of a placeholder."""
+    _seen(store, "local", "only-here")
+    _seen(store, "hp-linux", "something-else")
+
+    result = store.retire_legacy_local_duplicates("hp-linux")
+
+    assert result["retired"] == []
+    assert result["kept_unique"] == ["only-here"]
+    assert store.get("local", "only-here").status == STATUS_ACTIVE
+    assert store.get("hp-linux", "only-here") is None, "the session was not moved"
+
+
+def test_a_canonical_counterpart_that_is_not_active_does_not_authorise_a_retire(store):
+    """`MISSING` on the canonical side means the canonical row is NOT covering
+    a live session, so the legacy row may still be the only record of one."""
+    _seen(store, "local", "s1")
+    _seen(store, "hp-linux", "s1")
+    store.mark_missing("hp-linux", set())
+    assert store.get("hp-linux", "s1").status == STATUS_MISSING
+
+    result = store.retire_legacy_local_duplicates("hp-linux")
+
+    assert result["retired"] == []
+    assert result["kept_unique"] == ["s1"]
+    assert store.get("local", "s1").status == STATUS_ACTIVE
+
+
+def test_non_active_legacy_history_is_left_completely_alone(store):
+    """527 legacy rows on the live controller, only 22 of them ACTIVE. The rest
+    are history and history is not ours to rewrite."""
+    _seen(store, "local", "old")
+    store.mark_missing("local", set())
+    _seen(store, "hp-linux", "old")
+    before = store.get("local", "old")
+
+    store.retire_legacy_local_duplicates("hp-linux")
+
+    after = store.get("local", "old")
+    assert after.status == STATUS_MISSING == before.status
+    assert after.deleted_at is None
+
+
+def test_the_sweep_is_idempotent(store):
+    _seen(store, "local", "dup")
+    _seen(store, "hp-linux", "dup")
+
+    first = store.retire_legacy_local_duplicates("hp-linux")
+    stamped = store.get("local", "dup").deleted_at
+    second = store.retire_legacy_local_duplicates("hp-linux")
+    third = store.retire_legacy_local_duplicates("hp-linux")
+
+    assert first["retired"] == ["dup"]
+    assert second["retired"] == [] and third["retired"] == []
+    assert store.get("local", "dup").deleted_at == stamped, \
+        "a re-run must not re-stamp a row it already retired"
+    assert (store.get("local", "dup").notes or "").count("superseded by") == 1
+
+
+def test_a_deployment_that_never_named_its_controller_is_untouched(store):
+    """`local` is that deployment's real, working node id -- there is no second
+    id for it to be a duplicate OF."""
+    _seen(store, "local", "s1")
+
+    for canonical in ("local", "", "   ", None):
+        result = store.retire_legacy_local_duplicates(canonical)
+        assert result["skipped"] == "NO_CANONICAL_NODE_ID"
+        assert result["retired"] == []
+    assert store.get("local", "s1").status == STATUS_ACTIVE
+
+
+def test_another_nodes_rows_are_never_considered(store):
+    """Only the `local` placeholder migrates. A real remote node keeps its
+    rows even when the canonical node happens to run a same-named session."""
+    _seen(store, "dell-linux", "shared-name")
+    _seen(store, "hp-linux", "shared-name")
+
+    result = store.retire_legacy_local_duplicates("hp-linux")
+
+    assert result["retired"] == []
+    assert store.get("dell-linux", "shared-name").status == STATUS_ACTIVE
+
+
+def test_a_mixed_registry_ends_up_correct_in_one_pass(store):
+    _seen(store, "local", "dup-a")
+    _seen(store, "local", "dup-b")
+    _seen(store, "local", "unique")
+    _seen(store, "local", "history")
+    store.mark_missing("local", {"dup-a", "dup-b", "unique"})
+    _seen(store, "hp-linux", "dup-a")
+    _seen(store, "hp-linux", "dup-b")
+    _seen(store, "dell-linux", "unique")  # a DIFFERENT node, not a counterpart
+
+    result = store.retire_legacy_local_duplicates("hp-linux")
+
+    assert result["retired"] == ["dup-a", "dup-b"]
+    assert result["kept_unique"] == ["unique"]
+    assert store.get("local", "dup-a").status == STATUS_DELETED
+    assert store.get("local", "dup-b").status == STATUS_DELETED
+    assert store.get("local", "unique").status == STATUS_ACTIVE
+    assert store.get("local", "history").status == STATUS_MISSING
+    assert store.get("hp-linux", "dup-a").status == STATUS_ACTIVE
