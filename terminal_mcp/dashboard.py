@@ -14910,10 +14910,23 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         async with _runtime_task_cache_lock:
             now = anyio.current_time()
             if now >= float(_runtime_task_cache.get("expires_at") or 0.0):
+                # Mirror /dashboard/api/sessions exactly: the controller's
+                # fleet projection intentionally omits this controller's local
+                # tmux sessions, so local sessions must come from TerminalService.
+                local_listed = await anyio.to_thread.run_sync(terminal.dashboard_list_sessions)
                 fleet = await anyio.to_thread.run_sync(controller.terminal_list_sessions)
+                candidates: list[tuple[dict[str, Any], bool]] = []
+                for row in local_listed.get("sessions", []):
+                    if isinstance(row, dict):
+                        local_row = dict(row)
+                        local_row.setdefault("node_id", controller.local_node_id)
+                        candidates.append((local_row, True))
+                for row in fleet.get("sessions", []):
+                    if isinstance(row, dict) and row.get("node_id") != controller.local_node_id:
+                        candidates.append((dict(row), False))
                 observed: list[dict[str, Any]] = []
 
-                async def _probe(row: dict[str, Any]) -> None:
+                async def _probe(row: dict[str, Any], is_local: bool) -> None:
                     name = row.get("name")
                     if not isinstance(name, str) or not name or not row.get("effective_read", True):
                         return
@@ -14922,7 +14935,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                     async with _runtime_probe_limiter:
                         try:
                             status = await anyio.to_thread.run_sync(
-                                controller.terminal_status, qualified)
+                                terminal.terminal_status if is_local else controller.terminal_status,
+                                name if is_local else qualified,
+                            )
                         except Exception:  # noqa: BLE001 -- one unreachable
                             # session must not fail the whole summary
                             return
@@ -14960,9 +14975,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                     })
 
                 async with anyio.create_task_group() as tg:
-                    for row in fleet.get("sessions", []):
-                        if isinstance(row, dict):
-                            tg.start_soon(_probe, row)
+                    for row, is_local in candidates:
+                        tg.start_soon(_probe, row, is_local)
 
                 # Deterministic order so two polls of an unchanged fleet
                 # render identically instead of shuffling with probe timing.

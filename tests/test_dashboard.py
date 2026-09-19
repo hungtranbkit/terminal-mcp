@@ -2290,7 +2290,33 @@ def _session_row(name, node_id="hp-linux"):
 def _runtime_client(read_config, *, sessions, statuses, durable_running=()):
     service = TerminalService(read_config)
     server = build_mcp(service)
-    controller = _StubController(sessions, statuses)
+
+    # Mirror production ownership: hp-linux is local to TerminalService;
+    # all other node rows are supplied by the fleet controller.  Keeping
+    # this hermetic also prevents a test run on the HP controller from
+    # accidentally observing real tmux sessions on the host.
+    local_sessions = [
+        dict(row) for row in sessions
+        if row.get("node_id", "hp-linux") == "hp-linux"
+    ]
+    remote_sessions = [
+        dict(row) for row in sessions
+        if row.get("node_id", "hp-linux") != "hp-linux"
+    ]
+    controller = _StubController(remote_sessions, statuses)
+
+    service.dashboard_list_sessions = lambda: {"sessions": local_sessions}
+
+    def _local_status(name, *args, **kwargs):
+        qualified = f"hp-linux/{name}"
+        controller.status_calls.append(qualified)
+        return statuses.get(
+            qualified,
+            statuses.get(name, {"state": "IDLE", "reason": ""}),
+        )
+
+    service.terminal_status = _local_status
+
     queue = _StubQueue(durable_running)
     register_dashboard(server, service, controller=controller, queue=queue)
     client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})
