@@ -1188,3 +1188,42 @@ def test_a_budget_timeout_keeps_the_binding_because_the_engine_is_still_working(
     assert task.execution_session == "idle-one"
     assert receipt["poll"] is False
     assert "still driving it" in receipt["guidance"]
+
+
+def test_a_truncated_probe_budget_is_reported_as_such_not_as_nothing_eligible(store, queue):
+    """LIVE, hp-linux @ 347d7ad: 68 sessions, probe budget 3. Good runtimes sat
+    unexamined while the task was told "no eligible session among 68
+    candidates" -- true of what was checked, false as an answer."""
+    sessions = [_row(f"agent-{index:02d}") for index in range(6)]
+    controller = FakeController(
+        sessions=sessions,
+        records=[FakeRecord(node_id="local", session_name=row["name"],
+                            last_known_state="IDLE") for row in sessions],
+        # Every probe comes back busy, so the budget is spent without a hit.
+        statuses={row["name"]: {"state": "RUNNING"} for row in sessions})
+    router = _router(store, queue, controller, config=_config(probe_limit=2))
+
+    receipt = router.route_start("work")
+
+    assert receipt["routing_state"] == WAITING_RUNTIME
+    assert "still eligible but unverified" in receipt["routing_reason"]
+    assert "probe budget" in receipt["routing_reason"]
+
+
+def test_a_sufficient_probe_budget_finds_the_one_good_session_late_in_the_ranking(store, queue):
+    """The same fleet, with room to look: the router must reach the session
+    that is actually free even though it sorts last."""
+    sessions = [_row(f"agent-{index:02d}") for index in range(5)] + [_row("zzz-free")]
+    statuses = {row["name"]: {"state": "RUNNING"} for row in sessions}
+    statuses["zzz-free"] = {"state": "IDLE"}
+    controller = FakeController(
+        sessions=sessions,
+        records=[FakeRecord(node_id="local", session_name=row["name"],
+                            last_known_state="IDLE") for row in sessions],
+        statuses=statuses)
+    router = _router(store, queue, controller, config=_config(probe_limit=8))
+
+    receipt = router.route_start("work")
+
+    assert receipt["session"] == "zzz-free"
+    assert receipt["dispatched"] is True

@@ -228,12 +228,20 @@ class MatchResult:
     chosen: ScoredCandidate | None = None
     ranked: list[ScoredCandidate] = field(default_factory=list)
     considered: int = 0
+    unverified: int = 0
+    """Candidates that were still eligible when the probe budget ran out.
+
+    NOT the same as "nothing was eligible", and reporting them as if they were
+    is a lie the deferral reason used to tell: with a fleet of 68 sessions and
+    a budget of 3 probes, a perfectly good runtime can sit unexamined while the
+    task is told no runtime exists. A non-zero value here means "we stopped
+    looking", and the reason says so."""
 
     @property
     def eligible(self) -> list[ScoredCandidate]:
         return [row for row in self.ranked if row.eligible]
 
-    def rejections(self, limit: int = 5) -> list[dict[str, Any]]:
+    def rejections(self, limit: int = 12) -> list[dict[str, Any]]:
         """The most informative near-misses first.
 
         Ordered by score descending, so the operator sees the sessions that
@@ -241,11 +249,12 @@ class MatchResult:
         useless."""
         return [row.as_dict() for row in self.ranked if not row.eligible][:limit]
 
-    def as_dict(self, *, limit: int = 5) -> dict[str, Any]:
+    def as_dict(self, *, limit: int = 12) -> dict[str, Any]:
         return {
             "chosen": self.chosen.as_dict() if self.chosen else None,
             "considered": self.considered,
             "eligible_count": len(self.eligible),
+            "unverified": self.unverified,
             "top_candidates": [row.as_dict() for row in self.ranked[:limit]],
             "rejected": self.rejections(limit),
         }
@@ -468,10 +477,15 @@ def rank(profile: TaskProfile, candidates: Iterable[SessionCandidate], *,
         return result
 
     probes_used = 0
+    exhausted_at: int | None = None
     for index, row in enumerate(scored):
         if not row.eligible:
             continue
         if probes_used >= probe_limit:
+            # Out of probe budget with eligible candidates still unexamined.
+            # Record where we stopped rather than letting the caller read the
+            # remaining rows as rejections -- they were never looked at.
+            exhausted_at = index
             break
         probes_used += 1
         refreshed = evaluate(profile, probe(row.candidate))
@@ -482,6 +496,8 @@ def rank(profile: TaskProfile, candidates: Iterable[SessionCandidate], *,
             result.ranked = sorted(scored, key=lambda item: (-item.score, item.candidate.session))
             result.chosen = refreshed
             return result
+    if exhausted_at is not None:
+        result.unverified = sum(1 for row in scored[exhausted_at:] if row.eligible)
     result.ranked = sorted(scored, key=lambda item: (-item.score, item.candidate.session))
     result.chosen = None
     return result

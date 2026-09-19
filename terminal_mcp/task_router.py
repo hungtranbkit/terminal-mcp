@@ -482,6 +482,12 @@ class TaskRouter:
         summary = ", ".join(f"{count}x {reason}" for reason, count in
                             sorted(counts.items(), key=lambda item: -item[1]))
         tail = "" if spawn_allowed else "; spawning a new runtime is disabled by policy"
+        if match.unverified:
+            # Never say "nothing was eligible" when we simply stopped looking.
+            return (f"stopped after verifying {len(match.ranked) - match.unverified} of "
+                    f"{match.considered} candidates with {match.unverified} still eligible but "
+                    f"unverified (probe budget); raise router.probe_limit to look further"
+                    f"{tail}")
         return f"no eligible session among {match.considered} candidates ({summary}){tail}"
 
     def _dispatch(self, outcome: RoutingOutcome) -> bool:

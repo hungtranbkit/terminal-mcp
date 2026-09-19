@@ -172,7 +172,10 @@ class RouterConfig:
     dispatch_budget_seconds: float = 12.0
     #: How many ranked candidates get a live status probe before we commit.
     #: Each one is a round trip, so this is the other half of the latency bill.
-    probe_limit: int = 3
+    #: Sized for a fleet of this size: too low and the router stops looking
+    #: while good runtimes sit unexamined, which it now reports rather than
+    #: mislabelling as "nothing eligible".
+    probe_limit: int = 8
 
 
 @dataclass(frozen=True)
