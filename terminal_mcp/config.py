@@ -846,6 +846,34 @@ class RepoReadConfig:
 
 
 @dataclass(frozen=True)
+class UiWorkflowConfig:
+    """The central UI workflow policy (ui_workflow.py, TMCP-UI-WORKFLOW-001).
+
+    ON by default, unlike `browser`. The difference is what the capability
+    DOES: the browser gateway opens outbound connections and renders what
+    comes back, while this module only DECIDES -- it selects a project
+    profile, orders the precedence layers and grades an audit result. It
+    opens no socket, touches no file and installs nothing, so there is
+    nothing here an operator needs to opt into.
+
+    `installed_skills` is declared rather than probed, and that is the
+    determinism requirement rather than laziness: the runtime must not fetch
+    an arbitrary skill mid-task, so the policy reports a skill it was not
+    told about as MISSING instead of going to look for it. An operator who
+    installs Taste records it here once.
+
+    `default_project` is the profile used when neither an explicit project_id
+    nor the repo path matches one. Empty means fall back to the built-in
+    generic profile, which is the strictest posture -- see ui_workflow.GENERIC
+    for why an unrecognised project gets the tightest rules, not the loosest.
+    """
+
+    enabled: bool = True
+    installed_skills: tuple[str, ...] = ()
+    default_project: str = ""
+
+
+@dataclass(frozen=True)
 class BrowserGatewayConfig:
     """The Phase-1 browser gateway (browser_gateway.py, browser_worker.py).
 
@@ -1179,6 +1207,7 @@ class AppConfig:
     fleet_sync: FleetSyncConfig = FleetSyncConfig()
     repo_read: RepoReadConfig = RepoReadConfig()
     browser: BrowserGatewayConfig = BrowserGatewayConfig()
+    ui_workflow: UiWorkflowConfig = UiWorkflowConfig()
     worktree_janitor: WorktreeJanitorConfig = WorktreeJanitorConfig()
     prompt_delivery: PromptDeliveryConfig = PromptDeliveryConfig()
     work: WorkConfig = WorkConfig()
@@ -1619,6 +1648,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         fleet_sync=_load_fleet_sync_config(raw.get("fleet_sync", {})),
         repo_read=_load_repo_read_config(raw.get("repo_read", {})),
         browser=_load_browser_gateway_config(raw.get("browser", {})),
+        ui_workflow=_load_ui_workflow_config(raw.get("ui_workflow", {})),
         worktree_janitor=_load_worktree_janitor_config(raw.get("worktree_janitor", {})),
         prompt_delivery=_load_prompt_delivery_config(raw.get("prompt_delivery", {})),
         work=_load_work_config(raw.get("work", {})),
@@ -2193,6 +2223,32 @@ def _load_repo_read_config(raw: object) -> RepoReadConfig:
         max_log_entries=bounded("max_log_entries", RepoReadConfig.max_log_entries, 1, 5_000),
         max_diff_bytes=bounded("max_diff_bytes", RepoReadConfig.max_diff_bytes, 1_024, 16_000_000),
         timeout_seconds=float(timeout), extra_secret_globs=tuple(globs))
+
+
+def _load_ui_workflow_config(raw: object) -> UiWorkflowConfig:
+    """Strict, fail-closed, same posture as the browser loader.
+
+    A malformed skill list is an error rather than a silent empty tuple: a
+    typo there would make the policy report every skill missing, which reads
+    as "nothing is installed" and is exactly the kind of quiet wrong answer
+    this section exists to avoid.
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+    enabled = raw.get("enabled", UiWorkflowConfig.enabled)
+    if not isinstance(enabled, bool):
+        raise ValueError("ui_workflow.enabled must be a boolean")
+    skills = raw.get("installed_skills", [])
+    if not isinstance(skills, list) or not all(isinstance(x, str) and x.strip() for x in skills):
+        raise ValueError("ui_workflow.installed_skills must be a list of non-empty strings")
+    default_project = raw.get("default_project", "")
+    if not isinstance(default_project, str):
+        raise ValueError("ui_workflow.default_project must be a string")
+    return UiWorkflowConfig(
+        enabled=enabled,
+        installed_skills=tuple(x.strip() for x in skills),
+        default_project=default_project.strip(),
+    )
 
 
 def _load_browser_gateway_config(raw: object) -> BrowserGatewayConfig:

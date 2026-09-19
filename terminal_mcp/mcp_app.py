@@ -4,7 +4,7 @@ import logging
 
 from mcp.server.mcpserver import MCPServer
 
-from . import __version__
+from . import __version__, ui_workflow
 from .access_policy import ROLE_OPERATOR, filter_record, policy_table
 from .fleet_service import auth_status_for_node
 from .agent_availability import available_agent_types
@@ -5553,6 +5553,84 @@ def build_mcp(service: TerminalService | None = None,
             filters instead of guessing tag spellings."""
             return _notes(notes.facets)
 
+
+    # -- UI workflow policy (TMCP-UI-WORKFLOW-001) -------------------------
+    # Read-only and pure: it DECIDES (profile, precedence, audit verdict,
+    # next stage) and executes nothing. Registered as plain tools rather than
+    # terminal_turn actions on purpose -- terminal_turn's compact surface is
+    # the browser/session/queue EXECUTION path, and adding a policy query to
+    # it would widen the one surface this project keeps deliberately narrow.
+    # The Browser Gateway actions are untouched.
+    @server.tool()
+    def terminal_ui_workflow_plan(task: str = "", project_id: str | None = None,
+                                  repo_root: str | None = None,
+                                  reference_images: list[str] | None = None,
+                                  reference_provided: bool | None = None,
+                                  behaviour_change_requested: bool = False,
+                                  layers: dict | None = None) -> dict:
+        """The deterministic UI plan for one task, in one call.
+
+        Returns the project profile (viewports + checks), whether
+        Image-to-Code applies (it does ONLY with a real reference), the
+        resolved precedence chain and who won, whether this profile permits
+        an app-behaviour change, the stage/checkpoint list, and which skills
+        are installed vs missing. Pure -- same inputs, same plan, so it
+        survives a chat reset instead of being re-improvised.
+
+        This decides WHAT to verify. Verification itself stays on the
+        existing compact Browser Gateway surface (terminal_turn
+        browser_verify/browser_status/browser_screenshot/browser_stop).
+        """
+        config = terminal.config.ui_workflow
+        if not config.enabled:
+            return {"error": "UI_WORKFLOW_DISABLED",
+                    "detail": "set ui_workflow.enabled: true in config.yaml"}
+        return ui_workflow.plan(
+            task=task,
+            project_id=project_id or (config.default_project or None),
+            repo_root=repo_root,
+            reference_images=reference_images,
+            reference_provided=reference_provided,
+            behaviour_change_requested=behaviour_change_requested,
+            installed_skills=config.installed_skills,
+            layers=layers,
+        )
+
+    @server.tool()
+    def terminal_ui_workflow_audit_gate(findings: list[dict] | None = None,
+                                        counts: dict | None = None,
+                                        minor_fix_is_low_risk: bool = False) -> dict:
+        """Grade a Web Design Guidelines audit result.
+
+        critical > 0 -> FAIL (does not proceed); major > 0 -> FIX_REQUIRED
+        (fix BEFORE browser verification); minor -> PASS, fixed now only when
+        low risk. Returns the verdict, the counts it used and the next stage,
+        so the gate is actionable rather than only a judgement.
+        """
+        if not terminal.config.ui_workflow.enabled:
+            return {"error": "UI_WORKFLOW_DISABLED"}
+        return ui_workflow.audit_gate(findings, counts=counts,
+                                      minor_fix_is_low_risk=minor_fix_is_low_risk)
+
+    @server.tool()
+    def terminal_ui_workflow_policy() -> dict:
+        """The policy itself: precedence table, flow stages, checkpoints,
+        project profiles and the pinned skill catalog. Use it to answer "why
+        did it decide that" without re-deriving the rules."""
+        config = terminal.config.ui_workflow
+        return {
+            "enabled": config.enabled,
+            "policy_version": ui_workflow.UI_WORKFLOW_POLICY_VERSION,
+            "precedence": [{"rank": r, "layer": n, "authority": d}
+                           for r, n, d in ui_workflow.PRECEDENCE],
+            "stages": list(ui_workflow.STAGES),
+            "checkpoints": [{"checkpoint": n, "name": name, "completed_by_stage": st}
+                            for n, name, st in ui_workflow.CHECKPOINTS],
+            "profiles": [p.as_dict() for p in ui_workflow.PROFILES]
+                        + [ui_workflow.GENERIC.as_dict()],
+            "skills": ui_workflow.skill_catalog(installed=config.installed_skills),
+            "document": ui_workflow.policy_document(),
+        }
 
     # One-tool surface wiring (see compact_tools.TURN_HANDLER_ACTIONS): the
     # discovery/lifecycle/queue actions terminal_turn routes are bound to the

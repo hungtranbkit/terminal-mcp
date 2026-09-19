@@ -234,3 +234,18 @@ submit_watchdog:
   # Only Codex may receive automatic Enter retries. Unknown/other agents
   # are single-submit and become DELIVERY_UNKNOWN/STUCK if unconfirmed.
   retry_agent_types: [codex]
+
+# Central UI workflow policy (ui_workflow.py, TMCP-UI-WORKFLOW-001). Decides
+# only -- picks the project profile, orders the precedence layers, grades the
+# Web Design Guidelines audit and says which stage is next. It opens no
+# socket, installs nothing and never fetches a skill at runtime, which is why
+# it is on by default unlike `browser`.
+#
+# installed_skills is DECLARED, not probed: that is the determinism
+# requirement. A skill absent from this list is reported MISSING rather than
+# downloaded mid-task. Add an entry once the skill is really installed through
+# the normal Claude/Codex skill mechanism.
+ui_workflow:
+  enabled: true
+  installed_skills: []
+  # default_project: novaretail

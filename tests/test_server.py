@@ -403,6 +403,19 @@ async def test_server_registers_v1_and_binding_tools():
         "browser_status",
         "browser_screenshot",
         "browser_stop",
+        # Task router (landed with the router lane; this inventory had not
+        # been updated for it).
+        "terminal_task_route",
+        "terminal_route_start",
+        "terminal_queue_rescue_once",
+        "terminal_session_cleanup_candidates",
+        # UI workflow policy (TMCP-UI-WORKFLOW-001). Read-only decision tools:
+        # they pick the project profile, order the precedence layers and grade
+        # the guidelines audit. Registered as plain tools, NOT terminal_turn
+        # actions, so the compact execution surface stays narrow.
+        "terminal_ui_workflow_plan",
+        "terminal_ui_workflow_audit_gate",
+        "terminal_ui_workflow_policy",
     }
 
 
