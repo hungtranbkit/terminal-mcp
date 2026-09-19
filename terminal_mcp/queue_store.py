@@ -1898,6 +1898,33 @@ class QueueStore:
     whose placement the ROUTER chose and may therefore choose again -- as
     opposed to one a caller deliberately put in a specific lane."""
 
+    #: Bound, but not yet handed to the agent: the engine has either not
+    #: claimed the task or is still walking it through the gate.
+    PRE_DISPATCH_STATUSES = (QUEUED, PRECHECK, READY)
+
+    def bound_unstarted_tasks(self, *, limit: int = 50) -> list[QueueTask]:
+        """Tasks holding a runtime that have not started running on it.
+
+        WHY THIS EXISTS. The router drives a freshly bound lane itself, but
+        that drive is bounded by a wall clock so a submission cannot become a
+        long poll. When the clock wins, the task is left BOUND and
+        pre-dispatch -- and if its lane never opted into auto-dispatch, the
+        background lane sweep will not touch it either. Nobody would ever
+        finish what the router started, which is the stuck-QUEUED bug wearing
+        a different hat.
+
+        Restart-safe, like every other rescue input: pure durable state."""
+        placeholders = ",".join("?" for _ in self.PRE_DISPATCH_STATUSES)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM queue_tasks WHERE routing_state IN (?, ?) "
+                f"AND execution_session IS NOT NULL "
+                f"AND status IN ({placeholders}) "
+                f"ORDER BY priority DESC, updated_at ASC LIMIT ?",
+                (BOUND, SPAWNED, *self.PRE_DISPATCH_STATUSES, limit),
+            ).fetchall()
+        return [QueueTask.from_row(row) for row in rows]
+
     def routable_tasks(self, *, limit: int = 200) -> list[QueueTask]:
         """Tasks that are waiting for a runtime AND that routing is allowed to
         place. Those are two different questions, and conflating them breaks a

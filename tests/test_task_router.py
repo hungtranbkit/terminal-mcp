@@ -1295,3 +1295,47 @@ def test_the_match_and_dispatch_phases_share_one_wall_clock_budget(store, queue)
     # Stopped by the clock after ~3 probes, not after all 8.
     assert now["t"] <= 16.0
     assert "unverified" in receipt["routing_reason"]
+
+
+def test_a_time_boxed_route_is_finished_by_the_next_rescue_cycle(store, queue):
+    """LIVE, hp-linux @ 6d26358: the wall-clock budget left the task BOUND at
+    0 ticks, and its lane had never opted into auto-dispatch -- so nothing was
+    going to finish what the router started. That is the stuck-QUEUED bug
+    wearing a different hat.
+
+    The BOUND + pre-dispatch state is built directly here, which is exactly
+    what a route whose clock expired leaves behind."""
+    controller = FakeController(sessions=[_row("agent-a")],
+                                records=[FakeRecord(node_id="local", session_name="agent-a")])
+    engine = RecordingEngine(store)
+    router = _router(store, queue, controller, engine=engine)
+    created = queue.create_task("t", "work")
+    task_id = created["task_id"]
+    store.bind_task_to_session(task_id, "agent-a", node_id="local",
+                               evidence={"reason": "score 60"})
+    assert store.get_task(task_id).status == QUEUED
+    assert not any(lane.get("auto_dispatch_enabled") for lane in store.list_all_lanes())
+
+    report = router.rescue_once()
+
+    assert report["advanced"] == 1
+    assert store.get_task(task_id).status in START_UNDERWAY_STATUSES
+    assert engine.ticks
+
+
+def test_advancing_a_bound_task_the_engine_will_not_claim_hands_the_session_back(store, queue):
+    """Same sweep, opposite outcome: an engine that will not claim means the
+    session is doing nothing for this task, so it is handed back."""
+    controller = FakeController(sessions=[_row("agent-a")],
+                                records=[FakeRecord(node_id="local", session_name="agent-a")])
+    router = _router(store, queue, controller, engine=StubbornEngine())
+    created = queue.create_task("t", "work")
+    task_id = created["task_id"]
+    store.bind_task_to_session(task_id, "agent-a", node_id="local", evidence={"reason": "r"})
+
+    router.rescue_once()
+
+    task = store.get_task(task_id)
+    assert task.routing_state == WAITING_RUNTIME
+    assert task.execution_session is None
+    assert store.tasks_bound_to_session("agent-a") == []

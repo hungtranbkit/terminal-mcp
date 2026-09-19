@@ -739,8 +739,43 @@ class TaskRouter:
             elif outcome.outcome == DEFERRED:
                 deferred += 1
             results.append(outcome.as_dict())
+        advanced = self._advance_bound_tasks()
         return {"enabled": True, "scanned": len(tasks), "routed": routed,
-                "deferred": deferred, "results": results}
+                "deferred": deferred, "advanced": len(advanced), "results": results,
+                "advanced_results": advanced}
+
+    def _advance_bound_tasks(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        """Finish what a time-boxed route started.
+
+        The router drives a lane it has just bound, but stops on a wall clock
+        so a submission never becomes a long poll. When the clock wins the
+        task is BOUND and pre-dispatch, and if its lane never opted into
+        auto-dispatch the background sweep will not touch it either -- so this
+        step picks those up and keeps ticking them. Same release policy as the
+        synchronous path, so a task the engine will not claim still gets its
+        runtime handed back rather than holding it forever."""
+        advanced: list[dict[str, Any]] = []
+        try:
+            pending = self.store.bound_unstarted_tasks(limit=limit)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("task-router: bound-task scan failed")
+            return advanced
+        for task in pending:
+            outcome = RoutingOutcome(
+                outcome=ROUTED, task_id=task.id, session=task.execution_session,
+                node_id=task.execution_node_id, routing_state=task.routing_state or BOUND,
+                task_state=task.status, reason=(task.routing_evidence or {}).get("reason", ""))
+            try:
+                self._dispatch(outcome)
+                if self._should_release(outcome):
+                    self._release_and_defer(outcome, dict(task.routing_evidence or {}))
+            except Exception as exc:  # noqa: BLE001 -- one task must not wedge the sweep
+                _LOGGER.exception("task-router: advancing bound task %s failed", task.id)
+                advanced.append({"task_id": task.id, "outcome": "ERROR",
+                                 "reason": f"{type(exc).__name__}: {exc}"})
+                continue
+            advanced.append(outcome.as_dict())
+        return advanced
 
     def on_session_idle(self, session: str) -> dict[str, Any]:
         """Hook: a session just became free, so re-run the sweep now.
