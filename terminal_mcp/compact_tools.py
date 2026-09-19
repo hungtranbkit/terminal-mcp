@@ -89,6 +89,7 @@ TURN_HANDLER_ACTIONS: dict[str, str] = {
     "browser_verify": "browser_verify",
     "browser_screenshot": "browser_screenshot",
     "browser_run_task": "browser_run_task",
+    "browser_stop": "browser_stop",
 }
 #: Handler keys `start` composes. They are injected exactly like the ones in
 #: TURN_HANDLER_ACTIONS (mcp_app wires them to the very same implementations
@@ -121,10 +122,13 @@ BROWSER_ARGS: dict[str, frozenset[str]] = {
     "browser_verify": frozenset({"url", "assertions", "viewport_width", "viewport_height",
                                    "timeout_seconds", "screenshot", "wait_for"}),
     "browser_run_task": frozenset({"task", "url", "viewport_width", "viewport_height",
-                                     "timeout_seconds", "screenshot", "session_id"}),
+                                     "timeout_seconds", "screenshot", "session_id",
+                                     "allow_mutations"}),
     "browser_status": frozenset({"probe"}),
     "browser_screenshot": frozenset({"url", "viewport_width", "viewport_height",
                                        "timeout_seconds", "full_page"}),
+    # Takes nothing: it releases whatever this gateway has in flight.
+    "browser_stop": frozenset(),
 }
 
 _BLOCKED_ERRORS = {

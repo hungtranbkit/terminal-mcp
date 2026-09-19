@@ -59,6 +59,7 @@ import signal
 import selectors
 import tempfile
 import subprocess
+import threading
 import sys
 import time
 import uuid
@@ -85,6 +86,11 @@ _KILL_GRACE_SECONDS = 3.0
 #: "what has this gateway been doing", not an audit trail.
 _HISTORY = 20
 
+#: Step actions that WRITE to the page (browser_script.parse_step's
+#: vocabulary). Navigation, waiting, scrolling and assertions are reads and
+#: stay ungated.
+MUTATING_STEP_KINDS = frozenset({"click", "fill", "press"})
+
 
 def _state_dir() -> Path:
     state_home = os.environ.get("XDG_STATE_HOME")
@@ -104,6 +110,12 @@ class BrowserGateway:
         # tested without Chromium. Production always uses _spawn_worker.
         self._runner = runner or self._spawn_worker
         self._history: deque[dict[str, Any]] = deque(maxlen=_HISTORY)
+        # Workers currently in flight. Calls are synchronous and hard-bounded,
+        # so this is normally empty; it exists so `stop()` has something real
+        # to act on when a run outlives its caller (a disconnected client, a
+        # wedged Chromium) instead of being a verb that does nothing.
+        self._live: set[subprocess.Popen] = set()
+        self._live_lock = threading.Lock()
 
     # -- configuration -----------------------------------------------------
 
@@ -179,6 +191,8 @@ class BrowserGateway:
                 )
             except OSError as exc:
                 return {"ok": False, "error": "BROWSER_LAUNCH_FAILED", "detail": str(exc)}
+            with self._live_lock:
+                self._live.add(proc)
             try:
                 for name in chunks:
                     pipe = getattr(proc, name)
@@ -200,6 +214,8 @@ class BrowserGateway:
                                     "detail": "worker exceeded the 256 KiB output budget"}
             finally:
                 self._kill_group(proc)
+                with self._live_lock:
+                    self._live.discard(proc)
                 proc.stdout.close()
                 proc.stderr.close()
         out = chunks["stdout"].decode("utf-8", errors="replace")
@@ -217,6 +233,29 @@ class BrowserGateway:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": "BROWSER_WORKER_ERROR",
                     "detail": f"unreadable worker output ({type(exc).__name__})"}
+
+    def stop(self) -> dict[str, Any]:
+        """Release any browser work this gateway still has in flight.
+
+        There is no persistent browser to close -- every run is its own
+        process and its own context (see the class docstring) -- so on an
+        idle gateway this reports IDLE and touches nothing. What it DOES
+        cover is the case the per-call deadline cannot: a worker whose
+        caller went away, or a Chromium that outlived its job. Each worker
+        is its own process GROUP, so killing the group takes the browser
+        and the Playwright driver with it.
+        """
+        with self._live_lock:
+            live = list(self._live)
+        for proc in live:
+            self._kill_group(proc)
+            with self._live_lock:
+                self._live.discard(proc)
+        return {"status": "STOPPED" if live else "IDLE",
+                "terminated": len(live),
+                "engine": self.config.engine if hasattr(self.config, "engine") else "playwright-chromium",
+                "detail": ("terminated in-flight browser worker(s)" if live
+                           else "no browser work was in flight; nothing to stop")}
 
     @staticmethod
     def _kill_group(proc: subprocess.Popen) -> None:
@@ -427,7 +466,8 @@ class BrowserGateway:
     def run_task(self, task: str, *, url: str | None = None,
                  viewport_width: Any = None, viewport_height: Any = None,
                  timeout_seconds: Any = None, session_id: str | None = None,
-                 screenshot: bool = False) -> dict[str, Any]:
+                 screenshot: bool = False,
+                 allow_mutations: bool = False) -> dict[str, Any]:
         """Run a short scripted browser task written in plain steps.
 
         `session_id` is a CORRELATION LABEL only. Phase 1 starts every run
@@ -453,6 +493,21 @@ class BrowserGateway:
                 "'open <url>', 'click <selector>', 'fill <selector> with <text>', "
                 "'wait for <selector>', 'assert text contains: <text>'.",
                 unparsed=[scrub(e) for e in parse_errors][:10],
+                session_id=scrub(session_id, 120) if session_id else None)
+
+        # MUTATIONS ARE OPT-IN. click/fill/press change the page under the
+        # operator's own browser policy, and this surface is reachable from a
+        # chat client: "check that the cart page renders" must not be able to
+        # press the button that empties it as a side effect. Read-only tasks
+        # (goto/wait/scroll/assert) stay one call away; anything that writes
+        # needs the caller to say so, and is echoed back for the audit trail.
+        mutating = [step.action for step in steps if step.action in MUTATING_STEP_KINDS]
+        if mutating and not allow_mutations:
+            return self._error(
+                "BROWSER_MUTATION_NOT_ALLOWED",
+                "this task contains page-mutating steps; pass allow_mutations=true "
+                "to authorize them",
+                mutating_steps=sorted(set(mutating)),
                 session_id=scrub(session_id, 120) if session_id else None)
 
         target: str | None = None
@@ -502,6 +557,9 @@ class BrowserGateway:
             "task": "deterministic browser actions",
             "session_id": scrub(session_id, 120) if session_id else None,
             "session_state": "not-persisted",
+            # The audit half of the mutation gate: what this run was
+            # authorized to write, echoed back in the result a chat keeps.
+            **({"mutations": sorted(set(mutating))} if mutating else {}),
             "viewport": viewport,
             "duration_ms": duration_ms,
             "steps": [{"action": scrub(s.get("action"), 60),
