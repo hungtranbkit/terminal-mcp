@@ -18,6 +18,20 @@ WAIT_PATTERNS = tuple(
         r"\[Y/n\]",
         r"continue\?\s*$",
         r"waiting for input",
+        # Claude Code's own multi-choice selection widget (numbered options,
+        # arrow-key/Tab navigation, Enter to accept the highlighted choice).
+        # These three are the widget's UI-chrome strings, live-verified
+        # against a real attended session and already carried by
+        # adapters._WAITING_PATTERNS, which is where this set was found to
+        # be missing them: a session sitting on a real permission menu
+        # reported state=UNKNOWN/input_required=False from classify_status
+        # while the very same pane content made adapters refuse the send as
+        # TARGET_AWAITING_APPROVAL. The two pattern sets disagreeing about
+        # the same observed dialog is exactly the class of bug the removal
+        # note just below documents, in the other direction.
+        r"enter to select",
+        r"tab/arrow keys to navigate",
+        r"esc to cancel",
         # REMOVED (2026-09-07, real false positive found LIVE against a
         # real attended session, `window2`): this list used to also
         # include bare r"\bapprove\b" and r"\bpermission\b" word-boundary
@@ -39,6 +53,83 @@ WAIT_PATTERNS = tuple(
 ACTIVE_COMMANDS = {"claude", "codex", "python", "python3", "pytest", "node", "npm", "bash", "zsh"}
 
 
+# ---------------------------------------------------------------------------
+# Agent-CLI state markers -- the fix for "terminal_status says UNKNOWN for a
+# session whose own pane plainly shows what it is doing".
+#
+# Why the command+activity_epoch rules in classify_status are not enough:
+# tmux's #{session_activity} is unreliable for an Ink-rendered agent CLI, in
+# BOTH directions (terminal_wall.py's OutputChangeTracker reached the same
+# conclusion independently, from the same fleet). Captured LIVE on this host,
+# 2026-09-19, against real Claude Code 2.1.277 sessions:
+#
+#   terminal-mcp-claude-tests -- activity age 663s, yet genuinely WORKING:
+#     "* Billowing... (10m 25s . 17.9k tokens)"
+#     ">> auto mode on . 1 shell . esc to interrupt . <- for agents ..."
+#     pane_current_command="claude" with age>60 falls through every rule
+#     below to UNKNOWN, for a session that is unmistakably RUNNING.
+#
+#   hp-work / hp2 / terminal-mcp-claude-audit -- finished turns, idle:
+#     "* Sauteed for 20s . done 7:25 AM"
+#     "                    new task? /clear to save 167.7k tokens"
+#     "* Brewed for 19s . done 10:06 AM"
+#     "* Cogitated for 39m 35s . done 10:05 AM . 1 shell still running"
+#     same fall-through to UNKNOWN, for sessions that are unmistakably IDLE.
+#
+# Deliberately only these two markers, both read off the CLI's OWN chrome
+# (never the model's prose), both verified against those captures:
+#
+#   RUNNING -- "esc to interrupt". The busy footer, and already the one
+#     working-evidence marker adapters.py has real Claude AND real Codex
+#     evidence for; reused here rather than invented. NOT extended with
+#     adapters' looser \bworking\b/\bthinking\b, which an agent's own
+#     conversational text reaches trivially.
+#   IDLE -- the turn-finished status line "<middle dot> done H:MM AM/PM",
+#     and the "new task?" affordance on its own line. The U+00B7 separator
+#     and the 12-hour clock are both part of the captures above; the
+#     line-start anchor on "new task?" is what keeps it off a sentence that
+#     merely contains those words.
+#
+# Anything else stays UNKNOWN. Codex has no verified finished-turn marker on
+# record here, so none is guessed at -- the same standing rule the bare
+# \bapprove\b/\bpermission\b patterns above were deleted under.
+# ---------------------------------------------------------------------------
+AGENT_RUNNING_PATTERNS = (re.compile(r"esc to interrupt", re.IGNORECASE),)
+AGENT_IDLE_PATTERNS = (
+    re.compile(r"·\s*done\s+\d{1,2}:\d{2}\s*[ap]\.?m\.?\b", re.IGNORECASE),
+    re.compile(r"^\s*new task\?", re.IGNORECASE),
+)
+# The footer/status-line region. In every capture above the finished-turn
+# status line sits 6 non-empty lines from the bottom (status line, an
+# update/affordance line, a composer-box border, the composer, the other
+# border, the mode footer), so 8 covers it with margin without reaching back
+# into the conversation transcript above.
+AGENT_UI_MARKER_LINES = 8
+
+
+def detect_agent_ui_state(output: str) -> tuple[str | None, str]:
+    """RUNNING/IDLE read from an agent CLI's own footer, or (None, why-not).
+
+    Two separate passes, RUNNING first: a busy footer is the LIVE state and
+    must win outright over a "done 10:05 AM" line still visible from the
+    PREVIOUS turn. One pass over both pattern sets would instead let
+    whichever marker happened to sit lower in the pane decide, which is
+    exactly backwards.
+    """
+    recent = [line for line in output.splitlines() if line.strip()][-AGENT_UI_MARKER_LINES:]
+    for offset, line in enumerate(reversed(recent)):
+        for pattern in AGENT_RUNNING_PATTERNS:
+            if pattern.search(line):
+                return "RUNNING", (f"agent CLI busy footer matched {pattern.pattern!r} "
+                                   f"at bottom offset {offset}")
+    for offset, line in enumerate(reversed(recent)):
+        for pattern in AGENT_IDLE_PATTERNS:
+            if pattern.search(line):
+                return "IDLE", (f"agent CLI finished-turn marker matched {pattern.pattern!r} "
+                                f"at bottom offset {offset}")
+    return None, "no high-confidence agent CLI state marker near the pane bottom"
+
+
 def detect_waiting_input(output: str) -> tuple[bool, str]:
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     recent = lines[-12:]
@@ -58,6 +149,18 @@ def classify_status(session: SessionInfo, output: str, now: int | None = None) -
         return "IDLE", False, "tmux reports the active pane is dead"
     age = max(0, (now if now is not None else int(time.time())) - session.activity_epoch)
     command = session.pane_current_command.casefold()
+    # Checked BEFORE the activity-age rules below, not after: the pane's own
+    # footer is direct evidence of what the target is doing right now, while
+    # activity_epoch is an unreliable proxy that is wrong in both directions
+    # for an Ink-rendered agent CLI (see AGENT_RUNNING_PATTERNS above for the
+    # live captures). Ordering it after would leave an idle Claude session
+    # that merely redrew within 60s reporting RUNNING on the strength of that
+    # redraw, and a working one whose spinner has not moved reporting UNKNOWN.
+    # The command is restated in the reason string because that is where
+    # terminal_wall.command_from() reads it from.
+    ui_state, ui_reason = detect_agent_ui_state(output)
+    if ui_state is not None:
+        return ui_state, False, f"{ui_reason}; current command is {command or 'unknown'!r}"
     if command in ACTIVE_COMMANDS and age <= 60:
         return "RUNNING", False, f"current command is {command!r}; tmux activity age is {age}s"
     if command in {"bash", "zsh", "sh", "fish"} and age > 60:

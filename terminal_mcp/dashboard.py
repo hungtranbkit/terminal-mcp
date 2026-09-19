@@ -147,6 +147,9 @@ INPUT_ERROR_STATUS = {
     "INPUT_DISABLED": 403,
     "SENSITIVE_TARGET": 403,
     "SESSION_NOT_FOUND": 404,
+    # Not 404: the session may well exist -- a node that holds it could not be
+    # probed. 503 says "ask again", which is the actionable truth here.
+    "SESSION_LOCATION_UNKNOWN": 503,
     "GRANT_REQUIRED": 403,
     "READ_GRANT_REQUIRED": 403,
     "READ_RESTRICTED": 403,

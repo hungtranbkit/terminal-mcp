@@ -2,6 +2,7 @@ from terminal_mcp.models import SessionInfo
 from terminal_mcp.status import (
     classify_status,
     classify_supervisor_state,
+    detect_agent_ui_state,
     detect_waiting_input,
     parse_completion_marker,
     verify_completion_marker,
@@ -47,6 +48,204 @@ def test_ordinary_composer_mentioning_permission_is_not_waiting_input():
     state, input_required, _reason = classify_status(info("claude", 5), output, now=100)
     assert state != "WAITING_INPUT"
     assert input_required is False
+
+
+# ---------------------------------------------------------------------------
+# Claude Code 2.1.277 pane captures, taken LIVE from this host on 2026-09-19
+# (tmux capture-pane against the real sessions named in each constant). These
+# are the exact outputs that used to classify as UNKNOWN. Reproduced verbatim,
+# including the middle dots, box-drawing borders and trailing padding tmux
+# renders, because the padding and the line positions are part of what the
+# classifier reads.
+# ---------------------------------------------------------------------------
+RULE = "─" * 80
+
+# terminal-mcp-claude-tests: genuinely WORKING, but tmux reported an activity
+# age of 663s -- an Ink UI whose spinner had not redrawn while it waited on a
+# long shell command. This is the capture that made "agent + stale activity"
+# indistinguishable from a mystery.
+CLAUDE_WORKING = "\n".join((
+    "● Baseline at ~48%. Waiting for completion.",
+    "",
+    "● Waiting for baseline suite completion · 2m 28s",
+    "  ⏎  $ until ! pgrep -f 'pytest -q -p no:cacheprovider --maxfail=40' >/dev/null;",
+    "     do sleep 20; done; echo \"BASELINE DONE\"; tail -40",
+    "     /tmp/terminal-mcp-main-baseline.log (2m 26s)",
+    "     (ctrl+b ctrl+b (twice) to run in background)",
+    "",
+    "✻ Billowing… (10m 25s · ↓ 17.9k tokens)",
+    RULE,
+    "❯",
+    RULE,
+    "  ⏵⏵ auto mode on · 1 shell · esc to interrupt · ⇤ for agents · ⇥ to manage",
+))
+
+# hp-work: finished turn, idle for days. Carries BOTH idle markers -- the
+# "done 7:25 AM" status line and the "new task?" affordance.
+CLAUDE_IDLE_NEW_TASK = "\n".join((
+    "  my last message is still the fix if you want a retry to be readable.",
+    "",
+    "✻ Sautéed for 20s · done 7:25 AM",
+    "                                        new task? /clear to save 167.7k tokens",
+    RULE,
+    "❯ reset coordinator_attempts to 0",
+    RULE,
+    "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+))
+
+# terminal-mcp-claude-audit: finished turn with a background shell still
+# alive, and NO "new task?" line (an update notice occupies that row instead)
+# -- so the "done 10:05 AM" status line alone has to carry the verdict, from
+# six non-empty lines above the bottom. "1 shell still running" is on that
+# very line and must NOT be read as the agent running.
+CLAUDE_IDLE_DONE_ONLY = "\n".join((
+    "  Standing by — no further edits until you've merged and smoked efc9bb9.",
+    "",
+    "✻ Cogitated for 39m 35s · done 10:05 AM · 1 shell still running",
+    "                                        ✔ Update installed · Restart to update",
+    RULE,
+    "❯ viết report AUDIT-TERMINAL-MCP-2026-09-19.md ngay",
+    RULE,
+    "  ⏵⏵ auto mode on · 1 shell · ⇤ for agents · ⇥ to manage",
+))
+
+# Claude Code's own numbered permission widget. Its chrome line was carried by
+# adapters._WAITING_PATTERNS but not by this module's WAIT_PATTERNS, so a
+# session sitting on a real approval prompt classified as UNKNOWN here while
+# adapters refused the send as TARGET_AWAITING_APPROVAL.
+CLAUDE_PERMISSION_MENU = "\n".join((
+    "  Do you want to make this edit to core.py?",
+    "  ❯ 1. Yes",
+    "    2. Yes, and don't ask again this session",
+    "    3. No, tell Claude what to do differently",
+    "  Enter to select · Tab/arrow keys to navigate · Esc to cancel",
+))
+
+
+def test_working_claude_pane_is_running_despite_stale_tmux_activity():
+    # The exact regression: pane_current_command="claude" with an activity age
+    # far past the 60s ACTIVE_COMMANDS window used to fall through to UNKNOWN.
+    assert detect_agent_ui_state(CLAUDE_WORKING)[0] == "RUNNING"
+    state, input_required, reason = classify_status(info("claude", activity=0), CLAUDE_WORKING, now=663)
+    assert state == "RUNNING"
+    assert input_required is False
+    assert "esc to interrupt" in reason
+    # terminal_wall.command_from() parses the command back out of this string.
+    assert "current command is 'claude'" in reason
+
+
+def test_finished_claude_turn_with_new_task_affordance_is_idle():
+    assert detect_agent_ui_state(CLAUDE_IDLE_NEW_TASK)[0] == "IDLE"
+    state, input_required, _reason = classify_status(
+        info("claude", activity=0), CLAUDE_IDLE_NEW_TASK, now=438_554)
+    assert state == "IDLE"
+    assert input_required is False
+
+
+def test_finished_claude_turn_is_idle_from_the_done_status_line_alone():
+    assert detect_agent_ui_state(CLAUDE_IDLE_DONE_ONLY)[0] == "IDLE"
+    state, _input_required, _reason = classify_status(
+        info("claude", activity=0), CLAUDE_IDLE_DONE_ONLY, now=2497)
+    assert state == "IDLE"
+
+
+def test_idle_claude_that_redrew_recently_is_idle_not_running():
+    # The activity-age rule alone would say RUNNING here purely because the
+    # pane redrew within 60s -- the pane's own footer says the turn is done,
+    # and pane evidence must win over the proxy.
+    state, _input_required, _reason = classify_status(
+        info("claude", activity=95), CLAUDE_IDLE_DONE_ONLY, now=100)
+    assert state == "IDLE"
+
+
+def test_busy_footer_beats_a_previous_turns_done_marker():
+    # A working pane can still show the PREVIOUS turn's "done" line inside the
+    # marker window. The live busy footer is the current state.
+    mixed = CLAUDE_IDLE_DONE_ONLY + "\n  ⏵⏵ auto mode on · esc to interrupt · ⇤ for agents"
+    assert detect_agent_ui_state(mixed)[0] == "RUNNING"
+
+
+def test_claude_permission_menu_is_waiting_input():
+    waiting, _reason = detect_waiting_input(CLAUDE_PERMISSION_MENU)
+    assert waiting is True
+    state, input_required, _reason = classify_status(
+        info("claude", activity=0), CLAUDE_PERMISSION_MENU, now=5)
+    assert state == "WAITING_INPUT"
+    assert input_required is True
+
+
+# Two more LIVE captures, 2026-09-19, both sessions genuinely stuck on a real
+# approval dialog that classify_status reported as UNKNOWN before this change
+# -- the worst possible answer for this state, since nothing tells an operator
+# or a supervisor that the session is blocked on them.
+CLAUDE_READ_PERMISSION_DIALOG = "\n".join((
+    " tools follow next session, sandboxed commands at once.",
+    "",
+    " Allow reads outside the working directories?",
+    " ❯ 1. Yes, keep allowing reads outside the working directories",
+    "   2. No, block reads outside the working directories from now on",
+    "   3. No, ask again next time",
+    "",
+    " Esc to cancel · Tab to amend",
+))
+
+# Codex CLI's own tool-approval menu -- a different CLI, a different footer
+# ("enter to submit | esc to cancel"), the same shared chrome string.
+CODEX_TOOL_APPROVAL_MENU = "\n".join((
+    "  Allow Terminal MCP to run tool \"terminal_mcp.terminal_status\"?",
+    " ",
+    "  session: nova-claude-long",
+    " ",
+    "  › 1. Allow                   Run the tool and continue.",
+    "    2. Allow for this session  Run the tool and remember this choice for this",
+    "                               session.",
+    "    3. Always allow            Run the tool and remember this choice for",
+    "                               future tool calls.",
+    "    4. Cancel                  Cancel this tool call",
+    "  enter to submit | esc to cancel",
+))
+
+
+def test_live_claude_read_permission_dialog_is_waiting_input():
+    state, input_required, _reason = classify_status(
+        info("claude", activity=0), CLAUDE_READ_PERMISSION_DIALOG, now=900)
+    assert state == "WAITING_INPUT"
+    assert input_required is True
+
+
+def test_live_codex_tool_approval_menu_is_waiting_input():
+    state, input_required, _reason = classify_status(
+        info("codex", activity=0), CODEX_TOOL_APPROVAL_MENU, now=30)
+    assert state == "WAITING_INPUT"
+    assert input_required is True
+
+
+def test_ambiguous_agent_pane_stays_unknown():
+    # No busy footer, no finished-turn marker, no prompt: the honest answer is
+    # still UNKNOWN. This is what keeps the two markers above from becoming a
+    # general-purpose guess.
+    ambiguous = "\n".join(("  reading files...", "", "❯", RULE))
+    assert detect_agent_ui_state(ambiguous)[0] is None
+    state, _input_required, _reason = classify_status(info("claude", activity=0), ambiguous, now=999)
+    assert state == "UNKNOWN"
+
+
+def test_done_marker_far_above_the_footer_region_is_not_idle():
+    # Bounded window: a "done" line scrolled well up into the transcript is
+    # history, not the current state.
+    buried = ("✻ Worked for 14m 33s · done 2:31 AM\n"
+              + "\n".join(f"  transcript line {i}" for i in range(12)))
+    assert detect_agent_ui_state(buried)[0] is None
+
+
+def test_prose_mentioning_a_new_task_mid_sentence_is_not_idle():
+    # "new task?" only counts as the CLI's own affordance line, never as words
+    # inside a sentence -- the line-start anchor is what makes that true.
+    prose = "\n".join((
+        "  So should I pick up the new task? I can start on it now.",
+        "❯",
+    ))
+    assert detect_agent_ui_state(prose)[0] is None
 
 
 def test_real_yn_dialog_still_detected_as_waiting_input():
