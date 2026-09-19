@@ -414,7 +414,8 @@ class TerminalService:
                  leases: PaneLeaseStore | None = None,
                  killed_sessions: KilledSessionStore | None = None,
                  session_registry: SessionRegistryStore | None = None,
-                 session_knowledge: SessionKnowledgeStore | None = None) -> None:
+                 session_knowledge: SessionKnowledgeStore | None = None,
+                 registry_node_id: str | None = None) -> None:
         # `tmux` accepts ANY SessionBackend (session_backend.py) -- a
         # TmuxClient (the default, Linux) or a WindowsSessionBackend
         # (windows_backend.py, injected explicitly by windows_agent.py).
@@ -423,6 +424,25 @@ class TerminalService:
         # narrow, already-generic surface and runs completely unchanged
         # regardless of which backend this is -- see session_backend.py's
         # own module docstring for why.
+        # This node's canonical id, when the caller knows it. Set BEFORE any
+        # store is touched: everything below keys the durable session registry
+        # off it, including the legacy-duplicate migration at the end of this
+        # constructor.
+        #
+        # The class attribute it shadows reads TERMINAL_MCP_LOCAL_NODE_ID at
+        # import time, which is right for the controller (a server process
+        # started from a unit that sets it) and WRONG for a node agent: the
+        # agent is told its id on the command line (`--node-id hp-linux`) and
+        # its environment frequently does not carry the variable at all. It
+        # then wrote every session row under the placeholder `local` while
+        # believing itself to be hp-linux -- and on a host running BOTH a
+        # controller and an agent against the SAME session_registry.db, that
+        # re-created the legacy-ownership rows the migration had just retired,
+        # within seconds, on every listing pass. Measured on the canonical
+        # controller: 28 rows retired at 15:36:11, all 28 ACTIVE again under
+        # `local` by 15:38:52.
+        if registry_node_id and registry_node_id.strip():
+            self.REGISTRY_LOCAL_NODE_ID = registry_node_id.strip()
         self.config = config
         self.tmux = tmux or TmuxClient()
         self.bindings = bindings or BindingStore()
@@ -558,6 +578,12 @@ class TerminalService:
     # Keep legacy single-host behavior by default, but align the durable
     # session registry with the controller's configured fleet identity when
     # a self-hosted controller is explicitly named (for example hp-linux).
+    #
+    # This is the FALLBACK only. A caller that actually knows this node's id
+    # passes `registry_node_id=` to __init__, which shadows this per instance
+    # -- the node agent does exactly that with its own `--node-id`, because
+    # the environment variable is a controller convention the agent's own
+    # process usually never sees.
     REGISTRY_LOCAL_NODE_ID = os.environ.get("TERMINAL_MCP_LOCAL_NODE_ID", "local").strip() or "local"
 
     def _reconcile_session_registry(self, items: list[Any], grants_by_session: dict[str, SessionGrant]) -> None:

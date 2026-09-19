@@ -458,3 +458,36 @@ def test_repo_evidence_endpoint_requires_a_cwd(agent_client):
     response = agent_client.get("/v1/repo-evidence", headers=_auth())
     assert response.status_code == 400
     assert response.json()["error"] == "CWD_REQUIRED"
+
+
+def test_the_agent_cli_hands_its_own_node_id_to_the_session_registry(tmp_path, monkeypatch):
+    """The wiring that closes the legacy-ownership loop.
+
+    `--node-id` is the ONLY place an agent learns what it is called; the
+    class-level fallback reads TERMINAL_MCP_LOCAL_NODE_ID, a controller
+    convention an agent process usually never sees. Constructing
+    TerminalService without passing the id through is what filed every session
+    under the `local` placeholder and re-seeded the rows the controller's
+    migration had just retired.
+    """
+    from terminal_mcp import node_agent
+
+    seen: dict[str, object] = {}
+
+    class _Stop(RuntimeError):
+        pass
+
+    def _recorder(config, **kwargs):
+        seen.update(kwargs)
+        raise _Stop  # main() has nothing left to prove; do not start a server
+
+    monkeypatch.setattr(node_agent, "TerminalService", _recorder)
+    token_file = tmp_path / "token"
+    token_file.write_text("t" * 40)
+
+    with pytest.raises(_Stop):
+        node_agent.main(["--node-id", "hp-linux", "--controller-url", "http://c:8766",
+                         "--token-file", str(token_file)])
+
+    assert seen.get("registry_node_id") == "hp-linux", \
+        "the agent must record sessions under the id it registers and heartbeats as"

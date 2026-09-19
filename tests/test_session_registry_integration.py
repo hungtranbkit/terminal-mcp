@@ -470,3 +470,91 @@ def test_an_unnamed_controller_startup_leaves_the_registry_alone(tmp_path, monke
     )
 
     assert registry.get("local", "s1").status == "ACTIVE"
+
+
+def test_a_node_agent_records_sessions_under_its_own_node_id(tmp_path, monkeypatch):
+    """The defect that made the legacy-ownership migration futile.
+
+    A node agent is told its id on the command line (`--node-id hp-linux`) and
+    its environment usually does NOT carry TERMINAL_MCP_LOCAL_NODE_ID -- which
+    is the only thing the class-level fallback reads. It therefore filed every
+    session under the `local` placeholder while believing itself to be
+    hp-linux, and on a host running BOTH a controller and an agent against the
+    same session_registry.db that re-created the rows the controller's
+    migration had just retired, on the very next listing pass.
+    """
+    registry = SessionRegistryStore(tmp_path / "session_registry.db")
+    monkeypatch.delenv("TERMINAL_MCP_LOCAL_NODE_ID", raising=False)
+    monkeypatch.setattr(TerminalService, "REGISTRY_LOCAL_NODE_ID", "local")
+
+    agent = TerminalService(
+        _config(tmp_path),
+        bindings=BindingStore(tmp_path / "bindings.db"),
+        audit=AuditStore(tmp_path / "audit.db"),
+        grants=SessionGrantStore(tmp_path / "grants.db"),
+        leases=PaneLeaseStore(tmp_path / "leases.db"),
+        killed_sessions=KilledSessionStore(tmp_path / "killed_sessions.db"),
+        session_registry=registry,
+        registry_node_id="hp-linux",
+    )
+
+    assert agent.REGISTRY_LOCAL_NODE_ID == "hp-linux"
+    assert TerminalService.REGISTRY_LOCAL_NODE_ID == "local", \
+        "the override is per instance -- it must not leak onto the class"
+
+
+def test_a_controller_and_an_agent_on_one_host_agree_on_the_node_id(tmp_path, monkeypatch):
+    """The two-process case the defect actually bit, end to end: they share one
+    session_registry.db, so they have to agree on what this machine is called
+    or one of them keeps undoing the other's migration."""
+    registry_path = tmp_path / "session_registry.db"
+    monkeypatch.delenv("TERMINAL_MCP_LOCAL_NODE_ID", raising=False)
+    monkeypatch.setattr(TerminalService, "REGISTRY_LOCAL_NODE_ID", "hp-linux")
+
+    def _build(**extra):
+        return TerminalService(
+            _config(tmp_path),
+            bindings=BindingStore(tmp_path / "bindings.db"),
+            audit=AuditStore(tmp_path / "audit.db"),
+            grants=SessionGrantStore(tmp_path / "grants.db"),
+            leases=PaneLeaseStore(tmp_path / "leases.db"),
+            killed_sessions=KilledSessionStore(tmp_path / "killed_sessions.db"),
+            session_registry=SessionRegistryStore(registry_path),
+            **extra)
+
+    controller = _build()                               # reads the env convention
+    agent = _build(registry_node_id="hp-linux")         # told on the command line
+
+    assert controller.REGISTRY_LOCAL_NODE_ID == agent.REGISTRY_LOCAL_NODE_ID == "hp-linux"
+
+
+def test_an_agent_cannot_undo_the_migration_it_just_ran(tmp_path, monkeypatch):
+    """The regression in one run: retire the legacy duplicate, then let the
+    agent do a reconcile pass. Before the fix that pass re-created the row as
+    ACTIVE under `local`; now it writes under the canonical id and the retired
+    row stays retired."""
+    registry = SessionRegistryStore(tmp_path / "session_registry.db")
+    registry.upsert_seen("local", "shared-session")
+    registry.upsert_seen("hp-linux", "shared-session")
+    monkeypatch.delenv("TERMINAL_MCP_LOCAL_NODE_ID", raising=False)
+    monkeypatch.setattr(TerminalService, "REGISTRY_LOCAL_NODE_ID", "local")
+
+    agent = TerminalService(
+        _config(tmp_path),
+        bindings=BindingStore(tmp_path / "bindings.db"),
+        audit=AuditStore(tmp_path / "audit.db"),
+        grants=SessionGrantStore(tmp_path / "grants.db"),
+        leases=PaneLeaseStore(tmp_path / "leases.db"),
+        killed_sessions=KilledSessionStore(tmp_path / "killed_sessions.db"),
+        session_registry=registry,
+        registry_node_id="hp-linux",
+    )
+    assert registry.get("local", "shared-session").status == "DELETED", \
+        "constructing with the canonical id must run the retire sweep"
+
+    # A reconcile pass, which is what re-seeded the row before the fix.
+    agent.session_registry.upsert_seen(agent.REGISTRY_LOCAL_NODE_ID, "shared-session")
+
+    assert registry.get("local", "shared-session").status == "DELETED", \
+        "the agent re-seeded the legacy row it had just retired"
+    assert registry.get("hp-linux", "shared-session").status == "ACTIVE"
