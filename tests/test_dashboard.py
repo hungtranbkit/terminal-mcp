@@ -1702,6 +1702,14 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # Unprefixed alias kept for the operator bookmark that predates the
         # /dashboard prefix; read-only, same handler.
         "/ops/novaretail-dispatch": {"GET", "HEAD"},
+        # Phase-based project teams (d47ce85). Screen and detail read are
+        # GET/HEAD; every state change is its own explicit POST.
+        "/dashboard/projects": {"GET", "HEAD"},
+        "/dashboard/api/projects/detail": {"GET", "HEAD"},
+        "/dashboard/api/projects/bootstrap": {"POST"},
+        "/dashboard/api/projects/plan": {"POST"},
+        "/dashboard/api/projects/advance": {"POST"},
+        "/dashboard/api/projects/reconcile": {"POST"},
     }
     # The web terminal's WebSocket route is registered too, just outside
     # this HTTP-methods-only dict (WebSocketRoute has no .methods).

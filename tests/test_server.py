@@ -435,6 +435,20 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_unbind_agent_skill",
         # What a task is waiting on, for the attention/inbox surface.
         "terminal_task_attention",
+        # Phase-based project teams with a durable project manager
+        # (d47ce85). A project is a durable record with phases and a team,
+        # so it needs bootstrap/plan/start/advance/archive plus the reads.
+        # Plain tools, NOT terminal_turn actions -- same reason as above.
+        "terminal_project_bootstrap",
+        "terminal_project_plan",
+        "terminal_project_start",
+        "terminal_project_advance",
+        "terminal_project_archive",
+        "terminal_project_update",
+        "terminal_project_get",
+        "terminal_project_phase_status",
+        "terminal_project_registry_list",
+        "terminal_project_reconcile_team",
     }
 
 
