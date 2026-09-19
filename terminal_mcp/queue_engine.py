@@ -428,13 +428,33 @@ class QueueEngine:
             status = self.ops.terminal_status(session) or {}
         except Exception:  # noqa: BLE001
             status = {}
+        # The conversation id and agent_type come from the SESSION REGISTRY, not
+        # from terminal_status. Learned from the live smoke: terminal_status's
+        # `resume_conversation_id` is populated on the Windows backend only --
+        # tmux leaves it None by design (see models.py) -- so sourcing it from
+        # there persisted None for a real Claude session whose id was known all
+        # along, and the whole native-resume path silently degraded to
+        # checkpoint/restart. The registry is where terminal_create_session
+        # durably writes it, which is exactly what it is for.
+        registry_row: dict[str, Any] = {}
+        registry_get = getattr(self.ops, "terminal_registry_get", None)
+        if registry_get is not None:
+            try:
+                answer = registry_get(session) or {}
+                record = answer.get("record") if isinstance(answer.get("record"), dict) else answer
+                registry_row = record if isinstance(record, dict) else {}
+            except Exception:  # noqa: BLE001
+                registry_row = {}
         identity: dict[str, Any] = {
             "session": session,
-            "node_id": status.get("node_id"),
-            "cwd": status.get("cwd"),
-            "worktree": status.get("cwd"),
-            "agent_type": status.get("agent_type") or (task.metadata or {}).get("agent_type"),
-            "conversation_id": status.get("resume_conversation_id") or status.get("conversation_id"),
+            "node_id": status.get("node_id") or registry_row.get("node_id"),
+            "cwd": status.get("cwd") or registry_row.get("cwd"),
+            "worktree": status.get("cwd") or registry_row.get("worktree_path") or registry_row.get("cwd"),
+            "agent_type": (status.get("agent_type") or registry_row.get("agent_type")
+                           or registry_row.get("launcher_type") or (task.metadata or {}).get("agent_type")),
+            "conversation_id": (registry_row.get("conversation_id")
+                                or status.get("resume_conversation_id") or status.get("conversation_id")),
+            "branch": registry_row.get("git_branch"),
             "last_state": status.get("state"),
             "request_key": task.request_key,
             "attempt": task.attempt_count,

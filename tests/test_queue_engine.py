@@ -571,3 +571,35 @@ def test_a_controller_without_registry_reopen_never_claims_a_resume_it_did_not_d
             break
     assert "retry_mode=RESUME_NATIVE_CONVERSATION" in (result.detail or "")
     assert "native_resume=ok" not in (result.detail or "")
+
+
+def test_conversation_id_is_sourced_from_the_registry_not_terminal_status(store, ops):
+    # Live-smoke finding: terminal_status's resume_conversation_id is populated
+    # on the Windows backend ONLY -- tmux leaves it None by design -- so reading
+    # it from there persisted None for a real Claude session whose id was known
+    # all along, and native resume silently degraded to restart. The registry is
+    # where terminal_create_session durably writes it.
+    (task_id,) = store.set_tasks("lane-a", [{"prompt": PROMPT}])
+
+    class RegistryOps(type(ops)):
+        def terminal_registry_get(self, session):
+            return {"session_name": session, "conversation_id": "conv-from-registry",
+                    "agent_type": "claude", "worktree_path": "/w/lane", "git_branch": "fix/b"}
+
+    reg = RegistryOps()
+    # tmux-shaped status: NO resume_conversation_id at all.
+    reg.set_status("lane-a", {"state": "IDLE", "exists": True, "node_id": "local", "cwd": "/repo/a"})
+    _dispatch_once(store, reg)
+
+    state = store.get_recovery_state(task_id)
+    assert state["conversation_id"] == "conv-from-registry"
+    assert state["agent_type"] == "claude"
+    assert state["branch"] == "fix/b"
+
+
+def test_a_controller_without_registry_get_still_dispatches(store, ops):
+    # Optional capability: its absence must not break dispatch.
+    (task_id,) = store.set_tasks("lane-a", [{"prompt": PROMPT}])
+    ops.set_status("lane-a", {"state": "IDLE", "exists": True, "node_id": "local", "cwd": "/repo/a"})
+    assert PROMPT in _dispatch_once(store, ops)
+    assert store.get_recovery_state(task_id)["session"] == "lane-a"
