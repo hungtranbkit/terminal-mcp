@@ -157,6 +157,39 @@ class QueueLoop:
         # should be acted on in this cycle rather than waiting for the next one,
         # and the sweep below is what picks up anything the drain's single tick
         # per lane did not finish.
+        # NON-DISPATCH RECOVERY SWEEP, fleet-wide and BEFORE the lane walk
+        # below.
+        #
+        # The walk only visits lanes with auto_dispatch_enabled -- 7 of 56 on
+        # this deployment -- and until now every reconciler lived inside
+        # engine.tick(), which the walk is the only caller of. So the clears
+        # that are documented as automatic (a stale PRECHECK/DISPATCHING
+        # claim, a WAITING_SESSION whose session came back, a coordinator
+        # pause with nothing left to guard) never ran for an opted-out lane.
+        # A lane could sit paused for hours with tasks stranded behind it, as
+        # one really did (see reconcile_stale_lane_pause's docstring).
+        #
+        # These three are pure store operations: they move tasks back to
+        # QUEUED and clear a stale lane flag, and send NOTHING to any session.
+        # Opting a lane out of auto-dispatch still means no work is ever
+        # submitted to it -- it no longer means the lane stops being
+        # maintained. Each is idempotent, so a quiet cycle writes nothing.
+        # Resolved with getattr, not attribute access: a store that does not
+        # implement one of these (a narrower test double, an older store) must
+        # skip that sweep, never break the dispatch cycle -- the same fail-soft
+        # posture as the except below.
+        for name in ("reconcile_stale_lane_pause", "reconcile_stale_claims",
+                     "reconcile_uncertain_and_waiting"):
+            sweep = getattr(self.engine.store, name, None)
+            if sweep is None:
+                continue
+            try:
+                changed = sweep()
+            except Exception:  # noqa: BLE001 -- a sweep glitch must never stop dispatch
+                _LOGGER.exception("queue-loop: %s failed, continuing", name)
+            else:
+                if changed:
+                    _LOGGER.info("queue-loop: %s reconciled %s", name, changed)
         self._drain_events()
         if self.heartbeat_refresher is not None:
             try:

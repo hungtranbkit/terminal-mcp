@@ -35,7 +35,7 @@ from .dor_gate import check_definition_of_ready
 from .permissions import valid_session_name
 from .verify_queue import VerifyQueue
 from .queue_store import (
-    PAUSED, QUEUED, TERMINAL_STATUSES, UNASSIGNED_LANE, VERIFYING,
+    PAUSE_ORIGIN_USER, PAUSED, QUEUED, TERMINAL_STATUSES, UNASSIGNED_LANE, VERIFYING,
     InvalidTransitionError, TaskAlreadyClaimedError, QueueStore,
 )
 
@@ -646,9 +646,13 @@ class QueueService:
         return {"events": merged[:limit]}
 
     def pause(self, session: str, *, reason: str | None = None) -> dict[str, Any]:
+        """An explicit operator pause: a STANDING instruction, recorded with
+        PAUSE_ORIGIN_USER so the coordinator-pause reconciler
+        (reconcile_stale_lane_pause) can never clear it. Only resume() lifts
+        this one."""
         if error := self._validate_session(session):
             return error
-        self.store.pause_lane(session, reason=reason)
+        self.store.pause_lane(session, reason=reason, origin=PAUSE_ORIGIN_USER)
         return self.store.lane_status(session)
 
     def resume(self, session: str) -> dict[str, Any]:
