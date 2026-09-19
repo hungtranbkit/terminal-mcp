@@ -51,6 +51,7 @@ SESSION_NOT_ACTIVE = "SESSION_NOT_ACTIVE"
 WORKTREE_MISSING = "WORKTREE_MISSING"
 WAITING_INPUT = "WAITING_INPUT"
 RUNTIME_MISMATCH = "RUNTIME_MISMATCH"
+RUNTIME_CANNOT_RECEIVE_DISPATCH = "RUNTIME_CANNOT_RECEIVE_DISPATCH"
 INPUT_NOT_PERMITTED = "INPUT_NOT_PERMITTED"
 STALE_IDENTITY = "STALE_IDENTITY"
 SESSION_BUSY = "SESSION_BUSY"
@@ -70,6 +71,9 @@ REJECTION_TEXT: dict[str, str] = {
     WORKTREE_MISSING: "the session's working directory no longer exists",
     WAITING_INPUT: "session is blocked waiting for human input",
     RUNTIME_MISMATCH: "session runtime does not match the runtime this task requires",
+    RUNTIME_CANNOT_RECEIVE_DISPATCH: (
+        "this runtime cannot accept a queued dispatch: the engine's prompt is multi-line and "
+        "a plain shell executes each line as it arrives, so the send is refused"),
     INPUT_NOT_PERMITTED: "input into this session is not permitted",
     STALE_IDENTITY: "the session's grant is pinned to a process that no longer exists",
     SESSION_BUSY: "session is actively running something else",
@@ -104,6 +108,22 @@ CONTEXT_TIGHT_PERCENT = 85.0
 #: negative (an unknown repo alone is -50), and dispatching into a session the
 #: arithmetic has just called a bad idea would make the score decorative.
 MIN_ELIGIBLE_SCORE = 0
+
+#: Runtimes that can be QUEUE-DISPATCHED to.
+#:
+#: FOUND LIVE (hp-linux, 5541539): the router picked an idle, same-repo shell
+#: session and the engine refused the send with MULTILINE_SHELL_SEND_REFUSED.
+#: QueueEngine.build_dispatch_text wraps every prompt in a completion-marker
+#: template, which is multi-line by construction, and core.py refuses multi-line
+#: into a target that does not buffer embedded newlines -- a plain shell runs
+#: each line the instant it arrives, so there is no safe way to send it.
+#:
+#: That is a permanent property of the runtime, not a transient state, so it
+#: belongs in the hard rejects rather than being discovered one wasted binding
+#: at a time. Mirrors adapters.AgentAdapter.buffers_embedded_newlines; kept as
+#: an explicit list because the matcher must answer from a session record's
+#: `agent_type` string without constructing an adapter.
+DISPATCHABLE_RUNTIMES = frozenset({"claude", "codex"})
 
 #: Session states that mean "nothing is running here right now".
 IDLE_STATES = frozenset({"IDLE"})
@@ -329,6 +349,8 @@ def hard_reject(profile: TaskProfile, candidate: SessionCandidate) -> str | None
         # genuinely free is strictly better than being queued second behind
         # one that is not.
         return SESSION_BACKLOGGED
+    if candidate.runtime and str(candidate.runtime).lower() not in DISPATCHABLE_RUNTIMES:
+        return RUNTIME_CANNOT_RECEIVE_DISPATCH
     if profile.runtime_required and profile.preferred_runtime and candidate.runtime:
         if str(candidate.runtime).lower() != str(profile.preferred_runtime).lower():
             return RUNTIME_MISMATCH

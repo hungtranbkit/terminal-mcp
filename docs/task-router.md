@@ -38,13 +38,25 @@ Rejects: `NODE_OFFLINE`, `NODE_DRAINING`, `NODE_OVERLOADED`,
 `SESSION_NOT_ACTIVE`, `INPUT_NOT_PERMITTED`, `STALE_IDENTITY`,
 `WORKTREE_MISSING`, `WAITING_INPUT`, `SESSION_BUSY`, `SESSION_CLAIMED`,
 `RUNTIME_MISMATCH`, `REPO_MISMATCH`, `MISSING_REQUIRED_SKILL`,
-`AGENT_BOUND_ELSEWHERE`.
+`AGENT_BOUND_ELSEWHERE`, `SESSION_BACKLOGGED`, `RUNTIME_CANNOT_RECEIVE_DISPATCH`.
+
+Two of those were added after the first live smoke, because the router picked
+sessions it then could not start work in:
+
+* **`SESSION_BACKLOGGED`** — a lane is serial, so a session with work already
+  queued cannot start this task now however idle its pane looks. This was a
+  `-5` score penalty at first, which is how a backlogged session still won and
+  the task landed *behind* the existing queue.
+* **`RUNTIME_CANNOT_RECEIVE_DISPATCH`** — the engine wraps every prompt in a
+  multi-line completion-marker template, and a plain shell executes each line
+  as it arrives, so the send is refused (`MULTILINE_SHELL_SEND_REFUSED`). Only
+  `claude` and `codex` buffer a multi-line prompt.
 
 Scores: `+50` agent binding, `+30` same project, `+30` same repo, `+20`
 required skills, `+20` IDLE, `+10` branch affinity, `+10` healthy node, `+10`
 context `<70%`, `-20` context `>=85%`, `-40` dirty work on a different branch,
-`-50` required repo unknown, `-5` per already-queued task. A candidate must
-clear `MIN_ELIGIBLE_SCORE` (0) to be dispatched to.
+`-50` required repo unknown. A candidate must clear `MIN_ELIGIBLE_SCORE` (0)
+to be dispatched to.
 
 ### Unknown is not No
 
@@ -75,6 +87,32 @@ affinity**: that session or a clear refusal, never a silent reroute. Omitting
 the target is what invites routing. `start` without a target still returns
 `TARGET_REQUIRED` — a caller that forgot one gets an error, not a surprise.
 
+## Dispatch is driven, and reported honestly
+
+`QueueEngine.tick` makes at most **one** transition per call, and makes none
+at all when the admission governor declines, a lane is paused or a dependency
+is unmet. So binding plus one tick can never produce a running task. The
+router drives the same bounded sequence `turn(action="start")` uses, with the
+same constants, and derives `dispatched` from the task's real status — never
+from "tick did not raise".
+
+Driving those ticks does **not** touch `auto_dispatch_enabled`. That flag
+governs the background `QueueLoop`'s lane sweep and is left exactly as the
+operator set it; every tick still passes the coordinator gate and the governor.
+
+Three outcomes, three different truths:
+
+| Outcome | Binding | Receipt |
+| --- | --- | --- |
+| Engine advanced it | kept | `dispatched: true` |
+| Engine declined (governor, paused lane, …) | **released**, task re-matched | `WAITING_RUNTIME` + the engine's own reason |
+| `dispatch_budget_seconds` ran out | **kept** — the engine is mid-flight | `budget_exhausted: true`, server keeps driving |
+
+The last row is why the budget exists: a submission must not become a long
+poll. `dispatch_budget_seconds` (default 12s) and `probe_limit` (default 3
+round trips) bound the synchronous half; only the caller's wait ends, never
+the work.
+
 ## Concurrency
 
 `QueueStore.bind_task_to_session` takes SQLite's write lock (`BEGIN
@@ -100,9 +138,11 @@ router:
   rescue_enabled: true       # the periodic reconcile
   spawn_enabled: false       # create a session when nothing is eligible
   max_spawned_sessions: 4
-  default_runtime: shell
+  default_runtime: claude
   rescue_interval_seconds: 10
   rescue_batch_size: 20
+  dispatch_budget_seconds: 12   # wall-clock ceiling on the synchronous half
+  probe_limit: 3                # live status probes before committing
 ```
 
 `enabled`/`rescue_enabled` default **on**, unlike every other autonomous

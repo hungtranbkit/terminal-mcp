@@ -20,7 +20,7 @@ import pytest
 
 from terminal_mcp import session_matcher as sm
 from terminal_mcp import task_profile
-from terminal_mcp.compact_tools import START_UNDERWAY_STATUSES
+from terminal_mcp.compact_tools import MAX_START_TICKS, START_UNDERWAY_STATUSES
 from terminal_mcp.config import RouterConfig
 from terminal_mcp.queue_service import QueueService
 from terminal_mcp.queue_store import (
@@ -1096,3 +1096,95 @@ def test_real_payment_work_is_still_excluded(prompt):
 ])
 def test_git_and_ordinary_english_are_not_payment_work(prompt):
     assert "payment" not in task_profile.analyze(prompt=prompt).risk_flags
+
+
+# ---------------------------------------------------------------------------
+# LIVE FAILURE 2, hp-linux @ 5541539 -- an idle shell was chosen for a
+# dispatch it can never accept, and the synchronous call had no time ceiling.
+# ---------------------------------------------------------------------------
+
+def test_a_plain_shell_session_is_never_chosen_for_a_queued_dispatch(store, queue):
+    """The engine wraps every prompt in a multi-line completion-marker
+    template, and a shell executes each line as it arrives -- so the send is
+    refused. Found live: the router bound an idle same-repo shell, the engine
+    answered MULTILINE_SHELL_SEND_REFUSED, and the binding had to be undone.
+    That is a permanent property of the runtime, so it is rejected up front."""
+    controller = FakeController(
+        sessions=[_row("a-shell")],
+        records=[FakeRecord(node_id="local", session_name="a-shell",
+                            agent_type="shell", last_known_state="IDLE")])
+    router = _router(store, queue, controller)
+
+    receipt = router.route_start("echo hello")
+
+    assert receipt["session"] is None
+    assert receipt["rejected_candidates"][0]["rejected"] == sm.RUNTIME_CANNOT_RECEIVE_DISPATCH
+    assert "multi-line" in receipt["rejected_candidates"][0]["rejected_detail"]
+
+
+@pytest.mark.parametrize("runtime,chooseable", [("claude", True), ("codex", True),
+                                                ("shell", False), ("bash", False)])
+def test_only_runtimes_that_buffer_a_multiline_prompt_are_dispatchable(runtime, chooseable):
+    candidate = SessionCandidate(session="s", state="IDLE", runtime=runtime)
+    rejected = sm.hard_reject(_profile(), candidate)
+    assert (rejected is None) is chooseable
+
+
+def test_route_start_stops_driving_when_its_wall_clock_budget_runs_out(store, queue):
+    """A submission must not become a long poll. Each tick is remote node I/O,
+    so the drive is bounded by wall clock as well as by tick count."""
+    now = {"t": 0.0}
+
+    class SlowEngine:
+        def __init__(self):
+            self.ticks = 0
+
+        def tick(self, session):
+            self.ticks += 1
+            now["t"] += 3.0        # each tick costs three seconds
+            return _Result("SLOW")
+
+    engine = SlowEngine()
+    controller = FakeController(sessions=[_row("idle-one")],
+                                records=[FakeRecord(node_id="local", session_name="idle-one")])
+    router = TaskRouter(store, controller=controller, queue=queue, engine=engine,
+                        session_registry=controller.session_registry,
+                        config=_config(dispatch_budget_seconds=5.0),
+                        clock=lambda: now["t"])
+
+    receipt = router.route_start("work")
+
+    assert receipt["dispatched"] is False
+    assert receipt["budget_exhausted"] is True
+    assert "budget of 5s exhausted" in receipt["dispatch_detail"]
+    # Stopped by the clock, well before the tick ceiling.
+    assert engine.ticks == 2
+    assert engine.ticks < MAX_START_TICKS
+
+
+def test_a_budget_timeout_keeps_the_binding_because_the_engine_is_still_working(store, queue):
+    """Releasing here would be wrong. The engine may be mid-dispatch; only the
+    CALLER gave up waiting, so the task stays bound and the server carries on.
+    This is the opposite of the engine-refuses case, which does release."""
+    now = {"t": 0.0}
+
+    class SlowEngine:
+        def tick(self, session):
+            now["t"] += 10.0
+            return _Result("SLOW")
+
+    controller = FakeController(sessions=[_row("idle-one")],
+                                records=[FakeRecord(node_id="local", session_name="idle-one")])
+    router = TaskRouter(store, controller=controller, queue=queue, engine=SlowEngine(),
+                        session_registry=controller.session_registry,
+                        config=_config(dispatch_budget_seconds=5.0),
+                        clock=lambda: now["t"])
+
+    receipt = router.route_start("work")
+    task = store.get_task(receipt["task_id"])
+
+    assert receipt["budget_exhausted"] is True
+    assert task.routing_state == BOUND
+    assert task.execution_session == "idle-one"
+    assert receipt["poll"] is False
+    assert "still driving it" in receipt["guidance"]

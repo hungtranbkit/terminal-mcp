@@ -154,13 +154,25 @@ class RouterConfig:
     #: cannot spawn without bound even once spawning is enabled.
     max_spawned_sessions: int = 4
     #: agent_type used for a spawn when the task expresses no preference.
-    default_runtime: str = "shell"
+    #: NOT "shell": a plain shell cannot receive a queued dispatch at all (see
+    #: session_matcher.DISPATCHABLE_RUNTIMES), so spawning one would create a
+    #: session the matcher must immediately reject.
+    default_runtime: str = "claude"
     #: Seconds between rescue sweeps. Independent of the queue loop's own
     #: poll interval so a fast dispatch cadence does not force a fleet
     #: listing every three seconds.
     rescue_interval_seconds: float = 10.0
     #: Most tasks one sweep will attempt to place.
     rescue_batch_size: int = 20
+    #: WALL-CLOCK CEILING ON THE SYNCHRONOUS HALF OF route_start. Driving the
+    #: engine means remote node I/O per tick, and an unbounded drive turns a
+    #: submission into a long poll -- the exact thing a durable receipt exists
+    #: to avoid. When the budget runs out the task stays bound and the server
+    #: keeps advancing it; the only thing that stops is the caller's wait.
+    dispatch_budget_seconds: float = 12.0
+    #: How many ranked candidates get a live status probe before we commit.
+    #: Each one is a round trip, so this is the other half of the latency bill.
+    probe_limit: int = 3
 
 
 @dataclass(frozen=True)
@@ -1912,6 +1924,12 @@ def _load_router_config(router_raw: object) -> RouterConfig:
     max_spawned = int(router_raw.get("max_spawned_sessions", RouterConfig.max_spawned_sessions))
     if max_spawned < 0 or max_spawned > 100:
         raise ValueError("router.max_spawned_sessions must be between 0 and 100")
+    budget = float(router_raw.get("dispatch_budget_seconds", RouterConfig.dispatch_budget_seconds))
+    if not 1.0 <= budget <= 60.0:
+        raise ValueError("router.dispatch_budget_seconds must be between 1 and 60")
+    probe_limit = int(router_raw.get("probe_limit", RouterConfig.probe_limit))
+    if not 1 <= probe_limit <= 25:
+        raise ValueError("router.probe_limit must be between 1 and 25")
     return RouterConfig(
         enabled=bool(router_raw.get("enabled", RouterConfig.enabled)),
         rescue_enabled=bool(router_raw.get("rescue_enabled", RouterConfig.rescue_enabled)),
@@ -1920,6 +1938,8 @@ def _load_router_config(router_raw: object) -> RouterConfig:
         default_runtime=str(router_raw.get("default_runtime", RouterConfig.default_runtime)),
         rescue_interval_seconds=interval,
         rescue_batch_size=batch,
+        dispatch_budget_seconds=budget,
+        probe_limit=probe_limit,
     )
 
 

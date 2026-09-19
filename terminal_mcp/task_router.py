@@ -95,6 +95,10 @@ class RoutingOutcome:
     orchestrator stop watching."""
     dispatch_ticks: int = 0
     dispatch_detail: str | None = None
+    budget_exhausted: bool = False
+    """The CALLER's wait ran out, not the engine refusing. The distinction
+    decides whether the binding is kept (the engine is mid-flight and the
+    server carries on) or handed back (the engine will not take it)."""
     task_state: str | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
 
@@ -104,6 +108,7 @@ class RoutingOutcome:
             "node_id": self.node_id, "score": self.score, "reason": self.reason,
             "routing_state": self.routing_state, "dispatched": self.dispatched,
             "dispatch_ticks": self.dispatch_ticks, "dispatch_detail": self.dispatch_detail,
+            "budget_exhausted": self.budget_exhausted,
             "task_state": self.task_state, "routing_evidence": self.evidence,
         }
 
@@ -386,7 +391,8 @@ class TaskRouter:
                                   routing_state=UNROUTED, reason="router is disabled by policy")
 
         profile = self.profile_for(task)
-        match = sm.rank(profile, self.candidates(), probe=self._probe)
+        match = sm.rank(profile, self.candidates(), probe=self._probe,
+                        probe_limit=int(self._policy_value("probe_limit", 3)))
         evidence: dict[str, Any] = {
             "profile": profile.as_dict(),
             "decided_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -419,7 +425,7 @@ class TaskRouter:
                 node_id=chosen.candidate.node_id, score=chosen.score,
                 reason=evidence["reason"], routing_state=BOUND,
                 task_state=bound.get("status"), evidence=evidence)
-            if dispatch and not self._dispatch(outcome):
+            if dispatch and not self._dispatch(outcome) and not outcome.budget_exhausted:
                 return self._release_and_defer(outcome, evidence)
             return outcome
 
@@ -440,7 +446,8 @@ class TaskRouter:
                         outcome=SPAWNED_RUNTIME, task_id=task_id, session=session_name,
                         node_id=node_id, reason=evidence["reason"], routing_state=SPAWNED,
                         task_state=bound.get("status"), evidence=evidence)
-                    if dispatch and not self._dispatch(outcome):
+                    if (dispatch and not self._dispatch(outcome)
+                            and not outcome.budget_exhausted):
                         # A session the router itself just created that still
                         # will not start the task is a real problem, but the
                         # honest answer is the same: say so and re-match.
@@ -507,7 +514,18 @@ class TaskRouter:
             return False
         settled = START_UNDERWAY_STATUSES | START_NEEDS_HUMAN_STATUSES | START_SERVER_PENDING_STATUSES
         detail: str | None = None
+        budget = float(self._policy_value("dispatch_budget_seconds", 12.0))
+        deadline = self.clock() + budget
         for _ in range(MAX_START_TICKS):
+            if self.clock() >= deadline:
+                # A submission must never become a long poll. The task is
+                # durable and bound; the queue loop and the rescue sweep carry
+                # it from here, so the only thing this cutoff ends is how long
+                # the caller waits -- not the work.
+                outcome.budget_exhausted = True
+                detail = (f"dispatch budget of {budget:g}s exhausted after "
+                          f"{outcome.dispatch_ticks} tick(s); the server keeps advancing it")
+                break
             task = self.store.get_task(outcome.task_id)
             if task is None:
                 break
@@ -532,6 +550,8 @@ class TaskRouter:
                 detail = str(task.last_error)
         outcome.dispatched = outcome.task_state in START_UNDERWAY_STATUSES
         outcome.dispatch_detail = detail
+        if outcome.dispatched:
+            outcome.budget_exhausted = False
         _LOGGER.info("task-router: task=%s session=%s ticks=%s state=%s dispatched=%s detail=%s",
                      outcome.task_id, outcome.session, outcome.dispatch_ticks,
                      outcome.task_state, outcome.dispatched, detail)
@@ -741,6 +761,7 @@ class TaskRouter:
             "dispatched": dispatched,
             "dispatch_ticks": outcome.dispatch_ticks,
             "dispatch_detail": outcome.dispatch_detail,
+            "budget_exhausted": outcome.budget_exhausted,
             "explicit_target": explicit_target,
             "deduplicated": bool(created.get("deduplicated")),
             "request_key": created.get("request_key"),
@@ -754,6 +775,13 @@ class TaskRouter:
                 "no runtime was eligible, so the task is durably queued as WAITING_RUNTIME. "
                 "The server re-runs the match every rescue cycle and will start it as soon as a "
                 "compatible session frees up -- do not poll and do not re-send")
+        elif outcome.budget_exhausted:
+            receipt["needs_human"] = False
+            receipt["next_action"] = "none"
+            receipt["guidance"] = (
+                f"the task is durably bound to {outcome.session} and the server is still "
+                f"driving it; this call returned rather than hold the connection open "
+                f"({outcome.dispatch_detail}) -- do not poll and do not re-send")
         elif not dispatched:
             # Bound, but the engine did not start it. Saying "started" here is
             # how an orchestrator drops a task, so the receipt says the
