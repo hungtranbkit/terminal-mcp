@@ -109,6 +109,9 @@ _STATUS_ERROR_DISABLE_REASONS = {
     "NODE_OFFLINE": "node_unreachable",
     "NODE_NOT_FOUND": "node_not_found",
     "SESSION_NOT_FOUND": "target_missing",
+    # Deliberately node_unreachable, NOT target_missing: the target was never
+    # established to be missing -- a node that could hold it did not answer.
+    "SESSION_LOCATION_UNKNOWN": "node_unreachable",
     "AMBIGUOUS_SESSION": "ambiguous_target",
 }
 
