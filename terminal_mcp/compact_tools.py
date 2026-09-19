@@ -27,6 +27,45 @@ RECOMMENDED_RETRY_AFTER_MS = 5_000
 _RESUME_TOKEN = re.compile(r"^wait_[0-9a-f]{32}$")
 _MAX_TARGET_CHARS = 512
 
+# --------------------------------------------------------------------------
+# `turn`'s action vocabulary.
+#
+# WHY IT IS THIS WIDE. The compact ChatGPT surface advertises ONE tool, so
+# every normal orchestration step has to be reachable as an action here --
+# otherwise the connector needs a second advertised tool and the user is back
+# to a wall of "Called tool" rows. The five pane actions below are implemented
+# in this module; the rest are routed to handlers injected by mcp_app (see
+# CompactTerminalTools.handlers), because re-implementing session lifecycle or
+# durable queueing here would be a second source of truth for authorization
+# and idempotency. This table is the single place the vocabulary is defined --
+# the MCP tool layer validates nothing of its own.
+# --------------------------------------------------------------------------
+TURN_PANE_ACTIONS = ("inspect", "send", "send_wait", "wait", "resume")
+# action -> handler key in CompactTerminalTools.handlers
+TURN_HANDLER_ACTIONS: dict[str, str] = {
+    "list_sessions": "list_sessions",
+    "list_nodes": "list_nodes",
+    "create_session": "create_session",
+    "delete_session": "delete_session",
+    "enqueue_task": "enqueue_task",
+    "task_status": "task_status",
+    "task_batch_status": "task_batch_status",
+}
+# Short spellings a caller reaches for first. Resolved before dispatch so the
+# canonical name is the only thing the routing below has to know about.
+TURN_ACTION_ALIASES: dict[str, str] = {
+    "list": "list_sessions",
+    "sessions": "list_sessions",
+    "nodes": "list_nodes",
+    "create": "create_session",
+    "delete": "delete_session",
+    "kill": "delete_session",
+    "enqueue": "enqueue_task",
+    "task": "task_status",
+    "tasks": "task_batch_status",
+}
+TURN_ACTIONS = (*TURN_PANE_ACTIONS, *TURN_HANDLER_ACTIONS)
+
 _BLOCKED_ERRORS = {
     "ACCESS_DENIED", "ACTION_NOT_ALLOWED", "BINDING_INPUT_DISABLED",
     "BINDING_NOT_PINNED", "GRANT_REQUIRED", "IDENTITY_MISMATCH",
@@ -48,11 +87,20 @@ class CompactTerminalTools:
 
     def __init__(self, terminal: Any, controller: Any, *,
                  run_journal: Any = None,
+                 handlers: dict[str, Callable[..., Any]] | None = None,
                  monotonic: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep) -> None:
         self.terminal = terminal
         self.controller = controller
         self.run_journal = run_journal
+        # Late-bound implementations for the discovery/lifecycle/queue actions
+        # `turn` routes but does not own (see TURN_HANDLER_ACTIONS). They are
+        # the very same functions the individual MCP tools are registered
+        # from, injected by mcp_app once those are defined -- so a single-tool
+        # surface reuses one implementation instead of growing a second one
+        # here, and the wrapper-layer side effects those tools already carry
+        # (heartbeat refresh, supervisor-watch cleanup on delete) still run.
+        self.handlers: dict[str, Callable[..., Any]] = dict(handlers or {})
         self.monotonic = monotonic
         self.sleep = sleep
 
@@ -400,23 +448,57 @@ class CompactTerminalTools:
              desired_states: list[str] | None = None, resume_token: str | None = None,
              timeout: float = DEFAULT_WAIT_SECONDS, poll_interval: float = 1,
              tail_lines: int = 20, compact: bool = True,
-             idempotency_key: str | None = None) -> dict[str, Any]:
+             idempotency_key: str | None = None,
+             agent_type: str = "shell", working_directory: str | None = None,
+             initial_prompt: str | None = None, grant_mode: str = "none",
+             binding: str | None = None, node: str = "auto",
+             title: str | None = None, priority: int = 0,
+             metadata: dict[str, Any] | None = None, request_key: str | None = None,
+             task_id: str | None = None,
+             task_ids: list[str] | None = None) -> dict[str, Any]:
         """One MCP-call surface for one logical terminal turn.
 
-        Supported actions:
-        - inspect: status+tail for one target or many targets.
+        Pane actions, implemented here:
+        - inspect: status+tail for one target or many targets (`targets`), each
+          row carrying the `resource` context/quota health block.
         - send: guarded/idempotent task submission.
         - send_wait: submit, then create one durable bounded wait in the same call.
         - wait: create one durable bounded wait.
         - resume: resume a previously PENDING wait.
 
-        This deliberately composes the existing methods rather than creating a
-        second authorization, send, wait or idempotency implementation.
+        Discovery / lifecycle / durable-queue actions, routed to the same
+        implementations the individual tools use (see self.handlers):
+        - list_sessions (list, sessions), list_nodes (nodes)
+        - create_session (create): `target` is the new name; agent_type,
+          working_directory, initial_prompt, grant_mode, binding, node apply.
+        - delete_session (delete, kill): `target` is the name.
+        - enqueue_task (enqueue): `target` is the session, `text` the prompt;
+          title, priority, metadata, request_key apply.
+        - task_status (task): `task_id`. task_batch_status (tasks): `task_ids`.
+
+        Parameters are reused across actions on purpose -- `target` is the
+        session for every action that names one, and `text` is the prompt for
+        both send and enqueue -- so a single-tool surface stays learnable
+        instead of growing a parallel name per verb.
+
+        This deliberately composes the existing methods and handlers rather
+        than creating a second authorization, send, wait, lifecycle or
+        idempotency implementation.
         """
         normalized = str(action or "").strip().lower().replace("-", "_")
-        if normalized not in {"inspect", "send", "send_wait", "wait", "resume"}:
+        normalized = TURN_ACTION_ALIASES.get(normalized, normalized)
+        if normalized not in TURN_ACTIONS:
             return {"status": "FAILED", "error": "INVALID_ACTION",
-                    "allowed": ["inspect", "send", "send_wait", "wait", "resume"]}
+                    "allowed": list(TURN_ACTIONS),
+                    "aliases": dict(TURN_ACTION_ALIASES)}
+
+        if normalized in TURN_HANDLER_ACTIONS:
+            return self._handler_turn(
+                normalized, target=target, text=text, agent_type=agent_type,
+                working_directory=working_directory, initial_prompt=initial_prompt,
+                grant_mode=grant_mode, binding=binding, node=node, title=title,
+                priority=priority, metadata=metadata, request_key=request_key,
+                task_id=task_id, task_ids=task_ids)
 
         if normalized == "inspect":
             resolved_targets = list(targets or ([] if target is None else [target]))
@@ -469,3 +551,53 @@ class CompactTerminalTools:
                                      tail_lines=tail_lines)
         return {"status": waited.get("status", "FAILED"),
                 "action": normalized, "send": sent, "wait": waited}
+
+    def _handler_turn(self, action: str, *, target: str | None, text: str | None,
+                      agent_type: str, working_directory: str | None,
+                      initial_prompt: str | None, grant_mode: str,
+                      binding: str | None, node: str, title: str | None,
+                      priority: int, metadata: dict[str, Any] | None,
+                      request_key: str | None, task_id: str | None,
+                      task_ids: list[str] | None) -> dict[str, Any]:
+        """Route one non-pane action to its injected implementation.
+
+        Argument shaping only. Every authorization, allowed-cwd, protected-
+        session, idempotency and durability rule stays in the handler -- which
+        is the same function the standalone tool calls -- so routing a verb
+        through `turn` can never be a weaker path than calling it directly.
+        """
+        handler = self.handlers.get(TURN_HANDLER_ACTIONS[action])
+        if handler is None:
+            # An honest refusal, not a silent no-op: this deployment did not
+            # wire the action (a bare CompactTerminalTools in a test, or a
+            # build without the queue).
+            return {"status": "FAILED", "error": "ACTION_UNAVAILABLE", "action": action,
+                    "detail": f"{action} is not wired on this server"}
+
+        if action in {"create_session", "delete_session", "enqueue_task"} and (
+                not isinstance(target, str) or not target.strip()):
+            return {"status": "FAILED", "error": "TARGET_REQUIRED", "action": action}
+        if action == "enqueue_task" and (not isinstance(text, str) or not text.strip()):
+            return {"status": "FAILED", "error": "TEXT_REQUIRED", "action": action}
+        if action == "task_status" and (not isinstance(task_id, str) or not task_id.strip()):
+            return {"status": "FAILED", "error": "TASK_ID_REQUIRED", "action": action}
+        if action == "task_batch_status" and not isinstance(task_ids, list):
+            return {"status": "FAILED", "error": "TASK_IDS_REQUIRED", "action": action}
+
+        calls: dict[str, Callable[[], Any]] = {
+            "list_sessions": lambda: handler(),
+            "list_nodes": lambda: handler(),
+            "create_session": lambda: handler(
+                target.strip(), agent_type=agent_type, working_directory=working_directory,
+                initial_prompt=initial_prompt, grant_mode=grant_mode, binding=binding,
+                node=node),
+            "delete_session": lambda: handler(target.strip()),
+            "enqueue_task": lambda: handler(
+                target.strip(), text, title=title, priority=priority,
+                metadata=metadata, request_key=request_key),
+            "task_status": lambda: handler(task_id.strip()),
+            "task_batch_status": lambda: handler(task_ids),
+        }
+        result = calls[action]()
+        failed = isinstance(result, dict) and ("error" in result or result.get("status") == "FAILED")
+        return {"status": "FAILED" if failed else "OK", "action": action, "result": result}

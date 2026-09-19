@@ -84,6 +84,28 @@ def _fleet_session_names(controller: "ControllerService") -> list[str]:
     return names
 
 
+def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_session,
+                     enqueue_task, task_status, task_batch_status) -> dict[str, Any]:
+    """The implementations terminal_turn's non-pane actions route to.
+
+    Keyword-only and exhaustive on purpose: every key in
+    compact_tools.TURN_HANDLER_ACTIONS must appear here, so adding an action
+    without wiring it is a TypeError at the call site below rather than an
+    ACTION_UNAVAILABLE a user discovers on the live connector. The values are
+    the SAME functions registered as standalone tools -- never copies -- so the
+    one-tool surface cannot become a weaker path than the full one.
+    """
+    return {
+        "list_sessions": list_sessions,
+        "list_nodes": list_nodes,
+        "create_session": create_session,
+        "delete_session": delete_session,
+        "enqueue_task": enqueue_task,
+        "task_status": task_status,
+        "task_batch_status": task_batch_status,
+    }
+
+
 def build_mcp(service: TerminalService | None = None,
               supervisor: SupervisorService | None = None,
               supervisor_v2: SupervisorV2Service | None = None,
@@ -464,14 +486,52 @@ def build_mcp(service: TerminalService | None = None,
                       resume_token: str | None = None, timeout: float = 20,
                       poll_interval: float = 1, tail_lines: int = 20,
                       compact: bool = True,
-                      idempotency_key: str | None = None) -> dict:
-        """DEFAULT terminal surface: complete one logical inspect/send/wait/resume turn in one MCP call."""
+                      idempotency_key: str | None = None,
+                      agent_type: str = "shell", working_directory: str | None = None,
+                      initial_prompt: str | None = None, grant_mode: str = "none",
+                      binding: str | None = None, node: str = "auto",
+                      title: str | None = None, priority: int = 0,
+                      metadata: dict | None = None, request_key: str | None = None,
+                      task_id: str | None = None,
+                      task_ids: list[str] | None = None) -> dict:
+        """THE terminal surface: one logical orchestration step, one MCP call.
+
+        This covers every normal workflow, so a caller never needs a second
+        tool (and a chat never shows a wall of tool rows). `action` is one of:
+
+          inspect   status + bounded tail + `resource` health for one `target`
+                    or many `targets` (this IS batch inspect)
+          send      guarded, idempotent submission of `text`
+          send_wait send, then wait in the same call
+          wait      durable bounded wait for `desired_states`
+          resume    continue a wait that returned PENDING (`resume_token`)
+          list_sessions | list  every session, with node and access info
+          list_nodes    | nodes the fleet
+          create_session | create  `target` is the new name; `agent_type`,
+                    `working_directory`, `initial_prompt`, `grant_mode`,
+                    `binding`, `node` apply
+          delete_session | delete  `target` is the name
+          enqueue_task  | enqueue  durable, restart-safe task for `target`
+                    with prompt `text`; `title`/`priority`/`metadata`/
+                    `request_key` apply
+          task_status   | task     one task by `task_id`
+          task_batch_status | tasks up to 100 states by `task_ids`
+
+        `target` is the session for every action that names one and `text` is
+        the prompt for both send and enqueue. Each action routes to the exact
+        same implementation the standalone tool uses, so authorization,
+        allowed-cwd, protected-session and idempotency rules are identical.
+        """
         _refresh_local_heartbeat()
         return compact_tools.turn(
             action=action, target=target, targets=targets, text=text,
             desired_states=desired_states, resume_token=resume_token,
             timeout=timeout, poll_interval=poll_interval, tail_lines=tail_lines,
             compact=compact, idempotency_key=idempotency_key,
+            agent_type=agent_type, working_directory=working_directory,
+            initial_prompt=initial_prompt, grant_mode=grant_mode, binding=binding,
+            node=node, title=title, priority=priority, metadata=metadata,
+            request_key=request_key, task_id=task_id, task_ids=task_ids,
         )
 
     @server.tool()
@@ -5320,6 +5380,23 @@ def build_mcp(service: TerminalService | None = None,
             filters instead of guessing tag spellings."""
             return _notes(notes.facets)
 
+
+    # One-tool surface wiring (see compact_tools.TURN_HANDLER_ACTIONS): the
+    # discovery/lifecycle/queue actions terminal_turn routes are bound to the
+    # SAME functions registered as standalone tools above, never to
+    # reimplementations. Done here, after every definition, because these are
+    # closures over this build's own services. `server.tool()` returns the
+    # plain function, so this is an ordinary call with the wrapper-layer side
+    # effects (heartbeat refresh, supervisor-watch cleanup on delete) intact.
+    compact_tools.handlers.update(turn_handler_map(
+        list_sessions=terminal_list_sessions,
+        list_nodes=terminal_list_nodes,
+        create_session=terminal_create_session,
+        delete_session=terminal_delete_session,
+        enqueue_task=terminal_enqueue_task,
+        task_status=terminal_task_status,
+        task_batch_status=terminal_task_batch_status,
+    ))
 
     return server
 
