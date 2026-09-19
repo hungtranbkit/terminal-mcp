@@ -1,0 +1,50 @@
+# terminal-mcp-chatgpt-v1 -- the compact ChatGPT connector surface.
+#
+# PORTABLE ON PURPOSE. Every path below is either %h (this user's home) or
+# derived from it, because the previous unit shipped in this directory
+# hardcoded a retired layout (/home/dell/...) and was therefore uninstallable
+# on the canonical controller. Override REPO/VENV via a drop-in if your
+# checkout lives elsewhere:
+#
+#   systemctl --user edit terminal-mcp-chatgpt-v1.service
+#   [Service]
+#   Environment=TERMINAL_MCP_CHATGPT_PORT=8768
+#
+# is run from rather than assuming one.
+#
+# This unit owns NO state: no database, no tmux, no queue/supervisor loop. It
+# proxies every tool call to the full controller on loopback, so it is safe to
+# restart at any time and a crash cannot affect terminal-mcp-http.
+
+[Unit]
+Description=Terminal MCP compact ChatGPT connector surface (terminal-mcp-chatgpt-v1)
+# Wants, not Requires: the sidecar starts fine before the controller and
+# answers BACKEND_UNAVAILABLE until it is up, which is strictly better than
+# refusing to start and needing a manual kick after a boot race.
+Wants=terminal-mcp-http.service
+After=terminal-mcp-http.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/terminal-mcp
+# Loopback backend. Change ONLY if the controller moves port.
+Environment=TERMINAL_MCP_CHATGPT_BACKEND=http://127.0.0.1:8766/mcp
+Environment=TERMINAL_MCP_CHATGPT_PORT=8768
+EnvironmentFile=-%h/.config/terminal-mcp/chatgpt-v1.env
+ExecStart=%h/workspace/terminal-mcp/.venv/bin/terminal-mcp-chatgpt-v1
+Restart=always
+RestartSec=3
+
+# It reads nothing and writes nothing. ProtectHome=read-only is safe here in a
+# way it is not for the controller (which needs its sqlite state dir), and
+# PrivateTmp is fine too -- unlike terminal-mcp-http this process never
+# touches the tmux socket in /tmp.
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=default.target
