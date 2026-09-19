@@ -56,7 +56,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 from .coordinator import CoordinatorGate, OtherLaneSnapshot, SessionSnapshot
-from . import delivery_gate
+from . import delivery_gate, retry_recovery
 from .queue_store import (
     BLOCKED, COMPLETED, DISPATCH_UNCERTAIN, DISPATCHING, FAILED, PRECHECK, QUEUED, READY, RUNNING, VERIFYING,
     WAITING_SESSION, QueueStore, QueueTask, iso_now,
@@ -137,7 +137,7 @@ COMPLETION_INSTRUCTION_SENTENCE = (
     "line in this exact format (once), then stop:")
 
 
-def build_dispatch_text(task: QueueTask, *, nonce: str) -> str:
+def build_dispatch_text(task: QueueTask, *, nonce: str, continuation_text: str | None = None) -> str:
     """The 'wrapper rất ngắn' item 7 explicitly allows and limits: the
     task's own prompt is included VERBATIM, first, unmodified -- nothing
     here rewrites or reinterprets the business request. Only a short,
@@ -146,9 +146,23 @@ def build_dispatch_text(task: QueueTask, *, nonce: str) -> str:
     appended, reusing status.py's own COMPLETION_MARKER_RE protocol
     (task_id+attempt+nonce-bound) so a real, verifiable completion
     signal is possible instead of relying on a bare 'final report'
-    heuristic (item 11)."""
+    heuristic (item 11).
+
+    `continuation_text` (TMCP-RETRY-CONTEXT-002) replaces the prompt -- and
+    ONLY the prompt -- when this dispatch is a retry that retry_recovery
+    decided can continue existing work. The completion-marker instruction
+    still travels with it, still bound to this attempt's own nonce, because a
+    continued attempt has to be able to report completion exactly like a
+    first one.
+
+    Why this parameter exists at all: replaying the prompt on every attempt is
+    the production failure TMCP-RETRY-CONTEXT-002 was raised for. An agent
+    handed its original prompt again cannot tell a retry from a new task, so
+    it re-plans and an hour of reasoning is discarded. A retry that can
+    continue must say "continue", not say everything again.
+    """
     return (
-        f"{task.prompt}\n\n"
+        f"{continuation_text if continuation_text else task.prompt}\n\n"
         f"---\n"
         f"{REQUIREMENTS_REMINDER}\n\n"
         f"{COMPLETION_INSTRUCTION_SENTENCE}\n"
@@ -396,6 +410,160 @@ class QueueEngine:
 
     # -- dispatch -----------------------------------------------------------
 
+    def _snapshot_recovery_state(self, task: QueueTask, session: str, *, why: str) -> None:
+        """Persist recovery identity + a progress capsule for `task`.
+
+        Called BEFORE anything that destroys context -- a dispatch (so identity
+        is on disk before the agent can die), a BLOCKED/uncertain transition, or
+        a requeue. That ordering is the entire point: after a lease expires or an
+        agent process dies, the pane and its scrollback are gone, and anything
+        not already written down cannot be recovered.
+
+        Best-effort by construction. A failure here must never block or fail the
+        dispatch it is protecting -- a missing capsule degrades a later retry to
+        a weaker recovery mode, which is strictly better than refusing to run
+        the task at all.
+        """
+        try:
+            status = self.ops.terminal_status(session) or {}
+        except Exception:  # noqa: BLE001
+            status = {}
+        # The conversation id and agent_type come from the SESSION REGISTRY, not
+        # from terminal_status. Learned from the live smoke: terminal_status's
+        # `resume_conversation_id` is populated on the Windows backend only --
+        # tmux leaves it None by design (see models.py) -- so sourcing it from
+        # there persisted None for a real Claude session whose id was known all
+        # along, and the whole native-resume path silently degraded to
+        # checkpoint/restart. The registry is where terminal_create_session
+        # durably writes it, which is exactly what it is for.
+        registry_row: dict[str, Any] = {}
+        registry_get = getattr(self.ops, "terminal_registry_get", None)
+        if registry_get is not None:
+            try:
+                answer = registry_get(session) or {}
+                record = answer.get("record") if isinstance(answer.get("record"), dict) else answer
+                registry_row = record if isinstance(record, dict) else {}
+            except Exception:  # noqa: BLE001
+                registry_row = {}
+        identity: dict[str, Any] = {
+            "session": session,
+            "node_id": status.get("node_id") or registry_row.get("node_id"),
+            "cwd": status.get("cwd") or registry_row.get("cwd"),
+            "worktree": status.get("cwd") or registry_row.get("worktree_path") or registry_row.get("cwd"),
+            "agent_type": (status.get("agent_type") or registry_row.get("agent_type")
+                           or registry_row.get("launcher_type") or (task.metadata or {}).get("agent_type")),
+            "conversation_id": (registry_row.get("conversation_id")
+                                or status.get("resume_conversation_id") or status.get("conversation_id")),
+            "branch": registry_row.get("git_branch"),
+            "last_state": status.get("state"),
+            "request_key": task.request_key,
+            "attempt": task.attempt_count,
+            "reason": why,
+        }
+        # The capsule records only what can be observed here without asking the
+        # agent anything: the tail it last produced, and the git/branch facts
+        # the coordinator already reads. Richer fields (completed_steps,
+        # next_step) are written by whoever actually knows them -- an agent
+        # reporting progress, or an operator -- through record_recovery_state.
+        capsule: dict[str, Any] = {}
+        try:
+            tail = (self.ops.terminal_tail(session, 40) or {}).get("output") or ""
+        except Exception:  # noqa: BLE001
+            tail = ""
+        if tail.strip():
+            # Bounded on purpose: this is a recovery hint, not a transcript
+            # store, and an unbounded blob in a task row would grow forever.
+            capsule["last_decision"] = tail.strip()[-1200:]
+        if status.get("cwd"):
+            capsule["worktree"] = status["cwd"]
+        try:
+            self.store.record_recovery_state(task.id, identity=identity, capsule=capsule or None)
+        except Exception:  # noqa: BLE001 -- never let bookkeeping break dispatch
+            pass
+
+    def _relaunch_for_native_resume(self, session: str, plan: retry_recovery.RetryPlan) -> bool:
+        """Carry out RESUME_NATIVE_CONVERSATION's relaunch half.
+
+        Uses the agent's OWN resume mechanism through the existing
+        registry_reopen path (which already knows how to pass `--resume
+        <conversation_id>` for a resume-capable agent_type -- see core.py's
+        terminal_create_session), rather than a second, parallel relaunch
+        implementation. Returns True only if a reopen was actually performed,
+        so the caller can tell "resumed" from "could not resume".
+
+        A controller that does not expose registry_reopen (an older node, a
+        reduced ops object in a test) simply reports False: the continuation is
+        still sent into whatever is there, which is the pre-existing behaviour,
+        never a crash and never a silent fresh conversation presented as a
+        resume.
+        """
+        reopen = getattr(self.ops, "terminal_registry_reopen", None) or getattr(
+            self.ops, "registry_reopen", None)
+        if reopen is None or not plan.resume_conversation_id:
+            return False
+        try:
+            result = reopen(session, resume_session_id=plan.resume_conversation_id)
+        except TypeError:
+            # Older signature without the keyword -- try positionally rather
+            # than giving up on the resume entirely.
+            try:
+                result = reopen(session)
+            except Exception:  # noqa: BLE001
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+        return isinstance(result, dict) and not result.get("error")
+
+    def _retry_plan_for(self, task: QueueTask, session: str) -> retry_recovery.RetryPlan | None:
+        """The retry plan for THIS dispatch, or None if this is a first attempt.
+
+        Returns None for `attempt_count == 0` so a brand-new task takes exactly
+        the path it always has -- the prompt, verbatim, unchanged. Only a real
+        retry consults retry_recovery, and only a mode that does not replay the
+        prompt produces a continuation.
+
+        Facts come from the session's own live status (the same terminal_status
+        every other gate here reads) plus whatever recovery capsule the task's
+        metadata durably carries. Never raises: a retry whose facts cannot be
+        gathered falls back to None, i.e. today's replay behaviour, because a
+        broken lookup must not be able to strand a task.
+        """
+        if task.attempt_count < 1:
+            return None
+        try:
+            status = self.ops.terminal_status(session) or {}
+        except Exception:  # noqa: BLE001 -- a fact-gathering failure must never strand a retry
+            status = {}
+        # `exists` is the session; a non-error status whose state is not UNKNOWN
+        # means the pane is answering, which is the agent process still being
+        # there. A session that exists while its agent died reads UNKNOWN, and
+        # that is precisely the native-resume case.
+        session_alive = bool(status.get("exists")) and not status.get("error")
+        state = str(status.get("state") or "UNKNOWN").upper()
+        agent_alive = session_alive and state in ("RUNNING", "IDLE", "WAITING_INPUT")
+        # Read the DURABLE record, not anything held in memory: a retry after a
+        # service restart has no in-process state, and this is the path that has
+        # to work then. get_recovery_state re-reads from disk every call.
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        try:
+            recovery = self.store.get_recovery_state(task.id)
+        except Exception:  # noqa: BLE001 -- fall back to the row we already hold
+            recovery = metadata.get("recovery") if isinstance(metadata.get("recovery"), dict) else {}
+        ctx = retry_recovery.RetryContext(
+            task_id=task.id, session=session, request_key=task.request_key,
+            attempt=task.attempt_count + 1,
+            session_alive=session_alive, agent_process_alive=agent_alive,
+            agent_type=recovery.get("agent_type") or metadata.get("agent_type"),
+            conversation_id=recovery.get("conversation_id"),
+            capsule=retry_recovery.RecoveryCapsule.from_mapping(recovery.get("capsule")),
+            branch=recovery.get("branch"), worktree=recovery.get("worktree"),
+        )
+        plan = retry_recovery.plan_retry(ctx)
+        # RECOVERY_RESTART is the one mode that deliberately replays the
+        # prompt, so it reports no continuation and the caller falls back to
+        # exactly the pre-existing behaviour.
+        return None if plan.replays_prompt else plan
+
     def _dispatch(self, session: str, task_id: str) -> TickResult:
         task = self.store.get_task(task_id)
         nonce = self.store.ensure_verification_nonce(task_id)
@@ -412,7 +580,16 @@ class QueueEngine:
         # attempt (an explicit operator retry_task after a real BLOCKED/
         # FAILED, which clears it).
         idempotency_key = task.dispatch_idempotency_key or idempotency_key_for(task_id, task.attempt_count + 1)
-        dispatch_text = build_dispatch_text(task, nonce=nonce)
+        retry_plan = self._retry_plan_for(task, session)
+        # Identity on disk BEFORE the send, so an agent that dies mid-turn is
+        # still recoverable -- after it dies there is nothing left to read.
+        self._snapshot_recovery_state(task, session, why="pre-dispatch")
+        resumed_natively = False
+        if retry_plan is not None and retry_plan.relaunch_agent:
+            resumed_natively = self._relaunch_for_native_resume(session, retry_plan)
+        dispatch_text = build_dispatch_text(
+            task, nonce=nonce,
+            continuation_text=(retry_plan.continuation_text if retry_plan is not None else None))
         self.store.transition_task(task_id, DISPATCHING, event_type="DISPATCHED",
                                    extra_fields={"dispatch_idempotency_key": idempotency_key})
 
@@ -425,6 +602,8 @@ class QueueEngine:
         verdict = self._delivery_verdict(session, response, dispatch_text)
         self.store.record_delivery_verdict(task_id, verdict.to_dict())
         if response.get("error"):
+            # About to lose this attempt: write what we can still see first.
+            self._snapshot_recovery_state(task, session, why="blocked: send failed")
             self.store.transition_task(task_id, BLOCKED, event_type="BLOCKED",
                                        reason=f"send failed: {response['error']}")
             return TickResult(session, "BLOCKED", task_id=task_id, detail=str(response["error"]))
@@ -460,11 +639,16 @@ class QueueEngine:
             # rather than sending twice). _recheck_uncertain resolves
             # this on a later tick: real evidence of activity -> RUNNING,
             # else a grace period -> QUEUED for a fresh attempt.
+            self._snapshot_recovery_state(task, session, why="dispatch uncertain")
             self.store.mark_dispatch_uncertain(task_id, reason="delivery_state=DELIVERY_UNKNOWN")
             return TickResult(session, "DISPATCH_UNCERTAIN", task_id=task_id)
         self.store.transition_task(task_id, RUNNING, event_type="STARTED")
         self._ensure_long_task_watch(task, session, response, idempotency_key)
-        return TickResult(session, "DISPATCHED", task_id=task_id, detail=idempotency_key)
+        detail = idempotency_key
+        if retry_plan is not None:
+            detail = (f"{idempotency_key} retry_mode={retry_plan.mode}"
+                      + (" native_resume=ok" if resumed_natively else ""))
+        return TickResult(session, "DISPATCHED", task_id=task_id, detail=detail)
 
     @staticmethod
     def _long_task_metadata(task: QueueTask) -> tuple[bool, int | None]:

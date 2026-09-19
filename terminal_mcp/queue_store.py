@@ -55,6 +55,7 @@ from typing import Any, Sequence
 _LOGGER = logging.getLogger(__name__)
 
 from . import requirement_contract as rc
+from . import retry_recovery
 
 from . import worktree_cleanup as wj
 from .schema import Migration, apply_migrations
@@ -1500,6 +1501,111 @@ class QueueStore:
             row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
         return QueueTask.from_row(row) if row else None
 
+    # -- durable recovery state (TMCP-RETRY-CONTEXT-002) --------------------
+    # A retry can only continue work it can still SEE. Scrollback is destroyed
+    # by exactly the events that cause a retry -- lease expiry, a crashed
+    # engine, a dead agent process -- so the identity and progress a retry
+    # needs have to be written to disk BEFORE that happens, not read off a
+    # pane afterwards. These two methods are that durable record; the
+    # decisions made from it live in retry_recovery.py.
+
+    def record_recovery_state(self, task_id: str, *, identity: dict[str, Any] | None = None,
+                              capsule: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Merge recovery identity and/or a progress capsule into the task's
+        own metadata, under `metadata["recovery"]`.
+
+        MERGE, NEVER REPLACE, and this is the whole point rather than a
+        convenience. Invariant 6 of the hotfix forbids truncating or deleting
+        persisted recovery state, and the realistic way that happens is not a
+        DELETE -- it is a later, thinner write clobbering a richer earlier one
+        (a lease-expiry snapshot that knows only the session name overwriting a
+        capsule that knew five completed steps). So:
+
+          * a key whose new value is None/empty is DROPPED from the update
+            rather than written, which is what makes a partial writer safe;
+          * `capsule` merges key-by-key on top of the stored capsule for the
+            same reason;
+          * `conversation_id` is additionally WRITE-ONCE-ish: an existing one is
+            never replaced by a different value, because a resume token is the
+            single most expensive thing here to lose and a mid-recovery
+            relaunch is exactly when something might try.
+
+        Returns the merged `recovery` block as stored.
+        """
+        def _prune(data: dict[str, Any] | None) -> dict[str, Any]:
+            return {k: v for k, v in (data or {}).items() if v not in (None, "", [], {}, ())}
+
+        with self._connection() as connection:
+            row = connection.execute("SELECT metadata FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"no such task: {task_id}")
+            try:
+                metadata = json.loads(row["metadata"] or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            recovery = metadata.get("recovery")
+            recovery = dict(recovery) if isinstance(recovery, dict) else {}
+
+            stored_capsule = recovery.get("capsule")
+            stored_capsule = dict(stored_capsule) if isinstance(stored_capsule, dict) else {}
+
+            incoming = _prune(identity)
+            # Never trade a known resume token for a different one.
+            existing_conversation = recovery.get("conversation_id")
+            if existing_conversation and incoming.get("conversation_id") not in (None, existing_conversation):
+                incoming.pop("conversation_id", None)
+            recovery.update(incoming)
+
+            merged_capsule = {**stored_capsule, **_prune(capsule)}
+            if merged_capsule:
+                recovery["capsule"] = merged_capsule
+            recovery["updated_at"] = iso_now()
+            metadata["recovery"] = recovery
+            connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                               (json.dumps(metadata), iso_now(), task_id))
+        return recovery
+
+    def get_recovery_state(self, task_id: str) -> dict[str, Any]:
+        """The persisted recovery block, or {} -- read fresh from disk on every
+        call, so a NEW process (or a restarted service) sees exactly what the
+        previous one wrote with no in-memory carry-over."""
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(f"no such task: {task_id}")
+        recovery = (task.metadata or {}).get("recovery")
+        return dict(recovery) if isinstance(recovery, dict) else {}
+
+    def active_owner_for(self, *, task_id: str | None = None,
+                         request_key: str | None = None) -> dict[str, Any] | None:
+        """Who currently owns this logical task, if anyone.
+
+        "Owns" means a task that is genuinely in flight -- claimed or already
+        dispatched -- not merely present. Looked up by request_key as well as
+        id because the thing that must not be duplicated is the logical
+        REQUEST: the same work re-enqueued under a new task id and handed to a
+        second agent is the exact duplication invariant 7 forbids, and an
+        id-only check cannot see it.
+        """
+        in_flight = (PRECHECK, READY, DISPATCHING, RUNNING, VERIFYING)
+        placeholders = ",".join("?" for _ in in_flight)
+        with self._connection() as connection:
+            row = None
+            if task_id:
+                row = connection.execute(
+                    f"SELECT id, session, status, claimed_by, request_key FROM queue_tasks "
+                    f"WHERE id = ? AND status IN ({placeholders})", (task_id, *in_flight)).fetchone()
+            if row is None and request_key:
+                row = connection.execute(
+                    f"SELECT id, session, status, claimed_by, request_key FROM queue_tasks "
+                    f"WHERE request_key = ? AND status IN ({placeholders})",
+                    (request_key, *in_flight)).fetchone()
+        if row is None:
+            return None
+        return {"task_id": row["id"], "session": row["session"], "status": row["status"],
+                "owner": row["claimed_by"] or row["session"], "request_key": row["request_key"]}
+
     def next_dispatchable_task(self, session: str) -> QueueTask | None:
         """The one task queue_engine.py may dispatch right now for this
         session, or None. Deliberately enforces "only one task RUNNING
@@ -2667,6 +2773,20 @@ class QueueStore:
         task = self.get_task(task_id)
         if task is None:
             raise KeyError(f"no such task: {task_id}")
+        # TMCP-RETRY-CONTEXT-002 invariant 7: one owner at a time, and a
+        # duplicate retry reconciles to a no-op instead of producing a second
+        # owner. The check is by LOGICAL task (id, then request_key) because the
+        # duplication that actually hurts is the same request running twice on
+        # two agents -- an id-only check cannot see that. A retry of a task that
+        # is already in flight returns that task unchanged rather than raising:
+        # the caller asked for it to be running, and it is.
+        owner = self.active_owner_for(task_id=task_id, request_key=task.request_key)
+        is_noop, reason = retry_recovery.duplicate_retry_is_noop(
+            task_id=task_id, request_key=task.request_key, active_owner=owner)
+        if is_noop:
+            self.record_event(session=task.session, task_id=task_id,
+                              event_type="RETRY_DEDUPED", reason=reason)
+            return self.get_task(owner["task_id"]) or task
         return self.transition_task(task_id, QUEUED, event_type="RETRIED",
                                     extra_fields={"dispatch_idempotency_key": None})
 
