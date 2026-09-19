@@ -50,6 +50,15 @@ TURN_HANDLER_ACTIONS: dict[str, str] = {
     "enqueue_task": "enqueue_task",
     "task_status": "task_status",
     "task_batch_status": "task_batch_status",
+    # Browser gateway (TMCP-BROWSER-GATEWAY-001). The browser has to be
+    # reachable from the ONE-tool ChatGPT surface, or ChatGPT would need a
+    # second control plane to use it -- which is the exact thing this
+    # feature exists to avoid. Same rule as every other routed action: the
+    # value is the SAME function the standalone tool is registered from.
+    "browser_status": "browser_status",
+    "browser_verify": "browser_verify",
+    "browser_screenshot": "browser_screenshot",
+    "browser_stop": "browser_stop",
 }
 # Short spellings a caller reaches for first. Resolved before dispatch so the
 # canonical name is the only thing the routing below has to know about.
@@ -63,6 +72,9 @@ TURN_ACTION_ALIASES: dict[str, str] = {
     "enqueue": "enqueue_task",
     "task": "task_status",
     "tasks": "task_batch_status",
+    "browser": "browser_status",
+    "verify": "browser_verify",
+    "screenshot": "browser_screenshot",
 }
 TURN_ACTIONS = (*TURN_PANE_ACTIONS, *TURN_HANDLER_ACTIONS)
 
@@ -456,7 +468,11 @@ class CompactTerminalTools:
              metadata: dict[str, Any] | None = None, request_key: str | None = None,
              task_id: str | None = None,
              task_ids: list[str] | None = None,
-             long_task: bool = False) -> dict[str, Any]:
+             long_task: bool = False,
+             url: str | None = None, steps: list | None = None,
+             viewport: dict | None = None, job_id: str | None = None,
+             allow_mutations: bool = False,
+             screenshot: str = "on_failure") -> dict[str, Any]:
         """One MCP-call surface for one logical terminal turn.
 
         Pane actions, implemented here:
@@ -501,7 +517,9 @@ class CompactTerminalTools:
                 working_directory=working_directory, initial_prompt=initial_prompt,
                 grant_mode=grant_mode, binding=binding, node=node, title=title,
                 priority=priority, metadata=metadata, request_key=request_key,
-                task_id=task_id, task_ids=task_ids)
+                task_id=task_id, task_ids=task_ids, url=url, steps=steps,
+                viewport=viewport, job_id=job_id, allow_mutations=allow_mutations,
+                screenshot=screenshot)
 
         if normalized == "inspect":
             resolved_targets = list(targets or ([] if target is None else [target]))
@@ -586,7 +604,10 @@ class CompactTerminalTools:
                       binding: str | None, node: str, title: str | None,
                       priority: int, metadata: dict[str, Any] | None,
                       request_key: str | None, task_id: str | None,
-                      task_ids: list[str] | None) -> dict[str, Any]:
+                      task_ids: list[str] | None, url: str | None = None,
+                      steps: list | None = None, viewport: dict | None = None,
+                      job_id: str | None = None, allow_mutations: bool = False,
+                      screenshot: str = "on_failure") -> dict[str, Any]:
         """Route one non-pane action to its injected implementation.
 
         Argument shaping only. Every authorization, allowed-cwd, protected-
@@ -611,6 +632,9 @@ class CompactTerminalTools:
             return {"status": "FAILED", "error": "TASK_ID_REQUIRED", "action": action}
         if action == "task_batch_status" and not isinstance(task_ids, list):
             return {"status": "FAILED", "error": "TASK_IDS_REQUIRED", "action": action}
+        if action in {"browser_verify", "browser_screenshot"} and (
+                not isinstance(url, str) or not url.strip()):
+            return {"status": "FAILED", "error": "URL_REQUIRED", "action": action}
 
         calls: dict[str, Callable[[], Any]] = {
             "list_sessions": lambda: handler(),
@@ -625,6 +649,18 @@ class CompactTerminalTools:
                 metadata=metadata, request_key=request_key),
             "task_status": lambda: handler(task_id.strip()),
             "task_batch_status": lambda: handler(task_ids),
+            # `node` carries the same meaning it does for create_session --
+            # which node runs this -- so browser affinity needs no new
+            # argument. "auto" is the router's default, not a node name.
+            "browser_status": lambda: handler(job_id=job_id),
+            "browser_verify": lambda: handler(
+                url=url.strip(), steps=steps or [], viewport=viewport,
+                allow_mutations=allow_mutations, screenshot=screenshot,
+                node=None if node == "auto" else node),
+            "browser_screenshot": lambda: handler(
+                url=url.strip(), viewport=viewport,
+                node=None if node == "auto" else node),
+            "browser_stop": lambda: handler(),
         }
         result = calls[action]()
         failed = isinstance(result, dict) and ("error" in result or result.get("status") == "FAILED")
