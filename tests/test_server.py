@@ -17,6 +17,12 @@ async def test_server_registers_v1_and_binding_tools():
     assert "PREFERRED inspection" in (by_name["terminal_batch_inspect"].description or "")
     assert "PREFERRED send" in (by_name["terminal_send_task"].description or "")
     assert names == {
+        # terminal_turn is the PREFERRED entry point (see the server-level
+        # instructions asserted above); the two status tools below are its
+        # read-only companions.
+        "terminal_turn",
+        "terminal_task_batch_status",
+        "terminal_llm_governor_status",
         "terminal_list_sessions",
         "terminal_tail",
         "terminal_capture",

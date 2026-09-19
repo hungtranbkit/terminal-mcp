@@ -24,6 +24,7 @@ from .integration_store import publish_handoff_for_completed_task
 from .dor_gate import check_definition_of_ready
 from .git_isolation_service import GitIsolationService
 from .node_models import node_to_dict as _node_to_dict
+from . import orchestration_policy
 from .notes_service import NotesService
 from .notes_store import NotesError
 from .orchestrator_checkpoint import OrchestratorCheckpointStore
@@ -328,15 +329,14 @@ def build_mcp(service: TerminalService | None = None,
     server = MCPServer(
         name="terminal-mcp",
         description="Whitelist-only tmux observation and controlled input",
-        instructions=(
-            "PREFER terminal_turn for normal terminal work so one logical ChatGPT turn becomes one MCP call. "
-            "Use action=inspect for one/many targets, send for a guarded task, send_wait to submit and wait in one call, "
-            "wait for a new durable wait, and resume only when a prior turn returned PENDING. "
-            "terminal_batch_inspect/terminal_send_task/terminal_wait_for_state/terminal_resume_wait remain compact "
-            "compatibility tools; terminal_status, terminal_tail, and terminal_send_text are LOW-LEVEL/MANUAL only. "
-            "Do not split an inspect into separate status+tail calls, and do not split send_wait into send then wait "
-            "unless terminal_turn cannot express the operation. All existing authorization and input-safety gates apply."
-        ),
+        # Server-level MCP `instructions`: delivered inside the `initialize`
+        # response, before the client's first tool call, so a connecting
+        # ChatGPT client receives the orchestration workflow automatically
+        # rather than being re-taught it every chat. Stated ONCE here on
+        # purpose -- the alternative is appending policy to 280+ individual
+        # tool descriptions. See terminal_mcp/orchestration_policy.py for the
+        # single source of truth (and why the doc cannot drift from it).
+        instructions=orchestration_policy.server_instructions(),
         version=__version__,
     )
 

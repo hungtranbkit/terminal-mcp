@@ -12,6 +12,15 @@ checkpoint's own evidence) see **`docs/REQUIREMENTS.md`** — this file
 is the *operational* companion: how to actually drive the system
 correctly, not a restatement of what exists.
 
+For *who does what* — the orchestration workflow itself (ChatGPT
+orchestrates, Claude Code executes, Codex reviews, when to parallelise,
+what needs human approval) — see
+**`docs/CHATGPT_ORCHESTRATION_POLICY.md`**. You do not have to read it
+to follow it: that policy is the server-level MCP `instructions` string,
+so your client already received it in its `initialize` response. The
+file is generated from `terminal_mcp/orchestration_policy.py`, which is
+the single source of truth for both.
+
 **Status legend** (used throughout this file, same as REQUIREMENTS.md):
 **VERIFIED** — real, live-tested, safe to rely on. **IMPLEMENTED_NOT_
 LIVE_VERIFIED** — code exists and passes its own test suite, but has
