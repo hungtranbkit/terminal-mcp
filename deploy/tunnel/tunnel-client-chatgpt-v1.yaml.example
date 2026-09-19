@@ -1,0 +1,57 @@
+# tunnel-client profile for the COMPACT ChatGPT connector surface.
+#
+# Copy to ~/.config/tunnel-client/terminal-mcp-chatgpt-v1.yaml and run:
+#   tunnel-client run --profile terminal-mcp-chatgpt-v1
+#
+# WHY A SECOND PROFILE AND NOT A SUBPATH ON THE EXISTING ONE
+# ----------------------------------------------------------
+# The existing profile maps one MCP server url per channel:
+#
+#   mcp:
+#     server_urls:
+#       - channel: main
+#         url: "http://127.0.0.1:8766/mcp"
+#
+# tunnel-client probes THAT url and registers the catalog it finds under that
+# tunnel_id. It does not transparently forward arbitrary subpaths, so
+# `.../mcp/chatgpt-v1` on the existing tunnel would not reach the sidecar --
+# and more importantly, reusing the SAME tunnel_id is what keeps the stale
+# catalog alive. The whole point is a tunnel/connector identity that has never
+# been registered before.
+#
+# So this is a separate profile with its OWN tunnel_id, pointing at the
+# sidecar's own loopback port. Create the tunnel id the same way the first one
+# was created (see docs/CHATGPT_CONNECTOR.md); do not reuse
+# tunnel_6a952da18e308191bfeb3c138409704b -- that is the one currently serving
+# the stale legacy-six catalog, and it is still named "terminal-mcp-dell" from
+# a retired topology.
+
+config_version: 1
+
+control_plane:
+  base_url: "https://api.openai.com"
+  # REPLACE with the new tunnel id. Must NOT be the existing terminal-mcp one.
+  tunnel_id: "tunnel_REPLACE_WITH_A_NEW_ID"
+  # Read from the environment, never inlined. Point EnvironmentFile= /
+  # your shell at a mode-600 file holding CONTROL_PLANE_API_KEY.
+  api_key: "env:CONTROL_PLANE_API_KEY"
+
+health:
+  # 8769, deliberately one above the sidecar's 8768, so the health/admin
+  # surface of the tunnel and the MCP surface it fronts are adjacent and
+  # neither collides with the controller's 8766/8767 pair.
+  listen_addr: "127.0.0.1:8769"
+
+admin_ui:
+  open_browser: false
+
+log:
+  level: info
+  format: json
+
+mcp:
+  server_urls:
+    # The COMPACT surface. 11 tools, terminal-mcp-chatgpt-v1 identity.
+    # The full 293-tool surface stays on 8766 and is NOT the ChatGPT endpoint.
+    - channel: main
+      url: "http://127.0.0.1:8768/mcp"
