@@ -28,6 +28,8 @@ from . import orchestration_policy
 from .notes_service import NotesService
 from .notes_store import NotesError
 from .orchestrator_checkpoint import OrchestratorCheckpointStore
+from .browser_gateway import BrowserGateway
+from .browser_tools import register_browser_tools
 from .chat_checkpoint_tools import register_chat_checkpoint_tools
 from .planner_service import PlannerService
 from .planner_store import PlannerStore
@@ -85,7 +87,9 @@ def _fleet_session_names(controller: "ControllerService") -> list[str]:
 
 
 def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_session,
-                     enqueue_task, task_status, task_batch_status) -> dict[str, Any]:
+                     enqueue_task, task_status, task_batch_status,
+                     browser_status, browser_verify, browser_screenshot,
+                     browser_stop) -> dict[str, Any]:
     """The implementations terminal_turn's non-pane actions route to.
 
     Keyword-only and exhaustive on purpose: every key in
@@ -103,7 +107,52 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
         "enqueue_task": enqueue_task,
         "task_status": task_status,
         "task_batch_status": task_batch_status,
+        # May be None on a build with no browser gateway wired. The router
+        # already answers ACTION_UNAVAILABLE for a missing handler, which
+        # is the honest result -- far better than a browser action that
+        # silently resolves to nothing.
+        "browser_status": browser_status,
+        "browser_verify": browser_verify,
+        "browser_screenshot": browser_screenshot,
+        "browser_stop": browser_stop,
     }
+
+
+def _build_browser_gateway(terminal: TerminalService, controller: ControllerService | None) -> BrowserGateway:
+    """Wire the browser gateway to the EXISTING fleet primitives.
+
+    Nodes come from the node registry the controller already owns (its
+    `capabilities` column is probed, never declared -- see
+    capability_probe.py), and session affinity is resolved only for
+    sessions this node actually has. Nothing new is added to the fleet or
+    RPC layer: Phase 1 executes locally, and a named remote node gets a
+    typed BROWSER_UNAVAILABLE rather than a silent hop to the wrong host.
+    """
+    def _nodes() -> list[dict]:
+        if controller is None:
+            return []
+        return [_node_to_dict(node) for node in controller.list_nodes()]
+
+    def _session_node(session: str) -> str | None:
+        # Affinity we can honour cheaply and correctly: a session that
+        # lives on THIS node pins the plan here. Cross-node session
+        # lookup is a node-agent round trip per node and belongs with
+        # remote execution in Phase 2.
+        try:
+            sessions = terminal.tmux.list_sessions()
+        except Exception:  # noqa: BLE001 -- affinity is best-effort
+            return None
+        for item in sessions or []:
+            name = item.get("name") if isinstance(item, dict) else getattr(item, "name", None)
+            if name == session:
+                return controller.local_node_id if controller is not None else "local"
+        return None
+
+    return BrowserGateway(
+        nodes_provider=_nodes,
+        session_node_resolver=_session_node,
+        local_node_id=controller.local_node_id if controller is not None else "local",
+    )
 
 
 def build_mcp(service: TerminalService | None = None,
@@ -125,6 +174,7 @@ def build_mcp(service: TerminalService | None = None,
               work: Any = None,
               default_optional_services: bool = True,
               chat_checkpoints: OrchestratorCheckpointStore | None = None,
+              browser: BrowserGateway | None = None,
               run_journal: Any = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
@@ -238,6 +288,11 @@ def build_mcp(service: TerminalService | None = None,
             notes = NotesService.from_config(terminal.config)
         if chat_checkpoints is None:
             chat_checkpoints = OrchestratorCheckpointStore()
+        if browser is None:
+            # Constructing the gateway probes nothing and starts no
+            # browser -- a node without Browser Use installed simply
+            # answers DEGRADED from terminal_browser_status.
+            browser = _build_browser_gateway(terminal, controller)
         events = events if events is not None else EventBus()
 
     # Orchestration V1: connect the deterministic runtime to the bus. Until
@@ -494,7 +549,11 @@ def build_mcp(service: TerminalService | None = None,
                       metadata: dict | None = None, request_key: str | None = None,
                       task_id: str | None = None,
                       task_ids: list[str] | None = None,
-                      long_task: bool = False) -> dict:
+                      long_task: bool = False,
+                      url: str | None = None, steps: list | None = None,
+                      viewport: dict | None = None, job_id: str | None = None,
+                      allow_mutations: bool = False,
+                      screenshot: str = "on_failure") -> dict:
         """THE terminal surface: one logical orchestration step, one MCP call.
 
         This covers every normal workflow, so a caller never needs a second
@@ -519,6 +578,14 @@ def build_mcp(service: TerminalService | None = None,
                     `request_key` apply
           task_status   | task     one task by `task_id`
           task_batch_status | tasks up to 100 states by `task_ids`
+          browser_verify | verify  check a real page: `url`, bounded `steps`
+                    (navigate/click/fill/press/wait/assert_*), `viewport`
+                    (default 1348x768); page-changing steps need
+                    `allow_mutations`. PASS|FAIL|PENDING|ERROR
+          browser_screenshot | screenshot  capture `url` at `viewport`
+          browser_status | browser  gateway health, or one earlier result
+                    by `job_id` when a verify returned PENDING
+          browser_stop   release the managed browser
 
         Long work returns a durable task receipt; the server queue/watcher
         advances it after this call. The client must not automatically issue
@@ -539,6 +606,8 @@ def build_mcp(service: TerminalService | None = None,
             node=node, title=title, priority=priority, metadata=metadata,
             request_key=request_key, task_id=task_id, task_ids=task_ids,
             long_task=long_task,
+            url=url, steps=steps, viewport=viewport, job_id=job_id,
+            allow_mutations=allow_mutations, screenshot=screenshot,
         )
 
     @server.tool()
@@ -4586,6 +4655,10 @@ def build_mcp(service: TerminalService | None = None,
     if chat_checkpoints is not None:
         register_chat_checkpoint_tools(server, chat_checkpoints, projects)
 
+    browser_handlers: dict[str, Any] = {}
+    if browser is not None:
+        browser_handlers = register_browser_tools(server, browser)
+
     # ------------------------------------------------------------------
     # P0.2 Event Bus. Publish/claim/ack only -- NOTHING here starts an
     # autonomous consumer. Turning events into automatic dispatch is a
@@ -5403,6 +5476,10 @@ def build_mcp(service: TerminalService | None = None,
         enqueue_task=terminal_enqueue_task,
         task_status=terminal_task_status,
         task_batch_status=terminal_task_batch_status,
+        browser_status=browser_handlers.get("browser_status"),
+        browser_verify=browser_handlers.get("browser_verify"),
+        browser_screenshot=browser_handlers.get("browser_screenshot"),
+        browser_stop=browser_handlers.get("browser_stop"),
     ))
 
     return server

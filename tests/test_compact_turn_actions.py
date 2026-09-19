@@ -88,8 +88,10 @@ def test_an_unknown_action_is_refused_and_names_what_is_allowed():
 def test_every_alias_resolves_to_its_canonical_action(alias, canonical):
     handler = Recorder()
     tools = _tools({TURN_HANDLER_ACTIONS[canonical]: handler})
+    # The union of what the various verbs require -- browser_verify/
+    # browser_screenshot need a url the same way task_status needs a task_id.
     result = tools.turn(action=alias, target="s1", text="do it", task_id="t1",
-                        task_ids=["t1"])
+                        task_ids=["t1"], url="https://example.com")
     assert result["action"] == canonical, f"{alias} must resolve to {canonical}"
     assert len(handler.calls) == 1
 
@@ -238,7 +240,8 @@ def test_turn_handler_map_covers_every_routed_action():
     mapping = turn_handler_map(
         list_sessions=stub, list_nodes=stub, create_session=stub,
         delete_session=stub, enqueue_task=stub, task_status=stub,
-        task_batch_status=stub)
+        task_batch_status=stub, browser_status=stub, browser_verify=stub,
+        browser_screenshot=stub, browser_stop=stub)
     assert set(mapping) == set(TURN_HANDLER_ACTIONS.values())
     assert all(callable(value) for value in mapping.values())
 
