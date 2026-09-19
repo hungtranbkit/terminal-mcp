@@ -118,9 +118,33 @@ class AgentAdapter(ABC):
 
     name: str
 
+    # Does this target hold embedded newlines in an editable buffer instead
+    # of acting on each one as it arrives? An interactive agent CLI owns its
+    # own multiline composer and does; a target under ordinary tty line
+    # discipline (a shell) does NOT -- every "\n" in the injected text is a
+    # line the target runs the instant it arrives, BEFORE any submit key.
+    # See core.py's MULTILINE_SHELL_SEND_REFUSED guard for why that is a
+    # safety boundary and not a formatting detail.
+    buffers_embedded_newlines: bool = False
+
     @abstractmethod
     def identify_target_state(self, lines: list[str]) -> str:
         """One of TARGET_STATES, best-effort from the pane's current tail."""
+
+    def staged_submit_keys(self, lines: list[str]) -> tuple[str, ...]:
+        """The key sequence that submits a buffer this target is currently
+        holding STAGED -- typed in full, but parked in an editor whose Enter
+        inserts a newline rather than submitting (Claude Code's own
+        `ctrl+x ctrl+s to send now` footer). Empty means either "this target
+        has no such state" or "it is not in it right now", which is the
+        default for every adapter: a submit key is only ever offered on the
+        target's own on-screen evidence, never guessed.
+
+        The caller (core.py) must still re-verify, immediately before
+        pressing them, that the staged buffer is THIS attempt's own text --
+        these keys submit whatever is in the editor, so the same
+        attribution rule the Escape+Enter recovery uses applies here."""
+        return ()
 
     @abstractmethod
     def can_submit_now(self, lines: list[str]) -> bool:
@@ -268,6 +292,56 @@ _WAITING_PATTERNS = tuple(
 )
 
 
+# Claude Code's MULTILINE/STAGED editor footer. Found LIVE (2026-09-19,
+# session terminal-mcp-session-health): terminal_send_text returned
+# SUBMIT_CONFIRMED "via adapter ack evidence" while the entire prompt was
+# still sitting in Claude's input editor, with the footer reading
+# `ctrl+x ctrl+s to send now`. In that state Enter inserts a newline into the
+# buffer instead of submitting, so the pane genuinely redraws (rows above the
+# composer's own last line move as the buffer grows) -- which is exactly what
+# _shows_genuine_progress was built to detect, and why a staged editor could
+# masquerade as a real submission.
+#
+# Matched on the KEY SEQUENCE, which is UI chrome the model's own prose never
+# contains, rather than on the surrounding wording (this project's standing
+# rule: never invent unverified CLI-output phrasing). Both the `+` and `-`
+# spellings and the mac glyph form are accepted because the same hint renders
+# differently per platform/terminal; nothing else about the line is assumed.
+_STAGED_EDITOR_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"ctrl\s*[+-]\s*x\s+ctrl\s*[+-]\s*s",
+        r"⌃\s*x\s+⌃\s*s",
+    )
+)
+
+# The key sequence that footer names. Sent as tmux key names, one press each,
+# never as literal text -- and only ever when the staged footer is actually on
+# screen AND this attempt's own text is still visibly staged in it.
+CLAUDE_STAGED_SUBMIT_KEYS = ("C-x", "C-s")
+
+
+def _shows_staged_editor(lines: list[str]) -> bool:
+    """True when the pane's footer says the buffer is staged, not sent.
+
+    Position matters, not just presence. The hint is chrome drawn at the
+    bottom of the input box, so anything the target rendered BELOW the last
+    occurrence supersedes it: once a turn actually starts, its own output
+    (the busy footer) appears under the box. A scrolled-up copy of the hint
+    left behind in the scrollback is not evidence of anything -- treating a
+    bare "somewhere in the last 6 lines" match as live is how this check
+    would otherwise refuse to ever confirm a send that did submit.
+    """
+    tail = lines[-6:]
+    last_hint = None
+    for index, line in enumerate(tail):
+        if _match_any(_STAGED_EDITOR_PATTERNS, line):
+            last_hint = index
+    if last_hint is None:
+        return False
+    return not _match_any(_WORKING_PATTERNS, "\n".join(tail[last_hint + 1:]))
+
+
 def _shows_genuine_progress(before: list[str], after: list[str]) -> bool:
     """True if content *other than the composer's own last line* has moved
     -- a live-redrawing composer's own spinner/cursor/elapsed-timer tick
@@ -296,6 +370,7 @@ class CodexAdapter(AgentAdapter):
     failure mode (see tests/fixtures/laggy_line_reader.py and the existing
     RECOVERY_ELIGIBLE_COMMANDS history this adapter now encodes)."""
     name = "codex"
+    buffers_embedded_newlines = True
 
     def identify_target_state(self, lines: list[str]) -> str:
         tail = _tail(lines, 6)
@@ -409,11 +484,18 @@ class ClaudeAdapter(AgentAdapter):
     safe/conservative failure direction, never a false BLOCKED or a
     dropped send."""
     name = "claude"
+    buffers_embedded_newlines = True
 
     def identify_target_state(self, lines: list[str]) -> str:
         tail = _tail(lines, 6)
         if _match_any(_WAITING_PATTERNS, tail):
             return TARGET_WAITING
+        # Checked BEFORE the working patterns: a staged editor can coexist
+        # with a still-visible footer from the previous turn, and "the
+        # prompt is sitting unsent in the editor" is the more specific,
+        # more actionable fact of the two.
+        if _shows_staged_editor(lines):
+            return TARGET_COMPOSER
         if _match_any(_WORKING_PATTERNS, tail):
             return TARGET_RUNNING
         return TARGET_UNKNOWN
@@ -424,10 +506,24 @@ class ClaudeAdapter(AgentAdapter):
     def submit_ack_evidence(self, before: list[str], after: list[str], sent_text: str) -> bool:
         if after == before or not _shows_genuine_progress(before, after):
             return False
+        # Live false positive (2026-09-19, terminal-mcp-session-health): the
+        # staged-editor footer is proof of the OPPOSITE of submission -- the
+        # buffer is typed and parked, waiting for ctrl+x ctrl+s. Growing that
+        # buffer (each swallowed Enter adds a line) moves rows above the
+        # composer, so _shows_genuine_progress passes and, on an idle target,
+        # the was_busy echo requirement below never even applies: the send
+        # confirmed on a redraw caused by its own unsent text. Checked first,
+        # and overriding, precisely because the stronger-looking signal is the
+        # wrong one here.
+        if _shows_staged_editor(after) and _sent_text_echoed(after, sent_text):
+            return False
         was_busy = _match_any(_WORKING_PATTERNS, _tail(before, 6)) or _match_any(_WORKING_PATTERNS, _tail(after, 6))
         if was_busy:
             return _sent_text_echoed(after, sent_text)
         return True
+
+    def staged_submit_keys(self, lines: list[str]) -> tuple[str, ...]:
+        return CLAUDE_STAGED_SUBMIT_KEYS if _shows_staged_editor(lines) else ()
 
     def stuck_composer_evidence(self, before: list[str], after: list[str]) -> bool:
         return False  # never reproduced for Claude -- no recovery enabled, see docstring

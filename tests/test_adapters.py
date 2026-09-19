@@ -270,3 +270,76 @@ def test_windows_claude_now_receives_the_activation_nudge():
     from terminal_mcp.submit_flow import ACTIVATION_ADAPTERS
     assert select_adapter("claude.EXE").name in ACTIVATION_ADAPTERS
     assert select_adapter("bash").name not in ACTIVATION_ADAPTERS
+
+
+# ---------------------------------------------------------------------------
+# Claude's STAGED multiline editor (live false positive, 2026-09-19, session
+# terminal-mcp-session-health): terminal_send_text reported SUBMIT_CONFIRMED
+# "via adapter ack evidence" while the whole prompt sat unsent in the input
+# editor under a `ctrl+x ctrl+s to send now` footer. Each swallowed Enter
+# grows that buffer, which moves rows above the composer's own last line, so
+# _shows_genuine_progress passed and -- the target being idle -- the stricter
+# busy-window echo requirement never applied.
+# ---------------------------------------------------------------------------
+
+STAGED_FOOTER = "ctrl+x ctrl+s to send now"
+
+
+def _staged_pane(text: str) -> list[str]:
+    return ["claude composer ready", f"> {text}", "  continued line", STAGED_FOOTER]
+
+
+def test_claude_staged_editor_is_never_submit_evidence():
+    adapter = select_adapter("claude")
+    before = ["claude composer ready", "> "]
+    after = _staged_pane("run the health check")
+    # A bare pane-diff and even _shows_genuine_progress both pass here --
+    # that is exactly why this needs its own rule.
+    assert before != after
+    assert adapter.submit_ack_evidence(before, after, "run the health check") is False
+
+
+def test_claude_staged_editor_reports_composer_not_running():
+    adapter = select_adapter("claude")
+    assert adapter.identify_target_state(_staged_pane("hello")) == "composer"
+
+
+def test_claude_offers_the_submit_keys_its_own_footer_advertises():
+    adapter = select_adapter("claude")
+    assert adapter.staged_submit_keys(_staged_pane("hello")) == ("C-x", "C-s")
+    assert adapter.staged_submit_keys(["> hello", "esc to interrupt"]) == ()
+
+
+def test_staged_footer_spellings_are_all_recognised():
+    adapter = select_adapter("claude")
+    for footer in ("ctrl+x ctrl+s to send now", "Ctrl-X Ctrl-S to send now",
+                   "⌃x ⌃s to send now"):
+        assert adapter.staged_submit_keys(["> hi", footer]) == ("C-x", "C-s"), footer
+
+
+def test_a_stale_scrolled_up_footer_does_not_block_a_real_confirmation():
+    """Position matters: once the turn starts, its output renders BELOW the
+    hint. Treating a scrolled-up copy as live would make every subsequent
+    send permanently unconfirmable."""
+    adapter = select_adapter("claude")
+    before = _staged_pane("run the health check")
+    after = ["> run the health check", STAGED_FOOTER, "> run the health check",
+             "SUBMITTED[1]: run the health check", "esc to interrupt"]
+    assert adapter.staged_submit_keys(after) == ()
+    assert adapter.submit_ack_evidence(before, after, "run the health check") is True
+
+
+def test_staged_editor_holding_someone_elses_text_is_still_not_confirmed():
+    adapter = select_adapter("claude")
+    before = ["claude composer ready", "> "]
+    after = _staged_pane("a completely different draft")
+    # Not our text, so the echo rule does not apply -- but it is still not a
+    # submission, and the caller (core) withholds the keypress on attribution.
+    assert adapter.identify_target_state(after) == "composer"
+
+
+def test_only_shells_are_guarded_against_embedded_newlines():
+    assert select_adapter("bash").buffers_embedded_newlines is False
+    assert select_adapter("python3").buffers_embedded_newlines is False
+    assert select_adapter("codex").buffers_embedded_newlines is True
+    assert select_adapter("claude.EXE").buffers_embedded_newlines is True

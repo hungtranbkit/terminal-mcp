@@ -228,6 +228,15 @@ def _codex_followup_queued(snapshot: list[str]) -> bool:
     return bool(re.search(r"\bqueued\s+follow[- ]up\s+inputs?\b", " ".join(snapshot), re.IGNORECASE))
 
 
+def _has_embedded_newline(text: str) -> bool:
+    """Does this payload carry a line terminator a tty would act on?
+
+    Both spellings count: a lone "\\r" is Enter to a pty just as much as
+    "\\n" is, so a caller that normalised its script to CRLF -- or to bare
+    CR -- must not slip past the guard that rejects "\\n"."""
+    return "\n" in text or "\r" in text
+
+
 def _codex_draft_in_composer(snapshot: list[str], text: str) -> bool:
     """Return true only when this submission is still in Codex's composer.
 
@@ -457,7 +466,11 @@ class TerminalService:
         watchdog_config = WatchdogConfig(
             poll_interval_seconds=config.submit_watchdog.poll_interval_seconds,
             timeout_seconds=config.submit_watchdog.timeout_seconds,
-            max_enter_attempts=config.submit_watchdog.max_total_enters,
+            # Two distinct knobs -- see WatchdogConfig. Binding BOTH to
+            # max_total_enters made submit_watchdog.max_enter_attempts dead
+            # config and silently raised the foreground per-call Enter budget
+            # from the contract's 2 to 6.
+            max_enter_attempts=config.submit_watchdog.max_enter_attempts,
             max_total_enters=config.submit_watchdog.max_total_enters,
             retry_agent_types=frozenset(config.submit_watchdog.retry_agent_types),
         )
@@ -1791,6 +1804,42 @@ class TerminalService:
         command_before = info_before.pane_current_command or ""
         adapter = select_adapter(command_before)
 
+        # URGENT bugfix, live-reproduced 2026-09-19 on a fresh generic bash
+        # session (tmcp-surface-shell): a multiline payload came back BLOCKED /
+        # SUBMIT_UNCONFIRMED with enter_sent=False because the identity check
+        # below withheld the Enter -- yet the pane showed the here-doc's own
+        # `===SHOW===` output. The command had already RUN.
+        #
+        # Root cause: `tmux send-keys -l` writes the text's bytes straight to
+        # the pty, embedded "\n" included, and a target under ordinary tty line
+        # discipline acts on each newline the moment it arrives. Reproduced at
+        # the raw tmux layer with no Enter sent at all: line 1 executes, line 2
+        # is left in the buffer. So "withhold the final Enter" is not, and
+        # never was, a safety boundary for these targets -- by the time any
+        # verification, identity re-pin or refusal runs, N-1 of the N lines
+        # have already executed, and nothing can take them back.
+        #
+        # The only boundary that holds is refusing BEFORE the first byte goes
+        # out. Refused for press_enter either way, because the injection alone
+        # is what executes. An interactive agent CLI keeps multiline sends
+        # untouched (buffers_embedded_newlines): its composer owns the buffer,
+        # which is exactly the behaviour Codex/Claude prompts depend on.
+        if not adapter.buffers_embedded_newlines and _has_embedded_newline(text):
+            return {
+                "sent": False, "enter_sent": False, "characters": len(text),
+                "press_enter": press_enter, "correlation_id": correlation_id,
+                "agent_type": adapter.name, "session": session,
+                "delivery_state": DELIVERY_BLOCKED,
+                "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED),
+                "error": "MULTILINE_SHELL_SEND_REFUSED",
+                "submit_reason": (
+                    "the target is a plain shell, which executes every embedded newline as it "
+                    "arrives -- the text would start running line by line before any submit key, "
+                    "and a withheld Enter could not stop it; nothing was sent. Send one line per "
+                    "call, or write the script to a file and run that file in a single line"),
+                "_submit_started_monotonic": submit_started,
+            }
+
         # URGENT bugfix (real report: text lands in the composer but never
         # submits until a human presses Enter -- for BOTH Claude and Codex):
         # root cause is that this method never actually checked WHAT the
@@ -2175,6 +2224,22 @@ class TerminalService:
                                        + ("" if text else " (echo attributed to the composer's own "
                                                           "content, not to an empty sent text)"))
             return result
+
+        # The prompt may be typed in full but STAGED -- parked in a multiline
+        # editor whose Enter inserts a newline rather than submitting, with a
+        # footer naming the real submit key (Claude Code's `ctrl+x ctrl+s to
+        # send now`). That is the recurring "prompt sent but not running"
+        # report: the send looked finished, the agent never started.
+        # ClaudeAdapter.submit_ack_evidence now refuses to confirm off that
+        # state, which is what brings the flow HERE instead of returning a
+        # false SUBMIT_CONFIRMED above; pressing the key the target itself is
+        # advertising is the one action that actually submits it.
+        staged = self._submit_staged_editor_locked(
+            session, text, adapter, result, identity_before, command_before,
+            verify_timeout=verify_timeout)
+        if staged is not None:
+            return staged
+
         result["delivery_state"] = DELIVERY_UNKNOWN
         result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
         # Direct-send bugfix: `reason` (from _poll_for_submission, above)
@@ -2189,6 +2254,81 @@ class TerminalService:
             "the pane changed but no adapter-specific submission evidence was found within the "
             "verification window" if reason == "confirmed" else reason
         )
+        return result
+
+    def _submit_staged_editor_locked(self, session: str, text: str, adapter: Any,
+                                      result: dict[str, Any], identity_before: SessionIdentity,
+                                      command_before: str, *, verify_timeout: float) -> dict[str, Any] | None:
+        """One bounded, evidence-gated press of the submit key a STAGED
+        editor is itself advertising. Returns the finished result when the
+        attempt ran, or None when it was not applicable/not safe -- in which
+        case the caller's normal DELIVERY_UNKNOWN reporting continues
+        untouched.
+
+        The attribution rules are deliberately the same ones the Escape+Enter
+        recovery already uses, and for the same reason: `ctrl+x ctrl+s`
+        submits whatever is in the editor, so it must never be pressed on a
+        buffer this attempt cannot prove is its own.
+
+          1. a FRESH capture taken right here decides -- never the older
+             `after` that got us here;
+          2. identity and foreground command still match this attempt's
+             pinned values;
+          3. the staged footer is still on screen in that fresh capture; AND
+          4. this attempt's own text is still visibly staged in it.
+
+        Never loops (one press, one verification), never re-injects the
+        prompt, and never upgrades the outcome on its own: only real adapter
+        ack evidence measured across the keypress can confirm.
+        """
+        try:
+            info_now = self.tmux.get_session(session)
+            staged_snapshot = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
+        except TmuxError:
+            return None
+        if staged_snapshot is None or not adapter.staged_submit_keys(staged_snapshot):
+            return None
+        identity_now = None if info_now is None else SessionIdentity.from_session_info(info_now)
+        command_now = (info_now.pane_current_command or "") if info_now is not None else ""
+        if (identity_now is None or not identity_before.matches(identity_now)
+                or command_now != command_before):
+            return None
+        expected_echo = text or submit_flow.extract_composer_text(staged_snapshot)
+        if not expected_echo or not _sent_text_echoed(staged_snapshot, expected_echo):
+            # The editor is staged, but not with our text -- someone else's
+            # draft, or ours already gone. Submitting it would be submitting
+            # a buffer we cannot attribute; report honestly instead.
+            result["staged_editor_detected"] = True
+            result["delivery_state"] = DELIVERY_UNKNOWN
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
+            result["submit_reason"] = (
+                "the target is holding a staged editor buffer, but this attempt's own text is no "
+                "longer the one staged in it -- the submit key was withheld rather than submitting "
+                "a buffer that cannot be attributed to this send")
+            return result
+        keys = list(adapter.staged_submit_keys(staged_snapshot))
+        self.tmux.send_keys(session, keys)
+        result["staged_editor_detected"] = True
+        result["staged_submit_attempted"] = True
+        result["staged_submit_keys"] = keys
+        result["submit_key"] = "+".join(keys)
+        _, after_keys, _ = self._poll_for_submission(session, staged_snapshot, timeout=verify_timeout)
+        confirmed = (after_keys is not None
+                     and adapter.submit_ack_evidence(staged_snapshot, after_keys, expected_echo))
+        if confirmed:
+            result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
+            result["submit_reason"] = (
+                f"confirmed after submitting the staged editor with {result['submit_key']}")
+            return result
+        # Still staged, or consumed with no evidence either way. Both are
+        # unproven; neither may be reported as a submission.
+        result["delivery_state"] = DELIVERY_UNKNOWN
+        result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
+        result["submit_reason"] = (
+            f"the prompt was staged in the target's multiline editor and {result['submit_key']} was "
+            "sent once, but no adapter evidence confirmed the submission within the verification "
+            "window -- the prompt may still be sitting unsent")
         return result
 
     def _verified_codex_submit_locked(self, session: str, text: str, correlation_id: str,
@@ -2297,20 +2437,40 @@ class TerminalService:
             return "COMPOSER", "draft_still_in_composer"
 
         try:
-            # The direct submit profile remains the compatibility cap for a
-            # caller that explicitly configures a smaller bound. The
-            # background sweeper uses the service watchdog's six-Enter cap
-            # for production recovery.
+            # Per-run Enter budget for THIS foreground call. Two config
+            # objects have a say and they compose in one direction only:
+            #
+            #   submit_watchdog.max_enter_attempts -- the verified path's own
+            #     contract floor: the normal Enter plus at most one
+            #     evidence-gated Escape+Enter recovery.
+            #   submit.<agent>.max_enter_attempts -- the per-agent profile
+            #     (config.yaml's `submit:` block). It may RAISE that budget
+            #     for an agent with a known composer race; it must never
+            #     lower it below the contract, because its programmatic
+            #     default is the LEGACY single-Enter value (SubmitConfig's own
+            #     comment; tests/test_submit_config_wiring.py pins it) and
+            #     feeding that straight in capped this path at ONE Enter --
+            #     which made the recovery below structurally dead code, since
+            #     send_enter's `enter_calls >= 2` branch could never run.
+            #
+            # max_total_enters stays the hard ceiling over both: the durable
+            # per-submission budget this foreground run shares with every
+            # background watcher pass.
             profile = _submit_profile_for(self.config, adapter.name)
+            contract_attempts = self.submit_watchdog.config.max_enter_attempts
+            per_run_attempts = min(
+                max(int(getattr(profile, "max_enter_attempts", 0) or 0), contract_attempts),
+                self.submit_watchdog.config.max_total_enters,
+            )
             direct_watchdog = self.submit_watchdog
-            if profile.max_enter_attempts != self.submit_watchdog.config.max_total_enters:
+            if per_run_attempts != contract_attempts:
                 direct_watchdog = VerifiedSubmitWatchdog(
                     self.submissions,
                     WatchdogConfig(
                         poll_interval_seconds=self.submit_watchdog.config.poll_interval_seconds,
                         timeout_seconds=self.submit_watchdog.config.timeout_seconds,
-                        max_enter_attempts=min(profile.max_enter_attempts, 6),
-                        max_total_enters=min(profile.max_enter_attempts, 6),
+                        max_enter_attempts=per_run_attempts,
+                        max_total_enters=self.submit_watchdog.config.max_total_enters,
                         retry_agent_types=self.submit_watchdog.config.retry_agent_types,
                     ),
                 )
