@@ -163,7 +163,8 @@ this was built against:
 - `context.max_tokens` ← a window the model field states outright
   (`(1M context)`, `[1m]`), the same "provider stated its own window" rule
   `ai_context_window.py` uses. Unknown otherwise.
-- `usage.percent` / `reset_in_minutes` ← the `Usage …% (resets in …)` field;
+- `usage.percent` / `reset_in_minutes` ← the `Usage …% (resets in …)` field,
+  including a day-scale weekly window (`Usage Weekly 8% (resets in 6d 18h)`);
   `reset_at` is that offset applied to now.
 - `git.*` ← the session registry's `repo_root` / `git_branch`, plus one
   bounded, cached `git status --porcelain --untracked-files=normal`

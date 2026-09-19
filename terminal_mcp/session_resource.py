@@ -204,9 +204,15 @@ _TOKEN_MULTIPLIER = {"k": 1_000, "m": 1_000_000}
 # with, and adding them would inflate `used_tokens` past what was observed.
 _CONTEXT_TOKEN_FIELDS = {"in", "cache", "cached", "cache read", "cache write"}
 
-# `resets in 49m`, `resets in 1h 5m`, `resets in 2h`, `reset in 90 min`.
+# `resets in 49m`, `resets in 1h 5m`, `resets in 2h`, `reset in 90 min`, and
+# -- observed live on a WEEKLY quota window, 2026-09-19 --
+# `Usage Weekly ... 8% (resets in 6d 18h)`. Days are parsed because a weekly
+# window is the common real case, and reporting null for it would lose a
+# number the footer stated outright.
 _RESET_IN = re.compile(
-    r"\breset(?:s|ting)?\s+in\s+(?:(\d{1,3})\s*h(?:ours?|rs?)?)?\s*"
+    r"\breset(?:s|ting)?\s+in\s+"
+    r"(?:(\d{1,3})\s*d(?:ays?)?)?\s*"
+    r"(?:(\d{1,3})\s*h(?:ours?|rs?)?)?\s*"
     r"(?:(\d{1,4})\s*m(?:in(?:ute)?s?)?)?", re.IGNORECASE)
 
 # `[Opus 5 (1M context)]`, `[Sonnet 5]`, `claude-opus-5[1m]`. The bracketed
@@ -310,13 +316,16 @@ def _parse_context_tokens(text: str) -> int | None:
 
 def _parse_reset_minutes(text: str) -> int | None:
     for match in reversed(list(_RESET_IN.finditer(text))):
-        hours, minutes = match.group(1), match.group(2)
-        if hours is None and minutes is None:
+        days, hours, minutes = match.group(1), match.group(2), match.group(3)
+        if days is None and hours is None and minutes is None:
             continue
-        total = (int(hours) * 60 if hours else 0) + (int(minutes) if minutes else 0)
-        # A stated reset of 0 is not observable information; ignore it
-        # rather than reporting "resets now".
-        if 0 < total <= 60 * 24 * 7:
+        total = ((int(days) * 24 * 60 if days else 0)
+                 + (int(hours) * 60 if hours else 0)
+                 + (int(minutes) if minutes else 0))
+        # A stated reset of 0 is not observable information; ignore it rather
+        # than reporting "resets now". The upper bound keeps a misparse from
+        # becoming an absurd horizon while still covering a monthly window.
+        if 0 < total <= 60 * 24 * 31:
             return total
     return None
 

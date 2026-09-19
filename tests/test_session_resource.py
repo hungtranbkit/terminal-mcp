@@ -87,6 +87,10 @@ def test_parses_percent_remaining_form():
     ("Usage 30% (resets in 1h 5m)", 65),
     ("Usage 30% (resets in 2h)", 120),
     ("Usage 30% (reset in 90 min)", 90),
+    # Observed live on a weekly quota window, 2026-09-19 -- a null here would
+    # have lost a number the footer stated outright.
+    ("Usage Weekly █░░░░░░░░░ 8% (resets in 6d 18h)", 6 * 24 * 60 + 18 * 60),
+    ("Usage 30% (resets in 1d)", 24 * 60),
 ])
 def test_parses_reset_window_forms(footer, minutes):
     assert parse_session_resources(footer).usage_reset_in_minutes == minutes
@@ -152,6 +156,24 @@ def test_partial_footer_reports_only_what_it_stated():
     assert parsed.usage_reset_in_minutes is None
     assert parsed.context_max_tokens is None  # no window stated -> unknown
     assert parsed.model == "Sonnet 5"
+
+
+def test_weekly_quota_footer_is_read_in_full():
+    """The exact live remote footer (dell-linux/nova-claude-long): a weekly
+    Usage window, and a context bar at 0%."""
+    parsed = parse_session_resources(
+        "  [Opus 5 (1M context)] │ novaretail-web git:(feature/nwr-biz-audit-001*)\n"
+        "  Context ░░░░░░░░░░ 0% │ Usage Weekly █░░░░░░░░░ 8% (resets in 6d 18h)")
+    assert parsed.context_percent == 0
+    assert parsed.usage_percent == 8
+    assert parsed.usage_reset_in_minutes == 6 * 24 * 60 + 18 * 60
+    assert parsed.model == "Opus 5"
+    assert parsed.context_max_tokens == 1_000_000
+    # 0% is a real observation, not a missing one.
+    assert parsed.observed is True
+    block = build_resource_block(parsed=parsed)
+    assert block["context"]["status"] == "NORMAL"
+    assert block["usage"]["reset_at"] is not None
 
 
 def test_zero_reset_window_is_not_reported():
