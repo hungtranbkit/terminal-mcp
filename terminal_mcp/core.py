@@ -10,7 +10,8 @@ from typing import Any
 
 from . import composer, submit_flow
 from .adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STALLED, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
-                       DELIVERY_UNKNOWN, TARGET_WAITING, _sent_text_echoed, select_adapter,
+                       DELIVERY_UNKNOWN, TARGET_WAITING, _sent_text_echoed,
+                       enter_is_safe_after_command_change, select_adapter,
                        to_legacy_submit_status)
 from .audit import AuditStore
 from .bindings import Binding, BindingStore, valid_binding_name
@@ -1881,13 +1882,34 @@ class TerminalService:
             info_at_enter = None
         identity_at_enter = None if info_at_enter is None else SessionIdentity.from_session_info(info_at_enter)
         command_at_enter = (info_at_enter.pane_current_command or "") if info_at_enter is not None else ""
+        # Process generation, and the reason it is checked here at all: for a
+        # plain shell the foreground-command comparison below can no longer
+        # catch a replaced process (see enter_is_safe_after_command_change),
+        # and it never could catch the case that matters most -- a pane's shell
+        # killed and respawned reports the same name at both ends. tmux's
+        # #{pane_pid} is the pid of the process tmux itself spawned for the
+        # pane; it does not move while that process lives, and it is the only
+        # signal here that distinguishes "the same shell, one command later"
+        # from "a different shell wearing the same name". Applied to every
+        # adapter, so this revalidation is strictly stronger than what it
+        # replaces rather than a relaxation.
+        pid_changed = info_at_enter is not None and info_at_enter.pane_pid != info_before.pane_pid
+        command_ok = enter_is_safe_after_command_change(adapter, command_before, command_at_enter)
         if (identity_at_enter is None or not identity_before.matches(identity_at_enter)
-                or command_at_enter != command_before):
+                or pid_changed or not command_ok):
             result["delivery_state"] = DELIVERY_BLOCKED
             result["submit_status"] = to_legacy_submit_status(DELIVERY_BLOCKED)
             result["error"] = "IDENTITY_CHANGED_MID_SEND"
-            result["submit_reason"] = ("the pinned session identity or foreground command changed between "
-                                       "the text send and the Enter send -- Enter was withheld")
+            if pid_changed:
+                detail = (f"the pane's own process was replaced (pid {info_before.pane_pid} -> "
+                          f"{info_at_enter.pane_pid})")
+            elif identity_at_enter is None or not identity_before.matches(identity_at_enter):
+                detail = "the pinned session identity changed"
+            else:
+                detail = (f"the foreground command changed from {command_before!r} to "
+                          f"{command_at_enter!r}, which is not this pane's own shell")
+            result["submit_reason"] = (f"{detail} between the text send and the Enter send -- "
+                                       "Enter was withheld")
             return result
 
         # VERIFY_TEXT, and it belongs HERE -- before ACTIVATE, not after it.

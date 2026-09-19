@@ -165,6 +165,15 @@ class AgentAdapter(ABC):
         of already actively working, so Escape could genuinely interrupt
         real work rather than dismiss a stuck composer."""
 
+    foreground_command_is_identity: bool = True
+    """Does #{pane_current_command} identify the TARGET of this send?
+
+    For an agent CLI it does: the pane runs exactly one long-lived program,
+    the adapter was selected from its name, and that name changing means the
+    program this send was aimed at is gone. For a plain shell it does not --
+    see GenericShellAdapter's override. Defaults True so a future adapter is
+    strict until it deliberately says otherwise."""
+
 
 class GenericShellAdapter(AgentAdapter):
     """Fallback for any target with no more specific adapter (plain shells,
@@ -176,6 +185,12 @@ class GenericShellAdapter(AgentAdapter):
     target that was never RECOVERY_ELIGIBLE_COMMANDS-scoped keeps its
     already-tested behavior unchanged."""
     name = "generic"
+    # A shell's #{pane_current_command} is the program it is CURRENTLY
+    # RUNNING, not the thing being sent to -- it changes as a normal
+    # consequence of the shell doing its job, and is back to the shell's own
+    # name the moment a command finishes. See enter_is_safe_after_command_
+    # change below for the live false block this fixes.
+    foreground_command_is_identity = False
 
     def identify_target_state(self, lines: list[str]) -> str:
         return TARGET_UNKNOWN
@@ -465,3 +480,49 @@ def normalize_command(pane_current_command: str) -> str:
 
 def select_adapter(pane_current_command: str) -> AgentAdapter:
     return _ADAPTERS_BY_COMMAND.get(normalize_command(pane_current_command), _GENERIC)
+
+
+# Interactive shells, by the bare name tmux reports for a pane running one.
+# A pane whose foreground command is one of these is sitting at its OWN
+# prompt: there is no other program between the pty and the line editor that
+# an Enter could be misdelivered to.
+SHELL_COMMANDS = frozenset({"bash", "zsh", "sh", "fish", "dash", "ash", "ksh", "csh", "tcsh"})
+
+
+def enter_is_safe_after_command_change(adapter: AgentAdapter, command_before: str,
+                                      command_at_enter: str) -> bool:
+    """May Enter still be sent when #{pane_current_command} moved between the
+    text-send and the Enter-send?
+
+    The false block this exists to remove, reproduced live through the real
+    ChatGPT connector (2026-09-19, generic shell `tmcp-surface-shell` on
+    hp-linux): the shell accepted one multiline command, and the NEXT send came
+    back BLOCKED/IDENTITY_CHANGED_MID_SEND with enter_sent=false, agent_type=
+    generic. Nothing had been replaced. The pane was simply still running the
+    previous command when the text landed and was back at its prompt 80ms later
+    when Enter was about to go out, so `command_at_enter != command_before` --
+    the shell finishing its work was read as the target disappearing, and the
+    typed text was left sitting in the line editor, unexecutable.
+
+    What actually distinguishes the two cases:
+
+      agent CLI (foreground_command_is_identity) -- the pane runs one
+        long-lived program and the adapter was selected from its name, so any
+        change means the program this send was aimed at is gone. Blocks, with
+        exactly the behaviour it has always had.
+
+      shell -- a change INTO the pane's own shell means the previous command
+        finished and the pane is at its prompt: Enter is precisely what should
+        happen next, and withholding it is the bug. A change into anything
+        ELSE means some other program took over the pty between the paste and
+        the Enter, which is the one genuinely unsafe shape here (a stray Enter
+        would land in that program, not the shell), so it still blocks.
+
+    Deliberately not widened to "any change is fine for a shell": that would
+    give up the bash->vim case, which this keeps refusing.
+    """
+    if command_before == command_at_enter:
+        return True
+    if adapter.foreground_command_is_identity:
+        return False
+    return normalize_command(command_at_enter) in SHELL_COMMANDS
