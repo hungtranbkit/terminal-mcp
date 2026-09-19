@@ -204,15 +204,38 @@ _TOKEN_MULTIPLIER = {"k": 1_000, "m": 1_000_000}
 # with, and adding them would inflate `used_tokens` past what was observed.
 _CONTEXT_TOKEN_FIELDS = {"in", "cache", "cached", "cache read", "cache write"}
 
-# `resets in 49m`, `resets in 1h 5m`, `resets in 2h`, `reset in 90 min`.
+# `resets in 49m`, `resets in 1h 5m`, `resets in 2h`, `reset in 90 min`, and
+# -- observed live on a WEEKLY quota window, 2026-09-19 --
+# `Usage Weekly ... 8% (resets in 6d 18h)`. Days are parsed because a weekly
+# window is the common real case, and reporting null for it would lose a
+# number the footer stated outright.
 _RESET_IN = re.compile(
-    r"\breset(?:s|ting)?\s+in\s+(?:(\d{1,3})\s*h(?:ours?|rs?)?)?\s*"
+    r"\breset(?:s|ting)?\s+in\s+"
+    r"(?:(\d{1,3})\s*d(?:ays?)?)?\s*"
+    r"(?:(\d{1,3})\s*h(?:ours?|rs?)?)?\s*"
     r"(?:(\d{1,4})\s*m(?:in(?:ute)?s?)?)?", re.IGNORECASE)
 
 # `[Opus 5 (1M context)]`, `[Sonnet 5]`, `claude-opus-5[1m]`. The bracketed
 # window statement is the same "provider stated its own window" signal
 # ai_context_window.parse_variant_window trusts, in the footer's spelling.
 _MODEL_BRACKET = re.compile(r"\[\s*([^\[\]|]{1,80}?)\s*\]")
+# REAL false positive, found live 2026-09-19 right after deploy: a pane that
+# happened to be displaying this project's own source (`h["Mcp-Session-Id"]
+# = sid`) reported `model: "Mcp-Session-Id"`. "Any bracketed text containing a
+# letter" is not a model field -- brackets are the single most common
+# punctuation in a terminal. A model name is now only accepted when it
+# matches one of the known families outright, AND only when a labelled
+# Context/Usage percentage was observed in the same footer region (see
+# parse_session_resources): a model name with no resource fields beside it is
+# not a status footer, it is text that happens to be on screen.
+_MODEL_NAME = re.compile(
+    r"""^(?:
+          (?:claude[-\s])?(?:opus|sonnet|haiku)(?:[-\s]?\d+(?:[-.]\d+)*)?   # Claude
+        | (?:gpt|o)[-\s]?\d+(?:[-.]\d+)*(?:[-\s]?codex)?                   # OpenAI/Codex
+        | codex(?:[-\s](?:cli|mini|max))?                                   # bare Codex
+        )
+        (?:\s*\[\s*\d{1,4}\s*[km]\s*\])?$                                # optional [1m]
+    """, re.IGNORECASE | re.VERBOSE)
 _MODEL_WINDOW = re.compile(r"\(\s*(\d{1,4})\s*([km])\s*(?:context|ctx|window)?\s*\)",
                            re.IGNORECASE)
 
@@ -248,19 +271,24 @@ def _last_percent(pattern: re.Pattern[str], text: str) -> float | None:
 
 
 def _parse_model(text: str) -> tuple[str | None, int | None]:
-    """(model, max_tokens) from a bracketed footer model field."""
-    brackets = _MODEL_BRACKET.findall(text)
-    for raw in reversed(brackets):
+    """(model, max_tokens) from a bracketed footer model field.
+
+    Strict allowlist: a bracketed field is a model only if, once any stated
+    window is removed, what remains is a recognized model name. Anything else
+    -- a dict key, a log level, an index, a key hint -- yields (None, None),
+    and an unrecognized model is reported as unknown rather than echoed back
+    as if it had been identified."""
+    for raw in reversed(_MODEL_BRACKET.findall(text)):
         candidate = raw.strip()
-        # A bracketed field that is plainly not a model name (a progress
-        # bar fragment, a key hint) is skipped rather than reported.
-        if not candidate or not re.search(r"[A-Za-z]", candidate) or len(candidate) > 80:
+        if not candidate or len(candidate) > 80:
             continue
         window = None
         window_match = _MODEL_WINDOW.search(candidate)
         if window_match:
             window = int(window_match.group(1)) * _TOKEN_MULTIPLIER[window_match.group(2).lower()]
         name = _MODEL_WINDOW.sub("", candidate).strip(" ·|-")
+        if not _MODEL_NAME.match(name):
+            continue
         return (redact_text(name) or None), window
     return None, None
 
@@ -288,13 +316,16 @@ def _parse_context_tokens(text: str) -> int | None:
 
 def _parse_reset_minutes(text: str) -> int | None:
     for match in reversed(list(_RESET_IN.finditer(text))):
-        hours, minutes = match.group(1), match.group(2)
-        if hours is None and minutes is None:
+        days, hours, minutes = match.group(1), match.group(2), match.group(3)
+        if days is None and hours is None and minutes is None:
             continue
-        total = (int(hours) * 60 if hours else 0) + (int(minutes) if minutes else 0)
-        # A stated reset of 0 is not observable information; ignore it
-        # rather than reporting "resets now".
-        if 0 < total <= 60 * 24 * 7:
+        total = ((int(days) * 24 * 60 if days else 0)
+                 + (int(hours) * 60 if hours else 0)
+                 + (int(minutes) if minutes else 0))
+        # A stated reset of 0 is not observable information; ignore it rather
+        # than reporting "resets now". The upper bound keeps a misparse from
+        # becoming an absurd horizon while still covering a monthly window.
+        if 0 < total <= 60 * 24 * 31:
             return total
     return None
 
@@ -325,7 +356,6 @@ def parse_session_resources(output: str) -> ParsedResources:
     text = _footer_region(output)
     if not text:
         return ParsedResources()
-    model, model_window = _parse_model(text)
     remaining = _last_percent(_CONTEXT_REMAINING, text)
     if remaining is not None:
         # "4% remaining" is the same fact as "96% used" -- a restatement of
@@ -333,12 +363,20 @@ def parse_session_resources(output: str) -> ParsedResources:
         context_percent: float | None = _percent(str(100 - remaining))
     else:
         context_percent = _last_percent(_CONTEXT_USED, text)
+    usage_percent = _last_percent(_USAGE_USED, text)
+    # The model field is only read from something that IS a resource footer.
+    # No labelled percentage means no footer, so any bracketed text here is
+    # just pane content -- see _MODEL_NAME for the live false positive this
+    # second gate exists to close.
+    model, model_window = (_parse_model(text)
+                           if (context_percent is not None or usage_percent is not None)
+                           else (None, None))
     return ParsedResources(
         model=model,
         context_percent=context_percent,
         context_used_tokens=_parse_context_tokens(text),
         context_max_tokens=model_window,
-        usage_percent=_last_percent(_USAGE_USED, text),
+        usage_percent=usage_percent,
         usage_reset_in_minutes=_parse_reset_minutes(text),
     )
 

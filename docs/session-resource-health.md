@@ -163,7 +163,8 @@ this was built against:
 - `context.max_tokens` ← a window the model field states outright
   (`(1M context)`, `[1m]`), the same "provider stated its own window" rule
   `ai_context_window.py` uses. Unknown otherwise.
-- `usage.percent` / `reset_in_minutes` ← the `Usage …% (resets in …)` field;
+- `usage.percent` / `reset_in_minutes` ← the `Usage …% (resets in …)` field,
+  including a day-scale weekly window (`Usage Weekly 8% (resets in 6d 18h)`);
   `reset_at` is that offset applied to now.
 - `git.*` ← the session registry's `repo_root` / `git_branch`, plus one
   bounded, cached `git status --porcelain --untracked-files=normal`
@@ -174,6 +175,38 @@ Codex and plain shells have no such footer today, so they report
 `observed: false` and nulls. For sessions whose transcripts this controller
 *can* read, `ai_context_window.py` remains the stronger, structured path —
 this module is the one that works when only the screen is available.
+
+## Remote nodes: the central controller parses
+
+A node agent running an older build returns the footer inside `last_output`
+but no `resource` block. The HP controller parses what that node already sent
+it (`ControllerService._with_resource_health`), on both `terminal_status` and
+`terminal_status_bounded`, so **no node needs upgrading for its sessions to
+report resource health**. A node that does produce its own block keeps it —
+the controller checks first and never overwrites.
+
+On that path two fields are deliberately null:
+
+- `git.*` — the `cwd` in a remote payload names a directory on **another
+  machine**. Probing it on the controller would report *this* host's git
+  state under that path. Unknown git makes the rollover hook refuse
+  (`GIT_STATE_UNKNOWN`), which is the safe direction.
+- `agent` — the remote payload does not carry the pane's command, and it is
+  not guessed from the footer.
+
+`context`, `usage`, `model` and the policy verdict are identical to the local
+path, using the controller's own `session_health` thresholds.
+
+## `model` is an allowlist, not a heuristic
+
+Found live right after the first deploy: a pane that happened to be showing
+this project's own source (`h["Mcp-Session-Id"] = sid`) reported
+`model: "Mcp-Session-Id"`. Brackets are the most common punctuation in a
+terminal, so "any bracketed word" was never a model field. A model is now
+accepted only when it matches a known family (Opus/Sonnet/Haiku/Claude,
+GPT/o-series/Codex) **and** a labelled Context or Usage percentage was
+observed in the same footer region. An unrecognized model reads `null`; the
+numbers beside it are still reported.
 
 Pane text is untrusted output. The parsed model string goes through the same
 redaction as every other pane-derived field, and the block carries no pane

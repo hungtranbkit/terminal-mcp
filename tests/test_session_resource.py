@@ -8,6 +8,7 @@ number", and every one of these asserts a null rather than a value.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -86,6 +87,10 @@ def test_parses_percent_remaining_form():
     ("Usage 30% (resets in 1h 5m)", 65),
     ("Usage 30% (resets in 2h)", 120),
     ("Usage 30% (reset in 90 min)", 90),
+    # Observed live on a weekly quota window, 2026-09-19 -- a null here would
+    # have lost a number the footer stated outright.
+    ("Usage Weekly █░░░░░░░░░ 8% (resets in 6d 18h)", 6 * 24 * 60 + 18 * 60),
+    ("Usage 30% (resets in 1d)", 24 * 60),
 ])
 def test_parses_reset_window_forms(footer, minutes):
     assert parse_session_resources(footer).usage_reset_in_minutes == minutes
@@ -151,6 +156,24 @@ def test_partial_footer_reports_only_what_it_stated():
     assert parsed.usage_reset_in_minutes is None
     assert parsed.context_max_tokens is None  # no window stated -> unknown
     assert parsed.model == "Sonnet 5"
+
+
+def test_weekly_quota_footer_is_read_in_full():
+    """The exact live remote footer (dell-linux/nova-claude-long): a weekly
+    Usage window, and a context bar at 0%."""
+    parsed = parse_session_resources(
+        "  [Opus 5 (1M context)] │ novaretail-web git:(feature/nwr-biz-audit-001*)\n"
+        "  Context ░░░░░░░░░░ 0% │ Usage Weekly █░░░░░░░░░ 8% (resets in 6d 18h)")
+    assert parsed.context_percent == 0
+    assert parsed.usage_percent == 8
+    assert parsed.usage_reset_in_minutes == 6 * 24 * 60 + 18 * 60
+    assert parsed.model == "Opus 5"
+    assert parsed.context_max_tokens == 1_000_000
+    # 0% is a real observation, not a missing one.
+    assert parsed.observed is True
+    block = build_resource_block(parsed=parsed)
+    assert block["context"]["status"] == "NORMAL"
+    assert block["usage"]["reset_at"] is not None
 
 
 def test_zero_reset_window_is_not_reported():
@@ -449,3 +472,217 @@ def test_batch_inspect_unchanged_when_status_has_no_resource_block(tmp_path):
 
     result = CompactTerminalTools(terminal, Controller()).batch_inspect(["test-health"])
     assert "resource" not in result["targets"][0]
+
+
+# ---------------------------------------------------------------------------
+# Live false positive, 2026-09-19: a pane displaying this project's own source
+# reported model "Mcp-Session-Id". Brackets are the most common punctuation in
+# a terminal; "any bracketed word" was never a model field.
+# ---------------------------------------------------------------------------
+
+def test_bracketed_source_code_is_never_read_as_a_model():
+    pane = "\n".join([
+        '    h = {"Content-Type": "application/json"}',
+        '    if sid: h["Mcp-Session-Id"] = sid',
+        '    r = urllib.request.Request(URL, json.dumps(payload).encode(), h)',
+        "    print(rows[0], data['result'])",
+    ])
+    parsed = parse_session_resources(pane)
+    assert parsed.model is None
+    assert parsed.context_percent is None
+    assert parsed.usage_percent is None
+    assert parsed.usage_reset_in_minutes is None
+    assert parsed.context_max_tokens is None
+    assert parsed.observed is False
+    block = build_resource_block(parsed=parsed)
+    assert block["model"] is None
+    assert block["recommended_action"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize("bracketed", [
+    "Mcp-Session-Id", "INFO", "0", "ERROR", "warn", "x-api-key", "2026-09-19",
+    "tool_use", "terminal-mcp-claude-fleet",
+])
+def test_only_known_model_families_are_accepted(bracketed):
+    """Even beside a real footer, an unrecognized bracketed field is reported
+    as unknown rather than echoed back as an identified model."""
+    parsed = parse_session_resources(f"[{bracketed}] | Context 42% | Usage 10% (resets in 5m)")
+    assert parsed.model is None
+    # The numbers are still read -- a strict model gate must not cost the
+    # fields that were genuinely observed.
+    assert (parsed.context_percent, parsed.usage_percent) == (42, 10)
+
+
+@pytest.mark.parametrize("bracketed,expected", [
+    ("Opus 5 (1M context)", "Opus 5"),
+    ("Sonnet 5", "Sonnet 5"),
+    ("Haiku 4.5", "Haiku 4.5"),
+    ("claude-opus-5", "claude-opus-5"),
+    ("GPT-5", "GPT-5"),
+    ("gpt-5-codex", "gpt-5-codex"),
+    ("Codex", "Codex"),
+])
+def test_known_model_families_are_still_read(bracketed, expected):
+    parsed = parse_session_resources(f"[{bracketed}] | Context 42%")
+    assert parsed.model == expected
+
+
+def test_model_is_only_read_from_something_that_is_a_footer():
+    """A real model name with no labelled percentage beside it is text on a
+    screen, not a status footer."""
+    assert parse_session_resources("Running with [Opus 5 (1M context)] today").model is None
+    assert parse_session_resources("Running with [Opus 5 (1M context)] today").context_max_tokens is None
+
+
+# ---------------------------------------------------------------------------
+# Remote nodes: the CENTRAL controller enriches, so a node running an older
+# build needs no upgrade to report resource health.
+# ---------------------------------------------------------------------------
+
+REMOTE_FOOTER = (
+    "[Opus 5 (1M context)] | Context ██ 7% (in: 5, cache: 70k) | "
+    "Usage ███ 34% (resets in 20m)"
+)
+
+
+def _remote_controller(status_payload, *, health=None):
+    """A ControllerService with one REAL registered remote node whose client
+    returns an OLD-build status payload: a real footer in `last_output`, and
+    no `resource` key -- exactly what a node that has not been upgraded
+    sends today."""
+    import tempfile
+    from terminal_mcp.controller import ControllerService
+    from terminal_mcp.host_metrics import NodeMetrics
+    from terminal_mcp.node_registry import NodeRegistry
+
+    session_name = status_payload.get("session", "remote-session")
+
+    class OldBuildNodeClient:
+        def status(self, session, *, timeout_seconds=None):
+            return dict(status_payload)
+
+        def list_sessions(self, *, timeout_seconds=None):
+            return {"sessions": [{"name": session_name}]}
+
+    registry = NodeRegistry(Path(tempfile.mkdtemp()) / "nodes.db")
+    controller = ControllerService(registry, session_health=health or SessionHealthConfig())
+    registry.register("dell-linux", display_name="Dell", hostname="dell-host",
+                      endpoint="http://dell")
+    controller._clients["dell-linux"] = OldBuildNodeClient()
+    registry.heartbeat(
+        "dell-linux",
+        metrics=NodeMetrics(cpu_percent=5.0, load1=0.1, load5=0.1, load15=0.1, cpu_count=4,
+                            ram_total_bytes=8_000_000_000, ram_used_bytes=1_000_000_000,
+                            ram_percent=12.5, swap_total_bytes=0, swap_used_bytes=0,
+                            swap_percent=0.0, disk_total_bytes=100_000_000_000,
+                            disk_used_bytes=1_000_000_000, disk_free_bytes=99_000_000_000,
+                            disk_percent=1.0),
+        tmux_session_count=1, agent_counts={}, agent_types=("claude",),
+        agent_version="0.13.0", labels=(),
+    )
+    return controller
+
+
+def test_controller_enriches_a_remote_status_payload():
+    payload = {"session": "nova-claude-long", "exists": True, "allowed": True,
+               "state": "RUNNING", "input_required": False, "reason": "claude is running",
+               "last_output": _pane(REMOTE_FOOTER), "cwd": "/home/mesflow/work/nova",
+               "untrusted_output": True, "untrusted_fields": ["last_output"]}
+    result = _remote_controller(payload).terminal_status("nova-claude-long")
+    resource = result["resource"]
+    assert resource["context"]["percent"] == 7
+    assert resource["usage"]["percent"] == 34
+    assert resource["usage"]["reset_in_minutes"] == 20
+    assert resource["model"] == "Opus 5"
+    assert resource["context"]["status"] == "NORMAL"
+    assert resource["recommended_action"] == ACTION_CONTINUE
+    # 7% context with 34% quota spent: the two must not be conflated.
+    assert resource["usage"]["status"] == QUOTA_NORMAL
+    # Remote git is never probed from the controller -- that cwd is on
+    # another machine.
+    assert resource["git"] == {"repo": None, "branch": None, "dirty": None}
+    assert resource["rollover"]["checkpoint"]["cwd"] == "/home/mesflow/work/nova"
+    # Pre-existing remote fields survive the enrichment untouched.
+    assert result["state"] == "RUNNING" and result["node_id"] == "dell-linux"
+    assert result["untrusted_fields"] == ["last_output"]
+
+
+def test_remote_enrichment_also_applies_to_the_bounded_status_path():
+    """wait/resume use terminal_status_bounded; it must not be the one
+    surface that silently lacks the field."""
+    payload = {"session": "nova-claude-long", "state": "RUNNING",
+               "last_output": _pane(REMOTE_FOOTER)}
+    result = _remote_controller(payload).terminal_status_bounded("nova-claude-long", 10)
+    assert result["resource"]["context"]["percent"] == 7
+
+
+def test_controller_never_overwrites_a_block_the_node_already_sent():
+    own = {"agent": "claude", "model": "from-the-node", "observed": True}
+    payload = {"session": "nova-claude-long", "state": "RUNNING",
+               "last_output": _pane(REMOTE_FOOTER), "resource": own}
+    result = _remote_controller(payload).terminal_status("nova-claude-long")
+    assert result["resource"] == own
+
+
+def test_controller_enrichment_reports_unknown_for_a_footerless_remote_pane():
+    payload = {"session": "nova-shell", "state": "IDLE", "last_output": "$ ls\ntotal 0",
+               "cwd": "/home/mesflow"}
+    resource = _remote_controller(payload).terminal_status("nova-shell")["resource"]
+    assert resource["observed"] is False
+    assert resource["context"]["percent"] is None
+    assert resource["recommended_action"] == "UNKNOWN"
+
+
+def test_controller_enrichment_leaves_errors_alone():
+    payload = {"session": "nova-claude-long", "state": "RUNNING",
+               "last_output": _pane(REMOTE_FOOTER)}
+    controller = _remote_controller(payload)
+    assert "resource" not in controller.terminal_status("nope-not-here")
+
+
+def test_controller_enrichment_honours_disabled_config():
+    payload = {"session": "nova-claude-long", "state": "RUNNING",
+               "last_output": _pane(REMOTE_FOOTER)}
+    controller = _remote_controller(payload, health=SessionHealthConfig(enabled=False))
+    assert "resource" not in controller.terminal_status("nova-claude-long")
+
+
+def test_batch_inspect_includes_resource_for_a_remote_target():
+    payload = {"session": "nova-claude-long", "state": "RUNNING",
+               "last_output": _pane(REMOTE_FOOTER), "cwd": "/home/mesflow/work/nova"}
+    controller = _remote_controller(payload)
+
+    class Terminal:
+        def terminal_get_binding(self, binding):
+            return {"error": "BINDING_NOT_FOUND", "binding": binding}
+
+    class RoutingController:
+        def terminal_status(self, session):
+            return controller.terminal_status(session)
+
+        def terminal_tail(self, session, lines):
+            return {"session": session, "output": "tail", "truncated": False}
+
+    rows = CompactTerminalTools(Terminal(), RoutingController()).batch_inspect(
+        ["nova-claude-long"])["targets"]
+    assert rows[0]["resource"]["context"]["percent"] == 7
+    assert rows[0]["resource"]["usage"]["reset_in_minutes"] == 20
+
+
+def test_controller_picks_up_session_health_from_the_local_process_config(tmp_path):
+    """No new argument at any existing call site: the controller finds the
+    policy through the in-process TerminalService it already wraps."""
+    from terminal_mcp.controller import ControllerService
+    from terminal_mcp.node_client import LocalNodeClient
+    from terminal_mcp.node_registry import NodeRegistry
+    terminal = _service(tmp_path, health=SessionHealthConfig(watch_percent=2,
+                                                            prepare_rollover_percent=4,
+                                                            finish_rollover_percent=6,
+                                                            checkpoint_only_percent=8))
+    controller = ControllerService(NodeRegistry(tmp_path / "nodes.db"),
+                                   local_client=LocalNodeClient(terminal))
+    assert controller.session_health.watch_percent == 2
+    # And that policy is what the remote path applies: 7% is CRITICAL here.
+    enriched = controller._with_resource_health(
+        {"session": "s", "state": "RUNNING", "last_output": _pane(REMOTE_FOOTER)})
+    assert enriched["resource"]["context"]["status"] == "CRITICAL"

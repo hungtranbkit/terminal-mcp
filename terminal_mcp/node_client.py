@@ -109,6 +109,16 @@ class LocalNodeClient:
     def __init__(self, terminal: Any) -> None:
         self._terminal = terminal
 
+    @property
+    def terminal(self) -> Any:
+        """The wrapped in-process TerminalService.
+
+        Public because the controller needs this process's own AppConfig
+        (policy thresholds) without a second constructor argument threaded
+        through every call site. Read-only accessor; still a plain
+        delegation, never a second code path."""
+        return self._terminal
+
     def list_sessions(self, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         return self._terminal.terminal_list_sessions()
 
