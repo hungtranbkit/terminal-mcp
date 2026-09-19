@@ -75,21 +75,66 @@ def _text(result: types.CallToolResult) -> str:
 # The catalog IS the contract
 # ---------------------------------------------------------------------------
 
-def test_catalog_is_the_exact_ordered_contract():
-    assert CATALOG == (
-        "terminal_turn",
-        "terminal_batch_inspect",
-        "terminal_enqueue_task",
-        "terminal_task_status",
-        "terminal_task_batch_status",
-        "terminal_wait_for_state",
-        "terminal_resume_wait",
-        "terminal_list_sessions",
-        "terminal_create_session",
-        "terminal_delete_session",
-        "terminal_list_nodes",
-    )
+def test_catalog_is_exactly_one_tool():
+    """THE regression for the "many Called tool rows" complaint: eleven
+    advertised tools meant a model picked a different one per step, so one
+    logical orchestration step became five or six rows in the conversation.
+    One advertised tool makes that one row by construction."""
+    assert CATALOG == ("terminal_turn",)
+    assert len(CATALOG) == 1
     assert len(set(CATALOG)) == len(CATALOG), "no duplicates"
+
+
+#: What v1.x advertised. Kept as a named constant so the shrink is asserted
+#: against the real previous surface rather than a paraphrase of it.
+V1_CATALOG = (
+    "terminal_turn", "terminal_batch_inspect", "terminal_enqueue_task",
+    "terminal_task_status", "terminal_task_batch_status", "terminal_wait_for_state",
+    "terminal_resume_wait", "terminal_list_sessions", "terminal_create_session",
+    "terminal_delete_session", "terminal_list_nodes",
+)
+
+
+def test_every_retired_v1_tool_is_still_callable_but_never_advertised():
+    """Shrinking the catalog must not break a conversation that is already
+    open: a connector caches the catalog, so a client attached before v2.0.0
+    keeps calling the v1 names until its cache turns over."""
+    for name in V1_CATALOG:
+        if name == "terminal_turn":
+            continue
+        assert name not in CATALOG, f"{name} must not be advertised"
+        assert name in sidecar.CALL_COMPAT, f"{name} must stay callable"
+        backend = FakeBackend()
+        result = _call_tool(build_sidecar(backend), name, {"targets": ["x"]})
+        assert result.is_error in (False, None), name
+        assert backend.calls == [(name, {"targets": ["x"]})], \
+            f"{name} must forward verbatim to the backend"
+
+
+def test_call_compat_never_reopens_a_mutating_raw_tool():
+    for forbidden in ("terminal_send_text", "terminal_send_keys",
+                      "terminal_send_text_granted", "terminal_kill_session"):
+        assert forbidden not in sidecar.CALL_COMPAT
+        assert forbidden not in CATALOG
+
+
+def test_every_retired_tool_is_reachable_as_a_turn_action():
+    """The catalog is narrower; the CAPABILITY is not. Each retired tool has a
+    terminal_turn action that routes to the same backend implementation."""
+    from terminal_mcp import compact_tools as ct
+    for name, action in (
+            ("terminal_batch_inspect", "inspect"),
+            ("terminal_wait_for_state", "wait"),
+            ("terminal_resume_wait", "resume"),
+            ("terminal_list_sessions", "list_sessions"),
+            ("terminal_list_nodes", "list_nodes"),
+            ("terminal_create_session", "create_session"),
+            ("terminal_delete_session", "delete_session"),
+            ("terminal_enqueue_task", "enqueue_task"),
+            ("terminal_task_status", "task_status"),
+            ("terminal_task_batch_status", "task_batch_status"),
+    ):
+        assert action in ct.TURN_ACTIONS, f"{name} has no turn action ({action})"
 
 
 def test_raw_keystroke_tools_are_not_on_this_surface():
@@ -140,13 +185,21 @@ def test_the_instructions_carry_a_machine_readable_discovery_signal():
     text = sidecar.compact_instructions()
     assert SERVER_NAME in text
     assert sidecar.SURFACE_VERSION in text
-    assert f"EXACTLY these {len(CATALOG)} tools" in text
+    assert f"EXACTLY {len(CATALOG)} tool" in text
     for name in CATALOG:
         assert name in text, f"{name} must be named in the discovery signal"
     assert "STALE CACHED CATALOG" in text
     assert "terminal_status" in text
-    assert "NO terminal_status/terminal_tail" in text, \
-        "the compatibility bridge must not advertise legacy names in tools/list"
+    assert "USE terminal_turn FOR EVERYTHING" in text
+    assert "NO terminal_send_text/terminal_send_keys" in text, \
+        "the compatibility bridge must not advertise raw send in tools/list"
+    # Every action has to be named, or a model cannot find the capability that
+    # used to be its own tool.
+    for action in ("inspect", "send", "send_wait", "wait", "resume",
+                   "list_sessions", "list_nodes", "create_session",
+                   "delete_session", "enqueue_task", "task_status",
+                   "task_batch_status"):
+        assert action in text, f"action {action} must be named in the instructions"
 
 
 # ---------------------------------------------------------------------------
@@ -189,13 +242,13 @@ def test_list_tools_keeps_serving_the_cache_across_a_controller_restart():
 def test_a_catalog_tool_missing_upstream_is_loud_but_not_fatal(caplog):
     """A silently shrinking catalog is the failure mode this module exists to
     prevent, so it has to be visible."""
-    upstream = [_tool(n) for n in CATALOG if n != "terminal_resume_wait"]
+    upstream = [_tool("terminal_admin_thing")]  # the catalog tool is absent
     server = build_sidecar(FakeBackend(upstream))
     with caplog.at_level(logging.ERROR):
         served = [tool.name for tool in _list_tools(server)]
-    assert "terminal_resume_wait" not in served
-    assert len(served) == len(CATALOG) - 1
-    assert any("terminal_resume_wait" in record.getMessage()
+    assert "terminal_turn" not in served
+    assert len(served) == len(CATALOG) - 1 == 0
+    assert any("terminal_turn" in record.getMessage()
                for record in caplog.records), "missing tool must be logged by name"
 
 
@@ -360,8 +413,8 @@ def test_the_connector_catalog_can_never_be_the_legacy_six():
     catalog = set(CATALOG)
     assert catalog != LEGACY_SIX
     assert not LEGACY_SIX.issubset(catalog), "the legacy shape must not be re-offered"
-    assert "terminal_turn" in catalog
-    assert "terminal_batch_inspect" in catalog
+    assert catalog == {"terminal_turn"}
+    assert not (catalog & LEGACY_SIX), "no legacy name may be advertised at all"
 
 
 def test_list_tools_cannot_return_the_legacy_six_even_if_the_backend_offers_them():

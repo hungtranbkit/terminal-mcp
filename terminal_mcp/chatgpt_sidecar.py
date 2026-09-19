@@ -74,41 +74,33 @@ _log = logging.getLogger(__name__)
 
 SERVER_NAME = "terminal-mcp-chatgpt-v1"
 
-# The compact catalog. ORDERED and EXACT -- this tuple is the contract the
-# connector sees, and tests/test_chatgpt_sidecar.py asserts it literally so
-# that adding a tool here is a deliberate, reviewed act rather than a
-# side effect of something registered upstream.
+# THE COMPACT CATALOG: exactly one tool.
 #
-# Chosen so one logical ChatGPT turn needs one call:
-#   terminal_turn           the default surface: inspect/send/wait/resume
-#   terminal_batch_inspect  many targets in one call, instead of N tails
-#   terminal_enqueue_task   durable submission (idempotent, request_key'd)
-#   terminal_task_status    one task by id
-#   terminal_task_batch_status  up to 100 task states in one call
-#   terminal_wait_for_state durable wait
-#   terminal_resume_wait    resume a wait that returned PENDING
-#   terminal_list_sessions  discovery
-#   terminal_create_session lifecycle
-#   terminal_delete_session lifecycle
-#   terminal_list_nodes     fleet visibility (which node a session is on)
+# The previous eleven were all genuinely useful and all genuinely reachable --
+# and that was the problem. A model handed eleven plausible tools picks a
+# different one per step, so a single logical orchestration step ("look at
+# these four sessions, send to the idle one, wait for it") became four, five,
+# six separate "Called tool" rows in the conversation. The user's complaint was
+# never that a tool was missing; it was the wall of rows.
 #
-# Deliberately ABSENT: terminal_send_text / terminal_send_keys. Raw keystroke
-# injection is what terminal_turn's guarded send path exists to replace, and
-# publishing it here would re-offer the legacy shape this surface is meant to
-# retire. Everything else on the 293-tool surface remains available on the
-# full endpoint for admin/Claude Code use.
+# One advertised tool makes one orchestration step one row, by construction
+# rather than by asking the model nicely. Nothing was dropped: terminal_turn's
+# action vocabulary covers every one of the retired ten --
+#
+#   inspect (one target or many, i.e. batch inspect) | send | send_wait |
+#   wait | resume | list_sessions | list_nodes | create_session |
+#   delete_session | enqueue_task | task_status | task_batch_status
+#
+# -- routing each to the very same backend implementation the standalone tool
+# used (see compact_tools.TURN_HANDLER_ACTIONS), so this is a narrower
+# CATALOG, not a narrower capability.
+#
+# Deliberately ABSENT, and never to be added: terminal_send_text /
+# terminal_send_keys. Raw keystroke injection is what terminal_turn's guarded
+# send path exists to replace. Everything else on the 293-tool surface remains
+# available on the full endpoint for admin/Claude Code use.
 CATALOG: tuple[str, ...] = (
     "terminal_turn",
-    "terminal_batch_inspect",
-    "terminal_enqueue_task",
-    "terminal_task_status",
-    "terminal_task_batch_status",
-    "terminal_wait_for_state",
-    "terminal_resume_wait",
-    "terminal_list_sessions",
-    "terminal_create_session",
-    "terminal_delete_session",
-    "terminal_list_nodes",
 )
 
 DEFAULT_BACKEND_URL = "http://127.0.0.1:8766/mcp"
@@ -123,7 +115,7 @@ BACKEND_UNAVAILABLE = "BACKEND_UNAVAILABLE"
 #: surface a connector is actually attached to. That is the whole diagnostic
 #: gap that made this bug recur: a stale legacy-six connector and a healthy
 #: one were indistinguishable from inside a chat.
-SURFACE_VERSION = "1.1.0"
+SURFACE_VERSION = "2.0.0"
 
 # Read-only compatibility for ChatGPT conversations whose connector identity
 # is still pinned to the historical six-tool catalog.  These names are NOT
@@ -137,6 +129,31 @@ SURFACE_VERSION = "1.1.0"
 # never resurrect raw terminal_send_text/terminal_send_keys on the compact
 # surface.
 LEGACY_READ_COMPAT = frozenset({"terminal_status"})
+
+# Names this surface USED to advertise (v1.x) and still EXECUTES, though
+# tools/list no longer offers them. Shrinking the catalog must not break a
+# conversation that is already open: a connector caches the catalog, so a
+# client attached before v2.0.0 will keep calling these for as long as its
+# cache lives. They are forwarded verbatim -- each is a real backend tool, and
+# the backend remains the only authority -- so an in-flight orchestration
+# neither breaks nor silently changes behaviour.
+#
+# This is a CALL-time allowance, never a listing: nothing here can put a row
+# back in the catalog, and admin tools are still refused outright. Every one of
+# these is reachable as a terminal_turn action, which is what new
+# conversations get.
+CALL_COMPAT = frozenset({
+    "terminal_batch_inspect",
+    "terminal_enqueue_task",
+    "terminal_task_status",
+    "terminal_task_batch_status",
+    "terminal_wait_for_state",
+    "terminal_resume_wait",
+    "terminal_list_sessions",
+    "terminal_create_session",
+    "terminal_delete_session",
+    "terminal_list_nodes",
+})
 
 
 def compact_instructions() -> str:
@@ -154,18 +171,26 @@ def compact_instructions() -> str:
     return (
         f"SURFACE. You are connected to {SERVER_NAME} (compact surface "
         f"v{SURFACE_VERSION}, server version {__version__}), which publishes "
-        f"EXACTLY these {len(CATALOG)} tools: {catalog}.\n"
-        "If the tool list you can see does not match that, you are attached to a "
-        "STALE CACHED CATALOG. The known legacy six-tool cache may still call "
-        "terminal_status: this sidecar accepts that ONE read-only compatibility "
-        "name and translates it to terminal_turn(action=inspect), so inspection "
-        "and resource-health verification keep working without reopening raw send "
-        "tools. Re-point/reconnect remains the way to obtain the canonical catalog.\n"
-        "This surface deliberately has NO terminal_status/terminal_tail/"
-        "terminal_send_text/terminal_send_keys: use terminal_turn (action=inspect/"
-        "send/send_wait/wait/resume) and terminal_batch_inspect instead, which is "
-        "what the paragraph below means by the compact tools. Admin tools live on "
-        "the full endpoint and are not reachable here.\n\n"
+        f"EXACTLY {len(CATALOG)} tool: {catalog}.\n"
+        "USE terminal_turn FOR EVERYTHING. One logical orchestration step is one "
+        "terminal_turn call. Its `action` covers inspect (one `target` or many "
+        "`targets` -- this is batch inspect), send, send_wait, wait, resume, "
+        "list_sessions, list_nodes, create_session, delete_session, enqueue_task, "
+        "task_status and task_batch_status. `target` is the session for every "
+        "action that names one; `text` is the prompt for both send and "
+        "enqueue_task. Do not look for a separate tool per verb -- there is "
+        "none, and calling terminal_turn repeatedly for one step is the thing "
+        "this surface exists to avoid.\n"
+        "If the tool list you can see offers more than that one tool, you are "
+        "attached to a STALE CACHED CATALOG. Those older names (terminal_batch_"
+        "inspect, terminal_enqueue_task, terminal_wait_for_state, "
+        "terminal_list_sessions and the other v1 names, plus terminal_status) are "
+        "still accepted for compatibility so an open conversation keeps working, "
+        "but prefer terminal_turn; re-point/reconnect obtains the canonical "
+        "catalog.\n"
+        "This surface deliberately has NO terminal_send_text/terminal_send_keys: "
+        "terminal_turn(action=send) is the guarded replacement. Admin tools live "
+        "on the full endpoint and are not reachable here.\n\n"
         + orchestration_policy.server_instructions()
     )
 
@@ -321,10 +346,10 @@ def build_sidecar(backend: Backend | None = None, *,
                 "tail_lines": 1,
                 "compact": True,
             }
-        elif call_name not in catalog:
+        elif call_name not in catalog and call_name not in CALL_COMPAT:
             # Not on this surface. Refused here rather than forwarded: the
             # compact endpoint's whole value is that it cannot be used to
-            # reach the other 282 tools.
+            # reach the rest of the 293-tool surface.
             return types.CallToolResult(
                 content=[types.TextContent(
                     type="text",
