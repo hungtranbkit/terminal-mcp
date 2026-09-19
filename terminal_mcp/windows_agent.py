@@ -157,7 +157,12 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:  # noqa: BLE001 -- a failed adoption must not stop the agent
             _log.exception("detached session adoption failed -- sessions left running, "
                            "unadopted; they are NOT lost, retry by restarting this agent")
-    terminal = TerminalService(config, tmux=backend)
+    # `registry_node_id` is this agent's OWN id, the same one it registers and
+    # heartbeats under. Without it the durable session registry falls back to
+    # the `local` placeholder, and on a host that also runs a controller both
+    # processes share one session_registry.db -- so the agent kept re-creating
+    # the legacy-ownership rows the controller's migration had just retired.
+    terminal = TerminalService(config, tmux=backend, registry_node_id=args.node_id)
     # Retired session-name whitelist -> real grants, same as the controller
     # does at its own startup. Every node type runs this so a fleet cannot end
     # up with one machine still honouring a whitelist the others dropped.
