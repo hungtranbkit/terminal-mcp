@@ -830,3 +830,132 @@ def test_extract_composer_text_skips_trailing_blank_lines():
 
 def test_extract_composer_text_empty_snapshot_returns_empty():
     assert _extract_composer_text([]) == ""
+
+
+# ---------------------------------------------------------------------------
+# URGENT bugfix regressions, both live-reproduced 2026-09-19.
+#
+# 1. GENERIC SHELL, EMBEDDED NEWLINES (session tmcp-surface-shell): a
+#    multiline payload returned BLOCKED/SUBMIT_UNCONFIRMED with
+#    enter_sent=False -- the identity re-pin withheld the Enter -- and the
+#    pane nevertheless showed the payload's own `===SHOW===` output. The
+#    text injection itself had already run it. `tmux send-keys -l` writes
+#    embedded "\n" straight to the pty and a shell under ordinary tty line
+#    discipline acts on each one as it lands, so "withhold the final Enter"
+#    is not a safety boundary for these targets: by the time any check
+#    runs, N-1 of N lines have executed. The only boundary that holds is
+#    refusing before the first byte goes out.
+#
+# 2. CLAUDE STAGED MULTILINE EDITOR (session terminal-mcp-session-health):
+#    terminal_send_text returned SUBMIT_CONFIRMED "via adapter ack
+#    evidence" while the whole prompt was still sitting in Claude's input
+#    editor under a `ctrl+x ctrl+s to send now` footer -- staged, not sent.
+#    Each swallowed Enter grows that buffer, which moves rows above the
+#    composer's own last line, so _shows_genuine_progress passed and an
+#    idle target never reached the stricter busy-window echo check. This is
+#    the user's recurring "prompt sent but not running" report.
+# ---------------------------------------------------------------------------
+
+MULTILINE_SHELL_PAYLOAD = "echo ===SHOW===\necho SECOND_LINE"
+
+
+def test_generic_shell_multiline_send_is_refused_before_anything_executes(
+    tmux_session_factory, tmp_path
+):
+    session = tmux_session_factory("test-shell-multiline", "bash --norc --noprofile -i")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, MULTILINE_SHELL_PAYLOAD, press_enter=True)
+    assert result["sent"] is False
+    assert result["enter_sent"] is False
+    assert result["error"] == "MULTILINE_SHELL_SEND_REFUSED"
+    assert result["delivery_state"] == "BLOCKED"
+    assert result["submit_status"] == "SUBMIT_UNCONFIRMED"
+    # THE regression: no part of the payload may have executed, and nothing
+    # may be left staged in the shell's line buffer either.
+    pane = service.terminal_tail(session, 20)["output"]
+    assert "===SHOW===" not in pane
+    assert "SECOND_LINE" not in pane
+    assert "echo" not in pane
+
+
+def test_generic_shell_multiline_is_refused_even_without_press_enter(tmux_session_factory, tmp_path):
+    """press_enter=False is not safer: the injection is what executes."""
+    session = tmux_session_factory("test-shell-multiline-noenter", "bash --norc --noprofile -i")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, MULTILINE_SHELL_PAYLOAD, press_enter=False)
+    assert result["error"] == "MULTILINE_SHELL_SEND_REFUSED"
+    assert result["sent"] is False
+    assert "===SHOW===" not in service.terminal_tail(session, 20)["output"]
+
+
+def test_generic_shell_bare_carriage_return_is_refused_too(tmux_session_factory, tmp_path):
+    """A lone \\r is Enter to a pty exactly as much as \\n is."""
+    session = tmux_session_factory("test-shell-crlf", "bash --norc --noprofile -i")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "echo ===SHOW===\recho SECOND", press_enter=True)
+    assert result["error"] == "MULTILINE_SHELL_SEND_REFUSED"
+    assert "===SHOW===" not in service.terminal_tail(session, 20)["output"]
+
+
+def test_generic_shell_single_line_send_still_confirms_and_runs(tmux_session_factory, tmp_path):
+    """The guard is scoped to embedded newlines -- ordinary shell sends are
+    completely unchanged, still confirmed, still actually executed."""
+    session = tmux_session_factory("test-shell-single-line", "bash --norc --noprofile -i")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "echo ===SHOW===", press_enter=True)
+    assert result["sent"] is True
+    assert result["enter_sent"] is True
+    assert "error" not in result
+    assert result["submit_status"] == "SUBMIT_CONFIRMED"
+    time.sleep(0.4)
+    assert "===SHOW===" in service.terminal_tail(session, 20)["output"]
+
+
+def test_codex_multiline_prompt_is_not_refused(tmux_session_factory, tmp_path):
+    """An interactive agent CLI owns its own multiline composer -- the shell
+    guard must never reach it, or every multiline Codex/Claude prompt breaks."""
+    session = _codex_session(tmux_session_factory, "test-codex-multiline", "submits_and_shows_working")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "first line\nsecond line", press_enter=True)
+    assert result.get("error") != "MULTILINE_SHELL_SEND_REFUSED"
+    assert result["sent"] is True
+
+
+def test_claude_staged_multiline_editor_is_submitted_not_falsely_confirmed(
+    tmux_session_factory, tmp_path
+):
+    """THE false-positive regression: a staged editor must never confirm on
+    its own redraw, and the submit key the footer names must actually be
+    pressed and verified before SUBMIT_CONFIRMED is reported."""
+    session = _claude_session(tmux_session_factory, "test-claude-staged", "staged_multiline_editor")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "run the health check", press_enter=True)
+    assert result["staged_editor_detected"] is True
+    assert result["staged_submit_attempted"] is True
+    assert result["staged_submit_keys"] == ["C-x", "C-s"]
+    assert result["submit_status"] == "SUBMIT_CONFIRMED"
+    assert "staged editor" in result["submit_reason"]
+    pane = service.terminal_tail(session, 20)["output"]
+    assert "SUBMITTED[1]: run the health check" in pane
+    assert pane.count("SUBMITTED[") == 1  # one press, never a loop
+
+
+def test_claude_staged_editor_that_never_submits_is_never_confirmed(tmux_session_factory, tmp_path):
+    """The other direction: pressing the advertised key cannot manufacture a
+    confirmation when the prompt genuinely stays staged and unsent."""
+    session = _claude_session(tmux_session_factory, "test-claude-staged-stuck", "staged_never_submits")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "run the health check", press_enter=True)
+    assert result["staged_submit_attempted"] is True
+    assert result["submit_status"] == "SUBMIT_UNCONFIRMED"
+    assert result["delivery_state"] == "DELIVERY_UNKNOWN"
+    pane = service.terminal_tail(session, 20)["output"]
+    assert "SUBMITTED[" not in pane
+    assert "ctrl+x ctrl+s to send now" in pane  # still staged, honestly reported
