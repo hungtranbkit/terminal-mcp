@@ -10996,7 +10996,7 @@ GLOBAL_TASKS_HTML = """<!doctype html>
         rej.style.color = 'var(--muted)';
         rej.textContent = 'rejected: ' + task.router_rejections
           .map(r => `${clean(r.session)} (${clean(r.reason)})`).join(', ');
-        rej.title = task.router_rejections.map(r => `${clean(r.session)}: ${clean(r.detail)}`).join('\n');
+        rej.title = task.router_rejections.map(r => `${clean(r.session)}: ${clean(r.detail)}`).join('\\n');
         card.append(rej);
       }
       if (task.routing_reason) {

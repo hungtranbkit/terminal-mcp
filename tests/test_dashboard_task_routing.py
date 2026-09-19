@@ -109,3 +109,7 @@ def test_the_board_template_renders_the_routing_fields():
     assert "router_reason" in GLOBAL_TASKS_HTML
     assert "router_rejections" in GLOBAL_TASKS_HTML
     assert "WAITING_RUNTIME" in GLOBAL_TASKS_HTML
+
+
+def test_global_tasks_router_rejection_join_is_valid_js_escape():
+    assert r".join('\n')" in GLOBAL_TASKS_HTML
