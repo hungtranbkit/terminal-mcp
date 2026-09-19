@@ -15344,6 +15344,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             result["running"] = list(result.get("running", [])) + runtime_rows
         result["durable_running"] = len(result.get("running", [])) - len(runtime_rows)
         result["runtime_untracked"] = len(runtime_rows)
+        counts = result.get("counts")
+        if isinstance(counts, dict):
+            counts["running"] = len(result.get("running", []))
         # PM/Orchestrator checkpoint (§20.2): enrich each card with its
         # own latest routing decision, if any -- ONE bulk read (never
         # N+1 per card), done here at the dashboard-route layer rather

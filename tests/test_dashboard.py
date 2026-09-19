@@ -2275,6 +2275,8 @@ class _StubQueue:
         return {
             "backlog": [], "queued": [], "running": list(self._running),
             "blocked_review": [], "done": [],
+            "counts": {"backlog": 0, "queued": 0, "running": len(self._running),
+                       "blocked_review": 0, "done": 0},
         }
 
     def global_inbox(self, *, recent_limit: int = 20):
@@ -2466,6 +2468,7 @@ def test_global_tasks_board_includes_untracked_runtime_agents(read_config):
     body = response.json()
     assert body["durable_running"] == 0
     assert body["runtime_untracked"] == 1
+    assert body["counts"]["running"] == 1
     assert len(body["running"]) == 1
     synthetic = body["running"][0]
     assert synthetic["session"] == "nova-claude-long"
