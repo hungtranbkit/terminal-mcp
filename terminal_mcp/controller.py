@@ -28,6 +28,8 @@ from .node_client import LocalNodeClient, NodeClient, NodeClientError, RemoteNod
 from .node_models import NODE_ONLINE, Node
 from .node_health import NodeHealthPolicy, NodeHealthService
 from .node_registry import NodeRegistry
+from .session_resource import (ContextPolicy, build_resource_block,
+                              parse_session_resources)
 from .config import NodeHealthConfig
 from .connection_manager import ConnectionManager
 from .lease import ResourceLockStore
@@ -97,8 +99,20 @@ class ControllerService:
                 local_client: NodeClient | None = None, local_display_name: str = "Local",
                 local_hostname: str | None = None, local_workspace_root: str = "/",
                 node_health_config: NodeHealthConfig | None = None,
-                node_health: NodeHealthService | None = None) -> None:
+                node_health: NodeHealthService | None = None,
+                session_health: Any = None) -> None:
         self.registry = registry
+        # TMCP-SESSION-HEALTH-001: thresholds for the controller-side
+        # enrichment below (_with_resource_health). Taken from THIS process's
+        # own AppConfig via the local client when not passed explicitly, so a
+        # deployment that customizes session_health gets the same policy on
+        # the remote path as on the local one, with no new argument at any
+        # existing call site.
+        resolved_health = session_health
+        if resolved_health is None:
+            app_config = getattr(getattr(local_client, "terminal", None), "config", None)
+            resolved_health = getattr(app_config, "session_health", None)
+        self.session_health = resolved_health
         self.local_node_id = local_node_id
         self.local_workspace_root = local_workspace_root
         self._clients: dict[str, NodeClient] = {}
@@ -454,8 +468,62 @@ class ControllerService:
                                      lambda client, name: client.tail(name, lines, ansi=ansi)))
 
     def terminal_status(self, session: str) -> dict[str, Any]:
-        return _reredact(self._route(session, "status",
-                                     lambda client, name: client.status(name)))
+        return self._with_resource_health(
+            _reredact(self._route(session, "status",
+                                  lambda client, name: client.status(name))))
+
+    def _with_resource_health(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Add `resource` to a status payload whose node did not produce one.
+
+        THE CENTRAL HOST DOES THE PARSING. A remote node running an older
+        build returns the footer inside `last_output` but no `resource`
+        block -- and requiring every node in the fleet to be upgraded before
+        the controller can read a number that is already sitting in the
+        response it is holding would be a deployment coupling with nothing
+        to justify it. So the controller parses what the node sent it. A node
+        that DID enrich keeps its own block untouched (checked first), which
+        is what makes this forward-compatible rather than a second, competing
+        source of truth.
+
+        `git` is deliberately all-null on this path. The cwd in a remote
+        payload names a directory on ANOTHER machine; probing it here would
+        report THIS host's git state under that path -- exactly the
+        confidently-wrong number this feature exists to avoid. Unknown git
+        makes the rollover hook refuse (GIT_STATE_UNKNOWN), the safe
+        direction. `agent` is null for the same reason: the remote payload
+        does not carry the pane's command, and it is never guessed from the
+        footer.
+
+        Never raises: a status read must not fail because a footer was odd.
+        """
+        if not isinstance(result, dict) or "error" in result:
+            return result
+        if isinstance(result.get("resource"), dict):
+            return result
+        config = self.session_health
+        if config is not None and not getattr(config, "enabled", True):
+            return result
+        text = result.get("last_output")
+        if not isinstance(text, str):
+            return result
+        try:
+            policy = (ContextPolicy(
+                watch_percent=config.watch_percent,
+                prepare_rollover_percent=config.prepare_rollover_percent,
+                finish_rollover_percent=config.finish_rollover_percent,
+                checkpoint_only_percent=config.checkpoint_only_percent)
+                if config is not None else None)
+            result["resource"] = build_resource_block(
+                agent=None, parsed=parse_session_resources(text),
+                git={"repo": None, "branch": None, "dirty": None},
+                checkpoint={"task_id": None, "resume_token": None, "branch": None,
+                            "last_commit": None, "conversation_id": None,
+                            "worktree_path": None, "cwd": result.get("cwd"),
+                            "last_checkpoint_at": None},
+                policy=policy)
+        except Exception:  # noqa: BLE001 -- enrichment never breaks a status read
+            return result
+        return result
 
     def terminal_status_bounded(self, session: str, timeout_seconds: float) -> dict[str, Any]:
         """Status read whose resolution + node I/O share one caller-owned time budget.
@@ -496,7 +564,7 @@ class ControllerService:
             result.setdefault("node_name", node.display_name if node else node_id)
             if "redirected_from" in resolution:
                 result.setdefault("redirected_from", resolution["redirected_from"])
-        return _reredact(result)
+        return self._with_resource_health(_reredact(result))
 
     def terminal_capture(self, session: str, start_line: int | None = None) -> dict[str, Any]:
         return _reredact(self._route(session, "capture",
