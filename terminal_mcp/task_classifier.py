@@ -54,7 +54,18 @@ EXCLUSIONS: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"(?i)\b(auth|authoriz|authentic|permission|grant|rbac|acl|login|session[_ ]?token"
         r"|access[_ ]?control|cf[_-]?access"
         r"|đăng nhập|đăng xuất|phân quyền|quyền truy cập|xác thực|uỷ quyền|ủy quyền)\b")),
-    ("payment", re.compile(r"(?i)\b(payment|billing|invoice|charge|stripe|refund|checkout)\b")),
+    # `checkout` is deliberately NOT a bare keyword here. In this repository it
+    # is overwhelmingly the git verb -- "verify the current checkout is
+    # readable" was classified as a PAYMENT change on the live fleet, which
+    # escalated a read-only smoke task to SAFE/requires_approval. A payment
+    # checkout always says so in the next word, so the phrase is matched
+    # instead of the token. `charge` gets the same treatment for the same
+    # reason ("in charge of", "charge the battery").
+    ("payment", re.compile(
+        r"(?i)(\b(payment|billing|invoice|stripe|refund)\b"
+        r"|\bcheckout\s+(page|flow|form|session|cart|basket|process)\b"
+        r"|\b(payment|stripe|card)\s+checkout\b"
+        r"|\bcharge\s+(the\s+)?(card|customer|user|account)\b)")),
     ("database/schema/migration", re.compile(
         r"(?i)\b(migration|schema|alter table|drop table|truncate|backfill|reindex"
         r"|sqlite|postgres|mysql)\b")),

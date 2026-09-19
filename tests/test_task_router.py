@@ -20,6 +20,7 @@ import pytest
 
 from terminal_mcp import session_matcher as sm
 from terminal_mcp import task_profile
+from terminal_mcp.compact_tools import START_UNDERWAY_STATUSES
 from terminal_mcp.config import RouterConfig
 from terminal_mcp.queue_service import QueueService
 from terminal_mcp.queue_store import (
@@ -103,17 +104,58 @@ class FakeController:
         return {"session": name, "node_id": self.local_node_id}
 
 
-class RecordingEngine:
-    """Stands in for QueueEngine. Records which lanes were ticked; it never
-    needs to move the state machine, because what is under test is whether the
-    router hands the right lane to the engine at all."""
+class _Result:
+    def __init__(self, action, detail=None):
+        self.action = action
+        self.detail = detail
 
-    def __init__(self):
+
+class RecordingEngine:
+    """Stands in for QueueEngine, INCLUDING its one-transition-per-tick rule.
+
+    The first cut of this fake just recorded the lane and returned, which let
+    the live BOUND-but-QUEUED bug through the whole suite: the router called
+    tick() once, nothing moved, and every test still passed because the fake
+    never had a state machine to fail to advance. It now walks the real edges,
+    one per tick, so "did the router actually get this task running" is a
+    question these tests can answer.
+    """
+
+    def __init__(self, store=None):
+        self.store = store
         self.ticks: list[str] = []
+        self._path = ["PRECHECK", "READY", "DISPATCHING", "RUNNING"]
 
     def tick(self, session):
         self.ticks.append(session)
-        return type("Result", (), {"action": "DISPATCHED", "to_dict": lambda self: {}})()
+        if self.store is None:
+            return _Result("NO_STORE")
+        lane = self.store.lane_status(session)
+        pending = [row for row in lane["tasks"]
+                   if row["status"] in ("QUEUED", *self._path[:-1])]
+        if not pending:
+            return _Result("IDLE")
+        task = pending[0]
+        nxt = self._path[0] if task["status"] == "QUEUED" else \
+            self._path[self._path.index(task["status"]) + 1]
+        self.store.transition_task(task["id"], nxt, event_type="TEST_TICK")
+        return _Result(nxt, detail=None)
+
+
+class StubbornEngine:
+    """An engine that accepts the tick and refuses to move the task.
+
+    The real one does this whenever the admission governor declines, a lane is
+    paused, or a dependency is unmet -- and that is the state the live failure
+    was reported in."""
+
+    def __init__(self, detail="admission refused: claude concurrency limit reached"):
+        self.ticks: list[str] = []
+        self.detail = detail
+
+    def tick(self, session):
+        self.ticks.append(session)
+        return _Result("QUEUED", detail=self.detail)
 
 
 def _row(name, *, node_id="local", input_ok=True, stale=False):
@@ -133,7 +175,7 @@ def queue(store):
 
 def _router(store, queue, controller, *, engine=None, config=None):
     return TaskRouter(store, controller=controller, queue=queue,
-                      engine=engine or RecordingEngine(),
+                      engine=engine if engine is not None else RecordingEngine(store),
                       session_registry=controller.session_registry,
                       config=config or _config())
 
@@ -334,7 +376,7 @@ def test_route_start_without_a_target_binds_an_idle_compatible_session(store, qu
         sessions=[_row("agent-a")],
         records=[FakeRecord(node_id="local", session_name="agent-a", cwd=worktree,
                             repo_root=worktree, git_remote=None)])
-    engine = RecordingEngine()
+    engine = RecordingEngine(store)
     router = _router(store, queue, controller, engine=engine)
 
     receipt = router.route_start("do the work", metadata={"repo": worktree})
@@ -345,12 +387,15 @@ def test_route_start_without_a_target_binds_an_idle_compatible_session(store, qu
     assert receipt["dispatched"] is True
     assert receipt["poll"] is False
     assert "same repo" in receipt["routing_reason"]
-    assert engine.ticks == ["agent-a"]
+    assert set(engine.ticks) == {"agent-a"}
 
     task = store.get_task(receipt["task_id"])
     assert task.execution_session == "agent-a"
     assert task.routing_state == BOUND
     assert task.routing_evidence["reason"] == receipt["routing_reason"]
+    # Actually under way, not merely bound -- see the live BOUND+QUEUED failure.
+    assert task.status not in (QUEUED, "PRECHECK")
+    assert receipt["task_state"] == task.status
 
 
 def test_route_start_with_an_explicit_target_is_hard_affinity(store, queue, tmp_path):
@@ -361,14 +406,14 @@ def test_route_start_with_an_explicit_target_is_hard_affinity(store, queue, tmp_
         records=[FakeRecord(node_id="local", session_name="preferred"),
                  FakeRecord(node_id="local", session_name="named",
                             last_known_state="IDLE")])
-    engine = RecordingEngine()
+    engine = RecordingEngine(store)
     router = _router(store, queue, controller, engine=engine)
 
     receipt = router.route_start("work", target="named")
 
     assert receipt["session"] == "named"
     assert receipt["explicit_target"] is True
-    assert engine.ticks == ["named"]
+    assert set(engine.ticks) == {"named"}
     task = store.get_task(receipt["task_id"])
     assert task.execution_session == "named"
     assert task.metadata["pinned_session"] == "named"
@@ -495,7 +540,8 @@ def test_a_completed_task_releases_its_session_for_the_next_one(store, queue):
                                 records=[FakeRecord(node_id="local", session_name="only")])
     router = _router(store, queue, controller)
     first = router.route_start("one")
-    store.transition_task(first["task_id"], COMPLETED, event_type="TEST")
+    for status in ("RUNNING", "VERIFYING", COMPLETED):
+        store.transition_task(first["task_id"], status, event_type="TEST")
 
     second = router.route_start("two")
 
@@ -532,7 +578,7 @@ def test_queued_task_beside_idle_session_is_rescued(store, queue):
     controller = FakeController(sessions=[_row("idle-agent")],
                                 records=[FakeRecord(node_id="local", session_name="idle-agent",
                                                     last_known_state="IDLE")])
-    engine = RecordingEngine()
+    engine = RecordingEngine(store)
     router = _router(store, queue, controller, engine=engine)
 
     created = queue.create_task("stuck", "work that went nowhere")
@@ -547,7 +593,9 @@ def test_queued_task_beside_idle_session_is_rescued(store, queue):
     task = store.get_task(task_id)
     assert task.execution_session == "idle-agent"
     assert task.routing_state == BOUND
-    assert engine.ticks == ["idle-agent"]
+    assert set(engine.ticks) == {"idle-agent"}
+    # The bug was "bound but still QUEUED". Binding is not the assertion.
+    assert task.status not in (QUEUED, "PRECHECK")
 
 
 def test_rescue_retries_a_deferred_task_once_a_session_frees_up(store, queue):
@@ -589,7 +637,7 @@ def test_rescue_is_restart_safe_and_reaches_the_same_answer_from_disk(store, que
     # A brand-new store over the SAME file is exactly what a restart produces.
     reopened = QueueStore(store.path)
     router = TaskRouter(reopened, controller=controller, queue=QueueService(reopened),
-                        engine=RecordingEngine(),
+                        engine=RecordingEngine(reopened),
                         session_registry=controller.session_registry, config=_config())
 
     assert router.rescue_once()["routed"] == 1
@@ -899,4 +947,152 @@ def test_a_task_whose_session_vanished_is_rescued_even_from_a_named_lane(store, 
     report = router.rescue_once()
 
     assert report["routed"] == 1
-    assert store.get_task(task_id).execution_session == "survivor"
+    rehomed = store.get_task(task_id)
+    assert rehomed.execution_session == "survivor"
+    # WAITING_SESSION's only outgoing edge is QUEUED, and the rebind has to
+    # take it or the task is bound to a live runtime that can never claim it.
+    assert rehomed.status not in (WAITING_SESSION, QUEUED)
+
+
+# ---------------------------------------------------------------------------
+# LIVE FAILURE, hp-linux @ 5cecd87 -- BOUND + QUEUED + dispatched=true.
+#
+# route_start chose terminal-mcp-claude-audit (score 55) and returned
+# dispatched=true / routing_state=BOUND, while the task stayed status=QUEUED
+# at queue_position=2 with started_at=null and the session stayed IDLE. Three
+# separate defects lined up to produce it, and each gets its own test.
+# ---------------------------------------------------------------------------
+
+def test_a_session_whose_lane_already_has_queued_work_is_rejected(store, queue):
+    """DEFECT 1. This was a -5 score penalty, so a backlogged lane still won.
+    The task was appended BEHIND the existing queue and could not start."""
+    controller = FakeController(
+        sessions=[_row("terminal-mcp-claude-audit")],
+        records=[FakeRecord(node_id="local", session_name="terminal-mcp-claude-audit",
+                            last_known_state="IDLE")])
+    store.set_tasks("terminal-mcp-claude-audit", [{"prompt": "already waiting here"}])
+    router = _router(store, queue, controller)
+
+    receipt = router.route_start("ROUTER_SMOKE: verify and reply")
+
+    assert receipt["session"] is None
+    assert receipt["routing_state"] == WAITING_RUNTIME
+    assert receipt["rejected_candidates"][0]["rejected"] == sm.SESSION_BACKLOGGED
+    assert receipt["dispatched"] is False
+
+
+def test_dispatched_is_false_when_the_engine_declines_to_start_the_task(store, queue):
+    """DEFECT 2. `dispatched` came from "tick() did not raise", so a task the
+    admission governor had refused came back as started."""
+    controller = FakeController(sessions=[_row("idle-one")],
+                                records=[FakeRecord(node_id="local", session_name="idle-one")])
+    engine = StubbornEngine()
+    router = _router(store, queue, controller, engine=engine)
+
+    receipt = router.route_start("work the engine will not claim")
+
+    assert receipt["dispatched"] is False
+    assert receipt["status"] == "TASK_ACCEPTED"
+    assert engine.ticks, "the router must at least have tried"
+    assert "admission refused" in receipt["routing_reason"]
+
+
+def test_a_task_the_engine_will_not_start_is_released_not_left_bound_and_queued(store, queue):
+    """DEFECT 3. Leaving it BOUND parks the task in a lane nothing will advance
+    while holding a session other tasks could use -- the original bug with a
+    routing decision attached to it."""
+    controller = FakeController(sessions=[_row("idle-one")],
+                                records=[FakeRecord(node_id="local", session_name="idle-one")])
+    router = _router(store, queue, controller, engine=StubbornEngine())
+
+    receipt = router.route_start("work the engine will not claim")
+    task = store.get_task(receipt["task_id"])
+
+    assert task.routing_state == WAITING_RUNTIME
+    assert task.execution_session is None          # the session was handed back
+    assert task.status == QUEUED                   # durable, never failed
+    assert "released" in task.routing_evidence["reason"]
+    assert task.routing_evidence["undispatchable_session"] == "idle-one"
+    # And the freed session is offered to the next task rather than held.
+    assert store.tasks_bound_to_session("idle-one") == []
+
+
+def test_route_start_drives_the_lane_past_a_single_transition(store, queue):
+    """The engine makes ONE transition per tick, so binding plus one tick can
+    never reach a running task -- the router has to drive the sequence."""
+    controller = FakeController(sessions=[_row("idle-one")],
+                                records=[FakeRecord(node_id="local", session_name="idle-one")])
+    engine = RecordingEngine(store)
+    router = _router(store, queue, controller, engine=engine)
+
+    receipt = router.route_start("real work")
+
+    assert len(engine.ticks) > 1
+    assert receipt["dispatch_ticks"] > 1
+    assert receipt["task_state"] in START_UNDERWAY_STATUSES
+    assert receipt["dispatched"] is True
+
+
+def test_the_exact_live_scenario_now_reaches_a_truthful_outcome(store, queue, tmp_path):
+    """END TO END, with the live fleet's shape: two sessions in the SAME repo,
+    the first with work already queued in its lane and the second genuinely
+    free. The first is what the live router picked, and picking it is what
+    produced BOUND + QUEUED."""
+    repo = _repo_worktree(tmp_path, "terminal-mcp")
+    controller = FakeController(
+        sessions=[_row("terminal-mcp-claude-audit"), _row("free-runner")],
+        records=[
+            FakeRecord(node_id="local", session_name="terminal-mcp-claude-audit",
+                       cwd=repo, repo_root=repo, last_known_state="IDLE"),
+            FakeRecord(node_id="local", session_name="free-runner", cwd=repo,
+                       repo_root=repo, last_known_state="IDLE"),
+        ])
+    store.set_tasks("terminal-mcp-claude-audit", [{"prompt": "work already queued there"}])
+    engine = RecordingEngine(store)
+    router = _router(store, queue, controller, engine=engine)
+
+    receipt = router.route_start(
+        "ROUTER_SMOKE_001: verify the current Terminal MCP checkout is readable",
+        metadata={"repo": repo})
+
+    # The higher-scoring session is refused for a stated reason, and the task
+    # goes somewhere it can actually run -- never bound-and-stuck.
+    assert receipt["session"] == "free-runner"
+    assert receipt["dispatched"] is True
+    task = store.get_task(receipt["task_id"])
+    assert task.status in START_UNDERWAY_STATUSES
+    assert task.execution_session == "free-runner"
+    rejected = {row["session"]: row["rejected"] for row in
+                task.routing_evidence["rejected"]}
+    assert rejected["terminal-mcp-claude-audit"] == sm.SESSION_BACKLOGGED
+
+
+def test_a_read_only_smoke_prompt_is_not_classified_as_a_payment_change():
+    """The live smoke prompt came back risk_flags=['payment'] because the
+    payment exclusion matched the bare token `checkout` in "the current
+    Terminal MCP checkout" -- a git checkout, not a shopping one."""
+    profile = task_profile.analyze(
+        prompt="ROUTER_SMOKE_001: verify the current Terminal MCP checkout is readable "
+               "and reply exactly ROUTER_SMOKE_OK. Do not modify files, do not commit.")
+    assert profile.risk_flags == ()
+    assert profile.requires_approval is False
+
+
+@pytest.mark.parametrize("prompt", [
+    "update the stripe checkout flow",
+    "the billing page is broken",
+    "issue a refund for this invoice",
+    "charge the card on file twice",
+])
+def test_real_payment_work_is_still_excluded(prompt):
+    """The false-positive fix must not blunt the exclusion it narrowed."""
+    assert "payment" in task_profile.analyze(prompt=prompt).risk_flags
+
+
+@pytest.mark.parametrize("prompt", [
+    "git checkout main and run the tests",
+    "verify the checkout at /srv/app is clean",
+    "who is in charge of this module",
+])
+def test_git_and_ordinary_english_are_not_payment_work(prompt):
+    assert "payment" not in task_profile.analyze(prompt=prompt).risk_flags

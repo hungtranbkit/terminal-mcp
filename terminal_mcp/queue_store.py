@@ -1701,6 +1701,18 @@ class QueueStore:
                         "session": session, "held_by": holder["id"]}
 
             now = iso_now()
+            if task.status == WAITING_SESSION:
+                # Its old session was unreachable; this one is not. QUEUED is
+                # the only outgoing edge WAITING_SESSION has, and taking it
+                # here is what lets the engine claim the task at all -- left
+                # as-is the task would be bound to a live runtime and still
+                # unclaimable, which is the bound-but-stuck state this whole
+                # feature exists to remove. A fresh claim + full coordinator
+                # review is exactly what that status's own contract promises.
+                self._transition_locked(
+                    connection, task_id, WAITING_SESSION, QUEUED,
+                    event_type="REROUTED",
+                    reason=f"re-homed from {task.session!r} to {session!r} for a fresh claim")
             if task.session != session:
                 self._ensure_lane(connection, session)
                 max_position = connection.execute(

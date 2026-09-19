@@ -55,6 +55,7 @@ INPUT_NOT_PERMITTED = "INPUT_NOT_PERMITTED"
 STALE_IDENTITY = "STALE_IDENTITY"
 SESSION_BUSY = "SESSION_BUSY"
 SESSION_CLAIMED = "SESSION_CLAIMED"
+SESSION_BACKLOGGED = "SESSION_BACKLOGGED"
 REPO_MISMATCH = "REPO_MISMATCH"
 MISSING_REQUIRED_SKILL = "MISSING_REQUIRED_SKILL"
 AGENT_BOUND_ELSEWHERE = "AGENT_BOUND_ELSEWHERE"
@@ -73,6 +74,7 @@ REJECTION_TEXT: dict[str, str] = {
     STALE_IDENTITY: "the session's grant is pinned to a process that no longer exists",
     SESSION_BUSY: "session is actively running something else",
     SESSION_CLAIMED: "another task already holds this session",
+    SESSION_BACKLOGGED: "the session's lane already has queued work ahead of this task",
     REPO_MISMATCH: "session is checked out in a different repository",
     MISSING_REQUIRED_SKILL: "session does not provide a skill this task requires",
     AGENT_BOUND_ELSEWHERE: "this task's agent is bound to a different session",
@@ -94,7 +96,6 @@ SCORE_CONTEXT_ROOMY = 10
 PENALTY_CONTEXT_TIGHT = -20
 PENALTY_DIRTY_BRANCH = -40
 PENALTY_REPO_UNKNOWN = -50
-PENALTY_QUEUE_BACKLOG = -5
 
 CONTEXT_ROOMY_PERCENT = 70.0
 CONTEXT_TIGHT_PERCENT = 85.0
@@ -315,6 +316,19 @@ def hard_reject(profile: TaskProfile, candidate: SessionCandidate) -> str | None
         return SESSION_CLAIMED
     if candidate.active_tasks > 0:
         return SESSION_BUSY
+    if candidate.queued_tasks > 0:
+        # FOUND LIVE (hp-linux, 5cecd87): this was a -5 score penalty, so a
+        # lane with work already queued still looked eligible. The router bound
+        # a task there, appended it BEHIND the existing queue, and reported it
+        # dispatched -- producing exactly the BOUND-but-QUEUED state this whole
+        # feature exists to eliminate.
+        #
+        # A lane is serial. "Already has a queued task" means this task cannot
+        # start now, however attractive the session is otherwise, so it is a
+        # hard reject rather than a discount. Waiting for a runtime that is
+        # genuinely free is strictly better than being queued second behind
+        # one that is not.
+        return SESSION_BACKLOGGED
     if profile.runtime_required and profile.preferred_runtime and candidate.runtime:
         if str(candidate.runtime).lower() != str(profile.preferred_runtime).lower():
             return RUNTIME_MISMATCH
@@ -394,11 +408,6 @@ def score(profile: TaskProfile, candidate: SessionCandidate) -> tuple[int, list[
         total += PENALTY_DIRTY_BRANCH
         reasons.append(f"{PENALTY_DIRTY_BRANCH} uncommitted work on a different branch "
                        f"({candidate.branch}, task wants {profile.branch})")
-
-    if candidate.queued_tasks:
-        total += PENALTY_QUEUE_BACKLOG * min(candidate.queued_tasks, 4)
-        reasons.append(f"{PENALTY_QUEUE_BACKLOG * min(candidate.queued_tasks, 4)} "
-                       f"{candidate.queued_tasks} task(s) already queued here")
 
     return total, reasons
 

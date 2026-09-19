@@ -47,6 +47,10 @@ from typing import Any, Callable, Sequence
 
 from . import session_matcher as sm
 from . import task_profile
+from .compact_tools import (
+    MAX_START_TICKS, START_NEEDS_HUMAN_STATUSES, START_SERVER_PENDING_STATUSES,
+    START_UNDERWAY_STATUSES,
+)
 from .node_models import NODE_ONLINE
 from .queue_store import (
     BOUND, QUEUED, SPAWNED, TERMINAL_STATUSES, UNROUTED, WAITING_RUNTIME, QueueStore,
@@ -84,6 +88,13 @@ class RoutingOutcome:
     reason: str = ""
     routing_state: str = UNROUTED
     dispatched: bool = False
+    """TRUE ONLY WHEN THE ENGINE ACTUALLY ADVANCED THE TASK. Found live
+    (hp-linux, 5cecd87): this was set from "tick() did not raise", so a task
+    the engine had declined to claim came back dispatched=True while sitting
+    QUEUED -- a receipt that lies in exactly the direction that makes an
+    orchestrator stop watching."""
+    dispatch_ticks: int = 0
+    dispatch_detail: str | None = None
     task_state: str | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
 
@@ -92,6 +103,7 @@ class RoutingOutcome:
             "outcome": self.outcome, "task_id": self.task_id, "session": self.session,
             "node_id": self.node_id, "score": self.score, "reason": self.reason,
             "routing_state": self.routing_state, "dispatched": self.dispatched,
+            "dispatch_ticks": self.dispatch_ticks, "dispatch_detail": self.dispatch_detail,
             "task_state": self.task_state, "routing_evidence": self.evidence,
         }
 
@@ -407,8 +419,8 @@ class TaskRouter:
                 node_id=chosen.candidate.node_id, score=chosen.score,
                 reason=evidence["reason"], routing_state=BOUND,
                 task_state=bound.get("status"), evidence=evidence)
-            if dispatch:
-                self._dispatch(outcome)
+            if dispatch and not self._dispatch(outcome):
+                return self._release_and_defer(outcome, evidence)
             return outcome
 
         spawn_allowed = self.spawn_enabled if allow_spawn is None else allow_spawn
@@ -428,8 +440,11 @@ class TaskRouter:
                         outcome=SPAWNED_RUNTIME, task_id=task_id, session=session_name,
                         node_id=node_id, reason=evidence["reason"], routing_state=SPAWNED,
                         task_state=bound.get("status"), evidence=evidence)
-                    if dispatch:
-                        self._dispatch(outcome)
+                    if dispatch and not self._dispatch(outcome):
+                        # A session the router itself just created that still
+                        # will not start the task is a real problem, but the
+                        # honest answer is the same: say so and re-match.
+                        return self._release_and_defer(outcome, evidence)
                     return outcome
 
         evidence["reason"] = self._deferral_reason(match, spawn_allowed)
@@ -462,27 +477,89 @@ class TaskRouter:
         tail = "" if spawn_allowed else "; spawning a new runtime is disabled by policy"
         return f"no eligible session among {match.considered} candidates ({summary}){tail}"
 
-    def _dispatch(self, outcome: RoutingOutcome) -> None:
-        """Hand the freshly bound lane to the existing engine.
+    def _dispatch(self, outcome: RoutingOutcome) -> bool:
+        """Drive the bound lane until the task is genuinely under way.
 
-        One tick, not a loop. The engine makes one transition per call by
-        design, and the caller of a route is not the right place to spend
-        wall-clock driving a state machine that the queue loop and the
-        follower already advance."""
+        NOT ONE TICK. QueueEngine.tick makes at most ONE transition per call by
+        design (claim -> coordinator review -> dispatch), so a single tick
+        leaves a task at PRECHECK at best -- and if the engine declines to
+        claim at all (the LLM governor refusing admission, a paused lane, an
+        unmet dependency) it leaves it exactly where it was. Binding and
+        ticking once and calling that "dispatched" is what produced the live
+        BOUND-but-QUEUED failure.
+
+        So this drives the same bounded sequence `turn(action="start")` already
+        uses, with the same constants, and stops at the first settled state.
+        This is a bound on how long the ROUTER waits, never on the task, which
+        is durable from the moment it was persisted.
+
+        Driving the lane's ticks here does NOT touch `auto_dispatch_enabled`:
+        that flag governs the background QueueLoop's own lane sweep and stays
+        exactly as the operator left it. Every tick still passes through the
+        coordinator gate and the admission governor, so nothing here bypasses
+        a policy -- it only stops the router from walking away from a task it
+        just claimed a session for.
+
+        Returns True when the task really is under way.
+        """
         if self.engine is None or not outcome.session:
-            return
-        try:
-            result = self.engine.tick(outcome.session)
-        except Exception:  # noqa: BLE001 -- the binding is durable; a tick failure is recoverable
-            _LOGGER.exception("task-router: dispatch tick failed for %r", outcome.session)
-            return
-        outcome.dispatched = True
-        action = getattr(result, "action", None)
+            outcome.dispatch_detail = "no queue engine is wired on this server"
+            return False
+        settled = START_UNDERWAY_STATUSES | START_NEEDS_HUMAN_STATUSES | START_SERVER_PENDING_STATUSES
+        detail: str | None = None
+        for _ in range(MAX_START_TICKS):
+            task = self.store.get_task(outcome.task_id)
+            if task is None:
+                break
+            outcome.task_state = task.status
+            if task.status in settled:
+                break
+            try:
+                result = self.engine.tick(outcome.session)
+            except Exception:  # noqa: BLE001 -- the binding is durable; a tick failure is recoverable
+                _LOGGER.exception("task-router: dispatch tick failed for %r", outcome.session)
+                detail = detail or "queue engine tick raised"
+                break
+            outcome.dispatch_ticks += 1
+            # The engine's own words for why it could not move: an admission
+            # refusal, a paused lane, a coordinator verdict. Never invented here.
+            if getattr(result, "detail", None):
+                detail = str(result.detail)
         task = self.store.get_task(outcome.task_id)
         if task is not None:
             outcome.task_state = task.status
-        _LOGGER.info("task-router: dispatched task=%s session=%s action=%s state=%s",
-                     outcome.task_id, outcome.session, action, outcome.task_state)
+            if task.last_error and not detail:
+                detail = str(task.last_error)
+        outcome.dispatched = outcome.task_state in START_UNDERWAY_STATUSES
+        outcome.dispatch_detail = detail
+        _LOGGER.info("task-router: task=%s session=%s ticks=%s state=%s dispatched=%s detail=%s",
+                     outcome.task_id, outcome.session, outcome.dispatch_ticks,
+                     outcome.task_state, outcome.dispatched, detail)
+        return outcome.dispatched
+
+    def _release_and_defer(self, outcome: RoutingOutcome, evidence: dict[str, Any]) -> RoutingOutcome:
+        """The session was eligible but the engine would not start the task.
+
+        Hand the runtime back and say so. Leaving it BOUND would park the task
+        in a lane nothing is going to advance while holding a session other
+        tasks could have used -- the precise shape of the original production
+        failure, just with a routing decision attached to it."""
+        self.store.release_execution_binding(
+            outcome.task_id, reason=outcome.dispatch_detail or "engine did not advance the task")
+        held = outcome.session
+        evidence = dict(evidence)
+        evidence["reason"] = (
+            f"bound {held} but the queue engine did not start the task"
+            + (f": {outcome.dispatch_detail}" if outcome.dispatch_detail else "")
+            + "; the binding was released so the task can be re-matched")
+        evidence["undispatchable_session"] = held
+        self.store.record_routing_deferral(outcome.task_id, evidence=evidence)
+        self.invalidate()
+        return RoutingOutcome(
+            outcome=DEFERRED, task_id=outcome.task_id, task_state=outcome.task_state,
+            routing_state=WAITING_RUNTIME, reason=evidence["reason"],
+            dispatch_ticks=outcome.dispatch_ticks, dispatch_detail=outcome.dispatch_detail,
+            evidence=evidence)
 
     # -- spawning ----------------------------------------------------------
 
@@ -630,6 +707,9 @@ class TaskRouter:
                 task_id=task_id, session=target, reason=evidence["reason"],
                 routing_state=BOUND, task_state=bound.get("status"), evidence=evidence)
             if "error" not in bound:
+                # Hard affinity: the caller named this session, so a failure to
+                # start is reported, never "fixed" by moving the task somewhere
+                # the caller did not ask for.
                 self._dispatch(outcome)
             return self._receipt(outcome, created, explicit_target=True)
 
@@ -646,7 +726,7 @@ class TaskRouter:
         task_id learns nothing by asking again. When the answer is "still
         queued", the receipt says WHY rather than leaving the caller to guess.
         """
-        dispatched = outcome.outcome in (ROUTED, SPAWNED_RUNTIME) and outcome.dispatched
+        dispatched = outcome.dispatched
         receipt: dict[str, Any] = {
             "status": "TASK_STARTED" if dispatched else "TASK_ACCEPTED",
             "action": "route_start",
@@ -659,6 +739,8 @@ class TaskRouter:
             "score": outcome.score,
             "task_state": outcome.task_state,
             "dispatched": dispatched,
+            "dispatch_ticks": outcome.dispatch_ticks,
+            "dispatch_detail": outcome.dispatch_detail,
             "explicit_target": explicit_target,
             "deduplicated": bool(created.get("deduplicated")),
             "request_key": created.get("request_key"),
@@ -672,6 +754,18 @@ class TaskRouter:
                 "no runtime was eligible, so the task is durably queued as WAITING_RUNTIME. "
                 "The server re-runs the match every rescue cycle and will start it as soon as a "
                 "compatible session frees up -- do not poll and do not re-send")
+        elif not dispatched:
+            # Bound, but the engine did not start it. Saying "started" here is
+            # how an orchestrator drops a task, so the receipt says the
+            # opposite plainly and names the blocker the engine reported.
+            receipt["needs_human"] = False
+            receipt["next_action"] = "none"
+            receipt["guidance"] = (
+                f"the task is durably queued on {outcome.session} but the queue engine has not "
+                f"started it yet"
+                + (f" ({outcome.dispatch_detail})" if outcome.dispatch_detail else "")
+                + " -- the server keeps advancing it under this task_id; do not poll and do "
+                  "not re-send")
         else:
             receipt["needs_human"] = False
             receipt["next_action"] = "none"
