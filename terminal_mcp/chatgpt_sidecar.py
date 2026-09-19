@@ -184,6 +184,19 @@ class BackendUnavailable(RuntimeError):
     """
 
 
+def _transport_streams(transport: tuple[Any, ...]) -> tuple[Any, Any]:
+    """Extract read/write streams from supported MCP client tuple shapes.
+
+    ``streamable_http_client`` used to yield ``(read, write, session_id)``.
+    Current MCP releases yield ``(read, write)``.  The sidecar has never used
+    the optional session-id callback, so accepting both shapes keeps it a
+    transparent proxy across that dependency upgrade.
+    """
+    if len(transport) < 2:
+        raise RuntimeError("MCP streamable HTTP transport returned no streams")
+    return transport[0], transport[1]
+
+
 class Backend:
     """One MCP conversation with the full controller, per call.
 
@@ -204,7 +217,8 @@ class Backend:
     @contextlib.asynccontextmanager
     async def _session(self):
         try:
-            async with streamable_http_client(self.url) as (read, write, _get_session_id):
+            async with streamable_http_client(self.url) as transport:
+                read, write = _transport_streams(transport)
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     yield session
