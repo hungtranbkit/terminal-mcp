@@ -30,6 +30,81 @@ approval/input states stop recovery with `WAITING_APPROVAL`, and exhaustion
 is `STUCK`. Status is available from
 `/dashboard/api/verified-prompt-watcher` and the watcher state file.
 
+#### Installing it (it is not installed by having the files)
+
+The units live in `deploy/systemd/`, but a unit file in the repo is not a
+running timer, and for a long time that distinction hid a total outage of this
+path: the shipped units carried an absolute `/home/dell/...` `ExecStart` from a
+retired host, so on the canonical controller `systemctl --user is-enabled
+terminal-mcp-prompt-start-watcher.timer` answered `not-found` and the recovery
+cycle had never executed once.
+
+Install it with the idempotent installer, run **as the controller user on the
+controller host** (it enables only this timer and restarts nothing):
+
+```bash
+cd ~/workspace/terminal-mcp
+./deploy/install-prompt-start-watcher.sh          # --dry-run to preview
+```
+
+It resolves this host's real checkout, venv and controller config (taken from
+the live `terminal-mcp-http.service` so the watcher can never reconcile a
+*different* store than the controller writes to), renders the two units into
+`~/.config/systemd/user/`, seeds
+`~/.config/terminal-mcp/prompt-start-watcher.json` if it is missing, then
+`daemon-reload`s and `enable --now`s the timer. Re-running it converges rather
+than accumulating.
+
+Verify:
+
+```bash
+systemctl --user list-timers terminal-mcp-prompt-start-watcher.timer
+journalctl --user -u terminal-mcp-prompt-start-watcher.service -n 50 --no-pager
+cat ~/.local/state/terminal-mcp/prompt-start-watcher.json
+```
+
+`tests/test_prompt_start_watcher_units.py` is the guard against a repeat: it
+asserts the shipped units hardcode no host home, that a rendered `ExecStart`
+points at a binary that actually exists, and that every non-`.example` unit in
+`deploy/systemd/` is named by some installer in `deploy/`.
+
+#### What bounds it
+
+Three numbers, and they are deliberately the same number:
+`orchestration_policy.PROMPT_RETRY_CAP` (what the server-level MCP
+`instructions` promise clients), `submit_watchdog.WatchdogConfig.
+max_total_enters`, and the watcher's own `max_enters`. The watcher imports the
+first rather than restating it, so they cannot drift into three different
+sixes.
+
+The watcher's `max_enters` is checked **before** a record is handed to
+recovery, so lowering it genuinely lowers the budget. A record already at that
+budget is counted (`capped_count` in the state file) and skipped — the watcher
+declines to spend another Enter but does not also declare the record terminal,
+because the controller's own cap/TTL logic already owns that transition.
+
+What makes a duplicate Enter *impossible* is not the watcher's own check and
+not its `flock`. The `flock` only serializes watcher cycles against each other;
+the in-controller `SubmissionSweeper` is a separate writer against the same
+row and is not covered by it. The guarantee comes from
+`SubmissionStore.reserve_enter`, a single compare-and-increment `UPDATE ...
+WHERE enter_count < cap AND ack_state IN (QUEUED, INJECTED, SUBMITTING)`, which
+every writer must win before sending. A failed send still consumes its
+reservation: ambiguity fails closed.
+
+#### Known asymmetry: Claude gets no automatic recovery
+
+`core.recover_submission` returns `STUCK` with
+`single_submit_policy_no_retry` for any `agent_type` other than `codex`, and
+`WatchdogConfig.retry_agent_types` is `{"codex"}`. So the six-Enter budget the
+MCP `instructions` advertise applies to Codex only; a Claude submission gets
+exactly one Enter and no automatic retry. That is intentional — "Claude
+specifically: never spam Enter", below — but it means the advertised cap and
+the delivered behaviour differ by agent type, and a caller reading only the
+server instructions will not know that. Widening it would require a Claude
+`stuck_composer_evidence` signature that has never been reproduced, so it is
+recorded here rather than guessed at.
+
 > **Never resend a prompt's text past the activation-ambiguity boundary
 > unless there is positive evidence the first activation was not
 > accepted.**

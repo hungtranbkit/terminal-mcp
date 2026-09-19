@@ -1,11 +1,40 @@
 [Unit]
 Description=Terminal MCP verified prompt-start recovery (one bounded cycle)
-After=terminal-mcp-fed-controller.service
+Documentation=file:docs/prompt-submission.md
+# The controller owns the durable prompt_submissions.db this cycle
+# reconciles, but this is deliberately a weak ordering, not a dependency:
+# the whole point of a separate timer-driven process is that recovery keeps
+# running (and fails closed) across a controller restart or reconnect.
+After=terminal-mcp-http.service
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/dell/workspace/terminal-mcp-selfhost
-Environment=TERMINAL_MCP_CONFIG=/home/dell/.config/terminal-mcp-fed/config.yaml
-Environment=PYTHONPATH=/home/dell/workspace/terminal-mcp-selfhost
-ExecStart=/home/dell/workspace/terminal-mcp/.venv/bin/python -m terminal_mcp.prompt_start_watcher --config %h/.config/terminal-mcp/prompt-start-watcher.json
 
+# --- host-specific paths ---------------------------------------------------
+# These two lines are the ONLY host-dependent content in this unit, and
+# deploy/install-prompt-start-watcher.sh rewrites both with this host's real
+# checkout/venv before copying the file into ~/.config/systemd/user.
+#
+# The %h defaults below are the canonical controller layout
+# (~/workspace/terminal-mcp plus its own .venv), so an untouched copy of this
+# file is already correct on a host that follows it.  Never hardcode an
+# absolute /home/<someone> path here: that is exactly how this unit spent its
+# life uninstallable on every host but the one it was written on.
+WorkingDirectory=%h/workspace/terminal-mcp
+ExecStart=%h/workspace/terminal-mcp/.venv/bin/terminal-mcp-prompt-watcher --config %h/.config/terminal-mcp/prompt-start-watcher.json
+
+# Which controller config this cycle reads (TERMINAL_MCP_CONFIG) is host
+# state, not repo state -- the installer writes it into this env file so the
+# unit itself stays host-agnostic.  The leading "-" keeps the unit startable
+# before that file exists.
+EnvironmentFile=-%h/.config/terminal-mcp/prompt-start-watcher.env
+
+# One bounded cycle per activation; the timer owns the cadence.  There is
+# deliberately no Restart= here -- a failed cycle must wait for the next
+# timer tick rather than become a restart/Enter storm against a live pane.
+TimeoutStartSec=120
+
+# No [Install] section on purpose: this service is activated by
+# terminal-mcp-prompt-start-watcher.timer alone.  `systemctl --user enable`
+# on the service itself then fails loudly ("no installation config") instead
+# of silently creating a second, timer-less activation path.

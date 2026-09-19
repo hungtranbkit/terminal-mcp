@@ -1,10 +1,18 @@
 [Unit]
-Description=Run Terminal MCP verified prompt-start watcher every 10 seconds
+Description=Run the Terminal MCP verified prompt-start watcher on a fixed cadence
+Documentation=file:docs/prompt-submission.md
 
 [Timer]
+Unit=terminal-mcp-prompt-start-watcher.service
+# Cadence. deploy/install-prompt-start-watcher.sh rewrites these two values
+# from the watcher config's own interval_seconds so the timer and the config
+# cannot drift apart.
 OnBootSec=10
 OnUnitActiveSec=10
 AccuracySec=2
+# A missed window (laptop suspended, user session restarted) runs one catch-up
+# cycle, not one per missed tick -- systemd coalesces, and the cycle itself is
+# bounded by the durable per-submission Enter cap either way.
 Persistent=true
 
 [Install]

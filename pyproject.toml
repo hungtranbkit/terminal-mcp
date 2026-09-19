@@ -59,6 +59,7 @@ terminal-mcp-webauth = "terminal_mcp.webauth_cli:main"
 terminal-mcp-doctor = "terminal_mcp.doctor:main"
 terminal-mcp-node-doctor = "terminal_mcp.node_profile:main"
 terminal-mcp-tunnel-watchdog = "terminal_mcp.tunnel_watchdog:main"
+terminal-mcp-prompt-watcher = "terminal_mcp.prompt_start_watcher:main"
 terminal-node-agent = "terminal_mcp.node_agent:main"
 terminal-windows-node-agent = "terminal_mcp.windows_agent:main"
 

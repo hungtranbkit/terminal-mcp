@@ -322,3 +322,63 @@ unit for auto-start-at-logon/auto-restart. See `docs/multi-node.md`'s own
 note that this script has been reviewed but not executed anywhere (no
 Windows/PowerShell available in this project's own development
 environment).
+
+# terminal-mcp-prompt-start-watcher (verified prompt-start recovery)
+
+Unlike every other unit in this directory, these two are **not** `.example`
+files: `terminal-mcp-prompt-start-watcher.service` and `.timer` are real,
+host-agnostic units, and `deploy/install-prompt-start-watcher.sh` renders and
+installs them. Do not `cp` them by hand -- the two host-dependent directives
+(`WorkingDirectory=`, `ExecStart=`) carry `%h`-relative canonical defaults that
+the installer replaces with this host's actual checkout and venv.
+
+Why there is an installer at all: these units sat in the repo for a long time
+with an absolute `/home/dell/...` `ExecStart` inherited from a retired host.
+On the canonical controller `systemctl --user is-enabled
+terminal-mcp-prompt-start-watcher.timer` answered `not-found`, the state file
+`~/.local/state/terminal-mcp/prompt-start-watcher.json` had never been written,
+and the prompt-start recovery cycle had never run once. "Committed" was being
+read as "deployed". `tests/test_prompt_start_watcher_units.py` now asserts the
+difference.
+
+```bash
+# ON THE CONTROLLER, as the user that owns the tmux sessions:
+cd ~/workspace/terminal-mcp
+./deploy/install-prompt-start-watcher.sh --dry-run   # preview, writes nothing
+./deploy/install-prompt-start-watcher.sh
+```
+
+The installer is idempotent (re-running converges), enables only this timer,
+and restarts nothing else -- in particular it reads
+`terminal-mcp-http.service`'s `TERMINAL_MCP_CONFIG` to make sure the watcher
+reconciles the *same* `prompt_submissions.db` the controller writes to, but it
+never touches that unit.
+
+Over a bare ssh session without a user-systemd bus, export it first:
+
+```bash
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+```
+
+Verify a real activation (wait one interval -- 10s by default):
+
+```bash
+systemctl --user list-timers terminal-mcp-prompt-start-watcher.timer
+systemctl --user status terminal-mcp-prompt-start-watcher.service
+journalctl --user -u terminal-mcp-prompt-start-watcher.service -n 50 --no-pager
+cat ~/.local/state/terminal-mcp/prompt-start-watcher.json   # must be valid JSON
+```
+
+## Rollback
+
+```bash
+systemctl --user disable --now terminal-mcp-prompt-start-watcher.timer
+rm -f ~/.config/systemd/user/terminal-mcp-prompt-start-watcher.{service,timer}
+systemctl --user daemon-reload
+```
+
+Disabling the timer is safe: it removes the out-of-process recovery cycle only.
+The controller's own in-process `SubmissionSweeper` and the durable
+per-submission Enter cap are unaffected, and no submission can be duplicated by
+either the removal or the re-install -- the cap lives in the store, not in the
+timer. See `docs/prompt-submission.md` for the full bound.
