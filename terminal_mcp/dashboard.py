@@ -10952,7 +10952,53 @@ GLOBAL_TASKS_HTML = """<!doctype html>
       }
       const project = task.metadata && task.metadata.project;
       if (project) { const p = document.createElement('span'); p.className = 'chip'; p.textContent = clean(project); meta.append(p); }
+      // TMCP-TASK-ROUTER-001: where this task actually RUNS, which is not the
+      // same question as which lane it lives in. Shown only when the two
+      // differ or when routing has something to say -- an untouched legacy
+      // task looks exactly as it did before.
+      if (task.execution_session && task.execution_session !== task.session) {
+        const x = document.createElement('span'); x.className = 'chip session';
+        x.textContent = `▶ ${clean(task.execution_session)}`;
+        x.title = 'execution session chosen by the task router';
+        meta.append(x);
+      }
+      if (task.execution_node_id) {
+        const n = document.createElement('span'); n.className = 'chip';
+        n.textContent = clean(task.execution_node_id); n.title = 'execution node';
+        meta.append(n);
+      }
+      if (task.routing_state && task.routing_state !== 'UNROUTED') {
+        const r = document.createElement('span'); r.className = 'chip';
+        if (task.routing_state === 'WAITING_RUNTIME') { r.style.color = 'var(--amber)'; r.style.borderColor = 'var(--amber)'; }
+        r.textContent = clean(task.routing_state); r.title = 'routing state';
+        meta.append(r);
+      }
+      if (task.agent_id) {
+        const a = document.createElement('span'); a.className = 'chip';
+        a.textContent = `@${clean(task.agent_id)}`; a.title = 'agent'; meta.append(a);
+      }
+      for (const skill of (task.skill_ids || []).slice(0, 4)) {
+        const sk = document.createElement('span'); sk.className = 'chip';
+        sk.textContent = clean(skill); sk.title = 'skill'; meta.append(sk);
+      }
       card.append(title, meta);
+      if (task.router_reason) {
+        const why = document.createElement('div'); why.className = 'tc-error';
+        why.style.color = 'var(--muted)';
+        why.textContent = `router: ${clean(task.router_reason)}`;
+        card.append(why);
+      }
+      if (task.router_rejections && task.router_rejections.length) {
+        // An unexplained QUEUED is the bug this whole feature exists to
+        // remove, so a queued task shows exactly which sessions were looked
+        // at and what was wrong with each.
+        const rej = document.createElement('div'); rej.className = 'tc-error';
+        rej.style.color = 'var(--muted)';
+        rej.textContent = 'rejected: ' + task.router_rejections
+          .map(r => `${clean(r.session)} (${clean(r.reason)})`).join(', ');
+        rej.title = task.router_rejections.map(r => `${clean(r.session)}: ${clean(r.detail)}`).join('\n');
+        card.append(rej);
+      }
       if (task.routing_reason) {
         // PM/Orchestrator checkpoint (§20.2): explainability -- WHY this
         // task is (or would be) on this card, straight from the real,
@@ -15361,6 +15407,24 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         latest_decisions = await anyio.to_thread.run_sync(
             pm.store.latest_decisions_for_tasks, [row["id"] for row in all_rows])
         for row in all_rows:
+            # TMCP-TASK-ROUTER-001: flatten the persisted routing decision onto
+            # the card. The full evidence blob carries every candidate the
+            # router scored and is far too large to ship to a board that
+            # refreshes on a timer, so the card gets the three things a human
+            # actually reads -- where it runs, what state routing is in, and
+            # the one-line why -- plus the top rejections, which are the whole
+            # answer to "why is this still queued".
+            evidence = row.pop("routing_evidence", None) or {}
+            if isinstance(evidence, dict):
+                if evidence.get("reason"):
+                    row["router_reason"] = str(evidence["reason"])[:400]
+                rejected = evidence.get("rejected")
+                if isinstance(rejected, list) and rejected:
+                    row["router_rejections"] = [
+                        {"session": item.get("session"), "reason": item.get("rejected"),
+                         "detail": item.get("rejected_detail"), "score": item.get("score")}
+                        for item in rejected[:3] if isinstance(item, dict)
+                    ]
             decision = latest_decisions.get(row["id"])
             if decision is not None:
                 row["routing_reason"] = decision.reason

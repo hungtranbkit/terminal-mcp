@@ -76,6 +76,12 @@ class QueueService:
         # enabled gate starts/stops the real, wired-up loop rather than a
         # second, disconnected one.
         self.loop: Any = None
+        # TMCP-TASK-ROUTER-001's TaskRouter, same deferred-assignment pattern
+        # as engine/loop/planner above: built once by mcp_app.py over this
+        # SAME store so every surface (MCP tools, the compact `turn` action,
+        # the dashboard, the rescue sweep) drives one router with one view of
+        # the fleet, never several that could each decide differently.
+        self.router: Any = None
         # P0.5 Verify Queue, over the SAME store -- a verify job and the
         # task it verifies must commit together, which is only possible
         # in one database. Its `registry` (used solely to explain WHY a

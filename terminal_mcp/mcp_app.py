@@ -44,6 +44,7 @@ from .queue_task_follower import StartedTaskFollower
 from .request_governor import RequestGovernor
 from .queue_event_drain import QueueEventDrain
 from .queue_loop import QueueLoop
+from .task_router import TaskRouter
 from .project_task_feeder import ProjectTaskFeeder
 from .backlog_service import BacklogService
 from .event_bus import KNOWN_EVENT_TYPES, EventBus
@@ -88,7 +89,7 @@ def _fleet_session_names(controller: "ControllerService") -> list[str]:
 
 
 def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_session,
-                     enqueue_task, task_status, task_batch_status,
+                     enqueue_task, route_start, task_status, task_batch_status,
                      browser_status, browser_verify, browser_screenshot,
                      browser_run_task, browser_stop, dispatch_tick,
                      follow_task) -> dict[str, Any]:
@@ -107,6 +108,7 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
         "create_session": create_session,
         "delete_session": delete_session,
         "enqueue_task": enqueue_task,
+        "route_start": route_start,
         "task_status": task_status,
         "task_batch_status": task_batch_status,
         # May be None on a build with no browser gateway wired. The router
@@ -452,11 +454,25 @@ def build_mcp(service: TerminalService | None = None,
         _project_feeder = ProjectTaskFeeder(
             queue, terminal.config.queue.project_feeds,
             inventory_provider=controller.terminal_list_sessions)
+    # TMCP-TASK-ROUTER-001. Built over the SAME store, controller, queue
+    # service, engine and session registry everything else already uses --
+    # the router sequences those, it never gains a state of its own. Exposed
+    # as queue.router so the dashboard, the MCP tools and the compact `turn`
+    # surface all drive the one instance rather than each constructing a
+    # second one that would make its own, differently-cached fleet decisions.
+    task_router = TaskRouter(
+        queue.store, controller=controller, queue=queue, engine=queue_engine,
+        session_registry=terminal.session_registry, config=terminal.config)
+    queue.router = task_router
     queue.loop = queue.loop or QueueLoop(
         queue_engine, poll_interval_seconds=terminal.config.queue.poll_interval_seconds,
         heartbeat_refresher=_refresh_local_heartbeat,
         event_drain=_event_drain,
         project_feeder=_project_feeder,
+        # Queue Rescue runs as a step of the existing loop -- see
+        # QueueLoop._rescue_queued_tasks for why it is not a second thread.
+        task_router=task_router if terminal.config.router.rescue_enabled else None,
+        rescue_interval_seconds=terminal.config.router.rescue_interval_seconds,
     )
 
     def _active_queue_task_for(session: str) -> dict | None:
@@ -3211,6 +3227,71 @@ def build_mcp(service: TerminalService | None = None,
                              request_key=request_key)
 
     @server.tool()
+    def terminal_route_start(prompt: str, title: str | None = None, priority: int = 0,
+                             metadata: dict | None = None, request_key: str | None = None,
+                             project: str | None = None, agent_id: str | None = None,
+                             skill_ids: list[str] | None = None,
+                             target: str | None = None) -> dict:
+        """Start work WITHOUT naming a session -- the router picks one.
+
+        Use this for any task that is about a project, a repository or an
+        agent rather than about one specific terminal. The task is persisted
+        first (durable, restart-safe, request_key-deduplicated, exactly like
+        terminal_enqueue_task), then matched against every session in the
+        fleet: sessions that are offline, waiting for human input, in the
+        wrong repository, in a deleted worktree or already busy are rejected
+        outright, and the best-scoring eligible one is atomically claimed and
+        dispatched in this same call.
+
+        If nothing is eligible the task stays durably queued as
+        WAITING_RUNTIME with the reason for EVERY candidate recorded, and the
+        server re-runs the match automatically as sessions free up -- the
+        caller never polls and never re-sends.
+
+        `target`, if given, is HARD AFFINITY: that session or a clear
+        refusal, never a silent reroute. Omit it to let the router decide."""
+        if queue.router is None:
+            return {"error": "ROUTER_UNAVAILABLE"}
+        return queue.router.route_start(
+            prompt, title=title, priority=priority, metadata=metadata,
+            request_key=request_key, project=project, agent_id=agent_id,
+            skill_ids=skill_ids, target=target)
+
+    @server.tool()
+    def terminal_task_route(task_id: str) -> dict:
+        """Find and claim a runtime for one task that is already queued.
+
+        The manual form of what the rescue sweep does automatically -- useful
+        when an operator wants a specific stuck task placed right now, or
+        wants to see the routing decision for it without waiting a cycle."""
+        if queue.router is None:
+            return {"error": "ROUTER_UNAVAILABLE"}
+        return queue.router.route_task(task_id).as_dict()
+
+    @server.tool()
+    def terminal_queue_rescue_once() -> dict:
+        """Re-match every queued task that has no runtime bound to it.
+
+        One pass of Queue Rescue, on demand. Reports what was routed, what
+        stayed queued, and why -- per task."""
+        if queue.router is None:
+            return {"error": "ROUTER_UNAVAILABLE"}
+        return queue.router.rescue_once()
+
+    @server.tool()
+    def terminal_session_cleanup_candidates(limit: int = 50) -> dict:
+        """Sessions that LOOK retired, as a report. Never deletes anything.
+
+        A session is only a candidate when it is idle, holds no active or
+        queued task, and its working directory is demonstrably gone (or the
+        registry has already marked it killed/deleted). Anything busy,
+        waiting for input, or carrying work is excluded by construction."""
+        if queue.router is None:
+            return {"error": "ROUTER_UNAVAILABLE"}
+        from .stale_sessions import cleanup_candidates
+        return cleanup_candidates(queue.router, config=terminal.config, limit=limit)
+
+    @server.tool()
     def terminal_task_status(task_id: str) -> dict:
         """Direct by-id lookup for one task -- lets a caller track a
         specific task (e.g. one just returned by terminal_enqueue_task)
@@ -5486,6 +5567,7 @@ def build_mcp(service: TerminalService | None = None,
         create_session=terminal_create_session,
         delete_session=terminal_delete_session,
         enqueue_task=terminal_enqueue_task,
+        route_start=terminal_route_start,
         task_status=terminal_task_status,
         task_batch_status=terminal_task_batch_status,
         browser_status=browser_handlers.get("browser_status"),

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -52,14 +53,35 @@ from .queue_event_drain import QueueEventDrain
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL_SECONDS = 3.0
+DEFAULT_RESCUE_INTERVAL_SECONDS = 10.0
 
 
 class QueueLoop:
     def __init__(self, engine: QueueEngine, *, poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
                 heartbeat_refresher: Callable[[], None] | None = None,
                 event_drain: "QueueEventDrain | None" = None,
-                project_feeder: object | None = None) -> None:
+                project_feeder: object | None = None,
+                task_router: object | None = None,
+                rescue_interval_seconds: float = DEFAULT_RESCUE_INTERVAL_SECONDS) -> None:
         self.engine = engine
+        # QUEUE RESCUE (TMCP-TASK-ROUTER-001). Injected and optional, and run
+        # as a STEP of this cycle rather than as a second thread -- same
+        # reasoning as the event drain above: one loop drives the queue.
+        #
+        # It has its OWN interval because the two jobs have different costs. A
+        # tick reads durable state for one lane; a rescue sweep lists the whole
+        # fleet. Running the sweep at the tick cadence would mean a fleet
+        # listing every three seconds forever, which is how a safety feature
+        # becomes the thing an operator turns off.
+        self.task_router = task_router
+        self.rescue_interval_seconds = max(1.0, rescue_interval_seconds)
+        self._last_rescue_at: float | None = None
+        self._last_rescue: dict | None = None
+        # Set when a lane reports IDLE. A session that just became free is the
+        # single best moment to re-ask "is anything waiting for a runtime?",
+        # so that one cycle skips the interval instead of leaving a ready task
+        # queued for the rest of the window.
+        self._rescue_now = False
         # The event-bus drain, run as a STEP of this cycle. Injected and
         # optional: None means exactly today's behaviour, and there is still
         # only ever one background thread driving the queue (see
@@ -119,7 +141,10 @@ class QueueLoop:
                     "last_drain": self._last_drain,
                     "project_feed_enabled": self.project_feeder is not None,
                     "project_fleet": feeder_status,
-                    "last_feed": self._last_feed}
+                    "last_feed": self._last_feed,
+                    "rescue_enabled": self.task_router is not None,
+                    "rescue_interval_seconds": self.rescue_interval_seconds,
+                    "last_rescue": self._last_rescue}
 
     def run_one_cycle(self) -> list[dict]:
         """One full pass over every auto-dispatch-enabled lane -- the
@@ -146,6 +171,10 @@ class QueueLoop:
                 result = self.engine.tick(session)
                 row = result.to_dict()
                 results.append(row)
+                if result.action == "IDLE":
+                    # A free lane is the trigger the rescue sweep wants; the
+                    # sweep itself runs once, after the loop, never per lane.
+                    self._rescue_now = True
                 if result.action == "IDLE" and self.project_feeder is not None:
                     feed = self._feed_project_task(session)
                     if feed and feed.get("action") in ("ENQUEUED", "EXISTING_TASK"):
@@ -157,9 +186,40 @@ class QueueLoop:
                 _LOGGER.exception("queue-loop: tick failed for session %r, continuing with other lanes", session)
                 results.append({"session": session, "action": "ENGINE_ERROR", "task_id": None,
                                 "detail": f"{type(exc).__name__}: {exc}"})
+        self._rescue_queued_tasks()
         with self._lock:
             self._last_cycle_at = datetime.now(timezone.utc).isoformat()
         return results
+
+    def _rescue_queued_tasks(self) -> dict | None:
+        """Re-match every task that has no runtime bound to it.
+
+        THE STUCK-QUEUED FIX. The lane sweep above can only advance tasks in
+        lanes that opted into auto-dispatch; a task whose lane never opted in,
+        or which has no real lane at all (the unassigned backlog), was
+        previously invisible to every autonomous path in the system. This step
+        is what makes "queued while a compatible session is idle" a state that
+        repairs itself.
+
+        Never raises: a rescue failure must not stop the lane dispatch that is
+        this loop's primary job."""
+        if self.task_router is None:
+            return None
+        now = time.monotonic()
+        due = (self._rescue_now or self._last_rescue_at is None
+               or now - self._last_rescue_at >= self.rescue_interval_seconds)
+        if not due:
+            return None
+        self._rescue_now = False
+        self._last_rescue_at = now
+        try:
+            result = self.task_router.rescue_once()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.exception("queue-loop: task rescue failed, continuing with lane dispatch")
+            result = {"error": f"{type(exc).__name__}: {exc}"}
+        with self._lock:
+            self._last_rescue = result
+        return result
 
     def _feed_project_task(self, session: str) -> dict | None:
         """Ask the configured canonical-project feeder for one task.

@@ -121,6 +121,36 @@ CANCELLED = "CANCELLED"
 ALL_STATUSES = (QUEUED, PRECHECK, READY, DISPATCHING, DISPATCH_UNCERTAIN, RUNNING, VERIFYING, COMPLETED, BLOCKED,
                 FAILED, WAITING_SESSION, PAUSED, SKIPPED, CANCELLED)
 
+# -- routing state (TMCP-TASK-ROUTER-001) --------------------------------
+#
+# DELIBERATELY NOT A TASK STATUS. A task's status says how far through its
+# lifecycle it is; routing state says whether a RUNTIME has been found for it.
+# They are independent -- a QUEUED task may be BOUND (a session is claimed,
+# dispatch is imminent) or WAITING_RUNTIME (nothing eligible exists yet), and
+# collapsing the two would mean re-deciding every edge in VALID_TRANSITIONS
+# for a fact that is not a lifecycle stage at all. Same reasoning, and the
+# same shape, as v10's `deploy_state`.
+UNROUTED = "UNROUTED"
+"""No routing decision has ever been made for this task. This is the state the
+production bug lived in: a task nobody had tried to place looked exactly like
+one deliberately left alone, so no reconcile could tell them apart."""
+BOUND = "BOUND"
+"""A specific, eligible session is claimed for this task -- `execution_session`
+names it, and no other task may be bound to that session until this one
+settles. The claim is what makes concurrent routing safe."""
+SPAWNED = "SPAWNED"
+"""Bound to a session the router itself created because nothing eligible
+already existed. Distinct from BOUND so "did we grow the fleet for this" is
+answerable without reading the evidence blob."""
+WAITING_RUNTIME = "WAITING_RUNTIME"
+"""Reuse and spawn were both impossible, and `routing_evidence` says exactly
+why, for every candidate that was considered. The ONLY legitimate way for a
+task to sit queued -- an unexplained QUEUED is now a bug by construction."""
+ROUTING_STATES = (UNROUTED, BOUND, SPAWNED, WAITING_RUNTIME)
+
+#: Routing states that hold a live claim on `execution_session`.
+ROUTING_BOUND_STATES = frozenset({BOUND, SPAWNED})
+
 UNASSIGNED_LANE = "__unassigned__"
 """Unified Task System checkpoint (2026-09-07, docs/REQUIREMENTS.md §20):
 a reserved, real lane name for a Global Task with no session assigned
@@ -333,6 +363,16 @@ class QueueTask:
     # Deployment is a fact about an artifact, NOT a task status -- see
     # _add_v10_requirement_contract. Deploying never changes `status`.
     deploy_state: str | None = None
+    # TMCP-TASK-ROUTER-001 (migration v13). All nullable: a task created
+    # before the router existed reads UNROUTED/None and behaves exactly as
+    # it did. `session` remains the lane; these say which runtime is
+    # actually executing the work and why that one was chosen.
+    execution_session: str | None = None
+    execution_node_id: str | None = None
+    routing_state: str | None = None
+    routing_evidence: dict[str, Any] = field(default_factory=dict)
+    agent_id: str | None = None
+    skill_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "QueueTask":
@@ -366,6 +406,13 @@ class QueueTask:
             at_risk=bool(row["at_risk"]),
             project_id=(row["project_id"] if "project_id" in row.keys() else None),
             outcome_id=(row["outcome_id"] if "outcome_id" in row.keys() else None),
+            execution_session=(row["execution_session"] if "execution_session" in row.keys() else None),
+            execution_node_id=(row["execution_node_id"] if "execution_node_id" in row.keys() else None),
+            routing_state=(row["routing_state"] if "routing_state" in row.keys() else None),
+            routing_evidence=(_parse_json_object(row["routing_evidence"])
+                              if "routing_evidence" in row.keys() else {}),
+            agent_id=(row["agent_id"] if "agent_id" in row.keys() else None),
+            skill_ids=(tuple(_parse_json_list(row["skill_ids"])) if "skill_ids" in row.keys() else ()),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -392,6 +439,15 @@ class QueueTask:
             "at_risk": self.at_risk,
             "project_id": self.project_id,
             "outcome_id": self.outcome_id,
+            "execution_session": self.execution_session,
+            "execution_node_id": self.execution_node_id,
+            # A task the router has never seen reads UNROUTED rather than
+            # null: "no decision yet" is itself the answer a dashboard needs,
+            # and a missing key would read as "not applicable".
+            "routing_state": self.routing_state or UNROUTED,
+            "routing_evidence": self.routing_evidence,
+            "agent_id": self.agent_id,
+            "skill_ids": list(self.skill_ids),
         }
 
 
@@ -840,6 +896,57 @@ def _add_v12_long_task_watches(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX IF NOT EXISTS idx_long_task_watches_state ON long_task_watches(state)")
 
 
+def _add_v13_task_routing(connection: sqlite3.Connection) -> None:
+    """TMCP-TASK-ROUTER-001: where a task is actually being EXECUTED, who
+    owns it, and why the router chose that.
+
+    THE BUG THIS EXISTS TO MAKE IMPOSSIBLE. A durable task sat QUEUED while
+    its target session was IDLE, and nothing in the database could say why --
+    `session` was both "the lane this row lives in" and "the runtime that will
+    run it", so there was nowhere to record that a routing decision had (or
+    had not) been made, and no way for a restart-safe reconcile to tell a task
+    nobody had ever tried to place from one deliberately left alone.
+
+    Six nullable, additive columns, no status-enum change (same posture as
+    v10's `deploy_state`, and for the same reason: routing is a fact about
+    WHERE a task runs, not a stage of its lifecycle, so modelling it as a
+    status would mean re-deciding every edge in VALID_TRANSITIONS):
+
+      execution_session / execution_node_id -- the runtime currently bound to
+        this task. `session` stays the lane, unchanged, so every existing
+        query and every existing caller behaves exactly as before; ownership
+        of the TASK is stable while its execution binding may change.
+      routing_state -- UNROUTED / BOUND / SPAWNED / WAITING_RUNTIME. The
+        explicit answer to "why is this still queued", which is the thing
+        that was previously unrepresentable.
+      routing_evidence -- JSON: the chosen candidate's score, the reason, and
+        the top rejected candidates with their rejection reasons. Persisted
+        rather than recomputed so the dashboard shows what the router
+        ACTUALLY decided at the time, not what it would decide now.
+      agent_id / skill_ids -- the Agent+Skill bridge. Nullable on purpose:
+        this is a minimal bridge onto the existing store, never a second,
+        parallel task/agent database (Phase B's registries populate these
+        same columns rather than replacing them).
+    """
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(queue_tasks)")}
+    for column, declaration in (
+        ("execution_session", "TEXT"),
+        ("execution_node_id", "TEXT"),
+        ("routing_state", "TEXT"),
+        ("routing_evidence", "TEXT"),
+        ("agent_id", "TEXT"),
+        ("skill_ids", "TEXT"),
+    ):
+        if column not in columns:
+            connection.execute(f"ALTER TABLE queue_tasks ADD COLUMN {column} {declaration}")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_queue_tasks_execution_session "
+        "ON queue_tasks(execution_session) WHERE execution_session IS NOT NULL")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_queue_tasks_routing_state "
+        "ON queue_tasks(routing_state) WHERE routing_state IS NOT NULL")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
@@ -869,6 +976,9 @@ QUEUE_MIGRATIONS = [
     Migration(11, "durable project feeder packets with leases/checkpoints/idempotency",
              _add_v11_project_packets),
     Migration(12, "durable long-task execution watches", _add_v12_long_task_watches),
+    Migration(13, "TMCP-TASK-ROUTER-001: execution_session/execution_node_id/routing_state/"
+              "routing_evidence + the nullable agent_id/skill_ids bridge",
+              _add_v13_task_routing),
 ]
 
 
@@ -1506,6 +1616,293 @@ class QueueStore:
             updated_row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
         return QueueTask.from_row(updated_row).to_dict()
 
+    # -- execution binding (TMCP-TASK-ROUTER-001) --------------------------
+    #
+    # `session` is the LANE and stays exactly what it always was.
+    # `execution_session` is the RUNTIME claim, and these three methods are
+    # the only things that write it. They live here, in the store, rather
+    # than in the router, for the same reason claim_next_task does: the
+    # check and the write have to be one transaction or two routers racing
+    # over one idle session both win.
+
+    def tasks_bound_to_session(self, session: str) -> list[QueueTask]:
+        """Every non-terminal task currently claiming `session` as its runtime.
+
+        Terminal tasks are excluded deliberately: a COMPLETED task must not go
+        on holding a session hostage, and excluding them here is what releases
+        the claim without needing a hook on every transition edge."""
+        placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM queue_tasks WHERE execution_session = ? "
+                f"AND routing_state IN (?, ?) AND status NOT IN ({placeholders}) "
+                f"ORDER BY position",
+                (session, BOUND, SPAWNED, *TERMINAL_STATUSES),
+            ).fetchall()
+        return [QueueTask.from_row(row) for row in rows]
+
+    def bind_task_to_session(self, task_id: str, session: str, *, node_id: str | None = None,
+                             routing_state: str = BOUND, evidence: dict[str, Any] | None = None,
+                             agent_id: str | None = None,
+                             skill_ids: Sequence[str] | None = None) -> dict[str, Any]:
+        """Atomically claim `session` as this task's runtime, and move the row
+        into that lane in the same transaction.
+
+        THE WHOLE POINT IS THE ATOMICITY. Two routers (two MCP calls, a
+        rescue cycle overlapping a route_start, the same loop re-entered)
+        looking at the same fleet will reach the same conclusion at the same
+        moment, because the scoring is deterministic -- that is a feature
+        everywhere except here, where it means both would pick the one idle
+        session. `BEGIN IMMEDIATE` takes SQLite's write lock before the
+        eligibility read, so the second caller sees the first caller's claim
+        and is refused SESSION_ALREADY_CLAIMED rather than double-dispatching.
+
+        Idempotent for the SAME (task, session) pair: re-binding a task to the
+        runtime it already holds returns the task, not an error. A retried
+        route must not look like a failure.
+
+        Refusals are values, never exceptions -- the router turns each one
+        into a rejection reason a human reads on the dashboard.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+            task = QueueTask.from_row(row)
+            if task.status in TERMINAL_STATUSES:
+                connection.rollback()
+                return {"error": "TASK_ALREADY_SETTLED", "task_id": task_id, "status": task.status}
+            already_bound = task.routing_state in ROUTING_BOUND_STATES and task.execution_session
+            if already_bound and task.execution_session == session:
+                connection.rollback()
+                return {**task.to_dict(), "rebound": False}
+            if already_bound:
+                connection.rollback()
+                return {"error": "TASK_ALREADY_BOUND", "task_id": task_id,
+                        "execution_session": task.execution_session}
+            if task.status not in MOVABLE_STATUSES:
+                # PRECHECK/READY/DISPATCHING/RUNNING: the engine is mid-flight
+                # for this exact task. Re-homing it now is the double-dispatch
+                # race MOVABLE_STATUSES was drawn to avoid -- see its docstring.
+                connection.rollback()
+                return {"error": "TASK_NOT_BINDABLE", "task_id": task_id, "status": task.status}
+            placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
+            holder = connection.execute(
+                f"SELECT id FROM queue_tasks WHERE execution_session = ? AND id != ? "
+                f"AND routing_state IN (?, ?) AND status NOT IN ({placeholders}) LIMIT 1",
+                (session, task_id, BOUND, SPAWNED, *TERMINAL_STATUSES),
+            ).fetchone()
+            if holder is not None:
+                connection.rollback()
+                return {"error": "SESSION_ALREADY_CLAIMED", "task_id": task_id,
+                        "session": session, "held_by": holder["id"]}
+
+            now = iso_now()
+            if task.session != session:
+                self._ensure_lane(connection, session)
+                max_position = connection.execute(
+                    "SELECT COALESCE(MAX(position), -1) AS max_position FROM queue_tasks WHERE session = ?",
+                    (session,),
+                ).fetchone()["max_position"]
+                connection.execute(
+                    "UPDATE queue_tasks SET session = ?, position = ? WHERE id = ?",
+                    (session, max_position + 1, task_id),
+                )
+            connection.execute(
+                "UPDATE queue_tasks SET execution_session = ?, execution_node_id = ?, routing_state = ?, "
+                "routing_evidence = ?, node_id = COALESCE(?, node_id), updated_at = ? WHERE id = ?",
+                (session, node_id, routing_state, json.dumps(evidence) if evidence else None,
+                 node_id, now, task_id),
+            )
+            if agent_id is not None or skill_ids is not None:
+                self._write_agent_binding_locked(connection, task_id, agent_id=agent_id, skill_ids=skill_ids)
+            self._record_event_locked(
+                connection, session=session, task_id=task_id, event_type="TASK_ROUTED",
+                reason=(evidence or {}).get("reason"),
+                metadata={"routing_state": routing_state, "node_id": node_id,
+                          "from_lane": task.session, "score": (evidence or {}).get("score")},
+            )
+            updated = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            connection.commit()
+            self._drain_events()
+            return {**QueueTask.from_row(updated).to_dict(), "rebound": True}
+        except Exception:
+            connection.rollback()
+            self._discard_events()
+            raise
+        finally:
+            connection.close()
+
+    def release_execution_binding(self, task_id: str, *, reason: str) -> dict[str, Any]:
+        """Give the runtime back, keeping the task itself exactly where it is.
+
+        Used when the bound session turns out to be gone, unhealthy or no
+        longer eligible. The task is NOT failed and NOT moved -- it simply
+        becomes routable again, which is the whole difference between a task
+        that is waiting for a runtime and one that is stuck."""
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+            task = QueueTask.from_row(row)
+            if task.routing_state not in ROUTING_BOUND_STATES:
+                return {**task.to_dict(), "released": False}
+            connection.execute(
+                "UPDATE queue_tasks SET execution_session = NULL, execution_node_id = NULL, "
+                "routing_state = ?, updated_at = ? WHERE id = ?",
+                (UNROUTED, iso_now(), task_id),
+            )
+            self._record_event_locked(
+                connection, session=task.session, task_id=task_id,
+                event_type="TASK_ROUTE_RELEASED", reason=reason,
+                metadata={"released_session": task.execution_session})
+            updated = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+        return {**QueueTask.from_row(updated).to_dict(), "released": True}
+
+    def record_routing_deferral(self, task_id: str, *, evidence: dict[str, Any]) -> dict[str, Any]:
+        """No runtime could be found, and here is exactly why -- per candidate.
+
+        This is what makes an unexplained QUEUED impossible. A task that stays
+        queued now carries WAITING_RUNTIME plus the rejection reason for every
+        session the router looked at, so the dashboard answers "why is this
+        not running" from the record instead of from a guess."""
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+            task = QueueTask.from_row(row)
+            if task.routing_state in ROUTING_BOUND_STATES:
+                # Something bound it between the scoring pass and here. The
+                # binding is the newer, stronger fact -- never overwrite it
+                # with this pass's stale "nothing available".
+                return {**task.to_dict(), "deferred": False}
+            connection.execute(
+                "UPDATE queue_tasks SET routing_state = ?, routing_evidence = ?, updated_at = ? WHERE id = ?",
+                (WAITING_RUNTIME, json.dumps(evidence), iso_now(), task_id),
+            )
+            self._record_event_locked(
+                connection, session=task.session, task_id=task_id,
+                event_type="TASK_ROUTE_DEFERRED", reason=evidence.get("reason"),
+                metadata={"candidates_considered": evidence.get("candidates_considered")})
+            updated = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+        return {**QueueTask.from_row(updated).to_dict(), "deferred": True}
+
+    def _write_agent_binding_locked(self, connection: sqlite3.Connection, task_id: str, *,
+                                    agent_id: str | None, skill_ids: Sequence[str] | None) -> None:
+        if agent_id is not None:
+            connection.execute("UPDATE queue_tasks SET agent_id = ? WHERE id = ?", (agent_id, task_id))
+        if skill_ids is not None:
+            connection.execute("UPDATE queue_tasks SET skill_ids = ? WHERE id = ?",
+                               (json.dumps([str(skill) for skill in skill_ids]), task_id))
+
+    def set_agent_binding(self, task_id: str, *, agent_id: str | None = None,
+                          skill_ids: Sequence[str] | None = None) -> dict[str, Any]:
+        """The Agent+Skill bridge, written onto the task row itself.
+
+        A bridge, not a registry: these columns carry whatever agent/skill
+        identity a caller already has, so the router can match on it today
+        without a second store existing. Phase B's Agent Registry populates
+        these same columns -- it does not replace them."""
+        with self._connection() as connection:
+            row = connection.execute("SELECT id FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+            self._write_agent_binding_locked(connection, task_id, agent_id=agent_id, skill_ids=skill_ids)
+            connection.execute("UPDATE queue_tasks SET updated_at = ? WHERE id = ?", (iso_now(), task_id))
+            updated = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+        return QueueTask.from_row(updated).to_dict()
+
+    ROUTER_OWNED_METADATA_KEY = "router_owned"
+    """Set by route_start on a task created with no target. It marks a task
+    whose placement the ROUTER chose and may therefore choose again -- as
+    opposed to one a caller deliberately put in a specific lane."""
+
+    def routable_tasks(self, *, limit: int = 200) -> list[QueueTask]:
+        """Tasks that are waiting for a runtime AND that routing is allowed to
+        place. Those are two different questions, and conflating them breaks a
+        safety gate this project built on purpose.
+
+        WHAT IS IN SCOPE, AND WHY IT IS NOT "EVERY QUEUED TASK". A task sitting
+        in a named lane was deliberately put there by a caller, and that lane's
+        `auto_dispatch_enabled` flag is the operator's answer to "may anything
+        autonomous drive this session?" -- the mechanism that keeps real
+        production sessions safe (see queue_loop.py's two-gate docstring).
+        Re-homing such a task would walk straight through that gate: the
+        operator said "not this lane" and the router would answer "fine, a
+        different one then". So a task is rescuable only when routing it takes
+        nothing away from anybody:
+
+          * it is in the UNASSIGNED lane -- nobody chose a session for it, so
+            there is no decision to override. This is the case the production
+            bug lived in;
+          * it is WAITING_SESSION -- the session it was pinned to is gone, so
+            the original choice can no longer be honoured however much we
+            respect it;
+          * it is router-owned -- the router placed it in the first place, so
+            re-placing it changes nothing a human decided.
+
+        ONE PER REAL LANE, because a lane is serial: the second task in a lane
+        is not waiting for a runtime, it is waiting for the task ahead of it.
+        Each real lane therefore contributes exactly what the engine itself
+        would pick next (`_next_dispatchable_locked` -- the same function
+        claim_next_task uses, so a paused lane, an already-active lane and an
+        unmet dependency are honoured without a second set of rules that could
+        drift from the engine's). The UNASSIGNED lane is different in kind:
+        nothing in it is queued behind anything, so every unbound task there is
+        routable, each potentially to a different session.
+
+        Restart-safe by construction: every input is a durable row, so a
+        controller that has just come up re-derives the identical work list
+        with nothing carried across the restart.
+        """
+        with self._connection() as connection:
+            lanes = [row["session"] for row in connection.execute(
+                "SELECT DISTINCT session FROM queue_tasks WHERE status IN (?, ?) "
+                "AND (routing_state IS NULL OR routing_state NOT IN (?, ?))",
+                (QUEUED, WAITING_SESSION, BOUND, SPAWNED),
+            ).fetchall()]
+            found: list[QueueTask] = []
+            for session in lanes:
+                if session == UNASSIGNED_LANE:
+                    rows = connection.execute(
+                        "SELECT * FROM queue_tasks WHERE session = ? AND status IN (?, ?) "
+                        "AND (routing_state IS NULL OR routing_state NOT IN (?, ?)) "
+                        "ORDER BY priority DESC, position ASC",
+                        (UNASSIGNED_LANE, QUEUED, WAITING_SESSION, BOUND, SPAWNED),
+                    ).fetchall()
+                    found.extend(QueueTask.from_row(row) for row in rows)
+                    continue
+                candidate = self._next_dispatchable_locked(connection, session)
+                if candidate is None:
+                    # WAITING_SESSION never reaches _next_dispatchable_locked
+                    # (it filters on QUEUED). A task whose session vanished is
+                    # exactly the one re-routing exists for, so pick it up here.
+                    row = connection.execute(
+                        "SELECT * FROM queue_tasks WHERE session = ? AND status = ? "
+                        "AND (routing_state IS NULL OR routing_state NOT IN (?, ?)) "
+                        "ORDER BY priority DESC, position ASC LIMIT 1",
+                        (session, WAITING_SESSION, BOUND, SPAWNED),
+                    ).fetchone()
+                    candidate = QueueTask.from_row(row) if row is not None else None
+                if candidate is None or candidate.routing_state in ROUTING_BOUND_STATES:
+                    continue
+                if self._is_rescuable(candidate):
+                    found.append(candidate)
+        found.sort(key=lambda task: (-task.priority, task.created_at, task.position))
+        return found[:limit]
+
+    @classmethod
+    def _is_rescuable(cls, task: QueueTask) -> bool:
+        """See routable_tasks: may the router place THIS task, or would doing
+        so override somebody's explicit choice of lane?"""
+        if task.session == UNASSIGNED_LANE:
+            return True
+        if task.status == WAITING_SESSION:
+            return True
+        return bool((task.metadata or {}).get(cls.ROUTER_OWNED_METADATA_KEY))
     def get_task(self, task_id: str) -> QueueTask | None:
         with self._connection() as connection:
             row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()

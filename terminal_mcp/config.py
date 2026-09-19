@@ -123,6 +123,47 @@ class QueueConfig:
 
 
 @dataclass(frozen=True)
+class RouterConfig:
+    """TMCP-TASK-ROUTER-001: which routing behaviours are allowed to act.
+
+    THE DEFAULTS ARE NOT THE USUAL "OFF UNTIL AN OPERATOR OPTS IN", AND THAT
+    IS DELIBERATE. Every other autonomous switch in this project defaults off
+    because turning it on means the system may CREATE or SEND work nobody
+    asked for. Routing creates nothing: it only decides where work a caller
+    has already durably enqueued should run. Shipping it off by default would
+    mean shipping the bug it fixes -- a task left QUEUED beside an idle,
+    compatible session -- still armed on every deployment, which is precisely
+    the outcome this feature exists to remove.
+
+    `spawn_enabled` is the exception and IS off by default, because creating a
+    session is the one routing action that changes the fleet rather than
+    merely using it. An operator turns that on when they want the router to
+    grow capacity on demand.
+    """
+    #: Master switch. Off means route_start and the rescue sweep both decline,
+    #: and every existing session-targeted path keeps working exactly as before.
+    enabled: bool = True
+    #: The restart-safe reconcile that re-asks "could this run now?" for every
+    #: task with no runtime. This is the half that eliminates the stuck-QUEUED
+    #: bug for tasks nobody re-submits.
+    rescue_enabled: bool = True
+    #: Create a compatible session when nothing eligible exists. Off by
+    #: default: this is the only routing action that grows the fleet.
+    spawn_enabled: bool = False
+    #: Hard ceiling on router-created sessions, so a pathological backlog
+    #: cannot spawn without bound even once spawning is enabled.
+    max_spawned_sessions: int = 4
+    #: agent_type used for a spawn when the task expresses no preference.
+    default_runtime: str = "shell"
+    #: Seconds between rescue sweeps. Independent of the queue loop's own
+    #: poll interval so a fast dispatch cadence does not force a fleet
+    #: listing every three seconds.
+    rescue_interval_seconds: float = 10.0
+    #: Most tasks one sweep will attempt to place.
+    rescue_batch_size: int = 20
+
+
+@dataclass(frozen=True)
 class LLMGovernorConfig:
     """Process-wide admission limits for provider-bound agent work.
 
@@ -1132,6 +1173,7 @@ class AppConfig:
     ask_chatgpt: AskChatGptConfig = AskChatGptConfig()
     nodes: NodesConfig = NodesConfig()
     queue: QueueConfig = QueueConfig()
+    router: RouterConfig = RouterConfig()
     llm_governor: LLMGovernorConfig = LLMGovernorConfig()
     submit: SubmitConfig = SubmitConfig()
     integration_loop: IntegrationLoopConfig = IntegrationLoopConfig()
@@ -1571,6 +1613,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ask_chatgpt=_load_ask_chatgpt_config(raw.get("ask_chatgpt", {})),
         nodes=nodes_config,
         queue=_load_queue_config(raw.get("queue", {})),
+        router=_load_router_config(raw.get("router", {})),
         llm_governor=governor_config,
         submit=submit_config,
         integration_loop=_load_integration_loop_config(raw.get("integration_loop", {})),
@@ -1851,6 +1894,32 @@ def _load_lifecycle_config(raw: object) -> LifecycleConfig:
         worktree_roots=tuple(str(r) for r in roots), reconcile_limit=limit,
         allow_unverified_integration=bool(raw.get(
             "allow_unverified_integration", LifecycleConfig.allow_unverified_integration)),
+    )
+
+
+def _load_router_config(router_raw: object) -> RouterConfig:
+    """`router:` in config.yaml. Every field is validated, because a router
+    whose batch size is 0 or whose interval is negative fails silently -- it
+    just stops rescuing, which looks exactly like the bug it fixes."""
+    if not isinstance(router_raw, dict):
+        router_raw = {}
+    interval = float(router_raw.get("rescue_interval_seconds", RouterConfig.rescue_interval_seconds))
+    if interval < 1.0:
+        raise ValueError("router.rescue_interval_seconds must be at least 1.0")
+    batch = int(router_raw.get("rescue_batch_size", RouterConfig.rescue_batch_size))
+    if batch < 1 or batch > 500:
+        raise ValueError("router.rescue_batch_size must be between 1 and 500")
+    max_spawned = int(router_raw.get("max_spawned_sessions", RouterConfig.max_spawned_sessions))
+    if max_spawned < 0 or max_spawned > 100:
+        raise ValueError("router.max_spawned_sessions must be between 0 and 100")
+    return RouterConfig(
+        enabled=bool(router_raw.get("enabled", RouterConfig.enabled)),
+        rescue_enabled=bool(router_raw.get("rescue_enabled", RouterConfig.rescue_enabled)),
+        spawn_enabled=bool(router_raw.get("spawn_enabled", RouterConfig.spawn_enabled)),
+        max_spawned_sessions=max_spawned,
+        default_runtime=str(router_raw.get("default_runtime", RouterConfig.default_runtime)),
+        rescue_interval_seconds=interval,
+        rescue_batch_size=batch,
     )
 
 

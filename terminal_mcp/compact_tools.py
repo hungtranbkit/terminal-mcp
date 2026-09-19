@@ -78,6 +78,12 @@ TURN_HANDLER_ACTIONS: dict[str, str] = {
     "create_session": "create_session",
     "delete_session": "delete_session",
     "enqueue_task": "enqueue_task",
+    # TMCP-TASK-ROUTER-001. `start` needs a target; this one finds it. The
+    # two are deliberately separate actions rather than one action with an
+    # optional target: `start(target=...)` is HARD AFFINITY and must never
+    # silently reroute, so a caller that omitted a target by mistake should
+    # get TARGET_REQUIRED, not a different session than it expected.
+    "route_start": "route_start",
     "task_status": "task_status",
     "task_batch_status": "task_batch_status",
     # Browser gateway (TMCP-BROWSER-GATEWAY-001). The browser has to be
@@ -112,6 +118,9 @@ TURN_ACTION_ALIASES: dict[str, str] = {
     "browser": "browser_status",
     "verify": "browser_verify",
     "screenshot": "browser_screenshot",
+    "start_auto": "route_start",
+    "auto": "route_start",
+    "route": "route_start",
     "start_task": "start",
     "dispatch": "start",
     "run": "start",
@@ -874,8 +883,21 @@ class CompactTerminalTools:
         if action in {"create_session", "delete_session", "enqueue_task"} and (
                 not isinstance(target, str) or not target.strip()):
             return {"status": "FAILED", "error": "TARGET_REQUIRED", "action": action}
-        if action == "enqueue_task" and (not isinstance(text, str) or not text.strip()):
+        if action in {"enqueue_task", "route_start"} and (
+                not isinstance(text, str) or not text.strip()):
             return {"status": "FAILED", "error": "TEXT_REQUIRED", "action": action}
+        if action == "route_start":
+            # No target: that is the point. `target`, when a caller does pass
+            # one, is forwarded and honoured as hard affinity by the router --
+            # never re-decided here.
+            result = handler(text, title=title, priority=priority, metadata=metadata,
+                             request_key=request_key, target=target)
+            status = result.get("status", "OK") if isinstance(result, dict) else "OK"
+            return {"status": status, "action": action, "result": result,
+                    **{key: result[key] for key in
+                       ("task_id", "session", "node_id", "routing_state", "routing_outcome",
+                        "routing_reason", "score", "task_state", "dispatched", "poll")
+                       if isinstance(result, dict) and key in result}}
         if action == "task_status" and (not isinstance(task_id, str) or not task_id.strip()):
             return {"status": "FAILED", "error": "TASK_ID_REQUIRED", "action": action}
         if action == "task_batch_status" and not isinstance(task_ids, list):
