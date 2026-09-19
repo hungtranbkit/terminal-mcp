@@ -46,6 +46,7 @@ from .queue_event_drain import QueueEventDrain
 from .queue_loop import QueueLoop
 from .agent_registry import AgentRegistryStore
 from .agent_service import AgentService
+from .project_runtime import ProjectRuntimeService
 from .task_router import TaskRouter
 from .project_task_feeder import ProjectTaskFeeder
 from .backlog_service import BacklogService
@@ -94,6 +95,9 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
                      enqueue_task, route_start, task_status, task_batch_status,
                      agent_start, list_agents, get_agent, create_agent, update_agent,
                      list_skills, register_skill, bind_agent_skill, cleanup_candidates,
+                     project_plan, project_bootstrap, project_list, project_get,
+                     project_update, project_archive, project_phase_status,
+                     project_advance, project_reconcile_team, project_start,
                      browser_status, browser_verify, browser_screenshot,
                      browser_run_task, browser_stop, dispatch_tick,
                      follow_task) -> dict[str, Any]:
@@ -125,6 +129,17 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
         "register_skill": register_skill,
         "bind_agent_skill": bind_agent_skill,
         "cleanup_candidates": cleanup_candidates,
+        # TMCP-PROJECT-BOOTSTRAP-001. One logical operation = one turn call.
+        "project_plan": project_plan,
+        "project_bootstrap": project_bootstrap,
+        "project_list": project_list,
+        "project_get": project_get,
+        "project_update": project_update,
+        "project_archive": project_archive,
+        "project_phase_status": project_phase_status,
+        "project_advance": project_advance,
+        "project_reconcile_team": project_reconcile_team,
+        "project_start": project_start,
         "task_status": task_status,
         "task_batch_status": task_batch_status,
         # May be None on a build with no browser gateway wired. The router
@@ -171,6 +186,7 @@ def build_mcp(service: TerminalService | None = None,
               chat_checkpoints: OrchestratorCheckpointStore | None = None,
               browser: BrowserGateway | None = None,
               agents: "AgentService | None" = None,
+              projects: "ProjectRuntimeService | None" = None,
               run_journal: Any = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
@@ -491,8 +507,14 @@ def build_mcp(service: TerminalService | None = None,
         session_registry=terminal.session_registry, config=terminal.config,
         capacity_check=agents.capacity_block_reason)
     agents.router = task_router
+    # Bound-skill briefing, injected into the dispatch text. Assigned after
+    # construction because the engine is built before the agent registry --
+    # the alternative is reordering two long constructions for one callable.
+    queue_engine.skill_loader = agents.skill_preamble
+    projects = projects or ProjectRuntimeService(agents)
     queue.router = task_router
     queue.agents = agents
+    queue.projects = projects
     queue.loop = queue.loop or QueueLoop(
         queue_engine, poll_interval_seconds=terminal.config.queue.poll_interval_seconds,
         heartbeat_refresher=_refresh_local_heartbeat,
@@ -3320,6 +3342,127 @@ def build_mcp(service: TerminalService | None = None,
         from .stale_sessions import cleanup_candidates
         return cleanup_candidates(queue.router, config=terminal.config, limit=limit)
 
+    # -- Project runtime (TMCP-PROJECT-BOOTSTRAP-001) -----------------------
+
+    @server.tool()
+    def terminal_project_plan(name: str, description: str = "", repo_root: str | None = None,
+                              project_id: str | None = None, complexity: str | None = None,
+                              runtime: str | None = None, max_agents: int | None = None) -> dict:
+        """Analyse a project idea and PROPOSE a phase-scoped agent team.
+
+        Writes nothing -- this is the "show me what you would create" step.
+        Returns the detected stack/modules/complexity with the evidence for
+        each, the team for the first phase, and the teams later phases will
+        need (shown, not created). Deterministic: no model call."""
+        return projects.plan(name, description=description, repo_root=repo_root,
+                             project_id=project_id, complexity=complexity,
+                             runtime=runtime, max_agents=max_agents)
+
+    @server.tool()
+    def terminal_project_bootstrap(name: str, description: str = "",
+                                   repo_root: str | None = None,
+                                   project_id: str | None = None,
+                                   complexity: str | None = None, runtime: str | None = None,
+                                   max_agents: int | None = None, policy: dict | None = None,
+                                   roles: list[str] | None = None,
+                                   request_key: str | None = None) -> dict:
+        """Create the project and materialise its FIRST phase's team.
+
+        Not the whole pipeline: agents are created when the project reaches
+        the phase that needs them, so an eight-phase project does not start
+        life with eight idle identities. The one exception is the project
+        manager, which is cross-phase by definition and created up front
+        unless `policy.disable_pm` is set.
+
+        Idempotent by project id: re-running reconciles rather than
+        duplicating, so a wizard submitted twice is harmless."""
+        return projects.bootstrap(name, description=description, repo_root=repo_root,
+                                  project_id=project_id, complexity=complexity,
+                                  runtime=runtime, max_agents=max_agents, policy=policy,
+                                  roles=roles, request_key=request_key)
+
+    @server.tool()
+    def terminal_project_registry_list(status: str | None = None) -> dict:
+        """Every REGISTERED project with its phase, team size and task counts.
+
+        Distinct from `terminal_project_list`, which auto-detects the git
+        projects this fleet has sessions in. That one answers "what
+        repositories are we touching"; this one answers "what projects have a
+        team, a phase and a pipeline" -- a project can appear in either
+        without appearing in the other, and collapsing them would make
+        "project" mean two things."""
+        return projects.list_projects(status=status)
+
+    @server.tool()
+    def terminal_project_get(project_id: str) -> dict:
+        """One project in full: profile, policy, phase, team, phase history
+        and the agents upcoming phases will need."""
+        return projects.get_project(project_id)
+
+    @server.tool()
+    def terminal_project_update(project_id: str, name: str | None = None,
+                                description: str | None = None, policy: dict | None = None,
+                                complexity: str | None = None) -> dict:
+        """Update project fields. Use terminal_project_advance to move phase."""
+        fields = {key: value for key, value in (
+            ("name", name), ("description", description), ("policy", policy),
+            ("complexity", complexity)) if value is not None}
+        if not fields:
+            return {"error": "NO_FIELDS"}
+        return projects.update_project(project_id, **fields)
+
+    @server.tool()
+    def terminal_project_archive(project_id: str) -> dict:
+        """Archive a project and retire its team. Never deletes: the project
+        owns tasks and a phase history that stay readable."""
+        return projects.archive_project(project_id)
+
+    @server.tool()
+    def terminal_project_phase_status(project_id: str) -> dict:
+        """Where the project is in its pipeline: current phase, its gate,
+        active and dormant agents, what later phases will need, and the full
+        transition history with the evidence and handoffs."""
+        return projects.phase_status(project_id)
+
+    @server.tool()
+    def terminal_project_advance(project_id: str, to_phase: str | None = None,
+                                 reason: str = "", gate_evidence: dict | None = None,
+                                 handoff: dict | None = None) -> dict:
+        """Move the project to the next phase (or a named one) and reconcile
+        the team: wake or create what the new phase needs, make the rest
+        dormant. Backwards is legal -- a failed review returns to BUILD and
+        the original build agents wake with their history."""
+        return projects.advance(project_id, to_phase=to_phase, reason=reason,
+                                gate_evidence=gate_evidence, handoff=handoff)
+
+    @server.tool()
+    def terminal_project_reconcile_team(project_id: str) -> dict:
+        """Make the live team match the current phase without moving phase."""
+        return projects.reconcile_team(project_id)
+
+    @server.tool()
+    def terminal_project_start(project_id: str, prompt: str, title: str | None = None,
+                               capabilities: list[str] | None = None, approval: bool = False,
+                               agent_id: str | None = None, priority: int = 0,
+                               metadata: dict | None = None, request_key: str | None = None,
+                               target: str | None = None) -> dict:
+        """Send work to a PROJECT. No agent and no session needed.
+
+        Project -> PM orchestration -> specialist Agent -> Router -> Session.
+        The PM picks the agent by capability, phase and current load; the
+        existing router then chooses, reuses or spawns the runtime.
+
+        `approval=True` marks the task as a REVIEW/TEST/RELEASE gate, which
+        only an assurance role may take -- the agent that wrote the code and
+        the PM that asked for it are both refused.
+
+        When no agent can take the work you get NEEDS_TEAM_REVIEW with the
+        per-candidate reasons, never a randomly chosen session."""
+        return projects.project_start(project_id, prompt, title=title,
+                                      capabilities=capabilities or (), approval=approval,
+                                      agent_id=agent_id, priority=priority, metadata=metadata,
+                                      request_key=request_key, target=target)
+
     # -- Agent + Skill runtime (TMCP-AGENT-RUNTIME-001 Phase B) -------------
 
     @server.tool()
@@ -5836,6 +5979,16 @@ def build_mcp(service: TerminalService | None = None,
         register_skill=terminal_register_skill,
         bind_agent_skill=terminal_bind_agent_skill,
         cleanup_candidates=terminal_session_cleanup_candidates,
+        project_plan=terminal_project_plan,
+        project_bootstrap=terminal_project_bootstrap,
+        project_list=terminal_project_registry_list,
+        project_get=terminal_project_get,
+        project_update=terminal_project_update,
+        project_archive=terminal_project_archive,
+        project_phase_status=terminal_project_phase_status,
+        project_advance=terminal_project_advance,
+        project_reconcile_team=terminal_project_reconcile_team,
+        project_start=terminal_project_start,
         task_status=terminal_task_status,
         task_batch_status=terminal_task_batch_status,
         browser_status=browser_handlers.get("browser_status"),

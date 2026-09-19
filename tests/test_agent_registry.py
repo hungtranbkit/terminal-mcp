@@ -19,7 +19,7 @@ import pytest
 
 from terminal_mcp import skill_packages
 from terminal_mcp.agent_registry import (
-    AGENT_ACTIVE, AGENT_DISABLED, DEFAULT_MAX_SESSIONS, LATEST, SKILL_BASE, SKILL_TASK,
+    AGENT_MIGRATIONS, AGENT_ACTIVE, AGENT_DISABLED, DEFAULT_MAX_SESSIONS, LATEST, SKILL_BASE, SKILL_TASK,
     AgentRegistryError, AgentRegistryStore, valid_slug,
 )
 from terminal_mcp.agent_service import AgentService
@@ -60,8 +60,9 @@ def test_migrations_create_every_table_and_are_idempotent(tmp_path):
         tables = {row[0] for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert {"agents", "skills", "agent_skills", "agent_runs"} <= tables
-    assert version == 1
+    assert {"agents", "skills", "agent_skills", "agent_runs",
+            "projects", "project_phase_history"} <= tables
+    assert version == len(AGENT_MIGRATIONS)
 
 
 def test_the_database_file_is_not_world_readable(tmp_path):

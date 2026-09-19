@@ -297,3 +297,38 @@ class AgentService:
                 detail=receipt.get("routing_reason"))
         return {**receipt, "agent_id": agent.id, "agent_name": agent.name,
                 "skills": resolved_skills}
+
+    # -- skill injection (TMCP-PROJECT-BOOTSTRAP-001) -------------------------
+
+    def skill_preamble(self, task: Any) -> str | None:
+        """The standing briefing for one task's agent, bounded.
+
+        LOADS ONLY WHAT THE TASK PINNED. `task.skill_ids` was resolved to
+        `id@version` labels when the task was created, so this returns the
+        exact text that was in force then -- not whatever the skill says
+        today. That is what makes a run's evidence reproducible.
+
+        Bounded by COUNT here and by SIZE in the engine: an agent with a dozen
+        bound skills would otherwise front-load its prompt with more briefing
+        than request. The first few win, because base skills are ordered by
+        how central they are to the role."""
+        labels = list(getattr(task, "skill_ids", ()) or ())
+        if not labels:
+            return None
+        from .queue_engine import MAX_SKILLS_INJECTED
+
+        sections: list[str] = []
+        for label in labels[:MAX_SKILLS_INJECTED]:
+            skill_id, _, version = str(label).partition("@")
+            skill = self.store.get_skill(skill_id, version=version or None)
+            if skill is None or not skill.body:
+                continue
+            sections.append(f"## {skill.name} (skill {skill.id}@{skill.version})\n\n{skill.body}")
+        if not sections:
+            return None
+        omitted = max(0, len(labels) - MAX_SKILLS_INJECTED)
+        header = ("# Standing instructions for this agent\n\n"
+                  "These are how you work. The task follows below.")
+        if omitted:
+            header += f"\n\n({omitted} further bound skill(s) not loaded for this task.)"
+        return "\n\n".join([header, *sections])

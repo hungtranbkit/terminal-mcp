@@ -86,6 +86,9 @@ class QueueService:
         # engine/loop/router above: one instance, one registry, shared by the
         # MCP tools, the compact surface and the dashboard.
         self.agents: Any = None
+        # TMCP-PROJECT-BOOTSTRAP-001's ProjectRuntimeService, same
+        # deferred-assignment pattern: one instance over the one registry.
+        self.projects: Any = None
         # P0.5 Verify Queue, over the SAME store -- a verify job and the
         # task it verifies must commit together, which is only possible
         # in one database. Its `registry` (used solely to explain WHY a

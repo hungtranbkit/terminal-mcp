@@ -97,6 +97,17 @@ TURN_HANDLER_ACTIONS: dict[str, str] = {
     "bind_agent_skill": "bind_agent_skill",
     # Read-only: proposes, never deletes. See stale_sessions.py.
     "cleanup_candidates": "cleanup_candidates",
+    # TMCP-PROJECT-BOOTSTRAP-001. One logical operation, one turn call.
+    "project_plan": "project_plan",
+    "project_bootstrap": "project_bootstrap",
+    "project_list": "project_list",
+    "project_get": "project_get",
+    "project_update": "project_update",
+    "project_archive": "project_archive",
+    "project_phase_status": "project_phase_status",
+    "project_advance": "project_advance",
+    "project_reconcile_team": "project_reconcile_team",
+    "project_start": "project_start",
     "task_status": "task_status",
     "task_batch_status": "task_batch_status",
     # Browser gateway (TMCP-BROWSER-GATEWAY-001). The browser has to be
@@ -140,6 +151,14 @@ TURN_ACTION_ALIASES: dict[str, str] = {
     "bind_skill": "bind_agent_skill",
     "run_agent": "agent_start",
     "cleanup": "cleanup_candidates",
+    "projects": "project_list",
+    "project": "project_get",
+    "plan": "project_plan",
+    "bootstrap": "project_bootstrap",
+    "phase": "project_phase_status",
+    "advance": "project_advance",
+    "reconcile": "project_reconcile_team",
+    "new_project": "project_bootstrap",
     "stale_sessions": "cleanup_candidates",
     "auto": "route_start",
     "route": "route_start",
@@ -179,6 +198,21 @@ AGENT_ARGS: dict[str, frozenset[str]] = {
     "register_skill": frozenset({"skill_id", "version", "body", "name", "summary", "metadata"}),
     "bind_agent_skill": frozenset({"agent_id", "skill_id", "kind", "version"}),
     "cleanup_candidates": frozenset({"limit"}),
+    "project_plan": frozenset({"name", "description", "repo_root", "project_id",
+                                 "complexity", "runtime", "max_agents"}),
+    "project_bootstrap": frozenset({"name", "description", "repo_root", "project_id",
+                                      "complexity", "runtime", "max_agents", "policy",
+                                      "roles", "request_key"}),
+    "project_list": frozenset({"status"}),
+    "project_get": frozenset({"project_id"}),
+    "project_update": frozenset({"project_id", "name", "description", "policy", "complexity"}),
+    "project_archive": frozenset({"project_id"}),
+    "project_phase_status": frozenset({"project_id"}),
+    "project_advance": frozenset({"project_id", "to_phase", "reason", "gate_evidence",
+                                    "handoff"}),
+    "project_reconcile_team": frozenset({"project_id"}),
+    "project_start": frozenset({"project_id", "prompt", "title", "capabilities", "approval",
+                                  "agent_id", "priority", "metadata", "request_key", "target"}),
 }
 
 #: Arguments without which the action cannot mean anything. Checked here so
@@ -190,6 +224,15 @@ AGENT_REQUIRED: dict[str, tuple[str, ...]] = {
     "update_agent": ("agent_id",),
     "register_skill": ("skill_id",),
     "bind_agent_skill": ("agent_id", "skill_id"),
+    "project_plan": ("name",),
+    "project_bootstrap": ("name",),
+    "project_get": ("project_id",),
+    "project_update": ("project_id",),
+    "project_archive": ("project_id",),
+    "project_phase_status": ("project_id",),
+    "project_advance": ("project_id",),
+    "project_reconcile_team": ("project_id",),
+    "project_start": ("project_id", "prompt"),
 }
 
 _BLOCKED_ERRORS = {
@@ -952,17 +995,20 @@ class CompactTerminalTools:
             if unknown := sorted(key for key in extra if key not in allowed):
                 return {"status": "FAILED", "error": "UNKNOWN_ARGS", "action": action,
                         "unknown": unknown, "allowed": sorted(allowed)}
-            if target and "agent_id" in allowed:
-                extra.setdefault("agent_id", target)
-            if target and "skill_id" in allowed and "agent_id" not in allowed:
-                extra.setdefault("skill_id", target)
-            if text and "prompt" in allowed:
+            # `target` fills the action's FIRST required argument and `text`
+            # its second. One rule instead of a chain of special cases: the
+            # required list already says what each action's positionals mean,
+            # so target/text cannot drift from it.
+            required = AGENT_REQUIRED.get(action, ())
+            if target and required and required[0] in allowed:
+                extra.setdefault(required[0], target)
+            if text and len(required) > 1 and required[1] in allowed:
+                extra.setdefault(required[1], text)
+            elif text and "prompt" in allowed:
                 extra.setdefault("prompt", text)
-            elif text and "skill_id" in allowed and "agent_id" in allowed:
-                # bind_agent_skill is the one action naming TWO ids, so it
-                # reads the surface's two positionals in the obvious order:
-                # target is the agent, text is the skill.
-                extra.setdefault("skill_id", text)
+            elif text and "description" in allowed:
+                # A project's positional text is its description.
+                extra.setdefault("description", text)
             if title and "title" in allowed:
                 extra.setdefault("title", title)
             if metadata and "metadata" in allowed:
@@ -979,7 +1025,8 @@ class CompactTerminalTools:
                     **{key: result[key] for key in
                        ("task_id", "session", "node_id", "routing_state", "routing_outcome",
                         "routing_reason", "score", "task_state", "dispatched", "poll",
-                        "agent_id", "skills")
+                        "agent_id", "skills", "project_id", "phase", "agent_role",
+                        "pm_agent_id", "agent_selection_reason")
                        if isinstance(result, dict) and key in result}}
 
         if action == "route_start":
