@@ -2271,6 +2271,12 @@ class _StubQueue:
     def fleet_task_summary(self):
         return {"running": len(self._running), "queued": 0, "blocked": 0}
 
+    def board(self):
+        return {
+            "backlog": [], "queued": [], "running": list(self._running),
+            "blocked_review": [], "done": [],
+        }
+
     def global_inbox(self, *, recent_limit: int = 20):
         return {
             "summary": {"running": len(self._running), "queued": 0,
@@ -2446,6 +2452,27 @@ def test_global_inbox_appends_read_only_synthetic_rows(read_config):
     assert body["summary"]["total"] == 2
 
 
+def test_global_tasks_board_includes_untracked_runtime_agents(read_config):
+    """The /dashboard/tasks Kanban must show the same runtime work as the badge/inbox."""
+    client, _ = _runtime_client(
+        read_config,
+        sessions=[_session_row("nova-claude-long")],
+        statuses={"hp-linux/nova-claude-long":
+                  {"state": "RUNNING", "reason": "current command is 'claude'"}},
+    )
+
+    response = client.get("/dashboard/api/tasks/board")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["durable_running"] == 0
+    assert body["runtime_untracked"] == 1
+    assert len(body["running"]) == 1
+    synthetic = body["running"][0]
+    assert synthetic["session"] == "nova-claude-long"
+    assert synthetic["runtime_untracked"] is True
+    assert synthetic["actions_allowed"] == []
+
+
 def test_a_synthetic_runtime_row_cannot_be_cancelled_or_retried(read_config):
     """They are an observation, not queue state -- there is no durable row to
     act on, so the mutation is refused by name rather than reaching the store
@@ -2500,15 +2527,15 @@ def test_one_unreachable_session_does_not_fail_the_whole_summary(read_config):
     """A node going away mid-sweep must degrade, not 500."""
     class _Flaky(_StubController):
         def terminal_status(self, target, *args, **kwargs):
-            if target == "hp-linux/broken":
+            if target == "dell-linux/broken":
                 raise RuntimeError("node unreachable")
             return super().terminal_status(target, *args, **kwargs)
 
     service = TerminalService(read_config)
     server = build_mcp(service)
     controller = _Flaky(
-        [_session_row("broken"), _session_row("nova-claude-long")],
-        {"hp-linux/nova-claude-long":
+        [_session_row("broken", "dell-linux"), _session_row("nova-claude-long", "dell-linux")],
+        {"dell-linux/nova-claude-long":
          {"state": "RUNNING", "reason": "current command is 'claude'"}})
     register_dashboard(server, service, controller=controller, queue=_StubQueue())
     client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})

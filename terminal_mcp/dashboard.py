@@ -15334,6 +15334,16 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         result = await anyio.to_thread.run_sync(queue.board)
+        # Keep the dedicated /dashboard/tasks Kanban consistent with the
+        # summary badge and Global Inbox: surface active Claude/Codex
+        # sessions that are executing outside the durable queue as read-only
+        # synthetic RUNNING cards, deduped against durable running tasks.
+        tracked = _durable_running_keys(result.get("running", []))
+        runtime_rows = await _runtime_untracked_task_rows(tracked)
+        if runtime_rows:
+            result["running"] = list(result.get("running", [])) + runtime_rows
+        result["durable_running"] = len(result.get("running", [])) - len(runtime_rows)
+        result["runtime_untracked"] = len(runtime_rows)
         # PM/Orchestrator checkpoint (§20.2): enrich each card with its
         # own latest routing decision, if any -- ONE bulk read (never
         # N+1 per card), done here at the dashboard-route layer rather
