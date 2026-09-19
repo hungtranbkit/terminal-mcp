@@ -149,6 +149,9 @@ class TaskRouter:
         # submission and rescue alike -- because a limit that only held on the
         # submission path would be silently bypassed by the next reconcile.
         self.capacity_check = capacity_check
+        # Set for the duration of one route so the match and dispatch phases
+        # share a single wall-clock ceiling. Never read across calls.
+        self._deadline: float | None = None
         self._cache: tuple[float, list[SessionCandidate]] | None = None
         self._cache_ttl_seconds = 2.0
         # One routing decision at a time in this process. The store's
@@ -412,8 +415,16 @@ class TaskRouter:
                                       evidence=evidence)
 
         profile = self.profile_for(task)
+        # ONE wall-clock budget for the whole synchronous route, not one per
+        # phase. Found live (hp-linux): a 12s dispatch budget still produced a
+        # 42s call, because eight live probes across a 68-session fleet had
+        # already spent thirty seconds before the first tick.
+        budget = float(self._policy_value("dispatch_budget_seconds", 12.0))
+        route_deadline = self.clock() + budget
+        self._deadline = route_deadline
         match = sm.rank(profile, self.candidates(), probe=self._probe,
-                        probe_limit=int(self._policy_value("probe_limit", 3)))
+                        probe_limit=int(self._policy_value("probe_limit", 3)),
+                        deadline=lambda: self.clock() >= route_deadline)
         evidence: dict[str, Any] = {
             "profile": profile.as_dict(),
             "decided_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -446,7 +457,7 @@ class TaskRouter:
                 node_id=chosen.candidate.node_id, score=chosen.score,
                 reason=evidence["reason"], routing_state=BOUND,
                 task_state=bound.get("status"), evidence=evidence)
-            if dispatch and not self._dispatch(outcome) and not outcome.budget_exhausted:
+            if dispatch and not self._dispatch(outcome) and self._should_release(outcome):
                 return self._release_and_defer(outcome, evidence)
             return outcome
 
@@ -467,8 +478,7 @@ class TaskRouter:
                         outcome=SPAWNED_RUNTIME, task_id=task_id, session=session_name,
                         node_id=node_id, reason=evidence["reason"], routing_state=SPAWNED,
                         task_state=bound.get("status"), evidence=evidence)
-                    if (dispatch and not self._dispatch(outcome)
-                            and not outcome.budget_exhausted):
+                    if dispatch and not self._dispatch(outcome) and self._should_release(outcome):
                         # A session the router itself just created that still
                         # will not start the task is a real problem, but the
                         # honest answer is the same: say so and re-match.
@@ -542,7 +552,10 @@ class TaskRouter:
         settled = START_UNDERWAY_STATUSES | START_NEEDS_HUMAN_STATUSES | START_SERVER_PENDING_STATUSES
         detail: str | None = None
         budget = float(self._policy_value("dispatch_budget_seconds", 12.0))
-        deadline = self.clock() + budget
+        # The matching phase may already have spent part of the budget; a
+        # deadline handed down from there is honoured, so the two phases share
+        # one ceiling instead of each getting a full one.
+        deadline = self._deadline if self._deadline is not None else self.clock() + budget
         for _ in range(MAX_START_TICKS):
             if self.clock() >= deadline:
                 # A submission must never become a long poll. The task is
@@ -577,12 +590,56 @@ class TaskRouter:
                 detail = str(task.last_error)
         outcome.dispatched = outcome.task_state in START_UNDERWAY_STATUSES
         outcome.dispatch_detail = detail
-        if outcome.dispatched:
+        if outcome.task_state in settled:
+            # The task reached a real resting state, so the clock running out
+            # is not what happened to it. Found live: a task the coordinator
+            # had PAUSED came back saying "the server is still driving it",
+            # which is the same class of lie as the old dispatched=true.
             outcome.budget_exhausted = False
+            if outcome.task_state in START_NEEDS_HUMAN_STATUSES:
+                detail = self._settled_reason(outcome.task_id) or detail
+                outcome.dispatch_detail = detail
         _LOGGER.info("task-router: task=%s session=%s ticks=%s state=%s dispatched=%s detail=%s",
                      outcome.task_id, outcome.session, outcome.dispatch_ticks,
                      outcome.task_state, outcome.dispatched, detail)
         return outcome.dispatched
+
+    @staticmethod
+    def _should_release(outcome: RoutingOutcome) -> bool:
+        """Hand the runtime back, or keep it? Three different situations.
+
+        RELEASE when the engine simply would not claim the task -- it is still
+        QUEUED, the session is doing nothing for it, and some other runtime
+        might.
+
+        KEEP when the caller's clock ran out: the engine is mid-flight and
+        taking its session away would strand real work.
+
+        KEEP when the task is stopped for a HUMAN (the coordinator gate
+        refusing, a paused lane, a failed attempt). Re-matching would be
+        pointless -- the gate refused on grounds another session in the same
+        repo would hit too -- and it would replace an answerable "this is
+        blocked, here is why" with a task drifting between sessions.
+        """
+        if outcome.budget_exhausted:
+            return False
+        if outcome.task_state in START_NEEDS_HUMAN_STATUSES:
+            return False
+        return True
+
+    def _settled_reason(self, task_id: str) -> str | None:
+        """Why a stopped task stopped, in the words of whatever stopped it --
+        the coordinator's decision or the task's own last error, never a guess
+        assembled from the status name."""
+        task = self.store.get_task(task_id)
+        if task is None:
+            return None
+        if task.coordinator_reason:
+            return str(task.coordinator_reason)
+        decision = task.coordinator_decision or {}
+        if isinstance(decision, dict) and decision.get("reason"):
+            return str(decision["reason"])
+        return str(task.last_error) if task.last_error else None
 
     def _release_and_defer(self, outcome: RoutingOutcome, evidence: dict[str, Any]) -> RoutingOutcome:
         """The session was eligible but the engine would not start the task.
@@ -802,6 +859,17 @@ class TaskRouter:
                 "no runtime was eligible, so the task is durably queued as WAITING_RUNTIME. "
                 "The server re-runs the match every rescue cycle and will start it as soon as a "
                 "compatible session frees up -- do not poll and do not re-send")
+        elif outcome.task_state in START_NEEDS_HUMAN_STATUSES:
+            # Stopped, and only a person can move it. Saying anything else
+            # here is how an orchestrator silently drops a task.
+            receipt["needs_human"] = True
+            receipt["next_action"] = "resolve"
+            receipt["blocked_reason"] = outcome.dispatch_detail
+            receipt["guidance"] = (
+                f"this task is NOT running: it is {outcome.task_state}"
+                + (f" -- {outcome.dispatch_detail}" if outcome.dispatch_detail else "")
+                + ". Polling will not change that; resolve the blocker. The task is already "
+                  "durably queued under this task_id, so do not re-send the prompt")
         elif outcome.budget_exhausted:
             receipt["needs_human"] = False
             receipt["next_action"] = "none"

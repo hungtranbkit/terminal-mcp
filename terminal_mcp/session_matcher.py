@@ -456,8 +456,15 @@ def evaluate(profile: TaskProfile, candidate: SessionCandidate) -> ScoredCandida
 
 def rank(profile: TaskProfile, candidates: Iterable[SessionCandidate], *,
          probe: Callable[[SessionCandidate], SessionCandidate] | None = None,
-         probe_limit: int = 5) -> MatchResult:
+         probe_limit: int = 5,
+         deadline: Callable[[], bool] | None = None) -> MatchResult:
     """Rank the fleet for this task and pick the best genuinely usable session.
+
+    `deadline` is an optional "are we out of time?" predicate. Probing is
+    remote I/O, so a large fleet can spend more wall clock here than a caller
+    is willing to wait even well inside `probe_limit`; hitting it is recorded
+    as `unverified` exactly like exhausting the count, never as "nothing was
+    eligible".
 
     WHY THE LIVE PROBE IS RANKED, NOT EXHAUSTIVE. Deciding on registry state
     alone risks dispatching into a session that has started waiting for input
@@ -481,10 +488,11 @@ def rank(profile: TaskProfile, candidates: Iterable[SessionCandidate], *,
     for index, row in enumerate(scored):
         if not row.eligible:
             continue
-        if probes_used >= probe_limit:
-            # Out of probe budget with eligible candidates still unexamined.
-            # Record where we stopped rather than letting the caller read the
-            # remaining rows as rejections -- they were never looked at.
+        if probes_used >= probe_limit or (deadline is not None and deadline()):
+            # Out of probe budget -- by count or by clock -- with eligible
+            # candidates still unexamined. Record where we stopped rather than
+            # letting the caller read the remaining rows as rejections; they
+            # were never looked at.
             exhausted_at = index
             break
         probes_used += 1

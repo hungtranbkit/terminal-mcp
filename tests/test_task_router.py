@@ -1227,3 +1227,71 @@ def test_a_sufficient_probe_budget_finds_the_one_good_session_late_in_the_rankin
 
     assert receipt["session"] == "zzz-free"
     assert receipt["dispatched"] is True
+
+
+def test_a_coordinator_paused_task_is_reported_as_needing_a_human_not_as_in_flight(store, queue):
+    """LIVE, hp-linux @ 8bef6bd: the coordinator gate PAUSED a task and the
+    receipt still read "the server is still driving it" because the wall-clock
+    budget had also expired. Settled beats out-of-time: the clock running out
+    is not what happened to this task."""
+    class PausingEngine:
+        def __init__(self, store):
+            self.store = store
+
+        def tick(self, session):
+            lane = self.store.lane_status(session)
+            pending = [row for row in lane["tasks"] if row["status"] in ("QUEUED", "PRECHECK")]
+            if not pending:
+                return _Result("IDLE")
+            task = pending[0]
+            if task["status"] == "QUEUED":
+                self.store.transition_task(task["id"], "PRECHECK", event_type="TEST")
+                return _Result("CLAIMED")
+            # record_coordinator_decision performs the PAUSED transition
+            # itself -- the same call the real gate makes.
+            self.store.record_coordinator_decision(
+                task["id"], status="NEEDS_HUMAN",
+                reason="session 'other' is already working in the same worktree")
+            return _Result("PAUSED")
+
+    controller = FakeController(sessions=[_row("agent-a")],
+                                records=[FakeRecord(node_id="local", session_name="agent-a")])
+    router = _router(store, queue, controller, engine=PausingEngine(store))
+
+    receipt = router.route_start("work the gate will refuse")
+
+    assert receipt["task_state"] == "PAUSED"
+    assert receipt["dispatched"] is False
+    assert receipt["budget_exhausted"] is False
+    assert receipt["needs_human"] is True
+    assert receipt["next_action"] == "resolve"
+    assert "same worktree" in receipt["blocked_reason"]
+    assert "NOT running" in receipt["guidance"]
+
+
+def test_the_match_and_dispatch_phases_share_one_wall_clock_budget(store, queue):
+    """LIVE: a 12s dispatch budget still produced a 42s call, because the probe
+    phase had already spent thirty seconds before the first tick."""
+    now = {"t": 0.0}
+    sessions = [_row(f"agent-{index:02d}") for index in range(8)]
+
+    class SlowProbeController(FakeController):
+        def terminal_status(self, session):
+            now["t"] += 4.0        # every probe is a slow remote round trip
+            return {"state": "RUNNING"}
+
+    controller = SlowProbeController(
+        sessions=sessions,
+        records=[FakeRecord(node_id="local", session_name=row["name"],
+                            last_known_state="IDLE") for row in sessions])
+    router = TaskRouter(store, controller=controller, queue=queue,
+                        engine=RecordingEngine(store),
+                        session_registry=controller.session_registry,
+                        config=_config(dispatch_budget_seconds=10.0, probe_limit=8),
+                        clock=lambda: now["t"])
+
+    receipt = router.route_start("work")
+
+    # Stopped by the clock after ~3 probes, not after all 8.
+    assert now["t"] <= 16.0
+    assert "unverified" in receipt["routing_reason"]
