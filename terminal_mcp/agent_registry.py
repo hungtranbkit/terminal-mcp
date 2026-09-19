@@ -61,10 +61,32 @@ from typing import Any, Sequence
 
 from .schema import Migration, apply_migrations
 
-# -- agent state --------------------------------------------------------
+# -- agent lifecycle ----------------------------------------------------
+#
+# PHASE-SCOPED, NOT ALWAYS-ON. A project is a pipeline, so its agents come and
+# go with the phase that needs them. Keeping every agent ACTIVE from bootstrap
+# means paying for a QA identity before anything is written, and it puts the
+# build agents in the room while planning should still own the decisions.
 AGENT_ACTIVE = "ACTIVE"
+"""Materialised and in the current phase: may be started, may hold a runtime."""
+AGENT_IDLE = "IDLE"
+"""Materialised and in the current phase, but holding nothing right now. A
+scheduling observation, not a lifecycle stage -- the registry does not write
+it; the agent view derives it. Kept in the vocabulary so a caller reading a
+state never meets a value the enum does not list."""
+AGENT_DORMANT = "DORMANT"
+"""The project has moved past this agent's phase. It keeps its identity,
+skills and history, and it wakes if the project returns to that phase (a
+failed review sends BUILD back to work). It is NOT started while dormant."""
+AGENT_RETIRED = "RETIRED"
+"""Done for this project's lifetime. Distinct from DORMANT because a retired
+agent is not waiting for a phase to come round again."""
 AGENT_DISABLED = "DISABLED"
-AGENT_STATES = (AGENT_ACTIVE, AGENT_DISABLED)
+"""An operator switched it off, independent of any phase."""
+AGENT_STATES = (AGENT_ACTIVE, AGENT_IDLE, AGENT_DORMANT, AGENT_RETIRED, AGENT_DISABLED)
+
+#: States in which an agent may be handed work.
+AGENT_STARTABLE = frozenset({AGENT_ACTIVE, AGENT_IDLE})
 
 # -- skill binding kinds ------------------------------------------------
 SKILL_BASE = "BASE"
@@ -134,10 +156,24 @@ class Agent:
     created_at: str = ""
     updated_at: str = ""
     disabled_at: str | None = None
+    role: str | None = None
+    phases: tuple[str, ...] = ()
+    """Phases this agent is active in. Empty means every phase -- which is
+    what a Phase B agent created before the pipeline existed reads as."""
+    phase_state_reason: str | None = None
+    cross_phase: bool = False
+    """True for the project manager: a phase transition never makes it
+    dormant, because the coordination it owns spans the whole pipeline."""
 
     @property
     def enabled(self) -> bool:
-        return self.state == AGENT_ACTIVE
+        """May this agent be handed work right now?
+
+        DORMANT and RETIRED are not failures -- they are the normal resting
+        states of a phase-scoped agent -- but they are not startable either,
+        and conflating "off" with "not this phase" would make the two
+        indistinguishable in every caller."""
+        return self.state in AGENT_STARTABLE
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -146,7 +182,70 @@ class Agent:
             "enabled": self.enabled, "max_sessions": self.max_sessions, "repo": self.repo,
             "workspace": self.workspace, "model": self.model, "metadata": self.metadata,
             "created_at": self.created_at, "updated_at": self.updated_at,
-            "disabled_at": self.disabled_at,
+            "disabled_at": self.disabled_at, "role": self.role,
+            "phases": list(self.phases), "phase_state_reason": self.phase_state_reason,
+            "cross_phase": self.cross_phase,
+        }
+
+
+@dataclass(frozen=True)
+class Project:
+    """A durable, user-facing project identity and its pipeline position.
+
+    Distinct from `queue_tasks.project_id`, which is the TASK dimension and is
+    unchanged: a task may carry a project id this table has never heard of, and
+    it behaves exactly as it always did. Registering a Project adds a team, a
+    phase and a policy on top; it does not gate anything that worked before."""
+
+    id: str
+    name: str
+    description: str = ""
+    repo_root: str | None = None
+    workspace: str | None = None
+    stack: tuple[str, ...] = ()
+    modules: tuple[str, ...] = ()
+    capabilities: tuple[str, ...] = ()
+    complexity: str = "small"
+    domain: str = "software"
+    status: str = "ACTIVE"
+    phase: str = "INTAKE"
+    phase_entered_at: str | None = None
+    bootstrap_state: str = "PENDING"
+    pm_agent_id: str | None = None
+    """The project's durable coordinator. Exactly one per project, created at
+    bootstrap unless policy.disable_pm is set, and never phase-scoped."""
+    policy: dict[str, Any] = field(default_factory=dict)
+    profile: dict[str, Any] = field(default_factory=dict)
+    created_at: str = ""
+    updated_at: str = ""
+    archived_at: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.status == "ACTIVE"
+
+    @property
+    def allow_self_approval(self) -> bool:
+        """Whether a build role may supply REVIEW/TEST/RELEASE approval.
+
+        Recorded on the project rather than inferred from its size: a small
+        team still gets an independent QA agent by default, and waiving that
+        is a decision someone makes, not a consequence of being small."""
+        return bool(self.policy.get("allow_self_approval"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id, "name": self.name, "description": self.description,
+            "repo_root": self.repo_root, "workspace": self.workspace,
+            "stack": list(self.stack), "modules": list(self.modules),
+            "capabilities": list(self.capabilities), "complexity": self.complexity,
+            "domain": self.domain, "status": self.status, "active": self.active,
+            "phase": self.phase, "phase_entered_at": self.phase_entered_at,
+            "bootstrap_state": self.bootstrap_state, "pm_agent_id": self.pm_agent_id,
+            "policy": self.policy,
+            "profile": self.profile, "created_at": self.created_at,
+            "updated_at": self.updated_at, "archived_at": self.archived_at,
+            "allow_self_approval": self.allow_self_approval,
         }
 
 
@@ -267,8 +366,93 @@ def _create_v1(connection: sqlite3.Connection) -> None:
         "WHERE task_id IS NOT NULL")
 
 
+def _add_v2_projects_and_phases(connection: sqlite3.Connection) -> None:
+    """TMCP-PROJECT-BOOTSTRAP-001: the Project, and the pipeline it moves through.
+
+    WHY THE PROJECT LIVES HERE AND NOT IN A NEW DATABASE. Project and Agent are
+    the same kind of thing -- durable, user-facing identities that outlive every
+    session -- and Agent already has a `project_id`. Putting the Project beside
+    it makes that a real foreign key instead of a string that hopefully matches
+    something. It also keeps `queue_tasks.project_id` exactly as it was: that
+    column is the TASK dimension and project_service.py's composition view over
+    it is untouched, so every legacy task keeps working whether or not a
+    Project row exists for its id.
+
+    `projects.phase` is the state machine. `project_phase_history` is the
+    record of every transition -- who moved it, why, what evidence satisfied
+    the gate, which agents were active, and what was handed off. That history
+    is the reason a phase model is worth having at all: without it, "we are in
+    TEST" is an assertion, and with it, it is a claim with a trail.
+    """
+    connection.execute(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            repo_root TEXT,
+            workspace TEXT,
+            stack TEXT,
+            modules TEXT,
+            capabilities TEXT,
+            complexity TEXT NOT NULL DEFAULT 'small',
+            domain TEXT NOT NULL DEFAULT 'software',
+            status TEXT NOT NULL DEFAULT 'ACTIVE',
+            phase TEXT NOT NULL DEFAULT 'INTAKE',
+            phase_entered_at TEXT,
+            bootstrap_state TEXT NOT NULL DEFAULT 'PENDING',
+            pm_agent_id TEXT,
+            policy TEXT,
+            profile TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            archived_at TEXT
+        )
+        """
+    )
+    connection.execute("CREATE INDEX idx_projects_status ON projects(status)")
+    connection.execute("CREATE INDEX idx_projects_phase ON projects(phase)")
+    connection.execute(
+        """
+        CREATE TABLE project_phase_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL,
+            from_phase TEXT,
+            to_phase TEXT NOT NULL,
+            reason TEXT,
+            gate_evidence TEXT,
+            active_agent_ids TEXT,
+            handoff TEXT,
+            actor TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX idx_phase_history_project ON project_phase_history(project_id, id DESC)")
+    # Agents gain their pipeline identity. Nullable and additive: a Phase B
+    # agent with no role and no phases reads as always-available, exactly as
+    # it behaved before.
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(agents)")}
+    for column, declaration in (
+        ("role", "TEXT"),
+        ("phases", "TEXT"),          # JSON list; empty/NULL = every phase
+        ("phase_state_reason", "TEXT"),
+        # The one agent a phase transition never makes dormant. Stored rather
+        # than derived from `role` so a deployment can mark another agent
+        # cross-phase without editing the role tables.
+        ("cross_phase", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column not in columns:
+            connection.execute(f"ALTER TABLE agents ADD COLUMN {column} {declaration}")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_agents_role ON agents(project_id, role)")
+
+
 AGENT_MIGRATIONS = [
     Migration(1, "TMCP-AGENT-RUNTIME-001 Phase B: agents/skills/agent_skills/agent_runs", _create_v1),
+    Migration(2, "TMCP-PROJECT-BOOTSTRAP-001: projects + project_phase_history + agent "
+              "role/phases (phase-scoped teams)", _add_v2_projects_and_phases),
 ]
 
 
@@ -322,13 +506,20 @@ class AgentRegistryStore:
             max_sessions=row["max_sessions"], repo=row["repo"], workspace=row["workspace"],
             model=row["model"], metadata=_parse(row["metadata"], {}),
             created_at=row["created_at"], updated_at=row["updated_at"],
-            disabled_at=row["disabled_at"])
+            disabled_at=row["disabled_at"],
+            role=(row["role"] if "role" in row.keys() else None),
+            phases=(tuple(_parse(row["phases"], [])) if "phases" in row.keys() else ()),
+            phase_state_reason=(row["phase_state_reason"]
+                                if "phase_state_reason" in row.keys() else None),
+            cross_phase=bool(row["cross_phase"]) if "cross_phase" in row.keys() else False)
 
     def create_agent(self, agent_id: str, *, name: str | None = None, project_id: str | None = None,
                      description: str = "", runtime: str | None = None,
                      max_sessions: int = DEFAULT_MAX_SESSIONS, repo: str | None = None,
                      workspace: str | None = None, model: str | None = None,
-                     metadata: dict[str, Any] | None = None) -> Agent:
+                     metadata: dict[str, Any] | None = None, role: str | None = None,
+                     phases: Sequence[str] = (), state: str = AGENT_ACTIVE,
+                     cross_phase: bool = False) -> Agent:
         if not valid_slug(agent_id):
             raise AgentRegistryError(
                 f"invalid agent id {agent_id!r}: lowercase letters, digits, '-' and '_' only, "
@@ -340,10 +531,12 @@ class AgentRegistryStore:
             with self._connection() as connection:
                 connection.execute(
                     "INSERT INTO agents (id, name, project_id, description, runtime, state, "
-                    "max_sessions, repo, workspace, model, metadata, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (agent_id, name or agent_id, project_id, description, runtime, AGENT_ACTIVE,
-                     max_sessions, repo, workspace, model, _json(metadata), now, now))
+                    "max_sessions, repo, workspace, model, metadata, created_at, updated_at, "
+                    "role, phases, cross_phase) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (agent_id, name or agent_id, project_id, description, runtime, state,
+                     max_sessions, repo, workspace, model, _json(metadata), now, now,
+                     role, _json(list(phases)), int(cross_phase)))
         except sqlite3.IntegrityError as exc:
             raise AgentRegistryError(f"agent {agent_id!r} already exists") from exc
         return self.get_agent(agent_id)  # type: ignore[return-value]
@@ -372,7 +565,8 @@ class AgentRegistryStore:
     #: than silently ignored -- a typo'd field that appears to succeed is how a
     #: caller comes to believe it changed something it did not.
     UPDATABLE = ("name", "project_id", "description", "runtime", "max_sessions",
-                 "repo", "workspace", "model", "metadata", "state")
+                 "repo", "workspace", "model", "metadata", "state", "role", "phases",
+                 "phase_state_reason", "cross_phase")
 
     def update_agent(self, agent_id: str, **fields: Any) -> Agent:
         agent = self.get_agent(agent_id)
@@ -390,7 +584,7 @@ class AgentRegistryStore:
         assignments, params = [], []
         for key, value in fields.items():
             assignments.append(f"{key} = ?")
-            params.append(_json(value) if key == "metadata" else value)
+            params.append(_json(value) if key in ("metadata", "phases") else value)
         if "state" in fields:
             assignments.append("disabled_at = ?")
             params.append(_now() if fields["state"] == AGENT_DISABLED else None)
@@ -412,6 +606,142 @@ class AgentRegistryStore:
 
     def enable_agent(self, agent_id: str) -> Agent:
         return self.update_agent(agent_id, state=AGENT_ACTIVE)
+
+    # -- projects ----------------------------------------------------------
+
+    @staticmethod
+    def _project(row: sqlite3.Row) -> "Project":
+        return Project(
+            id=row["id"], name=row["name"], description=row["description"],
+            repo_root=row["repo_root"], workspace=row["workspace"],
+            stack=tuple(_parse(row["stack"], [])), modules=tuple(_parse(row["modules"], [])),
+            capabilities=tuple(_parse(row["capabilities"], [])),
+            complexity=row["complexity"], domain=row["domain"], status=row["status"],
+            phase=row["phase"], phase_entered_at=row["phase_entered_at"],
+            bootstrap_state=row["bootstrap_state"],
+            pm_agent_id=(row["pm_agent_id"] if "pm_agent_id" in row.keys() else None),
+            policy=_parse(row["policy"], {}),
+            profile=_parse(row["profile"], {}), created_at=row["created_at"],
+            updated_at=row["updated_at"], archived_at=row["archived_at"])
+
+    def create_project(self, project_id: str, *, name: str | None = None, description: str = "",
+                       repo_root: str | None = None, workspace: str | None = None,
+                       stack: Sequence[str] = (), modules: Sequence[str] = (),
+                       capabilities: Sequence[str] = (), complexity: str = "small",
+                       domain: str = "software", phase: str = "INTAKE",
+                       policy: dict[str, Any] | None = None,
+                       profile: dict[str, Any] | None = None) -> "Project":
+        if not valid_slug(project_id):
+            raise AgentRegistryError(
+                f"invalid project id {project_id!r}: lowercase letters, digits, '-' and '_' "
+                f"only, 1-64 characters")
+        now = _now()
+        try:
+            with self._connection() as connection:
+                connection.execute(
+                    "INSERT INTO projects (id, name, description, repo_root, workspace, stack, "
+                    "modules, capabilities, complexity, domain, status, phase, phase_entered_at, "
+                    "bootstrap_state, policy, profile, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, 'PENDING', ?, ?, ?, ?)",
+                    (project_id, name or project_id, description, repo_root, workspace,
+                     _json(list(stack)), _json(list(modules)), _json(list(capabilities)),
+                     complexity, domain, phase, now, _json(policy), _json(profile), now, now))
+                connection.execute(
+                    "INSERT INTO project_phase_history (project_id, from_phase, to_phase, reason, "
+                    "actor, created_at) VALUES (?, NULL, ?, ?, ?, ?)",
+                    (project_id, phase, "project created", "system", now))
+        except sqlite3.IntegrityError as exc:
+            raise AgentRegistryError(f"project {project_id!r} already exists") from exc
+        return self.get_project(project_id)  # type: ignore[return-value]
+
+    def get_project(self, project_id: str) -> "Project | None":
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        return self._project(row) if row else None
+
+    def list_projects(self, *, status: str | None = None, limit: int = 200) -> list["Project"]:
+        clause = "WHERE status = ?" if status else ""
+        params: tuple[Any, ...] = (status, limit) if status else (limit,)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM projects {clause} ORDER BY name LIMIT ?", params).fetchall()
+        return [self._project(row) for row in rows]
+
+    PROJECT_UPDATABLE = ("name", "description", "repo_root", "workspace", "stack", "modules",
+                         "capabilities", "complexity", "domain", "status", "bootstrap_state",
+                         "pm_agent_id", "policy", "profile")
+
+    def update_project(self, project_id: str, **fields: Any) -> "Project":
+        if self.get_project(project_id) is None:
+            raise AgentRegistryError(f"project {project_id!r} not found")
+        unknown = sorted(key for key in fields if key not in self.PROJECT_UPDATABLE)
+        if unknown:
+            raise AgentRegistryError(
+                f"cannot update {', '.join(unknown)}; updatable fields are "
+                f"{', '.join(self.PROJECT_UPDATABLE)}. Use set_phase to move the pipeline")
+        assignments, params = [], []
+        for key, value in fields.items():
+            assignments.append(f"{key} = ?")
+            params.append(_json(value) if key in ("stack", "modules", "capabilities",
+                                                  "policy", "profile") else value)
+        assignments.append("updated_at = ?")
+        params.append(_now())
+        with self._connection() as connection:
+            connection.execute(f"UPDATE projects SET {', '.join(assignments)} WHERE id = ?",
+                               (*params, project_id))
+        return self.get_project(project_id)  # type: ignore[return-value]
+
+    def archive_project(self, project_id: str) -> "Project":
+        """Archive, never delete -- same reasoning as disabling an agent. The
+        project owns tasks and a phase history, and deleting the row would
+        turn both into dangling references."""
+        project = self.get_project(project_id)
+        if project is None:
+            raise AgentRegistryError(f"project {project_id!r} not found")
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE projects SET status = 'ARCHIVED', archived_at = ?, updated_at = ? "
+                "WHERE id = ?", (_now(), _now(), project_id))
+        return self.get_project(project_id)  # type: ignore[return-value]
+
+    def set_phase(self, project_id: str, phase: str, *, reason: str = "",
+                  gate_evidence: dict[str, Any] | None = None,
+                  active_agent_ids: Sequence[str] = (), handoff: dict[str, Any] | None = None,
+                  actor: str = "mcp") -> "Project":
+        """Move the pipeline, and record WHY in the same transaction.
+
+        The history row is not logging. It is the difference between "we are in
+        TEST" being an assertion and being a claim with a trail: who moved it,
+        what evidence satisfied the previous gate, which agents were active,
+        and what they handed over."""
+        project = self.get_project(project_id)
+        if project is None:
+            raise AgentRegistryError(f"project {project_id!r} not found")
+        now = _now()
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE projects SET phase = ?, phase_entered_at = ?, updated_at = ? WHERE id = ?",
+                (phase, now, now, project_id))
+            connection.execute(
+                "INSERT INTO project_phase_history (project_id, from_phase, to_phase, reason, "
+                "gate_evidence, active_agent_ids, handoff, actor, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (project_id, project.phase, phase, reason, _json(gate_evidence),
+                 _json(list(active_agent_ids)), _json(handoff), actor, now))
+        return self.get_project(project_id)  # type: ignore[return-value]
+
+    def phase_history(self, project_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM project_phase_history WHERE project_id = ? ORDER BY id DESC "
+                "LIMIT ?", (project_id, limit)).fetchall()
+        history = []
+        for row in rows:
+            entry = dict(row)
+            for key in ("gate_evidence", "active_agent_ids", "handoff"):
+                entry[key] = _parse(entry.get(key), [] if key == "active_agent_ids" else {})
+            history.append(entry)
+        return history
 
     # -- skills ----------------------------------------------------------
 

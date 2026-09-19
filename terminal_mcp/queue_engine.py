@@ -137,7 +137,15 @@ COMPLETION_INSTRUCTION_SENTENCE = (
     "line in this exact format (once), then stop:")
 
 
-def build_dispatch_text(task: QueueTask, *, nonce: str, continuation_text: str | None = None) -> str:
+#: Hard ceilings on injected skill text. A skill is standing guidance, not a
+#: payload: past these limits the agent's own prompt starts competing with the
+#: briefing for attention, and the briefing wins by being first.
+MAX_SKILL_PREAMBLE_CHARS = 8_000
+MAX_SKILLS_INJECTED = 4
+
+
+def build_dispatch_text(task: QueueTask, *, nonce: str, continuation_text: str | None = None,
+                        skills_preamble: str | None = None) -> str:
     """The 'wrapper rất ngắn' item 7 explicitly allows and limits: the
     task's own prompt is included VERBATIM, first, unmodified -- nothing
     here rewrites or reinterprets the business request. Only a short,
@@ -160,8 +168,17 @@ def build_dispatch_text(task: QueueTask, *, nonce: str, continuation_text: str |
     handed its original prompt again cannot tell a retry from a new task, so
     it re-plans and an hour of reasoning is discarded. A retry that can
     continue must say "continue", not say everything again.
+
+    `skills_preamble` (TMCP-PROJECT-BOOTSTRAP-001) is the bound-skill briefing
+    for the agent that owns this task, placed BEFORE the prompt because
+    standing instructions have to be read before the request they qualify.
+    It is bounded in both count and size by the caller, and absent entirely
+    for a task with no agent -- which is every task that predates the agent
+    runtime, so their dispatch text stays byte-identical to before.
     """
+    preamble = f"{skills_preamble.strip()}\n\n---\n\n" if skills_preamble else ""
     return (
+        f"{preamble}"
         f"{continuation_text if continuation_text else task.prompt}\n\n"
         f"---\n"
         f"{REQUIREMENTS_REMINDER}\n\n"
@@ -278,9 +295,15 @@ class QueueEngine:
                 claimed_by: str = DEFAULT_CLAIMED_BY, lease_seconds: float = DEFAULT_LEASE_SECONDS,
                 on_completed: Callable[[QueueTask], None] | None = None,
                 verify_queue: Any = None, delivery_policy: Any = None,
-                governor: RequestGovernor | None = None) -> None:
+                governor: RequestGovernor | None = None,
+                skill_loader: Callable[[QueueTask], str | None] | None = None) -> None:
         self.store = store
         self.ops = ops
+        # TMCP-PROJECT-BOOTSTRAP-001: returns the bound-skill briefing for one
+        # task, or None. Injected rather than imported so the engine keeps
+        # knowing nothing about agents or skills -- it asks a callable and
+        # prepends whatever it gets back.
+        self.skill_loader = skill_loader
         # PROMPT DELIVERY / ACCEPTANCE GATE (delivery_gate.py). None ->
         # PromptDeliveryConfig()'s own default, which is advisory: the
         # verdict is computed and recorded, and every transition below
@@ -589,7 +612,8 @@ class QueueEngine:
             resumed_natively = self._relaunch_for_native_resume(session, retry_plan)
         dispatch_text = build_dispatch_text(
             task, nonce=nonce,
-            continuation_text=(retry_plan.continuation_text if retry_plan is not None else None))
+            continuation_text=(retry_plan.continuation_text if retry_plan is not None else None),
+            skills_preamble=self._skills_preamble(task))
         self.store.transition_task(task_id, DISPATCHING, event_type="DISPATCHED",
                                    extra_fields={"dispatch_idempotency_key": idempotency_key})
 
@@ -649,6 +673,31 @@ class QueueEngine:
             detail = (f"{idempotency_key} retry_mode={retry_plan.mode}"
                       + (" native_resume=ok" if resumed_natively else ""))
         return TickResult(session, "DISPATCHED", task_id=task_id, detail=detail)
+
+    def _skills_preamble(self, task: QueueTask) -> str | None:
+        """The agent's standing briefing for this task, or None.
+
+        Never raises and never blocks a dispatch: a skill store that is slow,
+        broken or simply absent must not stop work being sent. A task with no
+        agent has no briefing, which is the overwhelmingly common case and the
+        reason existing dispatch text is unchanged."""
+        if self.skill_loader is None or not getattr(task, "skill_ids", ()):
+            return None
+        try:
+            preamble = self.skill_loader(task)
+        except Exception:  # noqa: BLE001 -- a briefing is an enhancement, never a gate
+            _LOGGER.exception("queue-engine: skill preamble failed for task %s", task.id)
+            return None
+        if not preamble:
+            return None
+        text = str(preamble)
+        if len(text) > MAX_SKILL_PREAMBLE_CHARS:
+            # Truncated at a line boundary with an explicit marker: a briefing
+            # that stops mid-sentence reads as corruption, and silently
+            # dropping the tail would hide that a skill is too large.
+            text = text[:MAX_SKILL_PREAMBLE_CHARS].rsplit("\n", 1)[0]
+            text += "\n\n[skill briefing truncated at the configured size limit]"
+        return text
 
     @staticmethod
     def _long_task_metadata(task: QueueTask) -> tuple[bool, int | None]:

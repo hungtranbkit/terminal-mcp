@@ -1453,6 +1453,7 @@ DASHBOARD_HTML = """<!doctype html>
           <a href="/dashboard/sessions" id="sessionsAdminLink" role="menuitem">⚙ Quản lý session</a>
           <a href="/dashboard/nodes" id="nodesAdminLink" role="menuitem">🖥 Nodes</a>
           <a href="/dashboard/tasks" id="globalTasksLink" role="menuitem">🗂 Global Tasks</a>
+          <a href="/dashboard/projects" id="projectsLink" role="menuitem">📁 Projects</a>
           <a href="/dashboard/agents" id="agentsLink" role="menuitem">🤖 Agents</a>
           <a href="/dashboard/backlog" id="backlogLink" role="menuitem">📋 Project Backlog</a>
           <a href="/dashboard/notes" id="notesLink" role="menuitem">💡 Ghi chú / Ý tưởng</a>
@@ -10791,6 +10792,388 @@ AI_USAGE_HTML = """<!doctype html>
 # A view, not a new privilege surface: the same read guard as every other
 # admin page, over /dashboard/api/agents.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Projects -- the top of the user-facing hierarchy.
+#
+# Project -> Agents -> Skills -> Tasks -> Session. The first two are durable
+# identities a person thinks in; the last is runtime detail. This page is
+# deliberately the entry point, and sessions appear on it only as "where the
+# work is currently running" -- never as the thing you operate.
+#
+# One page, three views (overview / wizard / detail) selected by ?project_id=
+# and a wizard flag, for the same reason GLOBAL_TASKS_HTML is one page: a
+# fourth and fifth standalone admin template would be three more places to
+# keep the same header, the same escaping and the same live badge in sync.
+# ---------------------------------------------------------------------------
+PROJECTS_HTML = """<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Projects</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#26324b; --text:#eef2ff;
+            --muted:#9aa7bd; --green:#43d17c; --amber:#ffc857; --red:#ff6b6b; --accent:#5b8cff;
+            --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,'Cascadia Mono','DejaVu Sans Mono',monospace; }
+    * { box-sizing:border-box }
+    body { margin:0; font:14px/1.5 var(--mono); background:var(--bg); color:var(--text) }
+    a { color:var(--accent); text-decoration:none }
+    header { display:flex; justify-content:space-between; gap:16px; align-items:center;
+             padding:14px 24px; border-bottom:1px solid var(--line); flex-wrap:wrap }
+    h1 { margin:0; font-size:18px } h2 { font-size:15px; margin:0 0 8px }
+    .muted { color:var(--muted) }
+    .live { color:var(--green); font-size:12px } .live.offline { color:var(--red) }
+    .btn { background:#19243b; border:1px solid var(--line); border-radius:8px; color:var(--text);
+           padding:6px 12px; cursor:pointer; font:inherit; font-size:12px }
+    .btn:hover { background:#233252 } .btn.primary { border-color:var(--accent); color:var(--accent) }
+    main { padding:16px 24px 32px; display:flex; flex-direction:column; gap:14px }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 14px }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:8px; margin-top:8px }
+    .cell { background:#0f1730; border:1px solid var(--line); border-radius:8px; padding:7px 9px; font-size:12px }
+    .cell b { display:block; color:var(--muted); font-size:10px; font-weight:400; text-transform:uppercase }
+    .chip { display:inline-block; border-radius:999px; padding:1px 8px; border:1px solid var(--line);
+            font-size:10px; color:var(--muted); margin-right:4px }
+    .chip.on { color:var(--green); border-color:var(--green) }
+    .chip.off { color:var(--muted) }
+    .chip.pm { color:var(--accent); border-color:var(--accent) }
+    .chip.warn { color:var(--amber); border-color:var(--amber) }
+    .pipeline { display:flex; gap:4px; flex-wrap:wrap; margin:8px 0 }
+    .ph { border:1px solid var(--line); border-radius:6px; padding:3px 8px; font-size:10px; color:var(--muted) }
+    .ph.done { color:var(--green); border-color:#2c5f43 }
+    .ph.now { color:var(--text); border-color:var(--accent); background:#18233c }
+    label { font-size:11px; color:var(--muted); display:flex; flex-direction:column; gap:3px }
+    input[type=text], textarea, select { background:#0f1730; border:1px solid var(--line); color:var(--text);
+           border-radius:6px; padding:6px 9px; font:inherit; font-size:12px; width:100% }
+    textarea { min-height:64px; resize:vertical }
+    .row { display:flex; gap:10px; flex-wrap:wrap; margin-top:8px }
+    .row > label { flex:1; min-width:220px }
+    .err { color:var(--red); font-size:12px; min-height:14px }
+    .empty { color:var(--muted); text-align:center; padding:40px }
+    table { width:100%; border-collapse:collapse; font-size:12px; margin-top:6px }
+    th, td { text-align:left; padding:4px 6px; border-bottom:1px solid var(--line) }
+    th { color:var(--muted); font-weight:400; font-size:10px; text-transform:uppercase }
+  </style>
+</head>
+<head></head>
+<body>
+  <header>
+    <div><h1>&#128193; Projects</h1><div class="muted" id="sub">Project &#8594; Agents &#8594; Skills &#8594; Tasks</div></div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <button class="btn primary" id="newBtn" type="button">+ New Project</button>
+      <button class="btn" id="refreshBtn" type="button">&#10227;</button>
+      <a class="btn" href="/dashboard/agents">&#129302; Agents</a>
+      <a class="btn" href="/dashboard/tasks">&#128451; Tasks</a>
+      <a class="btn" href="/dashboard">&#8592; Terminal</a>
+      <span class="live" id="liveBadge">&#9679; LIVE</span>
+    </div>
+  </header>
+  <main id="root"><div class="empty">&#273;ang t&#7843;i&#8230;</div></main>
+  <script>
+    const root = document.querySelector('#root');
+    const liveBadge = document.querySelector('#liveBadge');
+    const clean = v => String(v === null || v === undefined ? '' : v);
+    const params = new URLSearchParams(location.search);
+    let currentId = params.get('project_id') || '';
+    let wizard = null;
+    let timer = null;
+
+    function el(tag, cls, text) {
+      const node = document.createElement(tag);
+      if (cls) node.className = cls;
+      if (text !== undefined) node.textContent = clean(text);
+      return node;
+    }
+    function cell(label, value) {
+      const c = el('div', 'cell');
+      c.append(el('b', null, label), document.createTextNode(clean(value) || '\u2014'));
+      return c;
+    }
+    function chip(text, cls) { return el('span', 'chip' + (cls ? ' ' + cls : ''), text); }
+
+    function pipeline(project) {
+      const bar = el('div', 'pipeline');
+      const phases = project.phases || [];
+      const at = phases.indexOf(project.phase);
+      phases.forEach((phase, index) => {
+        const node = el('div', 'ph' + (index < at ? ' done' : index === at ? ' now' : ''), phase);
+        bar.append(node);
+      });
+      return bar;
+    }
+
+    async function api(path, options) {
+      const response = await fetch(path, Object.assign({ headers: { 'Accept': 'application/json',
+        'Content-Type': 'application/json' } }, options || {}));
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || ('HTTP ' + response.status));
+      return body;
+    }
+
+    // ---- overview -------------------------------------------------------
+    function renderList(projects) {
+      root.replaceChildren();
+      if (!projects.length) {
+        const empty = el('div', 'empty', 'ch\u01b0a c\u00f3 project n\u00e0o \u2014 b\u1ea5m "New Project"');
+        root.append(empty);
+        return;
+      }
+      for (const project of projects) {
+        const card = el('div', 'card');
+        const head = el('h2');
+        const link = el('a', null, project.name || project.id);
+        link.href = '/dashboard/projects?project_id=' + encodeURIComponent(project.id);
+        head.append(link, chip(project.status, project.active ? 'on' : 'off'),
+                    chip(project.phase, 'warn'), chip(project.complexity));
+        if (project.pm_agent_id) head.append(chip('PM ' + project.pm_agent_id, 'pm'));
+        card.append(head, pipeline(project));
+        const grid = el('div', 'grid');
+        grid.append(
+          cell('repo', project.repo_root),
+          cell('stack', (project.stack || []).join(', ')),
+          cell('agents', `${clean(project.active_agent_count)} active / ${clean(project.agent_count)}`),
+          cell('tasks', `${clean(project.running_tasks)} running / ${clean(project.queued_tasks)} queued`),
+          cell('next gate', project.phase_gate));
+        card.append(grid);
+        root.append(card);
+      }
+    }
+
+    // ---- wizard ---------------------------------------------------------
+    function renderWizard() {
+      root.replaceChildren();
+      const card = el('div', 'card');
+      card.append(el('h2', null, 'New Project'));
+      const form = el('div');
+      const name = el('input'); name.type = 'text'; name.placeholder = 'traffic-camera-ai';
+      const desc = el('textarea');
+      desc.placeholder = 'Web app with map, camera streams, AI analysis API, backend, deploy.';
+      const repo = el('input'); repo.type = 'text'; repo.placeholder = '(optional) /path/to/repo';
+      const row = el('div', 'row');
+      const l1 = el('label'); l1.append(document.createTextNode('Name'), name);
+      const l3 = el('label'); l3.append(document.createTextNode('Repo path'), repo);
+      row.append(l1, l3);
+      const l2 = el('label'); l2.append(document.createTextNode('Description'), desc);
+      form.append(row, l2);
+      const err = el('div', 'err');
+      const actions = el('div', 'row');
+      const analyzeBtn = el('button', 'btn primary', 'Analyze');
+      const cancelBtn = el('button', 'btn', 'Cancel');
+      actions.append(analyzeBtn, cancelBtn);
+      card.append(form, actions, err);
+      root.append(card);
+      const planHost = el('div');
+      root.append(planHost);
+
+      cancelBtn.onclick = () => { wizard = null; load(); };
+      analyzeBtn.onclick = async () => {
+        err.textContent = '';
+        try {
+          const body = await api('/dashboard/api/projects/plan', { method: 'POST',
+            body: JSON.stringify({ name: name.value.trim(), description: desc.value.trim(),
+                                   repo_root: repo.value.trim() || null }) });
+          renderPlan(planHost, body.plan, { name: name.value.trim(),
+            description: desc.value.trim(), repo_root: repo.value.trim() || null }, err);
+        } catch (error) { err.textContent = clean(error.message); }
+      };
+    }
+
+    function renderPlan(host, plan, input, err) {
+      host.replaceChildren();
+      const profile = plan.profile || {};
+      const card = el('div', 'card');
+      card.append(el('h2', null, 'Detected'));
+      const grid = el('div', 'grid');
+      grid.append(cell('complexity', profile.complexity),
+                  cell('modules', (profile.modules || []).join(', ')),
+                  cell('stack', (profile.stack || []).join(', ')),
+                  cell('team size band', (plan.size_band || []).join('\u2013')),
+                  cell('first phase', plan.phase));
+      card.append(grid);
+      const why = el('div', 'muted');
+      why.style.fontSize = '11px'; why.style.marginTop = '6px';
+      why.textContent = (plan.notes || []).join(' \u00b7 ');
+      card.append(why);
+      host.append(card);
+
+      const team = el('div', 'card');
+      team.append(el('h2', null, 'Suggested team for ' + clean(plan.phase)));
+      const picks = [];
+      for (const agent of (plan.agents || [])) {
+        const line = el('div');
+        line.style.padding = '5px 0';
+        line.style.borderBottom = '1px solid var(--line)';
+        const box = el('input'); box.type = 'checkbox'; box.checked = true;
+        box.style.width = 'auto'; box.style.marginRight = '8px';
+        box.disabled = !!agent.cross_phase;   // the PM is not an optional box
+        picks.push({ box, role: agent.role });
+        const label = el('span');
+        label.append(document.createTextNode(clean(agent.name) + '  '),
+                     chip(agent.role, agent.cross_phase ? 'pm' : null));
+        if (agent.cross_phase) label.append(chip('cross-phase'));
+        if (agent.can_approve) label.append(chip('can approve', 'on'));
+        for (const skill of (agent.base_skills || [])) label.append(chip(skill));
+        const reason = el('div', 'muted'); reason.style.fontSize = '11px';
+        reason.textContent = clean(agent.reason);
+        line.append(box, label, reason);
+        team.append(line);
+      }
+      const upcoming = el('div', 'muted');
+      upcoming.style.fontSize = '11px'; upcoming.style.marginTop = '8px';
+      upcoming.textContent = 'Later phases will add: ' + Object.entries(plan.upcoming || {})
+        .map(([phase, list]) => `${phase} (${list.filter(a => !a.already_exists)
+          .map(a => a.role).join(', ') || 'no new agents'})`).join('  \u00b7  ');
+      team.append(upcoming);
+      const actions = el('div', 'row');
+      const createBtn = el('button', 'btn primary', 'Create Team');
+      actions.append(createBtn);
+      team.append(actions);
+      host.append(team);
+
+      createBtn.onclick = async () => {
+        err.textContent = '';
+        createBtn.disabled = true;
+        try {
+          const roles = picks.filter(p => p.box.checked).map(p => p.role);
+          const body = await api('/dashboard/api/projects/bootstrap', { method: 'POST',
+            body: JSON.stringify(Object.assign({}, input, { roles,
+              request_key: 'wizard-' + clean(input.name) + '-' + Date.now() })) });
+          wizard = null;
+          currentId = body.project.id;
+          history.replaceState({}, '', '/dashboard/projects?project_id=' +
+            encodeURIComponent(currentId));
+          load();
+        } catch (error) { err.textContent = clean(error.message); createBtn.disabled = false; }
+      };
+    }
+
+    // ---- detail ---------------------------------------------------------
+    function renderDetail(project) {
+      root.replaceChildren();
+      const head = el('div', 'card');
+      const title = el('h2');
+      title.append(document.createTextNode(clean(project.name)),
+                   chip(project.status, project.active ? 'on' : 'off'),
+                   chip(project.phase, 'warn'), chip(project.complexity));
+      if (project.pm_agent_id) title.append(chip('PM ' + project.pm_agent_id, 'pm'));
+      head.append(title, pipeline(project));
+      const grid = el('div', 'grid');
+      grid.append(cell('repo', project.repo_root), cell('stack', (project.stack || []).join(', ')),
+                  cell('modules', (project.modules || []).join(', ')),
+                  cell('backlog', `${clean(project.running_tasks)} running / ${clean(project.queued_tasks)} queued`),
+                  cell('next gate', project.phase_gate),
+                  cell('next phase', project.next_phase));
+      head.append(grid);
+      const actions = el('div', 'row');
+      const advanceBtn = el('button', 'btn primary',
+        'Advance to ' + clean(project.next_phase || '\u2014'));
+      advanceBtn.disabled = !project.next_phase;
+      const reconcileBtn = el('button', 'btn', 'Reconcile team');
+      const backBtn = el('button', 'btn', '\u2190 All projects');
+      actions.append(advanceBtn, reconcileBtn, backBtn);
+      const err = el('div', 'err');
+      head.append(actions, err);
+      root.append(head);
+
+      backBtn.onclick = () => { currentId = '';
+        history.replaceState({}, '', '/dashboard/projects'); load(); };
+      advanceBtn.onclick = async () => {
+        err.textContent = '';
+        try {
+          await api('/dashboard/api/projects/advance', { method: 'POST',
+            body: JSON.stringify({ project_id: project.id, reason: 'advanced from the dashboard' }) });
+          load();
+        } catch (error) { err.textContent = clean(error.message); }
+      };
+      reconcileBtn.onclick = async () => {
+        err.textContent = '';
+        try {
+          await api('/dashboard/api/projects/reconcile', { method: 'POST',
+            body: JSON.stringify({ project_id: project.id }) });
+          load();
+        } catch (error) { err.textContent = clean(error.message); }
+      };
+
+      const team = el('div', 'card');
+      team.append(el('h2', null, 'Agent Team'));
+      for (const agent of (project.agents || [])) {
+        const line = el('div');
+        line.style.padding = '6px 0'; line.style.borderBottom = '1px solid var(--line)';
+        const label = el('div');
+        label.append(document.createTextNode(clean(agent.name) + '  '),
+                     chip(agent.role, agent.cross_phase ? 'pm' : null),
+                     chip(agent.state, agent.startable ? 'on' : 'off'));
+        if (agent.in_current_phase) label.append(chip('this phase', 'warn'));
+        for (const skill of (agent.skills || [])) {
+          label.append(chip(clean(skill.skill_id) + '@' + clean(skill.version)));
+        }
+        const meta = el('div', 'muted'); meta.style.fontSize = '11px';
+        meta.textContent = `${clean(agent.active_tasks)} active / ${clean(agent.queued_tasks)} queued` +
+          (agent.phase_state_reason ? '  \u00b7  ' + clean(agent.phase_state_reason) : '');
+        line.append(label, meta);
+        team.append(line);
+      }
+      root.append(team);
+
+      const upcoming = el('div', 'card');
+      upcoming.append(el('h2', null, 'Upcoming phases'));
+      const table = el('table');
+      const thead = el('tr');
+      ['phase', 'agents', 'new'].forEach(h => thead.append(el('th', null, h)));
+      table.append(thead);
+      for (const [phase, list] of Object.entries(project.upcoming || {})) {
+        const tr = el('tr');
+        tr.append(el('td', null, phase),
+                  el('td', null, list.map(a => a.role).join(', ')),
+                  el('td', null, list.filter(a => !a.already_exists).map(a => a.role).join(', ') || '\u2014'));
+        table.append(tr);
+      }
+      upcoming.append(table);
+      root.append(upcoming);
+
+      const history_ = el('div', 'card');
+      history_.append(el('h2', null, 'Phase history & handoffs'));
+      const ht = el('table');
+      const hh = el('tr');
+      ['when', 'from', 'to', 'reason', 'handoff'].forEach(h => hh.append(el('th', null, h)));
+      ht.append(hh);
+      for (const entry of (project.phase_history || [])) {
+        const tr = el('tr');
+        tr.append(el('td', null, clean(entry.created_at).slice(0, 19)),
+                  el('td', null, entry.from_phase || '\u2014'),
+                  el('td', null, entry.to_phase),
+                  el('td', null, clean(entry.reason).slice(0, 70)),
+                  el('td', null, JSON.stringify(entry.handoff || {}).slice(0, 60)));
+        ht.append(tr);
+      }
+      history_.append(ht);
+      root.append(history_);
+    }
+
+    async function load() {
+      if (wizard) { renderWizard(); return; }
+      try {
+        if (currentId) {
+          const body = await api('/dashboard/api/projects/detail?project_id=' +
+                                 encodeURIComponent(currentId));
+          renderDetail(body.project);
+        } else {
+          const body = await api('/dashboard/api/projects');
+          renderList(body.projects || []);
+        }
+        liveBadge.classList.remove('offline');
+      } catch (error) { liveBadge.classList.add('offline'); }
+    }
+
+    document.querySelector('#newBtn').addEventListener('click', () => { wizard = true; load(); });
+    document.querySelector('#refreshBtn').addEventListener('click', load);
+    load();
+    timer = setInterval(() => { if (!wizard) load(); }, 6000);
+  </script>
+</body>
+</html>
+"""
+
+
 AGENTS_HTML = """<!doctype html>
 <html lang="vi">
 <head>
@@ -11139,9 +11522,19 @@ GLOBAL_TASKS_HTML = """<!doctype html>
         r.textContent = clean(task.routing_state); r.title = 'routing state';
         meta.append(r);
       }
+      // TMCP-PROJECT-BOOTSTRAP-001: the project owns the agent that owns the
+      // task, so the card names all three. The execution session stays
+      // secondary runtime metadata, shown above.
+      if (task.project_id) {
+        const pr = document.createElement('a'); pr.className = 'chip session';
+        pr.textContent = 'proj:' + clean(task.project_id);
+        pr.href = '/dashboard/projects?project_id=' + encodeURIComponent(task.project_id);
+        pr.title = 'project'; meta.append(pr);
+      }
       if (task.agent_id) {
-        const a = document.createElement('span'); a.className = 'chip';
-        a.textContent = `@${clean(task.agent_id)}`; a.title = 'agent'; meta.append(a);
+        const a = document.createElement('a'); a.className = 'chip session';
+        a.textContent = `@${clean(task.agent_id)}`; a.title = 'agent';
+        a.href = '/dashboard/agents'; meta.append(a);
       }
       for (const skill of (task.skill_ids || []).slice(0, 4)) {
         const sk = document.createElement('span'); sk.className = 'chip';
@@ -12616,6 +13009,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        rotation: "TokenRotationService | None" = None,
                        notes: NotesService | None = None,
                        agents: Any = None,
+                       projects: Any = None,
                        webauth: WebAuthStore | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
@@ -12643,6 +13037,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # server_http.py's real main() always passes an explicit,
         # persistent ConnectionStore instead of relying on this fallback.
         connection_store = ConnectionStore(ephemeral_db_path("connections", "connections.db"))
+    if projects is None:
+        projects = getattr(queue, "projects", None)
     if agents is None:
         # The SAME AgentService build_mcp constructed, reached through the
         # queue it was attached to -- never a second registry over a second
@@ -14019,6 +14415,146 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                                  "totals": {"rolling_5h": {}, "today": {}, "lifetime": {}}},
                                 status_code=200)
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/projects", methods=["GET"], include_in_schema=False)
+    async def dashboard_projects(request: Request) -> HTMLResponse | JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(PROJECTS_HTML, headers={"Cache-Control": "no-store",
+                                                    "X-Frame-Options": "DENY"})
+
+    def _projects_or_none():
+        return projects
+
+    @server.custom_route("/dashboard/api/projects", methods=["GET"], include_in_schema=False)
+    async def dashboard_api_projects(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        if projects is None:
+            return JSONResponse({"projects": [], "count": 0, "detail": "project runtime not wired"},
+                                headers={"Cache-Control": "no-store"})
+        status = request.query_params.get("status") or None
+        # ONE bulk read for the whole page: list_projects composes the queue
+        # counts from a single lane sweep, and probes no session at all.
+        result = await anyio.to_thread.run_sync(lambda: projects.list_projects(status=status))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/projects/detail", methods=["GET"], include_in_schema=False)
+    async def dashboard_api_project_detail(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        if projects is None:
+            return JSONResponse({"error": "PROJECT_RUNTIME_UNAVAILABLE"}, status_code=404)
+        project_id = request.query_params.get("project_id") or ""
+        if not project_id:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        result = await anyio.to_thread.run_sync(lambda: projects.get_project(project_id))
+        return JSONResponse(result, status_code=200 if "error" not in result else 404,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/projects/plan", methods=["POST"], include_in_schema=False)
+    async def dashboard_api_project_plan(request: Request) -> JSONResponse:
+        # A READ that happens to be a POST (the description is too long for a
+        # query string). It writes nothing, but it still goes through the
+        # mutation guard because it reads a caller-supplied repo path.
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        if projects is None:
+            return JSONResponse({"error": "PROJECT_RUNTIME_UNAVAILABLE"}, status_code=404)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "name is required"},
+                                status_code=400)
+        result = await anyio.to_thread.run_sync(lambda: projects.plan(
+            name.strip(),
+            description=str(body.get("description") or ""),
+            repo_root=(body.get("repo_root") or None),
+            complexity=(body.get("complexity") or None),
+            runtime=(body.get("runtime") or None)))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/projects/bootstrap", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_api_project_bootstrap(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        if projects is None:
+            return JSONResponse({"error": "PROJECT_RUNTIME_UNAVAILABLE"}, status_code=404)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "name is required"},
+                                status_code=400)
+        roles = body.get("roles")
+        _log.info("dashboard project_bootstrap name=%s identity=%s", name,
+                  identity.email if identity else None)
+        result = await anyio.to_thread.run_sync(lambda: projects.bootstrap(
+            name.strip(),
+            description=str(body.get("description") or ""),
+            repo_root=(body.get("repo_root") or None),
+            complexity=(body.get("complexity") or None),
+            runtime=(body.get("runtime") or None),
+            roles=(list(roles) if isinstance(roles, list) else None),
+            request_key=(str(body.get("request_key")) if body.get("request_key") else None)))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/projects/advance", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_api_project_advance(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        if projects is None:
+            return JSONResponse({"error": "PROJECT_RUNTIME_UNAVAILABLE"}, status_code=404)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        project_id = body.get("project_id") if isinstance(body, dict) else None
+        if not isinstance(project_id, str) or not project_id:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        result = await anyio.to_thread.run_sync(lambda: projects.advance(
+            project_id, to_phase=(body.get("to_phase") or None),
+            reason=str(body.get("reason") or ""),
+            gate_evidence=(body.get("gate_evidence") if isinstance(body.get("gate_evidence"), dict)
+                           else None),
+            handoff=(body.get("handoff") if isinstance(body.get("handoff"), dict) else None),
+            actor=(identity.email if identity else "dashboard")))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/projects/reconcile", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_api_project_reconcile(request: Request) -> JSONResponse:
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        if projects is None:
+            return JSONResponse({"error": "PROJECT_RUNTIME_UNAVAILABLE"}, status_code=404)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        project_id = body.get("project_id") if isinstance(body, dict) else None
+        if not isinstance(project_id, str) or not project_id:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        result = await anyio.to_thread.run_sync(lambda: projects.reconcile_team(project_id))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/agents", methods=["GET"], include_in_schema=False)
     async def dashboard_agents(request: Request) -> HTMLResponse | JSONResponse:

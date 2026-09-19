@@ -3,6 +3,15 @@ Description=Terminal MCP loopback Streamable HTTP server
 After=default.target
 
 [Service]
+# AGENT LAUNCHER DISCOVERY. agent_availability.available_agent_types calls
+# shutil.which() for every configured launch_command, so a node advertises
+# `claude`/`codex` only if the binary is on the SERVICE's PATH -- which is
+# systemd's own minimal default, not the login shell's. Found live on
+# hp-linux: claude and codex were installed under ~/.local/bin, the CLIs
+# worked in a terminal, and the node still (correctly, and unhelpfully)
+# reported shell-only, so the router could never spawn an agent runtime
+# there. Detection was right; the environment was wrong.
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=LLM_GLOBAL_MAX_CONCURRENCY=4
 Environment=LLM_OPENROUTER_MAX_CONCURRENCY=2
 Environment=LLM_CODEX_MAX_CONCURRENCY=2
