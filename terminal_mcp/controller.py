@@ -365,7 +365,12 @@ class ControllerService:
         falling back to probing every ONLINE node's own session list on a
         cache miss. Two nodes genuinely holding the same bare name is
         reported as AMBIGUOUS_SESSION -- never routed by guessing (task
-        item 3's own explicit requirement)."""
+        item 3's own explicit requirement).
+
+        SESSION_NOT_FOUND means "every node answered and none has it".
+        SESSION_LOCATION_UNKNOWN means "the nodes that answered do not have
+        it, and some node could not be asked" -- see the block below for the
+        live failure that distinction fixes."""
         now = time.monotonic() if now is None else now
         deadline = None
         if timeout_seconds is not None:
@@ -388,11 +393,18 @@ class ControllerService:
             return {"node_id": cached.node_id, "session": session}
 
         found_on: list[str] = []
+        # Nodes this pass could NOT look inside. Previously all three of these
+        # `continue`s were silent, so an incomplete probe was indistinguishable
+        # from a complete one -- see the SESSION_NOT_FOUND block below for the
+        # real failure that produced.
+        unprobed: list[dict[str, str]] = []
         for node in self.list_nodes():
             if node.status != NODE_ONLINE:
+                unprobed.append({"node_id": node.id, "reason": f"node status={node.status}"})
                 continue
             client = self._clients.get(node.id)
             if client is None:
+                unprobed.append({"node_id": node.id, "reason": "no client configured for this node"})
                 continue
             try:
                 if deadline is None:
@@ -403,7 +415,8 @@ class ControllerService:
                         return {"error": "RESOLUTION_TIMEOUT", "session": session}
                     listing = client.list_sessions(timeout_seconds=min(
                         MAX_BOUNDED_NODE_PROBE_SECONDS, remaining))
-            except NodeClientError:
+            except NodeClientError as exc:
+                unprobed.append({"node_id": node.id, "reason": f"session listing failed: {exc}"})
                 continue
             names = {row["name"] for row in listing.get("sessions", [])}
             if session in names:
@@ -425,6 +438,48 @@ class ControllerService:
                     resolved = dict(resolved)
                     resolved["redirected_from"] = session
                     return resolved
+            # An INCOMPLETE probe may never claim the session does not exist.
+            #
+            # The real failure (live, this fleet, 2026-09-19): a generic shell
+            # session created moments earlier started coming back
+            # SESSION_NOT_FOUND from every routed tool, while the session was
+            # sitting there perfectly alive on its own node. The location
+            # cache holds a positive answer for only session_cache_ttl_seconds
+            # (20s); the very next call re-probes, and a re-probe skips any
+            # node that is momentarily not ONLINE, has no client, or whose
+            # list_sessions call raises -- a remote node's heartbeat is
+            # push-based, so a single missed beat or one slow HTTP listing is
+            # enough. All three cases then fell into this branch and reported
+            # the session as GONE: the one answer a caller cannot recover
+            # from, for a node that was merely not looked at.
+            #
+            # Two honest answers replace it, and neither ever invents a
+            # location out of nothing:
+            #   * the (now expired) cache entry names a node this pass could
+            #     not probe -- that is positive prior evidence the session
+            #     lived there and no evidence at all that it has since gone,
+            #     so route there and say the location is stale. If it really
+            #     is gone, that node's own tmux says so, which is a true
+            #     SESSION_NOT_FOUND from the only place that can know.
+            #   * otherwise, SESSION_LOCATION_UNKNOWN, carrying exactly which
+            #     nodes could not be probed -- the same discipline
+            #     terminal_list_sessions already applies with its
+            #     `unreachable_nodes`, which is where the wording came from.
+            # A probe that DID reach every node and found nothing still
+            # reports SESSION_NOT_FOUND, unchanged.
+            unprobed_ids = {entry["node_id"] for entry in unprobed}
+            if cached is not None and cached.node_id in unprobed_ids:
+                # Deliberately not re-cached: the original timestamp stays, so
+                # the next call re-probes for real instead of pinning a stale
+                # location for another full TTL.
+                return {"node_id": cached.node_id, "session": session,
+                        "stale_location": True, "unprobed_nodes": unprobed}
+            if unprobed:
+                return {"error": "SESSION_LOCATION_UNKNOWN", "session": session,
+                        "unprobed_nodes": unprobed,
+                        "detail": f"session {session!r} was not found on any node this call could "
+                                  f"probe, and {len(unprobed)} node(s) could not be probed at all "
+                                  f"-- the session may still exist on one of them"}
             return {"error": "SESSION_NOT_FOUND", "session": session}
         if len(found_on) > 1:
             return {"error": "AMBIGUOUS_SESSION", "session": session, "nodes": found_on,
@@ -461,6 +516,12 @@ class ControllerService:
             result.setdefault("node_name", node.display_name if node else node_id)
             if "redirected_from" in resolution:
                 result.setdefault("redirected_from", resolution["redirected_from"])
+            # The call was routed on a last-known (expired) location because
+            # the node holding it could not be re-probed. Surfaced so a caller
+            # reading a successful result knows the routing decision itself was
+            # made on prior evidence, not a fresh listing.
+            if resolution.get("stale_location"):
+                result.setdefault("stale_location", True)
         return result
 
     def terminal_tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]:

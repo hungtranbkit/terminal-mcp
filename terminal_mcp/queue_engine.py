@@ -68,7 +68,14 @@ DEFAULT_CLAIMED_BY = "queue-engine"
 DEFAULT_LEASE_SECONDS = 300.0
 DEFAULT_UNCERTAIN_GRACE_SECONDS = 60.0
 
-SESSION_UNREACHABLE_ERRORS = frozenset({"SESSION_NOT_FOUND", "NODE_UNREACHABLE", "AMBIGUOUS_SESSION"})
+SESSION_UNREACHABLE_ERRORS = frozenset({"SESSION_NOT_FOUND", "NODE_UNREACHABLE", "AMBIGUOUS_SESSION",
+                                        # resolve_session's "the nodes that
+                                        # answered do not have it and some node
+                                        # could not be asked" -- strictly more
+                                        # recoverable than the SESSION_NOT_FOUND
+                                        # it was previously reported as, so it
+                                        # belongs in exactly the same bucket.
+                                        "SESSION_LOCATION_UNKNOWN"})
 """P0 (task: "persist-before-dispatch", item 9): these specific
 terminal_status/controller error codes mean the SESSION/NODE itself
 isn't reachable right now -- routine and auto-recoverable, never a

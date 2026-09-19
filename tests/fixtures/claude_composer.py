@@ -33,6 +33,17 @@ CLAUDE_FIXTURE_MODE env var selects behavior:
     of the sent text at all (models a genuine failure, not a race) --
     must still correctly report unconfirmed, proving the fix's extra
     polling doesn't turn a real failure into a false positive.
+  staged_multiline_editor -- the live 2026-09-19 false-positive repro
+    (session terminal-mcp-session-health): the prompt is typed in full
+    but STAGED in the multiline editor. Enter does NOT submit -- it
+    inserts a newline, which visibly grows the buffer (so a pane-diff
+    check sees "genuine progress" and pre-fix reported SUBMIT_CONFIRMED)
+    -- and the footer reads `ctrl+x ctrl+s to send now`. Only Ctrl-X
+    followed by Ctrl-S actually submits, after which the echo and the
+    "esc to interrupt" busy footer appear exactly as normal_submit.
+  staged_never_submits -- same staged editor, but Ctrl-X Ctrl-S is
+    swallowed too: nothing ever submits. Proves the staged-editor
+    keypress cannot turn a genuine failure into a false confirmation.
 """
 import os
 import sys
@@ -47,6 +58,9 @@ old_attrs = termios.tcgetattr(fd)
 tty.setraw(fd)
 
 buf = ""
+STAGED_MODES = ("staged_multiline_editor", "staged_never_submits")
+STAGED_FOOTER = "ctrl+x ctrl+s to send now"
+ctrl_x_pending = False
 
 try:
     sys.stdout.write("claude composer ready\r\n> ")
@@ -55,6 +69,43 @@ try:
         ch = sys.stdin.read(1)
         if not ch or ch == "\x03":
             break
+        if MODE in STAGED_MODES:
+            # Ctrl-X (0x18) then Ctrl-S (0x13) is the real submit key pair
+            # the footer advertises. Raw mode is already on, so 0x13 arrives
+            # as a byte rather than being eaten as XOFF flow control.
+            if ch == "\x18":
+                ctrl_x_pending = True
+                continue
+            if ch == "\x13" and ctrl_x_pending:
+                ctrl_x_pending = False
+                sent = buf.replace("\n", " ").strip()
+                buf = ""
+                if MODE == "staged_never_submits":
+                    # Swallowed: the buffer stays staged, footer unchanged.
+                    sys.stdout.write(f"\r\n> {sent}\r\n{STAGED_FOOTER}\r\n")
+                    sys.stdout.flush()
+                    continue
+                sys.stdout.write(f"\r\x1b[2K> {sent}\r\nSUBMITTED[1]: {sent}\r\n"
+                                 "esc to interrupt\r\n")
+                sys.stdout.flush()
+                continue
+            ctrl_x_pending = False
+            if ch in ("\n", "\r"):
+                # Enter inserts a newline into the staged buffer instead of
+                # submitting -- the whole point of this repro.
+                buf += "\n"
+                sys.stdout.write(f"\r\n  {STAGED_FOOTER}\r\n> ")
+                sys.stdout.flush()
+                continue
+            buf += ch
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+            if len(buf) == 1:
+                # The editor's own footer appears as soon as there is a
+                # buffer to send, exactly like the real one.
+                sys.stdout.write(f"\r\n{STAGED_FOOTER}\r\n> {buf}")
+                sys.stdout.flush()
+            continue
         if ch in ("\n", "\r"):
             sent = buf
             buf = ""

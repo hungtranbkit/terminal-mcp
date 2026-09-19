@@ -629,6 +629,156 @@ def test_invalidate_session_location_forces_reprobe(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# An INCOMPLETE probe may never claim a session does not exist.
+#
+# Live failure this closes (2026-09-19, this fleet): a generic shell session
+# created moments earlier began coming back SESSION_NOT_FOUND from every
+# routed tool while sitting perfectly alive on its own node. The location
+# cache holds a positive answer for only session_cache_ttl_seconds; the next
+# call re-probes, and a re-probe silently skipped any node that was
+# momentarily not ONLINE, had no client, or whose list_sessions raised. A
+# remote node's heartbeat is push-based, so one missed beat or one slow HTTP
+# listing was enough to report the session as GONE.
+# ---------------------------------------------------------------------------
+
+class _ListingBrokenClient(FakeNodeClient):
+    """Answers every routed call, but cannot be probed for its session list.
+
+    This is the shape of the real fault: the node is up and serving, one
+    listing call did not come back. `broken=True` on the base class would
+    break the routed call too and prove nothing about resolution.
+    """
+
+    def list_sessions(self, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        raise NodeClientError("simulated listing timeout")
+
+
+def test_unprobeable_node_never_reports_the_session_as_not_found(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    _register_fake_remote(controller, "flaky-node", _ListingBrokenClient({"ctrl-alive": {}}))
+
+    result = controller.resolve_session("ctrl-alive")
+    assert result["error"] == "SESSION_LOCATION_UNKNOWN"  # was SESSION_NOT_FOUND
+    assert [entry["node_id"] for entry in result["unprobed_nodes"]] == ["flaky-node"]
+    assert "could not be probed" in result["detail"]
+
+
+def test_offline_node_makes_an_unknown_name_unresolved_not_absent(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    # Registered but never heartbeated -- OFFLINE, so it is never probed.
+    controller.registry.register("dark-node", display_name="Dark", hostname="h", endpoint="http://x")
+    controller._clients["dark-node"] = FakeNodeClient({"ctrl-maybe-here": {}})
+
+    result = controller.resolve_session("ctrl-maybe-here")
+    assert result["error"] == "SESSION_LOCATION_UNKNOWN"
+    assert [entry["node_id"] for entry in result["unprobed_nodes"]] == ["dark-node"]
+
+
+def test_expired_cache_routes_to_the_last_known_node_it_could_not_reprobe(tmp_path):
+    # Positive prior evidence the session lived there, and no evidence at all
+    # that it has since gone -- so the call is routed, flagged stale, and the
+    # node itself gets to answer.
+    import time
+
+    from terminal_mcp.controller import SessionLocation
+
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    remote = _ListingBrokenClient({"ctrl-stale": {}})
+    _register_fake_remote(controller, "flaky-node", remote)
+    controller._session_location_cache["ctrl-stale"] = SessionLocation(
+        node_id="flaky-node", cached_at=time.monotonic() - 10_000)
+
+    resolved = controller.resolve_session("ctrl-stale")
+    assert resolved.get("error") is None, resolved
+    assert resolved["node_id"] == "flaky-node"
+    assert resolved["stale_location"] is True
+
+    # _route keeps its own independent "is this node ONLINE right now" gate, so
+    # a routed call against a node the health service has meanwhile demoted
+    # still refuses -- but it refuses as NODE_UNREACHABLE, naming the node, and
+    # never as SESSION_NOT_FOUND. That is the whole distinction: "your node is
+    # not answering" is recoverable and true; "your session does not exist" was
+    # neither.
+    routed = controller.terminal_status("ctrl-stale")
+    assert routed["error"] == "NODE_UNREACHABLE"
+    assert routed["node_id"] == "flaky-node"
+    assert remote is controller._clients["flaky-node"]
+
+
+def test_create_never_duplicates_a_name_whose_node_could_not_be_probed(tmp_path):
+    # The consequence that made the original failure compound: create's own
+    # "does this name already exist?" guard is resolve_session. Told
+    # SESSION_NOT_FOUND, it happily created a SECOND session under the same
+    # name on another node, and every later bare-name call then resolved
+    # AMBIGUOUS_SESSION. The stale-location answer keeps the guard honest.
+    import time
+
+    from terminal_mcp.controller import SessionLocation
+
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    _register_fake_remote(controller, "flaky-node", _ListingBrokenClient({"ctrl-dup": {}}))
+    controller._session_location_cache["ctrl-dup"] = SessionLocation(
+        node_id="flaky-node", cached_at=time.monotonic() - 10_000)
+
+    result = controller.terminal_create_session("ctrl-dup", "shell", str(tmp_path), node="auto")
+    assert result["error"] == "SESSION_ALREADY_EXISTS"
+    assert result["node_id"] == "flaky-node"
+    import subprocess
+    assert subprocess.run(["tmux", "has-session", "-t", "ctrl-dup"],
+                          capture_output=True).returncode != 0
+
+
+def test_stale_cache_fallback_never_re_pins_the_location(tmp_path):
+    # The expired entry keeps its original timestamp, so the very next call
+    # probes for real again instead of pinning a stale node for a full TTL.
+    import time
+
+    from terminal_mcp.controller import SessionLocation
+
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    _register_fake_remote(controller, "flaky-node", _ListingBrokenClient({"ctrl-stale2": {}}))
+    stale_at = time.monotonic() - 10_000
+    controller._session_location_cache["ctrl-stale2"] = SessionLocation(
+        node_id="flaky-node", cached_at=stale_at)
+
+    controller.resolve_session("ctrl-stale2")
+    assert controller._session_location_cache["ctrl-stale2"].cached_at == stale_at
+
+
+def test_stale_cache_pointing_at_a_node_that_WAS_probed_is_still_not_found(tmp_path):
+    # The node answered and does not have it. That is real negative evidence
+    # about the only place we had reason to look, so the honest answer is
+    # SESSION_NOT_FOUND -- the fallback must not launder it into a route.
+    import time
+
+    from terminal_mcp.controller import SessionLocation
+
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    _register_fake_remote(controller, "healthy-node", FakeNodeClient({"something-else": {}}))
+    controller._session_location_cache["ctrl-really-gone"] = SessionLocation(
+        node_id="healthy-node", cached_at=time.monotonic() - 10_000)
+
+    result = controller.resolve_session("ctrl-really-gone")
+    assert result["error"] == "SESSION_NOT_FOUND"
+
+
+def test_fully_probed_fleet_finding_nothing_is_still_session_not_found(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    _register_fake_remote(controller, "healthy-node", FakeNodeClient({"other": {}}))
+
+    result = controller.resolve_session("ctrl-nowhere-at-all")
+    assert result["error"] == "SESSION_NOT_FOUND"
+    assert "unprobed_nodes" not in result
+
+
+# ---------------------------------------------------------------------------
 # terminal_reopen_session -- routes via each node's own killed-sessions
 # list, NEVER live-session resolution (a killed session, by definition,
 # is never in any node's live tmux listing -- see this method's own

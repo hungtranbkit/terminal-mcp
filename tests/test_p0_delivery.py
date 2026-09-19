@@ -137,6 +137,142 @@ def test_pane_current_command_change_mid_send_also_blocks(tmux_session_factory, 
     assert result["enter_sent"] is False
 
 
+# ---------------------------------------------------------------------------
+# The mid-send revalidation must tell "the same shell, one command later" apart
+# from "a different process wearing the same name".
+#
+# Reproduced live through the real ChatGPT connector (2026-09-19): a freshly
+# created generic shell `tmcp-surface-shell` on hp-linux accepted one multiline
+# command, and the NEXT send came back BLOCKED/IDENTITY_CHANGED_MID_SEND,
+# agent_type=generic, enter_sent=false, enter_count=0, attempts=0. Nothing had
+# been replaced -- the pane was still running the previous command when the
+# text landed and was back at its own prompt 80ms later, so the raw
+# `command_at_enter != command_before` comparison read a shell finishing its
+# work as the target disappearing, and left the typed text unexecutable.
+# ---------------------------------------------------------------------------
+
+def _mid_send_mutation(service, monkeypatch, mutate_before=None, mutate_after=None):
+    """Rewrite what get_session reports before/after THIS attempt's text send.
+
+    Tied to the real semantic checkpoint (has tmux.send_text run yet) rather
+    than a call count, the same design the two identity tests above use and for
+    the same reason.
+    """
+    state = {"text_sent": False}
+    original_get_session = service.tmux.get_session
+    original_send_text = service.tmux.send_text
+
+    def faked_get_session(target: str):
+        info = original_get_session(target)
+        mutate = mutate_after if state["text_sent"] else mutate_before
+        if info is not None and mutate is not None:
+            info = info.__class__(**{**info.__dict__, **mutate})
+        return info
+
+    def marking_send_text(target: str, text: str, press_enter: bool):
+        original_send_text(target, text, press_enter)
+        state["text_sent"] = True
+
+    monkeypatch.setattr(service.tmux, "get_session", faked_get_session)
+    monkeypatch.setattr(service.tmux, "send_text", marking_send_text)
+
+
+def test_shell_returning_to_its_prompt_mid_send_does_not_false_block(tmux_session_factory, tmp_path,
+                                                                    monkeypatch):
+    # THE live repro, at the same checkpoints: the pane reports the previous
+    # command ("python3") when the text is sent and its own shell ("bash") when
+    # Enter is about to go out. That is a shell finishing a command, not a
+    # replaced target, so Enter must be sent and the submission confirmed.
+    session = tmux_session_factory("test-delivery-shell-settles", "bash -lc 'read v; echo GOT=$v; sleep 10'")
+    time.sleep(0.2)
+    service = _service(tmp_path)
+    _mid_send_mutation(service, monkeypatch, mutate_before={"pane_current_command": "python3"})
+
+    result = service.terminal_send_text(session, "hi-there", press_enter=True)
+
+    assert result.get("error") is None, result
+    assert result["agent_type"] == "generic"  # same adapter as the live report
+    assert result["enter_sent"] is True
+    assert result["enter_count"] == 1  # exactly one Enter, never a retry storm
+    assert result["delivery_state"] == DELIVERY_SUBMIT_CONFIRMED
+    time.sleep(0.3)
+    assert "GOT=hi-there" in service.terminal_tail(session, 20)["output"]
+
+
+def test_pane_process_replaced_mid_send_still_blocks_enter(tmux_session_factory, tmp_path, monkeypatch):
+    # The safety this keeps, and strengthens: a pane whose own process was
+    # replaced reports the SAME command name at both ends (bash -> bash), so
+    # the command comparison never could catch it. tmux's #{pane_pid} can.
+    session = tmux_session_factory("test-delivery-pid-replaced", "bash -lc 'read v; echo GOT=$v; sleep 10'")
+    time.sleep(0.2)
+    service = _service(tmp_path)
+    before = service.tmux.get_session(session)
+    assert before is not None
+    _mid_send_mutation(service, monkeypatch, mutate_after={"pane_pid": before.pane_pid + 424242})
+
+    result = service.terminal_send_text(session, "should-not-submit", press_enter=True)
+
+    assert result["delivery_state"] == DELIVERY_BLOCKED
+    assert result["error"] == "IDENTITY_CHANGED_MID_SEND"
+    assert result["enter_sent"] is False
+    assert "process was replaced" in result["submit_reason"]
+    pane = service.terminal_tail(session, 20)["output"]
+    assert "GOT=" not in pane  # Enter was withheld -- the read never completed
+
+
+def test_shell_taken_over_by_another_program_mid_send_still_blocks_enter(tmux_session_factory, tmp_path,
+                                                                        monkeypatch):
+    # Not relaxed for a shell: a change INTO something that is not the pane's
+    # own shell means another program owns the pty now, and a stray Enter would
+    # land in it. (test_pane_current_command_change_mid_send_also_blocks above
+    # covers the same rule from the other direction; this one states it
+    # explicitly as the boundary of the fix.)
+    session = tmux_session_factory("test-delivery-shell-taken-over", "bash -lc 'read v; echo GOT=$v; sleep 10'")
+    time.sleep(0.2)
+    service = _service(tmp_path)
+    _mid_send_mutation(service, monkeypatch, mutate_after={"pane_current_command": "vim"})
+
+    result = service.terminal_send_text(session, "should-not-submit", press_enter=True)
+
+    assert result["delivery_state"] == DELIVERY_BLOCKED
+    assert result["error"] == "IDENTITY_CHANGED_MID_SEND"
+    assert result["enter_sent"] is False
+    assert "not this pane's own shell" in result["submit_reason"]
+
+
+def test_enter_safety_rule_by_adapter():
+    # The rule itself, without a pty: an agent CLI's command name IS the
+    # target's identity and any change blocks; a shell's is transient metadata
+    # and only a change away from a shell blocks.
+    from terminal_mcp.adapters import (ClaudeAdapter, CodexAdapter, GenericShellAdapter,
+                                       enter_is_safe_after_command_change)
+
+    generic, claude, codex = GenericShellAdapter(), ClaudeAdapter(), CodexAdapter()
+
+    # Unchanged is always fine, for every adapter.
+    for adapter, command in ((generic, "bash"), (claude, "claude"), (codex, "codex")):
+        assert enter_is_safe_after_command_change(adapter, command, command) is True
+
+    # Shell: back to a prompt (any real shell, and a Windows-suffixed name) is
+    # safe; anything else is not.
+    assert enter_is_safe_after_command_change(generic, "python3", "bash") is True
+    assert enter_is_safe_after_command_change(generic, "git", "zsh") is True
+    assert enter_is_safe_after_command_change(generic, "pytest", "bash.exe") is True
+    assert enter_is_safe_after_command_change(generic, "bash", "vim") is False
+    assert enter_is_safe_after_command_change(generic, "bash", "ssh") is False
+
+    # Agent CLI: the process this send was aimed at is gone. Never safe --
+    # including a change to a shell, which means the agent itself exited.
+    assert enter_is_safe_after_command_change(claude, "claude", "bash") is False
+    assert enter_is_safe_after_command_change(codex, "codex", "bash") is False
+    assert enter_is_safe_after_command_change(claude, "claude", "node") is False
+
+    # A future adapter is strict until it deliberately opts out.
+    assert GenericShellAdapter.foreground_command_is_identity is False
+    assert ClaudeAdapter.foreground_command_is_identity is True
+    assert CodexAdapter.foreground_command_is_identity is True
+
+
 def test_stale_idempotency_claim_is_reclaimed_not_stuck_forever(tmp_path):
     # A crashed claimant (process killed after claiming, before storing a
     # result) must not leave the key permanently reporting
