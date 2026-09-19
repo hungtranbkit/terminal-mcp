@@ -135,3 +135,85 @@ def test_the_unassigned_path_is_idempotent_too(tmp_path):
     second = service.create_task("Global", "prompt", request_key="req-9")
     assert first["task_id"] == second["task_id"]
     assert second["deduplicated"] is True
+
+
+# -- closing a task the engine never dispatched ------------------------------
+#
+# The other half of the same discrepancy. record_manual_dispatch above notes
+# that a send went round the queue, but deliberately does not move the status
+# -- so a task whose work was driven in by hand stays QUEUED forever: no
+# attempt, no nonce, no completion marker, nothing the engine can ever act on.
+# Every board and dashboard then reports "pending" about work that has shipped.
+# QueueService.verify is the supported way to close it, with evidence.
+
+def _service(tmp_path):
+    from terminal_mcp.queue_service import QueueService
+
+    return QueueService(QueueStore(tmp_path / "queue.db"))
+
+
+def _undispatched_task(service, session="lane-a"):
+    (task_id,) = service.store.set_tasks(session, [{"prompt": "ship it", "title": "t"}])
+    task = service.store.get_task(task_id)
+    assert task.status == "QUEUED" and task.attempt_count == 0 and task.started_at is None
+    return task_id
+
+
+def test_a_task_executed_by_direct_sends_can_be_closed_with_evidence(tmp_path):
+    """The exact stale-QUEUED scenario: work done by hand in the session,
+    durable task never dispatched, and before this fix nothing could ever
+    move it out of QUEUED."""
+    service = _service(tmp_path)
+    task_id = _undispatched_task(service)
+    service.store.record_manual_dispatch(task_id, detail={
+        "at": "2026-09-19T09:40:00Z", "via": "terminal_send_text", "sent": True})
+
+    result = service.verify("lane-a", task_id, {
+        "commits": ["d277be5"], "tests": "225 passed", "live_verify": "PASS"})
+
+    assert "error" not in result, result
+    assert result["task"]["status"] == "COMPLETED"
+    assert result["task"]["completed_at"]
+
+
+def test_reconciled_completion_is_labelled_as_such_in_the_event_log(tmp_path):
+    """A human vouching for a task must not be indistinguishable from the
+    engine having verified a completion marker."""
+    service = _service(tmp_path)
+    task_id = _undispatched_task(service)
+    service.verify("lane-a", task_id, {"live_verify": "PASS"})
+
+    kinds = [e["event_type"] for e in service.store.list_events("lane-a")
+             if e.get("task_id") == task_id]
+    assert "RECONCILED" in kinds
+    assert "VERIFIED" not in kinds
+
+
+def test_reconciling_still_demands_evidence(tmp_path):
+    service = _service(tmp_path)
+    task_id = _undispatched_task(service)
+    assert service.verify("lane-a", task_id, {})["error"] == "EVIDENCE_REQUIRED"
+    assert service.store.get_task(task_id).status == "QUEUED"
+
+
+def test_a_task_the_engine_is_working_is_never_closed_from_the_side(tmp_path):
+    """Only a task with no attempt, no start and no claim qualifies -- closing
+    an in-flight one would race the engine's own transition."""
+    service = _service(tmp_path)
+    task_id = _undispatched_task(service)
+    service.store.transition_task(task_id, "DISPATCHING", event_type="DISPATCHING")
+
+    result = service.verify("lane-a", task_id, {"live_verify": "PASS"})
+    assert result["error"] == "INVALID_TRANSITION"
+    assert service.store.get_task(task_id).status == "DISPATCHING"
+
+
+def test_a_closed_task_is_no_longer_pending_anywhere(tmp_path):
+    """The point of the fix: the board must stop advertising it."""
+    service = _service(tmp_path)
+    task_id = _undispatched_task(service)
+    service.verify("lane-a", task_id, {"live_verify": "PASS"})
+
+    assert service.pending_counts().get("lane-a", 0) == 0
+    statuses = {t["id"]: t["status"] for t in service.status("lane-a")["tasks"]}
+    assert statuses[task_id] == "COMPLETED"

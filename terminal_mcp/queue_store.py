@@ -168,6 +168,15 @@ VALID_TRANSITIONS: dict[str, frozenset[str]] = {
         PRECHECK,     # Phase 2: engine claimed this task, coordinator review starting
         DISPATCHING,  # Phase 1 compat: direct dispatch, bypassing the coordinator gate
         SKIPPED, CANCELLED, PAUSED,
+        # RECONCILIATION ONLY, and only for a task that was never dispatched.
+        # When the work is done by direct sends into the session -- which
+        # record_manual_dispatch already notes on the task -- the engine has no
+        # attempt, no nonce and no marker, so none of its paths can ever close
+        # the task: it stays QUEUED forever while the work has shipped, and the
+        # queue reports "pending" about a finished job. Reached ONLY through
+        # QueueService.verify's undispatched branch, which still demands
+        # explicit evidence and records RECONCILED, never VERIFIED.
+        COMPLETED,
     }),
     PRECHECK: frozenset({
         READY,        # coordinator: READY
@@ -222,6 +231,7 @@ VALID_TRANSITIONS: dict[str, frozenset[str]] = {
     }),
     PAUSED: frozenset({
         QUEUED, PRECHECK, READY, DISPATCHING, DISPATCH_UNCERTAIN, RUNNING, VERIFYING, WAITING_SESSION, CANCELLED,
+        COMPLETED,  # reconciliation only -- see the QUEUED entry above
     }),  # resume (to paused_from_status) or cancel
     COMPLETED: frozenset(),
     SKIPPED: frozenset(),
@@ -2423,7 +2433,8 @@ class QueueStore:
                               (nonce, iso_now(), task_id))
         return nonce
 
-    def mark_completed_with_evidence(self, task_id: str, *, evidence: dict[str, Any]) -> QueueTask:
+    def mark_completed_with_evidence(self, task_id: str, *, evidence: dict[str, Any],
+                                     event_type: str = "VERIFIED") -> QueueTask:
         """VERIFYING -> COMPLETED, but ONLY through here -- unlike a bare
         transition_task(..., COMPLETED), this REQUIRES evidence (item 11:
         "Không phụ thuộc heuristic 'final report' đơn thuần... fallback
@@ -2448,7 +2459,12 @@ class QueueStore:
                 event_type="COMPLETION_REFUSED_REQUIREMENTS",
                 reason=f"{decision.reason}: {', '.join(decision.blocking_ids()) or decision.detail}")
             raise RequirementsNotCoveredError(decision)
-        return self.transition_task(task_id, COMPLETED, event_type="VERIFIED",
+        # `event_type` keeps a marker-verified completion ("VERIFIED") distinct
+        # from an operator reconciliation ("RECONCILED") in the event log. Both
+        # carry evidence and both pass the contract gate above; conflating them
+        # would hide which completions a human vouched for rather than the
+        # engine having proved.
+        return self.transition_task(task_id, COMPLETED, event_type=event_type,
                                     extra_fields={"verification_evidence": json.dumps(evidence)})
 
     # -- Requirement Contract ------------------------------------------------

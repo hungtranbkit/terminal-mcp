@@ -74,7 +74,16 @@ def _drive_to_status(store, task_id, status):
 
 
 @pytest.mark.parametrize("from_status,to_status", [
-    (QUEUED, RUNNING), (QUEUED, COMPLETED), (QUEUED, VERIFYING), (QUEUED, BLOCKED),
+    (QUEUED, RUNNING), (QUEUED, VERIFYING), (QUEUED, BLOCKED),
+    # (QUEUED, COMPLETED) and (PAUSED, COMPLETED) deliberately removed from
+    # this "must be rejected" list, same reasoning as (BLOCKED, COMPLETED)
+    # below: a task the engine never dispatched -- work driven in by hand --
+    # has no attempt, no nonce and no marker, so no engine path can ever close
+    # it and it sits QUEUED while the work has shipped. The edge exists only
+    # for that reconciliation and is guarded in the SERVICE layer, which
+    # demands evidence and refuses anything the engine has touched. Its real
+    # coverage lives in test_queue_manual_dispatch_reconcile.py; the guard
+    # itself is asserted just below.
     (COMPLETED, RUNNING), (COMPLETED, QUEUED), (COMPLETED, CANCELLED),
     (SKIPPED, QUEUED), (SKIPPED, RUNNING),
     (CANCELLED, QUEUED), (CANCELLED, RUNNING),
@@ -87,10 +96,34 @@ def _drive_to_status(store, task_id, status):
     (BLOCKED, RUNNING), (BLOCKED, VERIFYING), (BLOCKED, DISPATCHING),
     (RUNNING, QUEUED), (RUNNING, COMPLETED), (RUNNING, DISPATCHING),
     (DISPATCHING, VERIFYING), (DISPATCHING, COMPLETED),
-    (PAUSED, COMPLETED), (PAUSED, BLOCKED), (PAUSED, SKIPPED),
+    (PAUSED, BLOCKED), (PAUSED, SKIPPED),
 ])
 def test_every_undocumented_transition_is_rejected(from_status, to_status):
     assert is_valid_transition(from_status, to_status) is False
+
+
+@pytest.mark.parametrize("from_status", [QUEUED, PAUSED])
+def test_reconciliation_edge_exists_but_only_for_an_untouched_task(from_status, tmp_path):
+    """The edge is real, and the guard that keeps it honest is the service.
+
+    The transition table cannot express "only if the engine never touched
+    this", so the store allows the edge and QueueService.verify enforces the
+    condition. This pins both halves: the edge is present, and a task the
+    engine HAS touched is still refused there.
+    """
+    from terminal_mcp.queue_service import QueueService
+
+    assert is_valid_transition(from_status, COMPLETED) is True
+
+    service = QueueService(QueueStore(tmp_path / "queue.db"))
+    (task_id,) = service.store.set_tasks("lane-a", [{"prompt": "p", "title": "t"}])
+    if from_status == PAUSED:
+        service.store.transition_task(task_id, PAUSED, event_type="TEST")
+    assert service.verify("lane-a", task_id, {"live": "PASS"})["task"]["status"] == COMPLETED
+
+    (other,) = service.store.set_tasks("lane-b", [{"prompt": "p", "title": "t"}])
+    service.store.transition_task(other, DISPATCHING, event_type="TEST")
+    assert service.verify("lane-b", other, {"live": "PASS"})["error"] == "INVALID_TRANSITION"
 
 
 def test_transition_task_raises_on_invalid_transition_and_never_mutates(store):
