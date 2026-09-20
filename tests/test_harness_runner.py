@@ -29,7 +29,8 @@ import pytest
 from terminal_mcp import harness_policy as policy
 from terminal_mcp import harness_state as state
 from terminal_mcp.harness_engine import AgentResult, CheckResult, HarnessEngine
-from terminal_mcp.harness_runner import (DEFAULT_STALL_SECONDS, NoSessionAvailable,
+from terminal_mcp.harness_runner import (DEFAULT_STALL_SECONDS, SPAWN_SETTLE_SECONDS,
+                                         NoSessionAvailable,
                                          SessionBroker, TerminalAgentRunner,
                                          build_agent_text,
                                          dispatch_idempotency_key)
@@ -169,7 +170,7 @@ def _finish(ops, store, session_name, dispatch, payload):
 # ---------------------------------------------------------------------------
 
 def test_a_dispatch_sends_once_and_returns_without_waiting(store, artifacts):
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
     run = _run(store)
 
@@ -182,13 +183,13 @@ def test_a_dispatch_sends_once_and_returns_without_waiting(store, artifacts):
     assert len(ops.sends) == 1
     dispatch = store.open_dispatch_for(run.id)
     assert dispatch["state"] == "accepted"
-    assert dispatch["session_id"] == "claude-a"
+    assert dispatch["session_id"] == "harness-claude-a"
 
 
 def test_stepping_the_same_stage_again_does_not_send_a_second_prompt(store, artifacts):
     """The duplicate-dispatch failure. Whoever drives ticks may step a stage
     any number of times, and only the first of those may send."""
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
     run = _run(store)
 
@@ -213,7 +214,7 @@ def test_the_idempotency_key_is_stable_across_restarts():
 
 
 def test_a_refused_delivery_is_infrastructure_not_a_wrong_answer(store, artifacts):
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     ops.send_response = {"delivery_state": "TEXT_SENT", "press_enter": True}
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
 
@@ -226,7 +227,7 @@ def test_a_refused_delivery_is_infrastructure_not_a_wrong_answer(store, artifact
 
 
 def test_an_unknown_delivery_is_held_open_never_resent(store, artifacts):
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     ops.send_response = {"delivery_state": "DELIVERY_UNKNOWN", "press_enter": True}
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
     run = _run(store)
@@ -245,14 +246,14 @@ def test_an_unknown_delivery_is_held_open_never_resent(store, artifacts):
 
 def test_the_answer_is_read_from_the_file_not_the_pane(store, artifacts):
     """The pane has no scrollback. A long answer printed there is gone."""
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
     run = _run(store)
     runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
                session_id=None, iteration=1)
     dispatch = store.open_dispatch_for(run.id)
 
-    _finish(ops, store, "claude-a", dispatch, {"reported": "done", "commit": "abc123"})
+    _finish(ops, store, "harness-claude-a", dispatch, {"reported": "done", "commit": "abc123"})
     result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
                         tier="balanced", session_id=None, iteration=1)
 
@@ -265,13 +266,13 @@ def test_the_answer_is_read_from_the_file_not_the_pane(store, artifacts):
 def test_our_own_dispatched_prompt_is_not_read_back_as_the_answer(store, artifacts):
     """Our template contains a fully valid marker. Reading it back is how a
     session that did nothing gets recorded as finished."""
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
     run = _run(store)
     runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
                session_id=None, iteration=1)
     dispatch = store.open_dispatch_for(run.id)
-    ops.sessions["claude-a"].state = "IDLE"   # it went quiet without answering
+    ops.sessions["harness-claude-a"].state = "IDLE"   # it went quiet without answering
     # The pane contains ONLY our prompt -- the agent has written nothing.
     Path(dispatch["artifact_path"]).parent.mkdir(parents=True, exist_ok=True)
     Path(dispatch["artifact_path"]).write_text('{"reported": "done"}')
@@ -284,7 +285,7 @@ def test_our_own_dispatched_prompt_is_not_read_back_as_the_answer(store, artifac
 
 
 def test_a_marker_from_an_earlier_attempt_does_not_complete_this_one(store, artifacts):
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
     run = _run(store)
     runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
@@ -292,8 +293,8 @@ def test_a_marker_from_an_earlier_attempt_does_not_complete_this_one(store, arti
     dispatch = store.open_dispatch_for(run.id)
     Path(dispatch["artifact_path"]).parent.mkdir(parents=True, exist_ok=True)
     Path(dispatch["artifact_path"]).write_text('{"reported": "done"}')
-    ops.sessions["claude-a"].state = "IDLE"
-    ops.sessions["claude-a"].output += (
+    ops.sessions["harness-claude-a"].state = "IDLE"
+    ops.sessions["harness-claude-a"].output += (
         "\nfinished\n###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1 "
         f"task_id={dispatch['id']} attempt={dispatch['attempt']} "
         "nonce=a-stale-nonce-from-before status=completion_candidate "
@@ -305,14 +306,14 @@ def test_a_marker_from_an_earlier_attempt_does_not_complete_this_one(store, arti
 
 
 def test_done_with_no_artifact_is_infrastructure_not_a_failed_iteration(store, artifacts):
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
     run = _run(store)
     runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
                session_id=None, iteration=1)
     dispatch = store.open_dispatch_for(run.id)
-    ops.sessions["claude-a"].state = "IDLE"
-    ops.sessions["claude-a"].output += (
+    ops.sessions["harness-claude-a"].state = "IDLE"
+    ops.sessions["harness-claude-a"].output += (
         "\ndone\n###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1 "
         f"task_id={dispatch['id']} attempt={dispatch['attempt']} nonce={dispatch['nonce']} "
         "status=completion_candidate summary_sha256=abc###\n")
@@ -325,7 +326,7 @@ def test_done_with_no_artifact_is_infrastructure_not_a_failed_iteration(store, a
 
 def test_a_fenced_json_artifact_is_still_read(store, artifacts):
     """Recovering from three backticks beats failing a whole iteration."""
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
     run = _run(store)
     runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
@@ -333,8 +334,8 @@ def test_a_fenced_json_artifact_is_still_read(store, artifacts):
     dispatch = store.open_dispatch_for(run.id)
     Path(dispatch["artifact_path"]).parent.mkdir(parents=True, exist_ok=True)
     Path(dispatch["artifact_path"]).write_text('```json\n{"reported": "done"}\n```')
-    ops.sessions["claude-a"].state = "IDLE"
-    ops.sessions["claude-a"].output += (
+    ops.sessions["harness-claude-a"].state = "IDLE"
+    ops.sessions["harness-claude-a"].output += (
         "\ndone\n###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1 "
         f"task_id={dispatch['id']} attempt={dispatch['attempt']} nonce={dispatch['nonce']} "
         "status=completion_candidate summary_sha256=abc###\n")
@@ -349,12 +350,12 @@ def test_a_fenced_json_artifact_is_still_read(store, artifacts):
 # ---------------------------------------------------------------------------
 
 def test_a_healthy_builder_session_is_reused(store, artifacts):
-    ops = FakeOps([FakeSession("claude-a", output="context left: 40%")])
+    ops = FakeOps([FakeSession("harness-claude-a", output="context left: 40%")])
     broker = SessionBroker(ops, store)
-    run = _run(store, session="claude-a")
+    run = _run(store, session="harness-claude-a")
 
     pick = broker.pick(run=run, role=policy.BUILDER)
-    assert pick.session == "claude-a"
+    assert pick.session == "harness-claude-a"
     assert pick.reused is True
     assert ops.created == []
 
@@ -362,43 +363,51 @@ def test_a_healthy_builder_session_is_reused(store, artifacts):
 def test_a_session_over_the_context_ceiling_is_not_reused(store, artifacts):
     """At 90% the session is about to be replaced; one more task means doing
     the work twice."""
-    ops = FakeOps([FakeSession("claude-a", output="Context low (9% remaining)")])
+    ops = FakeOps([FakeSession("harness-claude-a", output="Context low (9% remaining)")])
     broker = SessionBroker(ops, store)
-    run = _run(store, session="claude-a")
+    run = _run(store, session="harness-claude-a")
 
     pick = broker.pick(run=run, role=policy.BUILDER)
-    assert pick.session != "claude-a"
+    assert pick.session != "harness-claude-a"
     assert pick.spawned is True
 
 
-def test_a_busy_session_is_not_handed_more_work(store, artifacts):
-    ops = FakeOps([FakeSession("claude-a", state="RUNNING")])
+def test_a_session_the_harness_did_not_create_is_never_adopted(store, artifacts):
+    """An agent TUI reports RUNNING whether it is generating or sitting at an
+    empty prompt, so pane state cannot tell "nobody is using this" from
+    "somebody is typing in it right now". Guessing wrong there drops a
+    machine-generated prompt into a human's attended session."""
+    ops = FakeOps([FakeSession("nova-auth-prod", output="context left: 20%"),
+                   FakeSession("mesflow-ha-exec")])
     broker = SessionBroker(ops, store)
-    run = _run(store, session="claude-a")
+    run = _run(store, session="nova-auth-prod")
 
     pick = broker.pick(run=run, role=policy.BUILDER)
-    assert pick.session != "claude-a"
+    assert pick.session not in ("nova-auth-prod", "mesflow-ha-exec")
+    assert pick.spawned is True
+    assert broker.owns("nova-auth-prod") is False
+    assert broker.owns("harness-builder-x-1") is True
 
 
 def test_a_session_waiting_on_a_human_is_not_handed_more_work(store, artifacts):
-    ops = FakeOps([FakeSession("claude-a", state="WAITING_INPUT")])
+    ops = FakeOps([FakeSession("harness-claude-a", state="WAITING_INPUT")])
     broker = SessionBroker(ops, store)
-    run = _run(store, session="claude-a")
-    assert broker.pick(run=run, role=policy.BUILDER).session != "claude-a"
+    run = _run(store, session="harness-claude-a")
+    assert broker.pick(run=run, role=policy.BUILDER).session != "harness-claude-a"
 
 
 def test_a_critical_evaluator_never_inherits_any_session_this_run_used(store, artifacts):
     """The whole value being paid for is that it did not watch the Builder
     reason. Handing it the Builder's pane destroys the thing being bought."""
-    ops = FakeOps([FakeSession("claude-a", output="context left: 40%")])
+    ops = FakeOps([FakeSession("harness-claude-a", output="context left: 40%")])
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
-    run = _run(store, session="claude-a")
+    run = _run(store, session="harness-claude-a")
     runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
-               session_id="claude-a", iteration=1)
+               session_id="harness-claude-a", iteration=1)
     run = store.require_run(run.id)
 
     pick = runner.broker.pick(run=run, role=policy.EVALUATOR, independent=True)
-    assert pick.session != "claude-a"
+    assert pick.session != "harness-claude-a"
     assert pick.spawned is True
     assert pick.reused is False
 
@@ -406,7 +415,7 @@ def test_a_critical_evaluator_never_inherits_any_session_this_run_used(store, ar
 def test_two_runs_never_get_the_same_session_at_once(store, artifacts):
     """The duplicate-spawn guard's other half: a pane holding one run's open
     dispatch is not a candidate for another run."""
-    ops = FakeOps([FakeSession("claude-a", output="context left: 40%")])
+    ops = FakeOps([FakeSession("harness-claude-a", output="context left: 40%")])
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
     first = _run(store, task_id="A-1")
     runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=first, tier="balanced",
@@ -414,7 +423,7 @@ def test_two_runs_never_get_the_same_session_at_once(store, artifacts):
 
     second = _run(store, task_id="B-1")
     pick = runner.broker.pick(run=second, role=policy.BUILDER)
-    assert pick.session != "claude-a"
+    assert pick.session != "harness-claude-a"
     assert pick.spawned is True
 
 
@@ -449,13 +458,13 @@ def test_a_spawned_session_opens_in_the_runs_worktree(store, artifacts, tmp_path
 # ---------------------------------------------------------------------------
 
 def test_a_dead_session_is_infrastructure_and_the_work_is_not_lost(store, artifacts):
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
     run = _run(store, worktree="/tmp/wt/x")
     runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
                session_id=None, iteration=1)
 
-    ops.sessions["claude-a"].alive = False  # the session is killed
+    ops.sessions["harness-claude-a"].alive = False  # the session is killed
     result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
                         tier="balanced", session_id=None, iteration=1)
 
@@ -467,12 +476,12 @@ def test_a_dead_session_is_infrastructure_and_the_work_is_not_lost(store, artifa
 def test_a_quiet_session_stalls_only_after_the_configured_patience(store, artifacts):
     """A Builder thinking and a Builder stalled look identical from outside,
     and the cost of being wrong in the impatient direction is killing work."""
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     patient = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
     run = _run(store)
     patient.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
                 session_id=None, iteration=1)
-    ops.sessions["claude-a"].state = "IDLE"   # it went quiet without answering
+    ops.sessions["harness-claude-a"].state = "IDLE"   # it went quiet without answering
     assert patient.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
                        tier="balanced", session_id=None, iteration=1).pending is True
 
@@ -484,12 +493,12 @@ def test_a_quiet_session_stalls_only_after_the_configured_patience(store, artifa
 
 
 def test_a_session_that_starts_asking_a_human_is_not_prompted_again(store, artifacts):
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
     run = _run(store)
     runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
                session_id=None, iteration=1)
-    ops.sessions["claude-a"].state = "WAITING_INPUT"
+    ops.sessions["harness-claude-a"].state = "WAITING_INPUT"
 
     result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
                         tier="balanced", session_id=None, iteration=1)
@@ -519,7 +528,7 @@ def repo(tmp_path):
 
 
 def test_the_engine_stops_at_a_pending_agent_instead_of_looping(store, artifacts, repo):
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     engine, _runner = _engine(store, ops, artifacts, repo)
     run, _ = engine.start(task_id="MOB-1", prompt="build it", title="Build",
                           project_id="pilot", acceptance=["it builds"], checks=["true"],
@@ -534,7 +543,7 @@ def test_the_engine_stops_at_a_pending_agent_instead_of_looping(store, artifacts
 
 
 def test_one_llm_call_is_charged_however_many_times_it_is_observed(store, artifacts, repo):
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     engine, _runner = _engine(store, ops, artifacts, repo)
     run, _ = engine.start(task_id="MOB-2", prompt="build it", title="Build",
                           project_id="pilot", acceptance=["it builds"], checks=["true"],
@@ -547,14 +556,14 @@ def test_one_llm_call_is_charged_however_many_times_it_is_observed(store, artifa
 
 
 def test_a_run_reaches_merge_ready_once_the_agent_answers(store, artifacts, repo):
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     engine, _runner = _engine(store, ops, artifacts, repo)
     run, _ = engine.start(task_id="MOB-3", prompt="build it", title="Build",
                           project_id="pilot", acceptance=["it builds"], checks=["true"],
                           changed_paths=["src"])
     engine.drive(run.id)
     dispatch = store.open_dispatch_for(run.id)
-    _finish(ops, store, "claude-a", dispatch, {"reported": "done", "commit": "c1"})
+    _finish(ops, store, "harness-claude-a", dispatch, {"reported": "done", "commit": "c1"})
 
     engine.drive(run.id, max_steps=10)
     assert store.require_run(run.id).stage == state.MERGE_READY
@@ -562,7 +571,7 @@ def test_a_run_reaches_merge_ready_once_the_agent_answers(store, artifacts, repo
 
 def test_a_killed_builder_resumes_the_same_run_iteration_and_worktree(store, artifacts, repo):
     """The kill/recovery proof, through the real adapter."""
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     engine, _runner = _engine(store, ops, artifacts, repo)
     run, _ = engine.start(task_id="MOB-4", prompt="build it", title="Build",
                           project_id="pilot", acceptance=["it builds"], checks=["true"],
@@ -572,7 +581,7 @@ def test_a_killed_builder_resumes_the_same_run_iteration_and_worktree(store, art
     before = store.require_run(run.id)
     engine.checkpoint(run.id, note="before the kill", remaining=["finish the ETA row"])
 
-    ops.sessions["claude-a"].alive = False       # kill it
+    ops.sessions["harness-claude-a"].alive = False       # kill it
     outcome = engine.step(run.id)
     assert outcome.to_stage == state.FAILED_INFRA
 
@@ -588,7 +597,7 @@ def test_a_killed_builder_resumes_the_same_run_iteration_and_worktree(store, art
 def test_the_stage_and_the_dispatch_survive_a_controller_restart(store, artifacts, repo, tmp_path):
     """Nothing the adapter needs lives in memory. A new store, a new engine
     and a new runner over the same file carry on observing the same agent."""
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     engine, _runner = _engine(store, ops, artifacts, repo)
     run, _ = engine.start(task_id="MOB-5", prompt="build it", title="Build",
                           project_id="pilot", acceptance=["it builds"], checks=["true"],
@@ -603,7 +612,7 @@ def test_the_stage_and_the_dispatch_survive_a_controller_restart(store, artifact
     assert reborn_store.require_run(run.id).stage == state.BUILDING
     assert reborn_store.open_dispatch_for(run.id)["id"] == dispatch_before["id"]
 
-    _finish(ops, reborn_store, "claude-a", dispatch_before, {"reported": "done"})
+    _finish(ops, reborn_store, "harness-claude-a", dispatch_before, {"reported": "done"})
     reborn_engine.drive(run.id, max_steps=10)
 
     assert reborn_store.require_run(run.id).stage == state.MERGE_READY
@@ -658,7 +667,7 @@ def test_an_artifact_carrying_this_dispatchs_nonce_completes_it_alone(store, art
     already be erased. The nonce in the FILE is the stronger signal: it is
     unguessable and unique to this attempt, so a file carrying it cannot be a
     leftover, an echo, or anything but a deliberate answer to this request."""
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
     run = _run(store)
     runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
@@ -677,7 +686,7 @@ def test_an_artifact_carrying_this_dispatchs_nonce_completes_it_alone(store, art
 
 
 def test_an_artifact_with_the_wrong_nonce_does_not_complete_a_dispatch(store, artifacts):
-    ops = FakeOps([FakeSession("claude-a")])
+    ops = FakeOps([FakeSession("harness-claude-a")])
     runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
     run = _run(store)
     runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
@@ -714,3 +723,105 @@ def test_the_adapter_spawns_through_either_session_api(store, artifacts):
 
     multi = FakeOps([])
     assert "node" in SessionBroker(multi, store)._spawn_kwargs()
+
+
+# ---------------------------------------------------------------------------
+# a freshly spawned CLI is not listening yet
+# ---------------------------------------------------------------------------
+
+def test_a_spawned_session_is_not_prompted_until_it_has_settled(store, artifacts):
+    """Observed live on Claude Code v2.1.278: the whole multi-line prompt sat
+    unsubmitted in the input box of a CLI that was still drawing its welcome
+    screen, while the dispatch read as accepted and nothing ever ran."""
+    ops = FakeOps([])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
+    run = _run(store)
+
+    result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+                        tier="balanced", session_id=None, iteration=1)
+
+    assert result.pending is True
+    assert ops.created, "a session was spawned"
+    assert ops.sends == [], "nothing may be sent into a CLI that is still booting"
+    assert store.open_dispatch_for(run.id)["state"] == "awaiting_session"
+
+
+def test_the_prompt_goes_in_once_the_spawned_session_has_settled(store, artifacts):
+    ops = FakeOps([])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts,
+                                 spawn_settle_seconds=0.0)
+    run = _run(store)
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
+               session_id=None, iteration=1)
+    assert ops.sends == []
+
+    result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+                        tier="balanced", session_id=None, iteration=1)
+    assert len(ops.sends) == 1
+    assert result.pending is True
+    assert store.open_dispatch_for(run.id)["state"] == "accepted"
+
+
+def test_a_spawned_session_that_never_comes_up_is_infrastructure(store, artifacts):
+    ops = FakeOps([])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts,
+                                 spawn_settle_seconds=0.0)
+    run = _run(store)
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
+               session_id=None, iteration=1)
+    for session in ops.sessions.values():
+        session.alive = False
+
+    result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+                        tier="balanced", session_id=None, iteration=1)
+    assert result.infra_failure is True
+    assert "never came up" in result.error
+
+
+def test_an_already_running_session_is_prompted_immediately(store, artifacts):
+    """The settle delay is for CLIs that have just started. A session already
+    idle and healthy has demonstrably finished booting."""
+    ops = FakeOps([FakeSession("harness-claude-a", output="context left: 40%")])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
+    run = _run(store, session="harness-claude-a")
+
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
+               session_id="harness-claude-a", iteration=1)
+    assert len(ops.sends) == 1
+
+
+# ---------------------------------------------------------------------------
+# a confirmed submit the target never took
+# ---------------------------------------------------------------------------
+
+def test_a_prompt_left_in_the_composer_is_held_and_never_resent(store, artifacts):
+    """The submit IS confirmed, so resending would duplicate it. The gate
+    already knows how to say this -- it just has to be asked, which is why
+    acceptance checking is on by default here and advisory on the queue."""
+    class StuckOps(FakeOps):
+        def terminal_send_text(self, session, text, press_enter=False, dry_run=False, **kwargs):
+            response = super().terminal_send_text(session, text, press_enter, dry_run, **kwargs)
+            # The text went in; the target never started working on it.
+            self.sessions[session].state = "IDLE"
+            return response
+
+    ops = StuckOps([FakeSession("harness-claude-a", output="context left: 40%")])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
+    run = _run(store, session="harness-claude-a")
+
+    result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+                        tier="balanced", session_id="harness-claude-a", iteration=1)
+    dispatch = store.open_dispatch_for(run.id)
+
+    assert result.pending is True
+    assert dispatch["state"] == "dispatching"
+    assert "not accepted" in (dispatch["error"] or "")
+
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
+               session_id="harness-claude-a", iteration=1)
+    assert len(ops.sends) == 1, "a confirmed submit is never resent"
+
+
+def test_acceptance_checking_is_on_by_default(store, artifacts):
+    assert TerminalAgentRunner(FakeOps([]), store,
+                               artifacts_root=artifacts).require_acceptance is True

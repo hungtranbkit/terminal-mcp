@@ -71,6 +71,14 @@ from .harness_contract import iso_now
 from .queue_engine import SESSION_UNREACHABLE_ERRORS, worker_output_after_prompt
 from .status import parse_completion_marker, verify_completion_marker
 
+#: How long a freshly SPAWNED session is given before the first prompt goes
+#: into it. A CLI that has just started is still drawing its welcome screen
+#: and is not listening: the prompt lands in a composer that is not ready to
+#: submit it, the send is reported confirmed, and the work never starts.
+#: Observed live on Claude Code v2.1.278 -- the whole multi-line prompt sat
+#: unsubmitted in the input box while the dispatch read as accepted.
+SPAWN_SETTLE_SECONDS = 20.0
+
 #: How long a pane may sit quiet with no marker and no artifact before the
 #: dispatch is called stalled. Generous: a Builder genuinely thinking, or
 #: waiting on a slow test, looks exactly like a stalled one from outside, and
@@ -206,12 +214,38 @@ class SessionBroker:
                 "awaiting_human": state in HUMAN_STATES or bool(status.get("input_required")),
                 "node_id": status.get("node_id")}
 
+    def owns(self, session: str | None) -> bool:
+        """Did the harness create this session?
+
+        THE HARNESS ADOPTS NOTHING IT DID NOT CREATE.
+
+        An agent TUI reports `RUNNING` whether it is generating a reply or
+        sitting at an empty prompt -- confirmed live on Claude Code v2.1.278,
+        where a freshly booted, idle session read as RUNNING. So pane state
+        cannot tell "busy" from "ready", which means it also cannot tell
+        "nobody is using this" from "somebody is typing in it right now".
+
+        Guessing wrong in that direction means dropping a machine-generated
+        prompt into a human's attended session. So the rule is ownership, not
+        inference: a session whose name this broker minted is fair game, and
+        every other session on the fleet is somebody else's. It costs a spawn
+        occasionally and it cannot interrupt anyone.
+        """
+        return bool(session) and str(session).startswith(f"{self.session_prefix}-")
+
     def healthy_for_reuse(self, session: str) -> tuple[bool, str, float | None]:
+        """Reusable means: ours, readable, not asking a human, and has room.
+
+        Deliberately NOT "not busy". See `owns` -- pane state cannot express
+        it for an agent TUI. Exclusivity comes from `sessions_in_use`, which
+        is the harness's own durable record of what it has dispatched into
+        and is authoritative rather than inferred.
+        """
+        if not self.owns(session):
+            return False, "not a harness-owned session", None
         health = self.health(session)
         if not health.get("alive"):
             return False, f"session unreadable: {health.get('reason')}", None
-        if health.get("busy"):
-            return False, "session is still working on something", None
         if health.get("awaiting_human"):
             return False, "session is waiting on a human", None
         percent = self.context_percent(session)
@@ -292,7 +326,7 @@ class SessionBroker:
 
         for candidate in self._candidates():
             name = candidate["session"]
-            if name in blocked:
+            if name in blocked or not self.owns(name):
                 continue
             if candidate.get("node_online") is False:
                 continue
@@ -405,9 +439,12 @@ def _age_seconds(stamp: str | None) -> float:
     return max(0.0, (datetime.now(timezone.utc) - moment).total_seconds())
 
 
-def _target_state_from_status(status: Mapping[str, Any]) -> str | None:
-    state = status.get("target_state") or status.get("state")
-    return str(state) if state else None
+#: Reused rather than reimplemented. `terminal_status` speaks pane states
+#: ("RUNNING"), delivery_gate speaks adapter target states ("running"), and a
+#: local helper that conflated the two silently produced "not accepted" for
+#: every send -- which is exactly the sort of quiet, plausible wrongness the
+#: acceptance gate exists to prevent, arriving via the gate itself.
+from .queue_engine import _target_state_from_status  # noqa: E402
 
 
 class TerminalAgentRunner:
@@ -426,7 +463,16 @@ class TerminalAgentRunner:
                  default_runtime: str = "claude",
                  stall_seconds: float = DEFAULT_STALL_SECONDS,
                  allow_spawn: bool = True,
-                 require_acceptance: bool = False) -> None:
+                 spawn_settle_seconds: float = SPAWN_SETTLE_SECONDS,
+                 #: ON by default, unlike the queue's advisory setting. The
+                 #: queue can afford advisory because a task that silently
+                 #: fails to start is noticed by an operator watching a board.
+                 #: A harness dispatch has no such observer: it would sit in
+                 #: BUILDING until the stall timeout, having spent a session
+                 #: and told nobody. The gate already knows how to say
+                 #: "the prompt is still in the composer" -- it just has to
+                 #: be asked.
+                 require_acceptance: bool = True) -> None:
         self.ops = ops
         self.store = store
         self.artifacts_root = Path(artifacts_root)
@@ -436,6 +482,7 @@ class TerminalAgentRunner:
         self.default_runtime = default_runtime
         self.stall_seconds = stall_seconds
         self.allow_spawn = allow_spawn
+        self.spawn_settle_seconds = spawn_settle_seconds
         self.require_acceptance = require_acceptance
 
     # -- the AgentRunner protocol -------------------------------------------
@@ -453,6 +500,8 @@ class TerminalAgentRunner:
 
         existing = self.store.latest_dispatch(run.id, iteration=iteration, role=role)
         if existing is not None:
+            if existing["state"] == "awaiting_session":
+                return self._send_when_ready(existing, prompt, run, role, iteration)
             if existing["state"] in self.store.OPEN_DISPATCH_STATES:
                 return self.poll(existing)
             if existing["state"] == "completed":
@@ -496,10 +545,48 @@ class TerminalAgentRunner:
                                        error=f"artifact directory: {exc}")
             return AgentResult(infra_failure=True, error=str(exc))
 
+        if pick.spawned:
+            # A CLI that has just been started is not listening yet. The
+            # dispatch is recorded with its session bound and NOTHING sent;
+            # the next step sends, by which time the pane has settled. This
+            # costs one tick and removes an entire class of silent failure.
+            self.store.update_dispatch(dispatch["id"], state="awaiting_session")
+            return AgentResult(pending=True, dispatch_id=dispatch["id"],
+                               session_id=pick.session, session_reused=False,
+                               agent=f"{pick.runtime}:{pick.session}")
+
         text = build_agent_text(
             prompt_text=getattr(prompt, "text", str(prompt)), role=role,
             dispatch_id=dispatch["id"], attempt=attempt, nonce=dispatch["nonce"],
             artifact_path=str(artifact), run_id=run.id, iteration=iteration)
+        return self._send(dispatch, pick, text)
+
+    def _send_when_ready(self, dispatch: Mapping[str, Any], prompt: Any, run: Any,
+                         role: str, iteration: int) -> Any:
+        """A spawned session, revisited. Send once it has settled."""
+        from .harness_engine import AgentResult
+
+        session = dispatch["session_id"]
+        health = self.broker.health(session)
+        if not health.get("alive"):
+            self.store.update_dispatch(dispatch["id"], state="failed",
+                                       error=f"spawned session never came up: "
+                                             f"{health.get('reason')}")
+            return AgentResult(infra_failure=True, session_id=session,
+                               error=f"spawned session never came up: {health.get('reason')}")
+        age = _age_seconds(dispatch.get("created_at"))
+        if age < self.spawn_settle_seconds or health.get("awaiting_human"):
+            self.store.update_dispatch(dispatch["id"], last_observed_at=iso_now())
+            return AgentResult(pending=True, dispatch_id=dispatch["id"],
+                               session_id=session)
+        text = build_agent_text(
+            prompt_text=getattr(prompt, "text", str(prompt)), role=role,
+            dispatch_id=dispatch["id"], attempt=int(dispatch["attempt"]),
+            nonce=dispatch["nonce"], artifact_path=str(dispatch["artifact_path"]),
+            run_id=run.id, iteration=iteration)
+        pick = SessionPick(session=session, node_id=dispatch.get("node_id"),
+                           runtime=dispatch.get("runtime"), reused=False,
+                           reason="spawned session has settled")
         return self._send(dispatch, pick, text)
 
     def _send(self, dispatch: Mapping[str, Any], pick: SessionPick, text: str) -> Any:
@@ -545,6 +632,19 @@ class TerminalAgentRunner:
             return AgentResult(pending=True, dispatch_id=dispatch["id"],
                                session_id=pick.session, session_reused=pick.reused,
                                context_percent=pick.context_percent,
+                               newly_dispatched=True,
+                               agent=f"{pick.runtime}:{pick.session}")
+        if verdict.kind == delivery_gate.NOT_ACCEPTED:
+            # The submit is CONFIRMED and the target did not take it -- most
+            # often the prompt sitting unsubmitted in a composer. Held open,
+            # never resent: resending a confirmed submit duplicates it. The
+            # stall timeout eventually escalates this as infrastructure,
+            # which is what it is.
+            self.store.update_dispatch(dispatch["id"], state="dispatching",
+                                       error=f"not accepted: {verdict.acceptance}",
+                                       last_observed_at=iso_now())
+            return AgentResult(pending=True, dispatch_id=dispatch["id"],
+                               session_id=pick.session, session_reused=pick.reused,
                                newly_dispatched=True,
                                agent=f"{pick.runtime}:{pick.session}")
         self.store.update_dispatch(dispatch["id"], state="accepted",

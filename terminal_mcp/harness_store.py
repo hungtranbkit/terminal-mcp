@@ -1118,13 +1118,15 @@ class HarnessStore:
                 "SELECT * FROM harness_dispatches WHERE id = ?", (dispatch_id,)).fetchone()
         return dict(row), True
 
-    #: States a dispatch may still be waiting in.
-    OPEN_DISPATCH_STATES = ("dispatching", "accepted", "running")
+    #: States a dispatch may still be waiting in. `awaiting_session` means the
+    #: session exists but nothing has been sent yet -- a freshly spawned CLI
+    #: is still drawing its welcome screen and is not listening.
+    OPEN_DISPATCH_STATES = ("awaiting_session", "dispatching", "accepted", "running")
 
     def open_dispatch_for(self, run_id: str, *, iteration: int | None = None,
                           role: str | None = None) -> dict[str, Any] | None:
         sql = ("SELECT * FROM harness_dispatches WHERE run_id = ? AND state IN "
-               "('dispatching','accepted','running')")
+               "('awaiting_session','dispatching','accepted','running')")
         args: list[Any] = [run_id]
         if iteration is not None:
             sql += " AND iteration = ?"
@@ -1196,7 +1198,8 @@ class HarnessStore:
         can be proven independent rather than merely requested.
         """
         sql = ("SELECT DISTINCT session_id FROM harness_dispatches WHERE state IN "
-               "('dispatching','accepted','running') AND session_id IS NOT NULL")
+               "('awaiting_session','dispatching','accepted','running') "
+               "AND session_id IS NOT NULL")
         args: list[Any] = []
         if exclude_run:
             sql += " AND run_id != ?"
