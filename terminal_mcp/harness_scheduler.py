@@ -113,11 +113,33 @@ class TaskNode:
     autonomous: bool = True
     not_autonomous_reason: str | None = None
     requested_mode: str | None = None
+    #: An INFRASTRUCTURE prerequisite this machine does not satisfy: the
+    #: repository is not here, or a toolchain the task's own checks invoke is
+    #: absent or the wrong version.
+    #:
+    #: Deliberately a SEPARATE field from `autonomous`, because the two route
+    #: to different places and conflating them would be wrong in both
+    #: directions. A missing human asset is nobody's problem but a person's --
+    #: it goes to the Human Decision Queue. A missing toolchain is not a
+    #: decision at all; it is a fact about this host, and the same task on a
+    #: machine that has the toolchain is perfectly autonomous. Putting an
+    #: absent Node runtime in front of a human as a "decision" would be
+    #: asking them to approve something rather than install it.
+    #:
+    #: What both share is the only thing that matters for cost: neither opens
+    #: a run, so neither spends a Planner token finding out.
+    infra_prerequisite: str | None = None
+
+    @property
+    def startable(self) -> bool:
+        return self.autonomous and self.infra_prerequisite is None
 
     def to_dict(self) -> dict[str, Any]:
         return {"id": self.id, "lane": self.lane, "priority": self.priority,
                 "depends_on": list(self.depends_on), "autonomous": self.autonomous,
                 "not_autonomous_reason": self.not_autonomous_reason,
+                "infra_prerequisite": self.infra_prerequisite,
+                "startable": self.startable,
                 "requested_mode": self.requested_mode}
 
 
@@ -235,12 +257,18 @@ class Assignment:
 class Plan:
     order: tuple[Assignment, ...]
     deferred: tuple[tuple[str, str], ...] = ()
+    #: The subset of `deferred` that is an infrastructure gap rather than a
+    #: human decision. Reported separately because the actions differ: one is
+    #: "install this / use that machine", the other is "somebody decide".
+    blocked_on_infra: tuple[tuple[str, str], ...] = ()
     scheduling: SchedulerPolicy = field(default_factory=scheduler_policy)
 
     def to_dict(self) -> dict[str, Any]:
         return {"scheduling": self.scheduling.to_dict(),
                 "order": [a.to_dict() for a in self.order],
-                "deferred": [{"task_id": t, "reason": r} for t, r in self.deferred]}
+                "deferred": [{"task_id": t, "reason": r} for t, r in self.deferred],
+                "blocked_on_infra": [{"task_id": t, "reason": r}
+                                     for t, r in self.blocked_on_infra]}
 
     @property
     def session_reuses(self) -> int:
@@ -272,6 +300,7 @@ def plan(nodes: Mapping[str, TaskNode], *, target: str,
     finished = set(satisfied)
     assignments: list[Assignment] = []
     deferred: list[tuple[str, str]] = []
+    blocked_on_infra: list[tuple[str, str]] = []
     lane_sessions: dict[str, str] = {}
     last_lane: str | None = None
     remaining = {task_id for task_id in closure(nodes, target)
@@ -291,11 +320,20 @@ def plan(nodes: Mapping[str, TaskNode], *, target: str,
             break
 
         blocked = [task_id for task_id in candidates
-                   if not (nodes[task_id].autonomous if task_id in nodes else True)]
+                   if not (nodes[task_id].startable if task_id in nodes else True)]
         for task_id in blocked:
             node = nodes[task_id]
-            deferred.append((task_id, node.not_autonomous_reason
-                             or "needs an input only a person can supply"))
+            if node.infra_prerequisite:
+                # A fact about this host, not a question for anybody. It is
+                # deferred with the exact gap named so an operator can close
+                # it, and NOT routed to the Human Decision Queue -- see
+                # TaskNode.infra_prerequisite for why the distinction is
+                # load-bearing rather than cosmetic.
+                blocked_on_infra.append((task_id, node.infra_prerequisite))
+                deferred.append((task_id, node.infra_prerequisite))
+            else:
+                deferred.append((task_id, node.not_autonomous_reason
+                                 or "needs an input only a person can supply"))
             remaining.discard(task_id)
             # NOT added to `finished`: a task routed to a human is not done,
             # and anything depending on it stays unstartable. Marking it
@@ -345,6 +383,7 @@ def plan(nodes: Mapping[str, TaskNode], *, target: str,
         remaining.discard(chosen)
 
     return Plan(order=tuple(assignments), deferred=tuple(deferred),
+                blocked_on_infra=tuple(blocked_on_infra),
                 scheduling=scheduling)
 
 

@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -130,16 +132,201 @@ def human_input_required(definition: TaskDefinition, repo_root: str | Path
     return None
 
 
+# ---------------------------------------------------------------------------
+# infrastructure prerequisites, decided without spending anything
+# ---------------------------------------------------------------------------
+
+#: Shell words that are not programs. `partition_checks` has its own, smaller
+#: list for a different question ("is this line a command at all"); this one
+#: answers "which programs does this line need to exist".
+_NOT_A_PROGRAM: frozenset[str] = frozenset({
+    "if", "then", "else", "fi", "for", "while", "do", "done", "case", "esac",
+    "true", "false", "test", "echo", "cd", "export", "source", ".", "set",
+    "exit", "read", "eval", "exec", "[", "[[",
+})
+
+#: Tokens that separate one command from the next. Matched against whole
+#: SHLEX TOKENS, never against raw text -- see programs_invoked.
+_SHELL_OPERATORS: frozenset[str] = frozenset({"&&", "||", "|", ";", "&", "(", ")"})
+
+
+def programs_invoked(command: str) -> tuple[str, ...]:
+    """Every program a shell line needs on PATH, in order, deduplicated.
+
+    Coarse on purpose. It is used to answer "could this check possibly run
+    here", and for that question a false positive (naming a program the line
+    would not actually reach) costs an over-cautious defer, while a false
+    negative costs a Planner call and a Builder iteration against a toolchain
+    that was never going to be there.
+    """
+    try:
+        # Tokenise the WHOLE line first, so quoting is respected. Splitting
+        # the raw text on shell operators instead looks equivalent and is
+        # not: a grep pattern like '^v(2[4-9]|[3-9][0-9])\.' contains a pipe
+        # and parentheses, and a textual split turns its alternation branches
+        # into "programs". That produced a blocker naming '2[4-9]' as a
+        # missing executable -- a task deferred for a reason that is not true.
+        tokens = shlex.split(str(command or ""))
+    except ValueError:
+        return ()
+
+    found: list[str] = []
+    expect_program = True
+    for token in tokens:
+        # `npm ci; npx tsc` tokenises as [..., "ci;", "npx", ...] -- the
+        # separator rides on the previous word, and without this the command
+        # after it is never seen. Missing a program is the costly direction:
+        # it lets a task through to a Planner and a Builder that will fail
+        # against a toolchain nobody checked for.
+        trailing_separator = token.endswith(";") or token.endswith("&")
+        token = token.rstrip(";&")
+        if not token:
+            expect_program = True
+            continue
+        if token in _SHELL_OPERATORS:
+            expect_program = True
+            continue
+        if not expect_program:
+            # An ARGUMENT -- but if the separator rode in on it, the next
+            # token starts a new command.
+            expect_program = trailing_separator
+            continue
+        expect_program = trailing_separator
+        if "=" in token and not token.startswith("-"):
+            expect_program = True  # VAR=value prefix; the program follows
+            continue
+        if token in _NOT_A_PROGRAM or token.startswith("-"):
+            continue
+        if token not in found:
+            found.append(token)
+    return tuple(found)
+
+
+def installed_version(program: str) -> str | None:
+    """`program -v` output, or None if it is not here or will not say.
+
+    Runs a version flag and nothing else. This is the one place the
+    prerequisite check touches the machine, it is bounded, and it is why the
+    whole gate costs no model call: a version string is a fact, and reading
+    it is cheaper by several orders of magnitude than asking a Planner to
+    reason about whether the environment is right.
+    """
+    if not shutil.which(program):
+        return None
+    for flag in ("-v", "--version"):
+        try:
+            done = subprocess.run([program, flag], capture_output=True, text=True,
+                                  timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        output = ((done.stdout or "") + (done.stderr or "")).strip()
+        if done.returncode == 0 and output:
+            return output.splitlines()[0].strip()
+    return None
+
+
+def infra_prerequisite_missing(definition: TaskDefinition, repo_root: str | Path, *,
+                               checks: Sequence[str] = ()) -> str | None:
+    """The infrastructure reason this task cannot start HERE, or None.
+
+    Decided entirely from the filesystem and a version string -- no model is
+    consulted, and no run is opened. That is the whole point: discovering
+    "this machine has no Node" by paying a Planner to write a contract and a
+    Builder to fail against it is the most expensive possible way to learn a
+    fact that `shutil.which` answers for free.
+
+    Three gaps, in the order they make a task unstartable:
+
+      1. the repository is not on this machine at all;
+      2. a program the task's own declared checks invoke is not installed;
+      3. it is installed, and its version contradicts an acceptance criterion
+         that names one.
+
+    The third is the interesting one, and it is why this returns the ACTUAL
+    version in the message. "node is missing" and "node is v26 where the
+    contract says v24" need completely different actions, and a blocker that
+    does not distinguish them sends somebody to find out by hand.
+    """
+    root = Path(repo_root)
+    if not root.exists():
+        return (f"the repository is not on this machine: {root} does not exist. "
+                f"No check can run and no Builder can edit anything.")
+
+    # WHICH LINES COUNT AS COMMANDS HERE, AND WHY IT IS NOT partition_checks.
+    #
+    # `partition_checks` answers "is this a command or a prose label" by
+    # asking whether the first word is on PATH. That is right for its job and
+    # exactly wrong for this one: on a machine MISSING the toolchain, a real
+    # check reads as prose, so the gate would find no gap precisely when
+    # there is one. Filtering through it made this function silently useless
+    # on the only hosts it matters on.
+    #
+    # So the two sources are treated differently, according to what they are:
+    #
+    #   * `checks` passed in is a DECISIVE CHECK MAP -- commands somebody
+    #     authored deliberately (see PILOT_CHECK_MAP). Every entry is a
+    #     command by construction, whether or not this host can run it. That
+    #     is the whole question being asked.
+    #   * `definition.checks` is whatever TASKS.json declared, which in real
+    #     files is mostly labels -- "typecheck", "component tests". Those are
+    #     filtered, because a label naming no program cannot imply a missing
+    #     one, and reporting `component` as an uninstalled executable would
+    #     be a blocker that is simply false.
+    #
+    # The residue is a bare two-word line with an absent program and no
+    # version claim, which is genuinely ambiguous with prose. It is treated
+    # as prose, consistently with partition_checks -- and the case that
+    # actually matters, a version claim in the acceptance, is caught by the
+    # loop below regardless.
+    needed: list[str] = []
+    if checks:
+        commands = tuple(checks)
+    else:
+        commands, _prose = partition_checks(definition.checks)
+    for command in commands:
+        for program in programs_invoked(command):
+            if program not in needed:
+                needed.append(program)
+    for program in needed:
+        if not shutil.which(program):
+            return (f"the declared checks invoke {program!r}, which is not "
+                    f"installed on this machine")
+
+    # A version claim in the acceptance, checked against what is actually here.
+    for criterion in definition.acceptance:
+        match = _REPORTS_VERSION.search(criterion)
+        if not match:
+            continue
+        program, major = match.group(1), match.group(2)
+        actual = installed_version(program)
+        if actual is None:
+            return (f"acceptance requires {program} v{major}.x and {program} is "
+                    f"not installed on this machine")
+        if not re.match(rf"^v?{re.escape(major)}\.", actual):
+            return (f"acceptance requires {program} v{major}.x; this machine has "
+                    f"{actual}. No code change can satisfy that -- it is a "
+                    f"toolchain prerequisite, not a defect in the work.")
+    return None
+
+
 def to_nodes(definitions: Mapping[str, TaskDefinition], *, repo_root: str | Path,
-             critical_tasks: Sequence[str] = ()) -> dict[str, sched.TaskNode]:
+             critical_tasks: Sequence[str] = (),
+             check_map: Mapping[str, Sequence[str]] | None = None
+             ) -> dict[str, sched.TaskNode]:
     critical = set(critical_tasks)
+    mapped = check_map if check_map is not None else PILOT_CHECK_MAP
     nodes: dict[str, sched.TaskNode] = {}
     for task_id, definition in definitions.items():
         reason = human_input_required(definition, repo_root)
+        # Both gates run before anything is scheduled, and neither costs a
+        # model call. A task that fails either opens no run at all.
+        infra = infra_prerequisite_missing(
+            definition, repo_root, checks=mapped.get(task_id, ()))
         nodes[task_id] = sched.TaskNode(
             id=task_id, lane=definition.lane, priority=definition.priority,
             depends_on=definition.depends_on,
             autonomous=reason is None, not_autonomous_reason=reason,
+            infra_prerequisite=infra,
             requested_mode=policy.CRITICAL if task_id in critical else None)
     return nodes
 
