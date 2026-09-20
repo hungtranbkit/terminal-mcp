@@ -799,6 +799,15 @@ NARROWER MCP endpoint in front of the same controller. It is a catalog filter
 and proxy that owns no state: authorization, routing, node selection and
 idempotency all stay in the controller on 8766.
 
+- **Post-result Streamable HTTP teardown tolerance (2026-09-20): IMPLEMENTED_NOT_LIVE_VERIFIED.**
+  The compact sidecar preserves a successfully decoded `tools/list` or
+  `CallToolResult` if the one-shot backend transport fails only while closing
+  afterwards. This closes a reproduced false-`BACKEND_UNAVAILABLE` path where
+  Uvicorn logged `Unexpected ASGI message 'http.response.start' ... after
+  response already completed`: the mutation may already have executed, so
+  converting its received final result into an error can provoke an unsafe
+  duplicate retry. The sidecar never retries the tool call; failures before any
+  result is decoded still propagate as `BACKEND_UNAVAILABLE`.
 - **Published catalog (`tools/list`): exactly one tool, `terminal_turn`**
   (`CATALOG`; `SURFACE_VERSION` is bumped whenever it changes, and is carried
   in the MCP `instructions` so an operator can tell which surface a connector
