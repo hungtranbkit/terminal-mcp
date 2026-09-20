@@ -210,10 +210,11 @@ def test_supervised_drives_the_task_through_the_queues_own_table(queue_store, re
 
     task = queue_store.get_task(task_id)
     assert task.status in (qs.RUNNING, qs.VERIFYING), task.status
-    events = [row["event_type"] for row in queue_store.task_events(task_id)] \
-        if hasattr(queue_store, "task_events") else []
-    if events:
-        assert "HARNESS_PROJECTION" in events
+    # Asserted through the queue's OWN event log, which is written in the
+    # same transaction as the status change -- so this cannot pass on a
+    # status that was set by some other path.
+    events = [row["event_type"] for row in queue_store.list_events("demo", limit=200)]
+    assert "HARNESS_PROJECTION" in events, events
 
 
 def test_a_projection_the_queue_refuses_is_recorded_not_forced(queue_store, repo):
