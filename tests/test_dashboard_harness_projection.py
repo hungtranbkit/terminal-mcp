@@ -271,3 +271,51 @@ def test_the_dashboard_exposes_no_way_to_drive_a_run(read_config, tmp_path):
     assert harness_routes, "the read routes must exist for this to mean anything"
     for path, methods in harness_routes.items():
         assert methods <= {"GET", "HEAD"}, f"{path} can write: {methods}"
+
+
+# ---------------------------------------------------------------------------
+# the page renders what the route supplies
+# ---------------------------------------------------------------------------
+
+def test_the_board_page_renders_the_harness_block():
+    """The route can serve `harness` on every card and the page can ignore
+    it; then the API is "done" and a human still sees the old board."""
+    from terminal_mcp.dashboard import GLOBAL_TASKS_HTML
+
+    assert "task.harness" in GLOBAL_TASKS_HTML
+    for field in ("projected_stage", "write_authority", "max_iterations",
+                  "builder", "evaluator", "blocker", "efficiency"):
+        assert field in GLOBAL_TASKS_HTML, field
+
+
+def test_the_page_shows_the_task_status_and_the_run_stage_separately(rig):
+    """They answer different questions -- where the task is in the durable
+    queue, and how far the AI attempt has got. The old board collapsed them
+    into one label and could not say which it meant."""
+    from terminal_mcp.dashboard import GLOBAL_TASKS_HTML
+
+    client, queue, harness = rig
+    task_id = _task(queue)
+    for target in (qs.PRECHECK, qs.READY, qs.DISPATCHING, qs.RUNNING):
+        queue.store.transition_task(task_id, target, event_type="TEST")
+    harness.start(task_id=task_id, acceptance=["a"], checks=["npm test"],
+                  write_authority=policy.SHADOW, steps=24)
+
+    card = _card(client.get("/dashboard/api/tasks/board").json(), task_id)
+
+    assert card["status"] == qs.RUNNING
+    assert card["harness"]["projected_stage"] != card["status"], \
+        "the two labels are independent; the card carries both"
+    # The page renders the status chip and the harness chip from the two
+    # separate fields, never one derived from the other.
+    assert "status-${task.status}" in GLOBAL_TASKS_HTML
+    assert "clean(h.projected_stage)" in GLOBAL_TASKS_HTML
+
+
+def test_a_shadow_run_is_visibly_marked_on_the_page():
+    """A run advancing WITHOUT driving the task must not look like one that
+    is driving it -- that is the entire comparison SHADOW exists for."""
+    from terminal_mcp.dashboard import GLOBAL_TASKS_HTML
+
+    assert "h.shadow" in GLOBAL_TASKS_HTML
+    assert "without writing its status" in GLOBAL_TASKS_HTML

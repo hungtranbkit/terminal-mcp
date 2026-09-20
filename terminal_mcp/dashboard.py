@@ -11542,6 +11542,52 @@ GLOBAL_TASKS_HTML = """<!doctype html>
       }
       const project = task.metadata && task.metadata.project;
       if (project) { const p = document.createElement('span'); p.className = 'chip'; p.textContent = clean(project); meta.append(p); }
+      // TMCP-HARNESS-001: the run's own stage, beside -- never instead of --
+      // the task's status. Both are shown because they answer different
+      // questions: `status` is where the task is in the durable queue
+      // lifecycle, `harness.stage` is how far the AI attempt has got. The
+      // old board collapsed those into one label and could not say which it
+      // meant. Absent entirely for a task that was never harnessed.
+      if (task.harness) {
+        const h = task.harness;
+        const stage = document.createElement('span');
+        stage.className = 'chip';
+        stage.textContent = `⚙ ${clean(h.projected_stage)}`;
+        stage.title = `harness run ${clean(h.run_id)}\nstage ${clean(h.stage)}`
+          + ` · mode ${clean(h.mode)} · ${clean(h.write_authority)}`
+          + `\niteration ${h.iteration}/${h.max_iterations}`
+          + (h.builder ? `\nbuilder ${clean(h.builder)}` : '')
+          + (h.evaluator ? `\nevaluator ${clean(h.evaluator)}` : '');
+        meta.append(stage);
+        if (h.shadow) {
+          // SHADOW is the whole point of the comparison, so it has to be
+          // visible: this run is advancing WITHOUT driving the task.
+          const s = document.createElement('span'); s.className = 'chip';
+          s.textContent = 'shadow';
+          s.title = 'the harness is running this task without writing its status';
+          meta.append(s);
+        }
+        if (h.progress && h.max_iterations > 1) {
+          const it = document.createElement('span'); it.className = 'chip';
+          it.textContent = `iter ${h.iteration}/${h.max_iterations}`;
+          meta.append(it);
+        }
+        const eff = h.efficiency || {};
+        const saved = (eff.planner_skipped || 0) + (eff.evaluator_skipped || 0);
+        if (eff.llm_calls !== undefined) {
+          const c = document.createElement('span'); c.className = 'chip';
+          c.textContent = `${eff.llm_calls} LLM`;
+          c.title = `${eff.llm_calls} model call(s) · ${saved} stage(s) skipped`
+            + ` · ${eff.reused_context_hits || 0} context reuse(s)`
+            + ` · ~${eff.prompt_tokens_estimate || 0} prompt tokens`;
+          meta.append(c);
+        }
+        if (h.blocker) {
+          const b = document.createElement('span'); b.className = 'chip status-BLOCKED';
+          b.textContent = `blocked: ${clean(h.blocker).slice(0, 60)}`;
+          meta.append(b);
+        }
+      }
       // TMCP-TASK-ROUTER-001: where this task actually RUNS, which is not the
       // same question as which lane it lives in. Shown only when the two
       // differ or when routing has something to say -- an untouched legacy
