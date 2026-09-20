@@ -58,6 +58,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 
 import uuid
@@ -311,6 +312,89 @@ class SessionRecord:
         return f"{self.node_id}/{self.session_name}"
 
 
+def _upsert_seen_params(node_id: str, session_name: str, existing: "SessionRecord | None", *,
+                        now: str, node_name: str | None, backend_type: str | None,
+                        cwd: str | None, agent_type: str | None, launch_command: str | None,
+                        launcher_type: str | None, last_known_state: str | None,
+                        read_granted: bool, input_granted: bool,
+                        binding_names: tuple[str, ...], backfill_project: bool,
+                        conversation_id: str | None, worktree_path: str | None,
+                        created_by_controller: bool) -> tuple:
+    """The parameter tuple for _UPSERT_SEEN_SQL, given the row already on disk.
+
+    Pure: it does no database work at all, which is what lets the one-at-a-time
+    `upsert_seen` and the batched `upsert_seen_many` share the EXACT same
+    preserve-what-we-do-not-know-better rules instead of growing a second,
+    subtly-different copy of them. The only I/O it can do is the git probe,
+    which is guarded by the same first-sighting condition it always was.
+    """
+    # Only actually shell out to git the FIRST time this session's cwd
+    # is seen (or if the cwd itself changed) -- a reconcile pass runs
+    # on every dashboard poll, and re-probing already-known project
+    # info on every single one of those would be a real, needless
+    # per-poll subprocess cost for something that essentially never
+    # changes for a long-lived session.
+    need_probe = backfill_project and cwd and (existing is None or existing.repo_root is None
+                                                or existing.cwd != cwd)
+    project = probe_project_info(cwd) if need_probe else {}
+    repo_root = project.get("repo_root") or (existing.repo_root if existing else None)
+    git_remote = project.get("git_remote") or (existing.git_remote if existing else None)
+    git_branch = project.get("git_branch") or (existing.git_branch if existing else None)
+    last_commit = project.get("last_commit") or (existing.last_commit if existing else None)
+    cwd = cwd or (existing.cwd if existing else None)
+    agent_type = agent_type or (existing.agent_type if existing else None)
+    metadata_complete = bool(agent_type) and (agent_type == "shell" or bool(cwd))
+    created_at = existing.created_at if existing else now
+    binding_json = json.dumps(list(binding_names) or (list(existing.binding_names) if existing else []))
+    # stable_session_id: generated ONCE, only reaches the row on the
+    # INSERT branch (the ON CONFLICT...DO UPDATE never mentions this
+    # column, so an existing row's own value is always left untouched --
+    # see this column's own migration docstring for why it must never
+    # change once assigned).
+    stable_session_id = existing.stable_session_id if existing else str(uuid.uuid4())
+    worktree_path = worktree_path or (existing.worktree_path if existing else None)
+    return (node_id, session_name, node_name, backend_type, cwd, repo_root, git_remote,
+            git_branch, last_commit, agent_type, launch_command, launcher_type,
+            created_at, now, now, last_known_state,
+            int(metadata_complete), int(read_granted), int(input_granted), now, binding_json,
+            conversation_id, stable_session_id, worktree_path, int(created_by_controller))
+
+
+_UPSERT_SEEN_SQL = (
+    """INSERT INTO session_records
+                   (node_id, session_name, node_name, backend_type, cwd, repo_root, git_remote,
+                    git_branch, last_commit, agent_type, launch_command, launcher_type,
+                    created_at, last_seen_at, last_activity_at, last_known_state, status,
+                    killed_at, deleted_at, offline_at, metadata_complete,
+                    read_granted, input_granted, grant_updated_at, binding_names, conversation_id,
+                    stable_session_id, worktree_path, created_by_controller)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE',
+                           NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(node_id, session_name) DO UPDATE SET
+                       node_name = excluded.node_name, backend_type = excluded.backend_type,
+                       cwd = excluded.cwd, repo_root = excluded.repo_root,
+                       git_remote = excluded.git_remote, git_branch = excluded.git_branch,
+                       last_commit = excluded.last_commit, agent_type = excluded.agent_type,
+                       launch_command = COALESCE(excluded.launch_command, session_records.launch_command),
+                       launcher_type = COALESCE(excluded.launcher_type, session_records.launcher_type),
+                       last_seen_at = excluded.last_seen_at, last_activity_at = excluded.last_activity_at,
+                       last_known_state = excluded.last_known_state, status = 'ACTIVE',
+                       killed_at = NULL, deleted_at = NULL, offline_at = NULL,
+                       metadata_complete = excluded.metadata_complete,
+                       read_granted = excluded.read_granted, input_granted = excluded.input_granted,
+                       grant_updated_at = excluded.grant_updated_at, binding_names = excluded.binding_names,
+                       conversation_id = COALESCE(excluded.conversation_id, session_records.conversation_id),
+                       worktree_path = COALESCE(excluded.worktree_path, session_records.worktree_path),
+                       -- Latches TRUE and never back: a session this controller
+                       -- created stays ours through every later discovery pass,
+                       -- and a discovery pass can never claim one it did not.
+                       created_by_controller = MAX(excluded.created_by_controller,
+                                                   session_records.created_by_controller),
+                       recovery_state = NULL, recovery_detail = NULL
+                """
+)
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -555,72 +639,92 @@ class SessionRegistryStore:
         meaningful (mirrors killed_at/offline_at's own "clear on
         ACTIVE" treatment just below)."""
         now = now or _now_iso()
-        existing = self.get(node_id, session_name)
-        # Only actually shell out to git the FIRST time this session's cwd
-        # is seen (or if the cwd itself changed) -- a reconcile pass runs
-        # on every dashboard poll, and re-probing already-known project
-        # info on every single one of those would be a real, needless
-        # per-poll subprocess cost for something that essentially never
-        # changes for a long-lived session.
-        need_probe = backfill_project and cwd and (existing is None or existing.repo_root is None
-                                                    or existing.cwd != cwd)
-        project = probe_project_info(cwd) if need_probe else {}
-        repo_root = project.get("repo_root") or (existing.repo_root if existing else None)
-        git_remote = project.get("git_remote") or (existing.git_remote if existing else None)
-        git_branch = project.get("git_branch") or (existing.git_branch if existing else None)
-        last_commit = project.get("last_commit") or (existing.last_commit if existing else None)
-        cwd = cwd or (existing.cwd if existing else None)
-        agent_type = agent_type or (existing.agent_type if existing else None)
-        metadata_complete = bool(agent_type) and (agent_type == "shell" or bool(cwd))
-        created_at = existing.created_at if existing else now
-        binding_json = json.dumps(list(binding_names) or (list(existing.binding_names) if existing else []))
-        # stable_session_id: generated ONCE, only reaches the row on the
-        # INSERT branch below (the ON CONFLICT...DO UPDATE never mentions
-        # this column, so an existing row's own value is always left
-        # untouched -- see this column's own migration docstring for why
-        # it must never change once assigned).
-        stable_session_id = existing.stable_session_id if existing else str(uuid.uuid4())
-        worktree_path = worktree_path or (existing.worktree_path if existing else None)
+        params = _upsert_seen_params(
+            node_id, session_name, self.get(node_id, session_name), now=now,
+            node_name=node_name, backend_type=backend_type, cwd=cwd, agent_type=agent_type,
+            launch_command=launch_command, launcher_type=launcher_type,
+            last_known_state=last_known_state, read_granted=read_granted,
+            input_granted=input_granted, binding_names=binding_names,
+            backfill_project=backfill_project, conversation_id=conversation_id,
+            worktree_path=worktree_path, created_by_controller=created_by_controller)
         with self._connection() as connection:
-            connection.execute(
-                """INSERT INTO session_records
-                   (node_id, session_name, node_name, backend_type, cwd, repo_root, git_remote,
-                    git_branch, last_commit, agent_type, launch_command, launcher_type,
-                    created_at, last_seen_at, last_activity_at, last_known_state, status,
-                    killed_at, deleted_at, offline_at, metadata_complete,
-                    read_granted, input_granted, grant_updated_at, binding_names, conversation_id,
-                    stable_session_id, worktree_path, created_by_controller)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE',
-                           NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(node_id, session_name) DO UPDATE SET
-                       node_name = excluded.node_name, backend_type = excluded.backend_type,
-                       cwd = excluded.cwd, repo_root = excluded.repo_root,
-                       git_remote = excluded.git_remote, git_branch = excluded.git_branch,
-                       last_commit = excluded.last_commit, agent_type = excluded.agent_type,
-                       launch_command = COALESCE(excluded.launch_command, session_records.launch_command),
-                       launcher_type = COALESCE(excluded.launcher_type, session_records.launcher_type),
-                       last_seen_at = excluded.last_seen_at, last_activity_at = excluded.last_activity_at,
-                       last_known_state = excluded.last_known_state, status = 'ACTIVE',
-                       killed_at = NULL, deleted_at = NULL, offline_at = NULL,
-                       metadata_complete = excluded.metadata_complete,
-                       read_granted = excluded.read_granted, input_granted = excluded.input_granted,
-                       grant_updated_at = excluded.grant_updated_at, binding_names = excluded.binding_names,
-                       conversation_id = COALESCE(excluded.conversation_id, session_records.conversation_id),
-                       worktree_path = COALESCE(excluded.worktree_path, session_records.worktree_path),
-                       -- Latches TRUE and never back: a session this controller
-                       -- created stays ours through every later discovery pass,
-                       -- and a discovery pass can never claim one it did not.
-                       created_by_controller = MAX(excluded.created_by_controller,
-                                                   session_records.created_by_controller),
-                       recovery_state = NULL, recovery_detail = NULL
-                """,
-                (node_id, session_name, node_name, backend_type, cwd, repo_root, git_remote,
-                 git_branch, last_commit, agent_type, launch_command, launcher_type,
-                 created_at, now, now, last_known_state,
-                 int(metadata_complete), int(read_granted), int(input_granted), now, binding_json,
-                 conversation_id, stable_session_id, worktree_path, int(created_by_controller)),
-            )
+            connection.execute(_UPSERT_SEEN_SQL, params)
         return self.get(node_id, session_name)
+
+    def upsert_seen_many(self, node_id: str, entries: "Sequence[dict[str, Any]]", *,
+                         mark_recovered: bool = True,
+                         now: str | None = None) -> dict[str, "SessionRecord"]:
+        """One reconcile pass's worth of ACTIVE sightings, in ONE transaction.
+
+        Semantically identical to calling `upsert_seen` once per entry -- it
+        shares the same SQL and the same `_upsert_seen_params` rules -- but it
+        opens ONE connection instead of four per session.
+
+        WHY THIS EXISTS. `upsert_seen` costs three connections (two reads for
+        `get`, one write) plus a fourth for `mark_drop_events_recovered_for`.
+        On a host with 39 live sessions that is 156 connections and 156
+        transactions for a single `terminal_list_sessions()` -- measured live
+        on hp-linux at 3s of pure sqlite time unloaded and 12-16s under
+        concurrent load from the running controller. Every fleet listing pays
+        it, and the task router's `_collect()` is a fleet listing, so it was
+        the single largest component of project_start latency.
+
+        Each entry is a dict of the same keyword arguments `upsert_seen`
+        takes, minus `node_id`, plus a required `session_name`. Returns the
+        rows as written, keyed by session name.
+        """
+        rows = list(entries)
+        if not rows:
+            return {}
+        now = now or _now_iso()
+        names = [str(row["session_name"]) for row in rows]
+        with self._connection() as connection:
+            # ONE read of everything this pass might update, instead of two
+            # per session. Bounded by the node's own row count, which is the
+            # same set we are about to write.
+            existing: dict[str, SessionRecord] = {}
+            for found in connection.execute(
+                    "SELECT * FROM session_records WHERE node_id = ?", (node_id,)):
+                record = _from_row(found)
+                if record is not None:
+                    existing[record.session_name] = record
+            params = [
+                _upsert_seen_params(
+                    node_id, str(row["session_name"]), existing.get(str(row["session_name"])),
+                    now=now,
+                    node_name=row.get("node_name"), backend_type=row.get("backend_type"),
+                    cwd=row.get("cwd"), agent_type=row.get("agent_type"),
+                    launch_command=row.get("launch_command"),
+                    launcher_type=row.get("launcher_type"),
+                    last_known_state=row.get("last_known_state"),
+                    read_granted=bool(row.get("read_granted", False)),
+                    input_granted=bool(row.get("input_granted", False)),
+                    binding_names=tuple(row.get("binding_names", ()) or ()),
+                    backfill_project=bool(row.get("backfill_project", True)),
+                    conversation_id=row.get("conversation_id"),
+                    worktree_path=row.get("worktree_path"),
+                    created_by_controller=bool(row.get("created_by_controller", False)))
+                for row in rows
+            ]
+            connection.executemany(_UPSERT_SEEN_SQL, params)
+            if mark_recovered:
+                # The batched form of mark_drop_events_recovered_for: every
+                # session in this pass is being seen ACTIVE right now, so any
+                # still-open drop event for it is closed out. One bounded
+                # UPDATE rather than one per session; zero matching rows in
+                # the common case, exactly as before.
+                placeholders = ",".join("?" for _ in names)
+                connection.execute(
+                    f"UPDATE drop_events SET recovered = 1, recovered_at = ? "
+                    f"WHERE node_id = ? AND recovered = 0 AND session_name IN ({placeholders})",
+                    (now, node_id, *names))
+            written: dict[str, SessionRecord] = {}
+            for found in connection.execute(
+                    "SELECT * FROM session_records WHERE node_id = ?", (node_id,)):
+                record = _from_row(found)
+                if record is not None and record.session_name in set(names):
+                    written[record.session_name] = record
+        return written
 
     def set_recovery_state(self, node_id: str, session_name: str, recovery_state: str, *,
                            detail: str | None = None, now: str | None = None) -> None:

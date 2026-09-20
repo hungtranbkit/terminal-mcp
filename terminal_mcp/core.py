@@ -613,6 +613,14 @@ class TerminalService:
             # ones it did, which auto-recovery then acted on. Provenance is
             # recorded explicitly at create time instead -- see
             # session_registry's created_by_controller column.
+            # ONE transaction for the whole pass, not four sqlite connections
+            # per session. Measured live on hp-linux (39 sessions): the
+            # per-session form cost 156 connections and 3s of sqlite time
+            # unloaded, 12-16s under concurrent controller load -- and every
+            # fleet listing, including the task router's own candidate
+            # collection, paid it on every call. Same SQL, same preserve
+            # rules, same drop-event close-out; see upsert_seen_many.
+            batch: list[dict[str, Any]] = []
             for item in items:
                 seen.add(item.name)
                 grant = grants_by_session.get(item.name)
@@ -622,19 +630,19 @@ class TerminalService:
                     if error is None:
                         cwd = str(resolved)
                 agent_type = self._classify_agent_type(item.pane_current_command)
-                binding_names = tuple(bindings_by_session.get(item.name, ()))
-                self.session_registry.upsert_seen(
-                    self.REGISTRY_LOCAL_NODE_ID, item.name, backend_type=self._registry_backend_type(),
-                    cwd=cwd, agent_type=agent_type, launcher_type=agent_type,
-                    read_granted=bool(grant and grant.read_enabled), input_granted=bool(grant and grant.input_enabled),
-                    binding_names=binding_names,
-                )
-                # Watchdog: this session is seen ACTIVE right now -- if it
-                # had an unrecovered drop event (came back on its own, or
-                # via terminal_registry_reopen), close that event out.
-                # Cheap even in the common (no prior drop) case: a bounded
-                # UPDATE with zero matching rows.
-                self.session_registry.mark_drop_events_recovered_for(self.REGISTRY_LOCAL_NODE_ID, item.name)
+                batch.append({
+                    "session_name": item.name,
+                    "backend_type": self._registry_backend_type(),
+                    "cwd": cwd, "agent_type": agent_type, "launcher_type": agent_type,
+                    "read_granted": bool(grant and grant.read_enabled),
+                    "input_granted": bool(grant and grant.input_enabled),
+                    "binding_names": tuple(bindings_by_session.get(item.name, ())),
+                })
+            # Watchdog: every session in this batch is seen ACTIVE right now,
+            # so `mark_recovered` closes out any unrecovered drop event for
+            # them in the same transaction -- what the per-session
+            # mark_drop_events_recovered_for call did, in one bounded UPDATE.
+            self.session_registry.upsert_seen_many(self.REGISTRY_LOCAL_NODE_ID, batch)
             vanished = self.session_registry.mark_missing(self.REGISTRY_LOCAL_NODE_ID, seen)
             # Watchdog (task: "theo dõi và noti session rớt đột ngột"): a
             # session that WAS active and is gone now, with no explicit
