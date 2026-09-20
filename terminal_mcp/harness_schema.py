@@ -38,6 +38,10 @@ import sqlite3
 from .schema import Migration
 
 HARNESS_SCHEMA_VERSION = 15
+#: The real-runtime adapter's durable dispatch record. A separate version
+#: because v15 has already been applied to a live database, and editing an
+#: applied migration in place means it never runs there.
+HARNESS_DISPATCH_SCHEMA_VERSION = 16
 
 
 def create_harness_tables(connection: sqlite3.Connection) -> None:
@@ -369,12 +373,92 @@ def create_harness_tables(connection: sqlite3.Connection) -> None:
         "ON harness_context_cache(project_id, last_used_at)")
 
 
+def create_harness_dispatch_tables(connection: sqlite3.Connection) -> None:
+    """One row per agent invocation. Additive and idempotent, like v15.
+
+    WHY A DISPATCH IS A DURABLE ROW AND NOT A VARIABLE
+
+    An agent invocation is not a function call that returns. A prompt is
+    written into a pane on some node, and minutes later a file appears and a
+    marker is printed. Between those two moments the controller may restart,
+    the session may die, and the same stage may be stepped again by whoever
+    is driving ticks.
+
+    If "there is a builder running for iteration 2" lives in memory, every one
+    of those events loses it, and the recovery is to send the prompt again --
+    which is the duplicate-dispatch failure that `dispatch_idempotency_key`
+    exists to prevent on the queue side. So it lives here, keyed uniquely on
+    (run, iteration, role, attempt), and the idempotency key is derived from
+    that tuple rather than minted fresh: replaying the same dispatch reaches
+    core.py's own idempotent_sends store and gets the ORIGINAL result back
+    instead of sending a second prompt to a working agent.
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS harness_dispatches (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            iteration INTEGER NOT NULL DEFAULT 0,
+            role TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 1,
+            -- 'dispatching' | 'accepted' | 'running' | 'completed'
+            -- | 'failed' | 'stalled' | 'abandoned'
+            state TEXT NOT NULL DEFAULT 'dispatching',
+            session_id TEXT,
+            node_id TEXT,
+            runtime TEXT,
+            worktree_path TEXT,
+            branch TEXT,
+            -- the SAME key on every replay of this dispatch: see the
+            -- docstring above.
+            idempotency_key TEXT NOT NULL,
+            correlation_id TEXT,
+            -- bound into the completion marker, so a marker from an earlier
+            -- attempt or scrolled back into view cannot be read as this one.
+            nonce TEXT NOT NULL,
+            -- where the agent writes its structured answer. The pane carries
+            -- the "I am done" signal; the FILE carries the content. See
+            -- harness_runner for why the content may never come off the pane.
+            artifact_path TEXT,
+            artifact_hash TEXT,
+            delivery_state TEXT,
+            delivery_verdict TEXT,
+            context_percent REAL,
+            session_reused INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            prompt_bytes INTEGER NOT NULL DEFAULT 0,
+            prompt_tokens_estimate INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            accepted_at TEXT,
+            last_observed_at TEXT,
+            completed_at TEXT,
+            UNIQUE(run_id, iteration, role, attempt)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_harness_dispatches_open "
+        "ON harness_dispatches(run_id, state)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_harness_dispatches_session "
+        "ON harness_dispatches(session_id, state)")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_harness_dispatches_key "
+        "ON harness_dispatches(idempotency_key)")
+
+
 HARNESS_MIGRATIONS: list[Migration] = [
     Migration(HARNESS_SCHEMA_VERSION,
               "TMCP-HARNESS-001: HarnessRun/Iteration/ExecutionContract/"
               "EvaluationResult/checkpoints/decisions/policies/artifacts + the "
               "append-only harness event log, in the canonical queue database",
               create_harness_tables),
+    Migration(HARNESS_DISPATCH_SCHEMA_VERSION,
+              "TMCP-HARNESS-001 real runtime: harness_dispatches -- one durable "
+              "row per agent invocation, so an in-flight Planner/Builder/Evaluator "
+              "survives a controller restart instead of being dispatched twice",
+              create_harness_dispatch_tables),
 ]
 
 #: Every table this feature owns. Used by the deprecation report and by the
@@ -383,5 +467,5 @@ HARNESS_TABLES: tuple[str, ...] = (
     "harness_runs", "harness_iterations", "harness_contracts",
     "harness_evaluations", "harness_events", "harness_checkpoints",
     "harness_decisions", "harness_policies", "harness_artifacts",
-    "harness_efficiency", "harness_context_cache",
+    "harness_efficiency", "harness_context_cache", "harness_dispatches",
 )

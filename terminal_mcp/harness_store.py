@@ -1073,6 +1073,138 @@ class HarnessStore:
             row = connection.execute(sql, args).fetchone()
         return {"entries": row["entries"], "hits": row["hits"], "bytes": row["bytes"]}
 
+    # -- dispatches (the real-runtime adapter's durable record) -------------
+    def open_dispatch(self, *, run_id: str, task_id: str, iteration: int, role: str,
+                      attempt: int, idempotency_key: str, nonce: str,
+                      session_id: str | None = None, node_id: str | None = None,
+                      runtime: str | None = None, worktree_path: str | None = None,
+                      branch: str | None = None, correlation_id: str | None = None,
+                      artifact_path: str | None = None,
+                      session_reused: bool = False,
+                      prompt_bytes: int = 0,
+                      prompt_tokens_estimate: int = 0) -> tuple[dict[str, Any], bool]:
+        """(dispatch, created). Exactly-once on (run, iteration, role, attempt).
+
+        A repeat returns the EXISTING row rather than a second one, which is
+        what makes a re-stepped stage resolve the dispatch already in flight
+        instead of sending the same prompt to a working agent again.
+        """
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM harness_dispatches WHERE run_id = ? AND iteration = ? "
+                "AND role = ? AND attempt = ?",
+                (run_id, iteration, role, attempt)).fetchone()
+            if row is not None:
+                return dict(row), False
+            dispatch_id = new_id("dsp")
+            connection.execute(
+                "INSERT INTO harness_dispatches (id, run_id, task_id, iteration, role, "
+                "attempt, state, session_id, node_id, runtime, worktree_path, branch, "
+                "idempotency_key, correlation_id, nonce, artifact_path, session_reused, "
+                "prompt_bytes, prompt_tokens_estimate, created_at) "
+                "VALUES (?,?,?,?,?,?,'dispatching',?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (dispatch_id, run_id, task_id, iteration, role, attempt, session_id,
+                 node_id, runtime, worktree_path, branch, idempotency_key,
+                 correlation_id, nonce, artifact_path, int(session_reused),
+                 prompt_bytes, prompt_tokens_estimate, iso_now()))
+            self._event_locked(connection, run_id, event_type="DISPATCH_OPENED",
+                               iteration=iteration, actor=session_id, reason=role,
+                               metadata={"dispatch_id": dispatch_id,
+                                         "idempotency_key": idempotency_key,
+                                         "session": session_id, "node": node_id,
+                                         "reused": bool(session_reused),
+                                         "artifact_path": artifact_path})
+            row = connection.execute(
+                "SELECT * FROM harness_dispatches WHERE id = ?", (dispatch_id,)).fetchone()
+        return dict(row), True
+
+    #: States a dispatch may still be waiting in.
+    OPEN_DISPATCH_STATES = ("dispatching", "accepted", "running")
+
+    def open_dispatch_for(self, run_id: str, *, iteration: int | None = None,
+                          role: str | None = None) -> dict[str, Any] | None:
+        sql = ("SELECT * FROM harness_dispatches WHERE run_id = ? AND state IN "
+               "('dispatching','accepted','running')")
+        args: list[Any] = [run_id]
+        if iteration is not None:
+            sql += " AND iteration = ?"
+            args.append(iteration)
+        if role:
+            sql += " AND role = ?"
+            args.append(role)
+        sql += " ORDER BY created_at DESC, rowid DESC LIMIT 1"
+        with self._connection() as connection:
+            row = connection.execute(sql, args).fetchone()
+        return dict(row) if row else None
+
+    def latest_dispatch(self, run_id: str, *, iteration: int, role: str
+                        ) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM harness_dispatches WHERE run_id = ? AND iteration = ? "
+                "AND role = ? ORDER BY attempt DESC LIMIT 1",
+                (run_id, iteration, role)).fetchone()
+        return dict(row) if row else None
+
+    def update_dispatch(self, dispatch_id: str, **fields: Any) -> dict[str, Any]:
+        allowed = {"state", "session_id", "node_id", "runtime", "worktree_path",
+                   "branch", "artifact_path", "artifact_hash", "delivery_state",
+                   "delivery_verdict", "context_percent", "error", "accepted_at",
+                   "last_observed_at", "completed_at", "session_reused",
+                   "prompt_bytes", "prompt_tokens_estimate", "correlation_id"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"not updatable on harness_dispatches: {sorted(unknown)}")
+        sets, args = [], []
+        for key, value in fields.items():
+            sets.append(f"{key} = ?")
+            args.append(_json(value) if key == "delivery_verdict"
+                        and not isinstance(value, str) else value)
+        args.append(dispatch_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT run_id, iteration, role, state FROM harness_dispatches WHERE id = ?",
+                (dispatch_id,)).fetchone()
+            if row is None:
+                raise LookupError(f"no dispatch {dispatch_id}")
+            connection.execute(
+                f"UPDATE harness_dispatches SET {', '.join(sets)} WHERE id = ?", args)
+            new_state = fields.get("state")
+            if new_state and new_state != row["state"]:
+                self._event_locked(
+                    connection, row["run_id"], event_type="DISPATCH_STATE",
+                    iteration=row["iteration"], reason=f"{row['role']}: "
+                    f"{row['state']} -> {new_state}",
+                    metadata={"dispatch_id": dispatch_id,
+                              "error": fields.get("error")})
+            updated = connection.execute(
+                "SELECT * FROM harness_dispatches WHERE id = ?", (dispatch_id,)).fetchone()
+        return dict(updated)
+
+    def dispatches(self, run_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM harness_dispatches WHERE run_id = ? "
+                "ORDER BY created_at, rowid", (run_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def sessions_in_use(self, *, exclude_run: str | None = None) -> set[str]:
+        """Sessions currently holding an OPEN harness dispatch.
+
+        Used to stop two runs handing work to the same pane at once -- the
+        duplicate-spawn guard's other half, and the reason a fresh evaluator
+        can be proven independent rather than merely requested.
+        """
+        sql = ("SELECT DISTINCT session_id FROM harness_dispatches WHERE state IN "
+               "('dispatching','accepted','running') AND session_id IS NOT NULL")
+        args: list[Any] = []
+        if exclude_run:
+            sql += " AND run_id != ?"
+            args.append(exclude_run)
+        with self._connection() as connection:
+            rows = connection.execute(sql, args).fetchall()
+        return {row["session_id"] for row in rows}
+
     # -- reporting -----------------------------------------------------------
     def run_report(self, run_id: str) -> dict[str, Any]:
         """Everything durably known about one run, in one read.
@@ -1093,5 +1225,6 @@ class HarnessStore:
             "decisions": self.list_decisions(status="", run_id=run_id),
             "artifacts": self.artifacts(run_id),
             "efficiency": self.efficiency(run_id),
+            "dispatches": self.dispatches(run_id),
             "events": self.events(run_id),
         }
