@@ -31,6 +31,7 @@ from .orchestrator_checkpoint import OrchestratorCheckpointStore
 from .browser_gateway import BrowserGateway
 from .browser_tools import register_browser_tools
 from .chat_checkpoint_tools import register_chat_checkpoint_tools
+from .harness_tools import register_harness_tools
 from .planner_service import PlannerService
 from .planner_store import PlannerStore
 from .pm_service import PMService
@@ -5080,6 +5081,16 @@ def build_mcp(service: TerminalService | None = None,
     browser_handlers: dict[str, Any] = {}
     if browser is not None:
         browser_handlers = register_browser_tools(server, browser)
+
+    # TMCP-HARNESS-001. Built over the queue's OWN database file -- the
+    # harness tables are part of that schema (migration v15), not a store
+    # beside it, so a HarnessRun and the queue_task it drives can commit
+    # together. Nothing here starts a loop: `terminal_harness_step` advances
+    # one stage per call and returns, which is the entire reason the engine
+    # has no scheduler thread of its own.
+    from .harness_store import HarnessStore as _HarnessStore
+    harness_handlers = register_harness_tools(
+        server, _HarnessStore(queue.store.path))
 
     # ------------------------------------------------------------------
     # P0.2 Event Bus. Publish/claim/ack only -- NOTHING here starts an

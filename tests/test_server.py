@@ -449,6 +449,17 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_project_phase_status",
         "terminal_project_registry_list",
         "terminal_project_reconcile_team",
+        # TMCP-HARNESS-001. Five tools and deliberately not more: start a
+        # run, move it one stage, look at it, see what is waiting on a human,
+        # and order a dependency graph. There is no run-to-completion tool --
+        # a loop on the server side runs whether or not anyone is watching,
+        # and the engine's whole posture is that something calls it when
+        # there is a reason to believe work has moved.
+        "terminal_harness_start",
+        "terminal_harness_step",
+        "terminal_harness_status",
+        "terminal_harness_decisions",
+        "terminal_harness_plan",
     }
 
 
