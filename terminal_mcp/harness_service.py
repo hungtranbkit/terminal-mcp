@@ -281,9 +281,18 @@ class HarnessService:
         if steps <= 0:
             return [], None
         outcomes: list[dict[str, Any]] = []
+        # Stepped here rather than delegating to `engine.drive`, which builds
+        # its whole list internally and therefore loses every completed step
+        # when a later one raises. Those steps really happened -- the run's
+        # stage and its event log both show them -- so a report that omits
+        # them describes a run that does not exist. The stop conditions are
+        # drive's own: an idle step, or a run that is done.
         try:
-            for outcome in engine.drive(run_id, max_steps=int(steps)):
+            for _ in range(int(steps)):
+                outcome = engine.step(run_id)
                 outcomes.append(outcome.to_dict())
+                if outcome.action == "idle" or outcome.done:
+                    break
         except Exception as exc:  # noqa: BLE001 -- reported, never swallowed
             return outcomes, f"{type(exc).__name__}: {exc}"
         return outcomes, None

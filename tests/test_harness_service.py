@@ -566,3 +566,41 @@ def test_status_for_an_unknown_run_is_an_honest_refusal(queue_store, repo):
     result = service.status(run_id="hrn_nope")
     assert result["status"] == "FAILED"
     assert result["error"] == "NO_RUN"
+
+
+def test_a_refused_drive_still_reports_the_steps_that_happened(queue_store, repo):
+    """With no AgentRunner, planning succeeds deterministically and the
+    Builder cannot be reached. The steps before that point are real -- the
+    run's stage and its event log both show them -- so a report that omitted
+    them would describe a run that does not exist."""
+    task_id = _task(queue_store)
+    service = HarnessService(store=HarnessStore(queue_store.path),
+                             queue=FakeQueue(queue_store), repo_root=str(repo),
+                             runner=None, check_runner=passing_checks)
+
+    started = service.start(task_id=task_id, acceptance=["a"], checks=["npm test"],
+                            steps=6)
+
+    assert started["status"] == "OK"
+    assert started["drive_error"], "the refusal is reported, not swallowed"
+    assert "AgentRunner" in started["drive_error"]
+    stages = [step["to_stage"] for step in started["steps"]]
+    assert stages, "the steps that happened must be reported"
+    assert state.PLAN_READY in stages
+    run = service.store.require_run(started["run"]["id"])
+    assert run.stage == stages[-1], \
+        "the last reported step is where the run actually is"
+
+
+def test_a_server_with_no_runner_cannot_spend_a_token(queue_store, repo):
+    """The P0 posture, asserted: every action works, planning is
+    deterministic, and nothing reaches a model."""
+    task_id = _task(queue_store)
+    service = HarnessService(store=HarnessStore(queue_store.path),
+                             queue=FakeQueue(queue_store), repo_root=str(repo),
+                             runner=None, check_runner=passing_checks)
+
+    started = service.start(task_id=task_id, acceptance=["a"], checks=["npm test"],
+                            steps=12)
+
+    assert service.store.efficiency(started["run"]["id"])["llm_calls"] == 0
